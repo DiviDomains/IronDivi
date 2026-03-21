@@ -23,18 +23,13 @@ jobs:
             use_cross: false
 
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             artifact: irondivi-x86_64-macos
             use_cross: false
 
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: irondivi-aarch64-macos
-            use_cross: false
-
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: irondivi-x86_64-windows
             use_cross: false
 
           # ── Cross-compiled builds (ubuntu-latest + cross-rs) ──────────
