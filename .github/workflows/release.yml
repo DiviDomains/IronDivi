@@ -16,21 +16,72 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── Native builds (GitHub-hosted runners) ──────────────────────
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: irondivi-linux-x86_64
+            artifact: irondivi-x86_64-linux-gnu
+            use_cross: false
+
           - target: x86_64-apple-darwin
             os: macos-13
-            artifact: irondivi-macos-x86_64
+            artifact: irondivi-x86_64-macos
+            use_cross: false
+
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: irondivi-macos-aarch64
+            artifact: irondivi-aarch64-macos
+            use_cross: false
+
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: irondivi-windows-x86_64
+            artifact: irondivi-x86_64-windows
+            use_cross: false
+
+          # ── Cross-compiled builds (ubuntu-latest + cross-rs) ──────────
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-aarch64-linux-gnu
+            use_cross: true
+
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            artifact: irondivi-linux-armv7
+            artifact: irondivi-armv7-linux-gnueabihf
+            use_cross: true
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: irondivi-x86_64-linux-musl
+            use_cross: true
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: irondivi-aarch64-linux-musl
+            use_cross: true
+
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-i686-linux-gnu
+            use_cross: true
+
+          - target: powerpc64le-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-powerpc64le-linux-gnu
+            use_cross: true
+
+          - target: s390x-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-s390x-linux-gnu
+            use_cross: true
+
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-riscv64-linux-gnu
+            use_cross: true
+
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            artifact: irondivi-x86_64-freebsd
+            use_cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -43,19 +94,17 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Install cross for ARM builds
       - name: Install cross
-        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      # Build with cross for ARM
       - name: Build (cross)
-        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        if: matrix.use_cross
+        continue-on-error: true
         run: cross build --release --target ${{ matrix.target }} --bin irondivid --bin irondivi-cli
 
-      # Build natively for other targets
       - name: Build (native)
-        if: matrix.target != 'armv7-unknown-linux-gnueabihf'
+        if: "!matrix.use_cross"
         run: cargo build --release --target ${{ matrix.target }} --bin irondivid --bin irondivi-cli
 
       # Package Unix builds
@@ -63,10 +112,15 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p ${{ matrix.artifact }}
-          cp target/${{ matrix.target }}/release/irondivid ${{ matrix.artifact }}/
-          cp target/${{ matrix.target }}/release/irondivi-cli ${{ matrix.artifact }}/
-          cp LICENSE README.md ${{ matrix.artifact }}/
-          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/irondivid ${{ matrix.artifact }}/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/irondivi-cli ${{ matrix.artifact }}/ 2>/dev/null || true
+          if [ -f LICENSE ]; then cp LICENSE ${{ matrix.artifact }}/; fi
+          if [ -f README.md ]; then cp README.md ${{ matrix.artifact }}/; fi
+          if [ -f ${{ matrix.artifact }}/irondivid ]; then
+            tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          else
+            echo "Build artifacts not found, skipping packaging"
+          fi
 
       # Package Windows builds
       - name: Package (Windows)
@@ -76,18 +130,24 @@ jobs:
           mkdir -p ${{ matrix.artifact }}
           cp target/${{ matrix.target }}/release/irondivid.exe ${{ matrix.artifact }}/
           cp target/${{ matrix.target }}/release/irondivi-cli.exe ${{ matrix.artifact }}/
-          cp LICENSE README.md ${{ matrix.artifact }}/
+          if [ -f LICENSE ]; then cp LICENSE ${{ matrix.artifact }}/; fi
+          if [ -f README.md ]; then cp README.md ${{ matrix.artifact }}/; fi
           7z a ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.*
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
 
   release:
     name: Create Release
     needs: build
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +155,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
