@@ -1,0 +1,2248 @@
+Name: aes
+Version: 0.8.4
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/block-ciphers
+
+Name: aho-corasick
+Version: 1.1.4
+License: MIT OR Unlicense
+Authors: Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/BurntSushi/aho-corasick
+
+Name: android_system_properties
+Version: 0.1.5
+License: Apache-2.0 OR MIT
+Authors: Nicolas Silva <nical@fastmail.com>
+Repository: https://github.com/nical/android_system_properties
+
+Name: anes
+Version: 0.1.6
+License: Apache-2.0 OR MIT
+Authors: Robert Vojta <rvojta@me.com>
+Repository: https://github.com/zrzka/anes-rs
+
+Name: anstream
+Version: 0.6.21
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-cli/anstyle.git
+
+Name: anstyle
+Version: 1.0.13
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-cli/anstyle.git
+
+Name: anstyle-parse
+Version: 0.2.7
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-cli/anstyle.git
+
+Name: anstyle-query
+Version: 1.1.5
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-cli/anstyle.git
+
+Name: anstyle-wincon
+Version: 3.0.11
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-cli/anstyle.git
+
+Name: anyhow
+Version: 1.0.100
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/anyhow
+
+Name: arrayvec
+Version: 0.7.6
+License: Apache-2.0 OR MIT
+Authors: bluss
+Repository: https://github.com/bluss/arrayvec
+
+Name: async-trait
+Version: 0.1.89
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/async-trait
+
+Name: atomic-waker
+Version: 1.1.2
+License: Apache-2.0 OR MIT
+Authors: Stjepan Glavina <stjepang@gmail.com>|Contributors to futures-rs
+Repository: https://github.com/smol-rs/atomic-waker
+
+Name: autocfg
+Version: 1.5.0
+License: Apache-2.0 OR MIT
+Authors: Josh Stone <cuviper@gmail.com>
+Repository: https://github.com/cuviper/autocfg
+
+Name: axum
+Version: 0.7.9
+License: MIT
+Repository: https://github.com/tokio-rs/axum
+
+Name: axum-core
+Version: 0.4.5
+License: MIT
+Repository: https://github.com/tokio-rs/axum
+
+Name: base16ct
+Version: 0.2.0
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/formats/tree/master/base16ct
+
+Name: base64
+Version: 0.21.7
+License: Apache-2.0 OR MIT
+Authors: Alice Maz <alice@alicemaz.com>|Marshall Pierce <marshall@mpierce.org>
+Repository: https://github.com/marshallpierce/rust-base64
+
+Name: base64
+Version: 0.22.1
+License: Apache-2.0 OR MIT
+Authors: Marshall Pierce <marshall@mpierce.org>
+Repository: https://github.com/marshallpierce/rust-base64
+
+Name: base64ct
+Version: 1.8.3
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/formats
+
+Name: bincode
+Version: 1.3.3
+License: MIT
+Authors: Ty Overby <ty@pre-alpha.com>|Francesco Mazzoli <f@mazzo.li>|David Tolnay <dtolnay@gmail.com>|Zoey Riordan <zoey@dos.cafe>
+Repository: https://github.com/servo/bincode
+
+Name: bindgen
+Version: 0.69.5
+License: BSD-3-Clause
+Authors: Jyun-Yan You <jyyou.tw@gmail.com>|Emilio Cobos Álvarez <emilio@crisal.io>|Nick Fitzgerald <fitzgen@gmail.com>|The Servo project developers
+Repository: https://github.com/rust-lang/rust-bindgen
+
+Name: bindgen
+Version: 0.72.1
+License: BSD-3-Clause
+Authors: Jyun-Yan You <jyyou.tw@gmail.com>|Emilio Cobos Álvarez <emilio@crisal.io>|Nick Fitzgerald <fitzgen@gmail.com>|The Servo project developers
+Repository: https://github.com/rust-lang/rust-bindgen
+
+Name: bip32
+Version: 0.5.3
+License: Apache-2.0 OR MIT
+Authors: Tony Arcieri <tony@iqlusion.io>
+Repository: https://github.com/iqlusioninc/crates/tree/main/bip32
+
+Name: bip39
+Version: 2.2.2
+License: CC0-1.0
+Authors: Steven Roose <steven@stevenroose.org>
+Repository: https://github.com/rust-bitcoin/rust-bip39/
+
+Name: bit-set
+Version: 0.8.0
+License: Apache-2.0 OR MIT
+Authors: Alexis Beingessner <a.beingessner@gmail.com>
+Repository: https://github.com/contain-rs/bit-set
+
+Name: bit-vec
+Version: 0.8.0
+License: Apache-2.0 OR MIT
+Authors: Alexis Beingessner <a.beingessner@gmail.com>
+Repository: https://github.com/contain-rs/bit-vec
+
+Name: bitcoin_hashes
+Version: 0.14.1
+License: CC0-1.0
+Authors: Andrew Poelstra <apoelstra@wpsoftware.net>
+Repository: https://github.com/rust-bitcoin/rust-bitcoin
+
+Name: bitflags
+Version: 1.3.2
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/bitflags/bitflags
+
+Name: bitflags
+Version: 2.10.0
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/bitflags/bitflags
+
+Name: block-buffer
+Version: 0.10.4
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/utils
+
+Name: block-comparator
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: block-padding
+Version: 0.3.3
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/utils
+
+Name: bs58
+Version: 0.5.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/Nullus157/bs58-rs
+
+Name: bumpalo
+Version: 3.19.1
+License: Apache-2.0 OR MIT
+Authors: Nick Fitzgerald <fitzgen@gmail.com>
+Repository: https://github.com/fitzgen/bumpalo
+
+Name: byteorder
+Version: 1.5.0
+License: MIT OR Unlicense
+Authors: Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/BurntSushi/byteorder
+
+Name: bytes
+Version: 1.11.0
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/tokio-rs/bytes
+
+Name: bzip2-sys
+Version: 0.1.13+1.0.8
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/alexcrichton/bzip2-rs
+
+Name: cast
+Version: 0.3.0
+License: Apache-2.0 OR MIT
+Authors: Jorge Aparicio <jorge@japaric.io>
+Repository: https://github.com/japaric/cast.rs
+
+Name: cbc
+Version: 0.1.2
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/block-modes
+
+Name: cc
+Version: 1.2.52
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/rust-lang/cc-rs
+
+Name: cexpr
+Version: 0.6.0
+License: Apache-2.0 OR MIT
+Authors: Jethro Beekman <jethro@jbeekman.nl>
+Repository: https://github.com/jethrogb/rust-cexpr
+
+Name: cfg-if
+Version: 1.0.4
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/rust-lang/cfg-if
+
+Name: chrono
+Version: 0.4.43
+License: Apache-2.0 OR MIT
+Repository: https://github.com/chronotope/chrono
+
+Name: ciborium
+Version: 0.2.2
+License: Apache-2.0
+Authors: Nathaniel McCallum <npmccallum@profian.com>
+Repository: https://github.com/enarx/ciborium
+
+Name: ciborium-io
+Version: 0.2.2
+License: Apache-2.0
+Authors: Nathaniel McCallum <npmccallum@profian.com>
+Repository: https://github.com/enarx/ciborium
+
+Name: ciborium-ll
+Version: 0.2.2
+License: Apache-2.0
+Authors: Nathaniel McCallum <npmccallum@profian.com>
+Repository: https://github.com/enarx/ciborium
+
+Name: cipher
+Version: 0.4.4
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/traits
+
+Name: clang-sys
+Version: 1.8.1
+License: Apache-2.0
+Authors: Kyle Mayes <kyle@mayeses.com>
+Repository: https://github.com/KyleMayes/clang-sys
+
+Name: clap
+Version: 4.5.54
+License: Apache-2.0 OR MIT
+Repository: https://github.com/clap-rs/clap
+
+Name: clap_builder
+Version: 4.5.54
+License: Apache-2.0 OR MIT
+Repository: https://github.com/clap-rs/clap
+
+Name: clap_derive
+Version: 4.5.49
+License: Apache-2.0 OR MIT
+Repository: https://github.com/clap-rs/clap
+
+Name: clap_lex
+Version: 0.7.7
+License: Apache-2.0 OR MIT
+Repository: https://github.com/clap-rs/clap
+
+Name: colorchoice
+Version: 1.0.4
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-cli/anstyle.git
+
+Name: const-oid
+Version: 0.9.6
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/formats/tree/master/const-oid
+
+Name: convert_case
+Version: 0.4.0
+License: MIT
+Authors: David Purdum <purdum41@gmail.com>
+Repository: https://github.com/rutrum/convert-case
+
+Name: core-foundation
+Version: 0.9.4
+License: Apache-2.0 OR MIT
+Authors: The Servo Project Developers
+Repository: https://github.com/servo/core-foundation-rs
+
+Name: core-foundation-sys
+Version: 0.8.7
+License: Apache-2.0 OR MIT
+Authors: The Servo Project Developers
+Repository: https://github.com/servo/core-foundation-rs
+
+Name: cpp-test-extractor
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: cpufeatures
+Version: 0.2.17
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/utils
+
+Name: criterion
+Version: 0.5.1
+License: Apache-2.0 OR MIT
+Authors: Jorge Aparicio <japaricious@gmail.com>|Brook Heisler <brookheisler@gmail.com>
+Repository: https://github.com/bheisler/criterion.rs
+
+Name: criterion-plot
+Version: 0.5.0
+License: Apache-2.0 OR MIT
+Authors: Jorge Aparicio <japaricious@gmail.com>|Brook Heisler <brookheisler@gmail.com>
+Repository: https://github.com/bheisler/criterion.rs
+
+Name: crossbeam-channel
+Version: 0.5.15
+License: Apache-2.0 OR MIT
+Repository: https://github.com/crossbeam-rs/crossbeam
+
+Name: crossbeam-deque
+Version: 0.8.6
+License: Apache-2.0 OR MIT
+Repository: https://github.com/crossbeam-rs/crossbeam
+
+Name: crossbeam-epoch
+Version: 0.9.18
+License: Apache-2.0 OR MIT
+Repository: https://github.com/crossbeam-rs/crossbeam
+
+Name: crossbeam-utils
+Version: 0.8.21
+License: Apache-2.0 OR MIT
+Repository: https://github.com/crossbeam-rs/crossbeam
+
+Name: crunchy
+Version: 0.2.4
+License: MIT
+Authors: Eira Fransham <jackefransham@gmail.com>
+Repository: https://github.com/eira-fransham/crunchy
+
+Name: crypto-bigint
+Version: 0.5.5
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/crypto-bigint
+
+Name: crypto-common
+Version: 0.1.7
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/traits
+
+Name: daemonize
+Version: 0.5.0
+License: Apache-2.0 OR MIT
+Authors: Fedor Gogolev <knsd@knsd.net>
+Repository: https://github.com/knsd/daemonize
+
+Name: data-encoding
+Version: 2.10.0
+License: MIT
+Authors: Julien Cretin <git@ia0.eu>
+Repository: https://github.com/ia0/data-encoding
+
+Name: der
+Version: 0.7.10
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/formats/tree/master/der
+
+Name: deranged
+Version: 0.5.5
+License: Apache-2.0 OR MIT
+Authors: Jacob Pratt <jacob@jhpratt.dev>
+Repository: https://github.com/jhpratt/deranged
+
+Name: derive_more
+Version: 0.99.20
+License: MIT
+Authors: Jelte Fennema <github-tech@jeltef.nl>
+Repository: https://github.com/JelteF/derive_more
+
+Name: digest
+Version: 0.10.7
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/traits
+
+Name: dirs
+Version: 5.0.1
+License: Apache-2.0 OR MIT
+Authors: Simon Ochsenreither <simon@ochsenreither.de>
+Repository: https://github.com/soc/dirs-rs
+
+Name: dirs-sys
+Version: 0.4.1
+License: Apache-2.0 OR MIT
+Authors: Simon Ochsenreither <simon@ochsenreither.de>
+Repository: https://github.com/dirs-dev/dirs-sys-rs
+
+Name: displaydoc
+Version: 0.2.5
+License: Apache-2.0 OR MIT
+Authors: Jane Lusby <jlusby@yaah.dev>
+Repository: https://github.com/yaahc/displaydoc
+
+Name: divi-consensus
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-crypto
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-masternode
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-network
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-node
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-primitives
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-rpc
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-script
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-storage
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: divi-wallet
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: ecdsa
+Version: 0.16.9
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/signatures/tree/master/ecdsa
+
+Name: either
+Version: 1.15.0
+License: Apache-2.0 OR MIT
+Authors: bluss
+Repository: https://github.com/rayon-rs/either
+
+Name: elliptic-curve
+Version: 0.13.8
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/traits/tree/master/elliptic-curve
+
+Name: encoding_rs
+Version: 0.8.35
+License: (Apache-2.0 OR MIT) AND BSD-3-Clause
+Authors: Henri Sivonen <hsivonen@hsivonen.fi>
+Repository: https://github.com/hsivonen/encoding_rs
+
+Name: equivalent
+Version: 1.0.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/indexmap-rs/equivalent
+
+Name: errno
+Version: 0.3.14
+License: Apache-2.0 OR MIT
+Authors: Chris Wong <lambda.fairy@gmail.com>|Dan Gohman <dev@sunfishcode.online>
+Repository: https://github.com/lambda-fairy/rust-errno
+
+Name: fastrand
+Version: 2.3.0
+License: Apache-2.0 OR MIT
+Authors: Stjepan Glavina <stjepang@gmail.com>
+Repository: https://github.com/smol-rs/fastrand
+
+Name: ff
+Version: 0.13.1
+License: Apache-2.0 OR MIT
+Authors: Sean Bowe <ewillbefull@gmail.com>|Jack Grigg <thestr4d@gmail.com>
+Repository: https://github.com/zkcrypto/ff
+
+Name: find-msvc-tools
+Version: 0.1.7
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/cc-rs
+
+Name: fnv
+Version: 1.0.7
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/servo/rust-fnv
+
+Name: foreign-types
+Version: 0.3.2
+License: Apache-2.0 OR MIT
+Authors: Steven Fackler <sfackler@gmail.com>
+Repository: https://github.com/sfackler/foreign-types
+
+Name: foreign-types-shared
+Version: 0.1.1
+License: Apache-2.0 OR MIT
+Authors: Steven Fackler <sfackler@gmail.com>
+Repository: https://github.com/sfackler/foreign-types
+
+Name: form_urlencoded
+Version: 1.2.2
+License: Apache-2.0 OR MIT
+Authors: The rust-url developers
+Repository: https://github.com/servo/rust-url
+
+Name: futures
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-channel
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-core
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-executor
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-io
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-macro
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-sink
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-task
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: futures-util
+Version: 0.3.31
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rust-lang/futures-rs
+
+Name: generic-array
+Version: 0.14.7
+License: MIT
+Authors: Bartłomiej Kamiński <fizyk20@gmail.com>|Aaron Trent <novacrazy@gmail.com>
+Repository: https://github.com/fizyk20/generic-array.git
+
+Name: getrandom
+Version: 0.2.17
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers
+Repository: https://github.com/rust-random/getrandom
+
+Name: getrandom
+Version: 0.3.4
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers
+Repository: https://github.com/rust-random/getrandom
+
+Name: glob
+Version: 0.3.3
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/rust-lang/glob
+
+Name: group
+Version: 0.13.0
+License: Apache-2.0 OR MIT
+Authors: Sean Bowe <ewillbefull@gmail.com>|Jack Grigg <jack@z.cash>
+Repository: https://github.com/zkcrypto/group
+
+Name: h2
+Version: 0.3.27
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/h2
+
+Name: half
+Version: 2.7.1
+License: Apache-2.0 OR MIT
+Authors: Kathryn Long <squeeself@gmail.com>
+Repository: https://github.com/VoidStarKat/half-rs
+
+Name: hashbrown
+Version: 0.16.1
+License: Apache-2.0 OR MIT
+Authors: Amanieu d'Antras <amanieu@gmail.com>
+Repository: https://github.com/rust-lang/hashbrown
+
+Name: heck
+Version: 0.5.0
+License: Apache-2.0 OR MIT
+Repository: https://github.com/withoutboats/heck
+
+Name: hermit-abi
+Version: 0.5.2
+License: Apache-2.0 OR MIT
+Authors: Stefan Lankes
+Repository: https://github.com/hermit-os/hermit-rs
+
+Name: hex
+Version: 0.4.3
+License: Apache-2.0 OR MIT
+Authors: KokaKiwi <kokakiwi@kokakiwi.net>
+Repository: https://github.com/KokaKiwi/rust-hex
+
+Name: hex-conservative
+Version: 0.2.2
+License: CC0-1.0
+Authors: Martin Habovštiak <martin.habovstiak@gmail.com>|Andrew Poelstra <apoelstra@wpsoftware.net>
+Repository: https://github.com/rust-bitcoin/hex-conservative
+
+Name: hmac
+Version: 0.12.1
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/MACs
+
+Name: http
+Version: 0.2.12
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Carl Lerche <me@carllerche.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/http
+
+Name: http
+Version: 1.4.0
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Carl Lerche <me@carllerche.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/http
+
+Name: http-body
+Version: 0.4.6
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>|Lucio Franco <luciofranco14@gmail.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/http-body
+
+Name: http-body
+Version: 1.0.1
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>|Lucio Franco <luciofranco14@gmail.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/http-body
+
+Name: http-body-util
+Version: 0.1.3
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>|Lucio Franco <luciofranco14@gmail.com>|Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/http-body
+
+Name: httparse
+Version: 1.10.1
+License: Apache-2.0 OR MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/seanmonstar/httparse
+
+Name: httpdate
+Version: 1.0.3
+License: Apache-2.0 OR MIT
+Authors: Pyfisch <pyfisch@posteo.org>
+Repository: https://github.com/pyfisch/httpdate
+
+Name: hyper
+Version: 0.14.32
+License: MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/hyper
+
+Name: hyper
+Version: 1.8.1
+License: MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/hyper
+
+Name: hyper-tls
+Version: 0.5.0
+License: Apache-2.0 OR MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/hyper-tls
+
+Name: hyper-util
+Version: 0.1.19
+License: MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/hyper-util
+
+Name: iana-time-zone
+Version: 0.1.64
+License: Apache-2.0 OR MIT
+Authors: Andrew Straw <strawman@astraw.com>|René Kijewski <rene.kijewski@fu-berlin.de>|Ryan Lopopolo <rjl@hyperbo.la>
+Repository: https://github.com/strawlab/iana-time-zone
+
+Name: iana-time-zone-haiku
+Version: 0.1.2
+License: Apache-2.0 OR MIT
+Authors: René Kijewski <crates.io@k6i.de>
+Repository: https://github.com/strawlab/iana-time-zone
+
+Name: icu_collections
+Version: 2.1.1
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: icu_locale_core
+Version: 2.1.1
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: icu_normalizer
+Version: 2.1.1
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: icu_normalizer_data
+Version: 2.1.1
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: icu_properties
+Version: 2.1.2
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: icu_properties_data
+Version: 2.1.2
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: icu_provider
+Version: 2.1.1
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: idna
+Version: 1.1.0
+License: Apache-2.0 OR MIT
+Authors: The rust-url developers
+Repository: https://github.com/servo/rust-url/
+
+Name: idna_adapter
+Version: 1.2.1
+License: Apache-2.0 OR MIT
+Authors: The rust-url developers
+Repository: https://github.com/hsivonen/idna_adapter
+
+Name: indexmap
+Version: 2.13.0
+License: Apache-2.0 OR MIT
+Repository: https://github.com/indexmap-rs/indexmap
+
+Name: inout
+Version: 0.1.4
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/utils
+
+Name: integration-tests
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: ipnet
+Version: 2.11.0
+License: Apache-2.0 OR MIT
+Authors: Kris Price <kris@krisprice.nz>
+Repository: https://github.com/krisprice/ipnet
+
+Name: irondivi-cli
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: irondivid
+Version: 0.1.0
+License: AGPL-3.0
+
+Name: is-terminal
+Version: 0.4.17
+License: MIT
+Authors: softprops <d.tangren@gmail.com>|Dan Gohman <dev@sunfishcode.online>
+Repository: https://github.com/sunfishcode/is-terminal
+
+Name: is_terminal_polyfill
+Version: 1.70.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/polyfill-rs/is_terminal_polyfill
+
+Name: itertools
+Version: 0.10.5
+License: Apache-2.0 OR MIT
+Authors: bluss
+Repository: https://github.com/rust-itertools/itertools
+
+Name: itertools
+Version: 0.12.1
+License: Apache-2.0 OR MIT
+Authors: bluss
+Repository: https://github.com/rust-itertools/itertools
+
+Name: itertools
+Version: 0.13.0
+License: Apache-2.0 OR MIT
+Authors: bluss
+Repository: https://github.com/rust-itertools/itertools
+
+Name: itoa
+Version: 1.0.17
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/itoa
+
+Name: jobserver
+Version: 0.1.34
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/rust-lang/jobserver-rs
+
+Name: js-sys
+Version: 0.3.85
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
+
+Name: k256
+Version: 0.13.4
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/elliptic-curves/tree/master/k256
+
+Name: lazy_static
+Version: 1.5.0
+License: Apache-2.0 OR MIT
+Authors: Marvin Löbel <loebel.marvin@gmail.com>
+Repository: https://github.com/rust-lang-nursery/lazy-static.rs
+
+Name: lazycell
+Version: 1.3.0
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Nikita Pekin <contact@nikitapek.in>
+Repository: https://github.com/indiv0/lazycell
+
+Name: libc
+Version: 0.2.180
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/rust-lang/libc
+
+Name: libloading
+Version: 0.8.9
+License: ISC
+Authors: Simonas Kazlauskas <libloading@kazlauskas.me>
+Repository: https://github.com/nagisa/rust_libloading/
+
+Name: libredox
+Version: 0.1.12
+License: MIT
+Authors: 4lDO2 <4lDO2@protonmail.com>
+Repository: https://gitlab.redox-os.org/redox-os/libredox.git
+
+Name: librocksdb-sys
+Version: 0.16.0+8.10.0
+License: Apache-2.0 OR BSD-3-Clause OR MIT
+Authors: Karl Hobley <karlhobley10@gmail.com>|Arkadiy Paronyan <arkadiy@ethcore.io>
+Repository: https://github.com/rust-rocksdb/rust-rocksdb
+
+Name: libz-sys
+Version: 1.1.23
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Josh Triplett <josh@joshtriplett.org>|Sebastian Thiel <sebastian.thiel@icloud.com>
+Repository: https://github.com/rust-lang/libz-sys
+
+Name: linux-raw-sys
+Version: 0.11.0
+License: Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT
+Authors: Dan Gohman <dev@sunfishcode.online>
+Repository: https://github.com/sunfishcode/linux-raw-sys
+
+Name: litemap
+Version: 0.8.1
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: lock_api
+Version: 0.4.14
+License: Apache-2.0 OR MIT
+Authors: Amanieu d'Antras <amanieu@gmail.com>
+Repository: https://github.com/Amanieu/parking_lot
+
+Name: log
+Version: 0.4.29
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/rust-lang/log
+
+Name: lz4-sys
+Version: 1.11.1+lz4-1.10.0
+License: MIT
+Authors: Jens Heyens <jens.heyens@ewetel.net>|Artem V. Navrotskiy <bozaro@buzzsoft.ru>|Patrick Marks <pmarks@gmail.com>
+Repository: https://github.com/10xGenomics/lz4-rs
+
+Name: matchers
+Version: 0.2.0
+License: MIT
+Authors: Eliza Weisman <eliza@buoyant.io>
+Repository: https://github.com/hawkw/matchers
+
+Name: matchit
+Version: 0.7.3
+License: BSD-3-Clause AND MIT
+Authors: Ibraheem Ahmed <ibraheem@ibraheem.ca>
+Repository: https://github.com/ibraheemdev/matchit
+
+Name: memchr
+Version: 2.7.6
+License: MIT OR Unlicense
+Authors: Andrew Gallant <jamslam@gmail.com>|bluss
+Repository: https://github.com/BurntSushi/memchr
+
+Name: mime
+Version: 0.3.17
+License: Apache-2.0 OR MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/hyperium/mime
+
+Name: minimal-lexical
+Version: 0.2.1
+License: Apache-2.0 OR MIT
+Authors: Alex Huszagh <ahuszagh@gmail.com>
+Repository: https://github.com/Alexhuszagh/minimal-lexical
+
+Name: mio
+Version: 1.1.1
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>|Thomas de Zeeuw <thomasdezeeuw@gmail.com>|Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/mio
+
+Name: moka
+Version: 0.12.13
+License: (Apache-2.0 OR MIT) AND Apache-2.0
+Repository: https://github.com/moka-rs/moka
+
+Name: native-tls
+Version: 0.2.14
+License: Apache-2.0 OR MIT
+Authors: Steven Fackler <sfackler@gmail.com>
+Repository: https://github.com/sfackler/rust-native-tls
+
+Name: nom
+Version: 7.1.3
+License: MIT
+Authors: contact@geoffroycouprie.com
+Repository: https://github.com/Geal/nom
+
+Name: nu-ansi-term
+Version: 0.50.3
+License: MIT
+Authors: ogham@bsago.me|Ryan Scheel (Havvy) <ryan.havvy@gmail.com>|Josh Triplett <josh@joshtriplett.org>|The Nushell Project Developers
+Repository: https://github.com/nushell/nu-ansi-term
+
+Name: num-conv
+Version: 0.2.0
+License: Apache-2.0 OR MIT
+Authors: Jacob Pratt <jacob@jhpratt.dev>
+Repository: https://github.com/jhpratt/num-conv
+
+Name: num-traits
+Version: 0.2.19
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/rust-num/num-traits
+
+Name: once_cell
+Version: 1.21.3
+License: Apache-2.0 OR MIT
+Authors: Aleksey Kladov <aleksey.kladov@gmail.com>
+Repository: https://github.com/matklad/once_cell
+
+Name: once_cell_polyfill
+Version: 1.70.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/polyfill-rs/once_cell_polyfill
+
+Name: oorandom
+Version: 11.1.5
+License: MIT
+Authors: Simon Heath <icefox@dreamquest.io>
+Repository: https://hg.sr.ht/~icefox/oorandom
+
+Name: openssl
+Version: 0.10.75
+License: Apache-2.0
+Authors: Steven Fackler <sfackler@gmail.com>
+Repository: https://github.com/rust-openssl/rust-openssl
+
+Name: openssl-macros
+Version: 0.1.1
+License: Apache-2.0 OR MIT
+
+Name: openssl-probe
+Version: 0.1.6
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/alexcrichton/openssl-probe
+
+Name: openssl-sys
+Version: 0.9.111
+License: MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Steven Fackler <sfackler@gmail.com>
+Repository: https://github.com/rust-openssl/rust-openssl
+
+Name: option-ext
+Version: 0.2.0
+License: MPL-2.0
+Authors: Simon Ochsenreither <simon@ochsenreither.de>
+Repository: https://github.com/soc/option-ext.git
+
+Name: parking_lot
+Version: 0.12.5
+License: Apache-2.0 OR MIT
+Authors: Amanieu d'Antras <amanieu@gmail.com>
+Repository: https://github.com/Amanieu/parking_lot
+
+Name: parking_lot_core
+Version: 0.9.12
+License: Apache-2.0 OR MIT
+Authors: Amanieu d'Antras <amanieu@gmail.com>
+Repository: https://github.com/Amanieu/parking_lot
+
+Name: password-hash
+Version: 0.5.0
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/traits/tree/master/password-hash
+
+Name: pbkdf2
+Version: 0.12.2
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/password-hashes/tree/master/pbkdf2
+
+Name: percent-encoding
+Version: 2.3.2
+License: Apache-2.0 OR MIT
+Authors: The rust-url developers
+Repository: https://github.com/servo/rust-url/
+
+Name: pin-project-lite
+Version: 0.2.16
+License: Apache-2.0 OR MIT
+Repository: https://github.com/taiki-e/pin-project-lite
+
+Name: pin-utils
+Version: 0.1.0
+License: Apache-2.0 OR MIT
+Authors: Josef Brandl <mail@josefbrandl.de>
+Repository: https://github.com/rust-lang-nursery/pin-utils
+
+Name: pkg-config
+Version: 0.3.32
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/rust-lang/pkg-config-rs
+
+Name: plotters
+Version: 0.3.7
+License: MIT
+Authors: Hao Hou <haohou302@gmail.com>
+Repository: https://github.com/plotters-rs/plotters
+
+Name: plotters-backend
+Version: 0.3.7
+License: MIT
+Authors: Hao Hou <haohou302@gmail.com>
+Repository: https://github.com/plotters-rs/plotters
+
+Name: plotters-svg
+Version: 0.3.7
+License: MIT
+Authors: Hao Hou <haohou302@gmail.com>
+Repository: https://github.com/plotters-rs/plotters.git
+
+Name: portable-atomic
+Version: 1.13.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/taiki-e/portable-atomic
+
+Name: potential_utf
+Version: 0.1.4
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: powerfmt
+Version: 0.2.0
+License: Apache-2.0 OR MIT
+Authors: Jacob Pratt <jacob@jhpratt.dev>
+Repository: https://github.com/jhpratt/powerfmt
+
+Name: ppv-lite86
+Version: 0.2.21
+License: Apache-2.0 OR MIT
+Authors: The CryptoCorrosion Contributors
+Repository: https://github.com/cryptocorrosion/cryptocorrosion
+
+Name: proc-macro2
+Version: 1.0.105
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>|Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/dtolnay/proc-macro2
+
+Name: proptest
+Version: 1.9.0
+License: Apache-2.0 OR MIT
+Authors: Jason Lingle
+Repository: https://github.com/proptest-rs/proptest
+
+Name: quick-error
+Version: 1.2.3
+License: Apache-2.0 OR MIT
+Authors: Paul Colomiets <paul@colomiets.name>|Colin Kiegel <kiegel@gmx.de>
+Repository: http://github.com/tailhook/quick-error
+
+Name: quote
+Version: 1.0.43
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/quote
+
+Name: r-efi
+Version: 5.3.0
+License: Apache-2.0 OR LGPL-2.1-or-later OR MIT
+Repository: https://github.com/r-efi/r-efi
+
+Name: rand
+Version: 0.8.5
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers
+Repository: https://github.com/rust-random/rand
+
+Name: rand
+Version: 0.9.2
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers
+Repository: https://github.com/rust-random/rand
+
+Name: rand_chacha
+Version: 0.3.1
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers|The CryptoCorrosion Contributors
+Repository: https://github.com/rust-random/rand
+
+Name: rand_chacha
+Version: 0.9.0
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers|The CryptoCorrosion Contributors
+Repository: https://github.com/rust-random/rand
+
+Name: rand_core
+Version: 0.6.4
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers
+Repository: https://github.com/rust-random/rand
+
+Name: rand_core
+Version: 0.9.5
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers
+Repository: https://github.com/rust-random/rand
+
+Name: rand_xorshift
+Version: 0.4.0
+License: Apache-2.0 OR MIT
+Authors: The Rand Project Developers|The Rust Project Developers
+Repository: https://github.com/rust-random/rngs
+
+Name: rayon
+Version: 1.11.0
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rayon-rs/rayon
+
+Name: rayon-core
+Version: 1.13.0
+License: Apache-2.0 OR MIT
+Repository: https://github.com/rayon-rs/rayon
+
+Name: redox_syscall
+Version: 0.5.18
+License: MIT
+Authors: Jeremy Soller <jackpot51@gmail.com>
+Repository: https://gitlab.redox-os.org/redox-os/syscall
+
+Name: redox_users
+Version: 0.4.6
+License: MIT
+Authors: Jose Narvaez <goyox86@gmail.com>|Wesley Hershberger <mggmugginsmc@gmail.com>
+Repository: https://gitlab.redox-os.org/redox-os/users
+
+Name: regex
+Version: 1.12.2
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers|Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/rust-lang/regex
+
+Name: regex-automata
+Version: 0.4.13
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers|Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/rust-lang/regex
+
+Name: regex-syntax
+Version: 0.8.8
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers|Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/rust-lang/regex
+
+Name: reqwest
+Version: 0.11.27
+License: Apache-2.0 OR MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/seanmonstar/reqwest
+
+Name: rfc6979
+Version: 0.4.0
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/signatures/tree/master/rfc6979
+
+Name: ripemd
+Version: 0.1.3
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/hashes
+
+Name: rocksdb
+Version: 0.22.0
+License: Apache-2.0
+Authors: Tyler Neely <t@jujit.su>|David Greenberg <dsg123456789@gmail.com>
+Repository: https://github.com/rust-rocksdb/rust-rocksdb
+
+Name: rustc-hash
+Version: 1.1.0
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/rust-lang-nursery/rustc-hash
+
+Name: rustc-hash
+Version: 2.1.1
+License: Apache-2.0 OR MIT
+Authors: The Rust Project Developers
+Repository: https://github.com/rust-lang/rustc-hash
+
+Name: rustc_version
+Version: 0.4.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/djc/rustc-version-rs
+
+Name: rustix
+Version: 1.1.3
+License: Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT
+Authors: Dan Gohman <dev@sunfishcode.online>|Jakub Konka <kubkon@jakubkonka.com>
+Repository: https://github.com/bytecodealliance/rustix
+
+Name: rustls-pemfile
+Version: 1.0.4
+License: Apache-2.0 OR ISC OR MIT
+Repository: https://github.com/rustls/pemfile
+
+Name: rustversion
+Version: 1.0.22
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/rustversion
+
+Name: rusty-fork
+Version: 0.3.1
+License: Apache-2.0 OR MIT
+Authors: Jason Lingle
+Repository: https://github.com/altsysrq/rusty-fork
+
+Name: ryu
+Version: 1.0.22
+License: Apache-2.0 OR BSL-1.0
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/ryu
+
+Name: salsa20
+Version: 0.10.2
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/stream-ciphers
+
+Name: same-file
+Version: 1.0.6
+License: MIT OR Unlicense
+Authors: Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/BurntSushi/same-file
+
+Name: schannel
+Version: 0.1.28
+License: MIT
+Authors: Steven Fackler <sfackler@gmail.com>|Steffen Butzer <steffen.butzer@outlook.com>
+Repository: https://github.com/steffengy/schannel-rs
+
+Name: scopeguard
+Version: 1.2.0
+License: Apache-2.0 OR MIT
+Authors: bluss
+Repository: https://github.com/bluss/scopeguard
+
+Name: scrypt
+Version: 0.11.0
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/password-hashes/tree/master/scrypt
+
+Name: sec1
+Version: 0.7.3
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/formats/tree/master/sec1
+
+Name: secp256k1
+Version: 0.27.0
+License: CC0-1.0
+Authors: Dawid Ciężarkiewicz <dpc@ucore.info>|Andrew Poelstra <apoelstra@wpsoftware.net>
+Repository: https://github.com/rust-bitcoin/rust-secp256k1/
+
+Name: secp256k1
+Version: 0.29.1
+License: CC0-1.0
+Authors: Dawid Ciężarkiewicz <dpc@ucore.info>|Andrew Poelstra <apoelstra@wpsoftware.net>
+Repository: https://github.com/rust-bitcoin/rust-secp256k1/
+
+Name: secp256k1-sys
+Version: 0.8.2
+License: CC0-1.0
+Authors: Dawid Ciężarkiewicz <dpc@ucore.info>|Andrew Poelstra <apoelstra@wpsoftware.net>|Steven Roose <steven@stevenroose.org>
+Repository: https://github.com/rust-bitcoin/rust-secp256k1/
+
+Name: secp256k1-sys
+Version: 0.10.1
+License: CC0-1.0
+Authors: Dawid Ciężarkiewicz <dpc@ucore.info>|Andrew Poelstra <apoelstra@wpsoftware.net>|Steven Roose <steven@stevenroose.org>
+Repository: https://github.com/rust-bitcoin/rust-secp256k1/
+
+Name: security-framework
+Version: 2.11.1
+License: Apache-2.0 OR MIT
+Authors: Steven Fackler <sfackler@gmail.com>|Kornel <kornel@geekhood.net>
+Repository: https://github.com/kornelski/rust-security-framework
+
+Name: security-framework-sys
+Version: 2.15.0
+License: Apache-2.0 OR MIT
+Authors: Steven Fackler <sfackler@gmail.com>|Kornel <kornel@geekhood.net>
+Repository: https://github.com/kornelski/rust-security-framework
+
+Name: semver
+Version: 1.0.27
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/semver
+
+Name: serde
+Version: 1.0.228
+License: Apache-2.0 OR MIT
+Authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>|David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/serde-rs/serde
+
+Name: serde_core
+Version: 1.0.228
+License: Apache-2.0 OR MIT
+Authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>|David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/serde-rs/serde
+
+Name: serde_derive
+Version: 1.0.228
+License: Apache-2.0 OR MIT
+Authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>|David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/serde-rs/serde
+
+Name: serde_json
+Version: 1.0.149
+License: Apache-2.0 OR MIT
+Authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>|David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/serde-rs/json
+
+Name: serde_path_to_error
+Version: 0.1.20
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/path-to-error
+
+Name: serde_spanned
+Version: 0.6.9
+License: Apache-2.0 OR MIT
+Repository: https://github.com/toml-rs/toml
+
+Name: serde_urlencoded
+Version: 0.7.1
+License: Apache-2.0 OR MIT
+Authors: Anthony Ramine <n.oxyde@gmail.com>
+Repository: https://github.com/nox/serde_urlencoded
+
+Name: sha1
+Version: 0.10.6
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/hashes
+
+Name: sha2
+Version: 0.10.9
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/hashes
+
+Name: sharded-slab
+Version: 0.1.7
+License: MIT
+Authors: Eliza Weisman <eliza@buoyant.io>
+Repository: https://github.com/hawkw/sharded-slab
+
+Name: shlex
+Version: 1.3.0
+License: Apache-2.0 OR MIT
+Authors: comex <comexk@gmail.com>|Fenhl <fenhl@fenhl.net>|Adrian Taylor <adetaylor@chromium.org>|Alex Touchet <alextouchet@outlook.com>|Daniel Parks <dp+git@oxidized.org>|Garrett Berg <googberg@gmail.com>
+Repository: https://github.com/comex/rust-shlex
+
+Name: signal-hook-registry
+Version: 1.4.8
+License: Apache-2.0 OR MIT
+Authors: Michal 'vorner' Vaner <vorner@vorner.cz>|Masaki Hara <ackie.h.gmai@gmail.com>
+Repository: https://github.com/vorner/signal-hook
+
+Name: signature
+Version: 2.2.0
+License: Apache-2.0 OR MIT
+Authors: RustCrypto Developers
+Repository: https://github.com/RustCrypto/traits/tree/master/signature
+
+Name: slab
+Version: 0.4.11
+License: MIT
+Authors: Carl Lerche <me@carllerche.com>
+Repository: https://github.com/tokio-rs/slab
+
+Name: smallvec
+Version: 1.15.1
+License: Apache-2.0 OR MIT
+Authors: The Servo Project Developers
+Repository: https://github.com/servo/rust-smallvec
+
+Name: socket2
+Version: 0.5.10
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Thomas de Zeeuw <thomasdezeeuw@gmail.com>
+Repository: https://github.com/rust-lang/socket2
+
+Name: socket2
+Version: 0.6.1
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>|Thomas de Zeeuw <thomasdezeeuw@gmail.com>
+Repository: https://github.com/rust-lang/socket2
+
+Name: stable_deref_trait
+Version: 1.2.1
+License: Apache-2.0 OR MIT
+Authors: Robert Grosse <n210241048576@gmail.com>
+Repository: https://github.com/storyyeller/stable_deref_trait
+
+Name: strsim
+Version: 0.11.1
+License: MIT
+Authors: Danny Guo <danny@dannyguo.com>|maxbachmann <oss@maxbachmann.de>
+Repository: https://github.com/rapidfuzz/strsim-rs
+
+Name: subtle
+Version: 2.6.1
+License: BSD-3-Clause
+Authors: Isis Lovecruft <isis@patternsinthevoid.net>|Henry de Valence <hdevalence@hdevalence.ca>
+Repository: https://github.com/dalek-cryptography/subtle
+
+Name: syn
+Version: 2.0.114
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/syn
+
+Name: sync_wrapper
+Version: 0.1.2
+License: Apache-2.0
+Authors: Actyx AG <developer@actyx.io>
+Repository: https://github.com/Actyx/sync_wrapper
+
+Name: sync_wrapper
+Version: 1.0.2
+License: Apache-2.0
+Authors: Actyx AG <developer@actyx.io>
+Repository: https://github.com/Actyx/sync_wrapper
+
+Name: synstructure
+Version: 0.13.2
+License: MIT
+Authors: Nika Layzell <nika@thelayzells.com>
+Repository: https://github.com/mystor/synstructure
+
+Name: system-configuration
+Version: 0.5.1
+License: Apache-2.0 OR MIT
+Authors: Mullvad VPN
+Repository: https://github.com/mullvad/system-configuration-rs
+
+Name: system-configuration-sys
+Version: 0.5.0
+License: Apache-2.0 OR MIT
+Authors: Mullvad VPN
+Repository: https://github.com/mullvad/system-configuration-rs
+
+Name: tagptr
+Version: 0.2.0
+License: Apache-2.0 OR MIT
+Authors: Oliver Giersch
+Repository: https://github.com/oliver-giersch/tagptr.git
+
+Name: tempfile
+Version: 3.24.0
+License: Apache-2.0 OR MIT
+Authors: Steven Allen <steven@stebalien.com>|The Rust Project Developers|Ashley Mannix <ashleymannix@live.com.au>|Jason White <me@jasonwhite.io>
+Repository: https://github.com/Stebalien/tempfile
+
+Name: thiserror
+Version: 1.0.69
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/thiserror
+
+Name: thiserror
+Version: 2.0.18
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/thiserror
+
+Name: thiserror-impl
+Version: 1.0.69
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/thiserror
+
+Name: thiserror-impl
+Version: 2.0.18
+License: Apache-2.0 OR MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/thiserror
+
+Name: thread_local
+Version: 1.1.9
+License: Apache-2.0 OR MIT
+Authors: Amanieu d'Antras <amanieu@gmail.com>
+Repository: https://github.com/Amanieu/thread_local-rs
+
+Name: time
+Version: 0.3.46
+License: Apache-2.0 OR MIT
+Authors: Jacob Pratt <open-source@jhpratt.dev>|Time contributors
+Repository: https://github.com/time-rs/time
+
+Name: time-core
+Version: 0.1.8
+License: Apache-2.0 OR MIT
+Authors: Jacob Pratt <open-source@jhpratt.dev>|Time contributors
+Repository: https://github.com/time-rs/time
+
+Name: time-macros
+Version: 0.2.26
+License: Apache-2.0 OR MIT
+Authors: Jacob Pratt <open-source@jhpratt.dev>|Time contributors
+Repository: https://github.com/time-rs/time
+
+Name: tinystr
+Version: 0.8.2
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: tinytemplate
+Version: 1.2.1
+License: Apache-2.0 OR MIT
+Authors: Brook Heisler <brookheisler@gmail.com>
+Repository: https://github.com/bheisler/TinyTemplate
+
+Name: tinyvec
+Version: 1.10.0
+License: Apache-2.0 OR MIT OR Zlib
+Authors: Lokathor <zefria@gmail.com>
+Repository: https://github.com/Lokathor/tinyvec
+
+Name: tinyvec_macros
+Version: 0.1.1
+License: Apache-2.0 OR MIT OR Zlib
+Authors: Soveu <marx.tomasz@gmail.com>
+Repository: https://github.com/Soveu/tinyvec_macros
+
+Name: tokio
+Version: 1.49.0
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tokio
+
+Name: tokio-macros
+Version: 2.6.0
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tokio
+
+Name: tokio-native-tls
+Version: 0.3.1
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tls
+
+Name: tokio-stream
+Version: 0.1.18
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tokio
+
+Name: tokio-test
+Version: 0.4.5
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tokio
+
+Name: tokio-tungstenite
+Version: 0.24.0
+License: MIT
+Authors: Daniel Abramov <dabramov@snapview.de>|Alexey Galakhov <agalakhov@snapview.de>
+Repository: https://github.com/snapview/tokio-tungstenite
+
+Name: tokio-util
+Version: 0.7.18
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tokio
+
+Name: toml
+Version: 0.8.23
+License: Apache-2.0 OR MIT
+Repository: https://github.com/toml-rs/toml
+
+Name: toml_datetime
+Version: 0.6.11
+License: Apache-2.0 OR MIT
+Repository: https://github.com/toml-rs/toml
+
+Name: toml_edit
+Version: 0.22.27
+License: Apache-2.0 OR MIT
+Repository: https://github.com/toml-rs/toml
+
+Name: toml_write
+Version: 0.1.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/toml-rs/toml
+
+Name: tower
+Version: 0.4.13
+License: MIT
+Authors: Tower Maintainers <team@tower-rs.com>
+Repository: https://github.com/tower-rs/tower
+
+Name: tower
+Version: 0.5.3
+License: MIT
+Authors: Tower Maintainers <team@tower-rs.com>
+Repository: https://github.com/tower-rs/tower
+
+Name: tower-http
+Version: 0.5.2
+License: MIT
+Authors: Tower Maintainers <team@tower-rs.com>
+Repository: https://github.com/tower-rs/tower-http
+
+Name: tower-layer
+Version: 0.3.3
+License: MIT
+Authors: Tower Maintainers <team@tower-rs.com>
+Repository: https://github.com/tower-rs/tower
+
+Name: tower-service
+Version: 0.3.3
+License: MIT
+Authors: Tower Maintainers <team@tower-rs.com>
+Repository: https://github.com/tower-rs/tower
+
+Name: tracing
+Version: 0.1.44
+License: MIT
+Authors: Eliza Weisman <eliza@buoyant.io>|Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tracing
+
+Name: tracing-appender
+Version: 0.2.4
+License: MIT
+Authors: Zeki Sherif <zekshi@amazon.com>|Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tracing
+
+Name: tracing-attributes
+Version: 0.1.31
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>|Eliza Weisman <eliza@buoyant.io>|David Barsky <dbarsky@amazon.com>
+Repository: https://github.com/tokio-rs/tracing
+
+Name: tracing-core
+Version: 0.1.36
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tracing
+
+Name: tracing-log
+Version: 0.2.0
+License: MIT
+Authors: Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tracing
+
+Name: tracing-subscriber
+Version: 0.3.22
+License: MIT
+Authors: Eliza Weisman <eliza@buoyant.io>|David Barsky <me@davidbarsky.com>|Tokio Contributors <team@tokio.rs>
+Repository: https://github.com/tokio-rs/tracing
+
+Name: try-lock
+Version: 0.2.5
+License: MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/seanmonstar/try-lock
+
+Name: tungstenite
+Version: 0.24.0
+License: Apache-2.0 OR MIT
+Authors: Alexey Galakhov|Daniel Abramov
+Repository: https://github.com/snapview/tungstenite-rs
+
+Name: typenum
+Version: 1.19.0
+License: Apache-2.0 OR MIT
+Authors: Paho Lurie-Gregg <paho@paholg.com>|Andre Bogus <bogusandre@gmail.com>
+Repository: https://github.com/paholg/typenum
+
+Name: unarray
+Version: 0.1.4
+License: Apache-2.0 OR MIT
+Repository: https://github.com/cameron1024/unarray
+
+Name: unicode-ident
+Version: 1.0.22
+License: (Apache-2.0 OR MIT) AND Unicode-3.0
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/unicode-ident
+
+Name: unicode-normalization
+Version: 0.1.25
+License: Apache-2.0 OR MIT
+Authors: kwantam <kwantam@gmail.com>|Manish Goregaokar <manishsmail@gmail.com>
+Repository: https://github.com/unicode-rs/unicode-normalization
+
+Name: url
+Version: 2.5.8
+License: Apache-2.0 OR MIT
+Authors: The rust-url developers
+Repository: https://github.com/servo/rust-url
+
+Name: utf-8
+Version: 0.7.6
+License: Apache-2.0 OR MIT
+Authors: Simon Sapin <simon.sapin@exyr.org>
+Repository: https://github.com/SimonSapin/rust-utf8
+
+Name: utf8_iter
+Version: 1.0.4
+License: Apache-2.0 OR MIT
+Authors: Henri Sivonen <hsivonen@hsivonen.fi>
+Repository: https://github.com/hsivonen/utf8_iter
+
+Name: utf8parse
+Version: 0.2.2
+License: Apache-2.0 OR MIT
+Authors: Joe Wilm <joe@jwilm.com>|Christian Duerr <contact@christianduerr.com>
+Repository: https://github.com/alacritty/vte
+
+Name: uuid
+Version: 1.19.0
+License: Apache-2.0 OR MIT
+Authors: Ashley Mannix<ashleymannix@live.com.au>|Dylan DPC<dylan.dpc@gmail.com>|Hunar Roop Kahlon<hunar.roop@gmail.com>
+Repository: https://github.com/uuid-rs/uuid
+
+Name: valuable
+Version: 0.1.1
+License: MIT
+Repository: https://github.com/tokio-rs/valuable
+
+Name: vcpkg
+Version: 0.2.15
+License: Apache-2.0 OR MIT
+Authors: Jim McGrath <jimmc2@gmail.com>
+Repository: https://github.com/mcgoo/vcpkg-rs
+
+Name: version_check
+Version: 0.9.5
+License: Apache-2.0 OR MIT
+Authors: Sergio Benitez <sb@sergio.bz>
+Repository: https://github.com/SergioBenitez/version_check
+
+Name: wait-timeout
+Version: 0.2.1
+License: Apache-2.0 OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/alexcrichton/wait-timeout
+
+Name: walkdir
+Version: 2.5.0
+License: MIT OR Unlicense
+Authors: Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/BurntSushi/walkdir
+
+Name: want
+Version: 0.3.1
+License: MIT
+Authors: Sean McArthur <sean@seanmonstar.com>
+Repository: https://github.com/seanmonstar/want
+
+Name: wasi
+Version: 0.11.1+wasi-snapshot-preview1
+License: Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT
+Authors: The Cranelift Project Developers
+Repository: https://github.com/bytecodealliance/wasi
+
+Name: wasip2
+Version: 1.0.1+wasi-0.2.4
+License: Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT
+Repository: https://github.com/bytecodealliance/wasi-rs
+
+Name: wasm-bindgen
+Version: 0.2.108
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen
+
+Name: wasm-bindgen-futures
+Version: 0.4.58
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
+
+Name: wasm-bindgen-macro
+Version: 0.2.108
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
+
+Name: wasm-bindgen-macro-support
+Version: 0.2.108
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
+
+Name: wasm-bindgen-shared
+Version: 0.2.108
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
+
+Name: web-sys
+Version: 0.3.85
+License: Apache-2.0 OR MIT
+Authors: The wasm-bindgen Developers
+Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys
+
+Name: winapi-util
+Version: 0.1.11
+License: MIT OR Unlicense
+Authors: Andrew Gallant <jamslam@gmail.com>
+Repository: https://github.com/BurntSushi/winapi-util
+
+Name: windows-core
+Version: 0.62.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-implement
+Version: 0.60.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-interface
+Version: 0.59.3
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-link
+Version: 0.2.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-result
+Version: 0.4.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-strings
+Version: 0.5.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-sys
+Version: 0.48.0
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-sys
+Version: 0.52.0
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-sys
+Version: 0.60.2
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-sys
+Version: 0.61.2
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-targets
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-targets
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows-targets
+Version: 0.53.5
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_aarch64_gnullvm
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_aarch64_gnullvm
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_aarch64_gnullvm
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_aarch64_msvc
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_aarch64_msvc
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_aarch64_msvc
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_gnu
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_gnu
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_gnu
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_gnullvm
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_gnullvm
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_msvc
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_msvc
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_i686_msvc
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_gnu
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_gnu
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_gnu
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_gnullvm
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_gnullvm
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_gnullvm
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_msvc
+Version: 0.48.5
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_msvc
+Version: 0.52.6
+License: Apache-2.0 OR MIT
+Authors: Microsoft
+Repository: https://github.com/microsoft/windows-rs
+
+Name: windows_x86_64_msvc
+Version: 0.53.1
+License: Apache-2.0 OR MIT
+Repository: https://github.com/microsoft/windows-rs
+
+Name: winnow
+Version: 0.7.14
+License: MIT
+Repository: https://github.com/winnow-rs/winnow
+
+Name: winreg
+Version: 0.50.0
+License: MIT
+Authors: Igor Shaula <gentoo90@gmail.com>
+Repository: https://github.com/gentoo90/winreg-rs
+
+Name: wit-bindgen
+Version: 0.46.0
+License: Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT
+Authors: Alex Crichton <alex@alexcrichton.com>
+Repository: https://github.com/bytecodealliance/wit-bindgen
+
+Name: writeable
+Version: 0.6.2
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: yoke
+Version: 0.8.1
+License: Unicode-3.0
+Authors: Manish Goregaokar <manishsmail@gmail.com>
+Repository: https://github.com/unicode-org/icu4x
+
+Name: yoke-derive
+Version: 0.8.1
+License: Unicode-3.0
+Authors: Manish Goregaokar <manishsmail@gmail.com>
+Repository: https://github.com/unicode-org/icu4x
+
+Name: zerocopy
+Version: 0.8.33
+License: Apache-2.0 OR BSD-2-Clause OR MIT
+Authors: Joshua Liebow-Feeser <joshlf@google.com>|Jack Wrenn <jswrenn@amazon.com>
+Repository: https://github.com/google/zerocopy
+
+Name: zerocopy-derive
+Version: 0.8.33
+License: Apache-2.0 OR BSD-2-Clause OR MIT
+Authors: Joshua Liebow-Feeser <joshlf@google.com>|Jack Wrenn <jswrenn@amazon.com>
+Repository: https://github.com/google/zerocopy
+
+Name: zerofrom
+Version: 0.1.6
+License: Unicode-3.0
+Authors: Manish Goregaokar <manishsmail@gmail.com>
+Repository: https://github.com/unicode-org/icu4x
+
+Name: zerofrom-derive
+Version: 0.1.6
+License: Unicode-3.0
+Authors: Manish Goregaokar <manishsmail@gmail.com>
+Repository: https://github.com/unicode-org/icu4x
+
+Name: zeroize
+Version: 1.8.2
+License: Apache-2.0 OR MIT
+Authors: The RustCrypto Project Developers
+Repository: https://github.com/RustCrypto/utils
+
+Name: zerotrie
+Version: 0.2.3
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: zerovec
+Version: 0.11.5
+License: Unicode-3.0
+Authors: The ICU4X Project Developers
+Repository: https://github.com/unicode-org/icu4x
+
+Name: zerovec-derive
+Version: 0.11.2
+License: Unicode-3.0
+Authors: Manish Goregaokar <manishsmail@gmail.com>
+Repository: https://github.com/unicode-org/icu4x
+
+Name: zmij
+Version: 1.0.14
+License: MIT
+Authors: David Tolnay <dtolnay@gmail.com>
+Repository: https://github.com/dtolnay/zmij
+
+Name: zstd-sys
+Version: 2.0.16+zstd.1.5.7
+License: Apache-2.0 OR MIT
+Authors: Alexandre Bury <alexandre.bury@gmail.com>
+Repository: https://github.com/gyscos/zstd-rs
+

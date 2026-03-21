@@ -1,0 +1,36 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-wallet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-storage = { workspace = true }
+divi-script = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rocksdb = { workspace = true }
+
+# BIP32/BIP39
+bip32 = "0.5"
+bip39 = "2.0"
+hmac = "0.12"
+bs58 = "0.5"
+
+# Encryption
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+pbkdf2 = { version = "0.12", features = ["simple"] }
+zeroize = "1.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }

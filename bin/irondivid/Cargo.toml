@@ -1,0 +1,42 @@
+[package]
+license = "AGPL-3.0-only"
+name = "irondivid"
+version.workspace = true
+edition.workspace = true
+description = "IronDivi daemon - Rust implementation of Divi node"
+
+[[bin]]
+name = "irondivid"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+divi-node = { workspace = true }
+divi-rpc = { workspace = true }
+divi-storage = { workspace = true }
+divi-primitives = { workspace = true }
+divi-wallet = { workspace = true }
+divi-crypto = { workspace = true }
+divi-masternode = { workspace = true }
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = "0.2"
+
+# Daemonization (Unix only)
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
+
+# Utilities
+dirs = "5.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+toml = "0.8"

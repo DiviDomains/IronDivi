@@ -1,0 +1,15 @@
+[
+  {
+    "name": "genesis_block_mainnet",
+    "source_file": "chainparams.cpp",
+    "line_number": 0,
+    "category": "block",
+    "description": "Divi mainnet genesis block",
+    "block_hash": "0000041e482b9b9691d98eefb48473405c0b8ec31b76df3797c74a78680ef818",
+    "merkle_root": "1b2ef6e2f28be914103a277377ae7729dcd125dfeb8bf97bd5964de0c8642b80",
+    "timestamp": 1508198921,
+    "bits": "1e0ffff0",
+    "nonce": 28917698,
+    "version": 1
+  }
+]

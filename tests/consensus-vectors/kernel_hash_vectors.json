@@ -1,0 +1,18 @@
+[
+  {
+    "name": "kernel_hash_example_1",
+    "source_file": "manual",
+    "line_number": 0,
+    "category": "kernel_hash",
+    "description": "Example kernel hash calculation for PoS",
+    "stake_modifier": "0",
+    "coinstake_time": 1638000000,
+    "utxo_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+    "utxo_n": 0,
+    "timestamp": 1638000006,
+    "expected_hash": "",
+    "params": {
+      "note": "Placeholder - extract real values from C++ tests"
+    }
+  }
+]

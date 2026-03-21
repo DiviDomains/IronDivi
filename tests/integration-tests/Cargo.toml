@@ -1,0 +1,22 @@
+[package]
+license = "AGPL-3.0-only"
+name = "integration-tests"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divi-primitives = { path = "../../crates/divi-primitives" }
+divi-network = { path = "../../crates/divi-network" }
+divi-rpc = { path = "../../crates/divi-rpc" }
+divi-crypto = { path = "../../crates/divi-crypto" }
+divi-consensus = { path = "../../crates/divi-consensus" }
+divi-storage = { path = "../../crates/divi-storage" }
+divi-wallet = { path = "../../crates/divi-wallet" }
+parking_lot = { workspace = true }
+rocksdb = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+hex = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }

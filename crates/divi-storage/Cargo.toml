@@ -1,0 +1,29 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-storage"
+version.workspace = true
+edition.workspace = true
+description = "Chain storage and state management for Divi"
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-script = { workspace = true }
+divi-consensus = { workspace = true }
+divi-masternode = { path = "../divi-masternode" }
+
+rocksdb = { workspace = true }
+moka = { version = "0.12", features = ["sync"] }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+hex = { workspace = true }

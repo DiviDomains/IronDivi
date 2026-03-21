@@ -1,0 +1,31 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-masternode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-script = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rocksdb = { workspace = true }
+byteorder = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "masternode"
+harness = false

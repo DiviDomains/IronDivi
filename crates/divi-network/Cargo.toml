@@ -1,0 +1,27 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-network"
+version.workspace = true
+edition.workspace = true
+description = "P2P network protocol implementation for Divi"
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-storage = { workspace = true }
+divi-masternode = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+tempfile = { workspace = true }
+tokio-test = "0.4"

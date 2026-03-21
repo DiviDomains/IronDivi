@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-linux-x86_64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: irondivi-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: irondivi-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: irondivi-windows-x86_64
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            artifact: irondivi-linux-armv7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Install cross for ARM builds
+      - name: Install cross
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      # Build with cross for ARM
+      - name: Build (cross)
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        run: cross build --release --target ${{ matrix.target }} --bin irondivid --bin irondivi-cli
+
+      # Build natively for other targets
+      - name: Build (native)
+        if: matrix.target != 'armv7-unknown-linux-gnueabihf'
+        run: cargo build --release --target ${{ matrix.target }} --bin irondivid --bin irondivi-cli
+
+      # Package Unix builds
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/irondivid ${{ matrix.artifact }}/
+          cp target/${{ matrix.target }}/release/irondivi-cli ${{ matrix.artifact }}/
+          cp LICENSE README.md ${{ matrix.artifact }}/
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      # Package Windows builds
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/irondivid.exe ${{ matrix.artifact }}/
+          cp target/${{ matrix.target }}/release/irondivi-cli.exe ${{ matrix.artifact }}/
+          cp LICENSE README.md ${{ matrix.artifact }}/
+          7z a ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

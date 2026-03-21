@@ -1,0 +1,15 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-script"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "stake_modifier_example_1",
+    "source_file": "manual",
+    "line_number": 0,
+    "category": "stake_modifier",
+    "description": "Example stake modifier calculation",
+    "chain_tip_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "utxo_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+    "utxo_n": 0,
+    "expected_modifier": "0",
+    "params": {
+      "note": "Placeholder - extract real values from C++ tests"
+    }
+  }
+]

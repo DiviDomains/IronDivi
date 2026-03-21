@@ -1,0 +1,26 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-node"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-script = { workspace = true }
+divi-consensus = { workspace = true }
+divi-network = { workspace = true }
+divi-storage = { workspace = true }
+divi-rpc = { workspace = true }
+divi-wallet = { workspace = true }
+divi-masternode = { workspace = true }
+
+tokio = { workspace = true, features = ["full", "sync", "rt-multi-thread", "signal"] }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

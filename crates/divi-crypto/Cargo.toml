@@ -1,0 +1,28 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divi-primitives = { workspace = true }
+secp256k1 = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+scrypt = "0.11"
+aes = "0.8"
+bs58 = "0.5"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "crypto"
+harness = false

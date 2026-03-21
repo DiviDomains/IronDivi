@@ -1,0 +1,25 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-consensus"
+version.workspace = true
+edition.workspace = true
+description = "Proof-of-Stake consensus implementation for Divi"
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+bs58 = "0.5"
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "consensus"
+harness = false

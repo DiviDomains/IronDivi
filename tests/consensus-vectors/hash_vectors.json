@@ -1,0 +1,29 @@
+[
+  {
+    "name": "empty_hash256",
+    "source_file": "manual",
+    "line_number": 0,
+    "category": "hash",
+    "input_hex": "",
+    "expected_hex": "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456",
+    "params": {}
+  },
+  {
+    "name": "single_byte_hash256",
+    "source_file": "manual",
+    "line_number": 0,
+    "category": "hash",
+    "input_hex": "00",
+    "expected_hex": "1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a",
+    "params": {}
+  },
+  {
+    "name": "abc_hash256",
+    "source_file": "manual",
+    "line_number": 0,
+    "category": "hash",
+    "input_hex": "616263",
+    "expected_hex": "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358",
+    "params": {}
+  }
+]
