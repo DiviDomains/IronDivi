@@ -169,14 +169,14 @@ impl BlockIndex {
     #[allow(dead_code)]
     fn add_u64_to_chain_work(chain_work: &mut [u8; 32], work: u64) {
         let mut carry: u16 = 0;
-        for i in 0..32 {
+        for (i, byte) in chain_work.iter_mut().enumerate() {
             let byte_work = if i < 8 {
                 ((work >> (i * 8)) & 0xff) as u16
             } else {
                 0
             };
-            let sum = (chain_work[i] as u16) + byte_work + carry;
-            chain_work[i] = (sum & 0xff) as u8;
+            let sum = (*byte as u16) + byte_work + carry;
+            *byte = (sum & 0xff) as u8;
             carry = sum >> 8;
         }
     }

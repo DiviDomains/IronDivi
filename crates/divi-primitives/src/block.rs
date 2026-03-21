@@ -65,8 +65,8 @@ impl BlockHeader {
     pub fn hash(&self) -> Hash256 {
         let serialized = serialize(self);
         // Double SHA256
-        let first_hash = Sha256::digest(&serialized);
-        let second_hash = Sha256::digest(&first_hash);
+        let first_hash = Sha256::digest(serialized);
+        let second_hash = Sha256::digest(first_hash);
         Hash256::from_bytes(second_hash.into())
     }
 
@@ -261,6 +261,7 @@ impl Encodable for Block {
 }
 
 impl Decodable for Block {
+    #[allow(unexpected_cfgs)]
     fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let header = BlockHeader::decode(reader)?;
         let header_size = header.encoded_size();
@@ -310,7 +311,7 @@ impl Decodable for Block {
 
             // Sanity check: typical block_sig is 65-72 bytes (recoverable ECDSA)
             // DER signatures are usually 70-72 bytes
-            if len > 200 || len < 60 {
+            if !(60..=200).contains(&len) {
                 eprintln!(
                     "BLOCK_PARSE: pos_before_sig={}, sig_len={}, header={}, tx_count_size={}, txs_size={}, tx_count={}",
                     pos_before_sig, len, header_size, tx_count_size, txs_total_size, tx_count
@@ -323,7 +324,7 @@ impl Decodable for Block {
                 if sig.len() >= 2 {
                     let first_byte = sig[0];
                     let valid_sig_start = first_byte == 0x30  // DER signature
-                        || (first_byte >= 0x1b && first_byte <= 0x22)  // Recoverable sig recovery ID
+                        || (0x1b..=0x22).contains(&first_byte)  // Recoverable sig recovery ID
                         || first_byte == 0x41; // Length prefix mistakenly included
                     if !valid_sig_start {
                         eprintln!(

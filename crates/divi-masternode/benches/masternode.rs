@@ -68,7 +68,7 @@ fn create_test_masternode_broadcast(rng: &mut StdRng, index: u32) -> MasternodeB
         _ => MasternodeTier::Diamond,
     };
 
-    let mut signature = vec![0u8; 71];
+    let mut signature = [0u8; 71];
     rng.fill(&mut signature[..]);
 
     let timestamp = 1600000000 + (index as i64);

@@ -21,7 +21,7 @@
 //!           Divi/divi/src/ProofOfStakeGenerator.cpp
 //!           Divi/divi/src/BlockProofVerifier.cpp
 
-use divi_primitives::{Amount, Block, Hash256, OutPoint, Transaction};
+use divi_primitives::{Amount, Hash256, OutPoint, Transaction};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 
@@ -134,13 +134,7 @@ fn stake_target_hit(
     tracing::debug!("  coin_age_weight_raw: {}", coin_age_weight_raw);
 
     // Convert coin_age_weight to Hash256 (uint256)
-    let coin_age_weight = if coin_age_weight_raw <= u128::MAX {
-        Hash256::from_u128_le(coin_age_weight_raw)
-    } else {
-        // Overflow - target always hit (regtest edge case)
-        // Reference: ProofOfStakeCalculator.cpp:24-28
-        return true;
-    };
+    let coin_age_weight = Hash256::from_u128_le(coin_age_weight_raw);
 
     tracing::debug!("  coin_age_target (full): {}", coin_age_target);
     tracing::debug!(
@@ -350,7 +344,7 @@ pub fn validate_coinstake_vault_rules(
     for input in &tx.vin {
         if let Some(prev_out) = get_prev_tx_output(&input.prevout) {
             if prev_out.script_pubkey.as_bytes() == script_bytes {
-                total_input_value = total_input_value + prev_out.value;
+                total_input_value += prev_out.value;
             }
         }
     }
@@ -370,7 +364,7 @@ pub fn validate_coinstake_vault_rules(
 
     // If vout[2] also pays to vault script (split), count it
     if tx.vout.len() > 2 && tx.vout[2].script_pubkey.as_bytes() == script_bytes {
-        total_vault_output_value = total_vault_output_value + tx.vout[2].value;
+        total_vault_output_value += tx.vout[2].value;
     }
 
     // Vault output value must be >= vault input value

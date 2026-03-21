@@ -63,8 +63,8 @@ pub use masternode::{
 };
 pub use payments::{
     calculate_block_subsidy, calculate_masternode_payment, calculate_score, find_payment_winner,
-    get_expected_payment_winner, validate_block_payment, PaymentValidationError,
-    PaymentVoteTracker,
+    find_top_n_winners, get_expected_payment_winner, get_tier_payment_multiplier,
+    validate_block_payment, PaymentValidationError, PaymentVoteTracker,
 };
 pub use relay::{MessageValidator, RelayManager, ValidationError};
 pub use rpc::{

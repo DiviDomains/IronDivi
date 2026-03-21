@@ -318,7 +318,7 @@ impl Opcode {
 
     /// Check if this is a push opcode (0x01-0x4b direct push)
     pub fn is_small_push(byte: u8) -> bool {
-        byte >= 0x01 && byte <= 0x4b
+        (0x01..=0x4b).contains(&byte)
     }
 
     /// Get the name of this opcode

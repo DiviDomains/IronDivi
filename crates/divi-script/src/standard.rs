@@ -126,7 +126,7 @@ pub fn extract_script_type(script: &[u8]) -> (ScriptType, Vec<Vec<u8>>) {
                 return (ScriptType::NonStandard, vec![]);
             }
             let push_len = script[pos] as usize;
-            if push_len < 33 || push_len > 65 || pos + 1 + push_len > script.len() {
+            if !(33..=65).contains(&push_len) || pos + 1 + push_len > script.len() {
                 return (ScriptType::NonStandard, vec![]);
             }
             solutions.push(script[pos + 1..pos + 1 + push_len].to_vec());
@@ -234,7 +234,7 @@ pub fn is_multisig(script: &[u8]) -> Option<(u8, u8)> {
     let n = decode_op_n(n_opcode)?;
 
     // Validate m <= n
-    if m > n || m < 1 || n < 1 || n > 16 {
+    if m > n || m < 1 || !(1..=16).contains(&n) {
         return None;
     }
 
@@ -487,7 +487,7 @@ fn extract_htlc_data(script: &[u8]) -> Option<Vec<Vec<u8>>> {
     let hash_type = script.get(pos)?;
     if !matches!(
         *hash_type,
-        0xa6 | 0xa7 | 0xa8 | 0xa9 | 0xaa // RIPEMD160, SHA1, SHA256, HASH160, HASH256
+        0xa6..=0xaa // RIPEMD160, SHA1, SHA256, HASH160, HASH256
     ) {
         return None;
     }

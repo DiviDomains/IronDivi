@@ -56,9 +56,9 @@ impl Script {
     /// - On error, "[error]" is appended and parsing stops
     pub fn to_asm(&self) -> String {
         let mut result = String::new();
-        let mut iter = ScriptIterator::new(&self.0);
+        let iter = ScriptIterator::new(&self.0);
 
-        while let Some(item) = iter.next() {
+        for item in iter {
             if !result.is_empty() {
                 result.push(' ');
             }

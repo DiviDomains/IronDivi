@@ -112,8 +112,9 @@ impl MasternodePaymentBlock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncStage {
+    #[default]
     Initial = 0,
     Sporks = 1,
     List = 2,
@@ -152,12 +153,6 @@ impl SyncStage {
             SyncStage::Finished => "FINISHED",
             SyncStage::Failed => "FAILED",
         }
-    }
-}
-
-impl Default for SyncStage {
-    fn default() -> Self {
-        SyncStage::Initial
     }
 }
 

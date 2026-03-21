@@ -39,7 +39,8 @@ const MAX_TX_IN_FLIGHT: usize = 100;
 const TX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Minimum fee rate for relay (satoshis per byte)
-const MIN_RELAY_FEE_RATE: f64 = 1.0;
+/// TODO: Use this when implementing fee-based relay filtering
+const _MIN_RELAY_FEE_RATE: f64 = 1.0;
 
 /// Event emitted when a transaction is received
 #[derive(Debug, Clone)]

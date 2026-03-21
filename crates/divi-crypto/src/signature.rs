@@ -93,9 +93,9 @@ impl RecoverableSig {
         }
         // Handle both compressed (31-34) and uncompressed (27-30) formats
         let rec_byte = data[0] as i32;
-        let recovery_id = if rec_byte >= 31 && rec_byte <= 34 {
+        let recovery_id = if (31..=34).contains(&rec_byte) {
             RecoveryId::from_i32(rec_byte - 31)?
-        } else if rec_byte >= 27 && rec_byte <= 30 {
+        } else if (27..=30).contains(&rec_byte) {
             RecoveryId::from_i32(rec_byte - 27)?
         } else {
             RecoveryId::from_i32(rec_byte)?
@@ -142,7 +142,7 @@ impl RecoverableSig {
         let secp = Secp256k1::new();
         let msg = message_hash(message);
         let pk = secp.recover_ecdsa(&msg, &self.inner)?;
-        Ok(PublicKey::from_bytes(&pk.serialize())?)
+        PublicKey::from_bytes(&pk.serialize())
     }
 
     /// Recover the public key from this signature and a raw 32-byte hash
@@ -152,7 +152,7 @@ impl RecoverableSig {
         let secp = Secp256k1::new();
         let msg = Message::from_digest(*hash);
         let pk = secp.recover_ecdsa(&msg, &self.inner)?;
-        Ok(PublicKey::from_bytes(&pk.serialize())?)
+        PublicKey::from_bytes(&pk.serialize())
     }
 }
 

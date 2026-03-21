@@ -223,10 +223,10 @@ impl Connection {
         );
 
         // Validate version
-        if their_version.version < MIN_PEER_PROTO_VERSION as i32 {
+        if their_version.version < MIN_PEER_PROTO_VERSION {
             return Err(NetworkError::VersionMismatch {
                 peer: their_version.version,
-                required: MIN_PEER_PROTO_VERSION as i32,
+                required: MIN_PEER_PROTO_VERSION,
             });
         }
 
@@ -256,7 +256,7 @@ impl Connection {
     /// Send our version message
     async fn send_version(&mut self) -> Result<(), NetworkError> {
         let version = VersionMessage {
-            version: PROTOCOL_VERSION as i32,
+            version: PROTOCOL_VERSION,
             services: services::NODE_NETWORK,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -400,7 +400,7 @@ impl Connection {
                             // Note: This is an approximation based on the command.
                             // For accurate tracking, we'd need to track bytes in the codec itself.
                             // For now, we use the message size as a proxy (header + payload).
-                            use crate::message::HEADER_SIZE;
+
                             let msg_bytes = msg.to_bytes(magic).map(|b| b.len()).unwrap_or(0);
                             let bytes_received = msg_bytes as u64;
 

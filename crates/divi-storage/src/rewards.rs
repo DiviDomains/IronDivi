@@ -239,7 +239,7 @@ pub fn is_lottery_block(height: u32, params: &RewardParams) -> bool {
     }
 
     let blocks_since_start = height - params.lottery_start_block;
-    blocks_since_start > 0 && (blocks_since_start % params.lottery_cycle) == 0
+    blocks_since_start > 0 && blocks_since_start.is_multiple_of(params.lottery_cycle)
 }
 
 /// Check if a block is a treasury payout block
@@ -251,7 +251,7 @@ pub fn is_treasury_block(height: u32, params: &RewardParams) -> bool {
     }
 
     let blocks_since_start = height - params.treasury_start_block;
-    blocks_since_start > 0 && (blocks_since_start % params.treasury_cycle) == 0
+    blocks_since_start > 0 && blocks_since_start.is_multiple_of(params.treasury_cycle)
 }
 
 /// Get accumulated lottery reward up to a lottery payout block
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(rewards.treasury_reward.as_sat(), (distributable * 16) / 100);
 
         // 1% to charity
-        assert_eq!(rewards.charity_reward.as_sat(), (distributable * 1) / 100);
+        assert_eq!(rewards.charity_reward.as_sat(), distributable / 100);
 
         // 0% to proposals
         assert_eq!(rewards.proposals_reward.as_sat(), 0);

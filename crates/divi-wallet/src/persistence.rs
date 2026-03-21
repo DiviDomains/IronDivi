@@ -55,6 +55,9 @@ const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
 const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
 
+/// Salt and encrypted master key pair
+type EncryptionMetadata = (Vec<u8>, Vec<u8>);
+
 /// Wallet database for persistence
 pub struct WalletDatabase {
     db: DB,
@@ -206,7 +209,7 @@ impl WalletDatabase {
     pub fn store_encrypted(&self, encrypted: bool) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
-            .put_cf(cf, KEY_ENCRYPTED, &[encrypted as u8])
+            .put_cf(cf, KEY_ENCRYPTED, [encrypted as u8])
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -241,7 +244,7 @@ impl WalletDatabase {
     }
 
     /// Load encryption metadata (salt and encrypted master key)
-    pub fn load_encryption_metadata(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, WalletError> {
+    pub fn load_encryption_metadata(&self) -> Result<Option<EncryptionMetadata>, WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
 
         let salt = match self
@@ -269,10 +272,10 @@ impl WalletDatabase {
     pub fn store_indices(&self, receiving: u32, change: u32) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
-            .put_cf(cf, KEY_RECEIVING_INDEX, &receiving.to_le_bytes())
+            .put_cf(cf, KEY_RECEIVING_INDEX, receiving.to_le_bytes())
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         self.db
-            .put_cf(cf, KEY_CHANGE_INDEX, &change.to_le_bytes())
+            .put_cf(cf, KEY_CHANGE_INDEX, change.to_le_bytes())
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -310,7 +313,7 @@ impl WalletDatabase {
     pub fn store_last_scan_height(&self, height: u32) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
-            .put_cf(cf, KEY_LAST_SCAN_HEIGHT, &height.to_le_bytes())
+            .put_cf(cf, KEY_LAST_SCAN_HEIGHT, height.to_le_bytes())
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -417,7 +420,7 @@ impl WalletDatabase {
         let cf = self.db.cf_handle(CF_SPENT).unwrap();
         let key = outpoint_key(outpoint);
         self.db
-            .put_cf(cf, key, &[1])
+            .put_cf(cf, key, [1])
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -476,7 +479,7 @@ impl WalletDatabase {
     pub fn mark_address_used(&self, address: &str) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_ADDRESSES).unwrap();
         self.db
-            .put_cf(cf, address.as_bytes(), &[1])
+            .put_cf(cf, address.as_bytes(), [1])
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -530,8 +533,8 @@ impl WalletDatabase {
         for item in iter {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
-                if key_str.starts_with("acc_") {
-                    let account = key_str[4..].to_string();
+                if let Some(account) = key_str.strip_prefix("acc_") {
+                    let account = account.to_string();
                     let addresses: Vec<String> = serde_json::from_slice(&value).map_err(|e| {
                         WalletError::Storage(format!("Failed to deserialize account: {}", e))
                     })?;
@@ -552,8 +555,8 @@ impl WalletDatabase {
         for item in iter {
             let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
             if let Ok(key_str) = String::from_utf8(key.to_vec()) {
-                if key_str.starts_with("addr_") {
-                    let address = key_str[5..].to_string();
+                if let Some(address) = key_str.strip_prefix("addr_") {
+                    let address = address.to_string();
                     let account = String::from_utf8(value.to_vec())
                         .map_err(|e| WalletError::Storage(e.to_string()))?;
                     mappings.push((address, account));

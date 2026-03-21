@@ -10,7 +10,6 @@
 // licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
 
 use std::fs;
-use std::path::PathBuf;
 
 #[test]
 fn test_config_file_integration() {

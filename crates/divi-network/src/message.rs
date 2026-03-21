@@ -85,7 +85,7 @@ impl MessageHeader {
     /// Validate the checksum against payload
     pub fn validate_checksum(&self, payload: &[u8]) -> bool {
         let hash = double_sha256(payload);
-        self.checksum == &hash[..4]
+        self.checksum == hash[..4]
     }
 
     /// Serialize the header

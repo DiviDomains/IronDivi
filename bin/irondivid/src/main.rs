@@ -795,7 +795,7 @@ async fn run_daemon(
             let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
             for tx in block.transactions.iter().skip(1) {
                 if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
-                    total_fees = total_fees + mempool_entry.fee;
+                    total_fees += mempool_entry.fee;
                 }
             }
             let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
@@ -834,7 +834,7 @@ async fn run_daemon(
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
                 for tx in block.transactions.iter().skip(1) {
                     if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
-                        total_fees = total_fees + mempool_entry.fee;
+                        total_fees += mempool_entry.fee;
                     }
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
@@ -898,7 +898,7 @@ async fn run_daemon(
                                 for input in &tx.vin {
                                     match chain_for_orphans.get_utxo(&input.prevout) {
                                         Ok(Some(utxo)) => {
-                                            input_total = input_total + utxo.value;
+                                            input_total += utxo.value;
                                         }
                                         _ => {
                                             // UTXO not found — tx may depend on another orphaned tx
@@ -967,7 +967,7 @@ async fn run_daemon(
                     };
                     wallet_for_catchup.scan_block(index.hash, height, &block.transactions);
                     scanned += 1;
-                    if scanned % 1000 == 0 {
+                    if scanned.is_multiple_of(1000) {
                         info!(
                             "Catch-up scan progress: {}/{} blocks",
                             scanned,
@@ -1004,8 +1004,8 @@ async fn run_daemon(
     };
 
     // Start staker if wallet is available
-    let staker = if wallet.is_some() {
-        let wallet_arc = wallet.as_ref().unwrap().clone();
+    let staker = if let Some(ref wallet_opt) = wallet {
+        let wallet_arc = wallet_opt.clone();
         let mempool = node.mempool().clone();
         let staker_chain = node.chain().clone();
         let staker_peer_manager = node.peer_manager().clone();
@@ -1014,7 +1014,7 @@ async fn run_daemon(
         let mut staking_config = StakingConfig::default();
         if config.network.network_type == NetworkType::Regtest {
             // Reduce minimum requirements for regtest
-            staking_config.min_stake_amount = 10_00000000; // 10 DIVI (instead of 10,000)
+            staking_config.min_stake_amount = 1_000_000_000; // 10 DIVI (instead of 10,000)
             staking_config.min_coin_age = 60; // 1 minute (instead of 1 hour)
         }
 
@@ -1041,7 +1041,7 @@ async fn run_daemon(
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
                 for tx in block.transactions.iter().skip(1) {
                     if let Some(mempool_entry) = mempool_for_staker.get(&tx.txid()) {
-                        total_fees = total_fees + mempool_entry.fee;
+                        total_fees += mempool_entry.fee;
                     }
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();

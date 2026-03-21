@@ -71,14 +71,14 @@ pub fn is_treasury_block_with_lottery(
 
     // If no lottery cycle specified, use legacy rule
     if lottery_cycle == 0 {
-        return (height % treasury_cycle) == 0;
+        return height.is_multiple_of(treasury_cycle);
     }
 
     let transition_height = lottery_cycle * treasury_cycle;
 
     if height < transition_height {
         // Pre-transition: legacy rule
-        (height % treasury_cycle) == 0
+        height.is_multiple_of(treasury_cycle)
     } else {
         // Post-transition: treasury block is one block after a lottery block
         // C++ logic: IsValidTreasuryBlockHeight(h) = IsValidLotteryBlockHeight(h - 1)
@@ -87,7 +87,7 @@ pub fn is_treasury_block_with_lottery(
         if lottery_height < transition_height {
             return false;
         }
-        ((lottery_height - transition_height) % lottery_cycle) == 0
+        (lottery_height - transition_height).is_multiple_of(lottery_cycle)
     }
 }
 
@@ -560,8 +560,8 @@ mod tests {
                 START_BLOCK,
                 CYCLE,
             );
-            total_treasury = total_treasury + t;
-            total_charity = total_charity + c;
+            total_treasury += t;
+            total_charity += c;
         }
 
         // Total blocks from 102 to 500 = 398 blocks

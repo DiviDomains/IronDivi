@@ -129,8 +129,8 @@ fn bench_coin_selection_with_exclusions(c: &mut Criterion) {
     // Test with varying numbers of excluded UTXOs
     for exclude_count in [0, 100, 500, 900] {
         let mut excluded = HashSet::new();
-        for i in 0..exclude_count {
-            excluded.insert(utxos[i].outpoint());
+        for utxo in utxos.iter().take(exclude_count) {
+            excluded.insert(utxo.outpoint());
         }
 
         group.bench_with_input(

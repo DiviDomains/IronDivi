@@ -142,7 +142,7 @@ impl CoinstakeBuilder {
         let mut prev_scripts = Vec::new();
         for (outpoint, prev_script) in &self.inputs {
             tx.vin.push(TxIn::new(
-                outpoint.clone(),
+                *outpoint,
                 Script::new(),
                 0xffffffff, // SEQUENCE_FINAL
             ));

@@ -29,8 +29,8 @@ pub fn calculate_score(outpoint: &OutPoint, tier: MasternodeTier, block_hash: &H
 
     let mut hasher = Sha256::new();
     hasher.update(block_hash.as_bytes());
-    hasher.update(&outpoint.txid.as_bytes());
-    hasher.update(&outpoint.vout.to_le_bytes());
+    hasher.update(outpoint.txid.as_bytes());
+    hasher.update(outpoint.vout.to_le_bytes());
 
     let mut hash = double_sha256(&hasher.finalize());
 
@@ -43,7 +43,7 @@ pub fn calculate_score(outpoint: &OutPoint, tier: MasternodeTier, block_hash: &H
 
 fn double_sha256(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let mut result = [0u8; 32];
     result.copy_from_slice(&second);
     result
@@ -235,10 +235,7 @@ impl BlockVotes {
     }
 
     fn add_vote(&mut self, vote: MasternodePaymentWinner) {
-        let votes = self
-            .votes
-            .entry(vote.vin_masternode)
-            .or_insert_with(Vec::new);
+        let votes = self.votes.entry(vote.vin_masternode).or_default();
         votes.push(vote);
         self.consensus_winner = None;
     }
@@ -265,10 +262,6 @@ impl BlockVotes {
 
         self.consensus_winner = winner;
         winner
-    }
-
-    fn get_consensus_winner(&self) -> Option<OutPoint> {
-        self.consensus_winner
     }
 
     fn has_minimum_votes(&self, min_votes: usize) -> bool {
@@ -521,7 +514,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Gold,
@@ -553,7 +546,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Silver,
@@ -599,7 +592,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Platinum,
@@ -632,7 +625,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Diamond,
@@ -982,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_validate_block_payment_invalid_height() {
-        use divi_primitives::transaction::{Transaction, TxOut};
+        use divi_primitives::transaction::Transaction;
 
         let tx = Transaction {
             version: 1,
@@ -1000,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_validate_block_payment_no_payee() {
-        use divi_primitives::transaction::{Transaction, TxOut};
+        use divi_primitives::transaction::Transaction;
 
         let tx = Transaction {
             version: 1,
@@ -1219,7 +1212,7 @@ mod tests {
         let outpoint1 = OutPoint::new(Hash256::zero(), 0);
         let mnb1 = MasternodeBroadcast::new(
             outpoint1,
-            addr.clone(),
+            addr,
             vec![1, 2, 3],
             vec![4, 5, 6],
             MasternodeTier::Copper,
@@ -1272,7 +1265,7 @@ mod tests {
         let outpoint1 = OutPoint::new(Hash256::zero(), 0);
         let mnb1 = MasternodeBroadcast::new(
             outpoint1,
-            addr.clone(),
+            addr,
             vec![1, 2, 3],
             vec![4, 5, 6],
             MasternodeTier::Copper,
@@ -1325,7 +1318,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Gold,

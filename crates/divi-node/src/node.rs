@@ -131,11 +131,11 @@ impl Node {
         // Initialize database, optionally with UTXO cache
         let db = Arc::new(if config.utxo_cache_size > 0 {
             tracing::info!("UTXO cache enabled: {} entries", config.utxo_cache_size);
-            ChainDatabase::open_with_utxo_cache(&config.chainstate_path(), config.utxo_cache_size)
+            ChainDatabase::open_with_utxo_cache(config.chainstate_path(), config.utxo_cache_size)
                 .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
         } else {
             tracing::info!("UTXO cache disabled (direct RocksDB reads)");
-            ChainDatabase::open(&config.chainstate_path())
+            ChainDatabase::open(config.chainstate_path())
                 .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
         });
 
@@ -904,14 +904,13 @@ impl Node {
                             )));
                         }
                     }
-                    total_input = total_input + utxo.value;
+                    total_input += utxo.value;
                 }
                 Ok(None) => {
                     // Not in UTXO set, check if it's an output of a mempool transaction
                     if let Some(mempool_entry) = self.mempool.get(&input.prevout.txid) {
                         if (input.prevout.vout as usize) < mempool_entry.tx.vout.len() {
-                            total_input = total_input
-                                + mempool_entry.tx.vout[input.prevout.vout as usize].value;
+                            total_input += mempool_entry.tx.vout[input.prevout.vout as usize].value;
                         } else {
                             return Err(NodeError::TransactionValidation(format!(
                                 "Input {}:{} output index out of bounds",
@@ -943,7 +942,7 @@ impl Node {
                     "Negative output value".into(),
                 ));
             }
-            total_output = total_output + output.value;
+            total_output += output.value;
         }
 
         // Input must be >= output (difference is the fee)
@@ -995,14 +994,13 @@ impl Node {
         for input in &tx.vin {
             match chain.get_utxo(&input.prevout) {
                 Ok(Some(utxo)) => {
-                    total_input = total_input + utxo.value;
+                    total_input += utxo.value;
                 }
                 Ok(None) => {
                     // Not in UTXO set, check if it's an output of a mempool transaction
                     if let Some(mempool_entry) = mempool.get(&input.prevout.txid) {
                         if (input.prevout.vout as usize) < mempool_entry.tx.vout.len() {
-                            total_input = total_input
-                                + mempool_entry.tx.vout[input.prevout.vout as usize].value;
+                            total_input += mempool_entry.tx.vout[input.prevout.vout as usize].value;
                         } else {
                             return Err(NodeError::TransactionValidation(format!(
                                 "Input {}:{} output index out of bounds",
@@ -1033,7 +1031,7 @@ impl Node {
                     "Negative output value".into(),
                 ));
             }
-            total_output = total_output + output.value;
+            total_output += output.value;
         }
 
         // Input must be >= output (difference is the fee)
@@ -1239,7 +1237,7 @@ mod tests {
     fn test_config() -> NodeConfig {
         let temp_dir = tempdir().unwrap();
         let mut config = NodeConfig::testnet(ChainMode::Divi);
-        config.data_dir = temp_dir.into_path();
+        config.data_dir = temp_dir.keep();
         config
     }
 
@@ -1346,7 +1344,6 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_no_outputs() {
-        use divi_primitives::amount::Amount;
         use divi_primitives::hash::Hash256;
         use divi_primitives::script::Script;
         use divi_primitives::transaction::{OutPoint, Transaction, TxIn};

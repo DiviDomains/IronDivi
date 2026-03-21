@@ -313,7 +313,7 @@ impl Staker {
         // This is an approximation - in reality we'd need to track total staking weight
         // We assume the total network has roughly 1 million DIVI staking
         // This is a very rough heuristic and will need tuning based on actual network behavior
-        const ESTIMATED_TOTAL_NETWORK_WEIGHT: u64 = 1_000_000_00000000; // 1M DIVI in satoshis
+        const ESTIMATED_TOTAL_NETWORK_WEIGHT: u64 = 100_000_000_000_000; // 1M DIVI in satoshis
 
         // Expected time formula:
         // time = (target / max_target) * (network_weight / my_weight) * block_spacing
@@ -348,7 +348,7 @@ impl Staker {
         // Clamp to reasonable values:
         // - Minimum: 60 seconds (one block time)
         // - Maximum: 30 days in seconds (for very small stakes)
-        let clamped = expected_seconds.max(60).min(30 * 24 * 3600);
+        let clamped = expected_seconds.clamp(60, 30 * 24 * 3600);
 
         Some(clamped)
     }
@@ -393,7 +393,7 @@ impl Staker {
             iteration += 1;
 
             // Log every 60 iterations (30 seconds at 500ms)
-            if iteration % 60 == 0 {
+            if iteration.is_multiple_of(60) {
                 info!("Staking loop iteration {}", iteration);
             }
 
@@ -703,10 +703,8 @@ impl Staker {
         }
 
         // Build combined candidate list
-        let mut candidates: Vec<StakeCandidate> = stakeable
-            .iter()
-            .map(|u| StakeCandidate::Regular(u))
-            .collect();
+        let mut candidates: Vec<StakeCandidate> =
+            stakeable.iter().map(StakeCandidate::Regular).collect();
         for (utxo, vault_script) in &vault_utxos {
             candidates.push(StakeCandidate::Vault(utxo, vault_script.clone()));
         }
@@ -721,7 +719,7 @@ impl Staker {
         // Log staking attempt (every 60 iterations to avoid spam)
         static ATTEMPT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 60 == 0 {
+        if count.is_multiple_of(60) {
             info!(
                 "Staking attempt #{}: {} UTXOs, total weight {} DIVI, tip height {}, current_time {}, n_bits=0x{:08x}, stake_modifier={}",
                 count, candidates.len(), total_weight / 100_000_000, next_height - 1, current_time, n_bits, tip.stake_modifier
@@ -823,7 +821,7 @@ impl Staker {
                 HashproofResult::FailedGeneration => {
                     generation_failed_count += 1;
                     // Diagnostic: log the first UTXO's details every 60 attempts
-                    if generation_failed_count == 1 && count % 60 == 0 {
+                    if generation_failed_count == 1 && count.is_multiple_of(60) {
                         let age = current_time.saturating_sub(block_time_of_first_confirmation);
                         info!(
                             "Sample UTXO {}:{} value={} age={}s ({:.1}h) block_time={}",
@@ -886,7 +884,7 @@ impl Staker {
         }
 
         // Log attempt summary (every 60 attempts to avoid spam)
-        if count % 60 == 0 {
+        if count.is_multiple_of(60) {
             info!(
                 "Staking attempt #{} summary: {} tried, {} no-proof, {} setup-failed, 0 success",
                 count,
@@ -1617,10 +1615,10 @@ mod tests {
     fn test_staking_config_custom_min_stake() {
         // Custom config with minimum stake amount
         let config = StakingConfig {
-            min_stake_amount: 1_000_00000000, // 1000 DIVI
+            min_stake_amount: 100_000_000_000, // 1000 DIVI
             ..Default::default()
         };
-        assert_eq!(config.min_stake_amount, 1_000_00000000);
+        assert_eq!(config.min_stake_amount, 100_000_000_000);
     }
 
     #[test]
@@ -1849,7 +1847,7 @@ mod tests {
         );
 
         // With 10,000 DIVI stake weight
-        let stake_weight = 10_000_00000000u64;
+        let stake_weight = 1_000_000_000_000_u64;
         let result = staker.calculate_expected_time(stake_weight);
 
         // Should return a reasonable time estimate
@@ -1895,8 +1893,8 @@ mod tests {
         );
 
         // Test with smaller stake weights to avoid hitting the minimum clamp
-        let weight_1x = 1_000_00000000u64; // 1,000 DIVI
-        let weight_2x = 2_000_00000000u64; // 2,000 DIVI
+        let weight_1x = 100_000_000_000u64; // 1,000 DIVI
+        let weight_2x = 200_000_000_000_u64; // 2,000 DIVI
 
         let time_1x = staker.calculate_expected_time(weight_1x).unwrap();
         let time_2x = staker.calculate_expected_time(weight_2x).unwrap();

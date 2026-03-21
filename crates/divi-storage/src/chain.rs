@@ -26,7 +26,7 @@ use divi_crypto::{compute_block_hash, compute_merkle_root, hash256};
 use divi_primitives::amount::Amount;
 use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
-use divi_primitives::transaction::{OutPoint, Transaction, TxOut};
+use divi_primitives::transaction::{OutPoint, Transaction};
 use divi_primitives::ChainMode;
 use divi_script::verify_input;
 use parking_lot::{Mutex, RwLock};
@@ -744,7 +744,7 @@ impl Chain {
                     *self.tip.write() = Some(index.clone());
 
                     // Periodically flush UTXO cache to disk (every 100 blocks)
-                    if self.db.has_utxo_cache() && accepted_height % 100 == 0 {
+                    if self.db.has_utxo_cache() && accepted_height.is_multiple_of(100) {
                         match self.db.flush_utxo_cache() {
                             Ok(count) => {
                                 if count > 0 {
@@ -1039,7 +1039,7 @@ impl Chain {
                 index.height
             );
             let mut index_mut = index.clone();
-            if let Err(e) = self.disconnect_block(&block, &mut index_mut) {
+            if let Err(e) = self.disconnect_block(block, &mut index_mut) {
                 warn!("Failed to disconnect block {}: {}", index.hash, e);
                 return Err(e);
             }
@@ -1056,7 +1056,7 @@ impl Chain {
             );
             let mut index_mut = index.clone();
             let (utxo_batch, undo_bytes) =
-                self.connect_block(&block, &mut index_mut).map_err(|e| {
+                self.connect_block(block, &mut index_mut).map_err(|e| {
                     warn!("Failed to connect block {}: {}", index.hash, e);
                     e
                 })?;
@@ -1148,7 +1148,7 @@ impl Chain {
                                     prev_is_coinbase,
                                     prev_is_coinstake,
                                 );
-                                utxo_batch.add(input.prevout.clone(), utxo);
+                                utxo_batch.add(input.prevout, utxo);
                             }
                         } else {
                             warn!(
@@ -1353,7 +1353,7 @@ impl Chain {
 
         // Validate proof-of-stake if this is a PoS block
         if block.is_proof_of_stake() {
-            self.validate_proof_of_stake(&block, parent)?;
+            self.validate_proof_of_stake(block, parent)?;
         }
 
         Ok(())
@@ -1587,7 +1587,7 @@ impl Chain {
             n_bits: block.header.bits,
             block_time_of_first_confirmation: kernel_block_index.time,
             block_hash_of_first_confirmation: kernel_block_index.hash,
-            utxo_being_staked: kernel_input.prevout.clone(),
+            utxo_being_staked: kernel_input.prevout,
             utxo_value: kernel_utxo.value,
             block_hash_of_chain_tip: parent.hash,
         };
@@ -1793,7 +1793,7 @@ impl Chain {
                     };
 
                     if let Some(ref utxo) = prev_utxo {
-                        block_undo.push(input.prevout.clone(), utxo.clone());
+                        block_undo.push(input.prevout, utxo.clone());
                     }
 
                     // Validate the input script against the previous output's scriptPubKey.
@@ -1837,8 +1837,8 @@ impl Chain {
                     }
 
                     // Track spent UTXOs and queue removal
-                    spent_in_block.insert(input.prevout.clone());
-                    utxo_batch.remove(input.prevout.clone());
+                    spent_in_block.insert(input.prevout);
+                    utxo_batch.remove(input.prevout);
                 }
             }
 
@@ -1863,9 +1863,9 @@ impl Chain {
                     is_coinstake,
                 );
                 // Track UTXOs created in this block
-                created_in_block.insert(outpoint.clone());
+                created_in_block.insert(outpoint);
                 // Queue UTXO addition in batch
-                utxo_batch.add(outpoint.clone(), utxo);
+                utxo_batch.add(outpoint, utxo);
                 utxos_created += 1;
 
                 // Debug: log specific UTXOs we're interested in
@@ -2148,7 +2148,7 @@ impl Chain {
                 continue; // Skip coinstake marker input
             }
             if let Some(utxo) = self.db.get_utxo(&input.prevout)? {
-                input_sum = input_sum + utxo.value;
+                input_sum += utxo.value;
             }
             // If UTXO not found, it may have been created earlier in this block (edge case)
             // The UTXO existence check in connect_block handles this
@@ -2305,9 +2305,11 @@ impl Chain {
         let coinstake_hash = self.compute_txid(coinstake);
 
         // C++ line 185: payment script is vout[0] for coinbase, vout[1] for coinstake
-        let payment_script = if coinstake.vout.first().map_or(false, |o| {
-            o.value == Amount::ZERO && o.script_pubkey.is_empty()
-        }) {
+        let payment_script = if coinstake
+            .vout
+            .first()
+            .is_some_and(|o| o.value == Amount::ZERO && o.script_pubkey.is_empty())
+        {
             // Coinstake: vout[0] is empty marker, payment is vout[1]
             coinstake.vout[1].script_pubkey.clone()
         } else {
@@ -2516,6 +2518,7 @@ impl Chain {
     }
 
     /// Update the chain tip
+    #[allow(dead_code)]
     fn update_tip(&self, index: BlockIndex) -> Result<(), StorageError> {
         self.db.set_best_block(&index.hash)?;
         self.db.set_chain_height(index.height)?;
@@ -2532,51 +2535,6 @@ impl Chain {
     /// Check if a UTXO exists
     pub fn has_utxo(&self, outpoint: &OutPoint) -> Result<bool, StorageError> {
         self.db.has_utxo(outpoint)
-    }
-
-    /// Repair a missing UTXO by reconstructing it from stored block data.
-    ///
-    /// Uses the tx_index to find the transaction that created the outpoint,
-    /// reconstructs the UTXO, writes it to the database, and returns it.
-    /// This handles UTXO set corruption from pre-write-through cache restarts.
-    #[deprecated(
-        note = "Use undo data for disconnect. This was a band-aid for UTXO cache data loss."
-    )]
-    fn repair_utxo(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, StorageError> {
-        if let Some((tx, height, is_coinbase, is_coinstake)) =
-            self.find_transaction(&outpoint.txid)?
-        {
-            if let Some(output) = tx.vout.get(outpoint.vout as usize) {
-                let utxo = Utxo::new(
-                    output.value,
-                    output.script_pubkey.clone(),
-                    height,
-                    is_coinbase,
-                    is_coinstake,
-                );
-                warn!(
-                    "Repaired missing UTXO {}:{} (value={}, height={}) from block data",
-                    outpoint.txid, outpoint.vout, output.value, height
-                );
-                self.db.add_utxo(outpoint, &utxo)?;
-                return Ok(Some(utxo));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Get UTXO with automatic repair from block data if missing.
-    ///
-    /// First checks the UTXO set. If not found, attempts to reconstruct
-    /// the UTXO from stored block data using the tx_index.
-    #[deprecated(
-        note = "Use db.get_utxo() directly. Repair is no longer needed with atomic writes."
-    )]
-    fn get_utxo_or_repair(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, StorageError> {
-        if let Some(utxo) = self.db.get_utxo(outpoint)? {
-            return Ok(Some(utxo));
-        }
-        self.repair_utxo(outpoint)
     }
 
     /// Flush the UTXO cache to database
@@ -2907,6 +2865,7 @@ mod tests {
     // ============================================================
 
     /// Helper to count UTXOs in the chain
+    #[allow(dead_code)]
     fn count_utxos(_chain: &Chain) -> usize {
         // We can't directly iterate UTXOs, so we'll track by checking known outpoints
         // For test purposes, we count based on the blocks we've added
@@ -3613,11 +3572,11 @@ mod tests {
         }
     }
 
-    /// Test that disconnecting blocks with empty outputs works correctly
-    ///
-    /// This tests the disconnect_block path which also needs to handle
-    /// empty outputs correctly (remove them all, not skip them).
-    #[test]
+    //     /// Test that disconnecting blocks with empty outputs works correctly
+    //     ///
+    //     /// This tests the disconnect_block path which also needs to handle
+    //     /// empty outputs correctly (remove them all, not skip them).
+    //     #[test]
     //     fn test_disconnect_block_removes_all_outputs_including_empty() {
     //         let (chain, _dir) = create_test_chain();
     //
@@ -3753,7 +3712,7 @@ mod tests {
         block.transactions.push(tx2.clone());
         block.header.merkle_root = compute_merkle_root(&block.transactions);
 
-        chain.accept_block(block).unwrap().hash;
+        chain.accept_block(block).unwrap();
 
         let tx1_hash = chain.compute_txid(&tx1);
         let tx2_hash = chain.compute_txid(&tx2);
@@ -3825,7 +3784,7 @@ mod tests {
         let index3 = chain.get_block_index(&hash3).unwrap().unwrap();
         let mtp = chain.get_median_time_past(&index3).unwrap();
 
-        let mut times = vec![
+        let mut times = [
             genesis_time,
             genesis_time + 60,
             genesis_time + 120,
@@ -3843,7 +3802,6 @@ mod tests {
         let (genesis_hash, genesis_time) = get_genesis_info(&chain);
 
         let mut prev_hash = genesis_hash;
-        let mut prev_time = genesis_time;
         let mut timestamps = vec![genesis_time];
 
         for i in 1..=10 {
@@ -3851,7 +3809,6 @@ mod tests {
             timestamps.push(block_time);
             let block = create_child_block_with_time(prev_hash, block_time);
             prev_hash = chain.accept_block(block).unwrap().hash;
-            prev_time = block_time;
         }
 
         let final_index = chain.get_block_index(&prev_hash).unwrap().unwrap();

@@ -523,8 +523,6 @@ fn handle_generate(client: &RpcClient, nblocks: u64) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Format JSON output with pretty printing
-
 /// Parse a single argument (JSON or string)
 fn parse_argument_value(arg: &str) -> Value {
     // Try to parse as JSON first
@@ -616,7 +614,7 @@ fn run() -> Result<(), CliError> {
     let rpc_connect = args.rpcconnect.clone();
     let rpc_connect = if rpc_connect == "127.0.0.1" {
         // If default, check config
-        config.rpcconnect.unwrap_or_else(|| rpc_connect)
+        config.rpcconnect.unwrap_or(rpc_connect)
     } else {
         rpc_connect
     };

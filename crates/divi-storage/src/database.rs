@@ -26,7 +26,7 @@ use moka::sync::Cache as MokaCache;
 use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Default RocksDB block cache size (128 MB)
 const DEFAULT_BLOCK_CACHE_SIZE: usize = 128 * 1024 * 1024;
@@ -355,7 +355,7 @@ impl ChainDatabase {
 
         // Also populate cache for fast reads
         if let Some(ref cache) = self.utxo_cache {
-            cache.insert(outpoint.clone(), utxo.clone());
+            cache.insert(*outpoint, utxo.clone());
         }
         Ok(())
     }
@@ -375,7 +375,7 @@ impl ChainDatabase {
             match self.db.get_cf(cf, key)? {
                 Some(data) => {
                     let utxo = Utxo::from_bytes(&data)?;
-                    cache.populate_from_db(outpoint.clone(), Some(utxo.clone()));
+                    cache.populate_from_db(*outpoint, Some(utxo.clone()));
                     Ok(Some(utxo))
                 }
                 None => Ok(None),
@@ -403,7 +403,7 @@ impl ChainDatabase {
 
         // Also update cache
         if let Some(ref cache) = self.utxo_cache {
-            cache.remove(outpoint.clone());
+            cache.remove(*outpoint);
         }
         Ok(())
     }
@@ -424,7 +424,7 @@ impl ChainDatabase {
             // Populate cache on miss if the UTXO exists
             if exists {
                 if let Ok(Some(utxo)) = self.get_utxo_direct(outpoint) {
-                    cache.populate_from_db(outpoint.clone(), Some(utxo));
+                    cache.populate_from_db(*outpoint, Some(utxo));
                 }
             }
             Ok(exists)
@@ -484,8 +484,7 @@ impl ChainDatabase {
             let utxo = Utxo::from_bytes(&value)?;
             stats.total_amount += utxo.value.as_sat() as u64;
 
-            let outpoint =
-                outpoint_from_key(&_key).map_err(|e| StorageError::Deserialization(e))?;
+            let outpoint = outpoint_from_key(&_key).map_err(StorageError::Deserialization)?;
             if last_txid.as_ref() != Some(&outpoint.txid) {
                 stats.transactions += 1;
                 last_txid = Some(outpoint.txid);
@@ -494,12 +493,12 @@ impl ChainDatabase {
             // Feed UTXO data into SHA256 hasher (matching C++ gettxoutsetinfo format):
             // txid (32 bytes) | vout (u32 LE) | height (u32 LE) | is_coinbase (1 byte) | amount (i64 LE) | scriptPubKey (varint len + bytes)
             hasher.update(outpoint.txid.as_bytes());
-            hasher.update(&outpoint.vout.to_le_bytes());
-            hasher.update(&utxo.height.to_le_bytes());
-            hasher.update(&[utxo.is_coinbase as u8]);
-            hasher.update(&utxo.value.as_sat().to_le_bytes());
+            hasher.update(outpoint.vout.to_le_bytes());
+            hasher.update(utxo.height.to_le_bytes());
+            hasher.update([utxo.is_coinbase as u8]);
+            hasher.update(utxo.value.as_sat().to_le_bytes());
             let script_bytes = utxo.script_pubkey.as_bytes();
-            hasher.update(&(script_bytes.len() as u32).to_le_bytes());
+            hasher.update((script_bytes.len() as u32).to_le_bytes());
             hasher.update(script_bytes);
         }
 
@@ -553,8 +552,7 @@ impl ChainDatabase {
     /// Set the chain height
     pub fn set_chain_height(&self, height: u32) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
-        self.db
-            .put_cf(cf, KEY_CHAIN_HEIGHT, &height.to_le_bytes())?;
+        self.db.put_cf(cf, KEY_CHAIN_HEIGHT, height.to_le_bytes())?;
         Ok(())
     }
 
@@ -624,7 +622,7 @@ impl ChainDatabase {
         wb.put_cf(
             &cf_metadata,
             KEY_CHAIN_HEIGHT,
-            &block_index.height.to_le_bytes(),
+            block_index.height.to_le_bytes(),
         );
         wb.put_cf(
             &cf_block_index,
@@ -644,12 +642,12 @@ impl ChainDatabase {
         if let Some(ref cache) = self.utxo_cache {
             for outpoint in &utxo_batch.removes {
                 if !added_set.contains(outpoint) {
-                    cache.remove(outpoint.clone());
+                    cache.remove(*outpoint);
                 }
             }
             for (outpoint, utxo) in &utxo_batch.adds {
                 if !removed_set.contains(outpoint) {
-                    cache.insert(outpoint.clone(), utxo.clone());
+                    cache.insert(*outpoint, utxo.clone());
                 }
             }
         }
@@ -730,12 +728,12 @@ impl ChainDatabase {
         if let Some(ref cache) = self.utxo_cache {
             for outpoint in &batch.removes {
                 if !added_set.contains(outpoint) {
-                    cache.remove(outpoint.clone());
+                    cache.remove(*outpoint);
                 }
             }
             for (outpoint, utxo) in &batch.adds {
                 if !removed_set.contains(outpoint) {
-                    cache.insert(outpoint.clone(), utxo.clone());
+                    cache.insert(*outpoint, utxo.clone());
                 }
             }
         }
@@ -1069,7 +1067,7 @@ mod tests {
 
         // Add coinstake UTXO
         let coinstake = Utxo::new(
-            Amount::from_sat(1000_000_000),
+            Amount::from_sat(1_000_000_000),
             Script::new_p2pkh(&[0x02; 20]),
             2,
             false,
@@ -1321,9 +1319,9 @@ mod tests {
         let (op2, u2) = make_utxo(2_000);
         let (op3, _u3) = make_utxo(3_000);
 
-        batch.add(op1.clone(), u1.clone());
-        batch.add(op2.clone(), u2.clone());
-        batch.remove(op3.clone());
+        batch.add(op1, u1.clone());
+        batch.add(op2, u2.clone());
+        batch.remove(op3);
 
         assert_eq!(batch.add_count(), 2);
         assert_eq!(batch.remove_count(), 1);
@@ -1352,7 +1350,7 @@ mod tests {
 
         // Then remove it via batch
         let mut batch = BatchedUtxoWriter::new();
-        batch.remove(op.clone());
+        batch.remove(op);
         db.flush_utxo_batch(&batch).unwrap();
 
         assert!(!db.has_utxo(&op).unwrap());
@@ -1386,8 +1384,8 @@ mod tests {
         let mut batch = BatchedUtxoWriter::new();
         let (op1, u1) = make_utxo(10_000);
         let (op2, u2) = make_utxo(20_000);
-        batch.add(op1.clone(), u1);
-        batch.add(op2.clone(), u2);
+        batch.add(op1, u1);
+        batch.add(op2, u2);
 
         db.flush_utxo_batch(&batch).unwrap();
 

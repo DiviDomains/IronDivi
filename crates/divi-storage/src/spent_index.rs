@@ -176,7 +176,7 @@ impl SpentIndex {
         let db_value = value.to_bytes();
 
         db.put_cf(&cf, &db_key, &db_value)
-            .map_err(|e| StorageError::Database(e))?;
+            .map_err(StorageError::Database)?;
         Ok(())
     }
 
@@ -189,8 +189,7 @@ impl SpentIndex {
 
         let db_key = key.to_db_key();
 
-        db.delete_cf(&cf, &db_key)
-            .map_err(|e| StorageError::Database(e))?;
+        db.delete_cf(&cf, &db_key).map_err(StorageError::Database)?;
         Ok(())
     }
 

@@ -164,7 +164,7 @@ fn test_regression_utxo_cache_flush_persists_to_db() {
         false,
     );
 
-    cache.insert(outpoint.clone(), utxo.clone());
+    cache.insert(outpoint, utxo.clone());
     assert_eq!(cache.dirty_count(), 1, "Must be dirty before flush");
 
     let flushed = cache.flush(db.inner_db()).expect("flush must succeed");

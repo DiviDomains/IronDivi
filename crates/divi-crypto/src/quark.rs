@@ -103,7 +103,7 @@ unsafe fn sph_round(
 
 /// Convenience macros are replaced by inline unsafe calls below to avoid
 /// borrow-checker issues with simultaneous references to different array slots.
-
+///
 /// Compute the Quark hash of `data`, returning a 256-bit (32-byte) result.
 ///
 /// This matches the C++ `HashQuark` function from Divi's `hash.h`.

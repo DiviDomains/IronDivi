@@ -206,10 +206,10 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
         let tx_lock_time = self.tx.lock_time as i64;
 
         // Check sequence is not final
-        if self.input_index < self.tx.vin.len() {
-            if self.tx.vin[self.input_index].sequence == 0xffffffff {
-                return false;
-            }
+        if self.input_index < self.tx.vin.len()
+            && self.tx.vin[self.input_index].sequence == 0xffffffff
+        {
+            return false;
         }
 
         // Lock time type threshold (500000000 = median timestamp ~1985)
@@ -375,7 +375,7 @@ mod tests {
         let pubkey_hash = pubkey.pubkey_hash();
 
         // Create a transaction spending to our key
-        let mut tx = Transaction {
+        let tx = Transaction {
             version: 2,
             vin: vec![TxIn::new(
                 OutPoint::new(Hash256::from_bytes([1u8; 32]), 0),

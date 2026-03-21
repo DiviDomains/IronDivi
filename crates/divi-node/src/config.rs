@@ -393,8 +393,8 @@ impl Default for StakingConfig {
             enabled: false,
             min_stake_amount: 0, // No minimum - any UTXO can stake (matches C++ Divi)
             reserve_balance: 0,
-            split_threshold: 100_000_00000000, // 100,000 DIVI
-            combine_threshold: 1_000_00000000, // 1,000 DIVI
+            split_threshold: 10_000_000_000_000, // 100,000 DIVI
+            combine_threshold: 100_000_000_000,  // 1,000 DIVI
         }
     }
 }
@@ -427,7 +427,7 @@ impl Default for MempoolConfig {
 }
 
 /// Debug configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DebugConfig {
     /// Enable debug logging
     pub debug_logging: bool,
@@ -443,18 +443,6 @@ pub struct DebugConfig {
 
     /// Print block on accept
     pub print_blocks: bool,
-}
-
-impl Default for DebugConfig {
-    fn default() -> Self {
-        DebugConfig {
-            debug_logging: false,
-            log_network: false,
-            log_rpc: false,
-            log_mempool: false,
-            print_blocks: false,
-        }
-    }
 }
 
 /// Index configuration

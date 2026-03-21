@@ -164,11 +164,11 @@ impl Target {
         let b = weight.to_u64_limbs();
 
         // Multiply with accumulation (schoolbook multiplication)
-        for i in 0..4 {
+        for (i, &ai) in a.iter().enumerate() {
             let mut carry: u128 = 0;
-            for j in 0..4 {
+            for (j, &bj) in b.iter().enumerate() {
                 let pos = i + j;
-                let product = (a[i] as u128) * (b[j] as u128) + (result[pos] as u128) + carry;
+                let product = (ai as u128) * (bj as u128) + (result[pos] as u128) + carry;
                 result[pos] = product as u64;
                 carry = product >> 64;
             }
@@ -213,11 +213,11 @@ impl Target {
     }
 
     /// Convert to array of u64 limbs (little-endian)
-    fn to_u64_limbs(&self) -> [u64; 4] {
+    fn to_u64_limbs(self) -> [u64; 4] {
         let mut limbs = [0u64; 4];
-        for i in 0..4 {
+        for (i, limb) in limbs.iter_mut().enumerate() {
             let offset = i * 8;
-            limbs[i] = u64::from_le_bytes([
+            *limb = u64::from_le_bytes([
                 self.0[offset],
                 self.0[offset + 1],
                 self.0[offset + 2],
@@ -234,9 +234,9 @@ impl Target {
     /// Create from array of u64 limbs (little-endian)
     fn from_u64_limbs(limbs: [u64; 4]) -> Self {
         let mut bytes = [0u8; 32];
-        for i in 0..4 {
+        for (i, &limb) in limbs.iter().enumerate() {
             let offset = i * 8;
-            let limb_bytes = limbs[i].to_le_bytes();
+            let limb_bytes = limb.to_le_bytes();
             bytes[offset..offset + 8].copy_from_slice(&limb_bytes);
         }
         Target(bytes)
@@ -784,7 +784,7 @@ mod tests {
         use divi_primitives::constants::COIN;
 
         // 2000 DIVI at 7 days age (maximum weight)
-        let value: i64 = 2000 * COIN as i64;
+        let value: i64 = 2000 * COIN;
         let time_weight: i64 = 601_200; // MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING
 
         let target = Target::from_compact(0x1e0fffff); // easiest mainnet target

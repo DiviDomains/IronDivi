@@ -17,7 +17,6 @@
 use clap::Parser;
 use divi_crypto::compute_block_hash;
 use divi_primitives::block::Block;
-use divi_primitives::hash::Hash256;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;

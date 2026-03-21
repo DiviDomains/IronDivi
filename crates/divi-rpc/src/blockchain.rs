@@ -276,7 +276,7 @@ impl BlockchainRpc {
                 t.height,
                 t.hash.to_string(),
                 chainwork_to_hex(&t.chain_work),
-                self.get_median_time(&t),
+                self.get_median_time(t),
                 bits_to_difficulty(t.bits),
             ),
             None => (
@@ -368,7 +368,7 @@ impl BlockchainRpc {
         let stats = self.chain.get_utxo_stats().map_err(|e| {
             RpcError::new(
                 codes::INTERNAL_ERROR,
-                &format!("Failed to get UTXO stats: {}", e),
+                format!("Failed to get UTXO stats: {}", e),
             )
         })?;
 
@@ -422,7 +422,7 @@ impl BlockchainRpc {
         timestamps[timestamps.len() / 2]
     }
 
-    fn tx_to_json(&self, tx: &divi_primitives::transaction::Transaction) -> Value {
+    fn _tx_to_json(&self, tx: &divi_primitives::transaction::Transaction) -> Value {
         let tx_bytes = serialize(tx);
         let txid = divi_crypto::hash256(&tx_bytes);
 
@@ -432,7 +432,7 @@ impl BlockchainRpc {
             .map(|input| {
                 if input.prevout.is_null() {
                     json!({
-                        "coinbase": hex::encode(&input.script_sig.as_bytes()),
+                        "coinbase": hex::encode(input.script_sig.as_bytes()),
                         "sequence": input.sequence
                     })
                 } else {
@@ -440,7 +440,7 @@ impl BlockchainRpc {
                         "txid": input.prevout.txid.to_string(),
                         "vout": input.prevout.vout,
                         "scriptSig": {
-                            "hex": hex::encode(&input.script_sig.as_bytes())
+                            "hex": hex::encode(input.script_sig.as_bytes())
                         },
                         "sequence": input.sequence
                     })
@@ -457,7 +457,7 @@ impl BlockchainRpc {
                     "value": output.value.as_sat() as f64 / 100_000_000.0,
                     "n": n,
                     "scriptPubKey": {
-                        "hex": hex::encode(&output.script_pubkey.as_bytes())
+                        "hex": hex::encode(output.script_pubkey.as_bytes())
                     }
                 })
             })
@@ -517,7 +517,7 @@ impl BlockchainRpc {
     pub fn get_tx_out(&self, params: &Params) -> Result<Value, Error> {
         use divi_primitives::hash::Hash160;
         use divi_primitives::transaction::OutPoint;
-        use divi_wallet::address::{Address, AddressType, Network};
+        use divi_wallet::address::{Address, Network};
 
         let txid_str = params
             .get_str(0)
@@ -552,10 +552,10 @@ impl BlockchainRpc {
                         Address::from_pubkey_hash(Hash160::from_bytes(pkh), Network::Mainnet)
                             .to_base58(),
                     )
-                } else if let Some(sh) = utxo.script_pubkey.extract_p2sh_hash() {
-                    Some(Address::p2sh(Hash160::from_bytes(sh), Network::Mainnet).to_base58())
                 } else {
-                    None
+                    utxo.script_pubkey.extract_p2sh_hash().map(|sh| {
+                        Address::p2sh(Hash160::from_bytes(sh), Network::Mainnet).to_base58()
+                    })
                 };
 
                 let script_type = if utxo.script_pubkey.is_p2pkh() {
@@ -607,11 +607,11 @@ impl BlockchainRpc {
     pub fn decode_script(&self, params: &Params) -> Result<Value, Error> {
         use divi_crypto::hash160;
         use divi_primitives::hash::Hash160;
-        use divi_primitives::script::Script;
+
         use divi_script::{
             extract_destinations, extract_script_type, get_script_type_name, to_asm,
         };
-        use divi_wallet::address::{Address, AddressType, Network};
+        use divi_wallet::address::{Address, Network};
 
         let hex_str = params
             .get_str(0)
@@ -631,24 +631,24 @@ impl BlockchainRpc {
             "type": type_name,
         });
 
-        if let Some((stype, destinations, req_sigs)) = extract_destinations(&script_bytes) {
+        if let Some((_stype, destinations, req_sigs)) = extract_destinations(&script_bytes) {
             result["reqSigs"] = json!(req_sigs);
 
             let addresses: Vec<String> = destinations
                 .iter()
-                .filter_map(|dest| match dest {
+                .map(|dest| match dest {
                     divi_script::Destination::PubKeyHash(pkh) => {
                         let mut bytes = [0u8; 20];
                         bytes.copy_from_slice(pkh);
                         let addr =
                             Address::from_pubkey_hash(Hash160::from_bytes(bytes), Network::Mainnet);
-                        Some(addr.to_base58())
+                        addr.to_base58()
                     }
                     divi_script::Destination::ScriptHash(sh) => {
                         let mut bytes = [0u8; 20];
                         bytes.copy_from_slice(sh);
                         let addr = Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
-                        Some(addr.to_base58())
+                        addr.to_base58()
                     }
                 })
                 .collect();

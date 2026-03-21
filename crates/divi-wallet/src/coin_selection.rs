@@ -122,7 +122,7 @@ impl CoinSelector for MinimumSelector {
         // Greedily add largest UTXOs until we have enough
         for utxo in utxos {
             selected.push(utxo.clone());
-            total_value = total_value + utxo.value;
+            total_value += utxo.value;
 
             // Calculate fee with current number of inputs
             // Add 1 to num_outputs to account for potential change output
@@ -143,7 +143,7 @@ impl CoinSelector for MinimumSelector {
         let estimated_fee = calculate_fee(selected.len(), num_outputs + 1, fee_rate);
         Err(WalletError::InsufficientFunds {
             need: (target + estimated_fee).as_sat() as i64,
-            have: total_value.as_sat() as i64,
+            have: total_value.as_sat(),
         })
     }
 }
@@ -323,7 +323,7 @@ mod tests {
         let result = select::select_minimum(&utxos, target, fee_rate, 1).unwrap();
 
         // Should select both UTXOs
-        assert!(result.utxos.len() >= 1);
+        assert!(!result.utxos.is_empty());
         assert!(result.total_value >= target + result.estimated_fee);
     }
 

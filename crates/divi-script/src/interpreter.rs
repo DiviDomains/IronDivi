@@ -14,12 +14,10 @@
 //! This module implements the Bitcoin/Divi script virtual machine,
 //! a stack-based language for transaction validation.
 
-use crate::error::{ScriptError, ScriptFlags, SigHashType};
+use crate::error::{ScriptError, ScriptFlags};
 use crate::opcodes::Opcode;
 use crate::stack::{cast_to_bool, ScriptNum, Stack, MAX_OPS_PER_SCRIPT, MAX_SCRIPT_SIZE};
-use divi_primitives::amount::Amount;
 use divi_primitives::script::Script;
-use divi_primitives::transaction::Transaction;
 
 /// Signature checker trait for verifying signatures during script execution
 pub trait SignatureChecker {
@@ -65,7 +63,7 @@ pub struct ScriptInterpreter<'a> {
     /// Number of opcodes executed
     op_count: usize,
     /// Code separator position for signature hashing
-    code_separator: usize,
+    _code_separator: usize,
 }
 
 impl<'a> ScriptInterpreter<'a> {
@@ -78,7 +76,7 @@ impl<'a> ScriptInterpreter<'a> {
             checker,
             exec_stack: Vec::new(),
             op_count: 0,
-            code_separator: 0,
+            _code_separator: 0,
         }
     }
 

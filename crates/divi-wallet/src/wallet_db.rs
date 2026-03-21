@@ -642,7 +642,7 @@ impl WalletDb {
         batch.put_cf(
             db.cf_metadata(),
             b"last_scan_height",
-            &self.last_scan_height.read().to_le_bytes(),
+            self.last_scan_height.read().to_le_bytes(),
         );
 
         if flags.utxos || flags.spent {
@@ -650,7 +650,7 @@ impl WalletDb {
             for outpoint in self.spent.read().iter() {
                 let key = outpoint_key(outpoint);
                 batch.delete_cf(db.cf_utxos(), &key);
-                batch.put_cf(db.cf_spent(), &key, &[1]);
+                batch.put_cf(db.cf_spent(), &key, [1]);
             }
 
             // Write current UTXOs (only if utxos dirty)
@@ -679,7 +679,7 @@ impl WalletDb {
 
         if flags.addresses {
             for addr in self.used_addresses.read().iter() {
-                batch.put_cf(db.cf_addresses(), addr.as_bytes(), &[1]);
+                batch.put_cf(db.cf_addresses(), addr.as_bytes(), [1]);
             }
         }
 
@@ -711,13 +711,13 @@ impl WalletDb {
             batch.put_cf(
                 db.cf_metadata(),
                 b"receiving_index",
-                &receiving.to_le_bytes(),
+                receiving.to_le_bytes(),
             );
-            batch.put_cf(db.cf_metadata(), b"change_index", &change.to_le_bytes());
+            batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
             batch.put_cf(
                 db.cf_metadata(),
                 b"encrypted",
-                &[*self.encrypted.read() as u8],
+                [*self.encrypted.read() as u8],
             );
         }
 
@@ -872,7 +872,7 @@ impl WalletDb {
     pub fn hd_master_key_id(&self) -> String {
         self.keystore
             .hd_master_key_id()
-            .map(|bytes| hex::encode(bytes))
+            .map(hex::encode)
             .unwrap_or_default()
     }
 
@@ -922,11 +922,11 @@ impl WalletDb {
         let utxo = self.utxos.write().remove(outpoint);
         if let Some(ref u) = utxo {
             debug!("Spent UTXO {}:{}", outpoint.txid, outpoint.vout);
-            self.spent.write().insert(outpoint.clone());
+            self.spent.write().insert(*outpoint);
             if let Some(h) = height {
                 self.spent_utxo_data
                     .write()
-                    .insert(outpoint.clone(), (u.clone(), h));
+                    .insert(*outpoint, (u.clone(), h));
                 // Persist to RocksDB so reorg recovery survives restart
                 if let Some(ref db) = self.db {
                     if let Err(e) = db.store_spent_utxo_data(outpoint, u, h) {
@@ -1005,7 +1005,7 @@ impl WalletDb {
                         "Reconciliation: removed phantom UTXO {}:{} ({} sat, addr={})",
                         outpoint.txid, outpoint.vout, utxo.value, utxo.address
                     );
-                    self.spent.write().insert(outpoint.clone());
+                    self.spent.write().insert(*outpoint);
                     removed += 1;
                 }
             }
@@ -1054,7 +1054,7 @@ impl WalletDb {
 
         if available_utxos.is_empty() {
             return Err(WalletError::InsufficientFunds {
-                need: target.as_sat() as i64,
+                need: target.as_sat(),
                 have: 0,
             });
         }
@@ -1341,7 +1341,7 @@ impl WalletDb {
 
             if self.is_mine_script(&output.script_pubkey) {
                 is_relevant = true;
-                received = received + output.value;
+                received += output.value;
 
                 // Extract address for labeling
                 let address = if let Some(hash_bytes) = output.script_pubkey.extract_p2pkh_hash() {
@@ -1387,7 +1387,7 @@ impl WalletDb {
             let outpoint = OutPoint::new(input.prevout.txid, input.prevout.vout);
             if let Some(utxo) = self.spend_utxo_at_height(&outpoint, height) {
                 is_relevant = true;
-                sent = sent + utxo.value;
+                sent += utxo.value;
                 trace!(
                     "Spent {} from {}:{}",
                     utxo.value,
@@ -1399,7 +1399,7 @@ impl WalletDb {
 
         // Record transaction if relevant
         if is_relevant {
-            let net_amount = received.as_sat() as i64 - sent.as_sat() as i64;
+            let net_amount = received.as_sat() - sent.as_sat();
             let category = if is_coinbase {
                 "coinbase"
             } else if is_coinstake {
@@ -1505,7 +1505,7 @@ impl WalletDb {
             let to_restore: Vec<_> = spent_data
                 .iter()
                 .filter(|(_, (_, spent_height))| *spent_height > fork_height)
-                .map(|(op, (utxo, _))| (op.clone(), utxo.clone()))
+                .map(|(op, (utxo, _))| (*op, utxo.clone()))
                 .collect();
 
             for (outpoint, utxo) in &to_restore {
@@ -1513,7 +1513,7 @@ impl WalletDb {
                     "Restoring UTXO {}:{} ({}) spent at orphaned height",
                     outpoint.txid, outpoint.vout, utxo.value
                 );
-                utxos.insert(outpoint.clone(), utxo.clone());
+                utxos.insert(*outpoint, utxo.clone());
                 spent_set.remove(outpoint);
                 spent_data.remove(outpoint);
                 // Remove from persisted CF so it doesn't resurrect after next restart
@@ -1549,7 +1549,7 @@ impl WalletDb {
         address_accounts.insert(addr_str.clone(), account.to_string());
         accounts
             .entry(account.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(addr_str);
         self.dirty.write().accounts = true;
     }
@@ -1685,8 +1685,8 @@ impl WalletDb {
     }
 }
 
-/// Encryption helpers
-/// These use AES-256-CBC with PBKDF2-HMAC-SHA512 for key derivation
+// Encryption helpers.
+// These use AES-256-CBC with PBKDF2-HMAC-SHA512 for key derivation.
 
 /// Number of PBKDF2 iterations (matches C++ Divi)
 const PBKDF2_ITERATIONS: u32 = 25000;

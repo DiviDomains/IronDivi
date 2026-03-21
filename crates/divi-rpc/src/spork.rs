@@ -11,7 +11,7 @@
 
 use crate::error::{Error, RpcError};
 use crate::protocol::Params;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub struct SporkRpc;
 
@@ -23,14 +23,13 @@ impl SporkRpc {
     pub fn spork(&self, params: &Params) -> Result<Value, Error> {
         let command = params.get_str(0);
 
-        match command {
-            Some(cmd) => match cmd.to_lowercase().as_str() {
+        if let Some(cmd) = command {
+            match cmd.to_lowercase().as_str() {
                 "show" | "active" => {}
                 _ => {
                     let _value = params.get_str(1);
                 }
-            },
-            None => {}
+            }
         }
 
         Err(RpcError::new(

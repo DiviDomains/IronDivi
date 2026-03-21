@@ -64,7 +64,7 @@ pub fn calculate_lottery_score(coinstake_hash: &Hash256, last_lottery_hash: &Has
     combined.extend_from_slice(last_lottery_hash.as_bytes());
 
     let first_hash = Sha256::digest(&combined);
-    let second_hash = Sha256::digest(&first_hash);
+    let second_hash = Sha256::digest(first_hash);
     Hash256::from_bytes(second_hash.into())
 }
 
@@ -107,7 +107,7 @@ pub fn get_last_lottery_height(height: u32, start_block: u32, cycle: u32) -> u32
 
 /// Check if a height is a lottery block
 pub fn is_lottery_block(height: u32, start_block: u32, cycle: u32) -> bool {
-    height >= start_block && (height % cycle == 0)
+    height >= start_block && height.is_multiple_of(cycle)
 }
 
 /// Update lottery winners with a new coinstake
@@ -255,8 +255,8 @@ mod tests {
         assert_eq!(payments[0].1.as_sat(), 2500_00000000);
 
         // Other 10 payments: 5% each = 250 DIVI
-        for i in 1..11 {
-            assert_eq!(payments[i].1.as_sat(), 250_00000000);
+        for payment in payments.iter().skip(1) {
+            assert_eq!(payment.1.as_sat(), 250_00000000);
         }
     }
 
@@ -558,18 +558,18 @@ mod tests {
         let payments = calculate_lottery_payments(&winners, Amount::from_sat(5000_00000000), 1000);
 
         // Big winner: 50% of 5,000,000 = 2,500,000 DIVI
-        assert_eq!(payments[0].1.as_sat(), 2_500_000_00000000);
+        assert_eq!(payments[0].1.as_sat(), 250_000_000_000_000);
 
         // Small winners: 5% each = 250,000 DIVI
-        for i in 1..11 {
-            assert_eq!(payments[i].1.as_sat(), 250_000_00000000);
+        for payment in payments.iter().skip(1) {
+            assert_eq!(payment.1.as_sat(), 25_000_000_000_000);
         }
     }
 
     // Lottery constants tests
     #[test]
     fn test_lottery_constants() {
-        assert_eq!(LOTTERY_TICKET_MINIMUM, 10_000_00000000);
+        assert_eq!(LOTTERY_TICKET_MINIMUM, 1_000_000_000_000);
         assert_eq!(LOTTERY_WINNER_COUNT, 11);
 
         // Regtest params

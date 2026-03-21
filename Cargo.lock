@@ -965,6 +965,7 @@ dependencies = [
  "bip39",
  "bs58",
  "cbc",
+ "criterion",
  "divi-crypto",
  "divi-primitives",
  "divi-script",

@@ -212,8 +212,8 @@ impl PeerHandle {
     pub fn try_send(
         &self,
         msg: NetworkMessage,
-    ) -> Result<(), mpsc::error::TrySendError<NetworkMessage>> {
-        self.tx.try_send(msg)
+    ) -> Result<(), Box<mpsc::error::TrySendError<NetworkMessage>>> {
+        self.tx.try_send(msg).map_err(Box::new)
     }
 }
 

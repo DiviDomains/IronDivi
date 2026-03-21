@@ -22,7 +22,7 @@ use divi_primitives::constants::COIN;
 /// Masternode tier levels
 ///
 /// Matches C++ `MasternodeTier` enum from masternode-tier.h
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum MasternodeTier {
     /// Copper tier - lowest collateral requirement
     Copper,
@@ -35,6 +35,7 @@ pub enum MasternodeTier {
     /// Diamond tier - highest collateral requirement
     Diamond,
     /// Invalid tier (used for error conditions)
+    #[default]
     Invalid,
 }
 
@@ -53,12 +54,6 @@ impl MasternodeTier {
     /// Check if this tier is valid (not Invalid)
     pub fn is_valid(&self) -> bool {
         !matches!(self, MasternodeTier::Invalid)
-    }
-}
-
-impl Default for MasternodeTier {
-    fn default() -> Self {
-        MasternodeTier::Invalid
     }
 }
 

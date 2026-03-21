@@ -231,9 +231,9 @@ fn test_regression_pos_target_bytes_above_16_not_truncated() {
 
     let bytes = base_target.as_bytes();
     // Bytes 0-15 must be zero (this is what u128 would have seen)
-    for i in 0..16 {
+    for (i, &byte) in bytes.iter().enumerate().take(16) {
         assert_eq!(
-            bytes[i], 0,
+            byte, 0,
             "byte {} of 0x1e0fffff target should be zero (lower 128 bits are empty)",
             i
         );
@@ -557,7 +557,7 @@ fn test_regression_utxo_cache_standalone_flush() {
     );
 
     // Insert into standalone cache (dirty)
-    cache.insert(outpoint.clone(), utxo.clone());
+    cache.insert(outpoint, utxo.clone());
     assert_eq!(cache.dirty_count(), 1, "Entry must be dirty before flush");
 
     // Flush to the DB

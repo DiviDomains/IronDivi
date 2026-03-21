@@ -487,7 +487,7 @@ mod tests {
 
         // Compute double-SHA256("abc") locally
         let first = Sha256::digest(b"abc");
-        let second = Sha256::digest(&first);
+        let second = Sha256::digest(first);
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&second);
         let computed = Hash256::from_bytes(bytes);

@@ -78,7 +78,7 @@ impl MempoolEntry {
 
 /// Entry for priority queue ordering by fee rate
 struct PriorityEntry {
-    txid: Hash256,
+    _txid: Hash256,
     fee_rate: f64,
 }
 
@@ -217,7 +217,7 @@ impl Mempool {
 
         // Add to priority queue
         self.priority_queue.write().push(PriorityEntry {
-            txid,
+            _txid: txid,
             fee_rate: entry.fee_rate,
         });
 
@@ -480,9 +480,10 @@ mod tests {
     use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
 
     fn test_config() -> MempoolConfig {
-        let mut config = MempoolConfig::default();
-        config.min_relay_fee = 1; // Very low for testing
-        config
+        MempoolConfig {
+            min_relay_fee: 1, // Very low for testing
+            ..MempoolConfig::default()
+        }
     }
 
     fn create_test_tx(prevout_txid: [u8; 32], value: i64) -> Transaction {
@@ -597,8 +598,10 @@ mod tests {
 
     #[test]
     fn test_low_fee_rejection() {
-        let mut config = MempoolConfig::default();
-        config.min_relay_fee = 100000; // High minimum
+        let config = MempoolConfig {
+            min_relay_fee: 100000, // High minimum
+            ..MempoolConfig::default()
+        };
         let mempool = Mempool::new(config);
 
         let tx = create_test_tx([1u8; 32], 50);

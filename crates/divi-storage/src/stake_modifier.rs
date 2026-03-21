@@ -22,7 +22,7 @@ pub const MODIFIER_INTERVAL_RATIO: i64 = 3;
 // Checkpoints removed - we compute stake modifiers algorithmically like C++
 
 pub fn get_stake_modifier_selection_interval_section(section: i32) -> i64 {
-    assert!(section >= 0 && section < 64);
+    assert!((0..64).contains(&section));
     let numerator = (MODIFIER_INTERVAL as i64) * 63;
     let denominator = 63 + ((63 - section) as i64 * (MODIFIER_INTERVAL_RATIO - 1));
     numerator / denominator
@@ -127,10 +127,8 @@ fn select_block_with_timestamp_upper_bound<'a>(
     let mut selected_index: Option<&'a BlockIndex> = None;
 
     for (time, hash) in blocks {
-        if let Some(ref bh) = best_hash {
-            if *time > timestamp_upper_bound {
-                break;
-            }
+        if best_hash.is_some() && *time > timestamp_upper_bound {
+            break;
         }
 
         if selected_hashes.contains(hash) {
@@ -150,11 +148,11 @@ fn select_block_with_timestamp_upper_bound<'a>(
         // C++ code: Hash(ss.begin(), ss.end()) where ss contains seed || modifier
         let mut hasher = Sha256::new();
         hasher.update(selection_seed.as_bytes());
-        hasher.update(&last_stake_modifier.to_le_bytes());
+        hasher.update(last_stake_modifier.to_le_bytes());
         let first_hash = hasher.finalize();
 
         let mut second_hasher = Sha256::new();
-        second_hasher.update(&first_hash);
+        second_hasher.update(first_hash);
         let hash_result = second_hasher.finalize();
 
         // SHA256 output directly maps to Hash256 bytes.
@@ -303,11 +301,11 @@ pub fn compute_next_stake_modifier<'a>(
         // Reference: ChainExtensionService.cpp:189-191
         let mut hasher = Sha256::new();
         hasher.update(prev_index.hash.as_bytes());
-        hasher.update(&new_stake_modifier.to_le_bytes());
+        hasher.update(new_stake_modifier.to_le_bytes());
         let first_hash = hasher.finalize();
 
         let mut second_hasher = Sha256::new();
-        second_hasher.update(&first_hash);
+        second_hasher.update(first_hash);
         let hash_result = second_hasher.finalize();
 
         u64::from_le_bytes([
@@ -366,9 +364,7 @@ mod tests {
     fn test_stake_entropy_bit_only_lowest_matters() {
         // All other bits set, lowest bit = 0
         let mut bytes = [0u8; 32];
-        for b in &mut bytes {
-            *b = 0xFF;
-        }
+        bytes.fill(0xFF);
         bytes[0] = 0b11111110; // all bits except lowest
         let hash = Hash256::from_bytes(bytes);
         assert_eq!(get_stake_entropy_bit(&hash), 0);
@@ -506,11 +502,11 @@ mod tests {
         fn compute_selection_hash(block_hash: &Hash256, modifier: u64) -> Hash256 {
             let mut hasher = Sha256::new();
             hasher.update(block_hash.as_bytes());
-            hasher.update(&modifier.to_le_bytes());
+            hasher.update(modifier.to_le_bytes());
             let first_hash = hasher.finalize();
 
             let mut second_hasher = Sha256::new();
-            second_hasher.update(&first_hash);
+            second_hasher.update(first_hash);
             let hash_result = second_hasher.finalize();
 
             // SHA256 output directly maps to Hash256 bytes
@@ -1093,7 +1089,7 @@ mod tests {
         sorted_blocks.sort_by_key(|(time, _)| *time);
 
         // Test round 0 selection with initial modifier
-        let mut selected_hashes = HashSet::new();
+        let selected_hashes = HashSet::new();
 
         // Block 58's time is 1538067920
         // timestamp_lower_bound = (1538067920 / 60) * 60 - 2087 = 1538067900 - 2087 = 1538065813

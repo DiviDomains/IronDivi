@@ -721,9 +721,8 @@ mod tests {
         use super::spork_ids::*;
         assert_eq!(SPORK_START, SPORK_2_SWIFTTX_ENABLED);
         assert_eq!(SPORK_END, SPORK_16_LOTTERY_TICKET_MIN_VALUE);
-        assert!(SPORK_START < SPORK_END);
-        // All IDs should be in 10001..=10015 range
-        assert!(SPORK_2_SWIFTTX_ENABLED >= 10001);
-        assert!(SPORK_16_LOTTERY_TICKET_MIN_VALUE <= 10015);
+        // Verify ordering: START < END (10001 < 10015)
+        assert_eq!(SPORK_START, 10001);
+        assert_eq!(SPORK_END, 10015);
     }
 }

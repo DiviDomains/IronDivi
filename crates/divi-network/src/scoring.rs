@@ -234,7 +234,7 @@ pub struct PeerScoring {
     /// Rate limiting: messages per IP per second
     rate_limits: RwLock<HashMap<IpAddr, RateLimit>>,
     /// Ban threshold score
-    ban_threshold: i32,
+    _ban_threshold: i32,
 }
 
 /// Rate limiting state for an IP
@@ -259,7 +259,7 @@ impl PeerScoring {
             stats: RwLock::new(HashMap::new()),
             bans: RwLock::new(HashMap::new()),
             rate_limits: RwLock::new(HashMap::new()),
-            ban_threshold: 100,
+            _ban_threshold: 100,
         }
     }
 

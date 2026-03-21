@@ -11,9 +11,10 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum MasternodeTier {
+    #[default]
     Invalid = 255,
     Copper = 0,
     Silver = 1,
@@ -100,12 +101,6 @@ impl MasternodeTier {
             MasternodeTier::Diamond => 1_000_000_000_000_000,
             MasternodeTier::Invalid => 0,
         }
-    }
-}
-
-impl Default for MasternodeTier {
-    fn default() -> Self {
-        MasternodeTier::Invalid
     }
 }
 

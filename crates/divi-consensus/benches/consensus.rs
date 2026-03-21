@@ -22,7 +22,7 @@
 //!
 //! Run with: cargo bench -p divi-consensus
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use divi_consensus::{
     bits_to_difficulty, compute_stake_hash, difficulty_to_bits, stake_target_hit, StakingData,
     Target,
@@ -189,8 +189,8 @@ fn bench_staking_simulation(c: &mut Criterion) {
                 470026099,
                 1538645320 + i * 1000,
                 Hash256::from_bytes(hash_bytes),
-                OutPoint::new(Hash256::from_bytes(hash_bytes), i as u32 % 5),
-                Amount::from_sat(rng.gen_range(1000_0000_0000..10000_0000_0000)),
+                OutPoint::new(Hash256::from_bytes(hash_bytes), i % 5),
+                Amount::from_sat(rng.gen_range(100_000_000_000..1_000_000_000_000)),
                 Hash256::from_bytes(hash_bytes),
             )
         })

@@ -124,7 +124,7 @@ fn bench_key_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("ecdsa_keygen");
 
     group.bench_function("generate_keypair", |b| {
-        b.iter(|| KeyPair::new_random());
+        b.iter(KeyPair::new_random);
     });
 
     // From known bytes (deterministic)

@@ -182,6 +182,7 @@ use crate::manager::MasternodeManager;
 use crate::masternode::MasternodeStatus;
 use crate::payments::PaymentVoteTracker;
 use crate::tier::MasternodeTier;
+#[cfg(test)]
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::OutPoint;
 use serde::{Deserialize, Serialize};
@@ -492,7 +493,7 @@ mod tests {
         let manager = MasternodeManager::new();
         let addr = ServiceAddr::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9999, 0, 0));
 
-        let tiers = vec![
+        let tiers = [
             MasternodeTier::Copper,
             MasternodeTier::Copper,
             MasternodeTier::Silver,
@@ -504,7 +505,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i as u32);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 *tier,
@@ -660,7 +661,7 @@ mod tests {
     fn test_rpc_get_status_multiple_statuses() {
         let addr = ServiceAddr::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9999, 0, 0));
 
-        let test_cases = vec![
+        let test_cases = [
             (MasternodeStatus::PreEnabled, "PRE_ENABLED"),
             (MasternodeStatus::Enabled, "ENABLED"),
             (MasternodeStatus::Expired, "EXPIRED"),
@@ -672,7 +673,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i as u32);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Copper,
@@ -698,7 +699,7 @@ mod tests {
 
         let mnb1 = MasternodeBroadcast::new(
             outpoint1,
-            addr.clone(),
+            addr,
             vec![1, 2, 3],
             vec![4, 5, 6],
             MasternodeTier::Diamond,
@@ -789,7 +790,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Silver,
@@ -836,7 +837,7 @@ mod tests {
         let manager = MasternodeManager::new();
         let addr = ServiceAddr::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9999, 0, 0));
 
-        let tiers = vec![
+        let tiers = [
             MasternodeTier::Copper,
             MasternodeTier::Silver,
             MasternodeTier::Gold,
@@ -848,7 +849,7 @@ mod tests {
             let outpoint = OutPoint::new(Hash256::zero(), i as u32);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 *tier,
@@ -881,13 +882,13 @@ mod tests {
         let manager = MasternodeManager::new();
         let addr = ServiceAddr::new(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9999, 0, 0));
 
-        let protocols = vec![70000, 70001, 70002, 70003];
+        let protocols = [70000, 70001, 70002, 70003];
 
         for (i, protocol) in protocols.iter().enumerate() {
             let outpoint = OutPoint::new(Hash256::zero(), i as u32);
             let mnb = MasternodeBroadcast::new(
                 outpoint,
-                addr.clone(),
+                addr,
                 vec![1, 2, 3],
                 vec![4, 5, 6],
                 MasternodeTier::Gold,
@@ -921,7 +922,7 @@ mod tests {
                 let outpoint = OutPoint::new(Hash256::zero(), vout);
                 let mnb = MasternodeBroadcast::new(
                     outpoint,
-                    addr.clone(),
+                    addr,
                     vec![1, 2, 3],
                     vec![4, 5, 6],
                     tier,

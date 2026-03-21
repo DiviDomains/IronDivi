@@ -19,7 +19,7 @@ use divi_primitives::amount::Amount;
 use divi_primitives::hash::Hash256;
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction};
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 use std::collections::HashSet;
 
 /// Column family names for address indexing
@@ -337,9 +337,8 @@ impl AddressIndex {
         let mut entries = Vec::new();
 
         let iter = self.db.prefix_iterator_cf(cf, &prefix);
-        let mut count = 0;
 
-        for item in iter {
+        for (count, item) in iter.enumerate() {
             let (key, value) = item?;
 
             // Check if key still matches our prefix
@@ -355,7 +354,6 @@ impl AddressIndex {
                     break;
                 }
             }
-            count += 1;
         }
 
         // Return in reverse order (newest first)
@@ -420,7 +418,7 @@ impl AddressIndex {
 
                 let outpoint = OutPoint::new(txid, vout as u32);
                 let utxo = AddressUtxo {
-                    outpoint: outpoint.clone(),
+                    outpoint,
                     value: output.value,
                     height,
                     is_coinbase,
@@ -556,7 +554,7 @@ mod tests {
         let script = Script::new_p2pkh(&[0u8; 20]);
         let outpoint = OutPoint::new(Hash256::from_bytes([1u8; 32]), 0);
         let utxo = AddressUtxo {
-            outpoint: outpoint.clone(),
+            outpoint,
             value: Amount::from_sat(1000000),
             height: 100,
             is_coinbase: false,
@@ -713,7 +711,7 @@ mod tests {
         let script = Script::new_p2pkh(&[0x10; 20]);
         let outpoint = OutPoint::new(Hash256::from_bytes([0x10; 32]), 0);
         let utxo = AddressUtxo {
-            outpoint: outpoint.clone(),
+            outpoint,
             value: Amount::from_sat(1_000_000),
             height: 1000,
             is_coinbase: true,
@@ -743,7 +741,7 @@ mod tests {
         let script = Script::new_p2pkh(&[0x20; 20]);
         let outpoint = OutPoint::new(Hash256::from_bytes([0x20; 32]), 0);
         let utxo = AddressUtxo {
-            outpoint: outpoint.clone(),
+            outpoint,
             value: Amount::from_sat(500_000),
             height: 100,
             is_coinbase: false,
@@ -775,7 +773,7 @@ mod tests {
         for i in 0..5u32 {
             let outpoint = OutPoint::new(Hash256::from_bytes([i as u8 + 1; 32]), i);
             let utxo = AddressUtxo {
-                outpoint: outpoint.clone(),
+                outpoint,
                 value: Amount::from_sat((i as i64 + 1) * 100_000),
                 height: 100,
                 is_coinbase: false,
@@ -808,14 +806,14 @@ mod tests {
         let op2 = OutPoint::new(Hash256::from_bytes([0x02; 32]), 0);
 
         let utxo1 = AddressUtxo {
-            outpoint: op1.clone(),
+            outpoint: op1,
             value: Amount::from_sat(100_000),
             height: 100,
             is_coinbase: false,
             is_coinstake: false,
         };
         let utxo2 = AddressUtxo {
-            outpoint: op2.clone(),
+            outpoint: op2,
             value: Amount::from_sat(200_000),
             height: 100,
             is_coinbase: false,

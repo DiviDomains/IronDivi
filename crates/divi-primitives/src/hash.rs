@@ -244,11 +244,11 @@ impl Hash256 {
         let mut result: [u64; 8] = [0; 8];
 
         // Standard long multiplication
-        for i in 0..4 {
+        for (i, &ai) in a.iter().enumerate() {
             let mut carry: u128 = 0;
-            for j in 0..4 {
+            for (j, &bj) in b.iter().enumerate() {
                 let idx = i + j;
-                let product = (a[i] as u128) * (b[j] as u128) + (result[idx] as u128) + carry;
+                let product = (ai as u128) * (bj as u128) + (result[idx] as u128) + carry;
                 result[idx] = product as u64;
                 carry = product >> 64;
             }
@@ -286,9 +286,9 @@ impl Hash256 {
         let mut carry = 0u16;
 
         // Little-endian addition with carry
-        for i in 0..32 {
-            let sum = self.0[i] as u16 + other.0[i] as u16 + carry;
-            result[i] = sum as u8;
+        for ((r, &a), &b) in result.iter_mut().zip(self.0.iter()).zip(other.0.iter()) {
+            let sum = a as u16 + b as u16 + carry;
+            *r = sum as u8;
             carry = sum >> 8;
         }
 
@@ -321,8 +321,8 @@ impl Hash256 {
     /// Bitwise NOT of all 32 bytes
     pub fn bitwise_not(&self) -> Self {
         let mut result = [0u8; 32];
-        for i in 0..32 {
-            result[i] = !self.0[i];
+        for (r, &b) in result.iter_mut().zip(self.0.iter()) {
+            *r = !b;
         }
         Hash256(result)
     }
@@ -361,9 +361,9 @@ impl Hash256 {
         for bit_pos in (0..256).rev() {
             // Shift remainder left by 1 bit
             let mut carry = 0u8;
-            for i in 0..32 {
-                let new_carry = remainder[i] >> 7;
-                remainder[i] = (remainder[i] << 1) | carry;
+            for r in remainder.iter_mut() {
+                let new_carry = *r >> 7;
+                *r = (*r << 1) | carry;
                 carry = new_carry;
             }
 
@@ -581,7 +581,7 @@ mod tests {
     // --------------- double-SHA256 helper used by tests ---------------
     fn double_sha256(data: &[u8]) -> [u8; 32] {
         let first = Sha256::digest(data);
-        let second = Sha256::digest(&first);
+        let second = Sha256::digest(first);
         let mut out = [0u8; 32];
         out.copy_from_slice(&second);
         out
@@ -688,8 +688,8 @@ mod tests {
         let a = Hash256::from_bytes([0x42; 32]);
         let b = Hash256::from_bytes([0x42; 32]);
         assert_eq!(a, b);
-        assert!(!(a < b));
-        assert!(!(a > b));
+        assert!(a >= b);
+        assert!(a <= b);
     }
 
     // ---- NEW: Hash256::hash() double-SHA256 test vector ----

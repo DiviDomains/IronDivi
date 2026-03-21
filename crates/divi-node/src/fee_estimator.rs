@@ -27,7 +27,7 @@ struct BlockFeeData {
     height: u32,
     total_fees: Amount,
     total_size: usize,
-    tx_count: usize,
+    _tx_count: usize,
 }
 
 pub struct FeeEstimator {
@@ -59,7 +59,7 @@ impl FeeEstimator {
             height,
             total_fees,
             total_size,
-            tx_count: block.transactions.len(),
+            _tx_count: block.transactions.len(),
         };
 
         blocks.push_back(fee_data);

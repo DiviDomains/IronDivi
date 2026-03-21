@@ -315,7 +315,7 @@ impl WalletRpc {
             // explicitly pre-generated; HD wallets derive keys on demand so the
             // effective available key count is always at least the target size.
             "keypoolsize": std::cmp::max(wallet.keypool_size(), 100u32),
-            "unlocked_until": if wallet.is_locked() { 0 } else { 0 },
+            "unlocked_until": 0,
             "paytxfee": 0.0001,
             "hdmasterkeyid": wallet.hd_master_key_id()
         }))
@@ -835,7 +835,7 @@ impl WalletRpc {
 
         for utxo in utxos {
             selected.push(utxo.clone());
-            total_input = total_input + utxo.value;
+            total_input += utxo.value;
 
             // Calculate required amount (send + fee estimate)
             let num_inputs = selected.len() as i64;
@@ -1187,7 +1187,7 @@ impl WalletRpc {
 
                         let addresses: Vec<String> = destinations
                             .iter()
-                            .filter_map(|dest| match dest {
+                            .map(|dest| match dest {
                                 divi_script::Destination::PubKeyHash(pkh) => {
                                     let mut bytes = [0u8; 20];
                                     bytes.copy_from_slice(&pkh[..]);
@@ -1195,14 +1195,14 @@ impl WalletRpc {
                                         Hash160::from_bytes(bytes),
                                         Network::Mainnet,
                                     );
-                                    Some(addr.to_base58())
+                                    addr.to_base58()
                                 }
                                 divi_script::Destination::ScriptHash(sh) => {
                                     let mut bytes = [0u8; 20];
                                     bytes.copy_from_slice(&sh[..]);
                                     let addr =
                                         Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
-                                    Some(addr.to_base58())
+                                    addr.to_base58()
                                 }
                             })
                             .collect();
@@ -1309,7 +1309,7 @@ impl WalletRpc {
 
                     let addresses: Vec<String> = destinations
                         .iter()
-                        .filter_map(|dest| match dest {
+                        .map(|dest| match dest {
                             divi_script::Destination::PubKeyHash(pkh) => {
                                 let mut bytes = [0u8; 20];
                                 bytes.copy_from_slice(&pkh[..]);
@@ -1317,14 +1317,14 @@ impl WalletRpc {
                                     Hash160::from_bytes(bytes),
                                     Network::Mainnet,
                                 );
-                                Some(addr.to_base58())
+                                addr.to_base58()
                             }
                             divi_script::Destination::ScriptHash(sh) => {
                                 let mut bytes = [0u8; 20];
                                 bytes.copy_from_slice(&sh[..]);
                                 let addr =
                                     Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
-                                Some(addr.to_base58())
+                                addr.to_base58()
                             }
                         })
                         .collect();
@@ -1389,7 +1389,7 @@ impl WalletRpc {
             let confs = utxo.confirmations(height);
             if confs >= min_conf {
                 let entry = by_addr.entry(utxo.address.clone()).or_insert((0, u32::MAX));
-                entry.0 += utxo.value.as_sat() as i64;
+                entry.0 += utxo.value.as_sat();
                 if confs < entry.1 {
                     entry.1 = confs;
                 }
@@ -1765,7 +1765,7 @@ impl WalletRpc {
 
         for utxo in utxos {
             selected.push(utxo.clone());
-            total_input = total_input + utxo.value;
+            total_input += utxo.value;
 
             // Calculate required amount (send + fee estimate)
             let num_inputs = selected.len() as i64;
@@ -1977,7 +1977,7 @@ impl WalletRpc {
 
         for utxo in owned_vault_utxos {
             selected.push(utxo.clone());
-            total_input = total_input + utxo.value;
+            total_input += utxo.value;
 
             let base_fee = Amount::from_sat(1000);
             let per_input_fee = Amount::from_sat(1000);
@@ -2385,7 +2385,7 @@ impl WalletRpc {
             })?;
 
             outputs.push((addr, amount));
-            total_send = total_send + amount;
+            total_send += amount;
         }
 
         if outputs.is_empty() {
@@ -2407,7 +2407,7 @@ impl WalletRpc {
 
         for utxo in utxos {
             selected.push(utxo.clone());
-            total_input = total_input + utxo.value;
+            total_input += utxo.value;
 
             let num_inputs = selected.len() as i64;
             let est_fee = base_fee
@@ -2457,8 +2457,8 @@ impl WalletRpc {
                         ))
                         .into());
                     }
-                    *amount = *amount - fee_per_output;
-                    adjusted_total_send = adjusted_total_send - fee_per_output;
+                    *amount -= fee_per_output;
+                    adjusted_total_send -= fee_per_output;
                 }
             }
         }
@@ -2734,7 +2734,7 @@ impl WalletRpc {
         let mut script_bytes = Vec::new();
 
         // OP_n (number required)
-        if nrequired >= 1 && nrequired <= 16 {
+        if (1..=16).contains(&nrequired) {
             script_bytes.push(Opcode::OP_1 as u8 + (nrequired as u8 - 1));
         } else {
             return Err(RpcError::invalid_params("nrequired must be between 1 and 16").into());
@@ -2748,7 +2748,7 @@ impl WalletRpc {
 
         // OP_m (total keys)
         let m = pubkeys.len();
-        if m >= 1 && m <= 16 {
+        if (1..=16).contains(&m) {
             script_bytes.push(Opcode::OP_1 as u8 + (m as u8 - 1));
         } else {
             return Err(RpcError::invalid_params("Number of keys must be between 1 and 16").into());
@@ -2908,7 +2908,7 @@ impl WalletRpc {
 
         for utxo in utxos {
             selected.push(utxo.clone());
-            total_input = total_input + utxo.value;
+            total_input += utxo.value;
 
             let num_inputs = selected.len() as i64;
             let est_fee = base_fee
@@ -3491,7 +3491,7 @@ impl WalletRpc {
                     if utxo.address == addr_str {
                         let confs = utxo.confirmations(height);
                         if confs >= min_conf && utxo.is_mature(height, wallet.coinbase_maturity()) {
-                            account_balance = account_balance + utxo.value;
+                            account_balance += utxo.value;
                         }
                     }
                 }
@@ -3523,7 +3523,7 @@ impl WalletRpc {
                 if utxo.address == addr_str {
                     let confs = utxo.confirmations(height);
                     if confs >= min_conf {
-                        total = total + utxo.value;
+                        total += utxo.value;
                     }
                 }
             }
@@ -3555,7 +3555,7 @@ impl WalletRpc {
                     if utxo.address == addr_str {
                         let confs = utxo.confirmations(height);
                         if confs >= min_conf {
-                            account_total = account_total + utxo.value;
+                            account_total += utxo.value;
                             if confs < min_confirmations {
                                 min_confirmations = confs;
                             }

@@ -177,10 +177,10 @@ impl Chain {
         }
 
         // Create output directory structure
-        fs::create_dir_all(output_dir).map_err(|e| StorageError::Io(e))?;
+        fs::create_dir_all(output_dir).map_err(StorageError::Io)?;
 
         let blocks_dir = output_dir.join("blocks");
-        fs::create_dir_all(&blocks_dir).map_err(|e| StorageError::Io(e))?;
+        fs::create_dir_all(&blocks_dir).map_err(StorageError::Io)?;
 
         info!(
             "Starting chain export: heights {} to {} ({} blocks)",
@@ -193,7 +193,7 @@ impl Chain {
         let mut exported_count = 0;
         for height in start_height..=end_height {
             // Progress logging every 10,000 blocks
-            if height > start_height && (height - start_height) % 10000 == 0 {
+            if height > start_height && (height - start_height).is_multiple_of(10000) {
                 info!(
                     "Export progress: {}/{} blocks ({:.1}%)",
                     height - start_height,
@@ -213,7 +213,7 @@ impl Chain {
                         StorageError::Serialization(format!("JSON serialization failed: {}", e))
                     })?;
 
-                    fs::write(&filepath, json).map_err(|e| StorageError::Io(e))?;
+                    fs::write(&filepath, json).map_err(StorageError::Io)?;
 
                     exported_count += 1;
                 }
@@ -251,7 +251,7 @@ impl Chain {
             StorageError::Serialization(format!("Manifest JSON serialization failed: {}", e))
         })?;
 
-        fs::write(&manifest_path, manifest_json).map_err(|e| StorageError::Io(e))?;
+        fs::write(&manifest_path, manifest_json).map_err(StorageError::Io)?;
 
         info!(
             "✅ Chain export complete: {} blocks exported to {:?}",

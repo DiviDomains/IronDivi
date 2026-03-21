@@ -160,7 +160,7 @@ pub fn get_next_work_required(
 fn compute_pos_difficulty(
     db: &Arc<ChainDatabase>,
     prev_block: &BlockIndex,
-    params: &DifficultyParams,
+    _params: &DifficultyParams,
 ) -> Result<u32, StorageError> {
     // PoS target limit: ~uint256(0) >> 24
     // Reference: DifficultyAdjuster.cpp:27
@@ -271,7 +271,7 @@ fn compute_pow_difficulty(
                         past_difficulty_avg = params.pow_limit;
                     }
                 }
-                past_difficulty_avg_prev = past_difficulty_avg.clone();
+                past_difficulty_avg_prev = past_difficulty_avg;
             }
 
             // Calculate timespan
@@ -494,8 +494,8 @@ mod tests {
         let mut prev_hash = Hash256::zero();
         for i in 0..25 {
             let time = 1000 + i * 60; // Perfect 60s spacing
-            let block = create_block_index(i, time, 0x1e0fffff, prev_hash.clone());
-            prev_hash = block.hash.clone();
+            let block = create_block_index(i, time, 0x1e0fffff, prev_hash);
+            prev_hash = block.hash;
             db.store_block_index(&block).unwrap();
         }
 
@@ -513,8 +513,10 @@ mod tests {
     #[test]
     fn test_pos_to_pow_transition() {
         let db = create_test_db();
-        let mut params = DifficultyParams::default();
-        params.last_pow_block = 100;
+        let params = DifficultyParams {
+            last_pow_block: 100,
+            ..DifficultyParams::default()
+        };
 
         // Block 100 (last PoW)
         let block100 = create_block_index(100, 6000, 0x1e0fffff, Hash256::zero());
@@ -540,8 +542,10 @@ mod tests {
         // These bits have significant bytes at position 24-26 in the hash,
         // which requires full 256-bit arithmetic (not just u128).
         let db = create_test_db();
-        let mut params = DifficultyParams::default();
-        params.last_pow_block = 100;
+        let params = DifficultyParams {
+            last_pow_block: 100,
+            ..DifficultyParams::default()
+        };
 
         // Block at height 24044 with bits 0x1b3be3cb, time delta 60s (perfect)
         let pprev = create_block_index(24044, 1772484940, 0x1b37b8d5, Hash256::zero());

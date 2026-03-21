@@ -22,16 +22,12 @@ pub const JSON_RPC_VERSION: &str = "2.0";
 /// JSON-RPC request ID
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[derive(Default)]
 pub enum RequestId {
     Number(i64),
     String(String),
+    #[default]
     Null,
-}
-
-impl Default for RequestId {
-    fn default() -> Self {
-        RequestId::Null
-    }
 }
 
 /// JSON-RPC request

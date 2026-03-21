@@ -81,7 +81,7 @@ impl UtxoCache {
                             "UTXO cache saving evicted dirty entry {}:{} for later flush",
                             key.txid, key.vout
                         );
-                        evicted_dirty_clone.write().insert((*key).clone(), value);
+                        evicted_dirty_clone.write().insert(*key, value);
                     }
                 } else if cause != RemovalCause::Replaced {
                     // For non-Replaced evictions, just remove from dirty set
@@ -150,8 +150,7 @@ impl UtxoCache {
         trace!("Cache insert: {}:{}", outpoint.txid, outpoint.vout);
         // Remove from evicted_dirty if present (we have a newer value now)
         self.evicted_dirty.write().remove(&outpoint);
-        self.cache
-            .insert(outpoint.clone(), CacheEntry::Present(utxo));
+        self.cache.insert(outpoint, CacheEntry::Present(utxo));
         self.dirty.write().insert(outpoint);
     }
 
@@ -166,7 +165,7 @@ impl UtxoCache {
         );
         // Remove from evicted_dirty if present (we have a newer state now)
         self.evicted_dirty.write().remove(&outpoint);
-        self.cache.insert(outpoint.clone(), CacheEntry::Deleted);
+        self.cache.insert(outpoint, CacheEntry::Deleted);
         self.dirty.write().insert(outpoint);
     }
 
@@ -189,10 +188,7 @@ impl UtxoCache {
         // First, flush entries that were evicted while dirty
         let evicted_entries: Vec<(OutPoint, CacheEntry)> = {
             let evicted = self.evicted_dirty.read();
-            evicted
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+            evicted.iter().map(|(k, v)| (*k, v.clone())).collect()
         };
 
         for (outpoint, entry) in &evicted_entries {
@@ -371,7 +367,7 @@ mod tests {
         let utxo = test_utxo(50000);
 
         // Insert
-        cache.insert(outpoint.clone(), utxo.clone());
+        cache.insert(outpoint, utxo.clone());
 
         // Get should return the UTXO
         let result = cache.get(&outpoint);
@@ -391,8 +387,8 @@ mod tests {
         let utxo = test_utxo(100000);
 
         // Insert then remove
-        cache.insert(outpoint.clone(), utxo);
-        cache.remove(outpoint.clone());
+        cache.insert(outpoint, utxo);
+        cache.remove(outpoint);
 
         // Get should return tombstone (Some(None))
         let result = cache.get(&outpoint);
@@ -422,8 +418,8 @@ mod tests {
         let outpoint1 = test_outpoint(4);
         let outpoint2 = test_outpoint(5);
 
-        cache.insert(outpoint1.clone(), test_utxo(1000));
-        cache.remove(outpoint2.clone());
+        cache.insert(outpoint1, test_utxo(1000));
+        cache.remove(outpoint2);
 
         // Present entry
         assert_eq!(cache.contains(&outpoint1), Some(true));
@@ -487,7 +483,7 @@ mod tests {
         let utxo = test_utxo(999999);
 
         // Populate from DB (simulating cache miss handling)
-        cache.populate_from_db(outpoint.clone(), Some(utxo.clone()));
+        cache.populate_from_db(outpoint, Some(utxo.clone()));
 
         // Sync cache to ensure counts are accurate
         cache.cache.run_pending_tasks();
@@ -534,7 +530,7 @@ mod tests {
         let cache = UtxoCache::new(1000);
         let outpoint = test_outpoint(20);
 
-        cache.populate_from_db(outpoint.clone(), None);
+        cache.populate_from_db(outpoint, None);
 
         // Run pending tasks to flush internal state
         cache.cache.run_pending_tasks();
@@ -558,14 +554,14 @@ mod tests {
         let utxo = test_utxo(12345);
 
         // First populate from DB
-        cache.populate_from_db(outpoint.clone(), Some(test_utxo(99999)));
+        cache.populate_from_db(outpoint, Some(test_utxo(99999)));
         cache.cache.run_pending_tasks();
 
         // Should not be dirty
         assert_eq!(cache.dirty_count(), 0);
 
         // Insert a newer value - this should mark dirty
-        cache.insert(outpoint.clone(), utxo.clone());
+        cache.insert(outpoint, utxo.clone());
 
         let result = cache.get(&outpoint);
         assert!(result.is_some());
@@ -580,12 +576,12 @@ mod tests {
         let utxo = test_utxo(5000);
 
         // Populate from DB (not dirty)
-        cache.populate_from_db(outpoint.clone(), Some(utxo));
+        cache.populate_from_db(outpoint, Some(utxo));
         cache.cache.run_pending_tasks();
         assert_eq!(cache.dirty_count(), 0);
 
         // Remove it - should mark dirty (tombstone)
-        cache.remove(outpoint.clone());
+        cache.remove(outpoint);
         assert_eq!(cache.dirty_count(), 1);
 
         // Should now be a tombstone
@@ -599,9 +595,9 @@ mod tests {
         let cache = UtxoCache::new(1000);
         let outpoint = test_outpoint(50);
 
-        cache.insert(outpoint.clone(), test_utxo(100));
-        cache.insert(outpoint.clone(), test_utxo(200));
-        cache.insert(outpoint.clone(), test_utxo(300));
+        cache.insert(outpoint, test_utxo(100));
+        cache.insert(outpoint, test_utxo(200));
+        cache.insert(outpoint, test_utxo(300));
 
         cache.cache.run_pending_tasks();
 

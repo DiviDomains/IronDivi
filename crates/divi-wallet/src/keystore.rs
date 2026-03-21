@@ -346,11 +346,7 @@ impl KeyStore {
         let issued = *self.receiving_index.read() + *self.change_index.read();
 
         // Keypool is HD keys pre-generated but not yet issued
-        if hd_key_count > issued {
-            hd_key_count - issued
-        } else {
-            0
-        }
+        hd_key_count.saturating_sub(issued)
     }
 
     /// Get the timestamp of the oldest key in the keypool

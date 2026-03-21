@@ -67,10 +67,10 @@ impl ScriptNum {
         if require_minimal {
             // Check that the number is encoded with the minimum possible
             // number of bytes.
-            if data[data.len() - 1] & 0x7f == 0 {
-                if data.len() <= 1 || data[data.len() - 2] & 0x80 == 0 {
-                    return Err(ScriptError::MinimalData);
-                }
+            if data[data.len() - 1] & 0x7f == 0
+                && (data.len() <= 1 || data[data.len() - 2] & 0x80 == 0)
+            {
+                return Err(ScriptError::MinimalData);
             }
         }
 
@@ -82,7 +82,7 @@ impl ScriptNum {
 
         // Handle sign bit
         if data[data.len() - 1] & 0x80 != 0 {
-            result &= !((0x80 as i64) << (8 * (data.len() - 1)));
+            result &= !(0x80_i64 << (8 * (data.len() - 1)));
             result = -result;
         }
 

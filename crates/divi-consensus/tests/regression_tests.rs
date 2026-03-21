@@ -124,12 +124,8 @@ fn test_regression_pos_target_upper_bytes_not_truncated_by_u128() {
     let bytes = target.as_bytes();
 
     // Lower 128 bits (bytes 0-15) are all zero — this is what u128 would see
-    for i in 0..16 {
-        assert_eq!(
-            bytes[i], 0,
-            "byte {} of 0x1e0fffff target should be zero",
-            i
-        );
+    for (i, &b) in bytes[..16].iter().enumerate() {
+        assert_eq!(b, 0, "byte {} of 0x1e0fffff target should be zero", i);
     }
 
     // Significant bits are in bytes 27-29 (above the u128 boundary)

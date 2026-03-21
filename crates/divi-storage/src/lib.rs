@@ -47,11 +47,13 @@ pub use difficulty::{get_next_work_required, DifficultyParams};
 pub use error::StorageError;
 pub use export::{BlockExport, ExportManifest, TransactionExport};
 pub use fork_activation::{ActivationState, Fork};
+#[allow(deprecated)]
+pub use lottery::calculate_winner_payout;
 pub use lottery::{
-    calculate_lottery_score, calculate_total_lottery_payout, calculate_winner_payout,
-    compute_ranked_scores, get_minimum_lottery_ticket, is_coinstake_valid_for_lottery,
-    select_lottery_winners, LotteryCoinstake, RankAwareScore, DEFAULT_LOTTERY_TICKET_MINIMUM,
-    LOTTERY_VETO_CYCLES, LOTTERY_WINNER_COUNT,
+    calculate_lottery_score, calculate_total_lottery_payout, compute_ranked_scores,
+    get_minimum_lottery_ticket, is_coinstake_valid_for_lottery, select_lottery_winners,
+    LotteryCoinstake, RankAwareScore, DEFAULT_LOTTERY_TICKET_MINIMUM, LOTTERY_VETO_CYCLES,
+    LOTTERY_WINNER_COUNT,
 };
 pub use masternode::{
     get_hash_rounds_for_tier, tier_from_string, tier_to_string, MasternodeCollateral,

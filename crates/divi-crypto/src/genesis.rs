@@ -73,7 +73,7 @@ pub fn compute_merkle_root(transactions: &[Transaction]) -> Hash256 {
     }
 
     // Get transaction hashes
-    let mut hashes: Vec<Hash256> = transactions.iter().map(|tx| hash_serialized(tx)).collect();
+    let mut hashes: Vec<Hash256> = transactions.iter().map(hash_serialized).collect();
 
     // Build merkle tree
     while hashes.len() > 1 {

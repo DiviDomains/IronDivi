@@ -27,6 +27,9 @@ use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Callback type for relaying messages to other peers
+type RelayCallback = Arc<RwLock<Option<Box<dyn Fn(NetworkMessage, PeerId) + Send + Sync>>>>;
+
 /// Handler for masternode P2P messages
 pub struct MasternodeHandler {
     manager: Arc<MasternodeManager>,
@@ -34,7 +37,7 @@ pub struct MasternodeHandler {
     /// Masternode sync status tracker
     sync_status: Arc<RwLock<SyncStatus>>,
     /// Callback for relaying messages to other peers
-    relay_callback: Arc<RwLock<Option<Box<dyn Fn(NetworkMessage, PeerId) + Send + Sync>>>>,
+    relay_callback: RelayCallback,
 }
 
 impl MasternodeHandler {

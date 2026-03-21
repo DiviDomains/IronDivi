@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(deserialized.version, PROTOCOL_VERSION);
         assert_eq!(deserialized.services, NODE_NETWORK);
         assert_eq!(deserialized.start_height, 500_000);
-        assert_eq!(deserialized.relay, true);
+        assert!(deserialized.relay);
         assert_eq!(deserialized.user_agent, "/IronDivi:0.1.0/");
 
         // The magic bytes for PrivateDivi testnet are 0x70 0xd1 0x76 0x12

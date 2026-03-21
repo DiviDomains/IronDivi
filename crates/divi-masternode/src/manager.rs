@@ -1195,7 +1195,7 @@ mod tests {
         // At height 120, we have 20 confirmations (>= 15 required)
         let result = manager.verify_collateral(&mnb.vin, &utxo_provider, 120);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -1256,7 +1256,7 @@ mod tests {
         let manager = MasternodeManager::new();
 
         // Test all tier amounts
-        let tiers_and_amounts = vec![
+        let tiers_and_amounts = [
             (MasternodeTier::Copper, 10_000_000_000_000i64),
             (MasternodeTier::Silver, 30_000_000_000_000i64),
             (MasternodeTier::Gold, 100_000_000_000_000i64),

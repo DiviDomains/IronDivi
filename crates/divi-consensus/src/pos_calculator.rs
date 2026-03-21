@@ -496,9 +496,9 @@ mod tests {
     #[test]
     fn test_coin_age_weight_one_day() {
         use divi_primitives::constants::COIN;
-        let value: i64 = 2000 * COIN as i64; // 2000 DIVI
+        let value: i64 = 2000 * COIN; // 2000 DIVI
         let time_weight: i64 = 86400; // 1 day
-        let expected_weight: i64 = (value as i128 * time_weight as i128) as i64 / COIN as i64 / 400;
+        let expected_weight: i64 = (value as i128 * time_weight as i128) as i64 / COIN / 400;
         assert_eq!(expected_weight, 432_000);
     }
 
@@ -508,12 +508,12 @@ mod tests {
     #[test]
     fn test_coin_age_weight_capped_at_maximum() {
         use divi_primitives::constants::COIN;
-        let value: i64 = 2000 * COIN as i64;
+        let value: i64 = 2000 * COIN;
         let age: i64 = 700_000; // exceeds 601_200
         let time_weight = age.min(MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING);
         assert_eq!(time_weight, MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING);
 
-        let expected_weight: i64 = (value as i128 * time_weight as i128) as i64 / COIN as i64 / 400;
+        let expected_weight: i64 = (value as i128 * time_weight as i128) as i64 / COIN / 400;
         assert_eq!(expected_weight, 3_006_000);
     }
 
@@ -534,7 +534,7 @@ mod tests {
     fn test_stake_target_hit_zero_time_weight() {
         let easy_target = Target::from_bytes([0xff; 32]);
         let hash = Hash256::from_bytes([0x00; 32]);
-        let value = 1_000_00000000i64;
+        let value = 100_000_000_000_i64;
         let time_weight = 0i64;
 
         let result = stake_target_hit(&hash, value, &easy_target, time_weight).unwrap();
@@ -546,7 +546,7 @@ mod tests {
     fn test_stake_target_hit_negative_time_weight() {
         let easy_target = Target::from_bytes([0xff; 32]);
         let hash = Hash256::from_bytes([0x00; 32]);
-        let value = 1_000_00000000i64;
+        let value = 100_000_000_000_i64;
         let time_weight = -100i64;
 
         let result = stake_target_hit(&hash, value, &easy_target, time_weight).unwrap();
@@ -561,7 +561,7 @@ mod tests {
         // Max-value target × large coin weight → overflow → always hit
         let max_target = Target::from_bytes([0xff; 32]);
         let hash = Hash256::from_bytes([0xff; 32]); // Would normally not hit
-        let value = 1_000_000_000_00000000i64; // 1 billion DIVI
+        let value = 100_000_000_000_000_000_i64; // 1 billion DIVI
         let time_weight = MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING;
 
         let result = stake_target_hit(&hash, value, &max_target, time_weight).unwrap();
@@ -594,7 +594,7 @@ mod tests {
         // The returned timestamp must be ≤ initial_timestamp (we count backward)
         let ts = result.timestamp().unwrap();
         assert!(ts <= 1538663336);
-        assert!(ts >= 1538663336 - N_HASH_DRIFT + 1); // Within the drift window
+        assert!(ts > 1538663336 - N_HASH_DRIFT); // Within the drift window
     }
 
     /// With an impossible target, create_hashproof must return FailedGeneration.

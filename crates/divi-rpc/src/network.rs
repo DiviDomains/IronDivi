@@ -329,7 +329,7 @@ impl NetworkRpc {
 
         // Find peer ID by address and disconnect
         // Note: This is a workaround since we don't have direct peer ID lookup by address
-        for peer_id in peer_manager.connected_peers() {
+        if let Some(peer_id) = peer_manager.connected_peers().into_iter().next() {
             // Just disconnect the first matching peer
             // In production, would need better peer ID -> address mapping
             peer_manager.disconnect(peer_id);

@@ -211,8 +211,8 @@ pub struct SyncProgress {
 struct BlockRequest {
     /// Peer we requested from
     peer_id: PeerId,
-    /// Block hash
-    hash: Hash256,
+    /// Block hash (stored for debugging; the HashMap key is canonical)
+    _hash: Hash256,
     /// When we sent the request
     requested_at: Instant,
 }
@@ -824,7 +824,7 @@ impl BlockSync {
                 *hash,
                 BlockRequest {
                     peer_id,
-                    hash: *hash,
+                    _hash: *hash,
                     requested_at: Instant::now(),
                 },
             );
@@ -891,7 +891,7 @@ impl BlockSync {
                 if pending.is_empty() {
                     break;
                 }
-                pending.front().map(|h| compute_block_hash(h))
+                pending.front().map(compute_block_hash)
             };
 
             let Some(hash) = next_hash else { break };
@@ -1634,7 +1634,7 @@ impl BlockSync {
                             hash,
                             BlockRequest {
                                 peer_id: try_peer,
-                                hash,
+                                _hash: hash,
                                 requested_at: Instant::now(),
                             },
                         );
@@ -2222,7 +2222,7 @@ mod tests {
             .as_secs() as u32;
 
         // Set timestamp 1 hour in future (within MAX_FUTURE_TIME)
-        header.time = now + 1 * 60 * 60;
+        header.time = now + 60 * 60;
         header.bits = 0x1e0fffff;
 
         // For PoS block (height > LAST_POW_BLOCK), only timestamp is checked

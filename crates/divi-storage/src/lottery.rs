@@ -95,7 +95,7 @@ pub fn calculate_lottery_score(
 
     // Double SHA256
     let first_hash = Sha256::digest(&combined);
-    let second_hash = Sha256::digest(&first_hash);
+    let second_hash = Sha256::digest(first_hash);
     Hash256::from_bytes(second_hash.into())
 }
 
@@ -401,7 +401,7 @@ mod tests {
         );
         let block_hash = Hash256::from_slice(&[3u8; 32]);
 
-        let ranked = compute_ranked_scores(&[coinstake.clone()], &block_hash);
+        let ranked = compute_ranked_scores(std::slice::from_ref(&coinstake), &block_hash);
 
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].0, coinstake);
@@ -668,8 +668,11 @@ mod tests {
         // Verify total distribution
         let total_distributed = big_reward.as_sat() + (small_reward.as_sat() * 10);
         // Should be close to total (may differ by rounding)
-        assert_eq!(total_distributed, 252_000_00000000 + (25_200_00000000 * 10));
-        assert_eq!(total_distributed, 504_000_00000000);
+        assert_eq!(
+            total_distributed,
+            25_200_000_000_000 + (2_520_000_000_000 * 10)
+        );
+        assert_eq!(total_distributed, 50_400_000_000_000);
     }
 
     // ========================================
@@ -713,7 +716,7 @@ mod tests {
         }
 
         // Verify total distribution adds up correctly
-        let total_distributed = if winners.len() > 0 {
+        let total_distributed = if !winners.is_empty() {
             first_place_payout.as_sat()
                 + (calculate_winner_payout(total_pot, 1, winners.len()).as_sat()
                     * (winners.len() - 1) as i64)

@@ -36,6 +36,12 @@ pub struct BlockUndo {
     pub entries: Vec<TxUndo>,
 }
 
+impl Default for BlockUndo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlockUndo {
     pub fn new() -> Self {
         Self {

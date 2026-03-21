@@ -49,9 +49,10 @@ impl From<ServiceAddr> for SocketAddrV6 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum MasternodeStatus {
+    #[default]
     PreEnabled = 0,
     Enabled = 1,
     Expired = 2,
@@ -60,12 +61,6 @@ pub enum MasternodeStatus {
     WatchdogExpired = 5,
     PoseBan = 6,
     VinSpent = 7,
-}
-
-impl Default for MasternodeStatus {
-    fn default() -> Self {
-        MasternodeStatus::PreEnabled
-    }
 }
 
 impl MasternodeStatus {

@@ -428,7 +428,7 @@ mod tests {
         // Verify the signature
         let result = verify_broadcast_signature(&broadcast, keypair.public_key());
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -446,7 +446,7 @@ mod tests {
         // Verify the signature
         let result = verify_ping_signature(&ping, keypair.public_key());
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -464,7 +464,7 @@ mod tests {
         // Verify the signature
         let result = verify_winner_signature(&winner, keypair.public_key());
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]

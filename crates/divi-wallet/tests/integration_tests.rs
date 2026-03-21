@@ -18,9 +18,8 @@
 //! - Phase E: Error handling
 
 use divi_primitives::amount::Amount;
-use divi_primitives::hash::{Hash160, Hash256};
+use divi_primitives::hash::Hash256;
 use divi_primitives::script::Script;
-use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
 use divi_wallet::coin_selection::select::{select_by_confirmations, select_minimum};
 use divi_wallet::wallet_db::{VaultMetadata, WalletUtxo};
