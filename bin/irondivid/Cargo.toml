@@ -32,7 +32,7 @@ tracing-appender = "0.2"
 
 # Daemonization (Unix only)
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5"
+libc = "0.2"
 
 # Utilities
 dirs = "5.0"

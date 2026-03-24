@@ -1293,7 +1293,7 @@ fn main() -> Result<()> {
     // Handle daemonization BEFORE initializing tokio runtime (Unix only)
     #[cfg(unix)]
     if args.daemon {
-        use daemonize::Daemonize;
+        use std::os::unix::io::AsRawFd;
 
         // Ensure data directory exists before daemonizing
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -1302,45 +1302,58 @@ fn main() -> Result<()> {
         }
 
         let pid_file = data_dir.join("irondivid.pid");
-        let stdout_file = data_dir.join("debug.log");
-        let stderr_file = data_dir.join("debug.log");
+        let log_file = data_dir.join("debug.log");
 
-        // Print message before daemonizing (last chance to write to original stdout)
-        eprintln!("Logging to {:?}", stdout_file);
+        eprintln!("Logging to {:?}", log_file);
 
-        // Open files for stdout/stderr redirection (append mode for debug.log)
-        let stdout = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stdout_file)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to open stdout file: {}", e);
-                std::process::exit(1);
-            });
-        let stderr = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_file)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to open stderr file: {}", e);
-                std::process::exit(1);
-            });
-
-        let daemonize = Daemonize::new()
-            .pid_file(&pid_file)
-            .working_directory(&data_dir)
-            .stdout(stdout)
-            .stderr(stderr);
-
-        match daemonize.start() {
-            Ok(_) => {
-                // Successfully daemonized, continue with initialization
-            }
-            Err(e) => {
-                eprintln!("Failed to daemonize: {}", e);
+        // First fork
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
                 std::process::exit(1);
             }
+            pid if pid > 0 => std::process::exit(0), // Parent exits
+            _ => {}                                  // Child continues
         }
+
+        // Create new session
+        if unsafe { libc::setsid() } == -1 {
+            eprintln!("Failed to setsid: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+
+        // Second fork (prevent reacquiring a controlling terminal)
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+                std::process::exit(1);
+            }
+            pid if pid > 0 => std::process::exit(0), // Intermediate parent exits
+            _ => {}                                  // Grandchild continues
+        }
+
+        // Set working directory
+        let _ = std::env::set_current_dir(&data_dir);
+
+        // Redirect stdout/stderr to log file
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to open log file: {}", e);
+                std::process::exit(1);
+            });
+        let log_fd = log.as_raw_fd();
+        unsafe {
+            libc::dup2(log_fd, libc::STDOUT_FILENO);
+            libc::dup2(log_fd, libc::STDERR_FILENO);
+            // Close stdin
+            libc::close(libc::STDIN_FILENO);
+        }
+
+        // Write PID file
+        let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
     }
 
     #[cfg(not(unix))]

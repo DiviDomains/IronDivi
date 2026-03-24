@@ -9,8 +9,17 @@ permissions:
   contents: write
 
 jobs:
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-audit
+      - run: cargo audit
+
   build:
     name: Build ${{ matrix.target }}
+    needs: audit
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
