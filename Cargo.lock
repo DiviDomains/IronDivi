@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "divi-consensus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bs58",
  "byteorder",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "divi-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "bs58",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "divi-masternode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "byteorder",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "divi-network"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "bytes",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "divi-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "divi-consensus",
  "divi-crypto",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "divi-primitives"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "criterion",
@@ -890,11 +890,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
 name = "divi-rpc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -923,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "divi-script"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "divi-crypto",
  "divi-primitives",
@@ -935,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "divi-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "chrono",
@@ -958,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "divi-wallet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "bip32",
@@ -1586,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "divi-consensus",
  "divi-crypto",
@@ -1613,7 +1614,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
 name = "irondivi-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1625,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "irondivid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

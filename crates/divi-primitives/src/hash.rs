@@ -130,10 +130,17 @@ impl Hash256 {
     }
 
     /// Create from a byte slice (must be exactly 32 bytes)
+    ///
+    /// # Panics
+    /// Panics if slice length is not exactly 32 bytes.
     pub fn from_slice(slice: &[u8]) -> Self {
+        assert!(
+            slice.len() == 32,
+            "Hash256::from_slice requires exactly 32 bytes, got {}",
+            slice.len()
+        );
         let mut arr = [0u8; 32];
-        let len = std::cmp::min(slice.len(), 32);
-        arr[..len].copy_from_slice(&slice[..len]);
+        arr.copy_from_slice(slice);
         Hash256(arr)
     }
 

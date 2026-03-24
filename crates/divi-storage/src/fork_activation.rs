@@ -122,6 +122,11 @@ impl ActivationState {
         // we use the Median Time Past instead.
         let current_time = if requires_block_index_context(fork) {
             // Use Median Time Past for these forks
+            debug_assert!(
+                self.median_time_past > 0,
+                "Fork {:?} requires MTP context. Use ActivationState::new_with_mtp() instead of new()",
+                fork
+            );
             self.median_time_past
         } else {
             // Use block timestamp directly

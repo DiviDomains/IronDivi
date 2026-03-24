@@ -134,7 +134,7 @@ impl Add for Amount {
     type Output = Self;
 
     fn add(self, other: Self) -> Self {
-        Amount(self.0 + other.0)
+        Amount(self.0.wrapping_add(other.0))
     }
 }
 
@@ -142,7 +142,7 @@ impl Sub for Amount {
     type Output = Self;
 
     fn sub(self, other: Self) -> Self {
-        Amount(self.0 - other.0)
+        Amount(self.0.wrapping_sub(other.0))
     }
 }
 
@@ -150,7 +150,7 @@ impl Mul<i64> for Amount {
     type Output = Self;
 
     fn mul(self, rhs: i64) -> Self {
-        Amount(self.0 * rhs)
+        Amount(self.0.wrapping_mul(rhs))
     }
 }
 
@@ -158,19 +158,19 @@ impl Div<i64> for Amount {
     type Output = Self;
 
     fn div(self, rhs: i64) -> Self {
-        Amount(self.0 / rhs)
+        Amount(self.0.wrapping_div(rhs))
     }
 }
 
 impl AddAssign for Amount {
     fn add_assign(&mut self, other: Self) {
-        self.0 += other.0;
+        self.0 = self.0.wrapping_add(other.0);
     }
 }
 
 impl SubAssign for Amount {
     fn sub_assign(&mut self, other: Self) {
-        self.0 -= other.0;
+        self.0 = self.0.wrapping_sub(other.0);
     }
 }
 
@@ -308,8 +308,8 @@ mod tests {
     #[test]
     fn test_amount_max_money() {
         use crate::constants::MAX_MONEY;
-        // 21 billion DIVI
-        assert_eq!(MAX_MONEY.as_divi(), 21_000_000_000i64);
+        // 2,534,320,700 DIVI — matches C++ mainnet nMaxMoneyOut
+        assert_eq!(MAX_MONEY.as_divi(), 2_534_320_700i64);
         assert!(MAX_MONEY.is_positive());
     }
 

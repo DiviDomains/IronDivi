@@ -297,7 +297,7 @@ impl Decodable for Block {
 
             // Log if detection seems wrong (has 2+ outputs but first isn't empty)
             if vout_ok && !vout0_empty && tx1.vout[0].value.0 == 0 {
-                eprintln!(
+                tracing::debug!(
                     "BLOCK_DEBUG: tx1 vout[0] value=0 but script not empty (len={}), is_pos={}",
                     tx1.vout[0].script_pubkey.len(),
                     is_pos
@@ -312,7 +312,7 @@ impl Decodable for Block {
             // Sanity check: typical block_sig is 65-72 bytes (recoverable ECDSA)
             // DER signatures are usually 70-72 bytes
             if !(60..=200).contains(&len) {
-                eprintln!(
+                tracing::warn!(
                     "BLOCK_PARSE: pos_before_sig={}, sig_len={}, header={}, tx_count_size={}, txs_size={}, tx_count={}",
                     pos_before_sig, len, header_size, tx_count_size, txs_total_size, tx_count
                 );
@@ -327,8 +327,8 @@ impl Decodable for Block {
                         || (0x1b..=0x22).contains(&first_byte)  // Recoverable sig recovery ID
                         || first_byte == 0x41; // Length prefix mistakenly included
                     if !valid_sig_start {
-                        eprintln!(
-                            "WARNING: block_sig doesn't start with expected bytes: {:02x?}, pos_before_sig={}",
+                        tracing::warn!(
+                            "block_sig doesn't start with expected bytes: {:02x?}, pos_before_sig={}",
                             &sig[..sig.len().min(8)], pos_before_sig
                         );
                     }

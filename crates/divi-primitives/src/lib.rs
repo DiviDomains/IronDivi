@@ -74,8 +74,8 @@ pub mod constants {
     /// One DIVI in satoshis (10^8)
     pub const COIN: i64 = 100_000_000;
 
-    /// Maximum money supply (21 billion DIVI)
-    pub const MAX_MONEY: Amount = Amount(21_000_000_000 * COIN);
+    /// Maximum money supply — matches C++ nMaxMoneyOut for mainnet (2,534,320,700 DIVI)
+    pub const MAX_MONEY: Amount = Amount(2_534_320_700 * COIN);
 
     /// Coinbase maturity for mainnet (must wait this many blocks to spend coinbase).
     /// Testnet and regtest use 1.

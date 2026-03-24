@@ -275,6 +275,9 @@ pub struct BlockSync {
     /// Callback invoked after a reorg with the orphaned transactions that should
     /// be re-added to the mempool
     orphaned_tx_callback: RwLock<Option<OrphanedTxCallback>>,
+    /// Counter for stall detection - increments each timeout cycle at same height
+    /// Format: (height_at_last_check, consecutive_stall_count)
+    stall_counter: RwLock<(u32, u32)>,
 }
 
 /// Sync statistics
@@ -310,6 +313,7 @@ impl BlockSync {
             block_connected_callback: RwLock::new(None),
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
+            stall_counter: RwLock::new((0, 0)),
         })
     }
 
@@ -1176,6 +1180,35 @@ impl BlockSync {
             );
         }
 
+        // Stall detection: if height hasn't changed across timeout cycles, rotate peer
+        let is_stalled = {
+            let mut stall = self.stall_counter.write();
+            if stall.0 == our_height && state != SyncState::Synced && state != SyncState::Idle {
+                stall.1 += 1;
+                if stall.1 >= 3 {
+                    warn!(
+                        "Sync stalled at height {} for {} cycles, rotating sync peer",
+                        our_height, stall.1
+                    );
+                    stall.1 = 0;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                stall.0 = our_height;
+                stall.1 = 0;
+                false
+            }
+        }; // RwLock guard dropped here
+        if is_stalled {
+            *self.sync_peer.write() = None;
+            self.downloaded_blocks.write().clear();
+            self.orphan_blocks.write().clear();
+            self.request_headers().await;
+            return;
+        }
+
         // Check header request timeout - capture values without holding lock across await
         let should_retry_headers = {
             let is_header_sync = state == SyncState::HeaderSync;
@@ -1735,34 +1768,54 @@ impl BlockSync {
         }
     }
 
-    /// Request missing blocks to fill gaps for orphans
-    /// Identifies the gap between our chain tip and the orphans, then requests those blocks
+    /// Request missing blocks to fill gaps for orphans.
+    ///
+    /// When blocks can't connect to our tip, we need to fill the gap. Instead of
+    /// just re-requesting from the same peer (which may send the same non-connecting
+    /// blocks), we force selection of a different sync peer to break the stall cycle.
     async fn request_missing_blocks_for_orphans(&self) {
         let our_height = self.chain.height();
 
-        // Check if we have orphans in a scope
         let orphan_count = {
             let orphans = self.orphan_blocks.read();
             if orphans.is_empty() {
                 return;
             }
             orphans.len()
-        }; // Lock dropped here
+        };
 
-        // For now, just assume orphans are slightly ahead of our tip
-        // The header sync will fill in the gaps properly
-        let min_orphan_height = our_height + 1;
-
-        if min_orphan_height <= our_height {
-            debug!("No gap to fill for orphans");
-            return;
-        }
-
-        // Request headers to fill the gap
         info!(
-            "Requesting headers to fill gap from height {} to {} for {} orphans",
-            our_height, min_orphan_height, orphan_count
+            "Requesting blocks to fill gap at height {} for {} orphans",
+            our_height, orphan_count
         );
+
+        // Force selection of a different sync peer to avoid getting the same
+        // non-connecting blocks from the same peer (the root cause of stall loops).
+        let current_sync = *self.sync_peer.read();
+        *self.sync_peer.write() = None;
+
+        // Try to find a peer that's NOT the current sync peer
+        let alt_peer = {
+            let peer_heights = self.peer_heights.read();
+            peer_heights
+                .iter()
+                .filter(|(&id, _)| Some(id) != current_sync)
+                .max_by_key(|(_, &h)| h)
+                .map(|(&id, _)| id)
+        };
+
+        if let Some(peer) = alt_peer {
+            *self.sync_peer.write() = Some(peer);
+            info!(
+                "Switching to alternative peer {} for gap fill (was {:?})",
+                peer, current_sync
+            );
+        } else if current_sync.is_some() {
+            debug!(
+                "No alternative peer available, will retry with same peer {:?}",
+                current_sync
+            );
+        }
 
         // Use header sync to get the missing blocks in order
         *self.state.write() = SyncState::HeaderSync;

@@ -1356,6 +1356,181 @@ impl Chain {
             self.validate_proof_of_stake(block, parent)?;
         }
 
+        // Verify block signature
+        self.verify_block_signature(block)?;
+
+        Ok(())
+    }
+
+    /// Verify the block signature
+    ///
+    /// Implements CheckBlockSignature() from C++ Divi:
+    /// - PoW blocks: block signature must be empty
+    /// - PoS blocks with P2PKH coinstake output: Recover public key from compact
+    ///   signature over the block hash, verify recovered pubkey's hash160 matches
+    ///   the output's pubkey hash
+    /// - PoS blocks with P2PK coinstake output: Standard ECDSA verify with the
+    ///   pubkey extracted from the script
+    /// - PoS blocks with vault (TX_VAULT) output: Recover public key from compact
+    ///   signature, verify against vault manager's key hash
+    fn verify_block_signature(&self, block: &Block) -> Result<(), StorageError> {
+        // PoW blocks must have an empty signature
+        if !block.is_proof_of_stake() {
+            if !block.block_sig.is_empty() {
+                return Err(StorageError::InvalidBlock(
+                    "PoW block must have empty signature".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        // PoS blocks must have a non-empty signature
+        if block.block_sig.is_empty() {
+            return Err(StorageError::InvalidBlock(
+                "PoS block must have a signature".into(),
+            ));
+        }
+
+        // Get coinstake transaction (vtx[1])
+        let coinstake = &block.transactions[1];
+
+        // Get coinstake's second output (vout[1]) — the staking output with the key
+        if coinstake.vout.len() < 2 {
+            return Err(StorageError::InvalidBlock(
+                "coinstake must have at least 2 outputs for signature verification".into(),
+            ));
+        }
+        let staking_output = &coinstake.vout[1];
+        let script_bytes = staking_output.script_pubkey.as_bytes();
+
+        // Compute block hash for signature verification
+        let block_hash = self.compute_block_hash(block);
+
+        // Determine the output type and verify accordingly
+        let (script_type, solutions) = divi_script::extract_script_type(script_bytes);
+
+        match script_type {
+            divi_script::ScriptType::PubKeyHash => {
+                // P2PKH: Use recoverable signature verification
+                // Recover pubkey from compact signature, check hash160 matches
+                if solutions.is_empty() || solutions[0].len() != 20 {
+                    return Err(StorageError::InvalidBlock(
+                        "invalid P2PKH script in coinstake output".into(),
+                    ));
+                }
+
+                let expected_hash: [u8; 20] = solutions[0]
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StorageError::InvalidBlock("invalid pubkey hash length".into()))?;
+
+                let recoverable_sig =
+                    divi_crypto::RecoverableSig::from_compact_with_recovery(&block.block_sig)
+                        .map_err(|e| {
+                            StorageError::InvalidBlock(format!(
+                                "invalid block signature format: {}",
+                                e
+                            ))
+                        })?;
+
+                let recovered_pubkey = recoverable_sig
+                    .recover_from_hash(block_hash.as_bytes())
+                    .map_err(|e| {
+                        StorageError::InvalidBlock(format!(
+                            "failed to recover pubkey from block signature: {}",
+                            e
+                        ))
+                    })?;
+
+                let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
+                if *recovered_hash.as_bytes() != expected_hash {
+                    return Err(StorageError::InvalidBlock(
+                        "block signature: recovered pubkey does not match coinstake P2PKH output"
+                            .into(),
+                    ));
+                }
+            }
+
+            divi_script::ScriptType::PubKey => {
+                // P2PK: Standard ECDSA verify with the pubkey from the script
+                if solutions.is_empty() {
+                    return Err(StorageError::InvalidBlock(
+                        "invalid P2PK script in coinstake output".into(),
+                    ));
+                }
+
+                let pubkey = divi_crypto::PublicKey::from_bytes(&solutions[0]).map_err(|e| {
+                    StorageError::InvalidBlock(format!(
+                        "invalid pubkey in coinstake P2PK output: {}",
+                        e
+                    ))
+                })?;
+
+                // For P2PK, the block_sig is a standard DER-encoded signature
+                let signature =
+                    divi_crypto::Signature::from_der(&block.block_sig).map_err(|e| {
+                        StorageError::InvalidBlock(format!(
+                            "invalid DER block signature for P2PK: {}",
+                            e
+                        ))
+                    })?;
+
+                if !divi_crypto::verify_hash(&pubkey, &signature, block_hash.as_bytes()) {
+                    return Err(StorageError::InvalidBlock(
+                        "block signature: ECDSA verify failed for coinstake P2PK output".into(),
+                    ));
+                }
+            }
+
+            divi_script::ScriptType::Vault => {
+                // Vault: Use recoverable signature with the vault manager's key hash
+                // solutions[1] is the vault pubkey hash (manager key)
+                if solutions.len() < 2 || solutions[1].len() != 20 {
+                    return Err(StorageError::InvalidBlock(
+                        "invalid vault script in coinstake output".into(),
+                    ));
+                }
+
+                let vault_hash: [u8; 20] = solutions[1].as_slice().try_into().map_err(|_| {
+                    StorageError::InvalidBlock("invalid vault pubkey hash length".into())
+                })?;
+
+                let recoverable_sig =
+                    divi_crypto::RecoverableSig::from_compact_with_recovery(&block.block_sig)
+                        .map_err(|e| {
+                            StorageError::InvalidBlock(format!(
+                                "invalid block signature format for vault: {}",
+                                e
+                            ))
+                        })?;
+
+                let recovered_pubkey = recoverable_sig
+                    .recover_from_hash(block_hash.as_bytes())
+                    .map_err(|e| {
+                        StorageError::InvalidBlock(format!(
+                            "failed to recover pubkey from vault block signature: {}",
+                            e
+                        ))
+                    })?;
+
+                let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
+                if *recovered_hash.as_bytes() != vault_hash {
+                    return Err(StorageError::InvalidBlock(
+                        "block signature: recovered pubkey does not match vault manager key".into(),
+                    ));
+                }
+            }
+
+            _ => {
+                return Err(StorageError::InvalidBlock(format!(
+                    "unsupported coinstake output script type for block signature: {:?}",
+                    script_type
+                )));
+            }
+        }
+
+        debug!("Block signature verified for block {}", block_hash);
+
         Ok(())
     }
 
