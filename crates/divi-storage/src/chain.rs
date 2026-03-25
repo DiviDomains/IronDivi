@@ -1221,6 +1221,7 @@ impl Chain {
     }
 
     /// Find a transaction by its hash and return (tx, height, is_coinbase, is_coinstake)
+    #[allow(dead_code)]
     fn find_transaction(
         &self,
         txid: &Hash256,
