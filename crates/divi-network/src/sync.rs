@@ -35,7 +35,7 @@ use tracing::{debug, error, info, trace, warn};
 const MAX_HEADERS_REQUEST: usize = 2000;
 
 /// Maximum blocks to have in flight at once
-const MAX_BLOCKS_IN_FLIGHT: usize = 16;
+const MAX_BLOCKS_IN_FLIGHT: usize = 128;
 
 /// Timeout for block downloads
 const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);

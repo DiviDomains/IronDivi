@@ -49,7 +49,7 @@ pub struct NodeConfig {
     /// Logging settings
     pub log: LogConfig,
 
-    /// UTXO cache size (number of entries). 0 = disabled (default).
+    /// UTXO cache size (number of entries). Default: 10_000_000. Set to 0 to disable.
     pub utxo_cache_size: u64,
 }
 
@@ -65,7 +65,7 @@ impl Default for NodeConfig {
             debug: DebugConfig::default(),
             index: IndexConfig::default(),
             log: LogConfig::default(),
-            utxo_cache_size: 0,
+            utxo_cache_size: 10_000_000,
         }
     }
 }

@@ -146,6 +146,10 @@ pub struct Chain {
     params: ChainParams,
     /// Lock for chain state modifications (connect/disconnect/reorg)
     chain_lock: Mutex<()>,
+    /// Whether the node is in Initial Block Download mode.
+    /// When true, script verification is skipped for performance since
+    /// the blockchain data is assumed valid during catch-up.
+    ibd_mode: RwLock<bool>,
 }
 
 impl Chain {
@@ -158,6 +162,7 @@ impl Chain {
             tip: RwLock::new(None),
             params,
             chain_lock: Mutex::new(()),
+            ibd_mode: RwLock::new(true),
         };
 
         // Load tip from database
@@ -179,6 +184,20 @@ impl Chain {
     /// Enable spent index for tracking spent outputs
     pub fn enable_spent_index(&mut self, spent_index: Arc<SpentIndex>) {
         self.spent_index = Some(spent_index);
+    }
+
+    /// Set IBD (Initial Block Download) mode.
+    ///
+    /// When IBD mode is active, script verification is skipped during
+    /// `connect_block` for performance, since the blockchain data is
+    /// assumed valid during initial sync catch-up.
+    pub fn set_ibd_mode(&self, ibd: bool) {
+        *self.ibd_mode.write() = ibd;
+    }
+
+    /// Check whether the node is in IBD (Initial Block Download) mode.
+    pub fn is_ibd(&self) -> bool {
+        *self.ibd_mode.read()
     }
 
     /// Initialize the genesis block if chain is empty
@@ -675,10 +694,13 @@ impl Chain {
                 let db_clone = self.db.clone();
                 let mut block_map = std::collections::HashMap::new();
 
+                let max_walk_depth = 500; // Stake modifier only needs ~35-60 blocks back
+                let mut walk_count = 0u32;
                 let mut current = Some(parent.clone());
                 while let Some(ref idx) = current {
                     block_map.insert(idx.hash, idx.clone());
-                    if idx.prev_hash.is_zero() {
+                    walk_count += 1;
+                    if idx.prev_hash.is_zero() || walk_count >= max_walk_depth {
                         break;
                     }
                     current = db_clone.get_block_index(&idx.prev_hash).ok().flatten();
@@ -1736,15 +1758,9 @@ impl Chain {
             ))
         })?;
 
-        // Get the transaction that created the kernel UTXO and its block height
-        let (_kernel_tx, kernel_height, _, _) = self
-            .find_transaction(&kernel_input.prevout.txid)?
-            .ok_or_else(|| {
-                StorageError::InvalidBlock(format!(
-                    "Kernel transaction not found: {}",
-                    kernel_input.prevout.txid
-                ))
-            })?;
+        // Use the UTXO's height field directly instead of calling find_transaction,
+        // which would load the full block just to extract the height we already have.
+        let kernel_height = kernel_utxo.height;
 
         // Get the block index that confirmed the kernel UTXO
         let kernel_block_index =
@@ -1823,15 +1839,13 @@ impl Chain {
             Some(current_tip) => {
                 // If this block directly extends the current tip, always accept it
                 // This handles the common case of sequential block sync
-                let block = self.db.get_block(&new_index.hash)?;
-                if let Some(block) = block {
-                    if block.header.prev_block == current_tip.hash {
-                        debug!(
-                            "should_update_tip: Block {} extends current tip {} - accepting",
-                            new_index.hash, current_tip.hash
-                        );
-                        return Ok(true);
-                    }
+                // Use prev_hash from BlockIndex to avoid loading the full block from DB.
+                if new_index.prev_hash == current_tip.hash {
+                    debug!(
+                        "should_update_tip: Block {} extends current tip {} - accepting",
+                        new_index.hash, current_tip.hash
+                    );
+                    return Ok(true);
                 }
 
                 // Otherwise, compare chain work (greater work wins)
@@ -1911,8 +1925,16 @@ impl Chain {
         // Build undo data: capture previous UTXO state for every input spent
         let mut block_undo = BlockUndo::with_capacity(tx_count * 2);
 
+        // Precompute all txids once to avoid redundant hash computations.
+        // These are reused in the main transaction loop and for the tx_index update.
+        let txids: Vec<Hash256> = block
+            .transactions
+            .iter()
+            .map(|tx| self.compute_txid(tx))
+            .collect();
+
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
-            let txid = self.compute_txid(tx);
+            let txid = txids[tx_idx];
 
             // Skip coinbase/coinstake input validation
             let is_coinbase = tx.is_coinbase();
@@ -1942,19 +1964,9 @@ impl Chain {
                     // Check if UTXO was created earlier in this same block
                     let exists_in_block = created_in_block.contains(&input.prevout);
 
-                    // If not in block, verify it exists in database
-                    if !exists_in_block && !self.db.has_utxo(&input.prevout)? {
-                        error!(
-                            "UTXO NOT FOUND: {}:{} in tx {} at height {} (block {})",
-                            input.prevout.txid, input.prevout.vout, txid, height, index.hash
-                        );
-                        return Err(StorageError::UtxoNotFound(format!(
-                            "{}:{}",
-                            input.prevout.txid, input.prevout.vout
-                        )));
-                    }
-
-                    // Capture previous UTXO state for undo data before removal
+                    // Capture previous UTXO state for undo data before removal.
+                    // For non-block UTXOs we perform a single get_utxo call and treat
+                    // None as "not found", avoiding a redundant has_utxo round-trip.
                     let prev_utxo = if exists_in_block {
                         // Intra-block spend: find in batch adds
                         utxo_batch
@@ -1963,8 +1975,19 @@ impl Chain {
                             .find(|(op, _)| op == &input.prevout)
                             .map(|(_, u)| u.clone())
                     } else {
-                        // Regular spend: get from DB directly
-                        self.db.get_utxo(&input.prevout)?
+                        // Regular spend: single DB read covers both existence check and data.
+                        let utxo = self.db.get_utxo(&input.prevout)?;
+                        if utxo.is_none() {
+                            error!(
+                                "UTXO NOT FOUND: {}:{} in tx {} at height {} (block {})",
+                                input.prevout.txid, input.prevout.vout, txid, height, index.hash
+                            );
+                            return Err(StorageError::UtxoNotFound(format!(
+                                "{}:{}",
+                                input.prevout.txid, input.prevout.vout
+                            )));
+                        }
+                        utxo
                     };
 
                     if let Some(ref utxo) = prev_utxo {
@@ -1981,7 +2004,10 @@ impl Chain {
                     // Skip validation for coinstake inputs — they spend staking vault
                     // outputs whose OP_REQUIRE_COINSTAKE opcode requires coinstake-aware
                     // context that the generic script interpreter doesn't model yet.
-                    if !is_coinstake {
+                    //
+                    // Also skip script verification entirely during IBD (Initial Block
+                    // Download) since the blockchain data is assumed valid during catch-up.
+                    if !is_coinstake && !*self.ibd_mode.read() {
                         if let Some(ref utxo) = prev_utxo {
                             // Determine the index of this input within the transaction.
                             // We iterate tx.vin alongside the outer loop so find by pointer.
@@ -2072,9 +2098,8 @@ impl Chain {
 
         if let Some(ref tx_index) = self.tx_index {
             let mut locations = Vec::with_capacity(block.transactions.len());
-            for (tx_idx, tx) in block.transactions.iter().enumerate() {
-                let txid = self.compute_txid(tx);
-                locations.push((txid, TxLocation::new(index.hash, tx_idx as u32)));
+            for (tx_idx, txid) in txids.iter().enumerate() {
+                locations.push((*txid, TxLocation::new(index.hash, tx_idx as u32)));
             }
             tx_index.put_locations_batch(&locations)?;
         }

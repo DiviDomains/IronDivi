@@ -16,8 +16,21 @@
 use crate::error::CryptoError;
 use crate::keys::{message_hash, PublicKey, SecretKey};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId, Signature as SecpSignature};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::Message;
+use std::cell::RefCell;
 use std::fmt;
+
+thread_local! {
+    static SECP256K1: RefCell<secp256k1::Secp256k1<secp256k1::All>> = RefCell::new(secp256k1::Secp256k1::new());
+}
+
+/// Use the thread-local secp256k1 context to avoid repeated allocation
+fn with_secp<F, R>(f: F) -> R
+where
+    F: FnOnce(&secp256k1::Secp256k1<secp256k1::All>) -> R,
+{
+    SECP256K1.with(|secp| f(&secp.borrow()))
+}
 
 /// An ECDSA signature
 #[derive(Clone, PartialEq, Eq)]
@@ -139,9 +152,8 @@ impl RecoverableSig {
 
     /// Recover the public key from this signature and message
     pub fn recover(&self, message: &[u8]) -> Result<PublicKey, CryptoError> {
-        let secp = Secp256k1::new();
         let msg = message_hash(message);
-        let pk = secp.recover_ecdsa(&msg, &self.inner)?;
+        let pk = with_secp(|secp| secp.recover_ecdsa(&msg, &self.inner))?;
         PublicKey::from_bytes(&pk.serialize())
     }
 
@@ -149,9 +161,8 @@ impl RecoverableSig {
     ///
     /// This is used for block signatures where the hash is already computed.
     pub fn recover_from_hash(&self, hash: &[u8; 32]) -> Result<PublicKey, CryptoError> {
-        let secp = Secp256k1::new();
         let msg = Message::from_digest(*hash);
-        let pk = secp.recover_ecdsa(&msg, &self.inner)?;
+        let pk = with_secp(|secp| secp.recover_ecdsa(&msg, &self.inner))?;
         PublicKey::from_bytes(&pk.serialize())
     }
 }
@@ -168,33 +179,28 @@ impl fmt::Debug for RecoverableSig {
 ///
 /// Returns a DER-encoded ECDSA signature.
 pub fn sign_message(secret_key: &SecretKey, message: &[u8]) -> Signature {
-    let secp = Secp256k1::new();
     let msg = message_hash(message);
-    let sig = secp.sign_ecdsa(&msg, secret_key.inner());
+    let sig = with_secp(|secp| secp.sign_ecdsa(&msg, secret_key.inner()));
     Signature { inner: sig }
 }
 
 /// Sign a message with recovery info (for message signing protocols)
 pub fn sign_recoverable(secret_key: &SecretKey, message: &[u8]) -> RecoverableSig {
-    let secp = Secp256k1::new();
     let msg = message_hash(message);
-    let sig = secp.sign_ecdsa_recoverable(&msg, secret_key.inner());
+    let sig = with_secp(|secp| secp.sign_ecdsa_recoverable(&msg, secret_key.inner()));
     RecoverableSig { inner: sig }
 }
 
 /// Verify a signature against a public key and message
 pub fn verify_message(public_key: &PublicKey, signature: &Signature, message: &[u8]) -> bool {
-    let secp = Secp256k1::new();
     let msg = message_hash(message);
-    secp.verify_ecdsa(&msg, signature.inner(), public_key.inner())
-        .is_ok()
+    with_secp(|secp| secp.verify_ecdsa(&msg, signature.inner(), public_key.inner())).is_ok()
 }
 
 /// Sign a raw 32-byte hash (no double-SHA256 applied)
 pub fn sign_hash(secret_key: &SecretKey, hash: &[u8; 32]) -> Result<Signature, CryptoError> {
-    let secp = Secp256k1::new();
     let msg = Message::from_digest(*hash);
-    let sig = secp.sign_ecdsa(&msg, secret_key.inner());
+    let sig = with_secp(|secp| secp.sign_ecdsa(&msg, secret_key.inner()));
     Ok(Signature { inner: sig })
 }
 
@@ -205,18 +211,15 @@ pub fn sign_hash_recoverable(
     secret_key: &SecretKey,
     hash: &[u8; 32],
 ) -> Result<RecoverableSig, CryptoError> {
-    let secp = Secp256k1::new();
     let msg = Message::from_digest(*hash);
-    let sig = secp.sign_ecdsa_recoverable(&msg, secret_key.inner());
+    let sig = with_secp(|secp| secp.sign_ecdsa_recoverable(&msg, secret_key.inner()));
     Ok(RecoverableSig { inner: sig })
 }
 
 /// Verify a signature against a raw 32-byte hash
 pub fn verify_hash(public_key: &PublicKey, signature: &Signature, hash: &[u8; 32]) -> bool {
-    let secp = Secp256k1::new();
     let msg = Message::from_digest(*hash);
-    secp.verify_ecdsa(&msg, signature.inner(), public_key.inner())
-        .is_ok()
+    with_secp(|secp| secp.verify_ecdsa(&msg, signature.inner(), public_key.inner())).is_ok()
 }
 
 #[cfg(test)]
