@@ -694,7 +694,13 @@ impl Chain {
                 let db_clone = self.db.clone();
                 let mut block_map = std::collections::HashMap::new();
 
-                let max_walk_depth = 500; // Stake modifier only needs ~35-60 blocks back
+                // Stake modifier needs blocks within the selection interval (~2087 seconds).
+                // On testnets with fast block production (~12s/block), this can span ~200 blocks.
+                // The selection algorithm also needs to find blocks by hash for entropy selection,
+                // and the last_modifier_index walk needs to find generated_stake_modifier flags.
+                // Use 2000 as a safe upper bound that covers all networks while still being
+                // much cheaper than the original full-chain walk.
+                let max_walk_depth = 2000;
                 let mut walk_count = 0u32;
                 let mut current = Some(parent.clone());
                 while let Some(ref idx) = current {
