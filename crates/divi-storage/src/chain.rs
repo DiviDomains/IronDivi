@@ -674,10 +674,34 @@ impl Chain {
         };
 
         // 6. Check contextual validity (skip for genesis)
+        // Only perform full PoS/signature validation for blocks extending the current tip.
+        // Side-chain blocks are stored with header-only validation and get full validation
+        // during reorg (connect_block). This matches C++ Divi's AcceptBlock vs ConnectTip
+        // separation and allows storing competing chain blocks for proper fork selection.
         if let Some(ref parent) = parent_index {
-            debug!("  ├─ Context validation (parent: {})", parent.hash);
-            self.check_block_context(&block, parent)?;
-            debug!("  ├─ Context validation: ✅ PASS");
+            let extends_tip = {
+                let tip = self.tip.read();
+                tip.as_ref().map(|t| t.hash == parent.hash).unwrap_or(true)
+            };
+            if extends_tip {
+                debug!("  ├─ Full context validation (extends tip)");
+                self.check_block_context(&block, parent)?;
+                debug!("  ├─ Context validation: ✅ PASS");
+            } else {
+                debug!("  ├─ Header-only context validation (side chain)");
+                // Minimal validation: timestamp and parent linkage only
+                if block.header.prev_block != parent.hash {
+                    return Err(StorageError::InvalidBlock("wrong parent".into()));
+                }
+                let mtp = self.get_median_time_past(parent)?;
+                if block.header.time <= mtp {
+                    return Err(StorageError::InvalidBlock(format!(
+                        "block timestamp {} is not greater than median time past {}",
+                        block.header.time, mtp
+                    )));
+                }
+                debug!("  ├─ Header validation: ✅ PASS (full validation deferred to reorg)");
+            }
         }
 
         // 7. Create block index
