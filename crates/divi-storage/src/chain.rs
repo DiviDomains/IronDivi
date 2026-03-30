@@ -711,12 +711,19 @@ impl Chain {
         // This prevents following minority forks during IBD.
         if let Some(expected_hash) = self.get_checkpoint_hash(height) {
             if hash != expected_hash {
+                warn!(
+                    "CHECKPOINT REJECT: Block {} at height {} fails checkpoint (expected {})",
+                    hash, height, expected_hash
+                );
                 return Err(StorageError::InvalidBlock(format!(
                     "Block {} at height {} fails checkpoint: expected {}",
                     hash, height, expected_hash
                 )));
             }
-            debug!("  ├─ Checkpoint at height {}: ✅ PASS", height);
+            warn!(
+                "CHECKPOINT PASS: Block {} at height {} matches checkpoint",
+                hash, height
+            );
         }
 
         let mut index = BlockIndex::from_header(&block.header, height, parent_index.as_ref());
