@@ -1800,7 +1800,19 @@ impl Chain {
         // Reference: Divi/divi/src/PoSStakeModifierService.cpp
         let stake_modifier = self.get_stake_modifier_for_validation(parent, &kernel_block_index)?;
 
-        // Debug logging for PoS validation
+        // Diagnostic logging for PoS validation (temporarily at warn level for debugging)
+        let target_height = parent.height + 1;
+        if target_height >= 49905 && target_height <= 49915 {
+            warn!("PoS validation for block at height {}:", target_height);
+            warn!("  stake_modifier: 0x{:016x}", stake_modifier);
+            warn!("  kernel_height: {}", kernel_height);
+            warn!("  kernel_block_time: {}", kernel_block_index.time);
+            warn!("  utxo_txid: {}", kernel_input.prevout.txid);
+            warn!("  utxo_vout: {}", kernel_input.prevout.vout);
+            warn!("  utxo_value: {}", kernel_utxo.value.as_sat());
+            warn!("  block_time: {}", block.header.time);
+            warn!("  block_bits: 0x{:08x}", block.header.bits);
+        }
         debug!("PoS validation for block at height {}:", parent.height + 1);
         debug!("  stake_modifier: 0x{:016x}", stake_modifier);
         debug!("  parent.height: {}", parent.height);
