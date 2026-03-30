@@ -141,6 +141,10 @@ pub struct Chain {
     spent_index: Option<Arc<SpentIndex>>,
     /// Current chain tip
     tip: RwLock<Option<BlockIndex>>,
+    /// Best known block index (block with the highest chain work we've seen).
+    /// Used by `activate_best_chain` to detect when a side-chain has accumulated
+    /// more work than the current tip and a reorganization is needed.
+    best_known_block: RwLock<Option<BlockIndex>>,
     /// Chain parameters
     #[allow(dead_code)]
     params: ChainParams,
@@ -160,6 +164,7 @@ impl Chain {
             tx_index: None,
             spent_index: None,
             tip: RwLock::new(None),
+            best_known_block: RwLock::new(None),
             params,
             chain_lock: Mutex::new(()),
             ibd_mode: RwLock::new(true),
@@ -454,6 +459,7 @@ impl Chain {
     fn load_tip(&mut self) -> Result<(), StorageError> {
         if let Some(hash) = self.db.get_best_block()? {
             if let Some(index) = self.db.get_block_index(&hash)? {
+                *self.best_known_block.write() = Some(index.clone());
                 *self.tip.write() = Some(index);
             }
         }
@@ -619,29 +625,25 @@ impl Chain {
 
         // 2. Check if we already have this block
         if let Some(existing_index) = self.db.get_block_index(&hash)? {
-            // We already have this block - but check if it triggers a reorg
-            // This handles the case where we stored a side-chain block earlier
-            // and now it (or its chain) has become the best chain
+            // We already have this block - update best_known_block in case
+            // this was stored as a side-chain block and now participates in
+            // the best chain evaluation.
+            self.update_best_known_block(&existing_index);
+
+            // Run activate_best_chain to check if any stored block
+            // (including this one) has more work than the current tip.
             let mut reorg_fork_height = None;
             let mut orphaned_transactions = Vec::new();
-            let tip = self.tip.read().clone();
-            if let Some(ref current_tip) = tip {
-                if self.should_update_tip(&existing_index)? {
-                    // This block has more work than our current tip
-                    // Check if it's not already on the main chain
-                    if !existing_index.status.contains(BlockStatus::ON_MAIN_CHAIN) {
-                        info!(
-                            "🔄 REORG TRIGGERED: Block {} (height {}) now has more work - triggering reorg",
-                            hash, existing_index.height
-                        );
-                        let mut index = existing_index;
-                        let (fork_height, orphans) =
-                            self.reorganize_chain(&block, &mut index, current_tip)?;
-                        reorg_fork_height = Some(fork_height);
-                        orphaned_transactions = orphans;
-                    }
-                }
+
+            if let Some((fork_height, orphans)) = self.activate_best_chain_inner()? {
+                info!(
+                    "🔄 REORG TRIGGERED: activate_best_chain found better chain after re-receiving block {} (height {})",
+                    hash, existing_index.height
+                );
+                reorg_fork_height = Some(fork_height);
+                orphaned_transactions = orphans;
             }
+
             debug!("  ├─ Already have block {}, skipping", hash);
             return Ok(AcceptBlockResult {
                 hash,
@@ -757,6 +759,12 @@ impl Chain {
         self.db.store_block_index(&index)?;
         debug!("  ├─ Storage: ✅ COMPLETE");
 
+        // 8b. Track the best known block (highest chain work we've seen).
+        // This enables activate_best_chain to detect when a side chain has
+        // accumulated more work than the current tip after subsequent blocks
+        // are stored.
+        self.update_best_known_block(&index);
+
         // 9. Try to connect to the chain
         let tip = self.tip.read().clone();
         let mut reorg_fork_height = None;
@@ -776,6 +784,9 @@ impl Chain {
                     self.db
                         .atomic_connect_block(&utxo_batch, &undo_bytes, &index.hash, &index)?;
                     *self.tip.write() = Some(index.clone());
+
+                    // Keep best_known_block in sync with the new tip
+                    self.update_best_known_block(&index);
 
                     // Periodically flush UTXO cache to disk (every 100 blocks)
                     if self.db.has_utxo_cache() && accepted_height.is_multiple_of(100) {
@@ -813,6 +824,9 @@ impl Chain {
                     reorg_fork_height = Some(fork_height);
                     orphaned_transactions = orphans;
 
+                    // Keep best_known_block in sync with the new tip
+                    self.update_best_known_block(&index);
+
                     // Always flush UTXO cache after reorg for consistency
                     if self.db.has_utxo_cache() {
                         match self.db.flush_utxo_cache() {
@@ -845,13 +859,31 @@ impl Chain {
                 self.db
                     .atomic_connect_block(&utxo_batch, &undo_bytes, &index.hash, &index)?;
                 *self.tip.write() = Some(index.clone());
+
+                // Keep best_known_block in sync with the new tip
+                self.update_best_known_block(&index);
+
                 debug!(
                     "✅ BLOCK ACCEPTED: {} at height {} (genesis/first)",
                     hash, accepted_height
                 );
             }
         } else {
-            debug!("  └─ Block stored as side-chain (insufficient work)");
+            // Block stored as side-chain. Run activate_best_chain to check
+            // whether this block (or any previously-stored descendant) has
+            // accumulated enough work to warrant a chain reorganization.
+            // This mirrors C++ Divi's ActivateBestChain pattern.
+            debug!("  ├─ Block stored as side-chain, running activate_best_chain");
+            if let Some((fork_height, orphans)) = self.activate_best_chain_inner()? {
+                info!(
+                    "activate_best_chain triggered reorg at fork height {} after storing side-chain block {}",
+                    fork_height, hash
+                );
+                reorg_fork_height = Some(fork_height);
+                orphaned_transactions = orphans;
+            } else {
+                debug!("  └─ Block stored as side-chain (insufficient work)");
+            }
         }
 
         Ok(AcceptBlockResult {
@@ -1800,19 +1832,7 @@ impl Chain {
         // Reference: Divi/divi/src/PoSStakeModifierService.cpp
         let stake_modifier = self.get_stake_modifier_for_validation(parent, &kernel_block_index)?;
 
-        // Diagnostic logging for PoS validation (temporarily at warn level for debugging)
-        let target_height = parent.height + 1;
-        if target_height >= 49905 && target_height <= 49915 {
-            warn!("PoS validation for block at height {}:", target_height);
-            warn!("  stake_modifier: 0x{:016x}", stake_modifier);
-            warn!("  kernel_height: {}", kernel_height);
-            warn!("  kernel_block_time: {}", kernel_block_index.time);
-            warn!("  utxo_txid: {}", kernel_input.prevout.txid);
-            warn!("  utxo_vout: {}", kernel_input.prevout.vout);
-            warn!("  utxo_value: {}", kernel_utxo.value.as_sat());
-            warn!("  block_time: {}", block.header.time);
-            warn!("  block_bits: 0x{:08x}", block.header.bits);
-        }
+        // Debug logging for PoS validation
         debug!("PoS validation for block at height {}:", parent.height + 1);
         debug!("  stake_modifier: 0x{:016x}", stake_modifier);
         debug!("  parent.height: {}", parent.height);
@@ -1901,6 +1921,127 @@ impl Chain {
             }
         }
         std::cmp::Ordering::Equal
+    }
+
+    /// Update the best known block if the given index has more chain work.
+    ///
+    /// Called after storing a new block index so that `activate_best_chain`
+    /// can later detect that a side chain has surpassed the current tip.
+    fn update_best_known_block(&self, index: &BlockIndex) {
+        let mut best = self.best_known_block.write();
+        let dominated = match &*best {
+            None => true,
+            Some(current_best) => {
+                Self::compare_chain_work(&index.chain_work, &current_best.chain_work)
+                    == std::cmp::Ordering::Greater
+            }
+        };
+        if dominated {
+            *best = Some(index.clone());
+        }
+    }
+
+    /// Activate the best chain, acquiring the chain lock first.
+    ///
+    /// Public entry point for callers that do NOT already hold the chain lock
+    /// (e.g., the sync layer after processing orphan blocks). For the internal
+    /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
+    pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
+        let _chain_guard = self.chain_lock.lock();
+        self.activate_best_chain_inner()
+    }
+
+    /// Inner implementation of activate_best_chain (caller must hold chain_lock).
+    ///
+    /// This mirrors C++ Divi's `ActivateBestChain`: after every block
+    /// acceptance, we check whether any stored block index has more
+    /// cumulative chain work than the current tip. If so, we reorganize
+    /// to that chain.
+    ///
+    /// Returns the reorg fork height and orphaned transactions if a
+    /// reorganization occurred, or `None` if no reorg was needed.
+    fn activate_best_chain_inner(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
+        let tip = self.tip.read().clone();
+        let best = self.best_known_block.read().clone();
+
+        let (current_tip, best_block) = match (tip, best) {
+            (Some(t), Some(b)) => (t, b),
+            _ => return Ok(None), // No tip or no best known block
+        };
+
+        // Nothing to do if the best known block is already the tip
+        if best_block.hash == current_tip.hash {
+            return Ok(None);
+        }
+
+        // Nothing to do if best known block is already on the main chain
+        // (this can happen if best_known_block was set before the tip was
+        // updated but after the block was connected)
+        if best_block.status.contains(BlockStatus::ON_MAIN_CHAIN) {
+            return Ok(None);
+        }
+
+        // Only reorg if the best known block has strictly more work
+        let cmp = Self::compare_chain_work(&best_block.chain_work, &current_tip.chain_work);
+        if cmp != std::cmp::Ordering::Greater {
+            return Ok(None);
+        }
+
+        // The best known block must have valid data to reorganize to it
+        if !best_block.status.contains(BlockStatus::HAVE_DATA) {
+            debug!(
+                "activate_best_chain: best block {} at height {} has more work but no data yet",
+                best_block.hash, best_block.height
+            );
+            return Ok(None);
+        }
+
+        info!(
+            "activate_best_chain: block {} at height {} (work {:02x?}...) beats current tip {} at height {} (work {:02x?}...) - reorganizing",
+            best_block.hash,
+            best_block.height,
+            &best_block.chain_work[..8],
+            current_tip.hash,
+            current_tip.height,
+            &current_tip.chain_work[..8],
+        );
+
+        // Load the full block data for the reorg target
+        let block = self
+            .db
+            .get_block(&best_block.hash)?
+            .ok_or_else(|| StorageError::BlockNotFound(best_block.hash.to_string()))?;
+
+        let mut best_index = best_block;
+        let (fork_height, orphaned_txs) =
+            self.reorganize_chain(&block, &mut best_index, &current_tip)?;
+
+        // Flush UTXO cache after reorg for consistency
+        if self.db.has_utxo_cache() {
+            match self.db.flush_utxo_cache() {
+                Ok(count) => {
+                    if count > 0 {
+                        debug!(
+                            "Flushed {} UTXO cache entries after activate_best_chain reorg",
+                            count
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to flush UTXO cache after activate_best_chain reorg: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "activate_best_chain: reorg complete, new tip {} at height {}",
+            best_index.hash, best_index.height
+        );
+
+        Ok(Some((fork_height, orphaned_txs)))
     }
 
     /// Connect a block to the chain (update UTXO set)
