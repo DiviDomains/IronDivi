@@ -706,6 +706,19 @@ impl Chain {
 
         // 7. Create block index
         let height = parent_index.as_ref().map(|p| p.height + 1).unwrap_or(0);
+
+        // 7a. Checkpoint validation — reject blocks at known heights with wrong hash.
+        // This prevents following minority forks during IBD.
+        if let Some(expected_hash) = self.get_checkpoint_hash(height) {
+            if hash != expected_hash {
+                return Err(StorageError::InvalidBlock(format!(
+                    "Block {} at height {} fails checkpoint: expected {}",
+                    hash, height, expected_hash
+                )));
+            }
+            debug!("  ├─ Checkpoint at height {}: ✅ PASS", height);
+        }
+
         let mut index = BlockIndex::from_header(&block.header, height, parent_index.as_ref());
         index.hash = hash;
         index.n_tx = block.transactions.len() as u32;
@@ -1396,6 +1409,32 @@ impl Chain {
     /// Compute the hash of a block
     fn compute_block_hash(&self, block: &Block) -> Hash256 {
         divi_crypto::compute_block_hash(&block.header)
+    }
+
+    /// Get the expected block hash at a checkpoint height, if any.
+    /// Checkpoints prevent following minority forks during IBD.
+    fn get_checkpoint_hash(&self, height: u32) -> Option<Hash256> {
+        use divi_primitives::ChainMode;
+
+        let network_type = self.network_type();
+        let chain_mode = self.params.chain_mode;
+
+        // Checkpoints are only for known fork points discovered during testing.
+        // Each entry maps (chain_mode, network_type, height) -> expected block hash.
+        match (chain_mode, network_type) {
+            (ChainMode::PrivateDivi, NetworkType::Mainnet) => match height {
+                // Fork at height 47791: two competing blocks existed.
+                // This is the block hash on the correct (highest-work) chain.
+                47791 => Some(
+                    Hash256::from_hex(
+                        "be98727e61b96a191f6474a283733830d7d56c66f6131c11540e009b993d7f1d",
+                    )
+                    .expect("invalid checkpoint hash"),
+                ),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Check basic block header validity
