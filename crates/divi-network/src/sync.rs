@@ -549,27 +549,28 @@ impl BlockSync {
             locator.len()
         );
 
-        // Send getblocks for initial sync
-        // Note: C++ Divi nodes treat getheaders the same as getblocks and return inv messages
-        // (HeadersFirstSyncingActive is disabled). So we use getblocks which is well-tested.
+        // Use getheaders for headers-first sync.
+        // This downloads all headers first, selects the best chain by cumulative work,
+        // then downloads only the blocks on the best chain. This avoids committing to the
+        // wrong fork during IBD — a problem with getblocks-based sync where the first
+        // block at a fork point wins unconditionally.
         let msg =
-            NetworkMessage::GetBlocks(GetHeadersMessage::new(locator.clone(), Hash256::zero()));
+            NetworkMessage::GetHeaders(GetHeadersMessage::new(locator.clone(), Hash256::zero()));
 
-        // Show first locator hash (our tip) for clarity
         let locator_tip = locator.first().map(|h| h.to_string()).unwrap_or_default();
         info!(
-            "Sending getblocks to peer {} from height {} (locator tip: {}...)",
+            "Sending getheaders to peer {} from height {} (locator tip: {}...)",
             peer_id,
             self.chain.height(),
             &locator_tip[..std::cmp::min(16, locator_tip.len())]
         );
 
         if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-            warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
+            warn!("Failed to send getheaders to peer {}: {}", peer_id, e);
             *self.sync_peer.write() = None;
         } else {
             *self.last_header_request.write() = Some(Instant::now());
-            debug!("getblocks sent successfully, waiting for inv response");
+            debug!("getheaders sent successfully, waiting for headers response");
         }
     }
 
@@ -690,18 +691,31 @@ impl BlockSync {
         );
 
         // Validate headers connect to our chain
+        // For headers-first sync, the first header's prev_block may connect to a block
+        // that is NOT the current tip (e.g., when the peer's chain diverged from ours).
+        // We check if the first header's parent is in our block index and use that as
+        // the starting point for validation.
         let (mut prev_hash, mut current_height) = {
             let pending = self.pending_headers.read();
             if let Some(last) = pending.back() {
-                // Calculate height based on pending headers count + chain height
                 let chain_height = self.chain.height();
                 let pending_count = pending.len() as u32;
                 (compute_block_hash(last), chain_height + pending_count)
-            } else if let Some(tip) = self.chain.tip() {
-                (tip.hash, tip.height)
             } else {
-                // Genesis case
-                (Hash256::zero(), 0)
+                // Check if the first header connects to a known block in our index
+                // (not necessarily the tip — could be a fork point)
+                let first_prev = headers[0].prev_block;
+                if let Ok(Some(parent_index)) = self.chain.get_block_index(&first_prev) {
+                    debug!(
+                        "Headers connect to block index at height {} (not current tip)",
+                        parent_index.height
+                    );
+                    (parent_index.hash, parent_index.height)
+                } else if let Some(tip) = self.chain.tip() {
+                    (tip.hash, tip.height)
+                } else {
+                    (Hash256::zero(), 0)
+                }
             }
         };
 
