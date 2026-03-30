@@ -739,7 +739,13 @@ impl Chain {
                         );
                     }
                     Err(e) => {
-                        warn!("Failed to compute stake modifier for block {}: {}", hash, e);
+                        // A failed modifier computation silently corrupts ALL subsequent
+                        // blocks' modifiers, causing PoS validation failures later.
+                        // This MUST be a hard error, not a warning.
+                        return Err(StorageError::ChainState(format!(
+                            "Failed to compute stake modifier for block {} at height {}: {}",
+                            hash, height, e
+                        )));
                     }
                 }
             }
