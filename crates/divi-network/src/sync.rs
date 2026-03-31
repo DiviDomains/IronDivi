@@ -412,6 +412,21 @@ impl BlockSync {
             );
             *self.state.write() = SyncState::HeaderSync;
         }
+
+        // If we're already at or ahead of all peers and still in IBD, exit IBD.
+        // This handles the case where the node restarts already synced — the sync
+        // engine never runs, so the Synced → exit IBD transition never fires.
+        if our_height >= height && self.chain.is_ibd() {
+            let best = *self.best_peer_height.read();
+            if our_height >= best {
+                info!(
+                    "Already synced (height {} >= best peer {}), exiting IBD mode",
+                    our_height, best
+                );
+                *self.state.write() = SyncState::Synced;
+                self.chain.set_ibd_mode(false);
+            }
+        }
     }
 
     /// Get a peer's known height (for testing and diagnostics)
