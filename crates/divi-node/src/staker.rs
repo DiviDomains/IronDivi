@@ -589,11 +589,12 @@ impl Staker {
         let current_height = tip.height;
         let next_height = current_height + 1;
 
-        // Don't stake while syncing — if tip is more than 10 minutes old,
-        // we're still catching up and would create fork blocks that get orphaned
-        let tip_age = current_time.saturating_sub(tip.time);
-        if tip_age > 600 {
-            debug!("Skipping stake: tip is {}s old (syncing)", tip_age);
+        // Don't stake while actively syncing (IBD mode).
+        // But DO stake on stale chains — IronDivi may be the only node capable of
+        // breaking a network deadlock where all C++ nodes disabled staking because
+        // the chain tip is >24h old.
+        if self.chain.is_ibd() {
+            debug!("Skipping stake: still in IBD mode");
             return StakeResult::RateLimited;
         }
 
