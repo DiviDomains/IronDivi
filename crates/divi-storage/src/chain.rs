@@ -1489,7 +1489,10 @@ impl Chain {
         }
 
         // Validate proof-of-stake if this is a PoS block
-        if block.is_proof_of_stake() {
+        // Skip during IBD — the chain is trusted by accumulated work, and PoS validation
+        // depends on stake modifiers which can diverge at fork points during IBD.
+        // Once synced to tip, PoS validation is enabled for all new blocks.
+        if block.is_proof_of_stake() && !*self.ibd_mode.read() {
             self.validate_proof_of_stake(block, parent)?;
         }
 

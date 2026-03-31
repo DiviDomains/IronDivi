@@ -950,6 +950,11 @@ impl BlockSync {
             if our_height >= best_height {
                 info!("Block sync complete at height {}", our_height);
                 *self.state.write() = SyncState::Synced;
+                // Disable IBD mode — enable full PoS and script validation for new blocks
+                if self.chain.is_ibd() {
+                    info!("Exiting IBD mode — full validation enabled for new blocks");
+                    self.chain.set_ibd_mode(false);
+                }
             } else {
                 // Need to sync more - request next batch of block hashes
                 info!(
