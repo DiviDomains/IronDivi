@@ -1311,10 +1311,11 @@ impl WalletDb {
         &self,
         block_hash: Hash256,
         height: u32,
+        block_time: u32,
         transactions: &[divi_primitives::transaction::Transaction],
     ) {
         for tx in transactions {
-            self.scan_transaction(tx, Some(block_hash), Some(height));
+            self.scan_transaction(tx, Some(block_hash), Some(height), Some(block_time));
         }
     }
 
@@ -1324,6 +1325,7 @@ impl WalletDb {
         tx: &divi_primitives::transaction::Transaction,
         block_hash: Option<Hash256>,
         height: Option<u32>,
+        block_time: Option<u32>,
     ) {
         let txid = tx.txid();
         let is_coinbase = tx.is_coinbase();
@@ -1433,14 +1435,21 @@ impl WalletDb {
                 None
             };
 
+            // Use block time for accurate transaction timestamps.
+            // During IBD scan, this preserves the actual block time rather than
+            // giving all historical transactions the same scan-time timestamp.
+            let timestamp = block_time.map(|t| t as u64).unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            });
+
             let wallet_tx = WalletTx {
                 txid,
                 block_hash,
                 block_height: height,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp,
                 amount: net_amount,
                 fee,
                 category: category.to_string(),
@@ -2142,7 +2151,7 @@ mod tests {
 
         // Scan the transaction
         let block_hash = Hash256::from_bytes([2u8; 32]);
-        wallet.scan_transaction(&tx, Some(block_hash), Some(100));
+        wallet.scan_transaction(&tx, Some(block_hash), Some(100), Some(1000000));
 
         // Verify the transaction was recorded with correct fee
         let wallet_tx = wallet.get_transaction(&tx.txid()).unwrap();

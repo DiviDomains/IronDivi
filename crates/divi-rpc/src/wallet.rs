@@ -759,7 +759,7 @@ impl WalletRpc {
             }
 
             // Scan the block
-            wallet.scan_block(index.hash, height, &block.transactions);
+            wallet.scan_block(index.hash, height, index.time, &block.transactions);
             scanned += 1;
 
             // Log progress every 1000 blocks
@@ -1598,7 +1598,7 @@ impl WalletRpc {
                 tracing::warn!("Could not determine height for funding tx {}, vault UTXOs may not be stakeable until next rescan", funding_tx);
             }
 
-            wallet.scan_transaction(&fund_tx, Some(location.block_hash), height);
+            wallet.scan_transaction(&fund_tx, Some(location.block_hash), height, None);
             tracing::info!(
                 "Scanned funding tx {} at height {:?} for vault UTXOs",
                 funding_tx,

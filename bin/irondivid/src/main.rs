@@ -845,7 +845,12 @@ async fn run_daemon(
                 fee_estimator_for_callback.add_block(height, block, total_fees);
 
                 // 2. Scan block for wallet transactions (adds new UTXOs, removes spent ones)
-                wallet_for_scan.scan_block(block_hash, height, &block.transactions);
+                wallet_for_scan.scan_block(
+                    block_hash,
+                    height,
+                    block.header.time,
+                    &block.transactions,
+                );
                 wallet_for_scan.set_last_scan_height(height);
 
                 // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
@@ -965,7 +970,12 @@ async fn run_daemon(
                         Ok(Some(blk)) => blk,
                         _ => continue,
                     };
-                    wallet_for_catchup.scan_block(index.hash, height, &block.transactions);
+                    wallet_for_catchup.scan_block(
+                        index.hash,
+                        height,
+                        block.header.time,
+                        &block.transactions,
+                    );
                     scanned += 1;
                     if scanned.is_multiple_of(1000) {
                         info!(
@@ -1052,7 +1062,12 @@ async fn run_daemon(
                 fee_estimator_for_staker.add_block(height, block, total_fees);
 
                 // 2. Scan block for wallet transactions
-                wallet_for_staker.scan_block(block_hash, height, &block.transactions);
+                wallet_for_staker.scan_block(
+                    block_hash,
+                    height,
+                    block.header.time,
+                    &block.transactions,
+                );
                 wallet_for_staker.set_last_scan_height(height);
 
                 // 3. Persist wallet changes
