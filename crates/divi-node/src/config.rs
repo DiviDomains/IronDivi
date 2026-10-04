@@ -290,6 +290,16 @@ pub struct P2pConfig {
     /// Enable peer discovery
     pub enable_discovery: bool,
 
+    /// `-connect` peers. When non-empty the node connects ONLY to these
+    /// (no built-in static peers, no DNS seeds), matching C++ `-connect`.
+    #[serde(default)]
+    pub connect: Vec<String>,
+
+    /// Accept inbound connections. `None` = default: listen unless `connect`
+    /// is set (C++ soft-sets `-listen=0` under `-connect`).
+    #[serde(default)]
+    pub listen: Option<bool>,
+
     /// Ban time for misbehaving peers (seconds)
     pub ban_time: u64,
 
@@ -305,8 +315,41 @@ impl Default for P2pConfig {
             max_inbound: 125,
             max_outbound: 8,
             enable_discovery: true,
+            connect: Vec::new(),
+            listen: None,
             ban_time: 86400, // 24 hours
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
+        }
+    }
+}
+
+/// Where a node finds peers, after `-connect` / `-listen` / discovery are applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSources {
+    pub static_peers: Vec<String>,
+    pub dns_seeds: Vec<String>,
+    pub listen: bool,
+}
+
+impl NodeConfig {
+    /// Resolve the peer sources. With `connect` set, outbound goes only to
+    /// those peers and inbound is off unless `listen` was given explicitly.
+    pub fn peer_sources(&self) -> PeerSources {
+        if !self.p2p.connect.is_empty() {
+            return PeerSources {
+                static_peers: self.p2p.connect.clone(),
+                dns_seeds: Vec::new(),
+                listen: self.p2p.listen.unwrap_or(false),
+            };
+        }
+        PeerSources {
+            static_peers: self.network.static_peers.clone(),
+            dns_seeds: if self.p2p.enable_discovery {
+                self.network.dns_seeds.clone()
+            } else {
+                Vec::new()
+            },
+            listen: self.p2p.listen.unwrap_or(true),
         }
     }
 }
@@ -581,5 +624,38 @@ mod tests {
         assert_eq!(config.network.magic, [0x70, 0xd1, 0x76, 0x13]);
         assert_eq!(config.p2p.port, 52476);
         assert_eq!(config.rpc.port, 52475);
+    }
+
+    #[test]
+    fn peer_sources_default_uses_builtin_peers_seeds_and_listens() {
+        let config = NodeConfig::testnet(ChainMode::PrivateDivi);
+        let src = config.peer_sources();
+        assert!(!src.static_peers.is_empty());
+        assert!(!src.dns_seeds.is_empty());
+        assert!(src.listen);
+    }
+
+    #[test]
+    fn peer_sources_connect_is_exclusive() {
+        // Regression: -connect used to be appended to the built-in testnet
+        // peers (vps1:52581..52585) and DNS seeds stayed on.
+        let mut config = NodeConfig::testnet(ChainMode::PrivateDivi);
+        config.p2p.connect = vec!["127.0.0.1:52581".to_string()];
+        let src = config.peer_sources();
+        assert_eq!(src.static_peers, vec!["127.0.0.1:52581".to_string()]);
+        assert!(src.dns_seeds.is_empty());
+        assert!(!src.listen, "-connect implies -listen=0 by default");
+
+        config.p2p.listen = Some(true);
+        assert!(config.peer_sources().listen, "explicit listen=1 wins");
+    }
+
+    #[test]
+    fn peer_sources_discovery_off_drops_dns_seeds_only() {
+        let mut config = NodeConfig::testnet(ChainMode::PrivateDivi);
+        config.p2p.enable_discovery = false;
+        let src = config.peer_sources();
+        assert!(src.dns_seeds.is_empty());
+        assert_eq!(src.static_peers, config.network.static_peers);
     }
 }

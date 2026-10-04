@@ -271,9 +271,9 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
             }
             "listen" => {
                 if let Some(b) = value.as_bool() {
-                    config.p2p.enable_discovery = b;
+                    config.p2p.listen = Some(b);
                 } else if let Some(i) = value.as_integer() {
-                    config.p2p.enable_discovery = i != 0;
+                    config.p2p.listen = Some(i != 0);
                 } else {
                     warn!("Invalid listen value in config file, expected boolean or integer");
                 }
@@ -390,12 +390,12 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
             }
             "connect" => {
                 if let Some(s) = value.as_str() {
-                    config.network.static_peers.push(s.to_string());
+                    config.p2p.connect.push(s.to_string());
                     config.p2p.enable_discovery = false;
                 } else if let Some(arr) = value.as_array() {
                     for v in arr {
                         if let Some(s) = v.as_str() {
-                            config.network.static_peers.push(s.to_string());
+                            config.p2p.connect.push(s.to_string());
                         } else {
                             warn!("Invalid connect array element, expected string");
                         }
@@ -541,7 +541,8 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
 
     // Add static peers from CLI (append to any from config file)
     if !args.connect.is_empty() {
-        config.network.static_peers.extend(args.connect.clone());
+        // Connect-only: resolved by NodeConfig::peer_sources().
+        config.p2p.connect.extend(args.connect.clone());
         config.p2p.enable_discovery = false; // Don't discover when using -connect
     } else if !args.addnode.is_empty() {
         config.network.static_peers.extend(args.addnode.clone());
@@ -1512,4 +1513,43 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     info!("IronDivi shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    fn cfg(extra: &[&str]) -> NodeConfig {
+        let dir = std::env::temp_dir().join(format!("irondivid-connect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut argv = vec![
+            "irondivid".to_string(),
+            "--mode".to_string(),
+            "privatedivi".to_string(),
+            "--testnet".to_string(),
+            format!("--datadir={}", dir.display()),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(argv)).unwrap()
+    }
+
+    #[test]
+    fn cli_connect_is_connect_only() {
+        // Regression: --connect appended to the built-in testnet peers
+        // (vps1.divi.domains:52581..52585) and DNS seeds stayed on.
+        let src = cfg(&["--connect=127.0.0.1:52581"]).peer_sources();
+        assert_eq!(src.static_peers, vec!["127.0.0.1:52581".to_string()]);
+        assert!(src.dns_seeds.is_empty());
+        assert!(!src.listen);
+    }
+
+    #[test]
+    fn cli_addnode_keeps_builtin_peers() {
+        let config = cfg(&["--addnode=127.0.0.1:52581"]);
+        let src = config.peer_sources();
+        assert!(src.static_peers.contains(&"127.0.0.1:52581".to_string()));
+        assert!(src.static_peers.len() > 1);
+        assert!(!src.dns_seeds.is_empty());
+        assert!(src.listen);
+    }
 }

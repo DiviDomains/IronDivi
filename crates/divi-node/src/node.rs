@@ -166,13 +166,20 @@ impl Node {
         let fee_estimator = Arc::new(FeeEstimator::new());
 
         // Create peer manager based on network type
+        let peer_sources = config.peer_sources();
+        if !config.p2p.connect.is_empty() {
+            tracing::info!(
+                "connect-only: peers={:?}, dns seeds off, listen={}",
+                peer_sources.static_peers,
+                peer_sources.listen
+            );
+        }
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,
             magic: config.network.magic,
-            dns_seeds: config.network.dns_seeds.clone(),
-            static_peers: config
-                .network
+            dns_seeds: peer_sources.dns_seeds.clone(),
+            static_peers: peer_sources
                 .static_peers
                 .iter()
                 .filter_map(|s| {
@@ -197,7 +204,11 @@ impl Node {
                     }
                 })
                 .collect(),
-            listen_addr: Some(config.p2p.socket_addr()),
+            listen_addr: if peer_sources.listen {
+                Some(config.p2p.socket_addr())
+            } else {
+                None
+            },
             default_port: config.p2p.port,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
