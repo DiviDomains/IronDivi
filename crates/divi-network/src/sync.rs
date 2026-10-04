@@ -236,6 +236,9 @@ pub type ReorgCallback = Arc<dyn Fn(u32) + Send + Sync>;
 /// should re-insert these into the mempool so they can be re-mined.
 pub type OrphanedTxCallback = Arc<dyn Fn(Vec<Transaction>) + Send + Sync>;
 
+/// Number of block hashes a getblocks answer carries when more follow (C++ limit).
+const MAX_GETBLOCKS_INV: usize = 500;
+
 /// Block synchronization manager
 pub struct BlockSync {
     /// Chain state
@@ -634,6 +637,32 @@ impl BlockSync {
         }
 
         peer
+    }
+
+    /// Locator for a continuation getblocks after an inv that brought nothing new.
+    ///
+    /// Returns Some only when the inv was a full getblocks answer (MAX_GETBLOCKS_INV
+    /// hashes), nothing from it was queued or in flight, and we know its last block.
+    fn inv_continuation_locator(
+        &self,
+        block_count: usize,
+        queued: usize,
+        already_downloading: usize,
+        last_block_hash: Option<Hash256>,
+    ) -> Option<Vec<Hash256>> {
+        if block_count < MAX_GETBLOCKS_INV || queued > 0 || already_downloading > 0 {
+            return None;
+        }
+        let last = last_block_hash?;
+        if !self.chain.get_block_index(&last).is_ok_and(|o| o.is_some()) {
+            return None;
+        }
+        let genesis = self.chain.genesis_hash();
+        if last == genesis {
+            Some(vec![last])
+        } else {
+            Some(vec![last, genesis])
+        }
     }
 
     /// Build block locator hashes
@@ -1456,6 +1485,12 @@ impl BlockSync {
             );
         }
 
+        let last_block_hash = items
+            .iter()
+            .rev()
+            .find(|i| i.inv_type == InvType::Block)
+            .map(|i| i.hash);
+
         let mut queued = 0;
         let mut already_have = 0;
         let mut already_downloading = 0;
@@ -1555,6 +1590,28 @@ impl BlockSync {
                 "Inventory result: queued={}, already_have={}, already_downloading={}",
                 queued, already_have, already_downloading
             );
+        }
+
+        // C++ parity (main.cpp ProcessMessage "inv"): on a very long side chain the
+        // peer's getblocks answer can be 500 blocks we already have. Re-sending the
+        // tip locator would get the same 500 back forever (vps1 testnet stalled at
+        // 208,970 this way), so continue from the last block of this inv instead.
+        if let Some(locator) =
+            self.inv_continuation_locator(block_count, queued, already_downloading, last_block_hash)
+        {
+            info!(
+                "All {} inv blocks already known; continuing getblocks from {} (long side chain)",
+                block_count, locator[0]
+            );
+            let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
+            if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+                warn!(
+                    "Failed to send continuation getblocks to peer {}: {}",
+                    peer_id, e
+                );
+            } else {
+                *self.last_header_request.write() = Some(Instant::now());
+            }
         }
 
         if queued > 0 {
@@ -1855,6 +1912,41 @@ mod tests {
 
         let sync = BlockSync::new(chain, peer_manager);
         (sync, dir)
+    }
+
+    #[test]
+    fn test_inv_continuation_full_known_inv_continues_from_last() {
+        // vps1 testnet stall: a full 500-hash inv of blocks we already have must
+        // produce a continuation getblocks from the last hash, not nothing.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let sync = BlockSync::new(chain, PeerManager::new(Default::default()));
+        let g = sync.chain.genesis_hash();
+        assert!(!g.is_zero());
+        assert_eq!(
+            sync.inv_continuation_locator(500, 0, 0, Some(g)),
+            Some(vec![g])
+        );
+    }
+
+    #[test]
+    fn test_inv_continuation_not_sent_when_progress_or_short_inv() {
+        let (sync, _dir) = create_test_sync();
+        let g = sync.chain.genesis_hash();
+        assert_eq!(sync.inv_continuation_locator(499, 0, 0, Some(g)), None);
+        assert_eq!(sync.inv_continuation_locator(500, 1, 0, Some(g)), None);
+        assert_eq!(sync.inv_continuation_locator(500, 0, 3, Some(g)), None);
+        assert_eq!(sync.inv_continuation_locator(500, 0, 0, None), None);
+        let unknown = Hash256::from_bytes([7u8; 32]);
+        assert_eq!(
+            sync.inv_continuation_locator(500, 0, 0, Some(unknown)),
+            None
+        );
     }
 
     #[test]

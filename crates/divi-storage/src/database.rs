@@ -340,6 +340,58 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Store a block index entry WITHOUT touching the height -> hash mapping.
+    ///
+    /// The height mapping must only ever describe the active chain. Blocks that
+    /// are merely stored (side-chain / stale siblings) or that are being
+    /// disconnected must use this method; only connecting a block to the
+    /// active chain (`atomic_connect_block`) may write the height mapping.
+    pub fn store_block_index_entry(&self, index: &BlockIndex) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+        self.db
+            .put_cf(cf, block_index_key(&index.hash), index.to_bytes())?;
+        self.block_index_cache.insert(index.hash, index.clone());
+        Ok(())
+    }
+
+    /// Raw height -> hash lookup (no block index load).
+    pub fn get_height_mapping(&self, height: u32) -> Result<Option<Hash256>, StorageError> {
+        if let Some(hash) = self.height_to_hash_cache.get(&height) {
+            return Ok(Some(hash));
+        }
+        let cf = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+        match self.db.get_cf(cf, height_key(height))? {
+            Some(d) if d.len() == 32 => {
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&d);
+                Ok(Some(Hash256::from_bytes(b)))
+            }
+            Some(_) => Err(StorageError::Deserialization("invalid hash length".into())),
+            None => Ok(None),
+        }
+    }
+
+    /// Overwrite the height -> hash mapping for one height (repair use).
+    pub fn set_height_mapping(&self, height: u32, hash: &Hash256) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+        self.db.put_cf(cf, height_key(height), hash.as_bytes())?;
+        self.height_to_hash_cache.insert(height, *hash);
+        Ok(())
+    }
+
+    /// Read a raw metadata value.
+    pub fn get_metadata(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        Ok(self.db.get_cf(cf, key)?)
+    }
+
+    /// Write a raw metadata value.
+    pub fn put_metadata(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db.put_cf(cf, key, value)?;
+        Ok(())
+    }
+
     // ========== UTXO Set ==========
 
     /// Add a UTXO

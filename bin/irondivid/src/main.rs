@@ -123,6 +123,15 @@ struct Args {
     #[arg(long, default_value = "true")]
     txindex: bool,
 
+    /// Start the staker at boot (`--staking=false` = C++ `-staking=0`; RPC setstaking can still start it)
+    #[arg(long)]
+    staking: Option<bool>,
+
+    /// Stake even when the chain tip is older than 24h (restart a stalled network).
+    /// Off by default: staking on a stale tip mints a private fork.
+    #[arg(long)]
+    stakeonstaletip: bool,
+
     /// Enable spent index for gettxout RPC
     #[arg(long)]
     spentindex: bool,
@@ -315,6 +324,26 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     }
                 }
             }
+            "staking" => {
+                if let Some(b) = value.as_bool() {
+                    config.staking.enabled = b;
+                } else if let Some(i) = value.as_integer() {
+                    config.staking.enabled = i != 0;
+                } else {
+                    warn!("Invalid staking value in config file, expected boolean or integer");
+                }
+            }
+            "stakeonstaletip" => {
+                if let Some(b) = value.as_bool() {
+                    config.staking.stake_on_stale_tip = b;
+                } else if let Some(i) = value.as_integer() {
+                    config.staking.stake_on_stale_tip = i != 0;
+                } else {
+                    warn!(
+                        "Invalid stakeonstaletip value in config file, expected boolean or integer"
+                    );
+                }
+            }
             // Index settings
             "txindex" => {
                 if let Some(b) = value.as_bool() {
@@ -496,6 +525,12 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
         config.debug.log_rpc = true;
     }
 
+    if let Some(staking) = args.staking {
+        config.staking.enabled = staking;
+    }
+    if args.stakeonstaletip {
+        config.staking.stake_on_stale_tip = true;
+    }
     config.index.txindex = args.txindex;
     config.index.spentindex = args.spentindex;
     config.index.addressindex = args.addressindex;
@@ -1022,10 +1057,19 @@ async fn run_daemon(
 
         // Use regtest-friendly staking config
         let mut staking_config = StakingConfig::default();
+        staking_config.allow_stale_tip = config.staking.stake_on_stale_tip;
+        if staking_config.allow_stale_tip {
+            warn!(
+                "-stakeonstaletip set: staking is allowed on a tip older than {}s",
+                staking_config.max_tip_age_secs
+            );
+        }
         if config.network.network_type == NetworkType::Regtest {
             // Reduce minimum requirements for regtest
             staking_config.min_stake_amount = 1_000_000_000; // 10 DIVI (instead of 10,000)
             staking_config.min_coin_age = 60; // 1 minute (instead of 1 hour)
+                                              // Regtest chains start from an old genesis; never apply the stale-tip guard.
+            staking_config.allow_stale_tip = true;
         }
 
         let staker = Arc::new(Staker::new(
@@ -1086,9 +1130,15 @@ async fn run_daemon(
             info!("Staker block callback registered (for self-accepted blocks)");
         }
 
-        // Start the staking loop
-        info!("Starting staker...");
-        staker.clone().start().await;
+        // Start the staking loop unless disabled (-staking=0)
+        if config.staking.enabled {
+            info!("Starting staker...");
+            staker.clone().start().await;
+        } else {
+            warn!(
+                "Staking disabled at startup (staking=false); use RPC setstaking true to start it"
+            );
+        }
 
         Some(staker)
     } else {

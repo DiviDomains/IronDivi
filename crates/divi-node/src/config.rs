@@ -385,16 +385,21 @@ pub struct StakingConfig {
 
     /// Combine stake threshold
     pub combine_threshold: i64,
+
+    /// Allow staking on a tip older than 24h (`stakeonstaletip`). Default off.
+    #[serde(default)]
+    pub stake_on_stale_tip: bool,
 }
 
 impl Default for StakingConfig {
     fn default() -> Self {
         StakingConfig {
-            enabled: false,
+            enabled: true,       // C++ -staking defaults to 1
             min_stake_amount: 0, // No minimum - any UTXO can stake (matches C++ Divi)
             reserve_balance: 0,
             split_threshold: 10_000_000_000_000, // 100,000 DIVI
             combine_threshold: 100_000_000_000,  // 1,000 DIVI
+            stake_on_stale_tip: false,
         }
     }
 }

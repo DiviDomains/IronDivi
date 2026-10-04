@@ -92,6 +92,32 @@ pub struct StakingConfig {
     pub max_block_weight: usize,
     /// Staking loop interval (milliseconds)
     pub loop_interval_ms: u64,
+    /// Refuse to stake when the chain tip is older than this many seconds
+    /// (C++ Divi parity: IsInitialBlockDownload's nMaxTipAge = 24h).
+    pub max_tip_age_secs: u32,
+    /// Explicit operator override (`-stakeonstaletip`): stake even when the tip
+    /// is older than `max_tip_age_secs`, e.g. to restart a stalled network.
+    pub allow_stale_tip: bool,
+}
+
+/// Default maximum tip age for staking: 24 hours (C++ `nMaxTipAge`).
+pub const DEFAULT_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
+
+/// Returns true when staking must be refused because the chain tip is stale.
+///
+/// A node that stakes on a stale tip extends a private fork: anything it mints
+/// is orphaned as soon as it sees the real chain. So staking on a stale tip is
+/// only allowed when the operator explicitly asks for it.
+pub fn stale_tip_blocks_staking(
+    now: u32,
+    tip_time: u32,
+    max_tip_age_secs: u32,
+    allow_stale_tip: bool,
+) -> bool {
+    if allow_stale_tip {
+        return false;
+    }
+    now.saturating_sub(tip_time) > max_tip_age_secs
 }
 
 impl Default for StakingConfig {
@@ -103,6 +129,8 @@ impl Default for StakingConfig {
             max_block_size: 2_000_000,
             max_block_weight: 4_000_000,
             loop_interval_ms: 500, // Try every 500ms
+            max_tip_age_secs: DEFAULT_MAX_TIP_AGE_SECS,
+            allow_stale_tip: false,
         }
     }
 }
@@ -590,12 +618,33 @@ impl Staker {
         let next_height = current_height + 1;
 
         // Don't stake while actively syncing (IBD mode).
-        // But DO stake on stale chains — IronDivi may be the only node capable of
-        // breaking a network deadlock where all C++ nodes disabled staking because
-        // the chain tip is >24h old.
         if self.chain.is_ibd() {
             debug!("Skipping stake: still in IBD mode");
             return StakeResult::RateLimited;
+        }
+
+        // Don't stake on a stale tip unless the operator explicitly allows it
+        // (-stakeonstaletip). Commit 34d75a0 removed this guard to let IronDivi
+        // break a network-wide stall; doing that by default lets a node that has
+        // lost its peers mint a private fork (vps1 testnet stall at 208,970).
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            let (max_age, allow_stale) = {
+                let c = self.config.read();
+                (c.max_tip_age_secs, c.allow_stale_tip)
+            };
+            if stale_tip_blocks_staking(now, tip.time, max_age, allow_stale) {
+                debug!(
+                    "Skipping stake: tip {} is {}s old (> {}s); set -stakeonstaletip to override",
+                    current_height,
+                    now.saturating_sub(tip.time),
+                    max_age
+                );
+                return StakeResult::RateLimited;
+            }
         }
 
         // CRITICAL: Rate limiting check (matches C++ limitStakingSpeed)
@@ -1920,5 +1969,49 @@ mod tests {
 
         // More lenient: just check that higher weight gives same or better time
         // The calculation might hit minimum clamps or integer rounding
+    }
+
+    #[test]
+    fn test_stale_tip_guard_default_refuses_old_tip() {
+        let max = DEFAULT_MAX_TIP_AGE_SECS;
+        let now = 2_000_000_000u32;
+        assert!(!stale_tip_blocks_staking(now, now, max, false));
+        assert!(!stale_tip_blocks_staking(now, now - max, max, false));
+        assert!(stale_tip_blocks_staking(now, now - max - 1, max, false));
+        assert!(stale_tip_blocks_staking(
+            now,
+            now - 30 * 24 * 3600,
+            max,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_stale_tip_guard_override_allows_old_tip() {
+        let now = 2_000_000_000u32;
+        assert!(!stale_tip_blocks_staking(
+            now,
+            now - 30 * 24 * 3600,
+            DEFAULT_MAX_TIP_AGE_SECS,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_stale_tip_guard_future_tip_is_not_stale() {
+        let now = 2_000_000_000u32;
+        assert!(!stale_tip_blocks_staking(
+            now,
+            now + 600,
+            DEFAULT_MAX_TIP_AGE_SECS,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_staking_config_default_has_stale_tip_guard() {
+        let c = StakingConfig::default();
+        assert_eq!(c.max_tip_age_secs, 24 * 60 * 60);
+        assert!(!c.allow_stale_tip);
     }
 }

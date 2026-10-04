@@ -156,6 +156,22 @@ pub struct Chain {
     ibd_mode: RwLock<bool>,
 }
 
+/// Metadata marker: the one-time height index repair has run on this datadir.
+const HEIGHT_INDEX_REPAIR_KEY: &[u8] = b"height_index_repair_v1";
+
+/// Result of [`Chain::repair_height_index`].
+#[derive(Debug, Default, Clone)]
+pub struct HeightIndexAudit {
+    /// Active-chain heights checked (tip down to genesis).
+    pub checked: u64,
+    /// Heights whose mapping did not point at the active-chain block.
+    pub mismatched: u64,
+    /// Mappings found above the tip.
+    pub removed_above_tip: u64,
+    /// Up to 16 of the mismatched heights (tip-first).
+    pub first_mismatches: Vec<u32>,
+}
+
 impl Chain {
     /// Create a new chain with the given database and parameters
     pub fn new(db: Arc<ChainDatabase>, params: ChainParams) -> Result<Self, StorageError> {
@@ -176,6 +192,17 @@ impl Chain {
         // Initialize genesis block if chain is empty
         if chain.tip().is_none() {
             chain.init_genesis()?;
+            chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
+        } else if chain.db.get_metadata(HEIGHT_INDEX_REPAIR_KEY)?.is_none() {
+            // One-time repair of height -> hash entries written for side-chain
+            // blocks by earlier versions (see store_block_index_entry).
+            info!("Auditing height index against the active chain (one-time repair)...");
+            let audit = chain.repair_height_index(true)?;
+            info!(
+                "Height index repair: checked {} heights, fixed {} stale entries, removed {} above tip",
+                audit.checked, audit.mismatched, audit.removed_above_tip
+            );
+            chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         }
 
         Ok(chain)
@@ -453,6 +480,120 @@ impl Chain {
         info!("Genesis block initialized: {}", genesis_hash);
 
         Ok(())
+    }
+
+    /// Audit (and optionally repair) the height -> hash index against the active
+    /// chain, walking from the tip back to genesis via `prev_hash`. Entries that
+    /// point at a block not on the active chain are rewritten; entries above the
+    /// tip are removed.
+    pub fn repair_height_index(&self, fix: bool) -> Result<HeightIndexAudit, StorageError> {
+        let mut audit = HeightIndexAudit::default();
+        let tip = match self.tip() {
+            Some(t) => t,
+            None => return Ok(audit),
+        };
+        let mut above = tip.height.saturating_add(1);
+        while self.db.get_height_mapping(above)?.is_some() {
+            audit.removed_above_tip += 1;
+            if fix {
+                self.db.remove_height_mapping(above)?;
+            }
+            above = above.saturating_add(1);
+        }
+        let mut cur = tip;
+        loop {
+            audit.checked += 1;
+            if self.db.get_height_mapping(cur.height)? != Some(cur.hash) {
+                audit.mismatched += 1;
+                if audit.first_mismatches.len() < 16 {
+                    audit.first_mismatches.push(cur.height);
+                }
+                if fix {
+                    self.db.set_height_mapping(cur.height, &cur.hash)?;
+                }
+            }
+            if cur.height == 0 || cur.prev_hash.is_zero() {
+                break;
+            }
+            cur = self.db.get_block_index(&cur.prev_hash)?.ok_or_else(|| {
+                StorageError::ChainState(format!(
+                    "height index audit: missing ancestor {} of height {}",
+                    cur.prev_hash, cur.height
+                ))
+            })?;
+        }
+        Ok(audit)
+    }
+
+    /// Resolve the block that confirmed a PoS kernel output, on the chain that
+    /// ends at `parent`.
+    ///
+    /// C++ (BlockProofVerifier.cpp) resolves this via GetTransaction -> hashBlock,
+    /// never via a height lookup. We prefer the tx index (main-chain only, kept in
+    /// sync by connect/disconnect), then the height mapping, and in both cases
+    /// require the candidate to sit at the UTXO's height and to be an ancestor of
+    /// `parent`; otherwise we walk back from `parent`. Never silently falls
+    /// through to an unverified block.
+    fn resolve_kernel_block_index(
+        &self,
+        parent: &BlockIndex,
+        kernel_txid: &Hash256,
+        kernel_height: u32,
+    ) -> Result<BlockIndex, StorageError> {
+        if kernel_height > parent.height {
+            return Err(StorageError::InvalidBlock(format!(
+                "Kernel height {} above parent height {}",
+                kernel_height, parent.height
+            )));
+        }
+        // Fast path only applies when `parent` is the active-chain block at its
+        // height; a side-branch parent is resolved by walking its own ancestry.
+        let parent_on_active = self.db.get_height_mapping(parent.height)? == Some(parent.hash);
+        if parent_on_active {
+            let mut candidates: Vec<Hash256> = Vec::with_capacity(2);
+            if let Some(ref tx_index) = self.tx_index {
+                if let Some(loc) = tx_index.get_location(kernel_txid)? {
+                    candidates.push(loc.block_hash);
+                }
+            }
+            if let Some(h) = self.db.get_height_mapping(kernel_height)? {
+                if !candidates.contains(&h) {
+                    candidates.push(h);
+                }
+            }
+            for hash in candidates {
+                let idx = match self.db.get_block_index(&hash)? {
+                    Some(i) if i.height == kernel_height => i,
+                    _ => continue,
+                };
+                let contains = match self.db.get_block(&hash)? {
+                    Some(b) => b
+                        .transactions
+                        .iter()
+                        .any(|tx| self.compute_txid(tx) == *kernel_txid),
+                    None => false,
+                };
+                if contains {
+                    return Ok(idx);
+                }
+                warn!(
+                    "Kernel lookup: block {} at height {} does not contain kernel tx {}; ignoring",
+                    hash, kernel_height, kernel_txid
+                );
+            }
+        }
+        // Slow path: walk ancestors of `parent` down to the kernel height.
+        let mut cur = parent.clone();
+        while cur.height > kernel_height {
+            cur = self.db.get_block_index(&cur.prev_hash)?.ok_or_else(|| {
+                StorageError::InvalidBlock(format!(
+                    "Kernel lookup: missing ancestor {} at height {}",
+                    cur.prev_hash,
+                    cur.height.saturating_sub(1)
+                ))
+            })?;
+        }
+        Ok(cur)
     }
 
     /// Load the chain tip from the database
@@ -800,7 +941,12 @@ impl Chain {
         // 8. Store block and index
         debug!("  ├─ Storing block data and index");
         self.db.store_block(&hash, &block)?;
-        self.db.store_block_index(&index)?;
+        // Index entry only: the height -> hash mapping is written solely when the
+        // block is connected to the active chain (atomic_connect_block). Writing it
+        // here let a later-arriving stale sibling overwrite the main-chain entry,
+        // which then fed the wrong kernel block time into PoS validation
+        // (mainnet block 4,168,729 rejected).
+        self.db.store_block_index_entry(&index)?;
         debug!("  ├─ Storage: ✅ COMPLETE");
 
         // 8b. Track the best known block (highest chain work we've seen).
@@ -1286,7 +1432,7 @@ impl Chain {
 
         // Update block status
         index.status.remove(BlockStatus::ON_MAIN_CHAIN);
-        self.db.store_block_index(index)?;
+        self.db.store_block_index_entry(index)?;
 
         // Update height mapping to remove this block's height entry
         // (the previous block at this height is on a different fork)
@@ -1880,15 +2026,9 @@ impl Chain {
         // which would load the full block just to extract the height we already have.
         let kernel_height = kernel_utxo.height;
 
-        // Get the block index that confirmed the kernel UTXO
+        // Get the block that confirmed the kernel UTXO, on this block's chain.
         let kernel_block_index =
-            self.get_block_index_by_height(kernel_height)?
-                .ok_or_else(|| {
-                    StorageError::InvalidBlock(format!(
-                        "Kernel block index not found at height: {}",
-                        kernel_height
-                    ))
-                })?;
+            self.resolve_kernel_block_index(parent, &kernel_input.prevout.txid, kernel_height)?;
 
         // Build StakingData
         // Reference: Divi/divi/src/BlockProofVerifier.cpp:100-106
@@ -4389,5 +4529,240 @@ mod tests {
         block.transactions.push(coinbase);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
         block
+    }
+
+    // ===== Lane E: height index must describe the active chain only =====
+
+    /// A stale sibling stored after the main-chain block must not overwrite the
+    /// height -> hash mapping (it did: accept_block wrote it for every block).
+    #[test]
+    fn test_side_chain_block_does_not_overwrite_height_index() {
+        let dir = tempdir().unwrap();
+        let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+        let (hash_a1, hash_b1);
+        {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let chain = Chain::new(db, params.clone()).unwrap();
+            let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+            let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+            hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+            let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+            chain.accept_block(a2).unwrap();
+            // Less-work sibling of A1 arrives late (stale block).
+            let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+            hash_b1 = chain.accept_block(b1).unwrap().hash;
+            assert_ne!(hash_a1, hash_b1);
+            assert_eq!(chain.height(), 2);
+            assert_eq!(
+                chain.get_block_index_by_height(1).unwrap().unwrap().hash,
+                hash_a1,
+                "height 1 must still map to the active-chain block"
+            );
+        }
+        // And on disk, not just in the cache.
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(db, params).unwrap();
+        assert_eq!(
+            chain.get_block_index_by_height(1).unwrap().unwrap().hash,
+            hash_a1
+        );
+        assert!(chain.db.get_block_index(&hash_b1).unwrap().is_some());
+    }
+
+    /// repair_height_index restores entries a pre-fix build corrupted and
+    /// removes entries above the tip.
+    #[test]
+    fn test_repair_height_index() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        chain.accept_block(a2).unwrap();
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+
+        // Reproduce the pre-fix on-disk state.
+        chain.db.set_height_mapping(1, &hash_b1).unwrap();
+        chain.db.set_height_mapping(7, &hash_b1).unwrap();
+
+        let audit = chain.repair_height_index(false).unwrap();
+        assert_eq!(
+            (audit.checked, audit.mismatched, audit.removed_above_tip),
+            (3, 1, 0)
+        );
+        // The above-tip scan is contiguous from tip+1; use a contiguous stale entry.
+        chain.db.remove_height_mapping(7).unwrap();
+        chain.db.set_height_mapping(3, &hash_b1).unwrap();
+
+        let audit = chain.repair_height_index(true).unwrap();
+        assert_eq!(audit.mismatched, 1);
+        assert_eq!(audit.removed_above_tip, 1);
+        assert_eq!(audit.first_mismatches, vec![1]);
+        assert_eq!(
+            chain.get_block_index_by_height(1).unwrap().unwrap().hash,
+            hash_a1
+        );
+        assert!(chain.get_block_index_by_height(3).unwrap().is_none());
+        let again = chain.repair_height_index(false).unwrap();
+        assert_eq!((again.mismatched, again.removed_above_tip), (0, 0));
+    }
+
+    // Real mainnet data: block 4,168,729 (076f3c67...) stakes output
+    // 92e02051...:1, confirmed at height 4,160,835 in block 1c64797f... (time
+    // 1786214610). A stale sibling ccdc7a9a... (time 1786214609) at the same height
+    // overwrote the height mapping, so validation used the wrong kernel block time
+    // and computed fd1b5590... instead of 00000036..., rejecting a valid block.
+    const MAINNET_4168729: &str = "040000004ea7f13657e99799b3649308c9b1a2214bf2ccb93943ad8470dc3d042432ef43c73f3ae138df9a7a9bc1ba056ec10a5b434aaaf438f8880e884b3972480d1b9ee3957e6a6a2d011b0000000000000000000000000000000000000000000000000000000000000000000000000201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0603199c3f0101ffffffff0100000000000000000000000000010000000135853e268545cddeb842a7af7ad74442b2ca159a46b5509e6929d7555120e092010000006b47304402201a71abbc6df7ba09365e0862b00b9c44a471f944cd63cc99d06f0dfa9be241df0220791aa648269fb533aca74dea6daa3ca0670432b69ec7511977e4932714288e0b0121025e79347493205945da83b6c218efa9d95395f1ec0810fdd14b4ded443e779f6a00ffffffff020000000000000000000023779a8603000032631498aa0889294384a3b218e334b1e7a55078d7f66367b914d6bd2e3196f9b54d83a796b6b76594d12e3d4ad06878a988ac000000004120601fef16097a3ab0641c2d3da690338bcefacac6249d9b3bf3ab0c404b2c19e97fb5fe6d1ae15e66e9a5771a1473942c609cb7c2e6347edb00df62f90f4a8aac";
+    const MAINNET_4160835_MAIN: &str = "040000003292b2889c76e7ae503d95a71c3ef55dc0ede7c2c27279a0a048086fc9216b01c080161abea3834b5afb3ee5c6113877cadad5cf38c0b71e66d18f5b6a12121bd278776aed36011b0000000000000000000000000000000000000000000000000000000000000000000000000201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0603437d3f0101ffffffff010000000000000000000000000001000000017082a6a7a0356668eaa0bfcba3aa9c8db5e98dc81d9a31e273edb102db76d611010000006c483045022100da7a8989d2fadbd2a26096c0205834c1140aa09dc84b3a9911d990eb0bf2524c02204447c1532765905d51ee2b6ce0778d02e339e37b3350c4ae3df7173063b146d70121025e79347493205945da83b6c218efa9d95395f1ec0810fdd14b4ded443e779f6a00ffffffff02000000000000000000007127027b03000032631498aa0889294384a3b218e334b1e7a55078d7f66367b914d6bd2e3196f9b54d83a796b6b76594d12e3d4ad06878a988ac000000004120c0d370f911e085bfdf29511b8b79578a03af59aade1f2e43aed7929e27fb684126ecbc9139eb9f6a7578bca6fbab5ed66636268b72fab1be340a9bfc3338e077";
+    const MAINNET_4160835_STALE: &str = "040000003292b2889c76e7ae503d95a71c3ef55dc0ede7c2c27279a0a048086fc9216b01c5905e42d5cc405ce781020d2b8e5be3df69d98fdfc089ee35c9d3364414ccd3d178776aed36011b0000000000000000000000000000000000000000000000000000000000000000000000000201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0603437d3f0101ffffffff0100000000000000000000000000010000000139bd722ff63fe914bdfc39a30e7094fef771d1ac445971c9f55bfbd1a1300d83010000006b47304402205967762c6d7a245173007f7915af174640e88495842e7162801a6e41f913a9cb02201d509ff4f7a00b172e15acd819e50c467605b9e78a031e427708a473c7e61ecf012103cd9d8bd4a5aa2abf8bd68b9ee329df2b303b5fed0b829a8d527aed93f8f172d600ffffffff02000000000000000000d9e190da95010000326314f4cc232c04bef1a87d8780bd7055d7cba4a7891b67b91438a39738d282862753945a3d19487f1e0a01e36d6878a988ac00000000411f9f61d2dbbd547c1fb48c2b2082172fb7cec32d27d8d06a8a386baf55233fb93b7ba972370b3de67bacac16a890a2c13af52da3691b03b2094148ca1c25f4d9a9";
+    const KERNEL_HEIGHT: u32 = 4_160_835;
+    const PARENT_HEIGHT: u32 = 4_168_728;
+
+    /// Build the on-disk state a pre-fix node had when it rejected 4,168,729.
+    /// `with_ancestry` links parent -> ... -> kernel block with placeholder
+    /// index entries so the kernel can be resolved by walking ancestors.
+    fn mainnet_4168729_fixture(
+        with_tx_index: bool,
+        with_ancestry: bool,
+    ) -> (Chain, tempfile::TempDir, Block, BlockIndex) {
+        use divi_primitives::serialize::deserialize;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+        let mut chain = Chain::new(
+            db,
+            ChainParams::for_network(NetworkType::Mainnet, ChainMode::Divi),
+        )
+        .unwrap();
+        let block: Block = deserialize(&hex::decode(MAINNET_4168729).unwrap()).unwrap();
+        let kb: Block = deserialize(&hex::decode(MAINNET_4160835_MAIN).unwrap()).unwrap();
+        let ob: Block = deserialize(&hex::decode(MAINNET_4160835_STALE).unwrap()).unwrap();
+        let kb_hash = chain.compute_block_hash(&kb);
+        let ob_hash = chain.compute_block_hash(&ob);
+        assert_eq!(
+            kb_hash.to_string(),
+            "1c64797f9da5660f7719601dcf2039c0ddc67425a42b06347c578e8cfea5b86b"
+        );
+        assert_eq!(
+            ob_hash.to_string(),
+            "ccdc7a9a5c97a7586928932ded2d14c14b45b241ec6659f9de2ee8fc4490ebde"
+        );
+        let kernel = block.transactions[1].vin[0].prevout;
+        assert_eq!(chain.compute_txid(&kb.transactions[1]), kernel.txid);
+
+        let mut kb_idx = BlockIndex::from_header(&kb.header, KERNEL_HEIGHT, None);
+        kb_idx.hash = kb_hash;
+        kb_idx.is_proof_of_stake = true;
+        let mut ob_idx = BlockIndex::from_header(&ob.header, KERNEL_HEIGHT, None);
+        ob_idx.hash = ob_hash;
+        ob_idx.is_proof_of_stake = true;
+        chain.db.store_block(&kb_hash, &kb).unwrap();
+        chain.db.store_block(&ob_hash, &ob).unwrap();
+        // Main block connected first, stale sibling stored afterwards: exactly the
+        // order that let the pre-fix accept_block overwrite the height mapping.
+        chain.db.store_block_index(&kb_idx).unwrap();
+        chain.db.store_block_index(&ob_idx).unwrap();
+        assert_eq!(
+            chain.db.get_height_mapping(KERNEL_HEIGHT).unwrap(),
+            Some(ob_hash)
+        );
+
+        // Parent 43ef3224... (4,168,728): generated stake modifier 0x8f778a3b1e0f81d4.
+        let mut parent = BlockIndex::from_header(&block.header, PARENT_HEIGHT, None);
+        parent.hash = block.header.prev_block;
+        parent.time = 1_786_680_822;
+        parent.bits = 0x1b01363e;
+        parent.stake_modifier = 0x8f77_8a3b_1e0f_81d4;
+        parent.generated_stake_modifier = true;
+        parent.is_proof_of_stake = true;
+        parent.prev_hash = Hash256::from_bytes([0xee; 32]);
+        if with_ancestry {
+            // Placeholder index entries for 4,160,836..=4,168,727.
+            let mut prev = kb_hash;
+            for h in (KERNEL_HEIGHT + 1)..PARENT_HEIGHT {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&h.to_le_bytes());
+                bytes[31] = 0xab;
+                let mut idx = parent.clone();
+                idx.hash = Hash256::from_bytes(bytes);
+                idx.prev_hash = prev;
+                idx.height = h;
+                idx.generated_stake_modifier = false;
+                chain.db.store_block_index_entry(&idx).unwrap();
+                prev = idx.hash;
+            }
+            parent.prev_hash = prev;
+        }
+        chain.db.store_block_index(&parent).unwrap();
+
+        chain
+            .db
+            .add_utxo(
+                &kernel,
+                &Utxo {
+                    value: Amount::from_sat(3_826_852_000_000),
+                    script_pubkey: Script::from_bytes(
+                        hex::decode("631498aa0889294384a3b218e334b1e7a55078d7f66367b914d6bd2e3196f9b54d83a796b6b76594d12e3d4ad06878a988ac").unwrap(),
+                    ),
+                    height: KERNEL_HEIGHT,
+                    is_coinbase: false,
+                    is_coinstake: true,
+                },
+            )
+            .unwrap();
+
+        if with_tx_index {
+            let tx_index = Arc::new(TxIndex::open(dir.path().join("txindex")).unwrap());
+            tx_index
+                .put_location(&kernel.txid, &TxLocation::new(kb_hash, 1))
+                .unwrap();
+            chain.enable_tx_index(tx_index);
+        }
+        (chain, dir, block, parent)
+    }
+
+    #[test]
+    fn test_pos_mainnet_4168729_kernel_resolved_via_tx_index() {
+        let (chain, _dir, block, parent) = mainnet_4168729_fixture(true, false);
+        chain
+            .validate_proof_of_stake(&block, &parent)
+            .expect("mainnet block 4,168,729 is valid and must pass PoS validation");
+    }
+
+    #[test]
+    fn test_pos_mainnet_4168729_kernel_resolved_without_tx_index() {
+        let (chain, _dir, block, parent) = mainnet_4168729_fixture(false, true);
+        chain
+            .validate_proof_of_stake(&block, &parent)
+            .expect("mainnet block 4,168,729 is valid and must pass PoS validation");
+    }
+
+    /// Control: with the stale sibling's time the kernel genuinely misses, so the
+    /// tests above can only pass if the right kernel block was used.
+    #[test]
+    fn test_pos_mainnet_4168729_stale_kernel_time_fails() {
+        let (_chain, _dir, block, parent) = mainnet_4168729_fixture(false, false);
+        let kernel = block.transactions[1].vin[0].prevout;
+        let mk = |time: u32| crate::pos_validation::StakingData {
+            n_bits: block.header.bits,
+            block_time_of_first_confirmation: time,
+            block_hash_of_first_confirmation: Hash256::zero(),
+            utxo_being_staked: kernel,
+            utxo_value: Amount::from_sat(3_826_852_000_000),
+            block_hash_of_chain_tip: parent.hash,
+        };
+        let run = |t| {
+            crate::pos_validation::compute_and_verify_proof_of_stake(
+                parent.stake_modifier,
+                &mk(t),
+                block.header.time,
+            )
+            .unwrap()
+        };
+        assert!(
+            run(1_786_214_610).1,
+            "main kernel block time must hit target"
+        );
+        assert!(!run(1_786_214_609).1, "stale sibling time must miss target");
     }
 }

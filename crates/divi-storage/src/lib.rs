@@ -41,7 +41,7 @@ pub mod utxo_cache;
 
 pub use address_index::{AddressHistoryEntry, AddressIndex, AddressUtxo, TxIndexEntry};
 pub use block_index::{BlockIndex, BlockStatus};
-pub use chain::{AcceptBlockResult, Chain, ChainParams, NetworkType};
+pub use chain::{AcceptBlockResult, Chain, ChainParams, HeightIndexAudit, NetworkType};
 pub use database::{ChainDatabase, UtxoStats};
 pub use difficulty::{get_next_work_required, DifficultyParams};
 pub use error::StorageError;
