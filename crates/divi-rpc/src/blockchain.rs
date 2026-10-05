@@ -198,8 +198,8 @@ impl BlockchainRpc {
                 },
             });
 
-            // Add nextblockhash if not tip
-            if let Some(tip) = self.chain.tip() {
+            // Add nextblockhash if on the active chain and not the tip
+            if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
                 if index.height < tip.height {
                     if let Ok(Some(next)) = self.chain.get_block_index_by_height(index.height + 1) {
                         result["nextblockhash"] = json!(next.hash.to_string());
@@ -255,8 +255,8 @@ impl BlockchainRpc {
                 },
             });
 
-            // Add nextblockhash if not tip
-            if let Some(tip) = self.chain.tip() {
+            // Add nextblockhash if on the active chain and not the tip
+            if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
                 if index.height < tip.height {
                     if let Ok(Some(next)) = self.chain.get_block_index_by_height(index.height + 1) {
                         result["nextblockhash"] = json!(next.hash.to_string());
@@ -389,7 +389,12 @@ impl BlockchainRpc {
 
     // Helper methods
 
+    /// Confirmations as C++ Divi reports them: -1 for a block that is not on
+    /// the active chain (a stored side-chain block), else tip - height + 1.
     fn get_confirmations(&self, index: &divi_storage::BlockIndex) -> i64 {
+        if !index.is_on_main_chain() {
+            return -1;
+        }
         match self.chain.tip() {
             Some(tip) => (tip.height as i64) - (index.height as i64) + 1,
             None => 0,
@@ -896,5 +901,99 @@ mod tests {
     fn test_parse_hash_invalid() {
         assert!(parse_hash("not_hex").is_err());
         assert!(parse_hash("0000").is_err()); // Too short
+    }
+
+    /// `len` regtest PoW blocks on genesis (heights <= 100 are PoW on regtest).
+    fn pow_chain(
+        chain: &Chain,
+        len: u32,
+        seed: u8,
+        time_offset: u32,
+    ) -> Vec<divi_primitives::block::Block> {
+        use divi_primitives::amount::Amount;
+        use divi_primitives::block::Block;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{Transaction, TxIn, TxOut};
+        let genesis = chain.tip().unwrap();
+        let (mut prev, mut t) = (genesis.hash, genesis.time + time_offset);
+        let mut out = Vec::new();
+        for h in 1..=len {
+            t += 60;
+            let mut tag = vec![0x05];
+            tag.extend_from_slice(&h.to_le_bytes());
+            tag.push(seed);
+            let mut block = Block::default();
+            block.header.version = 1;
+            block.header.prev_block = prev;
+            block.header.time = t;
+            block.header.bits = 0x207fffff;
+            block.transactions.push(Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
+                vout: vec![TxOut::new(
+                    Amount::from_sat(1250_00000000),
+                    Script::default(),
+                )],
+                lock_time: 0,
+            });
+            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            prev = divi_crypto::compute_block_hash(&block.header);
+            out.push(block);
+        }
+        out
+    }
+
+    fn header_of(rpc: &BlockchainRpc, hash: Hash256) -> Value {
+        rpc.get_block_header(&Params::Array(vec![json!(hash.to_string())]))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_getblockheader_confirmations_minus_one_off_main_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(divi_storage::ChainDatabase::open(dir.path()).unwrap());
+        let params = divi_storage::ChainParams::for_network(
+            NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let a = pow_chain(&chain, 3, 0xA1, 0);
+        let b = pow_chain(&chain, 4, 0xB2, 1);
+        let hash =
+            |blk: &divi_primitives::block::Block| divi_crypto::compute_block_hash(&blk.header);
+        for blk in a.iter().chain(b[..2].iter()) {
+            chain.accept_block(blk.clone()).unwrap();
+        }
+        let rpc = BlockchainRpc::new(chain.clone());
+        assert_eq!(chain.height(), 3);
+
+        // Active chain A: tip has 1 confirmation, A1 has 3.
+        assert_eq!(header_of(&rpc, hash(&a[2]))["confirmations"], json!(1));
+        assert_eq!(header_of(&rpc, hash(&a[0]))["confirmations"], json!(3));
+        assert_eq!(
+            header_of(&rpc, hash(&a[0]))["nextblockhash"],
+            json!(hash(&a[1]).to_string())
+        );
+        // Side chain B (stored, not active): -1, and no nextblockhash.
+        let b1 = header_of(&rpc, hash(&b[0]));
+        assert_eq!(b1["confirmations"], json!(-1));
+        assert!(
+            b1.get("nextblockhash").is_none(),
+            "side-chain block got {}",
+            b1
+        );
+        assert_eq!(header_of(&rpc, hash(&b[1]))["confirmations"], json!(-1));
+        assert_eq!(
+            rpc.get_block(&Params::Array(vec![json!(hash(&b[0]).to_string())]))
+                .unwrap()["confirmations"],
+            json!(-1)
+        );
+
+        // B out-works A: the roles flip.
+        chain.accept_block(b[2].clone()).unwrap();
+        chain.accept_block(b[3].clone()).unwrap();
+        assert_eq!(chain.height(), 4);
+        assert_eq!(header_of(&rpc, hash(&b[0]))["confirmations"], json!(4));
+        assert_eq!(header_of(&rpc, hash(&a[0]))["confirmations"], json!(-1));
     }
 }

@@ -3140,42 +3140,42 @@ impl Chain {
     /// Returns true if a reorg was triggered, false if block was already on main chain
     pub fn try_activate_block(&self, hash: &Hash256) -> Result<bool, StorageError> {
         // Acquire exclusive lock for chain state modifications
-        info!("try_activate_block: Waiting for chain lock...");
+        debug!("try_activate_block: Waiting for chain lock...");
         let _chain_guard = self.chain_lock.lock();
-        info!("try_activate_block: Chain lock acquired");
+        debug!("try_activate_block: Chain lock acquired");
 
         // Get the block index
         let existing_index = match self.db.get_block_index(hash)? {
             Some(idx) => idx,
             None => {
-                info!("try_activate_block: Block {} not found in index", hash);
+                debug!("try_activate_block: Block {} not found in index", hash);
                 return Ok(false); // Block not found
             }
         };
 
         // Already on main chain, nothing to do
         if existing_index.status.contains(BlockStatus::ON_MAIN_CHAIN) {
-            info!("try_activate_block: Block {} already on main chain", hash);
+            debug!("try_activate_block: Block {} already on main chain", hash);
             return Ok(false);
         }
 
         // Check if this block has more work than our tip
         let tip = self.tip.read().clone();
         let Some(ref current_tip) = tip else {
-            info!(
+            debug!(
                 "try_activate_block: No tip yet, cannot activate block {}",
                 hash
             );
             return Ok(false); // No tip yet
         };
 
-        info!(
+        debug!(
             "try_activate_block: Checking if block {} (height {}) should activate. Current tip: {} (height {})",
             hash, existing_index.height, current_tip.hash, current_tip.height
         );
 
         if !self.should_update_tip(&existing_index)? {
-            info!(
+            debug!(
                 "try_activate_block: Block {} should NOT update tip (insufficient work or doesn't extend)",
                 hash
             );
@@ -3194,7 +3194,7 @@ impl Chain {
             }
         };
 
-        info!(
+        debug!(
             "Activating stored block {} at height {} (current tip: {} at height {})",
             hash, existing_index.height, current_tip.hash, current_tip.height
         );

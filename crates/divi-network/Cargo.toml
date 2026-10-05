@@ -22,6 +22,8 @@ futures = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+divi-consensus = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = "0.4"
+tracing-subscriber = { workspace = true }

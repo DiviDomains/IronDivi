@@ -373,7 +373,14 @@ impl PeerManager {
 
     /// Discover peers from DNS seeds
     async fn discover_peers(self: Arc<Self>) {
-        info!("Discovering peers from DNS seeds");
+        if self.config.dns_seeds.is_empty() {
+            debug!("No DNS seeds configured; skipping DNS peer discovery");
+            return;
+        }
+        info!(
+            "Discovering peers from DNS seeds ({} configured)",
+            self.config.dns_seeds.len()
+        );
 
         for seed in &self.config.dns_seeds {
             debug!("Resolving DNS seed: {}", seed);
@@ -550,6 +557,12 @@ impl PeerManager {
         });
 
         Ok(peer_id)
+    }
+
+    /// Register a peer handle directly (tests capture its outbound messages).
+    #[cfg(test)]
+    pub(crate) fn insert_test_peer(&self, handle: PeerHandle) {
+        self.peers.write().insert(handle.id, handle);
     }
 
     /// Send a message to a specific peer
@@ -883,7 +896,7 @@ impl PeerManager {
             }
 
             // 3. Re-query DNS seeds as last resort
-            if self.can_connect_outbound() {
+            if self.can_connect_outbound() && !self.config.dns_seeds.is_empty() {
                 info!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;
             }
@@ -950,6 +963,50 @@ mod tests {
     fn test_testnet_config() {
         let pm = testnet_peer_manager(None);
         assert_eq!(pm.config.magic, crate::TESTNET_MAGIC);
+    }
+
+    /// Log sink for `tracing` output in one test.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_dns_discovery_log_when_seed_list_empty() {
+        let buf = LogBuf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        // current-thread runtime: the default subscriber covers the awaited call
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let pm = regtest_peer_manager(None);
+        assert!(pm.config.dns_seeds.is_empty());
+        Arc::clone(&pm).discover_peers().await;
+        tracing::info!("log capture marker");
+
+        let logs = String::from_utf8(buf.0.lock().clone()).unwrap();
+        assert!(
+            logs.contains("log capture marker"),
+            "capture not working: {:?}",
+            logs
+        );
+        assert!(
+            !logs.contains("Discovering peers from DNS seeds"),
+            "empty seed list still logged discovery: {:?}",
+            logs
+        );
     }
 
     #[test]

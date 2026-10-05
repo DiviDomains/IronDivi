@@ -279,8 +279,15 @@ pub struct BlockSync {
     /// be re-added to the mempool
     orphaned_tx_callback: RwLock<Option<OrphanedTxCallback>>,
     /// Counter for stall detection - increments each timeout cycle at same height
-    /// Format: (height_at_last_check, consecutive_stall_count)
-    stall_counter: RwLock<(u32, u32)>,
+    /// Format: ((main_height, side_chain_tip_height) at last check, consecutive_stall_count).
+    /// A growing side chain counts as progress: while a deep fork is fetched the
+    /// main-chain height stays put for many rounds.
+    stall_counter: RwLock<((u32, u32), u32)>,
+    /// Highest fully stored block we know of that is NOT on the main chain
+    /// (hash, height). A fork deeper than one getblocks batch (500 hashes) is
+    /// fetched across several rounds; this lets each round resume from where
+    /// the side chain ends instead of from the fork point.
+    side_chain_tip: RwLock<Option<(Hash256, u32)>>,
 }
 
 /// Sync statistics
@@ -316,7 +323,8 @@ impl BlockSync {
             block_connected_callback: RwLock::new(None),
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
-            stall_counter: RwLock::new((0, 0)),
+            stall_counter: RwLock::new(((0, 0), 0)),
+            side_chain_tip: RwLock::new(None),
         })
     }
 
@@ -665,9 +673,66 @@ impl BlockSync {
         }
     }
 
+    /// `Some(height)` when `hash` is fully stored but not on the main chain.
+    fn stored_side_chain_height(&self, hash: &Hash256) -> Option<u32> {
+        let index = self.chain.get_block_index(hash).ok()??;
+        if index.is_on_main_chain() || !self.chain.has_full_block(hash).unwrap_or(false) {
+            return None;
+        }
+        Some(index.height)
+    }
+
+    /// Remember `hash` as the side-chain tip if it is a stored side-chain block
+    /// higher than the current hint (or the current hint is no longer valid).
+    fn note_side_chain_block(&self, hash: Hash256) {
+        let Some(height) = self.stored_side_chain_height(&hash) else {
+            return;
+        };
+        let current = *self.side_chain_tip.read();
+        let replace = match current {
+            None => true,
+            Some((cur_hash, cur_height)) => {
+                height > cur_height || self.stored_side_chain_height(&cur_hash).is_none()
+            }
+        };
+        if replace {
+            *self.side_chain_tip.write() = Some((hash, height));
+        }
+    }
+
+    /// The side-chain tip hint, if it is still a stored block off the main chain.
+    /// Cleared once a reorg puts it on the main chain.
+    fn valid_side_chain_tip(&self) -> Option<(Hash256, u32)> {
+        let (hash, height) = (*self.side_chain_tip.read())?;
+        if self.stored_side_chain_height(&hash).is_some() {
+            Some((hash, height))
+        } else {
+            *self.side_chain_tip.write() = None;
+            None
+        }
+    }
+
     /// Build block locator hashes
+    ///
+    /// Normally walks back from the main-chain tip. When we hold a stored side
+    /// chain (a competing fork we are still downloading), its tip goes first:
+    /// a peer on that fork then answers from where our copy ends, so a fork
+    /// deeper than one 500-hash batch keeps growing round after round until it
+    /// out-works our tip and `accept_block` reorgs onto it. A peer that does
+    /// not know the hint skips it and matches on the main-chain entries.
+    ///
+    /// There is no max-reorg-depth rule in this codebase (nor in C++ Divi's
+    /// getblocks sync); the only fork-choice limit is the hard-coded
+    /// checkpoint table in `Chain::get_checkpoint_hash`.
     fn build_block_locator(&self) -> Vec<Hash256> {
         let mut locator = Vec::new();
+        if let Some((side_hash, side_height)) = self.valid_side_chain_tip() {
+            debug!(
+                "Block locator starts at stored side-chain block {} (height {}) to continue a competing fork",
+                side_hash, side_height
+            );
+            locator.push(side_hash);
+        }
         let tip = self.chain.tip();
 
         if let Some(tip_index) = tip {
@@ -903,6 +968,9 @@ impl BlockSync {
 
         // Try to connect blocks
         self.try_connect_blocks().await;
+
+        // A block stored on a competing fork becomes the side-chain locator hint.
+        self.note_side_chain_block(hash);
 
         // Relay block inv to other peers if the chain advanced (block was accepted).
         // Only relay during normal operation (not during initial bulk sync) to avoid
@@ -1228,9 +1296,13 @@ impl BlockSync {
         }
 
         // Stall detection: if height hasn't changed across timeout cycles, rotate peer
+        let progress = (
+            our_height,
+            self.valid_side_chain_tip().map_or(0, |(_, h)| h),
+        );
         let is_stalled = {
             let mut stall = self.stall_counter.write();
-            if stall.0 == our_height && state != SyncState::Synced && state != SyncState::Idle {
+            if stall.0 == progress && state != SyncState::Synced && state != SyncState::Idle {
                 stall.1 += 1;
                 if stall.1 >= 3 {
                     warn!(
@@ -1243,7 +1315,7 @@ impl BlockSync {
                     false
                 }
             } else {
-                stall.0 = our_height;
+                stall.0 = progress;
                 stall.1 = 0;
                 false
             }
@@ -1493,6 +1565,7 @@ impl BlockSync {
 
         let mut queued = 0;
         let mut already_have = 0;
+        let mut known_side_chain = 0usize;
         let mut already_downloading = 0;
         let mut reorg_triggered = false;
         let mut first_hash_checked = false;
@@ -1547,15 +1620,22 @@ impl BlockSync {
                                     continue;
                                 }
                                 Ok(false) => {
-                                    // Can't activate - parent missing or less work
-                                    // Download it again from the network
-                                    debug!(
-                                        "Block {} exists but can't activate, will redownload",
-                                        hash
-                                    );
+                                    // Stored on a side chain with less work than our
+                                    // tip. We already hold it: count it as known. Re-
+                                    // queueing it was the deep-fork loop: the queue
+                                    // drops blocks we have, and queued > 0 blocked the
+                                    // continuation getblocks, so every round restarted
+                                    // at the fork point and the fork never grew.
+                                    already_have += 1;
+                                    known_side_chain += 1;
+                                    self.note_side_chain_block(hash);
+                                    continue;
                                 }
                                 Err(e) => {
                                     warn!("Error trying to activate block {}: {}", hash, e);
+                                    already_have += 1;
+                                    known_side_chain += 1;
+                                    continue;
                                 }
                             }
                         }
@@ -1589,6 +1669,16 @@ impl BlockSync {
             info!(
                 "Inventory result: queued={}, already_have={}, already_downloading={}",
                 queued, already_have, already_downloading
+            );
+        }
+        if known_side_chain > 0 {
+            let side = *self.side_chain_tip.read();
+            info!(
+                "{} inv blocks are already stored on a side chain (side-chain tip {:?}, main tip height {}); \
+                 waiting for that fork to out-work the tip",
+                known_side_chain,
+                side.map(|(_, h)| h),
+                self.chain.height()
             );
         }
 
@@ -2413,5 +2503,285 @@ mod tests {
             matches!(result, Err(HeaderValidationError::InvalidBits(_))),
             "Should reject invalid bits for PoW block"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Deep side-chain reorg across getblocks batches (vps1 testnet, fork
+    // at 97,550). The peer's chain is heavier but the fork is longer than
+    // one 500-hash inv, and we already hold the first 500 side-chain
+    // blocks from an earlier round.
+    // ------------------------------------------------------------------
+
+    fn regtest_params() -> ChainParams {
+        ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        )
+    }
+
+    /// Build `len` consensus-valid regtest blocks on top of genesis.
+    ///
+    /// Heights 1..=100 are PoW; above that each block is PoS, built the way
+    /// `divi-node`'s staker builds one (coinbase marker, coinstake re-staking
+    /// the previous stake output, lottery and treasury payees, recoverable
+    /// block signature). The chain is built in its own scratch `Chain`, where
+    /// it is the main chain, so lottery winners come from the real chain code.
+    /// Stake-kernel checks are skipped in IBD mode, which a fresh `Chain` is in.
+    fn build_regtest_chain(len: u32, seed: u8, time_offset: u32) -> Vec<Block> {
+        use divi_consensus::{block_subsidy, lottery, treasury};
+        use divi_primitives::amount::Amount;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(db, regtest_params()).unwrap();
+
+        let key = divi_crypto::SecretKey::from_bytes(&[seed; 32]).unwrap();
+        let pay = Script::new_p2pkh(key.public_key().pubkey_hash().as_bytes());
+        let genesis = chain.tip().unwrap();
+        let (mut prev, mut t) = (genesis.hash, genesis.time + time_offset);
+        let mut stake: Option<(OutPoint, Amount)> = None;
+        let mut blocks = Vec::with_capacity(len as usize);
+
+        for h in 1..=len {
+            t += 60;
+            // Height + seed keep every coinbase txid unique across both chains.
+            let mut tag = vec![0x05];
+            tag.extend_from_slice(&h.to_le_bytes());
+            tag.push(seed);
+
+            let mut block = Block::default();
+            block.header.prev_block = prev;
+            block.header.time = t;
+            block.header.bits = 0x207fffff; // regtest never retargets
+
+            if h <= 100 {
+                block.header.version = 1;
+                let coinbase = Transaction {
+                    version: 1,
+                    vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
+                    vout: vec![TxOut::new(Amount::from_sat(1250_00000000), pay.clone())],
+                    lock_time: 0,
+                };
+                if h == 100 {
+                    stake = Some((OutPoint::new(coinbase.txid(), 0), coinbase.vout[0].value));
+                }
+                block.transactions.push(coinbase);
+            } else {
+                block.header.version = 4;
+                let parent = chain.get_block_index(&prev).unwrap().unwrap();
+                let (prevout, value) = stake.take().unwrap();
+                let rewards = block_subsidy::get_block_subsidy(h, 100);
+                let mut vout = vec![
+                    TxOut::new(Amount::ZERO, Script::default()),
+                    TxOut::new(value + rewards.stake + rewards.masternode, pay.clone()),
+                ];
+                let is_treasury = treasury::is_treasury_block_with_lottery(
+                    h,
+                    treasury::regtest::TREASURY_START_BLOCK,
+                    treasury::regtest::TREASURY_CYCLE,
+                    treasury::regtest::LOTTERY_CYCLE,
+                );
+                let is_lottery = lottery::is_lottery_block(
+                    h,
+                    lottery::regtest::LOTTERY_START_BLOCK,
+                    lottery::regtest::LOTTERY_CYCLE,
+                );
+                // Lottery payees are always enforced. Before the treasury/lottery
+                // transition both can fall on one height; the mint cap then allows
+                // only the treasury amount, and regtest does not enforce treasury
+                // payees, so such a block pays the lottery alone.
+                if is_lottery {
+                    for (script, amount) in lottery::calculate_lottery_payments(
+                        &parent.lottery_winners,
+                        Amount::from_sat(50_00000000),
+                        lottery::regtest::LOTTERY_CYCLE,
+                    ) {
+                        vout.push(TxOut::new(amount, script));
+                    }
+                }
+                if is_treasury && !is_lottery {
+                    let cycle = treasury::get_treasury_payment_cycle(
+                        h,
+                        treasury::regtest::TREASURY_CYCLE,
+                        treasury::regtest::LOTTERY_CYCLE,
+                    );
+                    let (t_amt, c_amt) =
+                        block_subsidy::calculate_weighted_treasury_payment(h, cycle, 100);
+                    vout.push(TxOut::new(t_amt, treasury::get_treasury_script(false)));
+                    vout.push(TxOut::new(c_amt, treasury::get_charity_script(false)));
+                }
+                let coinstake = Transaction {
+                    version: 1,
+                    vin: vec![TxIn {
+                        prevout,
+                        script_sig: Script::default(),
+                        sequence: 0xffffffff,
+                    }],
+                    vout,
+                    lock_time: 0,
+                };
+                stake = Some((OutPoint::new(coinstake.txid(), 1), coinstake.vout[1].value));
+                let marker = Transaction {
+                    version: 2,
+                    vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
+                    vout: vec![TxOut::new(Amount::ZERO, Script::default())],
+                    lock_time: 0,
+                };
+                block.transactions.push(marker);
+                block.transactions.push(coinstake);
+            }
+
+            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            if block.is_proof_of_stake() {
+                let hash = compute_block_hash(&block.header);
+                block.block_sig = divi_crypto::sign_hash_recoverable(&key, hash.as_bytes())
+                    .unwrap()
+                    .to_compact_with_recovery()
+                    .to_vec();
+            }
+            prev = chain
+                .accept_block(block.clone())
+                .unwrap_or_else(|e| panic!("scratch chain rejected height {}: {}", h, e))
+                .hash;
+            assert_eq!(chain.height(), h);
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    #[tokio::test]
+    async fn test_deep_side_chain_reorg_across_inv_batches() {
+        use crate::peer::PeerHandle;
+
+        const MAIN_LEN: u32 = 600; // our active chain A
+        const SIDE_LEN: usize = 700; // peer's heavier chain B, forked at genesis
+        const ALREADY_STORED: usize = 500; // B1..B500 stored as a side chain
+
+        let a_blocks = build_regtest_chain(MAIN_LEN, 0xA1, 0);
+        let b_blocks = build_regtest_chain(SIDE_LEN as u32, 0xB2, 1);
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let pm = PeerManager::new(Default::default());
+        let sync = BlockSync::new(chain.clone(), pm.clone());
+
+        let peer_id: PeerId = 7;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8192);
+        pm.insert_test_peer(PeerHandle {
+            id: peer_id,
+            addr: "127.0.0.1:1".parse().unwrap(),
+            tx,
+            inbound: false,
+        });
+
+        let g = chain.genesis_hash();
+        for b in &a_blocks {
+            chain.accept_block(b.clone()).unwrap();
+        }
+        let a_tip = compute_block_hash(&a_blocks.last().unwrap().header);
+        assert_eq!(chain.height(), MAIN_LEN);
+
+        let b_hashes: Vec<Hash256> = b_blocks
+            .iter()
+            .map(|b| compute_block_hash(&b.header))
+            .collect();
+        let by_hash: HashMap<Hash256, Block> = b_hashes
+            .iter()
+            .copied()
+            .zip(b_blocks.iter().cloned())
+            .collect();
+
+        // An earlier round already stored B1..B500 as a side chain.
+        for b in &b_blocks[..ALREADY_STORED] {
+            chain.accept_block(b.clone()).unwrap();
+        }
+        assert_eq!(
+            chain.tip().unwrap().hash,
+            a_tip,
+            "B500 has less work than A600"
+        );
+        assert!(!chain
+            .get_block_index(&b_hashes[ALREADY_STORED - 1])
+            .unwrap()
+            .unwrap()
+            .is_on_main_chain());
+
+        let inv = |hs: &[Hash256]| -> Vec<InvItem> {
+            hs.iter()
+                .map(|h| InvItem::new(InvType::Block, *h))
+                .collect()
+        };
+
+        // The C++ peer answers our main-chain locator from the fork point
+        // (genesis): the first 500 B hashes, all of which we already hold.
+        sync.handle_inv(peer_id, inv(&b_hashes[..ALREADY_STORED]))
+            .await;
+        assert!(
+            sync.pending_block_requests.read().is_empty(),
+            "stored side-chain blocks must count as known, not be re-queued"
+        );
+
+        // Simulated C++ peer: getblocks -> next <=500 hashes after the first
+        // locator hash it knows; getdata -> the blocks.
+        let mut getblocks_starts = Vec::new();
+        for _ in 0..200 {
+            let mut msgs = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                msgs.push(m);
+            }
+            if msgs.is_empty() {
+                break;
+            }
+            for m in msgs {
+                match m {
+                    NetworkMessage::GetBlocks(gb) => {
+                        let start = gb
+                            .locator_hashes
+                            .iter()
+                            .find_map(|h| {
+                                if *h == g {
+                                    Some(0)
+                                } else {
+                                    b_hashes.iter().position(|x| x == h).map(|p| p + 1)
+                                }
+                            })
+                            .unwrap_or(0);
+                        getblocks_starts.push(start);
+                        let end = (start + 500).min(b_hashes.len());
+                        if start < end {
+                            sync.handle_inv(peer_id, inv(&b_hashes[start..end])).await;
+                        }
+                    }
+                    NetworkMessage::GetData(items) => {
+                        for it in items {
+                            if let Some(b) = by_hash.get(&it.hash) {
+                                sync.handle_block(peer_id, b.clone()).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(
+            getblocks_starts.contains(&ALREADY_STORED),
+            "expected a getblocks continuing past B500, got starts {:?}",
+            getblocks_starts
+        );
+        let tip = chain.tip().unwrap();
+        assert_eq!(
+            tip.height as usize, SIDE_LEN,
+            "node must reorg onto the heavier chain"
+        );
+        assert_eq!(tip.hash, b_hashes[SIDE_LEN - 1]);
+        assert!(!chain
+            .get_block_index(&a_tip)
+            .unwrap()
+            .unwrap()
+            .is_on_main_chain());
     }
 }

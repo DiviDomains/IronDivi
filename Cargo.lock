@@ -803,6 +803,7 @@ version = "0.2.2"
 dependencies = [
  "byteorder",
  "bytes",
+ "divi-consensus",
  "divi-crypto",
  "divi-masternode",
  "divi-primitives",
@@ -817,6 +818,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
