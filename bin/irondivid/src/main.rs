@@ -1060,8 +1060,10 @@ async fn run_daemon(
         let staker_peer_manager = node.peer_manager().clone();
 
         // Use regtest-friendly staking config
-        let mut staking_config = StakingConfig::default();
-        staking_config.allow_stale_tip = config.staking.stake_on_stale_tip;
+        let mut staking_config = StakingConfig {
+            allow_stale_tip: config.staking.stake_on_stale_tip,
+            ..StakingConfig::default()
+        };
         if staking_config.allow_stale_tip {
             warn!(
                 "-stakeonstaletip set: staking is allowed on a tip older than {}s",
@@ -1637,5 +1639,101 @@ mod wallet_log_tests {
         let wallet = wallet.expect("wallet restore");
         assert_eq!(wallet.mnemonic().as_deref(), Some(mnemonic.as_str()));
         assert_mnemonic_not_logged(&logs, &mnemonic);
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use divi_primitives::ChainMode;
+
+    fn cfg(argv: &[&str]) -> NodeConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = vec![
+            "irondivid".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ];
+        v.extend(argv.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(v)).unwrap()
+    }
+
+    #[test]
+    fn unknown_mode_is_a_startup_error_listing_valid_values() {
+        let err = Args::try_parse_from(["irondivid", "--mode", "irondivi"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid value 'irondivi'"), "{err}");
+        assert!(
+            err.contains("[possible values: divi, privatedivi]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mode_defaults_to_divi() {
+        assert_eq!(
+            parse_chain_mode(&Args::parse_from(["irondivid"]).mode),
+            ChainMode::Divi
+        );
+        assert_eq!(parse_chain_mode("privatedivi"), ChainMode::PrivateDivi);
+    }
+
+    /// `--mode privatedivi --testnet` must select PrivateDivi testnet
+    /// end to end: magic, ports and genesis, not Divi testnet.
+    #[test]
+    fn mode_and_network_select_chain() {
+        use divi_node::config::NetworkType as N;
+        // (argv, mode, network, magic, p2p port, rpc port)
+        type Case = (&'static [&'static str], ChainMode, N, [u8; 4], u16, u16);
+        let cases: [Case; 5] = [
+            (
+                &[],
+                ChainMode::Divi,
+                N::Mainnet,
+                [0xdf, 0xa0, 0x8d, 0x8f],
+                51472,
+                51471,
+            ),
+            (
+                &["--testnet"],
+                ChainMode::Divi,
+                N::Testnet,
+                [0xdf, 0xa0, 0x8d, 0x78],
+                51474,
+                51473,
+            ),
+            (
+                &["--regtest"],
+                ChainMode::Divi,
+                N::Regtest,
+                [0xa1, 0xcf, 0x7e, 0xac],
+                51476,
+                51475,
+            ),
+            (
+                &["--mode", "privatedivi", "--testnet"],
+                ChainMode::PrivateDivi,
+                N::Testnet,
+                [0x70, 0xd1, 0x76, 0x12],
+                52474,
+                52473,
+            ),
+            (
+                &["--mode", "privatedivi", "--regtest"],
+                ChainMode::PrivateDivi,
+                N::Regtest,
+                [0x70, 0xd1, 0x76, 0x13],
+                52476,
+                52475,
+            ),
+        ];
+        for (argv, mode, net, magic, p2p, rpc) in cases {
+            let c = cfg(argv);
+            assert_eq!(c.network.chain_mode, mode, "{argv:?}");
+            assert_eq!(c.network.network_type, net, "{argv:?}");
+            assert_eq!(c.network.magic, magic, "{argv:?}");
+            assert_eq!(c.p2p.port, p2p, "{argv:?}");
+            assert_eq!(c.rpc.port, rpc, "{argv:?}");
+        }
     }
 }

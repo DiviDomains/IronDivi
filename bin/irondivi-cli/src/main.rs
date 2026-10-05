@@ -29,7 +29,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Exit codes matching bitcoin-cli/divi-cli
 mod exit_codes {
@@ -104,8 +104,9 @@ SPECIAL COMMANDS:
   -generate <n>         Generate n blocks to a new wallet address
 
 CONFIGURATION:
-  Config file is read from ~/.divi/divi.conf (or --conf path)
-  Cookie auth from ~/.divi/.cookie is used if no rpcuser/rpcpassword
+  Config file is read from ~/.divi/divi.conf, or ~/.privatedivi/privatedivi.conf
+  with --mode privatedivi (or --conf path)
+  Cookie auth from the same directory is used if no rpcuser/rpcpassword
 
 EXIT CODES:
   0   Success
@@ -315,21 +316,32 @@ struct Config {
     mode: Option<String>,
 }
 
-/// Read configuration file with section header support
-fn read_config(path: Option<PathBuf>, network: &str) -> Config {
-    use std::fs;
+/// The Core data directory for the chain mode: `~/.divi` for Divi and
+/// `~/.privatedivi` for PrivateDivi, matching divid and privatedivid.
+fn chain_home(home: &Path, privatedivi: bool) -> PathBuf {
+    home.join(if privatedivi { ".privatedivi" } else { ".divi" })
+}
 
-    let path = path.unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join(".divi").join("divi.conf"))
-            .unwrap_or_default()
-    });
+/// The default config file for the chain mode. PrivateDivi must not read
+/// `~/.divi/divi.conf`: that file belongs to a Divi node, and its `rpcport`
+/// would send a `--mode privatedivi` call to a node on another chain.
+fn default_conf_path(home: &Path, privatedivi: bool) -> PathBuf {
+    chain_home(home, privatedivi).join(if privatedivi {
+        "privatedivi.conf"
+    } else {
+        "divi.conf"
+    })
+}
+
+/// Read configuration file with section header support
+fn read_config(path: &Path, network: &str) -> Config {
+    use std::fs;
 
     if !path.exists() {
         return Config::default();
     }
 
-    let contents = match fs::read_to_string(&path) {
+    let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Config::default(),
     };
@@ -379,14 +391,8 @@ fn read_config(path: Option<PathBuf>, network: &str) -> Config {
 }
 
 /// Read cookie file for authentication
-fn read_cookie(datadir: Option<PathBuf>, network: &str) -> Option<(String, String)> {
+fn read_cookie(base: &Path, network: &str) -> Option<(String, String)> {
     use std::fs;
-
-    let base = datadir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join(".divi"))
-            .unwrap_or_default()
-    });
 
     let path = match network {
         "testnet" => base.join("testnet3").join(".cookie"),
@@ -572,18 +578,20 @@ fn format_output(value: &Value) -> String {
     }
 }
 
-fn run() -> Result<(), CliError> {
-    let mut args = Args::parse();
+/// Where an RPC call goes and with which credentials.
+#[derive(Debug)]
+struct Endpoint {
+    rpc_connect: String,
+    rpc_port: u16,
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
+}
 
-    // Handle stdin input
-    handle_stdin(&mut args)?;
-
-    // Need at least one argument (the method name)
-    if args.args.is_empty() {
-        return Err(CliError::InvalidParams(
-            "No method specified. Use --help for usage.".to_string(),
-        ));
-    }
+/// Resolve the RPC endpoint (priority: CLI args > config file > defaults).
+/// The default config file and cookie directory follow `--mode`, so a
+/// PrivateDivi call never picks up a Divi node's `rpcport` or credentials.
+fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
+    let privatedivi = args.mode == "privatedivi";
 
     // Determine network type
     let network = if args.regtest {
@@ -594,8 +602,11 @@ fn run() -> Result<(), CliError> {
         "mainnet"
     };
 
-    // Read config file (priority: CLI args > config file > defaults)
-    let config = read_config(args.conf.clone(), network);
+    let conf_path = args
+        .conf
+        .clone()
+        .unwrap_or_else(|| default_conf_path(home, privatedivi));
+    let config = read_config(&conf_path, network);
 
     // Apply config file values if CLI args not provided
     let testnet = args.testnet || config.testnet;
@@ -611,49 +622,75 @@ fn run() -> Result<(), CliError> {
     };
 
     // Determine RPC connection parameters (CLI > config > defaults)
-    let rpc_connect = args.rpcconnect.clone();
-    let rpc_connect = if rpc_connect == "127.0.0.1" {
+    let rpc_connect = if args.rpcconnect == "127.0.0.1" {
         // If default, check config
-        config.rpcconnect.unwrap_or(rpc_connect)
+        config.rpcconnect.unwrap_or_else(|| args.rpcconnect.clone())
     } else {
-        rpc_connect
+        args.rpcconnect.clone()
     };
 
     let rpc_port = args
         .rpcport
         .or(config.rpcport)
-        .unwrap_or_else(|| default_rpc_port(testnet, regtest, args.mode == "privatedivi"));
+        .unwrap_or_else(|| default_rpc_port(testnet, regtest, privatedivi));
 
     // Determine credentials (CLI > config > cookie file)
     let (rpc_user, rpc_password) = match (&args.rpcuser, &args.rpcpassword) {
         (Some(u), Some(p)) => (Some(u.clone()), Some(p.clone())),
-        _ => {
-            // Try config file
-            match (&config.rpcuser, &config.rpcpassword) {
-                (Some(u), Some(p)) => (Some(u.clone()), Some(p.clone())),
-                _ => {
-                    // Fall back to cookie file
-                    match read_cookie(args.datadir.clone(), network) {
-                        Some((u, p)) => (Some(u), Some(p)),
-                        None => (args.rpcuser.clone(), args.rpcpassword.clone()),
-                    }
+        _ => match (config.rpcuser, config.rpcpassword) {
+            (Some(u), Some(p)) => (Some(u), Some(p)),
+            _ => {
+                let base = args
+                    .datadir
+                    .clone()
+                    .unwrap_or_else(|| chain_home(home, privatedivi));
+                match read_cookie(&base, network) {
+                    Some((u, p)) => (Some(u), Some(p)),
+                    None => (args.rpcuser.clone(), args.rpcpassword.clone()),
                 }
             }
-        }
+        },
     };
+
+    Endpoint {
+        rpc_connect,
+        rpc_port,
+        rpc_user,
+        rpc_password,
+    }
+}
+
+fn run() -> Result<(), CliError> {
+    let mut args = Args::parse();
+
+    // Handle stdin input
+    handle_stdin(&mut args)?;
+
+    // Need at least one argument (the method name)
+    if args.args.is_empty() {
+        return Err(CliError::InvalidParams(
+            "No method specified. Use --help for usage.".to_string(),
+        ));
+    }
+
+    let home = dirs::home_dir().unwrap_or_default();
+    let endpoint = resolve_endpoint(&args, &home);
 
     // Build URL with optional wallet
     let url = if let Some(ref wallet) = args.rpcwallet {
-        format!("http://{}:{}/wallet/{}", rpc_connect, rpc_port, wallet)
+        format!(
+            "http://{}:{}/wallet/{}",
+            endpoint.rpc_connect, endpoint.rpc_port, wallet
+        )
     } else {
-        format!("http://{}:{}", rpc_connect, rpc_port)
+        format!("http://{}:{}", endpoint.rpc_connect, endpoint.rpc_port)
     };
 
     // Create RPC client
     let client = RpcClient {
         url,
-        username: rpc_user,
-        password: rpc_password,
+        username: endpoint.rpc_user,
+        password: endpoint.rpc_password,
     };
 
     // Get method and remaining args
@@ -734,4 +771,95 @@ fn main() {
         }
     };
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use std::fs;
+
+    /// A home directory holding only a Divi Core testnet `divi.conf`, the
+    /// layout found on vps1 where divid and irondivid share one user.
+    fn home_with_divi_conf() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".divi")).unwrap();
+        fs::write(
+            home.path().join(".divi/divi.conf"),
+            "testnet=1\nrpcport=51475\n",
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn default_conf_path_follows_mode() {
+        let home = Path::new("/h");
+        assert_eq!(
+            default_conf_path(home, false),
+            Path::new("/h/.divi/divi.conf")
+        );
+        assert_eq!(
+            default_conf_path(home, true),
+            Path::new("/h/.privatedivi/privatedivi.conf")
+        );
+        assert_eq!(chain_home(home, false), Path::new("/h/.divi"));
+        assert_eq!(chain_home(home, true), Path::new("/h/.privatedivi"));
+    }
+
+    /// Regression: `--mode privatedivi --testnet` used to read
+    /// `~/.divi/divi.conf` and query divid on 51475 (Divi testnet).
+    #[test]
+    fn privatedivi_ignores_divi_conf() {
+        let home = home_with_divi_conf();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--mode",
+            "privatedivi",
+            "--testnet",
+            "getblockcount",
+        ]);
+        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 52473);
+    }
+
+    #[test]
+    fn divi_still_reads_divi_conf() {
+        let home = home_with_divi_conf();
+        let args = Args::parse_from(["irondivi-cli", "getblockcount"]);
+        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 51475);
+    }
+
+    #[test]
+    fn privatedivi_reads_its_own_conf() {
+        let home = home_with_divi_conf();
+        fs::create_dir_all(home.path().join(".privatedivi")).unwrap();
+        fs::write(
+            home.path().join(".privatedivi/privatedivi.conf"),
+            "[test]\nrpcport=52599\n",
+        )
+        .unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--mode",
+            "privatedivi",
+            "--testnet",
+            "getblockcount",
+        ]);
+        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 52599);
+    }
+
+    #[test]
+    fn explicit_rpcport_wins() {
+        let home = home_with_divi_conf();
+        let args = Args::parse_from(["irondivi-cli", "--rpcport", "1234", "getblockcount"]);
+        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 1234);
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected_listing_valid_values() {
+        let err = Args::try_parse_from(["irondivi-cli", "--mode", "irondivi", "getblockcount"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("irondivi"), "{err}");
+        assert!(err.contains("divi") && err.contains("privatedivi"), "{err}");
+    }
 }

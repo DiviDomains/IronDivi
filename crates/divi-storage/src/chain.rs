@@ -3491,6 +3491,64 @@ mod tests {
     use divi_primitives::ChainMode;
     use tempfile::tempdir;
 
+    /// Each (mode x network) pair selects its own genesis (PrivateDivi
+    /// mainnet: see the ignored test below). The hashes are
+    /// literal here, not the test_vectors constants, so a swapped or
+    /// mistyped constant (which `for_network` would turn into a zero hash)
+    /// fails. Divi mainnet and PrivateDivi testnet are proven against live
+    /// Core nodes (dnsdivi divid, vps1 privatedivid).
+    #[test]
+    fn genesis_hash_per_mode_and_network() {
+        let cases = [
+            (
+                ChainMode::Divi,
+                NetworkType::Mainnet,
+                "00000e258596876664989374c7ee36445cf5f4f80889af415cc32478214394ea",
+            ),
+            (
+                ChainMode::Divi,
+                NetworkType::Testnet,
+                "00000f43b54bbcae395d815b255ac4ed0693bca7987d72b873d5d4b68d73a6bd",
+            ),
+            (
+                ChainMode::Divi,
+                NetworkType::Regtest,
+                "0000000b3f9980dcf71f5f52d69e30d3b02f807e0a77b91b6091701e4ae51a6f",
+            ),
+            (
+                ChainMode::PrivateDivi,
+                NetworkType::Testnet,
+                "000003071a9dac6c02eb354b7e44add111c5427d483301cb76ed521d621a3b1d",
+            ),
+            (
+                ChainMode::PrivateDivi,
+                NetworkType::Regtest,
+                "4b66fa19b46819cedf4dd4c3f84229916089e09e693e69d1beab944492b84ce3",
+            ),
+        ];
+        for (mode, net, want) in cases {
+            let p = ChainParams::for_network(net, mode);
+            assert_eq!(p.genesis_hash.to_hex(), want, "{mode:?} {net:?}");
+            assert_eq!(p.chain_mode, mode);
+            assert_eq!(p.network_type, net);
+        }
+    }
+
+    /// PrivateDivi mainnet was relaunched on 2026-04-20 (PrivateDivi Core
+    /// 21de13166, chainparams.cpp:172-175 magic 70 d2 76 11, :184 port
+    /// 52472, :254 genesis). irondivi still carries the pre-relaunch chain
+    /// (genesis 00000cde87..., magic 70 d1 76 11). Porting the relaunch is
+    /// a consensus change (premine, keys, subsidy), tracked separately.
+    #[test]
+    #[ignore = "PrivateDivi mainnet relaunch not yet ported"]
+    fn privatedivi_mainnet_genesis_matches_live_network() {
+        let p = ChainParams::for_network(NetworkType::Mainnet, ChainMode::PrivateDivi);
+        assert_eq!(
+            p.genesis_hash.to_hex(),
+            "00000cc899db77f0b4104ca9556b78947be103c25da7895e1a507a8b3e415fd7"
+        );
+    }
+
     /// Create a test chain with regtest network (genesis already initialized)
     fn create_test_chain() -> (Chain, tempfile::TempDir) {
         let dir = tempdir().unwrap();

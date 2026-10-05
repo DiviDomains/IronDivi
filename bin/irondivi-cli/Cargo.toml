@@ -23,3 +23,6 @@ serde_json = { workspace = true }
 # Utilities
 dirs = "5.0"
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
