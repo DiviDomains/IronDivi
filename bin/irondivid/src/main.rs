@@ -708,6 +708,18 @@ fn load_or_create_wallet(
     network: WalletNetwork,
     chain_mode: ChainMode,
 ) -> Result<Arc<WalletDb>> {
+    let restoring = std::env::var("WALLET_MNEMONIC").ok();
+    load_or_create_wallet_from(wallet_path, network, chain_mode, restoring)
+}
+
+/// Load the wallet at `wallet_path`, or create it: restored from `restoring`
+/// when a mnemonic is given, otherwise from a fresh random seed.
+fn load_or_create_wallet_from(
+    wallet_path: &PathBuf,
+    network: WalletNetwork,
+    chain_mode: ChainMode,
+    restoring: Option<String>,
+) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
         info!("Loading wallet from {:?}", wallet_path);
@@ -728,7 +740,6 @@ fn load_or_create_wallet(
     std::fs::create_dir_all(wallet_path)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
 
-    let restoring = std::env::var("WALLET_MNEMONIC").ok();
     let hd_wallet = if let Some(ref mnemonic) = restoring {
         // Use WALLET_CHAIN_MODE env var to override chain mode for mnemonic restore.
         // Falls back to the --mode flag value so PrivateDivi nodes derive correct addresses.
@@ -750,18 +761,10 @@ fn load_or_create_wallet(
         HdWallet::new(chain_mode).with_context(|| "Failed to generate HD wallet")?
     };
 
-    // Log the mnemonic for the user (they should back this up!)
-    if let Some(mnemonic) = hd_wallet.mnemonic() {
-        warn!("========================================");
-        warn!("  NEW WALLET CREATED");
-        warn!("  BACKUP YOUR MNEMONIC PHRASE:");
-        warn!("========================================");
-        warn!("  {}", mnemonic);
-        warn!("========================================");
-        warn!("  Store this in a safe place!");
-        warn!("  You will need it to recover your wallet.");
-        warn!("========================================");
-    }
+    // Never log the mnemonic: logs go to journald and log files, which are
+    // neither encrypted nor access-controlled like the wallet. Point the
+    // operator at the RPC that returns it on demand instead.
+    warn!("new wallet created; retrieve the seed with the dumphdinfo RPC");
 
     let wallet = WalletDb::create_persistent(wallet_path, network, hd_wallet)
         .with_context(|| "Failed to create wallet")?;
@@ -1551,5 +1554,88 @@ mod connect_tests {
         assert!(src.static_peers.len() > 1);
         assert!(!src.dns_seeds.is_empty());
         assert!(src.listen);
+    }
+}
+
+#[cfg(test)]
+mod wallet_log_tests {
+    use super::*;
+
+    /// Run `f` under a subscriber that records every event at every level, and
+    /// return its result with the formatted log text.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    /// Fail if the log text holds the phrase, or any run of three of its words.
+    fn assert_mnemonic_not_logged(logs: &str, mnemonic: &str) {
+        let words: Vec<&str> = mnemonic.split_whitespace().collect();
+        assert!(words.len() >= 12, "expected a full mnemonic");
+        assert!(!logs.contains(mnemonic), "the mnemonic was logged");
+        for run in words.windows(3) {
+            let run = run.join(" ");
+            assert!(!logs.contains(&run), "mnemonic words were logged: {run:?}");
+        }
+        assert!(
+            logs.contains("dumphdinfo"),
+            "wallet creation should point the operator at dumphdinfo"
+        );
+    }
+
+    #[test]
+    fn test_new_wallet_does_not_log_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let (wallet, logs) = capture_logs(|| {
+            load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+        });
+        let wallet = wallet.expect("wallet creation");
+        let mnemonic = wallet.mnemonic().expect("new wallet has a mnemonic");
+        assert_mnemonic_not_logged(&logs, &mnemonic);
+    }
+
+    #[test]
+    fn test_restored_wallet_does_not_log_mnemonic() {
+        // BIP39 test vector: public, holds nothing.
+        let mnemonic = "abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon abandon abandon about";
+        let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let (wallet, logs) = capture_logs(|| {
+            load_or_create_wallet_from(
+                &path,
+                WalletNetwork::Regtest,
+                ChainMode::Divi,
+                Some(mnemonic.clone()),
+            )
+        });
+        let wallet = wallet.expect("wallet restore");
+        assert_eq!(wallet.mnemonic().as_deref(), Some(mnemonic.as_str()));
+        assert_mnemonic_not_logged(&logs, &mnemonic);
     }
 }
