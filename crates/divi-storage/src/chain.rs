@@ -766,6 +766,14 @@ impl Chain {
 
         // 2. Check if we already have this block
         if let Some(existing_index) = self.db.get_block_index(&hash)? {
+            // Divi Core AcceptBlockHeader (ChainExtensionService.cpp): a known
+            // block marked failed is rejected, never re-evaluated.
+            if existing_index.failed() {
+                return Err(StorageError::InvalidBlock(format!(
+                    "block {} is marked invalid",
+                    hash
+                )));
+            }
             // We already have this block - update best_known_block in case
             // this was stored as a side-chain block and now participates in
             // the best chain evaluation.
@@ -813,6 +821,17 @@ impl Chain {
                     })?,
             )
         };
+
+        // 5a. Divi Core AcceptBlock / AcceptBlockHeader (ChainExtensionService.cpp):
+        // a block whose parent is marked failed is rejected and not stored.
+        if let Some(ref parent) = parent_index {
+            if parent.failed() {
+                return Err(StorageError::InvalidBlock(format!(
+                    "prev block {} at height {} is invalid, unable to add block {}",
+                    parent.hash, parent.height, hash
+                )));
+            }
+        }
 
         // 6. Check contextual validity (skip for genesis)
         // Only perform full PoS/signature validation for blocks extending the current tip.
@@ -1311,17 +1330,42 @@ impl Chain {
                 index.height
             );
             let mut index_mut = index.clone();
-            let (utxo_batch, undo_bytes) =
-                self.connect_block(block, &mut index_mut).map_err(|e| {
-                    warn!("Failed to connect block {}: {}", index.hash, e);
-                    e
-                })?;
-            self.db
-                .atomic_connect_block(&utxo_batch, &undo_bytes, &index_mut.hash, &index_mut)
-                .map_err(|e| {
-                    warn!("Failed to atomically write block {}: {}", index.hash, e);
-                    e
-                })?;
+            let connected =
+                self.connect_block(block, &mut index_mut)
+                    .and_then(|(utxo_batch, undo_bytes)| {
+                        self.db.atomic_connect_block(
+                            &utxo_batch,
+                            &undo_bytes,
+                            &index_mut.hash,
+                            &index_mut,
+                        )
+                    });
+            if let Err(e) = connected {
+                warn!("Failed to connect block {}: {}", index.hash, e);
+                // Divi Core ChainTipManager::connectTip -> InvalidBlockFound:
+                // a block that is invalid (not merely unreadable) is marked
+                // BLOCK_FAILED_VALID, and FindMostWorkChain marks its
+                // descendants BLOCK_FAILED_CHILD, so the chain is never
+                // selected again. Here the descendants on the path to the
+                // reorg target are exactly the rest of blocks_to_connect.
+                if Self::is_consensus_invalid(&e) {
+                    for (_, failed) in &blocks_to_connect[i..] {
+                        self.mark_block_failed(&failed.hash)?;
+                    }
+                    warn!(
+                        "reorganize_chain: marked block {} at height {} and {} descendant(s) invalid",
+                        index.hash,
+                        index.height,
+                        blocks_to_connect.len() - i - 1
+                    );
+                }
+                self.restore_chain_after_failed_reorg(
+                    &blocks_to_connect[..i],
+                    &blocks_to_disconnect,
+                    old_tip,
+                )?;
+                return Err(e);
+            }
         }
 
         // Update in-memory tip (DB tip already written by last atomic_connect_block)
@@ -1337,6 +1381,118 @@ impl Chain {
         );
 
         Ok((common_ancestor.height, orphaned_txs))
+    }
+
+    /// Whether an error proves the block itself invalid.
+    ///
+    /// Mirrors Divi Core's `state.IsInvalid() && !state.CorruptionPossible()`:
+    /// consensus failures mark a block failed, database and I/O errors do not,
+    /// since marking on those would permanently ban a valid chain.
+    fn is_consensus_invalid(err: &StorageError) -> bool {
+        matches!(
+            err,
+            StorageError::InvalidBlock(_)
+                | StorageError::UtxoNotFound(_)
+                | StorageError::DoubleSpend(_)
+        )
+    }
+
+    /// Persist the FAILED status on a stored block index.
+    fn mark_block_failed(&self, hash: &Hash256) -> Result<(), StorageError> {
+        if let Some(mut index) = self.db.get_block_index(hash)? {
+            if !index.failed() {
+                index.status.insert(BlockStatus::FAILED);
+                self.db.store_block_index_entry(&index)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `candidate` or any ancestor of it off the active chain is
+    /// marked failed. Blocks between the candidate and the failed ancestor are
+    /// marked failed too, as Divi Core's FindMostWorkChain does with
+    /// BLOCK_FAILED_CHILD (BlockCheckingHelpers.cpp).
+    fn has_failed_ancestor(&self, candidate: &BlockIndex) -> Result<bool, StorageError> {
+        let mut walked: Vec<Hash256> = Vec::new();
+        let mut current = self.db.get_block_index(&candidate.hash)?;
+        while let Some(index) = current {
+            if index.failed() {
+                for hash in &walked {
+                    self.mark_block_failed(hash)?;
+                }
+                return Ok(true);
+            }
+            if index.is_on_main_chain() || index.prev_hash.is_zero() {
+                return Ok(false);
+            }
+            walked.push(index.hash);
+            current = self.db.get_block_index(&index.prev_hash)?;
+        }
+        Ok(false)
+    }
+
+    /// Put the chain back on `old_tip` after a reorg failed part-way.
+    ///
+    /// `connected` are the new-chain blocks that did connect (ancestor first);
+    /// `disconnected` are the old-chain blocks (old tip first). Divi Core gets
+    /// the same result from ActivateBestChain, which after InvalidBlockFound
+    /// selects the most-work valid chain again - the one it just left.
+    fn restore_chain_after_failed_reorg(
+        &self,
+        connected: &[(Block, BlockIndex)],
+        disconnected: &[(Block, BlockIndex)],
+        old_tip: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        let restore = || -> Result<BlockIndex, StorageError> {
+            for (block, index) in connected.iter().rev() {
+                let mut stored = self
+                    .db
+                    .get_block_index(&index.hash)?
+                    .ok_or_else(|| StorageError::BlockNotFound(index.hash.to_string()))?;
+                self.disconnect_block(block, &mut stored)?;
+            }
+            for (block, index) in disconnected.iter().rev() {
+                let mut stored = self
+                    .db
+                    .get_block_index(&index.hash)?
+                    .ok_or_else(|| StorageError::BlockNotFound(index.hash.to_string()))?;
+                let (utxo_batch, undo_bytes) = self.connect_block(block, &mut stored)?;
+                self.db
+                    .atomic_connect_block(&utxo_batch, &undo_bytes, &stored.hash, &stored)?;
+            }
+            // disconnect_block does not move the DB tip; when no old block was
+            // reconnected it would still name a rolled-back block.
+            self.db.set_best_block(&old_tip.hash)?;
+            if self.db.has_utxo_cache() {
+                self.db.flush_utxo_cache()?;
+            }
+            Ok(self
+                .db
+                .get_block_index(&old_tip.hash)?
+                .unwrap_or_else(|| old_tip.clone()))
+        };
+
+        match restore() {
+            Ok(restored_tip) => {
+                info!(
+                    "reorganize_chain: restored previous tip {} at height {}",
+                    restored_tip.hash, restored_tip.height
+                );
+                *self.tip.write() = Some(restored_tip.clone());
+                *self.best_known_block.write() = Some(restored_tip);
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "reorganize_chain: failed to restore previous tip {} at height {}: {}",
+                    old_tip.hash, old_tip.height, e
+                );
+                Err(StorageError::ChainState(format!(
+                    "failed to restore tip {} after a failed reorg: {}",
+                    old_tip.hash, e
+                )))
+            }
+        }
     }
 
     /// Disconnect a block from the chain (reverse UTXO changes)
@@ -2141,6 +2297,11 @@ impl Chain {
     /// Called after storing a new block index so that `activate_best_chain`
     /// can later detect that a side chain has surpassed the current tip.
     fn update_best_known_block(&self, index: &BlockIndex) {
+        // A block known to be invalid is never a candidate (Divi Core keeps
+        // BLOCK_FAILED_MASK blocks out of setBlockIndexCandidates).
+        if index.failed() {
+            return;
+        }
         let mut best = self.best_known_block.write();
         let dominated = match &*best {
             None => true,
@@ -2206,6 +2367,17 @@ impl Chain {
                 "activate_best_chain: best block {} at height {} has more work but no data yet",
                 best_block.hash, best_block.height
             );
+            return Ok(None);
+        }
+
+        // Never reorganize onto a chain that contains a block already found
+        // invalid (Divi Core FindMostWorkChain skips BLOCK_FAILED_MASK chains).
+        if self.has_failed_ancestor(&best_block)? {
+            warn!(
+                "activate_best_chain: block {} at height {} is on an invalid chain - not reorganizing",
+                best_block.hash, best_block.height
+            );
+            *self.best_known_block.write() = Some(current_tip);
             return Ok(None);
         }
 
@@ -3159,6 +3331,12 @@ impl Chain {
             return Ok(false);
         }
 
+        // Never activate a block that is, or descends from, an invalid block.
+        if self.has_failed_ancestor(&existing_index)? {
+            debug!("try_activate_block: Block {} is on an invalid chain", hash);
+            return Ok(false);
+        }
+
         // Check if this block has more work than our tip
         let tip = self.tip.read().clone();
         let Some(ref current_tip) = tip else {
@@ -3634,6 +3812,116 @@ mod tests {
             chain.has_utxo(&outpoint_b1).unwrap(),
             "UTXO from B1 should exist after reorg"
         );
+    }
+
+    /// A side-chain block that fails to connect during a reorg must be marked
+    /// invalid together with its descendants, the old chain must be restored,
+    /// and later blocks must never make the node retry that chain.
+    /// Divi Core: ChainTipManager::connectTip -> InvalidBlockFound marks
+    /// BLOCK_FAILED_VALID; FindMostWorkChain marks descendants BLOCK_FAILED_CHILD;
+    /// AcceptBlock / AcceptBlockHeader reject a block whose parent is failed.
+    #[test]
+    fn test_reorg_marks_failed_side_chain_block_and_descendants_invalid() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+
+        // Main chain: genesis -> A1 -> A2
+        let block_a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(block_a1.clone()).unwrap().hash;
+        let block_a2 = create_child_block_with_pubkey(hash_a1, block_a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(block_a2.clone()).unwrap().hash;
+        assert_eq!(chain.height(), 2);
+
+        let utxo_a1 = OutPoint::new(chain.compute_txid(&block_a1.transactions[0]), 0);
+        let utxo_a2 = OutPoint::new(chain.compute_txid(&block_a2.transactions[0]), 0);
+
+        // Side chain: genesis -> B1 -> B2(bad) -> B3
+        let block_b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(block_b1.clone()).unwrap().hash;
+        let utxo_b1 = OutPoint::new(chain.compute_txid(&block_b1.transactions[0]), 0);
+
+        // B2 carries a transaction spending an output that does not exist. Its
+        // header is fine, so it is stored as a side-chain block; it can only
+        // fail when the reorg tries to connect it.
+        let mut block_b2 =
+            create_child_block_with_pubkey(hash_b1, block_b1.header.time, [0x1b; 20]);
+        block_b2.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([0xee; 32]), 0),
+                Script::from_bytes(vec![0x51]),
+                0xffff_ffff,
+            )],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1_00000000),
+                Script::new_p2pkh(&[0x1e; 20]),
+            )],
+            lock_time: 0,
+        });
+        block_b2.header.merkle_root = compute_merkle_root(&block_b2.transactions);
+        let hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
+
+        // B3 gives the side chain more work and triggers the reorg, which fails at B2.
+        let block_b3 = create_child_block_with_pubkey(hash_b2, block_b2.header.time, [0x1c; 20]);
+        let hash_b3 = chain.compute_block_hash(&block_b3);
+        assert!(
+            chain.accept_block(block_b3.clone()).is_err(),
+            "reorg onto a chain containing an invalid block must fail"
+        );
+
+        // The old chain is fully restored: tip, height and UTXO set.
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+        assert_eq!(chain.height(), 2);
+        assert_eq!(chain.db.get_best_block().unwrap(), Some(hash_a2));
+        assert!(
+            chain.has_utxo(&utxo_a1).unwrap(),
+            "A1 coinbase must be restored"
+        );
+        assert!(
+            chain.has_utxo(&utxo_a2).unwrap(),
+            "A2 coinbase must be restored"
+        );
+        assert!(
+            !chain.has_utxo(&utxo_b1).unwrap(),
+            "B1 coinbase must be rolled back"
+        );
+        let idx_a2 = chain.db.get_block_index(&hash_a2).unwrap().unwrap();
+        assert!(idx_a2.is_on_main_chain());
+
+        // The failing block and its descendant are marked invalid; B1 is not.
+        let idx_b1 = chain.db.get_block_index(&hash_b1).unwrap().unwrap();
+        let idx_b2 = chain.db.get_block_index(&hash_b2).unwrap().unwrap();
+        let idx_b3 = chain.db.get_block_index(&hash_b3).unwrap().unwrap();
+        assert!(!idx_b1.failed(), "B1 connected fine and must not be marked");
+        assert!(!idx_b1.is_on_main_chain());
+        assert!(
+            idx_b2.failed(),
+            "B2 failed to connect and must be marked invalid"
+        );
+        assert!(
+            idx_b3.failed(),
+            "B3 descends from B2 and must be marked invalid"
+        );
+
+        // Re-receiving a failed block is rejected and does not retry the reorg.
+        assert!(chain.accept_block(block_b3.clone()).is_err());
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+
+        // A child of a failed block is rejected outright.
+        let block_b4 = create_child_block_with_pubkey(hash_b3, block_b3.header.time, [0x1d; 20]);
+        assert!(chain.accept_block(block_b4).is_err());
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+
+        // Neither the explicit activation path nor activate_best_chain picks it again.
+        assert!(!chain.try_activate_block(&hash_b3).unwrap());
+        assert!(chain.activate_best_chain().unwrap().is_none());
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+
+        // The restored main chain still extends normally.
+        let block_a3 = create_child_block_with_pubkey(hash_a2, block_a2.header.time, [0x0c; 20]);
+        let hash_a3 = chain.accept_block(block_a3).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a3);
+        assert_eq!(chain.height(), 3);
     }
 
     // ============================================================
