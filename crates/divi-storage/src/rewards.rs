@@ -111,6 +111,17 @@ impl RewardParams {
         }
     }
 
+    /// PrivateDivi mainnet after the 2026-04-20 relaunch: Divi mainnet's
+    /// schedule with a 10,000,000 COIN premine (PrivateDivi Core 21de13166,
+    /// chainparams.cpp:179). Halving, PoW, lottery and treasury parameters
+    /// are unchanged (chainparams.cpp:186-201).
+    pub fn privatedivi_mainnet() -> Self {
+        Self {
+            premine_amount: Amount::from_sat(10_000_000 * COIN),
+            ..Self::mainnet()
+        }
+    }
+
     /// Testnet parameters
     pub fn testnet() -> Self {
         Self {
@@ -720,6 +731,23 @@ mod tests {
 
         let rewards = get_block_rewards(height, &params);
         assert!(rewards.total().as_sat() > 0);
+    }
+
+    #[test]
+    fn privatedivi_mainnet_reward_params() {
+        let pd = RewardParams::privatedivi_mainnet();
+        let divi = RewardParams::mainnet();
+        assert_eq!(block_subsidy(1, &pd).as_divi(), 10_000_000);
+        assert_eq!(block_subsidy(0, &pd), block_subsidy(0, &divi));
+        for h in [2u32, 100, 101, 525_599, 525_600, 1_051_200] {
+            assert_eq!(block_subsidy(h, &pd), block_subsidy(h, &divi), "height {h}");
+        }
+        assert_eq!(pd.last_pow_block, 100);
+        assert_eq!(pd.lottery_start_block, 101);
+        assert_eq!(pd.lottery_cycle, 10_080);
+        assert_eq!(pd.treasury_start_block, 101);
+        assert_eq!(pd.treasury_cycle, 10_081);
+        assert_eq!(pd.subsidy_halving_interval, 525_600);
     }
 
     #[test]

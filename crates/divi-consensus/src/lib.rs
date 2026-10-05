@@ -72,7 +72,8 @@ pub mod target;
 pub mod treasury;
 
 pub use block_subsidy::{
-    calculate_weighted_treasury_payment, get_block_subsidy, BlockRewards, SUBSIDY_HALVING_INTERVAL,
+    calculate_weighted_treasury_payment, get_block_subsidy, get_block_subsidy_for_chain,
+    premine_for_chain, BlockRewards, PRIVATEDIVI_MAINNET_PREMINE, SUBSIDY_HALVING_INTERVAL,
 };
 pub use error::ConsensusError;
 pub use lottery::{

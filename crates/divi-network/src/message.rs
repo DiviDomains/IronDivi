@@ -438,8 +438,8 @@ mod tests {
     #[test]
     fn test_privatedivi_mainnet_magic_value() {
         use crate::constants::PRIVATEDIVI_MAINNET_MAGIC;
-        // PrivateDivi mainnet magic must be 0x70 0xd1 0x76 0x11
-        assert_eq!(PRIVATEDIVI_MAINNET_MAGIC, [0x70, 0xd1, 0x76, 0x11]);
+        // PrivateDivi mainnet magic must be 0x70 0xd2 0x76 0x11 (2026-04-20 relaunch)
+        assert_eq!(PRIVATEDIVI_MAINNET_MAGIC, [0x70, 0xd2, 0x76, 0x11]);
     }
 
     #[test]

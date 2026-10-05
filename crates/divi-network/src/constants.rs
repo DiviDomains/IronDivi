@@ -28,8 +28,10 @@ pub const REGTEST_MAGIC: Magic = [0xa1, 0xcf, 0x7e, 0xac];
 /// Unit test magic bytes (same as regtest for convenience)
 pub const UNITTEST_MAGIC: Magic = [0xa1, 0xcf, 0x7e, 0xac];
 
-/// PrivateDivi mainnet magic bytes
-pub const PRIVATEDIVI_MAINNET_MAGIC: Magic = [0x70, 0xd1, 0x76, 0x11];
+/// PrivateDivi mainnet magic bytes. Bumped from 70 d1 76 11 by the
+/// 2026-04-20 relaunch (PrivateDivi Core 21de13166, chainparams.cpp:172-175)
+/// so pre-relaunch nodes cannot handshake with the relaunched chain.
+pub const PRIVATEDIVI_MAINNET_MAGIC: Magic = [0x70, 0xd2, 0x76, 0x11];
 
 /// PrivateDivi testnet magic bytes
 pub const PRIVATEDIVI_TESTNET_MAGIC: Magic = [0x70, 0xd1, 0x76, 0x12];

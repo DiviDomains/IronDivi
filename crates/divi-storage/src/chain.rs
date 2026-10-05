@@ -1723,27 +1723,15 @@ impl Chain {
     /// Get the expected block hash at a checkpoint height, if any.
     /// Checkpoints prevent following minority forks during IBD.
     fn get_checkpoint_hash(&self, height: u32) -> Option<Hash256> {
-        use divi_primitives::ChainMode;
-
-        let network_type = self.network_type();
-        let chain_mode = self.params.chain_mode;
-
         // Checkpoints are only for known fork points discovered during testing.
-        // Each entry maps (chain_mode, network_type, height) -> expected block hash.
-        match (chain_mode, network_type) {
-            (ChainMode::PrivateDivi, NetworkType::Mainnet) => match height {
-                // Fork at height 47791: two competing blocks existed.
-                // This is the block hash on the correct (highest-work) chain.
-                47791 => Some(
-                    Hash256::from_hex(
-                        "be98727e61b96a191f6474a283733830d7d56c66f6131c11540e009b993d7f1d",
-                    )
-                    .expect("invalid checkpoint hash"),
-                ),
-                _ => None,
-            },
-            _ => None,
-        }
+        // None are pinned today.
+        //
+        // PrivateDivi mainnet used to pin height 47791 of the pre-relaunch
+        // chain. The 2026-04-20 relaunch replaced that chain, and Core's
+        // relaunch checkpoint map holds only the genesis (PrivateDivi Core
+        // 21de13166, chainparams.cpp:107-109), so there is none here.
+        let _ = height;
+        None
     }
 
     /// Check basic block header validity
@@ -2817,7 +2805,12 @@ impl Chain {
         };
 
         // Get per-block rewards
-        let rewards = block_subsidy::get_block_subsidy(height, halving_interval);
+        let rewards = block_subsidy::get_block_subsidy_for_chain(
+            self.params.chain_mode,
+            network_type == NetworkType::Mainnet,
+            height,
+            halving_interval,
+        );
 
         // After DeprecateMasternodes (always active on PrivateDivi), fold masternode into stake
         // C++ reference: BlockConnectionService.cpp lines 322-326
@@ -3491,8 +3484,7 @@ mod tests {
     use divi_primitives::ChainMode;
     use tempfile::tempdir;
 
-    /// Each (mode x network) pair selects its own genesis (PrivateDivi
-    /// mainnet: see the ignored test below). The hashes are
+    /// Each (mode x network) pair selects its own genesis. The hashes are
     /// literal here, not the test_vectors constants, so a swapped or
     /// mistyped constant (which `for_network` would turn into a zero hash)
     /// fails. Divi mainnet and PrivateDivi testnet are proven against live
@@ -3517,6 +3509,11 @@ mod tests {
             ),
             (
                 ChainMode::PrivateDivi,
+                NetworkType::Mainnet,
+                "00000cc899db77f0b4104ca9556b78947be103c25da7895e1a507a8b3e415fd7",
+            ),
+            (
+                ChainMode::PrivateDivi,
                 NetworkType::Testnet,
                 "000003071a9dac6c02eb354b7e44add111c5427d483301cb76ed521d621a3b1d",
             ),
@@ -3535,18 +3532,44 @@ mod tests {
     }
 
     /// PrivateDivi mainnet was relaunched on 2026-04-20 (PrivateDivi Core
-    /// 21de13166, chainparams.cpp:172-175 magic 70 d2 76 11, :184 port
-    /// 52472, :254 genesis). irondivi still carries the pre-relaunch chain
-    /// (genesis 00000cde87..., magic 70 d1 76 11). Porting the relaunch is
-    /// a consensus change (premine, keys, subsidy), tracked separately.
+    /// 21de13166, chainparams.cpp:254 genesis). The live mainnet nodes on
+    /// vps1 report this hash at height 0.
     #[test]
-    #[ignore = "PrivateDivi mainnet relaunch not yet ported"]
     fn privatedivi_mainnet_genesis_matches_live_network() {
         let p = ChainParams::for_network(NetworkType::Mainnet, ChainMode::PrivateDivi);
         assert_eq!(
             p.genesis_hash.to_hex(),
             "00000cc899db77f0b4104ca9556b78947be103c25da7895e1a507a8b3e415fd7"
         );
+    }
+
+    /// The genesis irondivi builds for PrivateDivi mainnet hashes, by quark,
+    /// to the relaunch genesis: the header fields (nTime 1776703200, nNonce
+    /// 1440691, nBits 0x1e0ffff0, PrivateDivi Core chainparams.cpp:241-243)
+    /// and the unchanged coinbase reproduce Core's asserts at :254-255.
+    /// `init_genesis` only warns on a mismatch, so this is what catches one.
+    #[test]
+    fn privatedivi_mainnet_genesis_header_hashes_to_relaunch_genesis() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(
+            db,
+            ChainParams::for_network(NetworkType::Mainnet, ChainMode::PrivateDivi),
+        )
+        .unwrap();
+        let tip = chain.tip().expect("genesis");
+        assert_eq!(tip.height, 0);
+        let block = chain.get_block(&tip.hash).unwrap().expect("genesis block");
+        assert_eq!(
+            divi_crypto::compute_block_hash(&block.header).to_hex(),
+            "00000cc899db77f0b4104ca9556b78947be103c25da7895e1a507a8b3e415fd7"
+        );
+        assert_eq!(
+            block.header.merkle_root.to_hex(),
+            "4123e9ba36523af0b90b02b26663b76a11e9bf680e6c775d8dd6d7c66f95c4bd"
+        );
+        assert_eq!(block.header.time, 1_776_703_200);
+        assert_eq!(block.header.nonce, 1_440_691);
     }
 
     /// Create a test chain with regtest network (genesis already initialized)

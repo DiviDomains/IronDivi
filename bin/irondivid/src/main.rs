@@ -1685,7 +1685,7 @@ mod mode_tests {
         use divi_node::config::NetworkType as N;
         // (argv, mode, network, magic, p2p port, rpc port)
         type Case = (&'static [&'static str], ChainMode, N, [u8; 4], u16, u16);
-        let cases: [Case; 5] = [
+        let cases: [Case; 6] = [
             (
                 &[],
                 ChainMode::Divi,
@@ -1709,6 +1709,14 @@ mod mode_tests {
                 [0xa1, 0xcf, 0x7e, 0xac],
                 51476,
                 51475,
+            ),
+            (
+                &["--mode", "privatedivi"],
+                ChainMode::PrivateDivi,
+                N::Mainnet,
+                [0x70, 0xd2, 0x76, 0x11],
+                52472,
+                52471,
             ),
             (
                 &["--mode", "privatedivi", "--testnet"],

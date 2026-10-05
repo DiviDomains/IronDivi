@@ -92,21 +92,24 @@ pub mod genesis {
         pub const COINBASE_MESSAGE: &str =
             "February 2026 - PrivateDivi Network Genesis - divi.domains";
 
-        /// PrivateDivi mainnet genesis block data
+        /// PrivateDivi mainnet genesis block data: the 2026-04-20 relaunch
+        /// (PrivateDivi Core 21de13166, chainparams.cpp:241-255). The
+        /// coinbase, and so the merkle root, is unchanged from the
+        /// pre-relaunch chain; only nTime and nNonce moved.
         pub mod mainnet {
-            /// Genesis block hash
+            /// Genesis block hash (chainparams.cpp:254)
             pub const BLOCK_HASH: &str =
-                "00000cde87387f76349797373bd8e30809334433210820b8bb17bdde6e8b1e80";
+                "00000cc899db77f0b4104ca9556b78947be103c25da7895e1a507a8b3e415fd7";
 
-            /// Genesis merkle root
+            /// Genesis merkle root (chainparams.cpp:255)
             pub const MERKLE_ROOT: &str =
                 "4123e9ba36523af0b90b02b26663b76a11e9bf680e6c775d8dd6d7c66f95c4bd";
 
-            /// Genesis timestamp
-            pub const TIMESTAMP: u32 = 1771075434;
+            /// Genesis timestamp (chainparams.cpp:241, 2026-04-20 18:40 UTC)
+            pub const TIMESTAMP: u32 = 1776703200;
 
-            /// Genesis nonce
-            pub const NONCE: u32 = 12890;
+            /// Genesis nonce (chainparams.cpp:243)
+            pub const NONCE: u32 = 1440691;
 
             /// Genesis bits (difficulty)
             pub const BITS: u32 = 0x1e0ffff0;

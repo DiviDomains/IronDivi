@@ -16,7 +16,7 @@
 // - Reward distribution (stakers, masternodes, treasury, charity, lottery)
 // - Weighted calculation for treasury/lottery payments crossing halving boundaries
 
-use divi_primitives::Amount;
+use divi_primitives::{Amount, ChainMode};
 
 /// Halving interval: 60 * 24 * 365 = 525,600 blocks (~1 year at 1 minute/block)
 pub const SUBSIDY_HALVING_INTERVAL: u32 = 525_600;
@@ -140,6 +140,39 @@ pub fn get_block_subsidy(height: u32, halving_interval: u32) -> BlockRewards {
         lottery: Amount::from_divi(lottery),
         proposals: Amount::from_divi(proposals),
     }
+}
+
+/// Block-1 premine of the PrivateDivi mainnet relaunch, in whole coins.
+///
+/// PrivateDivi Core 21de13166 cut `premineAmt` from 617,222,416 to
+/// 10,000,000 COIN (chainparams.cpp:179); `Legacy::BlockSubsidy` returns it
+/// at height 1 (LegacyBlockSubsidies.cpp:19-20).
+pub const PRIVATEDIVI_MAINNET_PREMINE: i64 = 10_000_000;
+
+/// Block-1 premine, in whole coins, for a chain.
+///
+/// Only PrivateDivi mainnet differs. Every other chain keeps the value
+/// `block_subsidy` has always returned.
+pub fn premine_for_chain(chain_mode: ChainMode, is_mainnet: bool) -> i64 {
+    match (chain_mode, is_mainnet) {
+        (ChainMode::PrivateDivi, true) => PRIVATEDIVI_MAINNET_PREMINE,
+        _ => block_subsidy(1, SUBSIDY_HALVING_INTERVAL),
+    }
+}
+
+/// [`get_block_subsidy`] for a specific chain: identical at every height
+/// except the block-1 premine, which follows [`premine_for_chain`].
+pub fn get_block_subsidy_for_chain(
+    chain_mode: ChainMode,
+    is_mainnet: bool,
+    height: u32,
+    halving_interval: u32,
+) -> BlockRewards {
+    let mut rewards = get_block_subsidy(height, halving_interval);
+    if height == 1 {
+        rewards.stake = Amount::from_divi(premine_for_chain(chain_mode, is_mainnet));
+    }
+    rewards
 }
 
 /// Calculate treasury and charity payments with weighted accumulation
@@ -589,6 +622,71 @@ mod tests {
     fn test_block_subsidy_premine() {
         let rewards = get_block_subsidy(1, SUBSIDY_HALVING_INTERVAL);
         assert_eq!(rewards.stake, Amount::from_divi(617_222_416));
+    }
+
+    /// PrivateDivi mainnet relaunch: the premine is 10M; every other height
+    /// is the shared schedule (PrivateDivi Core 21de13166 changed only
+    /// `premineAmt`; LegacyBlockSubsidies.cpp is untouched).
+    #[test]
+    fn privatedivi_mainnet_subsidy_at_relaunch_boundaries() {
+        let pd = |h| {
+            get_block_subsidy_for_chain(ChainMode::PrivateDivi, true, h, SUBSIDY_HALVING_INTERVAL)
+        };
+        // (height, stake, lottery): genesis, premine, first PoW reward,
+        // last PoW block, first PoS block (lottery/treasury start 101),
+        // and both sides of each yearly subsidy step.
+        let cases: [(u32, i64, i64); 9] = [
+            (0, 50, 0),
+            (1, 10_000_000, 0),
+            (2, 1250, 0),
+            (100, 1250, 0),
+            (101, (1200 * 38) / 100, 50),
+            (1_051_199, (1200 * 38) / 100, 50),
+            (1_051_200, (1100 * 38) / 100, 50),
+            (5_781_599, (300 * 38) / 100, 50),
+            (5_781_600, (200 * 38) / 100, 50),
+        ];
+        for (h, stake, lottery) in cases {
+            let r = pd(h);
+            assert_eq!(r.stake, Amount::from_divi(stake), "height {h}");
+            assert_eq!(r.lottery, Amount::from_divi(lottery), "height {h}");
+        }
+    }
+
+    /// Outside block 1, PrivateDivi mainnet pays exactly what Divi does.
+    #[test]
+    fn privatedivi_mainnet_matches_divi_except_premine() {
+        for h in [
+            0u32, 2, 100, 101, 10_080, 10_081, 525_599, 525_600, 1_051_200,
+        ] {
+            assert_eq!(
+                get_block_subsidy_for_chain(
+                    ChainMode::PrivateDivi,
+                    true,
+                    h,
+                    SUBSIDY_HALVING_INTERVAL
+                ),
+                get_block_subsidy(h, SUBSIDY_HALVING_INTERVAL),
+                "height {h}"
+            );
+        }
+    }
+
+    /// Divi (every network) and PrivateDivi testnet/regtest keep the
+    /// premine `get_block_subsidy` has always reported.
+    #[test]
+    fn premine_unchanged_outside_privatedivi_mainnet() {
+        assert_eq!(premine_for_chain(ChainMode::Divi, true), 617_222_416);
+        assert_eq!(premine_for_chain(ChainMode::Divi, false), 617_222_416);
+        assert_eq!(
+            premine_for_chain(ChainMode::PrivateDivi, false),
+            617_222_416
+        );
+        assert_eq!(
+            get_block_subsidy_for_chain(ChainMode::Divi, true, 1, SUBSIDY_HALVING_INTERVAL),
+            get_block_subsidy(1, SUBSIDY_HALVING_INTERVAL)
+        );
+        assert_eq!(premine_for_chain(ChainMode::PrivateDivi, true), 10_000_000);
     }
 
     /// Subsidy must floor at MINIMUM_SUBSIDY (250 DIVI) far into the future.

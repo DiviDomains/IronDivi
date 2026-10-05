@@ -1165,7 +1165,7 @@ mod tests {
         };
         let pm = PeerManager::new(config);
         assert_eq!(pm.config.magic, PRIVATEDIVI_MAINNET_MAGIC);
-        assert_eq!(pm.config.magic, [0x70, 0xd1, 0x76, 0x11]);
+        assert_eq!(pm.config.magic, [0x70, 0xd2, 0x76, 0x11]);
     }
 
     #[test]
