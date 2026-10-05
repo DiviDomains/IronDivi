@@ -91,6 +91,41 @@ pub fn is_treasury_block_with_lottery(
     }
 }
 
+/// The superblock payout a block at a given height carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperblockPayout {
+    /// Treasury and charity are paid.
+    Treasury,
+    /// Lottery winners are paid.
+    Lottery,
+    /// Neither.
+    None,
+}
+
+/// Decide which superblock payout applies at `height`.
+///
+/// Before the superblock transition the treasury and lottery cycles are
+/// independent, so both can fall on one height (regtest: 150, 200, ... 450).
+/// Divi Core then pays, mint-allows and validates the treasury only: its
+/// BlockIncentivesPopulator `FillBlockPayee`, `IsBlockValueValid` and
+/// `HasValidPayees` all test `IsValidTreasuryBlockHeight` first and the lottery
+/// only in the `else` branch. The treasury wins; the lottery is skipped.
+pub fn superblock_payout(
+    height: u32,
+    treasury_start: u32,
+    treasury_cycle: u32,
+    lottery_start: u32,
+    lottery_cycle: u32,
+) -> SuperblockPayout {
+    if is_treasury_block_with_lottery(height, treasury_start, treasury_cycle, lottery_cycle) {
+        SuperblockPayout::Treasury
+    } else if crate::lottery::is_lottery_block(height, lottery_start, lottery_cycle) {
+        SuperblockPayout::Lottery
+    } else {
+        SuperblockPayout::None
+    }
+}
+
 /// Get the treasury payment cycle length for a given height.
 ///
 /// Matches C++ SuperblockHeightValidator::GetTreasuryBlockPaymentCycle:
@@ -217,6 +252,69 @@ mod tests {
 
     const START_BLOCK: u32 = 102;
     const CYCLE: u32 = 50;
+
+    fn regtest_payout(height: u32) -> SuperblockPayout {
+        superblock_payout(
+            height,
+            regtest::TREASURY_START_BLOCK,
+            regtest::TREASURY_CYCLE,
+            crate::lottery::regtest::LOTTERY_START_BLOCK,
+            crate::lottery::regtest::LOTTERY_CYCLE,
+        )
+    }
+
+    #[test]
+    fn test_superblock_payout_treasury_wins_coinciding_heights() {
+        // Pre-transition (regtest transition = 10 * 50 = 500) the lottery and
+        // treasury cycles coincide every 50 blocks; Divi Core pays treasury only.
+        for h in [150u32, 200, 250, 300, 350, 400, 450] {
+            assert!(crate::lottery::is_lottery_block(
+                h,
+                crate::lottery::regtest::LOTTERY_START_BLOCK,
+                crate::lottery::regtest::LOTTERY_CYCLE
+            ));
+            assert_eq!(regtest_payout(h), SuperblockPayout::Treasury, "height {h}");
+        }
+        assert_eq!(regtest_payout(110), SuperblockPayout::Lottery);
+        assert_eq!(regtest_payout(140), SuperblockPayout::Lottery);
+        assert_eq!(regtest_payout(149), SuperblockPayout::None);
+        assert_eq!(regtest_payout(151), SuperblockPayout::None);
+        // Post-transition: lottery at 500, 510, ...; treasury one block later.
+        assert_eq!(regtest_payout(500), SuperblockPayout::Lottery);
+        assert_eq!(regtest_payout(501), SuperblockPayout::Treasury);
+        assert_eq!(regtest_payout(550), SuperblockPayout::Lottery);
+    }
+
+    #[test]
+    fn test_superblock_payout_mainnet_and_testnet_never_coincide() {
+        // Mainnet and testnet cycles only meet at the transition height, after
+        // which treasury and lottery are one block apart by construction.
+        let nets = [
+            (
+                mainnet::TREASURY_START_BLOCK,
+                mainnet::TREASURY_CYCLE,
+                crate::lottery::mainnet::LOTTERY_START_BLOCK,
+                crate::lottery::mainnet::LOTTERY_CYCLE,
+            ),
+            (
+                testnet::TREASURY_START_BLOCK,
+                testnet::TREASURY_CYCLE,
+                crate::lottery::testnet::LOTTERY_START_BLOCK,
+                crate::lottery::testnet::LOTTERY_CYCLE,
+            ),
+        ];
+        for (ts, tc, ls, lc) in nets {
+            for h in (0..=(tc * lc + 2 * lc)).step_by(lc as usize) {
+                if crate::lottery::is_lottery_block(h, ls, lc) {
+                    assert_eq!(
+                        superblock_payout(h, ts, tc, ls, lc),
+                        SuperblockPayout::Lottery,
+                        "height {h}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_is_treasury_block() {

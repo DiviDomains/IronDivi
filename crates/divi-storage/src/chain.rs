@@ -2857,13 +2857,18 @@ impl Chain {
             ),
         };
 
-        let is_treasury = treasury::is_treasury_block_with_lottery(
+        // Treasury takes precedence where both cycles fall on one height
+        // (Divi Core BlockIncentivesPopulator::IsBlockValueValid / HasValidPayees).
+        let payout = treasury::superblock_payout(
             height,
             treasury_start,
             treasury_cycle,
+            lottery_start,
             treasury_lottery_cycle,
         );
-        let is_lottery = lottery::is_lottery_block(height, lottery_start, lottery_cycle);
+        debug_assert_eq!(treasury_lottery_cycle, lottery_cycle);
+        let is_treasury = payout == treasury::SuperblockPayout::Treasury;
+        let is_lottery = payout == treasury::SuperblockPayout::Lottery;
 
         // Compute expected max mint
         let expected_mint = if is_treasury {

@@ -2528,14 +2528,26 @@ mod tests {
     /// it is the main chain, so lottery winners come from the real chain code.
     /// Stake-kernel checks are skipped in IBD mode, which a fresh `Chain` is in.
     fn build_regtest_chain(len: u32, seed: u8, time_offset: u32) -> Vec<Block> {
-        use divi_consensus::{block_subsidy, lottery, treasury};
-        use divi_primitives::amount::Amount;
-        use divi_primitives::script::Script;
-        use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
-
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
         let chain = Chain::new(db, regtest_params()).unwrap();
+        extend_regtest_chain(&chain, len, seed, time_offset, 1250_00000000)
+    }
+
+    /// Extend `chain` from genesis to height `len` (see `build_regtest_chain`).
+    /// `pow_value_sat` is the value of each PoW coinbase; the stake re-staked
+    /// from height 101 on starts from the height-100 coinbase.
+    fn extend_regtest_chain(
+        chain: &Chain,
+        len: u32,
+        seed: u8,
+        time_offset: u32,
+        pow_value_sat: i64,
+    ) -> Vec<Block> {
+        use divi_consensus::block_subsidy;
+        use divi_primitives::amount::Amount;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let key = divi_crypto::SecretKey::from_bytes(&[seed; 32]).unwrap();
         let pay = Script::new_p2pkh(key.public_key().pubkey_hash().as_bytes());
@@ -2561,7 +2573,7 @@ mod tests {
                 let coinbase = Transaction {
                     version: 1,
                     vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
-                    vout: vec![TxOut::new(Amount::from_sat(1250_00000000), pay.clone())],
+                    vout: vec![TxOut::new(Amount::from_sat(pow_value_sat), pay.clone())],
                     lock_time: 0,
                 };
                 if h == 100 {
@@ -2577,41 +2589,7 @@ mod tests {
                     TxOut::new(Amount::ZERO, Script::default()),
                     TxOut::new(value + rewards.stake + rewards.masternode, pay.clone()),
                 ];
-                let is_treasury = treasury::is_treasury_block_with_lottery(
-                    h,
-                    treasury::regtest::TREASURY_START_BLOCK,
-                    treasury::regtest::TREASURY_CYCLE,
-                    treasury::regtest::LOTTERY_CYCLE,
-                );
-                let is_lottery = lottery::is_lottery_block(
-                    h,
-                    lottery::regtest::LOTTERY_START_BLOCK,
-                    lottery::regtest::LOTTERY_CYCLE,
-                );
-                // Lottery payees are always enforced. Before the treasury/lottery
-                // transition both can fall on one height; the mint cap then allows
-                // only the treasury amount, and regtest does not enforce treasury
-                // payees, so such a block pays the lottery alone.
-                if is_lottery {
-                    for (script, amount) in lottery::calculate_lottery_payments(
-                        &parent.lottery_winners,
-                        Amount::from_sat(50_00000000),
-                        lottery::regtest::LOTTERY_CYCLE,
-                    ) {
-                        vout.push(TxOut::new(amount, script));
-                    }
-                }
-                if is_treasury && !is_lottery {
-                    let cycle = treasury::get_treasury_payment_cycle(
-                        h,
-                        treasury::regtest::TREASURY_CYCLE,
-                        treasury::regtest::LOTTERY_CYCLE,
-                    );
-                    let (t_amt, c_amt) =
-                        block_subsidy::calculate_weighted_treasury_payment(h, cycle, 100);
-                    vout.push(TxOut::new(t_amt, treasury::get_treasury_script(false)));
-                    vout.push(TxOut::new(c_amt, treasury::get_charity_script(false)));
-                }
+                vout.extend(regtest_superblock_outputs(h, &parent.lottery_winners));
                 let coinstake = Transaction {
                     version: 1,
                     vin: vec![TxIn {
@@ -2649,6 +2627,104 @@ mod tests {
             blocks.push(block);
         }
         blocks
+    }
+
+    /// Superblock outputs a regtest coinstake at `h` must carry, in Divi
+    /// Core's order (BlockIncentivesPopulator::FillBlockPayee): a treasury
+    /// height pays treasury and charity, otherwise a lottery height pays the
+    /// winners. Before the lottery/treasury transition both can fall on one
+    /// height; treasury wins there.
+    fn regtest_superblock_outputs(
+        h: u32,
+        winners: &divi_primitives::LotteryWinners,
+    ) -> Vec<divi_primitives::transaction::TxOut> {
+        use divi_consensus::{block_subsidy, lottery, treasury};
+        use divi_primitives::amount::Amount;
+        use divi_primitives::transaction::TxOut;
+
+        match treasury::superblock_payout(
+            h,
+            treasury::regtest::TREASURY_START_BLOCK,
+            treasury::regtest::TREASURY_CYCLE,
+            lottery::regtest::LOTTERY_START_BLOCK,
+            lottery::regtest::LOTTERY_CYCLE,
+        ) {
+            treasury::SuperblockPayout::Treasury => {
+                let cycle = treasury::get_treasury_payment_cycle(
+                    h,
+                    treasury::regtest::TREASURY_CYCLE,
+                    treasury::regtest::LOTTERY_CYCLE,
+                );
+                let (t_amt, c_amt) =
+                    block_subsidy::calculate_weighted_treasury_payment(h, cycle, 100);
+                vec![
+                    TxOut::new(t_amt, treasury::get_treasury_script(false)),
+                    TxOut::new(c_amt, treasury::get_charity_script(false)),
+                ]
+            }
+            treasury::SuperblockPayout::Lottery => lottery::calculate_lottery_payments(
+                winners,
+                Amount::from_sat(50_00000000),
+                lottery::regtest::LOTTERY_CYCLE,
+            )
+            .into_iter()
+            .map(|(script, amount)| TxOut::new(amount, script))
+            .collect(),
+            treasury::SuperblockPayout::None => Vec::new(),
+        }
+    }
+
+    /// Divi Core pays the treasury, not the lottery, when a pre-transition
+    /// height is both (BlockIncentivesPopulator.cpp IsBlockValueValid /
+    /// HasValidPayees: `if IsValidTreasuryBlockHeight ... else if
+    /// IsValidLotteryBlockHeight`). Regtest height 150 is such a height.
+    /// The stake is above the 10,000 DIVI ticket minimum, so the lottery
+    /// has winners at 149 and a lottery-first rule would demand their
+    /// payments and reject the treasury-only block.
+    #[test]
+    fn test_coinciding_superblock_height_pays_treasury_not_lottery() {
+        use divi_consensus::{lottery, treasury};
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Chain::new(db, regtest_params()).unwrap();
+
+        // 20,000 DIVI PoW coinbases: every coinstake from 101 on is a ticket.
+        let blocks = extend_regtest_chain(&chain, 150, 0x7C, 0, 2_000_000_000_000);
+
+        assert!(treasury::is_treasury_block_with_lottery(
+            150,
+            treasury::regtest::TREASURY_START_BLOCK,
+            treasury::regtest::TREASURY_CYCLE,
+            treasury::regtest::LOTTERY_CYCLE,
+        ));
+        assert!(lottery::is_lottery_block(
+            150,
+            lottery::regtest::LOTTERY_START_BLOCK,
+            lottery::regtest::LOTTERY_CYCLE,
+        ));
+
+        let idx_149 = chain
+            .get_block_index(&compute_block_hash(&blocks[148].header))
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx_149.height, 149);
+        assert!(
+            !idx_149.lottery_winners.coinstakes.is_empty(),
+            "the lottery must have winners at 149 for this test to mean anything"
+        );
+
+        let coinstake = &blocks[149].transactions[1];
+        assert_eq!(chain.height(), 150);
+        assert_eq!(
+            coinstake.vout[2].script_pubkey,
+            treasury::get_treasury_script(false)
+        );
+        assert_eq!(
+            coinstake.vout[3].script_pubkey,
+            treasury::get_charity_script(false)
+        );
+        assert_eq!(coinstake.vout.len(), 4, "no lottery payees at 150");
     }
 
     #[tokio::test]

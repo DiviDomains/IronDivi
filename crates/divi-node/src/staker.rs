@@ -1038,78 +1038,62 @@ impl Staker {
         let height = tip.height + 1;
         let stake_reward = self.calculate_stake_reward(height);
 
-        // Check if this is a lottery block and get lottery payments
-        let (lottery_start, lottery_cycle) = match self.chain.network_type() {
+        // At most one superblock payout per block: where the treasury and
+        // lottery cycles coincide the treasury is paid and the lottery is not
+        // (Divi Core BlockIncentivesPopulator::FillBlockPayee).
+        let payout = superblock_payout(self.chain.network_type(), height);
+        let lottery_cycle = match self.chain.network_type() {
+            divi_storage::NetworkType::Mainnet => divi_consensus::lottery::mainnet::LOTTERY_CYCLE,
+            divi_storage::NetworkType::Testnet => divi_consensus::lottery::testnet::LOTTERY_CYCLE,
+            divi_storage::NetworkType::Regtest => divi_consensus::lottery::regtest::LOTTERY_CYCLE,
+        };
+        let lottery_payments = if payout == divi_consensus::treasury::SuperblockPayout::Lottery {
+            // Get lottery winners from the previous block (tip)
+            let winners = &tip.lottery_winners;
+
+            if !winners.coinstakes.is_empty() {
+                info!(
+                    "Creating lottery block {} with {} winners",
+                    height,
+                    winners.coinstakes.len()
+                );
+
+                // Calculate lottery payments (50 DIVI per block × cycle = total lottery payout)
+                let lottery_reward_per_block = Amount::from_sat(50_00000000);
+                let payments = divi_consensus::lottery::calculate_lottery_payments(
+                    winners,
+                    lottery_reward_per_block,
+                    lottery_cycle,
+                );
+
+                Some(payments)
+            } else {
+                warn!("Lottery block {} has no winners!", height);
+                None
+            }
+        } else {
+            None
+        };
+
+        let (treasury_cycle, treasury_lottery_cycle, is_mainnet) = match self.chain.network_type() {
             divi_storage::NetworkType::Mainnet => (
-                divi_consensus::lottery::mainnet::LOTTERY_START_BLOCK,
-                divi_consensus::lottery::mainnet::LOTTERY_CYCLE,
+                divi_consensus::treasury::mainnet::TREASURY_CYCLE,
+                divi_consensus::treasury::mainnet::LOTTERY_CYCLE,
+                true,
             ),
             divi_storage::NetworkType::Testnet => (
-                divi_consensus::lottery::testnet::LOTTERY_START_BLOCK,
-                divi_consensus::lottery::testnet::LOTTERY_CYCLE,
+                divi_consensus::treasury::testnet::TREASURY_CYCLE,
+                divi_consensus::treasury::testnet::LOTTERY_CYCLE,
+                false,
             ),
             divi_storage::NetworkType::Regtest => (
-                divi_consensus::lottery::regtest::LOTTERY_START_BLOCK,
-                divi_consensus::lottery::regtest::LOTTERY_CYCLE,
+                divi_consensus::treasury::regtest::TREASURY_CYCLE,
+                divi_consensus::treasury::regtest::LOTTERY_CYCLE,
+                false,
             ),
         };
-        let lottery_payments =
-            if divi_consensus::lottery::is_lottery_block(height, lottery_start, lottery_cycle) {
-                // Get lottery winners from the previous block (tip)
-                let winners = &tip.lottery_winners;
 
-                if !winners.coinstakes.is_empty() {
-                    info!(
-                        "Creating lottery block {} with {} winners",
-                        height,
-                        winners.coinstakes.len()
-                    );
-
-                    // Calculate lottery payments (50 DIVI per block × cycle = total lottery payout)
-                    let lottery_reward_per_block = Amount::from_sat(50_00000000);
-                    let payments = divi_consensus::lottery::calculate_lottery_payments(
-                        winners,
-                        lottery_reward_per_block,
-                        lottery_cycle,
-                    );
-
-                    Some(payments)
-                } else {
-                    warn!("Lottery block {} has no winners!", height);
-                    None
-                }
-            } else {
-                None
-            };
-
-        let (treasury_start, treasury_cycle, treasury_lottery_cycle, is_mainnet) =
-            match self.chain.network_type() {
-                divi_storage::NetworkType::Mainnet => (
-                    divi_consensus::treasury::mainnet::TREASURY_START_BLOCK,
-                    divi_consensus::treasury::mainnet::TREASURY_CYCLE,
-                    divi_consensus::treasury::mainnet::LOTTERY_CYCLE,
-                    true,
-                ),
-                divi_storage::NetworkType::Testnet => (
-                    divi_consensus::treasury::testnet::TREASURY_START_BLOCK,
-                    divi_consensus::treasury::testnet::TREASURY_CYCLE,
-                    divi_consensus::treasury::testnet::LOTTERY_CYCLE,
-                    false,
-                ),
-                divi_storage::NetworkType::Regtest => (
-                    divi_consensus::treasury::regtest::TREASURY_START_BLOCK,
-                    divi_consensus::treasury::regtest::TREASURY_CYCLE,
-                    divi_consensus::treasury::regtest::LOTTERY_CYCLE,
-                    false,
-                ),
-            };
-
-        let treasury_payments = if divi_consensus::treasury::is_treasury_block_with_lottery(
-            height,
-            treasury_start,
-            treasury_cycle,
-            treasury_lottery_cycle,
-        ) {
+        let treasury_payments = if payout == divi_consensus::treasury::SuperblockPayout::Treasury {
             info!("Creating treasury block {}", height);
 
             // Use transition-aware payment cycle and weighted calculation
@@ -1523,6 +1507,45 @@ pub struct StakingStatus {
     pub blocks: u32,
 }
 
+/// Which superblock payout a staked block at `height` must carry.
+///
+/// Divi Core `BlockIncentivesPopulator::FillBlockPayee` pays the treasury when
+/// `IsValidTreasuryBlockHeight`, else the lottery when
+/// `IsValidLotteryBlockHeight` - never both.
+pub(crate) fn superblock_payout(
+    network: divi_storage::NetworkType,
+    height: u32,
+) -> divi_consensus::treasury::SuperblockPayout {
+    use divi_consensus::{lottery, treasury};
+    let (treasury_start, treasury_cycle, lottery_start, lottery_cycle) = match network {
+        divi_storage::NetworkType::Mainnet => (
+            treasury::mainnet::TREASURY_START_BLOCK,
+            treasury::mainnet::TREASURY_CYCLE,
+            lottery::mainnet::LOTTERY_START_BLOCK,
+            lottery::mainnet::LOTTERY_CYCLE,
+        ),
+        divi_storage::NetworkType::Testnet => (
+            treasury::testnet::TREASURY_START_BLOCK,
+            treasury::testnet::TREASURY_CYCLE,
+            lottery::testnet::LOTTERY_START_BLOCK,
+            lottery::testnet::LOTTERY_CYCLE,
+        ),
+        divi_storage::NetworkType::Regtest => (
+            treasury::regtest::TREASURY_START_BLOCK,
+            treasury::regtest::TREASURY_CYCLE,
+            lottery::regtest::LOTTERY_START_BLOCK,
+            lottery::regtest::LOTTERY_CYCLE,
+        ),
+    };
+    treasury::superblock_payout(
+        height,
+        treasury_start,
+        treasury_cycle,
+        lottery_start,
+        lottery_cycle,
+    )
+}
+
 /// Get current Unix timestamp
 fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -1614,6 +1637,46 @@ fn compute_merkle_root(transactions: &[Transaction]) -> Hash256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the regtest lottery and treasury cycles coincide before the
+    /// superblock transition, the staker pays the treasury only, as Divi Core's
+    /// FillBlockPayee does; paying both made the coinstake mint too much.
+    #[test]
+    fn test_staker_pays_treasury_not_lottery_on_coinciding_height() {
+        use divi_consensus::treasury::SuperblockPayout;
+        use divi_storage::NetworkType;
+        for h in [150u32, 200, 250, 300, 350, 400, 450] {
+            assert_eq!(
+                superblock_payout(NetworkType::Regtest, h),
+                SuperblockPayout::Treasury,
+                "regtest height {h}"
+            );
+        }
+        assert_eq!(
+            superblock_payout(NetworkType::Regtest, 160),
+            SuperblockPayout::Lottery
+        );
+        assert_eq!(
+            superblock_payout(NetworkType::Regtest, 161),
+            SuperblockPayout::None
+        );
+        assert_eq!(
+            superblock_payout(NetworkType::Testnet, 40200),
+            SuperblockPayout::Lottery
+        );
+        assert_eq!(
+            superblock_payout(NetworkType::Testnet, 40201),
+            SuperblockPayout::Treasury
+        );
+        assert_eq!(
+            superblock_payout(NetworkType::Mainnet, 10080),
+            SuperblockPayout::Lottery
+        );
+        assert_eq!(
+            superblock_payout(NetworkType::Mainnet, 10081),
+            SuperblockPayout::Treasury
+        );
+    }
 
     #[test]
     fn test_staking_config_default() {
