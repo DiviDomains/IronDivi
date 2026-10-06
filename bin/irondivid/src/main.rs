@@ -868,7 +868,19 @@ async fn run_daemon(
             block_sync.set_block_connected_callback(Arc::new(move |block, height| {
                 let block_hash = compute_block_hash(&block.header);
 
-                // 1. Calculate fees from mempool entries and clean mempool
+                // 1. Scan block for wallet transactions (adds new UTXOs, removes spent ones).
+                // This runs before the mempool cleanup below so the wallet's mempool
+                // entries for this block are replaced by confirmed records in one step;
+                // otherwise a send would briefly show its inputs as unspent again.
+                wallet_for_scan.scan_block(
+                    block_hash,
+                    height,
+                    block.header.time,
+                    &block.transactions,
+                );
+                wallet_for_scan.set_last_scan_height(height);
+
+                // 2. Calculate fees from mempool entries and clean mempool
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
                 for tx in block.transactions.iter().skip(1) {
                     if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
@@ -881,15 +893,6 @@ async fn run_daemon(
                     tx_relay_for_callback.mark_seen(*txid);
                 }
                 fee_estimator_for_callback.add_block(height, block, total_fees);
-
-                // 2. Scan block for wallet transactions (adds new UTXOs, removes spent ones)
-                wallet_for_scan.scan_block(
-                    block_hash,
-                    height,
-                    block.header.time,
-                    &block.transactions,
-                );
-                wallet_for_scan.set_last_scan_height(height);
 
                 // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
                 if let Err(e) = wallet_for_scan.save_incremental() {
@@ -904,6 +907,25 @@ async fn run_daemon(
                 );
             }));
             info!("Unified block callback registered (mempool + fees + wallet)");
+
+            // Mirror wallet-relevant mempool transactions into the wallet so
+            // unconfirmed sends and receives show up immediately (0 confirmations).
+            // The listeners fire for every path into and out of the mempool: P2P
+            // relay, local RPC sends, confirmation, eviction and clearing.
+            {
+                let wallet_for_added = Arc::clone(wallet_arc);
+                node.mempool()
+                    .set_added_listener(Arc::new(move |tx: &Transaction| {
+                        if wallet_for_added.add_mempool_tx(tx) {
+                            info!("Wallet sees unconfirmed tx {}", tx.txid());
+                        }
+                    }));
+                let wallet_for_removed = Arc::clone(wallet_arc);
+                node.mempool()
+                    .set_removed_listener(Arc::new(move |tx: &Transaction| {
+                        wallet_for_removed.remove_mempool_tx(&tx.txid());
+                    }));
+            }
 
             // Register wallet reorg callback for chain reorganizations
             {
@@ -1096,7 +1118,17 @@ async fn run_daemon(
             staker.set_block_connected_callback(Arc::new(move |block, height| {
                 let block_hash = compute_block_hash(&block.header);
 
-                // 1. Calculate fees from mempool entries and clean mempool
+                // 1. Scan block for wallet transactions, before the mempool cleanup
+                // (see the block-connected callback for why)
+                wallet_for_staker.scan_block(
+                    block_hash,
+                    height,
+                    block.header.time,
+                    &block.transactions,
+                );
+                wallet_for_staker.set_last_scan_height(height);
+
+                // 2. Calculate fees from mempool entries and clean mempool
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
                 for tx in block.transactions.iter().skip(1) {
                     if let Some(mempool_entry) = mempool_for_staker.get(&tx.txid()) {
@@ -1109,15 +1141,6 @@ async fn run_daemon(
                     tx_relay_for_staker.mark_seen(*txid);
                 }
                 fee_estimator_for_staker.add_block(height, block, total_fees);
-
-                // 2. Scan block for wallet transactions
-                wallet_for_staker.scan_block(
-                    block_hash,
-                    height,
-                    block.header.time,
-                    &block.transactions,
-                );
-                wallet_for_staker.set_last_scan_height(height);
 
                 // 3. Persist wallet changes
                 if let Err(e) = wallet_for_staker.save_incremental() {

@@ -256,13 +256,21 @@ impl WalletRpc {
     pub fn get_balance(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        // Optional minconf parameter (default 1)
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-
+        // Divi Core (rpcwallet.cpp getbalance): with no params it returns
+        // GetBalance(), the trusted balance (confirmed coins plus our own
+        // unconfirmed change). With params it is `getbalance "*" minconf`, where
+        // our own 0-conf change counts at any minconf and others' 0-conf
+        // payments count only at minconf 0. IronDivi also accepts a bare
+        // numeric minconf as the first param.
         let height = self.current_height();
-        let balance = if min_conf == 0 {
+        let balance = if params.is_empty() {
             wallet.get_balance()
         } else {
+            let min_conf = if params.get_str(0).is_some() {
+                params.get_u64(1).unwrap_or(1)
+            } else {
+                params.get_u64(0).unwrap_or(1)
+            } as u32;
             wallet.get_confirmed_balance(height, min_conf)
         };
 

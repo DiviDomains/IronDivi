@@ -162,6 +162,47 @@ pub struct WalletTx {
     pub confirmations: u32,
 }
 
+/// A wallet transaction waiting in the mempool.
+///
+/// Kept in memory only, beside the confirmed state rather than inside it: the
+/// confirmed UTXO set, spent set and history are what get persisted and what
+/// the block scan updates, so a mempool transaction never touches them. When
+/// the transaction confirms, the block scan records it as usual and the entry
+/// is dropped; if it is evicted or conflicted, dropping the entry is enough.
+/// Where a coin in the wallet's effective UTXO view came from
+#[derive(Debug, Clone, Copy)]
+enum CoinSource {
+    /// Recorded from a block (the persisted UTXO set)
+    Block,
+    /// Output of a wallet transaction still in the mempool. Trusted when all
+    /// its inputs are ours (Core's IsTrusted), e.g. our own change.
+    Mempool { trusted: bool },
+}
+
+impl CoinSource {
+    /// Counts toward Core's GetBalance and may be selected for spending
+    fn is_trusted(self) -> bool {
+        match self {
+            CoinSource::Block => true,
+            CoinSource::Mempool { trusted } => trusted,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MempoolWalletTx {
+    /// Every outpoint the transaction spends (ours or not), for conflict checks
+    inputs: Vec<OutPoint>,
+    /// The subset of `inputs` that belong to this wallet
+    spends: Vec<OutPoint>,
+    /// Outputs paying this wallet (height None)
+    outputs: Vec<WalletUtxo>,
+    /// Core's IsTrusted for a 0-conf transaction: every input is ours
+    trusted: bool,
+    /// History entry shown by listtransactions/gettransaction (block_height None)
+    record: WalletTx,
+}
+
 /// Wallet database
 pub struct WalletDb {
     /// Key store
@@ -200,6 +241,8 @@ pub struct WalletDb {
     dirty: RwLock<DirtyFlags>,
     /// Spent UTXOs with spending height - for reorg restoration (in-memory only)
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
+    /// Wallet transactions in the mempool (in-memory only, never persisted)
+    mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
 }
 
 impl WalletDb {
@@ -224,6 +267,7 @@ impl WalletDb {
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
+            mempool_txs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -248,6 +292,7 @@ impl WalletDb {
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
+            mempool_txs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -277,6 +322,7 @@ impl WalletDb {
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
+            mempool_txs: RwLock::new(HashMap::new()),
         };
 
         // Load wallet data from database
@@ -362,6 +408,7 @@ impl WalletDb {
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
+            mempool_txs: RwLock::new(HashMap::new()),
         };
 
         Ok(wallet_db)
@@ -951,20 +998,63 @@ impl WalletDb {
         self.utxos.read().get(outpoint).cloned()
     }
 
-    /// Get all UTXOs
+    /// Get all UTXOs, including outputs of wallet transactions in the mempool
+    /// and excluding coins those transactions spend
     pub fn get_utxos(&self) -> Vec<WalletUtxo> {
-        self.utxos.read().values().cloned().collect()
+        self.effective_utxos().into_iter().map(|(u, _)| u).collect()
+    }
+
+    /// Unspent coins as Core sees them: confirmed UTXOs not spent by a mempool
+    /// transaction, plus our outputs of mempool transactions. The flag is
+    /// Core's IsTrusted: true for confirmed coins and for outputs of mempool
+    /// transactions that spend only our coins (our own change).
+    fn effective_utxos(&self) -> Vec<(WalletUtxo, CoinSource)> {
+        let overlay = self.mempool_txs.read();
+        let spent: HashSet<OutPoint> = overlay
+            .values()
+            .flat_map(|e| e.spends.iter().copied())
+            .collect();
+
+        let mut result: Vec<(WalletUtxo, CoinSource)> = self
+            .utxos
+            .read()
+            .values()
+            .filter(|u| !spent.contains(&u.outpoint()))
+            .map(|u| (u.clone(), CoinSource::Block))
+            .collect();
+        for entry in overlay.values() {
+            for u in &entry.outputs {
+                if !spent.contains(&u.outpoint()) {
+                    result.push((u.clone(), CoinSource::Mempool { trusted: entry.trusted }));
+                }
+            }
+        }
+        result
+    }
+
+    /// Outpoints spent by wallet transactions in the mempool
+    fn mempool_spent(&self) -> HashSet<OutPoint> {
+        self.mempool_txs
+            .read()
+            .values()
+            .flat_map(|e| e.spends.iter().copied())
+            .collect()
     }
 
     /// Get spendable UTXOs (mature and confirmed)
+    ///
+    /// Coins already spent by a mempool transaction are excluded. With
+    /// `min_confirmations == 0`, our own unconfirmed change is included, but
+    /// not unconfirmed coins from others (Core only spends trusted coins).
     pub fn get_spendable_utxos(
         &self,
         current_height: u32,
         min_confirmations: u32,
     ) -> Vec<WalletUtxo> {
-        self.utxos
-            .read()
-            .values()
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(_, source)| source.is_trusted())
+            .map(|(utxo, _)| utxo)
             .filter(|utxo| {
                 let confs = utxo.confirmations(current_height);
                 let mature = utxo.is_mature(current_height, self.coinbase_maturity());
@@ -979,7 +1069,6 @@ impl WalletDb {
                 // Only include UTXOs that are confirmed, mature, and not watch-only
                 confs >= min_confirmations && mature && !is_watch_only
             })
-            .cloned()
             .collect()
     }
 
@@ -1063,32 +1152,42 @@ impl WalletDb {
         select::select_minimum(&available_utxos, target, fee_rate, num_outputs)
     }
 
-    /// Get total balance
+    /// Get total balance: Core's GetBalance, i.e. trusted coins only
+    /// (confirmed, plus our own unconfirmed change)
     pub fn get_balance(&self) -> Amount {
-        self.utxos
-            .read()
-            .values()
-            .map(|u| u.value)
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(_, source)| source.is_trusted())
+            .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
     /// Get confirmed balance
+    ///
+    /// Matches Core's getbalance "*" minconf: coins spent by a mempool
+    /// transaction no longer count, our own unconfirmed change counts at any
+    /// minconf, and unconfirmed coins from others count only at minconf 0.
     pub fn get_confirmed_balance(&self, current_height: u32, min_confirmations: u32) -> Amount {
-        self.utxos
-            .read()
-            .values()
-            .filter(|utxo| utxo.confirmations(current_height) >= min_confirmations)
-            .map(|u| u.value)
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(utxo, source)| match source {
+                CoinSource::Block => utxo.confirmations(current_height) >= min_confirmations,
+                CoinSource::Mempool { trusted } => *trusted || min_confirmations == 0,
+            })
+            .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
-    /// Get unconfirmed balance
+    /// Get unconfirmed balance: Core's GetUnconfirmedBalance, i.e. unconfirmed
+    /// coins that are not trusted (incoming from others)
     pub fn get_unconfirmed_balance(&self) -> Amount {
-        self.utxos
-            .read()
-            .values()
-            .filter(|utxo| utxo.height.is_none())
-            .map(|u| u.value)
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(utxo, source)| match source {
+                CoinSource::Block => utxo.height.is_none(),
+                CoinSource::Mempool { trusted } => !*trusted,
+            })
+            .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
@@ -1126,8 +1225,8 @@ impl WalletDb {
 
     /// Get transaction history
     pub fn get_transactions(&self, count: Option<usize>) -> Vec<WalletTx> {
-        let txs = self.transactions.read();
-        let mut list: Vec<_> = txs.values().cloned().collect();
+        let mut list: Vec<_> = self.transactions.read().values().cloned().collect();
+        list.extend(self.mempool_txs.read().values().map(|e| e.record.clone()));
 
         // Sort by timestamp descending
         list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -1140,7 +1239,10 @@ impl WalletDb {
 
     /// Get a specific transaction
     pub fn get_transaction(&self, txid: &Hash256) -> Option<WalletTx> {
-        self.transactions.read().get(txid).cloned()
+        if let Some(tx) = self.transactions.read().get(txid) {
+            return Some(tx.clone());
+        }
+        self.mempool_txs.read().get(txid).map(|e| e.record.clone())
     }
 
     /// Mark an address as used
@@ -1345,22 +1447,7 @@ impl WalletDb {
                 is_relevant = true;
                 received += output.value;
 
-                // Extract address for labeling
-                let address = if let Some(hash_bytes) = output.script_pubkey.extract_p2pkh_hash() {
-                    let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
-                    Address::from_pubkey_hash(hash, self.network).to_string()
-                } else if let Some(vault) =
-                    divi_script::StakingVaultScript::from_script(&output.script_pubkey)
-                {
-                    // For vault UTXOs, use vault: prefix with manager address
-                    let manager_hash = Hash160::from_bytes(vault.vault_pubkey_hash);
-                    format!(
-                        "vault:{}",
-                        Address::from_pubkey_hash(manager_hash, self.network)
-                    )
-                } else {
-                    "unknown".to_string()
-                };
+                let address = self.output_address(&output.script_pubkey);
 
                 let mut utxo = WalletUtxo::new(
                     txid,
@@ -1458,6 +1545,188 @@ impl WalletDb {
 
             self.add_transaction(wallet_tx);
             debug!("Wallet tx {} {} {} sats", category, txid, net_amount.abs());
+        }
+
+        if block_hash.is_some() {
+            self.drop_confirmed_from_mempool(tx);
+        }
+    }
+
+    /// Label for an output we own: its P2PKH address, or "vault:<manager>"
+    fn output_address(&self, script_pubkey: &Script) -> String {
+        if let Some(hash_bytes) = script_pubkey.extract_p2pkh_hash() {
+            let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
+            Address::from_pubkey_hash(hash, self.network).to_string()
+        } else if let Some(vault) = divi_script::StakingVaultScript::from_script(script_pubkey) {
+            // For vault UTXOs, use vault: prefix with manager address
+            let manager_hash = Hash160::from_bytes(vault.vault_pubkey_hash);
+            format!(
+                "vault:{}",
+                Address::from_pubkey_hash(manager_hash, self.network)
+            )
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    /// Track a transaction that has entered the mempool.
+    ///
+    /// Returns true if it concerns this wallet. Nothing persisted is changed:
+    /// the block scan records the transaction once it confirms.
+    pub fn add_mempool_tx(&self, tx: &divi_primitives::transaction::Transaction) -> bool {
+        if tx.is_coinbase() || tx.is_coinstake() {
+            return false;
+        }
+        let txid = tx.txid();
+        if matches!(self.transactions.read().get(&txid), Some(t) if t.block_height.is_some()) {
+            return false;
+        }
+
+        // Ownership checks take keystore/vault locks, so do them before
+        // locking the overlay
+        let mut outputs = Vec::new();
+        let mut received = Amount::ZERO;
+        for (vout, output) in tx.vout.iter().enumerate() {
+            if output.is_empty() || !self.is_mine_script(&output.script_pubkey) {
+                continue;
+            }
+            received += output.value;
+            outputs.push(WalletUtxo::new(
+                txid,
+                vout as u32,
+                output.value,
+                output.script_pubkey.clone(),
+                self.output_address(&output.script_pubkey),
+            ));
+        }
+
+        let mut overlay = self.mempool_txs.write();
+        if overlay.contains_key(&txid) {
+            return false;
+        }
+
+        // Inputs we own: confirmed coins, or outputs of our other mempool txs
+        let mut inputs = Vec::new();
+        let mut spends = Vec::new();
+        let mut sent = Amount::ZERO;
+        {
+            let utxos = self.utxos.read();
+            for input in &tx.vin {
+                if input.prevout.is_null() {
+                    continue;
+                }
+                let outpoint = OutPoint::new(input.prevout.txid, input.prevout.vout);
+                inputs.push(outpoint);
+                let value = utxos.get(&outpoint).map(|u| u.value).or_else(|| {
+                    overlay.get(&outpoint.txid).and_then(|e| {
+                        e.outputs
+                            .iter()
+                            .find(|u| u.vout == outpoint.vout)
+                            .map(|u| u.value)
+                    })
+                });
+                if let Some(v) = value {
+                    spends.push(outpoint);
+                    sent += v;
+                }
+            }
+        }
+
+        if spends.is_empty() && outputs.is_empty() {
+            return false;
+        }
+
+        let net_amount = received.as_sat() - sent.as_sat();
+        let fee = if sent > Amount::ZERO {
+            let total_outputs = tx
+                .vout
+                .iter()
+                .filter(|o| !o.is_empty())
+                .map(|o| o.value)
+                .fold(Amount::ZERO, |a, b| a + b);
+            (sent > total_outputs).then(|| sent - total_outputs)
+        } else {
+            None
+        };
+        let category = if net_amount > 0 { "receive" } else { "send" };
+        let record = WalletTx {
+            txid,
+            block_hash: None,
+            block_height: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            amount: net_amount,
+            fee,
+            category: category.to_string(),
+            confirmations: 0,
+        };
+
+        debug!(
+            "Mempool wallet tx {} {} {} sats",
+            category,
+            txid,
+            net_amount.abs()
+        );
+        overlay.insert(
+            txid,
+            MempoolWalletTx {
+                trusted: spends.len() == inputs.len(),
+                inputs,
+                spends,
+                outputs,
+                record,
+            },
+        );
+        true
+    }
+
+    /// Stop tracking a transaction that has left the mempool.
+    ///
+    /// The wallet mirrors the mempool, so only this entry is dropped; any
+    /// child still in the mempool gets its own removal notice.
+    pub fn remove_mempool_tx(&self, txid: &Hash256) -> bool {
+        self.mempool_txs.write().remove(txid).is_some()
+    }
+
+    /// Number of wallet transactions currently tracked in the mempool
+    pub fn mempool_tx_count(&self) -> usize {
+        self.mempool_txs.read().len()
+    }
+
+    /// A transaction is now in a block: drop its mempool entry, and drop any
+    /// other entry that double-spends one of its inputs, together with that
+    /// entry's descendants (the node's mempool does not evict conflicts).
+    fn drop_confirmed_from_mempool(&self, tx: &divi_primitives::transaction::Transaction) {
+        let txid = tx.txid();
+        let mut overlay = self.mempool_txs.write();
+        if overlay.is_empty() {
+            return;
+        }
+        overlay.remove(&txid);
+
+        let confirmed_inputs: HashSet<OutPoint> = tx
+            .vin
+            .iter()
+            .filter(|i| !i.prevout.is_null())
+            .map(|i| OutPoint::new(i.prevout.txid, i.prevout.vout))
+            .collect();
+        let mut doomed: Vec<Hash256> = overlay
+            .iter()
+            .filter(|(_, e)| e.inputs.iter().any(|op| confirmed_inputs.contains(op)))
+            .map(|(id, _)| *id)
+            .collect();
+        while let Some(id) = doomed.pop() {
+            if overlay.remove(&id).is_some() {
+                info!("Dropped mempool wallet tx {} (conflicts with {})", id, txid);
+                doomed.extend(
+                    overlay
+                        .iter()
+                        .filter(|(_, e)| e.inputs.iter().any(|op| op.txid == id))
+                        .map(|(child, _)| *child),
+                );
+            }
         }
     }
 
@@ -1639,6 +1908,7 @@ impl WalletDb {
 
     /// Find vault UTXOs (UTXOs that pay to any tracked vault script)
     pub fn get_vault_utxos(&self, current_height: u32, min_confirmations: u32) -> Vec<WalletUtxo> {
+        let mempool_spent = self.mempool_spent();
         let vaults = self.vaults.read();
         let vault_scripts: std::collections::HashSet<_> =
             vaults.keys().map(|k| k.as_slice()).collect();
@@ -1647,6 +1917,9 @@ impl WalletDb {
             .read()
             .values()
             .filter(|utxo| {
+                if mempool_spent.contains(&utxo.outpoint()) {
+                    return false;
+                }
                 let confs = utxo.confirmations(current_height);
                 confs >= min_confirmations
                     && utxo.is_mature(current_height, self.coinbase_maturity())
@@ -1665,6 +1938,7 @@ impl WalletDb {
         current_height: u32,
         min_confirmations: u32,
     ) -> Vec<(WalletUtxo, divi_script::StakingVaultScript)> {
+        let mempool_spent = self.mempool_spent();
         let vaults = self.vaults.read();
         // Pre-parse all registered vault scripts
         let vault_scripts: HashMap<Vec<u8>, divi_script::StakingVaultScript> = vaults
@@ -1679,6 +1953,9 @@ impl WalletDb {
             .read()
             .values()
             .filter_map(|utxo| {
+                if mempool_spent.contains(&utxo.outpoint()) {
+                    return None;
+                }
                 let confs = utxo.confirmations(current_height);
                 if confs < min_confirmations
                     || !utxo.is_mature(current_height, self.coinbase_maturity())
@@ -2331,5 +2608,189 @@ mod tests {
             0,
             "Should not be spendable before maturity boundary"
         );
+    }
+
+    // -------- mempool overlay (unconfirmed transactions) --------
+
+    mod mempool_overlay {
+        use super::*;
+        use divi_primitives::transaction::{OutPoint as TxOutPoint, Transaction, TxIn, TxOut};
+
+        const COIN: i64 = 100_000_000;
+
+        fn spend(prevouts: &[(Hash256, u32)], outputs: Vec<(i64, Script)>) -> Transaction {
+            Transaction {
+                version: 1,
+                vin: prevouts
+                    .iter()
+                    .map(|(txid, vout)| TxIn {
+                        prevout: TxOutPoint { txid: *txid, vout: *vout },
+                        script_sig: Script::default(),
+                        sequence: 0xffffffff,
+                    })
+                    .collect(),
+                vout: outputs
+                    .into_iter()
+                    .map(|(v, script_pubkey)| TxOut { value: Amount::from_sat(v), script_pubkey })
+                    .collect(),
+                lock_time: 0,
+            }
+        }
+
+        fn stranger() -> Script {
+            Script::new_p2pkh(&[0xaa; 20])
+        }
+
+        fn mine(addr: &Address) -> Script {
+            Script::new_p2pkh(addr.hash.as_bytes())
+        }
+
+        /// Wallet holding one confirmed 100 DIVI coin at height 100.
+        fn funded() -> (WalletDb, Transaction) {
+            let wallet = create_test_wallet();
+            let addr = wallet.new_receiving_address().unwrap();
+            let fund = spend(&[(Hash256::from_bytes([9u8; 32]), 0)], vec![(100 * COIN, mine(&addr))]);
+            wallet.scan_block(Hash256::from_bytes([1u8; 32]), 100, 1_000, &[fund.clone()]);
+            assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+            (wallet, fund)
+        }
+
+        /// Our own send: 100 in, 30 to a stranger, 69.99 change, 0.01 fee.
+        fn own_send(wallet: &WalletDb, fund: &Transaction) -> Transaction {
+            let change = wallet.new_change_address().unwrap();
+            spend(
+                &[(fund.txid(), 0)],
+                vec![(30 * COIN, stranger()), (70 * COIN - 1_000_000, mine(&change))],
+            )
+        }
+
+        #[test]
+        fn own_send_is_trusted_before_confirmation() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            assert!(wallet.add_mempool_tx(&tx));
+            assert_eq!(wallet.mempool_tx_count(), 1);
+
+            // The spent input is gone; our change is spendable at 0 confirmations.
+            let spendable = wallet.get_spendable_utxos(100, 0);
+            assert!(spendable.iter().all(|u| u.txid != fund.txid()));
+            assert_eq!(spendable.len(), 1);
+            assert_eq!(spendable[0].txid, tx.txid());
+            assert!(wallet.get_spendable_utxos(100, 1).is_empty());
+
+            // Core: change is trusted, so it is in getbalance, not getunconfirmedbalance.
+            assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
+            assert_eq!(wallet.get_confirmed_balance(100, 1).as_sat(), 70 * COIN - 1_000_000);
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), 0);
+
+            let rec = wallet.get_transaction(&tx.txid()).unwrap();
+            assert_eq!(rec.category, "send");
+            assert_eq!(rec.fee.unwrap().as_sat(), 1_000_000);
+            assert!(rec.block_height.is_none());
+        }
+
+        #[test]
+        fn own_send_confirms_without_duplicates() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            wallet.add_mempool_tx(&tx);
+            let before = wallet.get_transactions(None).len();
+
+            wallet.scan_block(Hash256::from_bytes([2u8; 32]), 101, 1_060, &[tx.clone()]);
+
+            assert_eq!(wallet.mempool_tx_count(), 0);
+            assert_eq!(wallet.get_transactions(None).len(), before);
+            let rec = wallet.get_transaction(&tx.txid()).unwrap();
+            assert_eq!(rec.category, "send");
+            assert_eq!(rec.block_height, Some(101));
+            assert!(wallet.spent.read().contains(&OutPoint::new(fund.txid(), 0)));
+            assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
+            // The mempool's own remove after the block is a harmless no-op.
+            assert!(!wallet.remove_mempool_tx(&tx.txid()));
+        }
+
+        #[test]
+        fn incoming_from_stranger_is_untrusted() {
+            let wallet = create_test_wallet();
+            let addr = wallet.new_receiving_address().unwrap();
+            let tx = spend(&[(Hash256::from_bytes([7u8; 32]), 3)], vec![(5 * COIN, mine(&addr))]);
+            assert!(wallet.add_mempool_tx(&tx));
+
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+            assert_eq!(wallet.get_confirmed_balance(100, 1).as_sat(), 0);
+            assert_eq!(wallet.get_confirmed_balance(100, 0).as_sat(), 5 * COIN);
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), 5 * COIN);
+            assert!(wallet.get_spendable_utxos(100, 0).is_empty());
+
+            let utxos = wallet.get_utxos();
+            assert_eq!(utxos.len(), 1);
+            assert_eq!(utxos[0].confirmations(100), 0);
+            assert_eq!(wallet.get_transaction(&tx.txid()).unwrap().category, "receive");
+        }
+
+        #[test]
+        fn unrelated_tx_is_ignored() {
+            let (wallet, _) = funded();
+            let tx = spend(&[(Hash256::from_bytes([5u8; 32]), 0)], vec![(COIN, stranger())]);
+            assert!(!wallet.add_mempool_tx(&tx));
+            assert_eq!(wallet.mempool_tx_count(), 0);
+        }
+
+        #[test]
+        fn remove_reverts_state() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            wallet.add_mempool_tx(&tx);
+            assert!(wallet.remove_mempool_tx(&tx.txid()));
+
+            assert_eq!(wallet.mempool_tx_count(), 0);
+            assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+            assert!(wallet.get_transaction(&tx.txid()).is_none());
+            let spendable = wallet.get_spendable_utxos(101, 1);
+            assert_eq!(spendable.len(), 1);
+            assert_eq!(spendable[0].txid, fund.txid());
+        }
+
+        #[test]
+        fn conflicting_block_drops_entry_and_descendants() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            wallet.add_mempool_tx(&tx);
+            // A child spending the unconfirmed change.
+            let child = spend(&[(tx.txid(), 1)], vec![(69 * COIN, stranger())]);
+            assert!(wallet.add_mempool_tx(&child));
+            assert_eq!(wallet.mempool_tx_count(), 2);
+
+            // A different tx spending the same coin confirms instead.
+            let other = spend(&[(fund.txid(), 0)], vec![(99 * COIN, stranger())]);
+            wallet.scan_block(Hash256::from_bytes([3u8; 32]), 101, 1_060, &[other]);
+
+            assert_eq!(wallet.mempool_tx_count(), 0);
+            assert!(wallet.get_transaction(&tx.txid()).is_none());
+            assert!(wallet.get_transaction(&child.txid()).is_none());
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+        }
+
+        #[test]
+        fn overlay_is_not_persisted() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("overlay.dat");
+            let tx;
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                let addr = wallet.new_receiving_address().unwrap();
+                tx = spend(&[(Hash256::from_bytes([7u8; 32]), 0)], vec![(5 * COIN, mine(&addr))]);
+                assert!(wallet.add_mempool_tx(&tx));
+                wallet.save_incremental().unwrap();
+                wallet.save().unwrap();
+            }
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            assert_eq!(wallet.mempool_tx_count(), 0);
+            assert!(wallet.get_utxos().is_empty());
+            assert!(wallet.get_transaction(&tx.txid()).is_none());
+        }
     }
 }

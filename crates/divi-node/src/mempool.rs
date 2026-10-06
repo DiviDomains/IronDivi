@@ -21,6 +21,7 @@ use divi_primitives::transaction::Transaction;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Transaction entry in the mempool
@@ -105,6 +106,9 @@ impl Ord for PriorityEntry {
     }
 }
 
+/// Listener notified when a transaction enters or leaves the mempool
+pub type MempoolListener = Arc<dyn Fn(&Transaction) + Send + Sync>;
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -124,6 +128,12 @@ pub struct Mempool {
 
     /// Priority deltas for transactions (txid -> (priority_delta, fee_delta))
     priority_deltas: RwLock<HashMap<Hash256, (f64, i64)>>,
+
+    /// Called after a transaction is inserted (outside any mempool lock)
+    on_added: RwLock<Option<MempoolListener>>,
+
+    /// Called after a transaction is removed for any reason (outside any mempool lock)
+    on_removed: RwLock<Option<MempoolListener>>,
 }
 
 impl Mempool {
@@ -136,7 +146,20 @@ impl Mempool {
             spenders: RwLock::new(HashMap::new()),
             total_size: RwLock::new(0),
             priority_deltas: RwLock::new(HashMap::new()),
+            on_added: RwLock::new(None),
+            on_removed: RwLock::new(None),
         }
+    }
+
+    /// Register a listener for transactions entering the mempool
+    pub fn set_added_listener(&self, listener: MempoolListener) {
+        *self.on_added.write() = Some(listener);
+    }
+
+    /// Register a listener for transactions leaving the mempool
+    /// (confirmed, evicted, expired or explicitly removed)
+    pub fn set_removed_listener(&self, listener: MempoolListener) {
+        *self.on_removed.write() = Some(listener);
     }
 
     /// Check if a transaction is in the mempool
@@ -228,6 +251,11 @@ impl Mempool {
             entry.size
         );
 
+        let listener = self.on_added.read().clone();
+        if let Some(listener) = listener {
+            listener(&entry.tx);
+        }
+
         Ok(txid)
     }
 
@@ -248,6 +276,11 @@ impl Mempool {
         *self.total_size.write() -= entry.size;
 
         tracing::debug!("Removed tx {} from mempool", txid);
+
+        let listener = self.on_removed.read().clone();
+        if let Some(listener) = listener {
+            listener(&entry.tx);
+        }
 
         Some(entry)
     }
@@ -388,12 +421,19 @@ impl Mempool {
 
     /// Clear all transactions from mempool
     pub fn clear(&self) {
-        self.txs.write().clear();
+        let removed: Vec<MempoolEntry> = self.txs.write().drain().map(|(_, e)| e).collect();
         self.spenders.write().clear();
         self.priority_queue.write().clear();
         *self.total_size.write() = 0;
         self.priority_deltas.write().clear();
         tracing::info!("Mempool cleared");
+
+        let listener = self.on_removed.read().clone();
+        if let Some(listener) = listener {
+            for entry in &removed {
+                listener(&entry.tx);
+            }
+        }
     }
 }
 
