@@ -769,7 +769,11 @@ fn load_or_create_wallet_from(
     let wallet = WalletDb::create_persistent(wallet_path, network, hd_wallet)
         .with_context(|| "Failed to create wallet")?;
 
-    // When restoring from mnemonic, pre-generate addresses so catch-up scan can find UTXOs
+    // When restoring from mnemonic, pre-generate keys so the catch-up scan can find
+    // UTXOs. They go into the keypool, as in Core, so the receiving and change
+    // indices stay at 0: issuing them instead would put the next getnewaddress at
+    // /0/{lookahead} and the next change output at /1/{lookahead}, past the gap
+    // limit of other wallets restoring the same seed.
     if restoring.is_some() {
         let lookahead: u32 = std::env::var("WALLET_LOOKAHEAD")
             .ok()
@@ -779,15 +783,10 @@ fn load_or_create_wallet_from(
             "Pre-generating {} receiving and {} change addresses for wallet recovery",
             lookahead, lookahead
         );
-        for _ in 0..lookahead {
-            wallet
-                .new_receiving_address()
-                .with_context(|| "Failed to derive receiving address")?;
-            wallet
-                .new_change_address()
-                .with_context(|| "Failed to derive change address")?;
-        }
-        info!("Pre-generated {} addresses", lookahead * 2);
+        let generated = wallet
+            .refill_keypool(Some(lookahead * 2))
+            .with_context(|| "Failed to pre-generate recovery keys")?;
+        info!("Pre-generated {} addresses", generated);
     }
 
     // Save immediately
@@ -1639,6 +1638,43 @@ mod wallet_log_tests {
         let wallet = wallet.expect("wallet restore");
         assert_eq!(wallet.mnemonic().as_deref(), Some(mnemonic.as_str()));
         assert_mnemonic_not_logged(&logs, &mnemonic);
+    }
+    #[test]
+    fn test_restored_wallet_issues_from_index_zero() {
+        // Core's keypool hands out its oldest key, so a restored wallet's first
+        // change output goes to /1/0 even though the lookahead derived /1/0..199.
+        let mnemonic = "abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon abandon abandon about";
+        let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let wallet = load_or_create_wallet_from(
+            &path,
+            WalletNetwork::Regtest,
+            ChainMode::Divi,
+            Some(mnemonic.clone()),
+        )
+        .expect("wallet restore");
+
+        assert_eq!(wallet.keystore().get_indices(), (0, 0));
+        assert_eq!(wallet.keypool_size(), 400);
+
+        let hd = divi_wallet::HdWallet::from_mnemonic(&mnemonic, None, ChainMode::Divi).unwrap();
+        let addr_at = |change: bool, i: u32| {
+            let key = if change {
+                hd.derive_change(0, i).unwrap()
+            } else {
+                hd.derive_receiving(0, i).unwrap()
+            };
+            divi_wallet::KeyEntry::with_hd_path(key.secret_key().unwrap(), String::new())
+                .address(WalletNetwork::Regtest)
+        };
+        // The whole lookahead is still recognised for the catch-up scan.
+        assert!(wallet.is_mine(&addr_at(false, 199)));
+        assert!(wallet.is_mine(&addr_at(true, 199)));
+
+        assert_eq!(wallet.new_change_address().unwrap(), addr_at(true, 0));
+        assert_eq!(wallet.new_receiving_address().unwrap(), addr_at(false, 0));
     }
 }
 
