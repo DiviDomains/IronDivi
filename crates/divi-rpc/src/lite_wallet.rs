@@ -119,7 +119,7 @@ impl LiteWalletRpc {
 
         Ok(serde_json::json!({
             "balance": balance.as_sat(),
-            "balance_divi": balance.as_divi(),
+            "balance_divi": balance.as_divi_f64(),
             "confirmed": true,
         }))
     }
@@ -159,7 +159,7 @@ impl LiteWalletRpc {
                         "txid": utxo.outpoint.txid.to_string(),
                         "vout": utxo.outpoint.vout,
                         "address": addr_str,
-                        "amount": utxo.value.as_divi(),
+                        "amount": utxo.value.as_divi_f64(),
                         "satoshis": utxo.value.as_sat(),
                         "height": utxo.height,
                         "confirmations": confirmations,

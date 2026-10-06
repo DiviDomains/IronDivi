@@ -1213,7 +1213,8 @@ impl WalletRpc {
                     }
 
                     serde_json::json!({
-                        "value": output.value.as_divi(),
+                        "value": output.value.as_divi_f64(),
+                        "valueSat": output.value.as_sat(),
                         "n": n,
                         "scriptPubKey": script_obj,
                     })
@@ -1335,7 +1336,8 @@ impl WalletRpc {
                 }
 
                 serde_json::json!({
-                    "value": output.value.as_divi(),
+                    "value": output.value.as_divi_f64(),
+                    "valueSat": output.value.as_sat(),
                     "n": n,
                     "scriptPubKey": script_obj,
                 })
@@ -1701,7 +1703,7 @@ impl WalletRpc {
             result.push(json!({
                 "owner": vault.owner_address,
                 "manager": vault.manager_address,
-                "balance": balance.as_divi(),
+                "balance": balance.as_divi_f64(),
                 "balance_sat": balance.as_sat()
             }));
         }
@@ -2005,8 +2007,8 @@ impl WalletRpc {
                 codes::WALLET_ERROR,
                 format!(
                     "Insufficient vault funds. Have {}, need {}",
-                    total_input.as_divi(),
-                    (send_amount + final_fee).as_divi()
+                    total_input.as_divi_f64(),
+                    (send_amount + final_fee).as_divi_f64()
                 ),
             )
             .into());
@@ -2063,8 +2065,8 @@ impl WalletRpc {
 
         Ok(json!({
             "txid": txid.to_string(),
-            "amount": send_amount.as_divi(),
-            "fee": final_fee.as_divi()
+            "amount": send_amount.as_divi_f64(),
+            "fee": final_fee.as_divi_f64()
         }))
     }
 
@@ -3594,6 +3596,35 @@ mod tests {
         let wallet = HdWallet::new(ChainMode::Divi).unwrap();
         let wallet_db = Arc::new(WalletDb::with_hd_wallet(Network::Mainnet, wallet));
         WalletRpc::with_wallet(wallet_db)
+    }
+
+    #[test]
+    fn test_decode_raw_transaction_keeps_fractional_value() {
+        // Core prints ValueFromAmount (decimal DIVI) plus valueSat; truncating to
+        // whole DIVI hid the 0.4023402 of change from the 1,000 DIVI send.
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+
+        let mut tx = Transaction::new();
+        tx.vin.push(TxIn::new(
+            OutPoint::new(Hash256::from_bytes([7u8; 32]), 0),
+            Script::new(),
+            0xffff_ffff,
+        ));
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(9_072_940_234_020),
+            Script::new_p2pkh(&[1u8; 20]),
+        ));
+        tx.vout.push(TxOut::new(Amount::from_sat(3_000), Script::new_p2pkh(&[2u8; 20])));
+
+        let rpc = create_test_wallet_rpc();
+        let params = Params::Array(vec![serde_json::json!(hex::encode(serialize(&tx)))]);
+        let result = rpc.decode_raw_transaction(&params).unwrap();
+
+        assert_eq!(result["vout"][0]["value"].as_f64().unwrap(), 90_729.4023402);
+        assert_eq!(result["vout"][0]["valueSat"].as_i64().unwrap(), 9_072_940_234_020);
+        assert_eq!(result["vout"][1]["value"].as_f64().unwrap(), 0.00003);
+        assert_eq!(result["vout"][1]["valueSat"].as_i64().unwrap(), 3_000);
     }
 
     #[test]

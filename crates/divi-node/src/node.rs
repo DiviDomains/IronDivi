@@ -1178,7 +1178,7 @@ impl Node {
             bytes: stats.total_bytes,
             usage: stats.total_bytes,
             max_size: stats.max_size,
-            total_fee: stats.total_fee.as_divi() as f64 / 100_000_000.0,
+            total_fee: stats.total_fee.as_divi_f64(),
         }
     }
 
