@@ -925,6 +925,24 @@ async fn run_daemon(
                     .set_removed_listener(Arc::new(move |tx: &Transaction| {
                         wallet_for_removed.remove_mempool_tx(&tx.txid());
                     }));
+
+                // P2P is already running, so pick up anything relayed before the
+                // listener was in place. Oldest first so parents precede children;
+                // duplicates from the listener racing this loop are ignored.
+                let mempool = node.mempool();
+                let mut pending: Vec<_> = mempool
+                    .get_txids()
+                    .iter()
+                    .filter_map(|txid| mempool.get(txid))
+                    .collect();
+                pending.sort_by_key(|entry| std::cmp::Reverse(entry.age()));
+                let seen = pending
+                    .iter()
+                    .filter(|entry| wallet_arc.add_mempool_tx(&entry.tx))
+                    .count();
+                if seen > 0 {
+                    info!("Wallet picked up {} unconfirmed tx(s) already in the mempool", seen);
+                }
             }
 
             // Register wallet reorg callback for chain reorganizations
