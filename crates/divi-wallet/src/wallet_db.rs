@@ -1663,16 +1663,18 @@ impl WalletDb {
             confirmations: 0,
         };
 
-        debug!(
-            "Mempool wallet tx {} {} {} sats",
+        let trusted = spends.len() == inputs.len();
+        info!(
+            "Mempool wallet tx {} {} {} sats ({})",
             category,
             txid,
-            net_amount.abs()
+            net_amount.abs(),
+            if trusted { "trusted" } else { "untrusted" }
         );
         overlay.insert(
             txid,
             MempoolWalletTx {
-                trusted: spends.len() == inputs.len(),
+                trusted,
                 inputs,
                 spends,
                 outputs,
