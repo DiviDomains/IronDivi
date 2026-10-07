@@ -333,6 +333,17 @@ fn default_conf_path(home: &Path, privatedivi: bool) -> PathBuf {
     })
 }
 
+/// Strip one pair of matching surrounding quotes, as TOML string values carry.
+fn unquote(value: &str) -> &str {
+    let v = value.trim();
+    for q in ['"', '\''] {
+        if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
+            return &v[1..v.len() - 1];
+        }
+    }
+    v
+}
+
 /// Read configuration file with section header support
 fn read_config(path: &Path, network: &str) -> Config {
     use std::fs;
@@ -375,6 +386,8 @@ fn read_config(path: &Path, network: &str) -> Config {
         let line = line.split('#').next().unwrap_or(line).trim();
 
         if let Some((key, value)) = line.split_once('=') {
+            // irondivid reads the same file as TOML, where strings are quoted.
+            let value = unquote(value);
             match key.trim() {
                 "rpcuser" => config.rpcuser = Some(value.trim().to_string()),
                 "rpcpassword" => config.rpcpassword = Some(value.trim().to_string()),
@@ -861,5 +874,14 @@ mod endpoint_tests {
             .to_string();
         assert!(err.contains("irondivi"), "{err}");
         assert!(err.contains("divi") && err.contains("privatedivi"), "{err}");
+    }
+
+    #[test]
+    fn config_values_accept_toml_quotes() {
+        assert_eq!(unquote(" \"alice\" "), "alice");
+        assert_eq!(unquote("'alice'"), "alice");
+        assert_eq!(unquote("alice"), "alice");
+        assert_eq!(unquote("\""), "\"");
+        assert_eq!(unquote("51491"), "51491");
     }
 }

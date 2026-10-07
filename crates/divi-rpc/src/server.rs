@@ -27,8 +27,9 @@ use divi_storage::{AddressIndex, Chain};
 use divi_wallet::WalletDb;
 
 use axum::{
-    extract::{Path, State},
-    http::{header, Method, StatusCode},
+    extract::{Path, Request as HttpRequest, State},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::post,
     Router,
@@ -37,7 +38,7 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// RPC server configuration
 #[derive(Debug, Clone)]
@@ -860,24 +861,100 @@ async fn handle_wallet_rpc(
     )
 }
 
-/// Create the axum router for RPC
+/// Create the axum router for RPC, without authentication.
 pub fn create_router(server: Arc<RpcServer>) -> Router {
+    build_router(server, None)
+}
+
+/// Create the axum router for RPC, enforcing HTTP Basic authentication when
+/// `config` carries both a username and a password.
+pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
+    build_router(server, rpc_credentials(config))
+}
+
+fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-    Router::new()
+    let router = Router::new()
         .route("/", post(handle_rpc))
         .route("/wallet/:wallet_name", post(handle_wallet_rpc))
-        .with_state(server)
-        .layer(cors)
+        .with_state(server);
+
+    let router = match credentials {
+        Some(creds) => router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
+            let creds = creds.clone();
+            async move {
+                let authorization = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                if basic_auth_matches(authorization, &creds.0, &creds.1) {
+                    next.run(req).await
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(
+                            header::WWW_AUTHENTICATE,
+                            HeaderValue::from_static("Basic realm=\"jsonrpc\""),
+                        )],
+                    )
+                        .into_response()
+                }
+            }
+        })),
+        None => router,
+    };
+
+    // CORS stays outermost so preflight requests are answered without credentials.
+    router.layer(cors)
+}
+
+/// The credentials to enforce: both must be set, or the server runs open.
+fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
+    match (&config.username, &config.password) {
+        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
+            info!("RPC authentication enabled");
+            Some(Arc::new((u.clone(), p.clone())))
+        }
+        (None, None) => {
+            warn!("RPC authentication disabled: rpcuser/rpcpassword not set");
+            None
+        }
+        _ => {
+            warn!("RPC authentication disabled: set both rpcuser and rpcpassword");
+            None
+        }
+    }
+}
+
+/// Check an `Authorization` header against the expected Basic credentials.
+fn basic_auth_matches(authorization: Option<&str>, user: &str, password: &str) -> bool {
+    use base64::Engine;
+
+    let Some(encoded) = authorization.and_then(|h| {
+        h.strip_prefix("Basic ")
+            .or_else(|| h.strip_prefix("basic "))
+    }) else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+        return false;
+    };
+    let expected = format!("{user}:{password}");
+    constant_time_eq(&decoded, expected.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Start the RPC server
 pub async fn start_server(config: RpcConfig, chain: Arc<Chain>) -> Result<(), Error> {
     let server = Arc::new(RpcServer::new(chain));
-    let app = create_router(server);
+    let app = create_router_with_auth(server, &config);
 
     info!("Starting RPC server on {}", config.bind_address);
 
@@ -909,7 +986,7 @@ where
 
     setup_callbacks(&server);
 
-    let app = create_router(server);
+    let app = create_router_with_auth(server, &config);
 
     info!("Starting RPC server on {}", config.bind_address);
 
@@ -939,7 +1016,7 @@ where
     // Allow caller to set up callbacks
     setup_callbacks(&server);
 
-    let app = create_router(server);
+    let app = create_router_with_auth(server, &config);
 
     info!("Starting RPC server on {}", config.bind_address);
 
@@ -1289,5 +1366,50 @@ mod tests {
         let err = RpcError::parse_error();
         assert_eq!(err.code, codes::PARSE_ERROR);
         assert_eq!(err.code, -32700);
+    }
+
+    #[test]
+    fn basic_auth_accepts_only_the_configured_credentials() {
+        use base64::Engine;
+        let enc = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let basic = |s: &str| format!("Basic {}", enc(s));
+        assert!(basic_auth_matches(
+            Some(&basic("alice:s3cret")),
+            "alice",
+            "s3cret"
+        ));
+        assert!(!basic_auth_matches(None, "alice", "s3cret"));
+        assert!(!basic_auth_matches(
+            Some(&basic("alice:wrong")),
+            "alice",
+            "s3cret"
+        ));
+        assert!(!basic_auth_matches(
+            Some(&basic("bob:s3cret")),
+            "alice",
+            "s3cret"
+        ));
+        assert!(!basic_auth_matches(
+            Some(&basic("alice:s3cretX")),
+            "alice",
+            "s3cret"
+        ));
+        let bearer = format!("Bearer {}", enc("alice:s3cret"));
+        assert!(!basic_auth_matches(Some(&bearer), "alice", "s3cret"));
+        assert!(!basic_auth_matches(
+            Some("Basic !!notbase64"),
+            "alice",
+            "s3cret"
+        ));
+    }
+
+    #[test]
+    fn auth_is_enforced_only_with_both_credentials() {
+        let mut config = RpcConfig::default();
+        assert!(rpc_credentials(&config).is_none());
+        config.username = Some("alice".into());
+        assert!(rpc_credentials(&config).is_none());
+        config.password = Some("s3cret".into());
+        assert!(rpc_credentials(&config).is_some());
     }
 }
