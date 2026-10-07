@@ -158,10 +158,10 @@ It waits on lanes with a Monitor on the status files, not by polling.
 
 | # | Task | Exit criterion |
 |---|---|---|
-| 0.1 | Scaffold all five members, register in workspace, add deps (`bitcoin`, `reqwest` rustls, `rusqlite` bundled, `axum`, `tokio`, `async-trait`, `clap`), commit `Cargo.lock` | `cargo build --workspace` green, pushed |
+| 0.1 | Confirm push works with `git push origin main` (no-op) — the repo-local credential helper (§6) must be present. Scaffold all five members, register in workspace, add deps (`bitcoin`, `reqwest` rustls, `rusqlite` bundled, `axum`, `tokio`, `async-trait`, `clap`), commit `Cargo.lock` | `cargo build --workspace` green, pushed |
 | 0.2 | Write `divi-swap` types + `ChainBackend` trait + `HtlcParams` + state enum + config profiles (§3.1–3.2) | compiles; doc-tested script template |
 | 0.3 | **Live CLTV proof on Divi testnet** (go/no-go): build an HTLC P2SH with IronDivi crates, fund it from the testnet key, (a) claim with preimage, (b) second HTLC refunded after a 10 min locktime | both txids confirmed; recorded in RESULTS.md. If refund is rejected → stop, escalate to oracle (CLTV not active / sighash mismatch) |
-| 0.4 | Same on BTC signet with rust-bitcoin + mempool.space | both txids confirmed |
+| 0.4 | Same on BTC signet with rust-bitcoin + mempool.space. Refund locktime **≥ 2 h** ahead of current MTP (signet MTP lags wall clock ~1 h; a 10 min lock is rejected for over an hour and looks like a CLTV bug). Run the refund wait in the background. | both txids confirmed |
 | 0.5 | Fund engine keys: testnet DIVI from the vps1 faucet (`:19150`, via tailnet or ssh) or the dnsdivi testnet node wallets; signet BTC from a public signet faucet | maker ≥ 5,000 tDIVI, taker ≥ 0.01 sBTC. **If no faucet dispenses, this is the one question for Bert** |
 | 0.6 | Store keys in 1Password (`IronDivi Swap POC` items), resolver in `divi-swap::secrets` | `op read` at runtime works; nothing on disk |
 | 0.7 | Write lane briefs `docs/plans/swap-poc/lanes/*.md` and `tools/swap-poc/check-*.sh` | each check script fails before work starts (proves it can fail) |
@@ -174,7 +174,7 @@ It waits on lanes with a Monitor on the status files, not by polling.
 | **btc** | `crates/swap-chain-btc/` | Unit: P2WSH claim/refund verified with `bitcoinconsensus`. Integration (`live`): fund/claim/refund on signet; Esplora client retries + 429 backoff; blockstream fallback. |
 | **engine** | `crates/divi-swap/` (except frozen contract) | State machine driven by an in-memory `MockBackend`: happy path, cases A–D, crash at every state + restart, timeout invariant, "no coin selection before `TakerLockConfirmed`". Property test on random crash points. |
 | **daemon** | `bin/divi-swapd/`, `bin/divi-swap/` | HTTP API (`POST /offers`, `GET /offers/:id/quote` 60 s expiry, `POST /swaps`, `GET /swaps/:id`, `/healthz`); CLI taker flow; end-to-end run against two `MockBackend`s in one test. |
-| **deploy** | `deploy/divi-swapd/` | systemd unit (dedicated unprivileged user, `ProtectSystem=strict`, `NoNewPrivileges` — the divi-chatbot template), nginx location, log rotation at 10 MB, secret loading, `deploy.sh` that is idempotent and dry-runnable. `shellcheck` clean; dry run prints the plan. Does **not** touch dnsdivi. |
+| **deploy** | `deploy/divi-swapd/` | systemd unit (dedicated unprivileged user, `ProtectSystem=strict`, `NoNewPrivileges` — copy the divi-chatbot unit pattern described in `~/code/divi-infrastructure/DEPLOYMENT.md`), nginx location, log rotation at 10 MB, secret loading, `deploy.sh` that is idempotent and dry-runnable. `shellcheck` clean; dry run prints the plan. Does **not** touch dnsdivi. |
 
 Lanes are independent once Wave 0 lands: engine and daemon build against `MockBackend`,
 chain lanes against the trait. Gate: orchestrator merges nothing — lanes push to `main` themselves;
@@ -200,11 +200,12 @@ the gate is `cargo test --workspace` + clippy green on `main` and every check sc
 | Blocker | Handling |
 |---|---|
 | **Commit signing needs 1Password** (`op-ssh-sign`) | Launch lanes while Bert is present and 1Password is unlocked so the agent's approval is remembered. If a signing prompt can't be answered, the lane parks per `secret-management.md` §7.1: stage, write the message to `docs/plans/swap-poc/parked/<lane>-<n>.msg` (outside nothing secret), keep working, and leave one command (`git commit -F <file>`). Never `--no-gpg-sign`. |
+| **Push 403 / `Repository not found`** — default gh account is `bshuler`, repo needs `DiviDomains` | Already applied to this clone (2026-10-07), shared by every worktree: repo-local `credential.https://github.com.helper` that answers `username=DiviDomains` and `password=$(gh auth token -u DiviDomains)` (token from gh's keyring at call time; never on disk or argv). **Never `gh auth switch`** — it is global and races between lanes. Fresh clone: `git config --local --replace-all credential.https://github.com.helper ''` then `--add` the helper shown by `git config --local --get-all credential.https://github.com.helper` here. |
 | Testnet address/spent index missing | Block-scan design (§2); no dependency. |
 | No testnet DIVI | Wave 0.5; only legitimate question to Bert. |
 | Signet faucets rate-limit | Try several in Wave 0.4; keep taker sats small (0.001 per swap) and reuse refunds. |
 | Divi sighash differs from Bitcoin legacy | Proven in 0.3 against the live chain before lanes start. |
-| services.divi.domains proxy blocks a needed method | Lane writes it to status; orchestrator adds it to the proxy allowlist (`divi-infrastructure/divi-rpc-proxy`) or switches to the dnsdivi local testnet RPC (`51475`, localhost only). |
+| services.divi.domains proxy blocks a needed method | Lane writes it to status; orchestrator adds it to the proxy allowlist (`~/code/divi-infrastructure/divi-rpc-proxy/`) or switches to the dnsdivi local testnet RPC (`51475`, localhost only). |
 | vps1 memory | Nothing runs on vps1; engine is dnsdivi only. |
 
 ## 7. After the POC (not in this plan)
