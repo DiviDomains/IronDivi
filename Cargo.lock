@@ -89,9 +89,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.100"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arrayvec"
@@ -770,7 +770,7 @@ dependencies = [
  "divi-crypto",
  "divi-primitives",
  "hex",
- "rand 0.8.5",
+ "rand 0.8.8",
  "sha2",
  "thiserror 1.0.69",
  "tracing",
@@ -787,7 +787,7 @@ dependencies = [
  "divi-primitives",
  "hex",
  "proptest",
- "rand 0.8.5",
+ "rand 0.8.8",
  "ripemd",
  "scrypt",
  "secp256k1 0.29.1",
@@ -807,7 +807,7 @@ dependencies = [
  "divi-script",
  "hex",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rocksdb",
  "serde",
  "serde_json",
@@ -831,7 +831,7 @@ dependencies = [
  "futures",
  "hex",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.8.8",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -872,7 +872,7 @@ dependencies = [
  "derive_more",
  "hex",
  "proptest",
- "rand 0.8.5",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "sha2",
@@ -962,7 +962,7 @@ dependencies = [
  "hmac",
  "parking_lot",
  "pbkdf2",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rocksdb",
  "serde",
  "serde_json",
@@ -1539,7 +1539,7 @@ dependencies = [
  "divi-wallet",
  "hex",
  "parking_lot",
- "rand 0.8.5",
+ "rand 0.8.8",
  "rocksdb",
  "serde_json",
  "sha2",
@@ -2057,7 +2057,7 @@ dependencies = [
  "bit-vec",
  "bitflags",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.5",
  "rand_chacha 0.9.0",
  "rand_xorshift",
  "regex-syntax",
@@ -2151,9 +2151,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -2162,9 +2162,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.2"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -2552,7 +2552,7 @@ version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
- "rand 0.8.5",
+ "rand 0.8.8",
  "secp256k1-sys 0.10.1",
 ]
 
@@ -3209,7 +3209,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand 0.8.5",
+ "rand 0.8.8",
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
