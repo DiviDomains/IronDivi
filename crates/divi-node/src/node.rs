@@ -419,6 +419,11 @@ impl Node {
                                     tx_relay.handle_inv(peer_id, tx_items).await;
                                 }
                             }
+                            NetworkMessage::NotFound(items) => {
+                                // Fail block requests over to another peer now
+                                // instead of after the download timeout
+                                block_sync.handle_notfound(peer_id, items).await;
+                            }
                             NetworkMessage::Tx(tx) => {
                                 tx_relay.handle_tx(peer_id, tx).await;
                             }

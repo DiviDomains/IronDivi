@@ -26,6 +26,7 @@ use divi_storage::Chain;
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -39,6 +40,15 @@ const MAX_BLOCKS_IN_FLIGHT: usize = 128;
 
 /// Timeout for block downloads
 const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Failed attempts (timeouts or `notfound`) after which a block request is dropped.
+/// Before this cap a block nobody serves was re-requested every 60 s forever,
+/// ping-ponging between the same two peers.
+const MAX_BLOCK_REQUEST_ATTEMPTS: u32 = 5;
+
+/// How long a given-up block stays suppressed before it may be requested again.
+/// A fresh announcement from a peer that has not failed it lifts this early.
+const BLOCK_GIVE_UP_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Timeout for header requests
 const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -217,6 +227,68 @@ struct BlockRequest {
     requested_at: Instant,
 }
 
+/// Retry bookkeeping for one block hash, kept across re-queues
+#[derive(Default)]
+struct BlockRetryState {
+    /// Failed attempts so far (counted separately from `failed_peers`: with a
+    /// single peer the set never grows)
+    attempts: u32,
+    /// Peers that timed out on or answered `notfound` for this block
+    failed_peers: HashSet<PeerId>,
+    /// Last peer that announced the block via inv
+    announced_by: Option<PeerId>,
+    /// Set once `attempts` reached the cap; the block is not requested until
+    /// `BLOCK_GIVE_UP_BACKOFF` passes or a fresh peer announces it
+    gave_up_at: Option<Instant>,
+}
+
+/// Outcome of recording a failed block request
+#[derive(Debug, PartialEq, Eq)]
+enum BlockRetryOutcome {
+    /// Re-queued for another peer
+    Requeued,
+    /// Dropped because we already have the block
+    NoLongerNeeded,
+    /// Dropped because the attempt cap was reached
+    GaveUp,
+}
+
+/// Order the peers to try for a block request.
+///
+/// Peers that already failed this block go last (they stay as a fallback so a
+/// single-peer node can still retry). Among the rest: the announcing peer
+/// first, then the assigned peer, then everyone else rotated by `cursor`.
+/// `connected` comes from a `HashMap`, so it is sorted first; without that the
+/// "rotation" would follow hash order and keep landing on the same peers.
+fn order_retry_peers(
+    mut connected: Vec<PeerId>,
+    failed: &HashSet<PeerId>,
+    announced_by: Option<PeerId>,
+    assigned_peer: PeerId,
+    cursor: usize,
+) -> Vec<PeerId> {
+    connected.sort_unstable();
+    let (mut fresh, stale): (Vec<PeerId>, Vec<PeerId>) =
+        connected.into_iter().partition(|p| !failed.contains(p));
+
+    if !fresh.is_empty() {
+        let len = fresh.len();
+        fresh.rotate_left(cursor % len);
+    }
+    for preferred in [
+        assigned_peer,
+        announced_by.unwrap_or(BlockSync::UNASSIGNED_PEER),
+    ] {
+        if let Some(pos) = fresh.iter().position(|&p| p == preferred) {
+            let peer = fresh.remove(pos);
+            fresh.insert(0, peer);
+        }
+    }
+
+    fresh.extend(stale);
+    fresh
+}
+
 /// Orphan block tracking
 struct OrphanBlock {
     /// The orphan block
@@ -263,6 +335,10 @@ pub struct BlockSync {
     peer_block_requests: RwLock<HashMap<PeerId, HashSet<Hash256>>>,
     /// Blocks queued for download (not yet requested due to in-flight limits)
     pending_block_requests: RwLock<VecDeque<(Hash256, PeerId)>>,
+    /// Per-block retry state: attempt count, failed peers, announcer
+    block_retry: RwLock<HashMap<Hash256, BlockRetryState>>,
+    /// Round-robin offset for choosing among retry candidates
+    retry_cursor: AtomicUsize,
     /// Sync progress channel
     progress_tx: broadcast::Sender<SyncProgress>,
     /// Statistics
@@ -316,6 +392,8 @@ impl BlockSync {
             orphan_blocks: RwLock::new(HashMap::new()),
             peer_block_requests: RwLock::new(HashMap::new()),
             pending_block_requests: RwLock::new(VecDeque::new()),
+            block_retry: RwLock::new(HashMap::new()),
+            retry_cursor: AtomicUsize::new(0),
             progress_tx,
             stats: RwLock::new(SyncStats::default()),
             sync_peer: RwLock::new(None),
@@ -891,11 +969,13 @@ impl BlockSync {
             let pending = self.pending_headers.read();
             let in_flight = self.blocks_in_flight.read();
             let downloaded = self.downloaded_blocks.read();
+            let retry = self.block_retry.read();
 
             for header in pending.iter() {
                 let hash = compute_block_hash(header);
                 if !in_flight.contains_key(&hash)
                     && !downloaded.contains_key(&hash)
+                    && !retry.get(&hash).is_some_and(|r| r.gave_up_at.is_some())
                     && hashes_to_request.len() < MAX_BLOCKS_IN_FLIGHT - in_flight_count
                 {
                     hashes_to_request.push(hash);
@@ -961,6 +1041,7 @@ impl BlockSync {
         if let Some(requests) = self.peer_block_requests.write().get_mut(&peer_id) {
             requests.remove(&hash);
         }
+        self.block_retry.write().remove(&hash);
 
         // Store in downloaded blocks
         self.downloaded_blocks.write().insert(hash, block);
@@ -1357,42 +1438,11 @@ impl BlockSync {
             .collect();
 
         for (hash, peer_id) in timed_out {
-            warn!(
-                "Block {} request timed out from peer {}, re-queuing",
-                hash, peer_id
-            );
-            self.blocks_in_flight.write().remove(&hash);
-            if let Some(requests) = self.peer_block_requests.write().get_mut(&peer_id) {
-                requests.remove(&hash);
-            }
-
-            // Re-queue the block for download from a different connected peer
-            let connected = self.peer_manager.connected_peers();
-            if let Some(&alt_peer) = connected.iter().find(|&&p| p != peer_id) {
-                debug!("Re-queuing timed-out block {} with peer {}", hash, alt_peer);
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, alt_peer));
-            } else if !connected.is_empty() {
-                // If no alternative connected peer, re-queue with the same peer
-                debug!(
-                    "Re-queuing timed-out block {} with same peer {}",
-                    hash, peer_id
-                );
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, peer_id));
-            } else {
-                // No connected peers at all — mark as unassigned for later
-                debug!(
-                    "No connected peers for timed-out block {}, marking unassigned",
-                    hash
-                );
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, Self::UNASSIGNED_PEER));
-            }
+            warn!("Block {} request timed out from peer {}", hash, peer_id);
+            self.fail_block_request(hash, peer_id, "timed out");
         }
+
+        self.prune_block_retry(now);
 
         // Request more blocks if we have capacity - capture state before await
         let should_request_blocks = state == SyncState::BlockDownload;
@@ -1641,6 +1691,27 @@ impl BlockSync {
                         }
                     }
 
+                    // Remember who announced it, so retries prefer a peer that
+                    // claims to have it. A given-up block is lifted early only by a
+                    // peer that has not already failed it.
+                    {
+                        let mut retry = self.block_retry.write();
+                        let state = retry.entry(hash).or_default();
+                        let fresh_peer = !state.failed_peers.contains(&peer_id);
+                        if fresh_peer {
+                            state.announced_by = Some(peer_id);
+                        }
+                        if state.gave_up_at.is_some() {
+                            if fresh_peer {
+                                state.gave_up_at = None;
+                                state.attempts = 0;
+                            } else {
+                                already_downloading += 1;
+                                continue;
+                            }
+                        }
+                    }
+
                     // Check if we're already downloading it
                     if in_flight.contains_key(&hash) {
                         already_downloading += 1;
@@ -1782,6 +1853,7 @@ impl BlockSync {
 
             // Double-check we don't already have it
             if self.chain.has_block(&hash).unwrap_or(false) {
+                self.block_retry.write().remove(&hash);
                 consecutive_failures = 0;
                 continue;
             }
@@ -1789,9 +1861,16 @@ impl BlockSync {
                 consecutive_failures = 0;
                 continue;
             }
+            if self
+                .block_retry
+                .read()
+                .get(&hash)
+                .is_some_and(|r| r.gave_up_at.is_some())
+            {
+                consecutive_failures = 0;
+                continue;
+            }
 
-            // Build ordered list of peers to try: assigned peer first (if valid),
-            // then all other connected peers.
             let connected = self.peer_manager.connected_peers();
             if connected.is_empty() {
                 // No connected peers at all — put the block back as unassigned
@@ -1802,19 +1881,7 @@ impl BlockSync {
                 continue;
             }
 
-            let mut peers_to_try: Vec<PeerId> = Vec::with_capacity(connected.len());
-            // If assigned peer is connected and not the sentinel, try it first
-            if assigned_peer != Self::UNASSIGNED_PEER
-                && self.peer_manager.is_peer_connected(assigned_peer)
-            {
-                peers_to_try.push(assigned_peer);
-            }
-            // Add all other connected peers
-            for &p in &connected {
-                if p != assigned_peer {
-                    peers_to_try.push(p);
-                }
-            }
+            let peers_to_try = self.order_peers_for_block(&hash, assigned_peer, connected);
 
             // Try each peer until one succeeds
             let item = InvItem {
@@ -1860,6 +1927,124 @@ impl BlockSync {
                 consecutive_failures += 1;
             }
         }
+    }
+
+    /// Handle a `notfound` reply. A block the peer says it does not have is
+    /// failed over to another peer at once instead of waiting out the timeout.
+    pub async fn handle_notfound(&self, peer_id: PeerId, items: Vec<InvItem>) {
+        let mut requeued = 0;
+        for item in items {
+            if item.inv_type != InvType::Block {
+                continue;
+            }
+            // Only a reply from the peer we actually asked counts; anything else
+            // is stale (the request already moved on).
+            let asked_this_peer = self
+                .blocks_in_flight
+                .read()
+                .get(&item.hash)
+                .is_some_and(|req| req.peer_id == peer_id);
+            if !asked_this_peer {
+                continue;
+            }
+            debug!("Peer {} sent notfound for block {}", peer_id, item.hash);
+            if self.fail_block_request(item.hash, peer_id, "notfound")
+                == BlockRetryOutcome::Requeued
+            {
+                requeued += 1;
+            }
+        }
+
+        if requeued > 0 {
+            self.request_queued_blocks().await;
+        }
+    }
+
+    /// Record a failed block request (timeout or `notfound`) and decide what
+    /// happens next: drop it if we already have the block, give up once
+    /// `MAX_BLOCK_REQUEST_ATTEMPTS` is reached, otherwise re-queue it unassigned
+    /// so `request_queued_blocks` picks a peer that has not failed it.
+    fn fail_block_request(
+        &self,
+        hash: Hash256,
+        peer_id: PeerId,
+        reason: &str,
+    ) -> BlockRetryOutcome {
+        self.blocks_in_flight.write().remove(&hash);
+        if let Some(requests) = self.peer_block_requests.write().get_mut(&peer_id) {
+            requests.remove(&hash);
+        }
+
+        if self.chain.has_block(&hash).unwrap_or(false) {
+            self.block_retry.write().remove(&hash);
+            return BlockRetryOutcome::NoLongerNeeded;
+        }
+
+        let attempts = {
+            let mut retry = self.block_retry.write();
+            let state = retry.entry(hash).or_default();
+            state.attempts += 1;
+            state.failed_peers.insert(peer_id);
+            if state.attempts >= MAX_BLOCK_REQUEST_ATTEMPTS {
+                state.gave_up_at = Some(Instant::now());
+            }
+            state.attempts
+        };
+
+        if attempts >= MAX_BLOCK_REQUEST_ATTEMPTS {
+            info!(
+                "Giving up on block {} after {} failed requests (last: peer {} {}); \
+                 will retry if a new peer announces it or after {}s",
+                hash,
+                attempts,
+                peer_id,
+                reason,
+                BLOCK_GIVE_UP_BACKOFF.as_secs()
+            );
+            return BlockRetryOutcome::GaveUp;
+        }
+
+        debug!(
+            "Re-queuing block {} after peer {} {} (attempt {}/{})",
+            hash, peer_id, reason, attempts, MAX_BLOCK_REQUEST_ATTEMPTS
+        );
+        self.pending_block_requests
+            .write()
+            .push_back((hash, Self::UNASSIGNED_PEER));
+        BlockRetryOutcome::Requeued
+    }
+
+    /// Bound `block_retry`: lift give-ups whose backoff has passed and drop
+    /// entries for blocks that are neither in flight nor queued any more.
+    fn prune_block_retry(&self, now: Instant) {
+        let in_flight: HashSet<Hash256> = self.blocks_in_flight.read().keys().copied().collect();
+        let queued: HashSet<Hash256> = self
+            .pending_block_requests
+            .read()
+            .iter()
+            .map(|(h, _)| *h)
+            .collect();
+        self.block_retry
+            .write()
+            .retain(|hash, state| match state.gave_up_at {
+                Some(at) => now.duration_since(at) < BLOCK_GIVE_UP_BACKOFF,
+                None => in_flight.contains(hash) || queued.contains(hash),
+            });
+    }
+
+    /// Order the connected peers to try for one block request.
+    fn order_peers_for_block(
+        &self,
+        hash: &Hash256,
+        assigned_peer: PeerId,
+        connected: Vec<PeerId>,
+    ) -> Vec<PeerId> {
+        let (failed, announced_by) = match self.block_retry.read().get(hash) {
+            Some(state) => (state.failed_peers.clone(), state.announced_by),
+            None => (HashSet::new(), None),
+        };
+        let cursor = self.retry_cursor.fetch_add(1, Ordering::Relaxed);
+        order_retry_peers(connected, &failed, announced_by, assigned_peer, cursor)
     }
 
     /// Try to connect orphan blocks to the chain
@@ -2859,5 +3044,163 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_on_main_chain());
+    }
+    /// A sync manager with `n` test peers (ids 1..=n); returns their receivers.
+    fn sync_with_peers(
+        n: u64,
+    ) -> (
+        Arc<BlockSync>,
+        HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+        tempfile::TempDir,
+    ) {
+        use crate::peer::PeerHandle;
+
+        let (sync, dir) = create_test_sync();
+        let mut rxs = HashMap::new();
+        for id in 1..=n {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            sync.peer_manager.insert_test_peer(PeerHandle {
+                id,
+                addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
+                tx,
+                inbound: false,
+            });
+            rxs.insert(id, rx);
+        }
+        (sync, rxs, dir)
+    }
+
+    /// Peers that received a getdata for `hash` since the last drain.
+    fn getdata_recipients(
+        rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+        hash: Hash256,
+    ) -> Vec<PeerId> {
+        let mut got = Vec::new();
+        for (&id, rx) in rxs.iter_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                if let NetworkMessage::GetData(items) = msg {
+                    if items.iter().any(|i| i.hash == hash) {
+                        got.push(id);
+                    }
+                }
+            }
+        }
+        got.sort_unstable();
+        got
+    }
+
+    fn in_flight_peer(sync: &BlockSync, hash: &Hash256) -> Option<PeerId> {
+        sync.blocks_in_flight.read().get(hash).map(|r| r.peer_id)
+    }
+
+    /// Backdate the in-flight request so the next `check_timeouts` expires it.
+    fn expire_request(sync: &BlockSync, hash: &Hash256) {
+        let mut in_flight = sync.blocks_in_flight.write();
+        let req = in_flight.get_mut(hash).unwrap();
+        req.requested_at = Instant::now() - BLOCK_DOWNLOAD_TIMEOUT - Duration::from_secs(1);
+    }
+
+    #[test]
+    fn test_order_retry_peers_skips_failed_and_prefers_announcer() {
+        let failed: HashSet<PeerId> = [2].into_iter().collect();
+        // The announcer leads, the failed peer is only a last resort.
+        let order = order_retry_peers(vec![3, 1, 2, 4], &failed, Some(4), 0, 0);
+        assert_eq!(order[0], 4);
+        assert_eq!(*order.last().unwrap(), 2);
+        // A failed announcer is not preferred.
+        let order = order_retry_peers(vec![1, 2, 3], &failed, Some(2), 0, 0);
+        assert_eq!(*order.last().unwrap(), 2);
+        // Without preferences the cursor rotates the start over sorted peers.
+        let starts: Vec<PeerId> = (0..3)
+            .map(|c| order_retry_peers(vec![3, 1, 2], &HashSet::new(), None, 0, c)[0])
+            .collect();
+        assert_eq!(starts, vec![1, 2, 3]);
+        // Everyone failed: still returns them all (single-peer nodes can retry).
+        let all: HashSet<PeerId> = [1, 2].into_iter().collect();
+        assert_eq!(order_retry_peers(vec![2, 1], &all, None, 0, 0).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_block_retry_rotation_never_repicks_failed_peer() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        let hash = Hash256::from_bytes([0x5a; 32]);
+
+        sync.pending_block_requests.write().push_back((hash, 1));
+        sync.request_queued_blocks().await;
+        assert_eq!(getdata_recipients(&mut rxs, hash), vec![1]);
+
+        let mut tried = vec![1];
+        for _ in 0..2 {
+            expire_request(&sync, &hash);
+            sync.check_timeouts().await;
+            let got = getdata_recipients(&mut rxs, hash);
+            assert_eq!(got.len(), 1, "exactly one re-request per timeout");
+            assert!(
+                !tried.contains(&got[0]),
+                "re-requested from peer {} which already failed (tried {:?})",
+                got[0],
+                tried
+            );
+            tried.push(got[0]);
+        }
+        tried.sort_unstable();
+        assert_eq!(tried, vec![1, 2, 3], "all three peers tried once each");
+    }
+
+    #[tokio::test]
+    async fn test_block_retry_cap_gives_up() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hash = Hash256::from_bytes([0x6b; 32]);
+
+        sync.pending_block_requests.write().push_back((hash, 1));
+        sync.request_queued_blocks().await;
+        let mut requests = getdata_recipients(&mut rxs, hash).len();
+
+        for _ in 0..MAX_BLOCK_REQUEST_ATTEMPTS + 2 {
+            if in_flight_peer(&sync, &hash).is_none() {
+                break;
+            }
+            expire_request(&sync, &hash);
+            sync.check_timeouts().await;
+            requests += getdata_recipients(&mut rxs, hash).len();
+        }
+
+        assert_eq!(
+            requests,
+            MAX_BLOCK_REQUEST_ATTEMPTS as usize,
+            "one initial request plus {} retries, then stop",
+            MAX_BLOCK_REQUEST_ATTEMPTS - 1
+        );
+        assert!(in_flight_peer(&sync, &hash).is_none());
+        assert!(sync.pending_block_requests.read().is_empty());
+        assert!(sync.block_retry.read()[&hash].gave_up_at.is_some());
+
+        // Still suppressed: a re-queue does not send anything.
+        sync.pending_block_requests.write().push_back((hash, 1));
+        sync.request_queued_blocks().await;
+        assert!(getdata_recipients(&mut rxs, hash).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_notfound_redispatches_immediately() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hash = Hash256::from_bytes([0x7c; 32]);
+
+        sync.pending_block_requests.write().push_back((hash, 1));
+        sync.request_queued_blocks().await;
+        assert_eq!(getdata_recipients(&mut rxs, hash), vec![1]);
+
+        // A notfound from a peer we did not ask is ignored.
+        sync.handle_notfound(2, vec![InvItem::new(InvType::Block, hash)])
+            .await;
+        assert_eq!(in_flight_peer(&sync, &hash), Some(1));
+        assert!(getdata_recipients(&mut rxs, hash).is_empty());
+
+        // The asked peer's notfound moves the request on with no timeout.
+        sync.handle_notfound(1, vec![InvItem::new(InvType::Block, hash)])
+            .await;
+        assert_eq!(getdata_recipients(&mut rxs, hash), vec![2]);
+        assert_eq!(in_flight_peer(&sync, &hash), Some(2));
+        assert_eq!(sync.block_retry.read()[&hash].attempts, 1);
     }
 }
