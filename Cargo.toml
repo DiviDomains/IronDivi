@@ -13,6 +13,11 @@ members = [
     "crates/divi-masternode",
     "bin/irondivid",
     "bin/irondivi-cli",
+    "crates/divi-swap",
+    "crates/swap-chain-divi",
+    "crates/swap-chain-btc",
+    "bin/divi-swapd",
+    "bin/divi-swap",
     "tests/integration-tests",
     "tools/cpp-test-extractor",
     "tools/block-comparator",
@@ -36,6 +41,9 @@ divi-wallet = { path = "crates/divi-wallet" }
 divi-rpc = { path = "crates/divi-rpc" }
 divi-node = { path = "crates/divi-node" }
 divi-masternode = { path = "crates/divi-masternode" }
+divi-swap = { path = "crates/divi-swap" }
+swap-chain-divi = { path = "crates/swap-chain-divi" }
+swap-chain-btc = { path = "crates/swap-chain-btc" }
 
 # Crypto
 secp256k1 = { version = "0.29", features = ["recovery", "rand-std"] }
@@ -77,6 +85,18 @@ once_cell = "1.19"
 derive_more = "0.99"
 byteorder = "1.5"
 chrono = "0.4"
+
+# Atomic swap POC (docs/plans/atomic-swap-poc.md) — lanes must not edit these; ask the orchestrator
+bitcoin = { version = "0.32", features = ["serde", "rand-std", "bitcoinconsensus"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+clap = { version = "4.4", features = ["derive", "env"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+toml = "0.8"
+http-body-util = "0.1"
+wiremock = "0.6"
 
 # Testing
 proptest = "1.4"

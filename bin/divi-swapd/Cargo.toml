@@ -1,0 +1,35 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-swapd"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap maker daemon"
+
+[[bin]]
+name = "divi-swapd"
+path = "src/main.rs"
+
+[dependencies]
+divi-swap = { workspace = true }
+swap-chain-divi = { workspace = true }
+swap-chain-btc = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,26 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-swap"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap engine: HTLC contract, swap state machine, ChainBackend trait"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,30 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-chain-btc"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap ChainBackend for Bitcoin (signet) over Esplora HTTP"
+
+[features]
+# Integration tests against live signet (cargo test -p swap-chain-btc --features live -- --ignored)
+live = []
+
+[dependencies]
+divi-swap = { workspace = true }
+bitcoin = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+proptest = { workspace = true }
