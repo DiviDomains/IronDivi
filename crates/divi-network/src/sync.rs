@@ -975,7 +975,7 @@ impl BlockSync {
                 let hash = compute_block_hash(header);
                 if !in_flight.contains_key(&hash)
                     && !downloaded.contains_key(&hash)
-                    && !retry.get(&hash).is_some_and(|r| r.gave_up_at.is_some())
+                    && retry.get(&hash).is_none_or(|r| r.gave_up_at.is_none())
                     && hashes_to_request.len() < MAX_BLOCKS_IN_FLIGHT - in_flight_count
                 {
                     hashes_to_request.push(hash);
