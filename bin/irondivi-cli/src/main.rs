@@ -104,9 +104,12 @@ SPECIAL COMMANDS:
   -generate <n>         Generate n blocks to a new wallet address
 
 CONFIGURATION:
-  Config file is read from ~/.divi/divi.conf, or ~/.privatedivi/privatedivi.conf
-  with --mode privatedivi (or --conf path)
-  Cookie auth from the same directory is used if no rpcuser/rpcpassword
+  Config file (first that exists): --conf path; <datadir>/irondivi.conf with
+  --datadir; else irondivid's default data dir (~/.irondivi on Linux, plus
+  /privatedivi and /testnet or /regtest as for irondivid)/irondivi.conf.
+  Falls back to the Divi Core file: ~/.divi/divi.conf, or
+  ~/.privatedivi/privatedivi.conf with --mode privatedivi
+  Cookie auth from the Core directory (or --datadir) is used if no rpcuser/rpcpassword
 
 EXIT CODES:
   0   Success
@@ -331,6 +334,52 @@ fn default_conf_path(home: &Path, privatedivi: bool) -> PathBuf {
     } else {
         "divi.conf"
     })
+}
+
+/// irondivid's default data directory, mirroring `default_data_dir()` and the
+/// subdirectories irondivid adds: `/privatedivi` for PrivateDivi, then
+/// `/testnet` or `/regtest`.
+fn irondivi_data_dir(home: &Path, privatedivi: bool, network: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let mut dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("IronDivi");
+    #[cfg(target_os = "windows")]
+    let mut dir = dirs::data_dir()
+        .unwrap_or_else(|| home.to_path_buf())
+        .join("IronDivi");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut dir = home.join(".irondivi");
+    if privatedivi {
+        dir = dir.join("privatedivi");
+    }
+    match network {
+        "testnet" => dir.join("testnet"),
+        "regtest" => dir.join("regtest"),
+        _ => dir,
+    }
+}
+
+/// The config file to read when `--conf` is not given: irondivid's
+/// `irondivi.conf` (in `--datadir`, or irondivid's default data dir), else the
+/// Divi Core file. Without this an irondivid with RPC auth is unreachable,
+/// since its credentials live only in `irondivi.conf`.
+fn find_conf_path(
+    home: &Path,
+    datadir: Option<&Path>,
+    privatedivi: bool,
+    network: &str,
+) -> PathBuf {
+    let irondivi = match datadir {
+        Some(dir) => dir.join("irondivi.conf"),
+        None => irondivi_data_dir(home, privatedivi, network).join("irondivi.conf"),
+    };
+    if irondivi.exists() {
+        irondivi
+    } else {
+        default_conf_path(home, privatedivi)
+    }
 }
 
 /// Strip one pair of matching surrounding quotes, as TOML string values carry.
@@ -618,7 +667,7 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
     let conf_path = args
         .conf
         .clone()
-        .unwrap_or_else(|| default_conf_path(home, privatedivi));
+        .unwrap_or_else(|| find_conf_path(home, args.datadir.as_deref(), privatedivi, network));
     let config = read_config(&conf_path, network);
 
     // Apply config file values if CLI args not provided
@@ -858,6 +907,60 @@ mod endpoint_tests {
             "getblockcount",
         ]);
         assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 52599);
+    }
+
+    /// Regression: irondivi-cli read only the Core `~/.divi/divi.conf`, so it
+    /// got 401 from an irondivid whose credentials are in `irondivi.conf`.
+    #[test]
+    fn irondivi_conf_is_preferred_over_divi_conf() {
+        let home = home_with_divi_conf();
+        let dir = irondivi_data_dir(home.path(), false, "mainnet");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("irondivi.conf"),
+            "rpcuser = \"u\"\nrpcpassword = \"p\"\nrpcport = 51471\n",
+        )
+        .unwrap();
+        let args = Args::parse_from(["irondivi-cli", "getblockcount"]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_port, 51471);
+        assert_eq!(ep.rpc_user.as_deref(), Some("u"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn datadir_selects_its_irondivi_conf() {
+        let home = home_with_divi_conf();
+        let vault = home.path().join(".irondivi-vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("irondivi.conf"), "rpcport = 51491\n").unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--datadir",
+            vault.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 51491);
+    }
+
+    #[test]
+    fn irondivi_data_dir_follows_mode_and_network() {
+        let home = Path::new("/h");
+        let base = irondivi_data_dir(home, false, "mainnet");
+        assert_eq!(
+            irondivi_data_dir(home, true, "mainnet"),
+            base.join("privatedivi")
+        );
+        assert_eq!(
+            irondivi_data_dir(home, true, "testnet"),
+            base.join("privatedivi").join("testnet")
+        );
+        assert_eq!(
+            irondivi_data_dir(home, false, "regtest"),
+            base.join("regtest")
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(base, Path::new("/h/.irondivi"));
     }
 
     #[test]
