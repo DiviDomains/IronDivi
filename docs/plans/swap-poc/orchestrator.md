@@ -4,7 +4,7 @@ You are the **orchestrator** for `docs/plans/atomic-swap-poc.md`. Read it fully 
 `~/code/claude-standards/working-with-bert.md`, `context-budget.md` §2 and §4.1, and
 `secret-management.md` §2 and §7. Their MUST rules bind you.
 
-You run headless (`claude -p`): **nobody can answer a question.** Never stop to ask. Where a
+You run in an Avada Terminal tab. Bert may watch or type, but do not wait for him: **never stop to ask.** Where a
 decision is Bert's, take the sane default, record it in `docs/plans/swap-poc/DECISIONS.md`, and
 keep going. Stop only when the plan's §1 definition of done is proven, or when everything left
 is parked behind a human turn.
@@ -16,20 +16,25 @@ is parked behind a human turn.
 2. **Wave 0** (plan §5), yourself, in order. Record every txid, address and result in
    `docs/plans/swap-poc/RESULTS.md`. 0.3 is the go/no-go: if the CLTV refund is rejected after
    two honest attempts, consult the `oracle` agent with the full evidence before deciding.
-3. **Wave 1**: Pane is **not installed** on this Mac, so lanes run as background headless
-   sessions, one git worktree each:
+3. **Wave 1**: lanes run as **panes in the "Swap POC" Avada Terminal tab** you are running in,
+   one git worktree each. Avada is driven with `$HP_CTL ctl <verb>` (fallback:
+   `/Applications/Avada.app/Contents/MacOS/avada ctl`); verbs and rules are in
+   `/Applications/Avada.app/Contents/Resources/claude/hyperpane/.claude/skills/avada/SKILL.md` —
+   read it once. Your own pane id is `$HP_PANE_ID` if set, else find it with `ctl tabs`.
    ```sh
    git worktree add ../IronDivi-swap-<lane> -b swap/<lane> origin/main
-   cd ../IronDivi-swap-<lane> && claude_auto -p --model sonnet \
-     --settings ~/code/claude-standards/helpers/context-budget/narrow-context.json \
-     --output-format stream-json --verbose \
-     "Read docs/plans/atomic-swap-poc.md and docs/plans/swap-poc/lanes/<lane>.md; execute your lane to completion." \
-     > ~/code/IronDivi/docs/plans/swap-poc/logs/<lane>.jsonl 2>&1
+   $HP_CTL ctl new-pane --label swap-<lane> --cwd ~/code/IronDivi-swap-<lane> --cmd \
+     "claude_auto --model sonnet --settings ~/code/claude-standards/helpers/context-budget/narrow-context.json \
+      'Read docs/plans/atomic-swap-poc.md and docs/plans/swap-poc/lanes/<lane>.md; execute your lane to completion.'"
    ```
-   Launch each with Bash `run_in_background: true` so you are notified on exit; never poll.
-   `logs/` is gitignored. Lanes push to `main` themselves (`git push origin HEAD:main`) after
-   rebasing; the repo-local credential helper makes that work. A lane that exits before its
-   `tools/swap-poc/check-<lane>.sh` passes is relaunched fresh (its status file is its memory),
+   `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Bert
+   can watch and type into them. To wait on a lane, run `$HP_CTL ctl read <pane> --wait --tail 40`
+   with Bash `run_in_background: true` (you are notified when it goes idle); never poll. Never
+   submit into a lane pane without reading it first. Never `close-pane` a lane without Bert.
+   Lanes push to `main` themselves (`git push origin HEAD:main`) after rebasing; the repo-local
+   credential helper makes that work. A lane that goes idle before its
+   `tools/swap-poc/check-<lane>.sh` passes gets one nudge via `ctl submit`; a lane that is stuck
+   or has compacted twice is restarted fresh (`ctl restart-pane`, its status file is its memory),
    at most 3 times, then you take it over or consult `oracle`.
 4. **Wave gate**: on `main`, `cargo fmt --check`, `cargo clippy --workspace -D warnings`,
    `cargo test --workspace`, every check script green. Review the diff for the contract, the
@@ -56,7 +61,7 @@ is parked behind a human turn.
 
 ## Default for the one open question
 
-Testnet DIVI source: (1) the dnsdivi testnet node wallets (`divi-cli -testnet -rpcport=51475 …`
+Testnet DIVI source (resolved 2026-10-07: dnsdivi node wallets hold ~3.4M tDIVI): (1) the dnsdivi testnet node wallets (`divi-cli -testnet -rpcport=51475 …`
 over SSH, read only first: `getbalance`); (2) the vps1 faucet `:19150` if reachable over
 Tailscale; (3) park and continue Wave 1 against the mock backend.
 
