@@ -31,7 +31,7 @@ The orchestrator is another pane. Bert may type into your pane; answer him, then
 7. **Hard questions** (a bug that survived two attempts, a consensus/signing doubt) → the
    `oracle` agent with the full problem in the prompt. Do not ask Bert; take the sane default,
    note it under `- decisions:` in your status file.
-8. **Read the Wave 0 proofs** before writing chain code: `crates/swap-chain-*/examples/cltv_proof.rs`
+8. **Read the Wave 0 proofs** before writing chain code: `crates/swap-chain-*/examples/*_cltv_proof.rs`
    and the txids in `docs/plans/swap-poc/RESULTS.md` show the exact shapes the live chains accept.
 
 ## Key references (1Password, vault `global_secret_store`, field `password` = 32-byte hex)

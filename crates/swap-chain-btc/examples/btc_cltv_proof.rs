@@ -11,10 +11,10 @@
 //!
 //! ```sh
 //! export SWAP_KEY_REF="op://global_secret_store/IronDivi Swap POC - taker-btc/password"
-//! cargo run -p swap-chain-btc --example cltv_proof -- address
-//! cargo run -p swap-chain-btc --example cltv_proof -- fund <state.json>   # uses key's UTXOs
-//! cargo run -p swap-chain-btc --example cltv_proof -- claim <state.json>
-//! cargo run -p swap-chain-btc --example cltv_proof -- refund <state.json> # after locktime
+//! cargo run -p swap-chain-btc --example btc_cltv_proof -- address
+//! cargo run -p swap-chain-btc --example btc_cltv_proof -- fund <state.json>   # uses key's UTXOs
+//! cargo run -p swap-chain-btc --example btc_cltv_proof -- claim <state.json>
+//! cargo run -p swap-chain-btc --example btc_cltv_proof -- refund <state.json> # after locktime
 //! ```
 
 use bitcoin::absolute::LockTime;
@@ -237,7 +237,9 @@ async fn main() {
             }
         }
         _ => {
-            eprintln!("usage: cltv_proof address | fund <state> | claim <state> | refund <state>");
+            eprintln!(
+                "usage: btc_cltv_proof address | fund <state> | claim <state> | refund <state>"
+            );
             std::process::exit(2);
         }
     }

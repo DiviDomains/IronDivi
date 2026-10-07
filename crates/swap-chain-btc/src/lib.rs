@@ -9,4 +9,4 @@
 //! BTC `ChainBackend` over Esplora HTTP (mempool.space signet, blockstream fallback).
 //!
 //! Lane **btc** (docs/plans/swap-poc/lanes/btc.md) owns this crate. The Wave 0 live
-//! proof (`examples/cltv_proof.rs`) shows the transaction shapes that signet accepts.
+//! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that signet accepts.

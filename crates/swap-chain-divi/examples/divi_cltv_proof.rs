@@ -11,9 +11,10 @@
 //!
 //! ```sh
 //! export SWAP_KEY_REF="op://global_secret_store/IronDivi Swap POC - maker-divi/password"
-//! cargo run -p swap-chain-divi --example cltv_proof -- fund <funding_txid> <state.json>
-//! cargo run -p swap-chain-divi --example cltv_proof -- claim  <state.json>
-//! cargo run -p swap-chain-divi --example cltv_proof -- refund <state.json>   # after locktime
+//! cargo run -p swap-chain-divi --example divi_cltv_proof -- fund <funding_txid> <state.json>
+//! cargo run -p swap-chain-divi --example divi_cltv_proof -- claim  <state.json>
+//! cargo run -p swap-chain-divi --example divi_cltv_proof -- refund <state.json>   # after locktime
+//! cargo run -p swap-chain-divi --example divi_cltv_proof -- refund-cltv-violation <state.json>
 //! ```
 //! `<funding_txid>` is a tx paying the key's testnet P2PKH address (no address index on the
 //! proxy, so the txid is passed in). The state file holds only public data plus the
@@ -181,7 +182,7 @@ async fn main() {
             });
             std::fs::write(path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
         }
-        "claim" | "refund" | "refund-early" => {
+        "claim" | "refund" | "refund-early" | "refund-cltv-violation" => {
             let path = &args[2];
             let state: Value =
                 serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -211,6 +212,12 @@ async fn main() {
             if refund {
                 tx.lock_time = p.locktime;
             }
+            // Final tx (nLockTime < MTP) whose nLockTime is below the script's locktime:
+            // only OP_CHECKLOCKTIMEVERIFY can reject it.
+            let violation = cmd == "refund-cltv-violation";
+            if violation {
+                tx.lock_time = p.locktime - 1;
+            }
             let sig = sign(&tx, 0, &Script::from_bytes(redeem.clone()), &sk);
             tx.vin[0].script_sig = Script::from_bytes(if refund {
                 refund_script_sig(&sig, &redeem)
@@ -221,8 +228,12 @@ async fn main() {
                     .unwrap();
                 claim_script_sig(&sig, &pre, &redeem)
             });
-            verify_input(&tx, 0, &spk, Amount::from_sat(HTLC_VALUE))
-                .unwrap_or_else(|e| panic!("local verify {cmd}: {e:?}"));
+            let local = verify_input(&tx, 0, &spk, Amount::from_sat(HTLC_VALUE));
+            if violation {
+                eprintln!("local interpreter on CLTV violation: {local:?}");
+            } else {
+                local.unwrap_or_else(|e| panic!("local verify {cmd}: {e:?}"));
+            }
             let raw = hex::encode(serialize(&tx));
             let _: Transaction = deserialize(&hex::decode(&raw).unwrap()).unwrap();
             eprintln!(
@@ -239,7 +250,9 @@ async fn main() {
             }
         }
         _ => {
-            eprintln!("usage: cltv_proof fund <txid> <state> | claim <state> | refund <state>");
+            eprintln!(
+                "usage: divi_cltv_proof fund <txid> <state> | claim <state> | refund <state>"
+            );
             std::process::exit(2);
         }
     }

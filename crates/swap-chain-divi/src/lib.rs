@@ -9,4 +9,4 @@
 //! DIVI `ChainBackend` over the services.divi.domains JSON-RPC proxy.
 //!
 //! Lane **divi** (docs/plans/swap-poc/lanes/divi.md) owns this crate. The Wave 0 live
-//! proof (`examples/cltv_proof.rs`) shows the transaction shapes that the chain accepts.
+//! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that the chain accepts.
