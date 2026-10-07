@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "divi-consensus"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "bs58",
  "byteorder",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "divi-crypto"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "aes",
  "bs58",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "divi-masternode"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "byteorder",
  "chrono",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "divi-network"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "byteorder",
  "bytes",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "divi-node"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "divi-consensus",
  "divi-crypto",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "divi-primitives"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "byteorder",
  "criterion",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "divi-rpc"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "axum",
  "base64",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "divi-script"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "divi-crypto",
  "divi-primitives",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "divi-storage"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "byteorder",
  "chrono",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "divi-wallet"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "aes",
  "bip32",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "divi-consensus",
  "divi-crypto",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "irondivi-cli"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "irondivid"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
