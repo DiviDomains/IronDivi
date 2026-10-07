@@ -120,15 +120,10 @@ for the maker lock happens **only** on entering `MakerLocked` — that is the st
 
 ## 4. Orchestration
 
-**Mechanism:** one visible Pane per lane (Pane is the sanctioned co-drivable parallel-worktree
-tool, `~/code/AGENTS.md`), each running a **Sonnet** session via the narrow profile
-(`context-budget.md` §2.5 rule 13), launched with `claude_auto` (`working-with-bert.md` §9):
-
-```sh
-runpane panes create --repo IronDivi --name swap-<lane> --source agent --no-focus --wait-ready --yes --json \
-  --tool-command "claude_auto --settings ~/code/claude-standards/helpers/context-budget/narrow-context.json \
-     --model sonnet 'Read docs/plans/atomic-swap-poc.md and docs/plans/swap-poc/lanes/<lane>.md; execute your lane.'"
-```
+**Mechanism:** one headless background session per lane, each in its own git worktree, running
+**Sonnet** via the narrow profile (`context-budget.md` §2.5 rule 13), launched with `claude_auto`
+(`working-with-bert.md` §9). The orchestrator starts each with Bash `run_in_background` so it is
+notified on exit and never polls. Exact launch command: `docs/plans/swap-poc/orchestrator.md`.
 
 Rules every lane follows:
 
@@ -166,7 +161,7 @@ It waits on lanes with a Monitor on the status files, not by polling.
 | 0.6 | Store keys in 1Password (`IronDivi Swap POC` items), resolver in `divi-swap::secrets` | `op read` at runtime works; nothing on disk |
 | 0.7 | Write lane briefs `docs/plans/swap-poc/lanes/*.md` and `tools/swap-poc/check-*.sh` | each check script fails before work starts (proves it can fail) |
 
-### Wave 1 — parallel lanes (5 Panes, Sonnet)
+### Wave 1 — parallel lanes (5 background sessions, Sonnet)
 
 | Lane | Owns | Acceptance (`check-<lane>.sh`) |
 |---|---|---|
@@ -180,7 +175,7 @@ Lanes are independent once Wave 0 lands: engine and daemon build against `MockBa
 chain lanes against the trait. Gate: orchestrator merges nothing — lanes push to `main` themselves;
 the gate is `cargo test --workspace` + clippy green on `main` and every check script passing.
 
-### Wave 2 — integration on testnets (2 Panes)
+### Wave 2 — integration on testnets (2 background sessions)
 
 | Lane | Work | Acceptance |
 |---|---|---|
