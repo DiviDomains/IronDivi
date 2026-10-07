@@ -231,6 +231,19 @@ impl NetworkConfig {
         }
     }
 
+    /// The network's standard P2P port: the port DNS-seed results are dialed
+    /// on. Independent of `-port`, which only changes where this node listens.
+    pub fn default_p2p_port(&self) -> u16 {
+        match (self.network_type, self.chain_mode) {
+            (NetworkType::Mainnet, ChainMode::Divi) => 51472,
+            (NetworkType::Mainnet, ChainMode::PrivateDivi) => 52472,
+            (NetworkType::Testnet, ChainMode::Divi) => 51474,
+            (NetworkType::Testnet, ChainMode::PrivateDivi) => 52474,
+            (NetworkType::Regtest, ChainMode::Divi) => 51476,
+            (NetworkType::Regtest, ChainMode::PrivateDivi) => 52476,
+        }
+    }
+
     /// Testnet configuration
     pub fn testnet(chain_mode: ChainMode) -> Self {
         use divi_primitives::test_vectors::{dns_seeds, static_peers};
@@ -627,6 +640,23 @@ mod tests {
         assert_eq!(config.network.magic, [0x70, 0xd2, 0x76, 0x11]);
         assert_eq!(config.p2p.port, 52472);
         assert_eq!(config.rpc.port, 52471);
+    }
+
+    /// Seeds are dialed on the network's port even when `-port` moves the
+    /// listener (a second node on one host must still reach real peers).
+    #[test]
+    fn default_p2p_port_matches_network_and_ignores_listen_port() {
+        for mode in [ChainMode::Divi, ChainMode::PrivateDivi] {
+            for mut c in [
+                NodeConfig::mainnet(mode),
+                NodeConfig::testnet(mode),
+                NodeConfig::regtest(mode),
+            ] {
+                assert_eq!(c.network.default_p2p_port(), c.p2p.port);
+                c.p2p.port = 51492;
+                assert_ne!(c.network.default_p2p_port(), 51492);
+            }
+        }
     }
 
     /// Every default port across both modes and all networks is distinct,

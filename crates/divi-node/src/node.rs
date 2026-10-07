@@ -209,7 +209,7 @@ impl Node {
             } else {
                 None
             },
-            default_port: config.p2p.port,
+            default_port: config.network.default_p2p_port(),
         };
         let peer_manager = PeerManager::new(peer_manager_config);
 
