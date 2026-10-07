@@ -46,9 +46,11 @@ impl Amount {
         Amount(divi * COIN)
     }
 
-    /// Create amount from DIVI with decimal precision
+    /// Create amount from DIVI with decimal precision, rounded to the nearest
+    /// satoshi (Core's roundint64 in AmountFromValue). Truncating would turn
+    /// 0.29 DIVI into 28,999,999 sat, because 0.29 * 1e8 is 28999999.999999996.
     pub fn from_divi_f64(divi: f64) -> Self {
-        Amount((divi * COIN as f64) as i64)
+        Amount((divi * COIN as f64).round() as i64)
     }
 
     /// Get amount in satoshis
@@ -327,6 +329,19 @@ mod tests {
         // 0.001 DIVI = 100_000 satoshis
         let amt = Amount::from_divi_f64(0.001);
         assert_eq!(amt.as_sat(), 100_000);
+    }
+
+    #[test]
+    fn test_amount_from_divi_f64_rounds_like_core() {
+        // These products land just below the whole satoshi; truncation lost one.
+        assert_eq!(Amount::from_divi_f64(0.29).as_sat(), 29_000_000);
+        assert_eq!(Amount::from_divi_f64(19.99).as_sat(), 1_999_000_000);
+        assert_eq!(
+            Amount::from_divi_f64(90_729.4023402).as_sat(),
+            9_072_940_234_020
+        );
+        // roundint64 rounds away from zero for negatives too, as f64::round does.
+        assert_eq!(Amount::from_divi_f64(-0.29).as_sat(), -29_000_000);
     }
 
     #[test]

@@ -735,12 +735,12 @@ impl Staker {
             if count == 0 {
                 info!(
                     "No stakeable UTXOs after applying reserve balance of {} DIVI (first occurrence)",
-                    reserve / 100_000_000
+                    reserve as f64 / 100_000_000.0
                 );
             } else {
                 trace!(
                     "No stakeable UTXOs after applying reserve balance of {} DIVI",
-                    reserve / 100_000_000
+                    reserve as f64 / 100_000_000.0
                 );
             }
             return StakeResult::NoStakeableUtxos;
@@ -772,7 +772,7 @@ impl Staker {
         if count.is_multiple_of(60) {
             info!(
                 "Staking attempt #{}: {} UTXOs, total weight {} DIVI, tip height {}, current_time {}, n_bits=0x{:08x}, stake_modifier={}",
-                count, candidates.len(), total_weight / 100_000_000, next_height - 1, current_time, n_bits, tip.stake_modifier
+                count, candidates.len(), total_weight as f64 / 100_000_000.0, next_height - 1, current_time, n_bits, tip.stake_modifier
             );
         }
 
@@ -864,7 +864,7 @@ impl Staker {
                         "Hashproof SUCCESS for UTXO {}:{} value={}, timestamp={}",
                         utxo.txid,
                         utxo.vout,
-                        utxo.value.as_sat() / 100_000_000,
+                        utxo.value.as_divi_f64(),
                         ts
                     );
                 }
@@ -877,7 +877,7 @@ impl Staker {
                             "Sample UTXO {}:{} value={} age={}s ({:.1}h) block_time={}",
                             utxo.txid,
                             utxo.vout,
-                            utxo.value.as_sat() / 100_000_000,
+                            utxo.value.as_divi_f64(),
                             age,
                             age as f64 / 3600.0,
                             block_time_of_first_confirmation,
@@ -1118,8 +1118,8 @@ impl Staker {
             info!(
                 "Treasury block {} payments: {} DIVI treasury, {} DIVI charity",
                 height,
-                treasury_payment.as_divi(),
-                charity_payment.as_divi()
+                treasury_payment.as_divi_f64(),
+                charity_payment.as_divi_f64()
             );
 
             let treasury_script = divi_consensus::treasury::get_treasury_script(is_mainnet);
@@ -1479,9 +1479,9 @@ impl Staker {
         tracing::debug!(
             "Block {} rewards: stake={} DIVI (incl. mn fold), treasury={} DIVI, lottery={} DIVI",
             height,
-            stake_reward.as_divi(),
-            rewards.treasury.as_divi(),
-            rewards.lottery.as_divi(),
+            stake_reward.as_divi_f64(),
+            rewards.treasury.as_divi_f64(),
+            rewards.lottery.as_divi_f64(),
         );
 
         stake_reward

@@ -19,6 +19,7 @@ use crate::protocol::Params;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bip39::Mnemonic;
 use divi_primitives::amount::Amount;
+use divi_primitives::constants::MAX_MONEY;
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::serialize::{deserialize, serialize};
@@ -34,6 +35,24 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Parse a DIVI amount parameter the way Core's AmountFromValue does
+/// (JsonTxHelpers.cpp): reject negatives, values above MaxMoneyOut, and zero
+/// unless `allow_zero`; round to the nearest satoshi rather than truncating.
+/// Core's MaxMoneyOut is per-network; only the mainnet MAX_MONEY exists here,
+/// which is at most 0.03% below the test/regtest limit.
+fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
+    let invalid = || RpcError::new(codes::TYPE_ERROR, "Invalid amount");
+    let divi = value.as_f64().ok_or_else(invalid)?;
+    if !(0.0..=MAX_MONEY.as_divi_f64()).contains(&divi) {
+        return Err(invalid().into());
+    }
+    let amount = Amount::from_divi_f64(divi);
+    if (!allow_zero && amount.is_zero()) || amount > MAX_MONEY {
+        return Err(invalid().into());
+    }
+    Ok(amount)
+}
 
 /// Callback for submitting transactions to the mempool and network
 pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
@@ -810,12 +829,12 @@ impl WalletRpc {
         let dest_addr = Address::from_base58(addr_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
 
-        let amount_divi = params
-            .get(1)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| RpcError::invalid_params("Amount required"))?;
-
-        let send_amount = Amount::from_sat((amount_divi * 100_000_000.0) as i64);
+        let send_amount = amount_from_value(
+            params
+                .get(1)
+                .ok_or_else(|| RpcError::invalid_params("Amount required"))?,
+            false,
+        )?;
 
         let wallet = self.get_wallet()?;
 
@@ -928,7 +947,12 @@ impl WalletRpc {
         // Submit to mempool and broadcast
         self.submit_transaction(tx)?;
 
-        info!("Sent {} DIVI to {} (txid: {})", amount_divi, addr_str, txid);
+        info!(
+            "Sent {} DIVI to {} (txid: {})",
+            send_amount.as_divi_f64(),
+            addr_str,
+            txid
+        );
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -972,11 +996,7 @@ impl WalletRpc {
 
         // Add outputs
         for (addr_str, amount_value) in outputs {
-            let amount_divi = amount_value.as_f64().ok_or_else(|| {
-                RpcError::invalid_params(format!("Invalid amount for {}", addr_str))
-            })?;
-
-            let amount = Amount::from_sat((amount_divi * 100_000_000.0) as i64);
+            let amount = amount_from_value(amount_value, true)?;
 
             let addr = Address::from_base58(addr_str).map_err(|_| {
                 RpcError::new(
@@ -1734,12 +1754,12 @@ impl WalletRpc {
             RpcError::invalid_params("Missing required parameter: [owner_address:]manager_address")
         })?;
 
-        let amount_divi = params
-            .get(1)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?;
-
-        let send_amount = Amount::from_sat((amount_divi * 100_000_000.0) as i64);
+        let send_amount = amount_from_value(
+            params
+                .get(1)
+                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
+            false,
+        )?;
 
         let (owner_addr, manager_addr) = self.parse_vault_encoding(vault_encoding)?;
 
@@ -1872,7 +1892,9 @@ impl WalletRpc {
 
         info!(
             "Funded vault {} with {} DIVI (txid: {})",
-            vault_encoding, amount_divi, txid
+            vault_encoding,
+            send_amount.as_divi_f64(),
+            txid
         );
 
         Ok(serde_json::json!(txid.to_string()))
@@ -1929,12 +1951,12 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: diviaddress"))?;
 
-        let amount_divi = params
-            .get(1)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?;
-
-        let send_amount = Amount::from_sat((amount_divi * 100_000_000.0) as i64);
+        let send_amount = amount_from_value(
+            params
+                .get(1)
+                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
+            false,
+        )?;
 
         let dest_addr = Address::from_base58(destination)
             .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
@@ -2374,19 +2396,7 @@ impl WalletRpc {
         let mut total_send = Amount::ZERO;
 
         for (addr_str, amount_value) in amounts {
-            let amount_divi = amount_value.as_f64().ok_or_else(|| {
-                RpcError::invalid_params(format!("Invalid amount for {}", addr_str))
-            })?;
-
-            if amount_divi <= 0.0 {
-                return Err(RpcError::invalid_params(format!(
-                    "Invalid amount for {}: must be positive",
-                    addr_str
-                ))
-                .into());
-            }
-
-            let amount = Amount::from_sat((amount_divi * 100_000_000.0) as i64);
+            let amount = amount_from_value(amount_value, false)?;
             let addr = Address::from_base58(addr_str).map_err(|_| {
                 RpcError::new(
                     codes::INVALID_ADDRESS_OR_KEY,
@@ -2853,20 +2863,16 @@ impl WalletRpc {
             .get_str(1)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
 
-        let amount_divi = params
-            .get(2)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| RpcError::invalid_params("Amount required"))?;
+        let send_amount = amount_from_value(
+            params
+                .get(2)
+                .ok_or_else(|| RpcError::invalid_params("Amount required"))?,
+            false,
+        )?;
 
         let min_conf = params.get_u64(3).unwrap_or(1) as u32;
         let _comment = params.get_str(4);
         let _comment_to = params.get_str(5);
-
-        if amount_divi <= 0.0 {
-            return Err(RpcError::invalid_params("Amount must be positive").into());
-        }
-
-        let send_amount = Amount::from_sat((amount_divi * 100_000_000.0) as i64);
 
         let dest_addr = Address::from_base58(addr_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
@@ -3003,7 +3009,10 @@ impl WalletRpc {
 
         info!(
             "Sent {} DIVI from account '{}' to {} (txid: {})",
-            amount_divi, account, addr_str, txid
+            send_amount.as_divi_f64(),
+            account,
+            addr_str,
+            txid
         );
 
         Ok(serde_json::json!(txid.to_string()))
@@ -3623,16 +3632,63 @@ mod tests {
             Amount::from_sat(9_072_940_234_020),
             Script::new_p2pkh(&[1u8; 20]),
         ));
-        tx.vout.push(TxOut::new(Amount::from_sat(3_000), Script::new_p2pkh(&[2u8; 20])));
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(3_000),
+            Script::new_p2pkh(&[2u8; 20]),
+        ));
 
         let rpc = create_test_wallet_rpc();
         let params = Params::Array(vec![serde_json::json!(hex::encode(serialize(&tx)))]);
         let result = rpc.decode_raw_transaction(&params).unwrap();
 
         assert_eq!(result["vout"][0]["value"].as_f64().unwrap(), 90_729.4023402);
-        assert_eq!(result["vout"][0]["valueSat"].as_i64().unwrap(), 9_072_940_234_020);
+        assert_eq!(
+            result["vout"][0]["valueSat"].as_i64().unwrap(),
+            9_072_940_234_020
+        );
         assert_eq!(result["vout"][1]["value"].as_f64().unwrap(), 0.00003);
         assert_eq!(result["vout"][1]["valueSat"].as_i64().unwrap(), 3_000);
+    }
+
+    #[test]
+    fn test_create_raw_transaction_rounds_amount_like_core() {
+        // 0.29 * 1e8 is 28999999.999999996; Core's roundint64 gives 29,000,000.
+        let rpc = create_test_wallet_rpc();
+        let addr = rpc.get_new_address(&Params::None).unwrap();
+        let addr = addr.as_str().unwrap();
+
+        let params = Params::Array(vec![
+            serde_json::json!([{ "txid": "07".repeat(32), "vout": 0 }]),
+            serde_json::json!({ addr: 0.29 }),
+        ]);
+        let hex = rpc.create_raw_transaction(&params).unwrap();
+        let decoded = rpc
+            .decode_raw_transaction(&Params::Array(vec![hex]))
+            .unwrap();
+
+        assert_eq!(decoded["vout"][0]["valueSat"].as_i64().unwrap(), 29_000_000);
+    }
+
+    #[test]
+    fn test_amount_from_value_matches_core_validation() {
+        use serde_json::json;
+
+        assert_eq!(
+            amount_from_value(&json!(19.99), false).unwrap().as_sat(),
+            1_999_000_000
+        );
+        assert_eq!(
+            amount_from_value(&json!(5), false).unwrap().as_sat(),
+            500_000_000
+        );
+        // Zero is only allowed where Core passes allowZero (createrawtransaction).
+        assert!(amount_from_value(&json!(0), false).is_err());
+        assert!(amount_from_value(&json!(0), true).unwrap().is_zero());
+        // Rounds to zero, so it is rejected like a literal zero.
+        assert!(amount_from_value(&json!(0.000000001), false).is_err());
+        assert!(amount_from_value(&json!(-1), true).is_err());
+        assert!(amount_from_value(&json!(MAX_MONEY.as_divi() + 1), true).is_err());
+        assert!(amount_from_value(&json!("0.29"), true).is_err());
     }
 
     #[test]
