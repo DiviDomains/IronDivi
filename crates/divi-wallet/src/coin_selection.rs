@@ -114,7 +114,7 @@ impl CoinSelector for MinimumSelector {
             .collect();
 
         // Sort by value descending (largest first)
-        utxos.sort_by(|a, b| b.value.cmp(&a.value));
+        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         let mut selected = Vec::new();
         let mut total_value = Amount::ZERO;
@@ -142,7 +142,7 @@ impl CoinSelector for MinimumSelector {
         // Insufficient funds
         let estimated_fee = calculate_fee(selected.len(), num_outputs + 1, fee_rate);
         Err(WalletError::InsufficientFunds {
-            need: (target + estimated_fee).as_sat() as i64,
+            need: (target + estimated_fee).as_sat(),
             have: total_value.as_sat(),
         })
     }

@@ -941,7 +941,10 @@ async fn run_daemon(
                     .filter(|entry| wallet_arc.add_mempool_tx(&entry.tx))
                     .count();
                 if seen > 0 {
-                    info!("Wallet picked up {} unconfirmed tx(s) already in the mempool", seen);
+                    info!(
+                        "Wallet picked up {} unconfirmed tx(s) already in the mempool",
+                        seen
+                    );
                 }
             }
 

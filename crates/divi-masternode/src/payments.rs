@@ -121,7 +121,7 @@ pub fn find_top_n_winners(
         })
         .collect();
 
-    winners.sort_by(|a, b| b.score.cmp(&a.score));
+    winners.sort_by_key(|w| std::cmp::Reverse(w.score));
     winners.truncate(n);
     winners
 }

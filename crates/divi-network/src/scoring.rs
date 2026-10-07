@@ -438,7 +438,7 @@ impl PeerScoring {
             .iter()
             .map(|(id, s)| (*id, s.reliability_score()))
             .collect();
-        peers.sort_by(|a, b| b.1.cmp(&a.1));
+        peers.sort_by_key(|p| std::cmp::Reverse(p.1));
         peers
     }
 

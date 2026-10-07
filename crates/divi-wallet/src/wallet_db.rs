@@ -1025,7 +1025,12 @@ impl WalletDb {
         for entry in overlay.values() {
             for u in &entry.outputs {
                 if !spent.contains(&u.outpoint()) {
-                    result.push((u.clone(), CoinSource::Mempool { trusted: entry.trusted }));
+                    result.push((
+                        u.clone(),
+                        CoinSource::Mempool {
+                            trusted: entry.trusted,
+                        },
+                    ));
                 }
             }
         }
@@ -1229,7 +1234,7 @@ impl WalletDb {
         list.extend(self.mempool_txs.read().values().map(|e| e.record.clone()));
 
         // Sort by timestamp descending
-        list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        list.sort_by_key(|t| std::cmp::Reverse(t.timestamp));
 
         if let Some(n) = count {
             list.truncate(n);
@@ -2626,14 +2631,20 @@ mod tests {
                 vin: prevouts
                     .iter()
                     .map(|(txid, vout)| TxIn {
-                        prevout: TxOutPoint { txid: *txid, vout: *vout },
+                        prevout: TxOutPoint {
+                            txid: *txid,
+                            vout: *vout,
+                        },
                         script_sig: Script::default(),
                         sequence: 0xffffffff,
                     })
                     .collect(),
                 vout: outputs
                     .into_iter()
-                    .map(|(v, script_pubkey)| TxOut { value: Amount::from_sat(v), script_pubkey })
+                    .map(|(v, script_pubkey)| TxOut {
+                        value: Amount::from_sat(v),
+                        script_pubkey,
+                    })
                     .collect(),
                 lock_time: 0,
             }
@@ -2651,8 +2662,16 @@ mod tests {
         fn funded() -> (WalletDb, Transaction) {
             let wallet = create_test_wallet();
             let addr = wallet.new_receiving_address().unwrap();
-            let fund = spend(&[(Hash256::from_bytes([9u8; 32]), 0)], vec![(100 * COIN, mine(&addr))]);
-            wallet.scan_block(Hash256::from_bytes([1u8; 32]), 100, 1_000, &[fund.clone()]);
+            let fund = spend(
+                &[(Hash256::from_bytes([9u8; 32]), 0)],
+                vec![(100 * COIN, mine(&addr))],
+            );
+            wallet.scan_block(
+                Hash256::from_bytes([1u8; 32]),
+                100,
+                1_000,
+                std::slice::from_ref(&fund),
+            );
             assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
             (wallet, fund)
         }
@@ -2662,7 +2681,10 @@ mod tests {
             let change = wallet.new_change_address().unwrap();
             spend(
                 &[(fund.txid(), 0)],
-                vec![(30 * COIN, stranger()), (70 * COIN - 1_000_000, mine(&change))],
+                vec![
+                    (30 * COIN, stranger()),
+                    (70 * COIN - 1_000_000, mine(&change)),
+                ],
             )
         }
 
@@ -2682,7 +2704,10 @@ mod tests {
 
             // Core: change is trusted, so it is in getbalance, not getunconfirmedbalance.
             assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
-            assert_eq!(wallet.get_confirmed_balance(100, 1).as_sat(), 70 * COIN - 1_000_000);
+            assert_eq!(
+                wallet.get_confirmed_balance(100, 1).as_sat(),
+                70 * COIN - 1_000_000
+            );
             assert_eq!(wallet.get_unconfirmed_balance().as_sat(), 0);
 
             let rec = wallet.get_transaction(&tx.txid()).unwrap();
@@ -2698,7 +2723,12 @@ mod tests {
             wallet.add_mempool_tx(&tx);
             let before = wallet.get_transactions(None).len();
 
-            wallet.scan_block(Hash256::from_bytes([2u8; 32]), 101, 1_060, &[tx.clone()]);
+            wallet.scan_block(
+                Hash256::from_bytes([2u8; 32]),
+                101,
+                1_060,
+                std::slice::from_ref(&tx),
+            );
 
             assert_eq!(wallet.mempool_tx_count(), 0);
             assert_eq!(wallet.get_transactions(None).len(), before);
@@ -2715,7 +2745,10 @@ mod tests {
         fn incoming_from_stranger_is_untrusted() {
             let wallet = create_test_wallet();
             let addr = wallet.new_receiving_address().unwrap();
-            let tx = spend(&[(Hash256::from_bytes([7u8; 32]), 3)], vec![(5 * COIN, mine(&addr))]);
+            let tx = spend(
+                &[(Hash256::from_bytes([7u8; 32]), 3)],
+                vec![(5 * COIN, mine(&addr))],
+            );
             assert!(wallet.add_mempool_tx(&tx));
 
             assert_eq!(wallet.get_balance().as_sat(), 0);
@@ -2727,13 +2760,19 @@ mod tests {
             let utxos = wallet.get_utxos();
             assert_eq!(utxos.len(), 1);
             assert_eq!(utxos[0].confirmations(100), 0);
-            assert_eq!(wallet.get_transaction(&tx.txid()).unwrap().category, "receive");
+            assert_eq!(
+                wallet.get_transaction(&tx.txid()).unwrap().category,
+                "receive"
+            );
         }
 
         #[test]
         fn unrelated_tx_is_ignored() {
             let (wallet, _) = funded();
-            let tx = spend(&[(Hash256::from_bytes([5u8; 32]), 0)], vec![(COIN, stranger())]);
+            let tx = spend(
+                &[(Hash256::from_bytes([5u8; 32]), 0)],
+                vec![(COIN, stranger())],
+            );
             assert!(!wallet.add_mempool_tx(&tx));
             assert_eq!(wallet.mempool_tx_count(), 0);
         }
@@ -2784,7 +2823,10 @@ mod tests {
                 let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
                 let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
                 let addr = wallet.new_receiving_address().unwrap();
-                tx = spend(&[(Hash256::from_bytes([7u8; 32]), 0)], vec![(5 * COIN, mine(&addr))]);
+                tx = spend(
+                    &[(Hash256::from_bytes([7u8; 32]), 0)],
+                    vec![(5 * COIN, mine(&addr))],
+                );
                 assert!(wallet.add_mempool_tx(&tx));
                 wallet.save_incremental().unwrap();
                 wallet.save().unwrap();

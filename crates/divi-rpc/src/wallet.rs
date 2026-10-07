@@ -848,7 +848,7 @@ impl WalletRpc {
         let mut utxos = wallet.get_spendable_utxos(height, 1);
 
         // Sort by value descending for simple coin selection
-        utxos.sort_by(|a, b| b.value.cmp(&a.value));
+        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Fee estimation: ~1000 satoshis per input + 500 per output
         let base_fee = Amount::from_sat(1000);
@@ -1781,7 +1781,7 @@ impl WalletRpc {
         let mut utxos = wallet.get_spendable_utxos(height, 1);
 
         // Sort by value descending for simple coin selection
-        utxos.sort_by(|a, b| b.value.cmp(&a.value));
+        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Fee estimation: ~1000 satoshis per input + 500 per output
         let base_fee = Amount::from_sat(1000);
@@ -2414,7 +2414,7 @@ impl WalletRpc {
 
         // Get spendable UTXOs
         let mut utxos = wallet.get_spendable_utxos(height, min_conf);
-        utxos.sort_by(|a, b| b.value.cmp(&a.value));
+        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Simple coin selection
         let base_fee = Amount::from_sat(1000);
@@ -2910,7 +2910,7 @@ impl WalletRpc {
                 .collect()
         };
 
-        utxos.sort_by(|a, b| b.value.cmp(&a.value));
+        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Fee estimation
         let base_fee = Amount::from_sat(1000);

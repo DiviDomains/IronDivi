@@ -137,7 +137,7 @@ pub fn compute_ranked_scores(
         .collect();
 
     // Sort by score descending (highest scores first)
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     // Track seen script hashes to detect duplicates
     let mut seen_scripts = std::collections::HashSet::new();

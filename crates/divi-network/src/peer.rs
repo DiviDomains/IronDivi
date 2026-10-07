@@ -201,6 +201,9 @@ pub struct PeerHandle {
 
 impl PeerHandle {
     /// Send a message to this peer
+    // SendError hands the unsent message back to the caller; boxing it would
+    // change every call site for no runtime benefit.
+    #[allow(clippy::result_large_err)]
     pub async fn send(
         &self,
         msg: NetworkMessage,
