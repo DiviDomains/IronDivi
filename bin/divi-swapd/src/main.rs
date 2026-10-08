@@ -87,11 +87,13 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = DaemonConfig::load(&args.config)?;
-    let kind = args.backend.unwrap_or(if cfg.secrets.is_some() {
-        BackendKind::Live
-    } else {
-        BackendKind::Mock
-    });
+    let kind = args
+        .backend
+        .unwrap_or(if cfg.divi.is_some() && cfg.btc.is_some() {
+            BackendKind::Live
+        } else {
+            BackendKind::Mock
+        });
     let (divi, btc) = match kind {
         BackendKind::Mock => mock_backends(),
         BackendKind::Live => live_backends(&cfg)?,

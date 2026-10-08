@@ -35,33 +35,29 @@ pub enum BackendKind {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SecretRefs {
-    /// Reference to the maker's DIVI private key.
-    pub divi_key: String,
-    /// Reference to the maker's BTC private key.
-    pub btc_key: String,
+pub struct DiviSection {
+    /// DIVI JSON-RPC proxy URL.
+    #[serde(default = "default_divi_rpc")]
+    pub rpc_url: String,
+    /// Reference (`op://…` or `credential:<name>`) to the maker's DIVI key.
+    pub key: String,
+    /// Known-UTXO file (public data only).
+    pub wallet_path: Option<PathBuf>,
+    /// First block height to scan for wallet UTXOs.
+    pub scan_from_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Endpoints {
-    /// DIVI JSON-RPC proxy URL.
-    #[serde(default = "default_divi_rpc")]
-    pub divi_rpc: String,
+pub struct BtcSection {
+    #[serde(default = "default_network")]
+    pub network: String,
     /// Primary Esplora API base.
     #[serde(default = "default_esplora")]
-    pub btc_esplora: String,
+    pub esplora_url: String,
     /// Fallback Esplora API base.
-    pub btc_esplora_fallback: Option<String>,
-}
-
-impl Default for Endpoints {
-    fn default() -> Self {
-        Endpoints {
-            divi_rpc: default_divi_rpc(),
-            btc_esplora: default_esplora(),
-            btc_esplora_fallback: None,
-        }
-    }
+    pub fallback_esplora_url: Option<String>,
+    /// Reference (`op://…` or `credential:<name>`) to the maker's BTC key.
+    pub key: String,
 }
 
 fn default_divi_rpc() -> String {
@@ -70,11 +66,22 @@ fn default_divi_rpc() -> String {
 fn default_esplora() -> String {
     "https://mempool.space/signet/api".into()
 }
+fn default_network() -> String {
+    "signet".into()
+}
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8480".parse().expect("static address")
 }
 fn default_profile() -> Profile {
     Profile::Testnet
+}
+fn default_offers() -> Vec<Offer> {
+    vec![Offer {
+        id: "divi-btc-testnet".into(),
+        divi_sats_per_btc: 300_000_000_000_000,
+        min_btc_sats: 5_000,
+        max_btc_sats: 50_000,
+    }]
 }
 fn default_tick() -> u64 {
     5
@@ -88,18 +95,18 @@ pub struct DaemonConfig {
     pub db_path: PathBuf,
     #[serde(default = "default_profile")]
     pub profile: Profile,
-    /// Optional path prefix, e.g. `/swap` behind nginx.
+    /// Optional path prefix. Empty by default: nginx strips `/swap/` before proxying.
     #[serde(default)]
     pub path_prefix: String,
     /// Seconds between scheduler ticks.
     #[serde(default = "default_tick")]
     pub tick_secs: u64,
-    #[serde(default)]
+    /// Standing offers; a built-in testnet offer is used when none are configured.
+    #[serde(default = "default_offers")]
     pub offers: Vec<Offer>,
-    /// Required for the live backend; ignored by the mock backend.
-    pub secrets: Option<SecretRefs>,
-    #[serde(default)]
-    pub endpoints: Endpoints,
+    /// `[divi]` and `[btc]` are required by the live backend, ignored by the mock one.
+    pub divi: Option<DiviSection>,
+    pub btc: Option<BtcSection>,
 }
 
 impl DaemonConfig {
@@ -129,15 +136,17 @@ impl DaemonConfig {
         if self.tick_secs == 0 {
             bail!("tick_secs must be > 0");
         }
-        if self.offers.is_empty() {
-            bail!("config needs at least one [[offers]] entry");
-        }
         for o in &self.offers {
             if o.min_btc_sats > o.max_btc_sats {
                 bail!("offer {}: min_btc_sats > max_btc_sats", o.id);
             }
         }
-        for r in self.secrets.iter().flat_map(|s| [&s.divi_key, &s.btc_key]) {
+        let refs = self
+            .divi
+            .iter()
+            .map(|d| &d.key)
+            .chain(self.btc.iter().map(|b| &b.key));
+        for r in refs {
             divi_swap::secrets::SecretRef::parse(r)
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;
         }
@@ -157,9 +166,10 @@ id = "o1"
 divi_sats_per_btc = 100
 min_btc_sats = 1
 max_btc_sats = 10
-[secrets]
-divi_key = "op://v/i/f"
-btc_key = "credential:btc"
+[divi]
+key = "op://v/i/f"
+[btc]
+key = "credential:btc"
 "#;
 
     #[test]
@@ -167,6 +177,23 @@ btc_key = "credential:btc"
         let c = DaemonConfig::parse(GOOD).unwrap();
         assert_eq!(c.prefix(), "/swap");
         assert_eq!(c.profile, Profile::Testnet);
+    }
+
+    #[test]
+    fn parses_deploy_example() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/divi-swapd/divi-swapd.toml.example");
+        let c = DaemonConfig::load(&path).unwrap();
+        assert_eq!(c.listen.port(), 18480);
+        assert_eq!(c.prefix(), "");
+        assert_eq!(c.offers[0].id, "divi-btc-testnet");
+        let d = c.divi.unwrap();
+        assert_eq!(d.key, "credential:maker-divi");
+        assert_eq!(d.scan_from_height, Some(339800));
+        assert!(d.wallet_path.is_some());
+        let b = c.btc.unwrap();
+        assert_eq!(b.network, "signet");
+        assert!(b.fallback_esplora_url.is_some());
     }
 
     #[test]

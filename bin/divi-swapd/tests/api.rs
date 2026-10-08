@@ -108,7 +108,7 @@ async fn post_swaps_accepts_quote() {
     let id = sessions.get(&local).unwrap().maker_swap_id;
     let (code, v) = get_json(&format!("{}/swaps/{id}", d.base)).await;
     assert_eq!(code, 200);
-    assert_eq!(v["state"], "accepted");
+    assert_eq!(v["state"], "Accepted");
     assert_eq!(v["divi"], Value::Null, "maker has locked nothing yet");
     assert_eq!(w.maker_divi.funding_calls(), 0);
 
