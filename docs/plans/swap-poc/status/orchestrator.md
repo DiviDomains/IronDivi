@@ -12,6 +12,7 @@
   - lane btc — worktree `~/code/IronDivi-swap-btc`, pane `e35d61d6-4779-4c41-a937-70d5db976125`
   - lane divi — worktree `~/code/IronDivi-swap-divi`, pane `6f364e5b-4711-4ed3-a986-9d40416372a3` (seed tx `03f9983c…bb1f`)
 - **Broken:** none
+- **Compactions:** engine 1 (2026-10-07)
 - **Parked:** PARKED.md #1 signet sBTC (faucet CAPTCHA) — blocks 0.4 and btc lane live test only
 - **Next:** watch lanes (watcher script in scratchpad); restart engine if it compacts twice; Wave 1 gate.
 - Avada: tab "Swap POC" (0:17), orchestrator pane `pane-096e7cf3-fa59-4aa4-9f3d-4b1204f386c3`; `new-pane` needs `--window 0`.

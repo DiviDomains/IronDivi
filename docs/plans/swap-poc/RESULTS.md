@@ -26,3 +26,5 @@ Every txid, address and test result, newest last.
 - (b) refund B after MTP passed the locktime, **same signed tx**: accepted and confirmed — `ac8216e7909b4e555f627def75a455dcbbc9cfbedbae07965667cc3b4873c3ae` (nLockTime 1791417854)
 - Confirmations at 2026-10-07 check: fund-in 14, HTLC fund 11, claim 11, refund 1.
 - **0.3 verdict: GO.** IronDivi's sighash (redeem script as script code) and P2SH scriptSigs are accepted by the live Divi testnet; the CLTV refund path works. CLTV-violation probe (nLockTime = locktime − 1 on a second HTLC pair, fund `6ff5e4289f59b69a9463994c6619aa5c569cd68d7396cbdba92e0351271cfe26`) running — result below.
+- CLTV-violation probe, attempt 1 (pair 2): not run — `op read` returned `authorization timeout` (an unanswered 1Password approval); the follow-up normal refund resolved the key 5 s later and confirmed: `cf4ceb817c368b402ff05cebd0c2a7d3e3b6d5bfdbd4ecc29a60d8347e4b500e`.
+- CLTV-violation probe, attempt 2: pair 3 funded `a5ae12cb0e97f739370283f01850c07dd209b39211507f9063adba1103a94097` (B locktime 1791419031); probe runs when MTP passes it.
