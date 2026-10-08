@@ -12,4 +12,4 @@
 - decisions: mock chains are per-process, so `--backend mock` covers plumbing only; claim-policy flows are tested in-process via the `World` harness.
 - decisions: state lives in `~/.local/state/iron-divi-swap-poc/<scenario>-<backend>/` (outside the repo); previous runs are moved to `old-<stamp>/`. Ports 18491/18492/18493. Each swap uses E2E_BTC_SATS=10000 (<= 20,000).
 - needs: nothing.
-- last_sha: pending
+- last_sha: 8308c68
