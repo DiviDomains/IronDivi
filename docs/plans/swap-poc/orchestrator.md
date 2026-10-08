@@ -28,7 +28,8 @@ is parked behind a human turn.
       'Read docs/plans/atomic-swap-poc.md and docs/plans/swap-poc/lanes/<lane>.md; execute your lane to completion.'"
    ```
    (`--window 0` is required; the pane shell's PATH lacks `~/.local/bin`, so use the absolute path —
-   a pane whose command is not found closes at once.) `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Bert
+   a pane whose command is not found closes at once. `new-pane` lands in the window's
+   *active* tab: remember Bert's active tab, `focus-tab` Swap POC, create, then `focus-tab` back.) `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Bert
    can watch and type into them. To wait on a lane, run `$HP_CTL ctl read <pane> --wait --tail 40`
    with Bash `run_in_background: true` (you are notified when it goes idle); never poll. Never
    submit into a lane pane without reading it first. Never `close-pane` a lane without Bert.
