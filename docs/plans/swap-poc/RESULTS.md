@@ -31,3 +31,10 @@ Every txid, address and test result, newest last.
 - CLTV-violation probe, attempt 2 (pair 3): refund with nLockTime 1791419030 = script locktime − 1, MTP 1791419198 (tx final) — IronDivi interpreter `Err(UnsatisfiedLocktime)`; node **rejected** `64: non-mandatory-script-verify-flag (No error)`, txid would have been `1e184a6fdc4162ab9629e9b1da998cab48f22346400d27694b3158ffaee37f66`. Reading: relay policy (standard flags) enforces CLTV; the mempool's mandatory re-check excludes CLTV (same split as Bitcoin Core, hence "No error"); block validation enables CLTV by MTP after 1692792000 (plan §2, C++ `BlockTransactionChecker.cpp:119`), which testnet MTP is far past. **Verdict unchanged: GO.**
 - Side finding (outside POC scope): IronDivi's own block validation does not appear to apply script verification flags (no `ScriptFlags` use outside `divi-script`); worth an IronDivi audit item.
 - pair 3 B normal refund: `32575b2c84313a97a07ceffbd332cee928304b24ff880c8a98d609706aa6d933`
+
+## Wave 1 (gate on `main` at `18cf810`, 2026-10-08)
+- `cargo fmt --check` ok · `cargo clippy --workspace --all-targets --all-features -D warnings` ok · `cargo test --workspace` 1,776 passed, 0 failed.
+- check-engine PASS (`f99dbb5`) · check-daemon PASS · check-deploy PASS · check-divi PASS · check-btc: unit work done, 3 live-txid checks wait on sBTC (PARKED.md #1).
+- divi live test (lane divi): fund `db0078c0b400125dc5681341b887cd405ffb5e67faf539c9464b341d7c834702` / `b65825714e520eb72cc511c532431a4624f23b028cee8414b6aa7f64f5f4694f`, claim `b16e7eb7af3fd20d08741c0759d02d45c6498e472e69251ee8a55e434f4c3f95`, refund `454c1c1eedb9e5ae92c1954813a447d433c6bae455bc1b5ffcc4d8dec4b184b2` — all confirmed.
+- daemon live smoke with `op://` maker keys: `GET /healthz` → `{"ok":true,"version":"0.2.4","divi":{"tip":339964,"error":null},"btc":{"tip":325424,"error":null}}`.
+- Review: coin selection only on `TakerLockConfirmed → MakerLocked` after re-verifying the BTC lock; signed funding persisted before broadcast; no key reaches logs or disk.
