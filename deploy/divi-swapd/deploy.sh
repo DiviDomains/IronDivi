@@ -13,6 +13,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 DRY=0
 CMD=deploy
+# Toolchain installed alongside dnsdivi's default (other builds there keep theirs).
+TOOLCHAIN="${TOOLCHAIN:-1.98.1}"
+# NGINX=1 installs the /swap/ snippet and reloads nginx. Off by default: dnsdivi's nginx
+# serves production sites, and the POC maker is reached over an SSH tunnel to 127.0.0.1:18480.
+NGINX="${NGINX:-0}"
 
 for a in "$@"; do
   case "$a" in
@@ -67,11 +72,12 @@ deploy() {
   remote "install -d -o ubuntu -g ubuntu $(dirname "$SRC_DIR") $SRC_DIR"
   run rsync -az --delete --exclude target --exclude .git "$REPO/" "$HOST:$SRC_DIR/"
 
-  step "build release on $HOST (needs rustup toolchain for ubuntu)"
-  if ((DRY)); then echo "  [dry-run] ssh $HOST 'cd $SRC_DIR && cargo build --release -p divi-swapd'"
+  step "build release on $HOST with rust $TOOLCHAIN (ubuntu's rustup; non-login ssh has no cargo on PATH)"
+  local build=". \$HOME/.cargo/env && rustup toolchain install $TOOLCHAIN --profile minimal >/dev/null && cd $SRC_DIR && cargo +$TOOLCHAIN build --release -p divi-swapd"
+  if ((DRY)); then echo "  [dry-run] ssh $HOST '$build'"
   else
-    # shellcheck disable=SC2029  # SRC_DIR is expanded client-side on purpose
-    ssh "$HOST" "cd $SRC_DIR && cargo build --release -p divi-swapd"
+    # shellcheck disable=SC2029  # build is expanded client-side on purpose
+    ssh "$HOST" "$build"
   fi
 
   step "create service user and directories"
@@ -84,25 +90,32 @@ install -d -m 0700 -o root -g root /etc/divi-swapd/credentials"
 install -m 0755 $SRC_DIR/target/release/divi-swapd /usr/local/bin/divi-swapd
 [ -f /etc/divi-swapd/divi-swapd.toml ] || install -m 0640 -o root -g $SVC $SRC_DIR/deploy/divi-swapd/divi-swapd.toml.example /etc/divi-swapd/divi-swapd.toml"
 
-  step "install systemd unit, logrotate, nginx snippet"
+  step "install systemd unit and logrotate"
   remote "install -m 0644 $SRC_DIR/deploy/divi-swapd/divi-swapd.service /etc/systemd/system/divi-swapd.service
 install -m 0644 $SRC_DIR/deploy/divi-swapd/logrotate-divi-swapd /etc/logrotate.d/divi-swapd
-install -m 0644 $SRC_DIR/deploy/divi-swapd/nginx-swap.conf /etc/nginx/snippets/divi-swapd.conf
-nginx -t
 systemctl daemon-reload"
+  if ((NGINX)); then
+    step "install nginx snippet (include it once in the chosen server block)"
+    remote "install -m 0644 $SRC_DIR/deploy/divi-swapd/nginx-swap.conf /etc/nginx/snippets/divi-swapd.conf
+nginx -t"
+  fi
 
   step "check credentials exist before starting"
   remote 'test -s /etc/divi-swapd/credentials/maker-divi && test -s /etc/divi-swapd/credentials/maker-btc || { echo "credentials missing: run deploy.sh provision-secrets" >&2; exit 1; }'
 
-  step "start service and reload nginx"
+  step "start service"
   remote "systemctl enable $SVC
-systemctl restart $SVC
-systemctl reload nginx"
+systemctl restart $SVC"
+  if ((NGINX)); then
+    step "reload nginx"
+    remote "nginx -t && systemctl reload nginx"
+  fi
 
   step "health check"
   if ((DRY)); then echo "  [dry-run] ssh $HOST 'curl -fsS --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:18480/healthz'"
   else ssh "$HOST" "curl -fsS --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:18480/healthz"; echo; fi
-  echo "Then verify the public path: curl https://<dnsdivi-host>/swap/healthz (nginx snippet must be included in the server block once)."
+  if ((NGINX)); then echo "Then verify the public path: curl https://<dnsdivi-host>/swap/healthz"
+  else echo "Taker access: ssh -N -L 18480:127.0.0.1:18480 $HOST  (then http://127.0.0.1:18480)"; fi
 }
 
 rollback() {
