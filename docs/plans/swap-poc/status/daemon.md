@@ -9,3 +9,4 @@
 - left: wire DiviBackend into live_backends (bin/divi-swapd/src/main.rs) once swap-chain-divi lands; then a live smoke run
 - needs: Cargo.lock gains one line ("bitcoin") for divi-swapd direct dep; orchestrator to land
 - decisions: JSON logs on; BTC live backend built from [btc] (signet only, key via SecretRef, hex 32 bytes, zeroed after use); DIVI side still errors cleanly
+- last_sha: c28d7fb
