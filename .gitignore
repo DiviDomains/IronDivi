@@ -46,3 +46,4 @@ CURRENT
 LOCK
 LOG
 LOG.old.*
+__pycache__/

@@ -22,6 +22,8 @@ use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, Spe
 
 /// One chain, one engine key. A backend owns exactly one secp256k1 key (resolved from
 /// 1Password at startup): it funds HTLCs from that key's coins, and claims / refunds to it.
+// clippy >= 1.99 flags the `#[must_use]` that `async_trait` adds to the boxed futures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChainBackend: Send + Sync {
     /// Which chain this is.
