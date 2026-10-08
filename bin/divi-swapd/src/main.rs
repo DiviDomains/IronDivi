@@ -26,7 +26,9 @@ use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store, SwapConfig};
 use divi_swapd::{router, spawn_scheduler, AppState, BackendKind, BtcSection, DaemonConfig};
+use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
+use swap_chain_divi::{DiviBackend, FeePolicy as DiviFeePolicy};
 
 #[derive(Parser)]
 #[command(name = "divi-swapd", version, about = "Atomic swap maker daemon")]
@@ -100,13 +102,32 @@ fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
-fn live_backends(cfg: &DaemonConfig) -> Result<Backends> {
-    let (Some(_divi), Some(btc)) = (&cfg.divi, &cfg.btc) else {
+async fn live_backends(cfg: &DaemonConfig) -> Result<Backends> {
+    let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
-    let btc = live_btc(btc)?;
-    let _ = btc;
-    bail!("live DIVI backend is not wired yet: waiting on the swap-chain-divi lane")
+    let btc = live_btc(btc_cfg)?;
+    let hex_key = SecretRef::parse(&divi_cfg.key)
+        .and_then(|r| r.resolve())
+        .map_err(|e| anyhow::anyhow!("divi key: {e}"))?;
+    let key = divi_crypto::keys::SecretKey::from_hex(hex_key.trim())
+        .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
+    drop(hex_key);
+    let divi = DiviBackend::new(
+        &divi_cfg.rpc_url,
+        key,
+        DiviNetwork::Testnet,
+        DiviFeePolicy::default(),
+        divi_cfg.wallet_path.clone(),
+    )?;
+    tracing::info!(address = %divi.address(), "divi backend ready");
+    if let Some(from) = divi_cfg.scan_from_height {
+        match divi.scan_blocks(from).await {
+            Ok(next) => tracing::info!(from, next, balance = divi.balance(), "divi wallet scanned"),
+            Err(e) => tracing::warn!(error = %e, "divi wallet scan failed; continuing"),
+        }
+    }
+    Ok((Arc::new(divi), btc))
 }
 
 #[tokio::main]
@@ -129,7 +150,7 @@ async fn main() -> Result<()> {
         });
     let (divi, btc) = match kind {
         BackendKind::Mock => mock_backends(),
-        BackendKind::Live => live_backends(&cfg)?,
+        BackendKind::Live => live_backends(&cfg).await?,
     };
 
     let store = Store::open(&cfg.db_path).context("opening swap database")?;

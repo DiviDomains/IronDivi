@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use divi_swap::mock::MockChain;
 use divi_swap::{Amount, Chain, ChainBackend, Store, Taker};
@@ -129,13 +129,45 @@ fn backends(cli: &Cli) -> Result<(Arc<dyn ChainBackend>, Arc<dyn ChainBackend>)>
             let btc = MockChain::new(Chain::Btc, now, 600).backend(4, Amount(10 * Amount::COIN));
             Ok((Arc::new(divi), Arc::new(btc)))
         }
-        BackendArg::Live => {
-            for r in [&cli.divi_key, &cli.btc_key].into_iter().flatten() {
-                divi_swap::secrets::SecretRef::parse(r)?;
-            }
-            bail!("live backend is not wired yet: waiting on the swap-chain-divi / swap-chain-btc lanes")
-        }
+        BackendArg::Live => live_backends(cli),
     }
+}
+
+fn secret_hex(
+    reference: &Option<String>,
+    flag: &str,
+    what: &str,
+) -> Result<zeroize::Zeroizing<String>> {
+    let r = reference
+        .as_deref()
+        .with_context(|| format!("live backend needs {flag} <op://… or credential:…>"))?;
+    divi_swap::secrets::SecretRef::parse(r)
+        .and_then(|r| r.resolve())
+        .map_err(|e| anyhow::anyhow!("{what} key: {e}"))
+}
+
+fn live_backends(cli: &Cli) -> Result<(Arc<dyn ChainBackend>, Arc<dyn ChainBackend>)> {
+    let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
+    let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
+        .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
+    drop(dhex);
+    let bhex = secret_hex(&cli.btc_key, "--btc-key", "btc")?;
+    let mut raw = [0u8; 32];
+    hex::decode_to_slice(bhex.trim(), &mut raw)
+        .map_err(|_| anyhow::anyhow!("btc key is not 32 bytes of hex"))?;
+    let bkey = bitcoin::secp256k1::SecretKey::from_slice(&raw);
+    raw.fill(0);
+    let bkey = bkey.map_err(|_| anyhow::anyhow!("btc key is not a valid secp256k1 key"))?;
+    drop(bhex);
+    let divi = swap_chain_divi::DiviBackend::new(
+        "https://services.divi.domains/api/testnet/rpc/",
+        dkey,
+        divi_wallet::address::Network::Testnet,
+        swap_chain_divi::FeePolicy::default(),
+        None,
+    )?;
+    let btc = swap_chain_btc::BtcBackend::signet(bkey, swap_chain_btc::FeePolicy::default())?;
+    Ok((Arc::new(divi), Arc::new(btc)))
 }
 
 fn taker(cli: &Cli) -> Result<Taker> {
