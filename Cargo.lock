@@ -1092,8 +1092,11 @@ version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
+ "bitcoin",
  "clap",
+ "divi-crypto",
  "divi-swap",
+ "divi-wallet",
  "hex",
  "rand 0.8.8",
  "reqwest",
@@ -1107,6 +1110,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1117,8 +1121,10 @@ dependencies = [
  "axum",
  "bitcoin",
  "clap",
+ "divi-crypto",
  "divi-swap",
  "divi-swap-cli",
+ "divi-wallet",
  "hex",
  "http-body-util",
  "parking_lot",
