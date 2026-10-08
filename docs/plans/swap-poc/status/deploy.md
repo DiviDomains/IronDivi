@@ -1,0 +1,7 @@
+- done: deploy/divi-swapd/ (unit, nginx snippet, logrotate, toml example, deploy.sh incl. provision-secrets/rollback, README); check-deploy.sh PASS
+- running: nothing
+- broken: nothing
+- left: Wave 3 live run (needs human for ssh/op)
+- decisions: build on dnsdivi (rsync + cargo, no cross); port 127.0.0.1:18480; secrets via LoadCredential maker-divi/maker-btc; deploy.sh is bash 3.2 compatible
+- needs: daemon lane to accept `--config <toml>` and honor `listen`, `/healthz`; config keys in divi-swapd.toml.example (profile, listen, db_path, [divi], [btc]) are my proposal and must match the daemon's real config schema; dnsdivi needs rustup for user ubuntu and passwordless sudo
+- last_sha: see git log

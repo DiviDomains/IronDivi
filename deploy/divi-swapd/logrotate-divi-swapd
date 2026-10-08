@@ -1,0 +1,12 @@
+# Only needed if divi-swapd is configured with log_file. Under systemd it logs to the
+# journal; cap that with SystemMaxUse=200M in /etc/systemd/journald.conf.d/.
+/var/log/divi-swapd/*.log {
+    size 10M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su divi-swapd divi-swapd
+}

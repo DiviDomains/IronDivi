@@ -1,0 +1,37 @@
+[Unit]
+Description=divi-swapd atomic swap maker daemon (testnet POC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=divi-swapd
+Group=divi-swapd
+ExecStart=/usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml
+# DB lives in /var/lib/divi-swapd (0700 dir); files created 0600.
+StateDirectory=divi-swapd
+StateDirectoryMode=0700
+UMask=0077
+# Keys: root:root 0400 files, exposed to the service only via $CREDENTIALS_DIRECTORY.
+LoadCredential=maker-divi:/etc/divi-swapd/credentials/maker-divi
+LoadCredential=maker-btc:/etc/divi-swapd/credentials/maker-btc
+Restart=on-failure
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
