@@ -10,3 +10,4 @@
 - left: wire live backends (both chain lanes) and tracing json feature; live backend currently exits with a clear error
 - decisions: [[offers]] optional, built-in testnet offer used when absent; path_prefix defaults empty (nginx strips /swap/)
 - needs: deploy example puts `tick_secs = 10` after [[offers]], so TOML makes it an offers key and the daemon ignores it (default 5 s); move it above [divi] in the example
+- last_sha: 5ff4710
