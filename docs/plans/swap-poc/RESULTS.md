@@ -42,3 +42,10 @@ Every txid, address and test result, newest last.
 
 ## Wave 2
 - e2e-local: tooling done (`tools/swap-poc/e2e.sh`), live txids pending sBTC funding of the taker-btc address (PARKED.md #1). Results are recorded in `status/e2e-local.md` and will be copied here.
+
+## Wave 3
+- Deploy to dnsdivi (`deploy.sh deploy`, 2026-10-08 01:45 UTC): release build with rust 1.98.1 in 7m 11s; systemd `divi-swapd.service` active, `NRestarts=0`, binds `127.0.0.1:18480` only (DECISIONS #7).
+- Keys: `/etc/divi-swapd/credentials/{maker-divi,maker-btc}` root:root 0400, provisioned `op read` → ssh stdin; loaded via `LoadCredential=`.
+- Startup log: btc maker `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt`, divi maker `yH2vuZnVbVh1FopWEiFAMok93XKu6EUWG6`; wallet scan 339800→340015, balance 24,799.91965 tDIVI; `divi-swapd up … backend Live`.
+- `GET /healthz` on dnsdivi → `{"ok":true,"version":"0.2.5","divi":{"tip":340015,"error":null},"btc":{"tip":325429,"error":null}}`.
+- e2e against the deployed maker (via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`): pending sBTC (PARKED.md #1).

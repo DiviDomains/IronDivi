@@ -111,9 +111,9 @@ systemctl restart $SVC"
     remote "nginx -t && systemctl reload nginx"
   fi
 
-  step "health check"
-  if ((DRY)); then echo "  [dry-run] ssh $HOST 'curl -fsS --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:18480/healthz'"
-  else ssh "$HOST" "curl -fsS --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:18480/healthz"; echo; fi
+  step "health check (first start scans the DIVI wallet from scan_from_height: ~1 min)"
+  if ((DRY)); then echo "  [dry-run] ssh $HOST 'curl -fsS --retry 36 --retry-connrefused --retry-delay 5 http://127.0.0.1:18480/healthz'"
+  else ssh "$HOST" "curl -fsS --retry 36 --retry-connrefused --retry-delay 5 http://127.0.0.1:18480/healthz"; echo; fi
   if ((NGINX)); then echo "Then verify the public path: curl https://<dnsdivi-host>/swap/healthz"
   else echo "Taker access: ssh -N -L 18480:127.0.0.1:18480 $HOST  (then http://127.0.0.1:18480)"; fi
 }
