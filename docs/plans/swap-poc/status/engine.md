@@ -1,0 +1,15 @@
+# engine lane status
+- done: store (SQLite, 0600, write-ahead), maker + taker state machines, tests/engine.rs (12 scenarios incl. crash-at-every-state and proptest); check-engine.sh PASS
+- running: nothing
+- broken: nothing
+- left: nothing for the lane; daemon lane builds against Maker/Taker/Store
+- last_sha: see git log
+- needs: none
+- decisions:
+  - Gap check at maker lock: require btc_locktime - btc_mtp_now >= maker_timeout + claim_margin (SwapConfig::validate's literal gap would break as time elapses); otherwise Aborted with no coin selection.
+  - Maker aborts from Accepted if no taker lock arrives within lock_wait (default 1800s wall clock, injectable clock).
+  - Quotes are single-use; accept rejects expired quotes and duplicate hashes.
+  - Taker verifies the maker's DIVI lock on chain itself and claims only while DIVI MTP + 1800s <= maker locktime.
+  - Crash hooks: Maker/Taker::halt_after(state) return right after persisting the transition, before its side effect.
+  - Maker and taker may share one DB file (separate tables).
+- parked: none
