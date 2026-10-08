@@ -9,4 +9,4 @@
 - parked: unblock: fund tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg per PARKED.md #1, then rerun the driver
 - blocked-on-human: yes
 - decisions: maker_refundable runs use maker_timeout 1800 s / taker 18000 s (gap 16200 = required 4.5 h); mock daemon loses its in-memory chains on kill -9, so mock only proves driver mechanics, completion is live-only; states are held with BEFORE INSERT/UPDATE triggers on maker_swaps (upsert fires the INSERT trigger), no engine change
-- last_sha: pending
+- last_sha: 4b67f9e
