@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use divi_swap::mock::MockChain;
 use divi_swap::{Amount, Chain, ChainBackend, Store, Taker};
-use divi_swap_cli::{flow, MakerClient, RunOpts, Sessions};
+use divi_swap_cli::{flow, ClaimGate, ClaimPolicy, MakerClient, RunOpts, Sessions};
 
 #[derive(Parser)]
 #[command(
@@ -115,6 +115,19 @@ enum Cmd {
         /// Seconds between polls of the maker.
         #[arg(long, default_value_t = 10)]
         poll_secs: u64,
+        /// Late claim (test scenario): hold the DIVI claim until the DIVI median time is
+        /// this many seconds before the maker's refund locktime (must exceed 1800).
+        #[arg(long, conflicts_with = "never_claim")]
+        claim_not_before: Option<u32>,
+        /// Never claim (test scenario): wait out the BTC timelock and refund.
+        #[arg(long)]
+        never_claim: bool,
+    },
+    /// Print `key=value` txids for a swap: the taker's own plus the maker's view.
+    Txids {
+        /// Local swap id.
+        #[arg(long)]
+        swap: String,
     },
 }
 
@@ -226,22 +239,85 @@ async fn main() -> Result<()> {
             deal,
             timeout_secs,
             poll_secs,
+            claim_not_before,
+            never_claim,
         } => {
             let opts = RunOpts {
                 timeout: Duration::from_secs(*timeout_secs),
                 poll: Duration::from_secs(*poll_secs),
             };
-            let (local, state) = divi_swap_cli::run_swap(
-                &taker(&cli)?,
+            let policy = match (claim_not_before, never_claim) {
+                (Some(n), _) => ClaimPolicy::NotBefore {
+                    secs_before_timeout: *n,
+                },
+                (None, true) => ClaimPolicy::Never,
+                (None, false) => ClaimPolicy::Asap,
+            };
+            let (divi, btc) = backends(&cli)?;
+            let gate = ClaimGate {
+                policy,
+                store: Store::open(&cli.db)?,
+                divi: divi.clone(),
+            };
+            let taker = Taker::new(divi, btc, Store::open(&cli.db)?);
+            let (local, state) = flow::run_swap_gated(
+                &taker,
                 &MakerClient::new(&deal.maker.maker),
                 &sessions,
                 &deal.offer,
                 deal.btc_sats,
                 &opts,
                 &mut || {},
+                Some(&gate),
             )
             .await?;
             println!("{local} {state:?}");
+        }
+        Cmd::Txids { swap } => {
+            let s = sessions.get(swap)?;
+            let rec = Store::open(&cli.db)?
+                .get_taker_swap(swap)?
+                .with_context(|| format!("no taker record {swap}"))?;
+            let view = MakerClient::new(&s.maker_url)
+                .swap(&s.maker_swap_id)
+                .await?;
+            println!("taker_state={:?}", rec.state);
+            println!("maker_state={:?}", view.state);
+            let line = |k: &str, v: Option<String>| {
+                if let Some(v) = v {
+                    println!("{k}={v}");
+                }
+            };
+            line(
+                "btc_lock",
+                rec.btc_funding.as_ref().map(|f| f.tx.txid.to_string()),
+            );
+            line(
+                "btc_claim_by_maker",
+                view.btc.spend_txid.map(|t| t.to_string()),
+            );
+            line(
+                "btc_refund_by_taker",
+                rec.btc_refund.as_ref().map(|t| t.txid.to_string()),
+            );
+            line(
+                "divi_lock",
+                view.divi
+                    .as_ref()
+                    .and_then(|l| l.outpoint)
+                    .map(|o| o.txid.to_string()),
+            );
+            line(
+                "divi_claim_by_taker",
+                rec.divi_claim.as_ref().map(|t| t.txid.to_string()),
+            );
+            line(
+                "divi_spend_by_maker",
+                view.divi
+                    .as_ref()
+                    .and_then(|l| l.spend_txid)
+                    .map(|t| t.to_string()),
+            );
         }
     }
     Ok(())

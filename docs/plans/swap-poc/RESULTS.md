@@ -39,3 +39,6 @@ Every txid, address and test result, newest last.
 - daemon live smoke with `op://` maker keys: `GET /healthz` → `{"ok":true,"version":"0.2.4","divi":{"tip":339964,"error":null},"btc":{"tip":325424,"error":null}}`.
 - Review: coin selection only on `TakerLockConfirmed → MakerLocked` after re-verifying the BTC lock; signed funding persisted before broadcast; no key reaches logs or disk.
 - GitHub CI on `main` `53f1d03` (run 37712918965): Format, Clippy, Test, Build, Security Audit — all success (after allowing clippy 1.99 `double_must_use` on the `async_trait` trait).
+
+## Wave 2
+- e2e-local: tooling done (`tools/swap-poc/e2e.sh`), live txids pending sBTC funding of the taker-btc address (PARKED.md #1). Results are recorded in `status/e2e-local.md` and will be copied here.
