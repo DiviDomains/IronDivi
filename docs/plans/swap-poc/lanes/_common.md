@@ -15,7 +15,10 @@ The orchestrator is another pane. Bert may type into your pane; answer him, then
    Write it under `- needs:` in your status file and keep going around it; the orchestrator
    will land it on `main` and you rebase.
 3. **Stop condition is a script:** `tools/swap-poc/check-<lane>.sh` exits 0 only when you are
-   done. A Stop hook re-prompts you while it fails. Do not edit check scripts.
+   done. A Stop hook re-prompts you while it fails. Do not edit check scripts. If **everything**
+   left is blocked on a human (e.g. no testnet coins yet), write `- parked: <what, and the one
+   command or action that unblocks it>` and `- blocked-on-human: yes` in your status file; the
+   hook then lets you stop. Remove the line when you resume.
 4. **Land on `main` at each verified seam:** `cargo fmt && cargo clippy -p <crate> --all-targets
    --all-features -- -D warnings && cargo test -p <crate>` green → `git commit` (author is
    already Bert via git config; **no AI attribution, no Co-Authored-By**) →
