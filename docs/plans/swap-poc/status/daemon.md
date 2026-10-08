@@ -11,3 +11,4 @@
 - needs: Cargo.lock lines for new direct deps (divi-crypto, divi-wallet in both bins; bitcoin, zeroize in divi-swap-cli); orchestrator to land
 - decisions: divi scan_from_height is applied at startup via DiviBackend::scan_blocks (failure is a warning); CLI live backend uses the default testnet RPC URL
 - smoke: 2026-10-08 live run with op:// maker keys on port 18481: GET /healthz -> {"ok":true,"version":"0.2.4","divi":{"tip":339964,"error":null},"btc":{"tip":325424,"error":null}}; maker DIVI wallet scanned from 339800, balance 24799.91965 DIVI
+- last_sha: 031504f
