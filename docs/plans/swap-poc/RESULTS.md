@@ -38,3 +38,4 @@ Every txid, address and test result, newest last.
 - divi live test (lane divi): fund `db0078c0b400125dc5681341b887cd405ffb5e67faf539c9464b341d7c834702` / `b65825714e520eb72cc511c532431a4624f23b028cee8414b6aa7f64f5f4694f`, claim `b16e7eb7af3fd20d08741c0759d02d45c6498e472e69251ee8a55e434f4c3f95`, refund `454c1c1eedb9e5ae92c1954813a447d433c6bae455bc1b5ffcc4d8dec4b184b2` — all confirmed.
 - daemon live smoke with `op://` maker keys: `GET /healthz` → `{"ok":true,"version":"0.2.4","divi":{"tip":339964,"error":null},"btc":{"tip":325424,"error":null}}`.
 - Review: coin selection only on `TakerLockConfirmed → MakerLocked` after re-verifying the BTC lock; signed funding persisted before broadcast; no key reaches logs or disk.
+- GitHub CI on `main` `53f1d03` (run 37712918965): Format, Clippy, Test, Build, Security Audit — all success (after allowing clippy 1.99 `double_must_use` on the `async_trait` trait).
