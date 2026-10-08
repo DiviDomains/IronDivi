@@ -11,3 +11,5 @@
 - decisions: MTP = median of last 11 block times (proxy returns mediantime null); wallet is local JSON + block scan since proxy has no address/spent index; seeded from 03f9… only, outputs of 6ff5… excluded
 - note: stop-hook fmt/clippy/test FAILs were PATH only (cargo lives in /opt/homebrew/opt/rustup/bin)
 - last_sha: d3bd5e9
+- parked: stop-hook shell has no cargo on PATH, so check-divi.sh reports false FAILs; with PATH=/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH it prints PASS: divi. Unblock: add that dir to the PATH hooks run under (or export it at the top of tools/swap-poc/stop-hook.sh)
+- blocked-on-human: yes
