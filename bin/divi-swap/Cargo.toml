@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 description = "Atomic swap taker and operator CLI"
 
+[lib]
+name = "divi_swap_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "divi-swap"
 path = "src/main.rs"

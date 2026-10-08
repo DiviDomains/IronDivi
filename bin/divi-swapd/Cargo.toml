@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 description = "Atomic swap maker daemon"
 
+[lib]
+name = "divi_swapd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "divi-swapd"
 path = "src/main.rs"
@@ -31,5 +35,6 @@ reqwest = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+divi-swap-cli = { path = "../divi-swap" }
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
