@@ -23,11 +23,12 @@ is parked behind a human turn.
    read it once. Your own pane id is `$HP_PANE_ID` if set, else find it with `ctl tabs`.
    ```sh
    git worktree add ../IronDivi-swap-<lane> -b swap/<lane> origin/main
-   $HP_CTL ctl new-pane --label swap-<lane> --cwd ~/code/IronDivi-swap-<lane> --cmd \
-     "claude_auto --model sonnet --settings ~/code/claude-standards/helpers/context-budget/narrow-context.json \
+   $HP_CTL ctl new-pane --window 0 --label swap-<lane> --cwd ~/code/IronDivi-swap-<lane> --cmd \
+     "$HOME/.local/bin/claude_auto --model sonnet --settings $HOME/code/claude-standards/helpers/context-budget/narrow-context.json \
       'Read docs/plans/atomic-swap-poc.md and docs/plans/swap-poc/lanes/<lane>.md; execute your lane to completion.'"
    ```
-   `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Bert
+   (`--window 0` is required; the pane shell's PATH lacks `~/.local/bin`, so use the absolute path —
+   a pane whose command is not found closes at once.) `new-pane` prints the pane id; record it in your status file. Lanes are interactive so Bert
    can watch and type into them. To wait on a lane, run `$HP_CTL ctl read <pane> --wait --tail 40`
    with Bash `run_in_background: true` (you are notified when it goes idle); never poll. Never
    submit into a lane pane without reading it first. Never `close-pane` a lane without Bert.
