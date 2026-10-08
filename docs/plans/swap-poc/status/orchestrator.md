@@ -1,6 +1,6 @@
 # Orchestrator status
 
-- **Wave/step:** Wave 1 running (all 5 lanes); Wave 0: 0.3 GO, 0.4 parked on sBTC, CLTV-violation probe in background
+- **Wave/step:** Wave 1: engine PASS `f99dbb5`, deploy PASS `8c327e2`/`4166f49`, btc unit-done (live test parked on sBTC), daemon + divi running. Wave 0: 0.3 GO incl. CLTV-violation probe; 0.4 parked on sBTC
 - **Done:** 0.1 scaffold `5a753ab`; 0.2 contract; 0.6 four keys in 1Password; 0.5 maker-divi funded
   (`ac3c1522…d72a`); 0.3(a) DIVI claim `d5f9d1db…705c`; 0.3 early refund rejected `64: non-final`;
   0.7 briefs + checks (all proven failing); 0.3(b) CLTV refund `ac8216e7…c3ae` confirmed — **0.3 GO** (`c00ff9c`).
