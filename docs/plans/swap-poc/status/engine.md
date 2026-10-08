@@ -3,7 +3,7 @@
 - running: nothing
 - broken: nothing
 - left: nothing for the lane; daemon lane builds against Maker/Taker/Store
-- last_sha: see git log
+- last_sha: f99dbb5
 - needs: none
 - decisions:
   - Gap check at maker lock: require btc_locktime - btc_mtp_now >= maker_timeout + claim_margin (SwapConfig::validate's literal gap would break as time elapses); otherwise Aborted with no coin selection.
