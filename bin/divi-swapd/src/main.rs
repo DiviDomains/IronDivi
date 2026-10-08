@@ -23,8 +23,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use divi_swap::mock::MockChain;
+use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store, SwapConfig};
-use divi_swapd::{router, spawn_scheduler, AppState, BackendKind, DaemonConfig};
+use divi_swapd::{router, spawn_scheduler, AppState, BackendKind, BtcSection, DaemonConfig};
+use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
 
 #[derive(Parser)]
 #[command(name = "divi-swapd", version, about = "Atomic swap maker daemon")]
@@ -72,15 +74,46 @@ fn mock_backends() -> Backends {
     (Arc::new(d), Arc::new(b))
 }
 
-fn live_backends(_cfg: &DaemonConfig) -> Result<Backends> {
-    bail!("live backend is not wired yet: waiting on the swap-chain-divi / swap-chain-btc lanes")
+/// Resolve a `[…].key` reference into a secp256k1 key held only in memory.
+fn resolve_key(reference: &str, what: &str) -> Result<bitcoin::secp256k1::SecretKey> {
+    let r = SecretRef::parse(reference).map_err(|e| anyhow::anyhow!("{what} key: {e}"))?;
+    let hex_key = r
+        .resolve()
+        .map_err(|e| anyhow::anyhow!("{what} key: {e}"))?;
+    let mut raw = [0u8; 32];
+    hex::decode_to_slice(hex_key.trim(), &mut raw)
+        .map_err(|_| anyhow::anyhow!("{what} key is not 32 bytes of hex"))?;
+    let key = bitcoin::secp256k1::SecretKey::from_slice(&raw);
+    raw.fill(0);
+    key.map_err(|_| anyhow::anyhow!("{what} key is not a valid secp256k1 key"))
+}
+
+fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
+    if cfg.network != "signet" {
+        bail!("btc network {:?} unsupported: only signet", cfg.network);
+    }
+    let key = resolve_key(&cfg.key, "btc")?;
+    let mut endpoints = vec![cfg.esplora_url.clone()];
+    endpoints.extend(cfg.fallback_esplora_url.clone());
+    let backend = BtcBackend::new(endpoints, key, FeePolicy::default(), RetryPolicy::default())?;
+    tracing::info!(address = %backend.address(), "btc backend ready");
+    Ok(Arc::new(backend))
+}
+
+fn live_backends(cfg: &DaemonConfig) -> Result<Backends> {
+    let (Some(_divi), Some(btc)) = (&cfg.divi, &cfg.btc) else {
+        bail!("live backend needs both [divi] and [btc] sections");
+    };
+    let btc = live_btc(btc)?;
+    let _ = btc;
+    bail!("live DIVI backend is not wired yet: waiting on the swap-chain-divi lane")
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
-        .with_ansi(false)
+        .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

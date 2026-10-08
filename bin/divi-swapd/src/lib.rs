@@ -20,6 +20,6 @@ pub mod config;
 pub mod routes;
 pub mod scheduler;
 
-pub use config::{BackendKind, DaemonConfig};
+pub use config::{BackendKind, BtcSection, DaemonConfig};
 pub use routes::{router, AppState};
 pub use scheduler::spawn_scheduler;
