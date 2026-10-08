@@ -4,7 +4,7 @@
 - broken: nothing
 - left: nothing for the lane; daemon lane builds against Maker/Taker/Store
 - last_sha: f99dbb5
-- needs: none
+- needs: backend.rs (frozen) - CI clippy 1.99 flags clippy::double_must_use on #[async_trait] ChainBackend (backend.rs:25); orchestrator to add #[allow(clippy::double_must_use)] on the trait or bump async-trait. Local toolchain does not reproduce it.
 - decisions:
   - Gap check at maker lock: require btc_locktime - btc_mtp_now >= maker_timeout + claim_margin (SwapConfig::validate's literal gap would break as time elapses); otherwise Aborted with no coin selection.
   - Maker aborts from Accepted if no taker lock arrives within lock_wait (default 1800s wall clock, injectable clock).
