@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
-use divi_swap::{Amount, Chain, ChainBackend, Maker, Store, SwapConfig};
+use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{router, spawn_scheduler, AppState, BackendKind, BtcSection, DaemonConfig};
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
 
     let store = Store::open(&cfg.db_path).context("opening swap database")?;
     let maker = Arc::new(Maker::new(
-        SwapConfig::profile(cfg.profile),
+        cfg.swap_config()?,
         divi.clone(),
         btc.clone(),
         store,

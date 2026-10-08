@@ -87,6 +87,16 @@ fn default_tick() -> u64 {
     5
 }
 
+/// Optional overrides of the profile's timing, for tests that cannot wait hours
+/// (`SwapConfig::validate` still enforces the timeout-gap invariant).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SwapOverrides {
+    pub taker_timeout_secs: Option<u32>,
+    pub maker_timeout_secs: Option<u32>,
+    pub btc_confirmations: Option<u32>,
+    pub divi_confirmations: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_listen")]
@@ -107,6 +117,9 @@ pub struct DaemonConfig {
     /// `[divi]` and `[btc]` are required by the live backend, ignored by the mock one.
     pub divi: Option<DiviSection>,
     pub btc: Option<BtcSection>,
+    /// Overrides on top of `profile`.
+    #[serde(default)]
+    pub swap: SwapOverrides,
 }
 
 impl DaemonConfig {
@@ -120,6 +133,18 @@ impl DaemonConfig {
         let cfg: DaemonConfig = toml::from_str(text).context("parsing config")?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The profile's timing with `[swap]` overrides applied and validated.
+    pub fn swap_config(&self) -> Result<divi_swap::SwapConfig> {
+        let mut c = divi_swap::SwapConfig::profile(self.profile);
+        let o = &self.swap;
+        c.taker_timeout_secs = o.taker_timeout_secs.unwrap_or(c.taker_timeout_secs);
+        c.maker_timeout_secs = o.maker_timeout_secs.unwrap_or(c.maker_timeout_secs);
+        c.btc_confirmations = o.btc_confirmations.unwrap_or(c.btc_confirmations);
+        c.divi_confirmations = o.divi_confirmations.unwrap_or(c.divi_confirmations);
+        c.validate().map_err(|e| anyhow::anyhow!("[swap]: {e}"))?;
+        Ok(c)
     }
 
     /// Normalised prefix: empty, or `/seg` with no trailing slash.
@@ -194,6 +219,15 @@ key = "credential:btc"
         let b = c.btc.unwrap();
         assert_eq!(b.network, "signet");
         assert!(b.fallback_esplora_url.is_some());
+    }
+
+    #[test]
+    fn swap_overrides_apply_and_are_validated() {
+        let ok = format!("{GOOD}\n[swap]\nmaker_timeout_secs = 1800\ntaker_timeout_secs = 20000\n");
+        let c = DaemonConfig::parse(&ok).unwrap().swap_config().unwrap();
+        assert_eq!((c.maker_timeout_secs, c.taker_timeout_secs), (1800, 20000));
+        let bad = format!("{GOOD}\n[swap]\nmaker_timeout_secs = 1800\ntaker_timeout_secs = 3600\n");
+        assert!(DaemonConfig::parse(&bad).unwrap().swap_config().is_err());
     }
 
     #[test]
