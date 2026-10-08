@@ -454,13 +454,13 @@ async fn funding_selects_coins_and_change() {
     assert_eq!(tx.output[0].script_pubkey, htlc_script_pubkey(&h));
     assert_eq!(tx.output[1].script_pubkey, b.address().script_pubkey());
     let fee = 25_000 - 20_000 - tx.output[1].value.to_sat();
-    assert_eq!(
-        fee,
-        2 * tx.vsize() as u64,
-        "fee is 2 sat/vB of the signed size"
+    // Estimating with dummy 72-byte signatures never undershoots the real size; real DER
+    // signatures are 71-72 bytes, so it overshoots by under 1 vB per input.
+    let real = 2 * tx.vsize() as u64;
+    assert!(
+        fee >= real && fee <= real + 2 * tx.input.len() as u64,
+        "fee {fee} is 2 sat/vB of the signed size {real}"
     );
-    // Estimating with dummy 72-byte signatures never undershoots the real size.
-    assert!(fee >= 2 * tx.vsize() as u64);
 
     // 5,000 fits in the largest confirmed coin alone, with change.
     let f = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
