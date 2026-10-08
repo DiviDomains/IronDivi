@@ -4,6 +4,7 @@
 # Installed per worktree in .claude/settings.local.json by the orchestrator:
 #   {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"tools/swap-poc/stop-hook.sh <lane>","timeout":1800}]}]}}
 set -uo pipefail
+export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"  # hooks and panes start without the rust toolchain on PATH
 lane="$1"
 cat >/dev/null # hook input JSON (unused)
 root="$(git rev-parse --show-toplevel)"

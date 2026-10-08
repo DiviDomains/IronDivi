@@ -1115,6 +1115,7 @@ version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
+ "bitcoin",
  "clap",
  "divi-swap",
  "divi-swap-cli",
