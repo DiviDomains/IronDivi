@@ -175,6 +175,7 @@ impl ScriptFlags {
                 | Self::DERSIG
                 | Self::LOW_S
                 | Self::NULLDUMMY
+                | Self::REQUIRE_COINSTAKE
                 | Self::CHECKLOCKTIMEVERIFY,
         }
     }

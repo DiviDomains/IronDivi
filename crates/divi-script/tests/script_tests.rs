@@ -2026,5 +2026,7 @@ mod script_flags {
         assert!(f.has(ScriptFlags::LOW_S));
         assert!(f.has(ScriptFlags::NULLDUMMY));
         assert!(f.has(ScriptFlags::CHECKLOCKTIMEVERIFY));
+        // Divi Core MANDATORY_SCRIPT_VERIFY_FLAGS includes SCRIPT_REQUIRE_COINSTAKE
+        assert!(f.has(ScriptFlags::REQUIRE_COINSTAKE));
     }
 }

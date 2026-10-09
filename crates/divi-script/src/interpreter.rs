@@ -29,6 +29,13 @@ pub trait SignatureChecker {
 
     /// Check a sequence condition
     fn check_sequence(&self, sequence: i64) -> bool;
+
+    /// Check that the spending transaction is a coinstake
+    ///
+    /// Reference: Divi/divi/src/script/SignatureCheckers.h BaseSignatureChecker::CheckCoinstake
+    fn check_coinstake(&self) -> bool {
+        false
+    }
 }
 
 /// A null signature checker that fails all signature checks
@@ -595,9 +602,11 @@ impl<'a> ScriptInterpreter<'a> {
 
             // Divi-specific opcodes
             Opcode::OP_REQUIRE_COINSTAKE => {
-                if self.flags.has(ScriptFlags::REQUIRE_COINSTAKE) {
-                    // This is a marker opcode - validation happens at transaction level
-                    // If we reach here and the flag is set, the spending tx must be coinstake
+                // With the flag set, the spending transaction must be a coinstake;
+                // without it the opcode is a NOP.
+                // Reference: Divi/divi/src/script/StackManager.cpp CoinstakeCheckOp
+                if self.flags.has(ScriptFlags::REQUIRE_COINSTAKE) && !self.checker.check_coinstake()
+                {
                     return Err(ScriptError::RequireCoinstake);
                 }
             }

@@ -309,69 +309,82 @@ pub fn validate_coinstake_inputs_same_script(
     Ok(())
 }
 
+/// Minimum value of each half when a vault coinstake splits its output
+///
+/// Reference: Divi/divi/src/BlockTransactionChecker.cpp CheckCoinstakeForVaults (MIN_FOR_SPLITTING)
+const VAULT_MIN_FOR_SPLITTING: i64 = 10_000 * 100_000_000;
+
 /// Validate vault-specific coinstake rules
 ///
-/// For vault coinstakes (where the kernel input pays to a vault script):
-/// 1. Staking outputs must pay to the same vault script
-/// 2. Total vault output value >= total vault input value (no value lost from vault)
+/// For coinstakes that spend a staking vault:
+/// 1. All vault inputs must pay to one vault script
+/// 2. vout[1] must pay back to that vault script; vout[2] counts too only if
+///    it pays the same script and both outputs are at least 10,000 DIVI
+/// 3. The vault output must be at least the total input value plus the
+///    expected stake reward
 ///
-/// Reference: Divi/divi/src/VaultManager.cpp CheckCoinstakeForVaults()
+/// `expected_stake_reward` is Core's `CBlockRewards::nStakeReward`: the stake
+/// subsidy, with the masternode reward folded in after DeprecateMasternodes,
+/// and without fees.
+///
+/// Reference: Divi/divi/src/BlockTransactionChecker.cpp CheckCoinstakeForVaults()
 pub fn validate_coinstake_vault_rules(
     tx: &Transaction,
+    expected_stake_reward: Amount,
     get_prev_tx_output: &dyn Fn(&OutPoint) -> Option<divi_primitives::TxOut>,
 ) -> Result<(), String> {
-    if tx.vin.is_empty() {
-        return Err("Coinstake has no inputs".to_string());
-    }
-
-    // Get kernel input's script
-    let kernel_output = get_prev_tx_output(&tx.vin[0].prevout)
-        .ok_or_else(|| "Cannot find kernel UTXO".to_string())?;
-
-    // Check if kernel is a vault script - if not, no vault rules apply
-    // Vault scripts are exactly 50 bytes: OP_IF(0x63) <20> <owner> OP_ELSE(0x67) OP_REQUIRE_COINSTAKE(0xb9) <20> <manager> OP_ENDIF(0x68) ...
-    let script_bytes = kernel_output.script_pubkey.as_bytes();
-    if script_bytes.len() != 50
-        || script_bytes[0] != 0x63
-        || script_bytes[22] != 0x67
-        || script_bytes[23] != 0xb9
-    {
+    if !tx.is_coinstake() {
         return Ok(());
     }
 
-    // Sum total vault input value
-    let mut total_input_value = Amount::ZERO;
+    let mut value_in = Amount::ZERO;
+    let mut vault_script: Option<divi_primitives::script::Script> = None;
     for input in &tx.vin {
-        if let Some(prev_out) = get_prev_tx_output(&input.prevout) {
-            if prev_out.script_pubkey.as_bytes() == script_bytes {
-                total_input_value += prev_out.value;
+        let prev_out = get_prev_tx_output(&input.prevout).ok_or_else(|| {
+            format!(
+                "Cannot find coinstake input {}:{}",
+                input.prevout.txid, input.prevout.vout
+            )
+        })?;
+        value_in += prev_out.value;
+        if !divi_script::is_staking_vault_script(&prev_out.script_pubkey) {
+            continue;
+        }
+        match &vault_script {
+            Some(script) if *script != prev_out.script_pubkey => {
+                return Err("Vault coinstake spends from more than one vault script".to_string());
             }
+            Some(_) => {}
+            None => vault_script = Some(prev_out.script_pubkey),
         }
     }
 
-    // Check vault outputs (vout[0] is empty coinstake marker)
-    if tx.vout.len() < 2 {
-        return Err("Vault coinstake must have at least 2 outputs".to_string());
-    }
+    let Some(vault_script) = vault_script else {
+        return Ok(());
+    };
 
-    // vout[1] must pay to the same vault script
-    let stake_output = &tx.vout[1];
-    if stake_output.script_pubkey.as_bytes() != script_bytes {
+    // is_coinstake() guarantees at least two outputs
+    let reward_out = &tx.vout[1];
+    if reward_out.script_pubkey != vault_script {
         return Err("Vault coinstake output[1] must pay to the same vault script".to_string());
     }
+    let mut actual_output = reward_out.value;
 
-    let mut total_vault_output_value = stake_output.value;
-
-    // If vout[2] also pays to vault script (split), count it
-    if tx.vout.len() > 2 && tx.vout[2].script_pubkey.as_bytes() == script_bytes {
-        total_vault_output_value += tx.vout[2].value;
+    let min_for_splitting = Amount::from_sat(VAULT_MIN_FOR_SPLITTING);
+    if let Some(out2) = tx.vout.get(2) {
+        if actual_output >= min_for_splitting
+            && out2.value >= min_for_splitting
+            && out2.script_pubkey == vault_script
+        {
+            actual_output += out2.value;
+        }
     }
 
-    // Vault output value must be >= vault input value
-    if total_vault_output_value < total_input_value {
+    let expected_output = value_in + expected_stake_reward;
+    if actual_output < expected_output {
         return Err(format!(
-            "Vault output value ({}) < vault input value ({})",
-            total_vault_output_value, total_input_value
+            "Vault output value ({}) < input value plus stake reward ({})",
+            actual_output, expected_output
         ));
     }
 
@@ -599,5 +612,226 @@ mod tests {
             "Block 1M PoS validation should pass. Hash: {}",
             hash_proof
         );
+    }
+
+    // Vault coinstake rule, ported from Divi Core
+    // Reference: Divi/divi/src/test/kernel_tests.cpp (CheckCoinstakeForVaults cases)
+
+    use divi_primitives::script::Script;
+    use divi_primitives::transaction::{TxIn, TxOut};
+    use std::collections::HashMap;
+
+    const CENT: Amount = Amount::from_sat(1_000_000);
+
+    struct VaultFixture {
+        vault_script: Script,
+        other_vault_script: Script,
+        non_vault_script: Script,
+        vault_coins: Vec<OutPoint>,
+        non_vault_coins: Vec<OutPoint>,
+        utxos: HashMap<OutPoint, TxOut>,
+    }
+
+    impl VaultFixture {
+        fn new() -> Self {
+            let vault_script =
+                divi_script::StakingVaultScript::new([1u8; 20], [2u8; 20]).to_script();
+            let other_vault_script =
+                divi_script::StakingVaultScript::new([3u8; 20], [2u8; 20]).to_script();
+            let non_vault_script = Script::new_p2pkh(&[4u8; 20]);
+            let mut utxos = HashMap::new();
+            let mut coin = |n: u8, script: &Script| {
+                let outpoint = OutPoint::new(Hash256::from_slice(&[n; 32]), 0);
+                utxos.insert(
+                    outpoint,
+                    TxOut::new(Amount::from_divi(15_000), script.clone()),
+                );
+                outpoint
+            };
+            let vault_coins = vec![coin(10, &vault_script), coin(11, &vault_script)];
+            let non_vault_coins = vec![coin(20, &non_vault_script), coin(21, &non_vault_script)];
+            VaultFixture {
+                vault_script,
+                other_vault_script,
+                non_vault_script,
+                vault_coins,
+                non_vault_coins,
+                utxos,
+            }
+        }
+
+        fn coinstake(&self, inputs: &[OutPoint], outputs: &[(Amount, &Script)]) -> Transaction {
+            let mut tx = Transaction::new();
+            for input in inputs {
+                tx.vin.push(TxIn::new(*input, Script::new(), 0xffff_ffff));
+            }
+            tx.vout.push(TxOut::empty());
+            for (value, script) in outputs {
+                tx.vout.push(TxOut::new(*value, (*script).clone()));
+            }
+            tx
+        }
+
+        fn check(&self, tx: &Transaction) -> Result<(), String> {
+            validate_coinstake_vault_rules(tx, CENT, &|op| self.utxos.get(op).cloned())
+        }
+    }
+
+    fn divi(n: i64) -> Amount {
+        Amount::from_divi(n)
+    }
+
+    #[test]
+    fn vault_rule_ignores_non_coinstake_transactions() {
+        let f = VaultFixture::new();
+        let mut tx = f.coinstake(&f.vault_coins, &[(divi(1), &f.non_vault_script)]);
+        tx.vout.remove(0);
+        assert!(!tx.is_coinstake());
+        assert!(f.check(&tx).is_ok());
+    }
+
+    #[test]
+    fn vault_rule_allows_non_vault_split_into_two_outputs() {
+        let f = VaultFixture::new();
+        let tx = f.coinstake(
+            &f.non_vault_coins[..1],
+            &[
+                (divi(10_000), &f.non_vault_script),
+                (divi(5_000) + CENT, &f.non_vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_ok());
+    }
+
+    #[test]
+    fn vault_rule_allows_correct_vault_payment() {
+        let f = VaultFixture::new();
+        let tx = f.coinstake(&f.vault_coins, &[(divi(30_000) + CENT, &f.vault_script)]);
+        assert!(f.check(&tx).is_ok());
+    }
+
+    #[test]
+    fn vault_rule_rejects_payment_to_non_vault() {
+        let f = VaultFixture::new();
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[(divi(30_000) + CENT, &f.non_vault_script)],
+        );
+        assert!(f.check(&tx).is_err());
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[(divi(30_000) + CENT, &f.other_vault_script)],
+        );
+        assert!(f.check(&tx).is_err());
+    }
+
+    #[test]
+    fn vault_rule_rejects_underpayment() {
+        let f = VaultFixture::new();
+        // The full input but no reward is still an underpayment
+        let tx = f.coinstake(&f.vault_coins, &[(divi(30_000), &f.vault_script)]);
+        assert!(f.check(&tx).is_err());
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[(divi(30_000) + CENT - Amount::ONE_SAT, &f.vault_script)],
+        );
+        assert!(f.check(&tx).is_err());
+    }
+
+    #[test]
+    fn vault_rule_allows_staking_output_split() {
+        let f = VaultFixture::new();
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[
+                (divi(10_000), &f.vault_script),
+                (divi(20_000) + CENT, &f.vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_ok());
+    }
+
+    #[test]
+    fn vault_rule_rejects_split_too_often() {
+        let f = VaultFixture::new();
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[
+                (divi(10_000), &f.vault_script),
+                (divi(10_000), &f.vault_script),
+                (divi(10_000) + CENT, &f.vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_err());
+    }
+
+    #[test]
+    fn vault_rule_rejects_split_too_small() {
+        let f = VaultFixture::new();
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[
+                (divi(25_000), &f.vault_script),
+                (divi(5_000) + CENT, &f.vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_err());
+        let tx = f.coinstake(
+            &f.vault_coins,
+            &[
+                (divi(5_000), &f.vault_script),
+                (divi(25_000) + CENT, &f.vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_err());
+    }
+
+    // This and the mixed-script case below test the function alone: in block
+    // validation, validate_coinstake_inputs_same_script rejects mixed inputs first.
+    #[test]
+    fn vault_rule_requires_vault_to_absorb_non_vault_funds() {
+        let f = VaultFixture::new();
+        let inputs = [f.non_vault_coins[0], f.vault_coins[1]];
+        let tx = f.coinstake(
+            &inputs,
+            &[
+                (divi(10_000), &f.non_vault_script),
+                (divi(20_000) + CENT, &f.vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_err());
+        let tx = f.coinstake(
+            &inputs,
+            &[
+                (divi(10_000), &f.vault_script),
+                (divi(20_000) + CENT, &f.vault_script),
+            ],
+        );
+        assert!(f.check(&tx).is_ok());
+        let tx = f.coinstake(&inputs, &[(divi(30_000) + CENT, &f.vault_script)]);
+        assert!(f.check(&tx).is_ok());
+    }
+
+    #[test]
+    fn vault_rule_rejects_mixed_vault_scripts() {
+        let mut f = VaultFixture::new();
+        let other = OutPoint::new(Hash256::from_slice(&[30u8; 32]), 0);
+        f.utxos.insert(
+            other,
+            TxOut::new(divi(15_000), f.other_vault_script.clone()),
+        );
+        let tx = f.coinstake(
+            &[f.vault_coins[0], other],
+            &[(divi(30_000) + CENT, &f.vault_script)],
+        );
+        assert!(f.check(&tx).is_err());
+    }
+
+    #[test]
+    fn vault_rule_rejects_missing_input() {
+        let f = VaultFixture::new();
+        let missing = OutPoint::new(Hash256::from_slice(&[99u8; 32]), 0);
+        let tx = f.coinstake(&[missing], &[(divi(1), &f.vault_script)]);
+        assert!(f.check(&tx).is_err());
     }
 }

@@ -2148,9 +2148,15 @@ impl Chain {
                 StorageError::InvalidBlock(format!("Coinstake inputs validation failed: {}", e))
             })?;
 
-        crate::pos_validation::validate_coinstake_vault_rules(coinstake, &get_utxo).map_err(
-            |e| StorageError::InvalidBlock(format!("Vault coinstake validation failed: {}", e)),
-        )?;
+        let expected_stake_reward = Self::stake_reward(&self.block_rewards(parent.height + 1));
+        crate::pos_validation::validate_coinstake_vault_rules(
+            coinstake,
+            expected_stake_reward,
+            &get_utxo,
+        )
+        .map_err(|e| {
+            StorageError::InvalidBlock(format!("Vault coinstake validation failed: {}", e))
+        })?;
 
         // Full proof-of-stake verification
         // Reference: Divi/divi/src/BlockProofVerifier.cpp:110-126
@@ -2540,9 +2546,10 @@ impl Chain {
                     // observe any mismatches without breaking sync. Once we confirm parity
                     // with C++ we can promote this to a hard error.
                     //
-                    // Skip validation for coinstake inputs — they spend staking vault
-                    // outputs whose OP_REQUIRE_COINSTAKE opcode requires coinstake-aware
-                    // context that the generic script interpreter doesn't model yet.
+                    // Skip validation for coinstake inputs. The interpreter now enforces
+                    // OP_REQUIRE_COINSTAKE (Core's CoinstakeCheckOp), but checking coinstake
+                    // inputs and making failures fatal wait on log evidence and a vault-stake
+                    // canary. See docs/plans/coinstake-script-enforcement.md.
                     //
                     // Also skip script verification entirely during IBD (Initial Block
                     // Download) since the blockchain data is assumed valid during catch-up.
@@ -2783,6 +2790,34 @@ impl Chain {
         Ok(())
     }
 
+    /// Subsidy halving interval for this network
+    fn halving_interval(&self) -> u32 {
+        match self.network_type() {
+            NetworkType::Mainnet => 525_600u32,
+            NetworkType::Testnet => 1_000u32,
+            NetworkType::Regtest => 100u32,
+        }
+    }
+
+    /// Per-block rewards at `height`
+    fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
+        divi_consensus::block_subsidy::get_block_subsidy_for_chain(
+            self.params.chain_mode,
+            self.network_type() == NetworkType::Mainnet,
+            height,
+            self.halving_interval(),
+        )
+    }
+
+    /// Core's `nStakeReward`: after DeprecateMasternodes (always active on
+    /// PrivateDivi) the masternode reward is folded into the stake. Shared by
+    /// the mint check and the vault rule so the two cannot disagree.
+    ///
+    /// C++ reference: BlockConnectionService.cpp lines 322-326
+    fn stake_reward(rewards: &divi_consensus::block_subsidy::BlockRewards) -> Amount {
+        rewards.stake + rewards.masternode
+    }
+
     /// Validate block value (total mint) doesn't exceed expected rewards.
     /// Matches C++ BlockIncentivesPopulator::IsBlockValueValid and HasValidPayees.
     fn validate_block_value(&self, block: &Block, index: &BlockIndex) -> Result<(), StorageError> {
@@ -2796,25 +2831,9 @@ impl Chain {
         }
 
         let network_type = self.network_type();
-
-        // Get halving interval
-        let halving_interval = match network_type {
-            NetworkType::Mainnet => 525_600u32,
-            NetworkType::Testnet => 1_000u32,
-            NetworkType::Regtest => 100u32,
-        };
-
-        // Get per-block rewards
-        let rewards = block_subsidy::get_block_subsidy_for_chain(
-            self.params.chain_mode,
-            network_type == NetworkType::Mainnet,
-            height,
-            halving_interval,
-        );
-
-        // After DeprecateMasternodes (always active on PrivateDivi), fold masternode into stake
-        // C++ reference: BlockConnectionService.cpp lines 322-326
-        let base_expected = rewards.stake + rewards.masternode;
+        let halving_interval = self.halving_interval();
+        let rewards = self.block_rewards(height);
+        let base_expected = Self::stake_reward(&rewards);
 
         // Get treasury/lottery parameters
         let (treasury_cycle, treasury_start, treasury_lottery_cycle) = match network_type {

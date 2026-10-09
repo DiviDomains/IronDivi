@@ -157,6 +157,11 @@ fn double_sha256(data: &[u8]) -> [u8; 32] {
 }
 
 impl SignatureChecker for TransactionSignatureChecker<'_> {
+    /// Reference: Divi/divi/src/script/SignatureCheckers.cpp CheckCoinstake
+    fn check_coinstake(&self) -> bool {
+        self.tx.is_coinstake()
+    }
+
     fn check_sig(&self, sig: &[u8], pubkey: &[u8], script_code: &Script) -> bool {
         // Empty signature always fails
         if sig.is_empty() {
@@ -499,5 +504,91 @@ mod tests {
         };
         let checker_v1 = TransactionSignatureChecker::new(&tx_v1, 0, Amount::ZERO);
         assert!(!checker_v1.check_sequence(50));
+    }
+
+    /// Sign input 0 of `tx` against `script_pubkey` and set its scriptSig to
+    /// `<sig> <pubkey> <branch>` (branch true = owner path, false = vault path).
+    fn sign_vault_input(tx: &mut Transaction, script_pubkey: &Script, kp: &KeyPair, owner: bool) {
+        let checker = TransactionSignatureChecker::new(tx, 0, Amount::from_divi(15000));
+        let sighash = checker
+            .compute_sighash(script_pubkey, SigHashType::All, false)
+            .unwrap();
+        let mut sig = divi_crypto::sign_hash(kp.secret_key(), &sighash)
+            .unwrap()
+            .to_der();
+        sig.push(SigHashType::All as u8);
+        let pubkey = kp.public_key().to_bytes();
+
+        let mut script_sig = vec![sig.len() as u8];
+        script_sig.extend_from_slice(&sig);
+        script_sig.push(pubkey.len() as u8);
+        script_sig.extend_from_slice(&pubkey);
+        script_sig.push(if owner {
+            crate::opcodes::Opcode::OP_1 as u8
+        } else {
+            crate::opcodes::Opcode::OP_0 as u8
+        });
+        tx.vin[0].script_sig = Script::from_bytes(script_sig);
+    }
+
+    fn vault_spend_tx(coinstake: bool) -> Transaction {
+        let marker = if coinstake {
+            TxOut::new(Amount::ZERO, Script::new())
+        } else {
+            TxOut::new(Amount::from_divi(1), Script::new_p2pkh(&[0u8; 20]))
+        };
+        Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([7u8; 32]), 0),
+                Script::new(),
+                SEQUENCE_FINAL,
+            )],
+            vout: vec![
+                marker,
+                TxOut::new(Amount::from_divi(15000), Script::new_p2pkh(&[0u8; 20])),
+            ],
+            lock_time: 0,
+        }
+    }
+
+    /// Port of Divi Core script_tests.cpp "Vault spend but not coinstake",
+    /// "Owner spend regardless" and "Vault spend with coinstake", run through
+    /// verify_input with the standard flags (which include REQUIRE_COINSTAKE).
+    #[test]
+    fn test_vault_spend_requires_coinstake() {
+        let owner = create_test_keypair();
+        let manager = create_test_keypair();
+        let vault = crate::vault::StakingVaultScript::new(
+            *owner.public_key().pubkey_hash().as_bytes(),
+            *manager.public_key().pubkey_hash().as_bytes(),
+        )
+        .to_script();
+        let value = Amount::from_divi(15000);
+
+        // Vault spend but not coinstake: rejected
+        let mut tx = vault_spend_tx(false);
+        assert!(!tx.is_coinstake());
+        sign_vault_input(&mut tx, &vault, &manager, false);
+        assert!(matches!(
+            verify_input(&tx, 0, &vault, value),
+            Err(crate::error::ScriptError::RequireCoinstake)
+        ));
+
+        // Owner spend regardless: accepted
+        let mut tx = vault_spend_tx(false);
+        sign_vault_input(&mut tx, &vault, &owner, true);
+        verify_input(&tx, 0, &vault, value).expect("owner spend");
+
+        // Vault spend with coinstake: accepted
+        let mut tx = vault_spend_tx(true);
+        assert!(tx.is_coinstake());
+        sign_vault_input(&mut tx, &vault, &manager, false);
+        verify_input(&tx, 0, &vault, value).expect("vault spend in coinstake");
+
+        // The manager key cannot take the owner path
+        let mut tx = vault_spend_tx(false);
+        sign_vault_input(&mut tx, &vault, &manager, true);
+        assert!(verify_input(&tx, 0, &vault, value).is_err());
     }
 }
