@@ -91,14 +91,13 @@ fn resolve_key(reference: &str, what: &str) -> Result<bitcoin::secp256k1::Secret
 }
 
 fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
-    if cfg.network != "signet" {
-        bail!("btc network {:?} unsupported: only signet", cfg.network);
-    }
+    // Validates the name; the endpoints themselves come from the config.
+    swap_chain_btc::esplora_endpoints(&cfg.network).map_err(|e| anyhow::anyhow!("{e}"))?;
     let key = resolve_key(&cfg.key, "btc")?;
     let mut endpoints = vec![cfg.esplora_url.clone()];
     endpoints.extend(cfg.fallback_esplora_url.clone());
     let backend = BtcBackend::new(endpoints, key, FeePolicy::default(), RetryPolicy::default())?;
-    tracing::info!(address = %backend.address(), "btc backend ready");
+    tracing::info!(address = %backend.address(), network = %cfg.network, "btc backend ready");
     Ok(Arc::new(backend))
 }
 

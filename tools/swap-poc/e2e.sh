@@ -5,8 +5,11 @@
 # mock: plumbing only (daemon lifecycle, config, quote/accept) — mock chains are per-process,
 #       so a swap cannot progress across the daemon/CLI boundary; flows are tested in-process.
 # Run it as a background command; case-c takes ~3.5-4 h. Output ends with `- <key>_txid:` lines.
-# Env: E2E_STATE_DIR (default ~/.local/state/iron-divi-swap-poc), E2E_BTC_SATS (default 10000).
+# Env: SWAP_BTC_NETWORK (default signet), E2E_STATE_DIR (default ~/.local/state/iron-divi-swap-poc), E2E_BTC_SATS (default 10000).
 set -euo pipefail
+# SWAP_BTC_NETWORK=signet|testnet (testnet3); the taker CLI reads the same variable.
+btc_network="${SWAP_BTC_NETWORK:-signet}"
+export SWAP_BTC_NETWORK="$btc_network"
 
 usage() { echo "usage: $0 <happy|case-c|case-d> [--backend live|mock]" >&2; exit 2; }
 die() { echo "e2e: $*" >&2; exit 1; }
@@ -79,6 +82,8 @@ wallet_path = "$state/maker-wallet.json"
 scan_from_height = 339800
 
 [btc]
+network = "$btc_network"
+esplora_url = "https://mempool.space/$btc_network/api"
 key = "$(ref maker-btc)"
 TOML
 

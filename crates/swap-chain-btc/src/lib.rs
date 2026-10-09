@@ -38,6 +38,22 @@ type Result<T> = std::result::Result<T, SwapError>;
 pub const MEMPOOL_SIGNET: &str = "https://mempool.space/signet/api";
 /// Default secondary Esplora endpoint.
 pub const BLOCKSTREAM_SIGNET: &str = "https://blockstream.info/signet/api";
+/// Testnet3 primary Esplora endpoint.
+pub const MEMPOOL_TESTNET: &str = "https://mempool.space/testnet/api";
+/// Testnet3 secondary Esplora endpoint.
+pub const BLOCKSTREAM_TESTNET: &str = "https://blockstream.info/testnet/api";
+
+/// Default Esplora endpoints (primary first) for a test network name: `signet` or `testnet`
+/// (testnet3). Both use `tb1` addresses, so only the endpoints differ.
+pub fn esplora_endpoints(network: &str) -> Result<Vec<String>> {
+    match network {
+        "signet" => Ok(vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()]),
+        "testnet" => Ok(vec![MEMPOOL_TESTNET.into(), BLOCKSTREAM_TESTNET.into()]),
+        other => Err(SwapError::InvalidParams(format!(
+            "btc network {other:?} unsupported: signet or testnet"
+        ))),
+    }
+}
 
 /// How the sat/vB rate is chosen.
 #[derive(Debug, Clone, Copy)]
@@ -101,15 +117,20 @@ impl BtcBackend {
 
     /// Mempool.space with blockstream as secondary.
     pub fn signet(key: SecretKey, fees: FeePolicy) -> Result<Self> {
+        Self::for_network("signet", key, fees)
+    }
+
+    /// Default endpoints for `signet` or `testnet` (see [`esplora_endpoints`]).
+    pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
         Self::new(
-            vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()],
+            esplora_endpoints(network)?,
             key,
             fees,
             RetryPolicy::default(),
         )
     }
 
-    /// The key's P2WPKH signet address (where funding coins live and spends land).
+    /// The key's P2WPKH `tb1` address (same string on signet and testnet3; where funding coins live and spends land).
     pub fn address(&self) -> &Address {
         &self.address
     }

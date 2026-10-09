@@ -46,6 +46,14 @@ struct Cli {
     /// Secret reference for the taker's BTC key.
     #[arg(long, global = true)]
     btc_key: Option<String>,
+    /// BTC test network: `signet` or `testnet` (testnet3).
+    #[arg(
+        long,
+        global = true,
+        env = "SWAP_BTC_NETWORK",
+        default_value = "signet"
+    )]
+    btc_network: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -179,7 +187,11 @@ fn live_backends(cli: &Cli) -> Result<(Arc<dyn ChainBackend>, Arc<dyn ChainBacke
         swap_chain_divi::FeePolicy::default(),
         None,
     )?;
-    let btc = swap_chain_btc::BtcBackend::signet(bkey, swap_chain_btc::FeePolicy::default())?;
+    let btc = swap_chain_btc::BtcBackend::for_network(
+        &cli.btc_network,
+        bkey,
+        swap_chain_btc::FeePolicy::default(),
+    )?;
     Ok((Arc::new(divi), Arc::new(btc)))
 }
 

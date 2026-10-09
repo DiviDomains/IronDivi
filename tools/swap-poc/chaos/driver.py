@@ -39,7 +39,8 @@ KEYS = {
     "taker_btc": "op://global_secret_store/IronDivi Swap POC - taker-btc/password",
 }
 DIVI_UPSTREAM = "https://services.divi.domains/api/testnet/rpc/"
-ESPLORA_UPSTREAM = "https://mempool.space/signet/api"
+BTC_NETWORK = os.environ.get("SWAP_BTC_NETWORK", "signet")  # or "testnet" (testnet3)
+ESPLORA_UPSTREAM = f"https://mempool.space/{BTC_NETWORK}/api"
 
 
 def log(msg):
@@ -87,7 +88,7 @@ class Run:
                 f"maker_timeout_secs = {a.maker_timeout}", f"taker_timeout_secs = {a.taker_timeout}",
                 "[divi]", f'rpc_url = "{self.divi_px}/"', f'key = "{KEYS["maker_divi"]}"',
                 f'wallet_path = "{self.dir / "maker-divi-wallet.json"}"',
-                "[btc]", 'network = "signet"', f'esplora_url = "{self.esp_px}"',
+                "[btc]", f'network = "{BTC_NETWORK}"', f'esplora_url = "{self.esp_px}"',
                 f'key = "{KEYS["maker_btc"]}"',
             ]
         (self.dir / "maker.toml").write_text("\n".join(lines) + "\n")

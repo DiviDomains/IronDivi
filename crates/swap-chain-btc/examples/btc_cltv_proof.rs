@@ -32,14 +32,18 @@ use divi_swap::secrets::SecretRef;
 use serde_json::{json, Value};
 use std::str::FromStr;
 
-const API: &str = "https://mempool.space/signet/api";
+/// `SWAP_BTC_NETWORK=testnet` switches to testnet3 (same `tb1` addresses).
+fn api() -> String {
+    let net = std::env::var("SWAP_BTC_NETWORK").unwrap_or_else(|_| "signet".into());
+    swap_chain_btc::esplora_endpoints(&net).expect("SWAP_BTC_NETWORK")[0].clone()
+}
 const FEE: u64 = 1_000; // sats; ~5 sat/vB for these sizes
 const HTLC_VALUE: u64 = 20_000;
 /// Signet MTP lags wall clock ~1 h; 2 h ahead of MTP keeps the refund honest (plan 0.4).
 const REFUND_AHEAD_OF_MTP: u32 = 2 * 3600;
 
 async fn get(path: &str) -> String {
-    reqwest::get(format!("{API}{path}"))
+    reqwest::get(format!("{}{path}", api()))
         .await
         .unwrap()
         .text()
@@ -55,7 +59,7 @@ async fn mtp() -> u32 {
 
 async fn broadcast(tx: &Transaction) -> Result<String, String> {
     let resp = reqwest::Client::new()
-        .post(format!("{API}/tx"))
+        .post(format!("{}/tx", api()))
         .body(hex::encode(serialize(tx)))
         .send()
         .await

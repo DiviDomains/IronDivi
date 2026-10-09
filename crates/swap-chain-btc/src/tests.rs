@@ -520,16 +520,18 @@ mod live {
         println!("{what} broadcast: {}", id.to_rpc_hex());
     }
 
-    /// Fund two HTLCs on signet with the taker-btc key, claim one, refund the other once
+    /// Fund two HTLCs on signet (or `SWAP_BTC_NETWORK`) with the taker-btc key, claim one, refund the other once
     /// MTP passes a locktime 2 h ahead of the MTP at start. Takes about 3 h.
     #[tokio::test]
-    #[ignore = "needs a funded taker-btc signet address and ~3 h"]
+    #[ignore = "needs a funded taker-btc address (signet, or SWAP_BTC_NETWORK) and ~3 h"]
     async fn live_fund_claim_refund() {
         let hex = SecretRef::parse(KEY_REF).unwrap().resolve().unwrap();
         let key =
             bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(hex.trim()).unwrap()).unwrap();
-        let b = BtcBackend::signet(key, FeePolicy::Recommended { floor: 2 }).unwrap();
-        println!("address {}", b.address());
+        // SWAP_BTC_NETWORK=testnet runs it on testnet3 (DECISIONS #8).
+        let net = std::env::var("SWAP_BTC_NETWORK").unwrap_or_else(|_| "signet".into());
+        let b = BtcBackend::for_network(&net, key, FeePolicy::Recommended { floor: 2 }).unwrap();
+        println!("address {} on {net}", b.address());
 
         let locktime = b.median_time_past().await.unwrap() + REFUND_AHEAD_OF_MTP;
         let mk = |hash: [u8; 32]| HtlcParams {

@@ -49,9 +49,9 @@ divi_confirmed() {
   [[ "${c:-0}" =~ ^[0-9]+$ ]] && (( c >= 1 ))
 }
 
-# btc_confirmed <txid> — tx confirmed on signet (mempool.space).
+# btc_confirmed <txid> — tx confirmed on $SWAP_BTC_NETWORK (default signet; mempool.space).
 btc_confirmed() {
-  [[ "$(curl -s -m 20 "https://mempool.space/signet/api/tx/$1/status" | jq -r '.confirmed' 2>/dev/null)" == "true" ]]
+  [[ "$(curl -s -m 20 "https://mempool.space/${SWAP_BTC_NETWORK:-signet}/api/tx/$1/status" | jq -r '.confirmed' 2>/dev/null)" == "true" ]]
 }
 
 finish() {
