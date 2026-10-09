@@ -10,8 +10,8 @@
   - sBTC funding watcher on `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
   - lanes btc `e35d61d6…`, e2e-local `f4d4cac9…`, chaos `134f5516…`: parked blocked-on-human (sBTC)
   - e2e-local + chaos panes sit in Bert's tab 0:11 "deconstruct" (no move verb; closing needs Bert)
-- **Broken:** none
-- **Parked:** PARKED #2 — 1Password approval (dnsdivi ssh key + op read taker-btc) unanswered 23:23; redeploy did not reach the host, no tx broadcast. Retry from Next step 1 on Bert's next turn. Return leftovers to tb1qerzrlxcfu24davlur5sqmgzzgsal6wusda40er (testnet3).
+- **Broken:** none. CI green on main through `779a7a1`; mock e2e with SWAP_BTC_NETWORK=testnet ok.
+- **Parked:** PARKED #2 — 1Password approval (dnsdivi ssh key + op read taker-btc) unanswered 2026-10-08 23:23, again 2026-10-09 09:17 (nobody at the Mac); redeploy did not reach the host, no tx broadcast. Retry from Next step 1 on Bert's next turn. Return leftovers to tb1qerzrlxcfu24davlur5sqmgzzgsal6wusda40er (testnet3).
 - **Compactions:** orchestrator 2 (continuing on Bert's explicit 'continue orchestrating'); engine 1
 - **Next (serialize taker funding — one funding UTXO):**
   1. redeploy dnsdivi with `ef4a9c9`, set `[btc] network="testnet"`, esplora mempool.space/testnet + blockstream testnet fallback, restart, healthz

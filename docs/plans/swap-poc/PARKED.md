@@ -11,5 +11,7 @@
    unanswered, so `ssh dnsdivi` failed ("agent signing failed") and the testnet3 live test could not read
    `IronDivi Swap POC - taker-btc`. No tx was broadcast and the dnsdivi binary is unchanged (still pre-`ef4a9c9`, signet).
    Blocks: the dnsdivi redeploy and testnet switch, btc live, e2e-local, chaos live, and Wave 3 e2e.
+   Retried 2026-10-09 09:17: a foreground `op read` succeeded, but the test's own read hit "authorization timeout"
+   (60 s, nobody at the Mac) and `ssh dnsdivi` still failed agent signing. Still no tx broadcast.
    Unblock: be at the keyboard to approve 1Password, then say "continue" in the orchestrator pane. Check:
    `ssh dnsdivi true && op read "op://global_secret_store/IronDivi Swap POC - taker-btc/password" >/dev/null && echo ok`
