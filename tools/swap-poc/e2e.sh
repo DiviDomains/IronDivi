@@ -135,7 +135,7 @@ fi
 
 out="$state/taker-run.log"
 "${taker[@]}" run --maker "$base" --offer divi-btc-testnet --btc-sats "$btc_sats" \
-  --timeout-secs "$timeout_secs" "${taker_flags[@]}" 2>&1 | tee "$out"
+  --timeout-secs "$timeout_secs" ${taker_flags[@]+"${taker_flags[@]}"} 2>&1 | tee "$out"
 local_id="$(tail -1 "$out" | awk '{print $1}')"
 [[ -n "$local_id" ]] || die "taker run printed no swap id"
 
