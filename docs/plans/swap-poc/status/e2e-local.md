@@ -1,5 +1,6 @@
 # Lane e2e-local status
-e2e-local: DONE (happy, case-d, case-c live on testnet3 with all txids confirmed; aborted swap 252aa984 refunded; check-e2e-local PASS). Deployed-maker runs continue under "## deployed maker".
+e2e-local: DONE (happy, case-d, case-c live on testnet3 with all txids confirmed; aborted swap 252aa984 refunded; check-e2e-local PASS). 
+e2e-deployed: DONE (happy + case-c against dnsdivi divi-swapd, all txids confirmed; see "## deployed maker").
 - done: `tools/swap-poc/e2e.sh <happy|case-c|case-d> [--backend live|mock]` (shellcheck-clean; mock plumbing run verified: daemon start, healthz, [swap] override, quote, accept, cleanup).
 - done: CLI `divi-swap run --claim-not-before <secs>` (case D) and `--never-claim` (case C); `divi-swap txids --swap`; `ClaimGate`/`run_swap_gated` in `bin/divi-swap/src/flow.rs`.
 - done: daemon `[swap]` overrides (`maker_timeout_secs`, `taker_timeout_secs`), validated by `SwapConfig::validate`.
@@ -23,8 +24,7 @@ e2e-local: DONE (happy, case-d, case-c live on testnet3 with all txids confirmed
 - casec_btc_refund_txid: b2ba4d8dbcbf8a1a9865a86db03130d8f3fc992f56761cb962e9ec650736d938
 - done: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384 (10000 sats, HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729) confirmed in block 5157893, by `divi-swap refund` from a copy of its taker.db (`~/.local/state/iron-divi-swap-poc/refund-252aa984/`).
 - aborted_252aa984_btc_refund_txid: 564f4c60e7d5017d69df1cf189cde19b3f772124c48fb61e13e93a3f9d8838a0
-- left: deployed `case-c` results.
-- running: deployed `case-c` via the orchestrator's tunnel (`e2e.sh case-c --maker-url http://127.0.0.1:18480`; default profile, refunds ~6 h).
+- left: nothing.
 - broken: nothing known.
 - parked: nothing.
 - blocked-on-human: no
@@ -40,3 +40,8 @@ e2e-local: DONE (happy, case-d, case-c live on testnet3 with all txids confirmed
 - deployed_happy_divi_lock_txid: f812792bf5ce967e6a4abac6cc0bf5d2d90ec1ab927c71547d2bb946e03e095a
 - deployed_happy_divi_claim_txid: 2b3e0fce46471664282c07cb97e2d9fec45fe5df891835c62175f833f74694ab
 - deployed_happy_btc_claim_txid: 54844a09089e70901e4af1cc2fd628507b0f5a9b5dd105e2baa1d3298626e4bd
+- done: deployed `case-c` (swap ed2a1197, both sides Done; taker never claimed, maker refunded DIVI, taker refunded BTC in block 5157953).
+- deployed_casec_btc_lock_txid: d97d38feab97b275e724f73f63b6b9a5f0b7addf4ada1c5442ac6da951829c87
+- deployed_casec_divi_lock_txid: d21bf08f3dc53c52eeb8a14db45e34d1d61d5ba3204a3174313294ad35665bc6
+- deployed_casec_divi_refund_txid: f483a5abc04b14b396d92ed5caa21649759a99b5054df01888d082d7c0c7f26e
+- deployed_casec_btc_refund_txid: 69adab6c7701a66e9dcef330bddb5addccfca4f05f624fc0a175c6443ae7c12b
