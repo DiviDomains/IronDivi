@@ -94,8 +94,17 @@ if [[ "$backend" == live ]]; then
   done
 fi
 
-echo "e2e: building"
-(cd "$ROOT" && cargo build -q -p divi-swapd -p divi-swap-cli)
+# These binaries run on this machine, so they build here (remote-cargo builds for hp2's Linux, not macOS).
+# With --maker-url the daemon is remote: build only the taker CLI. E2E_SKIP_BUILD=1 reuses existing binaries.
+if [[ "${E2E_SKIP_BUILD:-0}" == 1 ]]; then
+  echo "e2e: E2E_SKIP_BUILD=1, using existing binaries"
+elif [[ -n "$maker_url" ]]; then
+  echo "e2e: building taker CLI"
+  (cd "$ROOT" && cargo build -q -p divi-swap-cli)
+else
+  echo "e2e: building"
+  (cd "$ROOT" && cargo build -q -p divi-swapd -p divi-swap-cli)
+fi
 swapd="$ROOT/target/debug/divi-swapd"
 swap="$ROOT/target/debug/divi-swap"
 
