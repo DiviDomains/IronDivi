@@ -71,7 +71,7 @@ Every txid, address and test result, newest last.
 ## Crash recovery and fault injection (chaos, live testnet3, `c2aa738`/`b4d3a76`; check-chaos PASS)
 - kill -9 at every persisted state (accepted, taker_lock_seen, taker_lock_confirmed, maker_locked, maker_lock_confirmed, taker_claimed, maker_claimed), restart, resume → `done`:
   swap `d2051de4-8cf8-4fca-ab7f-e5b4699c27a2`, BTC lock `9ba9be1708e9013b80d23a830e3e723b5d6509fbf6795e951b175861222dfcd4`, DIVI lock `e3f3b5fbbcd7ea023eef00ea17fca4d01817aefc5d7c6103bea14f23076ca4d1`, maker BTC claim `0b61e19b182f7146a4d65815fd5d2b250674e9ad99d08dbe2623c0a8f4970062`.
-- killed in `maker_refundable`, restarted → refunded: swap `4edafa7e-8e8a-4b31-a309-5055c83867df`, maker DIVI refund `f3e366f107a521305749b1d43fbd7908e2927e93a351e89452e276df5a68308e`; taker refused a too-close claim (1800 s margin); taker BTC refund after locktime 1791624351.
+- killed in `maker_refundable`, restarted → refunded: swap `4edafa7e-8e8a-4b31-a309-5055c83867df`, maker DIVI refund `f3e366f107a521305749b1d43fbd7908e2927e93a351e89452e276df5a68308e`; taker refused a too-close claim (1800 s margin); taker BTC refund after locktime 1791624351: `ce175eeeb009020001c9656066ed78feee379a47e112fc39def4c6a1ca1da465` (testnet3 block 5157903).
 - DIVI RPC 502 for 330 s (swap `1a91a4a7…`, maker BTC claim `5474b74fcba7495d20b9f38627e4d0cb7ac95ec7faf6785a787a0a59b7fd275a`) and Esplora 429 + Retry-After for 150 s (swap `e91c1f27…`, maker BTC claim `4cee5258c334f807c148a55f22c3bec939018ec811b53562869a43df4f3adad4`): retried and completed.
 - Full table: `status/chaos.md`.
 
