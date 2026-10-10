@@ -11,7 +11,7 @@ require_tests divi-swapd \
   old_config_without_direction_parses
 require_tests divi-swap-cli txids_reverse_keys
 for sub in run balance txids; do
-  if cargo run -q -p divi-swap-cli -- "$sub" --help >/dev/null 2>&1; then pass "divi-swap $sub --help"; else fail "divi-swap $sub --help"; fi
+  if rcargo run -q -p divi-swap-cli -- "$sub" --help >/dev/null 2>&1; then pass "divi-swap $sub --help"; else fail "divi-swap $sub --help"; fi
 done
-cargo run -q -p divi-swap-cli -- --help 2>/dev/null | grep -q -- '--divi-wallet' && pass "--divi-wallet" || fail "divi-swap --divi-wallet missing"
+rcargo run -q -p divi-swap-cli -- --help 2>/dev/null | grep -q -- '--divi-wallet' && pass "--divi-wallet" || fail "divi-swap --divi-wallet missing"
 finish rev-cli

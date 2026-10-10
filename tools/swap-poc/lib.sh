@@ -2,10 +2,12 @@
 # Shared helpers for tools/swap-poc/check-*.sh. Each check exits 0 only when its lane's
 # acceptance criteria (docs/plans/atomic-swap-poc.md §5) pass, and prints every failure.
 set -uo pipefail
-export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"  # hooks and panes start without the rust toolchain on PATH
+export PATH="$HOME/.local/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"  # hooks and panes start without the rust toolchain on PATH
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 2
 FAILS=0
+# Heavy cargo (clippy, test, run) goes to hp2 via remote-cargo: the Mac is swap-starved (Bert, 2026-10-10).
+rcargo() { if command -v remote-cargo >/dev/null 2>&1; then remote-cargo "$@"; else cargo "$@"; fi; }
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 pass() { echo "ok:   $*"; }
 
@@ -13,7 +15,7 @@ pass() { echo "ok:   $*"; }
 require_tests() {
   local pkg="$1"; shift
   local list
-  list="$(cargo test -q -p "$pkg" --all-features -- --list 2>/dev/null | grep ': test$' || true)"
+  list="$(rcargo test -q -p "$pkg" --all-features -- --list 2>/dev/null | grep ': test$' || true)"
   for t in "$@"; do
     if grep -q -- "$t" <<<"$list"; then pass "test exists: $t"; else fail "missing test: $pkg::$t"; fi
   done
@@ -23,9 +25,9 @@ require_tests() {
 crate_green() {
   local pkg="$1"
   if cargo fmt -p "$pkg" -- --check >/dev/null 2>&1; then pass "fmt $pkg"; else fail "cargo fmt -p $pkg"; fi
-  if cargo clippy -q -p "$pkg" --all-targets --all-features -- -D warnings >/dev/null 2>&1; then
+  if rcargo clippy -q -p "$pkg" --all-targets --all-features -- -D warnings >/dev/null 2>&1; then
     pass "clippy $pkg"; else fail "cargo clippy -p $pkg --all-targets --all-features -D warnings"; fi
-  if cargo test -q -p "$pkg" >/dev/null 2>&1; then pass "tests $pkg"; else fail "cargo test -p $pkg"; fi
+  if rcargo test -q -p "$pkg" >/dev/null 2>&1; then pass "tests $pkg"; else fail "cargo test -p $pkg"; fi
 }
 
 # no_todo <path> — no todo!/unimplemented! left in the lane's code.

@@ -19,8 +19,11 @@ The orchestrator is another pane. Bert may type into your pane; answer him, then
    left is blocked on a human (e.g. no testnet coins yet), write `- parked: <what, and the one
    command or action that unblocks it>` and `- blocked-on-human: yes` in your status file; the
    hook then lets you stop. Remove the line when you resume.
-4. **Land on `main` at each verified seam:** `cargo fmt && cargo clippy -p <crate> --all-targets
-   --all-features -- -D warnings && cargo test -p <crate>` green → `git commit` (author is
+4. **Heavy cargo runs on hp2:** use `remote-cargo <cargo args>` (on PATH; rsyncs your worktree incl.
+   uncommitted edits, returns cargo's exit code) for every build/clippy/test/run — never local `cargo`
+   for those (the Mac is swap-starved). `cargo fmt` and git stay local; commits stay local and signed.
+   **Land on `main` at each verified seam:** `cargo fmt && remote-cargo clippy -p <crate> --all-targets
+   --all-features -- -D warnings && remote-cargo test -p <crate>` green → `git commit` (author is
    already Bert via git config; **no AI attribution, no Co-Authored-By**) →
    `git pull --rebase origin main` → `git push origin HEAD:main`. Never `--no-gpg-sign`, never
    `gh auth switch`. If signing or push blocks on 1Password, write the message to
