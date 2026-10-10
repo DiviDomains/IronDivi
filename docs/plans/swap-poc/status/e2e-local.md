@@ -9,9 +9,15 @@
 - happy_divi_lock_txid: 77c76a2bbd1db12228102fe4bb1cff6c6a9869e35bb8d4879303c42849b673c4
 - happy_divi_claim_txid: 3594a688171bb2a752edc004f30cb82f2a3302f174454033ccf03a201b59e01e
 - happy_btc_claim_txid: ae7b4e5b7be714db5d7551e9f770fa0759445e9cee5f7692015d38dcb6dda45d
-- running: live `case-d`.
+- done: live `case-d` on testnet3 (swap 2611c82e, both sides Done; taker claimed DIVI 2399 s before the maker timeout).
+- cased_btc_lock_txid: 9115233786e227f0e7b23e8e79141ac5e2eb90615426f4dabfe481d9fd7413b1
+- cased_divi_lock_txid: ee0ccc511ebf92862f78c20a13f7426a412c5e4956e50d713faf1c299a2c9ed5
+- cased_divi_claim_txid: 365b5478383f8074e307e99a83004d57687d7e4c2e80a34929f815f774020733
+- cased_btc_claim_txid: 892784ecf811b305d3540adee0b3cdc213f56cc04df2e398766a87019f7643ce
+- cased_claim_secs_before_timeout: 2399
+- running: live `case-c` (~4 h).
 - running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
-- left: record the refund txid; `case-d` results, then live `case-c` (~3.5-4 h, background), one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
+- left: record the refund txid; live `case-c` results, one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
 - broken: nothing known.
 - parked: nothing.
 - blocked-on-human: no
