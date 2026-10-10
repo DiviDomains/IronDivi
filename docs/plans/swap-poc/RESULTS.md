@@ -16,7 +16,7 @@ Every txid, address and test result, newest last.
 
 ### 0.5 Funding
 - maker-divi ← 20,000 tDIVI from dnsdivi `/opt/divi-testnet/node5`: txid `ac3c1522c0a1af87a140808be8d0ec8eec3d3bac8bc0512334188986c4a7d72a`
-- taker-btc ← signet: **parked** (faucet CAPTCHA, PARKED.md #1)
+- taker-btc ← signet: parked (faucet CAPTCHA, PARKED.md #1), then resolved on **testnet3** (DECISIONS #8): Bert sent 197,253 sats to `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`, tx `f5ee5dc8…206a`. Leftovers return to `tb1qerzrlxcfu24davlur5sqmgzzgsal6wusda40er`.
 
 ### 0.3 Live CLTV proof, Divi testnet (`divi_cltv_proof`)
 - HTLC P2SH addresses computed by IronDivi match the node's `decodescript`: A `8pVwcRdSJKWN4ci1dPkVYSHkyigaB4RaDr`, B `8iZ67sZkYbXNwgDnbLP88W8m4426pNUAN2`
@@ -52,4 +52,33 @@ Every txid, address and test result, newest last.
 - Keys: `/etc/divi-swapd/credentials/{maker-divi,maker-btc}` root:root 0400, provisioned `op read` → ssh stdin; loaded via `LoadCredential=`.
 - Startup log: btc maker `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt`, divi maker `yH2vuZnVbVh1FopWEiFAMok93XKu6EUWG6`; wallet scan 339800→340015, balance 24,799.91965 tDIVI; `divi-swapd up … backend Live`.
 - `GET /healthz` on dnsdivi → `{"ok":true,"version":"0.2.5","divi":{"tip":340015,"error":null},"btc":{"tip":325429,"error":null}}`.
-- e2e against the deployed maker (via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`): pending sBTC (PARKED.md #1).
+- BTC network switched to testnet3 (DECISIONS #8). Redeploys: 2026-10-10 00:38 UTC (v0.2.5, testnet3), 00:55 UTC bind-first
+  (`a5b7a96`: `divi-swapd up` 1 s after start, healthz reports `divi_scan`, resumed scan done in 9 s; no probe outage),
+  05:42 UTC from `504da62` (includes `53c2bb3`); healthz `ok:true` after an 83 s catch-up scan.
+- The first local live happy (01:05 UTC) aborted on an Esplora `/tx` 404 race and Core -27; fixed in `53c2bb3` before any deployed run. Its 10,000 sats (HTLC `9b62069b…:0`, swap `252aa984…`) refund after locktime 1791620729.
+- **e2e against the deployed maker** (`e2e.sh <scenario> --maker-url http://127.0.0.1:18480`, `b865c90`, via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`; default testnet profile maker 10800 s / taker 21600 s; 10,000 sats):
+  - **happy** — taker swap `8b8943ac-2afb-46b9-9045-c0c40c5bcf35`, maker swap `39a3401d-4202-4c13-944a-13687d316929` (dnsdivi `/var/lib/divi-swapd/swaps.db`: `Done`). Both claims confirmed:
+    BTC lock `edb08a4a96d3d48b4f7d712e69b00fa27b19ed4308b911d12cacb0d8823c7b73` (block 5157875),
+    DIVI lock `f812792bf5ce967e6a4abac6cc0bf5d2d90ec1ab927c71547d2bb946e03e095a`,
+    DIVI claim (taker) `2b3e0fce46471664282c07cb97e2d9fec45fe5df891835c62175f833f74694ab`,
+    BTC claim (maker) `54844a09089e70901e4af1cc2fd628507b0f5a9b5dd105e2baa1d3298626e4bd`.
+  - **case C** — maker swap `406b03ad-d8df-43af-bd05-6bb73a83520b`, running since 06:58 UTC; refunds after the timelocks (result below).
+
+## BTC live proof (plan 0.4, `live_fund_claim_refund`, testnet3, `e020335`)
+- fund `9a5d15905f8295f472c5d5233a0970ba34adaffe823b0d415df79f1498cb1fae`, fund2 `051b72ada77d66e4ccc4af27c0af186c6baf40cf11669962298b89d4c950349c`
+- claim `bd22f564eb39af5e1b5f9d9d6021e64f8f939d951b878466eb583cfe49a91ae0`, refund `13509b955300b32e6910bf29517cb904c3600965cde644307a7e568a12f4ef55` — PASS (6249 s).
+
+## Crash recovery and fault injection (chaos, live testnet3, `c2aa738`/`b4d3a76`; check-chaos PASS)
+- kill -9 at every persisted state (accepted, taker_lock_seen, taker_lock_confirmed, maker_locked, maker_lock_confirmed, taker_claimed, maker_claimed), restart, resume → `done`:
+  swap `d2051de4-8cf8-4fca-ab7f-e5b4699c27a2`, BTC lock `9ba9be1708e9013b80d23a830e3e723b5d6509fbf6795e951b175861222dfcd4`, DIVI lock `e3f3b5fbbcd7ea023eef00ea17fca4d01817aefc5d7c6103bea14f23076ca4d1`, maker BTC claim `0b61e19b182f7146a4d65815fd5d2b250674e9ad99d08dbe2623c0a8f4970062`.
+- killed in `maker_refundable`, restarted → refunded: swap `4edafa7e-8e8a-4b31-a309-5055c83867df`, maker DIVI refund `f3e366f107a521305749b1d43fbd7908e2927e93a351e89452e276df5a68308e`; taker refused a too-close claim (1800 s margin); taker BTC refund after locktime 1791624351.
+- DIVI RPC 502 for 330 s (swap `1a91a4a7…`, maker BTC claim `5474b74fcba7495d20b9f38627e4d0cb7ac95ec7faf6785a787a0a59b7fd275a`) and Esplora 429 + Retry-After for 150 s (swap `e91c1f27…`, maker BTC claim `4cee5258c334f807c148a55f22c3bec939018ec811b53562869a43df4f3adad4`): retried and completed.
+- Full table: `status/chaos.md`.
+
+## Staking claim (plan §1.5)
+- Engine test `no_coin_selection_before_taker_lock_confirmed` (`crates/divi-swap/tests/engine.rs:521`): `funding_calls == 0` after accept, at `TakerLockSeen`, and at `TakerLockConfirmed`; exactly 1 on the edge to `MakerLocked`. Passes on main (CI `Test` job, and locally 2026-10-10).
+- Live corroboration: deployed case-C maker swap `406b03ad…` sat in `TakerLockSeen` with no DIVI lock while the BTC lock awaited confirmations.
+
+## CI (plan §1.6)
+- GitHub Actions on `main`: Format, Clippy, Test, Build, Security Audit all success through `10859ad` (run 38032638022), including every code commit of Wave 3 (`53c2bb3`, `c2aa738`, `504da62`, `b865c90`).
+
