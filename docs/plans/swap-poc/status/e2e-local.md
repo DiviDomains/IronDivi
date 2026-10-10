@@ -3,13 +3,13 @@
 - done: CLI `divi-swap run --claim-not-before <secs>` (case D) and `--never-claim` (case C); `divi-swap txids --swap`; `ClaimGate`/`run_swap_gated` in `bin/divi-swap/src/flow.rs`.
 - done: daemon `[swap]` overrides (`maker_timeout_secs`, `taker_timeout_secs`), validated by `SwapConfig::validate`.
 - done: in-process tests of both policies over simulated chains (`bin/divi-swapd/tests/e2e_gated.rs`); fmt, clippy -D warnings and tests green for divi-swap-cli and divi-swapd; check-daemon PASS.
-- running: nothing.
+- running: live `happy` on testnet3 (GO e2e received 2026-10-09; rerun after the startup-wait fix 25bfac8).
 - left: live runs `happy`, then `case-c` (~3.5-4 h, background), then `case-d`, one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
 - broken: nothing known.
-- parked: waiting for the orchestrator message "GO e2e" (btc lane funding tx confirmed on testnet3). Then run, serially in the background: SWAP_BTC_NETWORK=testnet tools/swap-poc/e2e.sh happy, then case-d, then case-c.
-- blocked-on-human: yes
+- parked: nothing.
+- blocked-on-human: no
 - decisions: case C/D use maker timeout 3600 s / taker 14410 s (taker safety margin is 1800 s so maker 1800 is impossible; gap 10810 >= required 10800). Happy uses the default testnet profile (21600/10800). Case D claims when DIVI MTP is 2400 s before the maker locktime (must exceed 1800).
 - decisions: mock chains are per-process, so `--backend mock` covers plumbing only; claim-policy flows are tested in-process via the `World` harness.
 - decisions: state lives in `~/.local/state/iron-divi-swap-poc/<scenario>-<backend>/` (outside the repo); previous runs are moved to `old-<stamp>/`. Ports 18491/18492/18493. Each swap uses E2E_BTC_SATS=10000 (<= 20,000).
 - needs: nothing.
-- last_sha: 7038c70
+- last_sha: 25bfac8
