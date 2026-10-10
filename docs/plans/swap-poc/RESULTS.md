@@ -62,7 +62,12 @@ Every txid, address and test result, newest last.
     DIVI lock `f812792bf5ce967e6a4abac6cc0bf5d2d90ec1ab927c71547d2bb946e03e095a`,
     DIVI claim (taker) `2b3e0fce46471664282c07cb97e2d9fec45fe5df891835c62175f833f74694ab`,
     BTC claim (maker) `54844a09089e70901e4af1cc2fd628507b0f5a9b5dd105e2baa1d3298626e4bd`.
-  - **case C** — maker swap `406b03ad-d8df-43af-bd05-6bb73a83520b`, running since 06:58 UTC; refunds after the timelocks (result below).
+  - **case C, taker never claims** — taker swap `ed2a1197`, maker swap `406b03ad-d8df-43af-bd05-6bb73a83520b` (dnsdivi: `Done`). All confirmed:
+    BTC lock `d97d38feab97b275e724f73f63b6b9a5f0b7addf4ada1c5442ac6da951829c87` (block 5157881),
+    DIVI lock `d21bf08f3dc53c52eeb8a14db45e34d1d61d5ba3204a3174313294ad35665bc6`,
+    maker DIVI refund after the maker timeout `f483a5abc04b14b396d92ed5caa21649759a99b5054df01888d082d7c0c7f26e`,
+    taker BTC refund after the taker timeout `69adab6c7701a66e9dcef330bddb5addccfca4f05f624fc0a175c6443ae7c12b` (block 5157953).
+  - Verified 2026-10-10 13:30 UTC: the four DIVI txids via `lib.sh divi_confirmed`, the four BTC txids on mempool.space testnet3.
 
 ## BTC live proof (plan 0.4, `live_fund_claim_refund`, testnet3, `e020335`)
 - fund `9a5d15905f8295f472c5d5233a0970ba34adaffe823b0d415df79f1498cb1fae`, fund2 `051b72ada77d66e4ccc4af27c0af186c6baf40cf11669962298b89d4c950349c`
