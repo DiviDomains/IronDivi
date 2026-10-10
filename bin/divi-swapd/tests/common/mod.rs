@@ -25,7 +25,7 @@ use std::time::Duration;
 use divi_swap::api::Offer;
 use divi_swap::mock::{MockBackend, MockChain};
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Profile, Store, SwapConfig, Taker};
-use divi_swapd::{router, spawn_scheduler, AppState};
+use divi_swapd::{router, spawn_scheduler, AppState, ScanStatus};
 use tokio::task::JoinHandle;
 
 pub const OFFER_ID: &str = "o1";
@@ -126,6 +126,7 @@ pub async fn serve(world: &World, maker: Arc<Maker>, tick: Option<Duration>) -> 
         maker: maker.clone(),
         divi: Arc::new(world.maker_divi.clone()),
         btc: Arc::new(world.maker_btc.clone()),
+        scan: ScanStatus::done(),
     };
     let app = router(state, "/swap");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

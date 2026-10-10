@@ -154,11 +154,6 @@ impl DiviBackend {
         self.wallet.lock().balance()
     }
 
-    /// Next height a scan should start from, as saved by the last completed `scan_blocks`.
-    pub fn scanned_height(&self) -> Option<u64> {
-        self.wallet.lock().scanned_height
-    }
-
     /// Never spend outputs of `txid`.
     pub fn exclude_txid(&self, txid: Txid) -> Result<()> {
         self.wallet.lock().exclude_txid(txid)
@@ -174,21 +169,32 @@ impl DiviBackend {
         self.wallet.lock().apply_tx(&tx, &self.spk.to_hex())
     }
 
+    /// Next block height a scan should start at, as persisted with the wallet.
+    pub fn scanned_height(&self) -> Option<u64> {
+        self.wallet.lock().scanned_height
+    }
+
     /// Scan blocks `from_height..=tip` for coins paying this key and spends of known coins.
     /// Returns the next height to scan from. Not called implicitly.
     pub async fn scan_blocks(&self, from_height: u64) -> Result<u64> {
         let tip = self.tip_height().await?;
+        self.scan_range(from_height, tip).await
+    }
+
+    /// Scan blocks `from_height..=to_height` and persist the cursor (`to_height + 1`) with the
+    /// wallet, so a later run can resume there. Returns the next height to scan from.
+    pub async fn scan_range(&self, from_height: u64, to_height: u64) -> Result<u64> {
         let spk = self.spk.to_hex();
-        for h in from_height..=tip {
+        for h in from_height..=to_height {
             for txid in self.block_txids(h).await? {
                 let tx = self.get_tx(&txid).await?;
                 self.wallet.lock().apply_tx(&tx, &spk)?;
             }
         }
         let mut w = self.wallet.lock();
-        w.scanned_height = Some(tip + 1);
+        w.scanned_height = Some(to_height + 1);
         w.record_broadcast(&[], &[])?;
-        Ok(tip + 1)
+        Ok(to_height + 1)
     }
 
     async fn block_txids(&self, height: u64) -> Result<Vec<String>> {

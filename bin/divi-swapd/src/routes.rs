@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use crate::scan::{ScanInfo, ScanState, ScanStatus};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -33,6 +34,21 @@ pub struct AppState {
     pub maker: Arc<Maker>,
     pub divi: Arc<dyn ChainBackend>,
     pub btc: Arc<dyn ChainBackend>,
+    pub scan: ScanStatus,
+}
+
+impl AppState {
+    /// 503 while the wallet's coin set is incomplete.
+    fn require_wallet(&self) -> Result<(), ApiError> {
+        if self.scan.is_done() {
+            Ok(())
+        } else {
+            Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "wallet scan in progress".into(),
+            ))
+        }
+    }
 }
 
 /// Build the router, nested under `prefix` (empty or `/seg`).
@@ -88,6 +104,7 @@ struct Health {
     version: &'static str,
     divi: ChainHealth,
     btc: ChainHealth,
+    divi_scan: ScanInfo,
 }
 
 async fn chain_health(b: &Arc<dyn ChainBackend>) -> ChainHealth {
@@ -105,11 +122,13 @@ async fn chain_health(b: &Arc<dyn ChainBackend>) -> ChainHealth {
 
 async fn healthz(State(s): State<AppState>) -> Json<Health> {
     let (divi, btc) = tokio::join!(chain_health(&s.divi), chain_health(&s.btc));
+    let scan = s.scan.info();
     Json(Health {
-        ok: divi.error.is_none() && btc.error.is_none(),
+        ok: divi.error.is_none() && btc.error.is_none() && scan.state == ScanState::Done,
         version: env!("CARGO_PKG_VERSION"),
         divi,
         btc,
+        divi_scan: scan,
     })
 }
 
@@ -127,6 +146,7 @@ async fn quote(
     Path(id): Path<String>,
     Query(p): Query<QuoteParams>,
 ) -> Result<Json<Quote>, ApiError> {
+    s.require_wallet()?;
     Ok(Json(s.maker.quote(&id, p.btc_sats).await?))
 }
 
@@ -134,6 +154,7 @@ async fn accept(
     State(s): State<AppState>,
     Json(req): Json<AcceptRequest>,
 ) -> Result<(StatusCode, Json<SwapView>), ApiError> {
+    s.require_wallet()?;
     Ok((StatusCode::CREATED, Json(s.maker.accept(req).await?)))
 }
 

@@ -31,3 +31,4 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 wiremock = { workspace = true }
 proptest = { workspace = true }
+tempfile = { workspace = true }

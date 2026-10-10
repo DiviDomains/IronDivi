@@ -450,3 +450,29 @@ fn txid_byte_order_round_trips() {
     let t = Txid::from_rpc_hex(&format!("{}{}", "01", "00".repeat(31))).unwrap();
     assert_eq!(from_hash(&to_hash(&t)), t);
 }
+
+#[tokio::test]
+async fn scan_cursor_persists_with_wallet() {
+    let (server, node) = mock().await;
+    node.result("getblockhash", json!("00".repeat(32)))
+        .result("getblock", json!({"tx": []}));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.json");
+    let key = SecretKey::new_random();
+    let open = || {
+        DiviBackend::new(
+            &server.uri(),
+            key.clone(),
+            Network::Testnet,
+            FeePolicy::default(),
+            Some(path.clone()),
+        )
+        .unwrap()
+    };
+    let b = open();
+    assert_eq!(b.scanned_height(), None);
+    assert_eq!(b.scan_range(100, 101).await.unwrap(), 102);
+    assert_eq!(b.scanned_height(), Some(102));
+    // A fresh process sees the saved cursor.
+    assert_eq!(open().scanned_height(), Some(102));
+}

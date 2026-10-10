@@ -18,8 +18,10 @@
 
 pub mod config;
 pub mod routes;
+pub mod scan;
 pub mod scheduler;
 
 pub use config::{BackendKind, BtcSection, DaemonConfig};
 pub use routes::{router, AppState};
-pub use scheduler::spawn_scheduler;
+pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
+pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};

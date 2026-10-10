@@ -25,7 +25,10 @@ use clap::Parser;
 use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
-use divi_swapd::{router, spawn_scheduler, AppState, BackendKind, BtcSection, DaemonConfig};
+use divi_swapd::{
+    router, run_scan, spawn_gated_scheduler, AppState, BackendKind, BtcSection, DaemonConfig,
+    ScanStatus,
+};
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
 use swap_chain_divi::{DiviBackend, FeePolicy as DiviFeePolicy};
@@ -51,6 +54,16 @@ fn parse_backend(s: &str) -> Result<BackendKind, String> {
 }
 
 type Backends = (Arc<dyn ChainBackend>, Arc<dyn ChainBackend>);
+
+/// DIVI wallet scan to run after the listener is bound.
+struct ScanJob {
+    divi: Arc<DiviBackend>,
+    from: u64,
+}
+
+/// Blocks per scan step; the cursor is persisted after each.
+const SCAN_CHUNK: u64 = 500;
+const SCAN_RETRY: Duration = Duration::from_secs(30);
 
 fn mock_backends() -> Backends {
     let now = std::time::SystemTime::now()
@@ -101,7 +114,7 @@ fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
-async fn live_backends(cfg: &DaemonConfig) -> Result<Backends> {
+async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
@@ -120,15 +133,12 @@ async fn live_backends(cfg: &DaemonConfig) -> Result<Backends> {
         divi_cfg.wallet_path.clone(),
     )?;
     tracing::info!(address = %divi.address(), "divi backend ready");
-    if let Some(from) = divi_cfg.scan_from_height {
-        // A saved wallet resumes where its last scan stopped; only a fresh one pays the full scan.
-        let from = divi.scanned_height().map_or(from, |h| h.max(from));
-        match divi.scan_blocks(from).await {
-            Ok(next) => tracing::info!(from, next, balance = divi.balance(), "divi wallet scanned"),
-            Err(e) => tracing::warn!(error = %e, "divi wallet scan failed; continuing"),
-        }
-    }
-    Ok((Arc::new(divi), btc))
+    let divi = Arc::new(divi);
+    let job = divi_cfg.scan_from_height.map(|from| ScanJob {
+        divi: divi.clone(),
+        from,
+    });
+    Ok(((divi, btc), job))
 }
 
 #[tokio::main]
@@ -149,9 +159,14 @@ async fn main() -> Result<()> {
         } else {
             BackendKind::Mock
         });
-    let (divi, btc) = match kind {
-        BackendKind::Mock => mock_backends(),
+    let ((divi, btc), scan_job) = match kind {
+        BackendKind::Mock => (mock_backends(), None),
         BackendKind::Live => live_backends(&cfg).await?,
+    };
+    let scan = if scan_job.is_some() {
+        ScanStatus::scanning()
+    } else {
+        ScanStatus::done()
     };
 
     let store = Store::open(&cfg.db_path).context("opening swap database")?;
@@ -162,13 +177,30 @@ async fn main() -> Result<()> {
         store,
         cfg.offers.clone(),
     )?);
-    let _scheduler = spawn_scheduler(maker.clone(), Duration::from_secs(cfg.tick_secs));
+    let _scheduler = spawn_gated_scheduler(
+        maker.clone(),
+        Duration::from_secs(cfg.tick_secs),
+        scan.clone(),
+    );
 
-    let app = router(AppState { maker, divi, btc }, &cfg.prefix());
+    let app = router(
+        AppState {
+            maker,
+            divi,
+            btc,
+            scan: scan.clone(),
+        },
+        &cfg.prefix(),
+    );
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("binding {}", cfg.listen))?;
     tracing::info!(listen = %cfg.listen, backend = ?kind, "divi-swapd up");
+    if let Some(job) = scan_job {
+        tokio::spawn(async move {
+            run_scan(&*job.divi, job.from, &scan, SCAN_CHUNK, SCAN_RETRY).await;
+        });
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

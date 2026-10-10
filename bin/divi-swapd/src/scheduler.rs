@@ -19,17 +19,32 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::scan::ScanStatus;
 use divi_swap::Maker;
 use tokio::task::JoinHandle;
 
 /// Tick once immediately (resuming whatever a previous run left in the store), then every
 /// `every`. Tick errors are logged and never stop the loop.
 pub fn spawn_scheduler(maker: Arc<Maker>, every: Duration) -> JoinHandle<()> {
+    spawn_gated_scheduler(maker, every, ScanStatus::done())
+}
+
+/// As [`spawn_scheduler`], but ticks (which may need wallet coins) are deferred until `scan`
+/// is done.
+pub fn spawn_gated_scheduler(
+    maker: Arc<Maker>,
+    every: Duration,
+    scan: ScanStatus,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(every);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            if !scan.is_done() {
+                tracing::debug!("wallet scan in progress; tick deferred");
+                continue;
+            }
             if let Err(e) = maker.tick().await {
                 tracing::warn!(error = %e, "scheduler tick failed");
             }
