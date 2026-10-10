@@ -1,7 +1,7 @@
 # divi-swapd testnet config. Contains references only, never key material.
 # Install as /etc/divi-swapd/divi-swapd.toml (root:divi-swapd 0640).
 profile = "testnet"          # 6h/3h timeouts, 1 BTC / 3 DIVI confirmations
-listen = "127.0.0.1:18480"   # nginx proxies /swap/ here
+listen = "127.0.0.1:18480"   # loopback only; takers use an SSH tunnel (nginx /swap/ is opt-in: deploy.sh NGINX=1, DECISIONS #7)
 db_path = "/var/lib/divi-swapd/swaps.db"
 tick_secs = 10               # scheduler interval for Maker::tick
 
