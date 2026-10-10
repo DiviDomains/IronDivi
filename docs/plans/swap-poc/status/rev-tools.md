@@ -7,4 +7,4 @@
 - broken: nothing known
 - left: nothing (check-rev-tools.sh passes); live reverse runs are the orchestrator's
 - decisions: preflight checks the maker advertises the offer and its BTC backend has a tip; maker BTC balance is not in the API, so it is checked only when E2E_MAKER_BTC_ADDRESS is set; taker DIVI balance is parsed as the first integer on a `divi` line of `divi-swap balance` (rev-cli to confirm the format)
-- last_sha: pending
+- last_sha: 6355c07
