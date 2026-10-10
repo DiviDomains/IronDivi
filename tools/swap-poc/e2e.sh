@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Real-testnet atomic swap scenarios, maker (divi-swapd) and taker (divi-swap) both local.
-#   tools/swap-poc/e2e.sh <happy|case-c|case-d> [--backend live|mock] [--maker-url URL]
+#   tools/swap-poc/e2e.sh <happy|case-c|case-d> [--backend live|mock] [--offer OFFER] [--maker-url URL]
+# --offer: divi-btc-testnet (default; taker pays BTC) or btc-divi-testnet (reverse; taker sells DIVI
+#   for BTC). Reverse: state dir rev-<scenario>-<backend|deployed>, txid prefix rev_<happy|casec|cased>.
 # --maker-url: use an already-running maker (e.g. the deployed one through an SSH tunnel) with its
 #   own profile; no local divi-swapd is built, configured or started. State: <scenario>-deployed.
 # live: DIVI testnet + BTC signet, keys resolved from 1Password at runtime (op:// refs only).
@@ -13,21 +15,25 @@ set -euo pipefail
 btc_network="${SWAP_BTC_NETWORK:-signet}"
 export SWAP_BTC_NETWORK="$btc_network"
 
-usage() { echo "usage: $0 <happy|case-c|case-d> [--backend live|mock] [--maker-url URL]" >&2; exit 2; }
+usage() { echo "usage: $0 <happy|case-c|case-d> [--backend live|mock] [--offer divi-btc-testnet|btc-divi-testnet] [--maker-url URL]" >&2; exit 2; }
 die() { echo "e2e: $*" >&2; exit 1; }
 
 scenario="${1:-}"; [[ -n "$scenario" ]] || usage
 shift || true
 backend=live
 maker_url=""
+offer=divi-btc-testnet
 while (($#)); do
   case "$1" in
     --backend) backend="${2:-}"; shift 2 || usage ;;
+    --offer) offer="${2:-}"; shift 2 || usage ;;
     --maker-url) maker_url="${2:-}"; shift 2 || usage; [[ -n "$maker_url" ]] || usage ;;
     *) usage ;;
   esac
 done
 [[ "$backend" == live || "$backend" == mock ]] || usage
+[[ "$offer" == divi-btc-testnet || "$offer" == btc-divi-testnet ]] || usage
+reverse=""; [[ "$offer" == btc-divi-testnet ]] && reverse=1
 [[ -z "$maker_url" || "$backend" == live ]] || die "--maker-url needs --backend live"
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -60,7 +66,12 @@ if [[ -n "$maker_url" ]]; then
 fi
 
 suffix="${maker_url:+deployed}"
-state="${E2E_STATE_DIR:-$HOME/.local/state/iron-divi-swap-poc}/$scenario-${suffix:-$backend}"
+# Reverse runs keep their own state dir and txid prefix; the shared taker DIVI wallet sits one level up.
+if [[ -n "$reverse" ]]; then
+  prefix="${prefix/#deployed_/deployed_rev_}"; [[ "$prefix" == *rev_* ]] || prefix="rev_$prefix"
+  scen_dir="rev-$scenario"
+else scen_dir="$scenario"; fi
+state="${E2E_STATE_DIR:-$HOME/.local/state/iron-divi-swap-poc}/$scen_dir-${suffix:-$backend}"
 case "$state" in "$ROOT"/*) die "state dir must be outside the repo: $state" ;; esac
 mkdir -p "$state"
 chmod 700 "$state"
@@ -145,16 +156,42 @@ taker=("$swap" --db "$state/taker.db" --backend "$backend")
 if [[ "$backend" == live ]]; then
   taker+=(--divi-key "$(ref taker-divi)" --btc-key "$(ref taker-btc)")
 fi
+# Reverse: the taker locks DIVI, so it needs a DIVI wallet (outside the repo, mode 0600; the scan resumes from its cursor).
+if [[ -n "$reverse" ]]; then
+  taker_wallet="$(dirname "$state")/taker-divi-wallet.json"
+  taker+=(--divi-wallet "$taker_wallet")
+fi
+
+# Reverse, live: the sides must be funded before anything locks. Fail now, with a reason, not hours in.
+if [[ -n "$reverse" && "$backend" == live ]]; then
+  offers_json="$(curl -s -m 10 "$base/offers")" || die "cannot list offers at $base"
+  [[ "$(jq -r --arg o "$offer" '[.[] | select(.id == $o)] | length' <<<"$offers_json" 2>/dev/null)" == 1 ]] ||
+    die "maker at $base does not advertise offer $offer (ids: $(jq -r '[.[].id] | join(",")' <<<"$offers_json" 2>/dev/null))"
+  [[ "$(curl -s -m 10 "$base/healthz" | jq -r '.btc.tip // empty' 2>/dev/null)" =~ ^[0-9]+$ ]] ||
+    die "maker's BTC backend is not reporting a tip (/healthz .btc.tip); it cannot fund the BTC leg"
+  # The maker's BTC balance is not exposed by the API; set E2E_MAKER_BTC_ADDRESS to check it on Esplora.
+  if [[ -n "${E2E_MAKER_BTC_ADDRESS:-}" ]]; then
+    have="$(curl -s -m 20 "https://mempool.space/$btc_network/api/address/$E2E_MAKER_BTC_ADDRESS/utxo" | jq '[.[] | select(.status.confirmed) | .value] | add // 0' 2>/dev/null)"
+    if [[ ! "${have:-0}" =~ ^[0-9]+$ ]] || ((have < btc_sats + 5000)); then
+      die "maker has ${have:-0} confirmed BTC sats at $E2E_MAKER_BTC_ADDRESS, needs >= $((btc_sats + 5000))"
+    fi
+  fi
+  # Taker DIVI: `divi-swap balance` prints a line with the spendable DIVI sats (first integer on the line mentioning divi).
+  bal_out="$("${taker[@]}" balance 2>&1)" || die "divi-swap balance failed: ${bal_out:0:300}"
+  have_divi="$(grep -i divi <<<"$bal_out" | grep -oE '[0-9]+' | head -1)"
+  [[ "${have_divi:-0}" -gt 0 ]] || die "taker has no spendable DIVI (balance output: ${bal_out:0:300}); fund the taker DIVI wallet first"
+  echo "e2e: preflight ok (offer $offer advertised, maker BTC backend up, taker DIVI balance $have_divi)"
+fi
 
 if [[ "$backend" == mock ]]; then
-  "${taker[@]}" quote --maker "$base" --offer divi-btc-testnet --btc-sats "$btc_sats"
-  local_id="$("${taker[@]}" accept --maker "$base" --offer divi-btc-testnet --btc-sats "$btc_sats" | tail -1)"
+  "${taker[@]}" quote --maker "$base" --offer "$offer" --btc-sats "$btc_sats"
+  local_id="$("${taker[@]}" accept --maker "$base" --offer "$offer" --btc-sats "$btc_sats" | tail -1)"
   echo "e2e: mock plumbing ok (accepted $local_id); no swap is possible across mock processes"
   exit 0
 fi
 
 out="$state/taker-run.log"
-"${taker[@]}" run --maker "$base" --offer divi-btc-testnet --btc-sats "$btc_sats" \
+"${taker[@]}" run --maker "$base" --offer "$offer" --btc-sats "$btc_sats" \
   --timeout-secs "$timeout_secs" ${taker_flags[@]+"${taker_flags[@]}"} 2>&1 | tee "$out"
 local_id="$(tail -1 "$out" | awk '{print $1}')"
 [[ -n "$local_id" ]] || die "taker run printed no swap id"
@@ -171,6 +208,17 @@ grep -q '^maker_state=Done' <<<"$txids" || die "maker did not reach Done"
 
 get() { sed -n "s/^$1=//p" <<<"$txids" | head -1; }
 {
+  if [[ -n "$reverse" ]]; then
+    echo "- ${prefix}_divi_lock_txid: $(get divi_lock)"
+    echo "- ${prefix}_btc_lock_txid: $(get btc_lock)"
+    if [[ "$scenario" == case-c ]]; then
+      echo "- ${prefix}_btc_refund_txid: $(get btc_spend_by_maker)"
+      echo "- ${prefix}_divi_refund_txid: $(get divi_refund_by_taker)"
+    else
+      echo "- ${prefix}_btc_claim_txid: $(get btc_claim_by_taker)"
+      echo "- ${prefix}_divi_claim_txid: $(get divi_claim_by_maker)"
+    fi
+  else
   echo "- ${prefix}_btc_lock_txid: $(get btc_lock)"
   echo "- ${prefix}_divi_lock_txid: $(get divi_lock)"
   if [[ "$scenario" == case-c ]]; then
@@ -179,6 +227,7 @@ get() { sed -n "s/^$1=//p" <<<"$txids" | head -1; }
   else
     echo "- ${prefix}_divi_claim_txid: $(get divi_claim_by_taker)"
     echo "- ${prefix}_btc_claim_txid: $(get btc_claim_by_maker)"
+  fi
   fi
   if [[ "$scenario" == case-d ]]; then
     secs="$(sed -n 's/.*claim_secs_before_timeout=\([0-9]*\).*/\1/p' "$out" | head -1)"

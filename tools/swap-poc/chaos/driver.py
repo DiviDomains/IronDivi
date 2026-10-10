@@ -48,6 +48,8 @@ ESPLORA_UPSTREAM = f"https://mempool.space/{BTC_NETWORK}/api"
 # lock so it never builds a second unconfirmed chain on a UTXO another lane is spending.
 TAKER_BTC_ADDRESS = "tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg"
 DIVI_SCAN_FROM = 339800
+FORWARD_OFFER = "divi-btc-testnet"
+REVERSE_OFFER = "btc-divi-testnet"  # taker sells DIVI for BTC
 # A finished e2e-local maker wallet (scanned from DIVI_SCAN_FROM) seeds ours, so the first start
 # resumes from its cursor instead of a ~15 min scan. Never one a live daemon has open.
 WALLET_SEEDS = [Path.home() / ".local/state/iron-divi-swap-poc" / d / "maker-wallet.json"
@@ -152,6 +154,10 @@ class Run:
         self.wait_for(self.healthy, 1800, "daemon /healthz with the DIVI wallet scanned")
         log(f"daemon up pid {self.daemon.pid}")
 
+    @property
+    def reverse(self):
+        return self.a.offer == REVERSE_OFFER
+
     def healthy(self):
         try:
             h = json.loads(http("GET", self.maker + "/healthz", timeout=10))
@@ -231,14 +237,17 @@ class Run:
     def taker(self, *args):
         cmd = [str(Path(self.a.bin_dir) / "divi-swap"), "--db", str(self.taker_db),
                "--backend", self.a.backend, "--divi-key", KEYS["taker_divi"],
-               "--btc-key", KEYS["taker_btc"], *args]
+               "--btc-key", KEYS["taker_btc"]]
+        if self.reverse:  # the taker locks DIVI, so it needs its own DIVI wallet
+            cmd += ["--divi-wallet", str(Path(self.a.workdir) / "taker-divi-wallet.json")]
+        cmd += list(args)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
             raise RuntimeError(f"divi-swap {args[0]} failed: {r.stderr.strip()[-400:]}")
         return r.stdout.strip()
 
     def accept(self):
-        return self.taker("accept", "--maker", self.maker, "--offer", "divi-btc-testnet",
+        return self.taker("accept", "--maker", self.maker, "--offer", self.a.offer,
                           "--btc-sats", str(self.a.btc_sats)).splitlines()[-1].strip()
 
     def claim_loop(self, local):
@@ -287,7 +296,7 @@ class Run:
         if self.progress.get("locked"):
             return
         for attempt in range(60):
-            if self.a.backend == "live":
+            if self.a.backend == "live" and not self.reverse:  # reverse locks DIVI, not BTC
                 self.wait_for(self.taker_funds_settled, self.a.state_timeout,
                               "confirmed taker BTC coins")
             try:
@@ -301,7 +310,8 @@ class Run:
         self.save(locked=True)
 
     def taker_refund(self, local, timeout):
-        """Refund the taker's BTC once its timelock passes; returns the refund txid."""
+        """Refund the taker's lock once its timelock passes; returns the refund txid."""
+        key = "divi_refund_by_taker" if self.reverse else "btc_refund_by_taker"
         end = time.time() + timeout
         while time.time() < end:
             try:
@@ -314,8 +324,8 @@ class Run:
             except Exception as e:
                 log(f"taker txids: {str(e)[:120]}")
                 ids = {}
-            if ids.get("btc_refund_by_taker"):
-                return ids["btc_refund_by_taker"]
+            if ids.get(key):
+                return ids[key]
             time.sleep(600)
         raise TimeoutError("taker BTC refund did not happen")
 
@@ -426,6 +436,8 @@ def main():
     ap.add_argument("--workdir", help="default ~/.cache/swap-chaos/<backend>")
     ap.add_argument("--bin-dir", default=str(HERE.parent.parent.parent / "target" / "debug"))
     ap.add_argument("--port", type=int, default=18600, help="maker port; proxies use port+1, +2")
+    ap.add_argument("--offer", choices=(FORWARD_OFFER, REVERSE_OFFER), default=FORWARD_OFFER,
+                    help="forward: taker pays BTC; btc-divi-testnet: taker pays DIVI (reverse)")
     ap.add_argument("--btc-sats", type=int, default=20000)
     ap.add_argument("--maker-timeout", type=int, default=3600, help="refund scenario only")
     ap.add_argument("--taker-timeout", type=int, default=14410, help="refund scenario only")
