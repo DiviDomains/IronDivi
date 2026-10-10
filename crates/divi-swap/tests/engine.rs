@@ -367,6 +367,10 @@ async fn case_b_taker_lock_invalid() {
         )
         .await
         .unwrap();
+    // Unconfirmed is not conclusive (a load-balanced Esplora can 404 `/tx` for a mempool tx
+    // whose `/status` it already knows), so the maker waits for a confirmation to abort.
+    h.maker.tick().await.unwrap();
+    assert_ne!(h.maker_state(), SwapState::Aborted);
     for _ in 0..4 {
         h.btc.mine(1);
         h.maker.tick().await.unwrap();

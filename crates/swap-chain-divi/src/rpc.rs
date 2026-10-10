@@ -164,6 +164,7 @@ pub fn classify_broadcast_error(message: &str) -> BroadcastClass {
         || m.contains("already in the block chain")
         || m.contains("txn-already-known")
         || m.contains("txn-already-in-mempool")
+        || m.contains("outputs already in utxo set")
     {
         BroadcastClass::AlreadyKnown
     } else if m.contains("non-final") || m.contains("locktime requirement not satisfied") {

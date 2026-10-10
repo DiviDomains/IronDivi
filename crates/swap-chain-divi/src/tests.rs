@@ -441,6 +441,10 @@ async fn rpc_errors_classified() {
         classify_broadcast_error("mandatory-script-verify-flag-failed"),
         BroadcastClass::Rejected
     );
+    assert_eq!(
+        classify_broadcast_error("Transaction outputs already in utxo set"),
+        BroadcastClass::AlreadyKnown
+    );
 }
 
 #[test]

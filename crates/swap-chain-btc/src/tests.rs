@@ -136,6 +136,14 @@ async fn refund_rejected_before_locktime() {
     ));
 }
 
+#[test]
+fn already_confirmed_is_already_known() {
+    // Bitcoin Core >= 0.21 rejects a re-broadcast of a confirmed tx with this -27 message.
+    assert!(is_already_known(
+        "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction outputs already in utxo set\"}"
+    ));
+}
+
 #[tokio::test]
 async fn broadcast_is_idempotent_when_already_known() {
     let server = MockServer::start().await;

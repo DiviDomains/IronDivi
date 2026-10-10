@@ -361,7 +361,9 @@ impl Maker {
                 self.enter(r, SwapState::TakerLockSeen)
             }
             None => {
-                if self.btc.confirmations(&op.txid).await?.is_some() {
+                // Only a confirmed tx is conclusive: Esplora behind a load balancer can know a
+                // mempool tx on `/status` while `/tx` still 404s on another backend.
+                if self.btc.confirmations(&op.txid).await?.unwrap_or(0) > 0 {
                     return self.abort(r, "taker lock does not match the HTLC");
                 }
                 if self.lock_window_gone(r).await? {
@@ -387,7 +389,9 @@ impl Maker {
                 Ok(Flow::Idle)
             }
             None => {
-                if self.btc.confirmations(&op.txid).await?.is_some() {
+                // Only a confirmed tx is conclusive: Esplora behind a load balancer can know a
+                // mempool tx on `/status` while `/tx` still 404s on another backend.
+                if self.btc.confirmations(&op.txid).await?.unwrap_or(0) > 0 {
                     return self.abort(r, "taker lock does not match the HTLC");
                 }
                 if self.btc_window_too_short(r).await? {

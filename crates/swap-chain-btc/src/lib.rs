@@ -280,6 +280,8 @@ fn is_already_known(body: &str) -> bool {
         || b.contains("already in the block chain")
         || b.contains("txn-already-in-mempool")
         || b.contains("txn-already-known")
+        // Bitcoin Core >= 0.21 wording for a tx that is already confirmed.
+        || b.contains("outputs already in utxo set")
 }
 
 fn btc_outpoint(o: &Outpoint) -> OutPoint {
