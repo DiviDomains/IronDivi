@@ -24,10 +24,12 @@
   05:42 UTC: dnsdivi redeployed from `504da62` (includes `53c2bb3`); healthz ok:true after an 83 s catch-up scan.
   Otherwise none. CI green on main through `7038c70`.
 - **Parked:** none (PARKED #2 resolved 2026-10-10).
-- **Compactions:** orchestrator 3; engine 1
-- **Live proofs so far (testnet3):** btc 0.4 PASS (`e020335`); e2e happy `8e00af2e` and case-d `2611c82e` Done;
-  chaos live 11/11 confirmed (`b4d3a76`, taker BTC refund pending timelock); case-c running; deployed-maker e2e next
-  (brief `…/briefs/e2e-deployed.md`).
+- **Compactions:** orchestrator 4; engine 1
+- **Live proofs so far (testnet3):** btc 0.4 PASS (`e020335`); e2e-local happy, case-d, case-c Done (check-e2e-local PASS);
+  chaos live 11/11 confirmed (check-chaos PASS; taker BTC refund pending, locktime 1791624351);
+  **deployed happy Done** (taker `8b8943ac`, maker `39a3401d` on dnsdivi, `10859ad`); deployed case-C running since
+  06:58 UTC (maker `406b03ad`; refunds ~10:00 / ~14:00 UTC) through the orchestrator-held tunnel. RESULTS.md filled (`1c415b4`).
+  Pending refunds: aborted `252aa984` (locktime 1791620729), chaos taker BTC, deployed case-C both sides.
 - **Next (serialize taker funding — one funding UTXO chain):**
   1. e2e-local happy → case-d → case-c (each after the previous BTC lock confirms)
   2. chaos live; 3. e2e happy + case C vs deployed maker via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`
