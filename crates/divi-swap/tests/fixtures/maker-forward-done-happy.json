@@ -1,0 +1,122 @@
+{
+  "id": "39a3401d-4202-4c13-944a-13687d316929",
+  "created_at": 1791612912,
+  "state": "Done",
+  "quote": {
+    "id": "c83b65ce-56da-4882-8e0a-b96c5b12ba91",
+    "offer_id": "divi-btc-testnet",
+    "btc_amount": 10000,
+    "divi_amount": 30000000000,
+    "expires_at": 1791612972,
+    "maker_btc_pubkey": "02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd",
+    "maker_divi_pubkey": "0208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776",
+    "taker_timeout_secs": 21600,
+    "maker_timeout_secs": 10800,
+    "btc_confirmations": 1,
+    "divi_confirmations": 3
+  },
+  "hash": [
+    236,
+    156,
+    211,
+    214,
+    148,
+    30,
+    39,
+    121,
+    181,
+    42,
+    130,
+    176,
+    236,
+    190,
+    143,
+    144,
+    17,
+    76,
+    223,
+    223,
+    61,
+    215,
+    17,
+    57,
+    188,
+    56,
+    61,
+    171,
+    172,
+    227,
+    10,
+    9
+  ],
+  "taker_divi_pubkey": "03bc0d77da235c268d222125da34633169d7f91260e5dd14d80236acb721a58378",
+  "btc_htlc": {
+    "hash": "ec9cd3d6941e2779b52a82b0ecbe8f90114cdfdf3dd71139bc383dabace30a09",
+    "claim_pubkey": "02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd",
+    "refund_pubkey": "03a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f5",
+    "locktime": 1791638751
+  },
+  "btc_outpoint": {
+    "txid": "edb08a4a96d3d48b4f7d712e69b00fa27b19ed4308b911d12cacb0d8823c7b73",
+    "vout": 0
+  },
+  "btc_locked": 10000,
+  "divi_htlc": {
+    "hash": "ec9cd3d6941e2779b52a82b0ecbe8f90114cdfdf3dd71139bc383dabace30a09",
+    "claim_pubkey": "03bc0d77da235c268d222125da34633169d7f91260e5dd14d80236acb721a58378",
+    "refund_pubkey": "0208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776",
+    "locktime": 1791623999
+  },
+  "divi_funding": {
+    "tx": {
+      "txid": "f812792bf5ce967e6a4abac6cc0bf5d2d90ec1ab927c71547d2bb946e03e095a",
+      "raw": "01000000018e30685adf76e25294e851a3937e92e20879bd3fd4b149573021a507f166e3f3000000006b483045022100f77d4a5aebb5da1fd99f7b81671e80f2bfda06732d2c625c5967f85e9111f7ac02204615f0ff7438ba992fb72d99606b1fc9deab8b5bce696edc3bbcd9521595f62801210208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776ffffffff0200ac23fc0600000017a914f4b3ba5e91e0bbcfc6b4c6cbb42a15a5a9d785eb87f8061cfc060000001976a914dbf7f911790f6393c19257fc9565d34df41fc2cc88ac00000000"
+    },
+    "outpoint": {
+      "txid": "f812792bf5ce967e6a4abac6cc0bf5d2d90ec1ab927c71547d2bb946e03e095a",
+      "vout": 0
+    },
+    "amount": 30000000000
+  },
+  "divi_scan_from": 343180,
+  "divi_refund": null,
+  "preimage": [
+    254,
+    141,
+    13,
+    206,
+    193,
+    18,
+    217,
+    94,
+    37,
+    135,
+    66,
+    160,
+    220,
+    155,
+    220,
+    41,
+    129,
+    109,
+    189,
+    216,
+    247,
+    97,
+    189,
+    118,
+    178,
+    100,
+    235,
+    174,
+    86,
+    129,
+    105,
+    183
+  ],
+  "btc_claim": {
+    "txid": "54844a09089e70901e4af1cc2fd628507b0f5a9b5dd105e2baa1d3298626e4bd",
+    "raw": "02000000000101737b3c82d8b0ac2cd111b90843ed197ba20fb0692e717d4f8bd4d3964a8ab0ed0000000000ffffffff01fa25000000000000160014e02cbf61fa8304bd1d2a2178e4aa42405b53db56044730440220171598eb04b44fb130d14a1b8fff03f4b67437c0a27a48a8e935a5c6e081110b02200ecc185d830e3709a824b764febad4cb20ebd7109a2407c44fe1e213b0b15a3f0120fe8d0dcec112d95e258742a0dc9bdc29816dbdd8f761bd76b264ebae568169b701017263a820ec9cd3d6941e2779b52a82b0ecbe8f90114cdfdf3dd71139bc383dabace30a09882102d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd6704df3cca6ab1752103a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f568ac00000000"
+  },
+  "last_error": null
+}

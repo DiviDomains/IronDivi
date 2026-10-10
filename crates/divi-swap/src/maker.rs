@@ -11,8 +11,13 @@
 //! against them).
 //!
 //! Rules (plan §3.2): persist every transition and every signed tx **before** broadcasting;
-//! every `step` is idempotent and safe to re-run after a crash; `build_funding` on the DIVI
-//! backend is called only on the `TakerLockConfirmed → MakerLocked` edge.
+//! every `step` is idempotent and safe to re-run after a crash; `build_funding` on the
+//! maker-leg backend is called only on the `TakerLockConfirmed → MakerLocked` edge (and on
+//! neither backend before it).
+//!
+//! Direction. The offer's [`Direction`] fixes which chain each leg is on: the taker leg on
+//! `taker_chain()`, the maker leg on `maker_chain()`. Everything below is written in those
+//! roles; the forward direction (taker pays BTC) is just one assignment.
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -25,7 +30,7 @@ use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
-use crate::types::Outpoint;
+use crate::types::{Amount, Chain, Outpoint};
 
 /// Default wall-clock time the maker waits for the taker's BTC lock after `accept`.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
@@ -88,7 +93,7 @@ impl Maker {
         self
     }
 
-    /// How long to wait for the taker's BTC lock before aborting an accepted swap.
+    /// How long to wait for the taker's lock before aborting an accepted swap.
     pub fn with_lock_wait_secs(mut self, secs: u64) -> Self {
         self.lock_wait_secs = secs;
         self
@@ -144,7 +149,7 @@ impl Maker {
         Ok(quote)
     }
 
-    /// Accept an unexpired quote: fixes the BTC HTLC the taker must fund.
+    /// Accept an unexpired quote: fixes the taker-leg HTLC the taker must fund.
     pub async fn accept(&self, req: AcceptRequest) -> Result<SwapView> {
         let mut qr = self
             .store
@@ -165,21 +170,24 @@ impl Maker {
         {
             return Err(SwapError::InvalidParams("hash already in use".into()));
         }
-        let btc_mtp = self.btc.median_time_past().await?;
-        let locktime = btc_mtp
+        let dir = qr.quote.direction;
+        let (tc, mc) = (dir.taker_chain(), dir.maker_chain());
+        let tmtp = self.chain(tc).median_time_past().await?;
+        let locktime = tmtp
             .checked_add(qr.quote.taker_timeout_secs)
             .ok_or_else(|| SwapError::InvalidParams("locktime overflow".into()))?;
-        let btc_htlc = HtlcParams {
+        let taker_leg_htlc = HtlcParams {
             hash: req.hash,
-            claim_pubkey: qr.quote.maker_btc_pubkey,
-            refund_pubkey: req.taker_btc_pubkey,
+            claim_pubkey: maker_key(&qr.quote, tc),
+            refund_pubkey: taker_key(&req, tc),
             locktime,
         };
-        btc_htlc.validate()?;
+        taker_leg_htlc.validate()?;
+        // The maker leg is built later, on its own chain's clock; check the keys now.
         HtlcParams {
             hash: req.hash,
-            claim_pubkey: req.taker_divi_pubkey,
-            refund_pubkey: qr.quote.maker_divi_pubkey,
+            claim_pubkey: taker_key(&req, mc),
+            refund_pubkey: maker_key(&qr.quote, mc),
             locktime,
         }
         .validate()?;
@@ -190,16 +198,16 @@ impl Maker {
             state: SwapState::Accepted,
             quote: qr.quote.clone(),
             hash: req.hash,
-            taker_divi_pubkey: req.taker_divi_pubkey,
-            btc_htlc,
-            btc_outpoint: None,
-            btc_locked: None,
-            divi_htlc: None,
-            divi_funding: None,
-            divi_scan_from: 0,
-            divi_refund: None,
+            taker_maker_leg_pubkey: taker_key(&req, mc),
+            taker_leg_htlc,
+            taker_leg_outpoint: None,
+            taker_leg_locked: None,
+            maker_leg_htlc: None,
+            maker_leg_funding: None,
+            maker_leg_scan_from: 0,
+            maker_leg_refund: None,
             preimage: None,
-            btc_claim: None,
+            taker_leg_claim: None,
             last_error: None,
         };
         qr.used = true;
@@ -208,12 +216,12 @@ impl Maker {
         Ok(view_of(&rec))
     }
 
-    /// The taker says it funded the BTC HTLC at `lock.outpoint`.
+    /// The taker says it funded the taker-leg HTLC at `lock.outpoint`.
     pub async fn notify_lock(&self, swap_id: &str, lock: LockNotice) -> Result<SwapView> {
         {
             let _g = self.gate.lock().await;
             let mut rec = self.load(swap_id)?;
-            match rec.btc_outpoint {
+            match rec.taker_leg_outpoint {
                 Some(op) if op == lock.outpoint => {}
                 Some(_) => {
                     return Err(SwapError::InvalidParams(
@@ -221,7 +229,7 @@ impl Maker {
                     ))
                 }
                 None if rec.state == SwapState::Accepted => {
-                    rec.btc_outpoint = Some(lock.outpoint);
+                    rec.taker_leg_outpoint = Some(lock.outpoint);
                     self.store.put_maker_swap(&rec)?;
                 }
                 None => {
@@ -327,44 +335,80 @@ impl Maker {
         }
     }
 
+    /// Backend for `c`.
+    fn chain(&self, c: Chain) -> &Arc<dyn ChainBackend> {
+        match c {
+            Chain::Btc => &self.btc,
+            Chain::Divi => &self.divi,
+        }
+    }
+
+    /// Backend of the taker leg.
+    fn tk(&self, r: &MakerRecord) -> &Arc<dyn ChainBackend> {
+        self.chain(r.quote.direction.taker_chain())
+    }
+
+    /// Backend of the maker leg.
+    fn mk(&self, r: &MakerRecord) -> &Arc<dyn ChainBackend> {
+        self.chain(r.quote.direction.maker_chain())
+    }
+
+    /// Confirmations the taker leg needs before we lock.
+    fn taker_leg_confs(&self, r: &MakerRecord) -> u32 {
+        match r.quote.direction.taker_chain() {
+            Chain::Btc => self.cfg.btc_confirmations,
+            Chain::Divi => self.cfg.divi_confirmations,
+        }
+    }
+
+    /// Confirmations the maker leg needs before we treat it as locked.
+    fn maker_leg_confs(&self, r: &MakerRecord) -> u32 {
+        match r.quote.direction.maker_chain() {
+            Chain::Btc => self.cfg.btc_confirmations,
+            Chain::Divi => self.cfg.divi_confirmations,
+        }
+    }
+
     /// True when waiting for the taker's lock is pointless: the wall-clock wait is over,
-    /// or the BTC window left could no longer cover our DIVI lock plus the claim margin.
+    /// or the taker-leg window left could no longer cover our lock plus the claim margin.
     ///
     /// Decision: the margin here is `maker_timeout + claim_margin`, not the full
-    /// `SwapConfig::validate` gap — that gap already budgets BTC MTP lag, which
-    /// `btc_locktime − btc_mtp_now` (both on the BTC clock) measures directly. Using the full
-    /// gap would abort every swap that waits even one block for a confirmation.
+    /// `SwapConfig::validate` gap — that gap already budgets taker-leg MTP lag, which
+    /// `taker_locktime − taker_chain_mtp_now` (both on the taker-leg clock) measures
+    /// directly. Using the full gap would abort every swap that waits even one block for a
+    /// confirmation.
     async fn lock_window_gone(&self, r: &MakerRecord) -> Result<bool> {
         if (self.clock)() > r.created_at + self.lock_wait_secs {
             return Ok(true);
         }
-        self.btc_window_too_short(r).await
+        self.taker_window_too_short(r).await
     }
 
-    async fn btc_window_too_short(&self, r: &MakerRecord) -> Result<bool> {
-        let mtp = self.btc.median_time_past().await?;
-        let remaining = r.btc_htlc.locktime.saturating_sub(mtp) as u64;
+    async fn taker_window_too_short(&self, r: &MakerRecord) -> Result<bool> {
+        let mtp = self.tk(r).median_time_past().await?;
+        let remaining = r.taker_leg_htlc.locktime.saturating_sub(mtp) as u64;
         let needed = r.quote.maker_timeout_secs as u64 + self.cfg.claim_margin_secs as u64;
         Ok(remaining < needed)
     }
 
     async fn on_accepted(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let Some(op) = r.btc_outpoint else {
+        let taker_amount = taker_leg_amount(&r.quote);
+        let Some(op) = r.taker_leg_outpoint else {
             if self.lock_window_gone(r).await? {
                 return self.abort(r, "taker never locked");
             }
             return Ok(Flow::Idle);
         };
-        match self.btc.htlc_output(&r.btc_htlc, &op).await? {
-            Some(lo) if lo.amount < r.quote.btc_amount => self.abort(r, "taker lock underfunded"),
+        match self.tk(r).htlc_output(&r.taker_leg_htlc, &op).await? {
+            Some(lo) if lo.amount < taker_amount => self.abort(r, "taker lock underfunded"),
             Some(lo) => {
-                r.btc_locked = Some(lo.amount);
+                r.taker_leg_locked = Some(lo.amount);
                 self.enter(r, SwapState::TakerLockSeen)
             }
             None => {
                 // Only a confirmed tx is conclusive: Esplora behind a load balancer can know a
                 // mempool tx on `/status` while `/tx` still 404s on another backend.
-                if self.btc.confirmations(&op.txid).await?.unwrap_or(0) > 0 {
+                if self.tk(r).confirmations(&op.txid).await?.unwrap_or(0) > 0 {
                     return self.abort(r, "taker lock does not match the HTLC");
                 }
                 if self.lock_window_gone(r).await? {
@@ -376,26 +420,27 @@ impl Maker {
     }
 
     async fn on_taker_lock_seen(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let op = self.btc_outpoint(r)?;
-        match self.btc.htlc_output(&r.btc_htlc, &op).await? {
-            Some(lo) if lo.amount < r.quote.btc_amount => self.abort(r, "taker lock underfunded"),
-            Some(lo) if lo.confirmations >= self.cfg.btc_confirmations => {
-                r.btc_locked = Some(lo.amount);
+        let taker_amount = taker_leg_amount(&r.quote);
+        let op = self.taker_leg_outpoint(r)?;
+        match self.tk(r).htlc_output(&r.taker_leg_htlc, &op).await? {
+            Some(lo) if lo.amount < taker_amount => self.abort(r, "taker lock underfunded"),
+            Some(lo) if lo.confirmations >= self.taker_leg_confs(r) => {
+                r.taker_leg_locked = Some(lo.amount);
                 self.enter(r, SwapState::TakerLockConfirmed)
             }
             Some(_) => {
-                if self.btc_window_too_short(r).await? {
-                    return self.abort(r, "BTC window ran out while confirming");
+                if self.taker_window_too_short(r).await? {
+                    return self.abort(r, "taker-leg window ran out while confirming");
                 }
                 Ok(Flow::Idle)
             }
             None => {
                 // Only a confirmed tx is conclusive: Esplora behind a load balancer can know a
                 // mempool tx on `/status` while `/tx` still 404s on another backend.
-                if self.btc.confirmations(&op.txid).await?.unwrap_or(0) > 0 {
+                if self.tk(r).confirmations(&op.txid).await?.unwrap_or(0) > 0 {
                     return self.abort(r, "taker lock does not match the HTLC");
                 }
-                if self.btc_window_too_short(r).await? {
+                if self.taker_window_too_short(r).await? {
                     return self.abort(r, "taker lock disappeared and window ran out");
                 }
                 Ok(Flow::Idle)
@@ -403,57 +448,56 @@ impl Maker {
         }
     }
 
-    /// The staking edge: the only place the maker selects DIVI coins.
+    /// The staking edge: the only place the maker selects coins (on the maker-leg chain).
     async fn on_taker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let op = self.btc_outpoint(r)?;
-        match self.btc.htlc_output(&r.btc_htlc, &op).await? {
+        let taker_amount = taker_leg_amount(&r.quote);
+        let op = self.taker_leg_outpoint(r)?;
+        match self.tk(r).htlc_output(&r.taker_leg_htlc, &op).await? {
             Some(lo)
-                if lo.amount >= r.quote.btc_amount
-                    && lo.confirmations >= self.cfg.btc_confirmations => {}
-            Some(lo) if lo.amount < r.quote.btc_amount => {
-                return self.abort(r, "taker lock underfunded")
-            }
+                if lo.amount >= taker_amount && lo.confirmations >= self.taker_leg_confs(r) => {}
+            Some(lo) if lo.amount < taker_amount => return self.abort(r, "taker lock underfunded"),
             Some(_) => return Ok(Flow::Idle), // confirmations dropped (reorg): wait
             None => return self.abort(r, "taker lock vanished"),
         }
-        if self.btc_window_too_short(r).await? {
-            return self.abort(r, "BTC window too short to lock safely");
+        if self.taker_window_too_short(r).await? {
+            return self.abort(r, "taker-leg window too short to lock safely");
         }
-        let divi_mtp = self.divi.median_time_past().await?;
+        let mb = self.mk(r).clone();
+        let mtp = mb.median_time_past().await?;
         let htlc = HtlcParams {
             hash: r.hash,
-            claim_pubkey: r.taker_divi_pubkey,
-            refund_pubkey: self.divi.pubkey(),
-            locktime: divi_mtp
+            claim_pubkey: r.taker_maker_leg_pubkey,
+            refund_pubkey: mb.pubkey(),
+            locktime: mtp
                 .checked_add(r.quote.maker_timeout_secs)
                 .ok_or_else(|| SwapError::InvalidParams("locktime overflow".into()))?,
         };
         htlc.validate()?;
-        let scan_from = self.divi.tip_height().await?;
-        let funding = self.divi.build_funding(&htlc, r.quote.divi_amount).await?;
-        r.divi_htlc = Some(htlc);
-        r.divi_funding = Some(funding);
-        r.divi_scan_from = scan_from;
+        let scan_from = mb.tip_height().await?;
+        let funding = mb.build_funding(&htlc, maker_leg_amount(&r.quote)).await?;
+        r.maker_leg_htlc = Some(htlc);
+        r.maker_leg_funding = Some(funding);
+        r.maker_leg_scan_from = scan_from;
         self.enter(r, SwapState::MakerLocked)
     }
 
     async fn on_maker_locked(&self, r: &mut MakerRecord) -> Result<Flow> {
         let funding = r
-            .divi_funding
+            .maker_leg_funding
             .clone()
             .ok_or_else(|| SwapError::Other("MakerLocked without a funding tx".into()))?;
         // Idempotent: a tx the chain already has is Ok.
-        self.divi.broadcast(&funding.tx).await?;
+        self.mk(r).broadcast(&funding.tx).await?;
         let confs = self
-            .divi
+            .mk(r)
             .confirmations(&funding.tx.txid)
             .await?
             .unwrap_or(0);
         let spent_already = confs >= 1 && self.revealed_preimage(r).await?.is_some();
-        if confs >= self.cfg.divi_confirmations || spent_already {
+        if confs >= self.maker_leg_confs(r) || spent_already {
             return self.enter(r, SwapState::MakerLockConfirmed);
         }
-        if self.divi_timed_out(r).await? {
+        if self.maker_leg_timed_out(r).await? {
             return self.enter(r, SwapState::MakerRefundable);
         }
         Ok(Flow::Idle)
@@ -464,7 +508,7 @@ impl Maker {
             r.preimage = Some(p);
             return self.enter(r, SwapState::TakerClaimed);
         }
-        if self.divi_timed_out(r).await? {
+        if self.maker_leg_timed_out(r).await? {
             return self.enter(r, SwapState::MakerRefundable);
         }
         Ok(Flow::Idle)
@@ -476,26 +520,26 @@ impl Maker {
             r.preimage = Some(p);
             return self.enter(r, SwapState::TakerClaimed);
         }
-        let (htlc, funding) = self.divi_leg(r)?;
-        let refund = match r.divi_refund.clone() {
+        let (htlc, funding) = self.maker_leg(r)?;
+        let refund = match r.maker_leg_refund.clone() {
             Some(tx) => tx,
             None => {
                 let tx = self
-                    .divi
+                    .mk(r)
                     .build_refund(&htlc, &funding.outpoint, funding.amount)
                     .await?;
-                r.divi_refund = Some(tx.clone());
+                r.maker_leg_refund = Some(tx.clone());
                 self.store.put_maker_swap(r)?; // write-ahead
                 tx
             }
         };
-        match self.divi.broadcast(&refund).await {
+        match self.mk(r).broadcast(&refund).await {
             Ok(_) => {}
             Err(SwapError::Premature(_)) => return Ok(Flow::Idle),
             Err(e) => return Err(e),
         }
         if self
-            .divi
+            .mk(r)
             .confirmations(&refund.txid)
             .await?
             .is_some_and(|c| c >= 1)
@@ -509,69 +553,72 @@ impl Maker {
         let preimage = r
             .preimage
             .ok_or_else(|| SwapError::Other("TakerClaimed without a preimage".into()))?;
-        let claim = match r.btc_claim.clone() {
+        let claim = match r.taker_leg_claim.clone() {
             Some(tx) => tx,
             None => {
-                let op = self.btc_outpoint(r)?;
+                let op = self.taker_leg_outpoint(r)?;
                 let amount = r
-                    .btc_locked
-                    .ok_or_else(|| SwapError::Other("no verified BTC amount".into()))?;
+                    .taker_leg_locked
+                    .ok_or_else(|| SwapError::Other("no verified taker-leg amount".into()))?;
                 let tx = self
-                    .btc
-                    .build_claim(&r.btc_htlc, &op, amount, &preimage)
+                    .tk(r)
+                    .build_claim(&r.taker_leg_htlc, &op, amount, &preimage)
                     .await?;
-                r.btc_claim = Some(tx.clone());
+                r.taker_leg_claim = Some(tx.clone());
                 self.store.put_maker_swap(r)?; // write-ahead
                 tx
             }
         };
-        self.btc.broadcast(&claim).await?;
+        self.tk(r).broadcast(&claim).await?;
         self.enter(r, SwapState::MakerClaimed)
     }
 
     async fn on_maker_claimed(&self, r: &mut MakerRecord) -> Result<Flow> {
         let claim = r
-            .btc_claim
+            .taker_leg_claim
             .clone()
             .ok_or_else(|| SwapError::Other("MakerClaimed without a claim tx".into()))?;
-        match self.btc.confirmations(&claim.txid).await? {
+        match self.tk(r).confirmations(&claim.txid).await? {
             Some(c) if c >= 1 => self.enter(r, SwapState::Done),
             _ => {
                 // Dropped from the mempool? Rebroadcasting identical bytes is harmless.
-                self.btc.broadcast(&claim).await?;
+                self.tk(r).broadcast(&claim).await?;
                 Ok(Flow::Idle)
             }
         }
     }
 
-    fn btc_outpoint(&self, r: &MakerRecord) -> Result<Outpoint> {
-        r.btc_outpoint
-            .ok_or_else(|| SwapError::Other("no BTC lock reported".into()))
+    fn taker_leg_outpoint(&self, r: &MakerRecord) -> Result<Outpoint> {
+        r.taker_leg_outpoint
+            .ok_or_else(|| SwapError::Other("no taker lock reported".into()))
     }
 
-    fn divi_leg(&self, r: &MakerRecord) -> Result<(HtlcParams, crate::types::Funding)> {
-        match (&r.divi_htlc, &r.divi_funding) {
+    fn maker_leg(&self, r: &MakerRecord) -> Result<(HtlcParams, crate::types::Funding)> {
+        match (&r.maker_leg_htlc, &r.maker_leg_funding) {
             (Some(h), Some(f)) => Ok((*h, f.clone())),
-            _ => Err(SwapError::Other("DIVI lock not built".into())),
+            _ => Err(SwapError::Other("maker lock not built".into())),
         }
     }
 
-    async fn divi_timed_out(&self, r: &MakerRecord) -> Result<bool> {
-        let (htlc, _) = self.divi_leg(r)?;
-        Ok(self.divi.median_time_past().await? >= htlc.locktime)
+    async fn maker_leg_timed_out(&self, r: &MakerRecord) -> Result<bool> {
+        let (htlc, _) = self.maker_leg(r)?;
+        Ok(self.mk(r).median_time_past().await? >= htlc.locktime)
     }
 
-    /// The preimage, if a transaction other than our own refund spent the DIVI lock.
+    /// The preimage, if a transaction other than our own refund spent the maker-leg lock.
     async fn revealed_preimage(&self, r: &MakerRecord) -> Result<Option<[u8; 32]>> {
-        let (_, funding) = self.divi_leg(r)?;
+        let (_, funding) = self.maker_leg(r)?;
         let Some(spend) = self
-            .divi
-            .find_spend(&funding.outpoint, r.divi_scan_from)
+            .mk(r)
+            .find_spend(&funding.outpoint, r.maker_leg_scan_from)
             .await?
         else {
             return Ok(None);
         };
-        if r.divi_refund.as_ref().is_some_and(|t| t.txid == spend.txid) {
+        if r.maker_leg_refund
+            .as_ref()
+            .is_some_and(|t| t.txid == spend.txid)
+        {
             return Ok(None);
         }
         Ok(spend.extract_preimage(&r.hash))
@@ -584,23 +631,53 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Value the taker locks.
+fn taker_leg_amount(q: &Quote) -> Amount {
+    match q.direction.taker_chain() {
+        Chain::Btc => q.btc_amount,
+        Chain::Divi => q.divi_amount,
+    }
+}
+
+/// Value the maker locks.
+fn maker_leg_amount(q: &Quote) -> Amount {
+    match q.direction.maker_chain() {
+        Chain::Btc => q.btc_amount,
+        Chain::Divi => q.divi_amount,
+    }
+}
+
+fn maker_key(q: &Quote, c: Chain) -> [u8; 33] {
+    match c {
+        Chain::Btc => q.maker_btc_pubkey,
+        Chain::Divi => q.maker_divi_pubkey,
+    }
+}
+
+fn taker_key(req: &AcceptRequest, c: Chain) -> [u8; 33] {
+    match c {
+        Chain::Btc => req.taker_btc_pubkey,
+        Chain::Divi => req.taker_divi_pubkey,
+    }
+}
+
 fn view_of(r: &MakerRecord) -> SwapView {
     SwapView {
         id: r.id.clone(),
         state: r.state,
         quote: r.quote.clone(),
         taker_leg: LegView {
-            htlc: r.btc_htlc,
-            amount: r.quote.btc_amount,
-            outpoint: r.btc_outpoint,
-            spend_txid: r.btc_claim.as_ref().map(|t| t.txid),
+            htlc: r.taker_leg_htlc,
+            amount: taker_leg_amount(&r.quote),
+            outpoint: r.taker_leg_outpoint,
+            spend_txid: r.taker_leg_claim.as_ref().map(|t| t.txid),
         },
-        maker_leg: match (&r.divi_htlc, &r.divi_funding) {
+        maker_leg: match (&r.maker_leg_htlc, &r.maker_leg_funding) {
             (Some(h), Some(f)) => Some(LegView {
                 htlc: *h,
                 amount: f.amount,
                 outpoint: Some(f.outpoint),
-                spend_txid: r.divi_refund.as_ref().map(|t| t.txid),
+                spend_txid: r.maker_leg_refund.as_ref().map(|t| t.txid),
             }),
             _ => None,
         },

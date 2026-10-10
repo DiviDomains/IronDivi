@@ -39,7 +39,9 @@ pub struct QuoteRecord {
     pub used: bool,
 }
 
-/// The maker's persisted view of one swap.
+/// The maker's persisted view of one swap. Legs are role-based: the *taker leg* is on
+/// `quote.direction.taker_chain()`, the *maker leg* on `maker_chain()`. Pre-direction records
+/// (taker leg = BTC, maker leg = DIVI) load through the serde aliases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MakerRecord {
     /// Swap id.
@@ -52,32 +54,40 @@ pub struct MakerRecord {
     pub quote: Quote,
     /// Taker's preimage hash.
     pub hash: [u8; 32],
-    /// Taker's DIVI pubkey (`claim_pubkey` of the DIVI HTLC).
-    #[serde(with = "hex33")]
-    pub taker_divi_pubkey: [u8; 33],
-    /// The BTC HTLC the taker must fund.
-    pub btc_htlc: HtlcParams,
+    /// Taker's pubkey on the maker-leg chain (`claim_pubkey` of the maker-leg HTLC).
+    #[serde(with = "hex33", alias = "taker_divi_pubkey")]
+    pub taker_maker_leg_pubkey: [u8; 33],
+    /// The taker-leg HTLC the taker must fund.
+    #[serde(alias = "btc_htlc")]
+    pub taker_leg_htlc: HtlcParams,
     /// Where the taker says it funded it.
-    pub btc_outpoint: Option<Outpoint>,
-    /// Value actually seen locked in the BTC HTLC.
-    pub btc_locked: Option<Amount>,
-    /// The DIVI HTLC, fixed when the maker locks.
-    pub divi_htlc: Option<HtlcParams>,
-    /// The signed DIVI funding tx (persisted before broadcast).
-    pub divi_funding: Option<Funding>,
-    /// DIVI height from which to scan for the taker's claim.
-    pub divi_scan_from: u64,
-    /// The signed DIVI refund tx, once built.
-    pub divi_refund: Option<SignedTx>,
+    #[serde(alias = "btc_outpoint")]
+    pub taker_leg_outpoint: Option<Outpoint>,
+    /// Value actually seen locked in the taker-leg HTLC.
+    #[serde(alias = "btc_locked")]
+    pub taker_leg_locked: Option<Amount>,
+    /// The maker-leg HTLC, fixed when the maker locks.
+    #[serde(alias = "divi_htlc")]
+    pub maker_leg_htlc: Option<HtlcParams>,
+    /// The signed maker-leg funding tx (persisted before broadcast).
+    #[serde(alias = "divi_funding")]
+    pub maker_leg_funding: Option<Funding>,
+    /// Maker-leg chain height from which to scan for the taker's claim.
+    #[serde(alias = "divi_scan_from")]
+    pub maker_leg_scan_from: u64,
+    /// The signed maker-leg refund tx, once built.
+    #[serde(alias = "divi_refund")]
+    pub maker_leg_refund: Option<SignedTx>,
     /// The preimage, once the taker revealed it.
     pub preimage: Option<[u8; 32]>,
-    /// The signed BTC claim tx, once built.
-    pub btc_claim: Option<SignedTx>,
+    /// The signed taker-leg claim tx, once built.
+    #[serde(alias = "btc_claim")]
+    pub taker_leg_claim: Option<SignedTx>,
     /// Last error the scheduler hit.
     pub last_error: Option<String>,
 }
 
-/// The taker's persisted view of one swap.
+/// The taker's persisted view of one swap (role-based legs, see [`MakerRecord`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakerRecord {
     /// Local swap id.
@@ -92,20 +102,27 @@ pub struct TakerRecord {
     pub hash: [u8; 32],
     /// The maker's id for this swap.
     pub maker_swap_id: Option<String>,
-    /// The BTC HTLC (our refund key).
-    pub btc_htlc: Option<HtlcParams>,
-    /// The signed BTC funding tx (persisted before broadcast).
-    pub btc_funding: Option<Funding>,
-    /// The maker's DIVI HTLC, once verified.
-    pub divi_htlc: Option<HtlcParams>,
-    /// The maker's DIVI lock output, once verified.
-    pub divi_outpoint: Option<Outpoint>,
-    /// Value of the maker's DIVI lock.
-    pub divi_amount: Option<Amount>,
-    /// The signed DIVI claim tx (persisted before broadcast).
-    pub divi_claim: Option<SignedTx>,
-    /// The signed BTC refund tx (persisted before broadcast).
-    pub btc_refund: Option<SignedTx>,
+    /// The taker-leg HTLC (our refund key).
+    #[serde(alias = "btc_htlc")]
+    pub taker_leg_htlc: Option<HtlcParams>,
+    /// The signed taker-leg funding tx (persisted before broadcast).
+    #[serde(alias = "btc_funding")]
+    pub taker_leg_funding: Option<Funding>,
+    /// The maker's HTLC, once verified.
+    #[serde(alias = "divi_htlc")]
+    pub maker_leg_htlc: Option<HtlcParams>,
+    /// The maker's lock output, once verified.
+    #[serde(alias = "divi_outpoint")]
+    pub maker_leg_outpoint: Option<Outpoint>,
+    /// Value of the maker's lock.
+    #[serde(alias = "divi_amount")]
+    pub maker_leg_amount: Option<Amount>,
+    /// The signed maker-leg claim tx (persisted before broadcast).
+    #[serde(alias = "divi_claim")]
+    pub maker_leg_claim: Option<SignedTx>,
+    /// The signed taker-leg refund tx (persisted before broadcast).
+    #[serde(alias = "btc_refund")]
+    pub taker_leg_refund: Option<SignedTx>,
     /// Last error.
     pub last_error: Option<String>,
 }
@@ -320,21 +337,21 @@ mod tests {
             state: SwapState::Accepted,
             quote: quote("q"),
             hash: [1; 32],
-            taker_divi_pubkey: [2; 33],
-            btc_htlc: HtlcParams {
+            taker_maker_leg_pubkey: [2; 33],
+            taker_leg_htlc: HtlcParams {
                 hash: [1; 32],
                 claim_pubkey: [2; 33],
                 refund_pubkey: [3; 33],
                 locktime: 1_800_000_000,
             },
-            btc_outpoint: None,
-            btc_locked: None,
-            divi_htlc: None,
-            divi_funding: None,
-            divi_scan_from: 0,
-            divi_refund: None,
+            taker_leg_outpoint: None,
+            taker_leg_locked: None,
+            maker_leg_htlc: None,
+            maker_leg_funding: None,
+            maker_leg_scan_from: 0,
+            maker_leg_refund: None,
             preimage: None,
-            btc_claim: None,
+            taker_leg_claim: None,
             last_error: None,
         }
     }
