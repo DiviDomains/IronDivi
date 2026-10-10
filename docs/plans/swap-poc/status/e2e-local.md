@@ -20,8 +20,9 @@
 - casec_divi_lock_txid: 13654e6fee8376b5338da65457f7e1d0899afcc847c248d3c94d47788f3f7b58
 - casec_divi_refund_txid: ef319519f3fc004b84e0894c48b03839b063c55f81df500f7ba325305335136f
 - casec_btc_refund_txid: b2ba4d8dbcbf8a1a9865a86db03130d8f3fc992f56761cb962e9ec650736d938
-- running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
-- left: record the refund txid of 252aa984; deployed-maker runs (e2e-deployed brief).
+- done: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384 (10000 sats, HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729) by `divi-swap refund` from a copy of its taker.db (`~/.local/state/iron-divi-swap-poc/refund-252aa984/`).
+- aborted_252aa984_btc_refund_txid: 564f4c60e7d5017d69df1cf189cde19b3f772124c48fb61e13e93a3f9d8838a0
+- left: deployed `case-c` results.
 - running: deployed `case-c` via the orchestrator's tunnel (`e2e.sh case-c --maker-url http://127.0.0.1:18480`; default profile, refunds ~6 h).
 - broken: nothing known.
 - parked: nothing.
