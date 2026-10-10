@@ -7,7 +7,10 @@
    for the proof; 0.01 for the whole POC. Then say "sBTC sent" in the orchestrator pane.
    Check: `curl -s https://mempool.space/signet/api/address/tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg | jq .chain_stats.funded_txo_sum`
 
-2. **1Password approval: dnsdivi SSH key and `op read` taker-btc** (2026-10-08 23:23). Both prompts went
+2. ~~**1Password approval: dnsdivi SSH key and `op read` taker-btc**~~ **RESOLVED 2026-10-10:** keys now resolve
+   through the secret proxy (`secret get`, `7038c70`) behind one secret-broker approval; all four keys read, `ssh dnsdivi`
+   works, dnsdivi redeployed on testnet3, btc live funding broadcast and confirmed.
+   Original (2026-10-08 23:23): both prompts went
    unanswered, so `ssh dnsdivi` failed ("agent signing failed") and the testnet3 live test could not read
    `IronDivi Swap POC - taker-btc`. No tx was broadcast and the dnsdivi binary is unchanged (still pre-`ef4a9c9`, signet).
    Blocks: the dnsdivi redeploy and testnet switch, btc live, e2e-local, chaos live, and Wave 3 e2e.
