@@ -159,7 +159,12 @@ fi
 # Reverse: the taker locks DIVI, so it needs a DIVI wallet (outside the repo, mode 0600; the scan resumes from its cursor).
 if [[ -n "$reverse" ]]; then
   taker_wallet="$(dirname "$state")/taker-divi-wallet.json"
-  taker+=(--divi-wallet "$taker_wallet")
+  # Older CLIs (before rev-cli landed) lack the flag; fine for mock plumbing, fatal for a live run.
+  if "$swap" --help 2>&1 | grep -q -- '--divi-wallet'; then
+    taker+=(--divi-wallet "$taker_wallet")
+  elif [[ "$backend" == live ]]; then
+    die "this divi-swap build has no --divi-wallet; rebase onto main with rev-cli landed"
+  fi
 fi
 
 # Reverse, live: the sides must be funded before anything locks. Fail now, with a reason, not hours in.
