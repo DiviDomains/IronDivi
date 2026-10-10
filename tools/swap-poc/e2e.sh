@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Real-testnet atomic swap scenarios, maker (divi-swapd) and taker (divi-swap) both local.
-#   tools/swap-poc/e2e.sh <happy|case-c|case-d> [--backend live|mock]
+#   tools/swap-poc/e2e.sh <happy|case-c|case-d> [--backend live|mock] [--maker-url URL]
+# --maker-url: use an already-running maker (e.g. the deployed one through an SSH tunnel) with its
+#   own profile; no local divi-swapd is built, configured or started. State: <scenario>-deployed.
 # live: DIVI testnet + BTC signet, keys resolved from 1Password at runtime (op:// refs only).
 # mock: plumbing only (daemon lifecycle, config, quote/accept) — mock chains are per-process,
 #       so a swap cannot progress across the daemon/CLI boundary; flows are tested in-process.
@@ -11,19 +13,22 @@ set -euo pipefail
 btc_network="${SWAP_BTC_NETWORK:-signet}"
 export SWAP_BTC_NETWORK="$btc_network"
 
-usage() { echo "usage: $0 <happy|case-c|case-d> [--backend live|mock]" >&2; exit 2; }
+usage() { echo "usage: $0 <happy|case-c|case-d> [--backend live|mock] [--maker-url URL]" >&2; exit 2; }
 die() { echo "e2e: $*" >&2; exit 1; }
 
 scenario="${1:-}"; [[ -n "$scenario" ]] || usage
 shift || true
 backend=live
+maker_url=""
 while (($#)); do
   case "$1" in
     --backend) backend="${2:-}"; shift 2 || usage ;;
+    --maker-url) maker_url="${2:-}"; shift 2 || usage; [[ -n "$maker_url" ]] || usage ;;
     *) usage ;;
   esac
 done
 [[ "$backend" == live || "$backend" == mock ]] || usage
+[[ -z "$maker_url" || "$backend" == live ]] || die "--maker-url needs --backend live"
 
 ROOT="$(git rev-parse --show-toplevel)"
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
@@ -46,13 +51,21 @@ case "$scenario" in
     taker_flags=(--claim-not-before 2400) ;;
   *) usage ;;
 esac
+# A remote maker keeps its own (default testnet) profile: 10800/21600 s, so case C's BTC refund
+# lands ~6 h in plus testnet MTP lag. Its txids get a deployed_ prefix.
+if [[ -n "$maker_url" ]]; then
+  timing=""
+  prefix="deployed_$prefix"
+  [[ "$scenario" == case-c ]] && timeout_secs=36000
+fi
 
-state="${E2E_STATE_DIR:-$HOME/.local/state/iron-divi-swap-poc}/$scenario-$backend"
+suffix="${maker_url:+deployed}"
+state="${E2E_STATE_DIR:-$HOME/.local/state/iron-divi-swap-poc}/$scenario-${suffix:-$backend}"
 case "$state" in "$ROOT"/*) die "state dir must be outside the repo: $state" ;; esac
 mkdir -p "$state"
 chmod 700 "$state"
 log="$state/daemon.log"
-base="http://127.0.0.1:$port"
+base="${maker_url:-http://127.0.0.1:$port}"
 
 vault="op://global_secret_store"
 ref() { echo "$vault/IronDivi Swap POC - $1/password"; }
@@ -61,7 +74,9 @@ if [[ "$backend" == live ]]; then
   # Fail fast, once, before anything starts: an unanswered 1Password prompt is a park, not a retry.
   # Through the secret proxy (cache, then secret-broker), which also warms its cache for the
   # daemon and CLI; a raw 1Password CLI call from here would be a Touch ID dialog per key.
-  for k in maker-divi maker-btc taker-divi taker-btc; do
+  keys=(taker-divi taker-btc)
+  [[ -n "$maker_url" ]] || keys+=(maker-divi maker-btc)
+  for k in "${keys[@]}"; do
     if ! secret get --name "irondivi-swap-poc-$k-password" --op-ref "$(ref "$k")" >/dev/null 2>&1; then
       die "cannot read the $k key (1Password locked, or secret-broker not running: secret-broker status). Rerun once it is up."
     fi
@@ -73,7 +88,7 @@ echo "e2e: building"
 swapd="$ROOT/target/debug/divi-swapd"
 swap="$ROOT/target/debug/divi-swap"
 
-cat >"$state/divi-swapd.toml" <<TOML
+[[ -n "$maker_url" ]] || cat >"$state/divi-swapd.toml" <<TOML
 listen = "127.0.0.1:$port"
 db_path = "$state/maker.db"
 tick_secs = 5
@@ -108,17 +123,22 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "e2e: scenario=$scenario backend=$backend maker=$base state=$state"
-"$swapd" --config "$state/divi-swapd.toml" --backend "$backend" >>"$log" 2>&1 &
-daemon_pid=$!
+healthy() { [[ "$(curl -s -m 10 "$base/healthz" | jq -r '.ok // empty' 2>/dev/null)" == true ]]; }
+if [[ -n "$maker_url" ]]; then
+  healthy || die "remote maker $base is not healthy (tunnel down?)"
+else
+  "$swapd" --config "$state/divi-swapd.toml" --backend "$backend" >>"$log" 2>&1 &
+  daemon_pid=$!
 
-# First start scans the DIVI wallet from scan_from_height (~15 min); later starts resume from the saved wallet.
-ready=""
-for _ in $(seq 1 750); do
-  kill -0 "$daemon_pid" 2>/dev/null || { tail -20 "$log" >&2; die "daemon exited during startup"; }
-  if [[ "$(curl -s "$base/healthz" | jq -r '.ok // empty' 2>/dev/null)" == true ]]; then ready=1; break; fi
-  sleep 2
-done
-[[ -n "$ready" ]] || { tail -20 "$log" >&2; die "daemon never became healthy"; }
+  # First start scans the DIVI wallet from scan_from_height (~15 min); later starts resume from the saved wallet.
+  ready=""
+  for _ in $(seq 1 750); do
+    kill -0 "$daemon_pid" 2>/dev/null || { tail -20 "$log" >&2; die "daemon exited during startup"; }
+    if healthy; then ready=1; break; fi
+    sleep 2
+  done
+  [[ -n "$ready" ]] || { tail -20 "$log" >&2; die "daemon never became healthy"; }
+fi
 echo "e2e: daemon healthy"
 
 taker=("$swap" --db "$state/taker.db" --backend "$backend")
@@ -162,7 +182,7 @@ get() { sed -n "s/^$1=//p" <<<"$txids" | head -1; }
   fi
   if [[ "$scenario" == case-d ]]; then
     secs="$(sed -n 's/.*claim_secs_before_timeout=\([0-9]*\).*/\1/p' "$out" | head -1)"
-    echo "- cased_claim_secs_before_timeout: $secs"
+    echo "- ${prefix}_claim_secs_before_timeout: $secs"
   fi
 } | tee "$state/results.txt"
 echo "e2e: $scenario done; paste $state/results.txt into the status file once the txids confirm"
