@@ -28,6 +28,7 @@ const TAKER_BTC_FUNDS: u64 = 10_000_000;
 fn offer() -> Offer {
     Offer {
         id: "o1".into(),
+        direction: divi_swap::api::Direction::TakerPaysBtc,
         divi_sats_per_btc: 50_000_000_000,
         min_btc_sats: 10_000,
         max_btc_sats: 5_000_000,
@@ -326,7 +327,7 @@ async fn case_b_taker_lock_invalid() {
     let view = h.maker.view(&h.maker_id).unwrap().unwrap();
     let f = h
         .tbtc
-        .build_funding(&view.btc.htlc, Amount(BTC_SATS - 1))
+        .build_funding(&view.taker_leg.htlc, Amount(BTC_SATS - 1))
         .await
         .unwrap();
     h.tbtc.broadcast(&f.tx).await.unwrap();
@@ -350,7 +351,7 @@ async fn case_b_taker_lock_invalid() {
     let mut h = H::new();
     h.accept(None).await;
     let view = h.maker.view(&h.maker_id).unwrap().unwrap();
-    let mut wrong = view.btc.htlc;
+    let mut wrong = view.taker_leg.htlc;
     wrong.refund_pubkey = [0x02; 33];
     let f = h
         .tbtc

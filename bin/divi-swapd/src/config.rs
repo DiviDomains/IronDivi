@@ -78,6 +78,7 @@ fn default_profile() -> Profile {
 fn default_offers() -> Vec<Offer> {
     vec![Offer {
         id: "divi-btc-testnet".into(),
+        direction: divi_swap::api::Direction::TakerPaysBtc,
         divi_sats_per_btc: 300_000_000_000_000,
         min_btc_sats: 5_000,
         max_btc_sats: 50_000,

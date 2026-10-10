@@ -300,6 +300,7 @@ mod tests {
         Quote {
             id: id.into(),
             offer_id: "o".into(),
+            direction: crate::api::Direction::TakerPaysBtc,
             btc_amount: Amount(1),
             divi_amount: Amount(2),
             expires_at: 3,

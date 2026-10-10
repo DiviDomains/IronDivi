@@ -109,7 +109,7 @@ async fn post_swaps_accepts_quote() {
     let (code, v) = get_json(&format!("{}/swaps/{id}", d.base)).await;
     assert_eq!(code, 200);
     assert_eq!(v["state"], "Accepted");
-    assert_eq!(v["divi"], Value::Null, "maker has locked nothing yet");
+    assert_eq!(v["maker_leg"], Value::Null, "maker has locked nothing yet");
     assert_eq!(w.maker_divi.funding_calls(), 0);
 
     let (_, all) = get_json(&format!("{}/swaps", d.base)).await;
@@ -217,7 +217,7 @@ async fn lock_notice_advances() {
         "after lock notice: {:?}",
         v.state
     );
-    assert!(v.btc.outpoint.is_some());
+    assert!(v.taker_leg.outpoint.is_some());
     assert_eq!(
         w.maker_divi.funding_calls(),
         0,
@@ -227,7 +227,7 @@ async fn lock_notice_advances() {
     // Unknown swap id on the lock route is a clean client error.
     let r = reqwest::Client::new()
         .post(format!("{}/swaps/nope/lock", d.base))
-        .json(&serde_json::json!({ "outpoint": v.btc.outpoint }))
+        .json(&serde_json::json!({ "outpoint": v.taker_leg.outpoint }))
         .send()
         .await
         .unwrap();

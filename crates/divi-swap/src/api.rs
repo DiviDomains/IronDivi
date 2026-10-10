@@ -9,29 +9,66 @@
 //! Wire types between taker and maker (the `divi-swapd` HTTP API) and the persisted swap
 //! record. **Frozen contract** — the engine and daemon lanes both build against these.
 //!
-//! Protocol (maker sells DIVI for BTC; the taker holds BTC and generates the preimage):
+//! Protocol. The offer's [`Direction`] says which coin the taker pays; the *taker leg* is on
+//! that chain and the *maker leg* on the other. The taker always generates the preimage,
+//! locks first, and gets the longer timeout. For [`Direction::TakerPaysBtc`] (maker sells
+//! DIVI) the taker leg is BTC; for [`Direction::TakerPaysDivi`] (maker buys DIVI) it is DIVI.
 //! 1. `GET /offers` → [`Offer`]s. `GET /offers/:id/quote?btc_sats=N` → [`Quote`] (60 s).
-//! 2. `POST /swaps` with [`AcceptRequest`] → [`SwapView`] in `accepted`, carrying the BTC
-//!    HTLC the taker must fund (claim = maker BTC key, refund = taker BTC key,
-//!    locktime = BTC MTP + taker timeout).
+//!    Both directions are sized in BTC sats; the price is always DIVI per BTC.
+//! 2. `POST /swaps` with [`AcceptRequest`] → [`SwapView`] in `accepted`, carrying the
+//!    taker-leg HTLC the taker must fund (claim = maker key, refund = taker key, both on the
+//!    taker-leg chain; locktime = that chain's MTP + taker timeout).
 //! 3. Taker funds it and `POST /swaps/:id/lock` with [`LockNotice`]. Maker verifies with
-//!    `htlc_output`, waits for confirmations, and only then selects coins and funds the DIVI
-//!    HTLC (claim = taker DIVI key, refund = maker DIVI key, locktime = DIVI MTP + maker
-//!    timeout). `GET /swaps/:id` shows it.
-//! 4. Taker verifies the DIVI lock, waits for confirmations, claims DIVI (revealing the
-//!    preimage). Maker's `find_spend` sees it and claims the BTC.
+//!    `htlc_output`, waits for confirmations, and only then selects coins and funds the
+//!    maker-leg HTLC (claim = taker key, refund = maker key, on the maker-leg chain;
+//!    locktime = that chain's MTP + maker timeout). `GET /swaps/:id` shows it.
+//! 4. Taker verifies the maker leg, waits for confirmations, claims it (revealing the
+//!    preimage). Maker's `find_spend` on the maker leg sees it and claims the taker leg.
 
 use serde::{Deserialize, Serialize};
 
 use crate::htlc::HtlcParams;
 use crate::state::SwapState;
-use crate::types::{Amount, Outpoint, Txid};
+use crate::types::{Amount, Chain, Outpoint, Txid};
 
-/// A standing offer to sell DIVI for BTC.
+/// Which coin the taker pays (and so which chain each leg is on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Maker sells DIVI: the taker locks BTC, the maker locks DIVI. Records and offers
+    /// written before directions existed are this.
+    #[default]
+    TakerPaysBtc,
+    /// Maker buys DIVI: the taker locks DIVI, the maker locks BTC.
+    TakerPaysDivi,
+}
+
+impl Direction {
+    /// Chain of the taker leg (funded first, by the taker, with the longer timeout).
+    pub fn taker_chain(self) -> Chain {
+        match self {
+            Direction::TakerPaysBtc => Chain::Btc,
+            Direction::TakerPaysDivi => Chain::Divi,
+        }
+    }
+
+    /// Chain of the maker leg (funded by the maker after the taker leg confirms).
+    pub fn maker_chain(self) -> Chain {
+        match self {
+            Direction::TakerPaysBtc => Chain::Divi,
+            Direction::TakerPaysDivi => Chain::Btc,
+        }
+    }
+}
+
+/// A standing offer to swap DIVI and BTC in one [`Direction`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Offer {
     /// Offer id.
     pub id: String,
+    /// Which coin the taker pays.
+    #[serde(default)]
+    pub direction: Direction,
     /// Price: DIVI sats paid per 1 BTC (1e8 BTC sats).
     pub divi_sats_per_btc: u64,
     /// Smallest swap, BTC sats.
@@ -54,25 +91,29 @@ pub struct Quote {
     pub id: String,
     /// Offer it was made from.
     pub offer_id: String,
-    /// BTC the taker locks.
+    /// Which coin the taker pays.
+    #[serde(default)]
+    pub direction: Direction,
+    /// BTC locked (by the taker for `TakerPaysBtc`, by the maker for `TakerPaysDivi`).
     pub btc_amount: Amount,
-    /// DIVI the maker locks.
+    /// DIVI locked (by the maker for `TakerPaysBtc`, by the taker for `TakerPaysDivi`).
     pub divi_amount: Amount,
     /// Unix seconds (wall clock).
     pub expires_at: u64,
-    /// Maker's BTC pubkey — `claim_pubkey` of the BTC HTLC.
+    /// Maker's BTC pubkey — claim key of a BTC taker leg, refund key of a BTC maker leg.
     #[serde(with = "hex33")]
     pub maker_btc_pubkey: [u8; 33],
-    /// Maker's DIVI pubkey — `refund_pubkey` of the DIVI HTLC.
+    /// Maker's DIVI pubkey — refund key of a DIVI maker leg, claim key of a DIVI taker leg.
     #[serde(with = "hex33")]
     pub maker_divi_pubkey: [u8; 33],
-    /// Taker's BTC HTLC lifetime (seconds after BTC MTP).
+    /// Taker-leg HTLC lifetime (seconds after the taker-leg chain's MTP).
     pub taker_timeout_secs: u32,
-    /// Maker's DIVI HTLC lifetime (seconds after DIVI MTP).
+    /// Maker-leg HTLC lifetime (seconds after the maker-leg chain's MTP).
     pub maker_timeout_secs: u32,
-    /// Confirmations the maker requires on the BTC lock.
+    /// Confirmations required on any BTC lock (the maker's check of a BTC taker leg, the
+    /// taker's check of a BTC maker leg).
     pub btc_confirmations: u32,
-    /// Confirmations the taker should require on the DIVI lock.
+    /// Confirmations required on any DIVI lock.
     pub divi_confirmations: u32,
 }
 
@@ -84,15 +125,15 @@ pub struct AcceptRequest {
     /// SHA256 of the taker's preimage.
     #[serde(with = "hex32")]
     pub hash: [u8; 32],
-    /// Taker's BTC pubkey — `refund_pubkey` of the BTC HTLC.
+    /// Taker's BTC pubkey — refund key of a BTC taker leg, claim key of a BTC maker leg.
     #[serde(with = "hex33")]
     pub taker_btc_pubkey: [u8; 33],
-    /// Taker's DIVI pubkey — `claim_pubkey` of the DIVI HTLC.
+    /// Taker's DIVI pubkey — claim key of a DIVI maker leg, refund key of a DIVI taker leg.
     #[serde(with = "hex33")]
     pub taker_divi_pubkey: [u8; 33],
 }
 
-/// `POST /swaps/:id/lock` body: where the taker funded the BTC HTLC.
+/// `POST /swaps/:id/lock` body: where the taker funded the taker-leg HTLC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockNotice {
     /// The BTC HTLC output.
@@ -120,12 +161,14 @@ pub struct SwapView {
     pub id: String,
     /// Maker-side state.
     pub state: SwapState,
-    /// The quote this swap executes.
+    /// The quote this swap executes (`quote.direction` says which chain each leg is on).
     pub quote: Quote,
-    /// Taker's BTC HTLC (known from `accepted`).
-    pub btc: LegView,
-    /// Maker's DIVI HTLC (known from `maker_locked`).
-    pub divi: Option<LegView>,
+    /// The taker's HTLC (known from `accepted`). Was `btc` before directions existed.
+    #[serde(alias = "btc")]
+    pub taker_leg: LegView,
+    /// The maker's HTLC (known from `maker_locked`). Was `divi` before directions existed.
+    #[serde(alias = "divi")]
+    pub maker_leg: Option<LegView>,
     /// Revealed preimage (hex), after `taker_claimed`.
     pub preimage: Option<String>,
     /// Last error the scheduler hit on this swap, for operators.
@@ -166,10 +209,25 @@ mod tests {
     fn divi_for_rounds_down() {
         let o = Offer {
             id: "o".into(),
+            direction: Direction::TakerPaysBtc,
             divi_sats_per_btc: 3_000_000 * 100_000_000,
             min_btc_sats: 1,
             max_btc_sats: 1_000_000,
         };
         assert_eq!(o.divi_for(100_000).0, 3_000 * 100_000_000);
+    }
+
+    #[test]
+    fn direction_defaults_for_pre_direction_json() {
+        let o: Offer = serde_json::from_str(
+            r#"{"id":"o","divi_sats_per_btc":1,"min_btc_sats":1,"max_btc_sats":2}"#,
+        )
+        .unwrap();
+        assert_eq!(o.direction, Direction::TakerPaysBtc);
+        assert_eq!(o.direction.taker_chain(), Chain::Btc);
+        assert_eq!(Direction::TakerPaysDivi.taker_chain(), Chain::Divi);
+        assert_eq!(Direction::TakerPaysDivi.maker_chain(), Chain::Btc);
+        let j = serde_json::to_value(Direction::TakerPaysDivi).unwrap();
+        assert_eq!(j, "taker_pays_divi");
     }
 }

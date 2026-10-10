@@ -224,8 +224,8 @@ class Run:
 
     def final_txid(self, sid):
         v = self.view(sid)
-        d = (v.get("divi") or {}).get("spend_txid") if v["state"].lower() == "makerrefunded" else None
-        return d or (v["btc"].get("spend_txid")) or (v.get("divi") or {}).get("spend_txid")
+        d = (v.get("maker_leg") or {}).get("spend_txid") if v["state"].lower() == "makerrefunded" else None
+        return d or (v["taker_leg"].get("spend_txid")) or (v.get("maker_leg") or {}).get("spend_txid")
 
     # -- taker ---------------------------------------------------------------------------
     def taker(self, *args):

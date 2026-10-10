@@ -58,6 +58,7 @@ impl World {
     pub fn offers() -> Vec<Offer> {
         vec![Offer {
             id: OFFER_ID.into(),
+            direction: divi_swap::api::Direction::TakerPaysBtc,
             divi_sats_per_btc: 1_000 * Amount::COIN,
             min_btc_sats: 1_000,
             max_btc_sats: 10_000_000,

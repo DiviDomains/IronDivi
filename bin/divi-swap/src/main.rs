@@ -306,7 +306,7 @@ async fn main() -> Result<()> {
             );
             line(
                 "btc_claim_by_maker",
-                view.btc.spend_txid.map(|t| t.to_string()),
+                view.taker_leg.spend_txid.map(|t| t.to_string()),
             );
             line(
                 "btc_refund_by_taker",
@@ -314,7 +314,7 @@ async fn main() -> Result<()> {
             );
             line(
                 "divi_lock",
-                view.divi
+                view.maker_leg
                     .as_ref()
                     .and_then(|l| l.outpoint)
                     .map(|o| o.txid.to_string()),
@@ -325,7 +325,7 @@ async fn main() -> Result<()> {
             );
             line(
                 "divi_spend_by_maker",
-                view.divi
+                view.maker_leg
                     .as_ref()
                     .and_then(|l| l.spend_txid)
                     .map(|t| t.to_string()),

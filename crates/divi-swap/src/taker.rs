@@ -116,7 +116,7 @@ impl Taker {
                 r.state
             )));
         }
-        let h = maker.btc.htlc;
+        let h = maker.taker_leg.htlc;
         h.validate()?;
         let bad = |what: &str| SwapError::InvalidParams(format!("maker's BTC HTLC: {what}"));
         if h.hash != r.hash {
@@ -240,7 +240,7 @@ impl Taker {
         if self.btc_refundable(r).await? {
             return self.enter(r, TakerState::Refunded);
         }
-        let Some(leg) = maker.and_then(|m| m.divi.as_ref()) else {
+        let Some(leg) = maker.and_then(|m| m.maker_leg.as_ref()) else {
             return Ok(Flow::Idle);
         };
         let Some(op) = leg.outpoint else {

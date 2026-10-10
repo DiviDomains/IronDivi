@@ -26,6 +26,7 @@ pub mod store;
 pub mod taker;
 pub mod types;
 
+pub use api::Direction;
 pub use backend::ChainBackend;
 pub use config::{Profile, SwapConfig};
 pub use error::{Result, SwapError};

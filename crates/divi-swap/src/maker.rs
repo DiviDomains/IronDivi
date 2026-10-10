@@ -126,6 +126,7 @@ impl Maker {
         let quote = Quote {
             id: uuid::Uuid::new_v4().to_string(),
             offer_id: offer.id.clone(),
+            direction: offer.direction,
             btc_amount: crate::types::Amount(btc_sats),
             divi_amount,
             expires_at: (self.clock)() + self.cfg.quote_expiry_secs as u64,
@@ -588,13 +589,13 @@ fn view_of(r: &MakerRecord) -> SwapView {
         id: r.id.clone(),
         state: r.state,
         quote: r.quote.clone(),
-        btc: LegView {
+        taker_leg: LegView {
             htlc: r.btc_htlc,
             amount: r.quote.btc_amount,
             outpoint: r.btc_outpoint,
             spend_txid: r.btc_claim.as_ref().map(|t| t.txid),
         },
-        divi: match (&r.divi_htlc, &r.divi_funding) {
+        maker_leg: match (&r.divi_htlc, &r.divi_funding) {
             (Some(h), Some(f)) => Some(LegView {
                 htlc: *h,
                 amount: f.amount,
