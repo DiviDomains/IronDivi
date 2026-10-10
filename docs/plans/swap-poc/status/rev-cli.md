@@ -3,7 +3,7 @@
 - running: -
 - broken: e2e_mock_rev_happy_path, e2e_mock_rev_refund fail until rev-engine lands (Taker/Maker engine still forward-only on main)
 - left: rebase on rev-engine; adapt TakerRecord field names (btc_htlc/divi_htlc -> role-based) in flow.rs `release` and txids.rs; rerun check-rev-cli.sh
-- last_sha: (see git log)
+- last_sha: 8bb9c53
 - decisions: DIVI wallet file mode via process umask 0o077 using an extern "C" umask declaration (no new dep) plus chmod of an existing file; BTC balance read from esplora /address/{addr} (chain+mempool funded-spent) since BtcBackend has no balance; `balance` needs --backend live; default config ships both offers at the same rate/limits; wallet is scanned to tip before lock/run/balance only when --divi-wallet is given; --divi-wallet with mock backend is an error
-- needs: deploy/divi-swapd/divi-swapd.toml.example should add the reverse offer `btc-divi-testnet` (direction = "taker_pays_divi"); orchestrator live run should pass --divi-scan-from 343648
+- needs: rev-engine must land on main (the two e2e_mock_rev_* tests drive the engine; nothing in bin/ can fix them); deploy/divi-swapd/divi-swapd.toml.example should add the reverse offer `btc-divi-testnet` (direction = "taker_pays_divi"); orchestrator live run should pass --divi-scan-from 343648
 - parked: -
