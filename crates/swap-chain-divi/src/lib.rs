@@ -154,6 +154,11 @@ impl DiviBackend {
         self.wallet.lock().balance()
     }
 
+    /// Next height a scan should start from, as saved by the last completed `scan_blocks`.
+    pub fn scanned_height(&self) -> Option<u64> {
+        self.wallet.lock().scanned_height
+    }
+
     /// Never spend outputs of `txid`.
     pub fn exclude_txid(&self, txid: Txid) -> Result<()> {
         self.wallet.lock().exclude_txid(txid)

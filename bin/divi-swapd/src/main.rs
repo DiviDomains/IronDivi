@@ -121,6 +121,8 @@ async fn live_backends(cfg: &DaemonConfig) -> Result<Backends> {
     )?;
     tracing::info!(address = %divi.address(), "divi backend ready");
     if let Some(from) = divi_cfg.scan_from_height {
+        // A saved wallet resumes where its last scan stopped; only a fresh one pays the full scan.
+        let from = divi.scanned_height().map_or(from, |h| h.max(from));
         match divi.scan_blocks(from).await {
             Ok(next) => tracing::info!(from, next, balance = divi.balance(), "divi wallet scanned"),
             Err(e) => tracing::warn!(error = %e, "divi wallet scan failed; continuing"),

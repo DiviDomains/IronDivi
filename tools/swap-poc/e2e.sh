@@ -111,8 +111,9 @@ echo "e2e: scenario=$scenario backend=$backend maker=$base state=$state"
 "$swapd" --config "$state/divi-swapd.toml" --backend "$backend" >>"$log" 2>&1 &
 daemon_pid=$!
 
+# First start scans the DIVI wallet from scan_from_height (~15 min); later starts resume from the saved wallet.
 ready=""
-for _ in $(seq 1 120); do
+for _ in $(seq 1 750); do
   kill -0 "$daemon_pid" 2>/dev/null || { tail -20 "$log" >&2; die "daemon exited during startup"; }
   if [[ "$(curl -s "$base/healthz" | jq -r '.ok // empty' 2>/dev/null)" == true ]]; then ready=1; break; fi
   sleep 2
