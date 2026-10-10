@@ -4,6 +4,6 @@
 - running: final fmt/clippy/test run
 - broken: nothing known
 - left: check-rev-engine.sh
-- last_sha: (set at commit)
+- last_sha: see git log (rebased onto rev-cli 8bb9c53)
 - decisions: reverse timeout profiles unchanged (DECISIONS #9); window-too-short measured on the taker-leg chain clock; Taker::new signature kept (divi, btc) — legs picked by quote.direction
 - needs: nothing

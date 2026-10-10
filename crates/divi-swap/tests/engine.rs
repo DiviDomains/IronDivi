@@ -93,10 +93,6 @@ impl H {
         H::with(FWD)
     }
 
-    fn rev() -> H {
-        H::with(REV)
-    }
-
     fn with(dir: Direction) -> H {
         let btc = MockChain::new(Chain::Btc, T0, 600);
         let divi = MockChain::new(Chain::Divi, T0, 60);

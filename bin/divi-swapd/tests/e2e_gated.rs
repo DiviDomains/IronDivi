@@ -96,7 +96,7 @@ async fn late_claim_waits_then_both_sides_finish() {
         .get_taker_swap(&local)
         .unwrap()
         .unwrap();
-    let locktime = rec.divi_htlc.unwrap().locktime;
+    let locktime = rec.maker_leg_htlc.unwrap().locktime;
     let left = locktime.saturating_sub(w.divi.mtp());
     assert!((1800..=lead).contains(&left), "{left}s before timeout");
 
@@ -163,7 +163,7 @@ async fn never_claim_ends_in_refunds() {
         .get_taker_swap(&local)
         .unwrap()
         .unwrap();
-    assert!(rec.divi_claim.is_none());
-    assert!(rec.btc_refund.is_some());
+    assert!(rec.maker_leg_claim.is_none());
+    assert!(rec.taker_leg_refund.is_some());
     d.stop();
 }

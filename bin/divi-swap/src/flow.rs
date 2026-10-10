@@ -207,8 +207,8 @@ async fn release(g: &ClaimGate, local: &str) -> Result<bool> {
         .get_taker_swap(local)?
         .ok_or_else(|| anyhow::anyhow!("no taker record {local}"))?;
     let (htlc, chain) = match rec.quote.direction.maker_chain() {
-        Chain::Divi => (rec.divi_htlc, &g.divi),
-        Chain::Btc => (rec.btc_htlc, &g.btc),
+        Chain::Divi => (rec.maker_leg_htlc, &g.divi),
+        Chain::Btc => (rec.maker_leg_htlc, &g.btc),
     };
     let locktime = htlc
         .ok_or_else(|| anyhow::anyhow!("MakerLockConfirmed without a maker-leg lock"))?

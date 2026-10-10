@@ -40,9 +40,12 @@ pub fn lines(rec: &TakerRecord, view: &SwapView) -> Vec<String> {
             out.push(format!("{k}={v}"));
         }
     };
-    let funding = rec.btc_funding.as_ref().map(|f| f.tx.txid.to_string());
-    let claim = rec.divi_claim.as_ref().map(|t| t.txid.to_string());
-    let refund = rec.btc_refund.as_ref().map(|t| t.txid.to_string());
+    let funding = rec
+        .taker_leg_funding
+        .as_ref()
+        .map(|f| f.tx.txid.to_string());
+    let claim = rec.maker_leg_claim.as_ref().map(|t| t.txid.to_string());
+    let refund = rec.taker_leg_refund.as_ref().map(|t| t.txid.to_string());
     let maker_lock = view
         .maker_leg
         .as_ref()
