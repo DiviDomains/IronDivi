@@ -11,12 +11,7 @@
   swaps.db empty. deploy.sh health-check wait raised to 20 min (wallet scan from 339800 takes ~14 min).
   00:55 UTC: redeployed with bind-first (`a5b7a96`): `divi-swapd up` 1 s after start, healthz 200 with
   `divi_scan` scanning → done in 9 s (resumed from saved cursor 342820); network testnet. No probe outage.
-- **Running:**
-  - divi-swapd on dnsdivi (systemd, testnet3, healthy, bind-first)
-  - secret-broker pane `ae8a03fc…` (tab 0:7) — keep it open while live runs need keys
-  - btc lane: live_fund_claim_refund on testnet3; funding `9a5d15905f8295f472c5d5233a0970ba34adaffe823b0d415df79f1498cb1fae` confirmed
-  - e2e-local lane: mock check, then happy → case-d → case-c (brief `~/.local/state/iron-divi-swap-poc/briefs/e2e-local.md`)
-  - chaos lane: mock check, then waits for "GO chaos" (brief `…/briefs/chaos.md`)
+- **Running:** divi-swapd on dnsdivi (systemd, testnet3, healthy, bind-first). All lanes done.
 - **Broken:** first live happy (01:05 UTC) aborted: maker misread taker lock `9b62069b…` as mismatched (esplora backend
   race) and taker failed on Core -27 'outputs already in utxo set'. Fixed in `53c2bb3` (e2e lane); 10k sats in HTLC
   `9b62069b…:0` refundable after locktime 1791620729 — e2e lane owns the refund. dnsdivi still runs pre-`53c2bb3`:
@@ -25,14 +20,10 @@
   Otherwise none. CI green on main through `7038c70`.
 - **Parked:** none (PARKED #2 resolved 2026-10-10).
 - **Compactions:** orchestrator 4; engine 1
-- **Live proofs so far (testnet3):** btc 0.4 PASS (`e020335`); e2e-local happy, case-d, case-c Done (check-e2e-local PASS);
-  chaos live 11/11 confirmed (check-chaos PASS; taker BTC refund pending, locktime 1791624351);
-  **deployed happy Done** (taker `8b8943ac`, maker `39a3401d` on dnsdivi, `10859ad`); deployed case-C running since
-  06:58 UTC (maker `406b03ad`; refunds ~10:00 / ~14:00 UTC) through the orchestrator-held tunnel. RESULTS.md filled (`1c415b4`).
-  Pending refunds: aborted `252aa984` (locktime 1791620729), chaos taker BTC, deployed case-C both sides.
-- **Next (serialize taker funding — one funding UTXO chain):**
-  1. e2e-local happy → case-d → case-c (each after the previous BTC lock confirms)
-  2. chaos live; 3. e2e happy + case C vs deployed maker via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`
-  4. sweep taker + maker BTC leftovers to tb1qerzrlxcfu24davlur5sqmgzzgsal6wusda40er (testnet3); RESULTS.md; final report
+- **DONE 2026-10-10 13:40 UTC:** every plan §1 item proven with confirmed txids (RESULTS.md §1 checklist).
+  Deployed happy (maker `39a3401d`) and case C (maker `406b03ad`) Done on dnsdivi; chaos live done; e2e-local done.
+  Tunnel closed. Leftover tBTC swept to the faucet return address (`3b4facaa…`, `1d80be5d…`).
+  divi-swapd keeps running on dnsdivi (testnet3, no open swaps; maker BTC wallet now empty, DIVI ~24.8k tDIVI).
+  Open: the plan's "promo page Status line" — no such page found in IronDivi, sibling repos or DiviDomains GitHub.
 - Avada: lanes in tabs 0:6 "Divi Swap 1" (orchestrator, engine, daemon, deploy) and 0:7 "Divi Swap 2" (btc, divi, e2e-local, chaos, secret-broker).
   Long briefs go in a file; a long `ctl submit` gets truncated.

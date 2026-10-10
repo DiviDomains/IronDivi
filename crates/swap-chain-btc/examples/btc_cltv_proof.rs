@@ -15,6 +15,7 @@
 //! cargo run -p swap-chain-btc --example btc_cltv_proof -- fund <state.json>   # uses key's UTXOs
 //! cargo run -p swap-chain-btc --example btc_cltv_proof -- claim <state.json>
 //! cargo run -p swap-chain-btc --example btc_cltv_proof -- refund <state.json> # after locktime
+//! cargo run -p swap-chain-btc --example btc_cltv_proof -- sweep <tb1 address> # all UTXOs out
 //! ```
 
 use bitcoin::absolute::LockTime;
@@ -240,9 +241,70 @@ async fn main() {
                 }
             }
         }
+        "sweep" => {
+            // Spend every UTXO on the key address to one output: returns leftover test coins.
+            let dest = Address::from_str(&args[2])
+                .expect("destination address")
+                .require_network(Network::Testnet)
+                .expect("tb1 address");
+            let utxos: Value =
+                serde_json::from_str(&get(&format!("/address/{addr}/utxo")).await).unwrap();
+            let coins: Vec<(OutPoint, u64)> = utxos
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|u| u["status"]["confirmed"].as_bool() == Some(true))
+                .map(|u| {
+                    let txid = Txid::from_str(u["txid"].as_str().unwrap()).unwrap();
+                    let vout = u["vout"].as_u64().unwrap() as u32;
+                    (OutPoint::new(txid, vout), u["value"].as_u64().unwrap())
+                })
+                .collect();
+            assert!(!coins.is_empty(), "no confirmed UTXOs on key address");
+            let total: u64 = coins.iter().map(|c| c.1).sum();
+            // 2 sat/vB: 11 vB overhead + 31 vB output + 68 vB per P2WPKH input.
+            let fee = 2 * (11 + 31 + 68 * coins.len() as u64);
+            let mut tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: coins
+                    .iter()
+                    .map(|c| TxIn {
+                        previous_output: c.0,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(total - fee),
+                    script_pubkey: dest.script_pubkey(),
+                }],
+            };
+            for (i, c) in coins.iter().enumerate() {
+                let sig = sign(&tx, i, &my_spk, c.1, false);
+                tx.input[i].witness = Witness::from_slice(&[sig, pk.to_bytes().to_vec()]);
+            }
+            let raw = serialize(&tx);
+            for (i, c) in coins.iter().enumerate() {
+                bitcoin::consensus::verify_script(&my_spk, i, Amount::from_sat(c.1), &raw)
+                    .unwrap_or_else(|e| panic!("consensus verify sweep input {i}: {e:?}"));
+            }
+            eprintln!(
+                "sweep: {} inputs, {total} sats, fee {fee}, to {dest}",
+                coins.len()
+            );
+            match broadcast(&tx).await {
+                Ok(txid) => println!("sweep txid {txid}"),
+                Err(e) => {
+                    println!("sweep rejected: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             eprintln!(
-                "usage: btc_cltv_proof address | fund <state> | claim <state> | refund <state>"
+                "usage: btc_cltv_proof address | fund <state> | claim <state> | refund <state> | sweep <tb1 address>"
             );
             std::process::exit(2);
         }
