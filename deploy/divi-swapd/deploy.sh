@@ -88,7 +88,9 @@ install -d -m 0700 -o root -g root /etc/divi-swapd/credentials"
   step "install binary (keeping previous as .prev) and config"
   remote "[ ! -f /usr/local/bin/divi-swapd ] || cp -p /usr/local/bin/divi-swapd /usr/local/bin/divi-swapd.prev
 install -m 0755 $SRC_DIR/target/release/divi-swapd /usr/local/bin/divi-swapd
-[ -f /etc/divi-swapd/divi-swapd.toml ] || install -m 0640 -o root -g $SVC $SRC_DIR/deploy/divi-swapd/divi-swapd.toml.example /etc/divi-swapd/divi-swapd.toml"
+[ -f /etc/divi-swapd/divi-swapd.toml ] || install -m 0640 -o root -g $SVC $SRC_DIR/deploy/divi-swapd/divi-swapd.toml.example /etc/divi-swapd/divi-swapd.toml
+# Configs from before the reverse direction list only the forward offer; add the reverse one once.
+grep -q '\"btc-divi-testnet\"' /etc/divi-swapd/divi-swapd.toml || printf '%s\n' '' '[[offers]]' 'id = \"btc-divi-testnet\"' 'direction = \"taker_pays_divi\"' 'divi_sats_per_btc = 300000000000000' 'min_btc_sats = 5000' 'max_btc_sats = 50000' >> /etc/divi-swapd/divi-swapd.toml"
 
   step "install systemd unit and logrotate"
   remote "install -m 0644 $SRC_DIR/deploy/divi-swapd/divi-swapd.service /etc/systemd/system/divi-swapd.service

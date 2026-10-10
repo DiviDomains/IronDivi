@@ -17,10 +17,19 @@ esplora_url = "https://mempool.space/signet/api"
 fallback_esplora_url = "https://blockstream.info/signet/api"
 key = "credential:maker-btc"
 
-# Standing offers (maker sells DIVI for BTC). Price is DIVI sats per 1 BTC.
+# Standing offers. Price is DIVI sats per 1 BTC; min/max are BTC sats in both directions.
+# direction: "taker_pays_btc" (maker sells DIVI, the default) or "taker_pays_divi" (maker sells BTC).
 [[offers]]
 id = "divi-btc-testnet"
+direction = "taker_pays_btc"
 divi_sats_per_btc = 300000000000000   # 3,000,000 DIVI per BTC
+min_btc_sats = 5000
+max_btc_sats = 50000
+
+[[offers]]
+id = "btc-divi-testnet"
+direction = "taker_pays_divi"
+divi_sats_per_btc = 300000000000000
 min_btc_sats = 5000
 max_btc_sats = 50000
 
