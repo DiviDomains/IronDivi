@@ -190,9 +190,9 @@ if [[ -n "$reverse" && "$backend" == live ]]; then
       die "maker has ${have:-0} confirmed BTC sats at $E2E_MAKER_BTC_ADDRESS, needs >= $((btc_sats + 5000))"
     fi
   fi
-  # Taker DIVI: `divi-swap balance` prints a line with the spendable DIVI sats (first integer on the line mentioning divi).
-  bal_out="$("${taker[@]}" balance 2>&1)" || die "divi-swap balance failed: ${bal_out:0:300}"
-  have_divi="$(grep -i divi <<<"$bal_out" | grep -oE '[0-9]+' | head -1)"
+  # Taker DIVI: `divi-swap balance` prints `divi_balance_sats=<n>` on stdout (scan progress goes to stderr).
+  bal_out="$("${taker[@]}" balance 2>/dev/null)" || die "divi-swap balance failed: ${bal_out:0:300}"
+  have_divi="$(sed -n 's/^divi_balance_sats=\([0-9][0-9]*\)$/\1/p' <<<"$bal_out")"
   [[ "${have_divi:-0}" -gt 0 ]] || die "taker has no spendable DIVI (balance output: ${bal_out:0:300}); fund the taker DIVI wallet first"
   echo "e2e: preflight ok (offer $offer advertised, maker BTC backend up, taker DIVI balance $have_divi)"
 fi
