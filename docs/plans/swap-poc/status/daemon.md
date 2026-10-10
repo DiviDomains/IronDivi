@@ -12,3 +12,5 @@
 - decisions: divi scan_from_height is applied at startup via DiviBackend::scan_blocks (failure is a warning); CLI live backend uses the default testnet RPC URL
 - smoke: 2026-10-08 live run with op:// maker keys on port 18481: GET /healthz -> {"ok":true,"version":"0.2.4","divi":{"tip":339964,"error":null},"btc":{"tip":325424,"error":null}}; maker DIVI wallet scanned from 339800, balance 24799.91965 DIVI
 - last_sha: 031504f
+- decisions: bind first, DIVI wallet scan runs in the background in 500-block chunks; cursor (scanned_height) persisted in wallet_path after each chunk; resume from max(scan_from_height, cursor); failures retried every 30s and shown in healthz; quote/accept 503 'wallet scan in progress' and scheduler ticks deferred until done; /healthz ok=false until done, adds divi_scan{state,next_height,target_height,error}
+- last_sha: c3cfa11
