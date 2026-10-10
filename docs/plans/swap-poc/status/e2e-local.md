@@ -22,7 +22,7 @@
 - casec_btc_refund_txid: b2ba4d8dbcbf8a1a9865a86db03130d8f3fc992f56761cb962e9ec650736d938
 - running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
 - left: record the refund txid of 252aa984; deployed-maker runs (e2e-deployed brief).
-- running: deployed `happy` via the orchestrator's tunnel (`e2e.sh happy --maker-url http://127.0.0.1:18480`); deployed `case-c` follows.
+- running: deployed `case-c` via the orchestrator's tunnel (`e2e.sh case-c --maker-url http://127.0.0.1:18480`; default profile, refunds ~6 h).
 - broken: nothing known.
 - parked: nothing.
 - blocked-on-human: no
@@ -31,3 +31,10 @@
 - decisions: state lives in `~/.local/state/iron-divi-swap-poc/<scenario>-<backend>/` (outside the repo); previous runs are moved to `old-<stamp>/`. Ports 18491/18492/18493. Each swap uses E2E_BTC_SATS=10000 (<= 20,000).
 - needs: nothing.
 - last_sha: b865c90
+
+## deployed maker
+- done: deployed `happy` against dnsdivi divi-swapd (53c2bb3, default testnet profile) via the orchestrator's tunnel (swap 8b8943ac, both sides Done; BTC lock confirmed in block 5157875).
+- deployed_happy_btc_lock_txid: edb08a4a96d3d48b4f7d712e69b00fa27b19ed4308b911d12cacb0d8823c7b73
+- deployed_happy_divi_lock_txid: f812792bf5ce967e6a4abac6cc0bf5d2d90ec1ab927c71547d2bb946e03e095a
+- deployed_happy_divi_claim_txid: 2b3e0fce46471664282c07cb97e2d9fec45fe5df891835c62175f833f74694ab
+- deployed_happy_btc_claim_txid: 54844a09089e70901e4af1cc2fd628507b0f5a9b5dd105e2baa1d3298626e4bd
