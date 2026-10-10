@@ -67,6 +67,7 @@ async fn late_claim_waits_then_both_sides_finish() {
         },
         store: Store::open(&tdb).unwrap(),
         divi: Arc::new(w.taker_divi.clone()),
+        btc: Arc::new(w.taker_btc.clone()),
     };
     let mut polls = 0u32;
     let (local, state) = flow::run_swap_gated(
@@ -134,6 +135,7 @@ async fn never_claim_ends_in_refunds() {
         policy: ClaimPolicy::Never,
         store: Store::open(&tdb).unwrap(),
         divi: Arc::new(w.taker_divi.clone()),
+        btc: Arc::new(w.taker_btc.clone()),
     };
     let (local, state) = flow::run_swap_gated(
         &taker,

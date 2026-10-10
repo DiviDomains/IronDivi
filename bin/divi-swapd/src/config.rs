@@ -76,13 +76,20 @@ fn default_profile() -> Profile {
     Profile::Testnet
 }
 fn default_offers() -> Vec<Offer> {
-    vec![Offer {
-        id: "divi-btc-testnet".into(),
-        direction: divi_swap::api::Direction::TakerPaysBtc,
+    use divi_swap::api::Direction;
+    [
+        ("divi-btc-testnet", Direction::TakerPaysBtc),
+        ("btc-divi-testnet", Direction::TakerPaysDivi),
+    ]
+    .into_iter()
+    .map(|(id, direction)| Offer {
+        id: id.into(),
+        direction,
         divi_sats_per_btc: 300_000_000_000_000,
         min_btc_sats: 5_000,
         max_btc_sats: 50_000,
-    }]
+    })
+    .collect()
 }
 fn default_tick() -> u64 {
     5
@@ -183,6 +190,7 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use divi_swap::api::Direction;
 
     const GOOD: &str = r#"
 db_path = "/tmp/x.db"
@@ -229,6 +237,37 @@ key = "credential:btc"
         assert_eq!((c.maker_timeout_secs, c.taker_timeout_secs), (1800, 20000));
         let bad = format!("{GOOD}\n[swap]\nmaker_timeout_secs = 1800\ntaker_timeout_secs = 3600\n");
         assert!(DaemonConfig::parse(&bad).unwrap().swap_config().is_err());
+    }
+
+    #[test]
+    fn old_config_without_direction_parses() {
+        let c = DaemonConfig::parse(GOOD).unwrap();
+        assert_eq!(c.offers[0].direction, Direction::TakerPaysBtc);
+        let reverse = GOOD.replace(
+            "id = \"o1\"",
+            "id = \"o1\"\ndirection = \"taker_pays_divi\"",
+        );
+        let c = DaemonConfig::parse(&reverse).unwrap();
+        assert_eq!(c.offers[0].direction, Direction::TakerPaysDivi);
+    }
+
+    #[test]
+    fn default_offers_cover_both_directions() {
+        let text = "db_path = \"/tmp/x.db\"";
+        let c = DaemonConfig::parse(text).unwrap();
+        let ids: Vec<_> = c
+            .offers
+            .iter()
+            .map(|o| (o.id.as_str(), o.direction))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("divi-btc-testnet", Direction::TakerPaysBtc),
+                ("btc-divi-testnet", Direction::TakerPaysDivi)
+            ]
+        );
+        assert_eq!(c.offers[0].divi_sats_per_btc, c.offers[1].divi_sats_per_btc);
     }
 
     #[test]

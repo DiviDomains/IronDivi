@@ -57,7 +57,7 @@ async fn offers_list() {
     let d = serve(&w, w.maker(Store::in_memory().unwrap()), None).await;
     let (code, body) = get_json(&format!("{}/offers", d.base)).await;
     assert_eq!(code, 200);
-    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body.as_array().unwrap().len(), 2);
     assert_eq!(body[0]["id"], OFFER_ID);
     // Routes exist only under the configured prefix.
     let bare = d.base.replace("/swap", "");
@@ -68,6 +68,31 @@ async fn offers_list() {
             .status(),
         404
     );
+    d.stop();
+}
+
+#[tokio::test]
+async fn offers_list_has_both_directions() {
+    let w = World::new();
+    let d = serve(&w, w.maker(Store::in_memory().unwrap()), None).await;
+    let (code, body) = get_json(&format!("{}/offers", d.base)).await;
+    assert_eq!(code, 200);
+    let dir = |id: &str| {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .map(|o| o["direction"].clone())
+    };
+    assert_eq!(dir(OFFER_ID), Some("taker_pays_btc".into()));
+    assert_eq!(dir(REV_OFFER_ID), Some("taker_pays_divi".into()));
+    let (code, q) = get_json(&format!(
+        "{}/offers/{REV_OFFER_ID}/quote?btc_sats={BTC_SATS}",
+        d.base
+    ))
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(q["direction"], "taker_pays_divi");
     d.stop();
 }
 

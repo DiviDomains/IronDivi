@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use divi_swap::taker::TAKER_SAFETY_MARGIN_SECS;
-use divi_swap::{ChainBackend, Store, Taker, TakerState};
+use divi_swap::{Chain, ChainBackend, Store, Taker, TakerState};
 
 use crate::client::MakerClient;
 use crate::session::{Session, Sessions};
@@ -73,11 +73,13 @@ impl ClaimPolicy {
 }
 
 /// What a gated run needs to read from: the taker's own store (the maker lock's locktime)
-/// and the DIVI backend (its median time).
+/// and the backend of the maker-leg chain (its median time): DIVI going forward, BTC in
+/// reverse.
 pub struct ClaimGate {
     pub policy: ClaimPolicy,
     pub store: Store,
     pub divi: Arc<dyn ChainBackend>,
+    pub btc: Arc<dyn ChainBackend>,
 }
 
 /// Quote, accept, lock, then step the taker until `Done`. `pump` is called once per poll
@@ -204,11 +206,14 @@ async fn release(g: &ClaimGate, local: &str) -> Result<bool> {
         .store
         .get_taker_swap(local)?
         .ok_or_else(|| anyhow::anyhow!("no taker record {local}"))?;
-    let locktime = rec
-        .divi_htlc
-        .ok_or_else(|| anyhow::anyhow!("MakerLockConfirmed without a DIVI lock"))?
+    let (htlc, chain) = match rec.quote.direction.maker_chain() {
+        Chain::Divi => (rec.divi_htlc, &g.divi),
+        Chain::Btc => (rec.btc_htlc, &g.btc),
+    };
+    let locktime = htlc
+        .ok_or_else(|| anyhow::anyhow!("MakerLockConfirmed without a maker-leg lock"))?
         .locktime;
-    let mtp = g.divi.median_time_past().await?;
+    let mtp = chain.median_time_past().await?;
     let open_at = match g.policy {
         ClaimPolicy::Asap => 0,
         ClaimPolicy::NotBefore {

@@ -29,6 +29,7 @@ use divi_swapd::{router, spawn_scheduler, AppState, ScanStatus};
 use tokio::task::JoinHandle;
 
 pub const OFFER_ID: &str = "o1";
+pub const REV_OFFER_ID: &str = "o1-rev";
 pub const BTC_SATS: u64 = 100_000;
 pub const T0: u32 = 1_700_000_000;
 
@@ -47,8 +48,8 @@ impl World {
         let btc = MockChain::new(Chain::Btc, T0, 600);
         World {
             maker_divi: divi.backend(1, Amount(1_000_000 * Amount::COIN)),
-            maker_btc: btc.backend(2, Amount(0)),
-            taker_divi: divi.backend(3, Amount(0)),
+            maker_btc: btc.backend(2, Amount(10 * Amount::COIN)),
+            taker_divi: divi.backend(3, Amount(1_000_000 * Amount::COIN)),
             taker_btc: btc.backend(4, Amount(10 * Amount::COIN)),
             divi,
             btc,
@@ -56,13 +57,20 @@ impl World {
     }
 
     pub fn offers() -> Vec<Offer> {
-        vec![Offer {
-            id: OFFER_ID.into(),
-            direction: divi_swap::api::Direction::TakerPaysBtc,
+        use divi_swap::api::Direction;
+        [
+            (OFFER_ID, Direction::TakerPaysBtc),
+            (REV_OFFER_ID, Direction::TakerPaysDivi),
+        ]
+        .into_iter()
+        .map(|(id, direction)| Offer {
+            id: id.into(),
+            direction,
             divi_sats_per_btc: 1_000 * Amount::COIN,
             min_btc_sats: 1_000,
             max_btc_sats: 10_000_000,
-        }]
+        })
+        .collect()
     }
 
     pub fn maker(&self, store: Store) -> Arc<Maker> {
