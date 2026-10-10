@@ -55,7 +55,7 @@ Every txid, address and test result, newest last.
 - BTC network switched to testnet3 (DECISIONS #8). Redeploys: 2026-10-10 00:38 UTC (v0.2.5, testnet3), 00:55 UTC bind-first
   (`a5b7a96`: `divi-swapd up` 1 s after start, healthz reports `divi_scan`, resumed scan done in 9 s; no probe outage),
   05:42 UTC from `504da62` (includes `53c2bb3`); healthz `ok:true` after an 83 s catch-up scan.
-- The first local live happy (01:05 UTC) aborted on an Esplora `/tx` 404 race and Core -27; fixed in `53c2bb3` before any deployed run. Its 10,000 sats (HTLC `9b62069b…:0`, swap `252aa984…`) refund after locktime 1791620729.
+- The first local live happy (01:05 UTC) aborted on an Esplora `/tx` 404 race and Core -27; fixed in `53c2bb3` before any deployed run. Its 10,000 sats (HTLC `9b62069b…:0`, swap `252aa984…`) refunded after locktime 1791620729: `564f4c60e7d5017d69df1cf189cde19b3f772124c48fb61e13e93a3f9d8838a0`.
 - **e2e against the deployed maker** (`e2e.sh <scenario> --maker-url http://127.0.0.1:18480`, `b865c90`, via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`; default testnet profile maker 10800 s / taker 21600 s; 10,000 sats):
   - **happy** — taker swap `8b8943ac-2afb-46b9-9045-c0c40c5bcf35`, maker swap `39a3401d-4202-4c13-944a-13687d316929` (dnsdivi `/var/lib/divi-swapd/swaps.db`: `Done`). Both claims confirmed:
     BTC lock `edb08a4a96d3d48b4f7d712e69b00fa27b19ed4308b911d12cacb0d8823c7b73` (block 5157875),
