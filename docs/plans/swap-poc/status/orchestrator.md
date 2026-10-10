@@ -24,6 +24,6 @@
   Deployed happy (maker `39a3401d`) and case C (maker `406b03ad`) Done on dnsdivi; chaos live done; e2e-local done.
   Tunnel closed. Leftover tBTC swept to the faucet return address (`3b4facaa…`, `1d80be5d…`).
   divi-swapd keeps running on dnsdivi (testnet3, no open swaps; maker BTC wallet now empty, DIVI ~24.8k tDIVI).
-  Open: the plan's "promo page Status line" — no such page found in IronDivi, sibling repos or DiviDomains GitHub.
+  Promo-page "Status" line: not applicable, no such page exists (Bert, 2026-10-10). Sweeps confirmed in block 5157959.
 - Avada: lanes in tabs 0:6 "Divi Swap 1" (orchestrator, engine, daemon, deploy) and 0:7 "Divi Swap 2" (btc, divi, e2e-local, chaos, secret-broker).
   Long briefs go in a file; a long `ctl submit` gets truncated.
