@@ -157,7 +157,7 @@ if [[ "$backend" == live ]]; then
   taker+=(--divi-key "$(ref taker-divi)" --btc-key "$(ref taker-btc)")
 fi
 # Reverse: the taker locks DIVI, so it needs a DIVI wallet (outside the repo, mode 0600; the scan resumes from its cursor).
-if [[ -n "$reverse" ]]; then
+if [[ -n "$reverse" && "$backend" == live ]]; then  # the flag is rejected on mock
   taker_wallet="$(dirname "$state")/taker-divi-wallet.json"
   # Older CLIs (before rev-cli landed) lack the flag; fine for mock plumbing, fatal for a live run.
   if "$swap" --help 2>&1 | grep -q -- '--divi-wallet'; then
