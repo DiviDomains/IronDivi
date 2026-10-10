@@ -59,9 +59,11 @@ ref() { echo "$vault/IronDivi Swap POC - $1/password"; }
 
 if [[ "$backend" == live ]]; then
   # Fail fast, once, before anything starts: an unanswered 1Password prompt is a park, not a retry.
+  # Through the secret proxy (cache, then secret-broker), which also warms its cache for the
+  # daemon and CLI; a raw 1Password CLI call from here would be a Touch ID dialog per key.
   for k in maker-divi maker-btc taker-divi taker-btc; do
-    if ! timeout 90 op read "$(ref "$k")" >/dev/null 2>&1; then
-      die "cannot read the $k key from 1Password (locked, or authorization timeout). Unlock 1Password and rerun."
+    if ! secret get --name "irondivi-swap-poc-$k-password" --op-ref "$(ref "$k")" >/dev/null 2>&1; then
+      die "cannot read the $k key (1Password locked, or secret-broker not running: secret-broker status). Rerun once it is up."
     fi
   done
 fi

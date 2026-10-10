@@ -10,8 +10,10 @@
 //!
 //! Keys are resolved into memory at startup and never written to disk, logged, or put on
 //! argv. Two sources, no silent fallback between them:
-//! - `op://vault/item/field` — `op read` (the 1Password CLI; interactive or service account
-//!   via `OP_SERVICE_ACCOUNT_TOKEN` in the environment);
+//! - `op://vault/item/field` — `secret get --name <item> --op-ref <ref>` (the secret proxy:
+//!   cache → `secret-broker` → 1Password CLI). Agent shells may not call the 1Password CLI
+//!   directly: each raw call is a new 1Password session and a new Touch ID dialog
+//!   (`secret-management.md` §2 rule 10). Resolve once per process;
 //! - `credential:<name>` — a systemd `LoadCredential=` file under `$CREDENTIALS_DIRECTORY`
 //!   (ramfs, readable only by the service), used on dnsdivi.
 
@@ -50,22 +52,25 @@ impl SecretRef {
     pub fn resolve(&self) -> Result<Zeroizing<String>> {
         let value = match self {
             SecretRef::OnePassword(r) => {
-                let out = Command::new("op")
-                    .args(["read", "--no-newline", r])
+                let out = Command::new("secret")
+                    .args(["get", "--name", &cache_name(r), "--op-ref", r])
                     .stdin(std::process::Stdio::null())
                     .output()
-                    .map_err(|e| SwapError::Secret(format!("cannot run op: {e}")))?;
+                    .map_err(|e| SwapError::Secret(format!("cannot run secret: {e}")))?;
                 let stdout = Zeroizing::new(out.stdout);
                 if !out.status.success() {
+                    // Exit 2: 1Password unavailable (nobody approved, or the broker is down): a pause.
                     return Err(SwapError::Secret(format!(
-                        "op read {r} failed (exit {:?}): {}",
+                        "secret get {r} failed (exit {:?}): {}",
                         out.status.code(),
                         String::from_utf8_lossy(&out.stderr).trim()
                     )));
                 }
                 Zeroizing::new(
                     String::from_utf8(stdout.to_vec())
-                        .map_err(|_| SwapError::Secret(format!("{r} is not UTF-8")))?,
+                        .map_err(|_| SwapError::Secret(format!("{r} is not UTF-8")))?
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string(),
                 )
             }
             SecretRef::SystemdCredential(name) => {
@@ -91,9 +96,37 @@ impl SecretRef {
     }
 }
 
+/// Proxy cache key for an `op://vault/item/field` reference: item and field, slugged.
+fn cache_name(r: &str) -> String {
+    let path = r.trim_start_matches("op://");
+    let tail = path.split_once('/').map_or(path, |(_, rest)| rest);
+    let slug: String = tail
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug.split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_names() {
+        assert_eq!(
+            cache_name("op://global_secret_store/IronDivi Swap POC - taker-btc/password"),
+            "irondivi-swap-poc-taker-btc-password"
+        );
+    }
 
     #[test]
     fn parse_refs() {
