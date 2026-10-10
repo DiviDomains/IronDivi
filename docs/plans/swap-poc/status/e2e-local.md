@@ -15,9 +15,13 @@
 - cased_divi_claim_txid: 365b5478383f8074e307e99a83004d57687d7e4c2e80a34929f815f774020733
 - cased_btc_claim_txid: 892784ecf811b305d3540adee0b3cdc213f56cc04df2e398766a87019f7643ce
 - cased_claim_secs_before_timeout: 2399
-- running: live `case-c` (~4 h).
+- done: live `case-c` on testnet3 (swap a84a56fa, both sides Done; taker never claimed, maker refunded DIVI, taker refunded BTC).
+- casec_btc_lock_txid: c2f46851b10059d55f5c610c37b318dcc7003be2b3ed6700767ceca616fa9ac7
+- casec_divi_lock_txid: 13654e6fee8376b5338da65457f7e1d0899afcc847c248d3c94d47788f3f7b58
+- casec_divi_refund_txid: ef319519f3fc004b84e0894c48b03839b063c55f81df500f7ba325305335136f
+- casec_btc_refund_txid: b2ba4d8dbcbf8a1a9865a86db03130d8f3fc992f56761cb962e9ec650736d938
 - running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
-- left: record the refund txid; live `case-c` results, one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
+- left: record the refund txid of 252aa984; deployed-maker runs (e2e-deployed brief).
 - broken: nothing known.
 - parked: nothing.
 - blocked-on-human: no
@@ -25,4 +29,4 @@
 - decisions: mock chains are per-process, so `--backend mock` covers plumbing only; claim-policy flows are tested in-process via the `World` harness.
 - decisions: state lives in `~/.local/state/iron-divi-swap-poc/<scenario>-<backend>/` (outside the repo); previous runs are moved to `old-<stamp>/`. Ports 18491/18492/18493. Each swap uses E2E_BTC_SATS=10000 (<= 20,000).
 - needs: nothing.
-- last_sha: 53c2bb3
+- last_sha: b865c90

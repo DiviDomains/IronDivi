@@ -41,7 +41,11 @@ Every txid, address and test result, newest last.
 - GitHub CI on `main` `53f1d03` (run 37712918965): Format, Clippy, Test, Build, Security Audit — all success (after allowing clippy 1.99 `double_must_use` on the `async_trait` trait).
 
 ## Wave 2
-- e2e-local: tooling done (`tools/swap-poc/e2e.sh`), live txids pending sBTC funding of the taker-btc address (PARKED.md #1). Results are recorded in `status/e2e-local.md` and will be copied here.
+- e2e-local: all three scenarios live on testnet3 (DIVI testnet + BTC testnet3), local maker, 10,000 sats each; `tools/swap-poc/check-e2e-local.sh` PASS (every txid confirmed).
+  - happy (swap 8e00af2e, default profile): BTC lock a1789248…5a90ce, DIVI lock 77c76a2b…b673c4, DIVI claim 3594a688…59e01e, BTC claim ae7b4e5b…dda45d.
+  - case D, late claim (swap 2611c82e, maker 3600 s / taker 14410 s): BTC lock 91152337…7413b1, DIVI lock ee0ccc51…2c9ed5, DIVI claim 365b5478…020733 (2399 s before the maker timeout), BTC claim 892784ec…7643ce.
+  - case C, taker never claims (swap a84a56fa): BTC lock c2f46851…fa9ac7, DIVI lock 13654e6f…7b58, maker DIVI refund ef319519…36f, taker BTC refund b2ba4d8d…d938.
+  - Full txids: `status/e2e-local.md`.
 
 ## Wave 3
 - Deploy to dnsdivi (`deploy.sh deploy`, 2026-10-08 01:45 UTC): release build with rust 1.98.1 in 7m 11s; systemd `divi-swapd.service` active, `NRestarts=0`, binds `127.0.0.1:18480` only (DECISIONS #7).
