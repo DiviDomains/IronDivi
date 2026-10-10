@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -243,12 +244,34 @@ class Run:
             with open(Path(self.a.workdir) / "results.txt", "a") as f:
                 f.write(line + "\n")
 
+    def run_mock_mechanics(self):
+        """Mock chains are per-process (taker and maker share none) and die with the daemon, so a
+        swap cannot finish. Prove only what the driver owns: hold, kill -9, restart, persistence,
+        proxy mode switching."""
+        self.hold("accepted")
+        sid, _ = self.begin()
+        self.kill_in("accepted", 60)
+        row = self.row()
+        assert row and row[0] == sid and row[1] == "accepted", f"row lost over kill -9: {row}"
+        for base, mode in ((self.divi_px, "502"), (self.esp_px, "429")):
+            self.px_mode(base, mode, 5 if mode == "429" else None)
+            try:
+                http("GET", base + "/x", timeout=5)
+                raise AssertionError(f"{mode} not injected")
+            except urllib.error.HTTPError as e:
+                assert e.code == int(mode), e.code
+            self.px_mode(base, "pass")
+        log(f"mock mechanics ok ({self.scenario})")
+
     # -- scenarios -----------------------------------------------------------------------
     def go(self):
         self.start_proxies()
         self.start_daemon()
         try:
-            getattr(self, "run_" + self.scenario)()
+            if self.a.backend == "mock":
+                self.run_mock_mechanics()
+            else:
+                getattr(self, "run_" + self.scenario)()
         finally:
             self.cleanup()
 
