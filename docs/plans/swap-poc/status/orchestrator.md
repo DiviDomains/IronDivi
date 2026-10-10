@@ -21,9 +21,13 @@
   race) and taker failed on Core -27 'outputs already in utxo set'. Fixed in `53c2bb3` (e2e lane); 10k sats in HTLC
   `9b62069b…:0` refundable after locktime 1791620729 — e2e lane owns the refund. dnsdivi still runs pre-`53c2bb3`:
   redeploy before the deployed-maker e2e.
+  05:42 UTC: dnsdivi redeployed from `504da62` (includes `53c2bb3`); healthz ok:true after an 83 s catch-up scan.
   Otherwise none. CI green on main through `7038c70`.
 - **Parked:** none (PARKED #2 resolved 2026-10-10).
 - **Compactions:** orchestrator 3; engine 1
+- **Live proofs so far (testnet3):** btc 0.4 PASS (`e020335`); e2e happy `8e00af2e` and case-d `2611c82e` Done;
+  chaos live 11/11 confirmed (`b4d3a76`, taker BTC refund pending timelock); case-c running; deployed-maker e2e next
+  (brief `…/briefs/e2e-deployed.md`).
 - **Next (serialize taker funding — one funding UTXO chain):**
   1. e2e-local happy → case-d → case-c (each after the previous BTC lock confirms)
   2. chaos live; 3. e2e happy + case C vs deployed maker via `ssh -N -L 18480:127.0.0.1:18480 dnsdivi`
