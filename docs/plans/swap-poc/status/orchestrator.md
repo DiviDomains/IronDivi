@@ -9,8 +9,10 @@
   2026-10-10 00:38 UTC: dnsdivi redeployed (v0.2.5) and switched to testnet3 (`/etc/divi-swapd/divi-swapd.toml`,
   signet copy at `.signet.bak`); healthz ok, divi tip 342838, btc tip 5157803, maker balance 24,799.91965 tDIVI,
   swaps.db empty. deploy.sh health-check wait raised to 20 min (wallet scan from 339800 takes ~14 min).
+  00:55 UTC: redeployed with bind-first (`a5b7a96`): `divi-swapd up` 1 s after start, healthz 200 with
+  `divi_scan` scanning → done in 9 s (resumed from saved cursor 342820); network testnet. No probe outage.
 - **Running:**
-  - divi-swapd on dnsdivi (systemd, testnet3, healthy)
+  - divi-swapd on dnsdivi (systemd, testnet3, healthy, bind-first)
   - secret-broker pane `ae8a03fc…` (tab 0:7) — keep it open while live runs need keys
   - btc lane: live_fund_claim_refund on testnet3; funding `9a5d15905f8295f472c5d5233a0970ba34adaffe823b0d415df79f1498cb1fae` confirmed
   - e2e-local lane: mock check, then happy → case-d → case-c (brief `~/.local/state/iron-divi-swap-poc/briefs/e2e-local.md`)
