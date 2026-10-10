@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Lane e2e-local acceptance. See docs/plans/swap-poc/lanes/e2e-local.md.
 source "$(dirname "$0")/lib.sh"
+# The live runs are on testnet3 (GO e2e, 2026-10-09).
+export SWAP_BTC_NETWORK="${SWAP_BTC_NETWORK:-testnet}"
 if [[ -f tools/swap-poc/e2e.sh ]]; then
   shellcheck tools/swap-poc/e2e.sh >/dev/null 2>&1 && pass "e2e.sh shellcheck" || fail "shellcheck tools/swap-poc/e2e.sh"
 else fail "missing tools/swap-poc/e2e.sh"; fi
