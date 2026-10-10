@@ -22,9 +22,10 @@
 - casec_btc_refund_txid: b2ba4d8dbcbf8a1a9865a86db03130d8f3fc992f56761cb962e9ec650736d938
 - running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
 - left: record the refund txid of 252aa984; deployed-maker runs (e2e-deployed brief).
+- running: deployed `happy` via the orchestrator's tunnel (`e2e.sh happy --maker-url http://127.0.0.1:18480`); deployed `case-c` follows.
 - broken: nothing known.
-- parked: deployed-maker runs. The tunnel `ssh -N -L 18480:127.0.0.1:18480 dnsdivi` failed once: the SSH agent could not sign with the dnsdivi key ("communication with agent failed", then Permission denied). Per the brief, no retry until a human confirms the agent is unlocked. `e2e.sh --maker-url` is ready (b865c90).
-- blocked-on-human: yes (SSH agent signing for dnsdivi)
+- parked: nothing.
+- blocked-on-human: no
 - decisions: case C/D use maker timeout 3600 s / taker 14410 s (taker safety margin is 1800 s so maker 1800 is impossible; gap 10810 >= required 10800). Happy uses the default testnet profile (21600/10800). Case D claims when DIVI MTP is 2400 s before the maker locktime (must exceed 1800).
 - decisions: mock chains are per-process, so `--backend mock` covers plumbing only; claim-policy flows are tested in-process via the `World` harness.
 - decisions: state lives in `~/.local/state/iron-divi-swap-poc/<scenario>-<backend>/` (outside the repo); previous runs are moved to `old-<stamp>/`. Ports 18491/18492/18493. Each swap uses E2E_BTC_SATS=10000 (<= 20,000).
