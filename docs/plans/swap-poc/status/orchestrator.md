@@ -17,7 +17,11 @@
   - btc lane: live_fund_claim_refund on testnet3; funding `9a5d15905f8295f472c5d5233a0970ba34adaffe823b0d415df79f1498cb1fae` confirmed
   - e2e-local lane: mock check, then happy → case-d → case-c (brief `~/.local/state/iron-divi-swap-poc/briefs/e2e-local.md`)
   - chaos lane: mock check, then waits for "GO chaos" (brief `…/briefs/chaos.md`)
-- **Broken:** none. CI green on main through `7038c70`.
+- **Broken:** first live happy (01:05 UTC) aborted: maker misread taker lock `9b62069b…` as mismatched (esplora backend
+  race) and taker failed on Core -27 'outputs already in utxo set'. Fixed in `53c2bb3` (e2e lane); 10k sats in HTLC
+  `9b62069b…:0` refundable after locktime 1791620729 — e2e lane owns the refund. dnsdivi still runs pre-`53c2bb3`:
+  redeploy before the deployed-maker e2e.
+  Otherwise none. CI green on main through `7038c70`.
 - **Parked:** none (PARKED #2 resolved 2026-10-10).
 - **Compactions:** orchestrator 3; engine 1
 - **Next (serialize taker funding — one funding UTXO chain):**
