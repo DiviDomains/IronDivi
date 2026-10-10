@@ -3,8 +3,10 @@
 - done: CLI `divi-swap run --claim-not-before <secs>` (case D) and `--never-claim` (case C); `divi-swap txids --swap`; `ClaimGate`/`run_swap_gated` in `bin/divi-swap/src/flow.rs`.
 - done: daemon `[swap]` overrides (`maker_timeout_secs`, `taker_timeout_secs`), validated by `SwapConfig::validate`.
 - done: in-process tests of both policies over simulated chains (`bin/divi-swapd/tests/e2e_gated.rs`); fmt, clippy -D warnings and tests green for divi-swap-cli and divi-swapd; check-daemon PASS.
-- running: live `happy` on testnet3 (GO e2e received 2026-10-09; rerun after the startup-wait fix 25bfac8).
-- left: live runs `happy`, then `case-c` (~3.5-4 h, background), then `case-d`, one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
+- done: live-run fixes: DIVI scan resumes from the saved wallet (25bfac8); e2e.sh empty `taker_flags` under bash 3.2 (bfd8381); maker aborts a mismatched BTC lock only once it is confirmed, and Core's -27 'outputs already in utxo set' counts as already-known (53c2bb3, CI green).
+- running: live `happy` rerun 3 on testnet3 after 53c2bb3 (run 2 aborted: maker swap 0c1a865e saw the taker lock 404 behind mempool.space's load balancer).
+- running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
+- left: record the refund txid; live `case-d`, then `case-c` (~3.5-4 h, background), one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
 - broken: nothing known.
 - parked: nothing.
 - blocked-on-human: no
@@ -12,4 +14,4 @@
 - decisions: mock chains are per-process, so `--backend mock` covers plumbing only; claim-policy flows are tested in-process via the `World` harness.
 - decisions: state lives in `~/.local/state/iron-divi-swap-poc/<scenario>-<backend>/` (outside the repo); previous runs are moved to `old-<stamp>/`. Ports 18491/18492/18493. Each swap uses E2E_BTC_SATS=10000 (<= 20,000).
 - needs: nothing.
-- last_sha: 25bfac8
+- last_sha: 53c2bb3
