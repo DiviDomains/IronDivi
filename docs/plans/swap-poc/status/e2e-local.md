@@ -4,9 +4,14 @@
 - done: daemon `[swap]` overrides (`maker_timeout_secs`, `taker_timeout_secs`), validated by `SwapConfig::validate`.
 - done: in-process tests of both policies over simulated chains (`bin/divi-swapd/tests/e2e_gated.rs`); fmt, clippy -D warnings and tests green for divi-swap-cli and divi-swapd; check-daemon PASS.
 - done: live-run fixes: DIVI scan resumes from the saved wallet (25bfac8); e2e.sh empty `taker_flags` under bash 3.2 (bfd8381); maker aborts a mismatched BTC lock only once it is confirmed, and Core's -27 'outputs already in utxo set' counts as already-known (53c2bb3, CI green).
-- running: live `happy` rerun 3 on testnet3 after 53c2bb3 (run 2 aborted: maker swap 0c1a865e saw the taker lock 404 behind mempool.space's load balancer).
+- done: live `happy` on testnet3 (rerun 3 after 53c2bb3; swap 8e00af2e, both sides Done; BTC lock and claim confirmed). Earlier run aborted: maker swap 0c1a865e saw the taker lock 404 behind mempool.space's load balancer.
+- happy_btc_lock_txid: a1789248bd12606bb4730557bc403e2784a52efab912f40005ee2aa63a5a90ce
+- happy_divi_lock_txid: 77c76a2bbd1db12228102fe4bb1cff6c6a9869e35bb8d4879303c42849b673c4
+- happy_divi_claim_txid: 3594a688171bb2a752edc004f30cb82f2a3302f174454033ccf03a201b59e01e
+- happy_btc_claim_txid: ae7b4e5b7be714db5d7551e9f770fa0759445e9cee5f7692015d38dcb6dda45d
+- running: live `case-d`.
 - running: refund of aborted taker swap 252aa984-8f15-4423-b094-d3f67bac2384: 10000 sats in HTLC 9b62069b15ac71f56c3a6eafeb08581de31291545cad1782e6ec9fd19a58658a:0, locktime 1791620729 (BTC MTP; ~6 h after the lock). Background job `~/.local/state/iron-divi-swap-poc/refund-252aa984/refund.sh` retries every 10 min against a copy of that taker.db.
-- left: record the refund txid; live `case-d`, then `case-c` (~3.5-4 h, background), one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
+- left: record the refund txid; `case-d` results, then live `case-c` (~3.5-4 h, background), one at a time (shared taker key); copy confirmed txids below and into RESULTS.md "Wave 2".
 - broken: nothing known.
 - parked: nothing.
 - blocked-on-human: no
