@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Lane chaos acceptance. See docs/plans/swap-poc/lanes/chaos.md.
 source "$(dirname "$0")/lib.sh"
+# The live runs are on testnet3 (GO chaos, 2026-10-09).
+export SWAP_BTC_NETWORK="${SWAP_BTC_NETWORK:-testnet}"
 F=docs/plans/swap-poc/status/chaos.md
 for k in accepted taker_lock_seen taker_lock_confirmed maker_locked maker_lock_confirmed \
          taker_claimed maker_claimed maker_refundable maker_refunded rpc_outage esplora_429; do
