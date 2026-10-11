@@ -96,8 +96,8 @@ fi
 
 # These binaries run on this machine, so they build here (remote-cargo builds for hp2's Linux, not macOS).
 # With --maker-url the daemon is remote: build only the taker CLI. E2E_SKIP_BUILD=1 reuses existing binaries.
-if [[ "${E2E_SKIP_BUILD:-0}" == 1 ]]; then
-  echo "e2e: E2E_SKIP_BUILD=1, using existing binaries"
+if [[ "${E2E_SKIP_BUILD:-0}" == 1 || -n "${E2E_BIN_DIR:-}" ]]; then
+  echo "e2e: using existing binaries in ${E2E_BIN_DIR:-target/debug}"
 elif [[ -n "$maker_url" ]]; then
   echo "e2e: building taker CLI"
   (cd "$ROOT" && cargo build -q -p divi-swap-cli)
@@ -105,8 +105,10 @@ else
   echo "e2e: building"
   (cd "$ROOT" && cargo build -q -p divi-swapd -p divi-swap-cli)
 fi
-swapd="$ROOT/target/debug/divi-swapd"
-swap="$ROOT/target/debug/divi-swap"
+# E2E_BIN_DIR: prebuilt binaries elsewhere (implies E2E_SKIP_BUILD), so a long live run survives `target/` going away.
+bin_dir="${E2E_BIN_DIR:-$ROOT/target/debug}"
+swapd="$bin_dir/divi-swapd"
+swap="$bin_dir/divi-swap"
 
 [[ -n "$maker_url" ]] || cat >"$state/divi-swapd.toml" <<TOML
 listen = "127.0.0.1:$port"
