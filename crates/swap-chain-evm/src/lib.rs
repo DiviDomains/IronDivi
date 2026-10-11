@@ -17,6 +17,7 @@
 mod artifact;
 mod backend;
 mod contract;
+mod embedded_bytecode;
 
 pub mod client;
 
@@ -25,6 +26,7 @@ pub use artifact::{bytecode, foundry_available};
 pub use backend::{amount_to_usdc_units, usdc_units_to_amount, UsdcBackend};
 pub use client::{connect_provider, deploy_contract, swap_id, EvmHtlcClient, SwapState};
 pub use contract::{IErc20, IErc20Htlc, IMockErc20};
+pub use embedded_bytecode::{erc20_htlc_bytecode, ERC20_HTLC_BYTECODE_HEX};
 
 /// Circle test USDC — Ethereum Sepolia.
 /// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses> and

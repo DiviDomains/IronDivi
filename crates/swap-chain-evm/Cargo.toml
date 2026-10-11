@@ -19,5 +19,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 secp256k1.workspace = true
 
+[[example]]
+name = "sepolia_ops"
+required-features = ["live"]
+
 [dev-dependencies]
+clap = { workspace = true, features = ["derive"] }
 tempfile = { workspace = true }
+zeroize.workspace = true

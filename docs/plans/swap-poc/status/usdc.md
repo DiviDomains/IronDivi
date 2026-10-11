@@ -97,17 +97,46 @@
   hours mid-session (every `Bash`/`Write`/`Edit` failed with `ENOSPC`); orchestrator freed
   space. `CARGO_INCREMENTAL=0` builds have been slow since (shared host, several lanes
   rebuilding from a cleared `target/` at once) — not a correctness issue, just wall-clock.
-- blocked-on-human: no — everything above is done and testable without secrets. The one
-  remaining item (live Sepolia exercise) is blocked, but there is nothing further for this
-  lane to build toward it: deploying `Erc20Htlc` to Sepolia and funding the taker-btc/
-  maker-btc addresses with Sepolia ETH + test USDC both need 1Password access (the Mac).
-  Ask: orchestrator deploys `Erc20Htlc` to Sepolia (any key, the contract is a static
-  template — e.g. `forge create` from `contracts/htlc` against an RPC + funded deployer key)
-  and records its address in `[usdc].htlc` (replacing the placeholder in
-  `divi-swapd.toml.example` and/or a live config), then funds the taker-btc/maker-btc
-  Sepolia addresses in `funding.md` with Sepolia ETH (gas) and test USDC
-  (faucet.circle.com). Once both exist, `live_sepolia_lock_claim` (`--features live`) and a
-  real swap through `divi-swapd`/`divi-swap` with `--usdc-htlc <address>` are ready to run
-  as-is — no code changes expected.
-  into divi-swapd/divi-swap-cli, mock/anvil e2e happy-path and refund both directions,
-  verify funding.md addresses
+- **Wave 3** (this seam): the Mac has no `forge`, so the live-deploy/fund step is now a
+  single Rust command instead of a shell-plus-forge recipe:
+  - `crates/swap-chain-evm/examples/sepolia_ops.rs` (`--features live`): `deploy`,
+    `send-eth`, `send-usdc`, `balances` (read-only, works with **no key**). The signing key
+    comes from `SWAP_EVM_KEY_HEX` only — never argv, never printed, zeroized on drop.
+    Deployment needs no `forge`/network build step: `erc20_htlc_bytecode()`
+    (`crates/swap-chain-evm/src/embedded_bytecode.rs`) is the contract's bytecode checked
+    in as a `.hex` file, with `embedded_bytecode::tests::embedded_bytecode_matches_a_fresh_forge_build`
+    (hp2 only) catching drift if `Erc20Htlc.sol` ever changes without regenerating it.
+  - Tested against anvil (dry-run `balances` with no key set, then `deploy`, `send-eth`,
+    `send-usdc` with a throwaway anvil key) — all four subcommands work; see the gas
+    numbers below, measured on the same anvil run.
+  - `tools/swap-poc/usdc-live.sh`: deploy (idempotent, skip with `--htlc`) → fund the maker
+    with gas ETH + a little USDC from the taker → `live_sepolia_lock_claim` → a real
+    `divi-usdc-sepolia` swap (maker sells DIVI, taker pays USDC) through `divi-swapd` +
+    `divi-swap`, mirroring `e2e.sh`'s structure (state dir outside the repo, `op://` refs
+    passed through to the Rust binaries that resolve them, `secret get` preflight). Keys
+    resolved here only for `sepolia_ops` calls (raw hex via `op read`, unset immediately
+    after); `divi-swapd`/`divi-swap` get `op://` reference strings and resolve their own.
+    **Untested beyond `sepolia_ops` itself** — it needs 1Password and the real network,
+    neither available on hp2; written carefully against `e2e.sh`'s established pattern.
+  - Gas measured for real (anvil, same contract bytecode that will go to Sepolia):
+    deploy 725,869; `approve` 29,016–46,116 (cold vs. warm slot); `lock` ~184,146–201,246;
+    `claim` 73,696; `refund` 70,293; plain ETH transfer 21,000; ERC-20 `transfer` (on
+    `MockErc20`; the real proxied Sepolia USDC may cost somewhat more) 51,654.
+- blocked-on-human: **yes** — only the actual funding/execution, everything else is done.
+  The orchestrator already landed 20 USDC on the taker (`0x4bb95b0c…D60C`,
+  tx `0xf5cc6366…28e3`); neither EVM address has Sepolia ETH yet, and the maker has no
+  USDC. Exact ask, now minimal because `usdc-live.sh` funds the maker itself from the
+  taker once the taker has gas:
+  1. Send the **taker** (`0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C`) **~0.1 Sepolia ETH**
+     (covers: deploying `Erc20Htlc` once, ~0.04 ETH with headroom over the measured 725,869
+     gas; funding the maker with 0.02 ETH + 2 USDC; `live_sepolia_lock_claim`'s
+     approve+lock+claim, ~0.02 ETH; one real swap's approve+lock+claim/refund, ~0.02 ETH).
+     A Sepolia faucet (e.g. the one at sepoliafaucet.com, or Circle's own if it drips ETH)
+     or any funded Sepolia key works — it does not need to be a "swap" key.
+  2. Run `op://`-aware, with the real key resolved from 1Password (already set up per
+     `funding.md`): `tools/swap-poc/usdc-live.sh` from a machine with `op`/`secret` and the
+     Rust toolchain (the Mac). It deploys, funds the maker, proves `live_sepolia_lock_claim`,
+     and runs one real `divi-usdc-sepolia` swap end to end; paste its
+     `$state/results.txt` into this file once the printed txids confirm.
+  No code changes are expected to be needed for step 2 — everything it calls already
+  passes against anvil.

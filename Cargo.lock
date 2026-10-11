@@ -6459,6 +6459,7 @@ version = "0.2.5"
 dependencies = [
  "alloy",
  "async-trait",
+ "clap",
  "divi-swap",
  "hex",
  "secp256k1 0.29.1",
@@ -6466,6 +6467,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
