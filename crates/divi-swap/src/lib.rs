@@ -6,7 +6,8 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, version 3.
 
-//! Atomic swap engine for DIVI ↔ BTC (HTLC, SHA256 hashlock, CLTV refunds).
+//! Atomic swap engine for DIVI ↔ any UTXO counter chain (BTC, LTC, ZEC; HTLC, SHA256
+//! hashlock, CLTV refunds).
 //!
 //! Plan: `docs/plans/atomic-swap-poc.md`. The modules [`types`], [`htlc`], [`backend`],
 //! [`state`], [`config`], [`error`] and [`api`] — plus the public signatures in [`maker`],
@@ -28,7 +29,7 @@ pub mod types;
 
 pub use api::Direction;
 pub use backend::ChainBackend;
-pub use config::{Profile, SwapConfig};
+pub use config::{ChainParams, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
 pub use maker::Maker;

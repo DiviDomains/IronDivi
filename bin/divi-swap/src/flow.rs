@@ -73,12 +73,13 @@ impl ClaimPolicy {
 }
 
 /// What a gated run needs to read from: the taker's own store (the maker lock's locktime)
-/// and the backend of the maker-leg chain (its median time): DIVI going forward, BTC in
-/// reverse.
+/// and the backend of the maker-leg chain (its median time): DIVI going forward, the counter
+/// chain in reverse.
 pub struct ClaimGate {
     pub policy: ClaimPolicy,
     pub store: Store,
     pub divi: Arc<dyn ChainBackend>,
+    /// The counter-chain backend (BTC, LTC, …).
     pub btc: Arc<dyn ChainBackend>,
 }
 
@@ -168,7 +169,7 @@ pub async fn begin(
     Ok(local)
 }
 
-/// Fund the BTC HTLC and tell the maker.
+/// Fund the taker-leg HTLC and tell the maker.
 pub async fn lock(
     taker: &Taker,
     client: &MakerClient,
@@ -206,11 +207,12 @@ async fn release(g: &ClaimGate, local: &str) -> Result<bool> {
         .store
         .get_taker_swap(local)?
         .ok_or_else(|| anyhow::anyhow!("no taker record {local}"))?;
-    let (htlc, chain) = match rec.quote.direction.maker_chain() {
-        Chain::Divi => (rec.maker_leg_htlc, &g.divi),
-        Chain::Btc => (rec.maker_leg_htlc, &g.btc),
+    let chain = match rec.quote.maker_chain() {
+        Chain::Divi => &g.divi,
+        _ => &g.btc,
     };
-    let locktime = htlc
+    let locktime = rec
+        .maker_leg_htlc
         .ok_or_else(|| anyhow::anyhow!("MakerLockConfirmed without a maker-leg lock"))?
         .locktime;
     let mtp = chain.median_time_past().await?;

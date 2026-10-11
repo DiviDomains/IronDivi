@@ -35,6 +35,7 @@ fn offer(dir: Direction) -> Offer {
     Offer {
         id: "o1".into(),
         direction: dir,
+        counter_chain: Chain::Btc,
         divi_sats_per_btc: 50_000_000_000,
         min_btc_sats: 10_000,
         max_btc_sats: 5_000_000,
@@ -284,40 +285,40 @@ impl H {
     /// The chain of the taker leg / maker leg.
     fn tl_chain(&self) -> &MockChain {
         match self.dir.taker_chain() {
-            Chain::Btc => &self.btc,
             Chain::Divi => &self.divi,
+            _ => &self.btc, // the counter chain (BTC here)
         }
     }
     fn ml_chain(&self) -> &MockChain {
         match self.dir.maker_chain() {
-            Chain::Btc => &self.btc,
             Chain::Divi => &self.divi,
+            _ => &self.btc, // the counter chain (BTC here)
         }
     }
 
     /// Maker's / taker's backend on the taker-leg chain and on the maker-leg chain.
     fn m_tl(&self) -> &MockBackend {
         match self.dir.taker_chain() {
-            Chain::Btc => &self.mbtc,
             Chain::Divi => &self.mdivi,
+            _ => &self.mbtc, // the counter chain (BTC here)
         }
     }
     fn m_ml(&self) -> &MockBackend {
         match self.dir.maker_chain() {
-            Chain::Btc => &self.mbtc,
             Chain::Divi => &self.mdivi,
+            _ => &self.mbtc, // the counter chain (BTC here)
         }
     }
     fn t_tl(&self) -> &MockBackend {
         match self.dir.taker_chain() {
-            Chain::Btc => &self.tbtc,
             Chain::Divi => &self.tdivi,
+            _ => &self.tbtc, // the counter chain (BTC here)
         }
     }
     fn t_ml(&self) -> &MockBackend {
         match self.dir.maker_chain() {
-            Chain::Btc => &self.tbtc,
             Chain::Divi => &self.tdivi,
+            _ => &self.tbtc, // the counter chain (BTC here)
         }
     }
 
@@ -375,8 +376,8 @@ fn assert_atomic(h: &H, scn: Scn) {
 /// Value of the swap on `c`: BTC sats or DIVI sats at the offer price.
 fn leg_amount(c: Chain) -> u64 {
     match c {
-        Chain::Btc => BTC_SATS,
         Chain::Divi => 500_000_000,
+        _ => BTC_SATS, // the counter chain (BTC here)
     }
 }
 

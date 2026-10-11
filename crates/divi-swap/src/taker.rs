@@ -10,10 +10,12 @@
 //! public signatures are frozen (the CLI builds against them).
 //!
 //! Legs are role-based: the taker leg (we fund first, longer timeout) is on
-//! `quote.direction.taker_chain()`, the maker leg (we claim) on `maker_chain()`.
+//! `quote.taker_chain()`, the maker leg (we claim) on `quote.maker_chain()` — DIVI and the
+//! quote's counter chain, in the order the direction says.
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::api::{AcceptRequest, LockNotice, Quote, SwapView};
@@ -21,10 +23,10 @@ use crate::backend::ChainBackend;
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
-use crate::types::{Amount, Chain};
+use crate::types::Chain;
 
 /// The taker stops claiming the maker leg this many seconds before the maker's locktime: a claim
-/// that confirms after the maker refunds would lose the DIVI while revealing the preimage.
+/// that confirms after the maker refunds would lose the maker leg while revealing the preimage.
 pub const TAKER_SAFETY_MARGIN_SECS: u32 = 1800;
 
 /// How far the taker-leg locktime may drift from `taker_chain_mtp + taker_timeout` (clock skew
@@ -51,21 +53,34 @@ pub enum TakerState {
     Done,
 }
 
-/// Taker engine. `divi` holds the taker's DIVI key, `btc` the taker's BTC key.
+/// Taker engine. `divi` holds the taker's DIVI key, each counter backend the taker's key on
+/// that chain.
 pub struct Taker {
     divi: Arc<dyn ChainBackend>,
-    btc: Arc<dyn ChainBackend>,
+    /// Counter-chain backends, by `chain()`.
+    counters: BTreeMap<Chain, Arc<dyn ChainBackend>>,
     store: Store,
     halt_after: Mutex<Option<TakerState>>,
     gate: tokio::sync::Mutex<()>,
 }
 
 impl Taker {
-    /// New taker engine.
+    /// New taker engine with one counter-chain backend (`btc` — any chain but DIVI; the
+    /// name predates counter chains).
     pub fn new(divi: Arc<dyn ChainBackend>, btc: Arc<dyn ChainBackend>, store: Store) -> Self {
+        Self::with_counters(divi, vec![btc], store)
+    }
+
+    /// New taker engine trading DIVI against every chain in `counters`, keyed by
+    /// [`ChainBackend::chain`] (a later backend for the same chain replaces an earlier one).
+    pub fn with_counters(
+        divi: Arc<dyn ChainBackend>,
+        counters: Vec<Arc<dyn ChainBackend>>,
+        store: Store,
+    ) -> Self {
         Taker {
             divi,
-            btc,
+            counters: counters.into_iter().map(|b| (b.chain(), b)).collect(),
             store,
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
@@ -86,7 +101,7 @@ impl Taker {
         let req = AcceptRequest {
             quote_id: quote.id.clone(),
             hash,
-            taker_btc_pubkey: self.btc.pubkey(),
+            taker_btc_pubkey: self.chain(quote.counter_chain)?.pubkey(),
             taker_divi_pubkey: self.divi.pubkey(),
         };
         let id = uuid::Uuid::new_v4().to_string();
@@ -123,21 +138,22 @@ impl Taker {
         let h = maker.taker_leg.htlc;
         h.validate()?;
         let bad = |what: &str| SwapError::InvalidParams(format!("maker's taker-leg HTLC: {what}"));
-        let dir = r.quote.direction;
-        let tb = self.chain(dir.taker_chain());
+        let tc = r.quote.taker_chain();
+        let tb = self.chain(tc)?;
         if h.hash != r.hash {
             return Err(bad("wrong hash"));
         }
         if h.refund_pubkey != tb.pubkey() {
             return Err(bad("refund key is not ours"));
         }
-        if h.claim_pubkey != maker_key(&r.quote, dir.taker_chain()) {
+        if h.claim_pubkey != r.quote.maker_pubkey(tc) {
             return Err(bad("claim key is not the quote's maker key"));
         }
         if maker.quote.id != r.quote.id
             || maker.quote.btc_amount != r.quote.btc_amount
             || maker.quote.divi_amount != r.quote.divi_amount
-            || maker.quote.direction != dir
+            || maker.quote.direction != r.quote.direction
+            || maker.quote.counter_chain != r.quote.counter_chain
         {
             return Err(bad("reply is for a different quote"));
         }
@@ -159,8 +175,8 @@ impl Taker {
             TakerState::Accepted => {
                 let htlc = self.taker_leg_htlc(&r)?;
                 let funding = self
-                    .tk(&r)
-                    .build_funding(&htlc, taker_leg_amount(&r.quote))
+                    .tk(&r)?
+                    .build_funding(&htlc, r.quote.taker_leg_amount())
                     .await?;
                 r.taker_leg_funding = Some(funding);
                 // Persist the signed tx before it can reach the network.
@@ -179,7 +195,7 @@ impl Taker {
             .taker_leg_funding
             .clone()
             .ok_or_else(|| SwapError::Other("Locked without a funding tx".into()))?;
-        self.tk(&r).broadcast(&funding.tx).await?;
+        self.tk(&r)?.broadcast(&funding.tx).await?;
         Ok(LockNotice {
             outpoint: funding.outpoint,
         })
@@ -218,21 +234,24 @@ impl Taker {
             .ok_or_else(|| SwapError::InvalidParams(format!("unknown swap {id:?}")))
     }
 
-    fn chain(&self, c: Chain) -> &Arc<dyn ChainBackend> {
-        match c {
-            Chain::Btc => &self.btc,
-            Chain::Divi => &self.divi,
+    /// Backend for `c`: DIVI, or one of the counter chains.
+    fn chain(&self, c: Chain) -> Result<&Arc<dyn ChainBackend>> {
+        if c == Chain::Divi {
+            return Ok(&self.divi);
         }
+        self.counters
+            .get(&c)
+            .ok_or_else(|| SwapError::InvalidParams(format!("no {c} backend")))
     }
 
     /// Backend of the taker leg (where we lock).
-    fn tk(&self, r: &TakerRecord) -> &Arc<dyn ChainBackend> {
-        self.chain(r.quote.direction.taker_chain())
+    fn tk(&self, r: &TakerRecord) -> Result<&Arc<dyn ChainBackend>> {
+        self.chain(r.quote.taker_chain())
     }
 
     /// Backend of the maker leg (where we claim).
-    fn mk(&self, r: &TakerRecord) -> &Arc<dyn ChainBackend> {
-        self.chain(r.quote.direction.maker_chain())
+    fn mk(&self, r: &TakerRecord) -> Result<&Arc<dyn ChainBackend>> {
+        self.chain(r.quote.maker_chain())
     }
 
     fn taker_leg_htlc(&self, r: &TakerRecord) -> Result<HtlcParams> {
@@ -261,12 +280,12 @@ impl Taker {
     }
 
     async fn taker_leg_refundable(&self, r: &TakerRecord) -> Result<bool> {
-        Ok(self.tk(r).median_time_past().await? >= self.taker_leg_htlc(r)?.locktime)
+        Ok(self.tk(r)?.median_time_past().await? >= self.taker_leg_htlc(r)?.locktime)
     }
 
     async fn on_locked(&self, r: &mut TakerRecord, maker: Option<&SwapView>) -> Result<Flow> {
         if let Some(f) = &r.taker_leg_funding {
-            self.tk(r).broadcast(&f.tx).await?; // idempotent; recovers a crash before broadcast
+            self.tk(r)?.broadcast(&f.tx).await?; // idempotent; recovers a crash before broadcast
         }
         if self.taker_leg_refundable(r).await? {
             return self.enter(r, TakerState::Refunded);
@@ -280,25 +299,24 @@ impl Taker {
         let htlc = leg.htlc;
         htlc.validate()?;
         let bad = |what: &str| SwapError::Other(format!("maker's lock: {what}"));
-        let dir = r.quote.direction;
-        let mb = self.mk(r).clone();
+        let mb = self.mk(r)?.clone();
         if htlc.hash != r.hash {
             return Err(bad("wrong hash"));
         }
         if htlc.claim_pubkey != mb.pubkey() {
             return Err(bad("claim key is not ours"));
         }
-        if htlc.refund_pubkey != maker_key(&r.quote, dir.maker_chain()) {
+        if htlc.refund_pubkey != r.quote.maker_pubkey(r.quote.maker_chain()) {
             return Err(bad("refund key is not the quote's maker key"));
         }
         // Trust the chain, not the maker's view, for amount and confirmations.
         let Some(lo) = mb.htlc_output(&htlc, &op).await? else {
             return Ok(Flow::Idle);
         };
-        if lo.amount < maker_leg_amount(&r.quote) {
+        if lo.amount < r.quote.maker_leg_amount() {
             return Err(bad("underfunded"));
         }
-        if lo.confirmations < maker_leg_confs(&r.quote) {
+        if lo.confirmations < r.quote.confirmations_on(r.quote.maker_chain()) {
             return Ok(Flow::Idle);
         }
         let mtp = mb.median_time_past().await?;
@@ -315,12 +333,12 @@ impl Taker {
         let htlc = r
             .maker_leg_htlc
             .ok_or_else(|| SwapError::Other("no verified maker lock".into()))?;
-        let mtp = self.mk(r).median_time_past().await?;
+        let mtp = self.mk(r)?.median_time_past().await?;
         if (mtp as u64) + TAKER_SAFETY_MARGIN_SECS as u64 <= htlc.locktime as u64 {
             let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
             let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
             let claim = self
-                .mk(r)
+                .mk(r)?
                 .build_claim(&htlc, &op, amount, &r.preimage)
                 .await?;
             r.maker_leg_claim = Some(claim);
@@ -339,9 +357,9 @@ impl Taker {
             .maker_leg_claim
             .clone()
             .ok_or_else(|| SwapError::Other("Claimed without a claim tx".into()))?;
-        self.mk(r).broadcast(&claim).await?;
+        self.mk(r)?.broadcast(&claim).await?;
         if self
-            .mk(r)
+            .mk(r)?
             .confirmations(&claim.txid)
             .await?
             .is_some_and(|c| c >= 1)
@@ -361,7 +379,7 @@ impl Taker {
                     .clone()
                     .ok_or_else(|| SwapError::Other("Refunded without a funding tx".into()))?;
                 let tx = self
-                    .tk(r)
+                    .tk(r)?
                     .build_refund(&htlc, &f.outpoint, f.amount)
                     .await?;
                 r.taker_leg_refund = Some(tx.clone());
@@ -369,13 +387,13 @@ impl Taker {
                 tx
             }
         };
-        match self.tk(r).broadcast(&refund).await {
+        match self.tk(r)?.broadcast(&refund).await {
             Ok(_) => {}
             Err(SwapError::Premature(_)) => return Ok(Flow::Idle),
             Err(e) => return Err(e),
         }
         if self
-            .tk(r)
+            .tk(r)?
             .confirmations(&refund.txid)
             .await?
             .is_some_and(|c| c >= 1)
@@ -390,32 +408,4 @@ enum Flow {
     Idle,
     Moved,
     Halted,
-}
-
-fn maker_key(q: &Quote, c: Chain) -> [u8; 33] {
-    match c {
-        Chain::Btc => q.maker_btc_pubkey,
-        Chain::Divi => q.maker_divi_pubkey,
-    }
-}
-
-fn taker_leg_amount(q: &Quote) -> Amount {
-    match q.direction.taker_chain() {
-        Chain::Btc => q.btc_amount,
-        Chain::Divi => q.divi_amount,
-    }
-}
-
-fn maker_leg_amount(q: &Quote) -> Amount {
-    match q.direction.maker_chain() {
-        Chain::Btc => q.btc_amount,
-        Chain::Divi => q.divi_amount,
-    }
-}
-
-fn maker_leg_confs(q: &Quote) -> u32 {
-    match q.direction.maker_chain() {
-        Chain::Btc => q.btc_confirmations,
-        Chain::Divi => q.divi_confirmations,
-    }
 }

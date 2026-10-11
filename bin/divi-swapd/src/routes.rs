@@ -16,6 +16,7 @@
 
 //! HTTP routes. Request/response bodies are the frozen `divi_swap::api` types.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::scan::{ScanInfo, ScanState, ScanStatus};
@@ -25,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
-use divi_swap::{ChainBackend, Maker, SwapError};
+use divi_swap::{Chain, ChainBackend, Maker, SwapError};
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 
@@ -33,6 +34,7 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub maker: Arc<Maker>,
     pub divi: Arc<dyn ChainBackend>,
+    /// The BTC backend. Other counter chains are reached through `maker`.
     pub btc: Arc<dyn ChainBackend>,
     pub scan: ScanStatus,
 }
@@ -104,6 +106,9 @@ struct Health {
     version: &'static str,
     divi: ChainHealth,
     btc: ChainHealth,
+    /// Counter chains other than BTC (LTC, ZEC, …), by ticker; omitted when there are none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    counters: BTreeMap<Chain, ChainHealth>,
     divi_scan: ScanInfo,
 }
 
@@ -122,12 +127,26 @@ async fn chain_health(b: &Arc<dyn ChainBackend>) -> ChainHealth {
 
 async fn healthz(State(s): State<AppState>) -> Json<Health> {
     let (divi, btc) = tokio::join!(chain_health(&s.divi), chain_health(&s.btc));
+    let mut counters = BTreeMap::new();
+    for c in s.maker.counter_chains() {
+        if c == s.btc.chain() {
+            continue;
+        }
+        if let Some(b) = s.maker.backend(c) {
+            counters.insert(c, chain_health(&b).await);
+        }
+    }
     let scan = s.scan.info();
+    let chains_ok = counters.values().all(|h| h.error.is_none());
     Json(Health {
-        ok: divi.error.is_none() && btc.error.is_none() && scan.state == ScanState::Done,
+        ok: divi.error.is_none()
+            && btc.error.is_none()
+            && chains_ok
+            && scan.state == ScanState::Done,
         version: env!("CARGO_PKG_VERSION"),
         divi,
         btc,
+        counters,
         divi_scan: scan,
     })
 }

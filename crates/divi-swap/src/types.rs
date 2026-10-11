@@ -15,22 +15,54 @@ use std::str::FromStr;
 
 use crate::error::SwapError;
 
-/// The chains this POC swaps between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The chains the engine swaps between. Every swap is DIVI against one *counter chain*
+/// (any UTXO chain with CLTV HTLCs); the serde names are the lowercase tickers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Chain {
     /// DIVI (testnet in the POC).
     Divi,
     /// Bitcoin (signet in the POC).
     Btc,
+    /// Litecoin.
+    Ltc,
+    /// Zcash (transparent addresses).
+    Zec,
+}
+
+impl Chain {
+    /// Every chain, DIVI first.
+    pub const ALL: [Chain; 4] = [Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec];
+
+    /// Lowercase ticker, as in serde and offer ids.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Chain::Divi => "divi",
+            Chain::Btc => "btc",
+            Chain::Ltc => "ltc",
+            Chain::Zec => "zec",
+        }
+    }
+
+    /// Whether this chain can be the counter chain of a swap (anything but DIVI).
+    pub fn is_counter(self) -> bool {
+        self != Chain::Divi
+    }
 }
 
 impl fmt::Display for Chain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Chain::Divi => "divi",
-            Chain::Btc => "btc",
-        })
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Chain {
+    type Err = SwapError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Chain::ALL
+            .into_iter()
+            .find(|c| c.as_str().eq_ignore_ascii_case(s))
+            .ok_or_else(|| SwapError::InvalidParams(format!("unknown chain {s:?}")))
     }
 }
 
@@ -294,6 +326,18 @@ mod tests {
         let mut s = vec![0x4c, 3, 1, 2, 3, 0x51];
         s.extend([0x02, 9, 9]);
         assert_eq!(script_pushes(&s), vec![vec![1, 2, 3], vec![9, 9]]);
+    }
+
+    #[test]
+    fn chain_names_round_trip() {
+        for c in Chain::ALL {
+            assert_eq!(c.to_string().parse::<Chain>().unwrap(), c);
+            assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+        }
+        assert_eq!(serde_json::to_value(Chain::Btc).unwrap(), "btc");
+        assert_eq!(serde_json::to_value(Chain::Divi).unwrap(), "divi");
+        assert!("doge".parse::<Chain>().is_err());
+        assert!(!Chain::Divi.is_counter() && Chain::Ltc.is_counter());
     }
 
     #[test]

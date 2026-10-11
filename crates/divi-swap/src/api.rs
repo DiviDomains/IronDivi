@@ -9,12 +9,20 @@
 //! Wire types between taker and maker (the `divi-swapd` HTTP API) and the persisted swap
 //! record. **Frozen contract** — the engine and daemon lanes both build against these.
 //!
-//! Protocol. The offer's [`Direction`] says which coin the taker pays; the *taker leg* is on
+//! Protocol. Every swap is DIVI against one *counter chain* (`Offer.counter_chain`, BTC when
+//! absent). The offer's [`Direction`] says which coin the taker pays; the *taker leg* is on
 //! that chain and the *maker leg* on the other. The taker always generates the preimage,
 //! locks first, and gets the longer timeout. For [`Direction::TakerPaysBtc`] (maker sells
-//! DIVI) the taker leg is BTC; for [`Direction::TakerPaysDivi`] (maker buys DIVI) it is DIVI.
+//! DIVI) the taker leg is on the counter chain; for [`Direction::TakerPaysDivi`] (maker buys
+//! DIVI) it is DIVI.
+//!
+//! Wire names. The deployed v0.2.5 daemon and every persisted record predate counter chains,
+//! so the counter-chain fields keep their `btc_*` JSON names (`btc_amount`,
+//! `maker_btc_pubkey`, `btc_confirmations`, `divi_sats_per_btc`, …): on an LTC offer
+//! `btc_amount` is the LTC amount in litoshis. The Rust field names follow the wire.
 //! 1. `GET /offers` → [`Offer`]s. `GET /offers/:id/quote?btc_sats=N` → [`Quote`] (60 s).
-//!    Both directions are sized in BTC sats; the price is always DIVI per BTC.
+//!    Both directions are sized in counter-chain sats; the price is always DIVI per counter
+//!    coin.
 //! 2. `POST /swaps` with [`AcceptRequest`] → [`SwapView`] in `accepted`, carrying the
 //!    taker-leg HTLC the taker must fund (claim = maker key, refund = taker key, both on the
 //!    taker-leg chain; locktime = that chain's MTP + taker timeout).
@@ -31,37 +39,54 @@ use crate::htlc::HtlcParams;
 use crate::state::SwapState;
 use crate::types::{Amount, Chain, Outpoint, Txid};
 
+fn default_counter_chain() -> Chain {
+    Chain::Btc
+}
+
 /// Which coin the taker pays (and so which chain each leg is on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
-    /// Maker sells DIVI: the taker locks BTC, the maker locks DIVI. Records and offers
-    /// written before directions existed are this.
+    /// Maker sells DIVI: the taker locks the counter coin (BTC, LTC, …), the maker locks
+    /// DIVI. Records and offers written before directions existed are this. The wire name
+    /// `taker_pays_btc` predates counter chains and is kept.
     #[default]
     TakerPaysBtc,
-    /// Maker buys DIVI: the taker locks DIVI, the maker locks BTC.
+    /// Maker buys DIVI: the taker locks DIVI, the maker locks the counter coin.
     TakerPaysDivi,
 }
 
 impl Direction {
-    /// Chain of the taker leg (funded first, by the taker, with the longer timeout).
+    /// Chain of the taker leg (funded first, by the taker, with the longer timeout) when the
+    /// counter chain is BTC. Swaps on other chains use [`Direction::taker_chain_vs`].
     pub fn taker_chain(self) -> Chain {
+        self.taker_chain_vs(Chain::Btc)
+    }
+
+    /// Chain of the maker leg (funded by the maker after the taker leg confirms) when the
+    /// counter chain is BTC. Swaps on other chains use [`Direction::maker_chain_vs`].
+    pub fn maker_chain(self) -> Chain {
+        self.maker_chain_vs(Chain::Btc)
+    }
+
+    /// Chain of the taker leg in a swap of DIVI against `counter`.
+    pub fn taker_chain_vs(self, counter: Chain) -> Chain {
         match self {
-            Direction::TakerPaysBtc => Chain::Btc,
+            Direction::TakerPaysBtc => counter,
             Direction::TakerPaysDivi => Chain::Divi,
         }
     }
 
-    /// Chain of the maker leg (funded by the maker after the taker leg confirms).
-    pub fn maker_chain(self) -> Chain {
+    /// Chain of the maker leg in a swap of DIVI against `counter`.
+    pub fn maker_chain_vs(self, counter: Chain) -> Chain {
         match self {
             Direction::TakerPaysBtc => Chain::Divi,
-            Direction::TakerPaysDivi => Chain::Btc,
+            Direction::TakerPaysDivi => counter,
         }
     }
 }
 
-/// A standing offer to swap DIVI and BTC in one [`Direction`].
+/// A standing offer to swap DIVI and a counter coin in one [`Direction`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Offer {
     /// Offer id.
@@ -69,18 +94,31 @@ pub struct Offer {
     /// Which coin the taker pays.
     #[serde(default)]
     pub direction: Direction,
-    /// Price: DIVI sats paid per 1 BTC (1e8 BTC sats).
+    /// The chain DIVI is swapped against. Offers written before counter chains are BTC.
+    #[serde(default = "default_counter_chain")]
+    pub counter_chain: Chain,
+    /// Price: DIVI sats paid per 1 counter coin (1e8 counter sats).
     pub divi_sats_per_btc: u64,
-    /// Smallest swap, BTC sats.
+    /// Smallest swap, counter-chain sats.
     pub min_btc_sats: u64,
-    /// Largest swap, BTC sats.
+    /// Largest swap, counter-chain sats.
     pub max_btc_sats: u64,
 }
 
 impl Offer {
-    /// DIVI sats for `btc_sats`, rounded down.
+    /// DIVI sats for `btc_sats` counter-chain sats, rounded down.
     pub fn divi_for(&self, btc_sats: u64) -> Amount {
         Amount(((btc_sats as u128 * self.divi_sats_per_btc as u128) / 100_000_000) as u64)
+    }
+
+    /// Chain of the taker leg.
+    pub fn taker_chain(&self) -> Chain {
+        self.direction.taker_chain_vs(self.counter_chain)
+    }
+
+    /// Chain of the maker leg.
+    pub fn maker_chain(&self) -> Chain {
+        self.direction.maker_chain_vs(self.counter_chain)
     }
 }
 
@@ -94,13 +132,18 @@ pub struct Quote {
     /// Which coin the taker pays.
     #[serde(default)]
     pub direction: Direction,
-    /// BTC locked (by the taker for `TakerPaysBtc`, by the maker for `TakerPaysDivi`).
+    /// The chain DIVI is swapped against. Quotes written before counter chains are BTC.
+    #[serde(default = "default_counter_chain")]
+    pub counter_chain: Chain,
+    /// Counter coin locked (by the taker for `TakerPaysBtc`, by the maker for
+    /// `TakerPaysDivi`), in counter-chain sats.
     pub btc_amount: Amount,
     /// DIVI locked (by the maker for `TakerPaysBtc`, by the taker for `TakerPaysDivi`).
     pub divi_amount: Amount,
     /// Unix seconds (wall clock).
     pub expires_at: u64,
-    /// Maker's BTC pubkey — claim key of a BTC taker leg, refund key of a BTC maker leg.
+    /// Maker's counter-chain pubkey — claim key of a counter-chain taker leg, refund key of
+    /// a counter-chain maker leg.
     #[serde(with = "hex33")]
     pub maker_btc_pubkey: [u8; 33],
     /// Maker's DIVI pubkey — refund key of a DIVI maker leg, claim key of a DIVI taker leg.
@@ -110,11 +153,60 @@ pub struct Quote {
     pub taker_timeout_secs: u32,
     /// Maker-leg HTLC lifetime (seconds after the maker-leg chain's MTP).
     pub maker_timeout_secs: u32,
-    /// Confirmations required on any BTC lock (the maker's check of a BTC taker leg, the
-    /// taker's check of a BTC maker leg).
+    /// Confirmations required on any counter-chain lock (the maker's check of a
+    /// counter-chain taker leg, the taker's check of a counter-chain maker leg).
     pub btc_confirmations: u32,
     /// Confirmations required on any DIVI lock.
     pub divi_confirmations: u32,
+}
+
+impl Quote {
+    /// Chain of the taker leg.
+    pub fn taker_chain(&self) -> Chain {
+        self.direction.taker_chain_vs(self.counter_chain)
+    }
+
+    /// Chain of the maker leg.
+    pub fn maker_chain(&self) -> Chain {
+        self.direction.maker_chain_vs(self.counter_chain)
+    }
+
+    /// Value locked on `chain` (DIVI or the counter chain).
+    pub fn amount_on(&self, chain: Chain) -> Amount {
+        if chain == Chain::Divi {
+            self.divi_amount
+        } else {
+            self.btc_amount
+        }
+    }
+
+    /// Value the taker locks.
+    pub fn taker_leg_amount(&self) -> Amount {
+        self.amount_on(self.taker_chain())
+    }
+
+    /// Value the maker locks.
+    pub fn maker_leg_amount(&self) -> Amount {
+        self.amount_on(self.maker_chain())
+    }
+
+    /// Maker's pubkey on `chain` (DIVI or the counter chain).
+    pub fn maker_pubkey(&self, chain: Chain) -> [u8; 33] {
+        if chain == Chain::Divi {
+            self.maker_divi_pubkey
+        } else {
+            self.maker_btc_pubkey
+        }
+    }
+
+    /// Confirmations required on a lock on `chain` (DIVI or the counter chain).
+    pub fn confirmations_on(&self, chain: Chain) -> u32 {
+        if chain == Chain::Divi {
+            self.divi_confirmations
+        } else {
+            self.btc_confirmations
+        }
+    }
 }
 
 /// `POST /swaps` body.
@@ -125,7 +217,8 @@ pub struct AcceptRequest {
     /// SHA256 of the taker's preimage.
     #[serde(with = "hex32")]
     pub hash: [u8; 32],
-    /// Taker's BTC pubkey — refund key of a BTC taker leg, claim key of a BTC maker leg.
+    /// Taker's counter-chain pubkey — refund key of a counter-chain taker leg, claim key of a
+    /// counter-chain maker leg.
     #[serde(with = "hex33")]
     pub taker_btc_pubkey: [u8; 33],
     /// Taker's DIVI pubkey — claim key of a DIVI maker leg, refund key of a DIVI taker leg.
@@ -133,10 +226,21 @@ pub struct AcceptRequest {
     pub taker_divi_pubkey: [u8; 33],
 }
 
+impl AcceptRequest {
+    /// Taker's pubkey on `chain` (DIVI or the counter chain).
+    pub fn taker_pubkey(&self, chain: Chain) -> [u8; 33] {
+        if chain == Chain::Divi {
+            self.taker_divi_pubkey
+        } else {
+            self.taker_btc_pubkey
+        }
+    }
+}
+
 /// `POST /swaps/:id/lock` body: where the taker funded the taker-leg HTLC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockNotice {
-    /// The BTC HTLC output.
+    /// The taker-leg HTLC output.
     pub outpoint: Outpoint,
 }
 
@@ -210,6 +314,7 @@ mod tests {
         let o = Offer {
             id: "o".into(),
             direction: Direction::TakerPaysBtc,
+            counter_chain: Chain::Btc,
             divi_sats_per_btc: 3_000_000 * 100_000_000,
             min_btc_sats: 1,
             max_btc_sats: 1_000_000,
@@ -229,5 +334,35 @@ mod tests {
         assert_eq!(Direction::TakerPaysDivi.maker_chain(), Chain::Btc);
         let j = serde_json::to_value(Direction::TakerPaysDivi).unwrap();
         assert_eq!(j, "taker_pays_divi");
+    }
+
+    #[test]
+    fn counter_chain_defaults_to_btc_and_picks_the_legs() {
+        let o: Offer = serde_json::from_str(
+            r#"{"id":"o","divi_sats_per_btc":1,"min_btc_sats":1,"max_btc_sats":2}"#,
+        )
+        .unwrap();
+        assert_eq!(o.counter_chain, Chain::Btc);
+        assert_eq!(
+            (o.taker_chain(), o.maker_chain()),
+            (Chain::Btc, Chain::Divi)
+        );
+        let o: Offer = serde_json::from_str(
+            r#"{"id":"o","direction":"taker_pays_divi","counter_chain":"ltc",
+                "divi_sats_per_btc":1,"min_btc_sats":1,"max_btc_sats":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (o.taker_chain(), o.maker_chain()),
+            (Chain::Divi, Chain::Ltc)
+        );
+        assert_eq!(
+            Direction::TakerPaysBtc.taker_chain_vs(Chain::Zec),
+            Chain::Zec
+        );
+        assert_eq!(
+            Direction::TakerPaysBtc.maker_chain_vs(Chain::Zec),
+            Chain::Divi
+        );
     }
 }

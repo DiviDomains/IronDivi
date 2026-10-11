@@ -1,0 +1,16 @@
+# Lane multichain — status
+
+- done: engine — `Chain::{Ltc,Zec}` (serde `ltc`/`zec`; `divi`/`btc` unchanged; `FromStr`, `Chain::ALL`); `Offer.counter_chain` / `Quote.counter_chain` (`#[serde(default)]` = btc); `Quote::{taker_chain, maker_chain, amount_on, maker_pubkey, confirmations_on}`, `AcceptRequest::taker_pubkey`, `Direction::{taker,maker}_chain_vs(counter)` replace every `match Chain` in maker.rs/taker.rs
+- done: `Maker::with_counters(cfg, divi, Vec<counter backends>, store, offers)` / `Taker::with_counters(divi, counters, store)`; `new` keeps its signature (its `btc` arg = one counter backend, keyed by `chain()`); maker refuses offers whose counter chain has no backend; `Maker::{counter_chains, backend}` accessors
+- done: `SwapConfig.chains: BTreeMap<Chain, ChainParams{confirmations, mtp_lag_secs}>` (`#[serde(default)]`), `confirmations(chain)`, `chain_params(chain)`; timeout gap uses the max MTP lag over all chains
+- done: divi-swapd — `--backend mock` adds LTC/ZEC mock chains + offers `divi-ltc-testnet`, `ltc-divi-testnet`, `divi-zec-testnet`, `zec-divi-testnet` (unless configured); `[swap.chains.<ticker>]` overrides; `/healthz` gains `counters.{ltc,zec}`; live mode refuses non-BTC offers with a clear error
+- done: divi-swap CLI — global `--counter-chain btc|ltc|zec` (default btc); non-btc needs `--backend mock`
+- done: tests `v025_records_still_load`, `mock_swap_{ltc,zec}_{forward,reverse}`, `one_maker_many_counter_chains` (crates/divi-swap/tests/multichain.rs), `old_config_toml_parses` (config.rs), daemon `daemon_swaps_ltc_and_zec_both_ways` (HTTP, all four offers to Done), config tests; smoke-ran `divi-swapd --backend mock` + `divi-swap --backend mock --counter-chain ltc accept`
+- done: tools/swap-poc/check-multichain.sh PASS (fmt/clippy/tests for divi-swap, divi-swapd, divi-swap-cli; wave-1 check-engine.sh still passes)
+- left: `[ltc]` / `[zec]` live sections in divi-swapd and live `--counter-chain ltc|zec` in the CLI, once lanes ltc/zec land constructors (`LtcBackend::new` exists in ~/swap-lanes/ltc, not yet on main)
+- decisions: wire/DB names stay `btc_*` and the Rust field names follow the wire (no rename churn for coin lanes or the CLI); docs say "counter chain"
+- decisions: `Direction::taker_chain()/maker_chain()` keep meaning "vs BTC" (existing callers/tests); engines use the quote's counter chain
+- decisions: a chain other than BTC/DIVI missing from `SwapConfig.chains` falls back to the stricter mainnet built-ins (LTC 6 confs / 1800 s lag, ZEC 10 / 1800 s); testnet profile LTC 2, ZEC 3; BTC/DIVI values unchanged
+- decisions: existing tests edited only mechanically (`Offer`/`Quote` literals gain `counter_chain: Btc`; exhaustive `match Chain` in tests/engine.rs gets `_` for the counter arm); none weakened or deleted
+- decisions: for the orchestrator (wave 4): a v0.2.5 taker CLI ignores `counter_chain`; if it took an LTC/ZEC offer it would lock BTC the maker never watches (maker aborts, taker refunds after 6 h — no loss). Only enable LTC/ZEC offers on dnsdivi with the new CLI out
+- note: hp2 root fs hit 100% mid-lane (remote-cargo 60G, ~/.cache 20G — not mine); I removed only my own target/debug/incremental and build with CARGO_INCREMENTAL=0

@@ -42,6 +42,10 @@ struct Cli {
     /// the public testnets.
     #[arg(long, global = true, value_enum, default_value = "live")]
     backend: BackendArg,
+    /// Chain swapped against DIVI: `btc`, `ltc` or `zec` (the offer's `counter_chain`).
+    /// Only `btc` has a live backend so far; the others need `--backend mock`.
+    #[arg(long, global = true, default_value = "btc", value_parser = parse_counter_chain)]
+    counter_chain: Chain,
     /// Secret reference (`op://…` or `credential:<name>`) for the taker's DIVI key.
     #[arg(long, global = true)]
     divi_key: Option<String>,
@@ -67,6 +71,14 @@ struct Cli {
     cmd: Cmd,
 }
 
+fn parse_counter_chain(s: &str) -> Result<Chain, String> {
+    match s.parse::<Chain>() {
+        Ok(c) if c.is_counter() => Ok(c),
+        Ok(_) => Err("the counter chain cannot be divi".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum BackendArg {
     Mock,
@@ -87,7 +99,7 @@ struct DealArgs {
     /// Offer id from `GET /offers`.
     #[arg(long)]
     offer: String,
-    /// BTC amount, in satoshis.
+    /// Counter-chain amount (BTC, LTC, …), in satoshis.
     #[arg(long)]
     btc_sats: u64,
 }
@@ -152,6 +164,7 @@ enum Cmd {
 
 struct Backends {
     divi: Arc<dyn ChainBackend>,
+    /// The `--counter-chain` backend.
     btc: Arc<dyn ChainBackend>,
     /// Concrete handles, live backend only.
     live: Option<(Arc<DiviBackend>, Arc<BtcBackend>)>,
@@ -167,8 +180,14 @@ fn backends(cli: &Cli) -> Result<Backends> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(1_700_000_000);
+            let block_secs = match cli.counter_chain {
+                Chain::Ltc => 150,
+                Chain::Zec => 75,
+                _ => 600,
+            };
             let divi = MockChain::new(Chain::Divi, now, 60).backend(3, Amount(10 * Amount::COIN));
-            let btc = MockChain::new(Chain::Btc, now, 600).backend(4, Amount(10 * Amount::COIN));
+            let btc = MockChain::new(cli.counter_chain, now, block_secs)
+                .backend(4, Amount(10 * Amount::COIN));
             Ok(Backends {
                 divi: Arc::new(divi),
                 btc: Arc::new(btc),
@@ -193,6 +212,12 @@ fn secret_hex(
 }
 
 fn live_backends(cli: &Cli) -> Result<Backends> {
+    if cli.counter_chain != Chain::Btc {
+        bail!(
+            "no live {} backend in this build yet; use --backend mock",
+            cli.counter_chain
+        );
+    }
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
         .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;

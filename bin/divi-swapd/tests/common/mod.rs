@@ -66,6 +66,7 @@ impl World {
         .map(|(id, direction)| Offer {
             id: id.into(),
             direction,
+            counter_chain: Chain::Btc,
             divi_sats_per_btc: 1_000 * Amount::COIN,
             min_btc_sats: 1_000,
             max_btc_sats: 10_000_000,

@@ -26,8 +26,8 @@ use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
-    router, run_scan, spawn_gated_scheduler, AppState, BackendKind, BtcSection, DaemonConfig,
-    ScanStatus,
+    mock_counter_offers, router, run_scan, spawn_gated_scheduler, AppState, BackendKind,
+    BtcSection, DaemonConfig, ScanStatus, MOCK_ONLY_CHAINS,
 };
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
@@ -39,8 +39,8 @@ struct Args {
     /// Path to the TOML config file.
     #[arg(long)]
     config: PathBuf,
-    /// Override the backend: `mock` runs both chains in-process (local/CI), `live` uses the
-    /// public testnets.
+    /// Override the backend: `mock` runs every chain in-process (local/CI, with LTC and ZEC
+    /// offers added), `live` uses the public testnets.
     #[arg(long, value_parser = parse_backend)]
     backend: Option<BackendKind>,
 }
@@ -53,7 +53,12 @@ fn parse_backend(s: &str) -> Result<BackendKind, String> {
     }
 }
 
-type Backends = (Arc<dyn ChainBackend>, Arc<dyn ChainBackend>);
+/// DIVI, BTC, and any further counter chains.
+struct Backends {
+    divi: Arc<dyn ChainBackend>,
+    btc: Arc<dyn ChainBackend>,
+    others: Vec<Arc<dyn ChainBackend>>,
+}
 
 /// DIVI wallet scan to run after the listener is bound.
 struct ScanJob {
@@ -76,8 +81,16 @@ fn mock_backends() -> Backends {
         divi.backend(1, Amount(1_000_000 * Amount::COIN)),
         btc.backend(2, Amount(0)),
     );
+    let mut chains = vec![divi, btc];
+    let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
+    for (seed, c) in (5u8..).zip(MOCK_ONLY_CHAINS) {
+        let block_secs = if c == Chain::Ltc { 150 } else { 75 };
+        let chain = MockChain::new(c, now, block_secs);
+        others.push(Arc::new(chain.backend(seed, Amount(1_000 * Amount::COIN))));
+        chains.push(chain);
+    }
     // Nobody else mines the simulated chains, so the daemon does: one block per tick.
-    for chain in [divi, btc] {
+    for chain in chains {
         tokio::spawn(async move {
             let mut i = tokio::time::interval(Duration::from_secs(5));
             loop {
@@ -86,7 +99,22 @@ fn mock_backends() -> Backends {
             }
         });
     }
-    (Arc::new(d), Arc::new(b))
+    Backends {
+        divi: Arc::new(d),
+        btc: Arc::new(b),
+        others,
+    }
+}
+
+/// `cfg.offers` plus the mock-only counter-chain offers whose ids are not configured.
+fn mock_offers(cfg: &DaemonConfig) -> Vec<divi_swap::api::Offer> {
+    let mut offers = cfg.offers.clone();
+    for o in mock_counter_offers() {
+        if !offers.iter().any(|have| have.id == o.id) {
+            offers.push(o);
+        }
+    }
+    offers
 }
 
 /// Resolve a `[…].key` reference into a secp256k1 key held only in memory.
@@ -118,6 +146,13 @@ async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
+    if let Some(o) = cfg.offers.iter().find(|o| o.counter_chain != Chain::Btc) {
+        bail!(
+            "offer {}: no live {} backend in this build yet; use --backend mock",
+            o.id,
+            o.counter_chain
+        );
+    }
     let btc = live_btc(btc_cfg)?;
     let hex_key = SecretRef::parse(&divi_cfg.key)
         .and_then(|r| r.resolve())
@@ -138,7 +173,12 @@ async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)
         divi: divi.clone(),
         from,
     });
-    Ok(((divi, btc), job))
+    let backends = Backends {
+        divi,
+        btc,
+        others: Vec::new(),
+    };
+    Ok((backends, job))
 }
 
 #[tokio::main]
@@ -159,10 +199,14 @@ async fn main() -> Result<()> {
         } else {
             BackendKind::Mock
         });
-    let ((divi, btc), scan_job) = match kind {
-        BackendKind::Mock => (mock_backends(), None),
-        BackendKind::Live => live_backends(&cfg).await?,
+    let (backends, scan_job, offers) = match kind {
+        BackendKind::Mock => (mock_backends(), None, mock_offers(&cfg)),
+        BackendKind::Live => {
+            let (b, job) = live_backends(&cfg).await?;
+            (b, job, cfg.offers.clone())
+        }
     };
+    let Backends { divi, btc, others } = backends;
     let scan = if scan_job.is_some() {
         ScanStatus::scanning()
     } else {
@@ -170,12 +214,13 @@ async fn main() -> Result<()> {
     };
 
     let store = Store::open(&cfg.db_path).context("opening swap database")?;
-    let maker = Arc::new(Maker::new(
+    let counters = std::iter::once(btc.clone()).chain(others).collect();
+    let maker = Arc::new(Maker::with_counters(
         cfg.swap_config()?,
         divi.clone(),
-        btc.clone(),
+        counters,
         store,
-        cfg.offers.clone(),
+        offers,
     )?);
     let _scheduler = spawn_gated_scheduler(
         maker.clone(),

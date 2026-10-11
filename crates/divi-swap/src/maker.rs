@@ -15,11 +15,13 @@
 //! maker-leg backend is called only on the `TakerLockConfirmed → MakerLocked` edge (and on
 //! neither backend before it).
 //!
-//! Direction. The offer's [`Direction`] fixes which chain each leg is on: the taker leg on
-//! `taker_chain()`, the maker leg on `maker_chain()`. Everything below is written in those
-//! roles; the forward direction (taker pays BTC) is just one assignment.
+//! Chains. Every swap is DIVI against the offer's counter chain; the offer's [`Direction`]
+//! fixes which chain each leg is on: the taker leg on `quote.taker_chain()`, the maker leg on
+//! `quote.maker_chain()`. Everything below is written in those roles, so a new UTXO counter
+//! chain needs only a [`ChainBackend`], no engine change.
 
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +34,7 @@ use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
 use crate::types::{Amount, Chain, Outpoint};
 
-/// Default wall-clock time the maker waits for the taker's BTC lock after `accept`.
+/// Default wall-clock time the maker waits for the taker's lock after `accept`.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
 
 /// Upper bound on transitions one `step` call performs (a swap has far fewer).
@@ -55,7 +57,8 @@ enum Flow {
 pub struct Maker {
     cfg: SwapConfig,
     divi: Arc<dyn ChainBackend>,
-    btc: Arc<dyn ChainBackend>,
+    /// Counter-chain backends, by `chain()`.
+    counters: BTreeMap<Chain, Arc<dyn ChainBackend>>,
     store: Store,
     offers: Vec<Offer>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -65,7 +68,9 @@ pub struct Maker {
 }
 
 impl Maker {
-    /// New engine. Fails if `cfg` violates the timeout invariant.
+    /// New engine with one counter-chain backend (`btc` — any chain but DIVI; the name
+    /// predates counter chains). Fails if `cfg` violates the timeout invariant or an offer's
+    /// counter chain has no backend.
     pub fn new(
         cfg: SwapConfig,
         divi: Arc<dyn ChainBackend>,
@@ -73,11 +78,41 @@ impl Maker {
         store: Store,
         offers: Vec<Offer>,
     ) -> Result<Self> {
+        Self::with_counters(cfg, divi, vec![btc], store, offers)
+    }
+
+    /// New engine trading DIVI against every chain in `counters` (one backend per chain,
+    /// keyed by [`ChainBackend::chain`]). Fails like [`Maker::new`], or on two backends for
+    /// one chain.
+    pub fn with_counters(
+        cfg: SwapConfig,
+        divi: Arc<dyn ChainBackend>,
+        counters: Vec<Arc<dyn ChainBackend>>,
+        store: Store,
+        offers: Vec<Offer>,
+    ) -> Result<Self> {
         cfg.validate()?;
+        let mut by_chain = BTreeMap::new();
+        for b in counters {
+            let c = b.chain();
+            if by_chain.insert(c, b).is_some() {
+                return Err(SwapError::InvalidParams(format!(
+                    "two counter backends for {c}"
+                )));
+            }
+        }
+        for o in &offers {
+            if !o.counter_chain.is_counter() || !by_chain.contains_key(&o.counter_chain) {
+                return Err(SwapError::InvalidParams(format!(
+                    "offer {}: no {} backend",
+                    o.id, o.counter_chain
+                )));
+            }
+        }
         Ok(Maker {
             cfg,
             divi,
-            btc,
+            counters: by_chain,
             store,
             offers,
             clock: Arc::new(unix_now),
@@ -111,7 +146,18 @@ impl Maker {
         self.offers.clone()
     }
 
-    /// Issue a quote valid for `cfg.quote_expiry_secs`. No coins are reserved.
+    /// The counter chains this maker has a backend for.
+    pub fn counter_chains(&self) -> Vec<Chain> {
+        self.counters.keys().copied().collect()
+    }
+
+    /// The backend for `chain` (DIVI or a counter chain), if this maker has one.
+    pub fn backend(&self, chain: Chain) -> Option<Arc<dyn ChainBackend>> {
+        self.chain(chain).ok().cloned()
+    }
+
+    /// Issue a quote for `btc_sats` counter-chain sats, valid for `cfg.quote_expiry_secs`.
+    /// No coins are reserved.
     pub async fn quote(&self, offer_id: &str, btc_sats: u64) -> Result<Quote> {
         let offer = self
             .offers
@@ -128,19 +174,21 @@ impl Maker {
         if divi_amount.0 == 0 {
             return Err(SwapError::InvalidParams("swap is worth no DIVI".into()));
         }
+        let counter = offer.counter_chain;
         let quote = Quote {
             id: uuid::Uuid::new_v4().to_string(),
             offer_id: offer.id.clone(),
             direction: offer.direction,
-            btc_amount: crate::types::Amount(btc_sats),
+            counter_chain: counter,
+            btc_amount: Amount(btc_sats),
             divi_amount,
             expires_at: (self.clock)() + self.cfg.quote_expiry_secs as u64,
-            maker_btc_pubkey: self.btc.pubkey(),
+            maker_btc_pubkey: self.chain(counter)?.pubkey(),
             maker_divi_pubkey: self.divi.pubkey(),
             taker_timeout_secs: self.cfg.taker_timeout_secs,
             maker_timeout_secs: self.cfg.maker_timeout_secs,
-            btc_confirmations: self.cfg.btc_confirmations,
-            divi_confirmations: self.cfg.divi_confirmations,
+            btc_confirmations: self.cfg.confirmations(counter),
+            divi_confirmations: self.cfg.confirmations(Chain::Divi),
         };
         self.store.put_quote(&QuoteRecord {
             quote: quote.clone(),
@@ -170,24 +218,23 @@ impl Maker {
         {
             return Err(SwapError::InvalidParams("hash already in use".into()));
         }
-        let dir = qr.quote.direction;
-        let (tc, mc) = (dir.taker_chain(), dir.maker_chain());
-        let tmtp = self.chain(tc).median_time_past().await?;
+        let (tc, mc) = (qr.quote.taker_chain(), qr.quote.maker_chain());
+        let tmtp = self.chain(tc)?.median_time_past().await?;
         let locktime = tmtp
             .checked_add(qr.quote.taker_timeout_secs)
             .ok_or_else(|| SwapError::InvalidParams("locktime overflow".into()))?;
         let taker_leg_htlc = HtlcParams {
             hash: req.hash,
-            claim_pubkey: maker_key(&qr.quote, tc),
-            refund_pubkey: taker_key(&req, tc),
+            claim_pubkey: qr.quote.maker_pubkey(tc),
+            refund_pubkey: req.taker_pubkey(tc),
             locktime,
         };
         taker_leg_htlc.validate()?;
         // The maker leg is built later, on its own chain's clock; check the keys now.
         HtlcParams {
             hash: req.hash,
-            claim_pubkey: taker_key(&req, mc),
-            refund_pubkey: maker_key(&qr.quote, mc),
+            claim_pubkey: req.taker_pubkey(mc),
+            refund_pubkey: qr.quote.maker_pubkey(mc),
             locktime,
         }
         .validate()?;
@@ -198,7 +245,7 @@ impl Maker {
             state: SwapState::Accepted,
             quote: qr.quote.clone(),
             hash: req.hash,
-            taker_maker_leg_pubkey: taker_key(&req, mc),
+            taker_maker_leg_pubkey: req.taker_pubkey(mc),
             taker_leg_htlc,
             taker_leg_outpoint: None,
             taker_leg_locked: None,
@@ -335,38 +382,34 @@ impl Maker {
         }
     }
 
-    /// Backend for `c`.
-    fn chain(&self, c: Chain) -> &Arc<dyn ChainBackend> {
-        match c {
-            Chain::Btc => &self.btc,
-            Chain::Divi => &self.divi,
+    /// Backend for `c`: DIVI, or one of the counter chains.
+    fn chain(&self, c: Chain) -> Result<&Arc<dyn ChainBackend>> {
+        if c == Chain::Divi {
+            return Ok(&self.divi);
         }
+        self.counters
+            .get(&c)
+            .ok_or_else(|| SwapError::InvalidParams(format!("no {c} backend")))
     }
 
     /// Backend of the taker leg.
-    fn tk(&self, r: &MakerRecord) -> &Arc<dyn ChainBackend> {
-        self.chain(r.quote.direction.taker_chain())
+    fn tk(&self, r: &MakerRecord) -> Result<&Arc<dyn ChainBackend>> {
+        self.chain(r.quote.taker_chain())
     }
 
     /// Backend of the maker leg.
-    fn mk(&self, r: &MakerRecord) -> &Arc<dyn ChainBackend> {
-        self.chain(r.quote.direction.maker_chain())
+    fn mk(&self, r: &MakerRecord) -> Result<&Arc<dyn ChainBackend>> {
+        self.chain(r.quote.maker_chain())
     }
 
     /// Confirmations the taker leg needs before we lock.
     fn taker_leg_confs(&self, r: &MakerRecord) -> u32 {
-        match r.quote.direction.taker_chain() {
-            Chain::Btc => self.cfg.btc_confirmations,
-            Chain::Divi => self.cfg.divi_confirmations,
-        }
+        self.cfg.confirmations(r.quote.taker_chain())
     }
 
     /// Confirmations the maker leg needs before we treat it as locked.
     fn maker_leg_confs(&self, r: &MakerRecord) -> u32 {
-        match r.quote.direction.maker_chain() {
-            Chain::Btc => self.cfg.btc_confirmations,
-            Chain::Divi => self.cfg.divi_confirmations,
-        }
+        self.cfg.confirmations(r.quote.maker_chain())
     }
 
     /// True when waiting for the taker's lock is pointless: the wall-clock wait is over,
@@ -385,21 +428,21 @@ impl Maker {
     }
 
     async fn taker_window_too_short(&self, r: &MakerRecord) -> Result<bool> {
-        let mtp = self.tk(r).median_time_past().await?;
+        let mtp = self.tk(r)?.median_time_past().await?;
         let remaining = r.taker_leg_htlc.locktime.saturating_sub(mtp) as u64;
         let needed = r.quote.maker_timeout_secs as u64 + self.cfg.claim_margin_secs as u64;
         Ok(remaining < needed)
     }
 
     async fn on_accepted(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let taker_amount = taker_leg_amount(&r.quote);
+        let taker_amount = r.quote.taker_leg_amount();
         let Some(op) = r.taker_leg_outpoint else {
             if self.lock_window_gone(r).await? {
                 return self.abort(r, "taker never locked");
             }
             return Ok(Flow::Idle);
         };
-        match self.tk(r).htlc_output(&r.taker_leg_htlc, &op).await? {
+        match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await? {
             Some(lo) if lo.amount < taker_amount => self.abort(r, "taker lock underfunded"),
             Some(lo) => {
                 r.taker_leg_locked = Some(lo.amount);
@@ -408,7 +451,7 @@ impl Maker {
             None => {
                 // Only a confirmed tx is conclusive: Esplora behind a load balancer can know a
                 // mempool tx on `/status` while `/tx` still 404s on another backend.
-                if self.tk(r).confirmations(&op.txid).await?.unwrap_or(0) > 0 {
+                if self.tk(r)?.confirmations(&op.txid).await?.unwrap_or(0) > 0 {
                     return self.abort(r, "taker lock does not match the HTLC");
                 }
                 if self.lock_window_gone(r).await? {
@@ -420,9 +463,9 @@ impl Maker {
     }
 
     async fn on_taker_lock_seen(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let taker_amount = taker_leg_amount(&r.quote);
+        let taker_amount = r.quote.taker_leg_amount();
         let op = self.taker_leg_outpoint(r)?;
-        match self.tk(r).htlc_output(&r.taker_leg_htlc, &op).await? {
+        match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await? {
             Some(lo) if lo.amount < taker_amount => self.abort(r, "taker lock underfunded"),
             Some(lo) if lo.confirmations >= self.taker_leg_confs(r) => {
                 r.taker_leg_locked = Some(lo.amount);
@@ -437,7 +480,7 @@ impl Maker {
             None => {
                 // Only a confirmed tx is conclusive: Esplora behind a load balancer can know a
                 // mempool tx on `/status` while `/tx` still 404s on another backend.
-                if self.tk(r).confirmations(&op.txid).await?.unwrap_or(0) > 0 {
+                if self.tk(r)?.confirmations(&op.txid).await?.unwrap_or(0) > 0 {
                     return self.abort(r, "taker lock does not match the HTLC");
                 }
                 if self.taker_window_too_short(r).await? {
@@ -450,9 +493,9 @@ impl Maker {
 
     /// The staking edge: the only place the maker selects coins (on the maker-leg chain).
     async fn on_taker_lock_confirmed(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let taker_amount = taker_leg_amount(&r.quote);
+        let taker_amount = r.quote.taker_leg_amount();
         let op = self.taker_leg_outpoint(r)?;
-        match self.tk(r).htlc_output(&r.taker_leg_htlc, &op).await? {
+        match self.tk(r)?.htlc_output(&r.taker_leg_htlc, &op).await? {
             Some(lo)
                 if lo.amount >= taker_amount && lo.confirmations >= self.taker_leg_confs(r) => {}
             Some(lo) if lo.amount < taker_amount => return self.abort(r, "taker lock underfunded"),
@@ -462,7 +505,7 @@ impl Maker {
         if self.taker_window_too_short(r).await? {
             return self.abort(r, "taker-leg window too short to lock safely");
         }
-        let mb = self.mk(r).clone();
+        let mb = self.mk(r)?.clone();
         let mtp = mb.median_time_past().await?;
         let htlc = HtlcParams {
             hash: r.hash,
@@ -474,7 +517,7 @@ impl Maker {
         };
         htlc.validate()?;
         let scan_from = mb.tip_height().await?;
-        let funding = mb.build_funding(&htlc, maker_leg_amount(&r.quote)).await?;
+        let funding = mb.build_funding(&htlc, r.quote.maker_leg_amount()).await?;
         r.maker_leg_htlc = Some(htlc);
         r.maker_leg_funding = Some(funding);
         r.maker_leg_scan_from = scan_from;
@@ -487,9 +530,9 @@ impl Maker {
             .clone()
             .ok_or_else(|| SwapError::Other("MakerLocked without a funding tx".into()))?;
         // Idempotent: a tx the chain already has is Ok.
-        self.mk(r).broadcast(&funding.tx).await?;
+        self.mk(r)?.broadcast(&funding.tx).await?;
         let confs = self
-            .mk(r)
+            .mk(r)?
             .confirmations(&funding.tx.txid)
             .await?
             .unwrap_or(0);
@@ -525,7 +568,7 @@ impl Maker {
             Some(tx) => tx,
             None => {
                 let tx = self
-                    .mk(r)
+                    .mk(r)?
                     .build_refund(&htlc, &funding.outpoint, funding.amount)
                     .await?;
                 r.maker_leg_refund = Some(tx.clone());
@@ -533,13 +576,13 @@ impl Maker {
                 tx
             }
         };
-        match self.mk(r).broadcast(&refund).await {
+        match self.mk(r)?.broadcast(&refund).await {
             Ok(_) => {}
             Err(SwapError::Premature(_)) => return Ok(Flow::Idle),
             Err(e) => return Err(e),
         }
         if self
-            .mk(r)
+            .mk(r)?
             .confirmations(&refund.txid)
             .await?
             .is_some_and(|c| c >= 1)
@@ -561,7 +604,7 @@ impl Maker {
                     .taker_leg_locked
                     .ok_or_else(|| SwapError::Other("no verified taker-leg amount".into()))?;
                 let tx = self
-                    .tk(r)
+                    .tk(r)?
                     .build_claim(&r.taker_leg_htlc, &op, amount, &preimage)
                     .await?;
                 r.taker_leg_claim = Some(tx.clone());
@@ -569,7 +612,7 @@ impl Maker {
                 tx
             }
         };
-        self.tk(r).broadcast(&claim).await?;
+        self.tk(r)?.broadcast(&claim).await?;
         self.enter(r, SwapState::MakerClaimed)
     }
 
@@ -578,11 +621,11 @@ impl Maker {
             .taker_leg_claim
             .clone()
             .ok_or_else(|| SwapError::Other("MakerClaimed without a claim tx".into()))?;
-        match self.tk(r).confirmations(&claim.txid).await? {
+        match self.tk(r)?.confirmations(&claim.txid).await? {
             Some(c) if c >= 1 => self.enter(r, SwapState::Done),
             _ => {
                 // Dropped from the mempool? Rebroadcasting identical bytes is harmless.
-                self.tk(r).broadcast(&claim).await?;
+                self.tk(r)?.broadcast(&claim).await?;
                 Ok(Flow::Idle)
             }
         }
@@ -602,14 +645,14 @@ impl Maker {
 
     async fn maker_leg_timed_out(&self, r: &MakerRecord) -> Result<bool> {
         let (htlc, _) = self.maker_leg(r)?;
-        Ok(self.mk(r).median_time_past().await? >= htlc.locktime)
+        Ok(self.mk(r)?.median_time_past().await? >= htlc.locktime)
     }
 
     /// The preimage, if a transaction other than our own refund spent the maker-leg lock.
     async fn revealed_preimage(&self, r: &MakerRecord) -> Result<Option<[u8; 32]>> {
         let (_, funding) = self.maker_leg(r)?;
         let Some(spend) = self
-            .mk(r)
+            .mk(r)?
             .find_spend(&funding.outpoint, r.maker_leg_scan_from)
             .await?
         else {
@@ -631,36 +674,6 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Value the taker locks.
-fn taker_leg_amount(q: &Quote) -> Amount {
-    match q.direction.taker_chain() {
-        Chain::Btc => q.btc_amount,
-        Chain::Divi => q.divi_amount,
-    }
-}
-
-/// Value the maker locks.
-fn maker_leg_amount(q: &Quote) -> Amount {
-    match q.direction.maker_chain() {
-        Chain::Btc => q.btc_amount,
-        Chain::Divi => q.divi_amount,
-    }
-}
-
-fn maker_key(q: &Quote, c: Chain) -> [u8; 33] {
-    match c {
-        Chain::Btc => q.maker_btc_pubkey,
-        Chain::Divi => q.maker_divi_pubkey,
-    }
-}
-
-fn taker_key(req: &AcceptRequest, c: Chain) -> [u8; 33] {
-    match c {
-        Chain::Btc => req.taker_btc_pubkey,
-        Chain::Divi => req.taker_divi_pubkey,
-    }
-}
-
 fn view_of(r: &MakerRecord) -> SwapView {
     SwapView {
         id: r.id.clone(),
@@ -668,7 +681,7 @@ fn view_of(r: &MakerRecord) -> SwapView {
         quote: r.quote.clone(),
         taker_leg: LegView {
             htlc: r.taker_leg_htlc,
-            amount: taker_leg_amount(&r.quote),
+            amount: r.quote.taker_leg_amount(),
             outpoint: r.taker_leg_outpoint,
             spend_txid: r.taker_leg_claim.as_ref().map(|t| t.txid),
         },

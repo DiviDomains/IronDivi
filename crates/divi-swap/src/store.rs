@@ -40,7 +40,7 @@ pub struct QuoteRecord {
 }
 
 /// The maker's persisted view of one swap. Legs are role-based: the *taker leg* is on
-/// `quote.direction.taker_chain()`, the *maker leg* on `maker_chain()`. Pre-direction records
+/// `quote.taker_chain()`, the *maker leg* on `quote.maker_chain()`. Pre-direction records
 /// (taker leg = BTC, maker leg = DIVI) load through the serde aliases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MakerRecord {
@@ -318,6 +318,7 @@ mod tests {
             id: id.into(),
             offer_id: "o".into(),
             direction: crate::api::Direction::TakerPaysBtc,
+            counter_chain: crate::types::Chain::Btc,
             btc_amount: Amount(1),
             divi_amount: Amount(2),
             expires_at: 3,

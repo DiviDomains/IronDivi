@@ -17,18 +17,19 @@
 //! TOML configuration. Keys are never accepted by value: only `op://…` or
 //! `credential:<name>` references, resolved at runtime by `divi_swap::secrets`.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use divi_swap::api::Offer;
-use divi_swap::Profile;
+use divi_swap::api::{Direction, Offer};
+use divi_swap::{Chain, Profile};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
-    /// Both chains simulated in-process.
+    /// Every chain simulated in-process.
     Mock,
     /// Real DIVI testnet RPC + BTC Esplora.
     Live,
@@ -76,7 +77,6 @@ fn default_profile() -> Profile {
     Profile::Testnet
 }
 fn default_offers() -> Vec<Offer> {
-    use divi_swap::api::Direction;
     [
         ("divi-btc-testnet", Direction::TakerPaysBtc),
         ("btc-divi-testnet", Direction::TakerPaysDivi),
@@ -85,11 +85,41 @@ fn default_offers() -> Vec<Offer> {
     .map(|(id, direction)| Offer {
         id: id.into(),
         direction,
+        counter_chain: Chain::Btc,
         divi_sats_per_btc: 300_000_000_000_000,
         min_btc_sats: 5_000,
         max_btc_sats: 50_000,
     })
     .collect()
+}
+
+/// Counter chains the mock backend simulates besides BTC (no live backend exists yet).
+pub const MOCK_ONLY_CHAINS: [Chain; 2] = [Chain::Ltc, Chain::Zec];
+
+/// The offers `--backend mock` adds for each of [`MOCK_ONLY_CHAINS`]: `divi-<c>-testnet`
+/// (maker sells DIVI) and `<c>-divi-testnet` (maker buys DIVI). Prices are placeholders.
+pub fn mock_counter_offers() -> Vec<Offer> {
+    MOCK_ONLY_CHAINS
+        .into_iter()
+        .flat_map(|c| {
+            let price = match c {
+                Chain::Ltc => 10_000 * 100_000_000, // 10,000 DIVI per LTC
+                _ => 5_000 * 100_000_000,           // 5,000 DIVI per ZEC
+            };
+            [
+                (format!("divi-{c}-testnet"), Direction::TakerPaysBtc),
+                (format!("{c}-divi-testnet"), Direction::TakerPaysDivi),
+            ]
+            .map(|(id, direction)| Offer {
+                id,
+                direction,
+                counter_chain: c,
+                divi_sats_per_btc: price,
+                min_btc_sats: 100_000,
+                max_btc_sats: 10_000_000,
+            })
+        })
+        .collect()
 }
 fn default_tick() -> u64 {
     5
@@ -103,6 +133,17 @@ pub struct SwapOverrides {
     pub maker_timeout_secs: Option<u32>,
     pub btc_confirmations: Option<u32>,
     pub divi_confirmations: Option<u32>,
+    /// `[swap.chains.<ticker>]` for counter chains other than BTC (BTC and DIVI use the
+    /// fields above).
+    #[serde(default)]
+    pub chains: BTreeMap<Chain, ChainOverrides>,
+}
+
+/// Per-chain overrides of the profile's [`divi_swap::ChainParams`].
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct ChainOverrides {
+    pub confirmations: Option<u32>,
+    pub mtp_lag_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +192,15 @@ impl DaemonConfig {
         c.maker_timeout_secs = o.maker_timeout_secs.unwrap_or(c.maker_timeout_secs);
         c.btc_confirmations = o.btc_confirmations.unwrap_or(c.btc_confirmations);
         c.divi_confirmations = o.divi_confirmations.unwrap_or(c.divi_confirmations);
+        for (&chain, ov) in &o.chains {
+            if matches!(chain, Chain::Btc | Chain::Divi) {
+                bail!("[swap.chains.{chain}]: use btc_confirmations / divi_confirmations");
+            }
+            let mut p = c.chain_params(chain);
+            p.confirmations = ov.confirmations.unwrap_or(p.confirmations);
+            p.mtp_lag_secs = ov.mtp_lag_secs.unwrap_or(p.mtp_lag_secs);
+            c.chains.insert(chain, p);
+        }
         c.validate().map_err(|e| anyhow::anyhow!("[swap]: {e}"))?;
         Ok(c)
     }
@@ -173,6 +223,9 @@ impl DaemonConfig {
             if o.min_btc_sats > o.max_btc_sats {
                 bail!("offer {}: min_btc_sats > max_btc_sats", o.id);
             }
+            if !o.counter_chain.is_counter() {
+                bail!("offer {}: counter_chain cannot be divi", o.id);
+            }
         }
         let refs = self
             .divi
@@ -190,7 +243,6 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use divi_swap::api::Direction;
 
     const GOOD: &str = r#"
 db_path = "/tmp/x.db"
@@ -268,6 +320,48 @@ key = "credential:btc"
             ]
         );
         assert_eq!(c.offers[0].divi_sats_per_btc, c.offers[1].divi_sats_per_btc);
+    }
+
+    #[test]
+    fn counter_chain_offers_and_overrides_parse() {
+        let text = format!(
+            "{GOOD}\n[[offers]]\nid = \"ltc-divi-testnet\"\ndirection = \"taker_pays_divi\"\n\
+             counter_chain = \"ltc\"\ndivi_sats_per_btc = 1\nmin_btc_sats = 1\nmax_btc_sats = 2\n\
+             [swap.chains.ltc]\nconfirmations = 4\n[swap.chains.zec]\nmtp_lag_secs = 900\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        assert_eq!(c.offers[0].counter_chain, Chain::Btc);
+        assert_eq!(c.offers[1].counter_chain, Chain::Ltc);
+        let s = c.swap_config().unwrap();
+        assert_eq!(s.confirmations(Chain::Ltc), 4);
+        assert_eq!(s.chain_params(Chain::Ltc).mtp_lag_secs, 1800);
+        assert_eq!(s.chain_params(Chain::Zec).mtp_lag_secs, 900);
+        assert_eq!(s.confirmations(Chain::Zec), 3); // testnet profile
+        assert_eq!(s.confirmations(Chain::Btc), 1);
+
+        let bad = format!("{GOOD}\n[swap.chains.btc]\nconfirmations = 4\n");
+        assert!(DaemonConfig::parse(&bad).unwrap().swap_config().is_err());
+        let divi = GOOD.replace("id = \"o1\"", "id = \"o1\"\ncounter_chain = \"divi\"");
+        assert!(DaemonConfig::parse(&divi).is_err());
+    }
+
+    #[test]
+    fn mock_counter_offer_ids() {
+        let ids: Vec<_> = mock_counter_offers().into_iter().map(|o| o.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "divi-ltc-testnet",
+                "ltc-divi-testnet",
+                "divi-zec-testnet",
+                "zec-divi-testnet"
+            ]
+        );
+        for o in mock_counter_offers() {
+            let (head, _) = o.id.split_once('-').unwrap();
+            let maker_sells_divi = head == "divi";
+            assert_eq!(maker_sells_divi, o.direction == Direction::TakerPaysBtc);
+        }
     }
 
     #[test]
