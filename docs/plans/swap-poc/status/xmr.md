@@ -3,61 +3,101 @@
 - done: baretxid fix (`f8f7e9b`); build-plan steps 2-4 (`3e99c00`); step 7's bridge
   (`0139101`); root `Cargo.toml` wiring (`c73478e`, `cf80ac0`); step 5a (`02e6f0c`);
   step 5b (`23265e7`); step 6 (`6f4c32a`); step 7 + the two-secret protocol correction
-  (`f54edba`); step 8, mock happy-path e2e (`1587eee`). Confirmed clean after lane-sync.
-  **New this round — step 9, the engine-integration proposal, done.** The last build-plan
-  step. Added `## Engine integration` to `xmr-design.md`:
-  - Verdict: `divi_swap::ChainBackend`/`SwapState` do not fit, more fundamentally than
-    the USDC lane's account-chain mismatch (`usdc-design.md` — that one's a shape
-    mismatch within the same hashlock model; this one is a different model). Four
-    structural mismatches, each actually load-bearing: (1) no hashlock/preimage at all —
-    every `ChainBackend` claim/refund method is parameterized by `HtlcParams`/`preimage`,
-    this design has neither; (2) four presigned DIVI transactions, not two, and three
-    need an off-chain DLEQ-proof-and-encrypted-signature exchange *before* they can even
-    be built — `ChainBackend` has no hook for "build something that depends on a value
-    the counterparty sends first"; (3) a second, non-UTXO, no-scripting chain (Monero)
-    needed *simultaneously*, not as an alternate counter-chain — `htlc_output`/
-    `find_spend` are meaningless questions there; (4) three outcomes (redeem/refund/
-    *punish*), not two, and `Tx_punish` is triggered by inaction, not an action —
-    `SwapState`'s two terminal paths have no slot for it.
-  - Option A (force a fit): considered and rejected as not even worth attempting —
-    unlike USDC, where one specific compromise (keeping `approve` outside the
-    write-ahead model) sufficed, there is no single compromise here; fixing all four
-    mismatches would leave nothing of the original trait but its name.
-  - Option B (recommended): a dedicated module outside `ChainBackend` entirely — a new
-    state enum mirroring `## Protocol`'s own table, two narrow backend-shaped traits
-    (DIVI-side reusing `crates/swap-chain-xmr`'s actual primitives; Monero-side wrapping
-    `monero_key_share`/the stagenet RPC client this lane already built), a setup phase
-    for the mutual DLEQ-proof exchange with no analog in today's `Quoted`/`Accepted`,
-    and its own daemon/CLI path rather than `divi-swapd`'s existing offer pipeline.
-  - What carries over regardless of which option: this lane's DIVI-side code
-    (`crates/swap-chain-xmr`) already reuses `divi-wallet`/`divi-script`/
-    `divi-primitives` the same way `swap-chain-divi` does, so a real implementation's
-    DIVI RPC/broadcast plumbing could share code with `swap-chain-divi` even without
-    sharing the `ChainBackend` trait.
-  - Docs-only change; `check-xmr.sh` still passes (no required section names touched,
-    `## Engine integration` is additional).
+  (`f54edba`); step 8, mock happy-path e2e (`1587eee`); step 9, engine-integration
+  proposal (`3f2aefa`). **All nine build-plan steps from `xmr-design.md` landed.**
+  Confirmed clean after lane-sync (fast-forward, no conflicts this round).
+  New this round: the live-stagenet/testnet run plan below, per the orchestrator's
+  request — written down now, for whoever (the orchestrator, from the Mac) actually
+  runs it, since it needs funded keys and real coordination this lane can't provide
+  from hp2.
 - running: nothing.
 - broken: none in my paths.
-- left: **all nine build-plan steps are done.** What remains is the one item repeatedly
-  parked as genuinely gated on elapsed time/coordination, not more Rust or more design:
-  - fund the address `monero_dkg`'s (reference-only) test derives and prove a live 2-of-2
-    cooperative spend on stagenet (self-mine via `getblocktemplate`/`submitblock`, no
-    faucet; both parties' live participation in `monero_wallet::send::multisig`), and
-    symmetrically an actual DIVI testnet broadcast of the `Tx_lock`/`Tx_cancel`/
-    `Tx_redeem` chain `happy_path_e2e.rs` already proves offline. Should use
-    `monero_key_share`'s additive keys (not `monero_dkg`'s PedPoP reference ones). Needs
-    real coordination between two throwaway identities and real wall-clock time for
-    confirmations on both chains — worth a dedicated pass, not foldable into a code
-    round, and per lane rule 5 the *funded* parts of this are the orchestrator's to run
-    from the Mac in any case.
-  - Separately, per `## Engine integration`'s recommendation above: deciding on and
-    scoping the dedicated adaptor-swap module (Option B) is the orchestrator's call, not
-    something for this lane to build unilaterally — see `- needs:` below.
-- decisions: none new this round — step 9 was writing up the integration question the
-  build plan already flagged, using the actual trait/state-machine source rather than
-  assumption (same discipline as the two design corrections in earlier rounds).
-- needs: the engine-integration decision itself — `## Engine integration`'s Option B
-  (a dedicated module/trait pair for adaptor-signature swaps, outside `ChainBackend`) vs.
-  any alternative the orchestrator prefers. This lane recommends Option B and explains
-  why Option A isn't worth attempting, but the actual choice belongs to the orchestrator,
-  same posture the plan already takes for USDC's wave 1c mismatch.
+- left: nothing coded. Two things remain, both decisions/actions for the orchestrator,
+  not more work for this lane:
+  1. The live run itself — see `- live_run_plan:` below for the exact coins, faucet,
+     keys, and commands.
+  2. The engine-integration decision (`## Engine integration` in `xmr-design.md`) —
+     see `- needs:` below.
+- decisions: none new this round.
+- needs: the engine-integration decision — `## Engine integration`'s Option B (a
+  dedicated module/trait pair for adaptor-signature swaps, outside `ChainBackend`) vs.
+  any alternative the orchestrator prefers. This lane recommends Option B; the choice
+  belongs to the orchestrator, same posture as USDC's wave 1c mismatch.
+- live_run_plan: the exact happy-path live run, for whoever executes it (needs funded
+  keys — **none of this runs from hp2**, per lane rule 5). Supersedes this status file's
+  earlier mentions of self-mining stagenet XMR via `getblocktemplate`/`submitblock` —
+  a real faucet exists and is simpler; use it instead.
+
+  **Coins needed** (both worthless test-network coins, no real value):
+  - A small amount of DIVI testnet coin for Maker's `Tx_lock` — 1 tDIVI is comfortably
+    enough to cover the swap amount plus fees on every subsequent presigned spend.
+  - 0.01 sXMR (stagenet XMR) for Taker to lock — one faucet request's worth (see below).
+
+  **Faucet**: `https://cypherfaucet.com/xmr-stagenet` (checked live 2026-10-11; listed
+  on getmonero.org, so a legitimate, maintained one, not a dead link). Enter a stagenet
+  address, solve a CAPTCHA, receive 0.01 sXMR; capped at once per hour per
+  address/IP. **The CAPTCHA means this step needs a human** — same exact blocker shape
+  as `DECISIONS.md` #5 (the BTC lane's signet faucet), so whoever runs this live pass
+  needs to visit the faucet page themselves once. A developer API exists for
+  programmatic requests but needs contacting the operator for access — not pursued
+  here since one manual drip is all this needs.
+  - Fallback if the faucet is ever down/insufficient: self-mine via a locally-run
+    `monerod --stagenet`'s `start_mining` JSON-RPC call to any address, no faucet
+    needed (stagenet mining is permissionless) — but mined (coinbase) outputs need
+    **60 confirmations (~2 h)** before spendable, vs. 10 confirmations (~20 min) for an
+    ordinary received output like the faucet's. The faucet path is strictly faster
+    when it's available; only fall back to mining if it isn't.
+
+  **Keys**: all freshly generated for this one run, thrown away afterward, exactly like
+  every other test in this lane — no 1Password entries needed (these coins have no
+  value to protect). Generate at run time, not ahead of time:
+  - Maker's and Taker's DIVI secp256k1 keypairs (`divi_crypto::keys::SecretKey::new_random()`
+    or equivalent) — these are the `{a', b'}` pair in `xmr-design.md`'s notation.
+  - Taker's own simple stagenet wallet (to receive the faucet drip before locking it
+    into the 2-of-2) — any stagenet wallet works; `monero-wallet-cli --stagenet
+    --generate-new-wallet <path>` is the straightforward option if a GUI isn't wanted.
+  - The DLEQ secrets `s_t`/`s_m` and the resulting Monero 2-of-2 spend-key shares —
+    generated by the swap code itself (`swap_adaptor::dleq::random_clamped_secret`,
+    `crates/swap-chain-xmr/src/monero_key_share.rs`), not supplied externally.
+  Run this whole thing from the orchestrator's Mac (or wherever holds `secret get`
+  access and isn't hp2), not here — matches how every other lane's `live` tests work.
+
+  **Commands / sequence** (numbers match `xmr-design.md`'s `## Protocol` `### Happy
+  path` steps where they line up):
+  1. Generate Maker/Taker DIVI keypairs; build the redeem script and its P2SH testnet
+     address: `swap_chain_xmr::multisig::{redeem_script, script_pubkey}` for the
+     scriptPubKey, `divi_wallet::Address::p2sh(hash, Network::Testnet)` for the
+     human-readable address to fund.
+  2. Run both DLEQ proofs (`swap_adaptor::dleq`), derive the additive Monero
+     `ThresholdKeys` (`monero_key_share::additive_two_of_two_keys`), and the Monero
+     stagenet address for the 2-of-2 lock output — identical code path to
+     `crates/swap-chain-xmr/src/monero_dkg.rs`'s `group_key_derives_a_real_stagenet_address`
+     test, just with `monero_key_share`'s keys instead of that test's PedPoP ones, and
+     `Network::Stagenet` (already what that test uses).
+  3. Visit `cypherfaucet.com/xmr-stagenet`, solve the CAPTCHA, send 0.01 sXMR to
+     Taker's *own* stagenet wallet address (not the 2-of-2 address yet — a real swap's
+     Taker already holds her XMR in her own wallet before locking it, so this mirrors
+     that). Wait 10 confirmations (~20 min).
+  4. From Taker's wallet, send the XMR into the 2-of-2 Monero address from step 2 —
+     this is the actual "Taker locks XMR" step in `## Protocol`'s happy path step 2.
+     Wait 10 confirmations (~20 min).
+  5. Ask whoever holds `dnsdivi` SSH access (per `DECISIONS.md` #1, the established
+     source for every other lane's live testnet DIVI) to run, from a dnsdivi node
+     wallet: `divi-cli -conf=<testnet.conf> sendtoaddress <maker-p2sh-testnet-address>
+     <amount>` — Maker's `Tx_lock`. Wait for 1-6 confirmations (DIVI testnet's existing
+     profile, same as the BTC/DIVI lane's live runs).
+  6. Build and broadcast `Tx_redeem` directly off `Tx_lock`'s output (the design
+     permits spending `Tx_redeem` from either `Tx_lock` or `Tx_cancel` — skip
+     `Tx_cancel` for this minimal happy-path run; it's already proven separately,
+     offline, by `swap_templates::tests::tx_punish_is_plain_and_pays_taker` and
+     `happy_path_e2e.rs`'s own use of it): `swap_templates::maker_encrypts_tx_redeem`
+     then `taker_completes_tx_redeem`, broadcast the result via the same DIVI testnet
+     RPC proxy (`services.divi.domains`) the BTC/DIVI lane's live tests already use.
+     Wait for confirmation.
+  7. Maker recovers `s_t` from the confirmed `Tx_redeem`
+     (`swap_templates::recover_secret_from_chain`), combines it with his own `s_m`
+     exactly as `happy_path_e2e.rs` checks arithmetically offline, and sweeps the full
+     Monero 2-of-2 output to a fresh stagenet address of his own, with the now-fully-
+     known private spend key (no multisig cooperation needed once Maker holds both
+     halves) — the actual proof that the live run completed the swap, not just that
+     the mock arithmetic checks out.
