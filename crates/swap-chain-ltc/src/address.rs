@@ -69,4 +69,30 @@ mod tests {
     fn rejects_bad_hrp() {
         assert!(encode_segwit_v0("", &[0u8; 20]).is_err());
     }
+
+    /// LTC P2WPKH re-encodes the same witness program (hash160 of the pubkey) as the BTC
+    /// `tb1…` address under HRP `tltc`, with no private key involved — the invariant
+    /// `docs/plans/swap-poc/funding.md` (orchestrator decision 64ae2a0) relies on to reuse
+    /// the existing `taker-btc`/`maker-btc` swap keys as the LTC funding addresses. If this
+    /// ever fails, `LtcBackend`'s derivation disagrees with that table — stop and report it,
+    /// per the orchestrator's instruction, rather than funding the wrong address.
+    #[test]
+    fn ltc_funding_addresses_match_funding_doc() {
+        let cases = [
+            (
+                "tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg",
+                "tltc1qa826ffe73xnqsm64x6fvln7sl0zp3rgf5gnf3p",
+            ),
+            (
+                "tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt",
+                "tltc1quqkt7c06svzt68f2y9uwf2jzgpd48k6k9akunz",
+            ),
+        ];
+        for (btc_tb1, want_tltc) in cases {
+            let (hrp, program) = decode_segwit_v0(btc_tb1).unwrap();
+            assert_eq!(hrp, "tb");
+            let got = encode_segwit_v0(TLTC_HRP, &program).unwrap();
+            assert_eq!(got, want_tltc, "re-encoding {btc_tb1}");
+        }
+    }
 }

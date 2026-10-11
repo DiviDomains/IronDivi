@@ -22,7 +22,10 @@ network = "testnet"
 esplora_url = "https://litecoinspace.org/testnet/api"
 # No independent secondary mirror of this API shape is known (swap-chain-ltc lane status,
 # decisions, 2026-10-11); fallback_esplora_url is left unset.
-key = "credential:maker-ltc"
+# Testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md,
+# decision 64ae2a0): no maker-ltc 1Password item or credential file exists or is needed —
+# this is the same maker-btc credential already loaded above.
+key = "credential:maker-btc"
 
 # Standing offers. Price is DIVI sats per 1 counter-chain coin; min/max are counter-chain
 # sats in both directions. direction: "taker_pays_btc" (maker sells DIVI, the default) or

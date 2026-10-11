@@ -15,8 +15,9 @@ UMask=0077
 # Keys: root:root 0400 files, exposed to the service only via $CREDENTIALS_DIRECTORY.
 LoadCredential=maker-divi:/etc/divi-swapd/credentials/maker-divi
 LoadCredential=maker-btc:/etc/divi-swapd/credentials/maker-btc
-# Enable once /etc/divi-swapd/credentials/maker-ltc exists: a missing file fails the unit (243/CREDENTIALS).
-#LoadCredential=maker-ltc:/etc/divi-swapd/credentials/maker-ltc
+# No LoadCredential=maker-ltc: testnets reuse the BTC swap key on every secp256k1 chain
+# (docs/plans/swap-poc/funding.md, decision 64ae2a0) — [ltc].key in the config is
+# credential:maker-btc, already loaded above.
 Restart=on-failure
 RestartSec=5
 ProtectSystem=strict

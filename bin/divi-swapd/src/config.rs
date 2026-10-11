@@ -310,7 +310,8 @@ key = "credential:btc"
         let l = c.ltc.unwrap();
         assert_eq!(l.network, "testnet");
         assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
-        assert_eq!(l.key, "credential:maker-ltc");
+        // Reuses the BTC swap key (funding.md decision 64ae2a0); no maker-ltc item exists.
+        assert_eq!(l.key, "credential:maker-btc");
         let ltc_ids: Vec<_> = c
             .offers
             .iter()
