@@ -3113,7 +3113,23 @@ dependencies = [
 name = "swap-chain-ltc"
 version = "0.2.5"
 dependencies = [
+ "async-trait",
+ "bech32",
+ "bitcoin",
  "divi-swap",
+ "hex",
+ "parking_lot",
+ "proptest",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+ "zeroize",
 ]
 
 [[package]]
