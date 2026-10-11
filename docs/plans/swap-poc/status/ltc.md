@@ -64,31 +64,43 @@
     - `ltc-live.sh --direction reverse --dry-run` (and `--direction both`) verified again
       end-to-end on `--backend mock` after this refactor: still accepts, still stops before
       lock, daemons still tear down cleanly (no leaked process/port).
+  - **Wave 3d** (this session): the btc lane no longer exists, so `crates/swap-chain-btc`
+    is now this lane's too (orchestrator). Ported the Wave 3a fix there: `build_funding_tx`
+    had the identical `needed`-seeded-to-0 underflow, masked (not fixed) by a prior quick
+    patch (`chosen.is_empty() || total < needed`) rather than the root-cause fix. Replaced
+    it with the same fix as `swap-chain-ltc` (seed `needed` from the zero-input fee estimate
+    before the loop). The pre-existing regression test
+    `funding_from_empty_wallet_is_insufficient_funds` already covered this case, so no
+    duplicate test was added (an initial port of `funding_fails_cleanly_with_no_utxos_at_all`
+    was removed once that overlap was spotted). `cargo fmt`/`clippy -D warnings`/`test
+    --all-features` clean for both `swap-chain-btc` (17 passed, 1 ignored) and
+    `swap-chain-ltc`. Noted in `status/btc.md` too.
+  - Live progress (orchestrator, from the Mac): taker→maker funding send (`ltc_send.rs`)
+    succeeded; **the forward happy-path swap then ran live and completed** — LTC lock
+    `2e28ead1…`, LTC claim `cef1dc11…`. Maker now holds ≈0.003 tLTC (received minus its
+    HTLC leg so far), taker still holds the remainder of its 0.01 tLTC. Reverse direction
+    should be fundable/runnable now; txids/confirmations not yet pasted here — orchestrator.
   - All of: `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`,
-    `cargo test` clean for `swap-chain-ltc` (33 tests, 2 `#[ignore]`), `divi-swapd`,
-    `divi-swap-cli`. `tools/swap-poc/check-ltc.sh` and `check-ltc-live.sh` both PASS.
-- running: nothing further queued. Next action is the orchestrator's: run the maker-funding
-  send (`ltc_send.rs`, `op://…/taker-btc` → `tltc1quqkt7c06svzt68f2y9uwf2jzgpd48k6k9akunz`,
-  0.004 tLTC) from the Mac, then both directions' live commands below.
-- left / next steps (both directions now unblocked once the send above confirms):
+    `cargo test` clean for `swap-chain-ltc` (33 tests, 2 `#[ignore]`), `swap-chain-btc`
+    (17 tests, 1 `#[ignore]`), `divi-swapd`, `divi-swap-cli`. `tools/swap-poc/check-ltc.sh`
+    and `check-ltc-live.sh` both PASS.
+- running: nothing further queued; idle until the orchestrator lands this or the next live
+  result (reverse direction, case-c either direction) comes in.
+- left / next steps:
   ```sh
-  # Sanity check first, either direction (no funds, no risk — stops before lock):
-  tools/swap-poc/ltc-live.sh --backend live --direction forward --dry-run
+  tools/swap-poc/ltc-live.sh --backend live --direction forward --dry-run   # sanity check
   tools/swap-poc/ltc-live.sh --backend live --direction reverse --dry-run
-
-  # Forward is funded now (taker 0.01 tLTC, confirmed tx be211c99…9285, block 4912514):
-  tools/swap-poc/ltc-live.sh --backend live --direction forward   # happy + case-c, ~8h; background it
-
-  # Reverse needs the maker send above to land first, then:
-  tools/swap-poc/ltc-live.sh --backend live --direction reverse   # happy + case-c, ~8h; background it
+  tools/swap-poc/ltc-live.sh --backend live --direction forward   # case-c still pending; happy done live above
+  tools/swap-poc/ltc-live.sh --backend live --direction reverse   # now that the maker holds tLTC
   ```
   Taker/maker LTC key refs resolve automatically to
   `op://global_secret_store/IronDivi Swap POC - {taker,maker}-btc/password`.
-  After both directions' happy+case-c runs confirm, paste `results.txt` txids into this
-  file and `docs/plans/swap-poc/RESULTS.md` (orchestrator, per `multi-coin.md` wave 3).
-  `live_fund_claim_refund` (`#[ignore] --features live`) is also runnable now with
-  `SWAP_LTC_TEST_KEY_HEX` = the taker-btc key's hex — a third independent live-path check
-  beyond what `ltc-live.sh` exercises through the daemon/CLI.
+  After both directions' happy+case-c runs confirm, paste `results.txt` txids (plus the
+  forward-happy txids above) into this file and `docs/plans/swap-poc/RESULTS.md`
+  (orchestrator, per `multi-coin.md` wave 3).
+  `live_fund_claim_refund` (`#[ignore] --features live`, `swap-chain-ltc`) is also runnable
+  now with `SWAP_LTC_TEST_KEY_HEX` = the taker-btc key's hex — a third independent
+  live-path check beyond what `ltc-live.sh` exercises through the daemon/CLI.
 - decisions:
   - Primary Esplora endpoint `https://litecoinspace.org/testnet/api`; no independent public
     secondary mirror found. `esplora_endpoints("testnet")` returns a single-element vec.
@@ -114,6 +126,4 @@
     `SWAP_LTC_TEST_KEY_HEX` (the live HTLC test's var): deliberately different names so a
     shell history or env dump can't confuse "the key I'm about to move funds with" and
     "the key the long-running funded HTLC test reads".
-- needs: orchestrator to relay the `build_funding_tx` empty-UTXO-list underflow pattern to
-  the btc lane (`crates/swap-chain-btc/src/tx.rs` has the identical `needed`-seeding logic,
-  copied from there in Wave 1) — not this lane's path to fix.
+- needs: nothing from the orchestrator right now.
