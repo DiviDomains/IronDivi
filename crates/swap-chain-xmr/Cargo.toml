@@ -41,3 +41,11 @@ monero-wallet = "0.2"
 monero-daemon-rpc = "0.2"
 monero-simple-request-rpc = "0.1"
 tokio = { workspace = true }
+# For xmr_live.rs: DIVI testnet RPC (reused, not reimplemented) and local-run state
+# persistence. swap-chain-divi is a sibling crate, not modified -- just its public
+# RpcClient/TESTNET_RPC.
+swap-chain-divi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }

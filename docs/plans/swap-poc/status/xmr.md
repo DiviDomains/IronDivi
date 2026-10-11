@@ -5,24 +5,73 @@
   step 5b (`23265e7`); step 6 (`6f4c32a`); step 7 + the two-secret protocol correction
   (`f54edba`); step 8, mock happy-path e2e (`1587eee`); step 9, engine-integration
   proposal (`3f2aefa`). **All nine build-plan steps from `xmr-design.md` landed.**
-  Confirmed clean after lane-sync (fast-forward, no conflicts this round).
-  New this round: the live-stagenet/testnet run plan below, per the orchestrator's
-  request — written down now, for whoever (the orchestrator, from the Mac) actually
-  runs it, since it needs funded keys and real coordination this lane can't provide
-  from hp2.
-- running: nothing.
+  New this round, per the orchestrator's "don't go idle, the live run is this lane's
+  job now" directive (decision: Option B for engine integration, `6095675` landed):
+  - Downloaded the official monerod v0.18.5.3 release into
+    `/mnt/storage1/bshuler-xmr` (outside the repo), verified against
+    `getmonero.org`'s signed `hashes.txt` (PGP-checked against `binaryFate`'s key from
+    `monero-project/monero`'s own GitHub, then SHA256-checked the binary) before
+    extracting or running anything.
+  - `monerod --stagenet --prune-blockchain` running in the background (`nice 10`,
+    `--max-concurrency 4`, RPC bound to `127.0.0.1:38081` only — confirmed via `ss
+    -tlnp`, no external exposure). **Never mainnet** — `nettype: stagenet` confirmed
+    live via `get_info`.
+  - `monero-wallet-rpc` running alongside it (RPC on `127.0.0.1:38088` only), with a
+    freshly generated throwaway wallet (`mining-wallet`,
+    `5AbHxitM2WMiq1b957FpA6ZMHPPSex3XNH3UU9ox2tGpMHj9mNwCXCEXWMUVnfhnrQLyeh8vNDy6Mitu5d4L9Zjm9p8LaiS`)
+    to mine to once sync completes — see `- running:` for why mining hasn't started
+    yet, and `- left:` for the correction to last round's premature "done".
+  - `crates/swap-chain-xmr/examples/xmr_live.rs`: the live happy-path harness against
+    local stagenet `monerod` + DIVI testnet, built and run for real (not just
+    `cargo check`) this round. `cargo build`/`clippy -D warnings`/`fmt --check` all
+    clean; `cargo test -p swap-chain-xmr` still 19/19 green (no regressions in the
+    nine build-plan steps' tests). Running it live against the actual local `monerod`
+    produces real output: generates fresh Maker/Taker DIVI keys and the real additive
+    Monero key share (reusing `monero_key_share`, not mocked), derives and prints both
+    addresses that need funding, persists state to
+    `/mnt/storage1/bshuler-xmr/xmr_live_state.json` (outside the repo) so it resumes
+    correctly across runs, and checks real funding/sync status via real RPC calls
+    (`services.divi.domains` for DIVI, local `monerod` for Monero) rather than mocking
+    either side. `Tx_redeem` build-and-broadcast is wired to the same
+    `swap_templates::{maker_encrypts_tx_redeem, taker_completes_tx_redeem}` the nine
+    build-plan steps already prove offline, gated on both legs reporting funded — not
+    yet exercised this round since neither leg has real coin yet (see `- needs:`).
+    The final Monero sweep (the actual spend of the 2-of-2 output once `s_t` is
+    recovered) is deliberately left as the next increment — it needs
+    `monero_wallet::scan::Scanner`/decoy selection against a real deposit that doesn't
+    exist yet either, so writing it now couldn't be tested against anything real.
+- running: `monerod` (PID varies across restarts) and `monero-wallet-rpc`,
+  both in the background on hp2, both still alive as of this round. `monerod` is
+  still syncing stagenet from genesis (height ~101,000 of target ~2,227,200, ~4.5%,
+  climbing steadily — outgoing peer count 4, no stall). Mining has **not** started:
+  starting it before the node is fully synced would mine on top of a stale/incomplete
+  local chain tip, and those blocks would almost certainly be orphaned the moment sync
+  catches up past them — pure wasted CPU, not "self-mining avoids the faucet
+  CAPTCHA" the orchestrator asked for. Will issue `start_mining` (2 threads, to the
+  mining-wallet address above) once `get_info`'s `synchronized` field goes `true`,
+  tracked and continued across future rounds on this same running daemon.
 - broken: none in my paths.
-- left: nothing coded. Two things remain, both decisions/actions for the orchestrator,
-  not more work for this lane:
-  1. The live run itself — see `- live_run_plan:` below for the exact coins, faucet,
-     keys, and commands.
-  2. The engine-integration decision (`## Engine integration` in `xmr-design.md`) —
-     see `- needs:` below.
-- decisions: none new this round.
-- needs: the engine-integration decision — `## Engine integration`'s Option B (a
-  dedicated module/trait pair for adaptor-signature swaps, outside `ChainBackend`) vs.
-  any alternative the orchestrator prefers. This lane recommends Option B; the choice
-  belongs to the orchestrator, same posture as USDC's wave 1c mismatch.
+- left: last round's status mistakenly marked "generate throwaway stagenet wallet and
+  mine" as fully done — only the wallet-generation half was actually done; the
+  `start_mining` RPC call was never issued. Corrected here; see `- running:` for the
+  real state and why it's gated on sync completion, not skipped.
+- decisions: none new this round (engine-integration decision already landed as
+  `6095675`, Option B, per the orchestrator).
+- needs: **DIVI testnet funding**, to actually exercise `Tx_redeem` build-and-broadcast
+  live (per the orchestrator: "Use fresh DIVI keys that I will fund with tDIVI. When
+  it needs DIVI funding, print the P2SH/address ... as needs:"). From this round's
+  real `xmr_live` run:
+  - DIVI P2SH testnet address (Maker's `Tx_lock`, needs ~1 tDIVI — comfortably covers
+    the swap amount plus fees on every subsequent presigned spend):
+    `8wRwFgKCKCVfxUmUAkMd3VLNRdwqUyhwut`
+  - Monero stagenet address (the 2-of-2 lock, Taker's leg) — no action needed from the
+    orchestrator here, this lane is self-mining toward it once `monerod` finishes
+    syncing: `53hWE4DtPhFAvGj998ShM5D47iQ7hC6L2FhtiNiaHzX54b51c6UH3DMiP4xsAjmVrWByCdYZ3MpbsYEiTX1WR4oL4q2uGum`
+  Once DIVI lands on the P2SH address, record its txid as `divi_lock_txid` in
+  `/mnt/storage1/bshuler-xmr/xmr_live_state.json` and re-run the example (`cargo run -p
+  swap-chain-xmr --example xmr_live --features live`) to pick it up — it polls for
+  confirmation and proceeds automatically once both legs are funded.
+  (examples/xmr_live.rs + dev-dependencies; build, clippy, fmt, tests and check-xmr.sh clean)
 - live_run_plan: the exact happy-path live run, for whoever executes it (needs funded
   keys — **none of this runs from hp2**, per lane rule 5). Supersedes this status file's
   earlier mentions of self-mining stagenet XMR via `getblocktemplate`/`submitblock` —
