@@ -462,6 +462,24 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
         self.prioritise_transaction(txid, priority_delta, fee_delta)
     }
 
+    fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.txs
+            .read()
+            .values()
+            .map(|e| divi_rpc::blockchain::MempoolTxInfo {
+                txid: e.txid,
+                size: e.size,
+                fee_sat: e.fee.as_sat(),
+                time: now - e.time.elapsed().as_secs() as i64,
+                depends: e.ancestors.iter().copied().collect(),
+            })
+            .collect()
+    }
+
     fn get_stats(&self) -> divi_rpc::blockchain::MempoolStats {
         divi_rpc::blockchain::MempoolStats {
             size: self.size(),

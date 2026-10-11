@@ -47,6 +47,19 @@ pub struct MempoolStats {
     pub min_fee: f64,
 }
 
+/// Per-transaction mempool details for `getrawmempool true`
+#[derive(Debug, Clone)]
+pub struct MempoolTxInfo {
+    pub txid: Hash256,
+    pub size: usize,
+    /// Fee in satoshis
+    pub fee_sat: i64,
+    /// Unix time the transaction entered the pool
+    pub time: i64,
+    /// Unconfirmed in-pool parents
+    pub depends: Vec<Hash256>,
+}
+
 /// Fee estimation result
 #[derive(Debug, Clone)]
 pub struct FeeEstimate {
@@ -59,6 +72,12 @@ pub struct FeeEstimate {
 /// Trait for mempool access (to avoid circular dependency)
 pub trait MempoolProvider: Send + Sync {
     fn get_txids(&self) -> Vec<Hash256>;
+
+    /// Details for every pool transaction (verbose getrawmempool)
+    fn get_tx_infos(&self) -> Vec<MempoolTxInfo> {
+        Vec::new()
+    }
+
     fn prioritise_transaction(&self, txid: &Hash256, priority_delta: f64, fee_delta: i64) -> bool;
 
     /// Get mempool statistics
@@ -398,7 +417,7 @@ impl BlockchainRpc {
 
         let stats = self.chain.get_utxo_stats().map_err(|e| {
             RpcError::new(
-                codes::INTERNAL_ERROR,
+                codes::MISC_ERROR,
                 format!("Failed to get UTXO stats: {}", e),
             )
         })?;
@@ -508,11 +527,32 @@ impl BlockchainRpc {
         })
     }
 
-    pub fn get_raw_mempool(&self, _params: &Params) -> Result<Value, Error> {
+    pub fn get_raw_mempool(&self, params: &Params) -> Result<Value, Error> {
+        let verbose = params.get(0).and_then(|v| v.as_bool()).unwrap_or(false);
         let mempool_guard = self.mempool.read();
         let Some(ref mempool) = *mempool_guard else {
-            return Ok(json!([]));
+            return Ok(if verbose { json!({}) } else { json!([]) });
         };
+
+        if verbose {
+            let height = self.chain.height();
+            let mut out = serde_json::Map::new();
+            for info in mempool.get_tx_infos() {
+                out.insert(
+                    info.txid.to_string(),
+                    json!({
+                        "size": info.size,
+                        "fee": info.fee_sat as f64 / 100_000_000.0,
+                        "time": info.time,
+                        "height": height,
+                        "startingpriority": 0.0,
+                        "currentpriority": 0.0,
+                        "depends": info.depends.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            return Ok(Value::Object(out));
+        }
 
         let txids: Vec<String> = mempool
             .get_txids()
@@ -543,7 +583,7 @@ impl BlockchainRpc {
 
         let mempool_guard = self.mempool.read();
         let Some(ref mempool) = *mempool_guard else {
-            return Err(RpcError::new(codes::INTERNAL_ERROR, "Mempool not available").into());
+            return Err(RpcError::new(codes::MISC_ERROR, "Mempool not available").into());
         };
 
         let success = mempool.prioritise_transaction(&txid, priority_delta, fee_delta);
@@ -626,7 +666,7 @@ impl BlockchainRpc {
 
     pub fn generate_block(&self, _params: &Params) -> Result<Value, Error> {
         Err(RpcError::new(
-            codes::INTERNAL_ERROR,
+            codes::MISC_ERROR,
             "generateblock is not yet implemented - requires full mining subsystem",
         )
         .into())
@@ -634,7 +674,7 @@ impl BlockchainRpc {
 
     pub fn set_generate(&self, _params: &Params) -> Result<Value, Error> {
         Err(RpcError::new(
-            codes::INTERNAL_ERROR,
+            codes::MISC_ERROR,
             "setgenerate is not yet implemented - requires full mining subsystem",
         )
         .into())

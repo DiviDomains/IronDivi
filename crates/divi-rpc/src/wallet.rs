@@ -742,9 +742,10 @@ impl WalletRpc {
     pub fn rescan_blockchain(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        let chain = self.chain.as_ref().ok_or_else(|| {
-            RpcError::new(codes::INTERNAL_ERROR, "Chain not available for rescan")
-        })?;
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available for rescan"))?;
 
         // Get start height (default to 0)
         let start_height = params.get_i64(0).unwrap_or(0).max(0) as u32;
@@ -1725,7 +1726,7 @@ impl WalletRpc {
         let chain = self
             .chain
             .as_ref()
-            .ok_or_else(|| RpcError::new(codes::INTERNAL_ERROR, "Chain not available"))?;
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available"))?;
 
         let height = chain.height();
 
@@ -1953,7 +1954,7 @@ impl WalletRpc {
         let _vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
 
         Err(RpcError::new(
-            codes::INTERNAL_ERROR,
+            codes::MISC_ERROR,
             format!(
                 "debitvaultbyname not yet implemented. This command requires coinstake creation, which is outside the current scope. The vault manager can ONLY spend vault funds via coinstake transactions (OP_REQUIRE_COINSTAKE enforces this). This command would create a coinstake spending {} DIVI from vault {} to {}. Full implementation requires: (1) Coinstake transaction building, (2) Kernel hash computation, (3) Proof-of-stake validation",
                 amount, vault_encoding, destination
@@ -1986,7 +1987,7 @@ impl WalletRpc {
         let chain = self
             .chain
             .as_ref()
-            .ok_or_else(|| RpcError::new(codes::INTERNAL_ERROR, "Chain not available"))?;
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available"))?;
         let height = chain.height();
 
         let vault_utxos = wallet.get_vault_utxos(height, 1);
@@ -2251,7 +2252,7 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: block_height"))?;
 
         Err(RpcError::new(
-            codes::INTERNAL_ERROR,
+            codes::MISC_ERROR,
             "Lottery functionality is a Divi-specific feature that requires lottery subsystem implementation. The Divi lottery system randomly selects winning addresses from staking participants and distributes lottery rewards at specific block heights. This feature will be added in a future release. For lottery information, please use the C++ Divi client."
         ).into())
     }
@@ -2266,7 +2267,7 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: locktime"))?;
 
         Err(RpcError::new(
-            codes::INTERNAL_ERROR,
+            codes::MISC_ERROR,
             "Treasury fund allocation requires governance subsystem implementation. This RPC command is used for treasury and governance operations to allocate funds for community proposals. The governance system requires masternode voting integration. This feature will be added in a future release. For treasury operations, please use the C++ Divi client."
         ).into())
     }
@@ -3299,7 +3300,7 @@ impl WalletRpc {
         // Hash with the DarkNet magic prefix to match C++ Divi's CHashWriter protocol
         let hash = message_magic_hash(message.as_bytes());
         let signature = divi_crypto::sign_hash_recoverable(secret, &hash)
-            .map_err(|e| RpcError::new(codes::INTERNAL_ERROR, format!("Signing failed: {}", e)))?;
+            .map_err(|e| RpcError::new(codes::MISC_ERROR, format!("Signing failed: {}", e)))?;
 
         // Return base64-encoded signature (65 bytes: recovery_id + r + s)
         let sig_bytes = signature.to_compact_with_recovery();

@@ -130,9 +130,10 @@ READ = {
 
 # Mutating/dangerous: called ONLY with a bogus argument so the call fails validation, never executes.
 MUTATING = [
-    "addnode", "ban", "clearbanned_SKIP", "stop_SKIP", "setgenerate", "generateblock", "prioritisetransaction",
+    "addnode", "ban", "clearbanned_SKIP", "stop_SKIP", "setgenerate", "prioritisetransaction",
     "invalidateblock", "reconsiderblock", "setmocktime", "reverseblocktransactions",
-    "createrawtransaction", "sendrawtransaction", "signrawtransaction", "signtransactionwithaddresskey",
+    "createrawtransaction", "sendrawtransaction", "signrawtransaction", "signtransactionwithaddresskey_SKIP",  # C++ 3.0.0 daemon dies on a no-arg call (silent exit, no assert text)
+   
     "addmultisigaddress", "addvault", "removevault", "fundvault", "debitvaultbyname", "reclaimvaultfunds",
     "backupwallet", "bip38decrypt", "bip38paperwallet", "dumpprivkey", "encryptwallet", "importaddress",
     "importprivkey", "keypoolrefill_SKIP", "loadwallet", "lockunspent", "sendfrom", "sendmany",

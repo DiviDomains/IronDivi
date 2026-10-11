@@ -112,12 +112,14 @@ impl RpcError {
 
     /// Standard invalid params error
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self::new(codes::INVALID_PARAMS, msg)
+        // C++ divid reports usage / argument errors as RPC_MISC_ERROR (-1)
+        Self::new(codes::MISC_ERROR, msg)
     }
 
     /// Standard internal error
     pub fn internal_error(msg: impl Into<String>) -> Self {
-        Self::new(codes::INTERNAL_ERROR, msg)
+        // C++ divid has no -32603; internal failures surface as RPC_MISC_ERROR (-1)
+        Self::new(codes::MISC_ERROR, msg)
     }
 
     /// Block not found error

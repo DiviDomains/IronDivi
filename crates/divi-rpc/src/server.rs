@@ -1437,13 +1437,13 @@ mod tests {
         assert!(err.message.contains("testmethod"));
 
         let err = RpcError::invalid_params("bad param");
-        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert_eq!(err.code, codes::MISC_ERROR);
 
         let err = RpcError::invalid_request("bad request");
         assert_eq!(err.code, codes::INVALID_REQUEST);
 
         let err = RpcError::internal_error("oops");
-        assert_eq!(err.code, codes::INTERNAL_ERROR);
+        assert_eq!(err.code, codes::MISC_ERROR);
 
         let err = RpcError::parse_error();
         assert_eq!(err.code, codes::PARSE_ERROR);

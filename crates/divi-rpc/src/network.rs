@@ -53,7 +53,7 @@ impl NetworkRpc {
             .unwrap_or(0);
 
         Ok(serde_json::json!({
-            "version": 70920,
+            "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
             "subversion": format!("/IronDivi:{}/", env!("CARGO_PKG_VERSION")),
             "protocolversion": 70920,
             "localservices": "0000000000000005",
@@ -63,17 +63,23 @@ impl NetworkRpc {
                 {
                     "name": "ipv4",
                     "limited": false,
-                    "reachable": true
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
                     "limited": true,
-                    "reachable": true
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false
                 },
                 {
                     "name": "onion",
                     "limited": true,
-                    "reachable": false
+                    "reachable": false,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false
                 }
             ],
             "relayfee": 0.0001,
@@ -107,6 +113,9 @@ impl NetworkRpc {
                     "subver": "/Divi Core:3.0.0/",
                     "inbound": *inbound,
                     "startingheight": 0,
+                    "banscore": 0,
+                    "inflight": [],
+                    "whitelisted": false,
                     "synced_headers": -1,
                     "synced_blocks": -1
                 })
@@ -192,13 +201,29 @@ impl NetworkRpc {
         let added_nodes = peer_manager.get_added_node_info();
 
         // Optional: filter by specific node address
-        let filter_addr: Option<std::net::SocketAddr> = params.get_str(0).and_then(|s| {
+        // C++ signature: getaddednodeinfo dns ( "node" ) -- the bool comes first
+        if params.get(0).and_then(|v| v.as_bool()).is_none() {
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "getaddednodeinfo dns ( \"node\" )\n\nArguments:\n1. dns   (boolean, required) true to include DNS details\n2. node  (string, optional) only return this added node",
+            )
+            .into());
+        }
+        let filter_addr: Option<std::net::SocketAddr> = params.get_str(1).and_then(|s| {
             if s.contains(':') {
                 s.parse().ok()
             } else {
                 format!("{}:51472", s).parse().ok()
             }
         });
+
+        if params.get_str(1).is_some() && !added_nodes.iter().any(|n| filter_addr == Some(n.addr)) {
+            return Err(RpcError::new(
+                codes::CLIENT_NODE_NOT_ADDED,
+                "Error: Node has not been added.",
+            )
+            .into());
+        }
 
         let result: Vec<_> = added_nodes
             .iter()

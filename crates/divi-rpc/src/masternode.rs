@@ -9,7 +9,7 @@
 // Portions derived from Divi Core (https://github.com/DiviProject/Divi)
 // licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
 
-use crate::error::{Error, RpcError};
+use crate::error::{codes, Error, RpcError};
 use crate::protocol::Params;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
 use parking_lot::RwLock;
@@ -39,7 +39,7 @@ impl MasternodeRpc {
             Ok(MasternodeRpcImpl::new(manager.clone()))
         } else {
             Err(RpcError::new(
-                -32603,
+                codes::MISC_ERROR,
                 "Masternode subsystem not initialized. This node is running in lite mode without masternode support."
             ).into())
         }
@@ -48,7 +48,7 @@ impl MasternodeRpc {
     // Stub error message for commands that need additional work
     fn masternode_not_implemented(&self) -> Error {
         RpcError::new(
-            -32603,
+            codes::MISC_ERROR,
             "Masternode functionality requires the full masternode subsystem including P2P protocol support, masternode broadcast mechanisms, and collateral verification. This feature will be implemented in a future release. For masternode operations, please use the C++ Divi client."
         ).into()
     }
@@ -64,7 +64,11 @@ impl MasternodeRpc {
     pub fn get_masternode_status(&self, _params: &Params) -> Result<Value, Error> {
         // This requires the node to be running as a masternode
         // For now, return error indicating not running as masternode
-        Err(RpcError::new(-32603, "This node is not configured as a masternode").into())
+        Err(RpcError::new(
+            codes::MISC_ERROR,
+            "This node is not configured as a masternode",
+        )
+        .into())
     }
 
     /// Print the masternode winners for the last n blocks
@@ -86,8 +90,13 @@ impl MasternodeRpc {
     pub fn list_masternodes(&self, params: &Params) -> Result<Value, Error> {
         let rpc = self.get_rpc()?;
         let mode = params.get_str(0).map(|s| s.to_string());
-        let list = rpc.list(mode);
-        Ok(serde_json::to_value(list)?)
+        let list = serde_json::to_value(rpc.list(mode))?;
+        // C++ listmasternodes returns a bare array of entries
+        Ok(match list.get("masternodes") {
+            Some(Value::Object(m)) => Value::Array(m.values().cloned().collect()),
+            Some(Value::Array(a)) => Value::Array(a.clone()),
+            _ => list,
+        })
     }
 
     /// Setup masternode configuration
@@ -185,12 +194,18 @@ impl MasternodeRpc {
                     "IsBlockchainSynced": true,
                     "timestampOfLastMasternodeListUpdate": 0,
                     "timestampOfLastMasternodeWinnerUpdate": 0,
-                    "currentMasternodeSyncStatus": 999
+                    "currentMasternodeSyncStatus": 999,
+                    "countOfFailedSyncAttempts": 0,
+                    "timestampOfLastFailedSync": 0,
+                    "fulfilledMasternodeListSyncRequests": 0,
+                    "fulfilledMasternodeWinnerSyncRequests": 0,
+                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
+                    "nominalNumberOfMasternodeWinnersReceived": 0
                 }))
             }
             "reset" | "next" => {
                 Err(RpcError::new(
-                    -32603,
+                    codes::MISC_ERROR,
                     "Masternode sync control requires full masternode subsystem. mnsync manages the synchronization of masternode lists, winners, and governance data across the P2P network. For masternode sync operations, please use the C++ Divi client."
                 ).into())
             }
@@ -246,8 +261,8 @@ mod tests {
         assert!(result.is_ok());
 
         let value = result.unwrap();
-        assert!(value["masternodes"].is_object());
-        assert_eq!(value["masternodes"].as_object().unwrap().len(), 0);
+        assert!(value.is_array());
+        assert_eq!(value.as_array().unwrap().len(), 0);
     }
 
     #[test]
