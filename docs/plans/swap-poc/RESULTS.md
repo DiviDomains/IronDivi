@@ -155,3 +155,9 @@ Explorers: `https://litecoinspace.org/testnet/tx/<txid>`, `https://services.divi
     DIVI lock (maker) `80ad9c72274fa8fb449f5cd68a5ee604474aa0bda4e802b62c20a6bb2fd76d13`,
     DIVI claim (taker) `d96e6d1cf054da8a0bb9f00bb982bb82d2cd945451d40c2ac4ea55b970ef96dc`,
     LTC claim (maker, preimage read from the DIVI spend) `cef1dc11c1fa6a303b1a2efda23de953bc9b082b6174380effb976cb950fa3dd`.
+- Reverse happy path (taker pays DIVI, gets LTC; local maker, `--direction reverse`, 100,000 litoshi),
+  swap `3686661f…`, taker Done / maker Done, 2026-10-11:
+    DIVI lock (taker) `654f49a1eb0ccc0703fdc882bcf1766bc6b32735e279337b494a32ea4729f1e0`,
+    LTC lock (maker) `77abd2529ac34113e88b1cda942f5cb7cda899033a2f1ddd938f453d8699d03b`,
+    LTC claim (taker) `c26cfb9b7948e8fc70f3f7aaffd26cb67ba1973838c3f2fb53f15b2e0db483fa`,
+    DIVI claim (maker, preimage read from the LTC spend) `358c4f0303910977bcf9169ffce776119aab7d0058399decb7ab93c4890a9ac1`.
