@@ -139,12 +139,31 @@ impl EvmHtlcClient {
         &self.provider
     }
 
+    /// The deployed `Erc20Htlc` contract address.
+    pub fn htlc_address(&self) -> Address {
+        self.htlc
+    }
+
     fn htlc_contract(&self) -> IErc20Htlc::IErc20HtlcInstance<DynProvider> {
         IErc20Htlc::new(self.htlc, self.provider.clone())
     }
 
     fn erc20(&self, token: Address) -> IErc20::IErc20Instance<DynProvider> {
         IErc20::new(token, self.provider.clone())
+    }
+
+    /// `allowance(owner, spender)` on `token`.
+    pub async fn token_allowance(
+        &self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+    ) -> Result<U256> {
+        self.erc20(token)
+            .allowance(owner, spender)
+            .call()
+            .await
+            .map_err(other::<_>("call allowance"))
     }
 
     /// `approve(htlc, amount)` on `token`, then `lock(token, amount, receiver, hashlock,

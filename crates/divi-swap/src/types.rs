@@ -28,11 +28,13 @@ pub enum Chain {
     Ltc,
     /// Zcash (transparent addresses).
     Zec,
+    /// USDC on an EVM chain (Sepolia, Base Sepolia).
+    Usdc,
 }
 
 impl Chain {
     /// Every chain, DIVI first.
-    pub const ALL: [Chain; 4] = [Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec];
+    pub const ALL: [Chain; 5] = [Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec, Chain::Usdc];
 
     /// Lowercase ticker, as in serde and offer ids.
     pub fn as_str(self) -> &'static str {
@@ -41,6 +43,7 @@ impl Chain {
             Chain::Btc => "btc",
             Chain::Ltc => "ltc",
             Chain::Zec => "zec",
+            Chain::Usdc => "usdc",
         }
     }
 

@@ -14,18 +14,11 @@ use alloy::node_bindings::Anvil;
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol;
 
 use crate::artifact::{bytecode, foundry_available};
 use crate::client::{connect_provider, deploy_contract, swap_id};
+use crate::contract::IMockErc20;
 use crate::EvmHtlcClient;
-
-sol! {
-    #[sol(rpc)]
-    interface IMockErc20 {
-        function mint(address to, uint256 amount) external;
-    }
-}
 
 /// Skip (rather than fail) a test that needs `forge`/`anvil` when neither is installed.
 macro_rules! require_foundry {

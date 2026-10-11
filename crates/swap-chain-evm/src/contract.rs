@@ -56,3 +56,11 @@ sol! {
         function transfer(address to, uint256 amount) external returns (bool);
     }
 }
+
+// `MockErc20.mint` (`contracts/htlc/test/MockErc20.sol`) — anvil-only test token funding.
+sol! {
+    #[sol(rpc)]
+    interface IMockErc20 {
+        function mint(address to, uint256 amount) external;
+    }
+}

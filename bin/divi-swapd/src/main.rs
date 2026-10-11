@@ -159,18 +159,45 @@ fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
+fn live_usdc(cfg: &divi_swapd::UsdcSection) -> Result<Arc<dyn ChainBackend>> {
+    let hex_key = divi_swap::secrets::SecretRef::parse(&cfg.key)
+        .and_then(|r| r.resolve())
+        .map_err(|e| anyhow::anyhow!("usdc key: {e}"))?;
+    let key: swap_chain_evm::PrivateKeySigner = hex_key
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("usdc key is not a valid secp256k1 hex key"))?;
+    drop(hex_key);
+    let htlc = cfg
+        .htlc
+        .parse()
+        .map_err(|e| anyhow::anyhow!("usdc htlc address: {e}"))?;
+    let token = cfg
+        .token
+        .parse()
+        .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
+    let address = key.address();
+    let backend = swap_chain_evm::UsdcBackend::new(&cfg.rpc_url, key, htlc, token)?;
+    tracing::info!(%address, htlc = %cfg.htlc, token = %cfg.token, "usdc backend ready");
+    Ok(Arc::new(backend))
+}
+
 async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
     for o in &cfg.offers {
-        let supported =
-            o.counter_chain == Chain::Btc || (o.counter_chain == Chain::Ltc && cfg.ltc.is_some());
+        let supported = match o.counter_chain {
+            Chain::Btc => true,
+            Chain::Ltc => cfg.ltc.is_some(),
+            Chain::Usdc => cfg.usdc.is_some(),
+            _ => false,
+        };
         if !supported {
-            let hint = if o.counter_chain == Chain::Ltc {
-                " (add [ltc] to the config)"
-            } else {
-                ""
+            let hint = match o.counter_chain {
+                Chain::Ltc => " (add [ltc] to the config)",
+                Chain::Usdc => " (add [usdc] to the config)",
+                _ => "",
             };
             bail!(
                 "offer {}: no live {} backend in this build yet{hint}; use --backend mock",
@@ -183,6 +210,9 @@ async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)
     let mut others = Vec::new();
     if let Some(ltc_cfg) = &cfg.ltc {
         others.push(live_ltc(ltc_cfg)?);
+    }
+    if let Some(usdc_cfg) = &cfg.usdc {
+        others.push(live_usdc(usdc_cfg)?);
     }
     let hex_key = SecretRef::parse(&divi_cfg.key)
         .and_then(|r| r.resolve())

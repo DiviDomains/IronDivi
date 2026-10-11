@@ -14,14 +14,17 @@
 //! `Claimed` logs. See `docs/plans/swap-poc/usdc-design.md` for how an account chain like
 //! this fits (or does not fit) the `divi_swap::ChainBackend` contract.
 
-#[cfg(test)]
 mod artifact;
+mod backend;
 mod contract;
 
 pub mod client;
 
+pub use alloy::signers::local::PrivateKeySigner;
+pub use artifact::{bytecode, foundry_available};
+pub use backend::{amount_to_usdc_units, usdc_units_to_amount, UsdcBackend};
 pub use client::{connect_provider, deploy_contract, swap_id, EvmHtlcClient, SwapState};
-pub use contract::{IErc20, IErc20Htlc};
+pub use contract::{IErc20, IErc20Htlc, IMockErc20};
 
 /// Circle test USDC — Ethereum Sepolia.
 /// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses> and

@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value = "live")]
     backend: BackendArg,
     /// Chain swapped against DIVI: `btc`, `ltc` or `zec` (the offer's `counter_chain`).
-    /// `btc` and `ltc` have live backends; `zec` needs `--backend mock`.
+    /// `btc`, `ltc` and `usdc` have live backends; `zec` needs `--backend mock`.
     #[arg(long, global = true, default_value = "btc", value_parser = parse_counter_chain)]
     counter_chain: Chain,
     /// Secret reference (`op://…` or `credential:<name>`) for the taker's DIVI key.
@@ -71,6 +71,18 @@ struct Cli {
         default_value = "signet"
     )]
     btc_network: String,
+    /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
+    #[arg(long, global = true)]
+    usdc_key: Option<String>,
+    /// EVM JSON-RPC URL (Sepolia, Base Sepolia, or an anvil instance in tests).
+    #[arg(long, global = true, env = "SWAP_EVM_RPC_URL")]
+    usdc_rpc_url: Option<String>,
+    /// Deployed `Erc20Htlc` contract address.
+    #[arg(long, global = true)]
+    usdc_htlc: Option<String>,
+    /// ERC-20 (USDC) token address. Defaults to Circle's Sepolia test USDC.
+    #[arg(long, global = true)]
+    usdc_token: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -255,6 +267,36 @@ fn secp_key(
     key.map_err(|_| anyhow::anyhow!("{what} key is not a valid secp256k1 key"))
 }
 
+/// The `--counter-chain usdc` live backend. `Backends.live` stays `None` for it (that tuple
+/// is concretely `(DiviBackend, CounterLive)`, used only by `Balance`).
+fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
+    let hex_key = secret_hex(&cli.usdc_key, "--usdc-key", "usdc")?;
+    let key: swap_chain_evm::PrivateKeySigner = hex_key
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("usdc key is not a valid secp256k1 hex key"))?;
+    drop(hex_key);
+    let rpc_url = cli
+        .usdc_rpc_url
+        .as_deref()
+        .context("live usdc backend needs --usdc-rpc-url")?;
+    let htlc = cli
+        .usdc_htlc
+        .as_deref()
+        .context("live usdc backend needs --usdc-htlc")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--usdc-htlc: {e}"))?;
+    let token = cli
+        .usdc_token
+        .as_deref()
+        .unwrap_or(swap_chain_evm::SEPOLIA_USDC)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--usdc-token: {e}"))?;
+    Ok(Arc::new(swap_chain_evm::UsdcBackend::new(
+        rpc_url, key, htlc, token,
+    )?))
+}
+
 fn live_backends(cli: &Cli) -> Result<Backends> {
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
@@ -273,6 +315,13 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         wallet,
     )?);
 
+    if cli.counter_chain == Chain::Usdc {
+        return Ok(Backends {
+            divi,
+            btc: live_usdc_backend(cli)?,
+            live: None,
+        });
+    }
     let (btc, counter): (Arc<dyn ChainBackend>, CounterLive) = match cli.counter_chain {
         Chain::Btc => {
             let bkey = secp_key(&cli.btc_key, "--btc-key", "btc")?;

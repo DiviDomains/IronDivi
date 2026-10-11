@@ -18,6 +18,7 @@ divi-swap = { workspace = true }
 swap-chain-divi = { workspace = true }
 swap-chain-btc = { workspace = true }
 swap-chain-ltc = { workspace = true }
+swap-chain-evm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

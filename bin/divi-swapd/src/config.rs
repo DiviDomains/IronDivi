@@ -75,6 +75,23 @@ pub struct LtcSection {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsdcSection {
+    /// EVM JSON-RPC URL (Sepolia, Base Sepolia, or an anvil instance in tests).
+    pub rpc_url: String,
+    /// Deployed `Erc20Htlc` contract address.
+    pub htlc: String,
+    /// ERC-20 (USDC) token address. Defaults to Circle's Sepolia test USDC.
+    #[serde(default = "default_usdc_token")]
+    pub token: String,
+    /// Reference (`op://…` or `credential:<name>`) to the maker's EVM key.
+    pub key: String,
+}
+
+fn default_usdc_token() -> String {
+    swap_chain_evm::SEPOLIA_USDC.into()
+}
+
 fn default_divi_rpc() -> String {
     "https://services.divi.domains/api/testnet/rpc/".into()
 }
@@ -192,6 +209,8 @@ pub struct DaemonConfig {
     /// Enables a live LTC counter backend; needed only for offers with `counter_chain =
     /// "ltc"`. Ignored by the mock backend (which always simulates LTC).
     pub ltc: Option<LtcSection>,
+    /// Required only if an offer's `counter_chain` is `usdc`.
+    pub usdc: Option<UsdcSection>,
     /// Overrides on top of `profile`.
     #[serde(default)]
     pub swap: SwapOverrides,
@@ -258,7 +277,8 @@ impl DaemonConfig {
             .iter()
             .map(|d| &d.key)
             .chain(self.btc.iter().map(|b| &b.key))
-            .chain(self.ltc.iter().map(|l| &l.key));
+            .chain(self.ltc.iter().map(|l| &l.key))
+            .chain(self.usdc.iter().map(|u| &u.key));
         for r in refs {
             divi_swap::secrets::SecretRef::parse(r)
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;

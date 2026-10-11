@@ -48,6 +48,10 @@ impl ChainParams {
             Chain::Zec => (if mainnet { 10 } else { 3 }, 1800),
             // 1-minute blocks.
             Chain::Divi => (if mainnet { 10 } else { 3 }, 1800),
+            // ~12-second blocks; 12 confirmations is the common safe-finality heuristic for
+            // Ethereum mainnet. No MTP smoothing on EVM (the contract itself compares against
+            // the latest block's timestamp), so the lag only needs to cover block-time jitter.
+            Chain::Usdc => (if mainnet { 12 } else { 3 }, if mainnet { 180 } else { 60 }),
         };
         ChainParams {
             confirmations,

@@ -27,6 +27,16 @@ esplora_url = "https://litecoinspace.org/testnet/api"
 # this is the same maker-btc credential already loaded above.
 key = "credential:maker-btc"
 
+[usdc]
+rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+# Placeholder until Erc20Htlc is deployed to Sepolia (orchestrator, funded key) — fill in
+# the real address before enabling a usdc offer.
+htlc = "0x0000000000000000000000000000000000000000"
+# token omitted: defaults to Circle's Sepolia test USDC (swap_chain_evm::SEPOLIA_USDC).
+# funding.md (2026-10-11): EVM reuses the BTC swap key (same secp256k1 pubkey, Ethereum
+# address derived from it) — no separate maker-usdc credential.
+key = "credential:maker-btc"
+
 # Standing offers. Price is DIVI sats per 1 counter-chain coin; min/max are counter-chain
 # sats in both directions. direction: "taker_pays_btc" (maker sells DIVI, the default) or
 # "taker_pays_divi" (maker sells the counter chain). counter_chain defaults to "btc".
@@ -59,4 +69,23 @@ counter_chain = "ltc"
 divi_sats_per_btc = 1000000000000
 min_btc_sats = 100000
 max_btc_sats = 10000000
+
+# Disabled until [usdc].htlc above is a real deployed address — min/max are USDC engine
+# sats (1e8 per coin; UsdcBackend needs whole multiples of 100 to convert to 1e6 base
+# units), so 1000000..100000000 is 0.01..1.00 USDC.
+[[offers]]
+id = "divi-usdc-sepolia"
+direction = "taker_pays_btc"
+counter_chain = "usdc"
+divi_sats_per_btc = 10000000000       # 100 DIVI per USDC (placeholder)
+min_btc_sats = 1000000
+max_btc_sats = 100000000
+
+[[offers]]
+id = "usdc-divi-sepolia"
+direction = "taker_pays_divi"
+counter_chain = "usdc"
+divi_sats_per_btc = 10000000000
+min_btc_sats = 1000000
+max_btc_sats = 100000000
 

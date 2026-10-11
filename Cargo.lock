@@ -2632,6 +2632,7 @@ dependencies = [
 name = "divi-swap"
 version = "0.2.5"
 dependencies = [
+ "alloy",
  "async-trait",
  "hex",
  "parking_lot",
@@ -2641,6 +2642,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "swap-chain-evm",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2668,6 +2670,7 @@ dependencies = [
  "serde_json",
  "swap-chain-btc",
  "swap-chain-divi",
+ "swap-chain-evm",
  "swap-chain-ltc",
  "tempfile",
  "tokio",
@@ -2699,6 +2702,7 @@ dependencies = [
  "serde_json",
  "swap-chain-btc",
  "swap-chain-divi",
+ "swap-chain-evm",
  "swap-chain-ltc",
  "tempfile",
  "tokio",
@@ -5763,6 +5767,7 @@ dependencies = [
  "async-trait",
  "divi-swap",
  "hex",
+ "secp256k1 0.29.1",
  "serde_json",
  "sha2",
  "tempfile",
