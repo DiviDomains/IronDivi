@@ -26,6 +26,8 @@
 //! 2. `POST /swaps` with [`AcceptRequest`] → [`SwapView`] in `accepted`, carrying the
 //!    taker-leg HTLC the taker must fund (claim = maker key, refund = taker key, both on the
 //!    taker-leg chain; locktime = that chain's MTP + taker timeout).
+//!    The request echoes the quote's `counter_chain`; one without it (a v0.2.5 client) is
+//!    accepted only for a BTC quote.
 //! 3. Taker funds it and `POST /swaps/:id/lock` with [`LockNotice`]. Maker verifies with
 //!    `htlc_output`, waits for confirmations, and only then selects coins and funds the
 //!    maker-leg HTLC (claim = taker key, refund = maker key, on the maker-leg chain;
@@ -35,6 +37,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::SwapError;
 use crate::htlc::HtlcParams;
 use crate::state::SwapState;
 use crate::types::{Amount, Chain, Outpoint, Txid};
@@ -224,9 +227,34 @@ pub struct AcceptRequest {
     /// Taker's DIVI pubkey — claim key of a DIVI maker leg, refund key of a DIVI taker leg.
     #[serde(with = "hex33")]
     pub taker_divi_pubkey: [u8; 33],
+    /// The counter chain the taker means to swap on, echoed from its quote. Clients older
+    /// than counter chains (v0.2.5) omit it and assume BTC, so the maker accepts a missing
+    /// echo only for a BTC quote: on an LTC/ZEC quote such a client would lock BTC the maker
+    /// never watches. Omitted from the JSON when `None`, as those clients sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_chain: Option<Chain>,
 }
 
 impl AcceptRequest {
+    /// Whether this take may proceed against `quote` (fail closed on counter-chain doubt).
+    pub fn check_counter_chain(&self, quote: &Quote) -> Result<(), SwapError> {
+        match self.counter_chain {
+            Some(c) if c == quote.counter_chain => Ok(()),
+            Some(c) => Err(SwapError::InvalidParams(format!(
+                "take is for counter chain {c} but quote {} is for {}",
+                quote.id, quote.counter_chain
+            ))),
+            None if quote.counter_chain == Chain::Btc => Ok(()),
+            None => Err(SwapError::InvalidParams(format!(
+                "offer {} swaps DIVI against {c}, but this take request does not name a \
+                 counter chain (a client older than counter chains assumes BTC and would lock \
+                 the wrong coin); upgrade divi-swap and pass --counter-chain {c}",
+                quote.offer_id,
+                c = quote.counter_chain
+            ))),
+        }
+    }
+
     /// Taker's pubkey on `chain` (DIVI or the counter chain).
     pub fn taker_pubkey(&self, chain: Chain) -> [u8; 33] {
         if chain == Chain::Divi {

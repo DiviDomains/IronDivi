@@ -103,6 +103,7 @@ impl Taker {
             hash,
             taker_btc_pubkey: self.chain(quote.counter_chain)?.pubkey(),
             taker_divi_pubkey: self.divi.pubkey(),
+            counter_chain: Some(quote.counter_chain),
         };
         let id = uuid::Uuid::new_v4().to_string();
         self.store.put_taker_swap(&TakerRecord {

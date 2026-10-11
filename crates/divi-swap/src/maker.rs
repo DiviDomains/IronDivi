@@ -206,6 +206,9 @@ impl Maker {
         if qr.used {
             return Err(SwapError::InvalidParams("quote already used".into()));
         }
+        // Before anything else touches the quote: an old client on a non-BTC offer must
+        // not get a taker-leg HTLC it would fund on the wrong chain.
+        req.check_counter_chain(&qr.quote)?;
         let now = (self.clock)();
         if now > qr.quote.expires_at {
             return Err(SwapError::InvalidParams("quote expired".into()));

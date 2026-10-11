@@ -32,6 +32,8 @@ use tokio::task::JoinHandle;
 const T0: u32 = 1_700_000_000;
 const LTC_SATS: u64 = 1_000_000;
 const TICK: Duration = Duration::from_millis(15);
+/// A BTC offer beside the LTC ones, for the old-client checks.
+const BTC_OFFER: &str = "divi-btc-testnet";
 
 /// DIVI and LTC chains; the maker also holds an (idle) BTC backend, as the daemon does.
 struct World {
@@ -127,14 +129,24 @@ impl Drop for Daemon {
 async fn serve(w: &World, db: &std::path::Path) -> Daemon {
     let counters: Vec<Arc<dyn ChainBackend>> =
         vec![Arc::new(w.maker_btc.clone()), Arc::new(w.maker_ltc.clone())];
-    let offers = [Direction::TakerPaysBtc, Direction::TakerPaysDivi].map(World::offer);
+    let mut offers = [Direction::TakerPaysBtc, Direction::TakerPaysDivi]
+        .map(World::offer)
+        .to_vec();
+    offers.push(Offer {
+        id: BTC_OFFER.into(),
+        direction: Direction::TakerPaysBtc,
+        counter_chain: Chain::Btc,
+        divi_sats_per_btc: 300_000 * Amount::COIN,
+        min_btc_sats: 5_000,
+        max_btc_sats: 50_000,
+    });
     let maker = Arc::new(
         Maker::with_counters(
             SwapConfig::profile(Profile::Testnet),
             Arc::new(w.maker_divi.clone()),
             counters,
             Store::open(db).unwrap(),
-            offers.to_vec(),
+            offers,
         )
         .unwrap(),
     );
@@ -302,4 +314,107 @@ async fn e2e_mock_ltc_forward_refund() {
 #[tokio::test]
 async fn e2e_mock_ltc_reverse_refund() {
     refund(Direction::TakerPaysDivi).await;
+}
+
+/// `POST /swaps` with a body shaped like a v0.2.5 taker's (no `counter_chain`), or a current
+/// one's (`echo = Some(..)`), for a fresh quote on `offer`. Returns the status and body.
+async fn raw_take(
+    w: &World,
+    base: &str,
+    offer: &str,
+    sats: u64,
+    echo: Option<&str>,
+) -> (u16, serde_json::Value) {
+    let q: serde_json::Value = reqwest::get(format!("{base}/offers/{offer}/quote?btc_sats={sats}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut body = serde_json::json!({
+        "quote_id": q["id"],
+        "hash": hex::encode(rand::random::<[u8; 32]>()),
+        "taker_btc_pubkey": hex::encode(w.taker_ltc.pubkey()),
+        "taker_divi_pubkey": hex::encode(w.taker_divi.pubkey()),
+    });
+    if let Some(c) = echo {
+        body["counter_chain"] = c.into();
+    }
+    let r = reqwest::Client::new()
+        .post(format!("{base}/swaps"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    (r.status().as_u16(), r.json().await.unwrap())
+}
+
+async fn swap_count(base: &str) -> usize {
+    let all: serde_json::Value = reqwest::get(format!("{base}/swaps"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    all.as_array().unwrap().len()
+}
+
+/// Wave-4 safety: a v0.2.5 taker CLI (which ignores `counter_chain` and would lock BTC) is
+/// refused on both LTC offers with a 400 that says what to do, before any swap exists.
+#[tokio::test]
+async fn old_client_take_of_ltc_offer_is_rejected() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    for dir in [Direction::TakerPaysBtc, Direction::TakerPaysDivi] {
+        let offer = World::offer(dir);
+        let (code, body) = raw_take(&w, &d.base, &offer.id, LTC_SATS, None).await;
+        assert_eq!(code, 400, "{body}");
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("does not name a counter chain"), "{msg}");
+        assert!(msg.contains("--counter-chain ltc"), "{msg}");
+        // Naming the wrong chain is refused too.
+        let (code, _) = raw_take(&w, &d.base, &offer.id, LTC_SATS, Some("btc")).await;
+        assert_eq!(code, 400);
+    }
+    assert_eq!(swap_count(&d.base).await, 0, "nothing accepted");
+    assert_eq!(
+        w.maker_ltc.funding_calls() + w.maker_divi.funding_calls(),
+        0
+    );
+}
+
+/// The v0.2.5 wire stays valid for BTC offers.
+#[tokio::test]
+async fn old_client_take_of_btc_offer_is_accepted() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let (code, body) = raw_take(&w, &d.base, BTC_OFFER, 10_000, None).await;
+    assert_eq!(code, 201, "{body}");
+    assert_eq!(body["state"], "Accepted");
+    assert_eq!(body["quote"]["counter_chain"], "btc");
+}
+
+/// A current client names the chain and is accepted, over raw HTTP and through the CLI flow.
+#[tokio::test]
+async fn new_client_take_of_ltc_offer_is_accepted() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let offer = World::offer(Direction::TakerPaysBtc);
+    let (code, body) = raw_take(&w, &d.base, &offer.id, LTC_SATS, Some("ltc")).await;
+    assert_eq!(code, 201, "{body}");
+    assert_eq!(body["quote"]["counter_chain"], "ltc");
+
+    let tdb = tmp.path().join("t.db");
+    let taker = taker(&w, &tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let local = flow::begin(&taker, &client, &sessions, &offer.id, LTC_SATS)
+        .await
+        .unwrap();
+    let id = sessions.get(&local).unwrap().maker_swap_id;
+    assert_eq!(client.swap(&id).await.unwrap().state, SwapState::Accepted);
+    assert_eq!(swap_count(&d.base).await, 2);
 }

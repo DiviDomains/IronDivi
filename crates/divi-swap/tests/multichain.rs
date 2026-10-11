@@ -321,3 +321,90 @@ async fn v025_records_still_load() {
     }
     maker.tick().await.unwrap();
 }
+
+/// A maker with BTC and LTC backends and one offer on each, and a taker holding both keys.
+async fn btc_and_ltc() -> (Maker, Taker, Store) {
+    let divi = MockChain::new(Chain::Divi, T0, 60);
+    let btc = MockChain::new(Chain::Btc, T0, 600);
+    let ltc = MockChain::new(Chain::Ltc, T0, 150);
+    let store = Store::in_memory().unwrap();
+    let maker = Maker::with_counters(
+        SwapConfig::profile(Profile::Testnet),
+        Arc::new(divi.backend(1, Amount(FUNDS))),
+        vec![
+            Arc::new(btc.backend(2, Amount(FUNDS))),
+            Arc::new(ltc.backend(3, Amount(FUNDS))),
+        ],
+        store.clone(),
+        vec![
+            offer("divi-btc", Direction::TakerPaysBtc, Chain::Btc),
+            offer("divi-ltc", Direction::TakerPaysBtc, Chain::Ltc),
+        ],
+    )
+    .unwrap();
+    let taker = Taker::with_counters(
+        Arc::new(divi.backend(4, Amount(FUNDS))),
+        vec![
+            Arc::new(btc.backend(5, Amount(FUNDS))),
+            Arc::new(ltc.backend(6, Amount(FUNDS))),
+        ],
+        store.clone(),
+    );
+    (maker, taker, store)
+}
+
+/// What a v0.2.5 taker sends: no `counter_chain` (its JSON never had the field).
+fn as_old_client(mut req: divi_swap::api::AcceptRequest) -> divi_swap::api::AcceptRequest {
+    req.counter_chain = None;
+    let json = serde_json::to_value(&req).unwrap();
+    assert!(json.get("counter_chain").is_none(), "old wire shape");
+    req
+}
+
+#[tokio::test]
+async fn old_client_take_of_ltc_offer_is_rejected() {
+    let (maker, taker, store) = btc_and_ltc().await;
+    let q = maker.quote("divi-ltc", COUNTER_SATS).await.unwrap();
+    let (_, req) = taker.prepare(&q).await.unwrap();
+    let err = maker.accept(as_old_client(req.clone())).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("does not name a counter chain"), "{msg}");
+    assert!(msg.contains("--counter-chain ltc"), "{msg}");
+    // Fail closed without side effects: no swap, quote still unused.
+    assert!(store.list_maker_swaps().unwrap().is_empty());
+    assert!(!store.get_quote(&q.id).unwrap().unwrap().used);
+    // The same take with the echo goes through.
+    maker.accept(req).await.unwrap();
+}
+
+#[tokio::test]
+async fn old_client_take_of_btc_offer_is_accepted() {
+    let (maker, taker, _) = btc_and_ltc().await;
+    let q = maker.quote("divi-btc", COUNTER_SATS).await.unwrap();
+    let (_, req) = taker.prepare(&q).await.unwrap();
+    let v = maker.accept(as_old_client(req)).await.unwrap();
+    assert_eq!(v.state, SwapState::Accepted);
+    assert_eq!(v.quote.counter_chain, Chain::Btc);
+}
+
+#[tokio::test]
+async fn new_client_take_of_ltc_offer_is_accepted() {
+    let (maker, taker, _) = btc_and_ltc().await;
+    let q = maker.quote("divi-ltc", COUNTER_SATS).await.unwrap();
+    let (tid, req) = taker.prepare(&q).await.unwrap();
+    assert_eq!(req.counter_chain, Some(Chain::Ltc));
+    let v = maker.accept(req).await.unwrap();
+    assert_eq!(v.quote.counter_chain, Chain::Ltc);
+    taker.accepted(&tid, &v).await.unwrap();
+}
+
+#[tokio::test]
+async fn take_naming_the_wrong_counter_chain_is_rejected() {
+    let (maker, taker, store) = btc_and_ltc().await;
+    let q = maker.quote("divi-ltc", COUNTER_SATS).await.unwrap();
+    let (_, mut req) = taker.prepare(&q).await.unwrap();
+    req.counter_chain = Some(Chain::Btc);
+    let msg = maker.accept(req).await.unwrap_err().to_string();
+    assert!(msg.contains("is for ltc"), "{msg}");
+    assert!(store.list_maker_swaps().unwrap().is_empty());
+}
