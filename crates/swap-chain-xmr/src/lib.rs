@@ -16,11 +16,13 @@
 //! Monero side's build-plan step 6: an additive 2-of-2 spend-key share bound to a
 //! `swap-adaptor` DLEQ secret. [`monero_dkg`] (test-only) is a PedPoP/FROST reference
 //! test only — not this swap's actual key-generation path, see [`monero_key_share`]'s
-//! docs for why.
+//! docs for why. [`swap_templates`] is build-plan step 7: the full
+//! `Tx_redeem`/`Tx_refund`/`Tx_punish` set with the corrected signer/completer roles.
 
 pub mod adaptor_bridge;
 pub mod monero_key_share;
 pub mod multisig;
+pub mod swap_templates;
 
 #[cfg(test)]
 mod monero_dkg;

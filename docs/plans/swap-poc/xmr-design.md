@@ -14,48 +14,77 @@ instead of the literature's Alice/Bob.
 
 ## Protocol
 
+**Corrected 2026-10-11** (consulted the `oracle` against the actual reference implementation,
+`comit-network/xmr-btc-swap`'s `swap/src/protocol/{alice,bob}/state.rs`, after noticing this
+section's table contradicted its own explanatory text): the original draft used a single shared
+secret `x` for everything. The real construction needs **two** — one per party — and the
+signer/completer roles below were wrong in three of the four presigned transactions. Fixed
+throughout; `Tx_cancel` was the one row that was already right.
+
 ### Roles
 
 - **Maker** quotes DIVI for XMR (symmetric to the existing BTC lane: Maker always holds the DIVI
-  leg). **Taker** holds XMR and wants DIVI.
-- Unlike the hashlock swap, **both legs lock into a 2-of-2 output**, not just one. Neither party's
-  on-chain lock is independently spendable; every subsequent transaction is pre-signed
-  (or adaptor-presigned) by both parties before the corresponding lock confirms. This is why the
-  protocol needs five transaction templates per leg instead of the two (claim/refund) the hashlock
-  design uses.
+  leg). **Taker** holds XMR and wants DIVI. Maps onto the literature's Bob (Maker, has
+  Bitcoin/DIVI) and Alice (Taker, has Monero).
+- Both legs lock into a 2-of-2 output, not just one. Neither party's on-chain lock is
+  independently spendable; every subsequent transaction is pre-signed (or adaptor-presigned) by
+  both parties before the corresponding lock confirms.
+- The swap is symmetric by design: completing it hands Maker the XMR (combine `s_m` + the `s_t`
+  he learns) and Taker the DIVI; aborting it hands Taker her XMR back (combine `s_t` + the `s_m`
+  she learns) and Maker his DIVI back. Either way, whichever party's *DIVI-chain* action
+  completes is what reveals the scalar the other party needs on the *Monero* chain — that
+  coupling is the entire point of using adaptor signatures instead of a hashlock.
 
 ### Key material (setup, off-chain)
-
-Each party generates, before anything touches a chain:
 
 | Key | Curve | Purpose |
 |---|---|---|
 | `a` (Maker) / `b` (Taker) | secp256k1 | DIVI-side 2-of-2 multisig key, one per party |
-| `v_m, s_m` (Maker) / `v_t, s_t` (Taker) | ed25519 | Monero view/spend key shares — the output is a 2-of-2 shared spend key `S = s_m·G + s_t·G` (Monero native multisig, not a script) |
-| `x` (Taker, if Taker is the XMR seller*) | **both** curves | the adaptor secret: one scalar, interpreted as both a secp256k1 and an ed25519 private key |
+| `v, s_m` (Maker) / `s_t` (Taker) | ed25519 | Monero spend-key shares — the output is a 2-of-2 shared spend key `S = s_m·G + s_t·G` (Monero native multisig, not a script); `v` is the (for now, simplified — see `## Stagenet`) shared view key |
+| `s_t` doubles as an adaptor secret, point `X = s_t·G_secp` | both curves | lets Maker encrypt his `Tx_redeem` signature under `X`; only Taker (who holds `s_t`) can complete it |
+| `s_m` doubles as a *second*, independent adaptor secret, point `Y = s_m·G_secp` | both curves | lets Taker encrypt her `Tx_refund` signature under `Y`; only Maker (who holds `s_m`) can complete it |
 
-\* Direction matters: whichever party's Monero-side spend key share doubles as the Bitcoin-side
-(DIVI-side) adaptor secret is the party who *reveals* their secret by completing the DIVI
-transaction. In the canonical protocol the XMR-locking party (Taker, here) plays that role, mapping
-onto the original Alice (has Monero) / Bob (has Bitcoin) roles: Taker ~ Alice, Maker ~ Bob.
-
-Taker proves, with the DLEQ proof (see [DLEQ](#dleq)), that the secp256k1 public point `X` it hands
-to Maker and the ed25519 component of its Monero spend-key share commit to the *same* scalar `x`,
-without revealing `x`. Maker checks the proof before locking anything.
+Each party's Monero spend-key share is *also* their DIVI-side adaptor secret for the transaction
+that reveals it to the other party. **Two DLEQ proofs are needed, not one** (the original draft's
+bug): Taker proves `s_t` is simultaneously the discrete log of `X` (secp256k1) and her ed25519
+Monero share; Maker proves `s_m` is simultaneously the discrete log of `Y` and his ed25519 Monero
+share. Without Maker's proof, Taker has no guarantee that completing `Tx_refund` actually hands
+her a usable Monero scalar — the abort path would be unsafe for her without it.
 
 ### Transaction templates (DIVI side)
 
-All five are built and exchanged as unsigned templates right after both parties commit to the deal
-(before either leg locks), so every party knows the full shape — and every timelock — before
-funds move:
+All four presigned transactions are built and exchanged as unsigned templates right after both
+parties commit to the deal (before either leg locks), so every party knows the full shape — and
+every timelock — before funds move:
 
-| Tx | Spends | Signed by | `nLockTime` | Purpose |
-|---|---|---|---|---|
-| `Tx_lock` | Maker's coins | Maker alone | none | Pays into the 2-of-2 `{a, b}` output. Ordinary DIVI tx, not part of the presigned set. |
-| `Tx_cancel` | `Tx_lock` output | both, at setup (plain 2-of-2 sig, no adaptor) | `t_cancel` | Moves the locked DIVI into a second 2-of-2 output `{a', b'}` so that if the swap stalls before Taker locks XMR, either party can get back to a refundable state without racing. Needed because `Tx_lock`'s own output has no escape hatch of its own — see below. |
-| `Tx_refund` | `Tx_cancel` output | Maker: adaptor-signed with point `X`; Taker: plain | `t_refund` (≥ `t_cancel`) | Pays Maker's leg back to Maker. Taker can only complete *Maker's* adaptor signature if Taker learns the decryption — which Taker already knows, being the adaptor-secret holder. **Maker publishing `Tx_refund` reveals nothing new** (Maker already had a plain signature from Taker); this path is for Maker-initiated abort. |
-| `Tx_punish` | `Tx_cancel` output | Taker: adaptor-signed with point `X`; Maker: plain | `t_punish` (≥ `t_refund` + margin) | Pays **all** of the cancelled output to Maker. Only valid if `Tx_refund` was never published. Deters Taker from locking XMR and then stalling: Maker eventually sweeps everything. |
-| `Tx_redeem` | `Tx_lock` (or `Tx_cancel`) output | Taker: adaptor-signed with point `X`; Maker: plain | none | Pays Maker's leg to **Taker**. Taker can only produce a valid signature by completing the adaptor with `x` — and broadcasting it **reveals `x`** (ECDSA adaptor signatures leak the secret to anyone who can read the two signatures off-chain vs. the completed one on-chain; see below). This is the step that lets Maker learn `x` and sweep the Monero side. |
+| Tx | Spends | Pays | Signed by | Completed + broadcast by | Reveals | `nLockTime` |
+|---|---|---|---|---|---|---|
+| `Tx_lock` | Maker's coins | the 2-of-2 `{a,b}` output | Maker alone | Maker | nothing | none |
+| `Tx_cancel` | `Tx_lock` | a fresh 2-of-2 `{a',b'}` output | both, plainly, no adaptor | either party | nothing | `t_cancel` |
+| `Tx_redeem` | `Tx_lock`/`Tx_cancel` | Taker | Maker: adaptor-encrypted under `X`; Taker: plain | **Taker** (decrypts with `s_t`) | `s_t`, to Maker | none |
+| `Tx_refund` | `Tx_cancel` | Maker | Taker: adaptor-encrypted under `Y`; Maker: plain | **Maker** (decrypts with `s_m`) | `s_m`, to Taker | `t_refund` (≥ `t_cancel`) |
+| `Tx_punish` | `Tx_cancel` | **Taker** | both, plainly, no adaptor (Maker signs at setup, Taker holds it) | **Taker** | nothing | `t_punish` (≥ `t_refund` + margin) |
+
+Why each one is shaped this way:
+
+- **`Tx_cancel`** just moves the lock to a fresh 2-of-2 so it has an escape hatch — `Tx_lock`'s
+  own output doesn't need one since it's never spent by anything *except* `Tx_cancel`.
+- **`Tx_redeem`** is the happy path: Taker wants this to go through (it pays her the DIVI), so
+  *she* is the one who completes Maker's encrypted signature (she already holds the decryption
+  key `s_t`) and broadcasts. Maker, watching the chain, now has both the encrypted and completed
+  versions of his own signature and recovers `s_t` — letting him combine it with his own `s_m`
+  to take the Monero. This is the step that actually completes the swap in both directions.
+- **`Tx_refund`** is the mirror image, for abort: Maker wants his DIVI back, so *he* completes
+  Taker's encrypted signature (he holds `s_m`) and broadcasts. Taker, watching the chain, recovers
+  `s_m` and combines it with her own `s_t` to reclaim her *own* locked XMR — without this, if
+  Maker could reclaim his DIVI with a plain signature, Taker's Monero would be permanently
+  stranded in the 2-of-2 output with no way for her to recover it alone.
+- **`Tx_punish`** needs no adaptor at all: it's a plain presigned transaction, signed by Maker at
+  setup and held by Taker, that pays *everything* to Taker if Maker locks DIVI, Taker locks XMR,
+  and Maker then goes silent (never completes `Tx_redeem`, never lets `Tx_refund` resolve things
+  either). Taker seizes Maker's DIVI as compensation; her own XMR stays stuck (she never learns
+  `s_m` in this branch, since nothing reveals it) — the real cost that falls on Maker for
+  stalling after both sides have committed, deterring exactly that behavior.
 
 `Tx_lock` has **no in-script timelock at all** — unlike the existing BTC/DIVI HTLC
 (`crates/divi-swap/src/htlc.rs`), which needs `OP_CHECKLOCKTIMEVERIFY` *inside* the script because
@@ -69,42 +98,54 @@ in [Risks](#risks).
 
 ### Happy path
 
-1. Exchange key material + DLEQ proof; build and exchange unsigned `Tx_cancel/_refund/_punish/_redeem`
-   templates; both sign the plain (non-adaptor) halves; Taker produces the adaptor-signed halves
-   for `Tx_refund`/`Tx_punish` keyed to point `X`, Maker produces the adaptor-signed half for
-   `Tx_redeem` keyed to the same `X`.
+1. Exchange key material + **both** DLEQ proofs (Taker proves `s_t`↔`X`; Maker proves `s_m`↔`Y`).
+   Build and exchange unsigned `Tx_cancel`/`_refund`/`_punish`/`_redeem` templates; both sign the
+   plain halves (`Tx_cancel` fully, plus each party's plain half of `_refund`/`_redeem`, plus
+   Maker's plain signature for `Tx_punish` handed to Taker); Maker produces the adaptor-encrypted
+   half of `Tx_redeem` keyed to `X`; Taker produces the adaptor-encrypted half of `Tx_refund`
+   keyed to `Y`.
 2. Maker broadcasts `Tx_lock` (DIVI). Taker waits for confirmations, then locks the matching XMR
-   amount into the 2-of-2 Monero output (`s_m + s_t`).
-3. Maker waits for the Monero lock's confirmations (Monero stagenet/mainnet wants far more than
-   DIVI — 10 confirmations is the figure COMIT/xmr-btc-swap ships with, vs. DIVI's existing 1–6;
-   see [Build plan](#build-plan)), then **completes** Taker's adaptor signature on `Tx_redeem`
-   using its own secret share of `X` and broadcasts it.
-4. Taker observes `Tx_redeem` on-chain, extracts `x` from the gap between the adaptor-encrypted
-   and completed ECDSA signatures (standard adaptor-signature decryption — the whole point of the
-   construction), and uses `x` to complete its half of the Monero spend key `s_t`, sweeping the
-   XMR output.
+   amount into the 2-of-2 Monero output (public key `S = s_m·G + s_t·G`, known to both from step
+   1's DLEQ proofs).
+3. Taker, once the Monero lock has enough confirmations (Monero stagenet/mainnet wants far more
+   than DIVI — 10 confirmations is the figure COMIT/xmr-btc-swap ships with, vs. DIVI's existing
+   1–6; see [Build plan](#build-plan)), **completes** Maker's adaptor-encrypted signature on
+   `Tx_redeem` using her own `s_t` and broadcasts it — claiming the DIVI.
+4. Maker observes the completed `Tx_redeem` on-chain, recovers `s_t` from the gap between the
+   adaptor-encrypted and completed ECDSA signatures (standard adaptor-signature decryption), and
+   combines it with his own `s_m` to spend the full Monero output.
 
 ### Failure cases
 
 - **Taker never locks XMR** (step 2 never happens): after `t_cancel`, either party broadcasts
-  `Tx_cancel`; after `t_refund`, Maker broadcasts `Tx_refund` to get the DIVI back. No secret is
-  exposed because Maker already held a plain signature — this path never touches the adaptor.
-- **Maker locks DIVI, Taker locks XMR, Maker then stalls** (never does step 3): after `t_punish`,
-  Taker broadcasts `Tx_punish`, taking all of the cancelled DIVI. This is the deterrent that makes
-  stalling after both locks strictly worse than completing the swap for Maker.
-- **Maker completes `Tx_redeem` but Taker is offline / can't extract `x` in time**: no new risk —
-  `x` is sitting in a public, permanent DIVI transaction; Taker (or anyone who archived that txid)
-  can extract it and sweep the Monero output at any later time, as long as the Monero output
-  itself hasn't separately timed out (Monero multisig outputs have no on-chain timelock of their
-  own, so this risk is bounded only by how long Taker is willing to wait — a liveness, not a
-  safety, concern).
+  `Tx_cancel`; after `t_refund`, Maker completes Taker's adaptor-encrypted signature on
+  `Tx_refund` (using his own `s_m`) and broadcasts it to get his DIVI back. This reveals `s_m` to
+  Taker, but she has nothing locked yet, so it's inert — no harm, just an unused side effect of
+  reusing the same transaction shape regardless of how early the abort happens.
+- **Maker locks DIVI, Taker locks XMR, Maker then stalls** (never does step 3, nor does he ever
+  let `Tx_refund` resolve): after `t_punish`, Taker broadcasts the plain, pre-signed `Tx_punish`,
+  taking all of the cancelled DIVI. No secret moves; her own XMR stays locked forever in this
+  branch (she never learns `s_m`) — the deterrent cost that falls on Maker, not her, for stalling.
+- **Maker locks DIVI, Taker locks XMR, then Maker broadcasts `Tx_refund` instead of completing
+  `Tx_redeem`** (he changes his mind after Taker already committed): Taker recovers `s_m` from
+  the chain, combines it with her own `s_t`, and reclaims her own XMR herself — she isn't left
+  stranded by Maker backing out, since this is exactly the mechanism `Tx_refund`'s adaptor
+  encryption exists for.
+- **Taker completes `Tx_redeem` but Maker is offline / can't recover `s_t` in time**: no new
+  risk — `s_t` is sitting in a public, permanent DIVI transaction; Maker (or anyone who archived
+  that txid) can recover it and spend the Monero output at any later time, as long as the Monero
+  output itself hasn't separately timed out (Monero multisig outputs have no on-chain timelock of
+  their own, so this risk is bounded only by how long Maker is willing to wait — a liveness, not
+  a safety, concern). Same reasoning applies symmetrically to Maker completing `Tx_refund` and
+  Taker being slow to recover `s_m`.
 - **Monero chain reorg / 51%-style deep reorg after Taker locks XMR but before Maker's DIVI-side
   `t_punish`**: out of scope for this design (Monero gives no finality guarantee beyond
   confirmation count; COMIT's own writeup treats this as accepted residual risk, mitigated only
   by confirmation count, same as every Monero application).
-- **Taker reveals `x` some other way (coerced, leaked) before Maker locks**: Maker's lock hadn't
-  happened yet, so there's nothing to steal; the DLEQ proof only binds `x` to `X`/`S`, it doesn't
-  protect `x` once known. Not a protocol failure.
+- **A party reveals their own secret some other way (coerced, leaked) before the other party has
+  locked anything of theirs against it**: the DLEQ proofs only bind each secret to its public
+  points, they don't protect the secret once known by other means; with nothing locked yet
+  there's nothing to steal. Not a protocol failure.
 
 ## DIVI scripts
 
@@ -174,13 +215,20 @@ doesn't need a suspender for.
 
 ### What needs proving
 
-Taker picks scalar `x`. It must be a valid secp256k1 private key (order
-`n ≈ 2^256 − 4.3×10^38`) **and** a valid ed25519 private key component (order
-`ℓ ≈ 2^252 + δ`, `δ` small). Taker reveals `X = x·G_secp256k1` to Maker and uses `x` as (part of)
-its Monero spend-key share, so the ed25519 point is `x·G_ed25519` folded into the shared spend
-public key `S`. Maker must be convinced `X` and (Taker's share of) `S` commit to the same `x`
-**without learning `x`** — otherwise Maker has no guarantee that completing `Tx_redeem`'s adaptor
-signature actually hands Taker a usable Monero key share.
+**Two instances of the same proof run, one per party** (`## Protocol`'s fix — the original draft
+only had Taker's half): Taker picks scalar `s_t`, Maker picks scalar `s_m`; each must be a valid
+secp256k1 private key (order `n ≈ 2^256 − 4.3×10^38`) **and** a valid ed25519 private key
+component (order `ℓ ≈ 2^252 + δ`, `δ` small). Taker reveals `X = s_t·G_secp256k1` to Maker (the
+point `Tx_redeem`'s adaptor signature is encrypted under) and uses `s_t` as her Monero spend-key
+share, so the ed25519 point `s_t·G_ed25519` folds into the shared spend public key `S`. Maker
+reveals `Y = s_m·G_secp256k1` to Taker (the point `Tx_refund`'s adaptor signature is encrypted
+under) and uses `s_m` as his Monero spend-key share, folding `s_m·G_ed25519` into the same `S`.
+Each party must be convinced the *other's* revealed point and Monero-side share commit to the
+same secret **without learning that secret** — otherwise completing the corresponding adaptor
+signature (`Tx_redeem` for Maker, `Tx_refund` for Taker) wouldn't be guaranteed to hand the
+completer a usable Monero scalar. Skipping Maker's proof (as the original draft did) leaves the
+abort path (`Tx_refund`) unsafe for Taker specifically — she'd have no guarantee `Y` corresponds
+to anything she could actually use to recover her XMR.
 
 ### Why it's hard
 
@@ -292,13 +340,19 @@ an account-less-but-multisig chain (plausible — flag it when reached, don't gu
    turns out to matter) and drive it end-to-end with two throwaway stagenet wallets, confirm a
    jointly-signed spend. *Acceptance:* XMR sent to the 2-of-2 output is spendable only with both
    shares' cooperation.
-6. **Wire adaptor secret ↔ DLEQ ↔ Monero spend share**: step 3's secret is step 4's `x`, which is
-   step 5's spend-key contribution. *Acceptance:* full key-material exchange produces a Monero
-   multisig wallet whose missing spend-key share is exactly the secret step 3's adaptor signature
-   will reveal.
-7. **Full DIVI-side transaction set** (`Tx_refund`/`Tx_punish`/`Tx_redeem`) with adaptor
+6. **Wire adaptor secret ↔ DLEQ ↔ Monero spend share**: done, `crates/swap-chain-xmr/src/
+   monero_key_share.rs`. Note the correction in `## Protocol`/`## DLEQ`: this runs **twice**,
+   once per party, via additive `Interpolation::Constant` 2-of-2 keys (not step 5's PedPoP/FROST
+   path — that produces Lagrange-aggregated shares, which can't be made to equal a pre-chosen
+   DLEQ secret; see the module's doc comment for the full reasoning). *Acceptance:* each party's
+   DLEQ secret becomes their literal Monero key share (not a derived aggregate) and both converge
+   on the same additive group key — done, tested.
+7. **Full DIVI-side transaction set** (`Tx_redeem`/`Tx_refund`/`Tx_punish`) with adaptor
    signatures in place of the plain multisig signatures from step 2 where [Protocol](#protocol)
-   calls for them. *Acceptance:* each of the three failure-case branches in
+   calls for them — per the correction above, `Tx_redeem` carries *Maker's* adaptor signature
+   (encrypted under Taker's `X`, completed by Taker), `Tx_refund` carries *Taker's* (encrypted
+   under Maker's `Y`, completed by Maker), and `Tx_punish` needs no adaptor at all (plain,
+   Maker-signed-at-setup, Taker-held). *Acceptance:* each of the failure-case branches in
    [Protocol](#protocol#failure-cases) reproduced on a local/testnet DIVI node with throwaway keys.
 8. **End-to-end happy path**, DIVI testnet + Monero stagenet, throwaway keys both sides.
    *Acceptance:* Maker's DIVI and Taker's XMR both move, `x` extracted from `Tx_redeem` and used to
