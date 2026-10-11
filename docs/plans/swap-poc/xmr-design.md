@@ -244,13 +244,21 @@ parked the BTC lane's signet funding (`DECISIONS.md` #5).
   2026-10-11 — verify liveness before use, public node sets rotate):
   `node.monerodevs.org:38089`, `node2.monerodevs.org:38089`, `node3.monerodevs.org:38089`,
   `stagenet.xmr-tw.org:38081`, `xmr-lux.boldsuck.org:38081`.
-- **`monero-wallet-rpc`** (the JSON-RPC daemon this design's Rust backend would drive, analogous
-  to how `swap-chain-btc` drives an Esplora endpoint) needs `--stagenet` and either a local
-  `monerod --stagenet` or one of the public nodes above via `--daemon-address`. Multisig wallet
-  flows (`prepare_multisig` / `make_multisig` / `exchange_multisig_keys`) are exposed over this
-  same RPC — no separate tooling needed for the 2-of-2 Monero output in [Protocol](#protocol).
-  No secrets involved in standing this up (throwaway stagenet wallets only), consistent with the
-  "no secrets on hp2" rule.
+- **Two viable paths for the 2-of-2 Monero output, not one** (corrected after reading
+  `monero-wallet`'s actual docs — checked 2026-10-11): (a) **`monero-wallet-rpc`** (the JSON-RPC
+  daemon this design's Rust backend would otherwise drive, analogous to how `swap-chain-btc`
+  drives an Esplora endpoint) exposes Monero's own interactive multisig flow
+  (`prepare_multisig` / `make_multisig` / `exchange_multisig_keys`), needs `--stagenet` and
+  either a local `monerod --stagenet` or one of the public nodes above via `--daemon-address`,
+  and produces an output any standard Monero wallet could eventually co-sign; or (b)
+  `monero-wallet`'s own `multisig` feature uses a **different, FROST-based 2-of-2** (faster,
+  single Rust dependency, no RPC round-trips for key exchange) — but the result is only
+  spendable by software speaking that same FROST protocol, which is fine here since both swap
+  parties already run this codebase. (b) is the simpler build; still needs a stagenet
+  `monerod`/`monero-wallet-rpc` reachable for broadcast and output scanning either way. Decide
+  between them at build-plan step 5, not before — both satisfy [Protocol](#protocol) identically.
+  No secrets involved in standing either up (throwaway stagenet wallets only), consistent with
+  the "no secrets on hp2" rule.
 - Monero confirmation depth is the dominant latency term versus DIVI: COMIT's own deployment used
   **10 confirmations** on the Monero leg (vs. 1–2 on the Bitcoin leg in the existing swap's
   profile); stagenet block time matches mainnet (~2 min), so a happy-path acceptance test's Monero
@@ -279,10 +287,11 @@ an account-less-but-multisig chain (plausible — flag it when reached, don't gu
    clamped `x`, derive the matching secp256k1 point and ed25519 scalar from the same `x`.
    *Acceptance:* proof verifies for a correctly-constructed witness; a tampered witness (bit
    flipped on one side only) is rejected.
-5. **Monero 2-of-2 multisig on stagenet**: drive `monero-wallet-rpc`'s multisig RPCs end-to-end
-   with two throwaway stagenet wallets, confirm a jointly-signed spend. *Acceptance:* XMR sent to
-   the 2-of-2 output is spendable only with both shares' cooperation (mirrors Monero's own
-   multisig test suite, just confirming this repo's RPC usage matches).
+5. **Monero 2-of-2 multisig on stagenet**: pick one of the two paths in [Stagenet](#stagenet)
+   (default to `monero-wallet`'s native FROST multisig unless interop with stock Monero wallets
+   turns out to matter) and drive it end-to-end with two throwaway stagenet wallets, confirm a
+   jointly-signed spend. *Acceptance:* XMR sent to the 2-of-2 output is spendable only with both
+   shares' cooperation.
 6. **Wire adaptor secret ↔ DLEQ ↔ Monero spend share**: step 3's secret is step 4's `x`, which is
    step 5's spend-key contribution. *Acceptance:* full key-material exchange produces a Monero
    multisig wallet whose missing spend-key share is exactly the secret step 3's adaptor signature

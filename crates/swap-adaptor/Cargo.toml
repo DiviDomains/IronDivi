@@ -1,0 +1,20 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-adaptor"
+version = "0.2.5"
+edition = "2021"
+description = "ECDSA adaptor signatures and cross-group (secp256k1 / ed25519) DLEQ proof, for the DIVI<->XMR adaptor-signature swap (docs/plans/swap-poc/xmr-design.md)"
+
+[dependencies]
+secp256kfun = "0.12"
+ecdsa_fun = { version = "0.12", features = ["adaptor"] }
+sigma_fun = { version = "0.9", features = ["ed25519"] }
+curve25519-dalek-ng = { version = "4", default-features = false, features = ["u64_backend"] }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = "0.6"
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

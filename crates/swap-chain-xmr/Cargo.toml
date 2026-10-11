@@ -1,0 +1,14 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-chain-xmr"
+version = "0.2.5"
+edition = "2021"
+description = "DIVI-side presigned 2-of-2 multisig skeleton for the DIVI<->XMR adaptor-signature swap (docs/plans/swap-poc/xmr-design.md)"
+
+[dependencies]
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-script = { workspace = true }
+divi-wallet = { workspace = true }
+divi-swap = { workspace = true }
+thiserror = { workspace = true }
