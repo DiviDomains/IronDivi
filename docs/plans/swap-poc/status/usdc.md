@@ -210,3 +210,54 @@
   deploy/funding, failing with a clear message instead of a confusing mid-deploy RPC error
   if the taker isn't funded yet. `shellcheck` clean on both `usdc-live.sh` and
   `usdc-live-dry-run.sh` now.
+- **Wave 6** (this seam): Etherscan/Basescan links for every tx `usdc-live.sh` sends, and a
+  case-c (refund) scenario for it — neither existed before (the script only ran one
+  hardcoded happy-path forward swap).
+  - Etherscan links: `deploy_contract_with_tx` (new, `crates/swap-chain-evm/src/client.rs`)
+    is `deploy_contract` plus the deployment tx hash, since the orchestrator needs that link
+    too; `sepolia_ops deploy` now prints `tx: 0x...` alongside `htlc_address: 0x...`.
+    `usdc-live.sh`'s new `print_tx` helper prints `$explorer/tx/$hash` right after every send
+    (deploy, maker ETH/USDC funding) and for every EVM-side txid in the post-swap `txids`
+    output (`btc_lock`/`btc_claim_by_*`/`btc_refund_by_taker`/`btc_spend_by_maker` — named
+    "btc" generically by `bin/divi-swap/src/txids.rs` regardless of the actual counter
+    chain). `explorer` is `sepolia.etherscan.io` or `sepolia.basescan.org`, picked by
+    `--network` the same way `usdc_token`/`default_rpc_url` already are.
+  - Case-c: `usdc-live.sh` restructured around `--scenario happy|case-c|all --direction
+    forward|reverse|both --dry-run`, modeled directly on `tools/swap-poc/ltc-live.sh`/
+    `zec-live.sh` (same `[swap] maker_timeout_secs=3600/taker_timeout_secs=14410` override
+    and `--never-claim` taker flag for case-c, same `--dry-run` boundary: stops after
+    `accept`, before the first broadcast). Offers are now `divi-usdc-$network`/
+    `usdc-divi-$network` for both directions in every scenario (previously only the forward
+    offer existed). Maker ETH/USDC funding targets now scale with how many runs are
+    requested (`total_runs` for gas — the maker signs an EVM claim or refund on every run
+    regardless of direction; `reverse_runs` for USDC collateral — only a reverse run spends
+    the maker's own USDC) instead of the old flat 0.02 ETH / 2 USDC.
+  - **No `--backend mock`**: `Chain::Usdc` is not in `divi_swapd::MOCK_ONLY_CHAINS`, so a
+    mock-backend maker has no USDC counter backend and cannot quote a usdc offer
+    (`Maker::quote` calls `self.chain(counter)?.pubkey()`, which fails with no registered
+    backend). Adding it would mean touching a constant shared with every other lane's mock
+    assumptions (breaks `bin/divi-swapd/tests/multichain.rs`'s `Net`, which registers exactly
+    Ltc/Zec/Btc backends and would then get an unregistered usdc offer) — out of scope here;
+    flagging as a possible future orchestrator decision, not doing it unilaterally.
+  - Checked, and ruled out as infeasible rather than skipped: running the real
+    `divi-swapd`/`divi-swap` *binaries* for case-c against anvil (closing the gap
+    `usdc-live-dry-run.sh`'s header already flagged). `--backend live` unconditionally needs
+    real `[divi]`/`[btc]` connectivity (`live_backends` in `bin/divi-swapd/src/main.rs`
+    bails if either is absent) — DIVI/BTC aren't EVM chains, so anvil cannot stand in for
+    them. This is a structural limit of `--backend live`, not specific to case-c; it already
+    blocked the happy path the same way.
+  - What's actually "tested with mock" here, given the above: (1) the refund mechanics
+    themselves were already proven at the engine level before this wave
+    (`usdc_swap_refund_forward`/`usdc_swap_refund_reverse`, `crates/divi-swap/tests/usdc.rs`,
+    already run by `usdc-live-dry-run.sh`); (2) two new unit tests in
+    `bin/divi-swapd/src/config.rs` (`usdc_live_happy_scenario_toml_parses_and_serves_both_directions`,
+    `usdc_live_case_c_scenario_toml_parses_with_its_swap_overrides`) parse the *exact* TOML
+    shape `usdc-live.sh`'s new `run_scenario` generates for both scenarios (placeholder
+    network/htlc/refs) through `DaemonConfig::parse`, catching drift between the bash and
+    the real config parser with no secrets, daemon, or network needed; (3) `usdc-live.sh`
+    itself cannot run on hp2 even with `--dry-run` (still needs a real `[divi]`/`[btc]`/
+    `[usdc]` daemon) — verified by `bash -n` + `shellcheck` (both clean) and careful review
+    instead.
+  - `cargo fmt`/`cargo clippy --workspace --all-targets -- -D warnings` clean; full
+    `swap-chain-evm`/`divi-swapd` test suites green (17 `divi-swapd` lib tests, up from 15);
+    `usdc-live-dry-run.sh` re-run clean end to end (exit 0).

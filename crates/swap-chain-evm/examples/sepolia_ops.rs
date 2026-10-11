@@ -37,7 +37,8 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use clap::{Parser, Subcommand};
 use swap_chain_evm::{
-    connect_provider, deploy_contract, erc20_htlc_bytecode, IErc20, PrivateKeySigner, UsdcNetwork,
+    connect_provider, deploy_contract_with_tx, erc20_htlc_bytecode, IErc20, PrivateKeySigner,
+    UsdcNetwork,
 };
 use zeroize::Zeroizing;
 
@@ -139,10 +140,11 @@ async fn main() {
             let address = key.address();
             let provider = connect_provider(&rpc_url, key).expect("connect provider");
             eprintln!("deploying Erc20Htlc from {address} on {network}...");
-            let htlc = deploy_contract(&provider, erc20_htlc_bytecode())
+            let (htlc, tx) = deploy_contract_with_tx(&provider, erc20_htlc_bytecode())
                 .await
                 .expect("deploy Erc20Htlc");
             println!("htlc_address: {htlc}");
+            println!("tx: {tx}");
         }
         Cmd::SendEth { to, wei } => {
             let key: PrivateKeySigner = read_key().trim().parse().expect("bad SWAP_EVM_KEY_HEX");

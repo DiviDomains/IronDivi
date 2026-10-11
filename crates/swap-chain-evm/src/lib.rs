@@ -25,7 +25,9 @@ pub mod client;
 pub use alloy::signers::local::PrivateKeySigner;
 pub use artifact::{bytecode, foundry_available};
 pub use backend::{amount_to_usdc_units, usdc_units_to_amount, UsdcBackend};
-pub use client::{connect_provider, deploy_contract, swap_id, EvmHtlcClient, SwapState};
+pub use client::{
+    connect_provider, deploy_contract, deploy_contract_with_tx, swap_id, EvmHtlcClient, SwapState,
+};
 pub use contract::{IErc20, IErc20Htlc, IMockErc20};
 pub use embedded_bytecode::{erc20_htlc_bytecode, ERC20_HTLC_BYTECODE_HEX};
 pub use network::UsdcNetwork;

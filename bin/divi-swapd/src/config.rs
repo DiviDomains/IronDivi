@@ -769,4 +769,83 @@ key = "credential:btc"
         let err = DaemonConfig::parse(&text).unwrap_err();
         assert!(err.to_string().contains("[usdc].network"), "{err}");
     }
+
+    /// The exact `[usdc]`/`[[offers]]` shape `tools/swap-poc/usdc-live.sh`'s `run_scenario`
+    /// generates for its "happy" scenario (placeholder `network`/`htlc`/`rpc_url`/secret
+    /// refs — the script fills in real ones). Catches drift between the two without needing
+    /// secrets, a daemon, or a network: a mock/unit-level check of a script this lane cannot
+    /// otherwise exercise on hp2 (no 1Password, no live Sepolia).
+    fn usdc_live_toml(timing: &str) -> String {
+        format!(
+            "listen = \"127.0.0.1:18494\"\n\
+             db_path = \"/tmp/usdc-live-test/maker.db\"\n\
+             tick_secs = 5\n\
+             {timing}\n\
+             [divi]\n\
+             key = \"op://v/maker-divi/f\"\n\
+             wallet_path = \"/tmp/usdc-live-test/maker-wallet.json\"\n\
+             scan_from_height = 339800\n\
+             \n\
+             [btc]\n\
+             network = \"testnet\"\n\
+             esplora_url = \"https://mempool.space/testnet/api\"\n\
+             key = \"op://v/maker-btc/f\"\n\
+             \n\
+             [usdc]\n\
+             network = \"sepolia\"\n\
+             rpc_url = \"https://ethereum-sepolia-rpc.publicnode.com\"\n\
+             htlc = \"0x1111111111111111111111111111111111111111\"\n\
+             key = \"op://v/maker-btc/f\"\n\
+             \n\
+             [[offers]]\n\
+             id = \"divi-usdc-sepolia\"\n\
+             direction = \"taker_pays_btc\"\n\
+             counter_chain = \"usdc\"\n\
+             divi_sats_per_btc = 10000000000\n\
+             min_btc_sats = 1000000\n\
+             max_btc_sats = 1000000000\n\
+             \n\
+             [[offers]]\n\
+             id = \"usdc-divi-sepolia\"\n\
+             direction = \"taker_pays_divi\"\n\
+             counter_chain = \"usdc\"\n\
+             divi_sats_per_btc = 10000000000\n\
+             min_btc_sats = 1000000\n\
+             max_btc_sats = 1000000000\n"
+        )
+    }
+
+    #[test]
+    fn usdc_live_happy_scenario_toml_parses_and_serves_both_directions() {
+        let c = DaemonConfig::parse(&usdc_live_toml("")).unwrap();
+        let served: Vec<_> = c
+            .offers
+            .iter()
+            .map(|o| (o.id.as_str(), o.counter_chain, o.direction))
+            .collect();
+        assert_eq!(
+            served,
+            [
+                ("divi-usdc-sepolia", Chain::Usdc, Direction::TakerPaysBtc),
+                ("usdc-divi-sepolia", Chain::Usdc, Direction::TakerPaysDivi),
+            ]
+        );
+        let u = c.usdc.clone().unwrap();
+        assert_eq!(u.network, "sepolia");
+        assert_eq!(u.htlc, "0x1111111111111111111111111111111111111111");
+        // The daemon's own default timeouts (happy scenario passes no [swap] override).
+        let s = c.swap_config().unwrap();
+        assert_eq!(s.taker_timeout_secs, 6 * 3600);
+        assert_eq!(s.maker_timeout_secs, 3 * 3600);
+    }
+
+    #[test]
+    fn usdc_live_case_c_scenario_toml_parses_with_its_swap_overrides() {
+        let timing = "[swap]\nmaker_timeout_secs = 3600\ntaker_timeout_secs = 14410\n";
+        let c = DaemonConfig::parse(&usdc_live_toml(timing)).unwrap();
+        assert!(c.serves(Chain::Usdc));
+        let s = c.swap_config().unwrap();
+        assert_eq!(s.taker_timeout_secs, 14410);
+        assert_eq!(s.maker_timeout_secs, 3600);
+    }
 }

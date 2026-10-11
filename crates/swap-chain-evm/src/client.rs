@@ -97,6 +97,15 @@ pub fn connect_provider(rpc_url: &str, key: PrivateKeySigner) -> Result<DynProvi
 
 /// Deploy raw `bytecode` (no constructor args) and return the new contract's address.
 pub async fn deploy_contract(provider: &DynProvider, bytecode: Vec<u8>) -> Result<Address> {
+    Ok(deploy_contract_with_tx(provider, bytecode).await?.0)
+}
+
+/// Same as [`deploy_contract`], also returning the deployment transaction's hash (e.g. to
+/// print a block-explorer link for it).
+pub async fn deploy_contract_with_tx(
+    provider: &DynProvider,
+    bytecode: Vec<u8>,
+) -> Result<(Address, B256)> {
     let tx = TransactionRequest::default().with_deploy_code(Bytes::from(bytecode));
     let pending = provider
         .send_transaction(tx)
@@ -106,9 +115,10 @@ pub async fn deploy_contract(provider: &DynProvider, bytecode: Vec<u8>) -> Resul
         .get_receipt()
         .await
         .map_err(other::<_>("await deployment receipt"))?;
-    receipt
+    let address = receipt
         .contract_address
-        .ok_or_else(|| SwapError::Other("deployment receipt lacks contract_address".into()))
+        .ok_or_else(|| SwapError::Other("deployment receipt lacks contract_address".into()))?;
+    Ok((address, receipt.transaction_hash))
 }
 
 /// Client for one `Erc20Htlc` deployment, signing with one key.
