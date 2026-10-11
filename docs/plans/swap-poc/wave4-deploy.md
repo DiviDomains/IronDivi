@@ -23,15 +23,28 @@ entry.
 ## 0. Preconditions
 
 - [ ] BTC reverse chaos run finished; nothing else is driving the maker.
+- [ ] **No second maker on the same keys** while dnsdivi serves: `tools/swap-poc/ltc-live.sh
+      --backend live`, `e2e.sh` and the chaos drivers start their *own* local `divi-swapd`
+      with `maker-divi` / `maker-btc` and a separate DIVI wallet file. Two makers on one key
+      track its coins independently and can pick the same UTXOs (a double spend that
+      leaves one swap's funding rejected mid-swap). Run those as rehearsals before the
+      deploy, not alongside it; check the Mac: `pgrep -fl divi-swapd` → nothing.
 - [ ] No swap in flight (the restart is crash-safe, but a clean start is easier to read, and
       a rollback needs it, see §5):
       ```sh
       ssh dnsdivi "curl -s http://127.0.0.1:18480/swaps" \
         | jq '[.[] | select(.state != "Done" and .state != "Aborted")] | length'   # → 0
       ```
-- [ ] Mac checkout clean, at `main` including the commit that added this file (it carries
-      the `enabled` offer switch; the counter_chain take check is eeec09c, LTC wiring 5159f29).
+- [ ] Mac checkout clean, at `main` **at or after 6037821**: `git merge-base --is-ancestor
+      6037821 HEAD && echo ok`. That main carries everything this deploy relies on: LTC
+      wiring 5159f29, the counter_chain take check eeec09c, the `enabled` switch + this
+      checklist cb345e1, and the two taker fixes 7dec6da / 6037821 (they live in the
+      `divi-swap` taker CLI, so the takers' binary must come from the same main; the
+      daemon picks them up too since both build the `divi-swap` engine crate).
       `deploy.sh` rsyncs the **working tree**, so no local edits.
+- [ ] Taker CLI built from that main on the Mac: `cargo build --release -p divi-swap-cli`
+      (`target/release/divi-swap`). A taker CLI older than 6037821 retries a too-late
+      maker lock as an error on every poll instead of quietly waiting for its refund.
 - [ ] dnsdivi has room for the build: `ssh dnsdivi df -h /opt` (the release build now also
       compiles swap-chain-ltc/-zec/-evm; allow ~3 GB under `/opt/divi-swapd/src/target`).
 - [ ] Record what runs now. `/healthz` `version` does **not** tell old from new: the
@@ -119,10 +132,26 @@ B=http://127.0.0.1:18480     # on dnsdivi; from the Mac: ssh -N -L 18480:127.0.0
       # → 400 {"error":"invalid parameters: offer divi-ltc-testnet swaps DIVI against ltc, but this take request does not name a counter chain …"}
       curl -s $B/swaps | jq length   # unchanged
       ```
-- [ ] A real LTC swap, once the checks pass: `tools/swap-poc/ltc-live.sh` (ltc lane;
-      `--dry-run` first), forward direction only. Takers need the new `divi-swap` with
-      `--counter-chain ltc --ltc-key …`; the taker LTC address holds 0.01 LTC (enough for
-      `min_btc_sats` = 0.001 LTC swaps).
+- [ ] A real LTC swap against dnsdivi, once the checks pass (forward only; tunnel up). Not
+      `ltc-live.sh`: that drives its own local maker (see §0). The taker LTC address
+      `tltc1qa826…` holds 0.01 LTC, enough for `min_btc_sats` = 0.001 LTC:
+      ```sh
+      ref() { echo "op://global_secret_store/IronDivi Swap POC - $1/password"; }
+      D=~/.local/state/iron-divi-swap-poc/wave4-ltc; mkdir -p "$D"; chmod 700 "$D"   # outside the repo
+      target/release/divi-swap --db "$D/taker.db" --backend live --counter-chain ltc \
+        --divi-key "$(ref taker-divi)" --ltc-key "$(ref taker-btc)" \
+        balance   # resolves both keys; ltc_address=tltc1qa826…, ltc_balance_sats >= 105000
+      target/release/divi-swap --db "$D/taker.db" --backend live --counter-chain ltc \
+        quote --maker http://127.0.0.1:18480 --offer divi-ltc-testnet --btc-sats 100000    # counter_chain "ltc"; no keys used
+      # then the whole flow, in the background (hours at worst: case-C timelocks); prints "<local id> Done":
+      target/release/divi-swap --db "$D/taker.db" --backend live --counter-chain ltc \
+        --divi-key "$(ref taker-divi)" --ltc-key "$(ref taker-btc)" \
+        run --maker http://127.0.0.1:18480 --offer divi-ltc-testnet --btc-sats 100000
+      target/release/divi-swap --db "$D/taker.db" txids --swap <local id>   # maker_state=Done
+      ```
+      (`quote` broadcasts nothing and creates no swap; don't `accept` separately before
+      `run`, which takes its own quote and would leave the accepted one to abort after 30
+      min.) LTC keys reuse the BTC refs (`funding.md`).
 
 ## 5. Rollback
 
@@ -152,8 +181,12 @@ the old binary ignores; terminal LTC records stay terminal.
 ## 6. Later switches (no rebuild; edit the file, restart)
 
 - **Reverse LTC** (`ltc-divi-testnet`): fund `tltc1quqkt7c06svzt68f2y9uwf2jzgpd48k6k9akunz`
-  with ≥ 0.1 LTC + fees (`max_btc_sats` = 0.1 LTC), confirm on litecoinspace, set
-  `enabled = true`, restart, quote it.
+  with ≥ `max_btc_sats` + fees (0.1 LTC + fees as configured), confirm on litecoinspace,
+  set `enabled = true`, restart, quote it. Without a faucet: `ltc_send` (ltc lane,
+  `crates/swap-chain-ltc/examples/ltc_send.rs`, key from `SWAP_LTC_KEY_HEX` only, run on
+  the Mac) can move LTC from the taker's 0.01 LTC to the maker; that cannot cover 0.1, so
+  also lower this offer's `max_btc_sats` to what the maker then holds minus ~5000 litoshi
+  of fees (e.g. send 400000, set `max_btc_sats = 300000`), and keep `min_btc_sats` ≤ it.
 - **ZEC**: once the maker t-address holds TAZ on the NU7 chain, set `enabled = true` on both
   ZEC offers (or only `divi-zec-testnet`, which needs no maker TAZ), restart, then check
   `/healthz` shows `counters.zec` with a tip from `testnet.zec.rocks` (the only known
