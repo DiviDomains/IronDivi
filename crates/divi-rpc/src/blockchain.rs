@@ -333,18 +333,24 @@ impl BlockchainRpc {
         }))
     }
 
-    /// Get chain tips
+    /// Get chain tips (active chain plus every known side branch)
     pub fn get_chain_tips(&self, _params: &Params) -> Result<Value, Error> {
-        let tip = self.chain.tip();
-        match tip {
-            Some(t) => Ok(json!([{
-                "height": t.height,
-                "hash": t.hash.to_string(),
-                "branchlen": 0,
-                "status": "active"
-            }])),
-            None => Ok(json!([])),
-        }
+        let tips = self
+            .chain
+            .get_chain_tips()
+            .map_err(|e| RpcError::internal_error(e.to_string()))?;
+        Ok(Value::Array(
+            tips.into_iter()
+                .map(|t| {
+                    json!({
+                        "height": t.height,
+                        "hash": t.hash.to_string(),
+                        "branchlen": t.branch_len,
+                        "status": t.status.as_str(),
+                    })
+                })
+                .collect(),
+        ))
     }
 
     /// Get difficulty

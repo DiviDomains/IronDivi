@@ -325,6 +325,27 @@ impl ChainDatabase {
         }
     }
 
+    /// Load every block index entry (active chain and side branches).
+    ///
+    /// Scans the `b`-prefixed keys of the block-index column family; the `h`
+    /// height-mapping keys are skipped. Used by `getchaintips`.
+    pub fn iter_all_block_indexes(&self) -> Result<Vec<BlockIndex>, StorageError> {
+        let cf = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(b"b", rocksdb::Direction::Forward),
+        );
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if key.first() != Some(&b'b') {
+                break;
+            }
+            out.push(BlockIndex::from_bytes(&value)?);
+        }
+        Ok(out)
+    }
+
     /// Check if a block index exists
     pub fn has_block_index(&self, hash: &Hash256) -> Result<bool, StorageError> {
         let cf = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();

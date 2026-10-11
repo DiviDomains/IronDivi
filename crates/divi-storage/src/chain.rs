@@ -131,6 +131,39 @@ impl ChainParams {
     }
 }
 
+/// Status of a chain tip, as reported by `getchaintips`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainTipStatus {
+    Active,
+    ValidFork,
+    ValidHeaders,
+    HeadersOnly,
+    Invalid,
+    Unknown,
+}
+
+impl ChainTipStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChainTipStatus::Active => "active",
+            ChainTipStatus::ValidFork => "valid-fork",
+            ChainTipStatus::ValidHeaders => "valid-headers",
+            ChainTipStatus::HeadersOnly => "headers-only",
+            ChainTipStatus::Invalid => "invalid",
+            ChainTipStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// One entry of `getchaintips`.
+#[derive(Debug, Clone)]
+pub struct ChainTip {
+    pub height: u32,
+    pub hash: Hash256,
+    pub branch_len: u32,
+    pub status: ChainTipStatus,
+}
+
 /// Chain state
 pub struct Chain {
     /// Database for persistent storage
@@ -660,6 +693,84 @@ impl Chain {
         height: u32,
     ) -> Result<Option<BlockIndex>, StorageError> {
         self.db.get_block_index_by_height(height)
+    }
+
+    /// All known chain tips, mirroring C++ `getchaintips`.
+    ///
+    /// A tip is any block index entry that no other entry names as its parent;
+    /// the active tip is always included. Sorted by height, highest first.
+    pub fn get_chain_tips(&self) -> Result<Vec<ChainTip>, StorageError> {
+        let entries = self.db.iter_all_block_indexes()?;
+        let by_hash: std::collections::HashMap<Hash256, &BlockIndex> =
+            entries.iter().map(|b| (b.hash, b)).collect();
+        let parents: std::collections::HashSet<Hash256> =
+            entries.iter().map(|b| b.prev_hash).collect();
+        let active_tip = self.tip();
+
+        let on_active = |b: &BlockIndex| -> Result<bool, StorageError> {
+            Ok(self.db.get_height_mapping(b.height)? == Some(b.hash))
+        };
+
+        let mut tips: Vec<&BlockIndex> = entries
+            .iter()
+            .filter(|b| !parents.contains(&b.hash))
+            .collect();
+        if let Some(ref t) = active_tip {
+            if !tips.iter().any(|b| b.hash == t.hash) {
+                if let Some(b) = by_hash.get(&t.hash) {
+                    tips.push(b);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(tips.len());
+        for tip in tips {
+            let active = on_active(tip)?;
+            // Walk back to the fork point on the active chain, noting whether
+            // any ancestor is failed or lacks block data.
+            let mut cur = tip;
+            let mut failed = false;
+            let mut missing_data = false;
+            while !active && !on_active(cur)? {
+                failed |= cur.status.contains(BlockStatus::FAILED);
+                missing_data |= !cur.status.contains(BlockStatus::HAVE_DATA)
+                    && !cur.status.contains(BlockStatus::VALID_SCRIPTS);
+                match by_hash.get(&cur.prev_hash) {
+                    Some(parent) => cur = parent,
+                    None => break,
+                }
+            }
+            let branch_len = if active {
+                0
+            } else if on_active(cur)? {
+                tip.height - cur.height
+            } else {
+                // Never joined the active chain (e.g. headers whose parent is
+                // unknown): the whole branch down to its lowest known block.
+                tip.height - cur.height + 1
+            };
+            let status = if active {
+                ChainTipStatus::Active
+            } else if failed {
+                ChainTipStatus::Invalid
+            } else if missing_data {
+                ChainTipStatus::HeadersOnly
+            } else if tip.status.contains(BlockStatus::VALID_SCRIPTS) {
+                ChainTipStatus::ValidFork
+            } else if tip.status.contains(BlockStatus::VALID_HEADER) {
+                ChainTipStatus::ValidHeaders
+            } else {
+                ChainTipStatus::Unknown
+            };
+            out.push(ChainTip {
+                height: tip.height,
+                hash: tip.hash,
+                branch_len,
+                status,
+            });
+        }
+        out.sort_by(|a, b| b.height.cmp(&a.height).then(a.hash.cmp(&b.hash)));
+        Ok(out)
     }
 
     /// Check if a block exists in the chain
@@ -4960,6 +5071,58 @@ mod tests {
             hash_a1
         );
         assert!(chain.db.get_block_index(&hash_b1).unwrap().is_some());
+    }
+
+    /// getchaintips must report side branches, not just the active tip.
+    #[test]
+    fn test_get_chain_tips_reports_side_branches() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(a2).unwrap().hash;
+        // Stale sibling of A1: stored, never connected.
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+
+        let tips = chain.get_chain_tips().unwrap();
+        assert_eq!(tips.len(), 2, "active tip plus one side branch: {tips:?}");
+        assert_eq!(tips[0].hash, hash_a2);
+        assert_eq!(tips[0].status, ChainTipStatus::Active);
+        assert_eq!(tips[0].branch_len, 0);
+        assert_eq!(tips[1].hash, hash_b1);
+        assert_eq!(tips[1].height, 1);
+        assert_eq!(tips[1].branch_len, 1);
+        assert_eq!(tips[1].status, ChainTipStatus::ValidHeaders);
+    }
+
+    /// After a reorg the abandoned branch is a fully validated `valid-fork`.
+    #[test]
+    fn test_get_chain_tips_after_reorg_marks_old_branch_valid_fork() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(a2).unwrap().hash;
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1.clone()).unwrap().hash;
+        let b2 = create_child_block_with_pubkey(hash_b1, b1.header.time, [0x1b; 20]);
+        let hash_b2 = chain.accept_block(b2.clone()).unwrap().hash;
+        let b3 = create_child_block_with_pubkey(hash_b2, b2.header.time, [0x1c; 20]);
+        let hash_b3 = chain.accept_block(b3).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_b3);
+
+        let tips = chain.get_chain_tips().unwrap();
+        assert_eq!(tips.len(), 2, "{tips:?}");
+        assert_eq!(
+            (tips[0].hash, tips[0].status),
+            (hash_b3, ChainTipStatus::Active)
+        );
+        assert_eq!(tips[1].hash, hash_a2);
+        assert_eq!(tips[1].branch_len, 2);
+        assert_eq!(tips[1].status, ChainTipStatus::ValidFork);
     }
 
     /// repair_height_index restores entries a pre-fix build corrupted and
