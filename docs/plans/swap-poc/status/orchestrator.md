@@ -42,3 +42,20 @@
   (`tx.rs` subtract overflow). Fixed in 7c867aa (empty wallet → `InsufficientFunds`; driver
   default testnet3). Swap 29378dca (taker DIVI locked, maker never funded) resumes with the fixed
   binaries; the maker funds or aborts safely, and the taker DIVI refunds at its timelock if not.
+- landed from hp2 lanes: bb992e4 (ltc `LtcBackend`), f8f7e9b (xmr design + DIVI `bare_txid`),
+  a865d9c (usdc `Erc20Htlc` + `swap-chain-evm`), d2b2742 (zec `ZecBackend`), f273975
+  (multichain engine: DIVI vs any UTXO counter chain). `hp2-land.sh` hardened: refreshes
+  `Cargo.lock` only when it had to drop the lane's copy, offline (1cabf5e); refuses a lane with
+  unmerged files (f345af6). The first zec landing was refused for a `UU Cargo.lock` + stray files.
+- a865d9c broke CI (unused `FromStr` import only the `live`-feature test uses); fixed on main.
+- hp2 disk hit 100% at ~12:40 (other projects' remote-cargo targets + sccache; lanes ~23 GB). I
+  removed my stale remote-cargo targets and the idle xmr/usdc lane targets; lanes build with
+  `CARGO_INCREMENTAL=0`. The lane watcher also flags the disk at ≥ 97%.
+- USDC engine fit: **Option A** (`UsdcBackend: ChainBackend` inside `swap-chain-evm`, no engine
+  contract change), per `usdc-design.md`. XMR continues with build-plan steps 2–4 (mockable).
+- wave 2 started: ltc, zec, usdc wire their backends into `divi-swapd`/`divi-swap` with mock e2e.
+- 13:11: chaos driver now fails fast when the swap aborts, and a resumed run parks an aborted swap
+  and starts over. Swap 29378dca was aborted by the maker ("taker-leg window too short") after
+  the long interruption; its 600 DIVI taker lock (local f4140a43) is refunded by the taker after
+  the chaos run (the maker never saw the preimage, so the coins are only the taker's). The rerun
+  uses `--btc-sats 6000` (180 DIVI per swap) so all four scenarios fit the taker's free DIVI.

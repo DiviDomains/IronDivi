@@ -224,7 +224,13 @@ class Run:
         raise TimeoutError(f"timed out after {timeout}s waiting for {what}")
 
     def wait_state(self, state, timeout):
-        self.wait_for(lambda: (self.row() or (None, None))[1] == state, timeout, f"state {state}")
+        def reached():
+            st = (self.row() or (None, None))[1]
+            if st and st.lower() == "aborted" and state != "aborted":
+                raise RuntimeError(f"swap aborted while waiting for {state}: "
+                                   f"{self.view(self.row()[0]).get('last_error')}")
+            return st == state
+        self.wait_for(reached, timeout, f"state {state}")
 
     def view(self, sid):
         return json.loads(http("GET", f"{self.maker}/swaps/{sid}"))
@@ -374,6 +380,16 @@ class Run:
 
     def begin(self):
         """accept (or resume) and return (maker_id, taker_local_id)."""
+        sid = self.progress.get("sid")
+        if sid and self.view(sid)["state"].lower() == "aborted":
+            # e.g. resumed after a long interruption and the maker judged the taker leg's window
+            # too short. Park its record (the taker refunds that lock after its timelock) and
+            # start this scenario over with a fresh swap.
+            parked = self.dir / f"progress-aborted-{sid}.json"
+            self.progress_path.rename(parked)
+            log(f"swap {sid} aborted; parked as {parked.name}, taker lock "
+                f"{self.progress.get('local')} needs a refund after its timelock; starting over")
+            self.progress = {}
         if "local" not in self.progress:
             self.save(local=self.accept())
         r = self.row()
