@@ -1,27 +1,25 @@
 # Lane zec status
 
-  landings; re-merged `bin/divi-swap{,d}/{Cargo.toml,src/lib.rs,src/main.rs,src/config.rs}`
-  keeping LTC, USDC and ZEC wiring side by side (both `live_usdc()`/`live_zec()` kept in
-  `divi-swapd/src/main.rs`, `live_backends()`'s offer-validation loop checks `cfg.ltc`/
-  `cfg.usdc`/`cfg.zec` all three, `UsdcSection`+`ZecSection` both re-exported from
-  `divi-swapd/src/lib.rs`, `bin/divi-swap/src/main.rs`'s `CounterLive` enum and the
-  `--counter-chain usdc` early-return path both intact). `cargo build`/`clippy -D warnings`/
-  `test` all green for `swap-chain-zec`, `divi-swapd`, `divi-swap-cli` after the merge
-  (including `multichain.rs`'s `daemon_swaps_ltc_and_zec_both_ways`); `check-zec.sh` PASS;
-  `git status --short` shows no `UU` and no stray files.
-- blocked-on-human: yes — see "parked" below. Everything else in wave 2/3 prep that doesn't
-  need funds or a key is done; keep reading, this is not a full stop.
-- parked: ZEC testnet funding needs a human with Mac/1Password access and ~15 minutes with
-  `zcash-devtool` (no secrets on hp2, so I can't do this myself). Exact steps, addresses and
-  API schema are under "- decisions: funding path" below — it's copy-paste ready. Short
-  version: claim 1 TAZ from the fauzec.com faucet into a throwaway `zcash-devtool` wallet
-  (shielded-only faucet, Unified/Sapling address required), then PCZT-send from that wallet to
-  our two transparent swap addresses (`tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk` taker,
-  `tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn` maker — same keys as taker-btc/maker-btc, see
-  `docs/plans/swap-poc/funding.md`). Once either address shows a balance (I can verify myself,
-  read-only, no key needed — `GetAddressUtxos` on a known address), I'll run
-  `live_fund_claim_refund`... except that test needs `SWAP_ZEC_TEST_KEY_HEX` which is a
-  secret too, so that run is the orchestrator's either way (same as other lanes' live tests).
+- blocked-on-human: yes — see "parked" below. Wave 2 (daemon+CLI wiring, merged side by side
+  with the LTC and USDC lanes) landed on main as `4fdae25`; everything buildable without coins
+  is done. Keep reading, this is not a full stop.
+- parked: ZEC testnet funding, still unresolved as of 2026-10-11 ~16:45 EDT. Per the
+  orchestrator's `ORCHESTRATOR-NOTE-faucet.md`: the fauzec.com claim (txid
+  `9cf8c2203229ef9577857439452c22b63ba0981b3419ba02dce98a05d7049814`) paid out 1 TAZ, but it
+  was mined at height 4,474,361 on a **pre-NU7 fork** (tip ~4,474,400, 75s blocks) — not the
+  chain `testnet.zec.rocks` (what `ZecBackend` targets) is on, which is past NU7 activation
+  (height 4,465,026, tip ~4,489,857, 25s blocks). The two chains diverged at/around the NU7
+  activation height, so that TAZ does not exist on our target chain and is unspendable by us.
+  Per the orchestrator: do not switch `ZecBackend` to the pre-NU7 server — NU7 is the real
+  testnet, this crate's `testnet.zec.rocks:443` choice stands. Funding still needs a human with
+  Mac/1Password access and `zcash-devtool`'s PCZT flow — exact steps are under
+  "- decisions: funding path" below, copy-paste ready — but any faucet claim must be verified
+  against the NU7 chain before relying on it (check the claiming wallet's `-s zecrocks` sync
+  reaches a NU7-height tip, not a stale pre-NU7 fork, before trusting its balance). Once either
+  swap address (`tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk` taker, `tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn`
+  maker) shows a balance via `GetAddressUtxos` on `testnet.zec.rocks` (I can verify myself,
+  read-only, no key needed), I'll know funding actually landed. `live_fund_claim_refund` still
+  also needs `SWAP_ZEC_TEST_KEY_HEX`, a secret, so running it is the orchestrator's either way.
 - done:
   - **Wave 1b** (`crates/swap-chain-zec/`): `ZecBackend` implementing `divi_swap::ChainBackend`
     over lightwalletd gRPC (`grpc.rs`), hand-rolled ZIP-244/ZIP-229 tx building+signing+digest
@@ -101,10 +99,32 @@
     matching `docs/plans/swap-poc/funding.md` and `tools/swap-poc/derive-addrs.py`'s
     methodology (same hash160, same `[0x1d,0x25]` prefix, same Base58Check). No address
     mismatch to report.
+  - **Live-readiness dry run** (while funding stays blocked): added
+    `crates/swap-chain-zec/examples/zec_live_dry_run.rs` + `tools/swap-poc/check-zec-live.sh`,
+    modeled on the LTC lane's equivalent (`ltc_live_dry_run.rs`/`check-ltc-live.sh`). With a
+    throwaway key (no funds needed), it resolves the real `testnet.zec.rocks` endpoint, reads
+    the live consensus branch id, and builds+signs+consensus-verifies (via `zcash_script`,
+    same as the unit tests) a claim and a refund HTLC spend — the first time the v6/NU7 digest
+    path ran against a real, live-fetched consensus branch id rather than a hardcoded test
+    constant. This directly narrows the "residual risk" noted above (still short of a real
+    broadcast, but no longer only self-consistent against a value we chose ourselves).
+    Running it immediately **found a real bug**: `build_funding_tx` panicked with
+    `attempt to subtract with overflow` when called against an address with a completely
+    empty UTXO set (a fresh, never-funded address — exactly this dry run's situation). Root
+    cause: `needed` was seeded at `0` before the coin-selection loop, so when the loop ran
+    zero times (no coins at all) the `total < needed` guard wrongly passed (`0 < 0` is
+    false), falling through to `needed - amount` and underflowing. Same bug class the LTC
+    lane hit and fixed in `566417a` — fixed the same way here: seed `needed` from the
+    zero-input skeleton's probe size before the loop. Added a
+    permanent regression test (`tx::tests::funding_selects_coins_and_change`, extended) for
+    a fully-empty coin slice, not just an insufficient-but-nonempty one. Re-ran the dry run
+    after the fix: now correctly reports `InsufficientFunds` and finishes clean. Fix is
+    purely additive to coin selection, no change to the digest/serialization layer.
 - running: nothing
 - broken: nothing
 - left:
-  - Fund the two addresses (blocked-on-human, see "parked").
+  - Fund the two addresses (blocked-on-human, see "parked") — first attempt landed on a stale
+    pre-NU7 fork and doesn't count; needs a retry verified against the NU7 chain.
   - `live_fund_claim_refund` (needs `SWAP_ZEC_TEST_KEY_HEX`; orchestrator's to run, no
     secrets on hp2) — once funded, this is the only way to get a true independent
     confirmation that the v6 digest fix above is byte-correct (see residual risk above).

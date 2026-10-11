@@ -1030,7 +1030,14 @@ pub fn build_funding_tx(
     let htlc_spk = htlc_script_pubkey(&htlc.redeem_script());
     let mut chosen: Vec<Coin> = Vec::new();
     let mut total = 0u64;
-    let mut needed = 0u64;
+    // Seeded from the zero-input skeleton so a coin list with no entries at all (a fresh,
+    // never-funded address) still reports InsufficientFunds instead of `needed` staying 0
+    // and `total < needed` wrongly passing, which then underflows `needed - amount` below.
+    let mut needed = amount
+        + ceil_fee(
+            zats_per_byte,
+            funding_probe_size(&chosen, &htlc_spk, amount, Some(0), &my_spk),
+        );
     for c in sorted {
         chosen.push(c);
         total += chosen.last().unwrap().value;
@@ -1578,6 +1585,12 @@ mod tests {
         // Insufficient funds is reported as such.
         let err =
             build_funding_tx(&secp, &sk, &pk, &coins, &h, 5_000_000, BRANCH_ID, 2).unwrap_err();
+        assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+
+        // A completely empty coin list (a fresh, never-funded address) must also report
+        // InsufficientFunds, not panic with a subtract-with-overflow (the live dry run
+        // example found this: `needed` must not stay seeded at 0 when the loop never runs).
+        let err = build_funding_tx(&secp, &sk, &pk, &[], &h, 20_000, BRANCH_ID, 2).unwrap_err();
         assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
     }
 }
