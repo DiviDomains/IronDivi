@@ -528,6 +528,47 @@ async fn funding_fails_cleanly_with_no_utxos_at_all() {
     assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
 }
 
+/// `LtcBackend::build_send` (plain P2WPKH send, no HTLC — used to move funds between
+/// wallets directly, e.g. `examples/ltc_send.rs`): selects coins, pays the destination,
+/// change back to self, and never broadcasts.
+#[tokio::test]
+async fn backend_send_selects_coins_and_change() {
+    let server = MockServer::start().await;
+    let from = backend(vec![server.uri()], TAKER_KEY);
+    let to = backend(vec![server.uri()], MAKER_KEY);
+    let from_addr = from.address().to_string();
+    let to_addr = to.address().to_string();
+    let t = |n: u8| hex::encode([n; 32]);
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{from_addr}/utxo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"txid": t(1), "vout": 0, "value": 50_000, "status": {"confirmed": true}}
+        ])))
+        .mount(&server)
+        .await;
+
+    let signed = from.build_send(&to_addr, 20_000).await.unwrap();
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&signed.raw).unwrap();
+    assert_eq!(tx.input.len(), 1);
+    assert_eq!(tx.output.len(), 2, "change expected");
+    assert_eq!(tx.output[0].value.to_sat(), 20_000);
+    let (_, to_program) = decode_segwit_v0(&to_addr).unwrap();
+    assert_eq!(
+        tx.output[0].script_pubkey,
+        bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_slice(&to_program).unwrap())
+    );
+    assert_eq!(signed.txid.0, tx.compute_txid().to_byte_array());
+
+    // Sending to its own address is rejected without even looking at coins.
+    let err = from.build_send(&from_addr, 20_000).await.unwrap_err();
+    assert!(matches!(err, SwapError::InvalidParams(_)), "{err:?}");
+
+    // A P2WSH destination (32-byte program) is rejected: build_send is P2WPKH-only.
+    let p2wsh_addr = encode_segwit_v0(TLTC_HRP, &[0x11u8; 32]).unwrap();
+    let err = from.build_send(&p2wsh_addr, 20_000).await.unwrap_err();
+    assert!(matches!(err, SwapError::InvalidParams(_)), "{err:?}");
+}
+
 /// `#[ignore]`, read-only: hits the real Litecoin testnet Esplora API for the tip height
 /// and a known block (the genesis hash at height 0).
 #[tokio::test]
