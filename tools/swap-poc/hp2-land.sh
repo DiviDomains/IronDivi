@@ -15,15 +15,22 @@ subject="$("${ssh_[@]}" "grep -E '^- *ready_to_land:' ~/$lane/docs/plans/swap-po
 patch="$(mktemp)"; trap 'rm -f "$patch"' EXIT
 "${ssh_[@]}" "cd ~/$lane && git add -A -N . && git diff --binary HEAD" >"$patch"
 base="$("${ssh_[@]}" "git -C ~/$lane rev-parse HEAD")"
+lock_excluded=0
 if ! git apply --3way "$patch" 2>/dev/null; then
   # Usually only Cargo.lock collides between lanes: apply the rest, regenerate the lock below.
   git checkout -q -- . && git clean -qfd
   git apply --3way --exclude=Cargo.lock "$patch" \
     || { echo "hp2-land: patch from $coin (base $base) does not apply on main"; exit 1; }
+  lock_excluded=1
 fi
 # The lane's own status file keeps its ready line in the commit; drop it there.
 sed -i '' -E '/^- *ready_to_land:/d' "docs/plans/swap-poc/status/$coin.md" 2>/dev/null || true
-cargo metadata --format-version 1 >/dev/null  # refresh Cargo.lock for any new deps
+# Refresh Cargo.lock only when the lane's copy was dropped. Offline: the lane already fetched the
+# deps on hp2, and an online metadata call can sit for ages on the shared package-cache lock.
+if [[ $lock_excluded == 1 ]]; then
+  cargo metadata --offline --format-version 1 >/dev/null \
+    || { echo "hp2-land: Cargo.lock needs new crates; run cargo fetch, then land again"; exit 1; }
+fi
 git add -A
 git -c user.name="Bert Shuler" -c user.email=BertShuler@proton.me commit -q -m "$subject"
 git push -q origin main
