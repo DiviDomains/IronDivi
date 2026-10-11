@@ -11,4 +11,8 @@ divi-crypto = { workspace = true }
 divi-script = { workspace = true }
 divi-wallet = { workspace = true }
 divi-swap = { workspace = true }
+swap-adaptor = { path = "../swap-adaptor" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
