@@ -203,3 +203,10 @@
     seam (fmt reformatted `bin/divi-swap/src/main.rs` and `crates/swap-chain-evm/src/tests.rs`
     on save; one clippy fix — `UsdcNetwork`'s manual `impl Default` replaced with
     `#[derive(Default)]` + `#[default]` on `Sepolia`, clippy's own suggested fix).
+- **Wave 5 fix** (this seam): shellcheck SC2034 on `tools/swap-poc/usdc-live.sh` —
+  `taker_addr` was set but never read after the wave-5 refactor. Used it rather than
+  dropped it: added a preflight right after building `sepolia_ops` that checks the taker
+  actually has gas ETH on `$network` (`ops balances --addr "$taker_addr"`) before attempting
+  deploy/funding, failing with a clear message instead of a confusing mid-deploy RPC error
+  if the taker isn't funded yet. `shellcheck` clean on both `usdc-live.sh` and
+  `usdc-live-dry-run.sh` now.

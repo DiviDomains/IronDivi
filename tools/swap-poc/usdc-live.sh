@@ -84,6 +84,11 @@ echo "usdc-live: building divi-swapd, divi-swap and swap-chain-evm's sepolia_ops
 cargo build -q -p divi-swapd -p divi-swap-cli
 cargo build -q -p swap-chain-evm --features live --example sepolia_ops
 
+echo "usdc-live: preflight — does the taker have gas ETH on $network to deploy/fund with?"
+taker_bal="$(ops balances --addr "$taker_addr")"
+taker_eth="$(sed -n 's/^eth_wei: //p' <<<"$taker_bal")"
+(( taker_eth > 0 )) || die "taker $taker_addr has no ETH on $network — fund it first (see funding.md)"
+
 if [[ -z "$htlc" ]]; then
   echo "usdc-live: no --htlc given — deploying a fresh Erc20Htlc from the taker key"
   key_hex="$(op read "$(ref taker-btc)")"
