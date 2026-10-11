@@ -15,7 +15,7 @@ subject="$("${ssh_[@]}" "grep -E '^- *ready_to_land:' ~/$lane/docs/plans/swap-po
 unmerged="$("${ssh_[@]}" "git -C ~/$lane diff --name-only --diff-filter=U")"
 [[ -z "$unmerged" ]] || { echo "hp2-land: $coin has unresolved conflicts: $unmerged"; exit 1; }
 patch="$(mktemp)"; trap 'rm -f "$patch"' EXIT
-"${ssh_[@]}" "cd ~/$lane && git add -A -N . && git diff --binary HEAD" >"$patch"
+"${ssh_[@]}" "cd ~/$lane && git add -A -N . && git diff --binary HEAD -- . ':(exclude)target'" >"$patch"
 base="$("${ssh_[@]}" "git -C ~/$lane rev-parse HEAD")"
 lock_excluded=0
 if ! git apply --3way "$patch" 2>/dev/null; then
