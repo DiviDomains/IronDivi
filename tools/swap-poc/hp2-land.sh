@@ -12,6 +12,8 @@ root="$(git rev-parse --show-toplevel)"; cd "$root"
 git pull -q --rebase origin main
 subject="$("${ssh_[@]}" "grep -E '^- *ready_to_land:' ~/$lane/docs/plans/swap-poc/status/$coin.md | head -1 | sed -E 's/^- *ready_to_land: *//'")"
 [[ -n "$subject" ]] || { echo "hp2-land: $coin has no ready_to_land line"; exit 1; }
+unmerged="$("${ssh_[@]}" "git -C ~/$lane diff --name-only --diff-filter=U")"
+[[ -z "$unmerged" ]] || { echo "hp2-land: $coin has unresolved conflicts: $unmerged"; exit 1; }
 patch="$(mktemp)"; trap 'rm -f "$patch"' EXIT
 "${ssh_[@]}" "cd ~/$lane && git add -A -N . && git diff --binary HEAD" >"$patch"
 base="$("${ssh_[@]}" "git -C ~/$lane rev-parse HEAD")"
