@@ -1,0 +1,13 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-chain-ltc"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap ChainBackend for Litecoin (testnet) over Esplora HTTP"
+
+[features]
+# Integration tests against the live testnet (cargo test -p swap-chain-ltc --features live -- --ignored)
+live = []
+
+[dependencies]
+divi-swap = { workspace = true }

@@ -3103,6 +3103,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "swap-chain-evm"
+version = "0.2.5"
+dependencies = [
+ "divi-swap",
+]
+
+[[package]]
+name = "swap-chain-ltc"
+version = "0.2.5"
+dependencies = [
+ "divi-swap",
+]
+
+[[package]]
+name = "swap-chain-zec"
+version = "0.2.5"
+dependencies = [
+ "divi-swap",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.114"
 source = "registry+https://github.com/rust-lang/crates.io-index"

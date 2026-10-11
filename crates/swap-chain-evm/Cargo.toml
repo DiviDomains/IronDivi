@@ -1,0 +1,13 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-chain-evm"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap HTLC for ERC-20 (USDC) on EVM testnets (Sepolia, Base Sepolia)"
+
+[features]
+# Integration tests against the live testnet (cargo test -p swap-chain-evm --features live -- --ignored)
+live = []
+
+[dependencies]
+divi-swap = { workspace = true }

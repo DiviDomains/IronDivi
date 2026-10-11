@@ -1,0 +1,13 @@
+[package]
+license = "AGPL-3.0-only"
+name = "swap-chain-zec"
+version.workspace = true
+edition.workspace = true
+description = "Atomic swap ChainBackend for Zcash transparent HTLCs (testnet)"
+
+[features]
+# Integration tests against the live testnet (cargo test -p swap-chain-zec --features live -- --ignored)
+live = []
+
+[dependencies]
+divi-swap = { workspace = true }

@@ -26,3 +26,12 @@
 - **Forward POC:** DONE 2026-10-10 13:40 UTC (RESULTS.md §1). divi-swapd on dnsdivi v0.2.5 `504da62`, testnet3, healthy.
 - **Compactions:** orchestrator 5
 - Long briefs go in a file (`~/.local/state/iron-divi-swap-poc/briefs/`); a long `ctl submit` gets truncated.
+
+## Multi-coin (plan: `multi-coin.md`)
+
+- 2026-10-11: wave 0 landed — crate scaffolds `swap-chain-{ltc,zec,evm}`, lane briefs
+  `lanes/{_hp2,ltc,zec,usdc,xmr}.md`, checks `check-{ltc,zec,usdc,xmr}.sh`, `hp2-land.sh`,
+  `lane-sync.sh`. Lanes run on hp2 (`~/swap-lanes/<coin>`), panes in Avada tab "Swap coins".
+- running: lanes ltc, zec, usdc, xmr (wave 1a–1d); orchestrator on wave 1e (engine generalization).
+- BTC reverse chaos still running in tab "Divi Swap 1" until ~21:30 UTC; no DIVI-key live runs
+  until it ends.

@@ -16,6 +16,9 @@ members = [
     "crates/divi-swap",
     "crates/swap-chain-divi",
     "crates/swap-chain-btc",
+    "crates/swap-chain-ltc",
+    "crates/swap-chain-zec",
+    "crates/swap-chain-evm",
     "bin/divi-swapd",
     "bin/divi-swap",
     "tests/integration-tests",
@@ -44,6 +47,9 @@ divi-masternode = { path = "crates/divi-masternode" }
 divi-swap = { path = "crates/divi-swap" }
 swap-chain-divi = { path = "crates/swap-chain-divi" }
 swap-chain-btc = { path = "crates/swap-chain-btc" }
+swap-chain-ltc = { path = "crates/swap-chain-ltc" }
+swap-chain-zec = { path = "crates/swap-chain-zec" }
+swap-chain-evm = { path = "crates/swap-chain-evm" }
 
 # Crypto
 secp256k1 = { version = "0.29", features = ["recovery", "rand-std"] }
