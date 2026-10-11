@@ -19,3 +19,14 @@ timelock, taker refunded its DIVI after its 6 h timelock. Txids read from the ta
 - deployed_rev_casec_btc_lock_txid: f1da64e17d6ddc9bc58f0ca0ce06a73788d7b4b885c060452726b14234bd83a3
 - deployed_rev_casec_btc_refund_txid: 13e030b56b2311fe07d799a9e77a73bd6fbcc1579880ec4ff7629bb37e204114
 - deployed_rev_casec_divi_refund_txid: ac3bab46e1ba29e3b56c702822e02370b17254987be7e244d341f71514028260
+
+## Case D (late claim) — swap 03bcb3e3-c697-4f66-8bee-2dc163faa76a (local maker 16676cc4-dd54-4387-973e-57a245bb0918), Done/Done
+
+Local maker (maker timeout 3600 s, taker 14410 s, `--claim-not-before 2400`); the taker claimed BTC 2398 s before the
+maker's BTC timelock, and the maker still claimed the DIVI with the preimage. All four confirmed 2026-10-11.
+
+- rev_cased_divi_lock_txid: baf8807301556b0d7fe32b0ded8cf14b83db8d36472271df379acacf23eb8961
+- rev_cased_btc_lock_txid: c7b214ca6c5257e4d0aa4d3d39c0b4cf2ad767e538755be796a65e5b9d7c6b80
+- rev_cased_btc_claim_txid: 7d205f3dbeed7adb4b450983a4ed283e71e5356f69bbddcf2cd3165672cbdb7e
+- rev_cased_divi_claim_txid: 4d33760060025b919576d275895c9b1e26a23cb5e6601e322d51311b43484536
+- rev_cased_claim_secs_before_timeout: 2398

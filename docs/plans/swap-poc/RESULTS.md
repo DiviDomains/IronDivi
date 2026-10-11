@@ -122,6 +122,13 @@ same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
     BTC lock `f1da64e17d6ddc9bc58f0ca0ce06a73788d7b4b885c060452726b14234bd83a3`,
     BTC refund (maker, after 3 h) `13e030b56b2311fe07d799a9e77a73bd6fbcc1579880ec4ff7629bb37e204114`,
     DIVI refund (taker, after 6 h) `ac3bab46e1ba29e3b56c702822e02370b17254987be7e244d341f71514028260`.
+- Case D, late claim (local maker, 3600 s / 14410 s), swap `03bcb3e3…` / maker `16676cc4…`, Done/Done, 2026-10-11:
+    DIVI lock `baf8807301556b0d7fe32b0ded8cf14b83db8d36472271df379acacf23eb8961`,
+    BTC lock `c7b214ca6c5257e4d0aa4d3d39c0b4cf2ad767e538755be796a65e5b9d7c6b80`,
+    BTC claim (taker, 2398 s before the maker timeout) `7d205f3dbeed7adb4b450983a4ed283e71e5356f69bbddcf2cd3165672cbdb7e`,
+    DIVI claim (maker) `4d33760060025b919576d275895c9b1e26a23cb5e6601e322d51311b43484536`.
+- Staking: in the reverse direction the maker locks BTC and never DIVI, so its staking coins are never selected.
+- Chaos (crash at every state, refund, outages) on live testnets: running 2026-10-11, see status/orchestrator.md.
 - Balances kept for reuse (no sweeps — Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"):
   maker BTC `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt` 121,266 sats; taker BTC `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
   9,722 sats; taker DIVI `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` 1,699.99273 tDIVI.
