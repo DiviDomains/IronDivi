@@ -247,6 +247,25 @@ impl PeerManager {
         self.peers.read().keys().copied().collect()
     }
 
+    /// Peer IDs of all connected peers whose remote IP equals `ip` (any port)
+    pub fn peer_ids_for_ip(&self, ip: std::net::IpAddr) -> Vec<PeerId> {
+        self.peers
+            .read()
+            .iter()
+            .filter(|(_, p)| p.addr.ip() == ip)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Peer ID of the connected peer with exactly this socket address
+    pub fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
+        self.peers
+            .read()
+            .iter()
+            .find(|(_, p)| &p.addr == addr)
+            .map(|(id, _)| *id)
+    }
+
     /// Check if a specific peer is currently connected
     pub fn is_peer_connected(&self, peer_id: PeerId) -> bool {
         self.peers.read().contains_key(&peer_id)

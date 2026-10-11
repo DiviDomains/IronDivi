@@ -14,7 +14,7 @@
 //! HTTP server for handling JSON-RPC requests using axum.
 
 use crate::blockchain::BlockchainRpc;
-use crate::error::{Error, RpcError};
+use crate::error::{codes, Error, RpcError};
 use crate::lite_wallet::LiteWalletRpc;
 use crate::masternode::MasternodeRpc;
 use crate::network::NetworkRpc;
@@ -285,15 +285,16 @@ impl RpcServer {
         };
 
         Ok(serde_json::json!({
-            "version": 2000000,
+            "version": "3.0.0.0",
             "protocolversion": PROTOCOL_VERSION,
+            "walletversion": 120200,
             "blocks": height,
             "timeoffset": 0,
             "connections": connections,
             "proxy": "",
             "difficulty": difficulty,
             "testnet": matches!(network_type, NetworkType::Testnet),
-            "moneysupply": 0, // TODO: cache from UTXO set — calling get_utxo_stats() on every getinfo is too expensive
+            "moneysupply": self.blockchain.money_supply(),
             "keypoololdest": keypoololdest,
             "keypoolsize": keypoolsize,
             "balance": balance,
@@ -302,6 +303,27 @@ impl RpcServer {
             "staking status": staking_status_text,
             "errors": ""
         }))
+    }
+
+    /// setmocktime - C++ only honours this on regtest; this node has no mock clock at all.
+    fn set_mock_time(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_storage::chain::NetworkType;
+
+        if params.get_i64(0).is_none() {
+            return Err(RpcError::invalid_params("setmocktime timestamp").into());
+        }
+        if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "setmocktime for regression testing (-regtest mode) only",
+            )
+            .into());
+        }
+        Err(RpcError::new(
+            codes::MISC_ERROR,
+            "setmocktime is not supported by this node",
+        )
+        .into())
     }
 
     /// Handle a single RPC request
@@ -354,6 +376,15 @@ impl RpcServer {
             "addnode" => self.network.read().add_node(params),
             "getaddednodeinfo" => self.network.read().get_added_node_info(params),
             "setban" => self.network.read().set_ban(params),
+            "ban" => self.network.read().ban(params),
+            "setmocktime" => self.set_mock_time(params),
+            "getinvalid" => Ok(serde_json::json!([{
+                // C++ 3.0.0 builds these from empty maps, so the report is always empty
+                "addresses_with_invalid": {},
+                "total_unspent": "0.00",
+                "total_minted": "0.00",
+                "total_valid_used": "0.00",
+            }])),
             "listbanned" => self.network.read().list_banned(params),
             "clearbanned" => self.network.read().clear_banned(params),
             "disconnectnode" => self.network.read().disconnect_node(params),
@@ -402,6 +433,7 @@ impl RpcServer {
             "getkeypoolsize" => self.wallet.get_keypool_size(params),
             "bip38encrypt" => self.wallet.bip38_encrypt(params),
             "bip38decrypt" => self.wallet.bip38_decrypt(params),
+            "bip38paperwallet" => self.wallet.bip38_paper_wallet(params),
             "loadwallet" => self.wallet.load_wallet(params),
             "getlotteryblockwinners" => self.wallet.get_lottery_block_winners(params),
             "allocatefunds" => self.wallet.allocate_funds(params),
@@ -654,12 +686,14 @@ impl RpcServer {
                 "listbanned",
                 "ping",
                 "setban",
+                "ban",
                 "",
                 "== Wallet ==",
                 "addmultisigaddress",
                 "allocatefunds",
                 "bip38decrypt",
                 "bip38encrypt",
+                "bip38paperwallet",
                 "dumphdinfo",
                 "dumpprivkey",
                 "getaccount",
@@ -1198,6 +1232,54 @@ mod tests {
         let response = server.handle_request(request);
         assert!(response.error.is_none());
         assert!(response.result.is_some());
+    }
+
+    fn call(server: &RpcServer, method: &str, params: Params) -> Response {
+        server.handle_request(Request {
+            jsonrpc: "2.0".to_string(),
+            id: RequestId::Number(1),
+            method: method.to_string(),
+            params,
+        })
+    }
+
+    #[test]
+    fn test_getinfo_parity_fields() {
+        let (server, _dir) = create_test_server();
+        let r = call(&server, "getinfo", Params::None).result.unwrap();
+        assert!(r["version"].is_string());
+        assert!(r["moneysupply"].is_number());
+        assert_eq!(r["walletversion"], serde_json::json!(120200));
+    }
+
+    #[test]
+    fn test_getinvalid_constant() {
+        let (server, _dir) = create_test_server();
+        let r = call(&server, "getinvalid", Params::None).result.unwrap();
+        assert_eq!(r[0]["total_unspent"], serde_json::json!("0.00"));
+    }
+
+    #[test]
+    fn test_setmocktime_is_an_honest_error() {
+        let (server, _dir) = create_test_server();
+        let resp = call(
+            &server,
+            "setmocktime",
+            Params::Array(vec![serde_json::json!(1)]),
+        );
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn test_ban_without_matching_peer_is_not_fatal() {
+        let (server, _dir) = create_test_server();
+        let resp = call(
+            &server,
+            "ban",
+            Params::Array(vec![serde_json::json!("1.2.3.4")]),
+        );
+        // dispatched (not -32601 method-not-found), whatever the network state
+        assert!(resp.error.map_or(true, |e| e.code != -32601));
     }
 
     #[test]

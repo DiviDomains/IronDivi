@@ -28,6 +28,8 @@ use std::sync::Arc;
 pub struct BlockchainRpc {
     chain: Arc<Chain>,
     mempool: RwLock<Option<Arc<dyn MempoolProvider>>>,
+    /// Money supply cached against the tip hash it was computed for
+    money_supply_cache: RwLock<Option<(Hash256, f64)>>,
 }
 
 /// Mempool statistics for RPC responses
@@ -92,6 +94,29 @@ impl BlockchainRpc {
         BlockchainRpc {
             chain,
             mempool: RwLock::new(None),
+            money_supply_cache: RwLock::new(None),
+        }
+    }
+
+    /// Total money supply in DIVI (equals the UTXO set total, as C++ `nMoneySupply` does).
+    ///
+    /// A full UTXO scan is costly, so the result is cached per tip hash.
+    pub fn money_supply(&self) -> f64 {
+        let Some(tip) = self.chain.tip() else {
+            return 0.0;
+        };
+        if let Some((hash, supply)) = *self.money_supply_cache.read() {
+            if hash == tip.hash {
+                return supply;
+            }
+        }
+        match self.chain.get_utxo_stats() {
+            Ok(stats) => {
+                let supply = stats.total_amount as f64 / 100_000_000.0;
+                *self.money_supply_cache.write() = Some((tip.hash, supply));
+                supply
+            }
+            Err(_) => 0.0,
         }
     }
 

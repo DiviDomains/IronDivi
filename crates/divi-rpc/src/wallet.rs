@@ -2172,6 +2172,33 @@ impl WalletRpc {
         Ok(json!(encrypted))
     }
 
+    /// Generate a fresh key (not stored in the wallet) and return it BIP38-encrypted
+    pub fn bip38_paper_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let passphrase = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: password"))?;
+
+        let wallet = self.get_wallet()?;
+        if wallet.is_locked() {
+            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
+        }
+        let network = wallet.network();
+
+        let secret = divi_crypto::keys::SecretKey::new_random();
+        let address = Address::p2pkh(&secret.public_key(), network).to_base58();
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(secret.as_bytes());
+
+        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, true).map_err(|e| {
+            RpcError::new(
+                codes::WALLET_ERROR,
+                format!("BIP38 encryption failed: {}", e),
+            )
+        })?;
+
+        Ok(json!({ "Address": address, "Encrypted Key": encrypted }))
+    }
+
     /// BIP38 decrypt private key
     pub fn bip38_decrypt(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let encrypted_key = params

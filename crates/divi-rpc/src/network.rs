@@ -327,20 +327,58 @@ impl NetworkRpc {
             );
         }
 
-        // Find peer ID by address and disconnect
-        // Note: This is a workaround since we don't have direct peer ID lookup by address
-        if let Some(peer_id) = peer_manager.connected_peers().into_iter().next() {
-            // Just disconnect the first matching peer
-            // In production, would need better peer ID -> address mapping
-            peer_manager.disconnect(peer_id);
-            return Ok(serde_json::Value::Null);
+        match peer_manager.peer_id_for_addr(&addr) {
+            Some(peer_id) => {
+                peer_manager.disconnect(peer_id);
+                Ok(serde_json::Value::Null)
+            }
+            None => Err(RpcError::new(
+                codes::CLIENT_NODE_NOT_CONNECTED,
+                "Could not find peer to disconnect",
+            )
+            .into()),
+        }
+    }
+
+    /// ban "outdated"|"ip" - ban and disconnect a connected peer (C++ `ban`).
+    ///
+    /// Like C++, only a currently connected peer can be banned; the ban is lifetime.
+    pub fn ban(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        const LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+        let target = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::invalid_params("ban [outdated|<ip_address>]"))?;
+        let peer_manager = self
+            .peer_manager
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Peer manager not available"))?;
+
+        if target == "outdated" {
+            // Peer sub-versions are not recorded after the handshake, so "outdated" peers
+            // cannot be identified; refuse rather than report an empty (false) success.
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "ban outdated is not supported: peer versions are not tracked",
+            )
+            .into());
         }
 
-        Err(RpcError::new(
-            codes::CLIENT_NODE_NOT_CONNECTED,
-            "Could not find peer to disconnect",
-        )
-        .into())
+        let ip: IpAddr = target.parse().map_err(|_| {
+            RpcError::new(
+                codes::CLIENT_INVALID_IP_OR_SUBNET,
+                format!("Invalid IP: {}", target),
+            )
+        })?;
+        let ids = peer_manager.peer_ids_for_ip(ip);
+        if ids.is_empty() {
+            return Ok(serde_json::json!({ "Banned": "Could not find matching node to ban" }));
+        }
+        peer_manager.ban_ip(ip, LIFETIME, "Manually banned via RPC");
+        for id in ids {
+            peer_manager.disconnect(id);
+        }
+        Ok(serde_json::json!({ "Banned": ip.to_string() }))
     }
 
     /// Get peer scoring info (debugging)
