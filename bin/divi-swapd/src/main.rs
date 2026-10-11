@@ -16,6 +16,7 @@
 
 //! divi-swapd — atomic swap maker daemon.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,11 +109,14 @@ fn mock_backends() -> Backends {
     }
 }
 
-/// `cfg.offers` plus the mock-only counter-chain offers whose ids are not configured.
+/// `cfg.offers` plus the mock-only counter-chain offers whose ids are not configured (an id
+/// configured with `enabled = false` stays off in mock mode too).
 fn mock_offers(cfg: &DaemonConfig) -> Vec<divi_swap::api::Offer> {
     let mut offers = cfg.offers.clone();
     for o in mock_counter_offers() {
-        if !offers.iter().any(|have| have.id == o.id) {
+        let configured =
+            offers.iter().any(|have| have.id == o.id) || cfg.disabled_offers.contains(&o.id);
+        if !configured {
             offers.push(o);
         }
     }
@@ -197,19 +201,33 @@ fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
-async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)> {
+async fn live_backends(
+    cfg: &DaemonConfig,
+    in_flight: &BTreeSet<Chain>,
+) -> Result<(Backends, Option<ScanJob>)> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
     let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
-    if let Some(ltc_cfg) = &cfg.ltc {
-        others.push(live_ltc(ltc_cfg)?);
+    for c in cfg.counter_backends_to_start(in_flight)? {
+        others.push(match c {
+            Chain::Ltc => live_ltc(cfg.ltc.as_ref().expect("checked by config"))?,
+            Chain::Usdc => live_usdc(cfg.usdc.as_ref().expect("checked by config"))?,
+            Chain::Zec => live_zec(cfg.zec.as_ref().expect("checked by config"))?,
+            other => bail!("no live {other} backend in this build"),
+        });
     }
-    if let Some(usdc_cfg) = &cfg.usdc {
-        others.push(live_usdc(usdc_cfg)?);
+    for (c, present) in [
+        (Chain::Ltc, cfg.ltc.is_some()),
+        (Chain::Usdc, cfg.usdc.is_some()),
+        (Chain::Zec, cfg.zec.is_some()),
+    ] {
+        if present && !others.iter().any(|b| b.chain() == c) {
+            tracing::info!(%c, "no enabled {c} offer and no {c} swap in flight; not starting the [{c}] backend");
+        }
     }
-    if let Some(zec_cfg) = &cfg.zec {
-        others.push(live_zec(zec_cfg)?);
+    if !cfg.disabled_offers.is_empty() {
+        tracing::info!(offers = ?cfg.disabled_offers, "offers disabled in config");
     }
     let known: Vec<Chain> = std::iter::once(Chain::Btc)
         .chain(others.iter().map(|b| b.chain()))
@@ -268,10 +286,19 @@ async fn main() -> Result<()> {
         } else {
             BackendKind::Mock
         });
+    let store = Store::open(&cfg.db_path).context("opening swap database")?;
+    // Counter chains of swaps still under way: their backends start even if every offer on
+    // that chain has since been switched off.
+    let in_flight: BTreeSet<Chain> = store
+        .list_maker_swaps()?
+        .iter()
+        .filter(|s| !s.state.is_terminal())
+        .map(|s| s.quote.counter_chain)
+        .collect();
     let (backends, scan_job, offers) = match kind {
         BackendKind::Mock => (mock_backends(), None, mock_offers(&cfg)),
         BackendKind::Live => {
-            let (b, job) = live_backends(&cfg).await?;
+            let (b, job) = live_backends(&cfg, &in_flight).await?;
             (b, job, cfg.offers.clone())
         }
     };
@@ -282,7 +309,6 @@ async fn main() -> Result<()> {
         ScanStatus::done()
     };
 
-    let store = Store::open(&cfg.db_path).context("opening swap database")?;
     let counters = std::iter::once(btc.clone()).chain(others).collect();
     let maker = Arc::new(Maker::with_counters(
         cfg.swap_config()?,

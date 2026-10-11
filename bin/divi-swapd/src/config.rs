@@ -17,7 +17,7 @@
 //! TOML configuration. Keys are never accepted by value: only `op://…` or
 //! `credential:<name>` references, resolved at runtime by `divi_swap::secrets`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -127,6 +127,32 @@ fn default_listen() -> SocketAddr {
 fn default_profile() -> Profile {
     Profile::Testnet
 }
+/// One `[[offers]]` table: the wire [`Offer`] plus daemon-only switches.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OfferEntry {
+    #[serde(flatten)]
+    pub offer: Offer,
+    /// `false` keeps the offer in the file but off `/offers` (and unquotable). A counter
+    /// chain whose offers are all disabled gets no backend, so its `[<chain>]` section can
+    /// stay in place without its API being needed. Defaults to `true`.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_offer_entries() -> Vec<OfferEntry> {
+    default_offers()
+        .into_iter()
+        .map(|offer| OfferEntry {
+            offer,
+            enabled: true,
+        })
+        .collect()
+}
+
 fn default_offers() -> Vec<Offer> {
     [
         ("divi-btc-testnet", Direction::TakerPaysBtc),
@@ -214,9 +240,16 @@ pub struct DaemonConfig {
     /// Seconds between scheduler ticks.
     #[serde(default = "default_tick")]
     pub tick_secs: u64,
-    /// Standing offers; a built-in testnet offer is used when none are configured.
-    #[serde(default = "default_offers")]
+    /// `[[offers]]` as written, including disabled ones; a built-in BTC pair is used when
+    /// none are configured.
+    #[serde(rename = "offers", default = "default_offer_entries")]
+    pub offer_entries: Vec<OfferEntry>,
+    /// The enabled offers — what the maker serves. Filled by [`DaemonConfig::parse`].
+    #[serde(skip)]
     pub offers: Vec<Offer>,
+    /// Ids of offers present but `enabled = false`. Filled by [`DaemonConfig::parse`].
+    #[serde(skip)]
+    pub disabled_offers: Vec<String>,
     /// `[divi]` and `[btc]` are required by the live backend, ignored by the mock one.
     pub divi: Option<DiviSection>,
     pub btc: Option<BtcSection>,
@@ -241,9 +274,60 @@ impl DaemonConfig {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let cfg: DaemonConfig = toml::from_str(text).context("parsing config")?;
+        let mut cfg: DaemonConfig = toml::from_str(text).context("parsing config")?;
+        for e in &cfg.offer_entries {
+            if e.enabled {
+                cfg.offers.push(e.offer.clone());
+            } else {
+                cfg.disabled_offers.push(e.offer.id.clone());
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Whether an enabled offer trades against `chain` (so its live backend is needed).
+    pub fn serves(&self, chain: Chain) -> bool {
+        self.offers.iter().any(|o| o.counter_chain == chain)
+    }
+
+    /// Whether the config has a `[<chain>]` section for this non-BTC counter chain.
+    fn has_section(&self, chain: Chain) -> bool {
+        match chain {
+            Chain::Ltc => self.ltc.is_some(),
+            Chain::Usdc => self.usdc.is_some(),
+            Chain::Zec => self.zec.is_some(),
+            Chain::Btc => self.btc.is_some(),
+            Chain::Divi => self.divi.is_some(),
+        }
+    }
+
+    /// Non-BTC counter chains whose live backend to start: those an enabled offer serves or a
+    /// non-terminal swap (`in_flight`) still runs on. A section whose offers are all disabled
+    /// and that no swap needs is skipped (no API calls, nothing in `/healthz`); disabling an
+    /// offer therefore never strands a swap already under way on that chain.
+    pub fn counter_backends_to_start(&self, in_flight: &BTreeSet<Chain>) -> Result<Vec<Chain>> {
+        let mut start = Vec::new();
+        for c in Chain::ALL
+            .into_iter()
+            .filter(|c| c.is_counter() && *c != Chain::Btc)
+        {
+            let swaps = in_flight.contains(&c);
+            let wanted = self.serves(c) || swaps;
+            match (wanted, self.has_section(c)) {
+                (true, true) => start.push(c),
+                (true, false) if swaps => bail!(
+                    "swaps in flight on {c} need the [{c}] section (restore it, or the maker \
+                     cannot claim or refund them)"
+                ),
+                (true, false) => bail!(
+                    "offer on {c} is enabled but there is no [{c}] section (add one, or set \
+                     enabled = false)"
+                ),
+                (false, _) => {}
+            }
+        }
+        Ok(start)
     }
 
     /// The profile's timing with `[swap]` overrides applied and validated.
@@ -281,7 +365,11 @@ impl DaemonConfig {
         if self.tick_secs == 0 {
             bail!("tick_secs must be > 0");
         }
-        for o in &self.offers {
+        let mut seen = std::collections::BTreeSet::new();
+        for o in self.offer_entries.iter().map(|e| &e.offer) {
+            if !seen.insert(&o.id) {
+                bail!("offer {}: duplicate id", o.id);
+            }
             if o.min_btc_sats > o.max_btc_sats {
                 bail!("offer {}: min_btc_sats > max_btc_sats", o.id);
             }
@@ -351,12 +439,24 @@ key = "credential:btc"
         // Reuses the BTC swap key (funding.md decision 64ae2a0); no maker-ltc item exists.
         assert_eq!(l.key, "credential:maker-btc");
         let ltc_ids: Vec<_> = c
-            .offers
+            .offer_entries
             .iter()
-            .filter(|o| o.counter_chain == Chain::Ltc)
-            .map(|o| o.id.as_str())
+            .filter(|e| e.offer.counter_chain == Chain::Ltc)
+            .map(|e| e.offer.id.as_str())
             .collect();
         assert_eq!(ltc_ids, ["divi-ltc-testnet", "ltc-divi-testnet"]);
+        // Served: BTC both ways and LTC forward. The reverse LTC offer (maker pays LTC), USDC
+        // (placeholder contract) and ZEC (no TAZ yet) are off.
+        let served: Vec<_> = c.offers.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(
+            served,
+            ["divi-btc-testnet", "btc-divi-testnet", "divi-ltc-testnet"]
+        );
+        assert!(c
+            .offers
+            .iter()
+            .all(|o| !matches!(o.counter_chain, Chain::Usdc | Chain::Zec)));
+        assert!(c.zec.is_some() && c.usdc.is_some());
     }
 
     #[test]
@@ -420,6 +520,119 @@ key = "credential:btc"
         assert!(DaemonConfig::parse(&bad).unwrap().swap_config().is_err());
         let divi = GOOD.replace("id = \"o1\"", "id = \"o1\"\ncounter_chain = \"divi\"");
         assert!(DaemonConfig::parse(&divi).is_err());
+    }
+
+    #[test]
+    fn disabled_offers_parse_but_are_not_served() {
+        let text = format!(
+            "{GOOD}\n[[offers]]\nid = \"divi-zec-testnet\"\ncounter_chain = \"zec\"\n\
+             enabled = false\ndivi_sats_per_btc = 1\nmin_btc_sats = 1\nmax_btc_sats = 2\n\
+             [[offers]]\nid = \"divi-ltc-testnet\"\ncounter_chain = \"ltc\"\nenabled = true\n\
+             divi_sats_per_btc = 1\nmin_btc_sats = 1\nmax_btc_sats = 2\n\
+             [zec]\nkey = \"credential:maker-btc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let ids: Vec<_> = c.offers.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["o1", "divi-ltc-testnet"]);
+        assert_eq!(c.disabled_offers, ["divi-zec-testnet"]);
+        assert_eq!(c.offer_entries.len(), 3);
+        assert!(c.serves(Chain::Ltc) && c.serves(Chain::Btc));
+        assert!(
+            !c.serves(Chain::Zec),
+            "[zec] present but every zec offer is off"
+        );
+        // Disabled offers are still validated, and ids must be unique across both.
+        let bad = text.replace(
+            "min_btc_sats = 1\nmax_btc_sats = 2\n[[offers]]",
+            "min_btc_sats = 3\nmax_btc_sats = 2\n[[offers]]",
+        );
+        assert!(DaemonConfig::parse(&bad).is_err());
+        let dup = text.replace("divi-zec-testnet", "o1");
+        assert!(DaemonConfig::parse(&dup).is_err());
+    }
+
+    #[test]
+    fn counter_backends_follow_offers_and_in_flight_swaps() {
+        let with = |extra: &str| {
+            DaemonConfig::parse(&format!(
+                "{GOOD}\n[[offers]]\nid = \"divi-ltc-testnet\"\ncounter_chain = \"ltc\"\n\
+                 {extra}divi_sats_per_btc = 1\nmin_btc_sats = 1\nmax_btc_sats = 2\n\
+                 [ltc]\nkey = \"credential:maker-btc\"\n[zec]\nkey = \"credential:maker-btc\"\n"
+            ))
+            .unwrap()
+        };
+        let none = BTreeSet::new();
+        let ltc_swap = BTreeSet::from([Chain::Ltc]);
+        // Served → started; [zec] present but unused → skipped.
+        assert_eq!(
+            with("").counter_backends_to_start(&none).unwrap(),
+            [Chain::Ltc]
+        );
+        // Offer switched off: skipped, unless a swap still runs on LTC.
+        let off = with("enabled = false\n");
+        assert!(off.counter_backends_to_start(&none).unwrap().is_empty());
+        assert_eq!(
+            off.counter_backends_to_start(&ltc_swap).unwrap(),
+            [Chain::Ltc]
+        );
+        // ZEC swap in flight with its section present: started even with no zec offer.
+        let zec_swap = BTreeSet::from([Chain::Zec]);
+        assert_eq!(
+            off.counter_backends_to_start(&zec_swap).unwrap(),
+            [Chain::Zec]
+        );
+        // Section removed while a swap needs it, or an enabled offer without a section: refuse.
+        let no_section = DaemonConfig::parse(GOOD).unwrap();
+        let err = no_section.counter_backends_to_start(&ltc_swap).unwrap_err();
+        assert!(err.to_string().contains("swaps in flight on ltc"), "{err}");
+        let bare = DaemonConfig::parse(&format!(
+            "{GOOD}\n[[offers]]\nid = \"z\"\ncounter_chain = \"zec\"\n\
+             divi_sats_per_btc = 1\nmin_btc_sats = 1\nmax_btc_sats = 2\n"
+        ))
+        .unwrap();
+        assert!(bare.counter_backends_to_start(&none).is_err());
+    }
+
+    #[test]
+    fn wave4_snippet_on_the_deployed_config() {
+        // What dnsdivi runs today (pre-counter-chain BTC pair) + the wave-4 append.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/divi-swapd");
+        let deployed = "db_path = \"/var/lib/divi-swapd/swaps.db\"\n\
+            [divi]\nkey = \"credential:maker-divi\"\n[btc]\nkey = \"credential:maker-btc\"\n\
+            [[offers]]\nid = \"divi-btc-testnet\"\ndivi_sats_per_btc = 300000000000000\n\
+            min_btc_sats = 5000\nmax_btc_sats = 50000\n\
+            [[offers]]\nid = \"btc-divi-testnet\"\ndirection = \"taker_pays_divi\"\n\
+            divi_sats_per_btc = 300000000000000\nmin_btc_sats = 5000\nmax_btc_sats = 50000\n";
+        let snippet = std::fs::read_to_string(base.join("wave4-offers.toml")).unwrap();
+        let c = DaemonConfig::parse(&format!("{deployed}\n{snippet}")).unwrap();
+        let served: Vec<_> = c
+            .offers
+            .iter()
+            .map(|o| (o.id.as_str(), o.counter_chain))
+            .collect();
+        assert_eq!(
+            served,
+            [
+                ("divi-btc-testnet", Chain::Btc),
+                ("btc-divi-testnet", Chain::Btc),
+                ("divi-ltc-testnet", Chain::Ltc),
+            ]
+        );
+        assert_eq!(
+            c.disabled_offers,
+            ["ltc-divi-testnet", "divi-zec-testnet", "zec-divi-testnet"]
+        );
+        let l = c.ltc.as_ref().unwrap();
+        assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
+        assert_eq!(l.key, "credential:maker-btc");
+        assert!(c.zec.is_some() && !c.serves(Chain::Zec));
+        assert!(c.usdc.is_none(), "wave 4 does not touch usdc");
+        // The appended offers match the mock ones, so local mock runs mirror dnsdivi.
+        for o in mock_counter_offers() {
+            let e = c.offer_entries.iter().find(|e| e.offer.id == o.id).unwrap();
+            assert_eq!(e.offer, o, "{}", o.id);
+        }
+        c.swap_config().unwrap();
     }
 
     #[test]

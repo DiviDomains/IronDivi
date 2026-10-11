@@ -37,6 +37,11 @@ htlc = "0x0000000000000000000000000000000000000000"
 # address derived from it) — no separate maker-usdc credential.
 key = "credential:maker-btc"
 
+[zec]
+lightwalletd_url = "https://testnet.zec.rocks:443"
+# Same BTC swap key (funding.md); started only while a zec offer below is enabled.
+key = "credential:maker-btc"
+
 # Standing offers. Price is DIVI sats per 1 counter-chain coin; min/max are counter-chain
 # sats in both directions. direction: "taker_pays_btc" (maker sells DIVI, the default) or
 # "taker_pays_divi" (maker sells the counter chain). counter_chain defaults to "btc".
@@ -62,21 +67,26 @@ divi_sats_per_btc = 1000000000000     # 10,000 DIVI per LTC
 min_btc_sats = 100000
 max_btc_sats = 10000000
 
+# Off until the maker's LTC address holds max_btc_sats + fees (the maker locks LTC here;
+# see docs/plans/swap-poc/wave4-deploy.md).
 [[offers]]
 id = "ltc-divi-testnet"
 direction = "taker_pays_divi"
 counter_chain = "ltc"
+enabled = false
 divi_sats_per_btc = 1000000000000
 min_btc_sats = 100000
 max_btc_sats = 10000000
 
-# Disabled until [usdc].htlc above is a real deployed address — min/max are USDC engine
+# `enabled = false` (an offer stays in the file but is not served; a counter chain with no
+# enabled offer gets no backend). Keep these off until [usdc].htlc above is a real deployed address — min/max are USDC engine
 # sats (1e8 per coin; UsdcBackend needs whole multiples of 100 to convert to 1e6 base
 # units), so 1000000..100000000 is 0.01..1.00 USDC.
 [[offers]]
 id = "divi-usdc-sepolia"
 direction = "taker_pays_btc"
 counter_chain = "usdc"
+enabled = false
 divi_sats_per_btc = 10000000000       # 100 DIVI per USDC (placeholder)
 min_btc_sats = 1000000
 max_btc_sats = 100000000
@@ -85,7 +95,27 @@ max_btc_sats = 100000000
 id = "usdc-divi-sepolia"
 direction = "taker_pays_divi"
 counter_chain = "usdc"
+enabled = false
 divi_sats_per_btc = 10000000000
 min_btc_sats = 1000000
 max_btc_sats = 100000000
 
+# ZEC: off until the maker t-address holds TAZ on the NU7 chain (funding.md). With every zec
+# offer disabled the [zec] backend is not started.
+[[offers]]
+id = "divi-zec-testnet"
+direction = "taker_pays_btc"
+counter_chain = "zec"
+enabled = false
+divi_sats_per_btc = 500000000000      # 5,000 DIVI per ZEC
+min_btc_sats = 100000
+max_btc_sats = 10000000
+
+[[offers]]
+id = "zec-divi-testnet"
+direction = "taker_pays_divi"
+counter_chain = "zec"
+enabled = false
+divi_sats_per_btc = 500000000000
+min_btc_sats = 100000
+max_btc_sats = 10000000

@@ -1,0 +1,59 @@
+
+# ---- wave 4 (2026-10): LTC and ZEC counter chains ------------------------------------------
+# Appended once to dnsdivi's /etc/divi-swapd/divi-swapd.toml (deploy.sh never overwrites that
+# file). Checklist: docs/plans/swap-poc/wave4-deploy.md. Needs a divi-swapd built from main at
+# or after the counter_chain take check (eeec09c); an older binary reads this as BTC offers.
+#
+# Keys: testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md),
+# so both sections use the maker-btc credential already loaded by divi-swapd.service.
+
+[ltc]
+network = "testnet"                                    # Litecoin testnet4
+esplora_url = "https://litecoinspace.org/testnet/api"  # no second mirror known; no fallback
+key = "credential:maker-btc"                           # maker LTC: tltc1quqkt7c06svzt68f2y9uwf2jzgpd48k6k9akunz
+
+[zec]
+# Every ZEC offer below is disabled, so divi-swapd does not start this backend (no lightwalletd
+# dependency, nothing in /healthz). Flip both offers to `enabled = true` once the maker
+# t-address holds TAZ on the NU7 chain (funding.md: the faucet pays on the stale pre-NU7 fork).
+lightwalletd_url = "https://testnet.zec.rocks:443"
+key = "credential:maker-btc"                           # maker ZEC: tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn
+
+# Maker sells DIVI for LTC: the maker locks DIVI, which it already holds.
+[[offers]]
+id = "divi-ltc-testnet"
+direction = "taker_pays_btc"
+counter_chain = "ltc"
+divi_sats_per_btc = 1000000000000   # 10,000 DIVI per LTC
+min_btc_sats = 100000               # 0.001 LTC
+max_btc_sats = 10000000             # 0.1 LTC
+
+# Maker buys DIVI with LTC: the maker locks LTC. Off until the maker LTC address above holds
+# at least max_btc_sats + fees: the maker selects coins only after the taker's DIVI lock
+# confirms, so an unfunded maker would leave the taker's DIVI locked until its 6 h refund.
+[[offers]]
+id = "ltc-divi-testnet"
+direction = "taker_pays_divi"
+counter_chain = "ltc"
+enabled = false
+divi_sats_per_btc = 1000000000000
+min_btc_sats = 100000
+max_btc_sats = 10000000
+
+[[offers]]
+id = "divi-zec-testnet"
+direction = "taker_pays_btc"
+counter_chain = "zec"
+enabled = false
+divi_sats_per_btc = 500000000000    # 5,000 DIVI per ZEC
+min_btc_sats = 100000
+max_btc_sats = 10000000
+
+[[offers]]
+id = "zec-divi-testnet"
+direction = "taker_pays_divi"
+counter_chain = "zec"
+enabled = false
+divi_sats_per_btc = 500000000000
+min_btc_sats = 100000
+max_btc_sats = 10000000
