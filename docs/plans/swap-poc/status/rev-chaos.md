@@ -33,5 +33,14 @@ Swap `034a66db-1b89-4f19-9573-e82e35ae7a38` (taker `50fec34e…`), daemon retrie
 | taker BTC claim | a533a88de3aeda47149935a4bcf7356f55aa5646b45846410f0687792a7448b0 |
 | maker DIVI claim | 123e19083abbc2d119039e2c8d1d3f926ecd92a32e4f773392265098fe5b726f |
 
-## esplora_429 (Esplora 429 + Retry-After) — running
-## refund (maker killed in maker_refundable) — pending
+## esplora_429 (Esplora 429 + Retry-After, 13:54:20–13:56:50) — PASS
+Swap `ef30f5db-d2bb-4096-b0ca-cf2b1429b3a0` (taker `d6c479db…`), daemon backed off through the 429s, Done.
+
+| leg | txid |
+|---|---|
+| taker DIVI lock | 6c26796830e922f419617db0f72f3995e9b8563d40d8b67123d1bb7094e68caf |
+| maker BTC lock | fc08d9e1f538665b8b3ce7b6ff9103e0f38ef5e0590fdab9b04901b08b333f07 |
+| taker BTC claim | 9c694eedd8f8a3942122db286d06263b1f7aa9eabbf72240480a46aaa7b21163 |
+| maker DIVI claim | e4549c7012953ff3ffb2dfb502f4f5aa20a7b296062b5b661f2c9a4ccf0bc1be |
+
+## refund (maker killed in maker_refundable) — running (needs both timelocks to expire, hours)
