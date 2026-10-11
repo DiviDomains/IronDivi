@@ -991,16 +991,41 @@ async fn forward_records_still_load() {
     assert_eq!(again.maker_leg_claim, taker.maker_leg_claim);
 }
 
-/// The reverse direction with LTC as the counter chain (`ltc-divi-testnet`: the taker locks
-/// DIVI, the maker locks LTC), through the same bodies as the BTC reverse suite above. Only
-/// chain parameters differ: 150 s blocks and LTC's own confirmation count from the profile.
-macro_rules! ltc_rev {
-    ($name:ident, $body:ident) => {
+/// The engine suite above, re-run with another counter chain: every body is driven through a
+/// harness whose counter chain is `$chain` (block interval `$secs`), in direction `$dir`. Only
+/// chain parameters differ from the BTC runs: block interval and the profile's confirmation
+/// count for that chain.
+macro_rules! on_counter {
+    ($name:ident, $chain:expr, $secs:expr, $dir:expr, $body:ident) => {
         #[tokio::test]
         async fn $name() {
-            on_counter(Chain::Ltc, 150);
-            $body(REV).await
+            on_counter($chain, $secs);
+            $body($dir).await
         }
+    };
+}
+
+/// `ltc-divi-testnet`: the taker locks DIVI, the maker locks LTC.
+macro_rules! ltc_rev {
+    ($name:ident, $body:ident) => {
+        on_counter!($name, Chain::Ltc, 150, REV, $body);
+    };
+}
+/// `divi-ltc-testnet`: the taker locks LTC, the maker locks DIVI.
+macro_rules! ltc_fwd {
+    ($name:ident, $body:ident) => {
+        on_counter!($name, Chain::Ltc, 150, FWD, $body);
+    };
+}
+/// `divi-zec-testnet` / `zec-divi-testnet` (transparent ZEC, 75 s blocks).
+macro_rules! zec_fwd {
+    ($name:ident, $body:ident) => {
+        on_counter!($name, Chain::Zec, 75, FWD, $body);
+    };
+}
+macro_rules! zec_rev {
+    ($name:ident, $body:ident) => {
+        on_counter!($name, Chain::Zec, 75, REV, $body);
     };
 }
 
@@ -1018,26 +1043,78 @@ ltc_rev!(
 ltc_rev!(ltc_rev_timeout_invariant_enforced, timeout_invariant_body);
 ltc_rev!(ltc_rev_quote_carries_ltc, quote_carries_counter_body);
 
-/// What the harness actually built: an LTC quote with LTC's confirmation count and key, a
-/// maker leg on the LTC chain (the guard that the `ltc_rev_*` tests are not BTC in disguise).
+ltc_fwd!(ltc_fwd_happy_path, happy_path_body);
+ltc_fwd!(ltc_fwd_case_a_taker_never_locks, case_a_body);
+ltc_fwd!(ltc_fwd_case_b_taker_lock_invalid, case_b_body);
+ltc_fwd!(ltc_fwd_case_c_taker_never_claims, case_c_body);
+ltc_fwd!(ltc_fwd_case_d_late_claim, case_d_body);
+ltc_fwd!(ltc_fwd_crash_at_every_maker_state, crash_maker_body);
+ltc_fwd!(ltc_fwd_crash_at_every_taker_state, crash_taker_body);
+ltc_fwd!(
+    ltc_fwd_no_coin_selection_before_taker_lock_confirmed,
+    no_coin_selection_body
+);
+ltc_fwd!(ltc_fwd_timeout_invariant_enforced, timeout_invariant_body);
+ltc_fwd!(ltc_fwd_quote_carries_ltc, quote_carries_counter_body);
+
+zec_fwd!(zec_fwd_happy_path, happy_path_body);
+zec_fwd!(zec_fwd_case_a_taker_never_locks, case_a_body);
+zec_fwd!(zec_fwd_case_b_taker_lock_invalid, case_b_body);
+zec_fwd!(zec_fwd_case_c_taker_never_claims, case_c_body);
+zec_fwd!(zec_fwd_case_d_late_claim, case_d_body);
+zec_fwd!(zec_fwd_crash_at_every_maker_state, crash_maker_body);
+zec_fwd!(zec_fwd_crash_at_every_taker_state, crash_taker_body);
+zec_fwd!(
+    zec_fwd_no_coin_selection_before_taker_lock_confirmed,
+    no_coin_selection_body
+);
+zec_fwd!(zec_fwd_timeout_invariant_enforced, timeout_invariant_body);
+zec_fwd!(zec_fwd_quote_carries_zec, quote_carries_counter_body);
+
+zec_rev!(zec_rev_happy_path, happy_path_body);
+zec_rev!(zec_rev_case_a_taker_never_locks, case_a_body);
+zec_rev!(zec_rev_case_b_taker_lock_invalid, case_b_body);
+zec_rev!(zec_rev_case_c_taker_never_claims, case_c_body);
+zec_rev!(zec_rev_case_d_late_claim, case_d_body);
+zec_rev!(zec_rev_crash_at_every_maker_state, crash_maker_body);
+zec_rev!(zec_rev_crash_at_every_taker_state, crash_taker_body);
+zec_rev!(
+    zec_rev_no_coin_selection_before_taker_lock_confirmed,
+    no_coin_selection_body
+);
+zec_rev!(zec_rev_timeout_invariant_enforced, timeout_invariant_body);
+zec_rev!(zec_rev_quote_carries_zec, quote_carries_counter_body);
+
+/// What the harness actually built: a quote on the configured counter chain with that chain's
+/// confirmation count and the maker's key there, the counter leg on the side the direction
+/// says, and the maker's coins selected on its own leg (the guard that the `ltc_*`/`zec_*`
+/// tests are not BTC in disguise).
 async fn quote_carries_counter_body(dir: Direction) {
     let mut h = H::with(dir);
     let (chain, _) = counter();
     let q = h.quote().await;
     assert_eq!(q.counter_chain, chain);
-    assert_eq!(
-        q.maker_chain(),
-        chain,
-        "reverse: the maker locks the counter coin"
-    );
+    let (counter_leg, divi_leg) = match dir {
+        Direction::TakerPaysBtc => (q.taker_chain(), q.maker_chain()),
+        Direction::TakerPaysDivi => (q.maker_chain(), q.taker_chain()),
+    };
+    assert_eq!((counter_leg, divi_leg), (chain, Chain::Divi));
     assert_eq!(q.btc_confirmations, h.cfg.confirmations(chain));
     assert_eq!(q.maker_btc_pubkey, h.mbtc.pubkey());
     assert_eq!(h.mbtc.chain(), chain);
     h.run(Scn::Happy, None, &[]).await;
     let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
     assert_eq!(rec.quote.counter_chain, chain);
-    assert_eq!(h.mbtc.funding_calls(), 1, "the maker funded on {chain}");
-    assert_eq!(h.mdivi.funding_calls(), 0);
+    let (on_counter_chain, on_divi) = match dir {
+        Direction::TakerPaysBtc => (0, 1),
+        Direction::TakerPaysDivi => (1, 0),
+    };
+    assert_eq!(
+        h.mbtc.funding_calls(),
+        on_counter_chain,
+        "maker funding on {chain}"
+    );
+    assert_eq!(h.mdivi.funding_calls(), on_divi, "maker funding on divi");
 }
 
 proptest! {
@@ -1052,6 +1129,42 @@ proptest! {
         outages in proptest::collection::vec(0usize..30, 0..6),
     ) {
         on_counter(Chain::Ltc, 150);
+        prop_body(REV, refund, maker_side, mi, ti, &outages);
+    }
+
+    #[test]
+    fn ltc_fwd_prop_random_crash_points(
+        refund in any::<bool>(),
+        maker_side in any::<bool>(),
+        mi in 0usize..MAKER_STATES.len(),
+        ti in 0usize..TAKER_STATES.len(),
+        outages in proptest::collection::vec(0usize..30, 0..6),
+    ) {
+        on_counter(Chain::Ltc, 150);
+        prop_body(FWD, refund, maker_side, mi, ti, &outages);
+    }
+
+    #[test]
+    fn zec_fwd_prop_random_crash_points(
+        refund in any::<bool>(),
+        maker_side in any::<bool>(),
+        mi in 0usize..MAKER_STATES.len(),
+        ti in 0usize..TAKER_STATES.len(),
+        outages in proptest::collection::vec(0usize..30, 0..6),
+    ) {
+        on_counter(Chain::Zec, 75);
+        prop_body(FWD, refund, maker_side, mi, ti, &outages);
+    }
+
+    #[test]
+    fn zec_rev_prop_random_crash_points(
+        refund in any::<bool>(),
+        maker_side in any::<bool>(),
+        mi in 0usize..MAKER_STATES.len(),
+        ti in 0usize..TAKER_STATES.len(),
+        outages in proptest::collection::vec(0usize..30, 0..6),
+    ) {
+        on_counter(Chain::Zec, 75);
         prop_body(REV, refund, maker_side, mi, ti, &outages);
     }
 }
