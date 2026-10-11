@@ -357,18 +357,105 @@ an account-less-but-multisig chain (plausible — flag it when reached, don't gu
 8. **End-to-end happy path**, DIVI testnet + Monero stagenet, throwaway keys both sides.
    *Acceptance:* Maker's DIVI and Taker's XMR both move, `x` extracted from `Tx_redeem` and used to
    sweep the Monero output, matching [Protocol](#protocol)'s happy path step by step.
-9. **Engine integration proposal**: write up how (or whether) this fits `ChainBackend` — likely
-   "it doesn't, cleanly" given `ChainBackend::build_claim`/`build_refund` assume a single-key spend
-   of a hash-locked output, not a multi-transaction presigned adaptor-signature dance with its own
-   state machine (`Tx_lock → Tx_cancel → {Tx_refund | Tx_punish | Tx_redeem}` doesn't map onto
-   `MakerLocked → MakerLockConfirmed → TakerClaimed`-style states 1:1). Flag this as a `- needs:`
-   for the orchestrator rather than forcing a fit, same posture the plan already takes for
-   USDC's account-based mismatch (`multi-coin.md`, wave 1c).
+9. **Engine integration proposal**: done, see [Engine integration](#engine-integration) — it
+   doesn't fit `ChainBackend`/`SwapState`, more fundamentally than USDC's account-based mismatch
+   (`multi-coin.md` wave 1c). Flagged as a `- needs:` for the orchestrator rather than forced.
 
 Steps 1–6 need no DIVI/Monero network coordination between parties and can run with mocks; 7–8 are
 where real stagenet/testnet coordination (two throwaway identities, timed broadcasts) becomes
 unavoidable. This lane produces the design and the prerequisite fix only — per `multi-coin.md`
 wave 1d, steps 2+ are a later plan, not a deliverable of this turn.
+
+## Engine integration
+
+Build-plan step 9. Verdict up front: **`divi_swap::ChainBackend`/`SwapState` do not fit this
+protocol, more fundamentally than the USDC lane's account-chain mismatch** (`usdc-design.md`'s
+`## Why ChainBackend does not fit directly` — that one is a shape mismatch within the same
+hashlock model; this one is a different model entirely). Flagging as a `- needs:` below rather
+than forcing a fit, same posture `usdc-design.md` takes.
+
+### Why it doesn't fit
+
+`ChainBackend` and `SwapState` are built around exactly one pattern: **one hashlocked UTXO
+output, one preimage, two chains that are both `ChainBackend` implementations of that same
+pattern.** Four mismatches, each one actually load-bearing (unlike USDC's, where two of three
+turned out not to matter on inspection):
+
+1. **No hashlock, no preimage, no single HTLC output.** Every `ChainBackend` method that moves
+   money takes an `HtlcParams` (`hash`, `claim_pubkey`, `refund_pubkey`, `locktime`) or a
+   `preimage: &[u8; 32]`. This design has neither — the DIVI side is a 2-of-2 P2SH multisig
+   whose spend authorization is an *adaptor signature*, not a hash preimage (`## DIVI scripts`,
+   `## Protocol`). `build_claim(htlc, at, amount, preimage)` has no parameter shape that could
+   carry "the counterparty's adaptor-encrypted signature, their verification point, and my own
+   decryption scalar" — the inputs `taker_completes_tx_redeem`/`maker_completes_tx_refund`
+   (`crates/swap-chain-xmr/src/swap_templates.rs`) actually need.
+2. **Four presigned DIVI transactions, not two, and three of them need an off-chain exchange
+   *before* any of them can be built.** `ChainBackend` assumes "fund, then claim-or-refund" —
+   two transactions, each buildable independently once its predecessor is confirmed. This design
+   needs `Tx_lock`, `Tx_cancel`, and *one of* `Tx_redeem`/`Tx_refund`/`Tx_punish`
+   (`## Protocol`'s table) — and `Tx_redeem`/`Tx_refund` cannot be built at all until both
+   parties have exchanged and verified **two DLEQ proofs** and their respective encrypted-
+   signature halves (`## Protocol` step 1). `ChainBackend` has no method that models "build
+   something that depends on a value the counterparty must send me first," because the hashlock
+   design never needs one — DIVI/BTC/LTC/ZEC's claim/refund are each single-party operations
+   against a *public* hash, not a two-party cryptographic handshake.
+3. **A second, non-UTXO chain with no scripting, needed simultaneously, not sequentially.**
+   Every existing swap leg pairs DIVI with *one* `ChainBackend` (BTC/LTC/ZEC, all UTXO,
+   scriptPubKey-based). This design needs DIVI *and* Monero, in the same swap, where Monero has
+   no scriptPubKey, no witness, no concept of "does this output match these HTLC params" —
+   `htlc_output`/`find_spend` are meaningless questions on Monero; you scan with a view key and
+   get back a value and whether it's yours, not "a hashlocked output or not."
+4. **Three outcomes, not two, and the third is triggered by inaction, not an action.**
+   `SwapState`'s terminal paths are `{TakerClaimed → MakerClaimed → Done}` or
+   `{MakerRefundable → MakerRefunded → Done}` — claim or refund, both consensual-shaped. This
+   design has a third, `Tx_punish` (`## Protocol`): Taker unilaterally seizing everything because
+   Maker went silent after both sides locked. It isn't a refund (funds don't return to their
+   original owner) and it isn't a claim (it's punitive, not a fair exchange) — `SwapState` has no
+   slot for it, and bolting it on as a third terminal branch off `MakerLockConfirmed` would be
+   describing a different state machine wearing the old enum's name.
+
+What *does* carry over cleanly, so a future implementation isn't starting from zero: DIVI-side
+primitives this lane already built (`crates/swap-chain-xmr`) reuse `divi-wallet`/`divi-script`/
+`divi-primitives` exactly like `swap-chain-divi` does, and a real implementation's DIVI-chain
+plumbing (RPC client, `tip_height`/`broadcast`/`confirmations`-equivalents) could share code with
+`swap-chain-divi` even though it can't share the `ChainBackend` *trait* itself.
+
+### Option A — force a fit
+
+Not attempted, and not recommended even as an exercise: unlike USDC (where forcing it meant
+accepting one specific compromise — `approve` living outside the write-ahead model), there is no
+single compromise here. `ChainBackend` would need simultaneous surgery to its parameter types
+(no more single `HtlcParams`), its call sequencing (methods that block on an off-chain exchange
+with the counterparty), and its chain model (a second backend with no scripting at all) — at
+which point what's left of the original trait is just the name.
+
+### Option B — a dedicated adaptor-swap module, outside `ChainBackend` entirely
+
+- A new state enum mirroring `## Protocol`'s own table directly (`DleqExchanged → MakerLocked →
+  TakerLocked → {Redeemed | Refunded | Punished}`) rather than reusing or extending `SwapState`.
+- Two backend-shaped traits, not one: a DIVI-side trait narrow enough to cover just
+  `crates/swap-chain-xmr`'s actual needs (build/complete/recover for the adaptor-signed
+  templates, plus broadcast/confirmations reused from existing DIVI plumbing), and a
+  Monero-side trait (`crates/swap-chain-xmr/src/monero_key_share.rs` + the stagenet RPC client
+  already prove the pieces this would wrap) — no attempt to unify them under one interface, since
+  nothing about their operations is actually shared beyond "has a key, can wait for
+  confirmations."
+- A setup phase with no analog in the existing engine at all: exchange and mutually verify both
+  DLEQ proofs before either party's lock is meaningful — this has to run *before* anything
+  resembling `Quoted`/`Accepted` today, as its own step, not squeezed into an existing one.
+- Lives as its own module/daemon path, not wired into `divi-swapd`'s existing offer pipeline —
+  the offer/quote mechanics those crates already have (fee quoting, offer expiry) are reusable in
+  spirit, not in code, since accepting an XMR offer kicks off a cross-group-proof handshake the
+  current `Accepted` state has no room for.
+
+### Recommendation
+
+Option B. This is a `- needs:` for the orchestrator (`docs/plans/swap-poc/status/xmr.md`), not a
+decision this lane should make unilaterally — same posture the plan already takes for USDC's
+mismatch (`multi-coin.md` wave 1c: "the orchestrator decides before wave 2"). What this lane
+*can* assert with confidence: don't spend effort trying to fit this into `ChainBackend` first and
+fall back to a new trait only if that fails — the four mismatches above are structural, not
+incidental, so a force-fit attempt would be wasted effort, not a useful first try.
 
 ## Risks
 
