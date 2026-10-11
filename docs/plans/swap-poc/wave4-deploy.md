@@ -47,9 +47,9 @@ entry.
       maker lock as an error on every poll instead of quietly waiting for its refund.
 - [ ] dnsdivi has room for the build: `ssh dnsdivi df -h /opt` (the release build now also
       compiles swap-chain-ltc/-zec/-evm; allow ~3 GB under `/opt/divi-swapd/src/target`).
-- [ ] Record what runs now. `/healthz` `version` does **not** tell old from new: the
-      workspace is still `0.2.5` on both (bump it on main first if you want it to, see lane
-      status). Use the binary checksum instead:
+- [ ] Record what runs now: `ssh dnsdivi "curl -s http://127.0.0.1:18480/healthz | jq -r .version"`
+      → `0.2.5` (the deployed binary; the wave-4 build reports `0.2.6`, the workspace
+      version since the commit that bumped it), and
       `ssh dnsdivi "sha256sum /usr/local/bin/divi-swapd"` (after the deploy this is the
       `.prev` file's checksum).
 
@@ -115,11 +115,13 @@ B=http://127.0.0.1:18480     # on dnsdivi; from the Mac: ssh -N -L 18480:127.0.0
 - [ ] Startup log has `ltc backend ready`, `no enabled zec offer and no zec swap in flight; not starting the [zec] backend`,
       `offers disabled in config` (listing `ltc-divi-testnet`, `divi-zec-testnet`, `zec-divi-testnet`):
       `ssh dnsdivi "sudo journalctl -u divi-swapd -n 200 -o cat" | grep -E 'backend ready|zec|disabled'`
-- [ ] New binary running: `ssh dnsdivi "sha256sum /usr/local/bin/divi-swapd /usr/local/bin/divi-swapd.prev"`
+- [ ] New binary running: `curl -s $B/healthz | jq -r .version` → **`0.2.6`**;
+      `ssh dnsdivi "sha256sum /usr/local/bin/divi-swapd /usr/local/bin/divi-swapd.prev"`
       → two different sums, `.prev` = the one recorded in §0; and `/offers` entries carry a
       `counter_chain` field (the v0.2.5 binary has none).
-- [ ] Health: `curl -s $B/healthz | jq '{ok, divi: .divi.tip, btc: .btc.tip, counters}'`
-      → `ok: true`, `counters.ltc.tip` a number with `error: null`, **no `zec`**.
+- [ ] Health: `curl -s $B/healthz | jq '{ok, version, divi: .divi.tip, btc: .btc.tip, counters}'`
+      → `ok: true`, `version: "0.2.6"`, `counters.ltc.tip` a number with `error: null`,
+      **no `zec`**.
       `/healthz` answers 200 even while `ok` is false, so `deploy.sh` returns as soon as the
       daemon is up; `ok` stays false until the DIVI wallet scan catches up from its saved
       cursor (`divi_scan.state`). Re-check until `true`.
@@ -177,8 +179,9 @@ DB (log: `ltc backend ready`), and stops starting it once none is left. Do not d
 1. Soft rollback first, and wait until that LTC count is 0.
 2. Restore the config: `ssh dnsdivi "sudo cp -p /etc/divi-swapd/divi-swapd.toml.pre-wave4 /etc/divi-swapd/divi-swapd.toml"`.
 3. `deploy/divi-swapd/deploy.sh rollback` (restores `/usr/local/bin/divi-swapd.prev`, restarts).
-4. Re-run the BTC checks in §4; `/offers` shows the two BTC offers only, without a
-   `counter_chain` field, and `sha256sum /usr/local/bin/divi-swapd` matches §0.
+4. Re-run the BTC checks in §4; `/healthz` reports `version: "0.2.5"`, `/offers` shows the
+   two BTC offers only, without a `counter_chain` field, and `sha256sum
+   /usr/local/bin/divi-swapd` matches §0.
 
 The DB needs no migration either way: records only gained fields (`counter_chain`), which
 the old binary ignores; terminal LTC records stay terminal.
