@@ -27,12 +27,13 @@ use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
     mock_counter_offers, router, run_scan, spawn_gated_scheduler, AppState, BackendKind,
-    BtcSection, DaemonConfig, LtcSection, ScanStatus, MOCK_ONLY_CHAINS,
+    BtcSection, DaemonConfig, LtcSection, ScanStatus, ZecSection, MOCK_ONLY_CHAINS,
 };
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
 use swap_chain_divi::{DiviBackend, FeePolicy as DiviFeePolicy};
 use swap_chain_ltc::LtcBackend;
+use swap_chain_zec::{FeePolicy as ZecFeePolicy, RetryPolicy as ZecRetryPolicy, ZecBackend};
 
 #[derive(Parser)]
 #[command(name = "divi-swapd", version, about = "Atomic swap maker daemon")]
@@ -182,38 +183,50 @@ fn live_usdc(cfg: &divi_swapd::UsdcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
+fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
+    let key = resolve_key(&cfg.key, "zec")?;
+    let mut endpoints = vec![cfg.lightwalletd_url.clone()];
+    endpoints.extend(cfg.fallback_lightwalletd_url.clone());
+    let backend = ZecBackend::new(
+        endpoints,
+        key,
+        ZecFeePolicy::default(),
+        ZecRetryPolicy::default(),
+    )?;
+    tracing::info!(address = %backend.address().encode(), "zec backend ready");
+    Ok(Arc::new(backend))
+}
+
 async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
-    for o in &cfg.offers {
-        let supported = match o.counter_chain {
-            Chain::Btc => true,
-            Chain::Ltc => cfg.ltc.is_some(),
-            Chain::Usdc => cfg.usdc.is_some(),
-            _ => false,
-        };
-        if !supported {
-            let hint = match o.counter_chain {
-                Chain::Ltc => " (add [ltc] to the config)",
-                Chain::Usdc => " (add [usdc] to the config)",
-                _ => "",
-            };
-            bail!(
-                "offer {}: no live {} backend in this build yet{hint}; use --backend mock",
-                o.id,
-                o.counter_chain
-            );
-        }
-    }
-    let btc = live_btc(btc_cfg)?;
-    let mut others = Vec::new();
+    let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
     if let Some(ltc_cfg) = &cfg.ltc {
         others.push(live_ltc(ltc_cfg)?);
     }
     if let Some(usdc_cfg) = &cfg.usdc {
         others.push(live_usdc(usdc_cfg)?);
     }
+    if let Some(zec_cfg) = &cfg.zec {
+        others.push(live_zec(zec_cfg)?);
+    }
+    let known: Vec<Chain> = std::iter::once(Chain::Btc)
+        .chain(others.iter().map(|b| b.chain()))
+        .collect();
+    if let Some(o) = cfg
+        .offers
+        .iter()
+        .find(|o| !known.contains(&o.counter_chain))
+    {
+        bail!(
+            "offer {}: no live {} backend in this build yet (add a [{}] section, or use --backend mock)",
+            o.id,
+            o.counter_chain,
+            o.counter_chain
+        );
+    }
+    let btc = live_btc(btc_cfg)?;
     let hex_key = SecretRef::parse(&divi_cfg.key)
         .and_then(|r| r.resolve())
         .map_err(|e| anyhow::anyhow!("divi key: {e}"))?;

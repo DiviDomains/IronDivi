@@ -28,6 +28,7 @@ use divi_swap_cli::{flow, ClaimGate, ClaimPolicy, MakerClient, RunOpts, Sessions
 use swap_chain_btc::BtcBackend;
 use swap_chain_divi::DiviBackend;
 use swap_chain_ltc::LtcBackend;
+use swap_chain_zec::ZecBackend;
 
 #[derive(Parser)]
 #[command(
@@ -43,8 +44,8 @@ struct Cli {
     /// the public testnets.
     #[arg(long, global = true, value_enum, default_value = "live")]
     backend: BackendArg,
-    /// Chain swapped against DIVI: `btc`, `ltc` or `zec` (the offer's `counter_chain`).
-    /// `btc`, `ltc` and `usdc` have live backends; `zec` needs `--backend mock`.
+    /// Chain swapped against DIVI: `btc`, `ltc`, `usdc` or `zec` (the offer's `counter_chain`).
+    /// `btc`, `ltc`, `usdc` and `zec` all have live backends.
     #[arg(long, global = true, default_value = "btc", value_parser = parse_counter_chain)]
     counter_chain: Chain,
     /// Secret reference (`op://…` or `credential:<name>`) for the taker's DIVI key.
@@ -56,6 +57,9 @@ struct Cli {
     /// Secret reference for the taker's LTC key (when `--counter-chain ltc`).
     #[arg(long, global = true)]
     ltc_key: Option<String>,
+    /// Secret reference for the taker's ZEC key (when `--counter-chain zec`).
+    #[arg(long, global = true)]
+    zec_key: Option<String>,
     /// Taker's DIVI coin database (live backend only; created mode 0600, must be outside any
     /// git tree). Required for the reverse direction, where the taker pays DIVI.
     #[arg(long, global = true)]
@@ -178,11 +182,12 @@ enum Cmd {
     },
 }
 
-/// Concrete counter-chain handle, live backend only (for `Balance`'s address + Esplora
+/// Concrete counter-chain handle, live backend only (for `Balance`'s address + balance
 /// lookup, which need the real type rather than `dyn ChainBackend`).
 enum CounterLive {
     Btc(Arc<BtcBackend>),
     Ltc(Arc<LtcBackend>),
+    Zec(Arc<ZecBackend>),
 }
 
 impl CounterLive {
@@ -190,15 +195,23 @@ impl CounterLive {
         match self {
             CounterLive::Btc(b) => b.address().to_string(),
             CounterLive::Ltc(b) => b.address().to_string(),
+            CounterLive::Zec(z) => z.address().encode(),
         }
     }
 
-    /// Esplora endpoints to query for this chain's balance.
-    fn esplora_endpoints(&self, btc_network: &str) -> Result<Vec<String>> {
-        Ok(match self {
-            CounterLive::Btc(_) => swap_chain_btc::esplora_endpoints(btc_network)?,
-            CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints("testnet")?,
-        })
+    /// Confirmed plus pending balance, in the chain's smallest unit.
+    async fn balance_sats(&self, btc_network: &str) -> Result<i64> {
+        match self {
+            CounterLive::Zec(z) => Ok(z.balance_zatoshi().await? as i64),
+            CounterLive::Btc(_) | CounterLive::Ltc(_) => {
+                let endpoints = match self {
+                    CounterLive::Btc(_) => swap_chain_btc::esplora_endpoints(btc_network)?,
+                    CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints("testnet")?,
+                    CounterLive::Zec(_) => unreachable!(),
+                };
+                chain_balance(&endpoints, &self.address()).await
+            }
+        }
     }
 }
 
@@ -251,8 +264,8 @@ fn secret_hex(
         .map_err(|e| anyhow::anyhow!("{what} key: {e}"))
 }
 
-/// Resolve `reference` and decode it as a 32-byte secp256k1 key (BTC and LTC share a key
-/// format: compressed pubkeys over the same curve, so one helper covers both).
+/// Resolve `reference` and decode it as a 32-byte secp256k1 key (BTC, LTC and ZEC share a
+/// key format: compressed pubkeys over the same curve, so one helper covers all three).
 fn secp_key(
     reference: &Option<String>,
     flag: &str,
@@ -340,6 +353,14 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
                 swap_chain_ltc::FeePolicy::default(),
             )?);
             (backend.clone(), CounterLive::Ltc(backend))
+        }
+        Chain::Zec => {
+            let zkey = secp_key(&cli.zec_key, "--zec-key", "zec")?;
+            let backend = Arc::new(ZecBackend::testnet(
+                zkey,
+                swap_chain_zec::FeePolicy::default(),
+            )?);
+            (backend.clone(), CounterLive::Zec(backend))
         }
         other => bail!("no live {other} backend in this build yet; use --backend mock"),
     };
@@ -488,11 +509,10 @@ async fn main() -> Result<()> {
             println!("divi_address={}", divi.address());
             println!("divi_balance_sats={}", divi.balance());
             println!("{}_address={addr}", cli.counter_chain);
-            let endpoints = counter.esplora_endpoints(&cli.btc_network)?;
             println!(
                 "{}_balance_sats={}",
                 cli.counter_chain,
-                chain_balance(&endpoints, &addr).await?
+                counter.balance_sats(&cli.btc_network).await?
             );
         }
         Cmd::Txids { swap } => {

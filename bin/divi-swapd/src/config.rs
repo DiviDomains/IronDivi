@@ -92,11 +92,25 @@ fn default_usdc_token() -> String {
     swap_chain_evm::SEPOLIA_USDC.into()
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZecSection {
+    /// Primary lightwalletd gRPC endpoint.
+    #[serde(default = "default_lightwalletd")]
+    pub lightwalletd_url: String,
+    /// Fallback lightwalletd gRPC endpoint.
+    pub fallback_lightwalletd_url: Option<String>,
+    /// Reference (`op://…` or `credential:<name>`) to the maker's ZEC key.
+    pub key: String,
+}
+
 fn default_divi_rpc() -> String {
     "https://services.divi.domains/api/testnet/rpc/".into()
 }
 fn default_esplora() -> String {
     "https://mempool.space/signet/api".into()
+}
+fn default_lightwalletd() -> String {
+    swap_chain_zec::TESTNET_LIGHTWALLETD.to_string()
 }
 fn default_network() -> String {
     "signet".into()
@@ -131,9 +145,9 @@ fn default_offers() -> Vec<Offer> {
 }
 
 /// Counter chains `--backend mock` simulates besides BTC, via a generic in-process
-/// `MockChain` rather than a dedicated mock. (LTC also has a live backend — see
-/// [`LtcSection`] — but mock mode always simulates every chain the same way, for fast
-/// hermetic local/CI coverage; ZEC has no live backend yet.)
+/// `MockChain` rather than a dedicated mock. (LTC and ZEC also have live backends — see
+/// [`LtcSection`] / [`ZecSection`] — but mock mode always simulates every chain the same
+/// way, for fast hermetic local/CI coverage.)
 pub const MOCK_ONLY_CHAINS: [Chain; 2] = [Chain::Ltc, Chain::Zec];
 
 /// The offers `--backend mock` adds for each of [`MOCK_ONLY_CHAINS`]: `divi-<c>-testnet`
@@ -211,6 +225,9 @@ pub struct DaemonConfig {
     pub ltc: Option<LtcSection>,
     /// Required only if an offer's `counter_chain` is `usdc`.
     pub usdc: Option<UsdcSection>,
+    /// Enables a live ZEC counter backend; needed only for offers with `counter_chain =
+    /// "zec"`. Ignored by the mock backend (which always simulates ZEC).
+    pub zec: Option<ZecSection>,
     /// Overrides on top of `profile`.
     #[serde(default)]
     pub swap: SwapOverrides,
@@ -278,7 +295,8 @@ impl DaemonConfig {
             .map(|d| &d.key)
             .chain(self.btc.iter().map(|b| &b.key))
             .chain(self.ltc.iter().map(|l| &l.key))
-            .chain(self.usdc.iter().map(|u| &u.key));
+            .chain(self.usdc.iter().map(|u| &u.key))
+            .chain(self.zec.iter().map(|z| &z.key));
         for r in refs {
             divi_swap::secrets::SecretRef::parse(r)
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;

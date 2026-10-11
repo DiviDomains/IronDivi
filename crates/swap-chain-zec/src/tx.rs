@@ -34,6 +34,18 @@ type Result<T> = std::result::Result<T, SwapError>;
 pub const NU5_VERSION_GROUP_ID: u32 = 0x26A7_270A;
 /// `nVersion = 5`, with the overwinter high bit set, as serialized in `nVersion` LE32.
 pub const V5_VERSION_BYTES: u32 = 0x8000_0005;
+/// NU6.3 (Ironwood) `nVersionGroupId` for v6 transactions — [ZIP 229]'s mandated constant,
+/// confirmed against live testnet transactions (lane zec, 2026-10-11): every transaction
+/// seen on `testnet.zec.rocks` over a 2000-block window is v6, this exact version group id.
+///
+/// [ZIP 229]: https://zips.z.cash/zip-0229
+pub const V6_VERSION_GROUP_ID: u32 = 0xD884_B698;
+/// `nVersion = 6`, with the overwinter high bit set, as serialized in `nVersion` LE32. This
+/// backend builds v6 transactions: the live testnet relays/mines v6 exclusively post-NU6.3
+/// (see [`V6_VERSION_GROUP_ID`]), even for plain transparent transfers with no Ironwood
+/// component — v5 is still consensus-valid per ZIP 229, but not what the network actually
+/// accepts in practice right now.
+pub const V6_VERSION_BYTES: u32 = 0x8000_0006;
 
 /// Outputs below this are uneconomical to spend (same floor as Bitcoin P2PKH dust).
 pub const DUST_ZATOSHI: u64 = 294;
@@ -203,6 +215,19 @@ const PERS_SCRIPTS: &[u8; 16] = b"ZTxTrScriptsHash";
 const PERS_TXIN: &[u8; 16] = b"Zcash___TxInHash";
 const PERS_TXID_PREFIX: &[u8; 12] = b"ZcashTxHash_";
 
+// ZIP 229 (v6 / Ironwood): `orchard_digest` gets a new personalization for v6 (even when
+// empty — the ZIP changes it unconditionally, "personalizations must be changed when what
+// is hashed at that node changes", since v6 also drops the anchor into auth data), and the
+// new Ironwood component digest reuses Orchard's sub-digest shape with its own
+// personalizations. `sapling_digest`'s own wrapper personalization is unchanged for v6 (only
+// its noncompact-spends child would change, which we never reach: we have zero spends).
+const PERS_ORCHARD_V6: &[u8; 16] = b"ZTxIdOrchardH_v6";
+const PERS_IRONWOOD_V6: &[u8; 16] = b"ZTxIdIronwd_H_v6";
+const PERS_IW_ACT_C_V6: &[u8; 16] = b"ZTxIdIrnActCH_v6";
+const PERS_IW_ACT_M_V6: &[u8; 16] = b"ZTxIdIrnActMH_v6";
+const PERS_IW_ACT_N_V6: &[u8; 16] = b"ZTxIdIrnActNH_v6";
+const PERS_S_SPENDS_N_V6: &[u8; 16] = b"ZTxIdSSpendNH_v6";
+
 /// T.1: header digest.
 fn header_digest(
     version_bytes: u32,
@@ -268,13 +293,20 @@ fn is_coinbase(vin: &[TxIn]) -> bool {
 struct ShieldedDigests;
 
 impl ShieldedDigests {
-    /// `spends`: each entry is the 96-byte `cv(32) || nullifier(32) || rk(32)` v5 spend
-    /// record. `anchor`: the single shared Sapling anchor (only meaningful if non-empty).
+    /// `spends`: each entry is the 96-byte `cv(32) || nullifier(32) || rk(32)` spend record.
+    /// `anchor`: the single shared Sapling anchor (only meaningful if non-empty). `v6`:
+    /// whether to use the [ZIP 229] v6 noncompact-spends personalization and omit the
+    /// anchor from it (the anchor moves to authorizing data in v6 — we never compute the
+    /// auth digest, so for us this just means leaving it out). Everything else (compact
+    /// digest, outputs, the `sapling_digest` wrapper personalization) is unchanged by v6.
+    ///
+    /// [ZIP 229]: https://zips.z.cash/zip-0229
     fn sapling(
         spends: &[[u8; 96]],
         anchor: [u8; 32],
         outputs: &[[u8; 756]],
         value_balance: i64,
+        v6: bool,
     ) -> [u8; 32] {
         if spends.is_empty() && outputs.is_empty() {
             return empty_digest(PERS_SAPLING);
@@ -287,11 +319,18 @@ impl ShieldedDigests {
             for s in spends {
                 compact.extend(&s[32..64]); // nullifier
                 noncompact.extend(&s[0..32]); // cv
-                noncompact.extend(anchor);
+                if !v6 {
+                    noncompact.extend(anchor);
+                }
                 noncompact.extend(&s[64..96]); // rk
             }
             let c = blake2b_person(PERS_S_SPENDS_C, &[&compact]);
-            let n = blake2b_person(PERS_S_SPENDS_N, &[&noncompact]);
+            let n_pers = if v6 {
+                PERS_S_SPENDS_N_V6
+            } else {
+                PERS_S_SPENDS_N
+            };
+            let n = blake2b_person(n_pers, &[&noncompact]);
             blake2b_person(PERS_S_SPENDS, &[&c, &n])
         };
         let outputs_digest = if outputs.is_empty() {
@@ -331,6 +370,62 @@ impl ShieldedDigests {
         if actions.is_empty() {
             return empty_digest(PERS_ORCHARD);
         }
+        let (c, m, n) =
+            Self::orchard_action_sub_digests(actions, PERS_O_ACT_C, PERS_O_ACT_M, PERS_O_ACT_N);
+        blake2b_person(
+            PERS_ORCHARD,
+            &[&c, &m, &n, &[flags], &value_balance.to_le_bytes(), &anchor],
+        )
+    }
+
+    /// `orchard_digest_v6` ([ZIP 229]): same shape as [`Self::orchard`], but with the v6
+    /// personalization and — since v6 moves the anchor to authorizing data — no anchor.
+    ///
+    /// [ZIP 229]: https://zips.z.cash/zip-0229
+    fn orchard_v6(actions: &[[u8; 820]], flags: u8, value_balance: i64) -> [u8; 32] {
+        if actions.is_empty() {
+            return empty_digest(PERS_ORCHARD_V6);
+        }
+        let (c, m, n) =
+            Self::orchard_action_sub_digests(actions, PERS_O_ACT_C, PERS_O_ACT_M, PERS_O_ACT_N);
+        blake2b_person(
+            PERS_ORCHARD_V6,
+            &[&c, &m, &n, &[flags], &value_balance.to_le_bytes()],
+        )
+    }
+
+    /// `ironwood_digest_v6` ([ZIP 229]): identical structure to [`Self::orchard_v6`] — the
+    /// Ironwood component reuses the Orchard Action encoding — but with Ironwood's own
+    /// personalizations.
+    ///
+    /// [ZIP 229]: https://zips.z.cash/zip-0229
+    fn ironwood_v6(actions: &[[u8; 820]], flags: u8, value_balance: i64) -> [u8; 32] {
+        if actions.is_empty() {
+            return empty_digest(PERS_IRONWOOD_V6);
+        }
+        let (c, m, n) = Self::orchard_action_sub_digests(
+            actions,
+            PERS_IW_ACT_C_V6,
+            PERS_IW_ACT_M_V6,
+            PERS_IW_ACT_N_V6,
+        );
+        blake2b_person(
+            PERS_IRONWOOD_V6,
+            &[&c, &m, &n, &[flags], &value_balance.to_le_bytes()],
+        )
+    }
+
+    /// The compact/memos/noncompact sub-digests shared by Orchard and Ironwood action
+    /// groups (same 820-byte `OrchardAction` record, [ZIP 229] §"Ironwood Action
+    /// descriptions use the same encoding as Orchard Actions").
+    ///
+    /// [ZIP 229]: https://zips.z.cash/zip-0229
+    fn orchard_action_sub_digests(
+        actions: &[[u8; 820]],
+        pers_c: &[u8; 16],
+        pers_m: &[u8; 16],
+        pers_n: &[u8; 16],
+    ) -> ([u8; 32], [u8; 32], [u8; 32]) {
         let mut compact = Vec::new();
         let mut memos = Vec::new();
         let mut noncompact = Vec::new();
@@ -346,12 +441,10 @@ impl ShieldedDigests {
             noncompact.extend(&a[724..740]); // encCiphertext[564..580]
             noncompact.extend(&a[740..820]); // outCiphertext
         }
-        let c = blake2b_person(PERS_O_ACT_C, &[&compact]);
-        let m = blake2b_person(PERS_O_ACT_M, &[&memos]);
-        let n = blake2b_person(PERS_O_ACT_N, &[&noncompact]);
-        blake2b_person(
-            PERS_ORCHARD,
-            &[&c, &m, &n, &[flags], &value_balance.to_le_bytes(), &anchor],
+        (
+            blake2b_person(pers_c, &[&compact]),
+            blake2b_person(pers_m, &[&memos]),
+            blake2b_person(pers_n, &[&noncompact]),
         )
     }
 }
@@ -373,6 +466,25 @@ fn combine_txid(
     blake2b_person(
         &txid_personalization(consensus_branch_id),
         &[&header, &transparent, &sapling, &orchard],
+    )
+}
+
+/// [ZIP 229] `txid_digest_v6`: like [`combine_txid`], but with an Ironwood component digest
+/// appended as a fifth child (after `orchard_digest_v6`, which the caller must have computed
+/// with the v6 personalization — see [`ShieldedDigests::orchard_v6`]).
+///
+/// [ZIP 229]: https://zips.z.cash/zip-0229
+fn combine_txid_v6(
+    header: [u8; 32],
+    transparent: [u8; 32],
+    sapling: [u8; 32],
+    orchard_v6: [u8; 32],
+    ironwood_v6: [u8; 32],
+    consensus_branch_id: u32,
+) -> [u8; 32] {
+    blake2b_person(
+        &txid_personalization(consensus_branch_id),
+        &[&header, &transparent, &sapling, &orchard_v6, &ironwood_v6],
     )
 }
 
@@ -469,7 +581,10 @@ fn transparent_sig_digest(
 }
 
 /// S.2 / T.3: the full ZIP-244 signature digest (equal to the txid digest when
-/// `signed_index` is `None` and `hash_type` is `SIGHASH_ALL`).
+/// `signed_index` is `None` and `hash_type` is `SIGHASH_ALL`). v5 only — this backend builds
+/// v6 transactions ([`signature_digest_v6`]); this function is kept to validate the v5
+/// algorithm against the official ZIP-244 test vectors (`zip244_sighash_vectors`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn signature_digest(
     header: [u8; 32],
@@ -489,12 +604,47 @@ pub(crate) fn signature_digest(
     )
 }
 
+/// [ZIP 229] v6 signature digest: identical to [`signature_digest`] (the transparent-input
+/// sighash algorithm, S.2, is unchanged by ZIP 229) but with the Ironwood component digest
+/// appended, mirroring [`combine_txid_v6`].
+///
+/// [ZIP 229]: https://zips.z.cash/zip-0229
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn signature_digest_v6(
+    header: [u8; 32],
+    consensus_branch_id: u32,
+    vin: &[TxIn],
+    vout: &[TxOut],
+    hash_type: u8,
+    signed_index: Option<usize>,
+    sig_inputs: &[SigInput],
+    sapling_digest: [u8; 32],
+    orchard_digest_v6: [u8; 32],
+    ironwood_digest_v6: [u8; 32],
+) -> [u8; 32] {
+    let transparent = transparent_sig_digest(vin, vout, hash_type, signed_index, sig_inputs);
+    blake2b_person(
+        &txid_personalization(consensus_branch_id),
+        &[
+            &header,
+            &transparent,
+            &sapling_digest,
+            &orchard_digest_v6,
+            &ironwood_digest_v6,
+        ],
+    )
+}
+
 pub(crate) const SIGHASH_ALL: u8 = 0x01;
 
-// ---- A transparent-only v5 transaction we build ourselves --------------------------------
+// ---- A transparent-only v6 transaction we build ourselves --------------------------------
 
-/// A Zcash v5 transaction with an empty Sapling bundle and an empty Orchard bundle: every
-/// transaction this backend ever builds (funding, claim, refund).
+/// A Zcash v6 ([ZIP 229] / NU6.3 "Ironwood") transaction with empty Sapling, Orchard and
+/// Ironwood bundles: every transaction this backend ever builds (funding, claim, refund).
+/// v6, not v5: the live testnet relays/mines only v6 transactions post-NU6.3, even plain
+/// transparent transfers — see [`V6_VERSION_BYTES`].
+///
+/// [ZIP 229]: https://zips.z.cash/zip-0229
 #[derive(Debug, Clone)]
 pub struct ZecTx {
     /// Read from the chain at build time (never hard-coded — brief, lane zec).
@@ -513,8 +663,8 @@ impl ZecTx {
     /// Full consensus serialization.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend(V5_VERSION_BYTES.to_le_bytes());
-        out.extend(NU5_VERSION_GROUP_ID.to_le_bytes());
+        out.extend(V6_VERSION_BYTES.to_le_bytes());
+        out.extend(V6_VERSION_GROUP_ID.to_le_bytes());
         out.extend(self.consensus_branch_id.to_le_bytes());
         out.extend(self.lock_time.to_le_bytes());
         out.extend(self.expiry_height.to_le_bytes());
@@ -529,13 +679,14 @@ impl ZecTx {
         out.push(0); // nSpendsSapling = 0
         out.push(0); // nOutputsSapling = 0
         out.push(0); // nActionsOrchard = 0
+        out.push(0); // nActionsIronwood = 0 (ZIP 229, new in v6)
         out
     }
 
     fn header_digest(&self) -> [u8; 32] {
         header_digest(
-            V5_VERSION_BYTES,
-            NU5_VERSION_GROUP_ID,
+            V6_VERSION_BYTES,
+            V6_VERSION_GROUP_ID,
             self.consensus_branch_id,
             self.lock_time,
             self.expiry_height,
@@ -544,11 +695,12 @@ impl ZecTx {
 
     /// The transaction id.
     pub fn txid(&self) -> [u8; 32] {
-        combine_txid(
+        combine_txid_v6(
             self.header_digest(),
             transparent_digest(&self.vin, &self.vout),
             empty_digest(PERS_SAPLING),
-            empty_digest(PERS_ORCHARD),
+            empty_digest(PERS_ORCHARD_V6),
+            empty_digest(PERS_IRONWOOD_V6),
             self.consensus_branch_id,
         )
     }
@@ -556,7 +708,7 @@ impl ZecTx {
     /// The `SIGHASH_ALL` digest for signing/verifying input `index`. `sig_inputs` has one
     /// entry per `vin`, in order (value + scriptCode of the output each input spends).
     pub fn signature_digest(&self, index: usize, sig_inputs: &[SigInput]) -> [u8; 32] {
-        signature_digest(
+        signature_digest_v6(
             self.header_digest(),
             self.consensus_branch_id,
             &self.vin,
@@ -565,16 +717,23 @@ impl ZecTx {
             Some(index),
             sig_inputs,
             empty_digest(PERS_SAPLING),
-            empty_digest(PERS_ORCHARD),
+            empty_digest(PERS_ORCHARD_V6),
+            empty_digest(PERS_IRONWOOD_V6),
         )
     }
 }
 
 /// A transaction read off the chain (ours or a counterparty's): fully parsed transparent
-/// parts, Sapling/Orchard bundles reduced to their digests (we never need their content, only
-/// whether the txid matches).
+/// parts, Sapling/Orchard/Ironwood bundles reduced to their digests (we never need their
+/// content, only whether the txid matches). Accepts both v5 (NU5) and v6 ([ZIP 229],
+/// NU6.3 "Ironwood") transactions — the live testnet currently mints only v6, but v5 remains
+/// consensus-valid, so a counterparty's spend could in principle still be v5.
+///
+/// [ZIP 229]: https://zips.z.cash/zip-0229
 #[derive(Debug, Clone)]
 pub struct ParsedTx {
+    /// See [`ZecTx`]. 5 or 6.
+    pub version: u32,
     /// See [`ZecTx`].
     pub consensus_branch_id: u32,
     /// `nLockTime`.
@@ -586,24 +745,33 @@ pub struct ParsedTx {
     /// Transparent outputs.
     pub vout: Vec<TxOut>,
     sapling_digest: [u8; 32],
+    /// Computed with the v5 or v6 personalization, matching [`Self::version`].
     orchard_digest: [u8; 32],
+    /// `None` for a v5 transaction (no Ironwood component exists in that format).
+    ironwood_digest: Option<[u8; 32]>,
 }
 
 impl ParsedTx {
-    /// Parse a v5 (NU5+) transaction. Older (pre-NU5) versions are rejected: this backend
-    /// only ever deals with transactions at or after NU5 activation.
+    /// Parse a v5 (NU5+) or v6 ([ZIP 229], NU6.3+) transaction. Older (pre-NU5) versions are
+    /// rejected: this backend only ever deals with transactions at or after NU5 activation.
+    ///
+    /// [ZIP 229]: https://zips.z.cash/zip-0229
     pub fn parse(raw: &[u8]) -> Result<Self> {
         let mut r = Reader::new(raw);
         let version_bytes = r.u32()?;
-        if version_bytes != V5_VERSION_BYTES {
-            return Err(SwapError::Other(format!(
-                "zec tx: unsupported version bytes {version_bytes:#x} (want v5 NU5+)"
-            )));
-        }
+        let (version, want_group_id) = match version_bytes {
+            V5_VERSION_BYTES => (5u32, NU5_VERSION_GROUP_ID),
+            V6_VERSION_BYTES => (6u32, V6_VERSION_GROUP_ID),
+            other => {
+                return Err(SwapError::Other(format!(
+                    "zec tx: unsupported version bytes {other:#x} (want v5 NU5+ or v6 NU6.3+)"
+                )))
+            }
+        };
         let version_group_id = r.u32()?;
-        if version_group_id != NU5_VERSION_GROUP_ID {
+        if version_group_id != want_group_id {
             return Err(SwapError::Other(format!(
-                "zec tx: unexpected version group id {version_group_id:#x}"
+                "zec tx: unexpected version group id {version_group_id:#x} for v{version}"
             )));
         }
         let consensus_branch_id = r.u32()?;
@@ -663,28 +831,73 @@ impl ParsedTx {
         if has_sapling {
             r.take(64)?; // binding sig
         }
-        let sapling_digest =
-            ShieldedDigests::sapling(&spend_blobs, anchor, &output_blobs, value_balance_sapling);
+        let sapling_digest = ShieldedDigests::sapling(
+            &spend_blobs,
+            anchor,
+            &output_blobs,
+            value_balance_sapling,
+            version >= 6,
+        );
 
         // Orchard: nActionsOrchard action records (820 bytes each), then (if any) flags(1),
         // valueBalance(8), anchor(32), proofs (CompactSize-prefixed), per-action sigs(64),
-        // binding sig(64).
+        // binding sig(64). The wire layout is identical for v5 and v6; only the *digest*
+        // formula differs (v6 excludes the anchor — ZIP 229 moves it to auth data — and uses
+        // a v6-specific personalization even when `nactions == 0`).
         let nactions = r.compact_size()? as usize;
         let mut action_blobs = Vec::with_capacity(nactions);
         for _ in 0..nactions {
             action_blobs.push(<[u8; 820]>::try_from(r.take(820)?).unwrap());
         }
-        let orchard_digest = if nactions > 0 {
+        let (orchard_flags, orchard_value_balance, orchard_anchor) = if nactions > 0 {
             let flags = r.take(1)?[0];
             let value_balance = r.u64()? as i64;
-            let o_anchor: [u8; 32] = r.take(32)?.try_into().unwrap();
+            let anchor: [u8; 32] = r.take(32)?.try_into().unwrap();
             let proof_len = r.compact_size()? as usize;
             r.take(proof_len)?;
             r.take(64 * nactions)?; // per-action spend auth sigs
             r.take(64)?; // binding sig
-            ShieldedDigests::orchard(&action_blobs, flags, value_balance, o_anchor)
+            (flags, value_balance, anchor)
         } else {
-            empty_digest(PERS_ORCHARD)
+            (0, 0, [0u8; 32])
+        };
+        let orchard_digest = if version >= 6 {
+            ShieldedDigests::orchard_v6(&action_blobs, orchard_flags, orchard_value_balance)
+        } else {
+            ShieldedDigests::orchard(
+                &action_blobs,
+                orchard_flags,
+                orchard_value_balance,
+                orchard_anchor,
+            )
+        };
+
+        // Ironwood (v6 only, ZIP 229): same record shape as Orchard, reusing OrchardAction.
+        let ironwood_digest = if version >= 6 {
+            let nactions = r.compact_size()? as usize;
+            let mut iw_blobs = Vec::with_capacity(nactions);
+            for _ in 0..nactions {
+                iw_blobs.push(<[u8; 820]>::try_from(r.take(820)?).unwrap());
+            }
+            let (flags, value_balance) = if nactions > 0 {
+                let flags = r.take(1)?[0];
+                let value_balance = r.u64()? as i64;
+                r.take(32)?; // anchorIronwood (auth data in v6, excluded from the digest)
+                let proof_len = r.compact_size()? as usize;
+                r.take(proof_len)?;
+                r.take(64 * nactions)?; // per-action spend auth sigs
+                r.take(64)?; // binding sig
+                (flags, value_balance)
+            } else {
+                (0, 0)
+            };
+            Some(ShieldedDigests::ironwood_v6(
+                &iw_blobs,
+                flags,
+                value_balance,
+            ))
+        } else {
+            None
         };
 
         if r.remaining() != 0 {
@@ -695,6 +908,7 @@ impl ParsedTx {
         }
 
         Ok(ParsedTx {
+            version,
             consensus_branch_id,
             lock_time,
             expiry_height,
@@ -702,25 +916,47 @@ impl ParsedTx {
             vout,
             sapling_digest,
             orchard_digest,
+            ironwood_digest,
         })
     }
 
     /// The transaction id.
     pub fn txid(&self) -> [u8; 32] {
+        let version_bytes = if self.version >= 6 {
+            V6_VERSION_BYTES
+        } else {
+            V5_VERSION_BYTES
+        };
+        let version_group_id = if self.version >= 6 {
+            V6_VERSION_GROUP_ID
+        } else {
+            NU5_VERSION_GROUP_ID
+        };
         let header = header_digest(
-            V5_VERSION_BYTES,
-            NU5_VERSION_GROUP_ID,
+            version_bytes,
+            version_group_id,
             self.consensus_branch_id,
             self.lock_time,
             self.expiry_height,
         );
-        combine_txid(
-            header,
-            transparent_digest(&self.vin, &self.vout),
-            self.sapling_digest,
-            self.orchard_digest,
-            self.consensus_branch_id,
-        )
+        let transparent = transparent_digest(&self.vin, &self.vout);
+        match self.ironwood_digest {
+            Some(ironwood) => combine_txid_v6(
+                header,
+                transparent,
+                self.sapling_digest,
+                self.orchard_digest,
+                ironwood,
+                self.consensus_branch_id,
+            ),
+            None => combine_txid(
+                header,
+                transparent,
+                self.sapling_digest,
+                self.orchard_digest,
+                self.consensus_branch_id,
+            ),
+        }
     }
 }
 
@@ -1205,6 +1441,12 @@ mod tests {
             script_code: h.redeem_script(),
         }];
         verify_htlc_spend(&tx, 0, &sig_inputs, &h.redeem_script()).unwrap();
+
+        // `ParsedTx::parse` (used by `find_spend`/`htlc_output` on a counterparty's raw tx)
+        // must recompute the exact same txid for a v6 transaction we built ourselves.
+        let parsed = ParsedTx::parse(&tx.serialize()).unwrap();
+        assert_eq!(parsed.version, 6);
+        assert_eq!(parsed.txid(), tx.txid());
     }
 
     #[test]

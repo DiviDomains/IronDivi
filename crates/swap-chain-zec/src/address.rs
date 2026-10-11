@@ -177,4 +177,31 @@ mod tests {
         assert_eq!(&spk2[2..22], &h2);
         assert_eq!(spk2[22], OP_EQUAL);
     }
+
+    /// Cross-check against `docs/plans/swap-poc/funding.md`: the taker-btc / maker-btc
+    /// swap keys (same pubkey, reused across chains per that decision) must derive the
+    /// exact `tm…` addresses the orchestrator funded on Zcash testnet. If this ever fails,
+    /// stop and report it — it means our P2PKH derivation disagrees with
+    /// `tools/swap-poc/derive-addrs.py`'s and funded TAZ would be unspendable by us.
+    #[test]
+    fn funding_table_addresses_match() {
+        let taker_btc_pubkey: [u8; 33] =
+            hex::decode("03a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f5")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let maker_btc_pubkey: [u8; 33] =
+            hex::decode("02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(
+            TransparentAddress::p2pkh(&taker_btc_pubkey).encode(),
+            "tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk"
+        );
+        assert_eq!(
+            TransparentAddress::p2pkh(&maker_btc_pubkey).encode(),
+            "tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn"
+        );
+    }
 }

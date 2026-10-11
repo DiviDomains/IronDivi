@@ -26,7 +26,9 @@ use divi_swap::{
 };
 
 use address::TransparentAddress;
-use grpc::{ClientError, CompactBlock, LightwalletdClient, RetryPolicy};
+use grpc::{ClientError, CompactBlock, LightwalletdClient};
+
+pub use grpc::RetryPolicy;
 
 type Result<T> = std::result::Result<T, SwapError>;
 
@@ -114,6 +116,16 @@ impl ZecBackend {
         &self.address
     }
 
+    /// Confirmed balance (sum of `GetAddressUtxos`) in zatoshi.
+    pub async fn balance_zatoshi(&self) -> Result<u64> {
+        let utxos = self
+            .client
+            .address_utxos(&self.address.encode())
+            .await
+            .map_err(SwapError::from)?;
+        Ok(utxos.iter().map(|u| u.value_zat as u64).sum())
+    }
+
     /// Read fresh from `GetLightdInfo` every call — never hard-coded, per the brief (a
     /// network upgrade changes it without warning).
     async fn consensus_branch_id(&self) -> Result<u32> {
@@ -184,12 +196,7 @@ fn spend_in_block(
 #[async_trait]
 impl ChainBackend for ZecBackend {
     fn chain(&self) -> Chain {
-        // `divi_swap::types::Chain` doesn't have a `Zec` variant yet (wave 1e, the
-        // orchestrator's job — see `- decisions:` in status/zec.md). `Btc` is the closest
-        // placeholder (same P2SH/CLTV/ECDSA-secp256k1 shape); nothing consumes this value yet
-        // since wave 2 engine wiring for zec hasn't started. One-line fix once `Chain::Zec`
-        // lands.
-        Chain::Btc
+        Chain::Zec
     }
 
     fn pubkey(&self) -> [u8; 33] {
@@ -538,6 +545,48 @@ mod tests {
         assert!(mtp > 1_700_000_000, "median time past {mtp}");
         let info = backend.consensus_branch_id().await.unwrap();
         assert!(info > 0, "consensus branch id {info:#x}");
+        println!("testnet.zec.rocks: tip={tip} mtp={mtp} consensus_branch_id={info:#010x}");
+    }
+
+    /// Diagnostic only (not part of the acceptance surface): what transaction version is
+    /// actually on-chain right now, post-NU6.3/NU7? We only ever build v5; if the network
+    /// requires v6 for everything (not just transactions touching the new Ironwood pool),
+    /// our transparent-only transactions would be rejected.
+    #[tokio::test]
+    #[ignore = "diagnostic: needs network access to testnet.zec.rocks"]
+    async fn probe_live_tx_version() {
+        let sk = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let backend = ZecBackend::testnet(sk, FeePolicy::default()).unwrap();
+        let tip = backend.client.latest_block().await.unwrap().height;
+        let blocks = backend
+            .client
+            .block_range(tip.saturating_sub(2000), tip)
+            .await
+            .unwrap();
+        let mut seen = 0;
+        for b in &blocks {
+            for t in &b.vtx {
+                let txid: [u8; 32] = t.txid.clone().try_into().unwrap();
+                if let Some(raw) = backend.client.get_transaction(&txid).await.unwrap() {
+                    let version_bytes = u32::from_le_bytes(raw.data[0..4].try_into().unwrap());
+                    println!(
+                        "height={} index={} txid={} version_bytes={version_bytes:#010x} (version {}) len={} vin_in_compact={} raw_head={}",
+                        b.height,
+                        t.index,
+                        hex::encode(&t.txid),
+                        version_bytes & 0x7fff_ffff,
+                        raw.data.len(),
+                        t.vin.len(),
+                        hex::encode(&raw.data[..raw.data.len().min(80)])
+                    );
+                    seen += 1;
+                    if seen > 30 {
+                        return;
+                    }
+                }
+            }
+        }
+        println!("total txs seen across scanned range: {seen}");
     }
 
     #[cfg(feature = "live")]
