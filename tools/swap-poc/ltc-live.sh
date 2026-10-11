@@ -281,7 +281,8 @@ run_direction() {
   if [[ "$backend" == live ]]; then
     taker+=(--divi-key "$(ref taker-divi)" --ltc-key "$taker_ltc_ref")
     if [[ "$direction" == reverse ]]; then
-      taker+=(--divi-wallet "$(dirname "$scen_state")/ltc-taker-divi-wallet.json")
+      # Same key as e2e.sh's taker, so share its already-scanned wallet (never run both at once).
+      taker+=(--divi-wallet "$(dirname "$scen_state")/taker-divi-wallet.json")
     fi
   fi
 
