@@ -19,6 +19,8 @@ members = [
     "crates/swap-chain-ltc",
     "crates/swap-chain-zec",
     "crates/swap-chain-evm",
+    "crates/swap-adaptor",
+    "crates/swap-chain-xmr",
     "bin/divi-swapd",
     "bin/divi-swap",
     "tests/integration-tests",
