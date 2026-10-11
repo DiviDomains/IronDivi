@@ -103,3 +103,25 @@ Plan Wave 3 step 4's promo-page "Status" line: not applicable — no promo page 
   taker `tb1qa826…hpg` 7 UTXOs 102,003 sats (fee 1,036) → `3b4facaae41f13e2db52915c63ec98ad27eab68ab0871a4994f536c545bc7eb1`;
   maker `tb1quqkt…zrt` 6 UTXOs 88,332 sats (fee 900) → `1d80be5d3c25adef1d04961cff1d02779087c9c0b205ea2f53ea18273b2f2bc1`.
   Returned 188,399 of 197,253 sats; the rest went to testnet fees over ~20 swaps and proofs.
+
+## Reverse direction — taker sells DIVI for BTC (offer `btc-divi-testnet`), done 2026-10-10
+Bert, 2026-10-10: "add the reverse direction, sell divi for btc". Plan `reverse-direction.md`; `Direction::TakerPaysDivi`,
+same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
+- Lanes rev-engine, rev-cli, rev-tools landed on `main` (`4ae2ed8`); `check-rev-{engine,cli,tools}.sh` PASS; CI green
+  on `4ae2ed8`, `161c761`, `2cab93b`.
+- Deployed: dnsdivi `divi-swapd` v0.2.5 from `4ae2ed8` offers both `divi-btc-testnet` and `btc-divi-testnet`
+  (`deploy.sh` appends the reverse offer to an existing config once); the forward swaps still load as Done.
+- Live, through the deployed maker (`check-rev-live.sh` PASS, all 8 txids confirmed; status/rev-live.md):
+  - Happy, 300 tDIVI → 10,000 sats, swap `e6c45f05…` / maker `d1a89c48…`, Done/Done:
+    DIVI lock `3747b6ff4af9efdbf9bf5705124cc38c3859d78a3df7ff2b8ca39dadf74dfbab`,
+    BTC lock `ceb4005ba73c1087e3d20bdaa70998f3646ff6e26feb6a825b84ff642a7a1e39`,
+    BTC claim (taker) `f2d7a3b2cba490a698f3c10dfcdd7b787b5b61dbc603b410f01fe0305ca73c93`,
+    DIVI claim (maker, preimage read from the BTC spend) `130dd4b512a0eba0ab392890513c5e638c83b0ff0ecbc34c3183031c61923d13`.
+  - Case C, swap `643682e4…` / maker `5cb25549…`, Done/Done; taker never claims:
+    DIVI lock `aa45b212101f5686005db2bbc7d205cb6cab3a4e56be680350545e5b84b68152`,
+    BTC lock `f1da64e17d6ddc9bc58f0ca0ce06a73788d7b4b885c060452726b14234bd83a3`,
+    BTC refund (maker, after 3 h) `13e030b56b2311fe07d799a9e77a73bd6fbcc1579880ec4ff7629bb37e204114`,
+    DIVI refund (taker, after 6 h) `ac3bab46e1ba29e3b56c702822e02370b17254987be7e244d341f71514028260`.
+- Balances kept for reuse (no sweeps — Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"):
+  maker BTC `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt` 121,266 sats; taker BTC `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
+  9,722 sats; taker DIVI `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` 1,699.99273 tDIVI.
