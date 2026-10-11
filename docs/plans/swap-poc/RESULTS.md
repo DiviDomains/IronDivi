@@ -128,7 +128,7 @@ same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
     BTC claim (taker, 2398 s before the maker timeout) `7d205f3dbeed7adb4b450983a4ed283e71e5356f69bbddcf2cd3165672cbdb7e`,
     DIVI claim (maker) `4d33760060025b919576d275895c9b1e26a23cb5e6601e322d51311b43484536`.
 - Staking: in the reverse direction the maker locks BTC and never DIVI, so its staking coins are never selected.
-- Chaos on live testnets (status/rev-chaos.md): crash at every persisted state PASS 2026-10-11, swap `e3ae6ba2…`, DIVI lock `b33c193a…`, BTC lock `7a296b06…`, BTC claim `4bda4c8d…`, DIVI claim `2e299287…`; RPC outage, Esplora 429 and refund scenarios running.
+- Chaos on live testnets (status/rev-chaos.md): crash at every persisted state PASS 2026-10-11, swap `e3ae6ba2…`, DIVI lock `b33c193a…`, BTC lock `7a296b06…`, BTC claim `4bda4c8d…`, DIVI claim `2e299287…`; DIVI RPC 502 outage PASS (swap `034a66db…`, DIVI claim `123e1908…`); Esplora 429 and refund running.
 - Balances kept for reuse (no sweeps — Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"):
   maker BTC `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt` 121,266 sats; taker BTC `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
   9,722 sats; taker DIVI `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` 1,699.99273 tDIVI.

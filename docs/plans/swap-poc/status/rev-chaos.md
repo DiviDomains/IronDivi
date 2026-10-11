@@ -23,6 +23,15 @@ maker_locked, maker_lock_confirmed, taker_claimed, maker_claimed; every restart 
 | taker BTC claim | 4bda4c8d2984970d13f6951a4354a16468a42544be88b7fddc385bf4232aa639 |
 | maker DIVI claim (preimage from the BTC spend) | 2e2992878de1e7d1edac2d8b08aacf455463dd6987990684b32b78829460a05e |
 
-## rpc_outage (DIVI RPC 502) — running
-## esplora_429 (Esplora 429 + Retry-After) — pending
+## rpc_outage (DIVI RPC 502 for 330 s, 13:34:56–13:40:26) — PASS
+Swap `034a66db-1b89-4f19-9573-e82e35ae7a38` (taker `50fec34e…`), daemon retried through the outage, Done.
+
+| leg | txid |
+|---|---|
+| taker DIVI lock | 93b125b848a9987e3917fcb06e4f2aa7e91536a6c9f1f6cc0164c0474da03c6a |
+| maker BTC lock | ee12c94f884883987692a661149b6e5fa747b100c0ed75de32de24c399f45b35 |
+| taker BTC claim | a533a88de3aeda47149935a4bcf7356f55aa5646b45846410f0687792a7448b0 |
+| maker DIVI claim | 123e19083abbc2d119039e2c8d1d3f926ecd92a32e4f773392265098fe5b726f |
+
+## esplora_429 (Esplora 429 + Retry-After) — running
 ## refund (maker killed in maker_refundable) — pending
