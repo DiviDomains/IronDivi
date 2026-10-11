@@ -627,10 +627,32 @@ key = "credential:btc"
         assert_eq!(l.key, "credential:maker-btc");
         assert!(c.zec.is_some() && !c.serves(Chain::Zec));
         assert!(c.usdc.is_none(), "wave 4 does not touch usdc");
-        // The appended offers match the mock ones, so local mock runs mirror dnsdivi.
+        // The appended offers match the mock ones, so local mock runs mirror dnsdivi —
+        // except ltc-divi-testnet's max_btc_sats, deliberately capped to the maker's live
+        // tLTC balance (wave4-offers.toml) rather than the mock's generic ceiling: that cap
+        // must only ever be tighter, never looser.
         for o in mock_counter_offers() {
             let e = c.offer_entries.iter().find(|e| e.offer.id == o.id).unwrap();
-            assert_eq!(e.offer, o, "{}", o.id);
+            if o.id == "ltc-divi-testnet" {
+                assert!(
+                    e.offer.max_btc_sats <= o.max_btc_sats,
+                    "{}: live cap {} exceeds the mock ceiling {}",
+                    o.id,
+                    e.offer.max_btc_sats,
+                    o.max_btc_sats
+                );
+                assert_eq!(
+                    Offer {
+                        max_btc_sats: o.max_btc_sats,
+                        ..e.offer.clone()
+                    },
+                    o,
+                    "{}",
+                    o.id
+                );
+            } else {
+                assert_eq!(e.offer, o, "{}", o.id);
+            }
         }
         c.swap_config().unwrap();
     }

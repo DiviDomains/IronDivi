@@ -31,6 +31,9 @@ max_btc_sats = 10000000             # 0.1 LTC
 # Maker buys DIVI with LTC: the maker locks LTC. Off until the maker LTC address above holds
 # at least max_btc_sats + fees: the maker selects coins only after the taker's DIVI lock
 # confirms, so an unfunded maker would leave the taker's DIVI locked until its 6 h refund.
+# max_btc_sats = maker's tLTC balance minus a 5,000 litoshi fee buffer (orchestrator,
+# 2026-10-11: maker held 299,861 litoshi before the live reverse run in progress then).
+# Re-check the maker's balance and lower this again before raising `enabled`.
 [[offers]]
 id = "ltc-divi-testnet"
 direction = "taker_pays_divi"
@@ -38,7 +41,7 @@ counter_chain = "ltc"
 enabled = false
 divi_sats_per_btc = 1000000000000
 min_btc_sats = 100000
-max_btc_sats = 10000000
+max_btc_sats = 294861
 
 [[offers]]
 id = "divi-zec-testnet"

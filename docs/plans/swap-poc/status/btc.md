@@ -1,17 +1,19 @@
 # btc lane status
 
 - note (orchestrator, 2026-10-11): the btc lane no longer exists; `crates/swap-chain-btc` is
-  now maintained by lane `ltc`. Fix landed: `build_funding_tx`'s coin-selection `needed` was
-  seeded to `0` and only updated inside the loop, so a coin list with zero UTXOs at all (not
-  just too few sats) left `total(0) < needed(0)` wrongly false and fell through to
-  `needed - amount`, underflowing — the same bug the ltc lane's live dry run caught in its
-  own copy of this logic (`crates/swap-chain-ltc/src/tx.rs`, copied from here originally).
-  A prior quick patch here (`chosen.is_empty() || total < needed`) masked the panic without
-  fixing the root cause; replaced with the proper fix (seed `needed` from the zero-input fee
-  estimate before the loop), matching the ltc crate exactly. The pre-existing regression test
-  `funding_from_empty_wallet_is_insufficient_funds` still covers it (so no duplicate test was
-  added). `cargo fmt`/`clippy -D warnings`/`test -p swap-chain-btc --all-features` all green
-  (17 passed, 1 ignored).
+  now maintained by lane `ltc`. Change landed: `build_funding_tx`'s coin-selection `needed`
+  was seeded to `0` and only updated inside the loop, so a coin list with zero UTXOs at all
+  left `needed` at `0` too — in `swap-chain-ltc`'s copy of this logic (copied from here
+  originally) that caused a live underflow panic (the ltc lane's live dry run caught it).
+  **Here it was already handled**: an existing explicit `chosen.is_empty() || total < needed`
+  guard caught the zero-UTXO case before the later `needed - amount` subtraction could ever
+  underflow, and `funding_from_empty_wallet_is_insufficient_funds` already regression-tested
+  it — so this was not a live bug in `swap-chain-btc`, just an inconsistency with the ltc fix.
+  Replaced the explicit guard with the same seeding approach as `swap-chain-ltc` (seed
+  `needed` from the zero-input fee estimate before the loop) so both crates' coin-selection
+  reads the same way; no behavior change, same pre-existing test still covers it (so no
+  duplicate test was added). `cargo fmt`/`clippy -D warnings`/`test -p swap-chain-btc
+  --all-features` all green (17 passed, 1 ignored).
 - done: BtcBackend (ChainBackend) — Esplora client (backoff, 429 Retry-After, secondary fallback), P2WPKH funding with coin selection + change, P2WSH claim/refund, libbitcoinconsensus verification of every built tx, find_spend (outspend, block-scan fallback), broadcast classification; 15 wiremock unit tests green; fmt + clippy -D warnings clean; live_fund_claim_refund written (feature `live`, #[ignore])
 - running: nothing
 - broken: nothing

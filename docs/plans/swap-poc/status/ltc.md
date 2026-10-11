@@ -65,25 +65,40 @@
       end-to-end on `--backend mock` after this refactor: still accepts, still stops before
       lock, daemons still tear down cleanly (no leaked process/port).
   - **Wave 3d** (this session): the btc lane no longer exists, so `crates/swap-chain-btc`
-    is now this lane's too (orchestrator). Ported the Wave 3a fix there: `build_funding_tx`
-    had the identical `needed`-seeded-to-0 underflow, masked (not fixed) by a prior quick
-    patch (`chosen.is_empty() || total < needed`) rather than the root-cause fix. Replaced
-    it with the same fix as `swap-chain-ltc` (seed `needed` from the zero-input fee estimate
-    before the loop). The pre-existing regression test
-    `funding_from_empty_wallet_is_insufficient_funds` already covered this case, so no
-    duplicate test was added (an initial port of `funding_fails_cleanly_with_no_utxos_at_all`
-    was removed once that overlap was spotted). `cargo fmt`/`clippy -D warnings`/`test
+    is now this lane's too (orchestrator). Ported the Wave 3a change there: `build_funding_tx`
+    had the identical `needed`-seeded-to-0 pattern, but **it was not a live bug in btc** — an
+    existing explicit `chosen.is_empty() || total < needed` guard already caught the
+    zero-UTXO case before the later subtraction could underflow, and
+    `funding_from_empty_wallet_is_insufficient_funds` already regression-tested it.
+    (Corrected after the orchestrator flagged the wording here first said it was a bug —
+    see `status/btc.md` for the corrected note.) Replaced the explicit guard with the same
+    `needed`-seeding approach as `swap-chain-ltc`, so both crates' coin-selection reads the
+    same way; a pure consistency refactor, no behavior change. No duplicate test added (an
+    initial port of `funding_fails_cleanly_with_no_utxos_at_all` was removed once the
+    overlap with the existing test was spotted). `cargo fmt`/`clippy -D warnings`/`test
     --all-features` clean for both `swap-chain-btc` (17 passed, 1 ignored) and
-    `swap-chain-ltc`. Noted in `status/btc.md` too.
+    `swap-chain-ltc`.
   - Live progress (orchestrator, from the Mac): taker→maker funding send (`ltc_send.rs`)
     succeeded; **the forward happy-path swap then ran live and completed** — LTC lock
     `2e28ead1…`, LTC claim `cef1dc11…`. Maker now holds ≈0.003 tLTC (received minus its
     HTLC leg so far), taker still holds the remainder of its 0.01 tLTC. Reverse direction
     should be fundable/runnable now; txids/confirmations not yet pasted here — orchestrator.
+  - **Wave 4 offers** (this session): `deploy/divi-swapd/wave4-offers.toml`'s
+    `ltc-divi-testnet` offer (maker sells LTC) had `max_btc_sats = 10_000_000` (0.1 tLTC) —
+    far more than the maker actually holds. Set it to `294_861` (maker's live balance,
+    299,861 litoshi per the orchestrator, minus a 5,000 litoshi fee buffer); still
+    `enabled = false` (not asked to flip it, and the comment above the offer already
+    documents the condition for doing so). This broke
+    `config::tests::wave4_snippet_on_the_deployed_config` in `bin/divi-swapd/src/config.rs`,
+    which asserted the deployed snippet's offers are byte-for-byte identical to
+    `mock_counter_offers()`'s generic ones — no longer true now that this one field is
+    deliberately balance-capped. Fixed the test to special-case `max_btc_sats` for
+    `ltc-divi-testnet` (assert the live cap is `<=` the mock ceiling, compare every other
+    field exactly) instead of relaxing the assertion generally.
   - All of: `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`,
     `cargo test` clean for `swap-chain-ltc` (33 tests, 2 `#[ignore]`), `swap-chain-btc`
-    (17 tests, 1 `#[ignore]`), `divi-swapd`, `divi-swap-cli`. `tools/swap-poc/check-ltc.sh`
-    and `check-ltc-live.sh` both PASS.
+    (17 tests, 1 `#[ignore]`), `divi-swapd` (11 lib + 27 integration tests),
+    `divi-swap-cli`. `tools/swap-poc/check-ltc.sh` and `check-ltc-live.sh` both PASS.
 - running: nothing further queued; idle until the orchestrator lands this or the next live
   result (reverse direction, case-c either direction) comes in.
 - left / next steps:
