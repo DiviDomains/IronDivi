@@ -140,3 +140,18 @@
      `$state/results.txt` into this file once the printed txids confirm.
   No code changes are expected to be needed for step 2 — everything it calls already
   passes against anvil.
+- **Wave 4** (this seam): `tools/swap-poc/usdc-live-dry-run.sh` — the anvil-backed proof
+  that `usdc-live.sh` itself will work, with no secrets and no real network writes (safe
+  anywhere, including hp2; run twice while writing it, both clean, exit 0). Spins up its
+  own anvil, deploys a `MockErc20` (stands in for Sepolia USDC — nothing is deployed at the
+  real USDC address on a fresh local chain) minted to a throwaway key, then runs the exact
+  `sepolia_ops deploy`/`send-eth`/`send-usdc` commands `usdc-live.sh` runs, then
+  `cargo test -p swap-chain-evm` (the anvil equivalent of `live_sepolia_lock_claim`, which
+  can't itself run against anvil — it hardcodes the real Sepolia USDC address) and
+  `cargo test -p divi-swap --test usdc` (a full DIVI<->USDC swap, both directions, proving
+  the swap logic end to end). Scope boundary, stated in the script's own header: this
+  proves the swap logic through the engine directly, not through the `divi-swapd`/
+  `divi-swap` CLI *binaries* wired together over HTTP — doing that too would need the dry
+  run to drive anvil's block production in lockstep with the daemon's confirmation polling
+  from a second process, which `tests/usdc.rs` already does under full control inside one
+  process (same boundary `e2e.sh` documents for its own `--backend mock`).
