@@ -30,3 +30,6 @@ multiexp = { version = "0.4", features = ["batch"] }
 # two incompatible copies of multiexp::BatchVerifier in one build. Pin the last version
 # before that widening so the whole tree agrees on 0.4.x.
 schnorr-signatures = "=0.5.2"
+curve25519-dalek = "4"
+monero-wallet = "0.2"
+zeroize = { workspace = true }

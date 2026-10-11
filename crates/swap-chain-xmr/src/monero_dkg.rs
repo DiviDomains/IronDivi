@@ -37,18 +37,16 @@
 mod tests {
     use ciphersuite::group::ff::PrimeField;
     use ciphersuite::Ed25519;
-    use dkg::{Participant, ThresholdParams};
+    use dkg::{Participant, ThresholdKeys, ThresholdParams};
     use dkg_pedpop::KeyGenMachine;
     use rand_core::OsRng;
     use std::collections::HashMap;
+    use zeroize::Zeroizing;
 
     const CONTEXT: [u8; 32] = *b"IronDivi xmr lane PedPoP test   ";
 
-    /// Run the full 2-of-2 PedPoP round trip and confirm both parties end up with
-    /// [`dkg::ThresholdKeys`] that agree on the shared group (public) key, while each
-    /// holding a secret share that individually cannot reconstruct it.
-    #[test]
-    fn two_of_two_pedpop_round_trip_produces_matching_keys() {
+    /// Run the full 2-of-2 PedPoP round trip, returning both parties' resulting keys.
+    fn pedpop_2_of_2() -> (ThresholdKeys<Ed25519>, ThresholdKeys<Ed25519>) {
         let party_a = Participant::new(1).unwrap();
         let party_b = Participant::new(2).unwrap();
 
@@ -85,14 +83,48 @@ mod tests {
             .unwrap()
             .complete();
 
-        // Both parties agree on the shared (group) public key -- the "2-of-2 Monero
-        // spend public key" the swap's lock output would use.
-        assert_eq!(keys_a.group_key(), keys_b.group_key());
+        (keys_a, keys_b)
+    }
 
-        // But each holds a *different* secret share -- neither alone is the spend key.
+    /// Both parties agree on the shared (group) public key -- the "2-of-2 Monero spend
+    /// public key" the swap's lock output would use -- while each holds a *different*
+    /// secret share, so neither alone is the spend key.
+    #[test]
+    fn two_of_two_pedpop_round_trip_produces_matching_keys() {
+        let (keys_a, keys_b) = pedpop_2_of_2();
+        assert_eq!(keys_a.group_key(), keys_b.group_key());
         assert_ne!(
             keys_a.original_secret_share().to_repr(),
             keys_b.original_secret_share().to_repr()
         );
+    }
+
+    /// Step 5b, first slice: the group key the PedPoP round trip produces bridges
+    /// directly into `monero-wallet`'s own Ed25519 point type (`ciphersuite::Ed25519`'s
+    /// `G` is `dalek_ff_group::EdwardsPoint`, a public-field wrapper around
+    /// `curve25519_dalek::EdwardsPoint` -- the exact type `monero_wallet::ed25519::Point`
+    /// converts from), and from there into a real Monero stagenet address — the address
+    /// the swap's lock output would actually pay XMR to.
+    ///
+    /// The view key is a simplification: a real 2-of-2 multisig conventionally shares the
+    /// view key in the clear between both parties (only the spend key needs threshold
+    /// protection, since knowing the view key alone only lets you *see* funds, not spend
+    /// them) rather than generating it independently per party as done here.
+    #[test]
+    fn group_key_derives_a_real_stagenet_address() {
+        let (keys_a, keys_b) = pedpop_2_of_2();
+
+        let spend_point = monero_wallet::ed25519::Point::from(keys_a.group_key().0);
+        let view_key = Zeroizing::new(monero_wallet::ed25519::Scalar::random(&mut OsRng));
+        let view_pair = monero_wallet::ViewPair::new(spend_point, view_key).unwrap();
+        let address = view_pair.legacy_address(monero_wallet::address::Network::Stagenet);
+
+        // Both parties' view of the group key must produce the identical address --
+        // this is the address the maker/taker agree the swap's XMR lock pays into.
+        let spend_point_b = monero_wallet::ed25519::Point::from(keys_b.group_key().0);
+        assert_eq!(spend_point, spend_point_b);
+
+        let rendered = address.to_string();
+        assert!(!rendered.is_empty());
     }
 }
