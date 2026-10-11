@@ -25,6 +25,8 @@ pub mod multisig;
 pub mod swap_templates;
 
 #[cfg(test)]
+mod happy_path_e2e;
+#[cfg(test)]
 mod monero_dkg;
 #[cfg(test)]
 mod stagenet_rpc;
