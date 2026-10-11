@@ -15,7 +15,8 @@ UMask=0077
 # Keys: root:root 0400 files, exposed to the service only via $CREDENTIALS_DIRECTORY.
 LoadCredential=maker-divi:/etc/divi-swapd/credentials/maker-divi
 LoadCredential=maker-btc:/etc/divi-swapd/credentials/maker-btc
-LoadCredential=maker-ltc:/etc/divi-swapd/credentials/maker-ltc
+# Enable once /etc/divi-swapd/credentials/maker-ltc exists: a missing file fails the unit (243/CREDENTIALS).
+#LoadCredential=maker-ltc:/etc/divi-swapd/credentials/maker-ltc
 Restart=on-failure
 RestartSec=5
 ProtectSystem=strict
