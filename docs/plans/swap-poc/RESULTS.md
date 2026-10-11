@@ -144,3 +144,14 @@ same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
 - Balances kept for reuse (no sweeps — Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"):
   maker BTC `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt` 121,266 sats; taker BTC `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
   9,722 sats; taker DIVI `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` 1,699.99273 tDIVI.
+
+## Multi-coin: LTC ↔ DIVI on live testnets (Litecoin testnet4 + DIVI testnet)
+
+Explorers: `https://litecoinspace.org/testnet/tx/<txid>`, `https://services.divi.domains/testnet/explorer/tx/<txid>`.
+
+- Forward happy path (taker pays LTC, gets DIVI; local maker, `ltc-live.sh --backend live --scenario happy
+  --direction forward`, 300,000 litoshi), swap `d41cf878…`, taker Done / maker Done, 2026-10-11:
+    LTC lock (taker) `2e28ead136e49658a9c1f57e98a2397c6d4f521fb36109bd794177f7a4ffc42c`,
+    DIVI lock (maker) `80ad9c72274fa8fb449f5cd68a5ee604474aa0bda4e802b62c20a6bb2fd76d13`,
+    DIVI claim (taker) `d96e6d1cf054da8a0bb9f00bb982bb82d2cd945451d40c2ac4ea55b970ef96dc`,
+    LTC claim (maker, preimage read from the DIVI spend) `cef1dc11c1fa6a303b1a2efda23de953bc9b082b6174380effb976cb950fa3dd`.
