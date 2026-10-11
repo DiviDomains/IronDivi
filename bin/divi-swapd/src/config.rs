@@ -77,19 +77,51 @@ pub struct LtcSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsdcSection {
-    /// EVM JSON-RPC URL (Sepolia, Base Sepolia, or an anvil instance in tests).
-    pub rpc_url: String,
+    /// Which EVM testnet this backend runs on: `"sepolia"` (default) or `"base-sepolia"`
+    /// (`swap_chain_evm::UsdcNetwork`). Only a label plus a source of defaults for
+    /// `rpc_url`/`token` below when they are left unset — the backend itself is
+    /// network-agnostic, so setting both explicitly works on any EVM chain regardless of
+    /// `network`. A single `[usdc]` section (and so a single `Chain::Usdc` backend) serves
+    /// one network at a time; running both concurrently needs a second counter chain.
+    #[serde(default = "default_usdc_network")]
+    pub network: String,
+    /// EVM JSON-RPC URL. Defaults to a free public endpoint for `network`.
+    pub rpc_url: Option<String>,
     /// Deployed `Erc20Htlc` contract address.
     pub htlc: String,
-    /// ERC-20 (USDC) token address. Defaults to Circle's Sepolia test USDC.
-    #[serde(default = "default_usdc_token")]
-    pub token: String,
+    /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `network`.
+    pub token: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's EVM key.
     pub key: String,
 }
 
-fn default_usdc_token() -> String {
-    swap_chain_evm::SEPOLIA_USDC.into()
+fn default_usdc_network() -> String {
+    swap_chain_evm::UsdcNetwork::Sepolia.as_str().into()
+}
+
+impl UsdcSection {
+    /// Parsed `network`, validated at config-load time by [`DaemonConfig::validate`].
+    pub fn network(&self) -> Result<swap_chain_evm::UsdcNetwork> {
+        self.network
+            .parse()
+            .map_err(|e| anyhow::anyhow!("[usdc].network: {e}"))
+    }
+
+    /// `rpc_url`, or `network`'s default public endpoint if unset.
+    pub fn rpc_url(&self) -> Result<String> {
+        Ok(match &self.rpc_url {
+            Some(u) => u.clone(),
+            None => self.network()?.default_rpc_url().to_string(),
+        })
+    }
+
+    /// `token`, or `network`'s USDC token address if unset.
+    pub fn token(&self) -> Result<String> {
+        Ok(match &self.token {
+            Some(t) => t.clone(),
+            None => self.network()?.usdc_token().to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,6 +421,9 @@ impl DaemonConfig {
             divi_swap::secrets::SecretRef::parse(r)
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;
         }
+        if let Some(u) = &self.usdc {
+            u.network()?;
+        }
         Ok(())
     }
 }
@@ -680,5 +715,58 @@ key = "credential:btc"
     fn rejects_raw_key_values() {
         let bad = GOOD.replace("op://v/i/f", "deadbeefdeadbeef");
         assert!(DaemonConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn usdc_network_defaults_to_sepolia_and_picks_its_rpc_and_token() {
+        let text = format!("{GOOD}\n[usdc]\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n");
+        let c = DaemonConfig::parse(&text).unwrap();
+        let u = c.usdc.unwrap();
+        assert_eq!(u.network, "sepolia");
+        assert_eq!(u.network().unwrap(), swap_chain_evm::UsdcNetwork::Sepolia);
+        assert_eq!(
+            u.rpc_url().unwrap(),
+            swap_chain_evm::UsdcNetwork::Sepolia.default_rpc_url()
+        );
+        assert_eq!(u.token().unwrap(), swap_chain_evm::SEPOLIA_USDC);
+    }
+
+    #[test]
+    fn usdc_network_base_sepolia_picks_its_own_rpc_and_token() {
+        let text = format!(
+            "{GOOD}\n[usdc]\nnetwork = \"base-sepolia\"\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let u = c.usdc.unwrap();
+        assert_eq!(
+            u.rpc_url().unwrap(),
+            swap_chain_evm::UsdcNetwork::BaseSepolia.default_rpc_url()
+        );
+        assert_eq!(u.token().unwrap(), swap_chain_evm::BASE_SEPOLIA_USDC);
+    }
+
+    #[test]
+    fn usdc_explicit_rpc_url_and_token_override_the_network_default() {
+        let text = format!(
+            "{GOOD}\n[usdc]\nnetwork = \"base-sepolia\"\nrpc_url = \"http://localhost:9999\"\n\
+             token = \"0x1111111111111111111111111111111111111111\"\nhtlc = \"0x00\"\n\
+             key = \"credential:usdc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let u = c.usdc.unwrap();
+        assert_eq!(u.rpc_url().unwrap(), "http://localhost:9999");
+        assert_eq!(
+            u.token().unwrap(),
+            "0x1111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn usdc_unknown_network_is_rejected_at_load_time() {
+        let text = format!(
+            "{GOOD}\n[usdc]\nnetwork = \"mainnet\"\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n"
+        );
+        let err = DaemonConfig::parse(&text).unwrap_err();
+        assert!(err.to_string().contains("[usdc].network"), "{err}");
     }
 }

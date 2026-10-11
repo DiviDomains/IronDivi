@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Live Sepolia USDC: deploy Erc20Htlc (idempotent — skip with --htlc), fund the maker key
-# with gas ETH and a little USDC, prove UsdcBackend live end to end
-# (live_sepolia_lock_claim), then run one real DIVI<->USDC swap: offer divi-usdc-sepolia
-# (maker sells DIVI, taker pays USDC — the direction fundable today; the maker holds no
-# USDC yet, see funding.md).
+# Live EVM USDC: deploy Erc20Htlc (idempotent — skip with --htlc), fund the maker key with
+# gas ETH and a little USDC, prove UsdcBackend live end to end (live_sepolia_lock_claim),
+# then run one real DIVI<->USDC swap: offer divi-usdc-<network> (maker sells DIVI, taker
+# pays USDC — the direction fundable today; the maker holds no USDC yet, see funding.md).
+# Runs against Ethereum Sepolia by default; pass --network base-sepolia to run the same
+# steps on Base Sepolia instead (same secp256k1 key, same Ethereum address on either chain
+# — only the RPC endpoint, HTLC deployment and USDC token address change).
 #
-#   tools/swap-poc/usdc-live.sh [--htlc 0x...] [--rpc-url URL] [--usdc-sats N] [--skip-fund]
+#   tools/swap-poc/usdc-live.sh [--network sepolia|base-sepolia] [--htlc 0x...] \
+#     [--rpc-url URL] [--usdc-sats N] [--skip-fund]
 #
 # Keys: reused from the BTC swap keys per docs/plans/swap-poc/funding.md (no new 1Password
 # items). `sepolia_ops` (crates/swap-chain-evm/examples/sepolia_ops.rs) takes a raw hex key
@@ -18,16 +21,19 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [--htlc 0x...] [--rpc-url URL] [--usdc-sats N] [--skip-fund]" >&2
+  echo "usage: $0 [--network sepolia|base-sepolia] [--htlc 0x...] [--rpc-url URL]" \
+    "[--usdc-sats N] [--skip-fund]" >&2
   exit 2
 }
 
+network="sepolia"
 htlc=""
-rpc_url="https://ethereum-sepolia-rpc.publicnode.com"
+rpc_url=""
 usdc_sats=100000000 # 1 USDC-equivalent in engine sats (1e8/coin); must be a multiple of 100
 skip_fund=""
 while (($#)); do
   case "$1" in
+    --network) network="${2:-}"; shift 2 || usage ;;
     --htlc) htlc="${2:-}"; shift 2 || usage ;;
     --rpc-url) rpc_url="${2:-}"; shift 2 || usage ;;
     --usdc-sats) usdc_sats="${2:-}"; shift 2 || usage ;;
@@ -45,12 +51,27 @@ die() { echo "usdc-live: $*" >&2; exit 1; }
 vault="op://global_secret_store"
 ref() { echo "$vault/IronDivi Swap POC - $1/password"; }
 
-# funding.md, 2026-10-11: EVM reuses the BTC swap keys (same secp256k1 pubkey).
+# Mirrors swap_chain_evm::UsdcNetwork (crates/swap-chain-evm/src/network.rs) — keep in sync.
+case "$network" in
+  sepolia)
+    default_rpc_url="https://ethereum-sepolia-rpc.publicnode.com"
+    usdc_token="0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+    ;;
+  base-sepolia)
+    default_rpc_url="https://sepolia.base.org"
+    usdc_token="0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+    ;;
+  *) die "--network must be sepolia or base-sepolia, got $network" ;;
+esac
+[[ -n "$rpc_url" ]] || rpc_url="$default_rpc_url"
+
+# funding.md, 2026-10-11: EVM reuses the BTC swap keys (same secp256k1 pubkey — the
+# Ethereum address derived from it is identical on every EVM chain, Sepolia or Base
+# Sepolia, since address derivation does not depend on chain id).
 taker_addr="0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C"
 maker_addr="0x995669a244d511542ca314e4068c754E3F555bd2"
-usdc_token="0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
 
-ops() { cargo run -q -p swap-chain-evm --features live --example sepolia_ops -- --rpc-url "$rpc_url" "$@"; }
+ops() { cargo run -q -p swap-chain-evm --features live --example sepolia_ops -- --network "$network" --rpc-url "$rpc_url" "$@"; }
 
 echo "usdc-live: preflight — can 1Password resolve the keys this run needs?"
 for k in taker-btc maker-btc maker-divi; do
@@ -102,13 +123,18 @@ if [[ -z "$skip_fund" ]]; then
   fi
 fi
 
-echo "usdc-live: live_sepolia_lock_claim (self-contained UsdcBackend sanity check)"
+case "$network" in
+  sepolia) lock_claim_test=live_sepolia_lock_claim; lock_claim_rpc_var=SWAP_EVM_SEPOLIA_RPC ;;
+  base-sepolia) lock_claim_test=live_base_sepolia_lock_claim; lock_claim_rpc_var=SWAP_EVM_BASE_SEPOLIA_RPC ;;
+esac
+echo "usdc-live: $lock_claim_test (self-contained UsdcBackend sanity check)"
 key_hex="$(op read "$(ref taker-btc)")"
-SWAP_EVM_TEST_KEY_HEX="$key_hex" SWAP_EVM_SEPOLIA_RPC="$rpc_url" \
-  cargo test -p swap-chain-evm --features live -- --ignored live_sepolia_lock_claim --nocapture
+SWAP_EVM_TEST_KEY_HEX="$key_hex" env "$lock_claim_rpc_var=$rpc_url" \
+  cargo test -p swap-chain-evm --features live -- --ignored "$lock_claim_test" --nocapture
 unset key_hex
 
-echo "usdc-live: real swap — offer divi-usdc-sepolia (maker sells DIVI for USDC)"
+offer_id="divi-usdc-$network"
+echo "usdc-live: real swap — offer $offer_id (maker sells DIVI for USDC)"
 state="${E2E_STATE_DIR:-$HOME/.local/state/iron-divi-swap-poc}/usdc-live"
 case "$state" in "$ROOT"/*) die "state dir must be outside the repo: $state" ;; esac
 mkdir -p "$state"
@@ -139,12 +165,13 @@ esplora_url = "https://mempool.space/testnet/api"
 key = "$(ref maker-btc)"
 
 [usdc]
+network = "$network"
 rpc_url = "$rpc_url"
 htlc = "$htlc"
 key = "$(ref maker-btc)"
 
 [[offers]]
-id = "divi-usdc-sepolia"
+id = "$offer_id"
 direction = "taker_pays_btc"
 counter_chain = "usdc"
 divi_sats_per_btc = 10000000000
@@ -180,11 +207,11 @@ done
 echo "usdc-live: daemon healthy at $base"
 
 taker=("$swap" --db "$state/taker.db" --backend live --counter-chain usdc \
-  --usdc-key "$(ref taker-btc)" --usdc-rpc-url "$rpc_url" --usdc-htlc "$htlc" \
-  --divi-key "$(ref taker-divi)")
+  --usdc-key "$(ref taker-btc)" --usdc-network "$network" --usdc-rpc-url "$rpc_url" \
+  --usdc-htlc "$htlc" --divi-key "$(ref taker-divi)")
 
 out="$state/taker-run.log"
-"${taker[@]}" run --maker "$base" --offer divi-usdc-sepolia --btc-sats "$usdc_sats" \
+"${taker[@]}" run --maker "$base" --offer "$offer_id" --btc-sats "$usdc_sats" \
   --timeout-secs 28800 2>&1 | tee "$out"
 local_id="$(tail -1 "$out" | awk '{print $1}')"
 [[ -n "$local_id" ]] || die "taker run printed no swap id"

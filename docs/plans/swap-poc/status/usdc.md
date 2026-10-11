@@ -155,3 +155,51 @@
   run to drive anvil's block production in lockstep with the daemon's confirmation polling
   from a second process, which `tests/usdc.rs` already does under full control inside one
   process (same boundary `e2e.sh` documents for its own `--backend mock`).
+- **Wave 5** (this seam): Base Sepolia (chain id 84532) added as a second EVM network next
+  to Sepolia, while Sepolia ETH funding is still pending. `UsdcBackend` itself needed no
+  change — it already only ever sees an RPC URL, an HTLC address and a token address, so it
+  was already network-agnostic; everything here is plumbing one layer up:
+  - `swap_chain_evm::UsdcNetwork` (new, `crates/swap-chain-evm/src/network.rs`): `Sepolia`
+    (default) or `BaseSepolia`, each with `usdc_token()`, `default_rpc_url()` (Sepolia:
+    publicnode; Base Sepolia: `https://sepolia.base.org`), `chain_id()` (11155111 / 84532,
+    informational only — alloy reads the real chain id from the RPC itself when signing),
+    `FromStr`/`Display` as `"sepolia"`/`"base-sepolia"`.
+  - `divi-swapd`'s `[usdc]` section gained `network` (default `"sepolia"`); `rpc_url` and
+    `token` are now optional and fall back to `network`'s defaults when unset, still
+    overridable explicitly either way. Bad `network` strings are rejected at config-load
+    time (`DaemonConfig::validate`), not at backend-start time. One `[usdc]` section is still
+    one `Chain::Usdc` backend — it serves one network at a time; relabelled offer ids are
+    just an operator-facing convention (`counter_chain` stays `"usdc"` regardless), noted in
+    a comment on `deploy/divi-swapd/divi-swapd.toml.example`.
+  - `divi-swap` CLI gained `--usdc-network` (same default/fallback behavior); `sepolia_ops`
+    gained `--network` (same). All three (`--network`/`--rpc-url`/`--token` on
+    `sepolia_ops`, and `[usdc].network`/`.rpc_url`/`.token` in the daemon config) resolve
+    the same way: explicit value wins, else the network's default.
+  - `tools/swap-poc/usdc-live.sh` gained `--network sepolia|base-sepolia`; it mirrors the
+    Rust defaults in a bash `case` (commented "keep in sync"), relabels the offer id
+    `divi-usdc-$network`, and switches which ignored live test it runs
+    (`live_sepolia_lock_claim` vs. the new `live_base_sepolia_lock_claim` —
+    `crates/swap-chain-evm/src/tests.rs`, same shape, `#[ignore]`, needs its own funded key
+    and is not run by anything today). EVM addresses are unchanged either way: Ethereum
+    address derivation from a secp256k1 key doesn't depend on chain id, so the same
+    taker/maker addresses from `funding.md` work on Base Sepolia too — only the RPC,
+    deployed HTLC address and USDC token address move.
+  - `tools/swap-poc/usdc-live-dry-run.sh` updated to pass `--network` through `sepolia_ops`
+    alongside its existing `--rpc-url`/`--token` overrides, proving the "network plus
+    explicit overrides" composition that `usdc-live.sh`'s funding step relies on. Re-run
+    clean, exit 0 (11 passed, 2 ignored — `live_sepolia_lock_claim` and the new
+    `live_base_sepolia_lock_claim`, correctly skipped by `cargo test`'s default filter).
+  - Mock tests added, no keys/network needed: `network::tests` (round trip, defaults,
+    distinct tokens/chain ids, rejects unknown names — `swap-chain-evm`); four
+    `UsdcSection`-resolution tests in `bin/divi-swapd/src/config.rs` (default-to-sepolia,
+    base-sepolia picks its own defaults, explicit override wins, unknown network rejected
+    at load time); five tests in `bin/divi-swap/src/main.rs` covering the same shape for
+    `--usdc-network` plus one proving `UsdcBackend::new` actually accepts both networks'
+    `default_rpc_url()` strings without any network access.
+  - No Base Sepolia funding exists yet (same blocked-on-human below) — `live_base_sepolia_lock_claim`
+    is written and ready but has never been run against the real network; Sepolia stays the
+    one usdc-live.sh actually exercises once funded.
+  - `cargo fmt`/`cargo clippy --workspace --all-targets -- -D warnings` both clean after this
+    seam (fmt reformatted `bin/divi-swap/src/main.rs` and `crates/swap-chain-evm/src/tests.rs`
+    on save; one clippy fix — `UsdcNetwork`'s manual `impl Default` replaced with
+    `#[derive(Default)]` + `#[default]` on `Sepolia`, clippy's own suggested fix).

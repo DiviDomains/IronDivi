@@ -252,3 +252,46 @@ async fn live_sepolia_lock_claim() {
     let state = client.swap_state(id).await.expect("swap_state");
     assert!(state.claimed);
 }
+
+/// Same as [`live_sepolia_lock_claim`], against Base Sepolia instead: needs Base Sepolia ETH
+/// for gas and Circle test USDC in the key's balance. Not run by `usdc-live.sh` today (no
+/// Base Sepolia funding exists yet, per `docs/plans/swap-poc/funding.md`); kept in sync with
+/// the Sepolia version so turning on Base Sepolia live needs no new test, only funding.
+#[cfg(feature = "live")]
+#[tokio::test]
+#[ignore]
+async fn live_base_sepolia_lock_claim() {
+    let key_hex = std::env::var("SWAP_EVM_TEST_KEY_HEX").expect("SWAP_EVM_TEST_KEY_HEX not set");
+    let rpc_url = std::env::var("SWAP_EVM_BASE_SEPOLIA_RPC").unwrap_or_else(|_| {
+        crate::UsdcNetwork::BaseSepolia
+            .default_rpc_url()
+            .to_string()
+    });
+    let key = PrivateKeySigner::from_str(key_hex.trim()).expect("bad SWAP_EVM_TEST_KEY_HEX");
+    let address = key.address();
+
+    let provider = connect_provider(&rpc_url, key).expect("connect");
+    let htlc_bytes = bytecode("Erc20Htlc").expect("build Erc20Htlc");
+    let htlc_address = deploy_contract(&provider, htlc_bytes)
+        .await
+        .expect("deploy Erc20Htlc");
+    let client = EvmHtlcClient::new(provider, address, htlc_address);
+
+    let token = Address::from_str(crate::BASE_SEPOLIA_USDC).expect("USDC address");
+    let amount = U256::from(1u64); // 0.000001 USDC (6 decimals) — smallest practical probe.
+    let preimage = B256::from(keccak256(b"live_base_sepolia_lock_claim"));
+    let hashlock = hashlock_for(preimage);
+    let timelock = future_timelock(3600);
+
+    let id = client
+        .lock(token, amount, address, hashlock, timelock)
+        .await
+        .expect("lock on Base Sepolia");
+    client
+        .claim(id, preimage)
+        .await
+        .expect("claim on Base Sepolia");
+
+    let state = client.swap_state(id).await.expect("swap_state");
+    assert!(state.claimed);
+}

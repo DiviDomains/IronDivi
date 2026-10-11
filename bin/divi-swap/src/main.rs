@@ -78,13 +78,17 @@ struct Cli {
     /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
     #[arg(long, global = true)]
     usdc_key: Option<String>,
-    /// EVM JSON-RPC URL (Sepolia, Base Sepolia, or an anvil instance in tests).
+    /// Which EVM testnet: `sepolia` (default) or `base-sepolia`. Only picks defaults for
+    /// `--usdc-rpc-url`/`--usdc-token` below when they are left unset.
+    #[arg(long, global = true, default_value = "sepolia")]
+    usdc_network: String,
+    /// EVM JSON-RPC URL. Defaults to a free public endpoint for `--usdc-network`.
     #[arg(long, global = true, env = "SWAP_EVM_RPC_URL")]
     usdc_rpc_url: Option<String>,
     /// Deployed `Erc20Htlc` contract address.
     #[arg(long, global = true)]
     usdc_htlc: Option<String>,
-    /// ERC-20 (USDC) token address. Defaults to Circle's Sepolia test USDC.
+    /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `--usdc-network`.
     #[arg(long, global = true)]
     usdc_token: Option<String>,
     #[command(subcommand)]
@@ -280,6 +284,25 @@ fn secp_key(
     key.map_err(|_| anyhow::anyhow!("{what} key is not a valid secp256k1 key"))
 }
 
+/// `--usdc-network`, resolved, plus `--usdc-rpc-url`/`--usdc-token` falling back to that
+/// network's defaults. Split out from [`live_usdc_backend`] so it can be unit-tested
+/// without a key or a network connection.
+fn usdc_endpoints(cli: &Cli) -> Result<(swap_chain_evm::UsdcNetwork, String, String)> {
+    let network: swap_chain_evm::UsdcNetwork = cli
+        .usdc_network
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("--usdc-network: {e}"))?;
+    let rpc_url = cli
+        .usdc_rpc_url
+        .clone()
+        .unwrap_or_else(|| network.default_rpc_url().to_string());
+    let token = cli
+        .usdc_token
+        .clone()
+        .unwrap_or_else(|| network.usdc_token().to_string());
+    Ok((network, rpc_url, token))
+}
+
 /// The `--counter-chain usdc` live backend. `Backends.live` stays `None` for it (that tuple
 /// is concretely `(DiviBackend, CounterLive)`, used only by `Balance`).
 fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
@@ -289,24 +312,18 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
         .parse()
         .map_err(|_| anyhow::anyhow!("usdc key is not a valid secp256k1 hex key"))?;
     drop(hex_key);
-    let rpc_url = cli
-        .usdc_rpc_url
-        .as_deref()
-        .context("live usdc backend needs --usdc-rpc-url")?;
+    let (_network, rpc_url, token) = usdc_endpoints(cli)?;
     let htlc = cli
         .usdc_htlc
         .as_deref()
         .context("live usdc backend needs --usdc-htlc")?
         .parse()
         .map_err(|e| anyhow::anyhow!("--usdc-htlc: {e}"))?;
-    let token = cli
-        .usdc_token
-        .as_deref()
-        .unwrap_or(swap_chain_evm::SEPOLIA_USDC)
+    let token = token
         .parse()
         .map_err(|e| anyhow::anyhow!("--usdc-token: {e}"))?;
     Ok(Arc::new(swap_chain_evm::UsdcBackend::new(
-        rpc_url, key, htlc, token,
+        &rpc_url, key, htlc, token,
     )?))
 }
 
@@ -529,4 +546,91 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut argv = vec!["divi-swap"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&[
+            "quote",
+            "--maker",
+            "http://x",
+            "--offer",
+            "o",
+            "--btc-sats",
+            "1",
+        ]);
+        Cli::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn usdc_network_defaults_to_sepolia() {
+        let (network, rpc_url, token) = usdc_endpoints(&cli(&[])).unwrap();
+        assert_eq!(network, swap_chain_evm::UsdcNetwork::Sepolia);
+        assert_eq!(
+            rpc_url,
+            swap_chain_evm::UsdcNetwork::Sepolia.default_rpc_url()
+        );
+        assert_eq!(token, swap_chain_evm::SEPOLIA_USDC);
+    }
+
+    #[test]
+    fn usdc_network_base_sepolia_picks_its_own_defaults() {
+        let (network, rpc_url, token) =
+            usdc_endpoints(&cli(&["--usdc-network", "base-sepolia"])).unwrap();
+        assert_eq!(network, swap_chain_evm::UsdcNetwork::BaseSepolia);
+        assert_eq!(
+            rpc_url,
+            swap_chain_evm::UsdcNetwork::BaseSepolia.default_rpc_url()
+        );
+        assert_eq!(token, swap_chain_evm::BASE_SEPOLIA_USDC);
+    }
+
+    #[test]
+    fn usdc_explicit_rpc_url_and_token_override_the_network_default() {
+        let (_, rpc_url, token) = usdc_endpoints(&cli(&[
+            "--usdc-network",
+            "base-sepolia",
+            "--usdc-rpc-url",
+            "http://localhost:9999",
+            "--usdc-token",
+            "0x1111111111111111111111111111111111111111",
+        ]))
+        .unwrap();
+        assert_eq!(rpc_url, "http://localhost:9999");
+        assert_eq!(token, "0x1111111111111111111111111111111111111111");
+    }
+
+    #[test]
+    fn usdc_unknown_network_is_rejected() {
+        let err = usdc_endpoints(&cli(&["--usdc-network", "mainnet"])).unwrap_err();
+        assert!(err.to_string().contains("--usdc-network"), "{err}");
+    }
+
+    #[test]
+    fn usdc_backend_constructs_on_either_networks_default_rpc_url_without_network_access() {
+        // UsdcBackend::new only parses the RPC URL and derives a pubkey locally; it makes no
+        // network calls, so this proves both networks' default_rpc_url() strings are valid
+        // URLs the backend actually accepts.
+        let htlc = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        for network in [
+            swap_chain_evm::UsdcNetwork::Sepolia,
+            swap_chain_evm::UsdcNetwork::BaseSepolia,
+        ] {
+            let backend = swap_chain_evm::UsdcBackend::new(
+                network.default_rpc_url(),
+                swap_chain_evm::PrivateKeySigner::random(),
+                htlc,
+                network.usdc_token().parse().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(backend.chain(), Chain::Usdc);
+        }
+    }
 }

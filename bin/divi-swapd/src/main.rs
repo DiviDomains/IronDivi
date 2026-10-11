@@ -177,13 +177,14 @@ fn live_usdc(cfg: &divi_swapd::UsdcSection) -> Result<Arc<dyn ChainBackend>> {
         .htlc
         .parse()
         .map_err(|e| anyhow::anyhow!("usdc htlc address: {e}"))?;
-    let token = cfg
-        .token
+    let rpc_url = cfg.rpc_url()?;
+    let token_str = cfg.token()?;
+    let token = token_str
         .parse()
         .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
     let address = key.address();
-    let backend = swap_chain_evm::UsdcBackend::new(&cfg.rpc_url, key, htlc, token)?;
-    tracing::info!(%address, htlc = %cfg.htlc, token = %cfg.token, "usdc backend ready");
+    let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?;
+    tracing::info!(%address, network = %cfg.network, htlc = %cfg.htlc, token = %token_str, "usdc backend ready");
     Ok(Arc::new(backend))
 }
 

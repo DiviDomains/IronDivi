@@ -6,9 +6,9 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, version 3.
 
-//! Operational CLI for live Sepolia USDC setup: deploy `Erc20Htlc`, move ETH (gas) and
-//! USDC between addresses, and check balances. Needs nothing beyond this binary — no
-//! `forge`, no local chain — so it runs from a machine that has neither (the
+//! Operational CLI for live EVM USDC setup (Sepolia or Base Sepolia): deploy `Erc20Htlc`,
+//! move ETH (gas) and USDC between addresses, and check balances. Needs nothing beyond this
+//! binary — no `forge`, no local chain — so it runs from a machine that has neither (the
 //! orchestrator's Mac).
 //!
 //! The signing key is read from `SWAP_EVM_KEY_HEX` only: never a CLI argument (so it never
@@ -25,6 +25,10 @@
 //!   -- send-eth --to 0x... --wei 2000000000000000
 //! SWAP_EVM_KEY_HEX=<hex> cargo run -p swap-chain-evm --features live --example sepolia_ops \
 //!   -- send-usdc --to 0x... --units 5000000
+//!
+//! # Base Sepolia instead of the default (Ethereum) Sepolia:
+//! cargo run -p swap-chain-evm --features live --example sepolia_ops -- \
+//!   --network base-sepolia balances --addr 0x...
 //! ```
 
 use alloy::network::TransactionBuilder;
@@ -33,24 +37,26 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use clap::{Parser, Subcommand};
 use swap_chain_evm::{
-    connect_provider, deploy_contract, erc20_htlc_bytecode, IErc20, PrivateKeySigner, SEPOLIA_USDC,
+    connect_provider, deploy_contract, erc20_htlc_bytecode, IErc20, PrivateKeySigner, UsdcNetwork,
 };
 use zeroize::Zeroizing;
-
-const DEFAULT_RPC: &str = "https://ethereum-sepolia-rpc.publicnode.com";
 
 #[derive(Parser)]
 #[command(
     name = "sepolia_ops",
-    about = "Sepolia USDC swap setup: deploy Erc20Htlc, fund addresses, check balances"
+    about = "EVM USDC swap setup (Sepolia or Base Sepolia): deploy Erc20Htlc, fund addresses, check balances"
 )]
 struct Cli {
-    /// EVM JSON-RPC URL.
-    #[arg(long, env = "SWAP_EVM_RPC_URL", default_value = DEFAULT_RPC)]
-    rpc_url: String,
-    /// ERC-20 (USDC) token address.
-    #[arg(long, default_value = SEPOLIA_USDC)]
-    token: String,
+    /// Which EVM testnet: `sepolia` (default) or `base-sepolia`. Only picks defaults for
+    /// `--rpc-url`/`--token` below when they are left unset.
+    #[arg(long, default_value = "sepolia")]
+    network: String,
+    /// EVM JSON-RPC URL. Defaults to a free public endpoint for `--network`.
+    #[arg(long, env = "SWAP_EVM_RPC_URL")]
+    rpc_url: Option<String>,
+    /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `--network`.
+    #[arg(long)]
+    token: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -100,12 +106,23 @@ fn parse_addr(what: &str, s: &str) -> Address {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let token = parse_addr("--token", &cli.token);
+    let network: UsdcNetwork = cli
+        .network
+        .parse()
+        .unwrap_or_else(|e| panic!("bad --network: {e}"));
+    let rpc_url = cli
+        .rpc_url
+        .clone()
+        .unwrap_or_else(|| network.default_rpc_url().to_string());
+    let token = parse_addr(
+        "--token",
+        cli.token.as_deref().unwrap_or(network.usdc_token()),
+    );
 
     match cli.cmd {
         Cmd::Balances { addr } => {
             let addr = parse_addr("--addr", &addr);
-            let url = cli.rpc_url.parse().expect("bad --rpc-url");
+            let url = rpc_url.parse().expect("bad --rpc-url");
             let provider = DynProvider::new(ProviderBuilder::new().connect_http(url));
             let eth = provider.get_balance(addr).await.expect("get_balance");
             let usdc = IErc20::new(token, provider.clone())
@@ -120,8 +137,8 @@ async fn main() {
         Cmd::Deploy => {
             let key: PrivateKeySigner = read_key().trim().parse().expect("bad SWAP_EVM_KEY_HEX");
             let address = key.address();
-            let provider = connect_provider(&cli.rpc_url, key).expect("connect provider");
-            eprintln!("deploying Erc20Htlc from {address}...");
+            let provider = connect_provider(&rpc_url, key).expect("connect provider");
+            eprintln!("deploying Erc20Htlc from {address} on {network}...");
             let htlc = deploy_contract(&provider, erc20_htlc_bytecode())
                 .await
                 .expect("deploy Erc20Htlc");
@@ -131,8 +148,8 @@ async fn main() {
             let key: PrivateKeySigner = read_key().trim().parse().expect("bad SWAP_EVM_KEY_HEX");
             let from = key.address();
             let to = parse_addr("--to", &to);
-            let provider = connect_provider(&cli.rpc_url, key).expect("connect provider");
-            eprintln!("sending {wei} wei from {from} to {to}...");
+            let provider = connect_provider(&rpc_url, key).expect("connect provider");
+            eprintln!("sending {wei} wei from {from} to {to} on {network}...");
             let tx = TransactionRequest::default()
                 .with_to(to)
                 .with_value(U256::from(wei));
@@ -150,8 +167,8 @@ async fn main() {
             let key: PrivateKeySigner = read_key().trim().parse().expect("bad SWAP_EVM_KEY_HEX");
             let from = key.address();
             let to = parse_addr("--to", &to);
-            let provider = connect_provider(&cli.rpc_url, key).expect("connect provider");
-            eprintln!("sending {units} USDC base units from {from} to {to}...");
+            let provider = connect_provider(&rpc_url, key).expect("connect provider");
+            eprintln!("sending {units} USDC base units from {from} to {to} on {network}...");
             let receipt = IErc20::new(token, provider)
                 .transfer(to, U256::from(units))
                 .send()

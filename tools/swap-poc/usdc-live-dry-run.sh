@@ -8,7 +8,8 @@
 # Step by step, mirroring usdc-live.sh:
 #   1. Spin up anvil; deploy a MockErc20 (stands in for real Sepolia USDC, which has no
 #      code on a fresh local chain) and mint it to a throwaway "taker" key.
-#   2. `sepolia_ops deploy` — the exact command usdc-live.sh runs to deploy `Erc20Htlc`.
+#   2. `sepolia_ops deploy` — the exact command usdc-live.sh runs to deploy `Erc20Htlc`
+#      (including the `--network` flag usdc-live.sh now always passes).
 #   3. `sepolia_ops send-eth` / `send-usdc` — the exact commands usdc-live.sh runs to fund
 #      the maker from the taker.
 #   4. The anvil-backed proof that `UsdcBackend` locks/claims/refunds for real:
@@ -70,7 +71,11 @@ token="$(cast send --rpc-url "$rpc_url" --private-key "$taker_key" --create "$to
 cast send --rpc-url "$rpc_url" --private-key "$taker_key" "$token" "mint(address,uint256)" "$taker_addr" 10000000 >/dev/null
 echo "usdc-live-dry-run: mock token $token minted 10 USDC-equivalent to taker $taker_addr"
 
-ops() { cargo run -q -p swap-chain-evm --features live --example sepolia_ops -- --rpc-url "$rpc_url" --token "$token" "$@"; }
+# --network is a no-op here since --rpc-url/--token are always given explicitly below (a
+# throwaway local token has no real network), but passing it anyway exercises the same
+# "--network plus explicit overrides" shape usdc-live.sh itself now uses, and proves the
+# flag doesn't break anything when combined with overrides.
+ops() { cargo run -q -p swap-chain-evm --features live --example sepolia_ops -- --network sepolia --rpc-url "$rpc_url" --token "$token" "$@"; }
 
 echo "usdc-live-dry-run: sepolia_ops deploy (the exact command usdc-live.sh runs)"
 out="$(SWAP_EVM_KEY_HEX="$taker_key" ops deploy)"

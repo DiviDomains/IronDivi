@@ -28,11 +28,17 @@ esplora_url = "https://litecoinspace.org/testnet/api"
 key = "credential:maker-btc"
 
 [usdc]
+# network defaults to "sepolia" if omitted; "base-sepolia" is the only other option
+# (swap_chain_evm::UsdcNetwork). It only picks defaults for rpc_url/token below when they
+# are left unset — a single [usdc] section (one Chain::Usdc backend) serves one EVM network
+# at a time, so switching network here moves the whole backend, it doesn't add a second one.
+network = "sepolia"
 rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
 # Placeholder until Erc20Htlc is deployed to Sepolia (orchestrator, funded key) — fill in
 # the real address before enabling a usdc offer.
 htlc = "0x0000000000000000000000000000000000000000"
-# token omitted: defaults to Circle's Sepolia test USDC (swap_chain_evm::SEPOLIA_USDC).
+# token omitted: defaults to Circle's test USDC for `network` (SEPOLIA_USDC here;
+# BASE_SEPOLIA_USDC if network = "base-sepolia").
 # funding.md (2026-10-11): EVM reuses the BTC swap key (same secp256k1 pubkey, Ethereum
 # address derived from it) — no separate maker-usdc credential.
 key = "credential:maker-btc"
@@ -81,7 +87,10 @@ max_btc_sats = 10000000
 # `enabled = false` (an offer stays in the file but is not served; a counter chain with no
 # enabled offer gets no backend). Keep these off until [usdc].htlc above is a real deployed address — min/max are USDC engine
 # sats (1e8 per coin; UsdcBackend needs whole multiples of 100 to convert to 1e6 base
-# units), so 1000000..100000000 is 0.01..1.00 USDC.
+# units), so 1000000..100000000 is 0.01..1.00 USDC. Ids say "sepolia" because [usdc].network
+# above is "sepolia"; relabel them (e.g. divi-usdc-base-sepolia) if that's switched to
+# "base-sepolia" — the id is just an operator-facing label, counter_chain stays "usdc"
+# either way, and the single [usdc] section/backend only ever serves one network at a time.
 [[offers]]
 id = "divi-usdc-sepolia"
 direction = "taker_pays_btc"
