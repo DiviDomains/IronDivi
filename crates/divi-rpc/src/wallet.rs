@@ -54,6 +54,26 @@ fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amou
     Ok(amount)
 }
 
+/// Compute the "bare txid": the txid of `tx` with every input's `scriptSig`
+/// cleared, matching Core's `CTransaction::GetBareTxid()`
+/// (primitives/transaction.cpp). Signing a transaction fills in scriptSigs,
+/// which changes `txid()`; the bare txid stays stable across that, so it is
+/// the identifier adaptor-signature swaps commit to before any signature
+/// exists. Coinbase transactions have no real signature, so Core defines
+/// their bare txid as equal to the normal txid (clearing the coinbase
+/// scriptSig would otherwise collide distinct coinbases on the same bare
+/// txid); mirror that special case here.
+fn bare_txid(tx: &Transaction) -> Hash256 {
+    if tx.is_coinbase() {
+        return tx.txid();
+    }
+    let mut stripped = tx.clone();
+    for input in &mut stripped.vin {
+        input.script_sig = Script::new();
+    }
+    stripped.txid()
+}
+
 /// Callback for submitting transactions to the mempool and network
 pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
 
@@ -1157,6 +1177,7 @@ impl WalletRpc {
 
             let (tx, location) = result;
             let txid_value = tx.txid().to_string();
+            let baretxid_value = bare_txid(&tx).to_string();
             let hex_value = hex::encode(serialize(&tx));
             let size = hex_value.len() / 2;
 
@@ -1252,7 +1273,7 @@ impl WalletRpc {
             Ok(serde_json::json!({
                 "hex": hex_value,
                 "txid": txid_value,
-                "baretxid": txid_value,
+                "baretxid": baretxid_value,
                 "version": tx.version,
                 "locktime": tx.lock_time,
                 "size": size,
@@ -1287,6 +1308,7 @@ impl WalletRpc {
             })?;
 
         let txid_value = tx.txid().to_string();
+        let baretxid_value = bare_txid(&tx).to_string();
 
         let vin: Vec<serde_json::Value> = tx
             .vin
@@ -1374,7 +1396,7 @@ impl WalletRpc {
 
         Ok(serde_json::json!({
             "txid": txid_value,
-            "baretxid": txid_value,
+            "baretxid": baretxid_value,
             "version": tx.version,
             "locktime": tx.lock_time,
             "vin": vin,
@@ -3613,6 +3635,85 @@ mod tests {
         let wallet = HdWallet::new(ChainMode::Divi).unwrap();
         let wallet_db = Arc::new(WalletDb::with_hd_wallet(Network::Mainnet, wallet));
         WalletRpc::with_wallet(wallet_db)
+    }
+
+    #[test]
+    fn baretxid_differs_from_txid_for_signed_tx() {
+        // Mirrors Core's BareTxid_tests.cpp: the bare txid is the hash of the tx
+        // with every scriptSig cleared, so it must survive signing unchanged
+        // while the real txid changes as soon as a scriptSig is filled in.
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+
+        let mut tx = Transaction::new();
+        tx.vin.push(TxIn::new(
+            OutPoint::new(Hash256::from_bytes([9u8; 32]), 0),
+            Script::new(),
+            0xffff_ffff,
+        ));
+        tx.vout.push(TxOut::new(
+            Amount::from_divi(1),
+            Script::new_p2pkh(&[3u8; 20]),
+        ));
+
+        // Unsigned: scriptSig is already empty, so txid and baretxid coincide.
+        let unsigned_txid = tx.txid();
+        let unsigned_bare = bare_txid(&tx);
+        assert_eq!(unsigned_bare, unsigned_txid);
+
+        // Sign by filling in a scriptSig, as a signer would just before broadcast.
+        tx.vin[0].script_sig = Script::from_bytes(vec![0x47, 0x30, 0x44, 0x02, 0x20, 0xaa]);
+        let signed_txid = tx.txid();
+        let signed_bare = bare_txid(&tx);
+
+        assert_ne!(
+            signed_txid, signed_bare,
+            "signing must change txid but not baretxid"
+        );
+        assert_eq!(
+            signed_bare, unsigned_bare,
+            "baretxid must stay stable across signing"
+        );
+
+        // RPC wiring: decode_raw_transaction must surface the distinct values.
+        let rpc = create_test_wallet_rpc();
+        let params = Params::Array(vec![serde_json::json!(hex::encode(serialize(&tx)))]);
+        let decoded = rpc.decode_raw_transaction(&params).unwrap();
+        assert_eq!(decoded["txid"].as_str().unwrap(), signed_txid.to_string());
+        assert_eq!(
+            decoded["baretxid"].as_str().unwrap(),
+            unsigned_bare.to_string()
+        );
+        assert_ne!(decoded["txid"], decoded["baretxid"]);
+
+        // A different scriptSig over the same unsigned content must land on the
+        // same baretxid too (it only commits to prevout/sequence/vout/version/locktime).
+        tx.vin[0].script_sig = Script::from_bytes(vec![0x48, 0x30, 0x45, 0x02, 0x21, 0xbb, 0xcc]);
+        assert_eq!(bare_txid(&tx), unsigned_bare);
+    }
+
+    #[test]
+    fn baretxid_equals_txid_for_coinbase() {
+        // Core special-cases coinbase: it has no real signature, but clearing
+        // its scriptSig anyway could collide two distinct coinbases on one
+        // bare txid, so Core defines the coinbase bare txid as the normal txid.
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{Transaction, TxIn, TxOut};
+
+        let mut tx = Transaction::new();
+        tx.vin.push(TxIn::coinbase(Script::from_bytes(vec![
+            0x04, 0xff, 0xff, 0x00, 0x1d,
+        ])));
+        tx.vout
+            .push(TxOut::new(Amount::from_divi(50), Script::new()));
+
+        assert_eq!(bare_txid(&tx), tx.txid());
+
+        // Changing the coinbase scriptSig (height/extranonce) must still move
+        // the bare txid, unlike the non-coinbase case.
+        let txid_before = tx.txid();
+        tx.vin[0].script_sig = Script::from_bytes(vec![0x04, 0xff, 0xff, 0x00, 0x1d, 0x01]);
+        assert_ne!(bare_txid(&tx), txid_before);
     }
 
     #[test]
