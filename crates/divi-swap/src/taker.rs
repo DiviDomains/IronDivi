@@ -125,6 +125,7 @@ impl Taker {
             maker_leg_amount: None,
             maker_leg_claim: None,
             taker_leg_refund: None,
+            claim_declined: None,
             last_error: None,
         })?;
         Ok((id, req))
@@ -296,6 +297,10 @@ impl Taker {
         if self.taker_leg_refundable(r).await? {
             return self.enter(r, TakerState::Refunded);
         }
+        if r.claim_declined.is_some() {
+            // Decided for good: never claim, just wait for the refund above to mature.
+            return Ok(Flow::Idle);
+        }
         let Some(leg) = maker.and_then(|m| m.maker_leg.as_ref()) else {
             return Ok(Flow::Idle);
         };
@@ -327,7 +332,18 @@ impl Taker {
         }
         let mtp = mb.median_time_past().await?;
         if (htlc.locktime as u64) < mtp as u64 + TAKER_SAFETY_MARGIN_SECS as u64 {
-            return Err(bad("locktime too close to claim safely"));
+            // Not an error to retry: a claim now could confirm after the maker refunds, losing
+            // the maker leg while revealing the preimage. Decide once, persist, and let the
+            // taker-leg refund run its course.
+            let reason = format!(
+                "maker-leg locktime {} is less than {TAKER_SAFETY_MARGIN_SECS}s after its \
+                 chain's MTP {mtp}; not claiming, waiting for the taker-leg refund",
+                htlc.locktime
+            );
+            tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
+            r.claim_declined = Some(reason);
+            self.store.put_taker_swap(r)?;
+            return Ok(Flow::Idle);
         }
         r.maker_leg_htlc = Some(htlc);
         r.maker_leg_outpoint = Some(op);

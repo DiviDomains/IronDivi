@@ -123,6 +123,11 @@ pub struct TakerRecord {
     /// The signed taker-leg refund tx (persisted before broadcast).
     #[serde(alias = "btc_refund")]
     pub taker_leg_refund: Option<SignedTx>,
+    /// Set once the taker decided never to claim the maker leg (its locktime was too close
+    /// to claim safely when the lock confirmed). Terminal for the claim path: the swap only
+    /// waits out the taker-leg refund. Absent in records written before the field existed.
+    #[serde(default)]
+    pub claim_declined: Option<String>,
     /// Last error.
     pub last_error: Option<String>,
 }
