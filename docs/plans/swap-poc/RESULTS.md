@@ -128,7 +128,19 @@ same timeout profile (DECISIONS #9): taker DIVI leg 6 h, maker BTC leg 3 h.
     BTC claim (taker, 2398 s before the maker timeout) `7d205f3dbeed7adb4b450983a4ed283e71e5356f69bbddcf2cd3165672cbdb7e`,
     DIVI claim (maker) `4d33760060025b919576d275895c9b1e26a23cb5e6601e322d51311b43484536`.
 - Staking: in the reverse direction the maker locks BTC and never DIVI, so its staking coins are never selected.
-- Chaos on live testnets (status/rev-chaos.md): crash at every persisted state PASS 2026-10-11, swap `e3ae6ba2…`, DIVI lock `b33c193a…`, BTC lock `7a296b06…`, BTC claim `4bda4c8d…`, DIVI claim `2e299287…`; DIVI RPC 502 outage PASS (swap `034a66db…`, DIVI claim `123e1908…`); Esplora 429 and refund running.
+- Chaos on live testnets (status/rev-chaos.md), all PASS, finished 2026-10-11 18:22 EDT:
+  - Crash at every persisted state: swap `e3ae6ba2…`, DIVI lock `b33c193a…`, BTC lock `7a296b06…`, BTC claim `4bda4c8d…`,
+    DIVI claim `2e2992878de1e7d1edac2d8b08aacf455463dd6987990684b32b78829460a05e`.
+  - DIVI RPC 502 outage: swap `034a66db…`, DIVI claim `123e19083abbc2d119039e2c8d1d3f926ecd92a32e4f773392265098fe5b726f`.
+  - Esplora HTTP 429: swap `ef30f5db…`, DIVI claim `e4549c7012953ff3ffb2dfb502f4f5aa20a7b296062b5b661f2c9a4ccf0bc1be`.
+  - Refund with a crash in `maker_refundable`/`maker_refunded`: swap `fdfdf352…`, maker BTC refund
+    `1a3dd95e04f3cda203e0471d1a40314251a571d285facee8c192ba14dba672af` (testnet3 block 5158301), taker DIVI refund after
+    the 6 h locktime `d1a45509a64dbbd88fa7e5bde370db0f0935bf674d058873d88c10365f404346` (the driver logs it as "taker BTC
+    refund"; it is the DIVI leg).
+  - Found: before 6037821 the taker CLI errored "locktime too close to claim safely" on every poll while waiting for its
+    refund (harmless: the refund check runs first). 6037821 makes it a one-time decline.
+  - A parked crash-test swap `f4140a43…` (600 tDIVI, lock `3efc7375…`) was refunded afterwards:
+    `df49a3e742375332dbdaaaabcd85cbbcbd544abb96694acd0de8e5cfdd94cac7`.
 - Balances kept for reuse (no sweeps — Bert 2026-10-10: "keep all our testnet coind so i dont need to get more"):
   maker BTC `tb1quqkt7c06svzt68f2y9uwf2jzgpd48k6ku45zrt` 121,266 sats; taker BTC `tb1qa826ffe73xnqsm64x6fvln7sl0zp3rgfdq3hpg`
   9,722 sats; taker DIVI `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` 1,699.99273 tDIVI.
