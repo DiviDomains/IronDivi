@@ -22,7 +22,8 @@ if ! git apply --3way "$patch" 2>/dev/null; then
   # Usually only Cargo.lock collides between lanes: apply the rest, regenerate the lock below.
   git checkout -q -- . && git clean -qfd
   git apply --3way --exclude=Cargo.lock "$patch" \
-    || { echo "hp2-land: patch from $coin (base $base) does not apply on main"; exit 1; }
+    || { git reset -q --hard HEAD; git clean -qfd -e target
+         echo "hp2-land: patch from $coin (base $base) does not apply on main; tree reset, lane must lane-sync"; exit 1; }
   lock_excluded=1
 fi
 # The lane's own status file keeps its ready line in the commit; drop it there.
