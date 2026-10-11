@@ -103,6 +103,11 @@ there is no [ltc] section` means the append in §2 did not land).
 
 ## 4. Checks (over the tunnel or on dnsdivi)
 
+Scripted, read-only (no keys, no swap; opens and closes its own tunnel):
+`tools/swap-poc/wave4-smoke.sh` (`--dry-run` prints the commands). It covers the health,
+offers, LTC quote, old-client 400 and `divi-swap quote --counter-chain ltc` items below
+and exits non-zero on any failure; the journal, checksum and real-swap items stay manual.
+
 ```sh
 B=http://127.0.0.1:18480     # on dnsdivi; from the Mac: ssh -N -L 18480:127.0.0.1:18480 dnsdivi
 ```
