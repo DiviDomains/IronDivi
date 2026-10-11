@@ -16,6 +16,52 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **`zec-live.sh case-c` expected duration, reviewed against the local maker profile,
+    2026-10-11 ~23:10 EDT.** `zec-live.sh`'s `case-c` TOML override is
+    `maker_timeout_secs = 3600` (1h), `taker_timeout_secs = 14410` (~4h 10s — chosen to clear
+    `SwapConfig::validate`'s minimum gap, `MIN_TIMEOUT_GAP_SECS = 3h`, by exactly 10s), CLI
+    budget `--timeout-secs 21600` (6h). Measured real block times myself just now (read-only,
+    no key — `GetLatestBlock`/`GetBlockRange` on `testnet.zec.rocks` for ZEC, `getblockcount`/
+    `getblockhash`/`getblock` on `services.divi.domains` for DIVI, both over the last 500
+    blocks): **ZEC ≈24.78 s/block** (matches the ~25s NU7 figure already in this file — the
+    `ChainParams::builtin` doc comment calling it "75-second blocks" predates the NU7 fix and
+    is now stale, though harmless: it only feeds `mtp_lag_secs`, which stays a generous 1800s
+    either way, see below) and **DIVI ≈60.16 s/block** (matches the existing "1-minute
+    blocks" assumption elsewhere in the repo). Confirmations required: 3 for both ZEC and
+    DIVI on testnet (`SwapConfig::profile(Testnet)`); MTP lag doc comment: "about six block
+    intervals" to go from broadcast to real median-time-past catching up to a locktime.
+    - A key structural fact that explains the shape of the run: **`maker_state=Done` depends
+      only on the maker's own leg**, not on the taker (`crates/divi-swap/src/maker.rs`:
+      `on_maker_refundable` broadcasts the maker's refund once its own locktime clears, then
+      `MakerRefunded → Done` fires as soon as that refund has 1 confirmation — nothing in
+      that path reads the taker's state at all). So in case C the **maker finishes in roughly
+      an hour**, while the **taker's own CLI `run` process keeps going for ~4 hours** because
+      `--never-claim` (`ClaimPolicy::Never`) only releases the taker's claim-hold once the
+      *maker leg's* MTP passes the maker's locktime (`bin/divi-swap/src/flow.rs::release`) —
+      after which the taker still has to wait out its *own*, much longer, `taker_timeout_secs`
+      before `on_refunded` (`crates/divi-swap/src/taker.rs`) can broadcast and confirm its
+      refund. This is the standard HTLC safety shape (the second party to lock gets the
+      shorter timeout so it can safely refund first) — not a bug, just worth knowing so
+      "maker side went quiet an hour in" during a live run isn't mistaken for a stall.
+    - **Expected durations** (broadcast-to-`Δ`≈confirmation wait before the other side locks,
+      using 3-confirmation and 6-block-MTP-catchup as expected-value estimates — real timing
+      has variance, this is not a guarantee):
+      - *Forward* (`divi-zec-testnet`, taker locks ZEC first, maker locks DIVI second): maker
+        done ≈ (taker-leg ZEC 3-conf wait ≈74s) + 3600s + (DIVI MTP catchup ≈361s) + (DIVI
+        1-conf ≈60s) ≈ **4,095s ≈ 1h 8m**. Taker (and thus the overall run) done ≈ 14,410s +
+        (ZEC MTP catchup ≈149s) + (ZEC 1-conf ≈25s) ≈ **14,584s ≈ 4h 3m** — inside the 21,600s
+        (6h) CLI budget with **~1h 57m to spare**.
+      - *Reverse* (`zec-divi-testnet`, taker locks DIVI first, maker locks ZEC second): maker
+        done ≈ (taker-leg DIVI 3-conf wait ≈180s) + 3600s + (ZEC MTP catchup ≈149s) + (ZEC
+        1-conf ≈25s) ≈ **3,954s ≈ 1h 6m**. Taker (overall run) done ≈ 14,410s + (DIVI MTP
+        catchup ≈361s) + (DIVI 1-conf ≈60s) ≈ **14,831s ≈ 4h 7m** — inside the 6h budget with
+        **~1h 53m to spare**.
+    - **Conclusion: the existing `--timeout-secs 21600` budget is correct and doesn't need
+      changing** — both directions land around 4h, with ~1h50m+ of margin either way. `happy`
+      (not reviewed in depth here, not what was asked) uses the un-overridden
+      `SwapConfig::profile(Testnet)` timeouts but the normal `ClaimPolicy::Asap` path, so it
+      finishes in low minutes (dominated by confirmation waits, not the multi-hour timeout
+      windows) — no 6h-scale wait there.
   - **Funding confirmed, read-only, 2026-10-11 ~19:05 EDT** (`GetAddressUtxos` on
     `testnet.zec.rocks`, via a new small checker,
     `crates/swap-chain-zec/examples/check_addr_utxos.rs` — no key needed, nothing signed; tip
