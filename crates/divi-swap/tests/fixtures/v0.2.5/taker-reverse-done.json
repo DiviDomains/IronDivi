@@ -1,0 +1,121 @@
+{
+  "id": "03bcb3e3-c697-4f66-8bee-2dc163faa76a",
+  "state": "done",
+  "quote": {
+    "id": "3353369a-7eb6-4a39-bdd3-adfeff476088",
+    "offer_id": "btc-divi-testnet",
+    "direction": "taker_pays_divi",
+    "btc_amount": 10000,
+    "divi_amount": 30000000000,
+    "expires_at": 1791725187,
+    "maker_btc_pubkey": "02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd",
+    "maker_divi_pubkey": "0208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776",
+    "taker_timeout_secs": 14410,
+    "maker_timeout_secs": 3600,
+    "btc_confirmations": 1,
+    "divi_confirmations": 3
+  },
+  "preimage": [
+    17,
+    221,
+    247,
+    160,
+    57,
+    57,
+    168,
+    150,
+    171,
+    157,
+    105,
+    147,
+    196,
+    248,
+    166,
+    18,
+    245,
+    202,
+    40,
+    75,
+    127,
+    23,
+    75,
+    82,
+    65,
+    185,
+    15,
+    96,
+    189,
+    103,
+    161,
+    175
+  ],
+  "hash": [
+    255,
+    50,
+    9,
+    239,
+    75,
+    155,
+    204,
+    225,
+    49,
+    140,
+    137,
+    44,
+    187,
+    64,
+    91,
+    17,
+    84,
+    186,
+    95,
+    76,
+    91,
+    2,
+    110,
+    187,
+    121,
+    182,
+    185,
+    253,
+    75,
+    175,
+    226,
+    237
+  ],
+  "maker_swap_id": "16676cc4-dd54-4387-973e-57a245bb0918",
+  "taker_leg_htlc": {
+    "hash": "ff3209ef4b9bcce1318c892cbb405b1154ba5f4c5b026ebb79b6b9fd4bafe2ed",
+    "claim_pubkey": "0208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776",
+    "refund_pubkey": "03bc0d77da235c268d222125da34633169d7f91260e5dd14d80236acb721a58378",
+    "locktime": 1791739214
+  },
+  "taker_leg_funding": {
+    "tx": {
+      "txid": "baf8807301556b0d7fe32b0ded8cf14b83db8d36472271df379acacf23eb8961",
+      "raw": "01000000015281b6845b5e54500368be564e3aab6ccb05d2c7bbb25d0086561f1012b245aa010000006a473044022019cc320de81ee5dc0df4e6d791e023d2083b651c589ce9e611ab08e8d109341802205fb16e8be7d9c1b66e2fcc6e80caef03445c07424f7b972039ba90fd1600048a012103bc0d77da235c268d222125da34633169d7f91260e5dd14d80236acb721a58378ffffffff0200ac23fc0600000017a914b1455f922f6f9386c2c0c59b7268d633001a4edc879073789c190000001976a914166a1461d9a71fa70f3064071db2b4bc2b4c5e9888ac00000000"
+    },
+    "outpoint": {
+      "txid": "baf8807301556b0d7fe32b0ded8cf14b83db8d36472271df379acacf23eb8961",
+      "vout": 0
+    },
+    "amount": 30000000000
+  },
+  "maker_leg_htlc": {
+    "hash": "ff3209ef4b9bcce1318c892cbb405b1154ba5f4c5b026ebb79b6b9fd4bafe2ed",
+    "claim_pubkey": "03a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f5",
+    "refund_pubkey": "02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd",
+    "locktime": 1791733690
+  },
+  "maker_leg_outpoint": {
+    "txid": "c7b214ca6c5257e4d0aa4d3d39c0b4cf2ad767e538755be796a65e5b9d7c6b80",
+    "vout": 0
+  },
+  "maker_leg_amount": 10000,
+  "maker_leg_claim": {
+    "txid": "7d205f3dbeed7adb4b450983a4ed283e71e5356f69bbddcf2cd3165672cbdb7e",
+    "raw": "02000000000101806b7c9d5b5ea696e75b7538e567d72acfb4c0393d4daad0e457526cca14b2c70000000000ffffffff01fa25000000000000160014e9d5a4a73e89a6086f553692cfcfd0fbc4188d0904483045022100813499fceee713e7522118e055b93ef0f829e02ac91fd14a079f9593ddf2c70802207fd03182724559a2a1b588da9a3ad8fbf94cab6769cb7f7a725ed84e9e0d886c012011ddf7a03939a896ab9d6993c4f8a612f5ca284b7f174b5241b90f60bd67a1af01017263a820ff3209ef4b9bcce1318c892cbb405b1154ba5f4c5b026ebb79b6b9fd4bafe2ed882103a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f56704baafcb6ab1752102d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd68ac00000000"
+  },
+  "taker_leg_refund": null,
+  "last_error": null
+}

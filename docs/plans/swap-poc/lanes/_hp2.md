@@ -9,8 +9,8 @@ Mac and may type into it; answer him, then carry on. Read `_common.md` too — i
    exists you are a restart. Rewrite it at every seam (`- done:`, `- running:`, `- broken:`,
    `- left:`, `- decisions:`, `- needs:`).
 2. **Own your paths only** (your brief lists them) plus your status file. The engine contract
-   (`crates/divi-swap/src/{types,htlc,backend,state,config,error,api}.rs`) is the orchestrator's;
-   it is being generalized for new chains right now. Need a change there? Write it under
+   (`crates/divi-swap/src/{types,htlc,backend,state,config,error,api}.rs`) belongs to lane
+   `engine` (wave 1e), which is generalizing it for new chains right now. Need a change there? Write it under
    `- needs:` and work around it. You **may** edit your own crate's `Cargo.toml` and the
    resulting `Cargo.lock` changes; never the root `Cargo.toml`.
 3. **Build with plain `cargo` on hp2** (it is the build box). Keep it niced:

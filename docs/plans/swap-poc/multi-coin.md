@@ -28,7 +28,7 @@ Follow-on to `docs/plans/atomic-swap-poc.md` §7. DIVI↔BTC is done both ways o
 | 1b | **ZEC** backend: transparent P2SH HTLC, v5 tx + ZIP-244 sighash; step 0 is the API feasibility check | lane `zec` | `check-zec.sh` |
 | 1c | **USDC**: Solidity HTLC (Sepolia / Base Sepolia) + Rust client in `swap-chain-evm`, plus a written proposal for fitting account chains into the engine | lane `usdc` | `check-usdc.sh` |
 | 1d | **XMR**: adaptor-signature swap design + the DIVI bare-txid fix it depends on | lane `xmr` | `check-xmr.sh` |
-| 1e | **Engine generalization**: DIVI ↔ any counter chain (`Chain::{Ltc,Zec,Usdc}`, counter chain on the offer, per-chain confirmations/timeouts); old persisted state still loads | orchestrator | `divi-swap` green, mock e2e for each new chain |
+| 1e | **Engine generalization**: DIVI ↔ any counter chain (`Chain::{Ltc,Zec,Usdc}`, counter chain on the offer, per-chain confirmations/timeouts); old persisted state still loads | lane `engine` (hp2, Opus) | `check-engine.sh` |
 | 2 | Wire each backend into `divi-swapd` / `divi-swap` (offers `ltc-divi-testnet`, `zec-divi-testnet`); mock e2e per coin, both directions | lanes + orchestrator | `e2e.sh --backend mock` per offer |
 | 3 | **Live** per coin, serial (timelocks set the wall clock): happy, case C, case D, both directions; txids verified on explorers | orchestrator (Mac, 1Password) | `RESULTS.md` sections, artifact updated |
 | 4 | Redeploy the dnsdivi maker with the new offers (after the BTC reverse chaos finishes) | orchestrator | health + offers on dnsdivi |

@@ -1,0 +1,123 @@
+{
+  "id": "16676cc4-dd54-4387-973e-57a245bb0918",
+  "created_at": 1791725127,
+  "state": "Done",
+  "quote": {
+    "id": "3353369a-7eb6-4a39-bdd3-adfeff476088",
+    "offer_id": "btc-divi-testnet",
+    "direction": "taker_pays_divi",
+    "btc_amount": 10000,
+    "divi_amount": 30000000000,
+    "expires_at": 1791725187,
+    "maker_btc_pubkey": "02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd",
+    "maker_divi_pubkey": "0208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776",
+    "taker_timeout_secs": 14410,
+    "maker_timeout_secs": 3600,
+    "btc_confirmations": 1,
+    "divi_confirmations": 3
+  },
+  "hash": [
+    255,
+    50,
+    9,
+    239,
+    75,
+    155,
+    204,
+    225,
+    49,
+    140,
+    137,
+    44,
+    187,
+    64,
+    91,
+    17,
+    84,
+    186,
+    95,
+    76,
+    91,
+    2,
+    110,
+    187,
+    121,
+    182,
+    185,
+    253,
+    75,
+    175,
+    226,
+    237
+  ],
+  "taker_maker_leg_pubkey": "03a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f5",
+  "taker_leg_htlc": {
+    "hash": "ff3209ef4b9bcce1318c892cbb405b1154ba5f4c5b026ebb79b6b9fd4bafe2ed",
+    "claim_pubkey": "0208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac776",
+    "refund_pubkey": "03bc0d77da235c268d222125da34633169d7f91260e5dd14d80236acb721a58378",
+    "locktime": 1791739214
+  },
+  "taker_leg_outpoint": {
+    "txid": "baf8807301556b0d7fe32b0ded8cf14b83db8d36472271df379acacf23eb8961",
+    "vout": 0
+  },
+  "taker_leg_locked": 30000000000,
+  "maker_leg_htlc": {
+    "hash": "ff3209ef4b9bcce1318c892cbb405b1154ba5f4c5b026ebb79b6b9fd4bafe2ed",
+    "claim_pubkey": "03a7f9cfee27410046ac906b13c2500672b2930584da9693ce69f9f0a81a5f22f5",
+    "refund_pubkey": "02d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd",
+    "locktime": 1791733690
+  },
+  "maker_leg_funding": {
+    "tx": {
+      "txid": "c7b214ca6c5257e4d0aa4d3d39c0b4cf2ad767e538755be796a65e5b9d7c6b80",
+      "raw": "02000000000101a383bd3442b126274560c085b8b4d78837a706cea00c8fc59bdc6d7de164daf10100000000ffffffff021027000000000000220020ef333eb459becd60501dfd0bc936b68dd6c891265fbd358486c6a23880417cc9648b010000000000160014e02cbf61fa8304bd1d2a2178e4aa42405b53db5602473044022034311783ecab2e58b5d28803cc0e9ae9de6f88d4376a44cce90fc5579ae5e5f9022067d83b43b95e99586aa848f7ca432dc5119ec8a9013399e796aceae26c3228ee012102d05bd358a1efd8e5aa9c82c10d0e2c0ce67c1e5a984f02684724df28a343a7dd00000000"
+    },
+    "outpoint": {
+      "txid": "c7b214ca6c5257e4d0aa4d3d39c0b4cf2ad767e538755be796a65e5b9d7c6b80",
+      "vout": 0
+    },
+    "amount": 10000
+  },
+  "maker_leg_scan_from": 5158257,
+  "maker_leg_refund": null,
+  "preimage": [
+    17,
+    221,
+    247,
+    160,
+    57,
+    57,
+    168,
+    150,
+    171,
+    157,
+    105,
+    147,
+    196,
+    248,
+    166,
+    18,
+    245,
+    202,
+    40,
+    75,
+    127,
+    23,
+    75,
+    82,
+    65,
+    185,
+    15,
+    96,
+    189,
+    103,
+    161,
+    175
+  ],
+  "taker_leg_claim": {
+    "txid": "4d33760060025b919576d275895c9b1e26a23cb5e6601e322d51311b43484536",
+    "raw": "01000000016189eb23cfca9a37df712247368ddb834bf18ced0d2be37f0d6b55017380f8ba00000000de47304402200d5bb47b4430d73a497a9d31e2ad2581979903419cf4ec08bc83f984ce6f815d022067a6247f71f54fbc7645244e5082d2bc8008a20604c6704a47e5f87ac9da38ec012011ddf7a03939a896ab9d6993c4f8a612f5ca284b7f174b5241b90f60bd67a1af514c7263a820ff3209ef4b9bcce1318c892cbb405b1154ba5f4c5b026ebb79b6b9fd4bafe2ed88210208078a573bb00fc7597785bf635fb9df76e6cdc7781084f270d79081afdac77667044ec5cb6ab1752103bc0d77da235c268d222125da34633169d7f91260e5dd14d80236acb721a5837868acffffffff01e0f81efc060000001976a914dbf7f911790f6393c19257fc9565d34df41fc2cc88ac00000000"
+  },
+  "last_error": null
+}
