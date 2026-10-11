@@ -18,13 +18,14 @@ divi-wallet = { workspace = true }
 divi-swap = { workspace = true }
 swap-adaptor = { path = "../swap-adaptor" }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
+dkg = "0.6"
+# "ed25519" is the real Monero-compatible ciphersuite; exposes ciphersuite::Ed25519.
+ciphersuite = { version = "0.4", features = ["ed25519"] }
 
 [dev-dependencies]
 rand = { workspace = true }
-dkg = "0.6"
 dkg-pedpop = "0.6"
-# "ed25519" is the real Monero-compatible ciphersuite; exposes ciphersuite::Ed25519.
-ciphersuite = { version = "0.4", features = ["ed25519"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # dkg-pedpop 0.6.0 uses multiexp::BatchVerifier without requesting multiexp's "batch"
 # feature itself (upstream packaging gap); pull it in ourselves so Cargo's feature
@@ -37,7 +38,6 @@ multiexp = { version = "0.4", features = ["batch"] }
 schnorr-signatures = "=0.5.2"
 curve25519-dalek = "4"
 monero-wallet = "0.2"
-zeroize = { workspace = true }
 monero-daemon-rpc = "0.2"
 monero-simple-request-rpc = "0.1"
 tokio = { workspace = true }
