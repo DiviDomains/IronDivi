@@ -18,3 +18,20 @@ re-encoding is asserted to match before printing). Script: `tools/swap-poc/deriv
 
 Keep every testnet coin; never sweep back to a faucet.
 XMR (ed25519, stagenet) gets its own wallet when its lane reaches live readiness.
+
+## ZEC testnet: faucet on the wrong fork (2026-10-11)
+
+NU7 activated on Zcash testnet at height 4,465,026 (Oct 4) and cut blocks to 25 s.
+`testnet.zec.rocks`, the server `swap-chain-zec` uses, follows the NU7 chain (tip ~4,489,850
+on Oct 11). fauzec.com still runs a pre-NU7 node: its claim to our funding wallet (txid
+`9cf8c2203229ef9577857439452c22b63ba0981b3419ba02dce98a05d7049814`, 1 TAZ) was mined at
+4,474,361 on a chain whose tip was ~4,474,400 (75 s blocks). zexplorer.app shows the same
+stale chain. A wallet synced against zec.rocks from height 4,474,000 never sees it, so those
+coins do not exist on the chain we swap on.
+
+Funding wallet (shielded, for splitting TAZ to the two t-addrs above): hp2
+`~/zec-faucet-wallet/wallet2` (zcash-devtool, birthday 4,474,000, age identity alongside).
+Its unified address:
+`utest1shuxck4zpa4rn9aa3ydyxnhgdc9aq66kr4x9dy95tegfm25ujh9uu5xvlnrhey42cd364kry7wgs4fkmwre69jaqw0jxzjelfxa4ltkzcpj2tevtq3gu924gczq4g26hf4dsxu9gwg499fmxlh80ypf23ty45vdjcphrz507gk9n07cz62pjcamnqt87v3jh79f53a3y8dxag0kjq4l`.
+TAZ sent straight to the taker/maker t-addrs works just as well. Needs a source on the
+NU7 chain.
