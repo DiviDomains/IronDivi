@@ -156,6 +156,13 @@ pub async fn begin(
     btc_sats: u64,
 ) -> Result<String> {
     let quote = client.quote(offer_id, btc_sats).await?;
+    let c = quote.counter_chain;
+    if !taker.counter_chains().contains(&c) {
+        bail!(
+            "offer {offer_id} swaps DIVI against {c}; rerun with --counter-chain {c} \
+             (and --{c}-key for the live backend)"
+        );
+    }
     let (local, req) = taker.prepare(&quote).await?;
     let view = client.accept(&req).await?;
     sessions.put(

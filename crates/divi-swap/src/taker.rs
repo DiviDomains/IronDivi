@@ -87,6 +87,11 @@ impl Taker {
         }
     }
 
+    /// The counter chains this taker holds a key on.
+    pub fn counter_chains(&self) -> Vec<Chain> {
+        self.counters.keys().copied().collect()
+    }
+
     /// Test hook: behave as if the process died right after persisting the transition
     /// into `state` — [`Taker::step`] returns before that state's side effect runs.
     #[doc(hidden)]

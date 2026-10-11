@@ -418,3 +418,32 @@ async fn new_client_take_of_ltc_offer_is_accepted() {
     assert_eq!(client.swap(&id).await.unwrap().state, SwapState::Accepted);
     assert_eq!(swap_count(&d.base).await, 2);
 }
+
+/// A taker CLI left on its default `--counter-chain btc` is told what to pass, and nothing
+/// reaches the maker.
+#[tokio::test]
+async fn btc_taker_on_ltc_offer_is_told_to_pass_counter_chain() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let tdb = tmp.path().join("t.db");
+    let btc_taker = Taker::new(
+        Arc::new(w.taker_divi.clone()),
+        Arc::new(w.maker_btc.clone()),
+        Store::open(&tdb).unwrap(),
+    );
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let offer = World::offer(Direction::TakerPaysBtc);
+    let err = flow::begin(&btc_taker, &client, &sessions, &offer.id, LTC_SATS)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--counter-chain ltc"), "{err}");
+    assert_eq!(swap_count(&d.base).await, 0);
+    assert!(Store::open(&tdb)
+        .unwrap()
+        .list_taker_swaps()
+        .unwrap()
+        .is_empty());
+}
