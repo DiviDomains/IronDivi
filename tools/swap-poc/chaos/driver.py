@@ -238,7 +238,7 @@ class Run:
         cmd = [str(Path(self.a.bin_dir) / "divi-swap"), "--db", str(self.taker_db),
                "--backend", self.a.backend, "--divi-key", KEYS["taker_divi"],
                "--btc-key", KEYS["taker_btc"]]
-        if self.reverse:  # the taker locks DIVI, so it needs its own DIVI wallet
+        if self.reverse and self.a.backend == "live":  # the taker locks DIVI: its own DIVI wallet
             cmd += ["--divi-wallet", str(Path(self.a.workdir) / "taker-divi-wallet.json")]
         cmd += list(args)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
