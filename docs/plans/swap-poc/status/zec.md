@@ -1,51 +1,45 @@
 # Lane zec status
 
-- blocked-on-human: yes — see "parked" below. Wave 2 (daemon+CLI wiring, merged side by side
-  with the LTC and USDC lanes) landed on main as `4fdae25`; everything buildable without coins
-  is done. Keep reading, this is not a full stop.
-- parked: ZEC testnet funding. **Update 2026-10-11 ~18:45 EDT — found a faucet that pays
-  transparent addresses directly, no shielded hop needed; this may unblock funding with zero
-  secrets.** Earlier: the orchestrator's fauzec.com claim (txid
-  `9cf8c2203229ef9577857439452c22b63ba0981b3419ba02dce98a05d7049814`) paid 1 TAZ on a
-  **pre-NU7 fork** (tip ~4,474,400, 75s blocks) — not the chain `testnet.zec.rocks` (what
-  `ZecBackend` targets) is on, which is past NU7 activation (height 4,465,026, tip
-  ~4,489,857+, 25s blocks) — so that TAZ is unspendable by us. Do not switch `ZecBackend` to
-  the pre-NU7 server; NU7 is the real testnet.
-  - **New faucet, verified live and on the correct chain just now**:
-    `https://faucet.testnet.valargroup.dev` (Valar Group; wallet is `zecd`,
-    github.com/zecrocks/zecd, synced against "Zakura" NU7 testnet infra). I independently
-    curled it myself (no secret involved — it's a public HTTP API, nothing resolved from
-    1Password): `GET /api/status` → `{"network":"testnet","ready":true,"chainHeight":4490176,
-    "walletSynced":true,...}`, height matching our own backend's live tip (`check-zec-live.sh`
-    read ~4,489,906 minutes earlier) — this is the real NU7 chain, not the stale fork. Its own
-    `/api/claim` error message confirms it accepts **`utest1…`, `ztestsapling…`, or `tm…`**
-    addresses — i.e. it pays transparent t-addresses *directly*, unlike fauzec.com
-    (shielded-only). If this holds, **the whole zcash-devtool/PCZT relay-wallet hop in the
-    funding path below becomes unnecessary** for this faucet specifically: one `curl -X POST
-    .../api/claim -d '{"address":"tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk"}'` (repeat for the
-    maker address) could fund both swap addresses directly, no key/signature/human step at
-    all. **I have not run this claim myself** — its documented limit is 0.125 TAZ per *IP*
-    per 24h (`"payout":"0.125","ipLimit":"0.125","windowSeconds":86400`), and hp2's IP may be
-    shared across lanes/sessions, so one claim exhausts the quota for a day; leaving the
-    actual claim (which address first, whether to also try `ztestsapling…` to this faucet's
-    own shielding-then-PCZT path as a backup) to the orchestrator's call rather than spending
-    that scarce, shared resource unilaterally. Status page:
-    `https://status.testnet.zakura.valargroup.dev/`.
-  - Other faucets checked: `zcashfaucet.jinolabs.xyz` is reachable
-    (`/api/status` → `"sender":"zallet"`, `"network":"testnet"`) but reports 0 drips in the
-    last 7 days as of this check — looks paused/dry, not a reliable second source right now.
-  - Funding still also has the slower fallback path if the faucet above doesn't pan out: a
-    human with Mac/1Password access running `zcash-devtool`'s PCZT flow — exact steps are
-    under "- decisions: funding path" below, copy-paste ready — but any faucet claim (fauzec
-    or otherwise) must be verified against the NU7 chain before relying on it (check the
-    claiming wallet's `-s zecrocks` sync reaches a NU7-height tip, not a stale fork, before
-    trusting its balance).
-  - Once either swap address (`tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk` taker,
-    `tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn` maker) shows a balance via `GetAddressUtxos` on
-    `testnet.zec.rocks` (I can verify myself, read-only, no key needed), I'll know funding
-    actually landed. `live_fund_claim_refund` still also needs `SWAP_ZEC_TEST_KEY_HEX`, a
-    secret, so running it is the orchestrator's either way.
+- blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
+  EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
+  on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
+  and the recommended per-run amount.
+- parked: nothing right now. History, for context: the orchestrator's first fauzec.com claim
+  (txid `9cf8c2203229ef9577857439452c22b63ba0981b3419ba02dce98a05d7049814`) paid 1 TAZ on a
+  **pre-NU7 fork** (tip ~4,474,400, 75s blocks) — not the chain `testnet.zec.rocks` is on — so
+  it was unspendable by us. I then found `https://faucet.testnet.valargroup.dev`, verified
+  live and on the correct NU7 chain, which pays transparent `tm…` addresses directly (no
+  shielded/PCZT hop). The orchestrator claimed from it themselves (Mac IP for the taker
+  address, dnsdivi IP for the maker address, so neither counts against hp2's own 24h/IP
+  quota — **do not also claim from hp2 today**, per the orchestrator). Both claims are now
+  mined and confirmed; see "done" below. `zcash-devtool`'s PCZT flow (under
+  "- decisions: funding path") is no longer needed unless this address/faucet ever needs
+  topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Funding confirmed, read-only, 2026-10-11 ~19:05 EDT** (`GetAddressUtxos` on
+    `testnet.zec.rocks`, via a new small checker,
+    `crates/swap-chain-zec/examples/check_addr_utxos.rs` — no key needed, nothing signed; tip
+    at check time was height 4,490,188, confirming this read itself is against the real NU7
+    chain, not the pre-NU7 fork):
+    - taker `tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk`: **12,500,000 zatoshi (0.125 TAZ)**, 1 UTXO,
+      mined at height 4,490,184 (5 confirmations at check time), txid
+      `13e335069477201682b6218b3c03b0ad2eed3c972c372ba0d2d216256f1fde8e` vout 0. Matches the
+      orchestrator's claim id `8bef7ddd4ac16091ee480f1e41ca2f91`.
+    - maker `tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn`: **12,500,000 zatoshi (0.125 TAZ)**, 1 UTXO,
+      mined at height 4,490,184 (5 confirmations at check time), txid
+      `ebd663bdb5473e6d8c3cfadd033b58d12a8ea2388853d0d03abe724e8f983a07` vout 0. Matches the
+      orchestrator's claim id `a1718348432f963f4b4a7cbd52bda8c6`.
+    - **Both are confirmed. `zec-live.sh happy` is unblocked for both directions.**
+    - **Recommended ZEC amount per run, given 0.125 TAZ (12,500,000 zatoshi) per side**: keep
+      `zec-live.sh`'s existing default, `E2E_ZEC_SATS` unset → 100,000 zatoshi (0.001 TAZ).
+      At `FeePolicy::default()` (2 zat/byte) a funding tx (1 P2PKH input, HTLC P2SH output,
+      P2PKH change output) is ~250–300 bytes, so the real fee is ~500–600 zatoshi — the
+      script's built-in 5,000 zatoshi fee buffer is already ~10x that, and the change output
+      clears the 294-zatoshi dust floor with room to spare. One `happy` run (forward +
+      reverse) spends at most ~105,000 zatoshi from each side, leaving ~12,395,000 zatoshi
+      (~99.2%) per address — enough for roughly another 115 runs at this size, so there's no
+      need to raise or lower `E2E_ZEC_SATS` for the planned happy-both-directions run, and
+      plenty of headroom left over for `case-c` afterward too.
   - **Wave 1b** (`crates/swap-chain-zec/`): `ZecBackend` implementing `divi_swap::ChainBackend`
     over lightwalletd gRPC (`grpc.rs`), hand-rolled ZIP-244/ZIP-229 tx building+signing+digest
     (`tx.rs`), t-address Base58Check (`address.rs`). `ZecBackend::chain()` now correctly
