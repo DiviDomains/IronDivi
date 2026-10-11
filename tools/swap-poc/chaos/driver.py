@@ -42,7 +42,8 @@ KEYS = {
     "taker_btc": "op://global_secret_store/IronDivi Swap POC - taker-btc/password",
 }
 DIVI_UPSTREAM = "https://services.divi.domains/api/testnet/rpc/"
-BTC_NETWORK = os.environ.get("SWAP_BTC_NETWORK", "signet")  # or "testnet" (testnet3)
+# Default testnet3: the shared BTC keys hold their coins there (signet wallets are empty).
+BTC_NETWORK = os.environ.get("SWAP_BTC_NETWORK", "testnet")  # or "signet"
 ESPLORA_UPSTREAM = f"https://mempool.space/{BTC_NETWORK}/api"
 # Public address of the shared taker BTC key; the driver waits for its coins to confirm before a
 # lock so it never builds a second unconfirmed chain on a UTXO another lane is spending.

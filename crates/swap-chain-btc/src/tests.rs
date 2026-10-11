@@ -498,6 +498,26 @@ async fn funding_selects_coins_and_change() {
     assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
 }
 
+#[tokio::test]
+async fn funding_from_empty_wallet_is_insufficient_funds() {
+    // An Esplora on the wrong network returns `[]` for the address; that used to panic with a
+    // subtract overflow in coin selection instead of reporting insufficient funds.
+    let server = MockServer::start().await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let addr = b.address().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{addr}/utxo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    let (_, hash) = new_preimage();
+    let err = b
+        .build_funding(&htlc(hash), Amount::from_sat(20_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+}
+
 #[cfg(feature = "live")]
 mod live {
     use std::time::Duration;

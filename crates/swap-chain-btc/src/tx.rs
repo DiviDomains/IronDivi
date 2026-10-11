@@ -115,7 +115,8 @@ pub fn build_funding_tx(
             break;
         }
     }
-    if total < needed {
+    // An empty wallet never enters the loop, so `needed` is still 0: check `chosen` too.
+    if chosen.is_empty() || total < needed {
         return Err(SwapError::InsufficientFunds(format!(
             "have {total} sats, need {needed} (amount {amount} + fee)"
         )));
