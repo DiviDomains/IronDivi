@@ -10,4 +10,13 @@ description = "Atomic swap HTLC for ERC-20 (USDC) on EVM testnets (Sepolia, Base
 live = []
 
 [dependencies]
+alloy = { version = "2.5.0", features = ["full", "node-bindings"] }
 divi-swap = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -8,5 +8,29 @@
 
 //! EVM (USDC) hash-time-locked contract client for the DIVI swap engine.
 //!
-//! Scaffold landed by the orchestrator; the usdc lane fills it in
-//! (docs/plans/swap-poc/lanes/usdc.md).
+//! The contract is `contracts/htlc/src/Erc20Htlc.sol` (Foundry; `forge test` there is the
+//! contract's own acceptance). This crate is the alloy client against it: deploy, lock
+//! (approve + lock), claim, refund, read swap state, and recover the preimage from
+//! `Claimed` logs. See `docs/plans/swap-poc/usdc-design.md` for how an account chain like
+//! this fits (or does not fit) the `divi_swap::ChainBackend` contract.
+
+#[cfg(test)]
+mod artifact;
+mod contract;
+
+pub mod client;
+
+pub use client::{connect_provider, deploy_contract, swap_id, EvmHtlcClient, SwapState};
+pub use contract::{IErc20, IErc20Htlc};
+
+/// Circle test USDC — Ethereum Sepolia.
+/// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses> and
+/// confirmed on Sepolia Etherscan, 2026-10-11.
+pub const SEPOLIA_USDC: &str = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+
+/// Circle test USDC — Base Sepolia.
+/// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses>, 2026-10-11.
+pub const BASE_SEPOLIA_USDC: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+
+#[cfg(test)]
+mod tests;
