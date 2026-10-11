@@ -12,6 +12,9 @@ root="$(git rev-parse --show-toplevel)"; cd "$root"
 git pull -q --rebase origin main
 subject="$("${ssh_[@]}" "grep -E '^- *ready_to_land:' ~/$lane/docs/plans/swap-poc/status/$coin.md | head -1 | sed -E 's/^- *ready_to_land: *//'")"
 [[ -n "$subject" ]] || { echo "hp2-land: $coin has no ready_to_land line"; exit 1; }
+# The line becomes the commit subject verbatim, so it must read like one ("swap(zec): …"),
+# not a status answer ("yes — re-synced …").
+[[ "$subject" =~ ^[a-z]+(\([a-z0-9-]+\))?:\  ]] || { echo "hp2-land: $coin ready_to_land is not a commit subject: $subject"; exit 1; }
 unmerged="$("${ssh_[@]}" "git -C ~/$lane diff --name-only --diff-filter=U")"
 [[ -z "$unmerged" ]] || { echo "hp2-land: $coin has unresolved conflicts: $unmerged"; exit 1; }
 patch="$(mktemp)"; trap 'rm -f "$patch"' EXIT
