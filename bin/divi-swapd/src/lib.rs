@@ -21,7 +21,9 @@ pub mod routes;
 pub mod scan;
 pub mod scheduler;
 
-pub use config::{mock_counter_offers, BackendKind, BtcSection, DaemonConfig, MOCK_ONLY_CHAINS};
+pub use config::{
+    mock_counter_offers, BackendKind, BtcSection, DaemonConfig, LtcSection, MOCK_ONLY_CHAINS,
+};
 pub use routes::{router, AppState};
 pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
 pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};

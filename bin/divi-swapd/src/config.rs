@@ -61,6 +61,20 @@ pub struct BtcSection {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct LtcSection {
+    #[serde(default = "default_ltc_network")]
+    pub network: String,
+    /// Primary Esplora API base.
+    #[serde(default = "default_ltc_esplora")]
+    pub esplora_url: String,
+    /// Fallback Esplora API base, if one exists (none known as of 2026-10-11 — see
+    /// `swap-chain-ltc`'s lane status).
+    pub fallback_esplora_url: Option<String>,
+    /// Reference (`op://…` or `credential:<name>`) to the maker's LTC key.
+    pub key: String,
+}
+
 fn default_divi_rpc() -> String {
     "https://services.divi.domains/api/testnet/rpc/".into()
 }
@@ -69,6 +83,12 @@ fn default_esplora() -> String {
 }
 fn default_network() -> String {
     "signet".into()
+}
+fn default_ltc_network() -> String {
+    "testnet".into()
+}
+fn default_ltc_esplora() -> String {
+    swap_chain_ltc::LITECOINSPACE_TESTNET.into()
 }
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8480".parse().expect("static address")
@@ -93,7 +113,10 @@ fn default_offers() -> Vec<Offer> {
     .collect()
 }
 
-/// Counter chains the mock backend simulates besides BTC (no live backend exists yet).
+/// Counter chains `--backend mock` simulates besides BTC, via a generic in-process
+/// `MockChain` rather than a dedicated mock. (LTC also has a live backend — see
+/// [`LtcSection`] — but mock mode always simulates every chain the same way, for fast
+/// hermetic local/CI coverage; ZEC has no live backend yet.)
 pub const MOCK_ONLY_CHAINS: [Chain; 2] = [Chain::Ltc, Chain::Zec];
 
 /// The offers `--backend mock` adds for each of [`MOCK_ONLY_CHAINS`]: `divi-<c>-testnet`
@@ -166,6 +189,9 @@ pub struct DaemonConfig {
     /// `[divi]` and `[btc]` are required by the live backend, ignored by the mock one.
     pub divi: Option<DiviSection>,
     pub btc: Option<BtcSection>,
+    /// Enables a live LTC counter backend; needed only for offers with `counter_chain =
+    /// "ltc"`. Ignored by the mock backend (which always simulates LTC).
+    pub ltc: Option<LtcSection>,
     /// Overrides on top of `profile`.
     #[serde(default)]
     pub swap: SwapOverrides,
@@ -231,7 +257,8 @@ impl DaemonConfig {
             .divi
             .iter()
             .map(|d| &d.key)
-            .chain(self.btc.iter().map(|b| &b.key));
+            .chain(self.btc.iter().map(|b| &b.key))
+            .chain(self.ltc.iter().map(|l| &l.key));
         for r in refs {
             divi_swap::secrets::SecretRef::parse(r)
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;
@@ -280,6 +307,17 @@ key = "credential:btc"
         let b = c.btc.unwrap();
         assert_eq!(b.network, "signet");
         assert!(b.fallback_esplora_url.is_some());
+        let l = c.ltc.unwrap();
+        assert_eq!(l.network, "testnet");
+        assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
+        assert_eq!(l.key, "credential:maker-ltc");
+        let ltc_ids: Vec<_> = c
+            .offers
+            .iter()
+            .filter(|o| o.counter_chain == Chain::Ltc)
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(ltc_ids, ["divi-ltc-testnet", "ltc-divi-testnet"]);
     }
 
     #[test]

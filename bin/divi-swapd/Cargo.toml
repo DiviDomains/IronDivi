@@ -17,6 +17,7 @@ path = "src/main.rs"
 divi-swap = { workspace = true }
 swap-chain-divi = { workspace = true }
 swap-chain-btc = { workspace = true }
+swap-chain-ltc = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

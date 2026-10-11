@@ -27,6 +27,7 @@ use divi_swap::{Amount, Chain, ChainBackend, Store, Taker};
 use divi_swap_cli::{flow, ClaimGate, ClaimPolicy, MakerClient, RunOpts, Sessions};
 use swap_chain_btc::BtcBackend;
 use swap_chain_divi::DiviBackend;
+use swap_chain_ltc::LtcBackend;
 
 #[derive(Parser)]
 #[command(
@@ -43,15 +44,18 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value = "live")]
     backend: BackendArg,
     /// Chain swapped against DIVI: `btc`, `ltc` or `zec` (the offer's `counter_chain`).
-    /// Only `btc` has a live backend so far; the others need `--backend mock`.
+    /// `btc` and `ltc` have live backends; `zec` needs `--backend mock`.
     #[arg(long, global = true, default_value = "btc", value_parser = parse_counter_chain)]
     counter_chain: Chain,
     /// Secret reference (`op://…` or `credential:<name>`) for the taker's DIVI key.
     #[arg(long, global = true)]
     divi_key: Option<String>,
-    /// Secret reference for the taker's BTC key.
+    /// Secret reference for the taker's BTC key (when `--counter-chain btc`).
     #[arg(long, global = true)]
     btc_key: Option<String>,
+    /// Secret reference for the taker's LTC key (when `--counter-chain ltc`).
+    #[arg(long, global = true)]
+    ltc_key: Option<String>,
     /// Taker's DIVI coin database (live backend only; created mode 0600, must be outside any
     /// git tree). Required for the reverse direction, where the taker pays DIVI.
     #[arg(long, global = true)]
@@ -162,12 +166,36 @@ enum Cmd {
     },
 }
 
+/// Concrete counter-chain handle, live backend only (for `Balance`'s address + Esplora
+/// lookup, which need the real type rather than `dyn ChainBackend`).
+enum CounterLive {
+    Btc(Arc<BtcBackend>),
+    Ltc(Arc<LtcBackend>),
+}
+
+impl CounterLive {
+    fn address(&self) -> String {
+        match self {
+            CounterLive::Btc(b) => b.address().to_string(),
+            CounterLive::Ltc(b) => b.address().to_string(),
+        }
+    }
+
+    /// Esplora endpoints to query for this chain's balance.
+    fn esplora_endpoints(&self, btc_network: &str) -> Result<Vec<String>> {
+        Ok(match self {
+            CounterLive::Btc(_) => swap_chain_btc::esplora_endpoints(btc_network)?,
+            CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints("testnet")?,
+        })
+    }
+}
+
 struct Backends {
     divi: Arc<dyn ChainBackend>,
     /// The `--counter-chain` backend.
     btc: Arc<dyn ChainBackend>,
     /// Concrete handles, live backend only.
-    live: Option<(Arc<DiviBackend>, Arc<BtcBackend>)>,
+    live: Option<(Arc<DiviBackend>, CounterLive)>,
 }
 
 fn backends(cli: &Cli) -> Result<Backends> {
@@ -211,25 +239,27 @@ fn secret_hex(
         .map_err(|e| anyhow::anyhow!("{what} key: {e}"))
 }
 
+/// Resolve `reference` and decode it as a 32-byte secp256k1 key (BTC and LTC share a key
+/// format: compressed pubkeys over the same curve, so one helper covers both).
+fn secp_key(
+    reference: &Option<String>,
+    flag: &str,
+    what: &str,
+) -> Result<bitcoin::secp256k1::SecretKey> {
+    let hex_key = secret_hex(reference, flag, what)?;
+    let mut raw = [0u8; 32];
+    hex::decode_to_slice(hex_key.trim(), &mut raw)
+        .map_err(|_| anyhow::anyhow!("{what} key is not 32 bytes of hex"))?;
+    let key = bitcoin::secp256k1::SecretKey::from_slice(&raw);
+    raw.fill(0);
+    key.map_err(|_| anyhow::anyhow!("{what} key is not a valid secp256k1 key"))
+}
+
 fn live_backends(cli: &Cli) -> Result<Backends> {
-    if cli.counter_chain != Chain::Btc {
-        bail!(
-            "no live {} backend in this build yet; use --backend mock",
-            cli.counter_chain
-        );
-    }
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
         .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
     drop(dhex);
-    let bhex = secret_hex(&cli.btc_key, "--btc-key", "btc")?;
-    let mut raw = [0u8; 32];
-    hex::decode_to_slice(bhex.trim(), &mut raw)
-        .map_err(|_| anyhow::anyhow!("btc key is not 32 bytes of hex"))?;
-    let bkey = bitcoin::secp256k1::SecretKey::from_slice(&raw);
-    raw.fill(0);
-    let bkey = bkey.map_err(|_| anyhow::anyhow!("btc key is not a valid secp256k1 key"))?;
-    drop(bhex);
     let wallet = cli
         .divi_wallet
         .as_deref()
@@ -242,15 +272,33 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         swap_chain_divi::FeePolicy::default(),
         wallet,
     )?);
-    let btc = Arc::new(BtcBackend::for_network(
-        &cli.btc_network,
-        bkey,
-        swap_chain_btc::FeePolicy::default(),
-    )?);
+
+    let (btc, counter): (Arc<dyn ChainBackend>, CounterLive) = match cli.counter_chain {
+        Chain::Btc => {
+            let bkey = secp_key(&cli.btc_key, "--btc-key", "btc")?;
+            let backend = Arc::new(BtcBackend::for_network(
+                &cli.btc_network,
+                bkey,
+                swap_chain_btc::FeePolicy::default(),
+            )?);
+            (backend.clone(), CounterLive::Btc(backend))
+        }
+        Chain::Ltc => {
+            let lkey = secp_key(&cli.ltc_key, "--ltc-key", "ltc")?;
+            let backend = Arc::new(LtcBackend::for_network(
+                "testnet",
+                lkey,
+                swap_chain_ltc::FeePolicy::default(),
+            )?);
+            (backend.clone(), CounterLive::Ltc(backend))
+        }
+        other => bail!("no live {other} backend in this build yet; use --backend mock"),
+    };
+
     Ok(Backends {
         divi: divi.clone(),
-        btc: btc.clone(),
-        live: Some((divi, btc)),
+        btc,
+        live: Some((divi, counter)),
     })
 }
 
@@ -262,10 +310,11 @@ async fn sync_divi(cli: &Cli, b: &Backends) -> Result<()> {
     Ok(())
 }
 
-/// Confirmed plus pending BTC sats at `address`, from the first Esplora endpoint that answers.
-async fn btc_balance(network: &str, address: &str) -> Result<i64> {
+/// Confirmed plus pending sats at `address`, from the first Esplora `endpoints` entry that
+/// answers (BTC and LTC serve the same Esplora JSON shape).
+async fn chain_balance(endpoints: &[String], address: &str) -> Result<i64> {
     let mut last = None;
-    for base in swap_chain_btc::esplora_endpoints(network)? {
+    for base in endpoints {
         let url = format!("{base}/address/{address}");
         let got = async {
             let v: serde_json::Value = reqwest::get(&url).await?.error_for_status()?.json().await?;
@@ -382,17 +431,19 @@ async fn main() -> Result<()> {
         }
         Cmd::Balance => {
             let b = backends(&cli)?;
-            let Some((divi, btc)) = &b.live else {
+            let Some((divi, counter)) = &b.live else {
                 bail!("balance needs --backend live");
             };
             sync_divi(&cli, &b).await?;
-            let addr = btc.address().to_string();
+            let addr = counter.address();
             println!("divi_address={}", divi.address());
             println!("divi_balance_sats={}", divi.balance());
-            println!("btc_address={addr}");
+            println!("{}_address={addr}", cli.counter_chain);
+            let endpoints = counter.esplora_endpoints(&cli.btc_network)?;
             println!(
-                "btc_balance_sats={}",
-                btc_balance(&cli.btc_network, &addr).await?
+                "{}_balance_sats={}",
+                cli.counter_chain,
+                chain_balance(&endpoints, &addr).await?
             );
         }
         Cmd::Txids { swap } => {

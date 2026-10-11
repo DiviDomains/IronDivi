@@ -13,10 +13,6 @@
 //! directly on `swap-chain-btc`; only address *string* encoding (`address.rs`) differs,
 //! since Litecoin's bech32 HRP (`tltc`/`ltc`) is not one of `bitcoin::Address`'s known
 //! `Network` variants.
-//!
-//! `chain()` returns [`Chain::Btc`] until the engine grows a `Chain::Ltc` variant
-//! (`- needs:` in the lane status file) — the closest existing value, since the two chains
-//! share scripts, sighash and serialization.
 
 mod address;
 mod client;
@@ -292,7 +288,7 @@ fn ltc_outpoint(o: &Outpoint) -> OutPoint {
 #[async_trait]
 impl ChainBackend for LtcBackend {
     fn chain(&self) -> Chain {
-        Chain::Btc
+        Chain::Ltc
     }
 
     fn pubkey(&self) -> [u8; 33] {

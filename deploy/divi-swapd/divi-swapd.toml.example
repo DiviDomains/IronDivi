@@ -17,8 +17,16 @@ esplora_url = "https://mempool.space/signet/api"
 fallback_esplora_url = "https://blockstream.info/signet/api"
 key = "credential:maker-btc"
 
-# Standing offers. Price is DIVI sats per 1 BTC; min/max are BTC sats in both directions.
-# direction: "taker_pays_btc" (maker sells DIVI, the default) or "taker_pays_divi" (maker sells BTC).
+[ltc]
+network = "testnet"
+esplora_url = "https://litecoinspace.org/testnet/api"
+# No independent secondary mirror of this API shape is known (swap-chain-ltc lane status,
+# decisions, 2026-10-11); fallback_esplora_url is left unset.
+key = "credential:maker-ltc"
+
+# Standing offers. Price is DIVI sats per 1 counter-chain coin; min/max are counter-chain
+# sats in both directions. direction: "taker_pays_btc" (maker sells DIVI, the default) or
+# "taker_pays_divi" (maker sells the counter chain). counter_chain defaults to "btc".
 [[offers]]
 id = "divi-btc-testnet"
 direction = "taker_pays_btc"
@@ -32,4 +40,20 @@ direction = "taker_pays_divi"
 divi_sats_per_btc = 300000000000000
 min_btc_sats = 5000
 max_btc_sats = 50000
+
+[[offers]]
+id = "divi-ltc-testnet"
+direction = "taker_pays_btc"
+counter_chain = "ltc"
+divi_sats_per_btc = 1000000000000     # 10,000 DIVI per LTC
+min_btc_sats = 100000
+max_btc_sats = 10000000
+
+[[offers]]
+id = "ltc-divi-testnet"
+direction = "taker_pays_divi"
+counter_chain = "ltc"
+divi_sats_per_btc = 1000000000000
+min_btc_sats = 100000
+max_btc_sats = 10000000
 

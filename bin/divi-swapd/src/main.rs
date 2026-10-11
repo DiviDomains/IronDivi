@@ -27,11 +27,12 @@ use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
     mock_counter_offers, router, run_scan, spawn_gated_scheduler, AppState, BackendKind,
-    BtcSection, DaemonConfig, ScanStatus, MOCK_ONLY_CHAINS,
+    BtcSection, DaemonConfig, LtcSection, ScanStatus, MOCK_ONLY_CHAINS,
 };
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
 use swap_chain_divi::{DiviBackend, FeePolicy as DiviFeePolicy};
+use swap_chain_ltc::LtcBackend;
 
 #[derive(Parser)]
 #[command(name = "divi-swapd", version, about = "Atomic swap maker daemon")]
@@ -142,18 +143,47 @@ fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
+fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
+    // Validates the name; the endpoints themselves come from the config.
+    swap_chain_ltc::esplora_endpoints(&cfg.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let key = resolve_key(&cfg.key, "ltc")?;
+    let mut endpoints = vec![cfg.esplora_url.clone()];
+    endpoints.extend(cfg.fallback_esplora_url.clone());
+    let backend = LtcBackend::new(
+        endpoints,
+        key,
+        swap_chain_ltc::FeePolicy::default(),
+        swap_chain_ltc::RetryPolicy::default(),
+    )?;
+    tracing::info!(address = %backend.address(), network = %cfg.network, "ltc backend ready");
+    Ok(Arc::new(backend))
+}
+
 async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
-    if let Some(o) = cfg.offers.iter().find(|o| o.counter_chain != Chain::Btc) {
-        bail!(
-            "offer {}: no live {} backend in this build yet; use --backend mock",
-            o.id,
-            o.counter_chain
-        );
+    for o in &cfg.offers {
+        let supported =
+            o.counter_chain == Chain::Btc || (o.counter_chain == Chain::Ltc && cfg.ltc.is_some());
+        if !supported {
+            let hint = if o.counter_chain == Chain::Ltc {
+                " (add [ltc] to the config)"
+            } else {
+                ""
+            };
+            bail!(
+                "offer {}: no live {} backend in this build yet{hint}; use --backend mock",
+                o.id,
+                o.counter_chain
+            );
+        }
     }
     let btc = live_btc(btc_cfg)?;
+    let mut others = Vec::new();
+    if let Some(ltc_cfg) = &cfg.ltc {
+        others.push(live_ltc(ltc_cfg)?);
+    }
     let hex_key = SecretRef::parse(&divi_cfg.key)
         .and_then(|r| r.resolve())
         .map_err(|e| anyhow::anyhow!("divi key: {e}"))?;
@@ -173,11 +203,7 @@ async fn live_backends(cfg: &DaemonConfig) -> Result<(Backends, Option<ScanJob>)
         divi: divi.clone(),
         from,
     });
-    let backends = Backends {
-        divi,
-        btc,
-        others: Vec::new(),
-    };
+    let backends = Backends { divi, btc, others };
     Ok((backends, job))
 }
 
