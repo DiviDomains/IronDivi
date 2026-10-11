@@ -186,8 +186,9 @@ TOML
   daemon_pid=$!
 
   healthy() { [[ "$(curl -s -m 10 "$base/healthz" | jq -r '.ok // empty' 2>/dev/null)" == true ]]; }
+  # /healthz waits for the first DIVI wallet scan, which takes several minutes live.
   local ready=""
-  for _ in $(seq 1 150); do
+  for _ in $(seq 1 "${E2E_HEALTH_TRIES:-900}"); do
     kill -0 "$daemon_pid" 2>/dev/null || { tail -20 "$log" >&2; stop_daemon; die "daemon exited during startup"; }
     if healthy; then ready=1; break; fi
     sleep 2
