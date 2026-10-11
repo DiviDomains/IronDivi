@@ -109,7 +109,14 @@ pub fn build_funding_tx(
 
     let mut chosen: Vec<Coin> = Vec::new();
     let mut total = 0u64;
-    let mut needed = 0u64;
+    // Seeded from the zero-input skeleton so a coin list with no entries at all (a fresh,
+    // never-funded address) still reports InsufficientFunds instead of `needed` staying 0
+    // and `total < needed` wrongly passing.
+    let mut needed = amount
+        + ceil_fee(
+            sat_per_vb,
+            skeleton(&chosen, htlc, amount, Some(0), &my_spk, &pk).vsize(),
+        );
     for c in sorted {
         chosen.push(c);
         total += c.value;

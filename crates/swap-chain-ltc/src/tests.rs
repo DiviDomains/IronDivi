@@ -506,6 +506,28 @@ async fn funding_selects_coins_and_change() {
     assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
 }
 
+/// A freshly generated, never-funded address (zero UTXOs, not just too few sats) reports
+/// `InsufficientFunds` instead of panicking: the live dry run (`examples/ltc_live_dry_run.rs`)
+/// hit this against a real throwaway key before the fix.
+#[tokio::test]
+async fn funding_fails_cleanly_with_no_utxos_at_all() {
+    let server = MockServer::start().await;
+    let b = backend(vec![server.uri()], TAKER_KEY);
+    let addr = b.address().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{addr}/utxo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let err = b
+        .build_funding(&h, Amount::from_sat(100_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+}
+
 /// `#[ignore]`, read-only: hits the real Litecoin testnet Esplora API for the tip height
 /// and a known block (the genesis hash at height 0).
 #[tokio::test]
