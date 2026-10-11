@@ -31,11 +31,27 @@ const TAKER_DIVI_FUNDS: u64 = 2_000_000_000;
 const FWD: Direction = Direction::TakerPaysBtc;
 const REV: Direction = Direction::TakerPaysDivi;
 
+thread_local! {
+    /// The counter chain (and its block interval) the harness builds on this test's thread:
+    /// BTC unless a test runs under [`on_counter`]. Fields named `btc`/`mbtc`/`tbtc` below
+    /// are that counter chain.
+    static COUNTER: std::cell::Cell<(Chain, u32)> = const { std::cell::Cell::new((Chain::Btc, 600)) };
+}
+
+/// Run the rest of this test thread's harness against `chain` (block interval `block_secs`).
+fn on_counter(chain: Chain, block_secs: u32) {
+    COUNTER.with(|c| c.set((chain, block_secs)));
+}
+
+fn counter() -> (Chain, u32) {
+    COUNTER.with(|c| c.get())
+}
+
 fn offer(dir: Direction) -> Offer {
     Offer {
         id: "o1".into(),
         direction: dir,
-        counter_chain: Chain::Btc,
+        counter_chain: counter().0,
         divi_sats_per_btc: 50_000_000_000,
         min_btc_sats: 10_000,
         max_btc_sats: 5_000_000,
@@ -95,7 +111,8 @@ impl H {
     }
 
     fn with(dir: Direction) -> H {
-        let btc = MockChain::new(Chain::Btc, T0, 600);
+        let (counter_chain, block_secs) = counter();
+        let btc = MockChain::new(counter_chain, T0, block_secs);
         let divi = MockChain::new(Chain::Divi, T0, 60);
         // Each side funds on the chain where it locks: the taker on the taker-leg chain, the
         // maker on the maker-leg chain.
@@ -972,4 +989,69 @@ async fn forward_records_still_load() {
     assert_eq!(again.maker_leg_funding, happy.maker_leg_funding);
     let again: TakerRecord = serde_json::from_str(&serde_json::to_string(&taker).unwrap()).unwrap();
     assert_eq!(again.maker_leg_claim, taker.maker_leg_claim);
+}
+
+/// The reverse direction with LTC as the counter chain (`ltc-divi-testnet`: the taker locks
+/// DIVI, the maker locks LTC), through the same bodies as the BTC reverse suite above. Only
+/// chain parameters differ: 150 s blocks and LTC's own confirmation count from the profile.
+macro_rules! ltc_rev {
+    ($name:ident, $body:ident) => {
+        #[tokio::test]
+        async fn $name() {
+            on_counter(Chain::Ltc, 150);
+            $body(REV).await
+        }
+    };
+}
+
+ltc_rev!(ltc_rev_happy_path, happy_path_body);
+ltc_rev!(ltc_rev_case_a_taker_never_locks, case_a_body);
+ltc_rev!(ltc_rev_case_b_taker_lock_invalid, case_b_body);
+ltc_rev!(ltc_rev_case_c_taker_never_claims, case_c_body);
+ltc_rev!(ltc_rev_case_d_late_claim, case_d_body);
+ltc_rev!(ltc_rev_crash_at_every_maker_state, crash_maker_body);
+ltc_rev!(ltc_rev_crash_at_every_taker_state, crash_taker_body);
+ltc_rev!(
+    ltc_rev_no_coin_selection_before_taker_lock_confirmed,
+    no_coin_selection_body
+);
+ltc_rev!(ltc_rev_timeout_invariant_enforced, timeout_invariant_body);
+ltc_rev!(ltc_rev_quote_carries_ltc, quote_carries_counter_body);
+
+/// What the harness actually built: an LTC quote with LTC's confirmation count and key, a
+/// maker leg on the LTC chain (the guard that the `ltc_rev_*` tests are not BTC in disguise).
+async fn quote_carries_counter_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let (chain, _) = counter();
+    let q = h.quote().await;
+    assert_eq!(q.counter_chain, chain);
+    assert_eq!(
+        q.maker_chain(),
+        chain,
+        "reverse: the maker locks the counter coin"
+    );
+    assert_eq!(q.btc_confirmations, h.cfg.confirmations(chain));
+    assert_eq!(q.maker_btc_pubkey, h.mbtc.pubkey());
+    assert_eq!(h.mbtc.chain(), chain);
+    h.run(Scn::Happy, None, &[]).await;
+    let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(rec.quote.counter_chain, chain);
+    assert_eq!(h.mbtc.funding_calls(), 1, "the maker funded on {chain}");
+    assert_eq!(h.mdivi.funding_calls(), 0);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    #[test]
+    fn ltc_rev_prop_random_crash_points(
+        refund in any::<bool>(),
+        maker_side in any::<bool>(),
+        mi in 0usize..MAKER_STATES.len(),
+        ti in 0usize..TAKER_STATES.len(),
+        outages in proptest::collection::vec(0usize..30, 0..6),
+    ) {
+        on_counter(Chain::Ltc, 150);
+        prop_body(REV, refund, maker_side, mi, ti, &outages);
+    }
 }
