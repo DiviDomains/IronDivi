@@ -56,8 +56,14 @@ impl MasternodeRpc {
     /// Get masternode count values
     pub fn get_masternode_count(&self, _params: &Params) -> Result<Value, Error> {
         let rpc = self.get_rpc()?;
-        let count = rpc.count();
-        Ok(serde_json::to_value(count)?)
+        let mut value = serde_json::to_value(rpc.count())?;
+        // Fields C++ always reports; the Rust manager does not track network types yet
+        if let Some(obj) = value.as_object_mut() {
+            for key in ["inqueue", "ipv4", "ipv6", "onion", "obfcompat", "stable"] {
+                obj.entry(key).or_insert(json!(0));
+            }
+        }
+        Ok(value)
     }
 
     /// Print masternode status
@@ -196,6 +202,7 @@ impl MasternodeRpc {
                     "timestampOfLastMasternodeWinnerUpdate": 0,
                     "currentMasternodeSyncStatus": 999,
                     "countOfFailedSyncAttempts": 0,
+                    "totalSuccessivePeerSyncRequests": 0,
                     "timestampOfLastFailedSync": 0,
                     "fulfilledMasternodeListSyncRequests": 0,
                     "fulfilledMasternodeWinnerSyncRequests": 0,

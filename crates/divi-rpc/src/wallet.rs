@@ -352,8 +352,13 @@ impl WalletRpc {
 
         Ok(serde_json::json!({
             "walletname": "wallet.dat",
+            "active_wallet": "wallet.dat",
             "walletversion": 120200,
             "balance": divi_balance,
+            "spendable_balance": divi_balance,
+            "vaulted_balance": 0.0,
+            // A Rust wallet can never be encrypted (see docs/rpc-parity-audit.md)
+            "encryption_status": "unencrypted",
             "unconfirmed_balance": divi_unconfirmed,
             "immature_balance": divi_immature,
             "txcount": wallet.get_transactions(None).len(),
