@@ -32,6 +32,13 @@
 - 2026-10-11: wave 0 landed — crate scaffolds `swap-chain-{ltc,zec,evm}`, lane briefs
   `lanes/{_hp2,ltc,zec,usdc,xmr}.md`, checks `check-{ltc,zec,usdc,xmr}.sh`, `hp2-land.sh`,
   `lane-sync.sh`. Lanes run on hp2 (`~/swap-lanes/<coin>`), panes in Avada tab "Swap coins".
-- running: lanes ltc, zec, usdc, xmr (wave 1a–1d); orchestrator on wave 1e (engine generalization).
-- BTC reverse chaos still running in tab "Divi Swap 1" until ~21:30 UTC; no DIVI-key live runs
-  until it ends.
+- hp2 lanes authenticate with the long-lived `CLAUDE_CODE_OAUTH_TOKEN` from 1Password item
+  `orch-claude-oauth`, piped to `hp2:~/.config/claude-swap/oauth.env` (600) and sourced by
+  `hp2:~/.local/bin/claude_auto`. Onboarding, trust and the bypass prompt are pre-accepted there.
+- running: lanes ltc, zec, usdc, xmr (wave 1a–1d, Sonnet) and **multichain** (wave 1e, Opus;
+  `lanes/multichain.md`, `check-multichain.sh`), all on hp2.
+- BTC reverse live chaos failed at 10:13: the driver defaulted to **signet**, so the maker's BTC
+  wallet looked empty, and an empty coin list slipped past the funds check and panicked
+  (`tx.rs` subtract overflow). Fixed in 7c867aa (empty wallet → `InsufficientFunds`; driver
+  default testnet3). Swap 29378dca (taker DIVI locked, maker never funded) resumes with the fixed
+  binaries; the maker funds or aborts safely, and the taker DIVI refunds at its timelock if not.
