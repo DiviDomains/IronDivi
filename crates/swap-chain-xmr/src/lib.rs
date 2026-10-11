@@ -12,11 +12,13 @@
 //! `nLockTime` schedule (not CSV/CLTV — see its docs) is enforced; and the bridge from a
 //! `swap-adaptor` ECDSA adaptor signature into a DIVI scriptSig ([`adaptor_bridge`]),
 //! proving a completed adaptor signature satisfies `OP_CHECKMULTISIG` exactly like a
-//! plain one. The cross-group DLEQ and the Monero side are not here yet — DLEQ lives in
-//! `swap-adaptor`, Monero is a later build-plan step.
+//! plain one. The cross-group DLEQ lives in `swap-adaptor`. [`monero_dkg`] (test-only for
+//! now) is the start of the Monero side: build-plan step 5's 2-of-2 key generation.
 
 pub mod adaptor_bridge;
 pub mod multisig;
 
+#[cfg(test)]
+mod monero_dkg;
 #[cfg(test)]
 mod tests;

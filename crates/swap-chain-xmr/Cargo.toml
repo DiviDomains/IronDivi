@@ -16,3 +16,17 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+dkg = "0.6"
+dkg-pedpop = "0.6"
+# "ed25519" is the real Monero-compatible ciphersuite; exposes ciphersuite::Ed25519.
+ciphersuite = { version = "0.4", features = ["ed25519"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# dkg-pedpop 0.6.0 uses multiexp::BatchVerifier without requesting multiexp's "batch"
+# feature itself (upstream packaging gap); pull it in ourselves so Cargo's feature
+# unification covers dkg-pedpop's otherwise-unresolved import.
+multiexp = { version = "0.4", features = ["batch"] }
+# schnorr-signatures 0.5.3 widened its multiexp requirement to ">=0.4.2, <=0.5", which
+# Cargo resolves as a separate 0.5.x instance alongside everyone else's strict "^0.4" --
+# two incompatible copies of multiexp::BatchVerifier in one build. Pin the last version
+# before that widening so the whole tree agrees on 0.4.x.
+schnorr-signatures = "=0.5.2"
