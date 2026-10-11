@@ -5,6 +5,11 @@ version = "0.2.5"
 edition = "2021"
 description = "DIVI-side presigned 2-of-2 multisig skeleton for the DIVI<->XMR adaptor-signature swap (docs/plans/swap-poc/xmr-design.md)"
 
+[features]
+# Integration tests against a public Monero stagenet node, read-only
+# (cargo test -p swap-chain-xmr --features live)
+live = []
+
 [dependencies]
 divi-primitives = { workspace = true }
 divi-crypto = { workspace = true }
@@ -33,3 +38,6 @@ schnorr-signatures = "=0.5.2"
 curve25519-dalek = "4"
 monero-wallet = "0.2"
 zeroize = { workspace = true }
+monero-daemon-rpc = "0.2"
+monero-simple-request-rpc = "0.1"
+tokio = { workspace = true }

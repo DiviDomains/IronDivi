@@ -21,4 +21,6 @@ pub mod multisig;
 #[cfg(test)]
 mod monero_dkg;
 #[cfg(test)]
+mod stagenet_rpc;
+#[cfg(test)]
 mod tests;
