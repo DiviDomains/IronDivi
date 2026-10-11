@@ -11,3 +11,33 @@ live = []
 
 [dependencies]
 divi-swap = { workspace = true }
+async-trait = { workspace = true }
+secp256k1 = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Base58Check t-address encoding (bs58) and the ZIP-244 BLAKE2b digest tree (blake2b_simd) are
+# tiny, pure-Rust, dependency-free of librustzcash's shielded stack. See `- decisions:` in
+# docs/plans/swap-poc/status/zec.md for why the tx/sighash layer is hand-rolled against the
+# official ZIP-244 test vectors instead of depending on zcash_primitives / zcash_transparent.
+bs58 = "0.5"
+blake2b_simd = "1"
+
+# Zcash's transparent script interpreter (pure Rust, no C++ FFI): used to self-check every
+# built claim/refund spend, and in tests, via a `SighashCalculator` callback that supplies our
+# own ZIP-244 digest (brief: "Zcash's transparent interpreter matches for these opcodes").
+zcash_script = "0.6"
+
+# Hand-written lightwalletd (CompactTxStreamer) gRPC client: no build-time protoc, the handful
+# of request/response messages are implemented directly with `prost::Message` derive.
+tonic = { version = "0.14", default-features = false, features = ["channel", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+http = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
