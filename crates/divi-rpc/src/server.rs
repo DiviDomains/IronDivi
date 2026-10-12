@@ -1279,7 +1279,7 @@ mod tests {
             Params::Array(vec![serde_json::json!("1.2.3.4")]),
         );
         // dispatched (not -32601 method-not-found), whatever the network state
-        assert!(resp.error.map_or(true, |e| e.code != -32601));
+        assert!(resp.error.is_none_or(|e| e.code != -32601));
     }
 
     #[test]
