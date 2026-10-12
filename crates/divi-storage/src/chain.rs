@@ -503,6 +503,7 @@ impl Chain {
             generated_stake_modifier: false,
             lottery_winners: divi_primitives::LotteryWinners::new(0),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         // Store the genesis block index
@@ -2875,6 +2876,37 @@ impl Chain {
                 debug!("  tx {}: created {} UTXOs", txid, utxos_created);
             }
         }
+
+        // Money supply: previous supply plus everything created minus everything consumed
+        // (coinbase/coinstake rewards raise it, fees burned by plain transactions lower it)
+        let prev_supply = if index.height == 0 {
+            Some(0)
+        } else {
+            self.db
+                .get_block_index(&index.prev_hash)?
+                // C++ never connects the genesis transactions, so genesis supply is 0
+                .and_then(|p| {
+                    if p.height == 0 {
+                        Some(0)
+                    } else {
+                        p.money_supply
+                    }
+                })
+        };
+        index.money_supply = prev_supply.map(|prev| {
+            let created: i64 = block
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.vout.iter())
+                .map(|o| o.value.as_sat())
+                .sum();
+            let spent: i64 = block_undo
+                .entries
+                .iter()
+                .map(|e| e.prev_utxo.value.as_sat())
+                .sum();
+            prev + created - spent
+        });
 
         // Prepare undo bytes (caller will write atomically with UTXOs + tip)
         let undo_bytes = if !block_undo.entries.is_empty() {

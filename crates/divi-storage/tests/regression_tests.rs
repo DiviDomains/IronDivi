@@ -270,6 +270,41 @@ fn test_regression_reorg_switches_to_longer_chain() {
     let _ = (hash_a1, hash_a2);
 }
 
+/// Each connected block records the running money supply: previous supply
+/// plus the value of every output created minus every input consumed.
+#[test]
+fn test_connect_block_records_money_supply() {
+    let (chain, _dir) = create_test_chain();
+    let genesis = chain.tip().expect("genesis must exist");
+
+    let block1 = build_block(genesis.hash, genesis.time, 0x0A);
+    let h1 = chain.accept_block(block1.clone()).unwrap().hash;
+    let block2 = build_block(h1, block1.header.time, 0x0B);
+    let h2 = chain.accept_block(block2.clone()).unwrap().hash;
+
+    let created = |b: &Block| -> i64 {
+        b.transactions
+            .iter()
+            .flat_map(|t| t.vout.iter())
+            .map(|o| o.value.as_sat())
+            .sum()
+    };
+    let s1 = chain
+        .get_block_index(&h1)
+        .unwrap()
+        .unwrap()
+        .money_supply
+        .expect("supply recorded for block 1");
+    let s2 = chain
+        .get_block_index(&h2)
+        .unwrap()
+        .unwrap()
+        .money_supply
+        .expect("supply recorded for block 2");
+    assert!(created(&block2) > 0);
+    assert_eq!(s2 - s1, created(&block2));
+}
+
 /// Bug 6 (commit 9cc17db): After a reorg, UTXOs from the abandoned chain must
 /// be removed, and UTXOs from the new chain must be present.
 #[test]

@@ -114,6 +114,9 @@ pub struct BlockIndex {
     /// Whether this block is a proof-of-stake block
     /// Set based on transaction structure (vtx[1] is coinstake)
     pub is_proof_of_stake: bool,
+    /// Cumulative money supply after this block (C++ `nMoneySupply`); `None` for indexes
+    /// written before it was tracked
+    pub money_supply: Option<i64>,
 }
 
 impl BlockIndex {
@@ -157,6 +160,7 @@ impl BlockIndex {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(height),
             is_proof_of_stake: false, // Will be set by caller based on block content
+            money_supply: None,
         }
     }
 
@@ -247,6 +251,12 @@ impl BlockIndex {
         // Serialize is_proof_of_stake flag (added for stake modifier computation)
         buf.push(if self.is_proof_of_stake { 1 } else { 0 });
 
+        // Money supply (added later; absent in old indexes)
+        if let Some(supply) = self.money_supply {
+            buf.push(1);
+            buf.write_i64::<LittleEndian>(supply).unwrap();
+        }
+
         buf
     }
 
@@ -301,6 +311,11 @@ impl BlockIndex {
         // Try to deserialize is_proof_of_stake flag (for backwards compatibility)
         let is_proof_of_stake = cursor.read_u8().map(|v| v != 0).unwrap_or(false);
 
+        let money_supply = match cursor.read_u8() {
+            Ok(1) => cursor.read_i64::<LittleEndian>().ok(),
+            _ => None,
+        };
+
         Ok(BlockIndex {
             hash,
             prev_hash,
@@ -320,6 +335,7 @@ impl BlockIndex {
             generated_stake_modifier,
             lottery_winners,
             is_proof_of_stake,
+            money_supply,
         })
     }
 }
@@ -382,6 +398,7 @@ mod tests {
             generated_stake_modifier: true,
             lottery_winners: LotteryWinners::new(100000),
             is_proof_of_stake: true,
+            money_supply: None,
         };
 
         let bytes = index.to_bytes();
@@ -401,6 +418,28 @@ mod tests {
         assert_eq!(decoded.stake_modifier, index.stake_modifier);
         assert!(decoded.generated_stake_modifier);
         assert!(decoded.is_proof_of_stake);
+    }
+
+    #[test]
+    fn test_block_index_money_supply_roundtrip() {
+        let mut index = BlockIndex::from_header(&BlockHeader::default(), 7, None);
+        let legacy = index.to_bytes();
+        assert_eq!(BlockIndex::from_bytes(&legacy).unwrap().money_supply, None);
+
+        index.money_supply = Some(123_456_789_000);
+        let bytes = index.to_bytes();
+        assert_eq!(bytes.len(), legacy.len() + 9);
+        assert_eq!(
+            BlockIndex::from_bytes(&bytes).unwrap().money_supply,
+            Some(123_456_789_000)
+        );
+        // An index written before the field existed still decodes.
+        assert_eq!(
+            BlockIndex::from_bytes(&bytes[..legacy.len()])
+                .unwrap()
+                .money_supply,
+            None
+        );
     }
 
     #[test]
@@ -424,6 +463,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(0),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         let bytes = index.to_bytes();
@@ -548,6 +588,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(0),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         assert!(!index.is_valid());
@@ -589,6 +630,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(100),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         assert!(!index.is_proof_of_stake);

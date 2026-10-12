@@ -173,6 +173,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::default(),
             is_proof_of_stake: false,
+            money_supply: None,
         }
     }
 

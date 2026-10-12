@@ -361,6 +361,7 @@ mod tests {
             lottery_winners: divi_primitives::lottery::LotteryWinners::default(),
             accumulator: None,
             is_proof_of_stake: false,
+            money_supply: None,
         }
     }
 

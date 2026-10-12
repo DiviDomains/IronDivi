@@ -914,6 +914,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(height),
             is_proof_of_stake: false,
+            money_supply: None,
         }
     }
 
@@ -968,6 +969,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(100),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         db.store_block_index(&index).unwrap();

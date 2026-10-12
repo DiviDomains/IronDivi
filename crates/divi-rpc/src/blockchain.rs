@@ -239,6 +239,7 @@ impl BlockchainRpc {
                 "bits": format!("{:08x}", index.bits),
                 "difficulty": bits_to_difficulty(index.bits),
                 "chainwork": chainwork_to_hex(&index.chain_work),
+                "acc_checkpoint": block.header.accumulator_checkpoint.to_string(),
                 "nTx": block.transactions.len(),
                 "previousblockhash": if index.height > 0 {
                     Some(index.prev_hash.to_string())
@@ -246,6 +247,12 @@ impl BlockchainRpc {
                     None
                 },
             });
+
+            // Per-block supply is only known for blocks connected since the
+            // field was added to the block index; omit it otherwise.
+            if let Some(supply) = index.money_supply {
+                result["moneysupply"] = json!(supply as f64 / 100_000_000.0);
+            }
 
             // Add nextblockhash if on the active chain and not the tip
             if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {

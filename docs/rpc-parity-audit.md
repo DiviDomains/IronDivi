@@ -56,7 +56,7 @@ corrupts the coin DB on purpose is not reproduced).
   return "not implemented"; `getmasternodewinners` now has the C++ shape and real tip height, but every winner is `Unknown` with 0 votes because payment votes are not received over the network yet; `getmasternodecount` lacks
   `inqueue/ipv4/ipv6/onion/obfcompat/stable`; `spork show|active` stubbed;
   `getlotteryblockwinners` stubbed (and requires an argument C++ does not).
-- `getblock`: no `moneysupply` or `acc_checkpoint` (needs a block-index schema change).
+- `getblock`: `acc_checkpoint` now present; `moneysupply` is recorded per block in the block index (trailing optional field, old databases still load) and shown only for blocks connected since that field was added, so an existing database shows it only after a resync/reindex. Genesis supply is 0, as in C++.
 - `getaddressesbylabel` returns all addresses; `loadwallet` (multi-wallet), `allocatefunds`,
   rescan variants are stubs.
 - `ban outdated`: peer versions are not tracked, returns an error.
@@ -108,6 +108,6 @@ These abort the C++ daemon; do not call them on a production node:
 
 1. Masternode subsystem RPCs (largest remaining gap).
 2. ~~`invalidateblock` family~~ done.
-3. `getblock` `moneysupply`/`acc_checkpoint` (block-index schema change).
+3. ~~`getblock` `moneysupply`/`acc_checkpoint`~~ done (unit and chain tests; not yet compared against C++ in a harness run).
 4. ~~Error-code order differences (`sendtoaddress`, `setaccount`, `importaddress`, `removevault`, `lockunspent`) and `ban` with a bad IP~~ done (unit-tested in `error_code_order_matches_cpp`).
 5. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.

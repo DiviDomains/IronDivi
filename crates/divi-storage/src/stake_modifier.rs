@@ -405,6 +405,7 @@ mod tests {
             generated_stake_modifier: true,
             lottery_winners: LotteryWinners::new(0),
             is_proof_of_stake: false, // Genesis is PoW
+            money_supply: None,
         };
 
         let result = compute_next_stake_modifier(Some(&genesis), &|_| None, &HashMap::new(), false);
@@ -440,6 +441,7 @@ mod tests {
             generated_stake_modifier: true,
             lottery_winners: LotteryWinners::new(base_height),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         // Block within same modifier interval (only 10 seconds later, within 60-second interval)
@@ -462,6 +464,7 @@ mod tests {
             generated_stake_modifier: false,
             lottery_winners: LotteryWinners::new(base_height + 1),
             is_proof_of_stake: false,
+            money_supply: None,
         };
 
         let mut block_map: HashMap<Hash256, &BlockIndex> = HashMap::new();
@@ -814,6 +817,7 @@ mod tests {
                 generated_stake_modifier: false,
                 lottery_winners: LotteryWinners::new(*height),
                 is_proof_of_stake: false,
+                money_supply: None,
             });
             prev_hash = hash;
         }
@@ -1073,6 +1077,7 @@ mod tests {
                 generated_stake_modifier: false,
                 lottery_winners: LotteryWinners::new(*height),
                 is_proof_of_stake: false, // All early blocks are PoW
+                money_supply: None,
             });
             prev_hash = hash;
         }
