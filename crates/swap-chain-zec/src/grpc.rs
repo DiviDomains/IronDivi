@@ -49,6 +49,30 @@ pub struct BlockRange {
     pub start: Option<BlockId>,
     #[prost(message, optional, tag = "2")]
     pub end: Option<BlockId>,
+    /// `repeated PoolType poolTypes`. Empty means Sapling + Orchard only (lightwalletd's
+    /// backward-compatible default), which strips every `CompactTx.vin` — so a transparent
+    /// HTLC spend is invisible unless this asks for [`POOL_TYPE_TRANSPARENT`].
+    #[prost(int32, repeated, tag = "3")]
+    pub pool_types: Vec<i32>,
+}
+
+/// `cash.z.wallet.sdk.rpc.PoolType.TRANSPARENT`.
+pub const POOL_TYPE_TRANSPARENT: i32 = 1;
+
+/// The `GetBlockRange` request for `start..=end`, asking for transparent data only:
+/// `find_spend` reads `CompactTx.vin`, nothing here reads shielded data.
+fn block_range_request(start: u64, end: u64) -> BlockRange {
+    BlockRange {
+        start: Some(BlockId {
+            height: start,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: end,
+            hash: vec![],
+        }),
+        pool_types: vec![POOL_TYPE_TRANSPARENT],
+    }
 }
 
 /// `cash.z.wallet.sdk.rpc.TxFilter`
@@ -379,16 +403,7 @@ impl LightwalletdClient {
         start: u64,
         end: u64,
     ) -> Result<Vec<CompactBlock>, ClientError> {
-        let req = BlockRange {
-            start: Some(BlockId {
-                height: start,
-                hash: vec![],
-            }),
-            end: Some(BlockId {
-                height: end,
-                hash: vec![],
-            }),
-        };
+        let req = block_range_request(start, end);
         retry_fallback(&self.endpoints, &self.retry, |ep| {
             Self::server_streaming(ep, PATH_GET_BLOCK_RANGE, req.clone())
         })
@@ -460,6 +475,18 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Without `poolTypes = [TRANSPARENT]` lightwalletd returns every `CompactTx.vin`
+    /// empty, so the maker never saw a taker's ZEC claim (live reverse swap, 2026-10-12).
+    #[test]
+    fn block_range_asks_for_transparent_inputs() {
+        use prost::Message;
+        let req = block_range_request(10, 20);
+        assert_eq!(req.pool_types, vec![POOL_TYPE_TRANSPARENT]);
+        let bytes = req.encode_to_vec();
+        // Field 3, packed repeated int32: tag 0x1a, length 1, value 1.
+        assert!(bytes.ends_with(&[0x1a, 0x01, 0x01]), "{bytes:02x?}");
+    }
 
     fn fast() -> RetryPolicy {
         RetryPolicy {
