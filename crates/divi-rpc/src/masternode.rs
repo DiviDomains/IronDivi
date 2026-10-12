@@ -10,6 +10,7 @@
 // licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
 
 use crate::error::{codes, Error, RpcError};
+use crate::mn_broadcast::{self, BroadcastRelay, BroadcastStore, MnContext};
 use crate::protocol::Params;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
 use parking_lot::RwLock;
@@ -21,6 +22,12 @@ pub struct MasternodeRpc {
     /// Reserved for network payment votes (not wired yet; see get_masternode_winners)
     #[allow(dead_code)]
     vote_tracker: Arc<RwLock<PaymentVoteTracker>>,
+    /// Pre-signed broadcasts (`importmnbroadcast` / `listmnbroadcasts`)
+    stored: BroadcastStore,
+    /// Datadir holding `masternode.conf`
+    datadir: RwLock<Option<std::path::PathBuf>>,
+    /// Sends raw broadcast bytes to the P2P layer
+    relay: RwLock<Option<BroadcastRelay>>,
 }
 
 impl MasternodeRpc {
@@ -28,7 +35,20 @@ impl MasternodeRpc {
         Self {
             manager: Arc::new(RwLock::new(None)),
             vote_tracker: Arc::new(RwLock::new(PaymentVoteTracker::new(10, 3))),
+            stored: BroadcastStore::default(),
+            datadir: RwLock::new(None),
+            relay: RwLock::new(None),
         }
+    }
+
+    /// Set the datadir: broadcasts persist to `mnbroadcasts.json`, config is `masternode.conf`
+    pub fn set_datadir(&self, dir: std::path::PathBuf) {
+        self.stored.set_path(dir.join("mnbroadcasts.json"));
+        *self.datadir.write() = Some(dir);
+    }
+
+    pub fn set_broadcast_relay(&self, relay: BroadcastRelay) {
+        *self.relay.write() = Some(relay);
     }
 
     pub fn set_manager(&self, manager: MasternodeManager) {
@@ -45,14 +65,6 @@ impl MasternodeRpc {
                 "Masternode subsystem not initialized. This node is running in lite mode without masternode support."
             ).into())
         }
-    }
-
-    // Stub error message for commands that need additional work
-    fn masternode_not_implemented(&self) -> Error {
-        RpcError::new(
-            codes::MISC_ERROR,
-            "Masternode functionality requires the full masternode subsystem including P2P protocol support, masternode broadcast mechanisms, and collateral verification. This feature will be implemented in a future release. For masternode operations, please use the C++ Divi client."
-        ).into()
     }
 
     /// Get masternode count values
@@ -113,68 +125,121 @@ impl MasternodeRpc {
         })
     }
 
-    /// Setup masternode configuration
-    pub fn setup_masternode(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters even though not used (for signature validation)
-        let _alias = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: alias"))?;
-        let _txhash = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: txhash"))?;
-        let _output_index = params
-            .get_str(2)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: outputIndex"))?;
-        let _collateral_pubkey = params.get_str(3).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: collateralPubKey")
-        })?;
-        let _ip_address = params
-            .get_str(4)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: ip_address"))?;
-        Err(self.masternode_not_implemented())
+    /// Usage error like C++ `runtime_error(help)` (code -1)
+    fn usage(msg: &str) -> Error {
+        RpcError::new(codes::MISC_ERROR, msg.to_string()).into()
     }
 
-    /// Start masternode
-    pub fn start_masternode(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters even though not used (for signature validation)
-        let _alias = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: alias"))?;
-        let _defer_relay = params.get_bool(1);
-        Err(self.masternode_not_implemented())
+    /// `setupmasternode alias txhash outputIndex collateralPubKey ip_address`
+    pub fn setup_masternode(
+        &self,
+        params: &Params,
+        ctx: &MnContext,
+        default_port: u16,
+    ) -> Result<Value, Error> {
+        if params.len() < 5 || params.len() > 6 {
+            return Err(Self::usage(
+                "setupmasternode alias txhash outputIndex collateralPubKey ip_address",
+            ));
+        }
+        let arg = |i: usize| -> Result<&str, Error> {
+            params
+                .get_str(i)
+                .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string").into())
+        };
+        mn_broadcast::setup_masternode(
+            ctx,
+            arg(0)?,
+            arg(1)?,
+            arg(2)?,
+            arg(3)?,
+            arg(4)?,
+            default_port,
+        )
     }
 
-    /// Broadcast masternode start message
-    pub fn broadcast_start_masternode(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters even though not used (for signature validation)
-        let _broadcast_hex = params
+    /// `startmasternode alias ( deferRelay )`
+    pub fn start_masternode(&self, params: &Params, ctx: &MnContext) -> Result<Value, Error> {
+        if params.is_empty() || params.len() > 2 {
+            return Err(Self::usage("startmasternode alias"));
+        }
+        let alias = params
             .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: broadcast_hex"))?;
-        let _append_broadcast_signature = params.get_str(1);
-        Err(self.masternode_not_implemented())
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string"))?;
+        match &ctx.wallet {
+            Some(w) if w.is_locked() => {
+                return Err(RpcError::new(
+                    codes::WALLET_UNLOCK_NEEDED,
+                    "Error: Please enter the wallet passphrase with walletpassphrase first.",
+                )
+                .into())
+            }
+            None => return Err(RpcError::new(codes::WALLET_ERROR, "Wallet disabled!").into()),
+            _ => {}
+        }
+        let conf = self
+            .datadir
+            .read()
+            .as_ref()
+            .map(|d| mn_broadcast::read_conf(&d.join("masternode.conf")))
+            .unwrap_or_default();
+        // This node never runs as the masternode itself, as on a C++ controller wallet
+        Ok(mn_broadcast::start_masternode(
+            &conf,
+            alias,
+            &self.stored,
+            false,
+        ))
     }
 
-    /// Sign masternode broadcast message
-    pub fn sign_mn_broadcast(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters even though not used (for signature validation)
-        let _mnhex = params
+    /// `broadcaststartmasternode hex ( sig )`
+    pub fn broadcast_start_masternode(
+        &self,
+        params: &Params,
+        ctx: &MnContext,
+    ) -> Result<Value, Error> {
+        if params.is_empty() || params.len() > 2 {
+            return Err(Self::usage("broadcaststartmasternode hex sig"));
+        }
+        let hex_in = params
             .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: mnhex"))?;
-        Err(self.masternode_not_implemented())
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string"))?;
+        let sig = match params.get_str(1) {
+            Some("update_ping") | None => None,
+            Some(s) => Some(s),
+        };
+        let relay = self.relay.read().clone();
+        mn_broadcast::relay_broadcast(ctx, relay.as_ref(), hex_in, sig)
     }
 
-    /// Import signed masternode broadcast
+    /// `signmnbroadcast mnhex`
+    pub fn sign_mn_broadcast(&self, params: &Params, ctx: &MnContext) -> Result<Value, Error> {
+        if params.len() != 1 {
+            return Err(Self::usage("signmnbroadcast mnhex"));
+        }
+        let hex_in = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string"))?;
+        mn_broadcast::sign_broadcast(ctx, hex_in)
+    }
+
+    /// `importmnbroadcast hex`
     pub fn import_mn_broadcast(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters even though not used (for signature validation)
-        let _broadcast_hex = params
+        if params.len() != 1 {
+            return Err(Self::usage("importmnbroadcast \"broadcast_hex\""));
+        }
+        let hex_in = params
             .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: broadcast_hex"))?;
-        Err(self.masternode_not_implemented())
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string"))?;
+        mn_broadcast::import_broadcast(&self.stored, hex_in)
     }
 
-    /// List stored pre-signed masternode broadcasts (none are stored yet)
-    pub fn list_mn_broadcasts(&self, _params: &Params) -> Result<Value, Error> {
-        Ok(json!([]))
+    /// `listmnbroadcasts`: the stored pre-signed broadcasts
+    pub fn list_mn_broadcasts(&self, params: &Params) -> Result<Value, Error> {
+        if !params.is_empty() {
+            return Err(Self::usage("listmnbroadcasts"));
+        }
+        Ok(mn_broadcast::list_broadcasts(&self.stored))
     }
 
     /// Show the message a masternode broadcast must be signed over.

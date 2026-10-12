@@ -53,10 +53,7 @@ corrupts the coin DB on purpose is not reproduced).
 
 **Stubs / hardcoded:**
 - `getpeerinfo`: now real per-peer `version`, `subver`, `services`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`, `conntime`, `pingtime`, `startingheight`, `banscore`, `id` (live stats published by each connection). `inflight`, `synced_headers`, `synced_blocks`, `whitelisted` are still constants.
-- Masternode subsystem (`verifymasternodesetup` and `listmnbroadcasts` are now real: the former reproduces the C++ `getMessageToSign` string byte for byte, the latter returns `[]` because no broadcasts are stored; both unit-tested, not yet compared against C++ in a harness run). The Rust `divi-masternode` broadcast wire format and signing are not C++-compatible (OutPoint vin, no lastPing, different signed bytes), which is why the rest need a rewrite of that crate: `startmasternode`, `setupmasternode`,
-  `broadcaststartmasternode`, `signmnbroadcast`, `importmnbroadcast`
-  return "not implemented"; `getmasternodewinners` now has the C++ shape and real tip height, but every winner is `Unknown` with 0 votes because payment votes are not received over the network yet; `getmasternodecount` lacks
-  `inqueue/ipv4/ipv6/onion/obfcompat/stable` (reported as 0).
+- Masternode subsystem: `signmnbroadcast`, `setupmasternode`, `broadcaststartmasternode`, `startmasternode`, `importmnbroadcast`, `listmnbroadcasts` and `verifymasternodesetup` are now real and use a byte-exact C++ `CMasternodeBroadcast`/`CMasternodePing` codec (`crates/divi-masternode/src/cpp_wire.rs`, message-signing hash `DarkNet Signed Message:\n`). Broadcasts are stored in `mnbroadcasts.json` in the datadir, `masternode.conf` is read from the datadir, and a valid broadcast is relayed to peers as raw `mnb` bytes. Unit-tested only; not yet compared against a C++ node. Known limits: inbound C++-format `mnb` handling (`divi-node/src/node.rs`, `divi-network/src/masternode_handler.rs`) still parses the older Rust format; `setupmasternode` generates a fresh key per call; the node never runs as a masternode, so `startmasternode` for a known alias returns the C++ controller-style failure and ping update is a no-op. `getmasternodewinners` has the C++ shape but every winner is `Unknown` (payment votes are not received); `getmasternodecount` lacks `inqueue/ipv4/ipv6/onion/obfcompat/stable` (reported as 0).
 - `spork show|active` are now real (`84e27d3`/`a399431`): the 11 C++ spork names with the C++ defaults, received values override; two-arg form gives `Invalid spork name` / `failure`. Unit-tested.
 - `getlotteryblockwinners` is now real: optional height (clamped to tip), C++ shape, candidates ranked with the consensus lottery score against the last lottery block. `decodescript` and `gettxout` also used a hardcoded mainnet address network; they now use the node's network.
 - `getblock`: `acc_checkpoint` now present; `moneysupply` is recorded per block in the block index (trailing optional field, old databases still load) and shown only for blocks connected since that field was added, so an existing database shows it only after a resync/reindex. Genesis supply is 0, as in C++.
@@ -109,7 +106,7 @@ These abort the C++ daemon; do not call them on a production node:
 
 ## Next
 
-1. Masternode subsystem RPCs (largest remaining gap).
+1. ~~Masternode subsystem RPCs~~ done (see above for limits); remaining: C++-format inbound `mnb`/`mnp` handling and payment votes.
 2. ~~`invalidateblock` family~~ done.
 3. ~~`getblock` `moneysupply`/`acc_checkpoint`~~ done (unit and chain tests; not yet compared against C++ in a harness run).
 4. ~~Error-code order differences (`sendtoaddress`, `setaccount`, `importaddress`, `removevault`, `lockunspent`) and `ban` with a bad IP~~ done (unit-tested in `error_code_order_matches_cpp`).

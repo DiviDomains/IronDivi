@@ -637,6 +637,11 @@ impl PeerManager {
         }
     }
 
+    /// Relay a raw C++-format masternode broadcast (`mnb`) to all connected peers
+    pub fn broadcast_masternode_broadcast(&self, bytes: Vec<u8>) {
+        self.broadcast(NetworkMessage::MasternodeBroadcast(bytes));
+    }
+
     /// Broadcast a block inv to all connected peers (standard Bitcoin inv/getdata protocol).
     ///
     /// Instead of pushing full block data, we announce the block hash via an `inv` message.

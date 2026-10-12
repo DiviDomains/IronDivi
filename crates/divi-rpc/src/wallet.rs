@@ -144,6 +144,11 @@ impl WalletRpc {
         *self.tx_submit.write() = Some(callback);
     }
 
+    /// The loaded wallet, if any
+    pub fn wallet_db(&self) -> Option<Arc<WalletDb>> {
+        self.wallet.read().clone()
+    }
+
     /// Get the wallet or return an error
     fn get_wallet(&self) -> Result<Arc<WalletDb>, Error> {
         self.wallet

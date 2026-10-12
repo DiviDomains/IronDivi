@@ -52,6 +52,7 @@ pub mod blockchain;
 pub mod error;
 pub mod lite_wallet;
 pub mod masternode;
+pub mod mn_broadcast;
 pub mod network;
 pub mod protocol;
 pub mod server;

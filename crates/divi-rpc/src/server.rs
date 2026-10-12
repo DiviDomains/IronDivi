@@ -189,6 +189,16 @@ impl RpcServer {
         self.masternode.set_manager(manager);
     }
 
+    /// Set the datadir used by the masternode RPCs (`masternode.conf`, stored broadcasts)
+    pub fn set_masternode_datadir(&self, dir: std::path::PathBuf) {
+        self.masternode.set_datadir(dir);
+    }
+
+    /// Set the hook that relays raw masternode broadcasts to peers
+    pub fn set_masternode_relay(&self, relay: crate::mn_broadcast::BroadcastRelay) {
+        self.masternode.set_broadcast_relay(relay);
+    }
+
     /// Update chain height (for wallet confirmations)
     pub fn set_height(&self, height: u32) {
         self.wallet.set_height(height);
@@ -485,10 +495,33 @@ impl RpcServer {
                 .masternode
                 .get_masternode_winners(params, self.blockchain.tip_height()),
             "listmasternodes" => self.masternode.list_masternodes(params),
-            "setupmasternode" => self.masternode.setup_masternode(params),
-            "startmasternode" => self.masternode.start_masternode(params),
-            "broadcaststartmasternode" => self.masternode.broadcast_start_masternode(params),
-            "signmnbroadcast" => self.masternode.sign_mn_broadcast(params),
+            "setupmasternode"
+            | "startmasternode"
+            | "broadcaststartmasternode"
+            | "signmnbroadcast" => {
+                use crate::mn_broadcast::MnContext;
+                use divi_storage::chain::NetworkType;
+                let chain = self.blockchain.chain();
+                let ctx = MnContext {
+                    chain,
+                    wallet: self.wallet.wallet_db(),
+                };
+                match method {
+                    "setupmasternode" => {
+                        let port = match chain.network_type() {
+                            NetworkType::Mainnet => 51472,
+                            NetworkType::Testnet => 51474,
+                            _ => 51476,
+                        };
+                        self.masternode.setup_masternode(params, &ctx, port)
+                    }
+                    "startmasternode" => self.masternode.start_masternode(params, &ctx),
+                    "broadcaststartmasternode" => {
+                        self.masternode.broadcast_start_masternode(params, &ctx)
+                    }
+                    _ => self.masternode.sign_mn_broadcast(params, &ctx),
+                }
+            }
             "importmnbroadcast" => self.masternode.import_mn_broadcast(params),
             "listmnbroadcasts" => self.masternode.list_mn_broadcasts(params),
             "verifymasternodesetup" => {

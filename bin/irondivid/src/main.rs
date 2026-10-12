@@ -1213,6 +1213,8 @@ async fn run_daemon(
         let spork_for_rpc = node.spork_manager().clone();
         let mempool_for_tx = node.mempool().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
+        let datadir_for_mn = config.data_dir.clone();
+        let pm_for_mn = node.peer_manager().clone();
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -1234,6 +1236,10 @@ async fn run_daemon(
                     // Initialize masternode manager
                     let mn_manager = divi_masternode::MasternodeManager::new();
                     rpc_server.set_masternode_manager(mn_manager);
+                    rpc_server.set_masternode_datadir(datadir_for_mn);
+                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
+                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    }));
                     info!("Masternode manager initialized");
 
                     // Wire up transaction submission (mempool + relay)
@@ -1320,6 +1326,8 @@ async fn run_daemon(
     } else {
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
+        let datadir_for_mn = config.data_dir.clone();
+        let pm_for_mn = node.peer_manager().clone();
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -1340,6 +1348,10 @@ async fn run_daemon(
                     // Initialize masternode manager
                     let mn_manager = divi_masternode::MasternodeManager::new();
                     rpc_server.set_masternode_manager(mn_manager);
+                    rpc_server.set_masternode_datadir(datadir_for_mn);
+                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
+                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    }));
                     info!("Masternode manager initialized");
                 }
             ) => {
