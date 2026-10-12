@@ -1054,10 +1054,13 @@ impl WalletRpc {
 
         // Decode transaction
         let tx_bytes = hex::decode(hex_str)
-            .map_err(|_| RpcError::invalid_params("Invalid transaction hex"))?;
+            .map_err(|_| RpcError::new(codes::INVALID_PARAMETER, "Invalid transaction hex"))?;
 
         let mut tx: Transaction = deserialize(&tx_bytes).map_err(|e| {
-            RpcError::invalid_params(format!("Failed to decode transaction: {}", e))
+            RpcError::new(
+                codes::DESERIALIZATION_ERROR,
+                format!("TX decode failed: {}", e),
+            )
         })?;
 
         // Optional: prevtxs array with previous outputs for signing
@@ -1116,10 +1119,13 @@ impl WalletRpc {
 
         // Decode transaction
         let tx_bytes = hex::decode(hex_str)
-            .map_err(|_| RpcError::invalid_params("Invalid transaction hex"))?;
+            .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
 
         let tx: Transaction = deserialize(&tx_bytes).map_err(|e| {
-            RpcError::invalid_params(format!("Failed to decode transaction: {}", e))
+            RpcError::new(
+                codes::DESERIALIZATION_ERROR,
+                format!("TX decode failed: {}", e),
+            )
         })?;
 
         let txid = tx.txid();
@@ -3198,7 +3204,7 @@ impl WalletRpc {
     pub fn lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let unlock = params
             .get_bool(0)
-            .ok_or_else(|| RpcError::invalid_params("unlock parameter required"))?;
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected boolean for unlock"))?;
 
         let outputs_array = params
             .get(1)
@@ -3436,7 +3442,7 @@ impl WalletRpc {
 
         // Parse address
         let address = Address::from_base58(address_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+            .map_err(|_| RpcError::new(codes::TYPE_ERROR, "Invalid address"))?;
 
         // Decode base64 signature
         let sig_bytes = STANDARD.decode(signature_b64).map_err(|_| {
@@ -3505,12 +3511,11 @@ impl WalletRpc {
             })?;
 
             let pubkey = if key_str.len() == 66 || key_str.len() == 130 {
-                divi_crypto::keys::PublicKey::from_hex(key_str).map_err(|_| {
-                    RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid hex public key")
-                })?
+                divi_crypto::keys::PublicKey::from_hex(key_str)
+                    .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid hex public key"))?
             } else {
                 let address = Address::from_base58(key_str)
-                    .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+                    .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid address"))?;
 
                 let wallet_guard = self.wallet.read();
                 if let Some(wallet) = wallet_guard.as_ref() {
@@ -3520,7 +3525,7 @@ impl WalletRpc {
                         .map(|entry| entry.public.clone())
                         .ok_or_else(|| {
                             RpcError::new(
-                                codes::INVALID_ADDRESS_OR_KEY,
+                                codes::MISC_ERROR,
                                 "Address not found in wallet - cannot extract pubkey",
                             )
                         })?

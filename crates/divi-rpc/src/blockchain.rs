@@ -735,14 +735,14 @@ impl BlockchainRpc {
             if !addresses.is_empty() {
                 result["addresses"] = json!(addresses);
             }
+        }
 
-            if type_name != "scripthash" {
-                let script_hash = hash160(&script_bytes);
-                let mut bytes = [0u8; 20];
-                bytes.copy_from_slice(script_hash.as_ref());
-                let p2sh_addr = Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
-                result["p2sh"] = json!(p2sh_addr.to_base58());
-            }
+        if type_name != "scripthash" {
+            let script_hash = hash160(&script_bytes);
+            let mut bytes = [0u8; 20];
+            bytes.copy_from_slice(script_hash.as_ref());
+            let p2sh_addr = Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
+            result["p2sh"] = json!(p2sh_addr.to_base58());
         }
 
         Ok(result)
