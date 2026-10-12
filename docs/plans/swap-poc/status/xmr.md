@@ -898,3 +898,76 @@
   final from this lane's side; `find_lock`'s extra height-window parameters are the one place a
   live `MoneroChain` impl needs to supply something their trait signature doesn't carry (the
   swap's own negotiated height) — flag if a different shape is wanted instead.
+
+## Public live DiviChain, the other half of the same multichain `- needs:`
+
+- **Orchestrator's task**: `~/swap-lanes/multichain/docs/plans/swap-poc/status/multichain.md`
+  line 69's other half — a live `DiviChain` (`build_funding` to an arbitrary script, raw-tx
+  broadcast, `find_spend`, `confirmations`) against `services.divi.domains/api/testnet/rpc`,
+  reusing what the existing DIVI HTLC client already does. Own crate or a new one, not files
+  multichain is editing; agree the trait shape with them via status files; add mock tests.
+- **Read `divi-swap-xmr/src/chain.rs`'s real `DiviChain` trait first** (not guessed):
+  ```rust
+  trait DiviChain {
+      fn payout_script(&self) -> Script;
+      async fn tip_height(&self) -> Result<u64>;
+      async fn median_time_past(&self) -> Result<u32>;
+      async fn build_funding(&self, script_pubkey: &Script, amount: u64) -> Result<Transaction>;
+      async fn broadcast(&self, tx: &Transaction) -> Result<()>;
+      async fn confirmations(&self, txid: &Hash256) -> Result<Option<u32>>;
+      async fn output(&self, at: &OutPoint) -> Result<Option<(TxOut, u32)>>;
+      async fn find_spend(&self, at: &OutPoint) -> Result<Option<Transaction>>;
+  }
+  ```
+  All `divi_primitives` types throughout (not `divi_swap::{Outpoint,Txid}`), and `Result<T>` is
+  `divi_swap::Result<T>` (`= Result<T, SwapError>`).
+- **`crates/swap-chain-xmr/src/divi_chain.rs` (new)**: `LiveDiviChain`, inherent methods with
+  the identical signature (same types, same `divi_swap::Result`) for every one of the above —
+  not a trait impl (no dependency on `divi-swap-xmr`), a drop-in body for whoever writes one.
+  **Reuses the existing DIVI HTLC client rather than reimplementing it**: `swap-chain-divi`
+  (lane **divi**'s crate, already a dependency here) already publicly exports exactly the
+  pieces needed — `Wallet`/`Utxo` (the coin-tracking set its own `DiviBackend::build_funding`
+  already uses), `FeePolicy`, `RpcClient`, `classify_broadcast_error`/`BroadcastClass`. This
+  module is the *same* coin-selection (prefer the smallest single coin that covers it, else
+  accumulate largest-first)/fee/broadcast-idempotency logic `DiviBackend` already has, read
+  directly from its source and generalized from "pay an HTLC script" to "pay an arbitrary
+  script" — the one thing `ChainBackend::build_funding` can't do, per the `- needs:`. No file
+  in `swap-chain-divi` or `divi-swap-xmr` was edited.
+  - `build_funding`/`broadcast`/`confirmations`/`output`: signatures match the trait exactly.
+  - **One signature difference, flagged rather than silently diverged:** `find_spend` takes an
+    extra `from_height: u64` the trait method doesn't. A blind, unbounded scan from genesis
+    isn't practical (same reasoning as `monero_chain::find_lock`'s height window last round) —
+    and isn't even a new idea here: `divi_swap::ChainBackend::find_spend` (the existing
+    hashlock engine's own trait) already takes exactly this parameter, so this matches
+    established precedent in this codebase rather than inventing a new convention. Whoever
+    wires the live `DiviChain` impl passes the height the relevant lock was negotiated at.
+  - `learn_utxo(txid)` (new, not in their trait — plumbing their `Wallet`-reuse needs):
+    teaches the wallet about a coin it doesn't know about yet (e.g. a previous round's
+    reclaimed output), the same `Wallet::apply_tx` call `DiviBackend` itself uses internally.
+- **Mock tests** (`divi_chain::tests`, `wiremock`): `payout_script` is the wallet's own P2PKH;
+  `tip_height` reads `getblockcount`; `build_funding` rejects insufficient funds with no coins
+  known, and — the full round trip — learns a mocked coin via `learn_utxo`, then builds a real
+  funding tx paying an arbitrary destination script with correct change back to the wallet,
+  locally script-verified; `broadcast` treats "already in block chain" as success and surfaces
+  a genuine "non-final" as `SwapError::Premature`; `confirmations` is `None` for code `-5`
+  ("no such transaction"); `output` returns the right `(TxOut, confirmations)` or `None` for a
+  missing vout index. 9/9 green.
+- **Live sanity tests** (`divi_chain::live`, `--features live`, read-only, no funds moved,
+  against the real `services.divi.domains` proxy): `tip_height`/`median_time_past` are real
+  (height > 300,000, mtp a real recent unix time); `output` reads a known-real, already-
+  confirmed outpoint (the role-swap round's `Tx_redeem` output, 95,900,000 sat) and gets back
+  the exact value. Both pass.
+- Full suite: `fmt`/`clippy -D warnings` clean (with `live`), 47/47 non-network
+  `swap-chain-xmr` tests green (9 new `divi_chain` mock tests); with `--features live`, the 9
+  mock + 2 new live sanity tests all pass, plus the pre-existing real-network suite (one of the
+  same pre-existing flaky public-node tests observed again, passed on immediate retry — not
+  caused by this round's code). `check-xmr.sh` PASS.
+- decisions: added `tokio` as a real (not just dev) dependency — `broadcast`'s reject-then-
+  recheck retry delay (same pattern `DiviBackend::broadcast` already uses) needs a real sleep,
+  not the dev-only `tokio` this crate's tests already had; `{ workspace = true }`, already
+  resolved, no new registry dependency.
+- needs: nothing from a human right now. Coordination for multichain: both halves of the
+  `- needs:` (this one and last round's `monero_chain`) are now answered from this lane's
+  side; `find_spend`'s `from_height` parameter is the one place a live `DiviChain` impl needs
+  to supply something their trait signature doesn't carry — flag if a different shape is
+  wanted instead.

@@ -28,8 +28,12 @@
 //! send/scan/sweep against a (spend pub, view secret) address, moved out of
 //! `examples/xmr_live.rs` so `divi-swap-xmr`'s own `MoneroChain` implementation can
 //! reuse it instead of reimplementing wallet-RPC digest auth and decoy selection.
+//! [`divi_chain`] is the other half of that same `- needs:`: a live `DiviChain` body
+//! reusing `swap-chain-divi`'s own `Wallet`/`FeePolicy`/broadcast-classification
+//! machinery, generalized to fund an arbitrary script instead of only an HTLC's.
 
 pub mod adaptor_bridge;
+pub mod divi_chain;
 pub mod live_rpc;
 pub mod monero_chain;
 pub mod monero_key_share;

@@ -39,6 +39,10 @@ swap-chain-divi = { workspace = true }
 # own digest-auth handling for monerod (a different RPC shape -- daemon, not wallet), so
 # this adds no new crate to the dependency tree, just a direct edge to an existing one.
 digest_auth = "0.3"
+# divi_chain::broadcast's reject-then-recheck retry delay (same pattern
+# swap-chain-divi::DiviBackend::broadcast already uses) needs a real sleep, not just
+# the dev-only tokio this crate's tests already had.
+tokio = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
@@ -60,6 +64,5 @@ monero-daemon-rpc = "0.2"
 monero-simple-request-rpc = "0.1"
 # monero_sweep's tests drive OutputWithDecoys::new (async) synchronously.
 futures = { workspace = true }
-tokio = { workspace = true }
 # For xmr_live.rs/xmr_live_refund.rs: local-run state persistence.
 serde = { workspace = true }

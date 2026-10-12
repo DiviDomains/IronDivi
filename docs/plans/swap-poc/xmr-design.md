@@ -345,6 +345,14 @@ parked the BTC lane's signet funding (`DECISIONS.md` #5).
   `digest_auth` crate (already a transitive dependency via `monero-simple-request-rpc`'s own
   digest-auth handling for `monerod`, which is a different, daemon-shaped RPC surface, not
   wallet-RPC-shaped).
+- **Updated 2026-10-12, the other half of the same `- needs:`:** `crates/swap-chain-xmr/src/
+  divi_chain.rs`'s `LiveDiviChain` is the DIVI-side counterpart — `build_funding` (now to an
+  arbitrary scriptPubKey, not just an HTLC's, the one thing `swap-chain-divi::ChainBackend
+  ::build_funding` can't do), `broadcast`, `confirmations`, `output`, `find_spend`. Reuses
+  `swap-chain-divi`'s own `Wallet`/`Utxo`/`FeePolicy`/`classify_broadcast_error` — the lane
+  **divi**'s crate, already a dependency here — rather than reimplementing coin selection or
+  broadcast-idempotency classification; no file in that crate (or in multichain's
+  `divi-swap-xmr`) was edited.
 
 ## Build plan
 
