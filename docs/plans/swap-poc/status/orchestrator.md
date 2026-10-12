@@ -18,8 +18,7 @@
   2. live case C, both refund (deployed maker) — DONE 2026-10-10
   3. live case D, late claim (local maker) — DONE 2026-10-11, swap `03bcb3e3…`, claimed 2398 s before the maker timeout
   4. live chaos `--scenario all --offer btc-divi-testnet` (crash at every state, refund, DIVI RPC 502, Esplora 429) —
-     RUNNING since 2026-10-11 14:12 UTC in pane `dcbe7782…` "rev-chaos" (tab 0:6), workdir `~/.cache/swap-chaos/rev-live`,
-     log `~/.local/state/iron-divi-swap-poc/chaos-rev-live.log`; ETA ~21:30 UTC (refund leg waits the taker's DIVI timelock).
+     DONE 2026-10-11 18:22 EDT, all four scenarios PASS (RESULTS.md, status/rev-chaos.md); taker DIVI refund `d1a45509…`.
      Mock dry run PASS after `491f264`.
   5. staking invariant — holds by construction: in the reverse direction the maker locks BTC, never DIVI.
   6. record txids (status/rev-live.md, RESULTS.md), update the explainer page, commit, CI.

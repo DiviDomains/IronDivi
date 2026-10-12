@@ -422,7 +422,7 @@ class Run:
         # The taker never claimed: take its BTC back after the taker timelock (BTC MTP lags).
         if self.a.backend == "live" and "taker_refund" not in self.progress:
             self.save(taker_refund=self.taker_refund(local, self.a.taker_timeout + 4 * 3600))
-        log(f"taker BTC refund {self.progress.get('taker_refund')}")
+        log(f"taker {'DIVI' if self.reverse else 'BTC'} refund {self.progress.get('taker_refund')}")
 
     def _outage(self, base, mode, secs, retry_after, key):
         t = self.a.state_timeout

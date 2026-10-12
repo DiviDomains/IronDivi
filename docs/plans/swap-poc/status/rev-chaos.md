@@ -43,4 +43,13 @@ Swap `ef30f5db-d2bb-4096-b0ca-cf2b1429b3a0` (taker `d6c479db…`), daemon backed
 | taker BTC claim | 9c694eedd8f8a3942122db286d06263b1f7aa9eabbf72240480a46aaa7b21163 |
 | maker DIVI claim | e4549c7012953ff3ffb2dfb502f4f5aa20a7b296062b5b661f2c9a4ccf0bc1be |
 
-## refund (maker killed in maker_refundable) — running (needs both timelocks to expire, hours)
+## refund (maker killed in maker_refundable and maker_refunded) — PASS, 2026-10-11 18:22 EDT
+Swap `fdfdf352-21b0-4ef4-8297-060114289531`; the maker resumed after each kill and refunded.
+
+| leg | txid |
+|---|---|
+| maker BTC refund (testnet3 block 5158301) | 1a3dd95e04f3cda203e0471d1a40314251a571d285facee8c192ba14dba672af |
+| taker DIVI refund (after the 6 h locktime) | d1a45509a64dbbd88fa7e5bde370db0f0935bf674d058873d88c10365f404346 |
+
+The driver logs the second as "taker BTC refund"; in the reverse direction it is the DIVI leg.
+Both confirmed (checked 2026-10-12 09:30 EDT: DIVI 902 confirmations).
