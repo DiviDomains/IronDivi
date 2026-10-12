@@ -195,6 +195,13 @@ the old binary ignores; terminal LTC records stay terminal.
   the Mac) can move LTC from the taker's 0.01 LTC to the maker; that cannot cover 0.1, so
   also lower this offer's `max_btc_sats` to what the maker then holds minus ~5000 litoshi
   of fees (e.g. send 400000, set `max_btc_sats = 300000`), and keep `min_btc_sats` ≤ it.
+
+  **Done (orchestrator, 2026-10-12):** `ltc_send` moved LTC from the taker to the maker, the
+  maker's balance landed at 190,000 + fees, so `ltc-divi-testnet` is live on dnsdivi with
+  `enabled = true` and `max_btc_sats = 190000` (lower than the 300000 example above — the
+  actual send amount; re-check the maker's real balance before raising it).
+  `deploy/divi-swapd/wave4-offers.toml` and `wave4_snippet_on_the_deployed_config` both
+  reflect this.
 - **ZEC**: once the maker t-address holds TAZ on the NU7 chain, set `enabled = true` on both
   ZEC offers (or only `divi-zec-testnet`, which needs no maker TAZ), restart, then check
   `/healthz` shows `counters.zec` with a tip from `testnet.zec.rocks` (the only known

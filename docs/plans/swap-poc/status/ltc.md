@@ -95,10 +95,39 @@
     deliberately balance-capped. Fixed the test to special-case `max_btc_sats` for
     `ltc-divi-testnet` (assert the live cap is `<=` the mock ceiling, compare every other
     field exactly) instead of relaxing the assertion generally.
+  - **Wave 4 live, dnsdivi** (orchestrator): the Wave 4 maker (0.2.6) is deployed; a real
+    `divi-ltc-testnet` swap against it finished (`RESULTS.md` `321f941`). `ltc-divi-testnet`
+    is now also `enabled` there, `max_btc_sats = 190000`. Orchestrator running live reverse
+    + case-c against it directly.
+  - **Case-C readiness, mock** (this session): confirmed/hardened the three behaviors the
+    orchestrator asked about, chain-agnostic so both directions share them (the backend
+    doesn't know which leg it's playing):
+    - Refund nLockTime/sequence: already covered,
+      `refund_verifies_with_consensus` asserts `lock_time == LockTime::from_time(LOCKTIME)`
+      and `sequence.0 == REFUND_SEQUENCE`. No change needed.
+    - Premature refund retried, not fatal: already covered,
+      `refund_rejected_before_locktime` asserts `SwapError::Premature` + `is_retryable()`.
+      No change needed.
+    - Esplora "already known" responses count as success: **gap found** — the matcher
+      (`is_already_known`) already recognized `txn-already-in-mempool`/`txn-already-known`
+      (Litecoin Core's wording, same as Bitcoin Core's), but nothing tested those two
+      specifically end-to-end, only "already in block chain" and "outputs already in utxo
+      set". Same bug class as the zec lane's Zebra-wording miss, `7c932f9`. Extended
+      `already_confirmed_is_already_known` to assert all four wordings, and added
+      `broadcast_is_idempotent_on_mempool_duplicate` (a refund broadcast hitting
+      `txn-already-in-mempool` must return the txid as success, not `Err`).
+  - **Wave 4 offers sync** (this session): updated `deploy/divi-swapd/wave4-offers.toml` to
+    match what's now live on dnsdivi — `ltc-divi-testnet` `enabled = true`,
+    `max_btc_sats = 190000` (was `false`/`294861`, this lane's prior guess before the
+    orchestrator's actual send amount). Confirmed the `<=`-mock-ceiling tolerance in
+    `wave4_snippet_on_the_deployed_config` (`bin/divi-swapd/src/config.rs`) was already in
+    place from a prior landing — just needed its `served`/`disabled_offers` list
+    expectations updated now that this offer moved from disabled to served. Noted the
+    190000 figure in `docs/plans/swap-poc/wave4-deploy.md` §6.
   - All of: `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`,
-    `cargo test` clean for `swap-chain-ltc` (33 tests, 2 `#[ignore]`), `swap-chain-btc`
-    (17 tests, 1 `#[ignore]`), `divi-swapd` (11 lib + 27 integration tests),
-    `divi-swap-cli`. `tools/swap-poc/check-ltc.sh` and `check-ltc-live.sh` both PASS.
+    `cargo test` clean for `swap-chain-ltc` (30 tests, 2 `#[ignore]`), `divi-swapd`
+    (17 lib + 27 integration tests), `divi-swap-cli`. `tools/swap-poc/check-ltc.sh` and
+    `check-ltc-live.sh` both PASS.
 - running: nothing further queued; idle until the orchestrator lands this or the next live
   result (reverse direction, case-c either direction) comes in.
 - left / next steps:
@@ -106,7 +135,7 @@
   tools/swap-poc/ltc-live.sh --backend live --direction forward --dry-run   # sanity check
   tools/swap-poc/ltc-live.sh --backend live --direction reverse --dry-run
   tools/swap-poc/ltc-live.sh --backend live --direction forward   # case-c still pending; happy done live above
-  tools/swap-poc/ltc-live.sh --backend live --direction reverse   # now that the maker holds tLTC
+  tools/swap-poc/ltc-live.sh --backend live --direction reverse   # orchestrator running this directly now
   ```
   Taker/maker LTC key refs resolve automatically to
   `op://global_secret_store/IronDivi Swap POC - {taker,maker}-btc/password`.

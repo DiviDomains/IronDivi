@@ -143,9 +143,18 @@ async fn refund_rejected_before_locktime() {
 
 #[test]
 fn already_confirmed_is_already_known() {
-    assert!(is_already_known(
-        "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction outputs already in utxo set\"}"
-    ));
+    // Every wording this backend relies on classify_broadcast_error/is_already_known to
+    // recognize, so a retried broadcast after the chain already has the tx counts as
+    // success instead of aborting the swap (the zec lane hit this with Zebra's distinct
+    // wording, 7c932f9 — Litecoin Core's wording is Bitcoin Core's, all covered here).
+    for body in [
+        "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}",
+        "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction outputs already in utxo set\"}",
+        "sendrawtransaction RPC error: {\"code\":-26,\"message\":\"txn-already-in-mempool\"}",
+        "sendrawtransaction RPC error: {\"code\":-26,\"message\":\"txn-already-known\"}",
+    ] {
+        assert!(is_already_known(body), "{body}");
+    }
 }
 
 #[tokio::test]
@@ -164,6 +173,30 @@ async fn broadcast_is_idempotent_when_already_known() {
     let b = backend(vec![server.uri()], TAKER_KEY);
     let signed = b
         .build_claim(&h, &outpoint(), Amount::from_sat(20_000), &pre)
+        .await
+        .unwrap();
+    assert_eq!(b.broadcast(&signed).await.unwrap(), signed.txid);
+}
+
+/// A refund broadcast retried after the chain already accepted it (e.g. the first
+/// response timed out) hits Esplora's "txn-already-in-mempool" instead of a real
+/// rejection — case C has both sides refund, so this must count as success, not abort the
+/// swap. Same bug class as the zec lane's Zebra "already exists in mempool" case, 7c932f9.
+#[tokio::test]
+async fn broadcast_is_idempotent_on_mempool_duplicate() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "sendrawtransaction RPC error: {\"code\":-26,\"message\":\"txn-already-in-mempool\"}",
+        ))
+        .mount(&server)
+        .await;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let signed = b
+        .build_refund(&h, &outpoint(), Amount::from_sat(20_000))
         .await
         .unwrap();
     assert_eq!(b.broadcast(&signed).await.unwrap(), signed.txid);

@@ -651,12 +651,10 @@ key = "credential:btc"
                 ("divi-btc-testnet", Chain::Btc),
                 ("btc-divi-testnet", Chain::Btc),
                 ("divi-ltc-testnet", Chain::Ltc),
+                ("ltc-divi-testnet", Chain::Ltc),
             ]
         );
-        assert_eq!(
-            c.disabled_offers,
-            ["ltc-divi-testnet", "divi-zec-testnet", "zec-divi-testnet"]
-        );
+        assert_eq!(c.disabled_offers, ["divi-zec-testnet", "zec-divi-testnet"]);
         let l = c.ltc.as_ref().unwrap();
         assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
         assert_eq!(l.key, "credential:maker-btc");
