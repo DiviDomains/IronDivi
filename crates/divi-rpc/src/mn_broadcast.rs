@@ -129,10 +129,13 @@ pub fn parse_service(s: &str, default_port: u16) -> Option<(IpAddr, u16)> {
     s.parse::<IpAddr>().ok().map(|ip| (ip, default_port))
 }
 
+/// Collateral outpoint (txid, vout) -> serialized broadcast
+type BroadcastMap = BTreeMap<([u8; 32], u32), Vec<u8>>;
+
 /// Persistent set of pre-signed broadcasts keyed by collateral outpoint
 #[derive(Default)]
 pub struct BroadcastStore {
-    entries: Mutex<BTreeMap<([u8; 32], u32), Vec<u8>>>,
+    entries: Mutex<BroadcastMap>,
     path: Mutex<Option<PathBuf>>,
 }
 
@@ -143,7 +146,7 @@ impl BroadcastStore {
             if let Ok(list) = serde_json::from_str::<Vec<String>>(&text) {
                 let mut map = self.entries.lock();
                 for h in list {
-                    if let Some(bytes) = hex::decode(&h).ok() {
+                    if let Ok(bytes) = hex::decode(&h) {
                         if let Ok(b) = CppBroadcast::decode(&bytes) {
                             map.insert((b.vin.prevout_hash, b.vin.prevout_n), bytes);
                         }
