@@ -79,7 +79,7 @@ jobs:
     # btc.sh/check-divi.sh are the same shape. Lane rules forbid editing check scripts to
     # split that out, so their mock-only coverage (crate_green, structural greps) stays
     # exactly what the Fmt/Clippy/Test jobs above already give it.
-    name: Mock-backend checks (xmr, usdc/evm+anvil, redeploy-maker gate)
+    name: Mock-backend checks (xmr, usdc/evm+anvil, redeploy-maker gate + rollback)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,3 +91,4 @@ jobs:
       - run: tools/swap-poc/check-xmr.sh
       - run: tools/swap-poc/check-usdc.sh
       - run: tools/swap-poc/test-redeploy-maker.sh
+      - run: tools/swap-poc/test-redeploy-rollback.sh
