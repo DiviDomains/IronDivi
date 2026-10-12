@@ -60,11 +60,11 @@ reorgs to a heavier chain). `signtransactionwithaddresskey` not started.
 **Shape differences (extras in Rust are harmless to clients; *missing* keys are bugs):**
 `getblockchaininfo`, `getmempoolinfo`, `getmininginfo`, `gettxoutsetinfo`
 (`bytes_serialized` missing), `getblock`, `getblockheader` (different shape),
-`gettxout` (`scriptPubKey.asm`, `version` missing), `getrawtransaction` (`vin[].coinbase`
+`gettxout` (now has `scriptPubKey.asm` and `version`; `version` is a constant 1 because the UTXO set does not store tx version), `getrawtransaction` (`vin[].coinbase`
 missing; C++ rejects a bool verbose arg with -1, Rust accepts it), `decodescript`
 (`p2sh` missing), `getwalletinfo` (now has all C++ keys; `spendable_balance` equals `balance` and `vaulted_balance` is 0 until vault accounting is wired), `getstakingstatus`
-(`stake split threshold` missing; `staking status` is a string vs bool),
-`getcoinavailability`, `listreceivedbyaccount` (`bcconfirmations`), `getmasternodestatus`.
+(fixed: bool `staking status`, `stake split threshold`; the old string is kept as `staking status text`),
+`getcoinavailability` (fixed: C++ `Vaulted`/`Stakable`/`Spendable`, verbose form with `AllVaults`/`NonVaults`; `Stakable` is approximated by mature non-vault coins), `listreceivedbyaccount` (`bcconfirmations`), `getmasternodestatus`.
 
 **Param-handling / error-code differences:** the remaining per-method code differences
 (`-3` type, `-5` invalid address, `-8` invalid parameter, `-13` unlock needed, `-15` wrong
@@ -102,5 +102,5 @@ These abort the C++ daemon; do not call them on a production node:
 
 1. Masternode subsystem RPCs (largest remaining gap).
 2. `invalidateblock` family (engine work).
-3. Fill the missing keys listed under "Shape differences".
+3. Fill the remaining missing keys under "Shape differences": `gettxoutsetinfo.bytes_serialized`, `getrawtransaction vin[].coinbase`, `decodescript p2sh`, `listreceivedbyaccount.bcconfirmations`.
 4. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.

@@ -1724,7 +1724,8 @@ impl WalletRpc {
     }
 
     /// Get coin availability - Show available vault funds
-    pub fn get_coin_availability(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    pub fn get_coin_availability(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let verbose = params.get_bool(0).unwrap_or(false);
         let wallet = self.get_wallet()?;
 
         let chain = self
@@ -1763,7 +1764,69 @@ impl WalletRpc {
             }));
         }
 
+        // C++ shape: Vaulted / Stakable / Spendable. Stakable is approximated by the
+        // confirmed, mature, non-vault coins (the node has no coin-age filter here).
+        let vault_utxos = wallet.get_vault_utxos(height, 1);
+        let vault_scripts: std::collections::HashSet<Vec<u8>> = wallet
+            .get_all_vaults()
+            .into_iter()
+            .map(|v| v.vault_script)
+            .collect();
+        let plain: Vec<_> = wallet
+            .get_spendable_utxos(height, 1)
+            .into_iter()
+            .filter(|u| !vault_scripts.contains(u.script_pubkey.as_bytes()))
+            .collect();
+        let sum = |us: &[divi_wallet::wallet_db::WalletUtxo]| -> f64 {
+            us.iter()
+                .fold(Amount::ZERO, |a, u| a + u.value)
+                .as_divi_f64()
+        };
+        let describe = |us: &[divi_wallet::wallet_db::WalletUtxo]| -> serde_json::Value {
+            let mut by_script: std::collections::BTreeMap<Vec<u8>, (Amount, Vec<String>)> =
+                Default::default();
+            for u in us {
+                let e = by_script
+                    .entry(u.script_pubkey.as_bytes().to_vec())
+                    .or_insert((Amount::ZERO, Vec::new()));
+                e.0 += u.value;
+                let txid = u.txid.to_string();
+                if !e.1.contains(&txid) {
+                    e.1.push(txid);
+                }
+            }
+            let mut all_vaults = Vec::new();
+            let mut vault_total = Amount::ZERO;
+            for (script, (value, txids)) in by_script {
+                if let Some(v) = wallet
+                    .get_all_vaults()
+                    .into_iter()
+                    .find(|v| v.vault_script == script)
+                {
+                    vault_total += value;
+                    all_vaults.push(json!({
+                        "vault": format!("{}:{}", v.owner_address, v.manager_address),
+                        "value": value.as_divi_f64(),
+                        "txids": txids,
+                    }));
+                }
+            }
+            let total = us.iter().fold(Amount::ZERO, |a, u| a + u.value);
+            json!({"AllVaults": all_vaults, "NonVaults": (total - vault_total).as_divi_f64()})
+        };
+        let (vaulted, stakable, spendable) = if verbose {
+            (describe(&vault_utxos), describe(&plain), describe(&plain))
+        } else {
+            (
+                json!(sum(&vault_utxos)),
+                json!(sum(&plain)),
+                json!(sum(&plain)),
+            )
+        };
         Ok(json!({
+            "Vaulted": vaulted,
+            "Stakable": stakable,
+            "Spendable": spendable,
             "vaults": result,
             "total_vaults": total_vaults
         }))

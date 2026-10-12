@@ -643,6 +643,7 @@ impl BlockchainRpc {
                 };
 
                 let mut script_obj = json!({
+                    "asm": divi_script::to_asm(utxo.script_pubkey.as_bytes()),
                     "hex": hex::encode(utxo.script_pubkey.as_bytes()),
                     "type": script_type,
                 });
@@ -654,6 +655,7 @@ impl BlockchainRpc {
                 Ok(json!({
                     "bestblock": best_block_hash,
                     "confirmations": confirmations,
+                    "version": 1,
                     "value": utxo.value.as_divi_f64(),
                     "scriptPubKey": script_obj,
                     "coinbase": utxo.is_coinbase,

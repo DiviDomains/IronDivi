@@ -102,7 +102,9 @@ impl StakingRpc {
             "staking_balance": info.staking_balance,
             "enoughcoins": info.enough_coins,
             "mnsync": info.mnsync,
-            "staking status": staking_status_text,
+            "staking status": info.staking && info.enabled,
+            "staking status text": staking_status_text,
+            "stake split threshold": 20000.0,
         }))
     }
 
@@ -229,7 +231,9 @@ mod tests {
         }));
 
         let result = rpc.get_staking_status(&Params::None).unwrap();
-        assert_eq!(result["staking status"], "Staking Active");
+        assert_eq!(result["staking status"], true);
+        assert_eq!(result["staking status text"], "Staking Active");
+        assert_eq!(result["stake split threshold"], 20000.0);
         assert_eq!(result["walletunlocked"], true);
         assert_eq!(result["staking_balance"], 10000.0);
     }
