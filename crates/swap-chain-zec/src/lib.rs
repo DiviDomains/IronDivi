@@ -190,6 +190,9 @@ fn is_already_known(message: &str) -> bool {
         // before this fix; "committed to the best chain" is the equivalent once it's mined.
         || m.contains("already exists in mempool")
         || m.contains("transaction was committed to the best chain")
+        // Zebra's mempool `InState` error: the tx (matched by its id) is already mined. Seen
+        // live when a case-C forward taker rebroadcast its confirmed ZEC lock.
+        || m.contains("transaction is already in state")
 }
 
 /// If `block` has a `CompactTx` spending `want_txid:want_vout`, (spender txid, input index).
@@ -529,6 +532,10 @@ mod tests {
             "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}"
         ));
         assert!(is_already_known("outputs already in utxo set"));
+        assert!(is_already_known(
+            "transaction rejected: failed to validate tx: WtxId(\"private\"), error: \
+             transaction is already in state"
+        ));
 
         // A genuine rejection (not already-known) must not be swallowed as success.
         assert!(!is_already_known("bad-txns-in-belowout"));
