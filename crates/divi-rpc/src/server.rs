@@ -470,7 +470,9 @@ impl RpcServer {
             // Masternode methods
             "getmasternodecount" => self.masternode.get_masternode_count(params),
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
-            "getmasternodewinners" => self.masternode.get_masternode_winners(params),
+            "getmasternodewinners" => self
+                .masternode
+                .get_masternode_winners(params, self.blockchain.tip_height()),
             "listmasternodes" => self.masternode.list_masternodes(params),
             "setupmasternode" => self.masternode.setup_masternode(params),
             "startmasternode" => self.masternode.start_masternode(params),

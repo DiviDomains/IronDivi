@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 pub struct MasternodeRpc {
     manager: Arc<RwLock<Option<MasternodeManager>>>,
+    /// Reserved for network payment votes (not wired yet; see get_masternode_winners)
+    #[allow(dead_code)]
     vote_tracker: Arc<RwLock<PaymentVoteTracker>>,
 }
 
@@ -77,19 +79,25 @@ impl MasternodeRpc {
         .into())
     }
 
-    /// Print the masternode winners for the last n blocks
-    pub fn get_masternode_winners(&self, params: &Params) -> Result<Value, Error> {
-        let rpc = self.get_rpc()?;
-        let blocks = params.get_i64(0).unwrap_or(10) as usize;
-        let _filter = params.get_str(1); // TODO: Apply filter
-
-        // Get current height from somewhere - for now use a placeholder
-        let current_height: i32 = 0; // TODO: Get from chain
-        let start_height = current_height.saturating_sub(blocks as i32);
-
-        let tracker = self.vote_tracker.read();
-        let winners = rpc.get_winners(&tracker, start_height, blocks);
-        Ok(serde_json::to_value(winners)?)
+    /// Print the masternode winners for the last n blocks.
+    ///
+    /// Payment votes are not yet received over the network, so every height reports the C++
+    /// "Unknown" winner with zero votes; the shape matches C++ (`nHeight` / `winner`).
+    pub fn get_masternode_winners(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+        self.get_rpc()?;
+        let blocks = match params.get(0) {
+            Some(Value::String(s)) => s.parse::<i32>().unwrap_or(0),
+            Some(v) => v.as_i64().unwrap_or(10) as i32,
+            None => 10,
+        };
+        let filter = params.get_str(1).unwrap_or("");
+        if !filter.is_empty() && !"Unknown".contains(filter) {
+            return Ok(json!([]));
+        }
+        let winners: Vec<Value> = (tip_height - blocks..tip_height + 20)
+            .map(|h| json!({"nHeight": h, "winner": {"address": "Unknown", "nVotes": 0}}))
+            .collect();
+        Ok(Value::Array(winners))
     }
 
     /// Get a ranked list of masternodes

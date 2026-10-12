@@ -108,6 +108,11 @@ fn chainwork_to_hex(chain_work: &[u8; 32]) -> String {
 }
 
 impl BlockchainRpc {
+    /// Current chain tip height
+    pub fn tip_height(&self) -> i32 {
+        self.chain.height() as i32
+    }
+
     /// Create new blockchain RPC handler
     pub fn new(chain: Arc<Chain>) -> Self {
         BlockchainRpc {
