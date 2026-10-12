@@ -3297,7 +3297,7 @@ impl WalletRpc {
 
     /// lockunspent - Lock or unlock UTXOs
     pub fn lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if params.len() < 1 || params.len() > 2 {
+        if params.is_empty() || params.len() > 2 {
             return Err(RpcError::invalid_params(
                 "lockunspent unlock [{\"txid\":\"txid\",\"vout\":n},...]",
             )
