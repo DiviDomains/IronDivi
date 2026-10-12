@@ -483,7 +483,15 @@ impl RpcServer {
             "signmnbroadcast" => self.masternode.sign_mn_broadcast(params),
             "importmnbroadcast" => self.masternode.import_mn_broadcast(params),
             "listmnbroadcasts" => self.masternode.list_mn_broadcasts(params),
-            "verifymasternodesetup" => self.masternode.verify_masternode_setup(params),
+            "verifymasternodesetup" => {
+                use divi_storage::chain::NetworkType;
+                let port = match self.blockchain.chain().network_type() {
+                    NetworkType::Mainnet => 51472,
+                    NetworkType::Testnet => 51474,
+                    _ => 51476,
+                };
+                self.masternode.verify_masternode_setup(params, port)
+            }
             "mnsync" => self.masternode.mnsync(params),
 
             // Spork methods

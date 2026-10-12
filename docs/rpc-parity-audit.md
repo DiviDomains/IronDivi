@@ -51,9 +51,9 @@ corrupts the coin DB on purpose is not reproduced).
 
 **Stubs / hardcoded:**
 - `getpeerinfo`: now real per-peer `version`, `subver`, `services`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`, `conntime`, `pingtime`, `startingheight`, `banscore`, `id` (live stats published by each connection). `inflight`, `synced_headers`, `synced_blocks`, `whitelisted` are still constants.
-- Masternode subsystem: `listmnbroadcasts`, `startmasternode`, `setupmasternode`,
-  `broadcaststartmasternode`, `signmnbroadcast`, `importmnbroadcast`,
-  `verifymasternodesetup` return "not implemented"; `getmasternodewinners` now has the C++ shape and real tip height, but every winner is `Unknown` with 0 votes because payment votes are not received over the network yet; `getmasternodecount` lacks
+- Masternode subsystem (`verifymasternodesetup` and `listmnbroadcasts` are now real: the former reproduces the C++ `getMessageToSign` string byte for byte, the latter returns `[]` because no broadcasts are stored; both unit-tested, not yet compared against C++ in a harness run). The Rust `divi-masternode` broadcast wire format and signing are not C++-compatible (OutPoint vin, no lastPing, different signed bytes), which is why the rest need a rewrite of that crate: `startmasternode`, `setupmasternode`,
+  `broadcaststartmasternode`, `signmnbroadcast`, `importmnbroadcast`
+  return "not implemented"; `getmasternodewinners` now has the C++ shape and real tip height, but every winner is `Unknown` with 0 votes because payment votes are not received over the network yet; `getmasternodecount` lacks
   `inqueue/ipv4/ipv6/onion/obfcompat/stable`; `spork show|active` stubbed;
   `getlotteryblockwinners` stubbed (and requires an argument C++ does not).
 - `getblock`: no `moneysupply` or `acc_checkpoint` (needs a block-index schema change).

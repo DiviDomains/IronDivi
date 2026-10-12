@@ -172,27 +172,55 @@ impl MasternodeRpc {
         Err(self.masternode_not_implemented())
     }
 
-    /// List pending masternode broadcasts
+    /// List stored pre-signed masternode broadcasts (none are stored yet)
     pub fn list_mn_broadcasts(&self, _params: &Params) -> Result<Value, Error> {
-        Err(self.masternode_not_implemented())
+        Ok(json!([]))
     }
 
-    /// Verify masternode is correctly configured
-    pub fn verify_masternode_setup(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters even though not used (for signature validation)
-        let _ip_address = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: ip_address"))?;
-        let _sigtime = params
+    /// Show the message a masternode broadcast must be signed over.
+    ///
+    /// Mirrors C++ `CMasternodeBroadcast::getMessageToSign`: `addr.ToString() + sigTime +
+    /// collateral pubkey bytes + masternode pubkey bytes + protocolVersion`. C++ builds the two
+    /// pubkeys from the characters of the argument strings, which never form a valid `CPubKey`,
+    /// so both contribute nothing; that quirk is reproduced so the output matches byte for byte.
+    pub fn verify_masternode_setup(
+        &self,
+        params: &Params,
+        default_port: u16,
+    ) -> Result<Value, Error> {
+        let bad = || -> Error {
+            RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Error parsing input arguments\n".to_string(),
+            )
+            .into()
+        };
+        if params.len() != 4 {
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "verifymasternodesetup ip_address sigtime collateralPubKey masternodePubKey",
+            )
+            .into());
+        }
+        let ip = params.get_str(0).ok_or_else(bad)?;
+        let sigtime: i64 = params
             .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: sigtime"))?;
-        let _collateral_pubkey = params.get_str(2).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: collateralPubKey")
-        })?;
-        let _masternode_pubkey = params.get_str(3).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: masternodePubKey")
-        })?;
-        Err(self.masternode_not_implemented())
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(bad)?;
+        params.get_str(2).ok_or_else(bad)?;
+        params.get_str(3).ok_or_else(bad)?;
+        let addr: std::net::IpAddr = ip.parse().map_err(|_| bad())?;
+        let addr_str = match addr {
+            std::net::IpAddr::V4(a) => format!("{}:{}", a, default_port),
+            std::net::IpAddr::V6(a) => format!("[{}]:{}", a, default_port),
+        };
+        let message = format!(
+            "{}{}{}",
+            addr_str,
+            sigtime,
+            divi_network::constants::PROTOCOL_VERSION
+        );
+        Ok(json!({ "expected_message_to_sign": hex::encode(message.as_bytes()) }))
     }
 
     /// Masternode sync control
@@ -290,5 +318,32 @@ mod tests {
 
         let value = result.unwrap();
         assert!(value["IsBlockchainSynced"].is_boolean());
+    }
+
+    #[test]
+    fn test_verifymasternodesetup_message() {
+        let rpc = MasternodeRpc::new();
+        let p = |v: &[&str]| Params::Array(v.iter().map(|s| serde_json::json!(s)).collect());
+        let v = rpc
+            .verify_masternode_setup(&p(&["1.2.3.4", "1700000000", "aa", "bb"]), 51474)
+            .unwrap();
+        let msg = String::from_utf8(
+            hex::decode(v["expected_message_to_sign"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            format!(
+                "1.2.3.4:514741700000000{}",
+                divi_network::constants::PROTOCOL_VERSION
+            )
+        );
+        assert!(rpc
+            .verify_masternode_setup(&p(&["nope", "1", "a", "b"]), 51474)
+            .is_err());
+        assert_eq!(
+            rpc.list_mn_broadcasts(&Params::None).unwrap(),
+            serde_json::json!([])
+        );
     }
 }
