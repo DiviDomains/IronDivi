@@ -237,6 +237,12 @@ pub async fn step(
     Ok(taker.step(local, view.as_ref()).await?)
 }
 
+/// Refund `local`'s taker leg without ever claiming the maker leg (see [`Taker::refund`]) —
+/// never needs the maker's view, so no `client`/`sessions` lookup either.
+pub async fn refund(taker: &Taker, local: &str) -> Result<TakerState> {
+    Ok(taker.refund(local).await?)
+}
+
 /// Whether the gate's policy now allows the claim (or, for `Never`, the claim window
 /// has closed so the next step takes the refund path).
 async fn release(g: &ClaimGate, local: &str) -> Result<bool> {

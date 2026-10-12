@@ -1015,6 +1015,100 @@ both!(
     resign_after_taker_claim_reject_body
 );
 
+/// Drive both engines (no claim-stepping gate) until the taker reaches `target`, frozen
+/// there via `halt_after` so nothing past it (in particular, `on_maker_lock_confirmed`'s
+/// claim branch) has run yet. Un-arms the hook before returning.
+async fn drive_taker_to(h: &mut H, target: TakerState) {
+    h.taker.halt_after(Some(target));
+    for _ in 0..40 {
+        let _ = h.maker.tick().await;
+        let view = h.maker.view(&h.maker_id).unwrap();
+        let _ = h.taker.step(&h.taker_id, view.as_ref()).await;
+        h.mine_all(1);
+        if h.taker_state() == target {
+            break;
+        }
+    }
+    assert_eq!(
+        h.taker_state(),
+        target,
+        "test setup bug: never reached {target:?}"
+    );
+    h.taker.halt_after(None);
+}
+
+/// `Taker::refund` called while `MakerLockConfirmed` and still well within the safe-to-claim
+/// window must leave the state alone and build no claim — the live bug (`Taker::step`, which
+/// `divi-swap refund` used to call, claims whenever still safe, regardless of the operator's
+/// intent to refund instead).
+async fn refund_never_claims_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::MakerLockConfirmed).await;
+
+    let state = h.taker.refund(&h.taker_id).await.unwrap();
+    assert_eq!(state, TakerState::MakerLockConfirmed);
+    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert!(
+        rec.maker_leg_claim.is_none(),
+        "refund must not build a claim"
+    );
+}
+
+/// `Taker::refund` repeated after the taker-leg timeout drives the same `MakerLockConfirmed`
+/// swap to `Done` via a refund, never a claim.
+async fn refund_after_timeout_reaches_done_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::MakerLockConfirmed).await;
+
+    h.tl_chain().advance_time(22_000); // past the taker's own (longer) timeout
+    for _ in 0..40 {
+        let state = h.taker.refund(&h.taker_id).await.unwrap();
+        h.mine_all(1);
+        if state == TakerState::Done {
+            let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+            assert!(rec.maker_leg_claim.is_none(), "must never have claimed");
+            return;
+        }
+    }
+    panic!("refund did not reach Done: {:?}", h.taker_state());
+}
+
+/// `Taker::refund` on an already-`Claimed` swap does nothing (leaves the state exactly as
+/// it is) rather than erroring or reverting.
+async fn refund_on_claimed_does_nothing_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await;
+
+    let state = h.taker.refund(&h.taker_id).await.unwrap();
+    assert_eq!(
+        state,
+        TakerState::Claimed,
+        "refund on Claimed must do nothing"
+    );
+}
+
+both!(
+    refund_never_claims,
+    rev_refund_never_claims,
+    refund_never_claims_body
+);
+both!(
+    refund_after_timeout_reaches_done,
+    rev_refund_after_timeout_reaches_done,
+    refund_after_timeout_reaches_done_body
+);
+both!(
+    refund_on_claimed_does_nothing,
+    rev_refund_on_claimed_does_nothing,
+    refund_on_claimed_does_nothing_body
+);
+
 const MAKER_HAPPY: &str = include_str!("fixtures/maker-forward-done-happy.json");
 const MAKER_CASEC: &str = include_str!("fixtures/maker-forward-done-casec.json");
 const TAKER_HAPPY: &str = include_str!("fixtures/taker-forward-done-happy.json");

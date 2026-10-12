@@ -1,11 +1,6 @@
 # Lane zec status
 
-- running: nothing. Orchestrator's 3-item queue: (1) v6 ZIP-244 vector cross-check — done,
-  see "done" below. (2) case-c readiness — done, found and fixed a real Premature-
-  classification bug before the live case-c run, see "done" below. (3) ltc/btc/evm/divi
-  broadcast-idempotency audit — already finished two rounds ago (read-only, "own your paths
-  only"): no gap in ltc/btc/divi, one real gap flagged in swap-chain-evm with a suggested
-  fix for that lane's owner. Nothing further from me on any of the three right now.
+- running: nothing.
 - blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
   EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
   on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
@@ -22,6 +17,44 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Engine bug (orchestrator, found live): `divi-swap refund` could claim instead,
+    2026-10-12 ~04:10 EDT.** Live: ZEC case-C swap `ab294b69` went to `Claimed` after an
+    operator ran `refund`, not `Refunded`. Root cause: `bin/divi-swap/src/main.rs` mapped
+    both `Cmd::Claim` and `Cmd::Refund` to the same `flow::step`, and `Taker::step` claims
+    the maker leg whenever it's still safe to (per `TakerState::MakerLockConfirmed`'s
+    handler, `on_maker_lock_confirmed`) — it has no notion of "the operator explicitly
+    asked to refund instead," so `refund` on a swap that was still within the safe-to-claim
+    window just... claimed.
+    - **Fix**: added `Taker::refund(local_id)` (`crates/divi-swap/src/taker.rs`) with its
+      own state machine (`advance_refund_only`), never reachable from `step`'s claim logic:
+      `Locked`/`MakerLockConfirmed` → `Refunded` only if `taker_leg_refundable`, else left
+      exactly as-is (no claim ever built); `Refunded` → drives to `Done` the same way
+      `step` does (reuses `on_refunded`); every other state (`Prepared`/`Accepted`/
+      `Claimed`/`Done`) is left untouched — in particular, calling `refund` on an
+      already-`Claimed` swap is a deliberate no-op, not an error.
+    - Added `flow::refund` (`bin/divi-swap/src/flow.rs`) — thinner than `flow::step`, since
+      `Taker::refund` never needs the maker's view, so no `MakerClient`/`Sessions` lookup
+      either. Split `Cmd::Claim | Cmd::Refund`'s shared match arm in `main.rs` into two:
+      `Claim` still calls `flow::step`, `Refund` now calls `flow::refund`. Updated `Refund`'s
+      doc comment to state plainly that it never claims, unlike `claim`/`run`.
+    - **Mock tests** (`crates/divi-swap/tests/engine.rs`, ×2 directions = 6 actual tests via
+      `both!`): a shared `drive_taker_to` helper uses the existing `halt_after` test hook to
+      freeze the taker exactly at a target state before anything past it runs (needed
+      because `Taker::step`'s internal loop chains straight through
+      `MakerLockConfirmed`'s claim branch in the same call if it's still safe — there's no
+      way to "catch" that state from outside without halting first; same timing gotcha
+      recorded for the maker's analogous chaining in an earlier round).
+      `refund_never_claims`: refund while `MakerLockConfirmed` and still well within the
+      safe window leaves the state alone and builds no claim. `refund_after_timeout_
+      reaches_done`: the same frozen swap, after advancing the taker-leg clock past its own
+      timeout, reaches `Done` via repeated `refund` calls, never a claim.
+      `refund_on_claimed_does_nothing`: refund on an already-`Claimed` swap is a no-op.
+    - Verified: `cargo fmt`/`cargo clippy -p divi-swap -p divi-swap-cli --all-targets
+      --all-features -- -D warnings` both clean; `cargo test -p divi-swap` (81 passed in
+      `engine.rs` alone, including the 6 new ones) and `cargo test -p divi-swap-cli` (10
+      passed) both green; `check-zec.sh` PASS (unaffected — this fix is in the shared
+      engine/CLI, not `swap-chain-zec`, but lane-synced and re-verified after landing
+      `cee8671` to make sure nothing regressed).
   - **Case-c readiness audit, 2026-10-12 ~02:20 EDT — found and fixed a real bug before the
     orchestrator's live case-c run.** Walked both directions' maker/taker refund paths
     (mock engine tests `zec_fwd_case_c_taker_never_claims`/`zec_rev_case_c_taker_never_claims`,

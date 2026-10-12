@@ -235,6 +235,55 @@ impl Taker {
         Ok(r.state)
     }
 
+    /// Refund the taker leg once its own timeout has passed — unlike [`Taker::step`], this
+    /// never claims the maker leg, even if that would still be safe. For an operator who
+    /// has decided to abandon the swap (or is testing the refund path) and explicitly asked
+    /// to refund, not for `step`'s normal "claim if still safe, else refund" judgment call.
+    pub async fn refund(&self, local_id: &str) -> Result<TakerState> {
+        let _g = self.gate.lock().await;
+        let mut r = self.load(local_id)?;
+        if r.state == TakerState::Done {
+            return Ok(r.state);
+        }
+        let had_error = r.last_error.take().is_some();
+        for _ in 0..16 {
+            match self.advance_refund_only(&mut r).await {
+                Ok(Flow::Moved) => {}
+                Ok(Flow::Idle | Flow::Halted) => break,
+                Err(e) => {
+                    r.last_error = Some(e.to_string());
+                    self.store.put_taker_swap(&r)?;
+                    return Err(e);
+                }
+            }
+        }
+        if had_error && r.last_error.is_none() {
+            self.store.put_taker_swap(&r)?;
+        }
+        Ok(r.state)
+    }
+
+    /// [`Taker::refund`]'s state machine: `Locked`/`MakerLockConfirmed` only ever move to
+    /// `Refunded` (never `Claimed`), and only once the taker leg is actually refundable;
+    /// `Refunded` drives the refund to `Done` the same way [`Taker::advance`] does; every
+    /// other state (including `Claimed`) is left exactly as it is.
+    async fn advance_refund_only(&self, r: &mut TakerRecord) -> Result<Flow> {
+        match r.state {
+            TakerState::Locked | TakerState::MakerLockConfirmed => {
+                if self.taker_leg_refundable(r).await? {
+                    self.enter(r, TakerState::Refunded)
+                } else {
+                    Ok(Flow::Idle)
+                }
+            }
+            TakerState::Refunded => self.on_refunded(r).await,
+            TakerState::Prepared
+            | TakerState::Accepted
+            | TakerState::Claimed
+            | TakerState::Done => Ok(Flow::Idle),
+        }
+    }
+
     fn load(&self, id: &str) -> Result<TakerRecord> {
         self.store
             .get_taker_swap(id)?

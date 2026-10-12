@@ -152,7 +152,10 @@ enum Cmd {
         #[arg(long)]
         swap: String,
     },
-    /// Refund the taker-leg lock if the taker timeout has passed (one taker step).
+    /// Refund the taker-leg lock once its timeout has passed. Unlike `claim`, this never
+    /// claims the maker leg even if that would still be safe — for an operator who has
+    /// decided to abandon the swap and explicitly wants to refund, not `claim`'s/`run`'s
+    /// normal "claim if still safe, else refund" judgment call (see `Taker::refund`).
     Refund {
         /// Local swap id.
         #[arg(long)]
@@ -471,9 +474,13 @@ async fn main() -> Result<()> {
                 .await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
-        Cmd::Claim { swap } | Cmd::Refund { swap } => {
+        Cmd::Claim { swap } => {
             let client = MakerClient::new(&sessions.get(swap)?.maker_url);
             let state = flow::step(&taker(&cli).await?, &client, &sessions, swap).await?;
+            println!("{state:?}");
+        }
+        Cmd::Refund { swap } => {
+            let state = flow::refund(&taker(&cli).await?, swap).await?;
             println!("{state:?}");
         }
         Cmd::Run {
