@@ -228,3 +228,11 @@ offers stayed disabled until the maker held enough coin.
     DIVI claim (maker) `688de9a79aa350d3db02da441c3b53b20b7cce98060d391d693388624eed42c3`.
   With this, the one deployed maker has completed happy-path swaps in both directions for BTC, LTC
   and ZEC.
+- Case C (both refund) for LTC against the deployed maker, forward (offer `divi-ltc-testnet`, taker
+  pays LTC and never claims), taker swap `393dce92…` / maker swap `a0e3c2cd…`, taker Refunded /
+  maker Done, 2026-10-12. The first `case-c-all.sh` run ended on a transient litecoinspace error
+  after both locks (fixed in `d1a72fe`); the swap was resumed from its db with `divi-swap refund`:
+    LTC lock (taker) `b7e7d75e8ea4a398552970f1e0fcbdae7c8d7af351acff394c27ba5eab563025`,
+    DIVI lock (maker) `7f5588a43db9e5af6371411735e1263e5c394744390c6bd9ca46baf96194e03f`,
+    DIVI refund (maker, CLTV path) `19f58c6bcfc60f565b6815b4d0a561ddde5c63f23aef9535ada74c9752205056`,
+    LTC refund (taker, CLTV path) `504b901f831c34948adede119b1180f97399b1a816199f06cd986c4e2708e7fe`.
