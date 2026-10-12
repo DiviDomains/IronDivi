@@ -273,3 +273,89 @@
     shell history or env dump can't confuse "the key I'm about to move funds with" and
     "the key the long-running funded HTLC test reads".
 - needs: nothing from the orchestrator right now.
+
+## Safe, repeatable maker redeploy (`tools/swap-poc/redeploy-maker.sh`)
+- done:
+  - `tools/swap-poc/redeploy-maker.sh`: run from the Mac only (cannot reach dnsdivi from
+    hp2). Read `deploy/divi-swapd/deploy.sh`, `deploy/divi-swapd/divi-swapd.service`,
+    `deploy/divi-swapd/README.md` and `docs/plans/swap-poc/wave4-deploy.md` first to
+    confirm, not guess, every path/name reused below: ssh host alias `dnsdivi`, installed
+    binary `/usr/local/bin/divi-swapd` with the existing `.prev`-backup convention,
+    systemd unit `divi-swapd`, health endpoint `/healthz` (not `/health` — the task
+    request's wording; every existing doc and `deploy.sh` itself say `/healthz`, so that's
+    what the script checks), and the maker's bind port `127.0.0.1:18480` on dnsdivi itself
+    for that health check over ssh.
+  - In-flight gate: reads `--maker-url` (default `http://127.0.0.1:18482`, exactly the
+    tunnel the task named — note this is deliberately a *different* local port from the
+    `18480` used in `wave4-deploy.md`'s examples; the two are unrelated tunnels/uses, not a
+    typo, so no "guessed" reconciliation was done) and refuses to redeploy unless every
+    swap's `state` is `Done` or `Aborted` — the same terminal-state definition
+    `wave4-deploy.md` §0/§5 already use. `--force-inflight` overrides and always prints
+    every in-flight id first (even when the maker can't be reached at all, in which case it
+    warns and proceeds instead of refusing).
+  - Binary: `--binary PATH` uses a prebuilt one; otherwise it shells out to `remote-cargo
+    build --release -p divi-swapd` (hp2, fast) from the repo root and expects the result at
+    `--built-binary-path` (default `<repo>/target/release/divi-swapd`, cargo's own default
+    layout — flagged, not hardcoded, since this lane cannot run or inspect `remote-cargo`
+    itself to confirm where it lands the artifact; `_hp2.md` rule 3 forbids running
+    `remote-cargo` from hp2 anyway). Never builds on dnsdivi — that's `deploy.sh`'s slower
+    path and is unchanged by this script.
+  - Deploy: scp's the binary to `dnsdivi:/tmp/divi-swapd.redeploy-new`, then over one
+    `ssh … sudo bash -s` call: backs up the current `/usr/local/bin/divi-swapd` to `.prev`
+    (skipped if none exists, e.g. a first run), installs the new one at mode 0755, restarts
+    the `divi-swapd` unit. Then waits for `/healthz` on `127.0.0.1:18480` over ssh (default
+    budget 300 s, `--health-timeout`/`--health-interval` adjustable) and on timeout rolls
+    back automatically: restores `.prev` over the binary, restarts the unit again, and
+    re-checks health once more to report whether the rollback itself came up healthy. If no
+    `.prev` exists (first-ever run failing health), it says so and leaves the unit as is
+    rather than guessing a rollback target.
+  - `--check-only`: runs just the in-flight gate against a real `--maker-url` and exits
+    with its verdict; nothing is built, shipped, or restarted. Added because `--dry-run`
+    (below) never performs even the read-only gate check for real — matching this repo's
+    own convention (`wave4-smoke.sh`'s `--dry-run` only echoes every `curl`, including
+    GETs) — so `--check-only` is the one mode that can answer "would the gate pass right
+    now?", and is also what the bash tests drive.
+  - `--dry-run`: prints every step (gate check included) and executes nothing, verified by
+    hand against both the default (remote-cargo) and `--binary` paths.
+  - `tools/swap-poc/test-redeploy-maker.sh`: bash-level tests for the in-flight gate only,
+    against a real mock HTTP server (stdlib `python3 http.server`, same style as
+    `tools/swap-poc/chaos/proxy.py`) bound to `127.0.0.1`, driven through
+    `redeploy-maker.sh --check-only` — no ssh, no build, no dnsdivi. 8 cases: all-terminal
+    passes silently; one/many in-flight swaps refuse and print every id (not just the
+    first); `--force-inflight` proceeds but still prints the ids; an unreachable maker
+    refuses by default and proceeds (with a warning) under `--force-inflight`; an empty
+    swap list passes; `--check-only` stops at the gate and never reaches `--host` at all
+    (checked by pointing `--host` at an unresolvable name and confirming that never
+    matters). All 8 pass. **Not** wired into `check-ltc.sh`: lane rules say "do not edit
+    check scripts," so it stays a standalone script — run it by hand, or have the
+    orchestrator run it from the Mac next to `redeploy-maker.sh` itself.
+  - `shellcheck` clean on both scripts (two intentional `SC2029`s disabled, matching
+    `deploy.sh`'s own precedent for client-side-expanded ssh commands; one intentional
+    `SC2329` disabled for the EXIT-trap cleanup function, matching `wave4-smoke.sh`'s own
+    precedent).
+  - No Rust changed by this task; `check-ltc.sh` re-run clean (fmt/clippy/tests on
+    `swap-chain-ltc`, `testnet_api_reachable` live). Picked up and reverted one stray
+    uncommitted local edit to `crates/swap-chain-zec/src/lib.rs` first (a leftover
+    duplicate `median_of_block_times` definition from before `f209780` landed, which would
+    not have compiled — not part of this task, just cleanup before starting it).
+- running: nothing; idle, waiting on the orchestrator to try `redeploy-maker.sh
+  --check-only` (and then a real run) against dnsdivi.
+- left / next steps: none on my side. The orchestrator needs the actual
+  `/etc/divi-swapd`-adjacent tunnel open at `18482` before `--check-only`/a real run can
+  read `/swaps`; sudo on dnsdivi for the install+restart; and `remote-cargo` reachable from
+  the Mac (or a prebuilt binary path) for the build step.
+- decisions:
+  - Health endpoint is `/healthz`, overriding the task text's informal "/health" — every
+    source of truth in the repo (`deploy.sh`, `divi-swapd.service`'s absence of any
+    `/health` route, `wave4-deploy.md`, `RESULTS.md`) uses `/healthz`, and guessing a route
+    that doesn't exist would make the health wait (and the rollback trigger) always fail.
+  - Kept the pre-flight gate's maker URL (`18482`, Mac-side tunnel for reading `/swaps`)
+    and the post-restart health check's remote port (`18480`, dnsdivi's own loopback bind,
+    reached over ssh, not through any Mac-side tunnel) as two independent, separately
+    flagged values rather than reconciling them to one: they are different connections for
+    different purposes, and the task named `18482` explicitly for the first one.
+  - Did not attempt to open or manage an ssh tunnel itself for the in-flight check (unlike
+    `wave4-smoke.sh`, which can open its own): the task's phrasing ("read … over the tunnel
+    at http://127.0.0.1:18482") reads as an already-open tunnel the orchestrator manages,
+    and one less moving part is safer for a pre-flight safety gate.
+- needs: nothing from the orchestrator right now.
