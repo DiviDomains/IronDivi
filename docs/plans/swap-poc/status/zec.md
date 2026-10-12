@@ -17,6 +17,29 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Mainnet-readiness review, 2026-10-12** (orchestrator-requested, docs-only plus tests
+    where a gap was found): wrote `docs/plans/swap-poc/mainnet-readiness.md` covering all
+    five coins (BTC, LTC, ZEC, USDC/EVM, XMR) — confirmations, timeouts/margins, fee policy,
+    dust limits, reorg depth, public backends, every value cited `file:line` and marked
+    `ok`/`risky`. Headline: BTC/LTC/XMR have no mainnet network support at all (hardcoded to
+    test networks, not a disableable flag); ZEC additionally can't produce a mainnet-valid
+    *transaction* right now — it always builds the NU7 v6 format, and the `oracle` agent
+    confirmed (high confidence, sources days old) NU7 is testnet-only until a targeted
+    2026-11-05 mainnet activation (go/no-go was 2026-10-20) — re-verify that date before ever
+    pointing this crate at a mainnet endpoint. One real bug found and fixed in my own crate:
+    `DUST_ZATOSHI` (`crates/swap-chain-zec/src/tx.rs`) was 294 zat, borrowed byte-for-byte from
+    Bitcoin's P2WPKH dust rule, which has no relationship to ZIP 317's flat 5000-zat-per-action
+    fee — a 294-zat output would cost more to ever spend than it's worth. Raised
+    `DUST_ZATOSHI` to equal `ZIP317_MARGINAL_FEE` (5000); added
+    `tx::tests::dust_floor_covers_the_zip317_marginal_fee`, a `const` assertion confirmed
+    failing-to-compile against the old value and passing against the fix. All 18 existing
+    `swap-chain-zec` unit tests still pass unchanged (checked every test's computed
+    change/payout value against the old 294→5000 gap by hand; none fall in it).
+    `crates/divi-swap/src/config.rs` needed no change — every shared-config value reviewed for
+    mainnet (confirmations, mtp_lag, timeouts, margins) was already safe, including ZEC's own
+    10-confirmation mainnet figure, which stays safe on both sides of the NU7 mainnet-
+    activation date (over-conservative before it, on-target after). `fmt`/`clippy -D
+    warnings`/`cargo test -p swap-chain-zec`/`check-zec.sh` all green.
   - **ZEC testnet confirmations raised 3 → 9, 2026-10-12 ~05:10 EDT** (orchestrator's
     decision on the safety-review finding below, explicitly authorizing this one edit to
     `crates/divi-swap/src/config.rs` — normally the frozen engine contract, lane

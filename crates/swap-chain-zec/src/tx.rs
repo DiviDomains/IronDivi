@@ -47,8 +47,13 @@ pub const V6_VERSION_GROUP_ID: u32 = 0xD884_B698;
 /// accepts in practice right now.
 pub const V6_VERSION_BYTES: u32 = 0x8000_0006;
 
-/// Outputs below this are uneconomical to spend (same floor as Bitcoin P2PKH dust).
-pub const DUST_ZATOSHI: u64 = 294;
+/// Outputs below this are uneconomical to spend. Equal to [`ZIP317_MARGINAL_FEE`] (defined
+/// below): under ZIP 317 every spend costs at least one marginal fee, so an output worth
+/// less than that is worse than worthless to whoever receives it. (Previously 294 zat,
+/// Bitcoin's byte-based P2PKH dust floor borrowed verbatim — that rule has no relationship
+/// to this chain's flat per-action ZIP 317 fee and badly undershot it; see
+/// `docs/plans/swap-poc/mainnet-readiness.md`.)
+pub const DUST_ZATOSHI: u64 = ZIP317_MARGINAL_FEE;
 
 // ---- CompactSize -----------------------------------------------------------------------
 
@@ -1767,6 +1772,21 @@ mod tests {
         assert_eq!(
             zip317_fee(&[p2pkh_in()], &[p2pkh_out(), p2pkh_out(), p2pkh_out()]),
             15_000
+        );
+    }
+
+    /// Mainnet-readiness review (docs/plans/swap-poc/mainnet-readiness.md): the old dust
+    /// floor (294 zat) was borrowed from Bitcoin's byte-based P2PKH dust rule and has no
+    /// relationship to this chain's real fee regime. Under ZIP 317, spending an output
+    /// later costs at least one marginal fee ([`ZIP317_MARGINAL_FEE`]) — so any output
+    /// worth less than that is worse than worthless to whoever receives it, not just
+    /// "non-standard" by a byte-size rule that no longer governs this chain's fees.
+    #[test]
+    fn dust_floor_covers_the_zip317_marginal_fee() {
+        const _: () = assert!(
+            DUST_ZATOSHI >= ZIP317_MARGINAL_FEE,
+            "DUST_ZATOSHI must be at least one ZIP 317 marginal fee, or a dust-sized \
+             output can cost more to spend than it is worth"
         );
     }
 }
