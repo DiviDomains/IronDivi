@@ -179,6 +179,11 @@ impl RpcServer {
         self.lite_wallet.write().set_mempool(mempool);
     }
 
+    /// Set the spork manager that backs the `spork` RPC
+    pub fn set_spork_manager(&self, sporks: Arc<divi_network::SporkManager>) {
+        self.spork.set_manager(sporks);
+    }
+
     /// Set the masternode manager
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);

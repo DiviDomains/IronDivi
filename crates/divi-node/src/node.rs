@@ -296,6 +296,11 @@ impl Node {
         &self.mempool
     }
 
+    /// Get the spork manager
+    pub fn spork_manager(&self) -> &Arc<SporkManager> {
+        &self.spork_manager
+    }
+
     /// Get fee estimator
     pub fn fee_estimator(&self) -> &Arc<FeeEstimator> {
         &self.fee_estimator

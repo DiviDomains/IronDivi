@@ -1210,6 +1210,7 @@ async fn run_daemon(
         // Setup staker callbacks if enabled
         let staker_ref = staker.clone();
         let mempool_for_rpc = node.mempool().clone();
+        let spork_for_rpc = node.spork_manager().clone();
         let mempool_for_tx = node.mempool().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
@@ -1227,6 +1228,7 @@ async fn run_daemon(
                 peer_manager,
                 move |rpc_server| {
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
                     // Initialize masternode manager
@@ -1317,6 +1319,7 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
+        let spork_for_rpc = node.spork_manager().clone();
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -1331,6 +1334,7 @@ async fn run_daemon(
                 peer_manager,
                 move |rpc_server| {
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
                     // Initialize masternode manager
