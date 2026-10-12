@@ -390,3 +390,36 @@
   - `cargo clippy --workspace --all-targets -- -D warnings` clean; `check-usdc.sh` PASS;
     `shellcheck` clean on both scripts; `usdc-live-dry-run.sh` re-run clean end to end
     (anvil proof + both real-network dry-runs, exit 0).
+- **Wave 10** (this seam): usdc mock e2e for crash recovery — kill/restart the taker
+  between `lock` and `claim`, both directions, on anvil. Mirrors `tests/engine.rs`'s
+  `crash_taker_body`/`Crash::Taker(TakerState::Locked)` (the BTC/DIVI chaos-equivalent at
+  the Rust level — there is no OS-process-kill chaos test anywhere in this repo; the only
+  thing that actually kills a real binary is `tools/swap-poc/chaos/driver.py`, and it kills
+  the *maker* (`divi-swapd`), never the taker), but with a real `UsdcBackend` over a spawned
+  anvil for the counter leg instead of `MockChain` (that struct's harness is BTC/DIVI-
+  `MockChain`-specific and isn't reusable for an account-chain backend without rewriting it).
+  - `crates/divi-swap/tests/usdc.rs`: new `crash_taker_between_lock_and_claim(dir)` — opens
+    a *file-backed* `Store` (not `in_memory`, so "restart" can reopen the same on-disk file
+    with a fresh connection, exactly like `tests/engine.rs::H::restart`), runs quote→
+    prepare→accept→accepted, arms `taker.halt_after(Some(TakerState::Locked))`, calls
+    `taker.lock()` and confirms it halts right where `Taker::lock` persists the `Locked`
+    transition and the signed-but-unbroadcast funding tx, *before* the `broadcast` call
+    (`crates/divi-swap/src/taker.rs`) — i.e., the crash point is "funding tx signed and
+    written to disk, never sent". Drops that `Taker`, reopens the store, builds a fresh
+    `Taker` (the maker's own process never crashed, so it keeps its original store handle
+    throughout) and resumes: `taker.lock()` again now hits the `Locked => {}` branch,
+    skipping re-signing, and broadcasts the persisted tx for the first time. Finishes the
+    swap through the normal tick/step loop and asserts the same balance invariants as
+    `full_swap` — the crash+resume must not double-fund, double-claim, or lose anything.
+    Two tests, both directions: `usdc_crash_taker_between_lock_and_claim_forward`/`_reverse`.
+  - Why `Locked` specifically: it is the one crash point genuinely "between lock and claim"
+    in `TakerState`'s own ordering (`Prepared, Accepted, Locked, MakerLockConfirmed,
+    Claimed, Refunded, Done`) and the one `tests/engine.rs` itself already uses for this
+    exact purpose on BTC/DIVI, so this is the same proof, not a new one invented for USDC.
+  - Noted, not fixed (out of scope, not my crate): `cargo clippy --workspace --all-targets
+    -- -D warnings` currently fails in `crates/divi-rpc/src/wallet.rs` (`len_zero`,
+    landed `84e27d3`, the `rpc` lane, nothing to do with USDC/EVM). Scoped clippy on
+    everything this seam touches is clean: `cargo clippy -p divi-swap --all-targets -- -D
+    warnings` and `-p swap-chain-evm --all-targets --all-features` both exit 0.
+  - `check-usdc.sh` PASS; full `tests/usdc.rs` suite green (8/8, up from 6 — the 2 new
+    tests), each new test independently green.

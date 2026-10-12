@@ -365,3 +365,113 @@ async fn usdc_swap_refund_forward_evm_increase_time() {
 async fn usdc_swap_refund_reverse_evm_increase_time() {
     refund_swap(Direction::TakerPaysDivi, TimeJump::IncreaseTime).await;
 }
+
+/// Kill/restart the taker between `lock` and `claim` — the same crash point
+/// `tests/engine.rs`'s `crash_taker_body` covers for BTC/DIVI (`Crash::Taker(TakerState::
+/// Locked)`), reproduced here with a real `UsdcBackend` over anvil for the counter leg
+/// instead of `MockChain`. `Taker::lock` persists `taker_leg_funding` and the `Locked`
+/// transition *before* broadcasting it (`crates/divi-swap/src/taker.rs`); `halt_after`
+/// makes it return early right there, simulating the process dying after the write-ahead
+/// persist but before the send. A fresh `Taker` reopening the same on-disk store must then
+/// resume and complete the swap — proving the persisted-but-unsent funding tx survives a
+/// restart and gets broadcast exactly once, never re-signed (which would double the
+/// approve+lock gas and risk two different signed txs racing for the same nonce) and never
+/// silently dropped (which would strand the swap in `Locked` forever).
+async fn crash_taker_between_lock_and_claim(dir: Direction) {
+    require_foundry!();
+    let w = setup().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("swap.db");
+    let store = Store::open(&path).unwrap();
+
+    // The maker's own process never crashes here — only the taker does — so the maker
+    // keeps running on its original store handle throughout.
+    let maker = Maker::new(
+        SwapConfig::profile(Profile::Testnet),
+        Arc::new(w.maker_divi.clone()),
+        w.maker_usdc.clone(),
+        store.clone(),
+        vec![offer(dir)],
+    )
+    .unwrap();
+    let taker = Taker::new(
+        Arc::new(w.taker_divi.clone()),
+        w.taker_usdc.clone(),
+        store.clone(),
+    );
+
+    let quote = maker.quote("o", COUNTER_ENGINE_SATS).await.unwrap();
+    let (tid, req) = taker.prepare(&quote).await.unwrap();
+    let view = maker.accept(req).await.unwrap();
+    taker.accepted(&tid, &view).await.unwrap();
+
+    taker.halt_after(Some(TakerState::Locked));
+    let err = taker.lock(&tid).await.unwrap_err();
+    assert!(err.to_string().contains("halted"), "{err}");
+    assert_eq!(
+        store.get_taker_swap(&tid).unwrap().unwrap().state,
+        TakerState::Locked,
+        "the Locked transition must have persisted before the halt"
+    );
+
+    // "Restart": drop the halted taker, reopen the same on-disk file with a fresh
+    // connection and a fresh (unhalted) Taker.
+    drop(taker);
+    let store2 = Store::open(&path).unwrap();
+    let taker = Taker::new(
+        Arc::new(w.taker_divi.clone()),
+        w.taker_usdc.clone(),
+        store2.clone(),
+    );
+
+    // Already Locked, so this skips re-signing and broadcasts the persisted funding tx
+    // for the first time.
+    let notice = taker.lock(&tid).await.expect("resumed lock must succeed");
+    let mid = maker.notify_lock(&view.id, notice).await.unwrap().id;
+
+    for _ in 0..120 {
+        maker.tick().await.unwrap();
+        let v = maker.view(&mid).unwrap();
+        let _ = taker.step(&tid, v.as_ref()).await;
+        w.divi.mine(1);
+        mine_usdc_block(&w.chain_provider).await;
+        let m = store2.get_maker_swap(&mid).unwrap().unwrap().state;
+        let t = store2.get_taker_swap(&tid).unwrap().unwrap().state;
+        if m == SwapState::Done && t == TakerState::Done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let m = store2.get_maker_swap(&mid).unwrap().unwrap();
+    let t = store2.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!((m.state, t.state), (SwapState::Done, TakerState::Done));
+    assert!(
+        m.preimage.is_some(),
+        "the happy path must still claim, not refund"
+    );
+
+    // Same balance check as `full_swap`: the crash+resume must not have double-funded,
+    // double-claimed, or lost anything.
+    let counter_units = COUNTER_ENGINE_SATS / 100;
+    let (usdc_claimant, divi_claimant) = match dir {
+        Direction::TakerPaysBtc => (w.maker_usdc_addr, &w.taker_divi),
+        Direction::TakerPaysDivi => (w.taker_usdc_addr, &w.maker_divi),
+    };
+    let got_usdc = usdc_balance(&w.chain_provider, w.token, usdc_claimant).await;
+    assert_eq!(got_usdc, U256::from(USDC_MINT + counter_units));
+    let divi_amount = quote.divi_amount.to_sat();
+    assert_eq!(
+        w.divi.balance(&divi_claimant.pubkey()).0,
+        DIVI_FUNDS + divi_amount - 1_000 // MockChain's flat claim fee
+    );
+}
+
+#[tokio::test]
+async fn usdc_crash_taker_between_lock_and_claim_forward() {
+    crash_taker_between_lock_and_claim(Direction::TakerPaysBtc).await;
+}
+
+#[tokio::test]
+async fn usdc_crash_taker_between_lock_and_claim_reverse() {
+    crash_taker_between_lock_and_claim(Direction::TakerPaysDivi).await;
+}
