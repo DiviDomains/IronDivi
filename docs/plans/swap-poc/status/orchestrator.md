@@ -37,6 +37,9 @@
 - hp2 lanes authenticate with the long-lived `CLAUDE_CODE_OAUTH_TOKEN` from 1Password item
   `orch-claude-oauth`, piped to `hp2:~/.config/claude-swap/oauth.env` (600) and sourced by
   `hp2:~/.local/bin/claude_auto`. Onboarding, trust and the bypass prompt are pre-accepted there.
+- 2026-10-12: the old account hit its usage limit; the lanes moved to account claude.ai.2. Token
+  now from 1Password `Private/claude.ai.2` field `password` (old file kept as `oauth.env.old-account`).
+  All five lanes were restarted with `--resume <their session>`, so the conversations carry over.
 - running: lanes ltc, zec, usdc, xmr (wave 1a–1d, Sonnet) and **multichain** (wave 1e, Opus;
   `lanes/multichain.md`, `check-multichain.sh`), all on hp2.
 - BTC reverse live chaos failed at 10:13: the driver defaulted to **signet**, so the maker's BTC
