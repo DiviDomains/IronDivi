@@ -565,3 +565,52 @@
   - Added a short usage note to `RESULTS.md`'s own top, pointing at the script and explaining
     the DIVI-skip behavior, per the ask.
   - `bash -n`/`shellcheck` clean; `check-usdc.sh` still PASS (no Rust changes this wave).
+- **Wave 15** (this seam): orchestrator ran `verify-results.sh` for real on the Mac
+  (dnsdivi reachable there) — 108/110 ok, 2 genuine attribution bugs, not actually-missing
+  txs. Fixed both, found a third instance of the same bug class by auditing every row by
+  hand afterward, and added a regression test per the ask.
+  - **Bug 1 — line 48's CLTV-violation probe**: the node *rejected* this tx; RESULTS.md says
+    "txid would have been `1e184a6f...`" — it was never broadcast, so no explorer will ever
+    show it, and checking it always read MISSING for the wrong reason. Fixed with a small
+    `EXCLUDED_TXIDS` allowlist (txid → documented reason, same shape as the existing
+    `CHAIN_OVERRIDES` one-off), excluded entirely from verification; reported in its own
+    `excluded` row/summary bucket, never counted toward the exit code.
+  - **Bug 2 — line 144's "maker BTC refund"**: confirmed on BTC testnet (block 5158301) but
+    the script attributed it to DIVI. Root cause: the prior wave's tier-2 fallback
+    (`line_keyword`) scanned the *whole physical line* for the first keyword found anywhere,
+    with no regard for position — so "taker DIVI refund after" (describing the *next* txid,
+    later on the same line) won over "maker BTC refund" (this txid's own, earlier label).
+    Fixed by replacing the old first-keyword/segment-reset design with one `resolve_keyword`
+    used everywhere (a line's own label, the running default, the section heading): a
+    rightmost/nearest-match search restricted to the text *before* the txid being resolved,
+    never past it.
+  - **Bug 3 (found while auditing, not reported, same root cause family)**: "nearest
+    preceding keyword" alone over-corrected on parenthetical asides — "DIVI claim (maker,
+    preimage read from the LTC spend) `<hash>`" was now resolving to "ltc" (the closer but
+    *wrong* word — the aside describes a different, already-spent leg's chain, not this
+    claim's own) instead of "divi" (the real label at the start of the clause). Three real
+    instances of exactly this pattern exist in the multi-coin sections (BTC/DIVI, LTC/DIVI,
+    ZEC/DIVI preimage-source asides) and all three were silently wrong until this fix.
+    Fixed by treating fully-matched (already-closed) parenthetical spans as invisible, same
+    as backtick spans, before the nearest-keyword search — a still-*open* paren (the
+    position being resolved is itself inside an unclosed aside, e.g. "DIVI RPC 502 ...
+    (swap `<id>`, maker BTC claim `<hash>`)") is instead a hard reset boundary, so only text
+    from after that `(` is visible, which is what makes the existing chaos-log cases
+    (Wave 14) still resolve correctly. This simplified the parser overall: the old
+    `HEXLIKE_RE`/boundary-reset machinery for distinguishing "resetting" vs "transparent"
+    backtick spans is no longer needed — stripping *all* backtick content (not just
+    hex-looking spans) and applying the same paren logic handles every case this document
+    actually contains, checked against the real file end to end.
+  - **Regression test, as asked**: `tools/swap-poc/test-verify-results.sh` (new, mirrors
+    `test-redeploy-maker.sh`'s shape — sibling `test-<tool>.sh`, not wired into
+    `check-usdc.sh` per the lane rule against editing check scripts). Needed a way to check
+    attribution without live network calls, so `verify-results.sh` gained `--parse-only`
+    (prints `<chain><TAB><txid>` / `excluded<TAB><txid><TAB><reason>`, no verification calls
+    at all) — also generally useful for auditing a `RESULTS.md` edit before spending real
+    API calls on it. The test builds a small synthetic fixture reproducing all three bugs
+    above (plus the real `CHAIN_OVERRIDES` txid) and asserts each resolves correctly.
+  - Reran the full script against the real file (DIVI rows skip on hp2, as expected; the
+    orchestrator already confirmed DIVI resolves fine from the Mac): 109 txids (110 minus
+    the newly-excluded one), 0 missing, 0 unattributed, 1 excluded, exit 0.
+  - `bash -n`/`shellcheck` clean on both scripts; `check-usdc.sh` still PASS (no Rust changes
+    this wave).

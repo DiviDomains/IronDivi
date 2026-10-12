@@ -4,10 +4,13 @@ Every txid, address and test result, newest last.
 
 **Verifying this file:** `tools/swap-poc/verify-results.sh` re-checks every txid below
 against its own chain's public explorer/node API (read-only, no keys, no cargo) and prints
-one row per txid — chain, txid, confirmations, ok/missing/skipped — exiting nonzero if any
-is missing. DIVI rows need `ssh dnsdivi` (not reachable from every host) and are reported
-skipped, not missing, when it isn't. Chain attribution is inferred from each txid's
-surrounding label text; see the script's own header comment for the exact rule.
+one row per txid — chain, txid, confirmations, ok/missing/skipped/excluded — exiting nonzero
+if any is missing. DIVI rows need `ssh dnsdivi` (not reachable from every host) and are
+reported skipped, not missing, when it isn't; a couple of txids RESULTS.md itself documents
+as computed-but-never-broadcast (a rejected probe) are reported excluded, not missing, for
+the same reason. Chain attribution is inferred from each txid's surrounding label text; see
+the script's own header comment for the exact rule, and `tools/swap-poc/test-verify-results.sh`
+(`--parse-only`, no network) for its regression cases.
 
 ## Plan §1 — done, 2026-10-10 (all on public testnets: DIVI testnet, BTC testnet3 per DECISIONS #8)
 1. Happy path, deployed `divi-swapd` on dnsdivi (maker) ↔ local `divi-swap` (taker), both claims confirmed — Wave 3, deployed happy.

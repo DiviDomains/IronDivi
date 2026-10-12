@@ -2,21 +2,34 @@
 # Read-only verification: every full (64-hex-char) txid in docs/plans/swap-poc/RESULTS.md,
 # checked against its own chain's public explorer/node API. No keys, no secrets, no cargo.
 #
-#   tools/swap-poc/verify-results.sh [path-to-RESULTS.md]
+#   tools/swap-poc/verify-results.sh [--parse-only] [path-to-RESULTS.md]
 #
-# Chain attribution: for each txid, the nearest preceding label word on the same line
-# (BTC/LTC/DIVI/ZEC/XMR/Sepolia/USDC) wins; if a line has none, the enclosing `##`/`###`
-# section heading's first such word is the fallback (RESULTS.md's own convention — see its
-# usage note — every multi-coin entry labels each txid inline; only a few early single-chain
-# sections rely on the heading).
+# Chain attribution: for each txid, the nearest preceding label word *on its own line*
+# (BTC/LTC/DIVI/ZEC/XMR/Sepolia/USDC) wins — not anywhere on the line, since a line can
+# legitimately mention a different, later txid's own label after this one. If a line has
+# none before this txid, the last label word stated on an earlier line since the last
+# `##`/`###` heading is the fallback, then the heading's own label word (RESULTS.md's own
+# convention — see its usage note — every multi-coin entry labels each txid inline; only a
+# few early single-chain sections rely on the heading).
+#
+# A handful of txids are hardcoded exceptions, because no generic rule reads them correctly:
+# CHAIN_OVERRIDES for one whose own label is a documented self-correction ("the driver logs
+# it as X; it is actually Y"); EXCLUDED_TXIDS for ones RESULTS.md itself says were computed
+# but never broadcast (a rejected probe — "txid would have been ..."), which would otherwise
+# always, correctly, read as MISSING. Both are listed with their reason in the script body.
 #
 # DIVI needs `ssh dnsdivi` running `divi-cli` there (no public DIVI testnet explorer API);
 # if that host is not reachable from wherever this runs (checked once, up front), every DIVI
 # row is reported SKIPPED rather than MISSING and does not affect the exit code — this is
 # expected on hp2, which has no route/host key for dnsdivi; it works from the Mac.
 #
+# --parse-only: print `<chain><TAB><txid>` per attributed txid and `excluded<TAB><txid><TAB>
+# <reason>` per excluded one, then exit 0 — no network calls at all. Used by
+# test-verify-results.sh to check attribution in isolation; also handy by hand to audit a
+# RESULTS.md edit before spending real API calls on it.
+#
 # Prints one row per unique (chain, txid): chain, txid, confirmations, ok/missing/skipped.
-# Exits nonzero if any row is MISSING (skipped rows do not count).
+# Exits nonzero if any row is MISSING (skipped and excluded rows do not count).
 set -uo pipefail
 die() { echo "verify-results: $*" >&2; exit 2; }
 ROOT="$(git rev-parse --show-toplevel)" || die "not inside a git repo"
@@ -24,6 +37,11 @@ cd "$ROOT" || die "cannot cd to $ROOT"
 command -v curl >/dev/null || die "curl not found"
 command -v python3 >/dev/null || die "python3 not found"
 
+PARSE_ONLY=0
+if [[ "${1:-}" == "--parse-only" ]]; then
+  PARSE_ONLY=1
+  shift
+fi
 RESULTS="${1:-docs/plans/swap-poc/RESULTS.md}"
 [[ -f "$RESULTS" ]] || die "no such file: $RESULTS"
 
@@ -60,12 +78,18 @@ KEYWORD_PATTERNS = [
 ]
 
 
-def first_keyword(text):
+def nearest_keyword(text):
+    # The occurrence closest to the *end* of text wins, not the first one found: a line
+    # (or a line prefix) can legitimately mention more than one chain — its own label, then
+    # a later txid's label further along — and only the label closest to the position being
+    # resolved actually describes it.
     best = None
     for name, pat in KEYWORD_PATTERNS:
-        m = pat.search(text)
-        if m and (best is None or m.start() < best[1]):
-            best = (name, m.start())
+        last = None
+        for mm in pat.finditer(text):
+            last = mm
+        if last and (best is None or last.start() > best[1]):
+            best = (name, last.start())
     return best[0] if best else None
 
 
@@ -76,25 +100,32 @@ def normalize_chain(chain):
     return "sepolia" if chain == "usdc" else chain
 
 
-# A backtick span resets where the next keyword search starts from (it's some other
-# identifier reference — a txid, a truncated hash, a UUID swap id — a natural topic
-# boundary) if its content is itself hex/dash/ellipsis-shaped. A span that *isn't*
-# (a file path, a short variable name, a hyphenated-but-wordy offer id like
-# "divi-ltc-testnet") is transparent: it does not break the search further back for the
-# label governing the next real txid. Both patterns occur in this document right before a
-# real txid on the same line (e.g. "tDIVI from dnsdivi `/opt/.../node5`: txid `<64 hex>`"
-# needs the path to be transparent; "(swap `<truncated>`, maker BTC claim `<64 hex>`)"
-# needs the truncated swap id to reset, or an earlier, unrelated "DIVI" on the same line
-# would leak through).
-HEXLIKE_RE = re.compile(r"^(?=.*[0-9a-fA-F])[0-9a-fA-F…-]{4,}$")
+MATCHED_PAREN_RE = re.compile(r"\([^()]*\)")
 
 
-def strip_backtick_content(text):
-    # Tiers 2/3/4 search *outside* any backtick span: quoted log lines and command
-    # output ("`divi-swapd up`", "`divi_scan`") legitimately contain other chains'
-    # names as plain substrings and must not leak into the fallback used for a
-    # *different* txid later on the same line or a later line in the same bullet.
-    return BACKTICK_RE.sub(" ", text)
+def resolve_keyword(text):
+    # Every tier searches *outside* any backtick span (quoted log lines and command output
+    # like "`divi-swapd up`", file paths, other txids/truncated-ids all legitimately
+    # contain other chains' names or hex-looking text as plain substrings) and *outside*
+    # any fully-matched, already-closed parenthetical aside (e.g. "DIVI claim (maker,
+    # preimage read from the LTC spend) `<hash>`" — the parenthetical is commentary about
+    # a *different* chain's earlier transaction, not this hash's own label, and must not
+    # beat the real "DIVI claim" label just for being closer). Repeated passes strip
+    # nested parens too. A still-*open* paren (no matching close within this text) is a
+    # hard boundary instead: the position being resolved sits inside that still-open
+    # aside, so content from *before* it belongs to an outer clause and does not apply
+    # (e.g. "DIVI RPC 502 ... (swap `<id>`, maker BTC claim " — only "BTC", stated inside
+    # the same open parenthetical as the hash itself, should win).
+    text = BACKTICK_RE.sub(" ", text)
+    while True:
+        new = MATCHED_PAREN_RE.sub(" ", text)
+        if new == text:
+            break
+        text = new
+    idx = text.rfind("(")
+    if idx != -1:
+        text = text[idx + 1 :]
+    return nearest_keyword(text)
 
 
 # The keyword heuristic reads what the surrounding prose *labels* a txid, which is right
@@ -107,49 +138,59 @@ CHAIN_OVERRIDES = {
     "d1a45509a64dbbd88fa7e5bde370db0f0935bf674d058873d88c10365f404346": "divi",
 }
 
+# These are computed-but-never-broadcast identifiers: RESULTS.md itself documents each one
+# as rejected before it could land on any chain. No explorer will ever show them, by
+# design — checking them would always, correctly, report MISSING, which misreads "never
+# sent" as "lost". Excluded entirely rather than checked; reason kept alongside for anyone
+# auditing this list later.
+EXCLUDED_TXIDS = {
+    "1e184a6fdc4162ab9629e9b1da998cab48f22346400d27694b3158ffaee37f66": (
+        "CLTV-violation probe deliberately rejected by the node "
+        "(64: non-mandatory-script-verify-flag); RESULTS.md line 48: "
+        "'txid would have been'"
+    ),
+}
+
 
 def parse_results(path):
     section_default = None
     running_default = None  # last keyword seen on any line, within the current section
     items = []  # (chain, txid, line_no)
+    excluded = []  # (txid, reason, line_no)
     with open(path) as f:
         for lineno, line in enumerate(f, 1):
             h = HEADING_RE.match(line)
             if h:
-                section_default = first_keyword(strip_backtick_content(h.group(1)))
+                section_default = resolve_keyword(h.group(1))
                 running_default = None
                 continue
-            line_keyword = first_keyword(strip_backtick_content(line))
-            boundary = 0
+            line_keyword = resolve_keyword(line)
             for m in BACKTICK_RE.finditer(line):
                 content = m.group(1)
-                if TXID_CONTENT_RE.fullmatch(content):
-                    segment = line[boundary : m.start()]
-                    # Tier 1: the label right before this txid (since the last reset
-                    # point). Tier 2: a label stated once earlier on the same physical
-                    # line and meant to cover every txid on it (e.g. "divi live test
-                    # (lane divi): fund `x` / `y`, claim `z`" — only "fund" precedes the
-                    # first hash in its own tier-1 segment, but the whole line is DIVI).
-                    # Tier 3: the last label seen on an *earlier* line since the last
-                    # heading — a bullet's own label line, followed by indented
-                    # continuation lines with none of their own (e.g. "- Leftover tBTC
-                    # swept ...:\n  taker ... -> `<64 hex>`;\n  maker ... -> `<64 hex>`.").
-                    # Tier 4: the enclosing section heading.
-                    chain = CHAIN_OVERRIDES.get(content) or (
-                        first_keyword(segment)
-                        or line_keyword
-                        or running_default
-                        or section_default
-                        or "unknown"
-                    )
-                    items.append((normalize_chain(chain), content, lineno))
-                    boundary = m.end()
-                elif HEXLIKE_RE.match(content):
-                    boundary = m.end()
-                # else: transparent — leave `boundary` where it was.
+                if not TXID_CONTENT_RE.fullmatch(content):
+                    continue
+                if content in EXCLUDED_TXIDS:
+                    excluded.append((content, EXCLUDED_TXIDS[content], lineno))
+                    continue
+                # Tier 1: the nearest label *before this txid, on its own line* — not
+                # anywhere on the line (a line can state a different, later txid's label
+                # after this one; e.g. "maker BTC refund `<hash>`, taker DIVI refund after
+                # the 6 h locktime `<other hash>`" — "DIVI" must not win for the BTC hash).
+                # Tier 2: the last label seen on an *earlier* line since the last heading —
+                # a bullet's own label line, followed by indented continuation lines with
+                # none of their own (e.g. "- Leftover tBTC swept ...:\n  taker ... ->
+                # `<64 hex>`;\n  maker ... -> `<64 hex>`.").
+                # Tier 3: the enclosing section heading.
+                chain = CHAIN_OVERRIDES.get(content) or (
+                    resolve_keyword(line[: m.start()])
+                    or running_default
+                    or section_default
+                    or "unknown"
+                )
+                items.append((normalize_chain(chain), content, lineno))
             if line_keyword:
                 running_default = line_keyword
-    return items
+    return items, excluded
 
 
 # ---- BTC / LTC: Esplora REST ----------------------------------------------------------
@@ -390,7 +431,20 @@ def verify_sepolia(txid):
 
 def main():
     results_path = sys.argv[1]
-    items = parse_results(results_path)
+    parse_only = len(sys.argv) > 2 and sys.argv[2] == "1"
+    items, excluded = parse_results(results_path)
+
+    if parse_only:
+        seen = set()
+        for chain, txid, _lineno in items:
+            if (chain, txid) in seen:
+                continue
+            seen.add((chain, txid))
+            print(f"{chain}\t{txid}")
+        for txid, reason, _lineno in excluded:
+            print(f"excluded\t{txid}\t{reason}")
+        return
+
     ssh_ok = check_ssh_dnsdivi()
     if any(chain == "divi" for chain, _, _ in items) and not ssh_ok:
         print(
@@ -398,6 +452,8 @@ def main():
             "every DIVI row below is skipped, not failed",
             file=sys.stderr,
         )
+    for txid, reason, lineno in excluded:
+        print(f"excluded {txid}      — {reason} (line {lineno})")
 
     verifiers = {
         "btc": verify_btc,
@@ -438,7 +494,7 @@ def main():
     total = len(seen)
     print(
         f"verify-results: {total} unique txid(s) checked, {missing} missing, "
-        f"{skipped} skipped, {unknown} unattributed"
+        f"{skipped} skipped, {len(excluded)} excluded, {unknown} unattributed"
     )
     sys.exit(1 if missing > 0 else 0)
 
@@ -447,4 +503,4 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-python3 "$PYHELPER" "$RESULTS"
+python3 "$PYHELPER" "$RESULTS" "$PARSE_ONLY"
