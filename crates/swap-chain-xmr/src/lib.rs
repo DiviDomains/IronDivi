@@ -19,9 +19,12 @@
 //! docs for why. [`swap_templates`] is build-plan step 7: the full
 //! `Tx_redeem`/`Tx_refund`/`Tx_punish` set with the corrected signer/completer roles.
 //! [`monero_sweep`] is the final step: spending the Monero 2-of-2 output once one party
-//! holds the combined full private spend key.
+//! holds the combined full private spend key. [`live_rpc`] is the shared RPC glue every
+//! live example (`examples/xmr_live.rs`, `examples/xmr_live_refund.rs`) needs to talk to
+//! a public restricted Monero node and the DIVI testnet proxy.
 
 pub mod adaptor_bridge;
+pub mod live_rpc;
 pub mod monero_key_share;
 pub mod monero_sweep;
 pub mod multisig;

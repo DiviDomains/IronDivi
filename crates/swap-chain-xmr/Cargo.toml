@@ -26,6 +26,13 @@ ciphersuite = { version = "0.4", features = ["ed25519"] }
 # this is a real dependency, not test-only, unlike the other monero-* crates below.
 monero-wallet = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
+# live_rpc is real (non-test) library code shared by every live example: the
+# restricted-public-node RPC glue (get_output_distribution/get_outs/get_block/
+# get_transactions) and the DIVI testnet RPC proxy client.
+reqwest = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+swap-chain-divi = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
@@ -45,11 +52,5 @@ monero-simple-request-rpc = "0.1"
 # monero_sweep's tests drive OutputWithDecoys::new (async) synchronously.
 futures = { workspace = true }
 tokio = { workspace = true }
-# For xmr_live.rs: DIVI testnet RPC (reused, not reimplemented) and local-run state
-# persistence. swap-chain-divi is a sibling crate, not modified -- just its public
-# RpcClient/TESTNET_RPC.
-swap-chain-divi = { workspace = true }
+# For xmr_live.rs/xmr_live_refund.rs: local-run state persistence.
 serde = { workspace = true }
-serde_json = { workspace = true }
-hex = { workspace = true }
-reqwest = { workspace = true }

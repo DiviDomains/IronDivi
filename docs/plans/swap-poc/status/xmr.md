@@ -445,3 +445,112 @@
      known private spend key (no multisig cooperation needed once Maker holds both
      halves) — the actual proof that the live run completed the swap, not just that
      the mock arithmetic checks out.
+
+## Round: live abort/refund path (orchestrator landed the forward swap as `3d8d3b3`/`12b738b`)
+
+- done, this round:
+  - Refactored the live-RPC machinery (`monerod_get_info`, `check_divi_confirmed`,
+    `check_xmr_confirmed`, `LiveDecoys`, `fetch_scannable_block`, `scan_for_lock_output`)
+    out of `examples/xmr_live.rs` into `crates/swap-chain-xmr/src/live_rpc.rs`
+    (real library code, gated test module behind `#[cfg(feature = "live")]` matching
+    `stagenet_rpc.rs`'s convention) so the abort-path example below reuses the exact
+    same, already-debugged code rather than a second copy that could silently drift.
+    Moved `reqwest`/`hex`/`serde_json`/`swap-chain-divi` from dev- to real
+    dependencies accordingly.
+  - Added `crates/swap-chain-xmr/examples/xmr_live_refund.rs`: the abort/refund path,
+    live, fresh throwaway keys, **short DIVI timelocks** (`t_cancel`/`t_refund` a few
+    blocks out — confirmed live DIVI testnet block time ≈53s/block, so a few blocks is
+    a few minutes, not hours) per the orchestrator's instruction. Funds its `Tx_lock`
+    by spending the *forward* run's own reclaimed DIVI (`xmr_live.rs`'s `Tx_redeem`
+    output 0) — no new tDIVI needed from a human. Resumable, same discipline as
+    `xmr_live.rs` (own state file, one step per invocation).
+  - `cargo test -p swap-chain-xmr --features live` 25/25 (22 existing + 3 live_rpc,
+    now exercised at the library level); `fmt`/`clippy -D warnings`/`check-xmr.sh` all
+    clean. Resolved a `lane-sync.sh` conflict (the orchestrator's landing of the
+    pre-refactor `xmr_live.rs`/`Cargo.toml`/`lib.rs` collided with this round's
+    refactor) by taking the refactored version wholesale — confirmed byte-identical
+    on the untracked `monero_sweep.rs`/`refund_path_e2e.rs` files first.
+  - **Real transactions broadcast, live**:
+    - DIVI `Tx_lock` (funds Maker's leg by spending the forward run's reclaimed
+      0.995 tDIVI P2PKH output): `187309c19edf1a20ddb494917e8698d7e1827cec960bc00c9dbfb175a3a0d7a1`
+    - Monero lock (Taker locks 0.05 XMR from `mining-wallet` into the fresh 2-of-2):
+      `773d75a087b193950e06ad6417d021bbbe3e71111ae7fbb4a3cc5581e13f3dab`, fee
+      44,040,000 atomic units, spent key images
+      `97e982b61a9b2a9679d25e6557db04d2bf3742d20ebc4edea0529555ca095f44` and
+      `52d3ff38d37720f44d3c2584e09f1410898351a6b8bb0e0670c8bc335cd621f2`
+    - `t_cancel = 346518`, `t_refund = 346520` (DIVI height was 346515 at funding
+      time) — picked once and persisted in `/mnt/storage1/bshuler-xmr/xmr_live_refund_state.json`.
+  - Nobody redeems by design (this is the abort scenario) — waiting on both
+    transactions' first confirmation, then `t_cancel`/`t_refund` maturation, before
+    `Tx_cancel`/`Tx_refund`/the refund-sweep. See `- left:` for what's still real
+    wall-clock time, not a decision.
+- running: `monero-wallet-rpc` (idle between transfers), nothing else new on hp2.
+- broken: none in my paths.
+- left: (1) wait for both transactions above to confirm; (2) wait for DIVI height to
+  reach `t_cancel` (346518) and build/broadcast `Tx_cancel`; (3) wait for `Tx_cancel`
+  to confirm and height to reach `t_refund` (346520), build `Tx_refund` (Taker
+  encrypts under Maker's `Y`, Maker completes with his own `s_m` and broadcasts,
+  revealing it), and recover `s_m` in-memory the same run it's built (same nonce
+  consistency reasoning as the forward run's `s_t` recovery); (4) Taker combines her
+  `s_t` with the recovered `s_m`, scans for the Monero lock output, and sweeps it back
+  to a fresh address of her own. All of this is wired, resumable code already —
+  nothing left to design, just real transactions that need real confirmations.
+- decisions: none new this round.
+- needs: nothing from a human. Not yet `ready_to_land` — `Tx_cancel`/`Tx_refund`/the
+  refund-sweep haven't broadcast yet (waiting on confirmations and timelock
+  maturation, both purely wall-clock). Will add the `ready_to_land:` line once the
+  abort path has actually completed live, same discipline as the forward run.
+- done (cont.): both `Tx_lock` and the Monero lock confirmed (1 confirmation each).
+  DIVI height reached `t_cancel` (346518) and `Tx_cancel` broadcast automatically on
+  the next invocation: `f8f5cf67bbba1e9f95e594adf6a74b948dad7aacc8bd8cdc0a91384665f5dbbb`.
+  Waiting for its confirmation and `t_refund` (346520) next.
+- done (cont.): `Tx_cancel` confirmed, DIVI height reached `t_refund` (346520).
+  `Tx_refund` built and broadcast automatically:
+  `b55438cd0416b7fbd57bdb5bf83dd50816f61d3ac8c337bd217707c167045390`. Taker recovered
+  `s_m` from the completed signature in-memory and it matched Maker's actual secret
+  (assert passed) -- the abort-path mirror of the forward run's `s_t` recovery, now
+  also proven live. Found the real Monero lock output via `scan_for_lock_output`
+  (50,000,000,000 atomic units, output index 10,104,516 -- matches the funding
+  transfer exactly). First refund-sweep broadcast attempt was **rejected**
+  (`"invalid_input": true`, everything else false) -- investigating; `xmr_refund_sweep_txid`
+  not yet set, so a re-run will redo decoy selection (randomized) and signing fresh.
+- **Fifth real bug found and fixed**: Monero's real
+  `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE` requires an ordinary (non-coinbase) output to
+  have **10 confirmations**, not just one, before it can be used as a transaction
+  *input* -- the refund-sweep's first broadcast attempt was rejected
+  (`"invalid_input": true`) because the Monero lock output had only 1 confirmation
+  (this run moved fast enough that the sweep was attempted within minutes of
+  funding, unlike the forward run, which happened to accumulate enough real
+  confirmations across several turns before its own sweep ran). Added
+  `live_rpc::{SPENDABLE_AGE, check_xmr_confirmed_n, check_xmr_spendable}` and gated
+  both `xmr_live.rs`'s and `xmr_live_refund.rs`'s sweep steps on it specifically
+  (distinct from the existing "is it confirmed at all" gate, which correctly stays
+  at 1 confirmation for that purpose). `cargo test -p swap-chain-xmr --features
+  live` 25/25, `clippy -D warnings`/`fmt`/`check-xmr.sh` all clean after the fix.
+  Waiting for the lock output to reach 10 confirmations before retrying the sweep.
+- **The abort/refund path is complete, live, on both chains, for real.** All five
+  transactions confirmed:
+  1. DIVI `Tx_lock` (Maker, funded from the forward run's reclaimed DIVI):
+     `187309c19edf1a20ddb494917e8698d7e1827cec960bc00c9dbfb175a3a0d7a1`
+  2. Monero lock (Taker locks 0.05 XMR from `mining-wallet`):
+     `773d75a087b193950e06ad6417d021bbbe3e71111ae7fbb4a3cc5581e13f3dab`, fee
+     44,040,000 atomic units, spent key images
+     `97e982b61a9b2a9679d25e6557db04d2bf3742d20ebc4edea0529555ca095f44` and
+     `52d3ff38d37720f44d3c2584e09f1410898351a6b8bb0e0670c8bc335cd621f2`
+  3. DIVI `Tx_cancel` (plain 2-of-2, both sign, nobody redeemed):
+     `f8f5cf67bbba1e9f95e594adf6a74b948dad7aacc8bd8cdc0a91384665f5dbbb` (21 confirmations)
+  4. DIVI `Tx_refund` (Taker's signature adaptor-encrypted under Maker's `Y`, Maker
+     completes with his own `s_m` and broadcasts, reclaiming his DIVI):
+     `b55438cd0416b7fbd57bdb5bf83dd50816f61d3ac8c337bd217707c167045390` (20 confirmations).
+     Taker recovered `s_m` from the completed signature in-memory this run and
+     confirmed it matches Maker's actual secret (`assert_eq!`, passed).
+  5. Monero refund-sweep (Taker combines her own `s_t` with the recovered `s_m` to
+     reconstruct the full spend key -- an ordinary single-key CLSAG send, not
+     multisig -- and reclaims her own locked XMR to a fresh address of her own):
+     `35fe7b474b835c1d34b06a2a8129982a5081f77be4b56fba0bec50c0b724a6dc` (2+ confirmations)
+  Both the forward (redeem) and abort (refund) directions of this design have now
+  run live, end to end, on real DIVI testnet and Monero stagenet chains, through a
+  real public restricted node. Five real bugs found and fixed across both rounds
+  (DIVI tx version, Monero pruned-tx scanning, distribution-fetch reliability, DIVI
+  relay fee, Monero spendable-age) — none of them theoretical, all caught by actually
+  running this live rather than only testing offline.
