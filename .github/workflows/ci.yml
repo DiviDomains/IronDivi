@@ -57,3 +57,37 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-audit
       - run: cargo audit
+
+  mock-checks:
+    # Swap-POC mock-backend acceptance (docs/plans/swap-poc/lanes/*.md), everything that
+    # needs no live testnet/chain network or secret: swap-adaptor + swap-chain-xmr
+    # (check-xmr.sh), the Erc20Htlc anvil tests + forge unit tests (check-usdc.sh — anvil is
+    # a local simulated chain, not a network call; forge-std is vendored at
+    # contracts/htlc/lib, so `forge test` fetches nothing), and the redeploy-maker.sh
+    # in-flight gate (test-redeploy-maker.sh, a loopback-only mock HTTP server). `cargo test
+    # --workspace` in the Test job above already builds+runs every swap crate's own unit
+    # tests (swap-chain-{btc,ltc,zec,divi,evm,xmr}, divi-swap, divi-swapd, divi-swap-cli are
+    # all `[workspace] members`; every live/network test is behind `#[cfg(feature = "live")]`
+    # and/or `#[ignore]`, so plain `cargo test --workspace` never reaches one) — this job adds
+    # Foundry so the anvil-backed tests in swap-chain-evm actually run instead of
+    # self-skipping ("forge/anvil not found on PATH"), plus the doc/structural checks
+    # check-xmr.sh and check-usdc.sh run beyond what a bare `cargo test` covers.
+    #
+    # Deliberately NOT run here: check-ltc.sh and check-zec.sh. Both end in a real call to a
+    # live testnet API (litecoinspace.org / a ZEC lightwalletd, via each crate's
+    # `--ignored testnet_api_reachable` test) that this workflow must not depend on; check-
+    # btc.sh/check-divi.sh are the same shape. Lane rules forbid editing check scripts to
+    # split that out, so their mock-only coverage (crate_green, structural greps) stays
+    # exactly what the Fmt/Clippy/Test jobs above already give it.
+    name: Mock-backend checks (xmr, usdc/evm+anvil, redeploy-maker gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: tools/swap-poc/check-xmr.sh
+      - run: tools/swap-poc/check-usdc.sh
+      - run: tools/swap-poc/test-redeploy-maker.sh

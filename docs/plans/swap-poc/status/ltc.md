@@ -359,3 +359,97 @@
     at http://127.0.0.1:18482") reads as an already-open tunnel the orchestrator manages,
     and one less moving part is safer for a pre-flight safety gate.
 - needs: nothing from the orchestrator right now.
+
+## CI coverage audit (`.github/workflows/ci.yml`)
+- done:
+  - Checked what the existing 5 jobs (Format, Clippy, Test, Build, Security Audit) actually
+    cover before changing anything. `cargo test --workspace` (Test job) already builds+runs
+    every swap crate's own unit tests: `swap-chain-{btc,ltc,zec,divi,evm,xmr}`, `divi-swap`,
+    `divi-swapd`, `divi-swap-cli` (binary name of `bin/divi-swap`) are all root `Cargo.toml`
+    `[workspace] members`, and every live/network test is behind `#[cfg(feature = "live")]`
+    and/or `#[ignore]` (confirmed by grep across all five chain crates plus `divi-swap-cli`),
+    so plain `cargo test --workspace` (no `--all-features`, no `-- --ignored`) never reaches
+    one. That part needed no fix.
+  - Real gap found: GitHub's `ubuntu-latest` runners have no Foundry (`forge`/`anvil`), so
+    `swap-chain-evm`'s anvil-backed tests (`anvil_lock_claim`, `anvil_lock_refund`,
+    `anvil_find_preimage_from_logs` — not feature-gated, they run under the existing Test
+    job's default-features `cargo test --workspace` today) hit the crate's own
+    `skip_if_no_foundry` guard and self-skip ("skipping: forge/anvil not found on PATH")
+    instead of actually exercising the HTLC contract. `contracts/htlc`'s `forge test` (15
+    Solidity tests) doesn't run in CI at all today — nothing invokes it. Neither is a live
+    network dependency: anvil is a local simulated chain, not a public RPC, and
+    `contracts/htlc/lib/forge-std` is vendored in git (`git ls-files` shows 35 tracked
+    files, no `.gitmodules`), so `forge test` fetches nothing at run time either.
+  - Second gap: `tools/swap-poc/check-xmr.sh` (pure `crate_green` on `swap-adaptor` +
+    `swap-chain-xmr`, plus `xmr-design.md` section-heading greps — zero network) and this
+    session's own `tools/swap-poc/test-redeploy-maker.sh` (loopback-only mock HTTP server)
+    were never wired into CI at all, despite needing nothing it doesn't already have.
+  - Added one new job, `mock-checks` (name: "Mock-backend checks (xmr, usdc/evm+anvil,
+    redeploy-maker gate)"), parallel to the existing 5 (no `needs:`, so it doesn't lengthen
+    the critical path): `actions/checkout@v4` → `dtolnay/rust-toolchain@stable` (clippy +
+    rustfmt, for `check-xmr.sh`'s/`check-usdc.sh`'s own `crate_green`) →
+    `Swatinem/rust-cache@v2` → `foundry-rs/foundry-toolchain@v1` (confirmed real and at
+    that floating major tag via the GitHub API before using it — `v1` currently resolves to
+    `v1.9.1`) → `tools/swap-poc/check-xmr.sh` → `tools/swap-poc/check-usdc.sh` (now actually
+    runs the anvil tests and `forge test contracts/htlc`, not skips them) →
+    `tools/swap-poc/test-redeploy-maker.sh`. All three ran clean locally under plain
+    `cargo`/`forge` (no `remote-cargo`, matching what CI has) before being added.
+  - **Deliberately did not add** `check-ltc.sh` or `check-zec.sh` (the two the task named
+    directly) as whole scripts: both end in a real call to a live testnet API
+    (`--ignored testnet_api_reachable` against `litecoinspace.org` / a ZEC lightwalletd) —
+    `check-btc.sh`/`check-divi.sh` are the same shape, for mempool.space / the DIVI RPC
+    proxy. Running them in CI would either make a hard gate depend on a third party's
+    uptime, or (if made non-blocking) still spend a CI run's time on a real network call
+    the task said nothing may need. Lane rules forbid editing check scripts to split the
+    live tail out, so there's no way to get just their mock portion from the script itself;
+    that portion (`crate_green`, `no_todo`, the `impl ChainBackend for …Backend` grep,
+    `require_tests` existence checks) is exactly what the existing Fmt/Clippy/Test jobs
+    already cover by compiling and running the crate for real, so duplicating it as
+    separate hand-written CI steps would just be the same assertions twice with a drift
+    risk between the two copies. Documented this reasoning directly in the YAML (a
+    multi-line comment on the new job) so the next lane/maintainer sees why those two
+    scripts are absent rather than assuming an oversight.
+  - Validated: `actionlint` wasn't installed on hp2, so fetched it via its own
+    `download-actionlint.bash` installer (one-time, to a scratch dir, not committed)
+    — v1.7.12 — and ran it against both workflow files; clean before and after the edit.
+    Also parsed the YAML with `python3 -c "import yaml; yaml.safe_load(...)"` as a second
+    check. Could not run `gh run list`/`gh run view` to confirm on the real CI yet per the
+    task's own sequencing ("confirm … after the orchestrator lands it"); will check once
+    told it landed.
+  - **Found, did not touch (not my path):** `cargo test --workspace` is failing on `main`
+    right now — confirmed via `gh run view --repo DiviDomains/IronDivi` on the two most
+    recent runs (`38268645050` on this lane's own `257128d`, and `38267374749` on
+    `92c85ce`, both "failure"; the prior run on `f209780` was green). Root cause:
+    `bin/divi-swapd/src/config.rs:551`'s test `counter_chain_offers_and_overrides_parse`
+    asserts `s.confirmations(Chain::Zec) == 3`, but `92c85ce` ("raise ZEC testnet
+    confirmations 3->9…") changed `crates/divi-swap/src/config.rs`'s testnet default from 3
+    to 9 without updating that downstream assertion. `bin/divi-swapd/src/config.rs` belongs
+    to the daemon/multichain lane, not this one — flagging for the orchestrator to route
+    rather than editing another lane's path. This is unrelated to (and unaffected by) the
+    CI workflow change above: it would fail the existing Test job today with or without
+    `mock-checks` added, and `mock-checks` running clean doesn't paper over it.
+- running: nothing; idle.
+- left / next steps: once landed, run `gh run view --repo DiviDomains/IronDivi <run-id>`
+  (or `gh run list --repo DiviDomains/IronDivi --limit 1`) to confirm the new `mock-checks`
+  job is green and nothing else regressed. Separately, someone on the daemon/multichain
+  lane needs to fix `counter_chain_offers_and_overrides_parse`'s stale `== 3` (now `== 9`)
+  so the Test job goes green again.
+- decisions:
+  - Treated "nothing may need network or secrets" as: no step's pass/fail may depend on a
+    live testnet/blockchain/RPC call (litecoinspace.org, mempool.space, a ZEC lightwalletd,
+    the DIVI RPC proxy) or a credential. Installing tooling itself (rustup via
+    `dtolnay/rust-toolchain`, `cargo install cargo-audit`, `foundryup` via
+    `foundry-rs/foundry-toolchain`) already happens in the existing jobs and needs ordinary
+    package-registry network access, same as any CI setup step — that's not what the task
+    was guarding against, and anvil/forge-std need no network at all once installed.
+  - Added `mock-checks` as its own parallel job rather than appending steps to the existing
+    `test` job: GitHub Actions jobs run concurrently by default, so a new job's wall time
+    adds to the workflow's *critical path* only if it's the slowest job, not to every other
+    job's time — keeps the "current time budget" ask meaningful instead of just serializing
+    more work onto the one job already taking the longest (~5 min per the real run history).
+  - `foundry-rs/foundry-toolchain@v1`: checked it's a real action (GitHub API, not
+    fabricated) and that `v1` is an actual floating tag before writing it into the YAML,
+    per the "never fabricate paths/values" rule — same bar as every path/port named in the
+    redeploy-maker.sh task.
+- needs: nothing from the orchestrator right now, other than routing the
+  `counter_chain_offers_and_overrides_parse` fix to whoever owns `bin/divi-swapd` currently.
