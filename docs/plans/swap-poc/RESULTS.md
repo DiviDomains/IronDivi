@@ -306,3 +306,15 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     DIVI cancel `a456859ec3134f62bf83d8c7d01fb9af864a4097cac917bbc79ad304d2d50b2a`,
     DIVI punish (taker) `d0cc708e7f133e30cdd40c4e859fcbd8c220ad393c0ebdda574b8b1b8a4606d9`.
   All three outcomes of the XMR design (redeem, refund, punish) are now proven live (`baf93cd`).
+- XMR buy direction (roles swapped: the business taker locks DIVI and buys XMR, the business
+  maker locks XMR and sells it), live redeem, 2026-10-12 (`66a89e2`), verified on-chain
+  2026-10-12 (DIVI 24/21 confirmations, XMR heights 2227725/2227736):
+    DIVI lock (taker) `6663858e514c662616b8c7dd6129111e35243ac907fea5bcb49174b392685365`,
+    XMR lock (maker, 0.02 XMR) `30f8d10455e37d2042ce785ed0fcd5e7ac76d75c333b4cdee17aa78940b3086d`,
+    DIVI redeem (maker) `0de8a0c6d5c117bf1aefa0bfd6d3c4790e7c9a52c5ee27c569858818e934307c`,
+    XMR sweep (taker) `18144dad1da133a29989a9268265043a41a0923e3df0befa6dbb19609fce19b8`.
+  Both XMR directions (sell and buy) have now run end to end on the same code path.
+- `tools/swap-poc/verify-results.sh`, first run from the Mac 2026-10-12: 110 unique txids, 108
+  confirmed. The 2 "missing" rows are script misattributions: `1e184a6f…` is the CLTV probe the
+  node rejected by design, and `1a3dd95e…` is a BTC refund (confirmed, testnet3 block 5158301)
+  that the script looked up on DIVI. Fix sent to the usdc lane.
