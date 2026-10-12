@@ -1,19 +1,6 @@
 # Lane zec status
 
-- running: nothing. Orchestrator's 4-item queue from the first live forward swap completing:
-  (1) lane-sync — done, twice (once mid-task when `e3b31c6` landed from under me, see below).
-  (2) taker `on_claimed` re-sign-on-reject + mock tests — done, see "done" below.
-  (3) ltc/btc/evm/divi broadcast-idempotency audit — done last round (read-only, "own your
-  paths only"): no gap in ltc/btc/divi, one real gap in swap-chain-evm (no txid check before
-  trusting "nonce too low" etc.), written up with a suggested one-line fix for that lane.
-  (4) cross-check `signature_digest_v6` against `zcash_primitives` for a P2SH input —
-  attempted via a background worktree agent, **blocked**: `zcash_primitives` conflicts with
-  this workspace's resolved `digest`/`bip32` versions (alloy wants stable `digest 0.11.3`,
-  `zcash_primitives` wants a `bip32 =0.6.0-pre.1` → `digest =0.11.0-pre.9` exact pre-release
-  pin; every zcash_primitives version 0.21–0.31.0-pre the agent tried hits the same wall or
-  needs yanked orchard/core2 releases). Fixing it needs a workspace-root `Cargo.toml`
-  `[patch]`/pin, which is out of scope for me (rule 2: "never the root Cargo.toml") — **needs
-  the orchestrator's call**, see "- needs:" below for the two live options.
+- running: nothing.
 - blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
   EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
   on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
@@ -30,6 +17,37 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Audit: `GetBlockRange` was the only lightwalletd call stripping default-pool data,
+    2026-10-12 ~02:00 EDT.** The orchestrator's `52b49de` fixed `GetBlockRange` (empty
+    `poolTypes` defaults to Sapling+Orchard only, silently dropping every `CompactTx.vin` —
+    the live DIVI→ZEC reverse swap's maker never saw the taker's ZEC claim because of this)
+    and asked me to check every other lightwalletd call this crate makes for the same
+    gotcha. Checked against the *authoritative* `CompactTxStreamer` proto definition (read
+    directly, not from memory or our own possibly-incomplete struct comments) for every RPC
+    this crate actually calls:
+    - `GetLatestBlock` (request `ChainSpec`): no fields at all — nothing to strip.
+    - `GetBlockRange` (request `BlockRange`): the only one with a `poolTypes` field — fixed.
+    - `GetTransaction` (request `TxFilter`: `block`, `index`, `hash` — response
+      `RawTransaction`: `data`, `height`): no pool field on either message, and
+      `RawTransaction.data` is the complete raw serialized tx (every pool, unfiltered) by
+      definition — there's nothing *to* filter at this level.
+    - `SendTransaction` (request `RawTransaction`): same raw-bytes-in, no filtering concept.
+    - `GetAddressUtxos` (request `GetAddressUtxosArg`: `addresses`, `startHeight`,
+      `maxEntries`): no pool field — this call is unconditionally transparent-only by its
+      very purpose (UTXOs are a transparent-chain concept), not a filtered view of a richer
+      response.
+    - `GetLightdInfo` (request `Empty`): no fields — metadata only.
+    - Our own struct definitions for all of these (`TxFilter`, `RawTransaction`,
+      `GetAddressUtxosArg`, `ChainSpec`, `Empty`) already match the real proto fields
+      exactly, confirmed field-for-field against the authoritative source rather than
+      assumed from our "fields we use" comments.
+    - **Conclusion: no further fix needed.** `GetBlockRange` was uniquely exposed because
+      it alone returns `CompactBlock`/`CompactTx` — a structure that bundles shielded *and*
+      transparent data in one response with pool selection as an explicit opt-in filter.
+      Every other call either has no pool concept or is unconditionally transparent/raw.
+    - Sanity-checked the landed fix too: `cargo test -p swap-chain-zec` green (13 passed,
+      including `52b49de`'s new `block_range_asks_for_transparent_inputs`), `clippy`/`fmt`
+      clean, `check-zec.sh` PASS.
   - **First live ZEC<->DIVI forward swap completed end-to-end** (orchestrator, from the Mac):
     taker claimed the DIVI, maker claimed the ZEC (`bd9c3cbb…`). Everything this lane built —
     v6/NU7 tx format, ZIP-317 fees, the P2SH scriptPubKey sighash fix, already-known-mempool
