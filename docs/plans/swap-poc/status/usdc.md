@@ -466,3 +466,32 @@
     workspace-wide clippy failure in `crates/divi-rpc/src/wallet.rs`, noted last wave,
     is still there and still not mine); full `divi-swapd` test suite green across every
     binary (new tests included); `cargo fmt` clean.
+- **Wave 12** (this seam): `tools/swap-poc/balances.sh` (new) — read-only balance dashboard
+  for every coin this POC swaps (BTC testnet3, LTC testnet4, DIVI testnet, ZEC testnet,
+  Sepolia ETH+USDC, Base Sepolia ETH+USDC), taker and maker, from public APIs only, no
+  keys. Cross-lane tool (not usdc-scoped), built because the orchestrator asked directly.
+  - Sources per coin, reused rather than reinvented: BTC/LTC via Esplora
+    `/address/<addr>/utxo` summed over confirmed entries (same pattern as `e2e.sh`'s own
+    maker-balance check); DIVI via the public `getaddressbalance` JSON-RPC method on
+    `services.divi.domains` (needs no wallet/key — confirmed live against both real
+    addresses while writing this; same RPC proxy `tools/swap-poc/lib.sh`'s `divi_confirmed`
+    already curls); ZEC via `crates/swap-chain-zec/examples/check_addr_utxos.rs` (the `zec`
+    lane's own read-only lightwalletd checker, landed `f6d759d` — reused as-is, not
+    duplicated); Sepolia/Base Sepolia via `sepolia_ops balances` (this lane's own, already
+    network-agnostic and keyless).
+  - `--check`: exits 1 if anything is below its own live script's per-run funding minimum,
+    printing every shortfall either way (informational mode always exits 0). Minimums, one
+    source per coin, documented inline: BTC 15000 sats (`e2e.sh`'s `E2E_BTC_SATS` default +
+    5000 fee buffer), LTC 105000 litoshi (`ltc-live.sh`'s `min_per_run`), ZEC 120000 zatoshi
+    (`zec-live.sh`'s `min_per_run`), USDC 0.02 ETH + 1 USDC (`usdc-live.sh`'s
+    `eth_per_run`/`usdc_units_per_run` at its default `--usdc-sats`, same on both networks
+    since the backend is network-agnostic). DIVI has no fixed minimum anywhere — its amount
+    is quote-derived and scales with whichever offer runs, unlike the others' flat per-run
+    figures — so 100 tDIVI is this script's own conservative floor, explicitly flagged in
+    the file as a judgment call rather than attributed to a script that doesn't define one.
+  - Run for real just now (read-only, no keys, safe): correctly reports the current state —
+    taker already holds 20 USDC on Sepolia (OK) but 0 ETH on both networks and the maker
+    holds nothing on either network yet (7 `SHORT` lines, `--check` exits 1) — matches
+    every other balance check this lane has done by hand this session.
+  - `shellcheck`/`bash -n` clean; `check-usdc.sh` still PASS (unaffected — new file, no
+    Rust changes this wave).
