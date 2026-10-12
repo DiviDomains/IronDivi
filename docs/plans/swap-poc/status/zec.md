@@ -76,16 +76,60 @@
       `ebd663bdb5473e6d8c3cfadd033b58d12a8ea2388853d0d03abe724e8f983a07` vout 0. Matches the
       orchestrator's claim id `a1718348432f963f4b4a7cbd52bda8c6`.
     - **Both are confirmed. `zec-live.sh happy` is unblocked for both directions.**
-    - **Recommended ZEC amount per run, given 0.125 TAZ (12,500,000 zatoshi) per side**: keep
-      `zec-live.sh`'s existing default, `E2E_ZEC_SATS` unset → 100,000 zatoshi (0.001 TAZ).
-      At `FeePolicy::default()` (2 zat/byte) a funding tx (1 P2PKH input, HTLC P2SH output,
-      P2PKH change output) is ~250–300 bytes, so the real fee is ~500–600 zatoshi — the
-      script's built-in 5,000 zatoshi fee buffer is already ~10x that, and the change output
-      clears the 294-zatoshi dust floor with room to spare. One `happy` run (forward +
-      reverse) spends at most ~105,000 zatoshi from each side, leaving ~12,395,000 zatoshi
-      (~99.2%) per address — enough for roughly another 115 runs at this size, so there's no
-      need to raise or lower `E2E_ZEC_SATS` for the planned happy-both-directions run, and
-      plenty of headroom left over for `case-c` afterward too.
+    - ~~Recommended ZEC amount per run~~ **superseded by the ZIP-317 fix below** — the
+      ~500–600 zatoshi fee estimate here assumed a plain per-byte rate, which is wrong (see
+      the live failure and fix just above/below). The real per-tx fee is ~10,000–15,000
+      zatoshi; `E2E_ZEC_SATS=100000` is still comfortably correct (a `happy` run now spends
+      up to ~120,000 zatoshi per side instead of ~105,000 — still <1% of the 12,500,000
+      zatoshi available per address), no change needed there.
+  - **Critical live-run fix, 2026-10-12 ~00:10 EDT: `swap-chain-zec` priced fees per byte;
+    Zebra's NU7 mempool requires the ZIP-317 conventional fee, not a per-byte rate.** The
+    orchestrator's first live happy-forward run failed at the taker's funding broadcast
+    (nothing broadcast, no coins moved): `transaction rejected: ... failed to verify ZIP-317
+    transaction rules, transaction was not inserted to mempool: Unpaid actions is higher
+    than the limit`. Root cause: `tx.rs`'s `ceil_fee = zats_per_byte * size` priced every
+    funding/claim/refund tx at a few hundred zatoshi (at `FeePolicy::default()` = 2 zat/
+    byte), but [ZIP 317](https://zips.z.cash/zip-0317) sets a real floor of
+    `marginal_fee(5000 zat) * max(grace_actions(2), logical_actions)`, where for an
+    all-transparent tx `logical_actions = max(ceil(total vin bytes / 150), ceil(total vout
+    bytes / 34))` — Zebra enforces this in its mempool acceptance rules regardless of what
+    fee we actually attach, so every tx we built was being rejected before this was caught
+    (coincidentally caught before any coins moved, since the taker's own funding broadcast
+    is the very first thing a live run does).
+    - Fixed in `crates/swap-chain-zec/src/tx.rs`: added `zip317_fee(vin, vout)` computing
+      the formula above directly from each probe's actual `TxIn`/`TxOut` serialized byte
+      lengths (via their own `write()`, so it can't drift from the real wire format), and
+      `probe_fee(probe, zats_per_byte) = max(zip317_fee(...), ceil_fee(...))` — the larger of
+      the ZIP-317 floor and the configured per-byte rate, so a future higher-priority
+      per-byte rate still wins if ever raised past the floor. `build_funding_tx` (both the
+      zero-coin seed and the coin-selection loop) and `build_spend_tx` (claim/refund) both
+      switched from `ceil_fee` to `probe_fee` — every tx this backend builds is covered, not
+      just funding. `funding_probe_size` became `funding_probe` (returns the probe `ZecTx`
+      itself, not just a byte count) so both the per-byte and ZIP-317 numbers can be
+      computed from the same probe.
+    - For every shape this backend actually builds (1–2 inputs, 1–2 outputs), the ZIP-317
+      floor lands on exactly its 2-action grace minimum, **10,000 zatoshi** — confirmed with
+      a dedicated pinned unit test, `zip317_fee_pins_expected_values` (1-in/2-out = 10,000;
+      1-in/1-out = 10,000 via the grace floor; 3-in/1-out = 15,000 once 3 inputs cross a
+      3rd action at 150 bytes/action; 1-in/3-out = 15,000 the same way at 34 bytes/action).
+      Also had to rework `funding_selects_coins_and_change`'s amounts/coin values (its old
+      ones assumed a ~500 zat fee; the coin-selection *narrative* — two small coins needed,
+      dust folds into the fee, a big coin covers a request alone, more coins get pulled in
+      as the request grows, insufficient funds is reported — is unchanged, just rescaled,
+      with the new exact fees pinned too: 10,000 for 1–2 inputs, 15,000 once a third coin is
+      pulled in).
+    - Also widened `zec-live.sh`'s `fee_buffer_sats` from 5,000 to 20,000 (covers the real
+      10,000–15,000 zat floor twice over) — this only affects the script's printed
+      "funding needed" estimate, not the actual on-chain amount (that's `build_funding_tx`'s
+      own job, now ZIP-317-aware), but it was wrong/misleading before and is accurate now.
+      The orchestrator also asked to widen "the needed-amount check in the funding build" —
+      that's exactly `build_funding_tx`'s `needed` calculation above; no separate check
+      elsewhere needed changing.
+    - Verified: `cargo test -p swap-chain-zec` all green (11 passed, both new tests
+      included); `check-zec.sh` and `check-zec-live.sh` (live dry run against
+      `testnet.zec.rocks`, throwaway key, builds+signs+consensus-verifies a claim and refund
+      with the new fee) both PASS. Did **not** verify against a real broadcast myself (no
+      key on hp2) — that's the orchestrator's rerun from the Mac once this lands.
   - **Wave 1b** (`crates/swap-chain-zec/`): `ZecBackend` implementing `divi_swap::ChainBackend`
     over lightwalletd gRPC (`grpc.rs`), hand-rolled ZIP-244/ZIP-229 tx building+signing+digest
     (`tx.rs`), t-address Base58Check (`address.rs`). `ZecBackend::chain()` now correctly

@@ -988,6 +988,41 @@ fn ceil_fee(zats_per_byte: u64, size: usize) -> u64 {
     zats_per_byte.max(1) * size as u64
 }
 
+/// [ZIP 317](https://zips.z.cash/zip-0317) conventional fee, zatoshi per logical action.
+/// Zebra's NU7 mempool enforces this as a floor: a plain per-byte fee (a few hundred
+/// zatoshi for our small txs) is rejected with "Unpaid actions is higher than the limit".
+const ZIP317_MARGINAL_FEE: u64 = 5000;
+/// Actions below this many are free (ZIP 317 "grace" allowance) — in practice this is the
+/// floor every one of our single-HTLC txs hits, since they never reach 2 real actions.
+const ZIP317_GRACE_ACTIONS: u64 = 2;
+/// Transparent input weight: a logical action's worth of input bytes (ZIP 317 §Fee
+/// calculation; `tx_in_total_size` is scaled by this instead of counting P2PKH inputs 1:1,
+/// so unusually large scriptSigs still count as more than one action).
+const ZIP317_IN_WEIGHT: u64 = 150;
+/// Transparent output weight, same idea as [`ZIP317_IN_WEIGHT`] for outputs.
+const ZIP317_OUT_WEIGHT: u64 = 34;
+
+/// Serialized length of one transparent input or output, via its own `write`.
+fn serialized_len(write: impl FnOnce(&mut Vec<u8>)) -> u64 {
+    let mut v = Vec::new();
+    write(&mut v);
+    v.len() as u64
+}
+
+/// [ZIP 317](https://zips.z.cash/zip-0317) conventional fee for an all-transparent tx:
+/// `marginal_fee * max(grace_actions, logical_actions)`, where (with no shielded actions)
+/// `logical_actions = max(ceil(total vin bytes / in_weight), ceil(total vout bytes /
+/// out_weight))`. This is what Zebra's mempool actually requires on NU7 testnet — a
+/// per-byte rate (`ceil_fee`/`zats_per_byte`) alone is not enough, so callers take the
+/// larger of the two.
+fn zip317_fee(vin: &[TxIn], vout: &[TxOut]) -> u64 {
+    let in_bytes: u64 = vin.iter().map(|t| serialized_len(|v| t.write(v))).sum();
+    let out_bytes: u64 = vout.iter().map(|t| serialized_len(|v| t.write(v))).sum();
+    let in_actions = in_bytes.div_ceil(ZIP317_IN_WEIGHT);
+    let out_actions = out_bytes.div_ceil(ZIP317_OUT_WEIGHT);
+    ZIP317_MARGINAL_FEE * in_actions.max(out_actions).max(ZIP317_GRACE_ACTIONS)
+}
+
 /// Placeholder DER signature length used to size a probe transaction before signing (71-72
 /// bytes is the real range; 72 never undersizes).
 const DUMMY_SIG_LEN: usize = 72;
@@ -1034,15 +1069,15 @@ pub fn build_funding_tx(
     // never-funded address) still reports InsufficientFunds instead of `needed` staying 0
     // and `total < needed` wrongly passing, which then underflows `needed - amount` below.
     let mut needed = amount
-        + ceil_fee(
+        + probe_fee(
+            &funding_probe(&chosen, &htlc_spk, amount, Some(0), &my_spk),
             zats_per_byte,
-            funding_probe_size(&chosen, &htlc_spk, amount, Some(0), &my_spk),
         );
     for c in sorted {
         chosen.push(c);
         total += chosen.last().unwrap().value;
-        let probe_size = funding_probe_size(&chosen, &htlc_spk, amount, Some(0), &my_spk);
-        needed = amount + ceil_fee(zats_per_byte, probe_size);
+        let probe = funding_probe(&chosen, &htlc_spk, amount, Some(0), &my_spk);
+        needed = amount + probe_fee(&probe, zats_per_byte);
         if total >= needed {
             break;
         }
@@ -1107,14 +1142,15 @@ pub fn build_funding_tx(
     })
 }
 
-/// Serialized size of a funding tx with dummy (but correctly-sized) P2PKH scriptSigs.
-fn funding_probe_size(
+/// A funding tx with dummy (but correctly-sized) P2PKH scriptSigs, for fee sizing before
+/// the real coin selection is final.
+fn funding_probe(
     chosen: &[Coin],
     htlc_spk: &[u8],
     amount: u64,
     change: Option<u64>,
     my_spk: &[u8],
-) -> usize {
+) -> ZecTx {
     let dummy_sig = vec![0u8; DUMMY_SIG_LEN];
     let dummy_pubkey = [0u8; 33];
     let dummy_script_sig = p2pkh_script_sig(&dummy_sig, &dummy_pubkey);
@@ -1128,7 +1164,7 @@ fn funding_probe_size(
             script_pubkey: my_spk.to_vec(),
         });
     }
-    let probe = ZecTx {
+    ZecTx {
         consensus_branch_id: 0,
         lock_time: 0,
         expiry_height: 0,
@@ -1141,8 +1177,13 @@ fn funding_probe_size(
             })
             .collect(),
         vout,
-    };
-    probe.serialize().len()
+    }
+}
+
+/// The fee a probe tx needs: the larger of the configured per-byte rate and the ZIP 317
+/// conventional fee Zebra's NU7 mempool actually enforces (see [`zip317_fee`]).
+fn probe_fee(probe: &ZecTx, zats_per_byte: u64) -> u64 {
+    ceil_fee(zats_per_byte, probe.serialize().len()).max(zip317_fee(&probe.vin, &probe.vout))
 }
 
 /// Which spend path to build.
@@ -1212,7 +1253,7 @@ pub fn build_spend_tx(
             script_pubkey: my_spk.clone(),
         }],
     };
-    let fee = ceil_fee(zats_per_byte, probe.serialize().len());
+    let fee = probe_fee(&probe, zats_per_byte);
     let out_value = amount.checked_sub(fee).filter(|v| *v >= DUST_ZATOSHI);
     let out_value = out_value.ok_or_else(|| {
         SwapError::InsufficientFunds(format!("HTLC value {amount} does not cover fee {fee}"))
@@ -1544,43 +1585,53 @@ mod tests {
             value,
             script_pubkey: my_spk.clone(),
         };
-        let coins = [coin(1, 10_000), coin(2, 15_000), coin(3, 900_000)];
+        // Sized so the ZIP 317 conventional fee (the real floor now — see
+        // `zip317_fee_pins_expected_values`) stays at its 10,000 zat grace-action minimum for
+        // up to 2 inputs, and steps up to 15,000 at 3 inputs (each adds ~148 bytes, crossing
+        // the 150-byte-per-action line on the third).
+        let coins = [coin(1, 50_000), coin(2, 60_000), coin(3, 200_000)];
         let (_, hash) = new_preimage();
         let h = htlc(hash);
 
-        // 20,000 needs the two smaller coins (largest-first selection).
-        let f = build_funding_tx(&secp, &sk, &pk, &coins[..2], &h, 20_000, BRANCH_ID, 2).unwrap();
+        // 95,000 needs the two smaller coins (largest-first selection): the biggest of the
+        // two (60,000) alone can't cover 95,000 + the 10,000 fee.
+        let f = build_funding_tx(&secp, &sk, &pk, &coins[..2], &h, 95_000, BRANCH_ID, 2).unwrap();
         assert_eq!(f.tx.vin.len(), 2);
         assert_eq!(f.htlc_vout, 0);
-        assert_eq!(f.tx.vout[0].value, 20_000);
+        assert_eq!(f.tx.vout[0].value, 95_000);
         assert_eq!(
             f.tx.vout[0].script_pubkey,
             htlc_script_pubkey(&h.redeem_script())
         );
         assert_eq!(f.tx.vout[1].script_pubkey, my_spk);
-        let real_size = f.tx.serialize().len();
-        assert!(
-            f.fee >= 2 * real_size as u64 - 4,
-            "fee {} vs size {real_size}",
-            f.fee
+        assert_eq!(
+            f.fee, 10_000,
+            "1-2 inputs, 2 outputs stays at the grace floor"
         );
+        assert_eq!(f.tx.vout[1].value, 110_000 - 95_000 - 10_000);
 
-        // A remainder below dust is folded into the fee instead of a change output.
-        let f2 = build_funding_tx(&secp, &sk, &pk, &coins[1..2], &h, 14_500, BRANCH_ID, 2).unwrap();
+        // A remainder below dust (250 < 294) is folded into the fee instead of a change
+        // output: 60,000 − 49,750 − 10,000 fee = 250.
+        let f2 = build_funding_tx(&secp, &sk, &pk, &coins[1..2], &h, 49_750, BRANCH_ID, 2).unwrap();
         assert_eq!(f2.tx.vin.len(), 1);
         assert_eq!(f2.tx.vout.len(), 1, "no dust change");
+        assert_eq!(f2.fee, 10_250);
 
         // Largest-first selection: a single big coin covers a request smaller than it.
-        let f3 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 500_000, BRANCH_ID, 2).unwrap();
+        let f3 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 150_000, BRANCH_ID, 2).unwrap();
         assert_eq!(f3.tx.vin.len(), 1);
+        assert_eq!(f3.fee, 10_000);
 
-        // More than the biggest coin holds pulls in the next-largest too.
-        let f4 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 905_000, BRANCH_ID, 2).unwrap();
+        // More than the biggest coin holds (less its fee) pulls in the next-largest too.
+        let f4 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 195_000, BRANCH_ID, 2).unwrap();
         assert_eq!(f4.tx.vin.len(), 2);
+        assert_eq!(f4.fee, 10_000);
 
-        // More than the two biggest coins hold pulls in all three.
-        let f5 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 920_000, BRANCH_ID, 2).unwrap();
+        // More than the two biggest coins hold pulls in all three — and 3 inputs (444 bytes)
+        // crosses into a 3rd ZIP 317 action, so the fee itself rises to 15,000.
+        let f5 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 255_000, BRANCH_ID, 2).unwrap();
         assert_eq!(f5.tx.vin.len(), 3);
+        assert_eq!(f5.fee, 15_000, "3 inputs crosses into a 3rd logical action");
 
         // Insufficient funds is reported as such.
         let err =
@@ -1592,5 +1643,51 @@ mod tests {
         // example found this: `needed` must not stay seeded at 0 when the loop never runs).
         let err = build_funding_tx(&secp, &sk, &pk, &[], &h, 20_000, BRANCH_ID, 2).unwrap_err();
         assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+    }
+
+    /// Pins the [ZIP 317](https://zips.z.cash/zip-0317) conventional fee for the tx shapes
+    /// this backend actually builds — the real floor Zebra's NU7 mempool enforces (a plain
+    /// per-byte fee of a few hundred zatoshi was rejected: "Unpaid actions is higher than
+    /// the limit"). Byte sizes use the same dummy 72-byte signature every probe uses.
+    #[test]
+    fn zip317_fee_pins_expected_values() {
+        let pk = pubkey_of(&TAKER_KEY);
+        let dummy_sig = vec![0u8; DUMMY_SIG_LEN];
+        let p2pkh_in = || TxIn {
+            prevout: OutPoint {
+                txid: [0u8; 32],
+                n: 0,
+            },
+            script_sig: p2pkh_script_sig(&dummy_sig, &pk),
+            sequence: 0xffff_ffff,
+        };
+        let htlc_out = || TxOut {
+            value: 1,
+            script_pubkey: vec![0u8; 23], // a P2SH scriptPubKey's exact length
+        };
+        let p2pkh_out = || TxOut {
+            value: 1,
+            script_pubkey: vec![0u8; 25], // a P2PKH scriptPubKey's exact length
+        };
+
+        // 1 P2PKH input (148 bytes -> 1 action) + HTLC funding output + P2PKH change (66
+        // bytes total -> 2 actions): the orchestrator's pinned funding-tx shape.
+        assert_eq!(
+            zip317_fee(&[p2pkh_in()], &[htlc_out(), p2pkh_out()]),
+            10_000
+        );
+        // 1 input + 1 output: both round down to 1 action, but the 2-action grace floor
+        // still applies.
+        assert_eq!(zip317_fee(&[p2pkh_in()], &[p2pkh_out()]), 10_000);
+        // 3 inputs (444 bytes -> 3 actions, 150 bytes/action) dominates the floor.
+        assert_eq!(
+            zip317_fee(&[p2pkh_in(), p2pkh_in(), p2pkh_in()], &[p2pkh_out()]),
+            15_000
+        );
+        // 3 P2PKH outputs (34 bytes each -> 102 bytes -> exactly 3 actions) dominates too.
+        assert_eq!(
+            zip317_fee(&[p2pkh_in()], &[p2pkh_out(), p2pkh_out(), p2pkh_out()]),
+            15_000
+        );
     }
 }

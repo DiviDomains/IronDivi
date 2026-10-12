@@ -72,7 +72,11 @@ ROOT="$(git rev-parse --show-toplevel)"
 export PATH="$HOME/.local/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 zec_zats="${E2E_ZEC_SATS:-100000}"   # 0.001 TAZ: the live_fund_claim_refund / brief ceiling's neighborhood
-fee_buffer_sats=5000
+# Zebra's NU7 mempool enforces the ZIP-317 conventional fee (marginal_fee=5000 zat/action,
+# a 2-action grace floor), not a plain per-byte rate: every tx this backend builds now pays
+# at least 10,000 zat, rising with input/output count (crates/swap-chain-zec/src/tx.rs's
+# `zip317_fee`). 20,000 covers that floor twice over, with room for a few extra UTXOs.
+fee_buffer_sats=20000
 min_per_run=$((zec_zats + fee_buffer_sats))
 
 # Funding addresses (docs/plans/swap-poc/funding.md, decision 64ae2a0): the BTC swap keys'
