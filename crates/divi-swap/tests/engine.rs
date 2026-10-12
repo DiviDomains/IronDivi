@@ -1109,6 +1109,84 @@ both!(
     refund_on_claimed_does_nothing_body
 );
 
+/// Safety review (orchestrator): the maker must never lock its own leg if there isn't
+/// enough of the taker-leg's own timeout left for the maker to later claim it safely —
+/// `maker.rs::taker_window_too_short` (`remaining = taker HTLC locktime - taker-chain mtp`
+/// vs `needed = maker_timeout_secs + claim_margin_secs`) is the gate, checked at every
+/// point the maker could still back out (`on_accepted`'s `lock_window_gone`,
+/// `on_taker_lock_seen`, and — the critical one — right before `build_funding` in
+/// `on_taker_lock_confirmed`, the "staking edge"). This exact path had zero test coverage
+/// before this review, despite being the primary protection for "the maker can never be
+/// left unable to claim after the taker claims." Testnet profile: taker_timeout 21,600s,
+/// maker_timeout 10,800s, claim_margin 1,800s, so `needed` = 12,600s out of the taker
+/// leg's 21,600s budget — eating into it past ~9,000s (while plenty, i.e. ~12,600s, is
+/// still nominally left before the taker leg's own locktime) must trip the gate.
+async fn maker_aborts_when_taker_window_too_short_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    h.tl_chain().advance_time(9_500);
+    for _ in 0..40 {
+        let _ = h.maker.tick().await;
+        h.mine_all(1);
+        if h.maker_state() == SwapState::Aborted {
+            break;
+        }
+    }
+    assert_eq!(
+        h.maker_state(),
+        SwapState::Aborted,
+        "must abort, not lock, on a too-short window"
+    );
+    assert_eq!(
+        h.m_ml().funding_calls(),
+        0,
+        "must never have selected coins for its own leg"
+    );
+}
+
+/// The same gate must not false-positive: comfortably within the window, the maker locks
+/// normally.
+async fn maker_locks_when_taker_window_is_fine_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    h.tl_chain().advance_time(100);
+    for _ in 0..40 {
+        let _ = h.maker.tick().await;
+        h.mine_all(1);
+        if matches!(
+            h.maker_state(),
+            SwapState::MakerLocked | SwapState::MakerLockConfirmed
+        ) {
+            break;
+        }
+    }
+    assert!(
+        matches!(
+            h.maker_state(),
+            SwapState::MakerLocked | SwapState::MakerLockConfirmed
+        ),
+        "expected to lock, got {:?}",
+        h.maker_state()
+    );
+    assert!(
+        h.m_ml().funding_calls() >= 1,
+        "must have selected coins for its own leg"
+    );
+}
+
+both!(
+    maker_aborts_too_short_window,
+    rev_maker_aborts_too_short_window,
+    maker_aborts_when_taker_window_too_short_body
+);
+both!(
+    maker_locks_window_fine,
+    rev_maker_locks_window_fine,
+    maker_locks_when_taker_window_is_fine_body
+);
+
 const MAKER_HAPPY: &str = include_str!("fixtures/maker-forward-done-happy.json");
 const MAKER_CASEC: &str = include_str!("fixtures/maker-forward-done-casec.json");
 const TAKER_HAPPY: &str = include_str!("fixtures/taker-forward-done-happy.json");
@@ -1285,6 +1363,38 @@ zec_rev!(
 );
 zec_rev!(zec_rev_timeout_invariant_enforced, timeout_invariant_body);
 zec_rev!(zec_rev_quote_carries_zec, quote_carries_counter_body);
+ltc_fwd!(
+    ltc_fwd_maker_aborts_too_short_window,
+    maker_aborts_when_taker_window_too_short_body
+);
+ltc_rev!(
+    ltc_rev_maker_aborts_too_short_window,
+    maker_aborts_when_taker_window_too_short_body
+);
+zec_fwd!(
+    zec_fwd_maker_aborts_too_short_window,
+    maker_aborts_when_taker_window_too_short_body
+);
+zec_rev!(
+    zec_rev_maker_aborts_too_short_window,
+    maker_aborts_when_taker_window_too_short_body
+);
+ltc_fwd!(
+    ltc_fwd_maker_locks_window_fine,
+    maker_locks_when_taker_window_is_fine_body
+);
+ltc_rev!(
+    ltc_rev_maker_locks_window_fine,
+    maker_locks_when_taker_window_is_fine_body
+);
+zec_fwd!(
+    zec_fwd_maker_locks_window_fine,
+    maker_locks_when_taker_window_is_fine_body
+);
+zec_rev!(
+    zec_rev_maker_locks_window_fine,
+    maker_locks_when_taker_window_is_fine_body
+);
 
 /// What the harness actually built: a quote on the configured counter chain with that chain's
 /// confirmation count and the maker's key there, the counter leg on the side the direction

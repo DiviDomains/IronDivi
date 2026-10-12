@@ -475,3 +475,76 @@ async fn usdc_crash_taker_between_lock_and_claim_forward() {
 async fn usdc_crash_taker_between_lock_and_claim_reverse() {
     crash_taker_between_lock_and_claim(Direction::TakerPaysDivi).await;
 }
+
+/// Safety review (orchestrator): the same `maker.rs::taker_window_too_short` gate proven
+/// against `MockChain` in `engine.rs` (`maker_aborts_too_short_window`), here against the
+/// real `UsdcBackend`/`Erc20Htlc` contract — confirms `median_time_past()`'s USDC-specific
+/// behavior (the latest block's own `block.timestamp`, no MTP smoothing, per
+/// `Erc20Htlc.sol`'s own `block.timestamp >= timelock` check) still trips the gate before
+/// the maker ever calls `build_funding` — i.e. before `Erc20Htlc.lock` is ever sent, no
+/// escrowed funds, nothing to get stuck. Eats into the taker leg's own 21,600s timeout
+/// (testnet) past the 12,600s (`maker_timeout_secs` + `claim_margin_secs`) threshold while
+/// ~9,100s nominally remains, on whichever chain the taker actually locked on.
+async fn window_too_short_aborts(dir: Direction) {
+    require_foundry!();
+    let w = setup().await;
+    let store = Store::in_memory().unwrap();
+    let maker = Maker::new(
+        SwapConfig::profile(Profile::Testnet),
+        Arc::new(w.maker_divi.clone()),
+        w.maker_usdc.clone(),
+        store.clone(),
+        vec![offer(dir)],
+    )
+    .unwrap();
+    let taker = Taker::new(
+        Arc::new(w.taker_divi.clone()),
+        w.taker_usdc.clone(),
+        store.clone(),
+    );
+
+    let quote = maker.quote("o", COUNTER_ENGINE_SATS).await.unwrap();
+    let (tid, req) = taker.prepare(&quote).await.unwrap();
+    let view = maker.accept(req).await.unwrap();
+    taker.accepted(&tid, &view).await.unwrap();
+    let notice = taker.lock(&tid).await.unwrap();
+    let mid = maker.notify_lock(&view.id, notice).await.unwrap().id;
+
+    const EAT_SECS: u64 = 9_500;
+    match dir {
+        Direction::TakerPaysBtc => {
+            jump_usdc_time(&w.chain_provider, EAT_SECS, TimeJump::SetNextBlockTimestamp).await
+        }
+        Direction::TakerPaysDivi => w.divi.advance_time(EAT_SECS as u32),
+    }
+
+    for _ in 0..60 {
+        maker.tick().await.unwrap();
+        w.divi.mine(1);
+        mine_usdc_block(&w.chain_provider).await;
+        if store.get_maker_swap(&mid).unwrap().unwrap().state == SwapState::Aborted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let m = store.get_maker_swap(&mid).unwrap().unwrap();
+    assert_eq!(
+        m.state,
+        SwapState::Aborted,
+        "must abort on a too-short window"
+    );
+    assert!(
+        m.maker_leg_funding.is_none(),
+        "must never have locked its own leg"
+    );
+}
+
+#[tokio::test]
+async fn usdc_window_too_short_aborts_forward() {
+    window_too_short_aborts(Direction::TakerPaysBtc).await;
+}
+
+#[tokio::test]
+async fn usdc_window_too_short_aborts_reverse() {
+    window_too_short_aborts(Direction::TakerPaysDivi).await;
+}

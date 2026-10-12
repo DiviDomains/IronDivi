@@ -17,6 +17,100 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Timeout-margin safety review across btc/ltc/zec/evm-usdc, 2026-10-12 ~04:40 EDT.**
+    Orchestrator's ask: confirm the maker can never be left unable to claim after the
+    taker claims (maker claim window vs taker timeout, block-time variance, confirmation
+    depths, MTP vs wall clock for CLTV, Zcash expiry height, EVM `block.timestamp`).
+    - **The protecting mechanism, identified and traced**: `maker.rs::taker_window_too_short`
+      — `remaining = taker-leg HTLC locktime − taker-chain median-time-past`, `needed =
+      maker_timeout_secs + claim_margin_secs` (the *config-driven*, profile-aware margin —
+      not to be confused with `taker.rs`'s separate, flat `TAKER_SAFETY_MARGIN_SECS =
+      1800`, which protects a *different* race: the taker's own claim-vs-the-maker's-refund
+      timing on the maker's leg, not the maker's reaction window on the taker's leg. Two
+      genuinely independent mechanisms that happen to share testnet's 1800s value by
+      coincidence, not an inconsistency — considered and ruled out as a finding). This gate
+      is checked at **every** point the maker could still back out: `on_accepted`'s
+      `lock_window_gone` (waiting for the lock to appear), `on_taker_lock_seen` (waiting for
+      confirmations, both the "still there" and "vanished" branches), and — the one that
+      matters most — immediately before `build_funding` in `on_taker_lock_confirmed`, the
+      "staking edge" comment's own name for the point of no return. Re-checking right there
+      closes the time-of-check-to-time-of-use gap a single early check would leave open.
+    - **Per-chain numbers, computed against real/measured block times** (not the nominal
+      ones in code comments, several of which are stale — see below):
+      - BTC: `mtp_lag_secs` 3600s both profiles. True MTP (median of 11 blocks) lags wall
+        clock by ≈5.5 block-intervals ≈3,300s at the real ~600s/block rate — 3600s gives a
+        thin but positive raw margin, and the *actual* protection comes from
+        `required_gap_secs`'s `2×mtp_lag + claim_margin` term stacking far beyond that
+        (10,800s testnet/mainnet). No bug.
+      - LTC: `mtp_lag_secs` 1800s. Real ~150s/block → bare MTP lag ≈825s — 1800s is >2× that
+        estimate. No bug.
+      - ZEC: `mtp_lag_secs` 1800s, but `ChainParams::builtin`'s comment ("75-second blocks")
+        is stale — the live NU7 chain is ≈24.8s/block (measured in an earlier round). Bare
+        MTP lag at the *real* rate ≈137s — 1800s is ≈13× that, so the margin itself is
+        **safe**, just far more generously padded than the (wrong) comment implies. See
+        the separate finding below about what the same stale assumption does to
+        *confirmation depth* (a different concern than margin safety).
+      - EVM/USDC: read `contracts/htlc/src/Erc20Htlc.sol` directly rather than assume —
+        `claim()` has no time gate at all (callable any time before `refunded`), `refund()`
+        requires exactly `block.timestamp >= timelock`, nothing else. `swap-chain-evm`'s
+        `median_time_past()` returns the latest block's own `block.timestamp` verbatim (no
+        median smoothing — there's nothing to smooth; the contract doesn't either), which
+        the existing code comment already claimed and this review now independently
+        confirms against the contract source itself. `mtp_lag_secs` 60s(testnet)/
+        180s(mainnet) is sized for block-time jitter only, correctly — EVM has no MTP-lag
+        cushion the way BTC-family chains do, but `required_gap_secs`'s global-max-based
+        sizing (always ≥10,800s, driven by BTC) swamps EVM's ~12s block time by three
+        orders of magnitude regardless.
+      - `required_gap_secs()` takes the **max** `mtp_lag_secs` over *every* configured
+        chain (`Chain::ALL`), not just the two chains a given swap actually uses — always
+        conservative (a swap between two fast, low-lag chains still gets BTC-grade margin),
+        never a shortfall.
+      - `median_time_past()` double-checked as a *true* median (sorted, `times[len/2]`) —
+        not an average, not "latest block" — in `swap-chain-btc`/`-ltc` (trust the node's
+        own `mediantime` field directly) and `swap-chain-divi` (computed by hand over the
+        last 11 blocks, since the node reports it null) and `swap-chain-zec` (reviewed in
+        an earlier round). Correct everywhere it's implemented.
+    - **Real, previously-unknown gap found: zero test coverage of the primary safety
+      gate.** `taker_window_too_short` — the single check this whole property rests on —
+      had **no test anywhere** exercising it, across any chain, before this review. Fixed:
+      - `crates/divi-swap/tests/engine.rs`: `maker_aborts_too_short_window`/
+        `maker_locks_window_fine` (the gate trips when it should and, just as important,
+        doesn't false-positive when there's plenty of time left), each via `both!` (BTC,
+        default) plus `ltc_fwd!`/`ltc_rev!`/`zec_fwd!`/`zec_rev!` — 12 actual tests, using
+        each chain's real confirmations/block-interval numbers through the existing mock
+        macros. Asserts both the resulting state (`Aborted`, not stuck or progressed) and
+        that `MockBackend::funding_calls()` stayed `0` — the maker never even selected
+        coins for its own leg, let alone broadcast anything.
+      - `crates/divi-swap/tests/usdc.rs`: `usdc_window_too_short_aborts_forward`/`_reverse`,
+        against the *real* `UsdcBackend`/`Erc20Htlc` contract over a spawned `anvil`
+        instance (not `MockChain`) — proves the gate holds for the one chain whose
+        `median_time_past()` semantics are structurally different from every other backend
+        (plain `block.timestamp`, no median-of-N at all) by eating into the taker leg's
+        timeout via `evm_setNextBlockTimestamp`/`MockChain::advance_time` (whichever chain
+        the taker actually locked on, by direction) and asserting `MakerRecord.
+        maker_leg_funding` stayed `None` — `Erc20Htlc.lock` was never even sent.
+      - All 14 new tests pass; merged cleanly alongside an orchestrator-landed
+        `usdc_crash_taker_between_lock_and_claim_{forward,reverse}` pair that happened to
+        touch the same file and insertion point (kept both, standard lane-sync pattern).
+    - **Side observation, not fixed (out of scope for *this* property, flagged for
+      awareness): ZEC's confirmation depth is shallower in absolute wall-clock terms than
+      its own design likely intended**, because of the same stale "75-second blocks"
+      assumption noted above. `ChainParams::builtin`'s testnet confirmations (3) × the
+      *assumed* 75s/block ≈ 225s of intended finality depth; at the *real* ≈24.8s/block
+      rate, 3 confirmations is only ≈75s deep — about a third of what the number "3" was
+      presumably chosen to achieve. This is a reorg-resistance question, not a timeout-
+      margin one: a shallower confirmation wait only *shortens* the time consumed before
+      the fixed timeout budgets start ticking, which if anything *helps* the margin
+      property this review was about, so it's not "the real bug" this task asked me to
+      fix. Raising ZEC's testnet confirmations (e.g. to ~9, to restore the original ~225s
+      intent) would need `crates/divi-swap/src/config.rs`, which is the frozen engine
+      contract (owned by lane `multichain`, not touchable here per the lane rules) — noting
+      it under "- needs:" below rather than editing it.
+    - Verified: `cargo fmt`/`cargo clippy -p divi-swap --all-targets --all-features -- -D
+      warnings` both clean; `cargo test -p divi-swap` green throughout (engine.rs 93 tests
+      including the 12 new; usdc.rs 10 including the 2 new); `check-zec.sh` PASS
+      (unaffected — this review's changes are all in the shared engine/tests, not
+      `swap-chain-zec`, but re-verified after lane-sync).
   - **Engine bug (orchestrator, found live): `divi-swap refund` could claim instead,
     2026-10-12 ~04:10 EDT.** Live: ZEC case-C swap `ab294b69` went to `Claimed` after an
     operator ran `refund`, not `Refunded`. Root cause: `bin/divi-swap/src/main.rs` mapped
@@ -676,3 +770,13 @@
   (asserts the redeem-script digest and the scriptPubKey digest differ, and that only the
   latter verifies) — self-consistent but not independently verified against a second
   implementation.
+- needs: a decision (`crates/divi-swap/src/config.rs`, the frozen engine contract — lane
+  `multichain`'s, not mine) on whether to bump `ChainParams::builtin`'s ZEC testnet
+  confirmations past 3, found during the timeout-margin safety review above. The "75-second
+  blocks" comment that justified "3" is stale (real NU7 is ≈24.8s/block); at the real rate,
+  3 confirmations is ≈75s of finality depth, about a third of what "3 confirmations at an
+  assumed 75s/block ≈225s" was presumably going for. Not a timeout-margin bug (a shallower
+  wait only leaves *more* of the fixed budget unused, if anything helping that property) —
+  purely a reorg-resistance question, and testnet stakes are low, so this is a "someone
+  should decide" flag, not an urgent fix. Bumping to ~9 would restore the original ~225s
+  intent at the real block rate, if that's still the desired depth.
