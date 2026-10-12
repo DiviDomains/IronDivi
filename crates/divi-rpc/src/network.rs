@@ -391,12 +391,13 @@ impl NetworkRpc {
             .into());
         }
 
-        let ip: IpAddr = target.parse().map_err(|_| {
-            RpcError::new(
-                codes::CLIENT_INVALID_IP_OR_SUBNET,
-                format!("Invalid IP: {}", target),
-            )
-        })?;
+        // C++ ban reports an unresolvable address the same way as an unknown peer
+        let ip: IpAddr = match target.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                return Ok(serde_json::json!({ "Banned": "Could not find matching node to ban" }));
+            }
+        };
         let ids = peer_manager.peer_ids_for_ip(ip);
         if ids.is_empty() {
             return Ok(serde_json::json!({ "Banned": "Could not find matching node to ban" }));

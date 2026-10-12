@@ -77,6 +77,8 @@ encryption state, `-22` deserialization) are listed per method in the harness ma
 
 ## Deliberate deviation
 
+`getrawtransaction` accepts a bool `verbose` (C++ rejects it with -1) and `getmasternodewinners` accepts an integer count (C++ wants a string). Rust stays lenient: a superset of C++ behaviour that cannot break a client written for C++.
+
 `encryptwallet`: C++ stops the daemon after encrypting (to rebuild the keypool). Rust keeps
 running and leaves the wallet locked. Rust has no keypool, so `getnewaddress` on a locked
 encrypted wallet returns -13 until `walletpassphrase`.
@@ -107,5 +109,5 @@ These abort the C++ daemon; do not call them on a production node:
 1. Masternode subsystem RPCs (largest remaining gap).
 2. ~~`invalidateblock` family~~ done.
 3. `getblock` `moneysupply`/`acc_checkpoint` (block-index schema change).
-4. Remaining error-code order differences (`sendtoaddress`, `setaccount`, `importaddress`, `removevault`) and `ban` with a bad IP.
+4. ~~Error-code order differences (`sendtoaddress`, `setaccount`, `importaddress`, `removevault`, `lockunspent`) and `ban` with a bad IP~~ done (unit-tested in `error_code_order_matches_cpp`).
 5. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.

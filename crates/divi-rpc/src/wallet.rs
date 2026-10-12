@@ -860,15 +860,15 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
 
-        let dest_addr = Address::from_base58(addr_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        // C++ checks the argument count (usage, -1) before anything else
+        let amount_value = params
+            .get(1)
+            .ok_or_else(|| RpcError::invalid_params("Amount required"))?;
 
-        let send_amount = amount_from_value(
-            params
-                .get(1)
-                .ok_or_else(|| RpcError::invalid_params("Amount required"))?,
-            false,
-        )?;
+        let dest_addr = Address::from_base58(addr_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+
+        let send_amount = amount_from_value(amount_value, false)?;
 
         let wallet = self.get_wallet()?;
 
@@ -1701,6 +1701,11 @@ impl WalletRpc {
         let vault_addresses = params.get_str(0).ok_or_else(|| {
             RpcError::invalid_params("Missing required parameter: owner_address:manager_address")
         })?;
+        if !vault_addresses.contains(':') {
+            return Err(
+                RpcError::new(codes::INVALID_PARAMETER, "Could not parse vault encoding!").into(),
+            );
+        }
         let tx_hash = params
             .get_str(1)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: tx_hash"))?;
@@ -2814,8 +2819,12 @@ impl WalletRpc {
             address
         } else {
             // Try as hex script
-            let script_bytes = hex::decode(addr_or_script)
-                .map_err(|_| RpcError::invalid_params("Invalid address or script hex"))?;
+            let script_bytes = hex::decode(addr_or_script).map_err(|_| {
+                RpcError::new(
+                    codes::INVALID_ADDRESS_OR_KEY,
+                    "Invalid Divi address or script",
+                )
+            })?;
 
             let script = Script::from_bytes(script_bytes);
 
@@ -3229,6 +3238,12 @@ impl WalletRpc {
 
     /// lockunspent - Lock or unlock UTXOs
     pub fn lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if params.len() < 1 || params.len() > 2 {
+            return Err(RpcError::invalid_params(
+                "lockunspent unlock [{\"txid\":\"txid\",\"vout\":n},...]",
+            )
+            .into());
+        }
         let unlock = params
             .get_bool(0)
             .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected boolean for unlock"))?;
@@ -3617,12 +3632,11 @@ impl WalletRpc {
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
-        let account = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Account required"))?;
+        // C++: the account is optional (defaults to "") and the address is checked first
+        let account = params.get_str(1).unwrap_or("");
 
         let address = Address::from_base58(address_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid Divi address"))?;
 
         let wallet = self.get_wallet()?;
 
@@ -3818,6 +3832,37 @@ mod tests {
             Error::Rpc(r) => r.code,
             other => panic!("expected an RPC error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn error_code_order_matches_cpp() {
+        let rpc = create_test_wallet_rpc();
+        let p = |v: &[&str]| Params::Array(v.iter().map(|s| serde_json::json!(s)).collect());
+        // sendtoaddress: argument count (usage, -1) before address validity
+        assert_eq!(
+            rpc_code(rpc.send_to_address(&p(&["__bad__"])).unwrap_err()),
+            codes::MISC_ERROR
+        );
+        // setaccount: address validity (-5) before the account is required
+        assert_eq!(
+            rpc_code(rpc.set_account(&p(&["__bad__"])).unwrap_err()),
+            codes::INVALID_ADDRESS_OR_KEY
+        );
+        // importaddress: neither an address nor hex script is -5
+        assert_eq!(
+            rpc_code(rpc.import_address(&p(&["__bad__"])).unwrap_err()),
+            codes::INVALID_ADDRESS_OR_KEY
+        );
+        // removevault without "owner:manager" is -8
+        assert_eq!(
+            rpc_code(rpc.remove_vault(&p(&["__bad__"])).unwrap_err()),
+            codes::INVALID_PARAMETER
+        );
+        // lockunspent without arguments is usage (-1)
+        assert_eq!(
+            rpc_code(rpc.lock_unspent(&Params::None).unwrap_err()),
+            codes::MISC_ERROR
+        );
     }
 
     #[test]
