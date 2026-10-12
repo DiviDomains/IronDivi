@@ -17,15 +17,20 @@
 #      `swap_id_matches_contract` (swap-chain-evm) — these are the anvil equivalent of
 #      `live_sepolia_lock_claim`, which hardcodes the real Sepolia USDC address and so
 #      cannot itself run against a local chain with nothing deployed at that address.
-#   5. The anvil-backed proof that a real DIVI<->USDC swap completes end to end:
-#      `usdc_swap_forward`/`usdc_swap_reverse` (divi-swap's tests/usdc.rs) — mock DIVI, a
-#      real `UsdcBackend` over this same anvil. This validates the swap logic through the
-#      engine directly, not through the divi-swapd/divi-swap CLI *binaries* wired together
-#      over HTTP; doing that too would need the dry run to also drive anvil's block
-#      production in lockstep with the daemon's confirmation polling from a second
-#      process, which is exactly what tests/usdc.rs already does under full, non-racy
-#      control inside one process. (Same scope boundary e2e.sh documents for its own
-#      --backend mock: plumbing proven, cross-process swap proven separately.)
+#   5. The anvil-backed proof that a real DIVI<->USDC swap completes end to end, both the
+#      happy path and usdc-live.sh's --scenario case-c (walk-away refund — neither side ever
+#      claims, both legs time out, both sides refund): `usdc_swap_forward`/
+#      `usdc_swap_reverse`, `usdc_swap_refund_forward`/`usdc_swap_refund_reverse` and
+#      `usdc_swap_refund_forward_evm_increase_time`/`usdc_swap_refund_reverse_evm_increase_time`
+#      (divi-swap's tests/usdc.rs — the last two prove case-c's refund timing against
+#      `evm_increaseTime`, not just `evm_setNextBlockTimestamp`) — mock DIVI, a real
+#      `UsdcBackend` over this same anvil. This validates the swap logic through the engine
+#      directly, not through the divi-swapd/divi-swap CLI *binaries* wired together over
+#      HTTP; doing that too would need the dry run to also drive anvil's block production in
+#      lockstep with the daemon's confirmation polling from a second process, which is
+#      exactly what tests/usdc.rs already does under full, non-racy control inside one
+#      process. (Same scope boundary e2e.sh documents for its own --backend mock: plumbing
+#      proven, cross-process swap proven separately.)
 set -euo pipefail
 
 die() { echo "usdc-live-dry-run: $*" >&2; exit 1; }
@@ -96,8 +101,10 @@ echo "usdc-live-dry-run: UsdcBackend lock/claim/refund against anvil (live_sepol
   "hardcodes the real Sepolia USDC address and so cannot itself run here)"
 cargo test -q -p swap-chain-evm --all-features
 
-echo "usdc-live-dry-run: a full DIVI<->USDC swap, both directions, through the engine" \
-  "(mock DIVI + a real UsdcBackend over a second anvil instance tests/usdc.rs spawns itself)"
+echo "usdc-live-dry-run: a full DIVI<->USDC swap, both directions, happy path and" \
+  "--scenario case-c (walk-away refund, both evm_setNextBlockTimestamp and evm_increaseTime)," \
+  "through the engine (mock DIVI + a real UsdcBackend over a second anvil instance" \
+  "tests/usdc.rs spawns itself)"
 cargo test -q -p divi-swap --test usdc
 
 echo "usdc-live-dry-run: OK — deploy, fund, lock/claim/refund and a full swap all proved" \

@@ -118,19 +118,42 @@ async fn mine_usdc_block(provider: &DynProvider) {
         .expect("evm_mine");
 }
 
+/// Two equally-valid ways to jump anvil's clock forward; different test/fork tooling
+/// supports one or the other (Hardhat/anvil both answer to either, but a forked mainnet
+/// node or a different client might not implement both), so this lane proves case-c
+/// against each rather than assuming one is universal.
+enum TimeJump {
+    /// Set an absolute timestamp for the *next* block only.
+    SetNextBlockTimestamp,
+    /// Advance the clock by a relative offset; anvil applies it starting from the next
+    /// mined block, so an explicit `evm_mine` follows to make it observable immediately.
+    IncreaseTime,
+}
+
 /// Jump anvil's clock `secs_forward` past its current latest block, so the next mined
 /// block (and every one after) carries it. Cheap and instant — no real waiting.
-async fn jump_usdc_time(provider: &DynProvider, secs_forward: u64) {
-    let latest = provider
-        .get_block_by_number(BlockNumberOrTag::Latest)
-        .await
-        .expect("get latest block")
-        .expect("latest block exists");
-    let target = latest.header.timestamp + secs_forward;
-    provider
-        .raw_request::<_, ()>("evm_setNextBlockTimestamp".into(), (target,))
-        .await
-        .expect("evm_setNextBlockTimestamp");
+async fn jump_usdc_time(provider: &DynProvider, secs_forward: u64, method: TimeJump) {
+    match method {
+        TimeJump::SetNextBlockTimestamp => {
+            let latest = provider
+                .get_block_by_number(BlockNumberOrTag::Latest)
+                .await
+                .expect("get latest block")
+                .expect("latest block exists");
+            let target = latest.header.timestamp + secs_forward;
+            provider
+                .raw_request::<_, ()>("evm_setNextBlockTimestamp".into(), (target,))
+                .await
+                .expect("evm_setNextBlockTimestamp");
+        }
+        TimeJump::IncreaseTime => {
+            provider
+                .raw_request::<_, i64>("evm_increaseTime".into(), (secs_forward,))
+                .await
+                .expect("evm_increaseTime");
+            mine_usdc_block(provider).await;
+        }
+    }
 }
 
 async fn usdc_balance(provider: &DynProvider, token: Address, account: Address) -> U256 {
@@ -228,7 +251,7 @@ async fn usdc_swap_reverse() {
 /// Taker never claims: both legs time out and both sides refund, through the real
 /// `UsdcBackend`'s `build_refund`/`broadcast` path (never exercised by the happy-path
 /// tests above, which only reach `build_claim`).
-async fn refund_swap(dir: Direction) {
+async fn refund_swap(dir: Direction, time_jump: TimeJump) {
     require_foundry!();
     let w = setup().await;
     let store = Store::in_memory().unwrap();
@@ -275,7 +298,7 @@ async fn refund_swap(dir: Direction) {
     // from here on neither side can claim safely — each independently decides to refund.
     let jump = SwapConfig::profile(Profile::Testnet).taker_timeout_secs as u64 + 3600;
     w.divi.advance_time(jump as u32);
-    jump_usdc_time(&w.chain_provider, jump).await;
+    jump_usdc_time(&w.chain_provider, jump, time_jump).await;
 
     for _ in 0..120 {
         maker.tick().await.unwrap();
@@ -321,10 +344,24 @@ async fn refund_swap(dir: Direction) {
 
 #[tokio::test]
 async fn usdc_swap_refund_forward() {
-    refund_swap(Direction::TakerPaysBtc).await;
+    refund_swap(Direction::TakerPaysBtc, TimeJump::SetNextBlockTimestamp).await;
 }
 
 #[tokio::test]
 async fn usdc_swap_refund_reverse() {
-    refund_swap(Direction::TakerPaysDivi).await;
+    refund_swap(Direction::TakerPaysDivi, TimeJump::SetNextBlockTimestamp).await;
+}
+
+/// Same case-c walk-away-refund proof as above, both directions, but advancing anvil's
+/// clock via `evm_increaseTime` (a relative offset) instead of `evm_setNextBlockTimestamp`
+/// (an absolute one) — the other RPC real test/fork tooling commonly uses for this, so
+/// case-c's refund path is proven against either.
+#[tokio::test]
+async fn usdc_swap_refund_forward_evm_increase_time() {
+    refund_swap(Direction::TakerPaysBtc, TimeJump::IncreaseTime).await;
+}
+
+#[tokio::test]
+async fn usdc_swap_refund_reverse_evm_increase_time() {
+    refund_swap(Direction::TakerPaysDivi, TimeJump::IncreaseTime).await;
 }

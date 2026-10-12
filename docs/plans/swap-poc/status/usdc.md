@@ -342,3 +342,32 @@
   the lane-sync) still asserted the old disabled shape; fixed to match `ltc-divi-testnet`
   now being served. All checks re-run clean after both fixes (`check-usdc.sh`, workspace
   clippy, `divi-swapd`/`swap-chain-evm`/`divi-swap-cli` suites, `shellcheck`, both dry runs).
+- **Wave 8** (this seam): orchestrator asked to add `--scenario case-c` and `--network
+  base-sepolia` to `usdc-live.sh` and prove case-c end to end on anvil via
+  `evm_increaseTime`. Both flags already existed, landed in `50f18a2` (the prior seam) —
+  `usdc-live.sh` has had `--scenario happy|case-c|all` and `--network sepolia|base-sepolia`
+  since then; reconfirmed live just now (`--dry-run --network base-sepolia --scenario
+  case-c` runs cleanly, no keys). Flagging this so the orchestrator's model of this lane
+  stays accurate rather than silently redoing already-landed work.
+  - New, actually new: case-c's refund timing is now also proven against `evm_increaseTime`
+    (a *relative* clock advance), not just the existing `evm_setNextBlockTimestamp`
+    (*absolute*) — different test/fork tooling supports one or the other, so proving both
+    means case-c's refund path isn't accidentally resting on one RPC's specific semantics.
+    `crates/divi-swap/tests/usdc.rs`: `jump_usdc_time` took a new `TimeJump` enum
+    (`SetNextBlockTimestamp` | `IncreaseTime`); `refund_swap(dir, time_jump)` now threads it
+    through. Two new tests, both directions:
+    `usdc_swap_refund_forward_evm_increase_time`/`usdc_swap_refund_reverse_evm_increase_time`
+    — same case-c proof as the existing `usdc_swap_refund_forward`/`_reverse` (taker never
+    claims, both legs time out, both sides refund through `UsdcBackend::build_refund`), just
+    advancing anvil's clock the other way. `evm_increaseTime` only takes effect on the next
+    *mined* block (confirmed empirically against a scratch anvil instance: returns the
+    applied delta, e.g. `99` for a requested `100`), so the jump is followed by an explicit
+    `evm_mine` the same way the existing `mine_usdc_block` helper already does elsewhere.
+  - `tools/swap-poc/usdc-live-dry-run.sh`'s doc comment and echo updated to name all 6
+    `tests/usdc.rs` tests it now runs (was 4), including both new ones.
+  - No live runs, no swap keys, as asked: everything proven on anvil with throwaway dev
+    keys; `usdc-live.sh --dry-run` (no keys) re-checked after lane-sync for both networks.
+  - `cargo fmt`/`cargo clippy --workspace --all-targets -- -D warnings` clean;
+    `check-usdc.sh` PASS; full `divi-swap` suite green (121 tests across 6 binaries, up from
+    119 — the 2 new tests), `tests/usdc.rs` specifically now 6/6; `shellcheck` clean on both
+    `usdc-live.sh` and `usdc-live-dry-run.sh`; `usdc-live-dry-run.sh` re-run clean end to end.
