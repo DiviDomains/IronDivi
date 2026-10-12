@@ -124,12 +124,41 @@
     place from a prior landing — just needed its `served`/`disabled_offers` list
     expectations updated now that this offer moved from disabled to served. Noted the
     190000 figure in `docs/plans/swap-poc/wave4-deploy.md` §6.
+  - **Transient-error bug fix** (this session, orchestrator bug report): a live case-c run
+    (`divi-swap run --counter-chain ltc --never-claim`) exited 1 after both locks on
+    `transient backend error: .../blocks/tip/hash: error sending request` — one Esplora
+    network hiccup killed the whole run. Root cause: `bin/divi-swap/src/flow.rs`'s
+    `run_swap_gated` (the one step loop shared by **every** counter chain — BTC, LTC, …,
+    not a per-chain thing) propagated any error from `release()` (which calls
+    `median_time_past()` every poll under `ClaimPolicy::Never`/`NotBefore`) or `step()`
+    straight out of the function via `?`, ending the run on the first transient failure
+    instead of retrying. Fixed: the loop now inspects the error (`anyhow::Error::
+    downcast_ref::<SwapError>().is_some_and(SwapError::is_retryable)` — catches both
+    `Transient` and `Premature`, matching the documented contract in `error.rs`: "Transient
+    is retried, Premature is retried later"), and on a retryable error logs a `WARN` and
+    retries the *same* poll after an exponential backoff (starts at `opts.poll`, doubles,
+    capped at 300 s; resets to `opts.poll` on the next success) instead of propagating.
+    A non-retryable error still ends the run as before.
+    - New regression test `never_claim_survives_a_transient_backend_error`
+      (`bin/divi-swapd/tests/e2e_gated.rs`, beside the existing `never_claim_ends_in_refunds`
+      it's modeled on): forces the plain BTC/DIVI mock world's DIVI backend offline
+      (`MockChain::set_offline`, already-existing fault injection — every `ChainBackend`
+      call on it fails `SwapError::Transient` while set) for 4 consecutive polls partway
+      through a `ClaimPolicy::Never` gated run, then asserts it still reaches
+      `TakerState::Done` with the taker refunded and nothing claimed. Deliberately **not**
+      LTC-specific — the fix lives in the shared loop, so the plain BTC/DIVI harness proves
+      it generically, cheaper than standing up the LTC mock world. (First draft used a
+      10-poll outage window; the exponential backoff on 10 *consecutive* failures balloons
+      past 15 s of real sleep — 15+30+…+7680 ms — making the test slow without adding
+      coverage. Shrunk to 4 polls, confirmed via a temporary `tracing_subscriber` capture
+      that the retries and backoff really fire, then removed the temporary logging.)
   - All of: `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`,
     `cargo test` clean for `swap-chain-ltc` (30 tests, 2 `#[ignore]`), `divi-swapd`
-    (17 lib + 27 integration tests), `divi-swap-cli`. `tools/swap-poc/check-ltc.sh` and
-    `check-ltc-live.sh` both PASS.
+    (18 lib + 28 integration tests), `divi-swap-cli` (5 lib tests).
+    `tools/swap-poc/check-ltc.sh` and `check-ltc-live.sh` both PASS.
 - running: nothing further queued; idle until the orchestrator lands this or the next live
-  result (reverse direction, case-c either direction) comes in.
+  result (reverse direction, case-c either direction) comes in. Orchestrator resuming the
+  interrupted live case-c run by hand with `divi-swap refund`.
 - left / next steps:
   ```sh
   tools/swap-poc/ltc-live.sh --backend live --direction forward --dry-run   # sanity check

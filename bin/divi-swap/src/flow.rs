@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use divi_swap::taker::TAKER_SAFETY_MARGIN_SECS;
-use divi_swap::{Chain, ChainBackend, Store, Taker, TakerState};
+use divi_swap::{Chain, ChainBackend, Store, SwapError, Taker, TakerState};
 
 use crate::client::MakerClient;
 use crate::session::{Session, Sessions};
@@ -124,17 +124,39 @@ pub async fn run_swap_gated(
     lock(taker, client, sessions, &local).await?;
     let started = Instant::now();
     let mut held = false;
+    let mut backoff = opts.poll;
     loop {
         pump();
-        let state = match (gate, held) {
+        // A transient backend error (a network hiccup on either chain, e.g. a failed
+        // Esplora request) must never end the run: retry this poll after a backoff
+        // instead of propagating it. Orchestrator bug report: a live case-c run died on
+        // one "error sending request" mid-poll, after both sides had already locked.
+        // Chain-agnostic — this is the one step loop shared by every counter chain.
+        let outcome = match (gate, held) {
             // Verified and persisted but not claimed: do not step (a step would claim).
-            (Some(g), true) if !release(g, &local).await? => TakerState::MakerLockConfirmed,
-            (Some(_), true) => {
-                taker.halt_after(None);
-                gate = None;
-                step(taker, client, sessions, &local).await?
+            (Some(g), true) => match release(g, &local).await {
+                Ok(false) => Ok(TakerState::MakerLockConfirmed),
+                Ok(true) => {
+                    taker.halt_after(None);
+                    gate = None;
+                    step(taker, client, sessions, &local).await
+                }
+                Err(e) => Err(e),
+            },
+            _ => step(taker, client, sessions, &local).await,
+        };
+        let state = match outcome {
+            Ok(s) => {
+                backoff = opts.poll;
+                s
             }
-            _ => step(taker, client, sessions, &local).await?,
+            Err(e) if is_retryable_backend_error(&e) => {
+                tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "transient backend error; retrying after backoff");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+                continue;
+            }
+            Err(e) => return Err(e),
         };
         if state == TakerState::Done {
             return Ok((local, state));
@@ -145,6 +167,14 @@ pub async fn run_swap_gated(
         }
         tokio::time::sleep(opts.poll).await;
     }
+}
+
+/// Whether `e` is a retryable [`SwapError`] (`Transient` or `Premature`,
+/// [`SwapError::is_retryable`]) that reached here through `?` into an `anyhow::Error` —
+/// the concrete type survives the conversion, so this still works.
+fn is_retryable_backend_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SwapError>()
+        .is_some_and(SwapError::is_retryable)
 }
 
 /// Fresh quote → prepare → `POST /swaps` → record the maker's reply. Returns the local id.

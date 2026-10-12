@@ -167,3 +167,71 @@ async fn never_claim_ends_in_refunds() {
     assert!(rec.taker_leg_refund.is_some());
     d.stop();
 }
+
+/// Orchestrator bug report: a live case-c run (`divi-swap run --never-claim`) died on a
+/// single transient Esplora error ("error sending request") mid-poll, after both sides had
+/// already locked. The fix is in `flow::run_swap_gated`'s step loop, not any one chain
+/// backend, so this reproduces it with the plain BTC/DIVI mock world (no LTC needed) by
+/// forcing the DIVI backend offline for a few polls — every `ChainBackend` call on it
+/// fails `SwapError::Transient` while offline (`MockChain::set_offline`), exactly the
+/// error class reported. The run must retry past it and still finish refunded.
+#[tokio::test]
+async fn never_claim_survives_a_transient_backend_error() {
+    let w = World::new();
+    let dir = tempfile::tempdir().unwrap();
+    let d = serve(
+        &w,
+        w.maker(Store::open(&dir.path().join("m.db")).unwrap()),
+        Some(TICK),
+    )
+    .await;
+    let tdb = dir.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let gate = ClaimGate {
+        policy: ClaimPolicy::Never,
+        store: Store::open(&tdb).unwrap(),
+        divi: Arc::new(w.taker_divi.clone()),
+        btc: Arc::new(w.taker_btc.clone()),
+    };
+    let mut polls = 0u32;
+    let mut went_offline = false;
+    let (local, state) = flow::run_swap_gated(
+        &taker,
+        &client,
+        &sessions,
+        OFFER_ID,
+        BTC_SATS,
+        &fast(),
+        &mut || {
+            polls += 1;
+            // A short outage partway through: long enough to prove the loop retries more
+            // than once, short enough that the backoff (doubling each consecutive
+            // failure) doesn't make the test slow — 4 failures tops out under 150 ms.
+            let offline = (20..24).contains(&polls);
+            went_offline |= offline;
+            w.divi.set_offline(offline);
+            w.divi.mine(1);
+            w.divi.advance_time(300);
+            w.btc.mine(1);
+            w.btc.advance_time(300);
+        },
+        Some(&gate),
+    )
+    .await
+    .unwrap();
+    assert!(went_offline, "the outage window never ran");
+    assert_eq!(state, TakerState::Done);
+    let id = sessions.get(&local).unwrap().maker_swap_id;
+    let view = client.swap(&id).await.unwrap();
+    assert!(view.preimage.is_none(), "nothing was ever claimed");
+    let rec = Store::open(&tdb)
+        .unwrap()
+        .get_taker_swap(&local)
+        .unwrap()
+        .unwrap();
+    assert!(rec.maker_leg_claim.is_none());
+    assert!(rec.taker_leg_refund.is_some());
+    d.stop();
+}
