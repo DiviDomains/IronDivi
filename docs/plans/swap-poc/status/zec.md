@@ -17,6 +17,39 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **ZEC testnet confirmations raised 3 → 9, 2026-10-12 ~05:10 EDT** (orchestrator's
+    decision on the safety-review finding below, explicitly authorizing this one edit to
+    `crates/divi-swap/src/config.rs` — normally the frozen engine contract, lane
+    `multichain`'s). `ChainParams::builtin`'s testnet-ZEC comment ("75-second blocks") was
+    stale; at the real ≈24.8s/block NU7 rate, the old "3" confirmations was only ≈75s of
+    finality depth, a third of the ≈225s the "3" was presumably chosen to reach at the
+    (wrong) assumed rate. 9 × 24.8s ≈ 223s restores the original intent almost exactly.
+    Comment fixed to state the real ≈25s rate and explain the 3→9 history, so the next
+    person doesn't have to re-derive it.
+    - **Re-checked the safety gate is still comfortable, as asked**: `required_gap_secs()`
+      depends only on `mtp_lag_secs` (unchanged, 1800) and `claim_margin_secs`, not
+      `confirmations` — the gap/margin math from the review above is completely unaffected
+      by this change. The only thing that changed is how many extra blocks `taker_window_
+      too_short`'s callers wait through before the maker locks — +6 confirmations × ≈24.8s
+      ≈ +149s, against a budget in the thousands of seconds (10,800s `required_gap_secs`
+      alone). Comfortable, confirmed by the full mock suite passing unchanged in substance.
+    - **Found and fixed a real regression this surfaced**: `crates/divi-swap/tests/
+      engine.rs`'s `case_d_body` (shared by `case_d_late_claim`/`zec_fwd_case_d_late_claim`/
+      `zec_rev_case_d_late_claim`/`ltc_fwd_case_d_late_claim`/`ltc_rev_case_d_late_claim`
+      etc.) drives the maker to `MakerLockConfirmed` in a hardcoded `0..12`-round loop —
+      sized for confirmations=3; at 9 it ran out of rounds before ZEC's lock finished
+      confirming, failing both ZEC directions (`left: MakerLocked, right:
+      MakerLockConfirmed`). Bumped to `0..30` (generous headroom for the new worst case
+      without materially slowing the other chains, which still break out early same as
+      before). This is exactly the kind of fast-feedback catch a real test suite is for —
+      found and fixed within the same session as the config change, before it could land
+      broken.
+    - Verified: `cargo test -p divi-swap --test engine` — the full `zec_*` family (26
+      tests, including `case_d` and every `crash_at_every_*`/`prop_random_crash_points`
+      variant) green, `case_d` across every chain family (default/BTC, LTC, ZEC — 6 tests)
+      green; full `cargo test -p divi-swap` (engine.rs + usdc.rs + taker_decline.rs + doc
+      tests) green; `cargo clippy -p divi-swap --all-targets --all-features -- -D
+      warnings` and `cargo fmt -p divi-swap -- --check` both clean; `check-zec.sh` PASS.
   - **Timeout-margin safety review across btc/ltc/zec/evm-usdc, 2026-10-12 ~04:40 EDT.**
     Orchestrator's ask: confirm the maker can never be left unable to claim after the
     taker claims (maker claim window vs taker timeout, block-time variance, confirmation
@@ -770,13 +803,6 @@
   (asserts the redeem-script digest and the scriptPubKey digest differ, and that only the
   latter verifies) — self-consistent but not independently verified against a second
   implementation.
-- needs: a decision (`crates/divi-swap/src/config.rs`, the frozen engine contract — lane
-  `multichain`'s, not mine) on whether to bump `ChainParams::builtin`'s ZEC testnet
-  confirmations past 3, found during the timeout-margin safety review above. The "75-second
-  blocks" comment that justified "3" is stale (real NU7 is ≈24.8s/block); at the real rate,
-  3 confirmations is ≈75s of finality depth, about a third of what "3 confirmations at an
-  assumed 75s/block ≈225s" was presumably going for. Not a timeout-margin bug (a shallower
-  wait only leaves *more* of the fixed budget unused, if anything helping that property) —
-  purely a reorg-resistance question, and testnet stakes are low, so this is a "someone
-  should decide" flag, not an urgent fix. Bumping to ~9 would restore the original ~225s
-  intent at the real block rate, if that's still the desired depth.
+- ~~needs: a decision on ZEC testnet confirmations~~ **decided and done** — see "done" below
+  (the orchestrator authorized editing `config.rs`, the normally-frozen engine contract,
+  for this one change specifically).

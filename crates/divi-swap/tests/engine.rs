@@ -535,8 +535,10 @@ async fn case_d_body(dir: Direction) {
     let mut h = H::with(dir);
     h.accept(None).await;
     h.lock_and_notify(None).await;
-    // Drive the maker alone until its lock is confirmed.
-    for _ in 0..12 {
+    // Drive the maker alone until its lock is confirmed. Generous enough for the slowest
+    // chain/profile combo currently configured (ZEC testnet's 9 confirmations on top of
+    // whichever leg it's on, plus the taker-leg wait before the maker even locks).
+    for _ in 0..30 {
         h.maker.tick().await.unwrap();
         h.mine_all(1);
         if h.maker_state() == SwapState::MakerLockConfirmed {

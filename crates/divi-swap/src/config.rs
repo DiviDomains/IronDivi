@@ -44,8 +44,10 @@ impl ChainParams {
             Chain::Btc => (if mainnet { 2 } else { 1 }, 3600),
             // 2.5-minute blocks: same wall-clock depth as BTC needs ~4× the blocks.
             Chain::Ltc => (if mainnet { 6 } else { 2 }, 1800),
-            // 75-second blocks.
-            Chain::Zec => (if mainnet { 10 } else { 3 }, 1800),
+            // ~25-second blocks (NU7, measured live; testnet confirmations raised from 3 to
+            // 9 to keep the same ~225s finality depth this chain always intended — the
+            // figure was set assuming 75s blocks before the real NU7 rate was measured).
+            Chain::Zec => (if mainnet { 10 } else { 9 }, 1800),
             // 1-minute blocks.
             Chain::Divi => (if mainnet { 10 } else { 3 }, 1800),
             // ~12-second blocks; 12 confirmations is the common safe-finality heuristic for
