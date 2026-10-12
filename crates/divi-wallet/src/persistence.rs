@@ -54,6 +54,10 @@ const KEY_LAST_SCAN_HEIGHT: &[u8] = b"last_scan_height";
 const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
 const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
+const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+
+/// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
+pub(crate) const ENCRYPTED_SECRET_SUFFIX: u8 = 0x01;
 
 /// Salt and encrypted master key pair
 type EncryptionMetadata = (Vec<u8>, Vec<u8>);
@@ -134,6 +138,38 @@ impl WalletDatabase {
                 Ok(Some(mnemonic))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Accessors for the encrypted mnemonic blob (`[IV][AES-256-CBC ciphertext]`)
+    pub fn load_encrypted_mnemonic(&self) -> Result<Option<Vec<u8>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_ENCRYPTED_MNEMONIC)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load every encrypted private key: stored under `hash160 || 0x01` in the keys CF
+    pub fn load_encrypted_secrets(&self) -> Result<Vec<(Hash160, Vec<u8>)>, WalletError> {
+        let cf = self.db.cf_handle(CF_KEYS).unwrap();
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if key.len() == 21 && key[20] == ENCRYPTED_SECRET_SUFFIX {
+                let hash = Hash160::from_bytes(key[..20].try_into().unwrap());
+                out.push((hash, value.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Force the metadata and key column families through compaction so that
+    /// overwritten/deleted plaintext does not linger in old SST files.
+    pub fn compact_secret_cfs(&self) {
+        for name in [CF_METADATA, CF_KEYS] {
+            if let Some(cf) = self.db.cf_handle(name) {
+                self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+            }
         }
     }
 
@@ -811,7 +847,14 @@ pub(crate) fn serialize_key_entry(entry: &KeyEntry) -> Vec<u8> {
     data.push(2u8);
 
     // Flags: bit 0 = watch_only
-    let flags = if entry.is_watch_only { 0x01 } else { 0x00 };
+    // bit 1 = secret stripped (held encrypted elsewhere; only the public key is stored)
+    let flags = if entry.is_watch_only {
+        0x01
+    } else if entry.secret.is_none() {
+        0x02
+    } else {
+        0x00
+    };
     data.push(flags);
 
     // Key data
@@ -863,8 +906,9 @@ fn deserialize_key_entry(data: &[u8]) -> Result<KeyEntry, WalletError> {
         let flags = data[pos];
         pos += 1;
         let is_watch_only = (flags & 0x01) != 0;
+        let secret_stripped = (flags & 0x02) != 0;
 
-        if is_watch_only {
+        if is_watch_only || secret_stripped {
             // Watch-only: read public key (33 bytes)
             if data.len() < pos + 33 {
                 return Err(WalletError::Storage("Invalid watch-only key data".into()));
@@ -873,7 +917,7 @@ fn deserialize_key_entry(data: &[u8]) -> Result<KeyEntry, WalletError> {
             let public = PublicKey::from_bytes(&pubkey_bytes)
                 .map_err(|e| WalletError::Storage(format!("Invalid public key: {}", e)))?;
             pos += 33;
-            (true, None, public)
+            (is_watch_only, None, public)
         } else {
             // Regular key: read secret (32 bytes)
             if data.len() < pos + 32 {

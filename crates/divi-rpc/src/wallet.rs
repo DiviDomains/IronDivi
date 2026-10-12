@@ -357,8 +357,7 @@ impl WalletRpc {
             "balance": divi_balance,
             "spendable_balance": divi_balance,
             "vaulted_balance": 0.0,
-            // A Rust wallet can never be encrypted (see docs/rpc-parity-audit.md)
-            "encryption_status": "unencrypted",
+            "encryption_status": wallet.encryption_status(),
             "unconfirmed_balance": divi_unconfirmed,
             "immature_balance": divi_immature,
             "txcount": wallet.get_transactions(None).len(),
@@ -367,7 +366,7 @@ impl WalletRpc {
             // explicitly pre-generated; HD wallets derive keys on demand so the
             // effective available key count is always at least the target size.
             "keypoolsize": std::cmp::max(wallet.keypool_size(), 100u32),
-            "unlocked_until": 0,
+            "unlocked_until": wallet.unlocked_until(),
             "paytxfee": 0.0001,
             "hdmasterkeyid": wallet.hd_master_key_id()
         }))
@@ -2619,11 +2618,49 @@ impl WalletRpc {
         // Change the passphrase
         wallet
             .change_passphrase(old_passphrase, new_passphrase)
-            .map_err(|_| {
-                RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
+            .map_err(|e| match e {
+                divi_wallet::WalletError::WrongPassphrase => RpcError::new(
+                    codes::WALLET_PASSPHRASE_INCORRECT,
+                    "Error: The wallet passphrase entered was incorrect.",
+                ),
+                other => RpcError::new(codes::WALLET_ENCRYPTION_FAILED, other.to_string()),
             })?;
 
         Ok(serde_json::Value::Null)
+    }
+
+    /// encryptwallet - Encrypt the wallet with a passphrase (one-way; leaves it locked)
+    pub fn encrypt_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let passphrase = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::invalid_params("encryptwallet \"passphrase\""))?;
+        if passphrase.is_empty() {
+            return Err(RpcError::invalid_params("passphrase can not be empty").into());
+        }
+
+        let wallet = self.get_wallet()?;
+
+        if wallet.is_encrypted() {
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an encrypted wallet, but encryptwallet was called.",
+            )
+            .into());
+        }
+
+        wallet.encrypt_wallet(passphrase).map_err(|e| {
+            RpcError::new(
+                codes::WALLET_ENCRYPTION_FAILED,
+                format!("Error: Failed to encrypt the wallet: {}", e),
+            )
+        })?;
+
+        // Unlike C++ Divi, the node keeps running: the wallet is already locked and
+        // its plaintext secrets are gone from memory and disk.
+        Ok(serde_json::json!(
+            "wallet encrypted; the wallet is now locked. Use walletpassphrase to unlock it. \
+             Back up your wallet again: earlier backups are not encrypted."
+        ))
     }
 
     /// getreceivedbyaddress - Get total amount received by an address
@@ -3668,6 +3705,78 @@ mod tests {
         let wallet = HdWallet::new(ChainMode::Divi).unwrap();
         let wallet_db = Arc::new(WalletDb::with_hd_wallet(Network::Mainnet, wallet));
         WalletRpc::with_wallet(wallet_db)
+    }
+
+    fn rpc_code(e: Error) -> i32 {
+        match e {
+            Error::Rpc(r) => r.code,
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encryptwallet_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let hd = HdWallet::new(ChainMode::Divi).unwrap();
+        let db = WalletDb::create_persistent(&dir.path().join("w"), Network::Testnet, hd).unwrap();
+        let rpc = WalletRpc::with_wallet(Arc::new(db));
+        let p = |v: &[&str]| Params::Array(v.iter().map(|s| serde_json::json!(s)).collect());
+
+        // Unencrypted: unlock/lock/change are wrong-state errors, status is unencrypted
+        let info = rpc.get_wallet_info(&Params::None).unwrap();
+        assert_eq!(info["encryption_status"], "unencrypted");
+        assert_eq!(
+            rpc_code(rpc.wallet_passphrase_change(&p(&["a", "b"])).unwrap_err()),
+            codes::WALLET_WRONG_ENC_STATE
+        );
+
+        assert!(rpc.encrypt_wallet(&p(&["secret pass"])).is_ok());
+        assert_eq!(
+            rpc.get_wallet_info(&Params::None).unwrap()["encryption_status"],
+            "locked"
+        );
+        // Second encryption is refused
+        assert_eq!(
+            rpc_code(rpc.encrypt_wallet(&p(&["again"])).unwrap_err()),
+            codes::WALLET_WRONG_ENC_STATE
+        );
+        // Locked wallet cannot hand out new addresses
+        assert_eq!(
+            rpc_code(rpc.get_new_address(&Params::None).unwrap_err()),
+            codes::WALLET_UNLOCK_NEEDED
+        );
+
+        // Wrong passphrase, then right one
+        let unlock = |pass: &str| {
+            rpc.wallet_passphrase(&Params::Array(vec![
+                serde_json::json!(pass),
+                serde_json::json!(60),
+            ]))
+        };
+        assert_eq!(
+            rpc_code(unlock("wrong").unwrap_err()),
+            codes::WALLET_PASSPHRASE_INCORRECT
+        );
+        unlock("secret pass").unwrap();
+        assert_eq!(
+            rpc.get_wallet_info(&Params::None).unwrap()["encryption_status"],
+            "unlocked"
+        );
+        assert!(rpc.get_new_address(&Params::None).is_ok());
+
+        // Change passphrase: wrong old fails, right old works, old no longer unlocks
+        assert_eq!(
+            rpc_code(
+                rpc.wallet_passphrase_change(&p(&["nope", "x"]))
+                    .unwrap_err()
+            ),
+            codes::WALLET_PASSPHRASE_INCORRECT
+        );
+        rpc.wallet_passphrase_change(&p(&["secret pass", "other pass"]))
+            .unwrap();
+        rpc.wallet_lock(&Params::None).unwrap();
+        assert!(unlock("secret pass").is_err());
+        unlock("other pass").unwrap();
     }
 
     #[test]

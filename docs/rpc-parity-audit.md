@@ -30,6 +30,7 @@ Implemented or fixed:
 | `listmasternodes` | returns a bare array |
 | `getaddednodeinfo` | arg order is `dns ( "node" )`; unknown node gives `-24` |
 | `getnetworkinfo`, `getpeerinfo`, `mnsync status` | missing fields added |
+| `encryptwallet`, `walletpassphrasechange`, `walletpassphrase`, `walletlock` | real wallet encryption: the mnemonic and every private key are AES-256-CBC encrypted under a random master key, which is sealed by a PBKDF2 key from the passphrase. Plaintext is deleted from the DB and compacted out. `getwalletinfo` reports real `encryption_status` and `unlocked_until`. Verified on a live regtest `irondivid`, including restart persistence |
 
 Harness result on live testnet nodes (157 call rows): before these fixes MATCH 22 /
 DIFFERS 69; after, **MATCH 47 / UNVERIFIED 8 / DIFFERS 40**. `bip38paperwallet` was also
@@ -42,9 +43,6 @@ round-tripped through `bip38decrypt` (right and wrong passphrase) on a live iron
 "invalidate then reorganise" path (`mark_block_failed`, `disconnect_block`,
 `reorganize_chain` exist in `divi-storage/src/chain.rs`, but `activate_best_chain` only
 reorgs to a heavier chain). `signtransactionwithaddresskey` not started.
-`encryptwallet`/`walletpassphrasechange`: a Rust wallet can never become encrypted (no
-encryption metadata is stored; the mnemonic is plaintext; `WalletDb::change_passphrase` is
-a no-op). This needs a design decision, not a fake RPC.
 
 **Stubs / hardcoded:**
 - `getpeerinfo`: `version`, `subver`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`,
@@ -77,6 +75,10 @@ encryption state, `-22` deserialization) are listed per method in the harness ma
 
 ## Deliberate deviation
 
+`encryptwallet`: C++ stops the daemon after encrypting (to rebuild the keypool). Rust keeps
+running and leaves the wallet locked. Rust has no keypool, so `getnewaddress` on a locked
+encrypted wallet returns -13 until `walletpassphrase`.
+
 `listbanned`: C++ returns `{"banned:": "<string>"}` (stray colon, value is a pre-formatted
 string: a C++ bug). Rust returns a proper array.
 
@@ -103,6 +105,5 @@ These abort the C++ daemon; do not call them on a production node:
 1. Per-peer stats for `getpeerinfo`.
 2. Masternode subsystem RPCs (largest remaining gap).
 3. `invalidateblock` family (engine work).
-4. `encryptwallet` design.
-5. Fill the missing keys listed under "Shape differences".
-6. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.
+4. Fill the missing keys listed under "Shape differences".
+5. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.

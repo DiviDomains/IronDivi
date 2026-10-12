@@ -297,6 +297,22 @@ impl KeyStore {
         *self.change_index.write() = change;
     }
 
+    /// Drop every private key and the HD seed from memory (wallet lock).
+    /// Public keys stay, so `have_key`/`is_mine` keep working while locked.
+    pub fn strip_secrets(&self) {
+        for entry in self.keys.write().values_mut() {
+            entry.secret = None;
+        }
+        *self.hd_wallet.write() = None;
+    }
+
+    /// Restore a private key stripped by `strip_secrets` (wallet unlock).
+    pub fn restore_secret(&self, hash: &Hash160, secret: SecretKey) {
+        if let Some(entry) = self.keys.write().get_mut(hash) {
+            entry.secret = Some(secret);
+        }
+    }
+
     /// Set the HD wallet (for restoration from persistence)
     pub fn set_hd_wallet(&self, wallet: HdWallet) {
         *self.hd_wallet.write() = Some(wallet);
