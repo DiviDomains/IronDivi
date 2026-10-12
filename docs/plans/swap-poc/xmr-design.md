@@ -484,10 +484,42 @@ incidental, so a force-fit attempt would be wasted effort, not a useful first tr
   harder to keep maintained than it looks, or demand is thin, or both. Budget this lane's
   downstream build (steps 2–9) as a multi-week effort, not a quick wire-up, even with the crates in
   [Crates](#crates) doing the cryptographic heavy lifting.
-- **No live-chain acceptance test exists yet** (this turn delivers design + the DIVI prerequisite
-  only, per scope) — everything above is verified against the real DIVI source and the current
-  crate ecosystem, but not yet against a running swap. Steps 7–8 of the build plan are where that
-  verification actually happens.
+- **Pre-segwit transaction malleability, closed against a passive relayer, not against the
+  transaction's own miner.** Every presigned child in [Protocol](#protocol) references its
+  parent by txid (`Tx_redeem`/`Tx_refund`/`Tx_punish` → `Tx_cancel` or `Tx_lock`), so if a
+  parent's byte encoding changes before it's mined, its txid changes and every child built
+  against the old txid becomes unspendable until a fresh set is co-signed. Checked against the
+  real `DiviProject/Divi` source (not assumed) rather than guessed, since the multichain lane
+  flagged this as an open question for this lane to close:
+  [`divi/src/script/standard.h`](https://github.com/DiviProject/Divi/blob/master/divi/src/script/standard.h)
+  defines `MANDATORY_SCRIPT_VERIFY_FLAGS = P2SH | DERSIG | REQUIRE_COINSTAKE` — deliberately
+  **not** `LOW_S`/`STRICTENC`/`NULLDUMMY`/`MINIMALDATA` — and `STANDARD_SCRIPT_VERIFY_FLAGS`
+  (the fuller set, including those) is checked only for **mempool acceptance**
+  (`MempoolConsensus.cpp`'s `AcceptToMemoryPool`, which checks `STANDARD_SCRIPT_VERIFY_FLAGS`
+  first, then re-checks `MANDATORY_SCRIPT_VERIFY_FLAGS` as a defense-in-depth DoS guard against
+  bugs in the standard set — the same comment, nearly verbatim, as Bitcoin Core's own historical
+  rationale for this exact split). Block-level consensus validation of an already-mined block
+  (`BlockTransactionChecker::Check`, run by every full node on every transaction in every
+  received block) enforces only `MANDATORY_SCRIPT_VERIFY_FLAGS`. Net effect, same as
+  pre-segwit Bitcoin: a third party who isn't mining the block **cannot** malleate a
+  transaction into propagating (mempool relay enforces `LOW_S` and the rest, rejecting a
+  flipped-S or non-minimal-push re-encoding before it ever reaches another node's mempool),
+  but **the transaction's own miner can** — they aren't relaying it through anyone else's
+  mempool policy, they're embedding their own re-encoding directly into a block they construct,
+  and that block only needs to satisfy the mandatory subset. This is a **liveness risk, not a
+  fund-loss risk**: the actual output being spent doesn't change, only its presigned children's
+  validity, so funds stay recoverable by cooperatively re-signing fresh children against
+  whatever txid actually got mined — but it does mean a malicious or compromised miner can grief
+  a swap into needing manual recovery. Mitigate operationally (same posture as the BTC/DIVI HTLC
+  lane already takes toward reorgs): watch for the parent's actual confirmed txid before relying
+  on a presigned child, and re-sign if it doesn't match what was planned for.
+- **Live-chain acceptance has now run, both directions.** The forward (happy) path and the
+  abort/refund path have both run live, end to end, on real DIVI testnet and Monero stagenet
+  chains, through a public restricted Monero node — every txid in
+  `docs/plans/swap-poc/status/xmr.md`. Five real bugs were found and fixed along the way (DIVI
+  tx version policy, Monero pruned-transaction scanning, `get_output_distribution` fetch
+  reliability, DIVI relay fee, Monero's real spendable-age minimum) — none of them visible from
+  offline testing alone.
 
 ## Recommendation
 

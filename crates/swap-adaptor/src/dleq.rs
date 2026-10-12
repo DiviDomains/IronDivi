@@ -29,6 +29,34 @@ use sigma_fun::HashTranscript;
 
 type Transcript = HashTranscript<Sha256, ChaCha20Rng>;
 
+/// [`CrossCurveDleq::nums`]'s secp256k1 generator, compressed SEC1 (33 bytes,
+/// `0x02 || x`) -- the first `0x02 || SHA256(label || ctr)` (big-endian `u32`
+/// counter) that is a valid x-coordinate, for `ctr` starting at 0 and the label
+/// `"IronDivi swap-adaptor CrossCurveDleq h_p secp256k1 v1"`. Reproduced by
+/// `tests::nums_matches_its_own_rederivation`; see [`CrossCurveDleq::nums`]'s docs for
+/// why the bytes are pinned here instead of recomputed at runtime.
+#[rustfmt::skip]
+const H_P_BYTES: [u8; 33] = [
+    0x02, 0x62, 0x98, 0xfc, 0xd1, 0x75, 0x34, 0x9a,
+    0x64, 0x78, 0x59, 0xda, 0x1a, 0xcd, 0xfd, 0x2c,
+    0x7b, 0xe0, 0x60, 0xa0, 0x36, 0x1d, 0x48, 0x0c,
+    0xb7, 0x8e, 0x73, 0xe9, 0xb0, 0xbd, 0x94, 0xef,
+    0xcb,
+];
+
+/// [`CrossCurveDleq::nums`]'s ed25519 generator, compressed (32 bytes) -- the first
+/// `SHA256(label || ctr)` that decompresses to a point, times the cofactor (clearing
+/// torsion into the prime-order subgroup) and non-identity, for `ctr` starting at 0
+/// and the label `"IronDivi swap-adaptor CrossCurveDleq h_q ed25519 v1"`. Reproduced
+/// by `tests::nums_matches_its_own_rederivation`.
+#[rustfmt::skip]
+const H_Q_BYTES: [u8; 32] = [
+    0xd8, 0xb0, 0x70, 0xdc, 0x27, 0x7a, 0x0c, 0x39,
+    0x9b, 0x78, 0x17, 0x9e, 0xda, 0x67, 0x6d, 0x5f,
+    0x5d, 0x10, 0x47, 0x88, 0x14, 0xcb, 0xd6, 0x23,
+    0x43, 0xa2, 0x1b, 0x5a, 0xc8, 0x10, 0xa2, 0x67,
+];
+
 /// Prover/verifier for one DLEQ instance. `h_p`/`h_q` are the Pedersen-commitment
 /// generator points (one per curve) baked into the 252 per-bit commitments the proof is
 /// built from.
@@ -65,6 +93,26 @@ impl CrossCurveDleq {
         let h_q: PointQ =
             &random_clamped_secret(rng) * &curve25519_dalek_ng::constants::ED25519_BASEPOINT_TABLE;
         Self::new(h_p, h_q)
+    }
+
+    /// The canonical, nothing-up-my-sleeve `(h_p, h_q)` pair every real swap must
+    /// agree on (see the NUMS requirement on [`CrossCurveDleq`] -- a prover who chose
+    /// these could forge the binding the whole proof exists to guarantee). Parses the
+    /// fixed, hard-coded bytes in [`H_P_BYTES`]/[`H_Q_BYTES`] rather than recomputing
+    /// them at runtime: the derivation (try-and-increment SHA-256 of a public,
+    /// domain-separated label -- `secp256k1_nums_h_p_candidate`/`ed25519_nums_h_q_candidate`
+    /// in the test module reproduce it) only has to run once, ever; pinning its output
+    /// as a constant means a future `sigma_fun`/`curve25519-dalek-ng` upgrade changing
+    /// some internal encoding detail can't silently mint a *different* pair than what
+    /// an already-run swap agreed on -- `nums_matches_its_own_rederivation` is the
+    /// drift alarm for that, not this function.
+    pub fn nums() -> Self {
+        Self::new(
+            PointP::from_bytes(H_P_BYTES).expect("H_P_BYTES is a valid compressed secp256k1 point"),
+            curve25519_dalek_ng::edwards::CompressedEdwardsY(H_Q_BYTES)
+                .decompress()
+                .expect("H_Q_BYTES is a valid compressed ed25519 point"),
+        )
     }
 
     /// Prove `secret` is simultaneously the discrete log of a secp256k1 point and an
@@ -170,5 +218,69 @@ mod tests {
 
         let (proof, claim) = dleq_a.prove(&secret, &mut rng);
         assert!(!dleq_b.verify(&proof, claim));
+    }
+
+    /// [`CrossCurveDleq::nums`]'s pinned bytes must actually reproduce the real
+    /// try-and-increment derivation they're supposed to be a frozen snapshot of --
+    /// the drift alarm the module docs promise: if a future dependency bump ever
+    /// changed anything about secp256k1/ed25519 point encoding, this fails loudly
+    /// instead of `nums()` silently handing out a different pair than a previously
+    /// run swap agreed on.
+    #[test]
+    fn nums_matches_its_own_rederivation() {
+        use curve25519_dalek_ng::edwards::CompressedEdwardsY;
+        use curve25519_dalek_ng::traits::IsIdentity;
+        use sha2::Digest as _;
+
+        const LABEL_P: &[u8] = b"IronDivi swap-adaptor CrossCurveDleq h_p secp256k1 v1";
+        const LABEL_Q: &[u8] = b"IronDivi swap-adaptor CrossCurveDleq h_q ed25519 v1";
+
+        fn candidate(label: &[u8], counter: u32) -> [u8; 32] {
+            let mut h = Sha256::new();
+            h.update(label);
+            h.update(counter.to_be_bytes());
+            h.finalize().into()
+        }
+
+        let h_p: PointP = (0u32..)
+            .find_map(|ctr| {
+                let mut bytes = [0u8; 33];
+                bytes[0] = 0x02;
+                bytes[1..].copy_from_slice(&candidate(LABEL_P, ctr));
+                PointP::from_bytes(bytes)
+            })
+            .expect("about half of all x-coordinates are on the curve");
+        assert_eq!(
+            h_p.to_bytes(),
+            H_P_BYTES,
+            "H_P_BYTES is stale -- re-derive and update it"
+        );
+
+        let h_q: PointQ = (0u32..)
+            .find_map(|ctr| {
+                CompressedEdwardsY(candidate(LABEL_Q, ctr))
+                    .decompress()
+                    .map(|p| p.mul_by_cofactor())
+                    .filter(|p| !p.is_identity())
+            })
+            .expect("about half of all y-coordinates decompress");
+        assert_eq!(
+            h_q.compress().to_bytes(),
+            H_Q_BYTES,
+            "H_Q_BYTES is stale -- re-derive and update it"
+        );
+    }
+
+    /// `nums()` must actually build a usable, working DLEQ instance against its own
+    /// pinned generators -- the real thing [`nums_matches_its_own_rederivation`]
+    /// doesn't exercise (it only checks the bytes, not that they parse into a working
+    /// proof system).
+    #[test]
+    fn nums_proves_and_verifies() {
+        let mut rng = thread_rng();
+        let dleq = CrossCurveDleq::nums();
+        let secret = random_clamped_secret(&mut rng);
+        let (proof, claim) = dleq.prove(&secret, &mut rng);
+        assert!(dleq.verify(&proof, claim));
     }
 }

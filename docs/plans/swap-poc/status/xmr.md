@@ -554,3 +554,115 @@
   (DIVI tx version, Monero pruned-tx scanning, distribution-fetch reliability, DIVI
   relay fee, Monero spendable-age) — none of them theoretical, all caught by actually
   running this live rather than only testing offline.
+
+## Round: multichain API handoff + punish-path live run
+
+- done, this round: synced onto `82d9a91` (resolved the same "untracked file now landed"
+  stash-pop snag as the two previous rounds — confirmed `xmr_live_refund.rs`/`live_rpc.rs`
+  byte-identical to the stash before dropping it).
+- **Answers to `~/swap-lanes/multichain/docs/plans/swap-poc/status/multichain.md`'s three
+  `- needs:` items for this lane** (per the orchestrator's "you own the crate" instruction):
+  1. **Canonical NUMS generators — provided.** `swap_adaptor::dleq::CrossCurveDleq::nums()`
+     is now real, public API: a fixed, hard-coded `(h_p, h_q)` pair (`H_P_BYTES`/`H_Q_BYTES`
+     constants in `dleq.rs`), not recomputed at runtime. Reviewed the multichain lane's own
+     try-and-increment stopgap (`divi-swap-xmr/src/nums.rs`) via the `oracle` first rather
+     than guessing on something this security-sensitive (a prover who could choose these
+     generators could forge the cross-curve binding the whole DLEQ proof exists to
+     guarantee) — verdict: cryptographically sound (the 0x02-parity fix matches BIP341's
+     `lift_x`; the ed25519 cofactor-clearing matches Monero's own alternate-generator `H`
+     derivation), but a *permanent* constant shouldn't be *defined* by live calls into
+     pre-1.0 crates (`sigma_fun`/`curve25519-dalek-ng`) whose internal encodings could
+     shift. Took the oracle's exact recommendation: ran the derivation once (fresh,
+     `swap-adaptor`-scoped label, not the downstream crate's own name), hard-coded the
+     resulting bytes as the constant, and kept try-and-increment only as a
+     `nums_matches_its_own_rederivation` test — a drift alarm, not the runtime path.
+     `cargo test -p swap-adaptor` 10/10 (2 new: that test, and `nums_proves_and_verifies`).
+     The multichain lane's own generators will change once they switch to this (expected —
+     nothing live has used their stopgap pair yet).
+  2. **Pre-segwit malleability — reviewed and documented, not fully closed.** Checked the
+     real `DiviProject/Divi` source (not assumed) rather than guessing: mempool acceptance
+     (`MempoolConsensus.cpp`'s `AcceptToMemoryPool`) checks the fuller
+     `STANDARD_SCRIPT_VERIFY_FLAGS` (includes `LOW_S`/`NULLDUMMY`/`STRICTENC`/`MINIMALDATA`),
+     but block-level consensus validation of an already-mined block
+     (`BlockTransactionChecker::Check`, what every full node runs on every transaction in
+     every received block) enforces only `MANDATORY_SCRIPT_VERIFY_FLAGS` (just
+     `P2SH`/`DERSIG`/coinstake-requirement — `divi/src/script/standard.h`). Same split
+     Bitcoin Core has always had, for the same reason (a defense-in-depth comment nearly
+     verbatim to Bitcoin's own). Net: a passive third party cannot malleate a transaction
+     into propagating (mempool relay would reject it), but **the transaction's own miner
+     can** re-encode it before including it in a block they personally construct. This is a
+     **liveness/griefing risk, not a fund-loss risk** (the actual output doesn't change,
+     only its presigned children's validity — recoverable by cooperatively re-signing fresh
+     children against whatever txid actually got mined). Written up in `xmr-design.md`'s
+     `## Risks` with the real citations.
+  3. **Live Monero API — already resolved, from the last two rounds' work; not a new gap.**
+     `swap_chain_xmr::live_rpc::{LiveDecoys, scan_for_lock_output, fetch_scannable_block,
+     monerod_get_info, check_xmr_confirmed, check_xmr_spendable}` and
+     `swap_chain_xmr::monero_sweep::sweep` are real, public library API (moved out of
+     `examples/xmr_live.rs` specifically so other consumers like `divi-swap-xmr` could use
+     them, not left example-only). Correcting one specific detail in the multichain status
+     note: `monero_sweep::sweep` does **not** take `ThresholdKeys` — its signature takes a
+     plain `&<Ed25519 as Ciphersuite>::F` (the already-combined full private spend scalar),
+     simpler than described. Build a Monero address straight from `monero_wallet::ViewPair`
+     (already a transitive dependency); no wrapper needed from this crate for that part.
+     The DIVI-side ask ("live `DiviChain`: `build_funding` to an arbitrary scriptPubKey +
+     raw-tx broadcast + `find_spend`") is **not this lane's crate** — `swap-chain-divi` is
+     owned by the `divi` lane, not `xmr`; flagging that split rather than silently taking on
+     scope that isn't mine. For what it's worth, every live example in this crate already
+     does exactly that pattern by hand (build a plain P2PKH-spend-to-arbitrary-scriptPubKey
+     transaction, broadcast via `swap_chain_divi::RpcClient::call_ok("sendrawtransaction",
+     ...)`) without needing `ChainBackend`/`HtlcParams` at all — see
+     `examples/xmr_live_refund.rs`'s/`xmr_live_punish.rs`'s Tx_lock-funding step for a
+     working reference, if useful to whoever picks up the `swap-chain-divi` side of this.
+- **Running the live punish path** (per the orchestrator's instruction: "if the design has
+  a punish path ... run it live with short timelocks like the refund run"). It does —
+  `xmr-design.md`'s `## Protocol` third failure case: "Maker locks DIVI, Taker locks XMR,
+  Maker then stalls" (never completes `Tx_refund`) → after `t_punish`, Taker broadcasts the
+  plain, pre-signed `Tx_punish`, seizing all of Maker's locked DIVI. Added
+  `examples/xmr_live_punish.rs`, same resumable discipline as the other two, funded from the
+  *refund* run's own reclaimed DIVI (again, no new tDIVI needed). Deliberately uses a small
+  XMR amount (0.01 XMR) since **this path's locked XMR is never recovered, by design** —
+  nobody ever learns `s_m` (Maker never completes `Tx_refund`), so Taker cannot reconstruct
+  the Monero spend key; this is the documented deterrent cost, not a bug, so there is no
+  final Monero sweep step in this example at all.
+  - Real transactions broadcast:
+    - DIVI `Tx_lock` (funded from the refund run's reclaimed DIVI):
+      `63bef2be6d281e62feee02c2029648abaf8a85a89f18ffdbe0bf238fca70cfeb`
+    - Monero lock (0.01 XMR from `mining-wallet`, permanently unrecoverable by design):
+      `cf2941b12ecaf42489825209aa5f4a6e7cc881ccc1b5bf16fe3f7aa9a3f958f2`, fee 43,840,000
+      atomic units, spent key images
+      `92649154c63351edfbda7d15d7afb3e4ef01164794a164a91ef4bd792f24b5bd` and
+      `18b5b260484e1a0135c1ee5f08fe408b6b047b0249d044af03bde1fd1de8eb8c`
+    - `t_cancel = 346570`, `t_punish = 346574` (DIVI height was 346567 at funding time)
+  - Waiting on confirmations and timelock maturation next (`Tx_cancel`, then the held
+    `Tx_punish`'s broadcast once `t_punish` matures) — not yet complete.
+- decisions: none new beyond the NUMS/malleability answers above.
+- needs: nothing from a human right now.
+- done (cont.): both punish-path `Tx_lock` and the Monero lock confirmed (6 and 1
+  confirmations respectively at check time). DIVI height reached `t_cancel` (346570)
+  and `Tx_cancel` broadcast automatically:
+  `a456859ec3134f62bf83d8c7d01fb9af864a4097cac917bbc79ad304d2d50b2a`. Waiting for its
+  confirmation (which also builds and holds `Tx_punish`) and `t_punish` (346574) next.
+- **The punish path is complete, live, on DIVI, for real.** `Tx_punish` confirmed (4
+  confirmations). Full transaction set for this round's live punish-path run:
+  1. DIVI `Tx_lock` (Maker, funded from the refund run's reclaimed DIVI):
+     `63bef2be6d281e62feee02c2029648abaf8a85a89f18ffdbe0bf238fca70cfeb`
+  2. Monero lock (Taker locks 0.01 XMR from `mining-wallet` — **permanently
+     unrecoverable by design**, see the module docs on why):
+     `cf2941b12ecaf42489825209aa5f4a6e7cc881ccc1b5bf16fe3f7aa9a3f958f2`, fee
+     43,840,000 atomic units, spent key images
+     `92649154c63351edfbda7d15d7afb3e4ef01164794a164a91ef4bd792f24b5bd` and
+     `18b5b260484e1a0135c1ee5f08fe408b6b047b0249d044af03bde1fd1de8eb8c`
+  3. DIVI `Tx_cancel` (plain 2-of-2, both sign):
+     `a456859ec3134f62bf83d8c7d01fb9af864a4097cac917bbc79ad304d2d50b2a` (6 confirmations)
+  4. DIVI `Tx_punish` (plain, pre-signed by both at `Tx_cancel`-confirm time, held by
+     Taker, broadcast once `t_punish` matured -- Maker never completed `Tx_refund`,
+     simulating a maker who stalled): `d0cc708e7f133e30cdd40c4e859fcbd8c220ad393c0ebdda574b8b1b8a4606d9`
+     (4 confirmations)
+  Re-ran the binary a second time after broadcasting `Tx_punish` to confirm it reports
+  idempotently ("already broadcast") rather than attempting a double-spend — it does.
+  **All three of this design's on-chain outcomes (redeem, refund, punish) have now run
+  live, end to end, on real DIVI testnet and Monero stagenet chains.** Six real bugs
+  found and fixed across all three rounds (DIVI tx version, Monero pruned-tx scanning,
+  distribution-fetch reliability, DIVI relay fee, Monero spendable-age minimum, plus
+  this round's NUMS-generator hardening) — none of them theoretical.
