@@ -11,6 +11,7 @@ pragma solidity 0.8.26;
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }
 
 /// `transfer`/`transferFrom` that tolerate tokens returning no value (USDT-style) while
@@ -98,7 +99,20 @@ contract Erc20Htlc {
             claimed: false,
             refunded: false
         });
+        // A fee-on-transfer token would deliver less than `amount`, while `claim`/`refund`
+        // still promise to pay out the full `amount` recorded above — the shortfall would
+        // only surface later, as a revert with no recovery path, when the contract's actual
+        // balance can no longer cover every swap's recorded `amount`. Caught here instead,
+        // before any state outlives this one reverting transaction (same "reject, don't
+        // silently round" stance as `amount_to_usdc_units`). `>=`, not `==`: a token that
+        // delivers *more* than requested leaves harmless dust the contract just holds, not
+        // a shortfall anyone can be stranded by.
+        uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), amount);
+        require(
+            token.balanceOf(address(this)) - balanceBefore >= amount,
+            "Erc20Htlc: fee-on-transfer tokens unsupported"
+        );
         emit Locked(id, msg.sender, receiver, address(token), amount, hashlock, timelock);
     }
 

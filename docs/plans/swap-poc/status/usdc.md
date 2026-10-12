@@ -614,3 +614,66 @@
     the newly-excluded one), 0 missing, 0 unattributed, 1 excluded, exit 0.
   - `bash -n`/`shellcheck` clean on both scripts; `check-usdc.sh` still PASS (no Rust changes
     this wave).
+- **Wave 16** (this seam): adversarial review of `Erc20Htlc.sol` and `usdc-live.sh` —
+  reentrancy, fee-on-transfer/non-standard ERC-20 returns, claim/refund exactly at the
+  timelock, double claim, a zero hashlock, approve races — with Foundry tests for each and
+  one real fix. `--network base-sepolia` on `usdc-live.sh`: re-confirmed fully working
+  (flagged again, since it has existed since `50f18a2` — re-ran `usdc-live-dry-run.sh`
+  end to end just now, both networks resolve real balances, exit 0).
+  - **Real bug found and fixed — fee-on-transfer tokens**: `lock()` recorded the nominal
+    `amount` requested, not what the contract actually received. A fee-on-transfer token
+    would deliver less, so `claim`/`refund` would later promise to pay out more than the
+    contract's real balance — a revert with no recovery path, discovered only when someone
+    tried to settle. Fixed by comparing the contract's own balance before/after the
+    `transferFrom` and reverting the *whole* `lock()` call (its earlier `swaps[id]` write
+    included, since a revert undoes the entire transaction) if less than `amount` actually
+    arrived — same "reject, don't silently round" stance already used by
+    `amount_to_usdc_units`. Used `>=`, not `==` (forge's own linter flagged the stricter
+    form as a dangerous strict-equality check on an externally-influenced value, correctly:
+    a token that delivers *more* than requested is harmless dust, not a shortfall).
+  - **Reentrancy — reviewed, no bug found, now proven by test instead of just asserted**:
+    `claim`/`refund`/`lock` were already checks-effects-interactions (state flips to
+    claimed/refunded *before* the token payout; `swaps[id]` is written before the funding
+    pull) — confirmed this actually holds against a real malicious token, not just by
+    reading the code. New `ReentrantErc20` mock (`contracts/htlc/test/AdversarialErc20.sol`)
+    calls back into `claim`/`refund` for the same id mid-payout;
+    `test_reentrantClaimCannotDoublePay`/`test_reentrantRefundCannotDoublePay` confirm the
+    reentrant call reverts (`already claimed`/`already refunded`) and the receiver/sender is
+    paid exactly once.
+  - **Non-standard ERC-20 returns**: `SafeTransfer` already tolerated a no-return-value
+    token (USDT-mainnet-style) and already rejected an explicit `false`, but neither was
+    exercised through the real contract before. New mocks `NoReturnErc20`/
+    `FalseReturningErc20` plus `test_lockClaimWorksWithNoReturnValueToken`/
+    `test_lockRefundWorksWithNoReturnValueToken`/`test_lockRejectsFalseReturningToken` now
+    prove both paths end to end, not just via `SafeTransfer`-only unit assertions.
+  - **Claim/refund at exactly the timelock**: refund-at-exact-timelock was already tested;
+    added `test_claimSucceedsExactlyAtTimelock` (claim has no time bound at all, must still
+    work right at the boundary) and `test_claimWinsRaceAtExactTimelock` (both are valid at
+    `block.timestamp == timelock`; whichever lands first wins and permanently blocks the
+    other — the designed atomic-swap race, confirmed intentional, not a bug).
+  - **Zero hashlock**: `test_zeroHashlockCannotBeClaimedButCanBeRefunded` — confirmed the
+    safe degenerate case (SHA-256 preimage resistance means nothing can ever satisfy a
+    zero hashlock, so the swap is simply unclaimable and only the sender's own refund can
+    ever recover it; not an exploit against anyone else).
+  - **Approve races**: `test_lockConsumesExactlyApprovedAmountLeavingRemainder` (lock pulls
+    exactly `amount`, never more, from the allowance) and
+    `test_lockRevertsCleanlyOnInsufficientAllowance` (an allowance short of `amount` — e.g.
+    from a racing second approval — reverts the whole call with no partial state committed;
+    the id stays free to retry). Double claim was already covered
+    (`test_doubleClaimRejected`); the two reentrant tests above are a strictly stronger
+    version of the same property.
+  - `erc20_htlc_bytecode.hex` regenerated (`forge build --force` + the doc comment's own
+    extraction command) after the `lock()` change — `embedded_bytecode_matches_a_fresh_
+    forge_build` first failed as expected, then passed after regenerating.
+  - `usdc-live.sh`: one real bug fixed — `--usdc-sats` was never validated to be a multiple
+    of 100 (USDC's 6 decimals vs. the engine's 1e8-per-coin sats), so a bad value would only
+    surface as a Rust-side rejection deep into a live run, after gas was already spent on
+    deploy/approve. Now validated up front (`die` before any network call).
+  - `forge fmt --check` has pre-existing drift unrelated to this wave (confirmed against
+    the original, untouched files too) — noted, not fixed; `check-usdc.sh` does not gate on
+    `fmt`.
+  - 26/26 Foundry tests green (was 15); `cargo test -p swap-chain-evm`/`-p divi-swapd`/
+    `-p divi-swap --test usdc` all green after the bytecode regeneration (confirmed
+    `live_usdc_excludes_an_enabled_but_underfunded_offer` and all 10 `tests/usdc.rs` tests
+    specifically); `usdc-live-dry-run.sh` re-run clean end to end; `check-usdc.sh` PASS;
+    `bash -n`/`shellcheck` clean on `usdc-live.sh`.

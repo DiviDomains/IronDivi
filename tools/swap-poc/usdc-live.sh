@@ -87,6 +87,9 @@ while (($#)); do
 done
 case "$scenario_arg" in happy|case-c|all) ;; *) usage ;; esac
 case "$direction_arg" in forward|reverse|both) ;; *) usage ;; esac
+[[ "$usdc_sats" =~ ^[0-9]+$ ]] || die "--usdc-sats must be a non-negative integer, got '$usdc_sats'"
+(( usdc_sats % 100 == 0 )) \
+  || die "--usdc-sats must be a multiple of 100 (USDC has 6 decimals; engine sats are 1e8/coin) — got $usdc_sats"
 maker_url="${maker_url%/}"
 scenarios=(happy case-c); [[ "$scenario_arg" == all ]] || scenarios=("$scenario_arg")
 directions=(forward reverse); [[ "$direction_arg" == both ]] || directions=("$direction_arg")
