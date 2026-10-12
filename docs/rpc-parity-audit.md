@@ -54,8 +54,9 @@ corrupts the coin DB on purpose is not reproduced).
 - Masternode subsystem (`verifymasternodesetup` and `listmnbroadcasts` are now real: the former reproduces the C++ `getMessageToSign` string byte for byte, the latter returns `[]` because no broadcasts are stored; both unit-tested, not yet compared against C++ in a harness run). The Rust `divi-masternode` broadcast wire format and signing are not C++-compatible (OutPoint vin, no lastPing, different signed bytes), which is why the rest need a rewrite of that crate: `startmasternode`, `setupmasternode`,
   `broadcaststartmasternode`, `signmnbroadcast`, `importmnbroadcast`
   return "not implemented"; `getmasternodewinners` now has the C++ shape and real tip height, but every winner is `Unknown` with 0 votes because payment votes are not received over the network yet; `getmasternodecount` lacks
-  `inqueue/ipv4/ipv6/onion/obfcompat/stable`; `spork show|active` stubbed;
-  `getlotteryblockwinners` stubbed (and requires an argument C++ does not).
+  `inqueue/ipv4/ipv6/onion/obfcompat/stable` (reported as 0).
+- `spork show|active` are now real (`84e27d3`/`a399431`): the 11 C++ spork names with the C++ defaults, received values override; two-arg form gives `Invalid spork name` / `failure`. Unit-tested.
+- `getlotteryblockwinners` is now real: optional height (clamped to tip), C++ shape, candidates ranked with the consensus lottery score against the last lottery block. `decodescript` and `gettxout` also used a hardcoded mainnet address network; they now use the node's network.
 - `getblock`: `acc_checkpoint` now present; `moneysupply` is recorded per block in the block index (trailing optional field, old databases still load) and shown only for blocks connected since that field was added, so an existing database shows it only after a resync/reindex. Genesis supply is 0, as in C++.
 - `getaddressesbylabel` returns all addresses; `loadwallet` (multi-wallet), `allocatefunds`,
   rescan variants are stubs.
