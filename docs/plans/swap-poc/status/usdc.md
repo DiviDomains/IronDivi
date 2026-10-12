@@ -261,3 +261,84 @@
   - `cargo fmt`/`cargo clippy --workspace --all-targets -- -D warnings` clean; full
     `swap-chain-evm`/`divi-swapd` test suites green (17 `divi-swapd` lib tests, up from 15);
     `usdc-live-dry-run.sh` re-run clean end to end (exit 0).
+- **Wave 7** (this seam): still blocked on Sepolia ETH landing on the taker (no ETA); kept
+  going on everything that doesn't need it.
+  - `docs/plans/swap-poc/usdc-deploy.md` (new) + `deploy/divi-swapd/usdc-offers.toml` (new):
+    the dnsdivi deploy checklist, modeled directly on `wave4-deploy.md`/`wave4-offers.toml`.
+    The config append (`[usdc]`, both offers `enabled = false`, placeholder htlc) is safe to
+    land on dnsdivi *today*, before the contract exists — pinned by the new test
+    `usdc_offers_snippet_on_top_of_the_wave4_deployed_config` in
+    `bin/divi-swapd/src/config.rs`. Includes the exact `sepolia_ops deploy` command and its
+    gas estimate (725,869 gas, measured against anvil with the identical bytecode that goes
+    to Sepolia; ~0.0007–0.007 ETH at Sepolia's typical 1–10 gwei). Live-checked (read-only,
+    no keys) 2026-10-12: taker holds 20 USDC/0 ETH, maker holds 0 USDC/0 ETH — unchanged
+    since the last check, cited directly in the doc so it doesn't go stale silently.
+  - `usdc-live.sh` gained `--maker-url URL` (drive an already-running maker, e.g. dnsdivi
+    once usdc-deploy.md lands there — mirrors `ltc-live.sh`/`zec-live.sh` exactly: builds
+    only the taker binary, verifies the remote serves the right offers before swapping,
+    keeps the remote's own timeout profile for case-c). Requires `--htlc` (no auto-deploy
+    against someone else's maker) and skips the deploy+fund preamble and the
+    `live_*_lock_claim` self-test entirely — those assume a locally-deployed contract this
+    script controls, not one a remote operator already set up.
+  - **`--dry-run` redefined**: it previously meant "quote+accept a real swap against a real
+    local daemon, then stop before lock" (this lane's own choice last wave, modeled on
+    ltc-live.sh) — that needed 1Password and a running `[divi]`/`[btc]`/`[usdc]` daemon
+    either way, so it was never actually runnable from hp2. Orchestrator asked explicitly
+    for `--dry-run` to check taker/maker ETH+USDC balances and print what's missing, which
+    needs *no* keys (`sepolia_ops balances` is read-only) — implemented that instead,
+    computing the same per-run funding targets the live funding step itself uses (plus a
+    taker-side allowance for the one-time deploy/self-test/funding-send costs, skipped under
+    `--maker-url`). Actually run on hp2 (needs nothing): confirms the taker already has
+    enough USDC (20 ≥ 2 needed for two reverse runs) but needs ~0.107 ETH more for a full
+    `--scenario all --direction both` run, and the maker needs ~0.08 ETH and 2 USDC — real,
+    useful output, not merely exercised.
+  - **Nonce-conflict / "already known" audit** (`crates/swap-chain-evm/src/backend.rs`):
+    `is_already_known` previously folded `"nonce too low"` and `"replacement transaction
+    underpriced"` into the same unconditional-success bucket as `"already known"`/`"already
+    imported"`. That is only safe for the latter two (same tx hash genuinely already in the
+    node's mempool). For the former two, *something* already occupies the nonce — usually
+    our own earlier broadcast having since mined (safe: this backend's write-ahead design
+    signs a claim/refund exactly once and only ever rebroadcasts the identical bytes), but
+    not necessarily: a stale read from a load-balanced public RPC, or the same key used by
+    a second process at once (against this lane's own rule, but not impossible), can mean a
+    *different* transaction took the nonce — then the signed bytes we hold can never land
+    under any nonce, and the old code would still return `Ok(tx.txid)`, so the engine would
+    poll `confirmations(&that_txid)` forever: a silent livelock, not a crash, which is why it
+    had gone unnoticed. Fix: split into `is_already_known` (unconditional success, as
+    before) and `is_nonce_conflict` (new); on the latter, `broadcast` now checks whether
+    *this* transaction's own hash has a receipt before declaring success, and returns
+    `SwapError::Rejected` naming the problem when it does not.
+    Regression tests on anvil (`crates/swap-chain-evm/src/tests.rs`):
+    `broadcast_is_idempotent_once_its_own_tx_has_mined` (the safe case — resending an
+    already-self-mined refund must still report success) and
+    `broadcast_errors_when_a_different_tx_stole_the_nonce` (the bug this wave fixes —
+    reproduced by signing a refund, then sending an unrelated transaction from the same key
+    first so it takes the nonce, then broadcasting the stale signed bytes: must now error,
+    where it previously would have returned a success for a transaction that can never
+    mine). Both need a real locked-and-timed-out swap first (`build_refund`'s own
+    `estimate_gas` reverts "no such swap" otherwise) — a new `locked_and_refundable` helper
+    does that.
+  - `cargo fmt`/`cargo clippy --workspace --all-targets -- -D warnings` clean; full
+    `swap-chain-evm` (15 tests, 2 ignored), `divi-swapd` (18 lib tests, up from 17),
+    `divi-swap-cli` and `divi-swap --test usdc` suites green; `shellcheck` clean on both
+    `usdc-live.sh` and `usdc-live-dry-run.sh`; `usdc-live-dry-run.sh` re-run clean end to end.
+- **hp2-land retry** (this seam): the first land attempt failed — this lane's base (`cbcafc3`)
+  was stale against main (now `19f9388`, via `6f8f962`), so the orchestrator's patch did not
+  apply. Decision: the orchestrator's message said "commit them", but `tools/swap-poc/
+  lane-sync.sh` documents the opposite invariant in its own header ("Lanes never commit, so
+  the landed changes reappear identical in the stash and pop cleanly"), matching this lane's
+  binding "never commit or push" rule. Read "commit them" as "finalize them for landing" and
+  ran `lane-sync.sh` instead of `git commit` — that is what actually fixes a stale-base land
+  failure, and keeps the uncommitted-working-tree invariant the land tooling expects intact.
+  `lane-sync.sh` hit a real stash-pop conflict in `tools/swap-poc/usdc-live.sh` and this
+  status file: both were conflicts against *this lane's own, already-landed* Wave 6 content
+  (the `ltc`/`zec` lanes never touch either file), confirmed by diffing each side — the
+  stashed copy was a strict superset, so both were resolved by taking it whole, `git add`ed
+  to clear the unmerged state, then **unstaged again** (`git reset`) to leave plain
+  uncommitted working-tree diffs, matching every prior seam. Separately, `wave4-offers.toml`
+  had changed upstream since this lane's test last read it (`0b10ac6`, the `ltc` lane: `ltc-
+  divi-testnet` flipped from disabled to enabled, max raised to 190000) — the new
+  `usdc_offers_snippet_on_top_of_the_wave4_deployed_config` test (added this wave, before
+  the lane-sync) still asserted the old disabled shape; fixed to match `ltc-divi-testnet`
+  now being served. All checks re-run clean after both fixes (`check-usdc.sh`, workspace
+  clippy, `divi-swapd`/`swap-chain-evm`/`divi-swap-cli` suites, `shellcheck`, both dry runs).

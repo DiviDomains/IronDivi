@@ -90,14 +90,28 @@ fn htlc_addresses(htlc: &HtlcParams) -> Result<(Address, Address)> {
     ))
 }
 
-/// A non-retryable RPC rejection that nonetheless means "this exact transaction already
-/// reached the chain" — broadcasting it again must look like success.
+/// A non-retryable RPC rejection that nonetheless means "this exact transaction (same
+/// hash) already reached the chain" — broadcasting it again must look like success, no
+/// further check needed.
 fn is_already_known(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    m.contains("already known")
-        || m.contains("already imported")
-        || m.contains("nonce too low")
-        || m.contains("replacement transaction underpriced")
+    m.contains("already known") || m.contains("already imported")
+}
+
+/// A non-retryable RPC rejection that means *some* transaction already occupies this
+/// nonce — but, unlike [`is_already_known`], not necessarily *this* one. The common case is
+/// genuinely safe (our own earlier broadcast already mined, and the chain caught up between
+/// retries — the write-ahead design here only ever signs a claim/refund once and keeps
+/// rebroadcasting the identical bytes, so nothing else should normally touch this nonce).
+/// But it is not the only case: a stale read from a load-balanced public RPC, or the same
+/// key used by a second process at once (both explicitly against this lane's own
+/// conventions, but not impossible), can mean a *different* transaction took the nonce —
+/// then this signed transaction can never land under any nonce, ever, and claiming success
+/// would make the engine wait forever for a confirmation that can't come. `broadcast` below
+/// disambiguates by checking whether *this* transaction's own hash was the one mined.
+fn is_nonce_conflict(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("nonce too low") || m.contains("replacement transaction underpriced")
 }
 
 /// [`ChainBackend`] for USDC on an EVM chain (Sepolia, Base Sepolia, or anvil in tests),
@@ -342,6 +356,26 @@ impl ChainBackend for UsdcBackend {
         match self.client.provider().send_raw_transaction(&tx.raw).await {
             Ok(_) => Ok(tx.txid),
             Err(e) if is_already_known(&e.to_string()) => Ok(tx.txid),
+            Err(e) if is_nonce_conflict(&e.to_string()) => {
+                // Confirm it was *our* transaction that took the nonce before calling this
+                // success — see `is_nonce_conflict`'s doc comment for why that is not
+                // guaranteed just because the node rejected a resend this way.
+                let hash = B256::from(tx.txid.0);
+                let mined = self
+                    .client
+                    .provider()
+                    .get_transaction_receipt(hash)
+                    .await
+                    .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?;
+                match mined {
+                    Some(_) => Ok(tx.txid),
+                    None => Err(SwapError::Rejected(format!(
+                        "nonce conflict and {} was never mined — a different transaction \
+                         took this nonce (stale RPC view, or this key in use elsewhere): {e}",
+                        tx.txid
+                    ))),
+                }
+            }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.to_ascii_lowercase().contains("revert") {

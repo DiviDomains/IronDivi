@@ -10,15 +10,19 @@
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::network::TransactionBuilder;
 use alloy::node_bindings::Anvil;
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
+
+use divi_swap::{Amount, ChainBackend, HtlcParams, Outpoint, Txid};
 
 use crate::artifact::{bytecode, foundry_available};
 use crate::client::{connect_provider, deploy_contract, swap_id};
 use crate::contract::IMockErc20;
-use crate::EvmHtlcClient;
+use crate::{EvmHtlcClient, UsdcBackend};
 
 /// Skip (rather than fail) a test that needs `forge`/`anvil` when neither is installed.
 macro_rules! require_foundry {
@@ -214,6 +218,170 @@ async fn anvil_find_preimage_from_logs() {
 
     let found = fx.sender.find_preimage(id).await.expect("find after claim");
     assert_eq!(found, Some(preimage));
+}
+
+/// Deploy, mint, lock (sender == receiver == `backend`'s own key, which is fine for a
+/// refund: `build_funding`/`build_refund` only ever check `sender == self`) and jump the
+/// chain clock past a short timelock — a real, refundable swap, so `build_refund`'s own
+/// `estimate_gas` call does not itself revert ("no such swap") before these tests ever get
+/// to exercise `broadcast`'s nonce handling.
+async fn locked_and_refundable(
+    deploy_provider: &alloy::providers::DynProvider,
+    backend: &UsdcBackend,
+    address: Address,
+    token: Address,
+) -> (HtlcParams, Outpoint, Amount) {
+    let pk = backend.pubkey();
+    let hash: [u8; 32] = B256::from(keccak256(b"nonce_conflict_test")).0;
+    let locktime = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        + 30) as u32;
+    let params = HtlcParams {
+        hash,
+        claim_pubkey: pk,
+        refund_pubkey: pk,
+        locktime,
+    };
+    let amount = Amount::from_sat(100); // 1 USDC base unit (100 engine sats / 100 per unit)
+
+    IMockErc20::new(token, deploy_provider.clone())
+        .mint(address, U256::from(1u64))
+        .send()
+        .await
+        .expect("send mint")
+        .get_receipt()
+        .await
+        .expect("mint receipt");
+
+    let outpoint = Outpoint {
+        txid: Txid([0u8; 32]),
+        vout: 0,
+    };
+    let funding = backend
+        .build_funding(&params, amount)
+        .await
+        .expect("build_funding");
+    // `backend.broadcast` only submits; it does not wait for a receipt. Wait for one here
+    // (via a plain provider, not `backend`'s own) so the lock is actually mined before the
+    // tests that call this build a refund against it — `build_refund`'s own `estimate_gas`
+    // would otherwise revert "no such swap" on a race.
+    deploy_provider
+        .send_raw_transaction(&funding.tx.raw)
+        .await
+        .expect("send lock")
+        .get_receipt()
+        .await
+        .expect("lock receipt");
+
+    mine_to(deploy_provider, U256::from(locktime)).await;
+    (params, outpoint, amount)
+}
+
+/// `is_nonce_conflict`'s safe case: our own earlier broadcast already mined (same hash),
+/// and we are asked to rebroadcast the identical bytes again — the write-ahead engine does
+/// exactly this on every tick until it sees a confirmation. The node reports this as a
+/// nonce conflict once the tx has left the mempool (it is no longer "already known" by
+/// hash, just "nonce too low" against a nonce the chain has moved past) — `broadcast` must
+/// still report success, by finding its own receipt.
+#[tokio::test]
+async fn broadcast_is_idempotent_once_its_own_tx_has_mined() {
+    require_foundry!();
+    let anvil = Anvil::new().spawn();
+    let endpoint = anvil.endpoint();
+    let key = PrivateKeySigner::from(&anvil.keys()[0]);
+    let address = key.address();
+    let deploy_provider = connect_provider(&endpoint, key.clone()).expect("deploy provider");
+    let htlc = deploy_contract(&deploy_provider, bytecode("Erc20Htlc").expect("build htlc"))
+        .await
+        .expect("deploy htlc");
+    let token = deploy_contract(
+        &deploy_provider,
+        bytecode("MockErc20").expect("build token"),
+    )
+    .await
+    .expect("deploy token");
+
+    let backend = UsdcBackend::new(&endpoint, key, htlc, token).expect("backend");
+    let (params, outpoint, amount) =
+        locked_and_refundable(&deploy_provider, &backend, address, token).await;
+    let refund = backend
+        .build_refund(&params, &outpoint, amount)
+        .await
+        .expect("build_refund");
+
+    let first = backend.broadcast(&refund).await.expect("first broadcast");
+    assert_eq!(first, refund.txid);
+    // Resend the identical signed bytes now that they have already mined.
+    let second = backend
+        .broadcast(&refund)
+        .await
+        .expect("rebroadcast of an already-mined tx must still report success");
+    assert_eq!(second, refund.txid);
+}
+
+/// `is_nonce_conflict`'s *unsafe* case: a different transaction — not ours — took the nonce
+/// our signed-but-not-yet-sent transaction was built against (a stale read from a
+/// load-balanced public RPC, or, against this lane's own rules, the same key in use by a
+/// second process at once). Before the fix in this wave, `is_already_known` folded "nonce
+/// too low" into unconditional success, so `broadcast` would have returned `Ok(refund.txid)`
+/// here even though `refund.txid` can now never be mined — the engine would then poll
+/// `confirmations(&refund.txid)` forever and the swap would never leave `MakerRefundable`/
+/// `TakerClaimed`. `broadcast` must surface an error instead.
+#[tokio::test]
+async fn broadcast_errors_when_a_different_tx_stole_the_nonce() {
+    require_foundry!();
+    let anvil = Anvil::new().spawn();
+    let endpoint = anvil.endpoint();
+    let key = PrivateKeySigner::from(&anvil.keys()[0]);
+    let address = key.address();
+    let deploy_provider = connect_provider(&endpoint, key.clone()).expect("deploy provider");
+    let htlc = deploy_contract(&deploy_provider, bytecode("Erc20Htlc").expect("build htlc"))
+        .await
+        .expect("deploy htlc");
+    let token = deploy_contract(
+        &deploy_provider,
+        bytecode("MockErc20").expect("build token"),
+    )
+    .await
+    .expect("deploy token");
+
+    let backend = UsdcBackend::new(&endpoint, key.clone(), htlc, token).expect("backend");
+    let (params, outpoint, amount) =
+        locked_and_refundable(&deploy_provider, &backend, address, token).await;
+    // Signed, but not yet sent: the mempool does not know about it yet, so the next query
+    // for this account's pending nonce still returns the same value `refund` was signed
+    // with.
+    let refund = backend
+        .build_refund(&params, &outpoint, amount)
+        .await
+        .expect("build_refund");
+
+    // A second, unrelated transaction from the same key, sent (and auto-mined by anvil)
+    // through the normal auto-filling path — it gets the same nonce `refund` was signed
+    // with, and lands first.
+    let stealer = connect_provider(&endpoint, key).expect("stealer provider");
+    stealer
+        .send_transaction(
+            TransactionRequest::default()
+                .with_to(address)
+                .with_value(U256::ZERO),
+        )
+        .await
+        .expect("send stealer tx")
+        .get_receipt()
+        .await
+        .expect("stealer receipt");
+
+    let err = backend
+        .broadcast(&refund)
+        .await
+        .expect_err("a stolen nonce must not be reported as success");
+    assert!(
+        err.to_string().contains("never mined"),
+        "wrong error: {err}"
+    );
 }
 
 /// Live Sepolia run: deploys a fresh `Erc20Htlc`, locks a tiny amount of Circle test USDC

@@ -691,6 +691,50 @@ key = "credential:btc"
     }
 
     #[test]
+    fn usdc_offers_snippet_on_top_of_the_wave4_deployed_config() {
+        // What dnsdivi runs after wave 4 (BTC + LTC, ZEC gated off) + the usdc append
+        // (tools/swap-poc/usdc-deploy.md), while the Erc20Htlc contract is still undeployed.
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/divi-swapd");
+        let deployed = "db_path = \"/var/lib/divi-swapd/swaps.db\"\n\
+            [divi]\nkey = \"credential:maker-divi\"\n[btc]\nkey = \"credential:maker-btc\"\n\
+            [[offers]]\nid = \"divi-btc-testnet\"\ndivi_sats_per_btc = 300000000000000\n\
+            min_btc_sats = 5000\nmax_btc_sats = 50000\n\
+            [[offers]]\nid = \"btc-divi-testnet\"\ndirection = \"taker_pays_divi\"\n\
+            divi_sats_per_btc = 300000000000000\nmin_btc_sats = 5000\nmax_btc_sats = 50000\n";
+        let wave4 = std::fs::read_to_string(base.join("wave4-offers.toml")).unwrap();
+        let usdc = std::fs::read_to_string(base.join("usdc-offers.toml")).unwrap();
+        let c = DaemonConfig::parse(&format!("{deployed}\n{wave4}\n{usdc}")).unwrap();
+        let served: Vec<_> = c
+            .offers
+            .iter()
+            .map(|o| (o.id.as_str(), o.counter_chain))
+            .collect();
+        assert_eq!(
+            served,
+            [
+                ("divi-btc-testnet", Chain::Btc),
+                ("btc-divi-testnet", Chain::Btc),
+                ("divi-ltc-testnet", Chain::Ltc),
+                ("ltc-divi-testnet", Chain::Ltc),
+            ],
+            "both usdc offers start disabled, same as zec's"
+        );
+        assert!(c.disabled_offers.contains(&"divi-usdc-sepolia".to_string()));
+        assert!(c.disabled_offers.contains(&"usdc-divi-sepolia".to_string()));
+        let u = c.usdc.clone().unwrap();
+        assert_eq!(u.network, "sepolia");
+        assert_eq!(u.htlc, "0x0000000000000000000000000000000000000000");
+        assert_eq!(u.key, "credential:maker-btc");
+        assert!(!c.serves(Chain::Usdc), "both usdc offers are disabled");
+        // counter_backends_to_start must not try to start [usdc] with no swap in flight and
+        // no enabled offer — the whole point of landing this file before the contract exists
+        // (ltc still starts: both ltc offers above are enabled).
+        let start = c.counter_backends_to_start(&BTreeSet::new()).unwrap();
+        assert_eq!(start, [Chain::Ltc]);
+        c.swap_config().unwrap();
+    }
+
+    #[test]
     fn mock_counter_offer_ids() {
         let ids: Vec<_> = mock_counter_offers().into_iter().map(|o| o.id).collect();
         assert_eq!(

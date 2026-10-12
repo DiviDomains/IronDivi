@@ -1,0 +1,54 @@
+
+# ---- USDC (Ethereum Sepolia, Circle test token) --------------------------------------------
+# Appended once to dnsdivi's /etc/divi-swapd/divi-swapd.toml (deploy.sh never overwrites that
+# file). Checklist: tools/swap-poc/usdc-deploy.md. Needs a divi-swapd built from main at or
+# after Chain::Usdc landed (94f2f55) and the [usdc].network plumbing (b99a0f5); an older
+# binary has no [usdc] section support at all and would reject this file.
+#
+# Keys: testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md),
+# so [usdc] below uses the maker-btc credential already loaded by divi-swapd.service — the
+# Ethereum address derived from it is 0x995669a244d511542ca314e4068c754E3F555bd2 (funding.md).
+# Safe to append as-is today, before the contract is deployed: both offers start disabled and
+# the placeholder htlc address below is never dialed while they are.
+
+[usdc]
+network = "sepolia"
+rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+# PLACEHOLDER — replace with the real Erc20Htlc address once deployed (usdc-deploy.md §2:
+# `sepolia_ops deploy`, ~725,869 gas). Both offers below stay `enabled = false` until this is
+# a real address: an enabled offer with the zero address here would quote fine (quoting
+# needs no contract call) but fail every `lock`/`claim`/`refund` against it.
+htlc = "0x0000000000000000000000000000000000000000"
+# token omitted: defaults to Circle's Sepolia test USDC (swap_chain_evm::SEPOLIA_USDC,
+# 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238).
+key = "credential:maker-btc"
+
+# Maker sells DIVI for USDC: the maker locks DIVI, which it already holds. Blocked only on
+# the real htlc address above — the taker already holds 20 USDC on Sepolia (tx
+# 0xf5cc6366…28e3, confirmed 2026-10-11) at 0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C, enough
+# to flip this one the moment the contract is deployed and this file's htlc is updated.
+[[offers]]
+id = "divi-usdc-sepolia"
+direction = "taker_pays_btc"
+counter_chain = "usdc"
+enabled = false
+divi_sats_per_btc = 10000000000       # 100 DIVI per USDC (placeholder; re-check before enabling)
+min_btc_sats = 1000000                # 0.01 USDC
+max_btc_sats = 100000000              # 1.00 USDC
+
+# Maker buys DIVI with USDC: the maker locks USDC. Blocked on the real htlc address above
+# AND the maker holding USDC — checked live (read-only, no keys) 2026-10-12:
+# 0x995669a244d511542ca314e4068c754E3F555bd2 holds 0 ETH and 0 USDC. The maker selects its
+# USDC allowance/lock only after the taker's DIVI lock confirms, so an unfunded maker would
+# leave a taker's DIVI locked until its refund. `tools/swap-poc/usdc-live.sh` funds the maker
+# with ~2 USDC (scaled by how many reverse runs are requested) from the taker automatically,
+# but that funding step itself needs the taker's Sepolia ETH for gas — the same thing this
+# whole file is blocked on.
+[[offers]]
+id = "usdc-divi-sepolia"
+direction = "taker_pays_divi"
+counter_chain = "usdc"
+enabled = false
+divi_sats_per_btc = 10000000000
+min_btc_sats = 1000000
+max_btc_sats = 100000000
