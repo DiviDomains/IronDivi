@@ -179,3 +179,15 @@ Transparent P2SH HTLC on Zcash (v6 transactions, ZIP-244 sighash, ZIP-317 fees).
   Zebra's "already exists in mempool" not treated as success (`7c932f9`), and the ZIP-244 sighash
   hashing the redeem script instead of the P2SH scriptPubKey (`90d857c`); the maker's stored,
   wrongly-signed claim is now re-signed after a permanent reject (`8743152`).
+- Reverse happy path (taker pays DIVI, gets ZEC; local maker, `zec-live.sh --scenario happy
+  --direction reverse`, 5 tDIVI for 100,000 zatoshi), taker swap `4f5f1b46…`, taker Done / maker
+  Done, 2026-10-12 ~01:05 UTC:
+    DIVI lock (taker) `a45322a43a226fe0f9bba84c5f2f951f947297a8762870931980eefdfafa694d`,
+    ZEC lock (maker) `ceb993023e51426ffe1178b15e0b356495d2b19af2c4fe6719e8895e7f35d4f1`,
+    ZEC claim (taker) `f15466af096de4dffce61277c53c1c7f71a5a01cc16bf4835fade289aea146f7` (height 4490460),
+    DIVI claim (maker, preimage read from the ZEC spend) `67be038027937fbf858dddf8e66a6da13c18a69d09ce61b69a065a4c9d8f6c30`.
+  Two more bugs surfaced live: `zec-live.sh` gave the reverse taker an unscanned DIVI wallet
+  (`54f2e75`), and lightwalletd's `GetBlockRange` strips every transparent input unless the
+  request asks for `poolTypes = [TRANSPARENT]`, so the maker could not see the taker's ZEC claim
+  (`52b49de`). After a restart on the fixed binary the maker read the preimage and claimed; the
+  taker's own timelock still had hours left, so no coins were at risk.
