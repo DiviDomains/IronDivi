@@ -2936,6 +2936,7 @@ mod tests {
             addr: "127.0.0.1:1".parse().unwrap(),
             tx,
             inbound: false,
+            stats: Default::default(),
         });
 
         let g = chain.genesis_hash();
@@ -3064,6 +3065,7 @@ mod tests {
                 addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
                 tx,
                 inbound: false,
+                stats: Default::default(),
             });
             rxs.insert(id, rx);
         }

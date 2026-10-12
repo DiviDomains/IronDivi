@@ -94,26 +94,28 @@ impl NetworkRpc {
             None => return Ok(serde_json::json!([])),
         };
 
-        let peers = peer_manager.get_peer_info();
+        use std::sync::atomic::Ordering::Relaxed;
+        let peers = peer_manager.get_peer_details();
         let peer_infos: Vec<serde_json::Value> = peers
             .iter()
-            .enumerate()
-            .map(|(id, (addr, inbound))| {
+            .map(|(id, addr, inbound, st, banscore)| {
+                let ping_us = st.ping_us.load(Relaxed);
+                let subver = st.subver.lock().clone();
                 serde_json::json!({
                     "id": id,
                     "addr": addr.to_string(),
-                    "services": "0000000000000001",
-                    "lastsend": 0,
-                    "lastrecv": 0,
-                    "bytessent": 0,
-                    "bytesrecv": 0,
-                    "conntime": 0,
-                    "pingtime": 0.0,
-                    "version": 70920,
-                    "subver": "/Divi Core:3.0.0/",
+                    "services": format!("{:016x}", st.services.load(Relaxed)),
+                    "lastsend": st.last_send.load(Relaxed),
+                    "lastrecv": st.last_recv.load(Relaxed),
+                    "bytessent": st.bytes_sent.load(Relaxed),
+                    "bytesrecv": st.bytes_recv.load(Relaxed),
+                    "conntime": st.conn_time.load(Relaxed),
+                    "pingtime": ping_us as f64 / 1_000_000.0,
+                    "version": st.version.load(Relaxed),
+                    "subver": subver,
                     "inbound": *inbound,
-                    "startingheight": 0,
-                    "banscore": 0,
+                    "startingheight": st.start_height.load(Relaxed),
+                    "banscore": banscore,
                     "inflight": [],
                     "whitelisted": false,
                     "synced_headers": -1,

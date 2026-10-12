@@ -87,7 +87,7 @@ pub use version::VersionMessage;
 pub use codec::DiviCodec;
 pub use connection::Connection;
 pub use masternode_handler::MasternodeHandler;
-pub use peer::{PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
+pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_manager::{
     mainnet_peer_manager, regtest_peer_manager, testnet_peer_manager, AddedNode, PeerManager,
     PeerManagerConfig,

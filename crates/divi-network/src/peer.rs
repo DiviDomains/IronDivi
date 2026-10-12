@@ -186,6 +186,64 @@ pub enum PeerEvent {
     },
 }
 
+/// Live per-peer statistics shared between the connection task and RPC readers
+#[derive(Debug, Default)]
+pub struct LivePeerStats {
+    /// Bytes sent to the peer
+    pub bytes_sent: AtomicU64,
+    /// Bytes received from the peer
+    pub bytes_recv: AtomicU64,
+    /// Unix time of the last send (0 = never)
+    pub last_send: AtomicU64,
+    /// Unix time of the last receive (0 = never)
+    pub last_recv: AtomicU64,
+    /// Unix time the connection was established
+    pub conn_time: AtomicU64,
+    /// Last ping round trip in microseconds (0 = none yet)
+    pub ping_us: AtomicU64,
+    /// Peer's advertised protocol version
+    pub version: AtomicU64,
+    /// Peer's advertised services
+    pub services: AtomicU64,
+    /// Peer's advertised start height
+    pub start_height: AtomicU64,
+    /// Peer's user agent
+    pub subver: parking_lot::Mutex<String>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl PeerInfo {
+    /// Publish this connection's counters to the shared stats
+    pub fn publish(&self, live: &LivePeerStats) {
+        let now = unix_now();
+        let ago = |t: Instant| now.saturating_sub(t.elapsed().as_secs());
+        live.bytes_sent.store(self.bytes_sent, Ordering::Relaxed);
+        live.bytes_recv.store(self.bytes_recv, Ordering::Relaxed);
+        live.last_send.store(ago(self.last_send), Ordering::Relaxed);
+        live.last_recv.store(ago(self.last_recv), Ordering::Relaxed);
+        live.conn_time
+            .store(ago(self.connected_at), Ordering::Relaxed);
+        live.ping_us
+            .store(self.ping_latency_ms.unwrap_or(0) * 1000, Ordering::Relaxed);
+        live.services.store(self.services, Ordering::Relaxed);
+        live.start_height
+            .store(self.start_height as u64, Ordering::Relaxed);
+        if let Some(v) = &self.version {
+            live.version.store(v.version as u64, Ordering::Relaxed);
+            let mut sv = live.subver.lock();
+            if *sv != v.user_agent {
+                *sv = v.user_agent.clone();
+            }
+        }
+    }
+}
+
 /// Handle for sending messages to a peer
 #[derive(Debug, Clone)]
 pub struct PeerHandle {
@@ -197,6 +255,8 @@ pub struct PeerHandle {
     pub tx: mpsc::Sender<NetworkMessage>,
     /// Whether this is an inbound connection (they connected to us)
     pub inbound: bool,
+    /// Live statistics published by the connection task
+    pub stats: std::sync::Arc<LivePeerStats>,
 }
 
 impl PeerHandle {

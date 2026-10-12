@@ -18,7 +18,9 @@ use crate::codec::DiviCodec;
 use crate::constants::{services, Magic, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
 use crate::error::NetworkError;
 use crate::message::NetAddr;
-use crate::peer::{new_peer_id, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
+use crate::peer::{
+    new_peer_id, LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState,
+};
 use crate::version::VersionMessage;
 use crate::{NetworkMessage, USER_AGENT};
 
@@ -71,6 +73,8 @@ pub struct Connection {
     total_bytes_sent: Arc<AtomicU64>,
     /// Global counter for total bytes received (shared across all connections)
     total_bytes_recv: Arc<AtomicU64>,
+    /// Shared live stats for RPC
+    stats: Arc<LivePeerStats>,
 }
 
 impl Connection {
@@ -99,12 +103,14 @@ impl Connection {
         let info = PeerInfo::new_outbound(peer_id, addr);
 
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_BUFFER);
+        let stats = Arc::new(LivePeerStats::default());
 
         let handle = PeerHandle {
             id: peer_id,
             addr,
             tx: outbound_tx,
             inbound: false, // This is an outbound connection (we connected to them)
+            stats: stats.clone(),
         };
 
         let conn = Connection {
@@ -118,6 +124,7 @@ impl Connection {
             shutdown_rx,
             total_bytes_sent,
             total_bytes_recv,
+            stats,
         };
 
         Ok((conn, handle))
@@ -142,12 +149,14 @@ impl Connection {
         let info = PeerInfo::new_inbound(peer_id, addr);
 
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_BUFFER);
+        let stats = Arc::new(LivePeerStats::default());
 
         let handle = PeerHandle {
             id: peer_id,
             addr,
             tx: outbound_tx,
             inbound: true, // This is an inbound connection (they connected to us)
+            stats: stats.clone(),
         };
 
         let conn = Connection {
@@ -161,6 +170,7 @@ impl Connection {
             shutdown_rx,
             total_bytes_sent,
             total_bytes_recv,
+            stats,
         };
 
         Ok((conn, handle))
@@ -198,6 +208,8 @@ impl Connection {
                 version,
             });
         }
+
+        self.info.publish(&self.stats);
 
         // Main message loop
         self.message_loop().await
@@ -350,6 +362,7 @@ impl Connection {
             mut shutdown_rx,
             total_bytes_sent,
             total_bytes_recv,
+            stats,
         } = self;
 
         // Split stream for concurrent read/write
@@ -364,6 +377,7 @@ impl Connection {
         ping_timer.tick().await; // Consume the immediate first tick
 
         loop {
+            info.publish(&stats);
             tokio::select! {
                 biased;
 

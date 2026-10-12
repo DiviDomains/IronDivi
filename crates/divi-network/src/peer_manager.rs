@@ -280,6 +280,30 @@ impl PeerManager {
             .collect()
     }
 
+    /// Get detailed peer info for RPC: (id, addr, inbound, live stats, ban score)
+    pub fn get_peer_details(
+        &self,
+    ) -> Vec<(
+        PeerId,
+        SocketAddr,
+        bool,
+        Arc<crate::peer::LivePeerStats>,
+        i64,
+    )> {
+        self.peers
+            .read()
+            .values()
+            .map(|p| {
+                let ban = self
+                    .scoring
+                    .get_stats(p.id)
+                    .map(|s| s.misbehavior_score as i64)
+                    .unwrap_or(0);
+                (p.id, p.addr, p.inbound, p.stats.clone(), ban)
+            })
+            .collect()
+    }
+
     /// Check if we have room for more outbound connections
     pub fn can_connect_outbound(&self) -> bool {
         let outbound_count = self.peers.read().values().filter(|p| !p.inbound).count();

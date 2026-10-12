@@ -45,9 +45,7 @@ round-tripped through `bip38decrypt` (right and wrong passphrase) on a live iron
 reorgs to a heavier chain). `signtransactionwithaddresskey` not started.
 
 **Stubs / hardcoded:**
-- `getpeerinfo`: `version`, `subver`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`,
-  `conntime`, `pingtime`, `startingheight`, `banscore` are constants; `id` is the list index.
-  Needs per-peer stat tracking in `PeerHandle`.
+- `getpeerinfo`: now real per-peer `version`, `subver`, `services`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`, `conntime`, `pingtime`, `startingheight`, `banscore`, `id` (live stats published by each connection). `inflight`, `synced_headers`, `synced_blocks`, `whitelisted` are still constants.
 - Masternode subsystem: `listmnbroadcasts`, `startmasternode`, `setupmasternode`,
   `broadcaststartmasternode`, `signmnbroadcast`, `importmnbroadcast`,
   `verifymasternodesetup` return "not implemented"; `getmasternodewinners` uses height 0 and
@@ -102,8 +100,7 @@ These abort the C++ daemon; do not call them on a production node:
 
 ## Next
 
-1. Per-peer stats for `getpeerinfo`.
-2. Masternode subsystem RPCs (largest remaining gap).
-3. `invalidateblock` family (engine work).
-4. Fill the missing keys listed under "Shape differences".
-5. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.
+1. Masternode subsystem RPCs (largest remaining gap).
+2. `invalidateblock` family (engine work).
+3. Fill the missing keys listed under "Shape differences".
+4. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.
