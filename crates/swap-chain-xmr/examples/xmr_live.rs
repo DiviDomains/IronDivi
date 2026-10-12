@@ -34,10 +34,8 @@ use divi_primitives::hash::Hash256;
 use divi_wallet::address::{Address, Network as DiviNetwork};
 use dkg::Participant;
 use monero_wallet::address::Network as XmrNetwork;
-use monero_wallet::interface::FeeRate;
-use monero_wallet::{OutputWithDecoys, ViewPair};
-use rand::{thread_rng, RngCore};
-use rand_core::OsRng;
+use monero_wallet::ViewPair;
+use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use swap_adaptor::adaptor::{AdaptorSigner, Scalar as SecpScalar};
 use swap_adaptor::dleq::{random_clamped_secret, ScalarQ};
@@ -46,7 +44,7 @@ use zeroize::Zeroizing;
 
 use swap_chain_xmr::live_rpc::{
     check_divi_confirmed, check_xmr_confirmed, check_xmr_spendable, monerod_get_info,
-    scan_for_lock_output, LiveDecoys, MONEROD_RPC_DEFAULT,
+    MONEROD_RPC_DEFAULT,
 };
 use swap_chain_xmr::monero_key_share::{additive_two_of_two_keys, dleq_secret_to_ed25519_scalar};
 use swap_chain_xmr::multisig::{redeem_script, script_pubkey};
@@ -401,7 +399,7 @@ async fn main() {
         );
         return;
     }
-    println!("Scanning for the Monero lock output...");
+    println!("Sweeping via swap_chain_xmr::monero_chain::sweep...");
     let recovered_s_t_ed25519 = {
         let mut bytes = recovered_s_t_secp.to_bytes();
         bytes.reverse();
@@ -414,55 +412,6 @@ async fn main() {
         group_key,
         "the combined spend key must reconstruct the Monero group key both sides agreed on"
     );
-
-    let output = scan_for_lock_output(
-        &monerod_rpc,
-        &xmr_lock_txid,
-        ViewPair::new(spend_point, state.xmr_view_key()).expect("torsion-free spend key"),
-    )
-    .await
-    .expect("the confirmed lock transaction must contain a scannable output for our key");
-    println!(
-        "Found the lock output: {} atomic units, output index {}.",
-        output.commitment().amount,
-        output.index_on_blockchain()
-    );
-
-    let info = monerod_get_info(&monerod_rpc)
-        .await
-        .expect("get_info reachable");
-    let latest_height = info["result"]["height"].as_u64().expect("height present") as usize;
-    let fee_body: serde_json::Value = reqwest::Client::new()
-        .post(format!("{monerod_rpc}/json_rpc"))
-        .json(&serde_json::json!({"jsonrpc":"2.0","id":"0","method":"get_fee_estimate"}))
-        .send()
-        .await
-        .expect("get_fee_estimate reachable")
-        .json()
-        .await
-        .expect("get_fee_estimate returns JSON");
-    let fee_rate = FeeRate::new(
-        fee_body["result"]["fee"].as_u64().expect("fee present"),
-        fee_body["result"]["quantization_mask"]
-            .as_u64()
-            .expect("quantization_mask present"),
-    )
-    .expect("daemon-reported fee rate is valid");
-
-    let live_decoys = LiveDecoys {
-        monerod_rpc: monerod_rpc.clone(),
-        latest_height,
-    };
-    let mut decoys = None;
-    for _ in 0..8 {
-        if let Ok(d) =
-            OutputWithDecoys::new(&mut OsRng, &live_decoys, 16, latest_height, output.clone()).await
-        {
-            decoys = Some(d);
-            break;
-        }
-    }
-    let decoys = decoys.expect("decoy selection should succeed within a handful of attempts");
 
     // A fresh throwaway destination -- Maker's own post-swap XMR wallet; nothing needs
     // to have sent anything to it beforehand, it's just where the swept funds land.
@@ -477,36 +426,29 @@ async fn main() {
     let destination = destination_view_pair.legacy_address(XmrNetwork::Stagenet);
     println!("Sweep destination (Maker's, freshly generated): {destination}");
 
-    let mut outgoing_view_key = [0u8; 32];
-    thread_rng().fill_bytes(&mut outgoing_view_key);
-    let tx = swap_chain_xmr::monero_sweep::sweep(
-        &mut OsRng,
-        &output,
-        decoys,
+    // `sweep` only dereferences `lock.txid` (it re-derives spend_pub from
+    // spend_secret and re-scans by txid internally) -- amount_piconero/confirmations
+    // are the shape `divi-swap-xmr::chain::XmrOutput` carries for a caller who got
+    // this from `find_lock`, not something this example separately tracked.
+    let lock = swap_chain_xmr::monero_chain::XmrLockOutput {
+        txid: xmr_lock_txid.clone(),
+        amount_piconero: 0,
+        confirmations: 0,
+    };
+    match swap_chain_xmr::monero_chain::sweep(
+        &monerod_rpc,
+        &lock,
+        full_spend_key.to_repr(),
+        state.xmr_view_key_bytes,
         destination,
-        outgoing_view_key,
-        fee_rate,
-        &full_spend_key,
     )
-    .expect("sweep must build and sign against the real lock output and live decoys");
-
-    let tx_hex = hex::encode(monero_wallet::transaction::Transaction::serialize(&tx));
-    let resp = reqwest::Client::new()
-        .post(format!("{monerod_rpc}/send_raw_transaction"))
-        .json(&serde_json::json!({"tx_as_hex": tx_hex, "do_not_relay": false}))
-        .send()
-        .await
-        .expect("send_raw_transaction reachable");
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .expect("send_raw_transaction returns JSON");
-    if body["status"] == "OK" && !body["not_relayed"].as_bool().unwrap_or(true) {
-        let sweep_txid = hex::encode(tx.hash());
-        println!("Monero sweep broadcast: {sweep_txid}");
-        state.xmr_sweep_txid = Some(sweep_txid);
-        state.save().expect("persist the sweep txid");
-    } else {
-        println!("Monero sweep broadcast rejected: {body}");
+    .await
+    {
+        Ok(sweep_txid) => {
+            println!("Monero sweep broadcast: {sweep_txid}");
+            state.xmr_sweep_txid = Some(sweep_txid);
+            state.save().expect("persist the sweep txid");
+        }
+        Err(e) => println!("Monero sweep broadcast rejected: {e}"),
     }
 }

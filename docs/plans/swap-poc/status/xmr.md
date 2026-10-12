@@ -807,3 +807,94 @@
   cross-lane crate dependency, which would have required a workspace `Cargo.toml`/`Cargo.lock`
   edit this lane doesn't make unilaterally.
 - needs: nothing from a human right now.
+
+## Public live MoneroChain API, for multichain's divi-swap-xmr
+
+- **Orchestrator's task, from multichain's own `- needs:`** (`~/swap-lanes/multichain/docs/
+  plans/swap-poc/status/multichain.md`): give `swap-chain-xmr` a public live `MoneroChain` API
+  — send to a `(spend pub, view secret)` address, scan for that output with the view key, sweep
+  it with the combined spend secret. Move the logic out of `examples/xmr_live.rs` into the
+  library, keep the example a thin caller, add mock tests. Coordinate exact signatures with
+  multichain via status files.
+- **Read their actual trait first** (`divi-swap-xmr/src/chain.rs`, not guessed) to shape mine to
+  fit it exactly:
+  ```rust
+  trait MoneroChain {
+      async fn lock(&self, spend_pub: &[u8; 32], view_secret: &[u8; 32], amount: u64) -> Result<String>;
+      async fn find_lock(&self, spend_pub: &[u8; 32], view_secret: &[u8; 32]) -> Result<Option<XmrOutput>>;
+      async fn sweep(&self, lock: &XmrOutput, spend_secret: &[u8; 32], view_secret: &[u8; 32]) -> Result<String>;
+      async fn confirmations(&self, txid: &str) -> Result<Option<u32>>;
+  }
+  struct XmrOutput { txid: String, amount: u64, confirmations: u32 }
+  ```
+- **`crates/swap-chain-xmr/src/monero_chain.rs` (new)** — free functions, not a trait impl (no
+  dependency on `divi-swap-xmr`), matching that shape as closely as a standalone library
+  reasonably can:
+  - `lock_address(spend_pub: [u8;32], view_secret: [u8;32], network: Network) -> Result<MoneroAddress, MoneroChainError>`
+    — pure, builds the `ViewPair`/address, no RPC.
+  - `lock(wallet_rpc: &str, username: &str, password: &str, spend_pub, view_secret, amount_piconero: u64, network) -> Result<String, MoneroChainError>`
+    — sends via `monero-wallet-rpc`'s `transfer`. **Real finding, not assumed:** confirmed live
+    that `monero-wallet-rpc` requires HTTP **Digest** auth (`curl -u user:pass` without
+    `--digest` → flat 401; `reqwest` has no built-in Digest support) — hand-rolled the
+    challenge/response round trip with the `digest_auth` crate (already a transitive dependency
+    via `monero-simple-request-rpc`, pulled in directly since that crate's own transport is
+    daemon-RPC-shaped, not wallet-RPC-shaped). Verified against the real `monero-wallet-rpc`
+    running on hp2 (`monero_chain::live::digest_auth_round_trip_works_against_the_real_wallet_rpc`,
+    read-only `get_balance`, no funds moved), not just a synthetic wiremock challenge.
+  - `find_lock(monerod_rpc: &str, spend_pub, view_secret, from_height: usize, max_blocks_to_scan: usize) -> Result<Option<XmrLockOutput>, MoneroChainError>`
+    — **one real signature difference from their trait, flagged explicitly rather than silently
+    diverging:** their `find_lock(spend_pub, view_secret)` takes no height hint, but blind
+    full-chain scanning from genesis isn't practical; this takes `from_height`/
+    `max_blocks_to_scan` the same way any real wallet scans from a known restore point rather
+    than genesis. Whoever wires the live `MoneroChain` impl should pass the height the swap's
+    Monero leg was negotiated at.
+  - `sweep(monerod_rpc: &str, lock: &XmrLockOutput, spend_secret: [u8;32], view_secret: [u8;32], destination: MoneroAddress) -> Result<String, MoneroChainError>`
+    — re-derives `spend_pub` from `spend_secret` (`G * spend_secret`; the trait doesn't pass
+    `spend_pub` to `sweep` either, for the same reason), re-scans for `lock.txid`'s real
+    `WalletOutput` (needed to build decoys/sign; `XmrLockOutput`'s plain fields aren't enough),
+    fetches the live fee estimate, retries decoy selection, signs, and broadcasts — the exact
+    logic `examples/xmr_live.rs`'s sweep step used to have inline, word for word.
+  - `confirmations(monerod_rpc: &str, txid: &str) -> Option<u32>` — `None` if the daemon reports
+    the txid in `missed_tx` (checked live what an unknown txid's response actually looks like,
+    not assumed), `Some(0)` if only in the mempool. Matches their `Result<Option<u32>>` minus the
+    `Result` (nothing here fails in a way worth distinguishing from "unknown").
+  - `XmrLockOutput { txid: String, amount_piconero: u64, confirmations: u32 }` — same three
+    fields as their `XmrOutput`, independently defined (no shared type, no crate dependency).
+  - **Byte encodings, pinned explicitly since the trait's `&[u8; 32]`s don't say:** `spend_pub`/
+    `spend_secret`/`view_secret` are all `monero-wallet`/`curve25519-dalek`'s own canonical
+    little-endian compressed-point/scalar bytes — the same encoding this crate's
+    `monero_key_share` and every live example already use. Multichain's live `MoneroChain`
+    impl should encode/decode the same way.
+- **`examples/xmr_live.rs`**: the sweep step (previously ~110 lines: scan, fetch fee estimate,
+  retry decoy selection, sign, broadcast) is now a single call to `monero_chain::sweep`; 6 now-
+  unused imports removed (`FeeRate`, `OutputWithDecoys`, `RngCore`, `OsRng`, `scan_for_lock_output`,
+  `LiveDecoys`). Not re-run live this round (no on-chain behavior changed — same calls, just
+  moved); `cargo build --example xmr_live --features live` compiles clean.
+- **Mock tests** (`monero_chain::tests`, `wiremock` — already an established pattern in this
+  workspace, `swap-chain-btc`/`-divi`/`-ltc` all use it the same way, `wiremock = { workspace =
+  true }` already in root `Cargo.toml`): `lock_address` pure validation (valid keys build an
+  address, an invalid point is rejected); `lock` sends the right destination/amount and parses
+  `tx_hash`, follows the Digest challenge end to end, surfaces an RPC error body; `confirmations`
+  reads the real field vs. returns `None` for `missed_tx`; `find_lock` returns `None` on an empty
+  window. Deep sweep-signing correctness stays covered by the pre-existing offline tests
+  (`monero_sweep::tests::sweep_builds_and_signs_against_synthetic_decoys`,
+  `happy_path_e2e`/`role_swap_e2e`) and the live-gated real-network ones — not re-proven with a
+  synthetic fake blockchain here, which would need byte-accurate fake Monero block/tx blobs for
+  little extra confidence.
+- Full suite: `fmt`/`clippy -D warnings` clean (with `live`), 38/38 non-network
+  `swap-chain-xmr` tests green (8 new `monero_chain` mock tests); 43 total with `--features
+  live` (the 8 mock tests plus the 1 new live digest-auth round-trip test, verified passing
+  against the real hp2 wallet-rpc, plus the pre-existing real-network suite). Same two
+  pre-existing flaky public-node tests observed again mid-session
+  (`fetch_scannable_block_decodes_a_block_with_a_real_transaction`,
+  `stagenet_rpc::live::connects_to_public_stagenet_node`), both passed on immediate retry.
+  `check-xmr.sh` PASS.
+- decisions: new crate dependencies both already resolved elsewhere in the workspace lockfile
+  before this round (`digest_auth` transitively via `monero-simple-request-rpc`, `wiremock`
+  directly in root `Cargo.toml`'s `[workspace.dependencies]`) — adding them to
+  `swap-chain-xmr`'s own `Cargo.toml` needed no new registry resolution, consistent with owning
+  my own crate's dependency list without touching the root manifest.
+- needs: nothing from a human right now. Coordination for multichain: the signatures above are
+  final from this lane's side; `find_lock`'s extra height-window parameters are the one place a
+  live `MoneroChain` impl needs to supply something their trait signature doesn't carry (the
+  swap's own negotiated height) — flag if a different shape is wanted instead.

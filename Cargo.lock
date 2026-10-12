@@ -6500,6 +6500,7 @@ version = "0.2.6"
 dependencies = [
  "ciphersuite",
  "curve25519-dalek",
+ "digest_auth",
  "divi-crypto",
  "divi-primitives",
  "divi-script",
@@ -6523,6 +6524,7 @@ dependencies = [
  "swap-chain-divi",
  "thiserror 1.0.69",
  "tokio",
+ "wiremock",
  "zeroize",
 ]
 

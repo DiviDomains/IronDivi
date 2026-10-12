@@ -33,9 +33,18 @@ reqwest = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 swap-chain-divi = { workspace = true }
+# monero_chain::lock needs this directly: monero-wallet-rpc requires HTTP Digest auth
+# (confirmed live -- a plain or Basic-auth request gets a flat 401), which reqwest has
+# no built-in support for. Already a transitive dependency via monero-simple-request-rpc's
+# own digest-auth handling for monerod (a different RPC shape -- daemon, not wallet), so
+# this adds no new crate to the dependency tree, just a direct edge to an existing one.
+digest_auth = "0.3"
 
 [dev-dependencies]
 rand = { workspace = true }
+# monero_chain's mock tests stand up a local HTTP server for monerod/monero-wallet-rpc
+# request/response shapes -- same pattern swap-chain-btc/-divi/-ltc already use.
+wiremock = { workspace = true }
 dkg-pedpop = "0.6"
 # dkg-pedpop 0.6.0 uses multiexp::BatchVerifier without requesting multiexp's "batch"
 # feature itself (upstream packaging gap); pull it in ourselves so Cargo's feature

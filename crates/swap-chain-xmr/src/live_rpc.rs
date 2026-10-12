@@ -306,6 +306,24 @@ pub async fn fetch_scannable_block(monerod_rpc: &str, height: usize) -> Scannabl
     }
 }
 
+/// Scans block `height` with `view_pair`, returning every output in it that belongs
+/// to us (ordinarily zero or one, for the narrow 2-of-2-lock use this crate puts it to,
+/// but a block can in principle contain more than one output the same view key can
+/// see). Shared by [`scan_for_lock_output`] (already knows which block to look in) and
+/// [`crate::monero_chain::find_lock`] (doesn't, and scans a range of these).
+pub async fn scan_block(
+    monerod_rpc: &str,
+    height: usize,
+    view_pair: ViewPair,
+) -> Vec<WalletOutput> {
+    let block = fetch_scannable_block(monerod_rpc, height).await;
+    let mut scanner = Scanner::new(view_pair);
+    match scanner.scan(block) {
+        Ok(outputs) => outputs.not_additionally_locked(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Scans the block containing `txid` with `view_pair`, returning the one output in it
 /// that belongs to us -- `None` if `txid` isn't confirmed yet or doesn't contain an
 /// output we can see.
@@ -324,11 +342,11 @@ pub async fn scan_for_lock_output(
         .await
         .ok()?;
     let height = tx_body["txs"][0]["block_height"].as_u64()? as usize;
-    let block = fetch_scannable_block(monerod_rpc, height).await;
-    let mut scanner = Scanner::new(view_pair);
-    let outputs = scanner.scan(block).ok()?.not_additionally_locked();
     let txid_bytes: [u8; 32] = hex::decode(txid).ok()?.try_into().ok()?;
-    outputs.into_iter().find(|o| o.transaction() == txid_bytes)
+    scan_block(monerod_rpc, height, view_pair)
+        .await
+        .into_iter()
+        .find(|o| o.transaction() == txid_bytes)
 }
 
 // No network access needed -- this re-reads a sibling crate's source text to catch

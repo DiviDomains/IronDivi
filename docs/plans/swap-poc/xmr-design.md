@@ -334,6 +334,17 @@ parked the BTC lane's signet funding (`DECISIONS.md` #5).
   profile); stagenet block time matches mainnet (~2 min), so a happy-path acceptance test's Monero
   leg alone is ~20 minutes wall-clock minimum — budget for this explicitly in test design rather
   than discovering it at CI timeout.
+- **Updated 2026-10-12 (multichain lane's `- needs:`, `docs/plans/swap-poc/status/multichain.md`):**
+  `crates/swap-chain-xmr/src/monero_chain.rs` is now the public live-`MoneroChain` API — `lock`
+  (send to a `(spend_pub, view_secret)` address), `find_lock` (scan a height range for an output
+  paying it), `sweep` (spend a found lock with the combined full spend secret), `confirmations`.
+  Moved out of `examples/xmr_live.rs`'s inline sweep step, which is now a thin caller of
+  `monero_chain::sweep`. Confirmed live: `monero-wallet-rpc` (path (a) above) requires HTTP
+  **Digest** auth — a plain or Basic-auth request gets a flat 401 — which `reqwest` has no
+  built-in support for; `lock` does the challenge/response round trip itself with the
+  `digest_auth` crate (already a transitive dependency via `monero-simple-request-rpc`'s own
+  digest-auth handling for `monerod`, which is a different, daemon-shaped RPC surface, not
+  wallet-RPC-shaped).
 
 ## Build plan
 

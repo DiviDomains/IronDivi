@@ -24,9 +24,14 @@
 //! a public restricted Monero node and the DIVI testnet proxy. [`timelocks`] is the
 //! built-in `t_cancel`/`t_refund`/`t_punish` safety scheme the mainnet-readiness review
 //! found missing: a safe default margin schedule plus an ordering validator.
+//! [`monero_chain`] is the multichain lane's asked-for public live Monero API --
+//! send/scan/sweep against a (spend pub, view secret) address, moved out of
+//! `examples/xmr_live.rs` so `divi-swap-xmr`'s own `MoneroChain` implementation can
+//! reuse it instead of reimplementing wallet-RPC digest auth and decoy selection.
 
 pub mod adaptor_bridge;
 pub mod live_rpc;
+pub mod monero_chain;
 pub mod monero_key_share;
 pub mod monero_sweep;
 pub mod multisig;
