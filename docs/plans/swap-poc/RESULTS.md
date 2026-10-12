@@ -270,3 +270,14 @@ recovers it and sweeps the XMR with the reconstructed key. Throwaway keys, hp2 h
     XMR sweep (maker, reconstructed spend key) `2fdb2583f7646da8c4795e0d1baaafbc643eed809ab9b188be211c8dbd65f9e5`.
 The refund/abort path is proven offline (`refund_path_e2e.rs`), not live. There is no reverse
 direction by design: the maker always holds the DIVI leg. Not yet served by `divi-swapd`.
+
+## Multi-coin: USDC ↔ DIVI on a local anvil chain (2026-10-12, main at `46e6b30`, run on hp2)
+
+Per DECISIONS #11, USDC is proven on anvil (Foundry's local EVM chain) now; the live Sepolia/Base Sepolia
+run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvil tests ran (none skipped):
+- `forge test contracts/htlc`: 15 passed, 0 failed (`Erc20Htlc` lock, claim, refund, wrong preimage, refund after claim).
+- `cargo test -p swap-chain-evm`: 13 passed, including `anvil_lock_claim`, `anvil_lock_refund`,
+  `anvil_find_preimage_from_logs`, nonce idempotency, and the embedded bytecode matching a fresh forge build.
+- `cargo test -p divi-swap --test usdc` (the swap engine end to end, DIVI mock vs USDC on anvil): 8 passed —
+  happy swap forward and reverse; case C refund both directions (two ways of moving the clock, incl.
+  `evm_increaseTime`); taker crash between lock and claim, recovered, both directions.

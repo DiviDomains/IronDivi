@@ -18,3 +18,9 @@
    (60 s, nobody at the Mac) and `ssh dnsdivi` still failed agent signing. Still no tx broadcast.
    Unblock: be at the keyboard to approve 1Password, then say "continue" in the orchestrator pane. Check:
    `ssh dnsdivi true && op read "op://global_secret_store/IronDivi Swap POC - taker-btc/password" >/dev/null && echo ok`
+
+3. **Test ETH for the live USDC run (Sepolia / Base Sepolia)** — parked 2026-10-12. Address
+   `0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C` has 0 ETH. Public faucets need a CAPTCHA or ~0.001 mainnet
+   ETH held, which the agent cannot do. USDC is proven on anvil meanwhile (DECISIONS #11).
+   Unblock (about a minute): the Google Cloud Web3 Sepolia faucet, sign in with Google, paste the address.
+   Check: `curl -s https://eth-sepolia.blockscout.com/api/v2/addresses/0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C | grep -o '"coin_balance":[^,]*'`
