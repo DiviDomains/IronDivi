@@ -412,6 +412,12 @@ impl Taker {
         match self.tk(r)?.broadcast(&refund).await {
             Ok(_) => {}
             Err(SwapError::Premature(_)) => return Ok(Flow::Idle),
+            Err(e @ SwapError::Rejected(_)) => {
+                // Refused for good: re-sign on the next step rather than resend dead bytes.
+                r.taker_leg_refund = None;
+                self.store.put_taker_swap(r)?;
+                return Err(e);
+            }
             Err(e) => return Err(e),
         }
         if self

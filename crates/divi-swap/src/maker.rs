@@ -582,6 +582,12 @@ impl Maker {
         match self.mk(r)?.broadcast(&refund).await {
             Ok(_) => {}
             Err(SwapError::Premature(_)) => return Ok(Flow::Idle),
+            Err(e @ SwapError::Rejected(_)) => {
+                // Refused for good: re-sign on the next step rather than resend dead bytes.
+                r.maker_leg_refund = None;
+                self.store.put_maker_swap(r)?;
+                return Err(e);
+            }
             Err(e) => return Err(e),
         }
         if self
@@ -615,7 +621,15 @@ impl Maker {
                 tx
             }
         };
-        self.tk(r)?.broadcast(&claim).await?;
+        if let Err(e) = self.tk(r)?.broadcast(&claim).await {
+            if matches!(e, SwapError::Rejected(_)) {
+                // The node refused these bytes for good (e.g. signed by an older, buggy
+                // build): forget them so the next step re-signs from the persisted preimage.
+                r.taker_leg_claim = None;
+                self.store.put_maker_swap(r)?;
+            }
+            return Err(e);
+        }
         self.enter(r, SwapState::MakerClaimed)
     }
 
