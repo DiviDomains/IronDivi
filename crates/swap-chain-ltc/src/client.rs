@@ -58,6 +58,11 @@ pub enum ClientError {
 impl From<ClientError> for SwapError {
     fn from(e: ClientError) -> Self {
         match e {
+            // A load-balanced Esplora can hand out a tip hash from one backend and then
+            // 404 the `/block/<hash>` lookup on a backend that has not seen it yet.
+            ClientError::Http(f) if f.status == 404 && f.body.contains("Block not found") => {
+                SwapError::Transient(format!("esplora HTTP {}: {}", f.status, f.body))
+            }
             ClientError::Http(f) => {
                 SwapError::Other(format!("esplora HTTP {}: {}", f.status, f.body))
             }
@@ -170,5 +175,38 @@ impl EsploraClient {
             }
         }
         Err(ClientError::Transient(last))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(status: u16, body: &str) -> SwapError {
+        ClientError::Http(HttpFailure {
+            status,
+            body: body.into(),
+        })
+        .into()
+    }
+
+    #[test]
+    fn lagging_backend_block_not_found_is_transient() {
+        assert!(matches!(
+            http(404, "Block not found"),
+            SwapError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn other_client_errors_stay_permanent() {
+        assert!(matches!(
+            http(404, "Transaction not found"),
+            SwapError::Other(_)
+        ));
+        assert!(matches!(
+            http(400, "sendrawtransaction RPC error"),
+            SwapError::Other(_)
+        ));
     }
 }
