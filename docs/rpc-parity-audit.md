@@ -38,10 +38,10 @@ round-tripped through `bip38decrypt` (right and wrong passphrase) on a live iron
 
 ## Still different (open)
 
-**Missing (return -32601):**
-`signtransactionwithaddresskey` not started.
+**Missing (return -32601):** none.
 
 **Implemented after the harness run (unit-tested only; regtest cannot mine over RPC):**
+`signtransactionwithaddresskey` (SIGHASH_SINGLE over a `<pubkey> OP_CHECKSIG` dummy script, returns the scriptSig asm, like C++).
 `invalidateblock`, `reconsiderblock`, `reverseblocktransactions` (`Chain::invalidate_block` /
 `reconsider_block`: roll the tip back past the block, mark it and descendants failed, then
 activate the best remaining valid chain; reconsider clears the flag on the block, its

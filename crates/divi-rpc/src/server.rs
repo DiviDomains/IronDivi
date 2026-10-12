@@ -446,6 +446,9 @@ impl RpcServer {
             "createrawtransaction" => self.wallet.create_raw_transaction(params),
             "signrawtransaction" => self.wallet.sign_raw_transaction(params),
             "signrawtransactionwithwallet" => self.wallet.sign_raw_transaction(params),
+            "signtransactionwithaddresskey" => {
+                self.wallet.sign_transaction_with_address_key(params)
+            }
             "sendrawtransaction" => self.wallet.send_raw_transaction(params),
             "getrawtransaction" => self.wallet.get_raw_transaction(params),
             "decoderawtransaction" => self.wallet.decode_raw_transaction(params),

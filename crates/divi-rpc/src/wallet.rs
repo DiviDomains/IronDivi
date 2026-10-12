@@ -1120,6 +1120,77 @@ impl WalletRpc {
         }))
     }
 
+    /// signtransactionwithaddresskey - sign one input with the wallet key of an address.
+    ///
+    /// Mirrors C++: SIGHASH_SINGLE over a `<pubkey> OP_CHECKSIG` dummy script, and the result is
+    /// the asm of the resulting scriptSig (the bare signature).
+    pub fn sign_transaction_with_address_key(
+        &self,
+        params: &Params,
+    ) -> Result<serde_json::Value, Error> {
+        use divi_script::SigHashType;
+        if params.len() != 3 {
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "signtransactionwithaddresskey \"hexstring\" \"address\" inputindex",
+            )
+            .into());
+        }
+        let hex_str = params.get_str(0).ok_or_else(|| {
+            RpcError::new(codes::INVALID_PARAMETER, "Invalid parameter, expected hex")
+        })?;
+        let input_index = params
+            .get_i64(2)
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type int for inputindex"))?;
+        let tx_bytes = hex::decode(hex_str).map_err(|_| {
+            RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Transaction hex data must be hexadecimal",
+            )
+        })?;
+        let mut tx: Transaction = deserialize(&tx_bytes)
+            .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
+        let address = Address::from_base58(params.get_str(1).unwrap_or("")).map_err(|_| {
+            RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
+        })?;
+        let wallet = self.get_wallet()?;
+        let entry = wallet
+            .keystore()
+            .get_key_by_address(&address)
+            .ok_or_else(|| {
+                RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
+            })?;
+        let unable = || RpcError::new(codes::WALLET_ERROR, "Unable to sign for input");
+        let secret = entry
+            .secret
+            .as_ref()
+            .filter(|_| !entry.is_watch_only)
+            .ok_or_else(unable)?;
+        if input_index < 0 || input_index as usize >= tx.vin.len() {
+            return Err(unable().into());
+        }
+        let mut dummy = vec![];
+        let pk = entry.public.to_bytes();
+        dummy.push(pk.len() as u8);
+        dummy.extend_from_slice(&pk);
+        dummy.push(0xac); // OP_CHECKSIG
+        let script_code = Script::from_bytes(dummy);
+        let sig = divi_wallet::signer::sign_input(
+            &tx,
+            input_index as usize,
+            &script_code,
+            secret,
+            SigHashType::Single,
+        )
+        .map_err(|_| unable())?;
+        let mut script_sig = vec![sig.len() as u8];
+        script_sig.extend_from_slice(&sig);
+        tx.vin[input_index as usize].script_sig = Script::from_bytes(script_sig);
+        Ok(json!(divi_script::to_asm(
+            tx.vin[input_index as usize].script_sig.as_bytes()
+        )))
+    }
+
     /// sendrawtransaction - Submit a raw transaction to the network
     pub fn send_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let hex_str = params
@@ -3862,6 +3933,45 @@ mod tests {
         assert_eq!(
             rpc_code(rpc.lock_unspent(&Params::None).unwrap_err()),
             codes::MISC_ERROR
+        );
+    }
+
+    #[test]
+    fn signtransactionwithaddresskey_signs_with_wallet_key() {
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let rpc = create_test_wallet_rpc();
+        let addr = rpc
+            .get_new_address(&Params::None)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([7; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![TxOut::new(Amount::from_sat(1000), Script::new())],
+            lock_time: 0,
+        };
+        let hex = hex::encode(serialize(&tx));
+        let params = Params::Array(vec![json!(hex), json!(addr), json!(0)]);
+        let asm = rpc.sign_transaction_with_address_key(&params).unwrap();
+        let asm = asm.as_str().unwrap();
+        // a bare DER signature ending in the SIGHASH_SINGLE byte
+        assert!(asm.starts_with("30") && asm.ends_with("03"), "{}", asm);
+        // unknown address and bad input index are wallet errors
+        let other = Params::Array(vec![json!(hex), json!("not-an-address"), json!(0)]);
+        assert_eq!(
+            rpc_code(rpc.sign_transaction_with_address_key(&other).unwrap_err()),
+            codes::WALLET_ERROR
+        );
+        let oob = Params::Array(vec![json!(hex), json!(addr), json!(5)]);
+        assert_eq!(
+            rpc_code(rpc.sign_transaction_with_address_key(&oob).unwrap_err()),
+            codes::WALLET_ERROR
         );
     }
 
