@@ -161,3 +161,21 @@ Explorers: `https://litecoinspace.org/testnet/tx/<txid>`, `https://services.divi
     LTC lock (maker) `77abd2529ac34113e88b1cda942f5cb7cda899033a2f1ddd938f453d8699d03b`,
     LTC claim (taker) `c26cfb9b7948e8fc70f3f7aaffd26cb67ba1973838c3f2fb53f15b2e0db483fa`,
     DIVI claim (maker, preimage read from the LTC spend) `358c4f0303910977bcf9169ffce776119aab7d0058399decb7ab93c4890a9ac1`.
+
+## Multi-coin: ZEC ↔ DIVI on live testnets (Zcash public testnet after NU7 + DIVI testnet)
+
+Explorers: `https://testnet.zecblock.com/tx/<txid>`, `https://services.divi.domains/testnet/explorer/tx/<txid>`.
+Transparent P2SH HTLC on Zcash (v6 transactions, ZIP-244 sighash, ZIP-317 fees).
+
+- Forward happy path (taker pays ZEC, gets DIVI; local maker, `zec-live.sh --scenario happy
+  --direction forward`, 100,000 zatoshi for 5 tDIVI), taker swap `5f04e6d3…` / maker swap `a0012c1b…`,
+  taker Done / maker Done, 2026-10-12 00:27 UTC:
+    ZEC lock (taker) `aada02c671a6b6b180f8e34ac4e151d6530ae11fefe6a3efae6e78452cb6aaad`,
+    DIVI lock (maker) `a1a0372458e4ab22df5120d9cb110cca05a05c3308684c7bca563b8a64abb306`,
+    DIVI claim (taker) `b7200416fabbaa00c69fdebee43a863fbc11af5393c8122c8fc69b739bb6bcd1`,
+    ZEC claim (maker, preimage read from the DIVI spend) `bd9c3cbb27d55d3831924be7aa64bffc02b9e132eaa39794e35e3f64e1285427`
+    (90,000 zat at height 4490433).
+  Three bugs surfaced live and were fixed mid-swap without losing coins: ZIP-317 fee (`4615240`),
+  Zebra's "already exists in mempool" not treated as success (`7c932f9`), and the ZIP-244 sighash
+  hashing the redeem script instead of the P2SH scriptPubKey (`90d857c`); the maker's stored,
+  wrongly-signed claim is now re-signed after a permanent reject (`8743152`).
