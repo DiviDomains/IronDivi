@@ -488,14 +488,16 @@ fn combine_txid_v6(
     )
 }
 
-/// One transparent input being signed: its previous output's value and `scriptCode`
-/// (the redeem script for a P2SH spend, the plain `scriptPubKey` for a P2PKH spend).
+/// One transparent input being signed: its previous output's value and `scriptPubKey`.
+///
+/// ZIP 244 (S.2c and S.2g.iii) commits to the previous output's `scriptPubKey` — for a P2SH
+/// HTLC that is the P2SH script, *not* the redeem script BIP 143 would use as `scriptCode`.
 #[derive(Debug, Clone)]
 pub struct SigInput {
     /// Value of the output this input spends, in zatoshi.
     pub value: u64,
-    /// The script committed to by this input's signature.
-    pub script_code: Vec<u8>,
+    /// The `scriptPubKey` of the output this input spends.
+    pub script_pubkey: Vec<u8>,
 }
 
 /// S.2: the transparent part of the signature digest for signing/verifying input
@@ -536,7 +538,7 @@ fn transparent_sig_digest(
     } else {
         let mut buf = Vec::new();
         for s in sig_inputs {
-            write_script(&mut buf, &s.script_code);
+            write_script(&mut buf, &s.script_pubkey);
         }
         blake2b_person(PERS_SCRIPTS, &[&buf])
     };
@@ -559,7 +561,7 @@ fn transparent_sig_digest(
             let mut buf = Vec::new();
             vin[i].prevout.write(&mut buf);
             buf.extend(sig_inputs[i].value.to_le_bytes());
-            write_script(&mut buf, &sig_inputs[i].script_code);
+            write_script(&mut buf, &sig_inputs[i].script_pubkey);
             buf.extend(vin[i].sequence.to_le_bytes());
             blake2b_person(PERS_TXIN, &[&buf])
         }
@@ -1126,7 +1128,7 @@ pub fn build_funding_tx(
         .iter()
         .map(|c| SigInput {
             value: c.value,
-            script_code: c.script_pubkey.clone(),
+            script_pubkey: c.script_pubkey.clone(),
         })
         .collect();
     for i in 0..chosen.len() {
@@ -1275,7 +1277,7 @@ pub fn build_spend_tx(
     };
     let sig_inputs = [SigInput {
         value: amount,
-        script_code: redeem.clone(),
+        script_pubkey: htlc_script_pubkey(&redeem),
     }];
     let digest = tx.signature_digest(0, &sig_inputs);
     let sig = ecdsa_sign_all(secp, sk, &digest);
@@ -1382,7 +1384,7 @@ mod tests {
                 .zip(v.script_pubkeys.iter())
                 .map(|(a, spk)| SigInput {
                     value: *a as u64,
-                    script_code: hex::decode(spk).unwrap(),
+                    script_pubkey: hex::decode(spk).unwrap(),
                 })
                 .collect();
 
@@ -1486,9 +1488,21 @@ mod tests {
         // build_spend_tx already ran verify_htlc_spend; re-run explicitly for clarity.
         let sig_inputs = [SigInput {
             value: 20_000,
-            script_code: h.redeem_script(),
+            script_pubkey: htlc_script_pubkey(&h.redeem_script()),
         }];
         verify_htlc_spend(&tx, 0, &sig_inputs, &h.redeem_script()).unwrap();
+
+        // Regression (live NU7 run, claim rejected "script verification failed"): ZIP 244
+        // signs the P2SH scriptPubKey, so a digest over the redeem script must not verify.
+        let redeem_inputs = [SigInput {
+            value: 20_000,
+            script_pubkey: h.redeem_script(),
+        }];
+        assert_ne!(
+            tx.signature_digest(0, &redeem_inputs),
+            tx.signature_digest(0, &sig_inputs)
+        );
+        assert!(verify_htlc_spend(&tx, 0, &redeem_inputs, &h.redeem_script()).is_err());
 
         // `ParsedTx::parse` (used by `find_spend`/`htlc_output` on a counterparty's raw tx)
         // must recompute the exact same txid for a v6 transaction we built ourselves.
@@ -1520,7 +1534,7 @@ mod tests {
         assert_eq!(tx.vin[0].sequence, REFUND_SEQUENCE);
         let sig_inputs = [SigInput {
             value: 20_000,
-            script_code: h.redeem_script(),
+            script_pubkey: htlc_script_pubkey(&h.redeem_script()),
         }];
         verify_htlc_spend(&tx, 0, &sig_inputs, &h.redeem_script()).unwrap();
     }
@@ -1566,7 +1580,7 @@ mod tests {
         let other = htlc(hash);
         let sig_inputs = [SigInput {
             value: 20_000,
-            script_code: other.redeem_script(),
+            script_pubkey: htlc_script_pubkey(&other.redeem_script()),
         }];
         assert!(verify_htlc_spend(&tx, 0, &sig_inputs, &other.redeem_script()).is_err());
     }
