@@ -908,6 +908,108 @@ async fn broadcast_after_persist() {
     }
 }
 
+/// Drive `h` (already past accept+lock) through `scn`, arming `chain.reject_next_broadcast()`
+/// the first round `armed(h)` is true (checked against the state as of the *previous*
+/// round, i.e. before this round's tick/step runs) — so the very next broadcast that round
+/// attempts gets rejected once, forcing the engine to drop its persisted bytes and re-sign.
+/// Asserts the swap still reaches the expected terminal balances, and that the reject point
+/// was actually reached (a test bug that never arms would otherwise pass trivially).
+async fn resign_after_reject(h: &mut H, scn: Scn, chain: &MockChain, mut armed: impl FnMut(&H) -> bool) {
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    let mut timed_out = false;
+    let mut injected = false;
+    for i in 0..80 {
+        if !injected && armed(h) {
+            chain.reject_next_broadcast();
+            injected = true;
+        }
+        h.round(scn, None, &mut timed_out, false).await;
+        if h.finished() {
+            assert!(injected, "reject point never reached in {i} rounds");
+            assert_atomic(h, scn);
+            return;
+        }
+    }
+    panic!(
+        "did not finish: maker {:?} taker {:?} injected={injected}",
+        h.maker_state(),
+        h.taker_state()
+    );
+}
+
+/// The maker's refund of its own leg (`on_maker_refundable`) drops the persisted refund and
+/// re-signs after a rejection, instead of resending dead bytes forever (regression: a maker
+/// persisted a claim signed by a buggy sighash and rebroadcast it forever — fixed for every
+/// claim/refund path, this covers the maker-refund one with the mock's reject switch).
+async fn resign_after_maker_refund_reject_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let ml_chain = h.ml_chain().clone();
+    resign_after_reject(&mut h, Scn::Refund, &ml_chain, |h| {
+        h.maker_state() == SwapState::MakerRefundable
+    })
+    .await;
+}
+
+/// The maker's claim of the taker's leg (`on_taker_claimed`) does the same. Armed one state
+/// earlier than the target (`MakerLockConfirmed`, not `TakerClaimed`): `on_taker_claimed`
+/// unconditionally chains into `MakerClaimed` on a successful broadcast (no confirmation
+/// gate), and the maker's `step()` keeps draining `Flow::Moved` transitions within one
+/// `tick()` call, so `TakerClaimed` is never observable as a paused, between-rounds state —
+/// arming while still `MakerLockConfirmed` catches the broadcast on its first attempt
+/// instead, inside whichever round's `tick()` drives the whole chain through.
+async fn resign_after_maker_claim_reject_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let tl_chain = h.tl_chain().clone();
+    resign_after_reject(&mut h, Scn::Happy, &tl_chain, |h| {
+        h.maker_state() == SwapState::MakerLockConfirmed
+    })
+    .await;
+}
+
+/// The taker's refund of its own leg (`on_refunded`) does the same.
+async fn resign_after_taker_refund_reject_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let tl_chain = h.tl_chain().clone();
+    resign_after_reject(&mut h, Scn::Refund, &tl_chain, |h| {
+        h.taker_state() == TakerState::Refunded
+    })
+    .await;
+}
+
+/// The taker's claim of the maker's leg (`on_claimed`) does the same — this path had no
+/// lazy-rebuild at all before this change (a cleared `maker_leg_claim` would hard-error
+/// instead of re-signing), so this is the strongest regression test of the four.
+async fn resign_after_taker_claim_reject_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let ml_chain = h.ml_chain().clone();
+    resign_after_reject(&mut h, Scn::Happy, &ml_chain, |h| {
+        h.taker_state() == TakerState::Claimed
+    })
+    .await;
+}
+
+both!(
+    resign_maker_refund,
+    rev_resign_maker_refund,
+    resign_after_maker_refund_reject_body
+);
+both!(
+    resign_maker_claim,
+    rev_resign_maker_claim,
+    resign_after_maker_claim_reject_body
+);
+both!(
+    resign_taker_refund,
+    rev_resign_taker_refund,
+    resign_after_taker_refund_reject_body
+);
+both!(
+    resign_taker_claim,
+    rev_resign_taker_claim,
+    resign_after_taker_claim_reject_body
+);
+
 const MAKER_HAPPY: &str = include_str!("fixtures/maker-forward-done-happy.json");
 const MAKER_CASEC: &str = include_str!("fixtures/maker-forward-done-casec.json");
 const TAKER_HAPPY: &str = include_str!("fixtures/taker-forward-done-happy.json");

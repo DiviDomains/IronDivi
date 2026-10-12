@@ -1,5 +1,11 @@
 # Lane zec status
 
+- running: cross-check test of `transparent_sig_digest` against the official `zcash_primitives`
+  crate for a P2SH input, delegated to a background worktree agent (orchestrator asked for
+  this after fixing the P2SH scriptPubKey bug below) — not applied yet, awaiting the agent's
+  report. **Broadcast-idempotency audit of ltc/btc/evm/divi done** (below) — read-only per
+  "own your paths only" (rule 2): I did not edit those crates myself, only reviewed and
+  report findings/suggested patches for their owning lanes (or the orchestrator) to apply.
 - blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
   EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
   on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
@@ -16,6 +22,103 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Broadcast-idempotency audit of ltc/btc/evm/divi, 2026-10-12 ~01:10 EDT** (read-only —
+    I own `swap-chain-zec` only, so this is findings/suggested patches for the owning lanes
+    or the orchestrator to apply, not a diff I made myself). Checked each backend's
+    `broadcast()`/`is_already_known` (or equivalent) against the cross-chain checklist
+    (`already exists in mempool`, `already in block chain`, `txn-already-known`,
+    `txn-already-in-mempool`, `Transaction already in block chain`, nonce-too-low-for-
+    same-hash) and, separately, whether each actually *verifies* the already-known tx is
+    the caller's own txid before returning `Ok`, not just pattern-matching the error text:
+    - **`swap-chain-ltc` / `swap-chain-btc`**: both check `already in block chain`/`already
+      in the block chain`/`txn-already-in-mempool`/`txn-already-known`/`outputs already in
+      utxo set` — the Esplora/Bitcoin-Core-family wording their actual backend
+      (mempool.space/litecoinspace.org, not Zebra) actually returns; Zebra's "already
+      exists in mempool"/"committed to the best chain" wording doesn't apply to them, so
+      no gap there. Better still: `broadcast()` already has an explicit txid-verification
+      fallback — on a `missingorspent` rejection (inputs already spent, e.g. by this same
+      tx while we were down) it calls `self.confirmations(&tx.txid)` and only treats it as
+      success if *that exact txid* shows up. **No gap found.**
+    - **`swap-chain-divi`**: same wording family as BTC/LTC (`classify_broadcast_error` in
+      `rpc.rs`, matches zcashd/Bitcoin-Core convention — DIVI's testnet node is its own
+      fork, not Zebra, so the Zebra-specific wording isn't expected to apply here either,
+      though I have no live evidence either way). Also already verifies the exact txid via
+      `self.get_tx_opt(&tx.txid)` before treating an ambiguous `Rejected` class as success.
+      **No gap found**, same pattern as BTC/LTC.
+    - **`swap-chain-evm` (USDC) — gap found.** `is_already_known` in `backend.rs` covers
+      `already known`/`already imported`/`nonce too low`/`replacement transaction
+      underpriced`, but unlike every other backend, `broadcast()` returns `Ok(tx.txid)` for
+      these **without checking the chain at all** — it trusts the error text alone. This
+      matters specifically for EVM: "nonce too low" is genuinely ambiguous (unlike a raw-tx
+      hash rebroadcast on UTXO chains, where there's only ever the one txid we submitted to
+      be "already known"). A *different* transaction could in principle occupy the same
+      nonce slot — returning `Ok` blindly would make the caller believe its specific
+      claim/refund landed when actually something else did, or nothing did. The crate
+      already has everything needed to close this the same way BTC/LTC/DIVI do: its own
+      `confirmations()` (same file, a few lines below) calls `get_transaction_receipt`/
+      `get_transaction_by_hash` on `txid` and returns `Some` if either finds it. Suggested
+      fix (not applied — not my crate): in `broadcast()`'s `Err(e) if
+      is_already_known(&e.to_string())` arm, call `self.confirmations(&tx.txid).await?` and
+      only return `Ok(tx.txid)` if that's `Some(_)`; otherwise fall through to the normal
+      rejection path (the error text matched an "already known"-shaped message, but the
+      specific tx isn't actually on chain, which is exactly the case worth refusing to
+      paper over).
+  - **Live claim bug: ZIP-244 sighash was hashing the HTLC redeem script where it must hash
+    the P2SH `scriptPubKey`, 2026-10-12 ~00:50 EDT.** The live forward run's maker claim of
+    the taker's ZEC lock was rejected by Zebra: "could not verify a transparent script:
+    script verification failed" (lock itself was fine — pure P2PKH, so the consensus branch
+    id etc. were already proven good). I started reproducing this offline (fetch the real
+    lock tx, rebuild the claim, diff against a from-scratch spec read) and had independently
+    converged on the same root cause the orchestrator found and landed first, as `90d857c`:
+    `SigInput`'s field (then named `script_code`) fed the HTLC **redeem script** into both
+    the ZIP-244 S.2c (`scriptpubkeys_sig_digest`, aggregate over every input) and S.2g.iii
+    (the signed input's own digest) — but ZIP 244 departs from Bitcoin's BIP-143
+    `scriptCode` substitution: **both** fields commit to the spent output's actual on-chain
+    `scriptPubKey` (for a P2SH HTLC, the P2SH script `OP_HASH160 <hash> OP_EQUAL`), never
+    the redeem script. I confirmed this myself independently by reading the ZIP-244 spec
+    text directly (not from memory) — S.2c: "`scriptpubkeys_sig_digest`... all `pk_script`
+    fields for the coins spent"; S.2g.iii: "`scriptPubKey` is the field encoding... of the
+    `pk_script` field for the coin spent by the transparent input. For P2SH coins, this
+    differs from the `redeemScript` committed to in ZIP 243" — explicit confirmation ZIP 244
+    deliberately changed this from ZIP 243/BIP 143. For a P2PKH input scriptCode==scriptPubKey
+    trivially, which is exactly why the funding tx (all P2PKH) worked and only the P2SH
+    claim/refund broke — and why the official ZIP-244 test vectors (none exercise a P2SH
+    input with a differing redeem script) never caught it. Landed fix: `SigInput.script_code`
+    renamed `script_pubkey`; `build_spend_tx` now passes `htlc_script_pubkey(&redeem)` (the
+    P2SH wrapper), not `redeem` itself; a regression test pins that signing against the
+    redeem script produces a *different* digest and fails `verify_htlc_spend`. I lane-synced
+    onto it (clean, no conflicts) and re-ran the full suite — all green.
+  - **`zec-live.sh --check-funding` + confirmed refund fees, 2026-10-12 ~00:30 EDT** (after
+    `4615240`, the ZIP-317 fix, landed; orchestrator rerunning live happy both ways from the
+    Mac concurrently with this).
+    - Added `--check-funding` to `zec-live.sh`: read-only, no key, builds/runs nothing else
+      — prints both swap addresses' confirmed balances (reuses
+      `crates/swap-chain-zec/examples/check_addr_utxos.rs`, the same `GetAddressUtxos` check
+      used to confirm the faucet claims) and how many more happy/case-c runs each can afford
+      at `min_per_run` (`zec_zats` + `fee_buffer_sats` = 120,000 zatoshi) — happy and case-c
+      cost the same per run since both lock the identical `$zec_zats` amount, so one number
+      covers either. Just ran it: both taker and maker still show their original
+      12,500,000-zatoshi UTXO untouched (193 confirmations at check time) → **104 more runs
+      each** at the current rate — i.e. the orchestrator's concurrent live rerun from the
+      Mac hadn't broadcast anything yet as of this check (or its own first broadcast is still
+      pending/in flight; this tool can't tell "not started" from "about to start", only "has
+      this specific original UTXO been spent yet").
+    - **Confirmed case-c refund txs pay the ZIP-317 fee too, not just funding.** Added fee
+      assertions directly to the existing `claim_script_executes`/`refund_script_executes`
+      tests (which call `build_spend_tx` the same way the real claim/refund code path
+      does): both pin `amount(20,000) - tx.vout[0].value == 10,000` exactly — the 2-action
+      grace floor, same as funding (1-in/1-out: claim's scriptSig is long enough to push the
+      input to 2 actions on its own via the redeem-script length, refund's scriptSig does
+      too; the single P2PKH output stays at 1 action; `max` of the two is 2 either way, so
+      both land on the same 10,000-zat number as the funding-tx case). This was already true
+      by construction (`build_spend_tx` routes through the same `probe_fee` the funding fix
+      added, for both `Spend::Claim` and `Spend::Refund`) but wasn't pinned by a test before
+      the orchestrator explicitly asked — now it is, so a future change to either spend path
+      can't silently regress back to a plain per-byte fee without a test failing.
+    - Verified: `cargo test -p swap-chain-zec` all green (11 passed, 2 new fee assertions
+      included); `cargo clippy`/`fmt` clean; `check-zec.sh` PASS; `zec-live.sh
+      --check-funding` ran live against `testnet.zec.rocks` (output above), `shellcheck`
+      clean on the script.
   - **`zec-live.sh case-c` expected duration, reviewed against the local maker profile,
     2026-10-11 ~23:10 EDT.** `zec-live.sh`'s `case-c` TOML override is
     `maker_timeout_secs = 3600` (1h), `taker_timeout_secs = 14410` (~4h 10s — chosen to clear

@@ -1485,6 +1485,12 @@ mod tests {
         assert_eq!(tx.lock_time, 0);
         assert_eq!(tx.vin[0].sequence, 0xffff_ffff);
         assert!(tx.vout[0].value < 20_000);
+        // A claim pays the ZIP 317 conventional fee too, not the old per-byte rate.
+        assert_eq!(
+            20_000 - tx.vout[0].value,
+            10_000,
+            "claim fee should be the ZIP 317 2-action grace floor"
+        );
         // build_spend_tx already ran verify_htlc_spend; re-run explicitly for clarity.
         let sig_inputs = [SigInput {
             value: 20_000,
@@ -1537,6 +1543,13 @@ mod tests {
             script_pubkey: htlc_script_pubkey(&h.redeem_script()),
         }];
         verify_htlc_spend(&tx, 0, &sig_inputs, &h.redeem_script()).unwrap();
+        // A refund pays the ZIP 317 conventional fee too, not the old per-byte rate — the
+        // orchestrator's live case-c runs need this exactly as much as funding does.
+        assert_eq!(
+            20_000 - tx.vout[0].value,
+            10_000,
+            "refund fee should be the ZIP 317 2-action grace floor"
+        );
     }
 
     #[test]

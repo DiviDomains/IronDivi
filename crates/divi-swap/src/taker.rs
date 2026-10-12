@@ -375,11 +375,33 @@ impl Taker {
     }
 
     async fn on_claimed(&self, r: &mut TakerRecord) -> Result<Flow> {
-        let claim = r
-            .maker_leg_claim
-            .clone()
-            .ok_or_else(|| SwapError::Other("Claimed without a claim tx".into()))?;
-        self.mk(r)?.broadcast(&claim).await?;
+        let claim = match r.maker_leg_claim.clone() {
+            Some(tx) => tx,
+            None => {
+                let htlc = r
+                    .maker_leg_htlc
+                    .ok_or_else(|| SwapError::Other("Claimed without a maker-leg lock".into()))?;
+                let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
+                let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
+                let tx = self
+                    .mk(r)?
+                    .build_claim(&htlc, &op, amount, &r.preimage)
+                    .await?;
+                r.maker_leg_claim = Some(tx.clone());
+                self.store.put_taker_swap(r)?; // write-ahead
+                tx
+            }
+        };
+        if let Err(e) = self.mk(r)?.broadcast(&claim).await {
+            if matches!(e, SwapError::Rejected(_)) {
+                // Refused for good (e.g. signed by an older, buggy build): forget it so the
+                // next step re-signs from the persisted preimage, same as the maker/taker
+                // claim/refund paths.
+                r.maker_leg_claim = None;
+                self.store.put_taker_swap(r)?;
+            }
+            return Err(e);
+        }
         if self
             .mk(r)?
             .confirmations(&claim.txid)

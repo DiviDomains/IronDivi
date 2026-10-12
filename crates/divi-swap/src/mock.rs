@@ -62,6 +62,9 @@ struct ChainState {
     /// outpoint → spending txid
     spends: HashMap<Outpoint, Txid>,
     offline: bool,
+    /// One-shot: the next `broadcast()` call fails with `SwapError::Rejected` instead of
+    /// whatever it would otherwise do, then clears itself.
+    reject_next_broadcast: bool,
 }
 
 /// A simulated chain shared by several backends.
@@ -109,6 +112,15 @@ impl MockChain {
     /// While offline every backend call fails with `SwapError::Transient`.
     pub fn set_offline(&self, offline: bool) {
         self.state.lock().offline = offline;
+    }
+
+    /// The next `broadcast()` on this chain (by any backend) fails with
+    /// `SwapError::Rejected`, as if a node refused the signed bytes for good (e.g. a stale
+    /// or buggy signature) — before touching any balance/spend state. One-shot: it clears
+    /// itself after firing, so a re-signed retry goes through normally. For tests of the
+    /// "a rejected claim/refund is forgotten and re-signed on the next step" paths.
+    pub fn reject_next_broadcast(&self) {
+        self.state.lock().reject_next_broadcast = true;
     }
 
     /// Current MTP.
@@ -286,6 +298,10 @@ impl ChainBackend for MockBackend {
         let parsed: MockTx = serde_json::from_slice(&tx.raw)
             .map_err(|e| SwapError::Rejected(format!("decode: {e}")))?;
         let mut s = self.chain.state.lock();
+        if s.reject_next_broadcast {
+            s.reject_next_broadcast = false;
+            return Err(SwapError::Rejected("mock: forced rejection (test)".into()));
+        }
         if s.txs.contains_key(&tx.txid) {
             return Ok(tx.txid);
         }

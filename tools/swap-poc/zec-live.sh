@@ -7,6 +7,15 @@
 #
 #   tools/swap-poc/zec-live.sh [--scenario happy|case-c|all] [--direction forward|reverse|both]
 #                              [--backend live|mock] [--dry-run] [--maker-url URL]
+#   tools/swap-poc/zec-live.sh --check-funding
+#
+# --check-funding: read-only, no key, nothing built or run — prints both swap addresses'
+# confirmed balances (via crates/swap-chain-zec/examples/check_addr_utxos.rs, the same
+# GetAddressUtxos check used to confirm the faucet claims landed) and how many more
+# happy/case-c runs each can still afford at $min_per_run zatoshi/run (below), given the
+# ZIP-317 conventional fee every tx now pays (crates/swap-chain-zec/src/tx.rs's
+# `zip317_fee`) instead of the old, wrong, plain per-byte rate. Exits before any other flag
+# is even parsed as a scenario/direction/backend choice.
 #
 # --maker-url URL: drive an already-running maker instead of a local one (e.g. a deployed
 # divi-swapd through an SSH tunnel), like e2e.sh/ltc-live.sh --maker-url. Nothing is built
@@ -38,6 +47,7 @@ set -euo pipefail
 
 usage() {
   echo "usage: $0 [--scenario happy|case-c|all] [--direction forward|reverse|both] [--backend live|mock] [--dry-run] [--maker-url URL]" >&2
+  echo "       $0 --check-funding" >&2
   exit 2
 }
 die() { echo "zec-live: $*" >&2; exit 1; }
@@ -47,6 +57,7 @@ direction_arg=both
 backend=live
 dry_run=0
 maker_url=""
+check_funding=0
 while (($#)); do
   case "$1" in
     --scenario) scenario_arg="${2:-}"; shift 2 || usage ;;
@@ -54,10 +65,13 @@ while (($#)); do
     --backend) backend="${2:-}"; shift 2 || usage ;;
     --dry-run) dry_run=1; shift ;;
     --maker-url) maker_url="${2:-}"; shift 2 || usage; [[ -n "$maker_url" ]] || usage ;;
+    --check-funding) check_funding=1; shift ;;
     *) usage ;;
   esac
 done
-[[ "$backend" == live || "$backend" == mock ]] || usage
+if ((!check_funding)); then
+  [[ "$backend" == live || "$backend" == mock ]] || usage
+fi
 case "$scenario_arg" in happy|case-c|all) ;; *) usage ;; esac
 case "$direction_arg" in forward|reverse|both) ;; *) usage ;; esac
 maker_url="${maker_url%/}"
@@ -85,6 +99,23 @@ min_per_run=$((zec_zats + fee_buffer_sats))
 # items; taker/maker ZEC key refs below are the *-btc ones.
 taker_zec_addr="tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk"
 maker_zec_addr="tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn"
+
+if ((check_funding)); then
+  echo "zec-live: checking funding (read-only, no key — GetAddressUtxos on testnet.zec.rocks)"
+  out="$(cd "$ROOT" && cargo run -q -p swap-chain-zec --example check_addr_utxos -- \
+    "$taker_zec_addr" "$maker_zec_addr")" || die "check_addr_utxos failed"
+  echo "$out"
+  taker_total="$(sed -n -E "s/^${taker_zec_addr}: total ([0-9]+) zatoshi.*/\1/p" <<<"$out")"
+  maker_total="$(sed -n -E "s/^${maker_zec_addr}: total ([0-9]+) zatoshi.*/\1/p" <<<"$out")"
+  taker_total="${taker_total:-0}"
+  maker_total="${maker_total:-0}"
+  echo "zec-live: at $min_per_run zatoshi/run (zec_zats=$zec_zats + fee_buffer_sats=$fee_buffer_sats" \
+       "-- the real ZIP-317 fee per tx is ~10,000-15,000 zat, see tx.rs's zip317_fee; happy" \
+       "and case-c cost the same per run since both lock the same \$zec_zats amount):"
+  echo "  taker ($taker_zec_addr): $taker_total zatoshi -> $((taker_total / min_per_run)) more run(s)"
+  echo "  maker ($maker_zec_addr): $maker_total zatoshi -> $((maker_total / min_per_run)) more run(s)"
+  exit 0
+fi
 
 forward_runs=0 reverse_runs=0
 for s in "${scenarios[@]}"; do

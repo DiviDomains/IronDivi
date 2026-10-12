@@ -165,7 +165,11 @@ fn classify_broadcast_error(message: &str) -> SwapError {
     }
 }
 
-/// Whether a reject reason means "the chain already has this exact transaction."
+/// Whether a reject reason means "the chain already has this exact transaction" — i.e. a
+/// rebroadcast of a tx `broadcast()` itself already sent is not a failure. There's nothing
+/// to cross-check the error against a different txid with (unlike e.g. an EVM nonce
+/// collision): we only ever submit the one `signed_tx.raw` we just built, so a node telling
+/// us it already has "the transaction" can only mean that same tx.
 fn is_already_known(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("already in block chain")
@@ -173,7 +177,10 @@ fn is_already_known(message: &str) -> bool {
         || m.contains("txn-already-in-mempool")
         || m.contains("txn-already-known")
         || m.contains("outputs already in utxo set")
-        // Zebra's wording for a tx it already holds in its mempool or has mined.
+        // Zebra's wording (not zcashd's) for a tx it already holds in its mempool or has
+        // mined: a live happy-forward run's taker rebroadcast its own already-mined ZEC
+        // lock and got "already exists in mempool" back, which the CLI treated as fatal
+        // before this fix; "committed to the best chain" is the equivalent once it's mined.
         || m.contains("already exists in mempool")
         || m.contains("transaction was committed to the best chain")
 }
@@ -470,6 +477,43 @@ mod tests {
         assert!(is_already_known(
             "transaction rejected: any transaction with the same effects will be rejected \
              from the mempool until a chain reset: transaction was committed to the best chain"
+        ));
+    }
+
+    /// `broadcast()` must treat a rebroadcast of a tx the chain already has as success, not
+    /// a fatal error — the exact live failure: a taker's ZEC lock was accepted and mined,
+    /// the taker then rebroadcast it (e.g. after a retry/restart) and Zebra's rejection was
+    /// treated as fatal, killing the CLI with real coins already moved.
+    #[test]
+    fn broadcast_idempotent_already_known_errors() {
+        // The exact live message (Zebra's NU7 mempool wording), and the equivalent once
+        // the same tx has already been mined rather than just sitting in the mempool.
+        assert!(is_already_known(
+            "transaction rejected: transaction already exists in mempool"
+        ));
+        assert!(is_already_known(
+            "transaction rejected: any transaction with the same effects will be rejected \
+             from the mempool until a chain reset: transaction was committed to the best chain"
+        ));
+        // Case-insensitive, and with a gRPC Status's Display wrapper around the real text
+        // (`ClientError::Rejected` stores `tonic::Status::to_string()`, not the bare
+        // message).
+        assert!(is_already_known(
+            "status: InvalidArgument, message: \"Transaction already exists in mempool\", details: [], metadata: MetadataMap { headers: {} }"
+        ));
+        // zcashd/bitcoind-style reject reasons (legacy JSON-RPC, still possible from a
+        // zcashd-era node or a stale test vector).
+        assert!(is_already_known("txn-already-known"));
+        assert!(is_already_known("txn-already-in-mempool"));
+        assert!(is_already_known(
+            "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}"
+        ));
+        assert!(is_already_known("outputs already in utxo set"));
+
+        // A genuine rejection (not already-known) must not be swallowed as success.
+        assert!(!is_already_known("bad-txns-in-belowout"));
+        assert!(!is_already_known(
+            "transaction rejected: ... Unpaid actions is higher than the limit"
         ));
     }
 
