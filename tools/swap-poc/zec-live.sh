@@ -284,7 +284,9 @@ run_direction() {
   if [[ "$backend" == live ]]; then
     taker+=(--divi-key "$(ref taker-divi)" --zec-key "$taker_zec_ref")
     if [[ "$direction" == reverse ]]; then
-      taker+=(--divi-wallet "$(dirname "$scen_state")/zec-taker-divi-wallet.json")
+      # Same key as e2e.sh/ltc-live.sh's taker, so share its already-scanned wallet (a fresh
+      # one has no scan height and divi-swap refuses it). Never run these scripts at once.
+      taker+=(--divi-wallet "$(dirname "$scen_state")/taker-divi-wallet.json")
     fi
   fi
 
