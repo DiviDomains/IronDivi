@@ -173,6 +173,9 @@ fn is_already_known(message: &str) -> bool {
         || m.contains("txn-already-in-mempool")
         || m.contains("txn-already-known")
         || m.contains("outputs already in utxo set")
+        // Zebra's wording for a tx it already holds in its mempool or has mined.
+        || m.contains("already exists in mempool")
+        || m.contains("transaction was committed to the best chain")
 }
 
 /// If `block` has a `CompactTx` spending `want_txid:want_vout`, (spender txid, input index).
@@ -460,6 +463,13 @@ mod tests {
 
         assert!(is_already_known(
             "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}"
+        ));
+        assert!(is_already_known(
+            "transaction rejected: transaction already exists in mempool"
+        ));
+        assert!(is_already_known(
+            "transaction rejected: any transaction with the same effects will be rejected \
+             from the mempool until a chain reset: transaction was committed to the best chain"
         ));
     }
 
