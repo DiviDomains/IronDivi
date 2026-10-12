@@ -36,6 +36,8 @@ Harness result on live testnet nodes (157 call rows): before these fixes MATCH 2
 DIFFERS 69; after, **MATCH 47 / UNVERIFIED 8 / DIFFERS 40**. A later run on fully synced nodes (after the missing-key and error-code fixes below, commit `8965355`) gave **MATCH 49 / UNVERIFIED 10 / DIFFERS 36**, with no "missing in Rust" keys left except `getblock` `moneysupply`/`acc_checkpoint`. The `walletpassphrase`/`walletpassphrasechange`/`encryptwallet` encryption-state ordering and `listaccounts` default `""` account were fixed after that run and are covered by unit tests only. `bip38paperwallet` was also
 round-tripped through `bip38decrypt` (right and wrong passphrase) on a live irondivid.
 
+Final run (commit `a399431`, both nodes at the same testnet tip, Rust resynced from scratch): **MATCH 61 / UNVERIFIED 11 / DIFFERS 23**, with no key missing in Rust anywhere. Values compared live and identical: `getblock` `moneysupply` and `acc_checkpoint` at heights 1, 1000, 200000, 346000; `getlotteryblockwinners` (no arg and an explicit height); `spork show` and `spork active`. The 23 DIFFERS are Rust-only extra keys (harmless), documented deliberate deviations (`listbanned`, `loadwallet`, lenient `getrawtransaction`/`getmasternodewinners` args), wallet-state-dependent ordering in the harness (the C++ wallet was encrypted by an earlier mutating call, so `walletpassphrase*` codes differ), `setgenerate` (-32601 vs -1), and `startmasternode`.
+
 ## Still different (open)
 
 **Missing (return -32601):** none.
