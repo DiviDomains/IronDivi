@@ -371,3 +371,22 @@
     `check-usdc.sh` PASS; full `divi-swap` suite green (121 tests across 6 binaries, up from
     119 — the 2 new tests), `tests/usdc.rs` specifically now 6/6; `shellcheck` clean on both
     `usdc-live.sh` and `usdc-live-dry-run.sh`; `usdc-live-dry-run.sh` re-run clean end to end.
+- **Wave 9** (this seam): orchestrator asked (again) for `usdc-live.sh` to accept `--network
+  base-sepolia` with a dry-run test, while still blocked on Sepolia ETH. As flagged last
+  seam: `--network sepolia|base-sepolia` already exists on `usdc-live.sh` (landed `50f18a2`)
+  — re-flagging once more so this doesn't keep getting re-requested as new work. What *was*
+  missing, and is genuinely new this seam: an automated check that `--dry-run --network
+  base-sepolia` actually reaches the real network, not just that the flag parses.
+  `tools/swap-poc/usdc-live-dry-run.sh` gained a step 6: after its anvil-only proof, it now
+  also runs `usdc-live.sh --dry-run --network sepolia` and `--dry-run --network
+  base-sepolia` for real — safe to do even in an otherwise-offline-friendly script, since
+  `--dry-run` only ever reads balances (`sepolia_ops balances`, no key, no broadcast). Ran
+  clean just now: both networks resolve, both report real current balances (taker already
+  holds 20 USDC on Sepolia, 0 on Base Sepolia — expected, it is a different token on a
+  different chain; both still need Sepolia/Base-Sepolia ETH for gas). This is also the
+  concrete evidence that Base Sepolia (chain id 84532, Circle USDC
+  `0x036CbD53842c5426634e7929541eC2318f3dCF7e`) is a live, correctly-wired alternative the
+  moment any faucet pays out there instead of Sepolia.
+  - `cargo clippy --workspace --all-targets -- -D warnings` clean; `check-usdc.sh` PASS;
+    `shellcheck` clean on both scripts; `usdc-live-dry-run.sh` re-run clean end to end
+    (anvil proof + both real-network dry-runs, exit 0).

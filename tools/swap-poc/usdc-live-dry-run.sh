@@ -31,6 +31,11 @@
 #      exactly what tests/usdc.rs already does under full, non-racy control inside one
 #      process. (Same scope boundary e2e.sh documents for its own --backend mock: plumbing
 #      proven, cross-process swap proven separately.)
+#   6. `usdc-live.sh --dry-run`, for real, against both real networks (Sepolia and Base
+#      Sepolia) — the one step above that is *not* anvil-only: `--dry-run` only ever reads
+#      balances (no key, no broadcast), so it is safe to run for real here too, and this is
+#      the only way to prove `--network base-sepolia` actually resolves to a reachable RPC
+#      and the real Circle USDC contract there, not just that the flag parses.
 set -euo pipefail
 
 die() { echo "usdc-live-dry-run: $*" >&2; exit 1; }
@@ -107,5 +112,14 @@ echo "usdc-live-dry-run: a full DIVI<->USDC swap, both directions, happy path an
   "tests/usdc.rs spawns itself)"
 cargo test -q -p divi-swap --test usdc
 
+echo "usdc-live-dry-run: usdc-live.sh --dry-run against both real networks (read-only" \
+  "balance check, no key, no broadcast — the one real-network step in this otherwise" \
+  "anvil-only script)"
+for net in sepolia base-sepolia; do
+  echo "usdc-live-dry-run: usdc-live.sh --dry-run --network $net"
+  "$ROOT/tools/swap-poc/usdc-live.sh" --dry-run --network "$net"
+done
+
 echo "usdc-live-dry-run: OK — deploy, fund, lock/claim/refund and a full swap all proved" \
-  "against anvil. usdc-live.sh's real-network equivalents are the only steps left."
+  "against anvil, and --dry-run confirmed reachable on both real networks. usdc-live.sh's" \
+  "funded real-network run is the only step left."
