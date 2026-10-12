@@ -1,11 +1,19 @@
 # Lane zec status
 
-- running: cross-check test of `transparent_sig_digest` against the official `zcash_primitives`
-  crate for a P2SH input, delegated to a background worktree agent (orchestrator asked for
-  this after fixing the P2SH scriptPubKey bug below) — not applied yet, awaiting the agent's
-  report. **Broadcast-idempotency audit of ltc/btc/evm/divi done** (below) — read-only per
-  "own your paths only" (rule 2): I did not edit those crates myself, only reviewed and
-  report findings/suggested patches for their owning lanes (or the orchestrator) to apply.
+- running: nothing. Orchestrator's 4-item queue from the first live forward swap completing:
+  (1) lane-sync — done, twice (once mid-task when `e3b31c6` landed from under me, see below).
+  (2) taker `on_claimed` re-sign-on-reject + mock tests — done, see "done" below.
+  (3) ltc/btc/evm/divi broadcast-idempotency audit — done last round (read-only, "own your
+  paths only"): no gap in ltc/btc/divi, one real gap in swap-chain-evm (no txid check before
+  trusting "nonce too low" etc.), written up with a suggested one-line fix for that lane.
+  (4) cross-check `signature_digest_v6` against `zcash_primitives` for a P2SH input —
+  attempted via a background worktree agent, **blocked**: `zcash_primitives` conflicts with
+  this workspace's resolved `digest`/`bip32` versions (alloy wants stable `digest 0.11.3`,
+  `zcash_primitives` wants a `bip32 =0.6.0-pre.1` → `digest =0.11.0-pre.9` exact pre-release
+  pin; every zcash_primitives version 0.21–0.31.0-pre the agent tried hits the same wall or
+  needs yanked orchard/core2 releases). Fixing it needs a workspace-root `Cargo.toml`
+  `[patch]`/pin, which is out of scope for me (rule 2: "never the root Cargo.toml") — **needs
+  the orchestrator's call**, see "- needs:" below for the two live options.
 - blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
   EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
   on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
@@ -22,6 +30,55 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **First live ZEC<->DIVI forward swap completed end-to-end** (orchestrator, from the Mac):
+    taker claimed the DIVI, maker claimed the ZEC (`bd9c3cbb…`). Everything this lane built —
+    v6/NU7 tx format, ZIP-317 fees, the P2SH scriptPubKey sighash fix, already-known-mempool
+    handling — proved out against real consensus, real funds, real time.
+  - **Taker's `on_claimed` (maker-leg claim) now re-signs after a rejection too, 2026-10-12
+    ~01:40 EDT** — the 4th and last of the claim/refund broadcast paths; `8743152` fixed the
+    other three (maker claim, maker refund, taker refund) but missed this one, which
+    previously had **no recovery path at all**: it read `r.maker_leg_claim` with a bare
+    `.ok_or_else` that hard-errored if the stored tx was ever cleared, since nothing had
+    ever cleared it. Added the same lazy-rebuild-then-clear-on-`Rejected` pattern
+    `on_taker_claimed` (the maker's analogous function) already had: if the stored claim is
+    missing, rebuild it from `maker_leg_htlc`/`maker_leg_outpoint`/`maker_leg_amount`/
+    `preimage` (all already on `TakerRecord`) before broadcasting; on `SwapError::Rejected`,
+    clear it and return the error so the next step rebuilds and re-signs instead of
+    resending dead bytes forever (`crates/divi-swap/src/taker.rs::on_claimed`).
+    - **Mock test infrastructure**: added `MockChain::reject_next_broadcast()` — a one-shot
+      switch that forces the *next* `broadcast()` call on that chain to fail with
+      `SwapError::Rejected`, checked before the existing dedupe/already-known logic so it
+      can force-fail even a rebroadcast of bytes the mock chain already accepted
+      (`crates/divi-swap/src/mock.rs`). Used it to write 4 regression tests in
+      `crates/divi-swap/tests/engine.rs` (×2 directions = 8 actual `#[tokio::test]`s via the
+      existing `both!` macro), one per claim/refund path: `resign_maker_refund`,
+      `resign_maker_claim`, `resign_taker_refund`, `resign_taker_claim`. Each drives a real
+      swap through the shared `H` harness, arms the reject at the right moment, and asserts
+      the swap still finishes with the expected atomic balances afterward.
+    - **Non-obvious timing gotcha, worth recording**: `Maker::step()`/`Taker::step()` both
+      loop internally, draining every `Flow::Moved` state transition within *one* `tick()`/
+      `step()` call (see `MAX_TRANSITIONS_PER_STEP`) — so a state that unconditionally
+      chains into the next (e.g. `on_taker_claimed` always calls `enter(MakerClaimed)` right
+      after a successful broadcast, no confirmation gate) is never observable as "paused"
+      between test rounds. `resign_maker_claim` had to arm one state *earlier*
+      (`MakerLockConfirmed`, not `TakerClaimed`) so the pre-armed reject catches the
+      broadcast on its first real attempt, inside whichever round's `tick()` ends up
+      driving the whole chain through. The other three paths (`on_maker_refundable`,
+      `on_refunded`, `on_claimed`) all pause at `Idle` once broadcast succeeds but
+      confirmations are still 0, so arming at the target state itself works for them — the
+      reject there lands on the *next* round's redundant rebroadcast attempt instead, which
+      is still a faithful test of the same "treat a rejected rebroadcast as recoverable, not
+      fatal" behavior.
+    - Verified: `cargo test -p divi-swap` all green (82 tests in `engine.rs` alone, including
+      the 8 new ones; 4 in `usdc.rs`; 3 doc-tests), `cargo clippy --workspace --all-targets`
+      clean, `cargo fmt` clean, `cargo build --workspace` clean, `check-zec.sh` PASS.
+    - **Landing note**: my prior `ready_to_land` (check-funding/fee-pins) landed as `e3b31c6`
+      *while this work was in progress* and its landing script's `git add -A -N .` swept up
+      my not-yet-finished `mock.rs`/`taker.rs`/`engine.rs` edits too (visible in `e3b31c6`'s
+      diff) — harmless since what landed was already the fully-fixed, tests-passing version
+      (confirmed by diffing `e3b31c6`'s copy against my final one: identical except
+      formatting, which this `ready_to_land` also fixes), but a reminder to re-check
+      `ready_to_land` status before starting unrelated work next time.
   - **Broadcast-idempotency audit of ltc/btc/evm/divi, 2026-10-12 ~01:10 EDT** (read-only —
     I own `swap-chain-zec` only, so this is findings/suggested patches for the owning lanes
     or the orchestrator to apply, not a diff I made myself). Checked each backend's
@@ -478,3 +535,17 @@
   `testnet.zec.rocks:443` is confirmed to answer real gRPC calls (it's what this crate
   already uses in production). `grpc.rs`'s `Vec<String>` retry+fallback plumbing is ready
   the moment a second one turns up live; nothing to build, just a URL to add.
+- needs: a decision on the `zcash_primitives` cross-check (item 4 of the queue above) — it's
+  blocked on a dependency conflict I can't fix within `crates/swap-chain-zec` alone (rule 2:
+  never the root `Cargo.toml`). Two live options, from the worktree agent's report:
+  (a) a workspace-root `[patch]`/version pin forcing stable `digest`/`bip32` so
+  `zcash_primitives =0.30.1` resolves — agent says the actual cross-check test is otherwise
+  ready to drop in once this unblocks it; (b) generate one independent P2SH
+  (redeem≠scriptPubKey) ZIP-244 vector out-of-tree (a throwaway crate with its own lockfile,
+  or the `zcash-test-vectors` generator) and embed the resulting digest bytes into
+  `zip244_vectors.rs` as a new official-style vector — gets independence without touching
+  this workspace's dependency graph at all. Current coverage without either: the official
+  ZIP-244 v5 vectors (all-P2PKH, don't exercise this) plus `90d857c`'s regression unit test
+  (asserts the redeem-script digest and the scriptPubKey digest differ, and that only the
+  latter verifies) — self-consistent but not independently verified against a second
+  implementation.

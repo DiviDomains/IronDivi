@@ -914,7 +914,12 @@ async fn broadcast_after_persist() {
 /// attempts gets rejected once, forcing the engine to drop its persisted bytes and re-sign.
 /// Asserts the swap still reaches the expected terminal balances, and that the reject point
 /// was actually reached (a test bug that never arms would otherwise pass trivially).
-async fn resign_after_reject(h: &mut H, scn: Scn, chain: &MockChain, mut armed: impl FnMut(&H) -> bool) {
+async fn resign_after_reject(
+    h: &mut H,
+    scn: Scn,
+    chain: &MockChain,
+    mut armed: impl FnMut(&H) -> bool,
+) {
     h.accept(None).await;
     h.lock_and_notify(None).await;
     let mut timed_out = false;
