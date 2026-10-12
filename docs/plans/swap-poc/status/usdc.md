@@ -523,3 +523,45 @@
     previous cargo-based run exactly, including the ZEC cross-check above); `--check` still
     exits 1 with the same 7 shortfalls; bad-arg handling still exits 2.
   - `shellcheck`/`bash -n` clean; `check-usdc.sh` still PASS (unaffected, no Rust changes).
+- **Wave 14** (this seam): `tools/swap-poc/verify-results.sh` (new) — read-only re-check of
+  every txid in `RESULTS.md` against its own chain's public explorer/node API; no keys, no
+  cargo. Cross-lane tool (not usdc-scoped), built because Sepolia ETH is still unfunded and
+  the orchestrator asked directly.
+  - **Chain attribution** is the hard part: `RESULTS.md` labels txids inline, once per line,
+    once per bullet with indented continuation lines, or only in the section heading, with no
+    single consistent convention. A 4-tier fallback (same-line segment since the last reset →
+    whole line → last label seen on an earlier line since the last heading → the heading
+    itself) resolved all 110 real txids with 0 left "unknown", but needed two real fixes found
+    only by running it against the actual file and checking every row by hand:
+    (1) backtick-quoted *content* (e.g. `` `divi-swapd up` ``, `` `divi_scan` `` — log
+    strings/command output, not labels) must not feed the whole-line/running-default tiers,
+    or an unrelated earlier mention leaks forward onto a later, differently-chained txid
+    (caught on line 68: a BTC refund three lines below two DIVI-daemon-log mentions was
+    coming out "divi"); fixed by stripping backtick spans before those two tiers only (tier 1
+    was already backtick-content-free by construction). (2) one single txid (line 138) is a
+    DIVI refund that the document's own prose explicitly flags as mislabeled in its
+    surrounding text ("the driver logs it as 'taker BTC refund'; it is the DIVI leg") — no
+    generic heuristic reads that self-correction, so it's a one-entry hardcoded override
+    keyed by txid, not a parser rule.
+  - **Per-chain verification**, all read-only, no keys: BTC/LTC via Esplora `/tx/<txid>` +
+    `/blocks/tip/height` (mempool.space/testnet, litecoinspace.org/testnet) — litecoinspace.org's
+    Cloudflare front door 403s Python's default `urllib` User-Agent (curl's default UA passes
+    through fine); fixed by sending an explicit UA on every request to either host, found only
+    by running the real script against real txids (every LTC row was silently coming out
+    MISSING until this fix, which would have been wrongly read as "these are actually gone").
+    ZEC reuses the exact gRPC-over-HTTP/2 hand-framing this lane wrote for `balances.sh`
+    (Wave 13) — `GetTransaction`/`GetLatestBlock` against the same lightwalletd endpoint, txid
+    bytes reversed per the Bitcoin-family convention (confirmed needed by testing). XMR via
+    `node.monerodevs.org:38089/get_transactions` (plain REST+JSON, not JSON-RPC — simplest of
+    the lot, `confirmations` given directly). Sepolia via plain `eth_getTransactionReceipt`/
+    `eth_blockNumber` JSON-RPC. DIVI via `ssh dnsdivi divi-cli getrawtransaction <txid> 1`
+    exactly as asked — confirmed by direct test that `ssh dnsdivi` fails ("Host key
+    verification failed") from hp2, so every DIVI row is reported **skipped** (not missing,
+    doesn't affect the exit code) when that's true; works from the Mac.
+  - Exit code: nonzero iff at least one row is genuinely MISSING; skipped rows never count.
+    Verified both directions: a fabricated all-zero txid produces one MISSING row and exit 1;
+    the real file now produces 0 missing, 61 skipped (60 DIVI + the one hardcoded-override
+    DIVI row), 0 unattributed, exit 0.
+  - Added a short usage note to `RESULTS.md`'s own top, pointing at the script and explaining
+    the DIVI-skip behavior, per the ask.
+  - `bash -n`/`shellcheck` clean; `check-usdc.sh` still PASS (no Rust changes this wave).
