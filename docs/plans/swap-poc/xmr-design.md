@@ -26,6 +26,28 @@ throughout; `Tx_cancel` was the one row that was already right.
 - **Maker** quotes DIVI for XMR (symmetric to the existing BTC lane: Maker always holds the DIVI
   leg). **Taker** holds XMR and wants DIVI. Maps onto the literature's Bob (Maker, has
   Bitcoin/DIVI) and Alice (Taker, has Monero).
+- **Updated 2026-10-12, both party assignments:** everywhere in this doc and in
+  `swap-chain-xmr`'s code, **Maker/Taker name the crypto-protocol role — whoever locks DIVI
+  first (Maker) vs. whoever locks XMR (Taker) — not a fixed business identity.** The protocol
+  itself never changes: the DIVI holder always locks first (`Tx_lock`, Maker alone), and
+  completing `Tx_redeem` always pays the DIVI to whoever holds `s_t` (Taker). What's free to
+  vary is *which business party* (`divi-swap`'s quote-provider vs. quote-acceptor — call them
+  business-maker/business-taker) takes on which crypto role, giving a market both directions
+  from the same functions in [`swap_templates`](../../../crates/swap-chain-xmr/src/swap_templates.rs)
+  and [`multisig`](../../../crates/swap-chain-xmr/src/multisig.rs):
+  - **Sell XMR** (the direction landed and live-proven so far): business-taker locks XMR
+    (crypto-Taker), business-maker locks DIVI first (crypto-Maker). Business-taker ends up
+    with DIVI — she sold her XMR.
+  - **Buy XMR** (this round): business-taker locks DIVI first (crypto-Maker), business-maker
+    locks XMR (crypto-Taker). Business-taker ends up with XMR — she bought it with DIVI.
+  Every function in `swap_templates.rs`/`multisig.rs` takes plain `SecretKey`/`Point`/`Scalar`
+  arguments with no hardcoded assumption about which business party calls `maker_*` vs.
+  `taker_*` — the crate already supports both assignments; only the caller (the engine, or a
+  live example/test picking which throwaway keypair plays which role) decides the mapping. See
+  `swap-chain-xmr`'s `role_swap_e2e` test and `examples/xmr_live_role_swap.rs` for both
+  assignments exercised offline and live. The `divi-swap-xmr` engine's own
+  maker/taker state machines are the multichain lane's to wire a reverse (buy-XMR) direction
+  into; nothing here blocks it.
 - Both legs lock into a 2-of-2 output, not just one. Neither party's on-chain lock is
   independently spendable; every subsequent transaction is pre-signed (or adaptor-presigned) by
   both parties before the corresponding lock confirms.

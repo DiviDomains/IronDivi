@@ -37,6 +37,8 @@ mod monero_dkg;
 #[cfg(test)]
 mod refund_path_e2e;
 #[cfg(test)]
+mod role_swap_e2e;
+#[cfg(test)]
 mod stagenet_rpc;
 #[cfg(test)]
 mod tests;

@@ -666,3 +666,84 @@
   found and fixed across all three rounds (DIVI tx version, Monero pruned-tx scanning,
   distribution-fetch reliability, DIVI relay fee, Monero spendable-age minimum, plus
   this round's NUMS-generator hardening) — none of them theoretical.
+
+## Role-swapped XMR direction (buy XMR, not just sell it)
+
+- **Orchestrator's task:** today's live-proven direction only lets the (business) taker
+  *sell* XMR (she locks XMR, locks-DIVI-first party is the business-maker). A market also
+  needs the taker to *buy* XMR with DIVI: taker locks DIVI first, maker locks XMR. "The
+  protocol stays the same... only which party holds which coin changes." Scope: make
+  `swap-chain-xmr` support both assignments, add mock tests for both, run one live redeem
+  with roles swapped, coordinate with multichain via status files (not editing their
+  crates), write `ready_to_land`.
+- **Finding: no code change was needed in the crypto layer.** Read `swap_templates.rs` and
+  `multisig.rs` end to end: every function (`maker_encrypts_tx_redeem`,
+  `taker_completes_tx_redeem`, `taker_encrypts_tx_refund`, `maker_completes_tx_refund`,
+  `build_presigned_spend`, `sign_input`, …) takes plain `SecretKey`/`Point`/`Scalar`
+  arguments with no identity type and no hardcoded assumption about which business party
+  calls which. "Maker"/"Taker" in this crate's code and in `xmr-design.md`'s protocol
+  tables **already name the crypto-protocol role** (whoever locks DIVI first vs. whoever
+  locks XMR), not a fixed business identity — confirmed by re-reading
+  `~/swap-lanes/multichain/docs/plans/swap-poc/status/multichain.md`'s XMR-engine section
+  too: `divi-swap-xmr` already consumes this crate only through its public API
+  (`swap_adaptor::{adaptor,dleq}`, `swap_chain_xmr::{multisig,swap_templates,
+  adaptor_bridge}`) with its own maker/taker state machines layered on top — nothing in
+  `swap-chain-xmr` needed to change shape for them to assign either business party to
+  either crypto role. Their one open `- needs:` item (live chain API for `MoneroChain`) was
+  already answered last round (`live_rpc`, `monero_sweep::sweep`); nothing new from them
+  specific to this role-swap request.
+- **What this round actually added**, since "support both assignments" was a
+  documentation + evidence gap, not a code gap:
+  - `xmr-design.md` `## Protocol` `### Roles`: a new bullet spelling out the
+    crypto-role-vs-business-role distinction and both directions ("sell XMR" = today's
+    live-proven one; "buy XMR" = this round's), pointing at the new test/example below as
+    evidence, and flagging that wiring an actual reverse direction into `divi-swap-xmr`'s
+    engine is the multichain lane's call, not blocked by anything here.
+  - `crates/swap-chain-xmr/src/role_swap_e2e.rs` (new, registered in `lib.rs`): offline
+    mock test `buy_xmr_direction_business_taker_as_crypto_maker_chains_end_to_end`, a
+    structural mirror of `happy_path_e2e.rs` with the business party in each crypto-role
+    slot swapped (business-taker plays crypto-Maker and ends up with the reconstructed
+    Monero secret; business-maker plays crypto-Taker and ends up as the `Tx_redeem`
+    payout), proving the same functions chain correctly either way. 22/22 crate tests green
+    (10 swap-adaptor + 22 swap-chain-xmr, including this one), `fmt`/`clippy -D warnings`
+    clean with the `live` feature too.
+  - `examples/xmr_live_role_swap.rs` (new): the live run below.
+- **Live redeem, roles swapped, real DIVI testnet + Monero stagenet, throwaway keys,
+  resumable state file (`/mnt/storage1/bshuler-xmr/xmr_live_role_swap_state.json`), never
+  mainnet (checked at startup like every other live example here):**
+  - Funding, no new tDIVI or human step needed: `Tx_lock` spends the live punish round's
+    own reclaimed DIVI (`examples/xmr_live_punish.rs`'s `Tx_punish` output 0, 96,900,000
+    sat, paid to that round's Taker key — recycled the same way every round since the
+    first has funded its `Tx_lock` from the previous round's reclaim). The Monero lock
+    (0.02 XMR) is the usual manual `monero-wallet-rpc transfer` from `mining-wallet`
+    (5.25 XMR unlocked balance at the time, plenty left after).
+  - Real transactions broadcast and confirmed:
+    1. DIVI `Tx_lock` (business-taker's leg — she locks DIVI first this round, taking the
+       crypto-Maker role): `6663858e514c662616b8c7dd6129111e35243ac907fea5bcb49174b392685365`
+    2. Monero lock (business-maker's leg — she locks XMR to sell it, taking the
+       crypto-Taker role), 0.02 XMR from `mining-wallet`:
+       `30f8d10455e37d2042ce785ed0fcd5e7ac76d75c333b4cdee17aa78940b3086d`, fee 43,980,000
+       atomic units, spent key images
+       `ff5b200a9a23c7d6b67a8b7b151ad58a72e4523b42397cd57f3dff055b78b566` and
+       `606e10e6c41ce7c2c1f2110665d2b3209ed91f87266b3de6de47052fc406e657`
+    3. DIVI `Tx_redeem` (business-taker encrypts as crypto-Maker, business-maker completes
+       with `s_t` and broadcasts, claiming the DIVI — she sold her XMR for it):
+       `0de8a0c6d5c117bf1aefa0bfd6d3c4790e7c9a52c5ee27c569858818e934307c` (12 confirmations
+       at check time)
+    4. Monero sweep (business-taker recovers `s_t` from the broadcast `Tx_redeem`, combines
+       it with her own `s_m`, sweeps the full 2-of-2 — she bought the XMR with the DIVI she
+       locked): `18144dad1da133a29989a9268265043a41a0923e3df0befa6dbb19609fce19b8`, confirmed
+       (block 2227736), 20,000,000,000 atomic units found at the lock output, 16 decoys
+  - Same resumability discipline proven again: the mid-run poll's `grep -q` match closed
+    the pipe (SIGPIPE) right after `Tx_redeem` broadcast but before the sweep step printed
+    anything; re-running picked up cleanly from the persisted `divi_redeem_txid` ("Tx_redeem
+    already broadcast in an earlier run... reusing the already-known s_t") instead of
+    re-deriving or double-broadcasting.
+  - **The buy-XMR direction now has a real, live, on-chain redeem — both directions this
+    design supports (sell XMR, buy XMR) have run end to end on real DIVI testnet and
+    Monero stagenet chains, with the identical `swap_templates`/`multisig` code path.**
+- decisions: did not touch `divi-swapd`/`divi-swap` (multichain's crates, per the task's
+  explicit scope limit) — wiring an actual reverse (buy-XMR) offer/direction into
+  `divi-swap-xmr`'s engine is the multichain lane's to do, on top of this round's evidence
+  that nothing here blocks it.
+- needs: nothing from a human right now.
