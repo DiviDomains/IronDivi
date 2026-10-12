@@ -21,7 +21,9 @@
 //! [`monero_sweep`] is the final step: spending the Monero 2-of-2 output once one party
 //! holds the combined full private spend key. [`live_rpc`] is the shared RPC glue every
 //! live example (`examples/xmr_live.rs`, `examples/xmr_live_refund.rs`) needs to talk to
-//! a public restricted Monero node and the DIVI testnet proxy.
+//! a public restricted Monero node and the DIVI testnet proxy. [`timelocks`] is the
+//! built-in `t_cancel`/`t_refund`/`t_punish` safety scheme the mainnet-readiness review
+//! found missing: a safe default margin schedule plus an ordering validator.
 
 pub mod adaptor_bridge;
 pub mod live_rpc;
@@ -29,6 +31,7 @@ pub mod monero_key_share;
 pub mod monero_sweep;
 pub mod multisig;
 pub mod swap_templates;
+pub mod timelocks;
 
 #[cfg(test)]
 mod happy_path_e2e;

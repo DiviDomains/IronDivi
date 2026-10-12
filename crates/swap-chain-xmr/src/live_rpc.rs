@@ -48,16 +48,37 @@ pub async fn monerod_get_info(monerod_rpc: &str) -> reqwest::Result<serde_json::
         .await
 }
 
-/// Whether a DIVI testnet transaction has at least one confirmation
+/// The shared engine's mainnet DIVI confirmation depth
+/// (`crates/divi-swap/src/config.rs`'s `SwapConfig::profile(Profile::Mainnet)
+/// .divi_confirmations`) -- mirrored here, not imported, since `swap-chain-xmr` has no
+/// crate dependency on `divi-swap` (cross-lane; adding one would mean editing the
+/// workspace `Cargo.toml`/`Cargo.lock`, which `_hp2.md` reserves for the orchestrator).
+/// `config_drift_alarm`'s test module re-reads that file's literal source at test
+/// time and fails loudly if its mainnet value ever changes out from under this
+/// mirror. Found via the mainnet-readiness review: this
+/// crate's DIVI-side confirmation check was hardcoded to `>= 1`, 10x thinner than the
+/// engine uses for every other coin's DIVI leg on mainnet.
+pub const DIVI_CONFIRMATIONS_MAINNET: u64 = 10;
+
+/// Whether a DIVI transaction has at least `min_confirmations`
 /// (`getrawtransaction` against the testnet RPC proxy).
-pub async fn check_divi_confirmed(rpc: &RpcClient, txid: &str) -> bool {
+pub async fn check_divi_confirmed_n(rpc: &RpcClient, txid: &str, min_confirmations: u64) -> bool {
     match rpc
         .call_ok("getrawtransaction", serde_json::json!([txid, 1]))
         .await
     {
-        Ok(v) => v.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0) >= 1,
+        Ok(v) => v.get("confirmations").and_then(|c| c.as_u64()).unwrap_or(0) >= min_confirmations,
         Err(_) => false,
     }
+}
+
+/// Whether a DIVI transaction has matured past [`DIVI_CONFIRMATIONS_MAINNET`] --
+/// the crate's safe-by-default depth. Pass an explicit, shallower depth via
+/// [`check_divi_confirmed_n`] instead (e.g. for fast testnet iteration in a live
+/// example) when the caller has deliberately decided a thinner bar is acceptable;
+/// nothing in this crate still hardcodes a thin default itself.
+pub async fn check_divi_confirmed(rpc: &RpcClient, txid: &str) -> bool {
+    check_divi_confirmed_n(rpc, txid, DIVI_CONFIRMATIONS_MAINNET).await
 }
 
 /// Monero's real `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE`: an ordinary (non-coinbase)
@@ -308,6 +329,81 @@ pub async fn scan_for_lock_output(
     let outputs = scanner.scan(block).ok()?.not_additionally_locked();
     let txid_bytes: [u8; 32] = hex::decode(txid).ok()?.try_into().ok()?;
     outputs.into_iter().find(|o| o.transaction() == txid_bytes)
+}
+
+// No network access needed -- this re-reads a sibling crate's source text to catch
+// drift in a value this crate mirrors rather than depends on. Runs in a plain
+// `cargo test`, unlike the live-gated module below.
+#[cfg(test)]
+mod config_drift_alarm {
+    //! `DIVI_CONFIRMATIONS_MAINNET` mirrors `crates/divi-swap/src/config.rs`'s
+    //! `SwapConfig::profile(Profile::Mainnet).divi_confirmations` without a crate
+    //! dependency (cross-lane; see this module's own docs). This is the drift alarm:
+    //! it re-parses that file's literal source at test time, so a change to the real
+    //! value fails this test loudly instead of silently leaving the mirror stale.
+
+    use super::DIVI_CONFIRMATIONS_MAINNET;
+
+    /// Pulled in via `include_str!`, not `fs::read` at test time, so a missing file
+    /// (e.g. a checkout without `divi-swap`) fails the *build*, not just this test --
+    /// this crate has no runtime dependency on `divi-swap` either way. Path is
+    /// relative to this source file: `crates/swap-chain-xmr/src/` up to `crates/`,
+    /// then into the sibling crate.
+    const CONFIG_RS_SOURCE: &str = include_str!("../../divi-swap/src/config.rs");
+
+    /// Finds `Profile::Mainnet => SwapConfig { ... divi_confirmations: N, ... }`'s `N`
+    /// by locating the `Mainnet` match arm first, then the field within it -- doesn't
+    /// need a real parser, just enough structure to not silently match the `Testnet`
+    /// arm's own `divi_confirmations` value instead (`config.rs` writes `Mainnet`
+    /// first, but this doesn't depend on that order).
+    fn parse_mainnet_divi_confirmations(source: &str) -> u64 {
+        let mainnet_arm_start = source
+            .find("Profile::Mainnet => SwapConfig {")
+            .expect("config.rs must still have a Profile::Mainnet => SwapConfig arm");
+        let mainnet_arm = &source[mainnet_arm_start..];
+        let field_start = mainnet_arm
+            .find("divi_confirmations:")
+            .expect("the Mainnet arm must still set divi_confirmations")
+            + "divi_confirmations:".len();
+        let value_str = mainnet_arm[field_start..]
+            .trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .expect("a numeric literal must follow divi_confirmations:");
+        value_str
+            .parse()
+            .expect("divi_confirmations's value must be a plain integer literal")
+    }
+
+    #[test]
+    fn mainnet_divi_confirmations_matches_the_engines_config() {
+        assert_eq!(
+            DIVI_CONFIRMATIONS_MAINNET,
+            parse_mainnet_divi_confirmations(CONFIG_RS_SOURCE),
+            "crates/divi-swap/src/config.rs's mainnet divi_confirmations changed -- update \
+             DIVI_CONFIRMATIONS_MAINNET in live_rpc.rs to match (and re-check whatever \
+             reasoning set this crate's value in the first place)"
+        );
+    }
+
+    /// Synthetic input, not the real file: pins the parser's own arm-selection logic
+    /// (picks the `Mainnet` arm's value, not `Testnet`'s, regardless of which one
+    /// appears first or what either value is) independent of whatever the real file's
+    /// two values happen to be right now -- the real-file test above would pass by
+    /// coincidence if this were broken and the two values ever matched.
+    #[test]
+    fn parser_picks_the_mainnet_arm_not_the_testnet_one() {
+        let synthetic = "\
+            match p {
+                Profile::Testnet => SwapConfig {
+                    divi_confirmations: 3,
+                },
+                Profile::Mainnet => SwapConfig {
+                    divi_confirmations: 42,
+                },
+            }";
+        assert_eq!(parse_mainnet_divi_confirmations(synthetic), 42);
+    }
 }
 
 // Gated behind the `live` feature, same convention as `stagenet_rpc.rs`'s

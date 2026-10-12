@@ -747,3 +747,63 @@
   `divi-swap-xmr`'s engine is the multichain lane's to do, on top of this round's evidence
   that nothing here blocks it.
 - needs: nothing from a human right now.
+
+## Mainnet-readiness fixes: DIVI confirmation depth, timelock schedule
+
+- **Orchestrator's task, from the mainnet-readiness review (`48dbd50`):** `live_rpc.rs:53-60`
+  waited for only 1 DIVI confirmation while the shared engine uses `divi_confirmations: 10` on
+  mainnet (`crates/divi-swap/src/config.rs:100`) for every other coin's DIVI leg — 10x
+  thinner. Make the depth a parameter of this crate, defaulting to the engine's per-network
+  (mainnet) value, mirrored via a const with a test that fails if `config.rs` changes (without
+  editing `config.rs` — multichain may be using it). Also give `t_refund`/`t_punish` a
+  built-in safe default schedule, with a test rejecting unsafe orderings. Keep it within
+  `swap-chain-xmr`.
+- **`crates/swap-chain-xmr/src/live_rpc.rs`:** added `DIVI_CONFIRMATIONS_MAINNET: u64 = 10`
+  and `check_divi_confirmed_n(rpc, txid, min_confirmations)`; `check_divi_confirmed(rpc, txid)`
+  keeps its old 2-argument signature (no call-site changes needed in any of the four live
+  examples) but now defaults to `DIVI_CONFIRMATIONS_MAINNET` instead of the old hardcoded
+  `>= 1`. A caller that deliberately wants a thinner bar (e.g. faster testnet iteration) calls
+  `check_divi_confirmed_n` explicitly instead — the thin default itself is gone, not just
+  overridable.
+  - Drift alarm (`config_drift_alarm` test module, no `live` feature needed): reads
+    `crates/divi-swap/src/config.rs`'s literal source via `include_str!` (a sibling crate in
+    the same workspace — no new crate dependency, so no `Cargo.toml`/`Cargo.lock` edit), parses
+    out `Profile::Mainnet => SwapConfig { ... divi_confirmations: N, ... }`'s `N`, and asserts
+    it still equals `10`. A second test pins the parser itself against synthetic input (picks
+    the `Mainnet` arm, not `Testnet`'s) so the real-file test's correctness doesn't rest on the
+    two profiles' values happening to differ right now. Did not edit `config.rs` itself.
+- **`crates/swap-chain-xmr/src/timelocks.rs` (new):** `xmr-design.md`'s `## Protocol` table
+  has always required `t_cancel < t_refund < t_punish`, but nothing in this crate ever
+  provided a schedule — every template builder in `swap_templates.rs`/`multisig.rs` takes
+  `lock_time` as a bare parameter, by design (this crate doesn't own offer negotiation). Added:
+  - `default_schedule(t_cancel) -> (t_refund, t_punish)`: `t_refund = t_cancel` (the design
+    doc's own documented simplification — `Tx_refund` spends `Tx_cancel`'s output, so it can't
+    be mined earlier anyway) plus a 3-hour `t_punish` margin (`DEFAULT_PUNISH_MARGIN_BLOCKS`,
+    at the 1-minute DIVI block interval `config.rs` itself assumes) — generous on purpose,
+    matching the proportion multichain's own `divi-swap-xmr::XmrConfig::testnet` already chose
+    (`t_punish = t_cancel + 6h` on top of a `t_cancel = +6h` window — half the cancel window as
+    the punish margin), adopted as this crate's one profile-free default.
+  - `validate_schedule(t_cancel, t_refund, t_punish) -> Result<(), ScheduleError>`: rejects
+    `t_refund < t_cancel` and `t_punish <= t_refund` (ordering/non-positive-margin, not a
+    minimum margin size — a live example's deliberately short, explicitly-flagged testnet
+    timelocks are a legitimate choice to make explicitly, not something this validator exists
+    to block). `t_cancel` itself stays entirely caller-chosen, same reasoning as the DIVI
+    confirmation depth above: this crate has no network-profile concept to pick it from.
+  - 6 tests: the built-in default always validates; `t_refund == t_cancel` is accepted (not an
+    "unsafe ordering"); `t_refund < t_cancel` rejected; `t_punish <= t_refund` rejected (both
+    equal and strictly before); a 1-block punish margin is accepted (ordering-only, not a
+    minimum-size check).
+- `xmr-design.md`'s `## Risks` DIVI-relative-timelock-gap bullet extended with this round's
+  fix, pointing at both new mechanisms.
+- Full suite: `fmt`/`clippy -D warnings` clean (with the `live` feature too), 30/30 non-network
+  `swap-chain-xmr` tests green (8 new: 2 `config_drift_alarm` + 6 `timelocks`). The
+  `live`-feature-gated real-network tests are unaffected by this round's code (two flaked with
+  a transient connection reset against the public node mid-session, passed on immediate retry
+  — a pre-existing flakiness in that test module, not caused by this change). `check-xmr.sh`
+  PASS. No live run needed this round — both changes are library-level defaults/validators,
+  not new on-chain behavior to demonstrate.
+- decisions: did not edit `crates/divi-swap/src/config.rs` (multichain's file, per the task's
+  explicit instruction) — mirrored its value with a drift-tested constant instead of adding a
+  cross-lane crate dependency, which would have required a workspace `Cargo.toml`/`Cargo.lock`
+  edit this lane doesn't make unilaterally.
+- needs: nothing from a human right now.

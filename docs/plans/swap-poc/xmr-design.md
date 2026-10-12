@@ -493,6 +493,18 @@ incidental, so a force-fit attempt would be wasted effort, not a useful first tr
   schedule mistakes — every `t_cancel < t_refund < t_punish` ordering is fixed at setup with no
   script-level backstop if one party's clock assumptions are wrong (mitigate the same way the
   existing BTC/DIVI HTLC lane does: generous margins, `median_time_past` not wall clock).
+  **Updated 2026-10-12 (mainnet-readiness review, `48dbd50`):** this crate had no built-in
+  schedule or confirmation-depth default anywhere to back that mitigation up with — the
+  DIVI-side confirmation check was hardcoded to `>= 1` (10x thinner than the shared engine's
+  mainnet DIVI depth), and every template builder took `lock_time` as a bare parameter with
+  no margin scheme at all. Closed: `crates/swap-chain-xmr/src/live_rpc.rs`'s
+  `DIVI_CONFIRMATIONS_MAINNET` (mirrors `crates/divi-swap/src/config.rs`'s own mainnet
+  `divi_confirmations`, with a test that fails if that file's value ever drifts from this
+  mirror) and `crates/swap-chain-xmr/src/timelocks.rs`'s `default_schedule`/
+  `validate_schedule` (a generous built-in `t_refund`/`t_punish` margin given a caller-chosen
+  `t_cancel`, plus a validator that rejects a backwards or zero-margin ordering). Both are
+  parameters with safe defaults, not new hardcoded constants callers can't override —
+  consistent with this crate not owning network-profile selection itself.
 - **Both maintained candidate crates (`monero-serai`, `secp256kfun`) are pre-1.0** and under
   active development, meaning API churn risk across the multi-stage build plan above; pin exact
   revs, don't float on a branch.
