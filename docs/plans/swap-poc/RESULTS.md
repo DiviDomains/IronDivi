@@ -191,3 +191,19 @@ Transparent P2SH HTLC on Zcash (v6 transactions, ZIP-244 sighash, ZIP-317 fees).
   request asks for `poolTypes = [TRANSPARENT]`, so the maker could not see the taker's ZEC claim
   (`52b49de`). After a restart on the fixed binary the maker read the preimage and claimed; the
   taker's own timelock still had hours left, so no coins were at risk.
+
+## Wave 4: one deployed maker on dnsdivi serves BTC, LTC and ZEC (divi-swapd 0.2.6)
+
+Deployed per `wave4-deploy.md` on 2026-10-12: preconditions passed, offers appended
+(`wave4-offers.toml`), `deploy.sh` dry run then real deploy; `/healthz` reports 0.2.6 `ok:true`,
+journal shows "ltc backend ready", and `tools/swap-poc/wave4-smoke.sh` PASS. Live offers at first
+boot: `divi-btc-testnet`, `btc-divi-testnet`, `divi-ltc-testnet`; `ltc-divi-testnet` and both ZEC
+offers stayed disabled until the maker held enough coin.
+
+- Real LTC swap against the deployed maker (offer `divi-ltc-testnet`, taker on a laptop through an
+  ssh tunnel, 100,000 litoshi for 10 tDIVI), taker swap `85d95523…` / maker swap `ca6c2df1…`,
+  taker Done / maker MakerClaimed:
+    LTC lock (taker) `554dbc9be121b9d2fb5b4ea76e7538dd5db1d86c2818e12db63cc9dd1453a639`,
+    DIVI lock (maker) `dbaa61eb2c922858aacce16cb3195722b7d8fee00400b479a4881d7b7bf3e4fd`,
+    DIVI claim (taker) `d7253b9f2d7ad1b1be7558f67cb5ac91a71bef5f7d9a12456863cd79fd11e592`,
+    LTC claim (maker, preimage read from the DIVI spend) `b531eea2033ba28ef9e65c6808cf0b5f85fc8eae3ec35bae299b6407daea40f2`.
