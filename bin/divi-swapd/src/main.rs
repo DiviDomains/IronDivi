@@ -164,7 +164,20 @@ fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
-fn live_usdc(cfg: &divi_swapd::UsdcSection) -> Result<Arc<dyn ChainBackend>> {
+/// Floor the maker's own balance must meet before an *enabled* usdc offer is actually
+/// served — independent of, and in addition to, the config's `enabled` flag. Checked once
+/// at startup against the live balance; a maker that drops under the floor after it was
+/// funded keeps serving until the next restart (same as every other config change here).
+const MIN_MAKER_ETH_WEI: u128 = 10_000_000_000_000_000; // 0.01 ETH
+const MIN_MAKER_USDC_UNITS: u64 = 10_000_000; // 10 USDC, 6 decimals
+
+/// Builds the live `UsdcBackend` and checks its balance against every enabled usdc offer
+/// in `offers`, returning the ids of any that are enabled but underfunded — the caller
+/// drops those from what it actually serves.
+async fn live_usdc(
+    cfg: &divi_swapd::UsdcSection,
+    offers: &[divi_swap::api::Offer],
+) -> Result<(Arc<dyn ChainBackend>, Vec<String>)> {
     let hex_key = divi_swap::secrets::SecretRef::parse(&cfg.key)
         .and_then(|r| r.resolve())
         .map_err(|e| anyhow::anyhow!("usdc key: {e}"))?;
@@ -184,8 +197,32 @@ fn live_usdc(cfg: &divi_swapd::UsdcSection) -> Result<Arc<dyn ChainBackend>> {
         .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
     let address = key.address();
     let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?;
-    tracing::info!(%address, network = %cfg.network, htlc = %cfg.htlc, token = %token_str, "usdc backend ready");
-    Ok(Arc::new(backend))
+    let (eth_wei, usdc_units) = backend
+        .gas_and_token_balance()
+        .await
+        .map_err(|e| anyhow::anyhow!("usdc balance check: {e}"))?;
+    tracing::info!(
+        %address, network = %cfg.network, htlc = %cfg.htlc, token = %token_str,
+        %eth_wei, %usdc_units, "usdc backend ready"
+    );
+    let mut underfunded = Vec::new();
+    for o in offers.iter().filter(|o| o.counter_chain == Chain::Usdc) {
+        if !swap_chain_evm::usdc_offer_is_fundable(
+            o.direction,
+            eth_wei,
+            usdc_units,
+            MIN_MAKER_ETH_WEI,
+            MIN_MAKER_USDC_UNITS,
+        ) {
+            tracing::warn!(
+                offer = %o.id, %eth_wei, %usdc_units,
+                "usdc offer is enabled but the maker's balance is below the floor \
+                 (need >= 0.01 ETH, and >= 10 USDC to sell USDC); not serving it until funded"
+            );
+            underfunded.push(o.id.clone());
+        }
+    }
+    Ok((Arc::new(backend), underfunded))
 }
 
 fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
@@ -205,15 +242,21 @@ fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
 async fn live_backends(
     cfg: &DaemonConfig,
     in_flight: &BTreeSet<Chain>,
-) -> Result<(Backends, Option<ScanJob>)> {
+) -> Result<(Backends, Option<ScanJob>, Vec<divi_swap::api::Offer>)> {
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
     let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
+    let mut underfunded_offers: Vec<String> = Vec::new();
     for c in cfg.counter_backends_to_start(in_flight)? {
         others.push(match c {
             Chain::Ltc => live_ltc(cfg.ltc.as_ref().expect("checked by config"))?,
-            Chain::Usdc => live_usdc(cfg.usdc.as_ref().expect("checked by config"))?,
+            Chain::Usdc => {
+                let (backend, underfunded) =
+                    live_usdc(cfg.usdc.as_ref().expect("checked by config"), &cfg.offers).await?;
+                underfunded_offers.extend(underfunded);
+                backend
+            }
             Chain::Zec => live_zec(cfg.zec.as_ref().expect("checked by config"))?,
             other => bail!("no live {other} backend in this build"),
         });
@@ -266,7 +309,13 @@ async fn live_backends(
         from,
     });
     let backends = Backends { divi, btc, others };
-    Ok((backends, job))
+    let offers = cfg
+        .offers
+        .iter()
+        .filter(|o| !underfunded_offers.contains(&o.id))
+        .cloned()
+        .collect();
+    Ok((backends, job, offers))
 }
 
 #[tokio::main]
@@ -298,10 +347,7 @@ async fn main() -> Result<()> {
         .collect();
     let (backends, scan_job, offers) = match kind {
         BackendKind::Mock => (mock_backends(), None, mock_offers(&cfg)),
-        BackendKind::Live => {
-            let (b, job) = live_backends(&cfg, &in_flight).await?;
-            (b, job, cfg.offers.clone())
-        }
+        BackendKind::Live => live_backends(&cfg, &in_flight).await?,
     };
     let Backends { divi, btc, others } = backends;
     let scan = if scan_job.is_some() {
@@ -344,4 +390,100 @@ async fn main() -> Result<()> {
     }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::network::TransactionBuilder;
+    use alloy::primitives::U256;
+    use alloy::providers::Provider;
+    use alloy::rpc::types::TransactionRequest;
+    use divi_swap::api::{Direction, Offer};
+
+    fn offer(id: &str, direction: Direction) -> Offer {
+        Offer {
+            id: id.into(),
+            direction,
+            counter_chain: Chain::Usdc,
+            divi_sats_per_btc: 1,
+            min_btc_sats: 1,
+            max_btc_sats: 2,
+        }
+    }
+
+    /// `live_usdc` end to end against anvil: builds the real backend from a `[usdc]`
+    /// section (RPC URL, HTLC address, token — read exactly the way a deployed config
+    /// would supply them) and confirms it serves an enabled offer that only needs gas
+    /// (`divi-usdc-sepolia`, the maker sells DIVI it already holds) while refusing one
+    /// that also needs USDC collateral the maker does not hold (`usdc-divi-sepolia`).
+    #[tokio::test]
+    async fn live_usdc_excludes_an_enabled_but_underfunded_offer() {
+        if !swap_chain_evm::foundry_available() {
+            eprintln!("skipping: forge/anvil not found on PATH");
+            return;
+        }
+        let anvil = alloy::node_bindings::Anvil::new().spawn();
+        let endpoint = anvil.endpoint();
+
+        let deployer = swap_chain_evm::PrivateKeySigner::from(&anvil.keys()[0]);
+        let maker_key = swap_chain_evm::PrivateKeySigner::random();
+        let maker_hex = hex::encode(maker_key.to_bytes());
+        let maker_addr = maker_key.address();
+
+        let deploy_provider =
+            swap_chain_evm::connect_provider(&endpoint, deployer).expect("deploy provider");
+        let htlc = swap_chain_evm::deploy_contract(
+            &deploy_provider,
+            swap_chain_evm::erc20_htlc_bytecode(),
+        )
+        .await
+        .expect("deploy htlc");
+        let token = swap_chain_evm::deploy_contract(
+            &deploy_provider,
+            swap_chain_evm::bytecode("MockErc20").expect("build MockErc20"),
+        )
+        .await
+        .expect("deploy token");
+
+        // Enough gas to meet MIN_MAKER_ETH_WEI, but no USDC at all: forward must still be
+        // servable, reverse must not.
+        deploy_provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .with_to(maker_addr)
+                    .with_value(U256::from(MIN_MAKER_ETH_WEI)),
+            )
+            .await
+            .expect("fund maker gas")
+            .get_receipt()
+            .await
+            .expect("fund maker gas receipt");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test-maker-usdc"), &maker_hex).unwrap();
+        // SAFETY: this is the only test in this binary that reads or sets
+        // CREDENTIALS_DIRECTORY, so there is no cross-test race on the process environment.
+        unsafe {
+            std::env::set_var("CREDENTIALS_DIRECTORY", dir.path());
+        }
+
+        let cfg = divi_swapd::UsdcSection {
+            network: "sepolia".into(),
+            rpc_url: Some(endpoint.clone()),
+            htlc: format!("{htlc}"),
+            token: Some(format!("{token}")),
+            key: "credential:test-maker-usdc".into(),
+        };
+        let offers = vec![
+            offer("divi-usdc-sepolia", Direction::TakerPaysBtc),
+            offer("usdc-divi-sepolia", Direction::TakerPaysDivi),
+        ];
+
+        let (_backend, underfunded) = live_usdc(&cfg, &offers).await.expect("live_usdc");
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+        assert_eq!(underfunded, vec!["usdc-divi-sepolia".to_string()]);
+    }
 }

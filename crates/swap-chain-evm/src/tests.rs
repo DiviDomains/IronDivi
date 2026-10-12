@@ -108,6 +108,44 @@ fn hashlock_for(preimage: B256) -> B256 {
     B256::from(digest)
 }
 
+/// `UsdcBackend::gas_and_token_balance` — divi-swapd's own funding gate reads this before
+/// deciding whether to serve a usdc offer, so it has to report real numbers, not anvil's
+/// own genesis balance for an account nobody touched.
+#[tokio::test]
+async fn gas_and_token_balance_reports_eth_and_minted_usdc() {
+    require_foundry!();
+    let anvil = Anvil::new().spawn();
+    let endpoint = anvil.endpoint();
+    let key = PrivateKeySigner::from(&anvil.keys()[0]);
+    let address = key.address();
+    let deploy_provider = connect_provider(&endpoint, key.clone()).expect("deploy provider");
+    let htlc = deploy_contract(&deploy_provider, bytecode("Erc20Htlc").expect("build htlc"))
+        .await
+        .expect("deploy htlc");
+    let token = deploy_contract(
+        &deploy_provider,
+        bytecode("MockErc20").expect("build token"),
+    )
+    .await
+    .expect("deploy token");
+    IMockErc20::new(token, deploy_provider.clone())
+        .mint(address, U256::from(5_000_000u64))
+        .send()
+        .await
+        .expect("send mint")
+        .get_receipt()
+        .await
+        .expect("mint receipt");
+
+    let backend = UsdcBackend::new(&endpoint, key, htlc, token).expect("backend");
+    let (eth, usdc) = backend
+        .gas_and_token_balance()
+        .await
+        .expect("gas_and_token_balance");
+    assert!(eth > U256::ZERO, "anvil dev accounts start funded with ETH");
+    assert_eq!(usdc, U256::from(5_000_000u64));
+}
+
 #[tokio::test]
 async fn swap_id_matches_contract() {
     require_foundry!();

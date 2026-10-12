@@ -36,6 +36,7 @@ use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use secp256k1::{PublicKey as Secp256k1PublicKey, SecretKey as Secp256k1SecretKey};
 
+use divi_swap::api::Direction;
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx, SpendInfo,
     SwapError, Txid,
@@ -71,6 +72,28 @@ pub fn usdc_units_to_amount(units: U256) -> Result<Amount> {
         .checked_mul(ENGINE_PER_USDC_UNIT)
         .map(Amount::from_sat)
         .ok_or_else(|| SwapError::Other("USDC amount overflows engine sats".into()))
+}
+
+/// Whether a maker holding `eth_wei`/`usdc_units` can actually serve an offer trading
+/// `direction`, regardless of the offer's own `enabled` flag: below either floor, the maker
+/// would accept a swap it cannot lock or claim, stranding the taker until a refund.
+/// `divi-usdc-sepolia`-shaped offers (maker sells DIVI it already holds, `taker_pays_btc`)
+/// only need gas to claim the taker's USDC lock; `usdc-divi-sepolia`-shaped ones (maker
+/// sells USDC, `taker_pays_divi`) need USDC collateral too. Pure — no network — so it is
+/// unit-testable without anvil; `UsdcBackend::gas_and_token_balance` is the only part of
+/// this check that actually touches a chain.
+pub fn usdc_offer_is_fundable(
+    direction: Direction,
+    eth_wei: U256,
+    usdc_units: U256,
+    min_eth_wei: u128,
+    min_usdc_units: u64,
+) -> bool {
+    let has_gas = eth_wei >= U256::from(min_eth_wei);
+    match direction {
+        Direction::TakerPaysBtc => has_gas,
+        Direction::TakerPaysDivi => has_gas && usdc_units >= U256::from(min_usdc_units),
+    }
 }
 
 /// The Ethereum address a compressed secp256k1 pubkey signs from.
@@ -154,6 +177,21 @@ impl UsdcBackend {
             token,
             compressed_pubkey,
         })
+    }
+
+    /// This backend's own ETH (gas) and `self.token` (USDC) balances — e.g. to check a
+    /// maker is actually funded before serving an offer that would need to sign a
+    /// transaction on this chain.
+    pub async fn gas_and_token_balance(&self) -> Result<(U256, U256)> {
+        let address = self.client.address();
+        let eth = self
+            .client
+            .provider()
+            .get_balance(address)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_balance: {e}")))?;
+        let usdc = self.client.token_balance(self.token, address).await?;
+        Ok((eth, usdc))
     }
 
     /// Sign (but do not send) a call to the HTLC contract from this backend's key.
@@ -585,5 +623,67 @@ mod tests {
             Amount::from_sat(10_000_000)
         );
         assert!(amount_to_usdc_units(Amount::from_sat(1)).is_err());
+    }
+
+    const TEN_USDC: u64 = 10_000_000; // 6 decimals
+    const POINT_01_ETH: u128 = 10_000_000_000_000_000; // 18 decimals
+
+    #[test]
+    fn divi_usdc_offer_needs_only_gas() {
+        // taker_pays_btc: the maker sells DIVI it already holds, and only claims the
+        // taker's USDC lock — no USDC collateral of its own needed, at any balance.
+        assert!(usdc_offer_is_fundable(
+            Direction::TakerPaysBtc,
+            U256::from(POINT_01_ETH),
+            U256::ZERO,
+            POINT_01_ETH,
+            TEN_USDC,
+        ));
+        assert!(!usdc_offer_is_fundable(
+            Direction::TakerPaysBtc,
+            U256::from(POINT_01_ETH - 1),
+            U256::from(u64::MAX),
+            POINT_01_ETH,
+            TEN_USDC,
+        ));
+    }
+
+    #[test]
+    fn usdc_divi_offer_needs_gas_and_usdc_collateral() {
+        // taker_pays_divi: the maker sells USDC, so it needs both the gas floor and the
+        // USDC floor — either one short is enough to refuse it.
+        assert!(usdc_offer_is_fundable(
+            Direction::TakerPaysDivi,
+            U256::from(POINT_01_ETH),
+            U256::from(TEN_USDC),
+            POINT_01_ETH,
+            TEN_USDC,
+        ));
+        assert!(!usdc_offer_is_fundable(
+            Direction::TakerPaysDivi,
+            U256::from(POINT_01_ETH - 1),
+            U256::from(TEN_USDC),
+            POINT_01_ETH,
+            TEN_USDC,
+        ));
+        assert!(!usdc_offer_is_fundable(
+            Direction::TakerPaysDivi,
+            U256::from(POINT_01_ETH),
+            U256::from(TEN_USDC - 1),
+            POINT_01_ETH,
+            TEN_USDC,
+        ));
+    }
+
+    #[test]
+    fn usdc_offer_fundability_is_exact_at_the_floor() {
+        // Exactly at the floor counts as fundable (>=, not >) on both axes.
+        assert!(usdc_offer_is_fundable(
+            Direction::TakerPaysDivi,
+            U256::from(POINT_01_ETH),
+            U256::from(TEN_USDC),
+            POINT_01_ETH,
+            TEN_USDC,
+        ));
     }
 }

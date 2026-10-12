@@ -44,3 +44,4 @@ parking_lot = { workspace = true }
 divi-swap-cli = { path = "../divi-swap" }
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
+alloy = { version = "2.5.0", features = ["node-bindings"] }

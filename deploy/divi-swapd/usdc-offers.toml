@@ -10,6 +10,14 @@
 # Ethereum address derived from it is 0x995669a244d511542ca314e4068c754E3F555bd2 (funding.md).
 # Safe to append as-is today, before the contract is deployed: both offers start disabled and
 # the placeholder htlc address below is never dialed while they are.
+#
+# Second gate, in code, independent of `enabled` below: at startup divi-swapd checks the
+# maker's live balance (bin/divi-swapd/src/main.rs::live_usdc, MIN_MAKER_ETH_WEI = 0.01 ETH,
+# MIN_MAKER_USDC_UNITS = 10 USDC) and will not actually serve an *enabled* usdc offer whose
+# direction needs collateral the maker does not hold — `usdc-divi-sepolia` needs both floors
+# (it sells USDC), `divi-usdc-sepolia` only the gas one (it sells DIVI it already holds, and
+# only claims the taker's USDC). So flipping `enabled = true` ahead of funding is safe: the
+# offer simply will not go live until the balance check passes on a restart.
 
 [usdc]
 network = "sepolia"

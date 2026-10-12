@@ -120,6 +120,14 @@ above). `usdc-divi-sepolia` additionally needs the maker to hold USDC; fund it f
 0x995669a244d511542ca314e4068c754E3F555bd2 --units <n>` directly from the taker key), then
 check its balance the same read-only way as §0 before flipping.
 
+divi-swapd also checks this itself at startup now (`bin/divi-swapd/src/main.rs::live_usdc`):
+an *enabled* usdc offer whose direction needs collateral the maker does not hold (>= 0.01
+ETH always; >= 10 USDC for `usdc-divi-sepolia` specifically, since it sells USDC) is logged
+and simply not served, rather than failing the whole daemon or quoting a swap it cannot
+lock. So both offers below could be left `enabled = true` ahead of funding and would come
+online on their own the next restart after the maker is funded — flipping by hand first is
+still the more deliberate, auditable path this doc uses.
+
 ```sh
 ssh dnsdivi "sudo sed -i '/id = \"divi-usdc-sepolia\"/,/^$/ s/enabled = false/enabled = true/' /etc/divi-swapd/divi-swapd.toml"
 ssh dnsdivi "sudo grep -B1 -A6 'divi-usdc-sepolia' /etc/divi-swapd/divi-swapd.toml"   # confirm only this offer flipped

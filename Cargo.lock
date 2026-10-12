@@ -2823,6 +2823,7 @@ dependencies = [
 name = "divi-swapd"
 version = "0.2.6"
 dependencies = [
+ "alloy",
  "anyhow",
  "axum",
  "bitcoin",

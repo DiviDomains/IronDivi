@@ -423,3 +423,46 @@
     warnings` and `-p swap-chain-evm --all-targets --all-features` both exit 0.
   - `check-usdc.sh` PASS; full `tests/usdc.rs` suite green (8/8, up from 6 — the 2 new
     tests), each new test independently green.
+- **Wave 11** (this seam): make the deployed maker ready to serve USDC the moment ETH
+  arrives — the disabled-by-default offers already existed (`deploy/divi-swapd/
+  usdc-offers.toml`, Wave 7: `divi-usdc-sepolia`/`usdc-divi-sepolia`, `[usdc]` with
+  rpc_url/htlc/token; flagging again since this keeps getting re-requested as new work).
+  What's genuinely new: divi-swapd now *also* refuses to serve an enabled usdc offer whose
+  direction needs collateral the maker's live balance does not cover, independent of the
+  config's own `enabled` flag.
+  - `crates/swap-chain-evm/src/backend.rs`: `UsdcBackend::gas_and_token_balance()` (new) —
+    the backend's own ETH + `self.token` balance in one call. `usdc_offer_is_fundable
+    (direction, eth_wei, usdc_units, min_eth_wei, min_usdc_units) -> bool` (new, pure, no
+    network): `taker_pays_btc` (`divi-usdc-sepolia`-shaped: maker sells DIVI it already
+    holds, only claims the taker's USDC lock) needs only the gas floor; `taker_pays_divi`
+    (`usdc-divi-sepolia`-shaped: maker sells USDC) needs both floors. Both exported.
+  - `bin/divi-swapd/src/main.rs`: `live_usdc` now reads `(RPC URL, HTLC address, token)`
+    from `[usdc]` exactly as before, additionally calls `gas_and_token_balance`, and checks
+    every *enabled* usdc offer against it with `MIN_MAKER_ETH_WEI` (0.01 ETH) /
+    `MIN_MAKER_USDC_UNITS` (10 USDC) — the orchestrator's exact numbers. An offer that fails
+    is logged (`tracing::warn!`) and dropped from what the daemon actually serves; it is
+    *not* a hard failure of the whole daemon (an unfunded usdc offer must not take down a
+    daemon that's otherwise fine on BTC/LTC/ZEC). `live_backends` threads this through and
+    now returns the already-filtered offer list; `main()` no longer needs its own filtering
+    step (one return value removed a `cfg.offers.clone()` that would have ignored the gate).
+  - Mock tests, no live network or swap keys:
+    - `crates/swap-chain-evm/src/backend.rs` (pure, no anvil): `divi_usdc_offer_needs_only_gas`,
+      `usdc_divi_offer_needs_gas_and_usdc_collateral`, `usdc_offer_fundability_is_exact_at_the_floor`.
+    - `crates/swap-chain-evm/src/tests.rs` (anvil): `gas_and_token_balance_reports_eth_and_minted_usdc`.
+    - `bin/divi-swapd/src/main.rs` (anvil, new `#[cfg(test)] mod tests`, `alloy` added as a
+      dev-dependency): `live_usdc_excludes_an_enabled_but_underfunded_offer` — builds the
+      real `live_usdc` against a spawned anvil from a literal `UsdcSection` (RPC URL, a
+      freshly-deployed `Erc20Htlc`/`MockErc20` as htlc/token, a `credential:`-resolved
+      throwaway key written to a tempdir with `CREDENTIALS_DIRECTORY` pointed at it — the
+      real secret-resolution path, not bypassed), funds the maker with exactly the ETH
+      floor and zero USDC, and confirms `divi-usdc-sepolia` is kept while `usdc-divi-sepolia`
+      is excluded. This is the one test in the binary that touches `CREDENTIALS_DIRECTORY`,
+      so there is no cross-test env-var race.
+  - Updated `usdc-offers.toml`/`usdc-deploy.md` to document the new code-level gate as a
+    second, independent safety net on top of the config's `enabled` flag (kept
+    `enabled = false` as asked — belt and suspenders, not a replacement for it).
+  - `check-usdc.sh` PASS; scoped clippy clean (`-p divi-swapd -p swap-chain-evm
+    --all-targets --all-features -- -D warnings`, exit 0 — the pre-existing unrelated
+    workspace-wide clippy failure in `crates/divi-rpc/src/wallet.rs`, noted last wave,
+    is still there and still not mine); full `divi-swapd` test suite green across every
+    binary (new tests included); `cargo fmt` clean.
