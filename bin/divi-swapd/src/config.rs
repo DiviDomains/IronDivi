@@ -548,7 +548,7 @@ key = "credential:btc"
         assert_eq!(s.confirmations(Chain::Ltc), 4);
         assert_eq!(s.chain_params(Chain::Ltc).mtp_lag_secs, 1800);
         assert_eq!(s.chain_params(Chain::Zec).mtp_lag_secs, 900);
-        assert_eq!(s.confirmations(Chain::Zec), 3); // testnet profile
+        assert_eq!(s.confirmations(Chain::Zec), 9); // testnet profile (NU7 block rate, 92c85ce)
         assert_eq!(s.confirmations(Chain::Btc), 1);
 
         let bad = format!("{GOOD}\n[swap.chains.btc]\nconfirmations = 4\n");
