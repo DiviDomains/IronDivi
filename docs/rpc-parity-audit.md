@@ -39,10 +39,15 @@ round-tripped through `bip38decrypt` (right and wrong passphrase) on a live iron
 ## Still different (open)
 
 **Missing (return -32601):**
-`invalidateblock`, `reconsiderblock`, `reverseblocktransactions` need a chain-engine
-"invalidate then reorganise" path (`mark_block_failed`, `disconnect_block`,
-`reorganize_chain` exist in `divi-storage/src/chain.rs`, but `activate_best_chain` only
-reorgs to a heavier chain). `signtransactionwithaddresskey` not started.
+`signtransactionwithaddresskey` not started.
+
+**Implemented after the harness run (unit-tested only; regtest cannot mine over RPC):**
+`invalidateblock`, `reconsiderblock`, `reverseblocktransactions` (`Chain::invalidate_block` /
+`reconsider_block`: roll the tip back past the block, mark it and descendants failed, then
+activate the best remaining valid chain; reconsider clears the flag on the block, its
+ancestors and descendants). Error codes: missing block `-5`, wrong arg count `-1`, state
+failure `-20`. `reverseblocktransactions` is invalidate then reconsider (the C++ flag that
+corrupts the coin DB on purpose is not reproduced).
 
 **Stubs / hardcoded:**
 - `getpeerinfo`: now real per-peer `version`, `subver`, `services`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`, `conntime`, `pingtime`, `startingheight`, `banscore`, `id` (live stats published by each connection). `inflight`, `synced_headers`, `synced_blocks`, `whitelisted` are still constants.
@@ -100,7 +105,7 @@ These abort the C++ daemon; do not call them on a production node:
 ## Next
 
 1. Masternode subsystem RPCs (largest remaining gap).
-2. `invalidateblock` family (engine work).
+2. ~~`invalidateblock` family~~ done.
 3. `getblock` `moneysupply`/`acc_checkpoint` (block-index schema change).
 4. Remaining error-code order differences (`sendtoaddress`, `setaccount`, `importaddress`, `removevault`) and `ban` with a bad IP.
 5. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.

@@ -1606,6 +1606,141 @@ impl Chain {
         }
     }
 
+    /// Mark a block (and so every chain through it) invalid, as the
+    /// `invalidateblock` RPC does. If the block is on the active chain the tip
+    /// is rolled back to its parent, then the best remaining valid chain is
+    /// activated.
+    pub fn invalidate_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+        let _chain_guard = self.chain_lock.lock();
+        let target = self
+            .db
+            .get_block_index(hash)?
+            .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
+        if target.height == 0 {
+            return Err(StorageError::InvalidBlock(
+                "cannot invalidate the genesis block".into(),
+            ));
+        }
+        self.mark_block_failed(hash)?;
+
+        if target.is_on_main_chain() {
+            if self.db.has_utxo_cache() {
+                self.db.flush_utxo_cache()?;
+            }
+            loop {
+                let tip = self
+                    .tip
+                    .read()
+                    .clone()
+                    .ok_or_else(|| StorageError::ChainState("no chain tip".into()))?;
+                let block = self
+                    .db
+                    .get_block(&tip.hash)?
+                    .ok_or_else(|| StorageError::BlockNotFound(tip.hash.to_string()))?;
+                let mut stored = self
+                    .db
+                    .get_block_index(&tip.hash)?
+                    .unwrap_or_else(|| tip.clone());
+                self.disconnect_block(&block, &mut stored)?;
+                self.mark_block_failed(&tip.hash)?;
+                let parent = self
+                    .db
+                    .get_block_index(&block.header.prev_block)?
+                    .ok_or_else(|| {
+                        StorageError::BlockNotFound(block.header.prev_block.to_string())
+                    })?;
+                self.db.set_best_block(&parent.hash)?;
+                if self.db.has_utxo_cache() {
+                    self.db.flush_utxo_cache()?;
+                }
+                *self.tip.write() = Some(parent.clone());
+                *self.best_known_block.write() = Some(parent);
+                if tip.hash == *hash {
+                    break;
+                }
+            }
+        }
+        self.activate_best_valid_chain()
+    }
+
+    /// Clear the invalid flag on a block, its ancestors and its descendants
+    /// (`reconsiderblock`), then activate the best valid chain.
+    pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+        let _chain_guard = self.chain_lock.lock();
+        let target = self
+            .db
+            .get_block_index(hash)?
+            .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
+        let all = self.db.iter_all_block_indexes()?;
+        let by_hash: std::collections::HashMap<Hash256, BlockIndex> =
+            all.iter().map(|i| (i.hash, i.clone())).collect();
+
+        let mut to_clear: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+        // Ancestors of the target
+        let mut cur = Some(target.clone());
+        while let Some(i) = cur {
+            to_clear.insert(i.hash);
+            cur = by_hash.get(&i.prev_hash).cloned();
+        }
+        // Descendants of the target
+        for i in &all {
+            let mut walk = Some(i.clone());
+            while let Some(w) = walk {
+                if w.hash == target.hash {
+                    to_clear.insert(i.hash);
+                    break;
+                }
+                if w.height <= target.height {
+                    break;
+                }
+                walk = by_hash.get(&w.prev_hash).cloned();
+            }
+        }
+        for h in to_clear {
+            if let Some(mut i) = by_hash.get(&h).cloned() {
+                if i.failed() {
+                    i.status.remove(BlockStatus::FAILED);
+                    self.db.store_block_index_entry(&i)?;
+                }
+            }
+        }
+        self.activate_best_valid_chain()
+    }
+
+    /// Move the active chain to the most-work valid chain, trying candidates
+    /// in descending work order and skipping any that turn out invalid.
+    /// Caller must hold `chain_lock`.
+    fn activate_best_valid_chain(&self) -> Result<(), StorageError> {
+        let mut candidates: Vec<BlockIndex> = self
+            .db
+            .iter_all_block_indexes()?
+            .into_iter()
+            .filter(|i| !i.failed() && i.status.contains(BlockStatus::HAVE_DATA))
+            .collect();
+        candidates.sort_by(|a, b| Self::compare_chain_work(&b.chain_work, &a.chain_work));
+        for cand in candidates {
+            let tip = match self.tip.read().clone() {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            if Self::compare_chain_work(&cand.chain_work, &tip.chain_work)
+                != std::cmp::Ordering::Greater
+            {
+                break;
+            }
+            *self.best_known_block.write() = Some(cand);
+            match self.activate_best_chain_inner() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => continue,
+                Err(e) if Self::is_consensus_invalid(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let tip = self.tip.read().clone();
+        *self.best_known_block.write() = tip;
+        Ok(())
+    }
+
     /// Disconnect a block from the chain (reverse UTXO changes)
     fn disconnect_block(&self, block: &Block, index: &mut BlockIndex) -> Result<(), StorageError> {
         info!(
@@ -5123,6 +5258,67 @@ mod tests {
         assert_eq!(tips[1].hash, hash_a2);
         assert_eq!(tips[1].branch_len, 2);
         assert_eq!(tips[1].status, ChainTipStatus::ValidFork);
+    }
+
+    /// invalidateblock on an active block rolls the tip back to its parent
+    /// (or switches to a valid competing branch); reconsiderblock restores it.
+    #[test]
+    fn test_invalidate_and_reconsider_block() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(a2.clone()).unwrap().hash;
+        let a3 = create_child_block_with_pubkey(hash_a2, a2.header.time, [0x0c; 20]);
+        let hash_a3 = chain.accept_block(a3).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a3);
+
+        let a2_coinbase = OutPoint::new(
+            chain.compute_txid(&chain.get_block(&hash_a2).unwrap().unwrap().transactions[0]),
+            0,
+        );
+        assert!(chain.has_utxo(&a2_coinbase).unwrap());
+
+        // Invalidate A2: A2 and A3 leave the chain, tip is A1.
+        chain.invalidate_block(&hash_a2).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a1);
+        assert_eq!(chain.height(), 1);
+        assert!(!chain.has_utxo(&a2_coinbase).unwrap_or(true));
+        assert!(chain.get_block_index(&hash_a2).unwrap().unwrap().failed());
+        assert!(chain.get_block_index(&hash_a3).unwrap().unwrap().failed());
+
+        // Reconsider A2: the chain returns to A3.
+        chain.reconsider_block(&hash_a2).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_a3);
+        assert_eq!(chain.height(), 3);
+        assert!(chain.has_utxo(&a2_coinbase).unwrap());
+        assert!(!chain.get_block_index(&hash_a3).unwrap().unwrap().failed());
+
+        // Unknown block
+        assert!(matches!(
+            chain.invalidate_block(&Hash256::from_bytes([0x77; 32])),
+            Err(StorageError::BlockNotFound(_))
+        ));
+    }
+
+    /// Invalidating the active tip switches to a valid shorter side branch
+    /// only if it has more work than the new tip; here it does.
+    #[test]
+    fn test_invalidate_block_switches_to_side_branch() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let a1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+        let hash_a1 = chain.accept_block(a1.clone()).unwrap().hash;
+        let a2 = create_child_block_with_pubkey(hash_a1, a1.header.time, [0x0b; 20]);
+        let hash_a2 = chain.accept_block(a2).unwrap().hash;
+        let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time + 1, [0x1a; 20]);
+        let hash_b1 = chain.accept_block(b1).unwrap().hash;
+        assert_eq!(chain.tip().unwrap().hash, hash_a2);
+
+        chain.invalidate_block(&hash_a1).unwrap();
+        assert_eq!(chain.tip().unwrap().hash, hash_b1);
+        assert_eq!(chain.height(), 1);
     }
 
     /// repair_height_index restores entries a pre-fix build corrupted and

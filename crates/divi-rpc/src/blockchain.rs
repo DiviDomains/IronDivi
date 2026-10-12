@@ -402,6 +402,37 @@ impl BlockchainRpc {
         ))
     }
 
+    /// invalidateblock / reconsiderblock / reverseblocktransactions
+    pub fn invalidate_block_family(&self, method: &str, params: &Params) -> Result<Value, Error> {
+        let usage = || RpcError::invalid_params(format!("{} \"hash\"", method));
+        if params.len() != 1 {
+            return Err(usage().into());
+        }
+        let hash_str = params.get_str(0).ok_or_else(usage)?;
+        // C++ uint256S: an unparseable hash becomes the zero hash, which is never found
+        let hash = Hash256::from_hex(hash_str).unwrap_or_else(|_| Hash256::zero());
+        let map_err = |e: divi_storage::StorageError| -> Error {
+            match e {
+                divi_storage::StorageError::BlockNotFound(_) => {
+                    RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Block not found").into()
+                }
+                other => RpcError::database_error(other.to_string()).into(),
+            }
+        };
+        match method {
+            "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
+            "reconsiderblock" => self.chain.reconsider_block(&hash).map_err(map_err)?,
+            _ => {
+                // C++ reverseblocktransactions invalidates (reversing the block's
+                // transactions in the coin DB) then reconsiders; the net effect on a
+                // sound database is a roll-back and re-connect of the block.
+                self.chain.invalidate_block(&hash).map_err(map_err)?;
+                self.chain.reconsider_block(&hash).map_err(map_err)?;
+            }
+        }
+        Ok(Value::Null)
+    }
+
     /// Get difficulty
     pub fn get_difficulty(&self, _params: &Params) -> Result<Value, Error> {
         let tip = self.chain.tip();
@@ -1025,6 +1056,52 @@ mod tests {
     fn header_of(rpc: &BlockchainRpc, hash: Hash256) -> Value {
         rpc.get_block_header(&Params::Array(vec![json!(hash.to_string())]))
             .unwrap()
+    }
+
+    #[test]
+    fn test_invalidate_reconsider_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(divi_storage::ChainDatabase::open(dir.path()).unwrap());
+        let params = divi_storage::ChainParams::for_network(
+            NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let a = pow_chain(&chain, 3, 0xA1, 0);
+        for blk in &a {
+            chain.accept_block(blk.clone()).unwrap();
+        }
+        let rpc = BlockchainRpc::new(chain.clone());
+        let h2 = divi_crypto::compute_block_hash(&a[1].header).to_string();
+        let p = |s: &str| Params::Array(vec![json!(s)]);
+
+        assert_eq!(
+            rpc.invalidate_block_family("invalidateblock", &p(&h2))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(chain.height(), 1);
+        assert_eq!(
+            rpc.invalidate_block_family("reconsiderblock", &p(&h2))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(chain.height(), 3);
+        assert_eq!(
+            rpc.invalidate_block_family("reverseblocktransactions", &p(&h2))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(chain.height(), 3);
+
+        let missing = "aa".repeat(32);
+        let err = rpc
+            .invalidate_block_family("invalidateblock", &p(&missing))
+            .unwrap_err();
+        assert!(err.to_string().contains("Block not found"));
+        assert!(rpc
+            .invalidate_block_family("invalidateblock", &Params::None)
+            .is_err());
     }
 
     #[test]

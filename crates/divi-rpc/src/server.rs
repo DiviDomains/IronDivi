@@ -349,6 +349,9 @@ impl RpcServer {
             "getblockchaininfo" => self.blockchain.get_blockchain_info(params),
             "getinfo" => self.get_info(params),
             "getchaintips" => self.blockchain.get_chain_tips(params),
+            "invalidateblock" | "reconsiderblock" | "reverseblocktransactions" => {
+                self.blockchain.invalidate_block_family(method, params)
+            }
             "getdifficulty" => self.blockchain.get_difficulty(params),
             "gettxoutsetinfo" => self.blockchain.get_txout_set_info(params),
             "getrawmempool" => self.blockchain.get_raw_mempool(params),
@@ -659,6 +662,9 @@ impl RpcServer {
                 "getblockhash",
                 "getblockheader",
                 "getchaintips",
+                "invalidateblock",
+                "reconsiderblock",
+                "reverseblocktransactions",
                 "getdifficulty",
                 "getinfo",
                 "getmininginfo",
