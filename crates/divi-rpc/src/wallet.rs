@@ -1204,6 +1204,12 @@ impl WalletRpc {
                 .vin
                 .iter()
                 .map(|input| {
+                    if input.prevout.txid == Hash256::zero() && input.prevout.vout == 0xffffffff {
+                        return serde_json::json!({
+                            "coinbase": hex::encode(input.script_sig.as_bytes()),
+                            "sequence": input.sequence,
+                        });
+                    }
                     serde_json::json!({
                         "txid": input.prevout.txid.to_string(),
                         "vout": input.prevout.vout,
@@ -3743,7 +3749,8 @@ impl WalletRpc {
                 result.push(serde_json::json!({
                     "account": account_name,
                     "amount": divi,
-                    "confirmations": if min_confirmations == u32::MAX { 0 } else { min_confirmations }
+                    "confirmations": if min_confirmations == u32::MAX { 0 } else { min_confirmations },
+                    "bcconfirmations": if min_confirmations == u32::MAX { 0 } else { min_confirmations }
                 }));
             }
         }

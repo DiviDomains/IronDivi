@@ -432,6 +432,7 @@ impl BlockchainRpc {
             "transactions": stats.transactions,
             "txouts": stats.txouts,
             "bogosize": stats.bytes_serialized,
+            "bytes_serialized": stats.bytes_serialized,
             "hash_serialized": hash_serialized,
             "total_amount": total_amount_divi
         }))
