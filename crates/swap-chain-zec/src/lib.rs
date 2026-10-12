@@ -158,6 +158,13 @@ fn classify_broadcast_error(message: &str) -> SwapError {
     if m.contains("non-final")
         || m.contains("locktime requirement not satisfied")
         || m.contains("non-mandatory-script-verify-flag (locktime")
+        // Zebra's own wording (not zcashd's) for a refund whose nLockTime hasn't matured
+        // yet: `TransactionError::LockedUntilAfterBlockHeight`/`...BlockTime` in
+        // zebra-consensus/src/error.rs are both "transaction is locked until after block
+        // height/time {..}" — our htlc locktimes are always the time variant (values well
+        // above ZIP-203's 500,000,000 height/time threshold), but matching the shared
+        // "locked until after block" stem covers both just in case.
+        || m.contains("locked until after block")
     {
         SwapError::Premature(message.trim().to_string())
     } else {
@@ -462,6 +469,19 @@ mod tests {
 
         let err2 = classify_broadcast_error("Locktime requirement not satisfied");
         assert!(matches!(err2, SwapError::Premature(_)), "{err2:?}");
+
+        // Zebra's own wording (zebra-consensus/src/error.rs, TransactionError::
+        // LockedUntilAfterBlock{Height,Time}'s Display) — a case-c refund attempted before
+        // its locktime matures must be retried, not treated as a fatal rejection.
+        let err4 = classify_broadcast_error(
+            "transaction rejected: transaction is locked until after block time 2026-10-12 12:00:00 UTC",
+        );
+        assert!(matches!(err4, SwapError::Premature(_)), "{err4:?}");
+        assert!(err4.is_retryable());
+        let err5 = classify_broadcast_error(
+            "transaction rejected: transaction is locked until after block height Height(4500000)",
+        );
+        assert!(matches!(err5, SwapError::Premature(_)), "{err5:?}");
 
         // Other node refusals are not retryable.
         let err3 = classify_broadcast_error("bad-txns-in-belowout");

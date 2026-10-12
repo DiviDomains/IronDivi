@@ -1428,6 +1428,58 @@ mod tests {
                         parsed.orchard_digest,
                     );
                     assert_eq!(got, hex32(exp), "vector {i}: hash_type {hash_type:#x}");
+
+                    // Cross-check `signature_digest_v6` — what `ZecTx` actually calls in
+                    // production — against the same officially-vetted transparent input.
+                    // No official v6 (ZIP 229/NU6.3) vectors exist yet, so this is the
+                    // strongest available check: reconstruct the v6 combine by hand from
+                    // the exact `transparent_sig_digest` call that just matched the
+                    // official vector above (S.2, unchanged between v5 and v6 per ZIP
+                    // 229), and confirm `signature_digest_v6` produces exactly that — i.e.
+                    // v6's pipeline really does consume the vetted transparent digest, not
+                    // a diverged one, for every official vector with a transparent input.
+                    let header_v6 = header_digest(
+                        V6_VERSION_BYTES,
+                        V6_VERSION_GROUP_ID,
+                        parsed.consensus_branch_id,
+                        parsed.lock_time,
+                        parsed.expiry_height,
+                    );
+                    let orchard_v6_empty = empty_digest(PERS_ORCHARD_V6);
+                    let ironwood_v6_empty = empty_digest(PERS_IRONWOOD_V6);
+                    let transparent = transparent_sig_digest(
+                        &parsed.vin,
+                        &parsed.vout,
+                        hash_type,
+                        Some(idx),
+                        &sig_inputs,
+                    );
+                    let want_v6 = blake2b_person(
+                        &txid_personalization(parsed.consensus_branch_id),
+                        &[
+                            &header_v6,
+                            &transparent,
+                            &parsed.sapling_digest,
+                            &orchard_v6_empty,
+                            &ironwood_v6_empty,
+                        ],
+                    );
+                    let got_v6 = signature_digest_v6(
+                        header_v6,
+                        parsed.consensus_branch_id,
+                        &parsed.vin,
+                        &parsed.vout,
+                        hash_type,
+                        Some(idx),
+                        &sig_inputs,
+                        parsed.sapling_digest,
+                        orchard_v6_empty,
+                        ironwood_v6_empty,
+                    );
+                    assert_eq!(
+                        got_v6, want_v6,
+                        "vector {i}: v6 cross-check hash_type {hash_type:#x}"
+                    );
                 }
             }
         }

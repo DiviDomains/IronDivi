@@ -1,6 +1,11 @@
 # Lane zec status
 
-- running: nothing.
+- running: nothing. Orchestrator's 3-item queue: (1) v6 ZIP-244 vector cross-check — done,
+  see "done" below. (2) case-c readiness — done, found and fixed a real Premature-
+  classification bug before the live case-c run, see "done" below. (3) ltc/btc/evm/divi
+  broadcast-idempotency audit — already finished two rounds ago (read-only, "own your paths
+  only"): no gap in ltc/btc/divi, one real gap flagged in swap-chain-evm with a suggested
+  fix for that lane's owner. Nothing further from me on any of the three right now.
 - blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
   EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
   on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
@@ -17,6 +22,77 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Case-c readiness audit, 2026-10-12 ~02:20 EDT — found and fixed a real bug before the
+    orchestrator's live case-c run.** Walked both directions' maker/taker refund paths
+    (mock engine tests `zec_fwd_case_c_taker_never_claims`/`zec_rev_case_c_taker_never_claims`,
+    both green — ZEC-specific confirmations/MTP-lag timing checked out) plus the real
+    `ZecBackend` refund-building code against three concerns:
+    - **Refund fee**: already pinned to the ZIP-317 floor (10,000 zat) by
+      `tx::tests::refund_script_executes`'s `assert_eq!(20_000 - tx.vout[0].value, 10_000, ...)`
+      — no gap, confirmed still holds.
+    - **`nLockTime`/`expiry_height`**: `build_spend_tx`'s refund path sets `lock_time =
+      htlc.locktime` and `sequence = REFUND_SEQUENCE` (`0xffff_fffe`, not final) — correct
+      HTLC convention, needed for both the script's `OP_CHECKLOCKTIMEVERIFY` and the
+      transaction-level nLockTime check to actually apply. `expiry_height = 0` ("no expiry")
+      — read Zebra's actual source
+      (`zebra-consensus/src/transaction/check.rs::validate_expiry_height_mined`) to confirm
+      this is deliberately exempt, not just "happened to work once live": ZIP-203 says "if
+      a transaction... nExpiryHeight field is nonzero, then it MUST NOT be mined at a block
+      height greater than its nExpiryHeight" — the check only fires `if let Some(expiry_height)
+      = ...`, and Zebra's `Transaction::expiry_height()` maps the raw `0` to `None`, so the
+      mined-height and `MaximumExpiryHeight` checks both skip entirely. Confirmed by spec
+      text, not just by the one live claim that already used this path successfully.
+    - **Locktime-not-yet-reached must retry, not abort — found a real gap.** Fetched
+      Zebra's actual `TransactionError` definitions
+      (`zebra-consensus/src/error.rs`, via `gh search code`/`gh api` against
+      `ZcashFoundation/zebra` — same approach that caught the ZIP-317 and
+      `GetBlockRange`-pool-stripping bugs: read the real source, don't trust zcashd-legacy
+      wording to carry over). Zebra's wording for a transaction whose nLockTime hasn't
+      matured is `TransactionError::LockedUntilAfterBlockHeight`/`...BlockTime`, Display
+      `"transaction is locked until after block height {h}"` / `"...block time {t}"` —
+      **completely different from the zcashd-legacy strings `classify_broadcast_error` was
+      checking** (`"non-final"`, `"Locktime requirement not satisfied"`,
+      `"non-mandatory-script-verify-flag (locktime"`). A live case-c refund attempted
+      before its locktime matured would have been misclassified `Rejected` (fatal, aborts
+      the swap) instead of `Premature` (retried next tick — both `on_maker_refundable` and
+      `on_refunded` already handle `Premature` correctly by returning `Flow::Idle`, so the
+      *engine* side was fine; only the *classification* was missing this wording). Fixed:
+      added `m.contains("locked until after block")` to `classify_broadcast_error`'s
+      premature branch (`crates/swap-chain-zec/src/lib.rs`) — covers both the height and
+      time variants with one substring, robust to whatever prefix Zebra's gRPC wrapper adds
+      (same pattern as the already-known-mempool fix). Added two regression tests pinning
+      the exact Zebra wording to `refund_rejected_before_locktime`.
+    - Our own htlc locktimes are always the *time* variant (values far above ZIP-203's
+      500,000,000 height/time threshold — e.g. `1791785143` from the live run), so
+      `LockedUntilAfterBlockTime` is the one that would actually fire in practice; the fix
+      covers the height variant too since the shared "locked until after block" stem costs
+      nothing extra and the engine treats both identically anyway.
+    - Verified: `cargo test -p swap-chain-zec` green (13 passed, 2 new assertions),
+      `clippy`/`fmt` clean, `check-zec.sh` and `check-zec-live.sh` (live dry run against the
+      real NU7 chain) both PASS.
+  - **Cross-checked `signature_digest_v6` (the production code path) against the official
+    ZIP-244 test vectors, 2026-10-12 ~02:05 EDT.** The existing `zip244_sighash_vectors`
+    test only ran vectors through the v5-only `signature_digest` entry point
+    (`#[cfg(test)]`-gated specifically because production code uses v6). Extended it: for
+    every vector with a transparent input and every sighash type it defines, in addition to
+    the existing v5 check, reconstruct `signature_digest_v6`'s combine by hand from the
+    *exact* `transparent_sig_digest` call that just matched the official vector (S.2 is
+    unchanged between v5 and v6 per ZIP 229), with v6's own empty Orchard/Ironwood digests
+    (`PERS_ORCHARD_V6`/`PERS_IRONWOOD_V6` — **not** v5's `orchard_digest`, which has a
+    different personalization and would be a type error to reuse), and assert
+    `signature_digest_v6` produces exactly that. All pass.
+    - **Honest limitation, stated plainly**: no official vectors exist with a P2SH input
+      (redeem script ≠ scriptPubKey — exactly why `90d857c`'s bug slipped past the official
+      vectors in the first place) or with a v6/NU6.3 structure (none exist yet at all, per
+      the earlier `zcash_primitives` cross-check attempt). So this proves v6's *pipeline*
+      correctly consumes the same officially-vetted transparent digest for every P2PKH-style
+      vector, including mixed shielded+transparent ones — it does **not** independently
+      re-derive the digest from a second implementation (the earlier `zcash_primitives`
+      attempt — blocked on a workspace dependency conflict — would have; see "- needs:"
+      below, still open) and it does not add new P2SH coverage beyond what `90d857c`'s own
+      regression test already has. Still a real, if narrower, forward step: it's the first
+      time v6's actual code path (not just the shared helper by inference) has been checked
+      against any official ground truth.
   - **Audit: `GetBlockRange` was the only lightwalletd call stripping default-pool data,
     2026-10-12 ~02:00 EDT.** The orchestrator's `52b49de` fixed `GetBlockRange` (empty
     `poolTypes` defaults to Sapling+Orchard only, silently dropping every `CompactTx.vin` —
