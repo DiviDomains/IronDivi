@@ -21,6 +21,20 @@ byte from Bitcoin and didn't account for ZIP 317's flat per-action fee, so a dus
 output was spendable-by-the-old-rule but worth less than it would cost to ever spend. Fixed;
 see ZEC §Dust limits.
 
+## Decision: testnet-only is intended for this POC
+
+The POC's definition of done (`docs/plans/atomic-swap-poc.md` §1) is "proven on public
+testnets", and mainnet was never in its scope. So the missing mainnet support below is
+deliberate, not a defect, and nothing in this repo should be run with real funds. Moving to
+mainnet is a separate project, tracked as these work items (one per coin, plus shared):
+
+- [ ] **BTC:** add a mainnet `Network` and esplora endpoint list (`swap-chain-btc/src/lib.rs:48-55,107`); raise mainnet confirmations above 2.
+- [ ] **LTC:** wire the mainnet HRP and endpoints (`swap-chain-ltc/src/lib.rs:52-58,111`).
+- [ ] **ZEC:** add mainnet address prefixes and a lightwalletd endpoint, and pick the v5/v6 tx format by activation height (mainnet NU7 2026-11-05) (`swap-chain-zec/src/address.rs:18-21`, `tx.rs:34-48`).
+- [ ] **USDC/EVM:** add Ethereum/Base mainnet `network.rs` variants with the canonical USDC addresses, and an audited HTLC deployment.
+- [ ] **XMR:** mainnet backends, and remove the runtime refusal only after the above (`xmr_live.rs:174-191`).
+- [ ] **Shared:** a mainnet timeout/confirmation profile in `divi-swap/src/config.rs`, an external security review, and staged low-value mainnet trials.
+
 ## BTC
 
 | Dimension | Value | file:line | Verdict |
