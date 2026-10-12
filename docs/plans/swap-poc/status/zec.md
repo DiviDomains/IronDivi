@@ -17,6 +17,29 @@
   "- decisions: funding path") is no longer needed unless this address/faucet ever needs
   topping up again later and the 24h-per-IP quota is the limiter.
 - done:
+  - **Lightwalletd endpoint configurability, 2026-10-12** (orchestrator follow-up on the
+    mainnet-readiness review's single-endpoint-no-fallback finding): re-searched for a second
+    public ZEC testnet lightwalletd — see the resolved `- needs:` entry below for the full
+    evidence trail (re-checked every prior dead candidate, found and ruled out one new one
+    with a live curl test, and independently corroborated via `logos-co/logos-zcash-node-
+    module`'s own curated server list, which also has only one non-Tor testnet entry). No
+    second one exists to hardcode, so made the list configurable instead: added
+    `swap_chain_zec::lightwalletd_endpoints(network)` (mirrors btc/ltc's `esplora_endpoints`
+    shape) plus a new `SWAP_ZEC_LIGHTWALLETD_EXTRA` env var (comma-separated, appended after
+    the built-in default) so a second endpoint can be wired in later with no code change;
+    `ZecBackend::for_network`/`testnet()` now go through it. Verified end-to-end with a
+    throwaway example binary (`SWAP_ZEC_LIGHTWALLETD_EXTRA="https://a:443,https://b:443"` →
+    `["https://testnet.zec.rocks:443", "https://a:443", "https://b:443"]`, correct order).
+    The actual ordered-failover *mechanism* (`grpc::retry_fallback`, tried per-endpoint with
+    retries, short-circuits on a hard rejection) and its mock test
+    (`client_retries_and_falls_back`) already existed before this task and were already
+    required by `check-zec.sh` — not duplicated; added two new unit tests
+    (`lightwalletd_endpoints_default_is_testnet_primary_only`,
+    `extra_endpoints_append_in_order_and_drop_blanks`) for the actually-new configurable-list
+    code, at the same closure-based mock level. `fmt`/`clippy -D warnings`/`cargo test -p
+    swap-chain-zec` (20 passed, 2 live-only ignored)/`check-zec.sh`/a full workspace build
+    (including `divi-swapd`, which has its own independent TOML-level fallback-endpoint config,
+    unaffected) all green.
   - **Mainnet-readiness review, 2026-10-12** (orchestrator-requested, docs-only plus tests
     where a gap was found): wrote `docs/plans/swap-poc/mainnet-readiness.md` covering all
     five coins (BTC, LTC, ZEC, USDC/EVM, XMR) — confirmations, timeouts/margins, fee policy,
@@ -801,17 +824,58 @@
     doesn't exercise anything in my code. The transaction my code needs to get right starting
     from that funded t-address onward (building the HTLC funding tx, claim, refund) is the
     part validated above.
-- needs: a second public testnet lightwalletd (or other read-only) endpoint, for fallback.
-  Re-checked 2026-10-11 ~18:45 EDT: still none currently usable. `lwd.testnet.zec.pro:443`
-  (Smart Block Software/zec.pro open infra, also referenced by `zcash-devtool`-adjacent
-  tooling) TLS/ALPN-handshakes fine (`CN=zec.pro`, negotiates `h2`) but every actual HTTP/2
-  request returns Cloudflare `521 web server is down` — origin is down fleet-wide right now
-  (same result on its mainnet and explorer hosts too), so it's documented but not live.
-  `testnet.zainod.zingolabs.dev` does not resolve (NXDOMAIN). No `grpcurl` on this host to
-  confirm an actual `CompactTxStreamer` RPC beyond TLS/ALPN on any candidate — only
-  `testnet.zec.rocks:443` is confirmed to answer real gRPC calls (it's what this crate
-  already uses in production). `grpc.rs`'s `Vec<String>` retry+fallback plumbing is ready
-  the moment a second one turns up live; nothing to build, just a URL to add.
+- ~~needs: a second public testnet lightwalletd (or other read-only) endpoint, for
+  fallback~~ **re-searched 2026-10-12, still none found — made configurable instead**
+  (orchestrator's follow-up task on the mainnet-readiness finding). Re-checked every prior
+  candidate plus new ones:
+  - `lwd.testnet.zec.pro:443`: still Cloudflare `521` (origin down).
+  - `testnet.zainod.zingolabs.dev`, `zaino(.testnet).zingolabs.dev`,
+    `testnet.zaino.zingolabs.dev`: still NXDOMAIN.
+  - `lightwalletd.testnet.electriccoin.co`: TLS handshake failure this time (`sslv3 alert
+    handshake failure`), port 9067 times out — still dead, different symptom than last check.
+  - New candidate found via web search and ruled out with evidence:
+    `lightwalletd.testnet.cipherscan.app:443` resolves and TLS-handshakes, but serves a cert
+    for `api.testnet.cipherscan.app` (SAN mismatch) — that's a REST API (`testnet.zecblock.com`
+    after a redirect; `/v1/scan/lightwalletd` is a JSON-wrapped endpoint, not a public
+    `CompactTxStreamer` gRPC port), not wire-compatible with this crate's hand-rolled gRPC
+    client without a different protocol adapter entirely — out of scope.
+  - Strongest evidence: cloned `logos-co/logos-zcash-node-module` (an actively maintained
+    project whose entire purpose is curating a live-health-polled, multi-operator lightwalletd
+    server list per network — exactly the kind of source that would know about a second one).
+    Its own hardcoded testnet list (`rust-lib/src/servers.rs`, `TESTNET` const) has exactly
+    **one** non-Tor entry: `testnet.zec.rocks`. Its second operator is a **Tor onion service**
+    (`cnphkglrgl6xb4bz4zukbntfimrdqk3u4rf4mys2vhrvc73w3ulhb4id.onion:9067`) — not reachable via
+    plain `curl --http2`, and hp2 has no `tor`/`torsocks` installed; installing one would be a
+    new system dependency and a long-lived daemon, out of scope for this task without the
+    orchestrator's say-so. Verified live, direct `curl --http2` `GetLatestBlock` call (empty
+    `ChainSpec` frame, `\x00\x00\x00\x00\x00`) against `testnet.zec.rocks:443` still returns
+    `grpc-status: 0` and a real `BlockID` — confirms the one known-good endpoint is still up
+    and the test methodology is sound; every other candidate above failed before even getting
+    that far. **Conclusion: no second plain-HTTPS public ZEC testnet lightwalletd endpoint is
+    currently known to exist**, corroborated by an independent, actively-maintained project's
+    own curated list, not just my own search.
+  - Since no second endpoint exists to hardcode, made the list **configurable** instead (the
+    task's explicit fallback instruction): `swap_chain_zec::lightwalletd_endpoints(network)`
+    (`crates/swap-chain-zec/src/lib.rs`) mirrors the btc/ltc lanes' `esplora_endpoints(network)`
+    shape and appends any comma-separated URLs from a new `SWAP_ZEC_LIGHTWALLETD_EXTRA` env var
+    after the built-in default — so a second endpoint can be wired in, by whoever's running the
+    daemon, the moment one turns up, with no code change and no rebuild. `ZecBackend::
+    for_network`/`testnet()` now go through it. (Separately, `bin/divi-swapd`'s own
+    `ZecSection::fallback_lightwalletd_url` TOML config already lets the *daemon* take a
+    fallback list directly — unaffected, not touched, this task's new env var is for the
+    library-level default only.)
+  - **The ordered-failover mechanism this was all building toward already existed before this
+    task**: `crates/swap-chain-zec/src/grpc.rs`'s `retry_fallback` already tries every endpoint
+    in a `Vec<String>` in order, retrying transient errors and short-circuiting on a rejection,
+    and every `LightwalletdClient` RPC method already routes through it; its mock test
+    (`client_retries_and_falls_back`) was already required by `check-zec.sh` before this task.
+    Didn't duplicate it with a second, harder-to-build gRPC-over-wiremock test (tonic requires
+    real `grpc-status` HTTP/2 trailers that `wiremock`, built for plain REST like the btc/ltc
+    lanes' `esplora_falls_back_to_secondary`, doesn't model) — added
+    `lightwalletd_endpoints_default_is_testnet_primary_only` and
+    `extra_endpoints_append_in_order_and_drop_blanks` instead, covering the actually-new code
+    (the configurable list), at the same closure-based-mock level the existing failover test
+    already uses successfully for this hand-rolled client.
 - needs: a decision on the `zcash_primitives` cross-check (item 4 of the queue above) — it's
   blocked on a dependency conflict I can't fix within `crates/swap-chain-zec` alone (rule 2:
   never the root `Cargo.toml`). Two live options, from the worktree agent's report:

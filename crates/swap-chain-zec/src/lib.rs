@@ -34,8 +34,65 @@ type Result<T> = std::result::Result<T, SwapError>;
 
 /// The only public testnet lightwalletd endpoint confirmed reachable from hp2 as of step 0
 /// (TLS + ALPN h2 handshake succeeds; used by default by Zecwallet-lite's testnet preset).
-/// No working fallback has been found yet — see `- needs:` in `docs/plans/swap-poc/status/zec.md`.
+///
+/// No second working plain-HTTPS endpoint has been found despite a real search (see
+/// `- decisions:` in `docs/plans/swap-poc/status/zec.md` for the evidence): every other
+/// candidate tried either doesn't resolve, fails TLS, or 521s at its origin, and the one
+/// actively-maintained project that curates a real multi-operator Zcash testnet server list
+/// (`logos-co/logos-zcash-node-module`) itself only has one non-Tor testnet entry — its
+/// second operator is Tor-onion-only, which this crate doesn't attempt (a new system
+/// dependency, out of scope here). [`lightwalletd_endpoints`] is still written to take a
+/// list, not a single URL, and [`LIGHTWALLETD_EXTRA_ENV`] lets a second endpoint be wired in
+/// the moment one turns up, without a code change.
 pub const TESTNET_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
+
+/// Env var (comma-separated `https://host:port` entries) appended, in order, after the
+/// built-in default(s) in [`lightwalletd_endpoints`] — the configurable half of the fallback
+/// list this crate can't yet populate with a second known-good public endpoint itself.
+pub const LIGHTWALLETD_EXTRA_ENV: &str = "SWAP_ZEC_LIGHTWALLETD_EXTRA";
+
+/// Built-in lightwalletd endpoints (primary first) for a network name: currently only
+/// `testnet`, and currently only [`TESTNET_LIGHTWALLETD`] — see its docs for why there's no
+/// second entry yet.
+fn default_endpoints(network: &str) -> Result<Vec<String>> {
+    match network {
+        "testnet" => Ok(vec![TESTNET_LIGHTWALLETD.to_string()]),
+        other => Err(SwapError::InvalidParams(format!(
+            "zec network {other:?} unsupported: testnet"
+        ))),
+    }
+}
+
+/// Appends endpoints parsed from a comma-separated list (as read from
+/// [`LIGHTWALLETD_EXTRA_ENV`]) after `endpoints`, in order — pure, no env access, so it's
+/// testable without mutating process-global state. Blank/whitespace-only entries (a trailing
+/// comma, an unset-but-present env var) are dropped rather than becoming a bogus endpoint
+/// that only fails at call time.
+fn with_extra_endpoints(mut endpoints: Vec<String>, extra: Option<&str>) -> Vec<String> {
+    if let Some(extra) = extra {
+        endpoints.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
+    }
+    endpoints
+}
+
+/// Default lightwalletd endpoints (primary first) for a network name — [`default_endpoints`]
+/// plus whatever [`LIGHTWALLETD_EXTRA_ENV`] adds, mirroring the btc/ltc lanes'
+/// `esplora_endpoints(network)` shape (same ordered-list-of-fallback-URLs convention the
+/// `ChainBackend`s' shared `grpc`/`client` retry-then-fall-back-to-next-endpoint logic — see
+/// [`grpc::retry_fallback`] — is built around).
+pub fn lightwalletd_endpoints(network: &str) -> Result<Vec<String>> {
+    let extra = std::env::var(LIGHTWALLETD_EXTRA_ENV).ok();
+    Ok(with_extra_endpoints(
+        default_endpoints(network)?,
+        extra.as_deref(),
+    ))
+}
 
 /// Blocks scanned per `find_spend` call (mirrors the BTC lane's `MAX_SCAN_BLOCKS`): we have
 /// no "find the spend of this outpoint" index on this API, only block scanning.
@@ -101,14 +158,21 @@ impl ZecBackend {
         })
     }
 
-    /// [`TESTNET_LIGHTWALLETD`], the step-0 default.
-    pub fn testnet(key: SecretKey, fees: FeePolicy) -> Result<Self> {
+    /// Default endpoints for `network` (see [`lightwalletd_endpoints`]) — currently only
+    /// `"testnet"`.
+    pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
         Self::new(
-            vec![TESTNET_LIGHTWALLETD.to_string()],
+            lightwalletd_endpoints(network)?,
             key,
             fees,
             RetryPolicy::default(),
         )
+    }
+
+    /// [`TESTNET_LIGHTWALLETD`] (plus any [`LIGHTWALLETD_EXTRA_ENV`] fallback), the step-0
+    /// default.
+    pub fn testnet(key: SecretKey, fees: FeePolicy) -> Result<Self> {
+        Self::for_network("testnet", key, fees)
     }
 
     /// The key's P2PKH `tm…` address (where funding coins live and spends land).
@@ -469,6 +533,42 @@ mod tests {
     use super::*;
     use crate::grpc::{CompactTx, CompactTxIn};
     use crate::tx::OutPoint;
+
+    #[test]
+    fn lightwalletd_endpoints_default_is_testnet_primary_only() {
+        assert_eq!(
+            default_endpoints("testnet").unwrap(),
+            vec![TESTNET_LIGHTWALLETD.to_string()]
+        );
+        let err = default_endpoints("mainnet").unwrap_err();
+        assert!(matches!(err, SwapError::InvalidParams(_)), "{err:?}");
+    }
+
+    /// The configurable half of the fallback list (`LIGHTWALLETD_EXTRA_ENV`'s parsing):
+    /// appended in order after the built-in default(s), blanks/whitespace dropped, `None`
+    /// (unset) left as a no-op — pure, so this doesn't need to touch the real process env
+    /// (and risk racing other tests that might).
+    #[test]
+    fn extra_endpoints_append_in_order_and_drop_blanks() {
+        let base = vec!["https://primary:443".to_string()];
+        assert_eq!(with_extra_endpoints(base.clone(), None), base);
+        assert_eq!(with_extra_endpoints(base.clone(), Some("")), base);
+        assert_eq!(
+            with_extra_endpoints(base.clone(), Some("https://second:443")),
+            vec!["https://primary:443", "https://second:443"]
+        );
+        // Ordered (second before third), and a stray blank entry (trailing comma, or
+        // whitespace-only) is dropped rather than becoming a bogus endpoint that would
+        // only ever fail at call time.
+        assert_eq!(
+            with_extra_endpoints(base, Some(" https://second:443 , , https://third:443,")),
+            vec![
+                "https://primary:443",
+                "https://second:443",
+                "https://third:443"
+            ]
+        );
+    }
 
     #[test]
     fn refund_rejected_before_locktime() {
