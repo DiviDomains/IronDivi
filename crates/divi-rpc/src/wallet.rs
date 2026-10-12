@@ -607,6 +607,15 @@ impl WalletRpc {
 
     /// walletpassphrase - Unlock wallet for specified time
     pub fn wallet_passphrase(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if let Ok(wallet) = self.get_wallet() {
+            if !wallet.is_encrypted() {
+                return Err(RpcError::new(
+                    codes::WALLET_WRONG_ENC_STATE,
+                    "Error: running with an unencrypted wallet, but this call needs an encrypted one.",
+                )
+                .into());
+            }
+        }
         let passphrase = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Passphrase required"))?;
@@ -2671,6 +2680,15 @@ impl WalletRpc {
 
     /// walletpassphrasechange - Change wallet passphrase
     pub fn wallet_passphrase_change(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if let Ok(wallet) = self.get_wallet() {
+            if !wallet.is_encrypted() {
+                return Err(RpcError::new(
+                    codes::WALLET_WRONG_ENC_STATE,
+                    "Error: running with an unencrypted wallet, but this call needs an encrypted one.",
+                )
+                .into());
+            }
+        }
         let old_passphrase = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Old passphrase required"))?;
@@ -2706,6 +2724,15 @@ impl WalletRpc {
 
     /// encryptwallet - Encrypt the wallet with a passphrase (one-way; leaves it locked)
     pub fn encrypt_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if let Ok(wallet) = self.get_wallet() {
+            if wallet.is_encrypted() {
+                return Err(RpcError::new(
+                    codes::WALLET_WRONG_ENC_STATE,
+                    "Error: running with an encrypted wallet, but encryptwallet was called.",
+                )
+                .into());
+            }
+        }
         let passphrase = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("encryptwallet \"passphrase\""))?;
@@ -3685,6 +3712,10 @@ impl WalletRpc {
             let divi = account_balance.as_sat() as f64 / 100_000_000.0;
             result.insert(account_name, serde_json::json!(divi));
         }
+        // C++ always lists the default account ""
+        result
+            .entry(String::new())
+            .or_insert(serde_json::json!(0.0));
 
         Ok(serde_json::json!(result))
     }

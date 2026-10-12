@@ -33,7 +33,7 @@ Implemented or fixed:
 | `encryptwallet`, `walletpassphrasechange`, `walletpassphrase`, `walletlock` | real wallet encryption: the mnemonic and every private key are AES-256-CBC encrypted under a random master key, which is sealed by a PBKDF2 key from the passphrase. Plaintext is deleted from the DB and compacted out. `getwalletinfo` reports real `encryption_status` and `unlocked_until`. Verified on a live regtest `irondivid`, including restart persistence |
 
 Harness result on live testnet nodes (157 call rows): before these fixes MATCH 22 /
-DIFFERS 69; after, **MATCH 47 / UNVERIFIED 8 / DIFFERS 40**. `bip38paperwallet` was also
+DIFFERS 69; after, **MATCH 47 / UNVERIFIED 8 / DIFFERS 40**. A later run on fully synced nodes (after the missing-key and error-code fixes below, commit `8965355`) gave **MATCH 49 / UNVERIFIED 10 / DIFFERS 36**, with no "missing in Rust" keys left except `getblock` `moneysupply`/`acc_checkpoint`. The `walletpassphrase`/`walletpassphrasechange`/`encryptwallet` encryption-state ordering and `listaccounts` default `""` account were fixed after that run and are covered by unit tests only. `bip38paperwallet` was also
 round-tripped through `bip38decrypt` (right and wrong passphrase) on a live irondivid.
 
 ## Still different (open)
@@ -48,8 +48,7 @@ reorgs to a heavier chain). `signtransactionwithaddresskey` not started.
 - `getpeerinfo`: now real per-peer `version`, `subver`, `services`, `lastsend`, `lastrecv`, `bytessent`, `bytesrecv`, `conntime`, `pingtime`, `startingheight`, `banscore`, `id` (live stats published by each connection). `inflight`, `synced_headers`, `synced_blocks`, `whitelisted` are still constants.
 - Masternode subsystem: `listmnbroadcasts`, `startmasternode`, `setupmasternode`,
   `broadcaststartmasternode`, `signmnbroadcast`, `importmnbroadcast`,
-  `verifymasternodesetup` return "not implemented"; `getmasternodewinners` uses height 0 and
-  the wrong shape (`height`/`payee` vs C++ `nHeight`/`winner`); `getmasternodecount` lacks
+  `verifymasternodesetup` return "not implemented"; `getmasternodewinners` now has the C++ shape and real tip height, but every winner is `Unknown` with 0 votes because payment votes are not received over the network yet; `getmasternodecount` lacks
   `inqueue/ipv4/ipv6/onion/obfcompat/stable`; `spork show|active` stubbed;
   `getlotteryblockwinners` stubbed (and requires an argument C++ does not).
 - `getblock`: no `moneysupply` or `acc_checkpoint` (needs a block-index schema change).
@@ -102,5 +101,6 @@ These abort the C++ daemon; do not call them on a production node:
 
 1. Masternode subsystem RPCs (largest remaining gap).
 2. `invalidateblock` family (engine work).
-3. Fill the remaining missing keys under "Shape differences": `gettxoutsetinfo.bytes_serialized`, `getrawtransaction vin[].coinbase`, `decodescript p2sh`, `listreceivedbyaccount.bcconfirmations`.
-4. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.
+3. `getblock` `moneysupply`/`acc_checkpoint` (block-index schema change).
+4. Remaining error-code order differences (`sendtoaddress`, `setaccount`, `importaddress`, `removevault`) and `ban` with a bad IP.
+5. Re-run the harness with a funded fixture wallet on both sides to verify the list-returning wallet RPCs.
