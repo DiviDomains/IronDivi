@@ -495,3 +495,31 @@
     every other balance check this lane has done by hand this session.
   - `shellcheck`/`bash -n` clean; `check-usdc.sh` still PASS (unaffected — new file, no
     Rust changes this wave).
+- **Wave 13** (this seam): `balances.sh` must not run cargo — the Mac refuses local cargo
+  under load. Rewrote the ZEC and EVM lookups to need no Rust at all, verified by actually
+  running the script with cargo absent from `PATH` (`env -i PATH=/usr/bin:/bin:/usr/local/bin
+  ... bash tools/swap-poc/balances.sh`), not just by inspection.
+  - **ZEC**: lightwalletd (`testnet.zec.rocks:443`) only speaks real gRPC-over-HTTP/2 —
+    confirmed by probing it directly; no public Zcash-testnet REST/JSON explorer API
+    answered (tried several: zcha.in, chain.so, blockcypher, a couple of generic zcash
+    explorers — all 403/404/deprecated). gRPC turned out genuinely reachable with plain
+    `curl --http2` though (TLS ALPN negotiates h2 with no special flags needed), and the
+    one call this script needs (`CompactTxStreamer/GetAddressUtxos`) is a trivial, flat
+    protobuf message both ways (`GetAddressUtxosArg{addresses}` in,
+    `GetAddressUtxosReplyList{GetAddressUtxosReply{..., value_zat, ...}}` out) — cheap to
+    hand-encode/decode without a protobuf package. A ~70-line python3-stdlib-only helper
+    (embedded in the script, written to a tempfile at runtime) does the grpc framing
+    (1-byte flag + 4-byte big-endian length) and a generic flat protobuf field scanner.
+    Verified byte-for-byte against the old Rust checker's own output before swapping it in:
+    both reported exactly 12,240,000 / 12,550,000 zatoshi for the taker/maker.
+  - **EVM** (Sepolia/Base Sepolia, ETH + USDC): plain `eth_getBalance` (direct hex result)
+    and `eth_call` with the ERC-20 `balanceOf(address)` selector `0x70a08231` (address
+    left-padded to 32 bytes) — both just curl + the same python3 helper's `hex-to-int`
+    (parse the JSON-RPC response, `int(result, 16)`). No `sepolia_ops`/cargo involved at
+    all now.
+  - BTC/LTC (Esplora)/DIVI (`getaddressbalance` JSON-RPC) were already cargo-free;
+    unchanged. `--check` mode unchanged (same minimums, same exit-code semantics).
+  - Tested for real, cargo absent from `PATH`: all 16 rows resolve correctly (matches the
+    previous cargo-based run exactly, including the ZEC cross-check above); `--check` still
+    exits 1 with the same 7 shortfalls; bad-arg handling still exits 2.
+  - `shellcheck`/`bash -n` clean; `check-usdc.sh` still PASS (unaffected, no Rust changes).
