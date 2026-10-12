@@ -219,3 +219,12 @@ offers stayed disabled until the maker held enough coin.
     ZEC lock (maker) `e34466d11610ced136ee97c6119cb70619509f89f1ad55f4559d254f1b729788`,
     ZEC claim (taker) `ad816a07c0fa963225fb580b595afe99c52de2d91227141ccaf181989781016e`,
     DIVI claim (maker) `c0837dbd1db68cafd6d7c75c249074fc8f40f1d87e886df7a12be2b3b671d384`.
+- Real reverse LTC swap against the deployed maker (`ltc-live.sh --scenario happy --direction reverse
+  --maker-url`, offer `ltc-divi-testnet`, taker pays DIVI and receives 100,000 litoshi), taker swap
+  `b0258a2c…` / maker swap `a90759ac…`, taker Done / maker Done, 2026-10-12:
+    DIVI lock (taker) `6f7f50cf229af497c87630157bd614039699febaf65dc3a0f908009ed7cc2824`,
+    LTC lock (maker) `30b24a879b8786951cecf4325c690d0729b5f8186ef509ec75c60f6e973dc306`,
+    LTC claim (taker) `c443b9f20945544c915e2f5b1285785d5548f24c79670362728afcc306b698fc`,
+    DIVI claim (maker) `688de9a79aa350d3db02da441c3b53b20b7cce98060d391d693388624eed42c3`.
+  With this, the one deployed maker has completed happy-path swaps in both directions for BTC, LTC
+  and ZEC.
