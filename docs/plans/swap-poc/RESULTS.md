@@ -290,3 +290,12 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     DIVI refund (maker completes the taker's adaptor signature, revealing `s_m`) `b55438cd0416b7fbd57bdb5bf83dd50816f61d3ac8c337bd217707c167045390`,
     XMR refund sweep (taker, `s_t + s_m`) `35fe7b474b835c1d34b06a2a8129982a5081f77be4b56fba0bec50c0b724a6dc`.
   Both XMR paths (redeem and refund) are now proven live.
+- XMR punish path, live, 2026-10-12 (maker locks DIVI, taker locks XMR, the maker then stalls and
+  never completes the refund; after `t_punish` the taker broadcasts the presigned punish tx and
+  takes the maker's DIVI). The taker's 0.01 sXMR stays locked forever, which is the design's
+  deterrent cost. DIVI txs chain lock → cancel → punish, all confirmed; XMR lock at height 2227714:
+    DIVI lock (maker) `63bef2be6d281e62feee02c2029648abaf8a85a89f18ffdbe0bf238fca70cfeb`,
+    XMR lock (taker) `cf2941b12ecaf42489825209aa5f4a6e7cc881ccc1b5bf16fe3f7aa9a3f958f2`,
+    DIVI cancel `a456859ec3134f62bf83d8c7d01fb9af864a4097cac917bbc79ad304d2d50b2a`,
+    DIVI punish (taker) `d0cc708e7f133e30cdd40c4e859fcbd8c220ad393c0ebdda574b8b1b8a4606d9`.
+  All three outcomes of the XMR design (redeem, refund, punish) are now proven live (`baf93cd`).
