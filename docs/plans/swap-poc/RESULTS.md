@@ -254,3 +254,19 @@ offers stayed disabled until the maker held enough coin.
     DIVI claim (taker) `b435603863f867537fb92ff0126c499359977c2c598d4d99da737df02c625153`,
     ZEC claim (maker) `90d1c886b446586a31dca804b18795dab2b4a3601ced4d80ccb45fa2bab6965a`.
   `divi-swap refund` is being changed to a refund-only path; ZEC case C is being rerun.
+
+## Multi-coin: XMR ↔ DIVI adaptor-signature swap (Monero stagenet + DIVI testnet), forward, 2026-10-12
+
+No HTLC on Monero: the maker locks DIVI in a 2-of-2 P2SH, the taker locks XMR to an address whose
+spend key is the sum of two shares (`s_m + s_t`), tied to secp256k1 by a cross-group DLEQ proof. The
+taker claims DIVI by completing the maker's adaptor signature, which reveals `s_t`; the maker
+recovers it and sweeps the XMR with the reconstructed key. Throwaway keys, hp2 harness
+`crates/swap-chain-xmr/examples/xmr_live.rs` through the public stagenet node `node.monerodevs.org`
+(landed `3d8d3b3`). All confirmed (DIVI redeem 49 conf; both XMR txs mined, heights 2227378 and
+2227665):
+    DIVI lock (maker, 1 tDIVI) `42479911d2eed46f2d81282a5456967385f9252de0b8f11f3211d50b907505a6`,
+    XMR lock (taker, 0.1 sXMR into the 2-of-2) `2eba3d81480e068f649147a9395fc96fd56d26c083b97e75f9b725db46358636`,
+    DIVI redeem (taker, completed adaptor signature) `3b9f3b383cb50e576df9d3e8403c2b2edd7e9ee1e67ef8335089eb406f6c3e4f`,
+    XMR sweep (maker, reconstructed spend key) `2fdb2583f7646da8c4795e0d1baaafbc643eed809ab9b188be211c8dbd65f9e5`.
+The refund/abort path is proven offline (`refund_path_e2e.rs`), not live. There is no reverse
+direction by design: the maker always holds the DIVI leg. Not yet served by `divi-swapd`.
