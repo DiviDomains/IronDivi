@@ -43,6 +43,7 @@
 //! All implementations must be validated against C++ Divi testnet data.
 
 mod constants;
+pub mod cpp_wire;
 mod manager;
 mod masternode;
 mod payments;
