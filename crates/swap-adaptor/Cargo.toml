@@ -1,7 +1,7 @@
 [package]
 license = "AGPL-3.0-only"
 name = "swap-adaptor"
-version = "0.2.5"
+version.workspace = true
 edition = "2021"
 description = "ECDSA adaptor signatures and cross-group (secp256k1 / ed25519) DLEQ proof, for the DIVI<->XMR adaptor-signature swap (docs/plans/swap-poc/xmr-design.md)"
 

@@ -18,9 +18,12 @@
 //! test only — not this swap's actual key-generation path, see [`monero_key_share`]'s
 //! docs for why. [`swap_templates`] is build-plan step 7: the full
 //! `Tx_redeem`/`Tx_refund`/`Tx_punish` set with the corrected signer/completer roles.
+//! [`monero_sweep`] is the final step: spending the Monero 2-of-2 output once one party
+//! holds the combined full private spend key.
 
 pub mod adaptor_bridge;
 pub mod monero_key_share;
+pub mod monero_sweep;
 pub mod multisig;
 pub mod swap_templates;
 
@@ -28,6 +31,8 @@ pub mod swap_templates;
 mod happy_path_e2e;
 #[cfg(test)]
 mod monero_dkg;
+#[cfg(test)]
+mod refund_path_e2e;
 #[cfg(test)]
 mod stagenet_rpc;
 #[cfg(test)]

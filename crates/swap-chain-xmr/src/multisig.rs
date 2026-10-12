@@ -26,6 +26,7 @@ use divi_crypto::hash::hash160;
 use divi_crypto::keys::SecretKey;
 use divi_crypto::signature::sign_hash;
 use divi_primitives::amount::Amount;
+use divi_primitives::constants::CURRENT_TX_VERSION;
 use divi_primitives::hash::Hash256;
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -116,7 +117,7 @@ pub fn build_presigned_spend(
 ) -> Result<Transaction, MultisigError> {
     let _ = input_value; // not yet needed by legacy sighash; kept for the segwit-less API's symmetry with swap-chain-btc/ltc.
     let mut tx = Transaction {
-        version: 2,
+        version: CURRENT_TX_VERSION,
         vin: vec![TxIn::new(prevout, Script::new(), sequence)],
         vout: vec![output],
         lock_time,

@@ -81,7 +81,7 @@ mod tests {
         // Build the unsigned skeleton the same way build_presigned_spend does internally,
         // then sign input 0 for A normally and for B via the adaptor path.
         let mut tx = divi_primitives::transaction::Transaction {
-            version: 2,
+            version: divi_primitives::constants::CURRENT_TX_VERSION,
             vin: vec![divi_primitives::transaction::TxIn::new(
                 test_outpoint(9),
                 divi_primitives::script::Script::new(),
@@ -131,7 +131,7 @@ mod tests {
         let spk = script_pubkey(&redeem);
 
         let mut tx = divi_primitives::transaction::Transaction {
-            version: 2,
+            version: divi_primitives::constants::CURRENT_TX_VERSION,
             vin: vec![divi_primitives::transaction::TxIn::new(
                 test_outpoint(9),
                 divi_primitives::script::Script::new(),

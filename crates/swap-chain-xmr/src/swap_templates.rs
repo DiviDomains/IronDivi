@@ -33,6 +33,7 @@
 
 use divi_crypto::keys::SecretKey;
 use divi_primitives::amount::Amount;
+use divi_primitives::constants::CURRENT_TX_VERSION;
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use divi_script::{verify_input, ScriptError, SigHashType};
@@ -72,7 +73,7 @@ pub fn divi_secret_to_adaptor_scalar(sk: &SecretKey) -> Scalar {
 
 fn unsigned_spend(prevout: OutPoint, output: TxOut, lock_time: u32, sequence: u32) -> Transaction {
     Transaction {
-        version: 2,
+        version: CURRENT_TX_VERSION,
         vin: vec![TxIn::new(prevout, Script::new(), sequence)],
         vout: vec![output],
         lock_time,
