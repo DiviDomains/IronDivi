@@ -345,6 +345,30 @@ async fn find_spend_unspent_and_unknown() {
     assert!(b.find_spend(&unknown, 0).await.unwrap().is_none()); // wiremock 404
 }
 
+/// A load-balanced backend can report an outpoint spent before another replica has
+/// indexed the spending tx itself (the same lagging-backend class as the "Block not
+/// found" bug, `d371a22`, just one hop later: the outspend lookup and the spender tx
+/// lookup can land on different replicas). `find_spend` must treat that as "not found
+/// yet" (the caller polls again), not a permanent error.
+#[tokio::test]
+async fn find_spend_treats_a_lagging_spender_lookup_as_not_found_yet() {
+    let server = MockServer::start().await;
+    let fund = outpoint();
+    let spender = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}/outspend/1", fund.txid)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "spent": true, "txid": spender, "vin": 1,
+            "status": {"confirmed": true, "block_height": 777}
+        })))
+        .mount(&server)
+        .await;
+    // No mock for GET /tx/{spender}: wiremock answers 404, exactly what a replica that
+    // has not indexed the spender yet would return.
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    assert!(b.find_spend(&fund, 700).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn find_spend_scans_blocks_without_outspend() {
     let server = MockServer::start().await;
@@ -467,6 +491,97 @@ async fn median_time_past_reads_tip_block() {
         .await;
     let b = backend(vec![server.uri()], MAKER_KEY);
     assert_eq!(b.median_time_past().await.unwrap(), 1_790_000_000);
+}
+
+/// A block that a backend handed us as "the tip" but has not finished indexing can come
+/// back without `mediantime` — a transient, not a permanent, condition.
+#[tokio::test]
+async fn median_time_past_missing_field_is_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("tiphash"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/block/tiphash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"timestamp": 1})))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let err = b.median_time_past().await.unwrap_err();
+    assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+}
+
+/// An Esplora `/blocks/tip/height` never legitimately answers 200 with an empty body; a
+/// backend caught mid-restart might. Transient, not permanent.
+#[tokio::test]
+async fn tip_height_empty_body_is_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let err = b.tip_height().await.unwrap_err();
+    assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+}
+
+/// Same as above for a garbled (non-numeric) body instead of an empty one.
+#[tokio::test]
+async fn tip_height_unparseable_body_is_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>502</html>"))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let err = b.tip_height().await.unwrap_err();
+    assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+}
+
+/// A 2xx response that fails to parse as JSON (a truncated body, or an HTML page from a
+/// misbehaving proxy in front of Esplora) is a transport artifact, not Esplora's answer —
+/// real Esplora error bodies are plain text and carry a non-2xx status.
+#[tokio::test]
+async fn malformed_json_body_is_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("tiphash"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/block/tiphash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let err = b.median_time_past().await.unwrap_err();
+    assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+}
+
+/// A UTXO response that is not a JSON array (e.g. a proxy error object, or a truncated
+/// body) is a backend/transport glitch, not a reason to give up on funding permanently.
+#[tokio::test]
+async fn funding_transient_on_malformed_utxo_response() {
+    let server = MockServer::start().await;
+    let b = backend(vec![server.uri()], TAKER_KEY);
+    let addr = b.address().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{addr}/utxo")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"error": "not ready"})))
+        .mount(&server)
+        .await;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let err = b
+        .build_funding(&h, Amount::from_sat(20_000))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
 }
 
 #[tokio::test]

@@ -156,6 +156,79 @@
     `cargo test` clean for `swap-chain-ltc` (30 tests, 2 `#[ignore]`), `divi-swapd`
     (18 lib + 28 integration tests), `divi-swap-cli` (5 lib tests).
     `tools/swap-poc/check-ltc.sh` and `check-ltc-live.sh` both PASS.
+  - **Transient-vs-permanent audit, every chain client** (this session, orchestrator bug
+    report: a live LTC case-C run died on `esplora HTTP 404: Block not found` from one
+    litecoinspace backend lagging another, landed as `d371a22` for btc+ltc's `/block/
+    <hash>` lookup specifically). Used 3 parallel Explore agents to audit
+    `swap-chain-{zec,divi,evm}` for the same bug class (404/not-found-on-a-just-seen-
+    resource, empty tip, 502/HTML bodies, node-warmup errors) while auditing btc/ltc
+    myself; verified every finding against source before fixing, fixed only what was
+    confirmed low-risk, left what wasn't with the reasoning recorded below. One test per
+    fix, all synthetic (no live network needed), `keep genuine rejects permanent` honored
+    throughout — several near-misses caught and reverted before landing (see decisions).
+    - **btc + ltc** (identical fix, both crates — the ltc one already had the "Block not
+      found" fix landed; this adds the rest of the same bug family): `find_spend`'s
+      `/tx/{spender}` lookup used `get()` (errors on 404) instead of `get_opt()` — a
+      replica that reported an outpoint spent can still 404 the spender tx itself on a
+      different backend. Now `Ok(None)` ("not found yet", the caller polls again), not a
+      permanent error. `tip_height` empty/unparseable body, `median_time_past`'s missing
+      `mediantime`, `parse_json`'s malformed-JSON catch-all, and the UTXO-list-not-an-array
+      check all moved `Other` → `Transient` — none of these are ever legitimate permanent
+      answers from Esplora, only transport/proxy artifacts. 10 new tests total (5 per
+      crate): `find_spend_treats_a_lagging_spender_lookup_as_not_found_yet`,
+      `tip_height_{empty_body,unparseable_body}_is_transient`,
+      `median_time_past_missing_field_is_transient`, `malformed_json_body_is_transient`,
+      `funding_transient_on_malformed_utxo_response`.
+    - **divi**: `rpc.rs`'s `once()` now routes bitcoind-style `-28` (node warmup:
+      "Loading block index...") and `-5` "Block not found" (the direct DIVI analog of the
+      esplora bug — `getblock`/`getblockhash` on a lagging proxy backend) through
+      `RpcError::Swap(Transient)` *before* `RpcClient::call`'s own retry loop, not just at
+      the final `From<RpcError>` conversion — so they get retried with backoff within one
+      `call()`, not only at the engine level. (`-5` is reused for "No such mempool or
+      blockchain transaction" too; disambiguated by message text, confirmed distinct with
+      `tx_not_found_by_message_stays_distinct_from_block_not_found`.) `tip_height`'s
+      non-numeric `getblockcount` and `median_time_past`'s block-without-`time` also moved
+      to `Transient`. Higher-severity fix: `broadcast()`'s `BroadcastClass::Rejected` path
+      confirmed absence via a single `get_tx_opt` lookup before giving up — but that
+      lookup can race the same lagging-proxy condition and wrongly confirm a tx that
+      actually exists is "gone", turning a transient broadcast duplicate into a permanent
+      `Rejected`. Now retries the lookup twice (500 ms apart) before concluding `Rejected`.
+      6 new tests, including `broadcast_rejection_confirmed_present_after_a_lagging_lookup`
+      (needed extending the test harness's `Node` mock with a `flaky_error` helper: fails
+      N times then falls through to the real answer, to simulate the race).
+    - **zec**: `grpc.rs`'s `From<Status> for ClientError` added `Code::Unknown` (tonic's
+      literal fallback for an unexplained transport failure in this client's exact build —
+      no `server` feature, confirmed by reading the vendored tonic source) and
+      `Code::Cancelled` (client-side timeout/cancel) to the transient set.
+      **Deliberately did not** add `Code::NotFound`/`Code::Internal` despite the audit
+      flagging them as a *possible* further gap: `is_tx_not_found` depends on a genuine
+      "unknown tx" answer arriving as `Rejected` so it can inspect the message text and
+      turn it into `Ok(None)`; folding those codes into `Transient` would have silently
+      broken that already-correct mechanism for no confirmed benefit (no evidence
+      lightwalletd ever uses those codes for the lagging-replica case the lines above
+      exist for). `median_time_past`'s "lightwalletd returned no blocks" (a `tip_height`/
+      `block_range` cross-backend race, same family as the others) moved `Other` →
+      `Transient`; extracted into a pure `median_of_block_times` helper first since there
+      was no mock gRPC server harness to test the method end-to-end (this crate has no
+      `server` tonic feature compiled in at all). 4 new tests.
+    - **evm**: `estimate_gas` and the `approve` send (in `sign_call`/`build_funding`)
+      unconditionally mapped every error to `Other` — including a 429/502/503/timeout from
+      a public RPC provider, no different from `broadcast()`'s own transport failures,
+      which that method already classifies correctly. Added a shared `is_revert` helper
+      (mirrors `broadcast`'s existing `contains("revert")` check) so both sites split
+      transport failures (`Transient`) from a genuine on-chain revert (`Rejected`, e.g.
+      `claim()` with the wrong preimage caught at estimation time) the same way; `approve`'s
+      receipt-await (no revert-detection relevance once a tx is accepted into a block) and
+      `token_allowance` (a pure read, no legitimate permanent-rejection case) went straight
+      to `Transient`. No mock transport exists in this crate to inject synthetic HTTP
+      errors (anvil won't produce 429/502), so tested the pure classification logic
+      directly instead (`is_already_known`/`is_nonce_conflict` also had zero direct tests
+      before this — only indirect, via anvil integration tests): 3 new tests.
+  - All of: `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings` clean
+    for `swap-chain-{btc,ltc,divi,zec,evm}`; `cargo test --all-features` clean for all five
+    (btc 25, ltc 36, divi 15, zec 17, evm 16 — all passing, 0 failed); `divi-swapd`/
+    `divi-swap-cli` full suites re-run clean too (nothing downstream broke).
+    `tools/swap-poc/check-ltc.sh` and `check-ltc-live.sh` both still PASS.
 - running: nothing further queued; idle until the orchestrator lands this or the next live
   result (reverse direction, case-c either direction) comes in. Orchestrator resuming the
   interrupted live case-c run by hand with `divi-swap refund`.

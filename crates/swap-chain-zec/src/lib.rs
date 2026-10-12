@@ -195,6 +195,21 @@ fn is_already_known(message: &str) -> bool {
         || m.contains("transaction is already in state")
 }
 
+/// The median of a set of block times (`median_time_past`'s definition). An empty input
+/// means `block_range` answered with nothing for heights up to a tip we were just given —
+/// `tip_height` and `block_range` can land on different lightwalletd backends, so that is
+/// "this one hasn't indexed that far yet," not "the chain truly has no blocks."
+fn median_of_block_times(times: impl Iterator<Item = u32>) -> Result<u32> {
+    let mut times: Vec<u32> = times.collect();
+    if times.is_empty() {
+        return Err(SwapError::Transient(
+            "lightwalletd returned no blocks for median-time-past (tip not indexed yet?)".into(),
+        ));
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2])
+}
+
 /// If `block` has a `CompactTx` spending `want_txid:want_vout`, (spender txid, input index).
 fn spend_in_block(
     block: &CompactBlock,
@@ -240,14 +255,7 @@ impl ChainBackend for ZecBackend {
             .block_range(start, tip)
             .await
             .map_err(SwapError::from)?;
-        let mut times: Vec<u32> = blocks.iter().map(|b| b.time).collect();
-        if times.is_empty() {
-            return Err(SwapError::Other(
-                "lightwalletd returned no blocks for median-time-past".into(),
-            ));
-        }
-        times.sort_unstable();
-        Ok(times[times.len() / 2])
+        median_of_block_times(blocks.iter().map(|b| b.time))
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -501,6 +509,16 @@ mod tests {
             "transaction rejected: any transaction with the same effects will be rejected \
              from the mempool until a chain reset: transaction was committed to the best chain"
         ));
+    }
+
+    #[test]
+    fn median_of_block_times_computes_and_rejects_empty() {
+        assert_eq!(median_of_block_times([3u32, 1, 2].into_iter()).unwrap(), 2);
+        // `tip_height` and `block_range` landing on different lightwalletd backends can
+        // answer with no blocks at all for a tip we were just given — transient, not "the
+        // chain has no blocks."
+        let err = median_of_block_times(std::iter::empty()).unwrap_err();
+        assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
     }
 
     /// `broadcast()` must treat a rebroadcast of a tx the chain already has as success, not

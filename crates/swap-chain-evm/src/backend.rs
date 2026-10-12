@@ -137,6 +137,14 @@ fn is_nonce_conflict(msg: &str) -> bool {
     m.contains("nonce too low") || m.contains("replacement transaction underpriced")
 }
 
+/// Whether an RPC error's message means the EVM reverted the call — a genuine, permanent
+/// rejection (e.g. `claim()` with the wrong preimage) — as opposed to a transport-level
+/// failure (429/502/503 from a public RPC provider, a timeout) that happened to occur
+/// while estimating gas or sending a transaction. Mirrors `broadcast`'s own check below.
+fn is_revert(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("revert")
+}
+
 /// [`ChainBackend`] for USDC on an EVM chain (Sepolia, Base Sepolia, or anvil in tests),
 /// over one deployed `Erc20Htlc` and one ERC-20 token.
 #[derive(Clone)]
@@ -224,10 +232,20 @@ impl UsdcBackend {
             .with_call(call)
             .with_chain_id(chain_id)
             .with_nonce(nonce);
-        let gas = provider
-            .estimate_gas(probe.clone())
-            .await
-            .map_err(|e| SwapError::Other(format!("estimate_gas: {e}")))?;
+        let gas = provider.estimate_gas(probe.clone()).await.map_err(|e| {
+            // `eth_estimateGas` is how a revert (e.g. `claim()` with the wrong preimage)
+            // is usually caught, before ever broadcasting — a genuine, permanent
+            // rejection. But this same call just as easily fails on a transport-level
+            // hiccup (429/502/503 from a public RPC provider, a timeout, a "still
+            // syncing" node) with no revert involved at all; only the former should be
+            // permanent.
+            let msg = format!("estimate_gas: {e}");
+            if is_revert(&msg) {
+                SwapError::Rejected(msg)
+            } else {
+                SwapError::Transient(msg)
+            }
+        })?;
         let fees = provider
             .estimate_eip1559_fees()
             .await
@@ -309,10 +327,20 @@ impl ChainBackend for UsdcBackend {
                         }),
                 )
                 .await
-                .map_err(|e| SwapError::Other(format!("send approve: {e}")))?
+                .map_err(|e| {
+                    // Some ERC-20s legitimately revert a non-zero -> non-zero approve,
+                    // but most failures sending/confirming this are transport-level
+                    // (429/502/503/timeout), same reasoning as `estimate_gas` above.
+                    let msg = format!("send approve: {e}");
+                    if is_revert(&msg) {
+                        SwapError::Rejected(msg)
+                    } else {
+                        SwapError::Transient(msg)
+                    }
+                })?
                 .get_receipt()
                 .await
-                .map_err(|e| SwapError::Other(format!("await approve receipt: {e}")))?;
+                .map_err(|e| SwapError::Transient(format!("await approve receipt: {e}")))?;
         }
         let hashlock = B256::from(htlc.hash);
         let timelock = U256::from(htlc.locktime);
@@ -416,7 +444,7 @@ impl ChainBackend for UsdcBackend {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.to_ascii_lowercase().contains("revert") {
+                if is_revert(&msg) {
                     Err(SwapError::Rejected(msg))
                 } else {
                     Err(SwapError::Transient(msg))
@@ -610,6 +638,41 @@ mod tests {
             eth_address_from_pubkey(&maker_pubkey).unwrap().to_string(),
             "0x995669a244d511542ca314e4068c754E3F555bd2"
         );
+    }
+
+    /// `broadcast`'s idempotency check (geth's wording for a tx already in its own
+    /// mempool, or parity/besu's "already imported") — the EVM analog of BTC's "already
+    /// in mempool"/"already in block chain" handling. No direct test existed for this
+    /// before (only indirectly, via the nonce-conflict anvil tests).
+    #[test]
+    fn already_known_recognizes_geth_and_parity_wording() {
+        assert!(is_already_known(
+            "already known: Transaction already known on this node"
+        ));
+        assert!(is_already_known("Transaction already imported"));
+        assert!(!is_already_known("execution reverted: wrong preimage"));
+    }
+
+    #[test]
+    fn nonce_conflict_recognizes_both_wordings() {
+        assert!(is_nonce_conflict("nonce too low: next nonce 5, tx nonce 3"));
+        assert!(is_nonce_conflict("replacement transaction underpriced"));
+        assert!(!is_nonce_conflict("execution reverted"));
+    }
+
+    /// A genuine on-chain revert (e.g. `claim()` with the wrong preimage) must stay a
+    /// permanent rejection; a transport-level failure (429/502/503 from a public RPC
+    /// provider, a timeout) hitting the exact same call (`estimate_gas`, `send_raw_
+    /// transaction`, the `approve` send) must not — it has no "revert" in it at all.
+    #[test]
+    fn revert_detection_distinguishes_from_transport_failures() {
+        assert!(is_revert("execution reverted: wrong preimage"));
+        assert!(is_revert(
+            "server returned an error response: error code 3: execution reverted"
+        ));
+        assert!(!is_revert("error sending request: connection reset"));
+        assert!(!is_revert("HTTP error 503: Service Unavailable"));
+        assert!(!is_revert("deadline has elapsed"));
     }
 
     #[test]

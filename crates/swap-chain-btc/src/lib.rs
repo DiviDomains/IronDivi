@@ -219,7 +219,10 @@ impl BtcBackend {
 }
 
 fn parse_json(body: &str) -> Result<Value> {
-    serde_json::from_str(body).map_err(|e| SwapError::Other(format!("bad Esplora JSON: {e}")))
+    // A non-error (2xx) response that fails to parse as JSON is a transport/proxy artifact
+    // (a truncated or HTML body), not a deliberate answer from the chain: real Esplora
+    // error bodies are plain text and never reach this function (see `ClientError::Http`).
+    serde_json::from_str(body).map_err(|e| SwapError::Transient(format!("bad Esplora JSON: {e}")))
 }
 
 fn hex_items(v: &Value) -> Result<Vec<Vec<u8>>> {
@@ -300,9 +303,15 @@ impl ChainBackend for BtcBackend {
 
     async fn tip_height(&self) -> Result<u64> {
         let body = self.esplora.get("/blocks/tip/height").await?;
-        body.trim()
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            // A load-balanced backend occasionally answers 200 with an empty body
+            // mid-reindex; a real tip height is never empty.
+            return Err(SwapError::Transient("empty tip height response".into()));
+        }
+        trimmed
             .parse()
-            .map_err(|e| SwapError::Other(format!("bad tip height {body:?}: {e}")))
+            .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
     }
 
     async fn median_time_past(&self) -> Result<u32> {
@@ -311,7 +320,11 @@ impl ChainBackend for BtcBackend {
         block["mediantime"]
             .as_u64()
             .map(|t| t as u32)
-            .ok_or_else(|| SwapError::Other("block JSON lacks mediantime".into()))
+            .ok_or_else(|| {
+                // Esplora always sets mediantime on a real block; its absence means we read a
+                // block from a backend that has not finished indexing it yet.
+                SwapError::Transient("block JSON lacks mediantime (still indexing?)".into())
+            })
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -320,7 +333,9 @@ impl ChainBackend for BtcBackend {
             .await?;
         let coins = utxos
             .as_array()
-            .ok_or_else(|| SwapError::Other("utxo response is not an array".into()))?
+            .ok_or_else(|| {
+                SwapError::Transient("utxo response is not an array (malformed?)".into())
+            })?
             .iter()
             .map(|u| {
                 Ok(Coin {
@@ -470,7 +485,12 @@ impl ChainBackend for BtcBackend {
         let spender = outspend["txid"]
             .as_str()
             .ok_or_else(|| SwapError::Other("outspend lacks txid".into()))?;
-        let t = self.get_json(&format!("/tx/{spender}")).await?;
+        // A load-balanced backend can report the outspend before another replica has
+        // indexed the spending tx itself; treat that race as "not found yet" (the caller
+        // polls find_spend again), not a permanent error.
+        let Some(t) = self.get_json_opt(&format!("/tx/{spender}")).await? else {
+            return Ok(None);
+        };
         let height = outspend["status"]["block_height"].as_u64();
         spend_from_tx(&t, &prev, outpoint.vout, height)
     }

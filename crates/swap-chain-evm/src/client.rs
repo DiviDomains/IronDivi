@@ -169,11 +169,14 @@ impl EvmHtlcClient {
         owner: Address,
         spender: Address,
     ) -> Result<U256> {
+        // A pure read with no legitimate permanent-rejection case: any failure here (a
+        // 429/502/503 from a public RPC provider, a timeout) is transport-level, not the
+        // chain refusing anything — unlike the write-side calls below, which can revert.
         self.erc20(token)
             .allowance(owner, spender)
             .call()
             .await
-            .map_err(other::<_>("call allowance"))
+            .map_err(|e| SwapError::Transient(format!("call allowance: {e}")))
     }
 
     /// `approve(htlc, amount)` on `token`, then `lock(token, amount, receiver, hashlock,

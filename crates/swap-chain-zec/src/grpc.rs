@@ -234,6 +234,18 @@ impl From<Status> for ClientError {
             | Code::DeadlineExceeded
             | Code::ResourceExhausted
             | Code::Aborted => ClientError::Transient(s.to_string()),
+            // This client has no `server` feature compiled in (see Cargo.toml), so
+            // tonic's own `Status::from_error` never reaches its h2-reason-specific
+            // mapping (that table is `#[cfg(feature = "server")]`); any transport-level
+            // failure it can't otherwise explain — a dropped connection mid-stream, a
+            // proxy returning a garbled/non-gRPC body — falls through to its generic
+            // `Code::Unknown` fallback, and a client-side timeout/cancel surfaces as
+            // `Code::Cancelled`. Neither is lightwalletd rejecting anything: both are
+            // transient. (`Code::NotFound`/`Code::Internal` stay out of this arm — those
+            // carry real lightwalletd signals, e.g. `is_tx_not_found` below depends on a
+            // genuine "unknown tx" answer arriving as `Rejected` so it can inspect the
+            // message.)
+            Code::Unknown | Code::Cancelled => ClientError::Transient(s.to_string()),
             _ => ClientError::Rejected(s.to_string()),
         }
     }
@@ -475,6 +487,46 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// `Code::Unknown` is tonic's generic fallback for a transport-level failure this
+    /// client build can't otherwise explain (no `server` feature → no h2-reason table);
+    /// `Code::Cancelled` is a benign client-side timeout/cancel. Neither is lightwalletd
+    /// rejecting anything — both must retry, not end the swap.
+    #[test]
+    fn unknown_and_cancelled_status_are_transient() {
+        assert!(matches!(
+            ClientError::from(Status::new(tonic::Code::Unknown, "stream reset")),
+            ClientError::Transient(_)
+        ));
+        assert!(matches!(
+            ClientError::from(Status::new(tonic::Code::Cancelled, "client cancelled")),
+            ClientError::Transient(_)
+        ));
+    }
+
+    /// `Code::NotFound` stays `Rejected` (not folded into the transient set above):
+    /// `is_tx_not_found` depends on a genuine "unknown tx" answer arriving this way so it
+    /// can inspect the message and turn it into `Ok(None)`, not a hard error.
+    #[test]
+    fn not_found_status_stays_rejected_for_is_tx_not_found() {
+        assert!(matches!(
+            ClientError::from(Status::new(tonic::Code::NotFound, "No such transaction")),
+            ClientError::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn is_tx_not_found_recognizes_every_known_wording() {
+        for m in [
+            "NotFound",
+            "transaction not found",
+            "No such mempool or blockchain transaction",
+            "No information available about transaction",
+        ] {
+            assert!(is_tx_not_found(m), "{m}");
+        }
+        assert!(!is_tx_not_found("mandatory-script-verify-flag-failed"));
+    }
 
     /// Without `poolTypes = [TRANSPARENT]` lightwalletd returns every `CompactTx.vin`
     /// empty, so the maker never saw a taker's ZEC claim (live reverse swap, 2026-10-12).

@@ -17,6 +17,8 @@ mod wallet;
 pub use rpc::{classify_broadcast_error, BroadcastClass, RetryPolicy, RpcClient, RpcError};
 pub use wallet::{Utxo, Wallet};
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use divi_crypto::keys::SecretKey;
 use divi_crypto::signature::sign_hash;
@@ -321,7 +323,11 @@ impl ChainBackend for DiviBackend {
             .call_ok("getblockcount", json!([]))
             .await?
             .as_u64()
-            .ok_or_else(|| SwapError::Other("getblockcount: not a number".into()))
+            .ok_or_else(|| {
+                // A proxy returning a null/non-numeric block count is a glitch, not a real
+                // "the chain has no height" condition.
+                SwapError::Transient("getblockcount: not a number".into())
+            })
     }
 
     async fn median_time_past(&self) -> Result<u32> {
@@ -331,11 +337,11 @@ impl ChainBackend for DiviBackend {
         let mut times = Vec::with_capacity(11);
         for _ in 0..11 {
             let block = self.rpc.call_ok("getblock", json!([hash, true])).await?;
-            times.push(
-                block["time"]
-                    .as_u64()
-                    .ok_or_else(|| SwapError::Other("block without time".into()))?,
-            );
+            times.push(block["time"].as_u64().ok_or_else(|| {
+                // A real block always has a time; its absence means a proxy-fronted
+                // node behind the one that reported this hash hasn't indexed it yet.
+                SwapError::Transient("block without time (still indexing?)".into())
+            })?);
             match block.get("previousblockhash").filter(|p| p.is_string()) {
                 Some(prev) => hash = prev.clone(),
                 None => break,
@@ -468,8 +474,21 @@ impl ChainBackend for DiviBackend {
                 BroadcastClass::Premature => return Err(SwapError::Premature(message)),
                 BroadcastClass::Rejected => {
                     // A rejection of a tx the chain already has (e.g. its inputs are now
-                    // spent by itself) is still success.
-                    if self.get_tx_opt(&tx.txid).await?.is_none() {
+                    // spent by itself) is still success. A single `None` here is not
+                    // proof of absence, though: a proxy fronting more than one node can
+                    // reject against one backend while another already has the tx (the
+                    // same lagging-backend race as the esplora "Block not found" bug) —
+                    // so double-check a couple of times, with a short delay, before
+                    // concluding the rejection is real.
+                    let mut known = self.get_tx_opt(&tx.txid).await?.is_some();
+                    for _ in 0..2 {
+                        if known {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        known = self.get_tx_opt(&tx.txid).await?.is_some();
+                    }
+                    if !known {
                         return Err(SwapError::Rejected(message));
                     }
                 }

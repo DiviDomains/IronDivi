@@ -120,10 +120,23 @@ impl RpcClient {
         // bitcoind-style nodes answer RPC errors with HTTP 4xx/5xx and a JSON body: prefer it.
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
             if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-                return Err(RpcError::Node {
-                    code: err["code"].as_i64().unwrap_or(0),
-                    message: err["message"].as_str().unwrap_or("").to_string(),
-                });
+                let code = err["code"].as_i64().unwrap_or(0);
+                let message = err["message"].as_str().unwrap_or("").to_string();
+                // -28 is bitcoind's (and DIVI's) node-warmup code ("Loading block
+                // index...", "Verifying blocks..."); -5 is reused for both "Block not
+                // found" (a load-balanced proxy serving a block a different backend
+                // already reported as the tip, the exact DIVI analog of the esplora
+                // "Block not found" 404 bug) and "No such mempool or blockchain
+                // transaction" (not this case — that one is handled by message text).
+                // Both are transient: routing them through `RpcError::Swap` gets them
+                // retried by this method's own backoff loop, not just correctly labeled
+                // after it gives up.
+                if code == -28 || (code == -5 && message.contains("Block not found")) {
+                    return Err(RpcError::Swap(SwapError::Transient(format!(
+                        "rpc {code}: {message}"
+                    ))));
+                }
+                return Err(RpcError::Node { code, message });
             }
             if status.is_success() {
                 return Ok(v.get("result").cloned().unwrap_or(Value::Null));

@@ -26,6 +26,10 @@ struct Node {
     results: Arc<Mutex<HashMap<String, Value>>>,
     errors: Arc<Mutex<HashMap<String, NodeError>>>,
     plain: Arc<Mutex<HashMap<String, u16>>>,
+    /// method -> (remaining failures, error); counted down on each call, then falls
+    /// through to `results`/`errors` once exhausted — for "a lagging backend answers
+    /// wrong a few times, then catches up" races.
+    flaky: Arc<Mutex<HashMap<String, (u32, NodeError)>>>,
 }
 
 impl Node {
@@ -43,12 +47,26 @@ impl Node {
             .insert(m.into(), (http, code, msg.into()));
         self
     }
+    fn flaky_error(&self, m: &str, times: u32, http: u16, code: i64, msg: &str) -> &Self {
+        self.flaky
+            .lock()
+            .insert(m.into(), (times, (http, code, msg.into())));
+        self
+    }
 }
 
 impl Respond for Node {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&req.body).unwrap();
         let m = body["method"].as_str().unwrap_or("").to_string();
+        if let Some((remaining, (http, code, msg))) = self.flaky.lock().get_mut(&m) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return ResponseTemplate::new(*http).set_body_json(
+                    json!({"result": null, "error": {"code": code, "message": msg}, "id": 1}),
+                );
+            }
+        }
         if let Some(http) = self.plain.lock().get(&m) {
             return ResponseTemplate::new(*http).set_body_string("upstream unavailable");
         }
@@ -445,6 +463,112 @@ async fn rpc_errors_classified() {
         classify_broadcast_error("Transaction outputs already in utxo set"),
         BroadcastClass::AlreadyKnown
     );
+}
+
+/// Bitcoin-Core-style (and DIVI's) node-warmup code -28 ("Loading block index...",
+/// "Verifying blocks...") is transient, not a permanent rejection: it is retried by
+/// `RpcClient::call`'s own backoff loop and, if the node is still warming up after every
+/// attempt, surfaces as `Transient` — never `Other`.
+#[tokio::test]
+async fn node_warmup_is_transient() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.error("getblockcount", 500, -28, "Loading block index...");
+    assert!(matches!(b.tip_height().await, Err(SwapError::Transient(_))));
+}
+
+/// A proxy fronting more than one node can report a block height as the tip via one
+/// backend and then 404-equivalent ("Block not found", code -5) a `getblock`/
+/// `getblockhash` lookup on a backend that has not indexed it yet — the direct DIVI
+/// analog of the esplora "Block not found" bug fixed in btc/ltc (`d371a22`).
+#[tokio::test]
+async fn lagging_proxy_block_not_found_is_transient() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getblockcount", json!(100));
+    node.result("getblockhash", json!("deadbeef"));
+    node.error("getblock", 500, -5, "Block not found");
+    assert!(matches!(
+        b.median_time_past().await,
+        Err(SwapError::Transient(_))
+    ));
+}
+
+/// -5 is reused for "No such mempool or blockchain transaction" too (a real, permanent
+/// absence for `getrawtransaction`) — confirm that wording does NOT get swept into the
+/// "Block not found" transient case above.
+#[tokio::test]
+async fn tx_not_found_by_message_stays_distinct_from_block_not_found() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.error(
+        "getrawtransaction",
+        500,
+        -5,
+        "No such mempool or blockchain transaction",
+    );
+    assert_eq!(b.get_tx_opt(&txid_n(9)).await.unwrap(), None);
+}
+
+/// A proxy returning a null/non-numeric block count is a glitch, not "the chain has no
+/// height".
+#[tokio::test]
+async fn tip_height_non_numeric_is_transient() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getblockcount", json!(null));
+    assert!(matches!(b.tip_height().await, Err(SwapError::Transient(_))));
+}
+
+/// A real block always has a `time`; its absence from a block we were just given the
+/// hash of means the backend serving it has not finished indexing.
+#[tokio::test]
+async fn median_time_past_missing_time_is_transient() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getblockcount", json!(100));
+    node.result("getblockhash", json!("deadbeef"));
+    node.result("getblock", json!({"tx": []}));
+    assert!(matches!(
+        b.median_time_past().await,
+        Err(SwapError::Transient(_))
+    ));
+}
+
+/// A `sendrawtransaction` rejection does not necessarily mean the tx is truly absent: a
+/// proxy fronting more than one node can reject against one backend while another
+/// already has the tx. `broadcast` must double-check rather than trust a single `-5` and
+/// conclude `Rejected` — the same lagging-backend race as the block-lookup bugs above,
+/// one step further down the call chain.
+#[tokio::test]
+async fn broadcast_rejection_confirmed_present_after_a_lagging_lookup() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    let (_, hash) = new_preimage();
+    let tx = b
+        .build_refund(
+            &htlc_for(&b, hash),
+            &Outpoint {
+                txid: txid_n(5),
+                vout: 0,
+            },
+            AMOUNT,
+        )
+        .await
+        .unwrap();
+
+    node.error("sendrawtransaction", 500, -26, "16: bad-txns-inputs-spent");
+    // The first getrawtransaction lookup races a lagging backend and still answers -5;
+    // the second one (after broadcast's retry delay) has caught up.
+    node.flaky_error(
+        "getrawtransaction",
+        1,
+        500,
+        -5,
+        "No such mempool or blockchain transaction",
+    );
+    node.result("getrawtransaction", tx_json(&tx.txid, &[], &[], 0));
+    assert_eq!(b.broadcast(&tx).await.unwrap(), tx.txid);
 }
 
 #[test]
