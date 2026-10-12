@@ -281,3 +281,12 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
 - `cargo test -p divi-swap --test usdc` (the swap engine end to end, DIVI mock vs USDC on anvil): 8 passed —
   happy swap forward and reverse; case C refund both directions (two ways of moving the clock, incl.
   `evm_increaseTime`); taker crash between lock and claim, recovered, both directions.
+- XMR abort/refund path, live, 2026-10-12 (nobody redeems; both sides get their coins back; landed
+  with the spendable-age fix). DIVI txs chain lock → cancel → refund; all confirmed (DIVI 31+ conf,
+  XMR heights 2227690 and 2227704):
+    DIVI lock (maker) `187309c19edf1a20ddb494917e8698d7e1827cec960bc00c9dbfb175a3a0d7a1`,
+    XMR lock (taker, 0.05 sXMR into the 2-of-2) `773d75a087b193950e06ad6417d021bbbe3e71111ae7fbb4a3cc5581e13f3dab`,
+    DIVI cancel (2-of-2) `f8f5cf67bbba1e9f95e594adf6a74b948dad7aacc8bd8cdc0a91384665f5dbbb`,
+    DIVI refund (maker completes the taker's adaptor signature, revealing `s_m`) `b55438cd0416b7fbd57bdb5bf83dd50816f61d3ac8c337bd217707c167045390`,
+    XMR refund sweep (taker, `s_t + s_m`) `35fe7b474b835c1d34b06a2a8129982a5081f77be4b56fba0bec50c0b724a6dc`.
+  Both XMR paths (redeem and refund) are now proven live.
