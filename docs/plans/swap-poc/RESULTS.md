@@ -236,3 +236,21 @@ offers stayed disabled until the maker held enough coin.
     DIVI lock (maker) `7f5588a43db9e5af6371411735e1263e5c394744390c6bd9ca46baf96194e03f`,
     DIVI refund (maker, CLTV path) `19f58c6bcfc60f565b6815b4d0a561ddde5c63f23aef9535ada74c9752205056`,
     LTC refund (taker, CLTV path) `504b901f831c34948adede119b1180f97399b1a816199f06cd986c4e2708e7fe`.
+- Case C for LTC against the deployed maker, reverse (offer `ltc-divi-testnet`, taker pays DIVI and
+  never claims), taker swap `e2142ee1…`, taker Refunded / maker Done, 2026-10-12. The first run ended
+  on Esplora "404 Block not found" from a lagging load-balanced backend (now transient, `d371a22`);
+  the swap was resumed from its db after the maker's locktime had passed:
+    DIVI lock (taker) `fae5fc620d355e189c82aa94278f36e366234e778c0d3ea76547b541e83d04e3`,
+    LTC lock (maker) `1a95af0e7e2be26f6e3821366f124cd88ddb5c4e8516da7a2b86069a679b8cff`,
+    LTC refund (maker, CLTV path) `98b734ea734ea1f3011f66a73e25bef7f017b8f17889a7bba45579f2ffda3e16`,
+    DIVI refund (taker, CLTV path) `02073185c8884f7f23d4196118db565ca0171dca826db714de6164bb71d05e1e`.
+  LTC case C is now proven in both directions against the deployed maker.
+- ZEC case C, first forward attempt (taker swap `ab294b69…`): the run ended on Zebra's "transaction
+  is already in state" rebroadcast reply (now already-known, `c0aed4b`). Resuming with `divi-swap
+  refund` *claimed* instead, because `refund` shared the generic step loop, which claims a confirmed
+  maker lock when it is safe to. It became a valid happy swap, taker Done / maker Done:
+    ZEC lock (taker) `f8181ba3108cc17e53f057641deede99e7ac55bb4e7f74020803648795e0d3b7`,
+    DIVI lock (maker) `d38e84fdce817a126e937a508ed7e17b1b391ee2e0530fb4c0188339b3d3b3e5`,
+    DIVI claim (taker) `b435603863f867537fb92ff0126c499359977c2c598d4d99da737df02c625153`,
+    ZEC claim (maker) `90d1c886b446586a31dca804b18795dab2b4a3601ced4d80ccb45fa2bab6965a`.
+  `divi-swap refund` is being changed to a refund-only path; ZEC case C is being rerun.
