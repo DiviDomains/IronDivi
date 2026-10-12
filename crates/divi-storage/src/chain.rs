@@ -3381,7 +3381,8 @@ impl Chain {
     }
 
     /// Get lottery parameters for the current network.
-    fn get_lottery_params(&self) -> (u32, u32) {
+    /// Lottery `(start_block, cycle_length)` for this network.
+    pub fn get_lottery_params(&self) -> (u32, u32) {
         use divi_consensus::lottery;
         match self.network_type() {
             NetworkType::Mainnet => (

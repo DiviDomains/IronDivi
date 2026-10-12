@@ -2409,18 +2409,6 @@ impl WalletRpc {
         ).into())
     }
 
-    /// Get lottery block winners
-    pub fn get_lottery_block_winners(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let _height = params
-            .get_i64(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: block_height"))?;
-
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "Lottery functionality is a Divi-specific feature that requires lottery subsystem implementation. The Divi lottery system randomly selects winning addresses from staking participants and distributes lottery rewards at specific block heights. This feature will be added in a future release. For lottery information, please use the C++ Divi client."
-        ).into())
-    }
-
     /// Allocate treasury funds
     pub fn allocate_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let _target = params

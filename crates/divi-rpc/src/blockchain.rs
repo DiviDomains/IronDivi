@@ -16,7 +16,7 @@
 use crate::error::{codes, Error, RpcError};
 use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
-use divi_primitives::hash::Hash256;
+use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::serialize::serialize;
 use divi_storage::chain::NetworkType;
 use divi_storage::Chain;
@@ -125,6 +125,107 @@ impl BlockchainRpc {
     /// Total money supply in DIVI (equals the UTXO set total, as C++ `nMoneySupply` does).
     ///
     /// A full UTXO scan is costly, so the result is cached per tip hash.
+    /// Address-encoding network matching the chain this node runs on
+    fn address_network(&self) -> divi_wallet::address::Network {
+        use divi_wallet::address::Network;
+        match self.chain.network_type() {
+            NetworkType::Mainnet => Network::Mainnet,
+            NetworkType::Testnet => Network::Testnet,
+            NetworkType::Regtest => Network::Regtest,
+        }
+    }
+
+    /// getlotteryblockwinners [block_height]
+    ///
+    /// Candidates recorded in the block index at `block_height` (default and
+    /// maximum: the tip), ranked against the last lottery block before it.
+    pub fn get_lottery_block_winners(&self, params: &Params) -> Result<Value, Error> {
+        use divi_script::extract_destinations;
+        use divi_wallet::address::Address;
+
+        if params.len() > 1 {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "getlotteryblockwinners [block_height]").into(),
+            );
+        }
+        let tip = self.chain.tip().ok_or_else(|| {
+            RpcError::new(codes::MISC_ERROR, "Could not acquire lock on chain tip.")
+        })?;
+        let height = match params.get_i64(0) {
+            Some(h) => h.clamp(0, tip.height as i64) as u32,
+            None => tip.height,
+        };
+        let index = self
+            .chain
+            .get_block_index_by_height(height)?
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Block not in main chain"))?;
+
+        let (start, cycle) = self.chain.get_lottery_params();
+        let last_lottery_height = start.max(cycle * (height.saturating_sub(1) / cycle));
+        let last_lottery = self
+            .chain
+            .get_block_index_by_height(last_lottery_height)?
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Last lottery block not found"))?;
+
+        let coinstakes = &index.lottery_winners.coinstakes;
+        // C++ computeRankedScoreAwareCoinstakes: rank by score, highest first
+        let mut ranked: Vec<(Hash256, Hash256)> = coinstakes
+            .iter()
+            .map(|c| {
+                (
+                    c.tx_hash,
+                    divi_consensus::lottery::calculate_lottery_score(
+                        &c.tx_hash,
+                        &last_lottery.hash,
+                    ),
+                )
+            })
+            .collect();
+        ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        let network = self.address_network();
+
+        let candidates: Vec<Value> = coinstakes
+            .iter()
+            .map(|cs| {
+                let addresses = extract_destinations(cs.script_pubkey.as_bytes())
+                    .map(|(_, dests, _)| dests)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|d| match d {
+                        divi_script::Destination::PubKeyHash(h) => {
+                            let mut b = [0u8; 20];
+                            b.copy_from_slice(h);
+                            Address::from_pubkey_hash(Hash160::from_bytes(b), network).to_base58()
+                        }
+                        divi_script::Destination::ScriptHash(h) => {
+                            let mut b = [0u8; 20];
+                            b.copy_from_slice(h);
+                            Address::p2sh(Hash160::from_bytes(b), network).to_base58()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(":");
+                let (rank, score) = ranked
+                    .iter()
+                    .position(|(h, _)| *h == cs.tx_hash)
+                    .map(|r| (r, ranked[r].1.to_string()))
+                    .unwrap_or((0, String::new()));
+                json!({
+                    "Address": addresses,
+                    "Rank": rank,
+                    "Score": score.chars().take(8).collect::<String>(),
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "Is Lottery Block": divi_consensus::lottery::is_lottery_block(height, start, cycle),
+            "Block Height": height,
+            "Block Hash ": index.hash.to_string(),
+            "Lottery Candidates": candidates,
+        }))
+    }
+
     pub fn money_supply(&self) -> f64 {
         let Some(tip) = self.chain.tip() else {
             return 0.0;
@@ -637,8 +738,7 @@ impl BlockchainRpc {
     pub fn get_tx_out(&self, params: &Params) -> Result<Value, Error> {
         use divi_primitives::hash::Hash160;
         use divi_primitives::transaction::OutPoint;
-        use divi_wallet::address::{Address, Network};
-
+        use divi_wallet::address::Address;
         let txid_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing txid parameter"))?;
@@ -669,12 +769,12 @@ impl BlockchainRpc {
 
                 let address = if let Some(pkh) = utxo.script_pubkey.extract_p2pkh_hash() {
                     Some(
-                        Address::from_pubkey_hash(Hash160::from_bytes(pkh), Network::Mainnet)
+                        Address::from_pubkey_hash(Hash160::from_bytes(pkh), self.address_network())
                             .to_base58(),
                     )
                 } else {
                     utxo.script_pubkey.extract_p2sh_hash().map(|sh| {
-                        Address::p2sh(Hash160::from_bytes(sh), Network::Mainnet).to_base58()
+                        Address::p2sh(Hash160::from_bytes(sh), self.address_network()).to_base58()
                     })
                 };
 
@@ -733,7 +833,7 @@ impl BlockchainRpc {
         use divi_script::{
             extract_destinations, extract_script_type, get_script_type_name, to_asm,
         };
-        use divi_wallet::address::{Address, Network};
+        use divi_wallet::address::Address;
 
         let hex_str = params
             .get_str(0)
@@ -762,14 +862,17 @@ impl BlockchainRpc {
                     divi_script::Destination::PubKeyHash(pkh) => {
                         let mut bytes = [0u8; 20];
                         bytes.copy_from_slice(pkh);
-                        let addr =
-                            Address::from_pubkey_hash(Hash160::from_bytes(bytes), Network::Mainnet);
+                        let addr = Address::from_pubkey_hash(
+                            Hash160::from_bytes(bytes),
+                            self.address_network(),
+                        );
                         addr.to_base58()
                     }
                     divi_script::Destination::ScriptHash(sh) => {
                         let mut bytes = [0u8; 20];
                         bytes.copy_from_slice(sh);
-                        let addr = Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
+                        let addr =
+                            Address::p2sh(Hash160::from_bytes(bytes), self.address_network());
                         addr.to_base58()
                     }
                 })
@@ -784,7 +887,7 @@ impl BlockchainRpc {
             let script_hash = hash160(&script_bytes);
             let mut bytes = [0u8; 20];
             bytes.copy_from_slice(script_hash.as_ref());
-            let p2sh_addr = Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
+            let p2sh_addr = Address::p2sh(Hash160::from_bytes(bytes), self.address_network());
             result["p2sh"] = json!(p2sh_addr.to_base58());
         }
 

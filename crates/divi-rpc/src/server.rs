@@ -439,7 +439,7 @@ impl RpcServer {
             "bip38decrypt" => self.wallet.bip38_decrypt(params),
             "bip38paperwallet" => self.wallet.bip38_paper_wallet(params),
             "loadwallet" => self.wallet.load_wallet(params),
-            "getlotteryblockwinners" => self.wallet.get_lottery_block_winners(params),
+            "getlotteryblockwinners" => self.blockchain.get_lottery_block_winners(params),
             "allocatefunds" => self.wallet.allocate_funds(params),
 
             // Raw transaction methods
@@ -644,7 +644,7 @@ impl RpcServer {
                 "bip38encrypt" => "bip38encrypt \"diviaddress\" \"passphrase\"\n\nEncrypts a private key with a passphrase using BIP38.\n\nArguments:\n1. \"diviaddress\"   (string, required) The divi address\n2. \"passphrase\"    (string, required) The passphrase\n\nResult:\n\"key\"                (string) The encrypted private key",
                 "bip38decrypt" => "bip38decrypt \"bip38key\" \"passphrase\"\n\nDecrypts a BIP38 encrypted private key.\n\nArguments:\n1. \"bip38key\"      (string, required) The encrypted private key\n2. \"passphrase\"    (string, required) The passphrase\n\nResult:\n\"key\"                (string) The decrypted private key in WIF format",
                 "loadwallet" => "loadwallet \"filename\"\n\nLoads wallet into memory.\n\nArguments:\n1. \"filename\"       (string, required) The filename of the wallet.dat to be loaded.",
-                "getlotteryblockwinners" => "getlotteryblockwinners [block_height]\n\nReturns the lottery winners for a specific block.\n\nArguments:\n1. block_height    (numeric, required) The block height",
+                "getlotteryblockwinners" => "getlotteryblockwinners [block_height]\n\nReturns the lottery candidates recorded at a block.\n\nArguments:\n1. block_height    (numeric, optional) The block height (default and maximum: the tip)",
                 "allocatefunds" => "allocatefunds purpose alias tier ( \"pay wallet\" ( \"voting wallet\" ) )\n\nAllocates treasury funds for governance purposes.\n\nArguments:\n1. purpose    (string, required) The purpose of allocation\n2. alias      (string, required) Identifier for this allocation",
                 // Vault
                 "addvault" => "addvault \"<owner_address>:<manager_address>\" funding_txhash\n\nAllows vault manager to accept to stake the indicated vault script.\n\nArguments:\n1. \"<owner_address>:<manager_address>\"  (string, required) Vault representation as a pair of addresses.\n2. \"tx_hash\"  (string, required) The transaction hash to search for the initial funding.",
