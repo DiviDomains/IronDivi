@@ -1,5 +1,8 @@
 # Orchestrator status
 
+- **USDC (2026-10-12):** validated-on-simulation (anvil 36/36, `898b1e2`; DECISIONS #12). Lane not held. Only remaining
+  live step: Sepolia run, faucet-gated, parked not blocking (PARKED #3).
+
 - **Wave/step:** Reverse direction (Bert 2026-10-10: "add the reverse direction, sell divi for btc").
   Plan `docs/plans/swap-poc/reverse-direction.md`. Contract (`Direction`, role-based `SwapView` legs) on main `3b8bb1b`.
 - **Lanes:** rev-engine, rev-cli, rev-tools all landed (main `4ae2ed8`, CI green; check-rev-{engine,cli,tools}.sh PASS
