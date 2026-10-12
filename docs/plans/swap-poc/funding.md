@@ -35,3 +35,35 @@ Its unified address:
 `utest1shuxck4zpa4rn9aa3ydyxnhgdc9aq66kr4x9dy95tegfm25ujh9uu5xvlnrhey42cd364kry7wgs4fkmwre69jaqw0jxzjelfxa4ltkzcpj2tevtq3gu924gczq4g26hf4dsxu9gwg499fmxlh80ypf23ty45vdjcphrz507gk9n07cz62pjcamnqt87v3jh79f53a3y8dxag0kjq4l`.
 TAZ sent straight to the taker/maker t-addrs works just as well. Needs a source on the
 NU7 chain.
+
+## Sepolia / Base Sepolia ETH faucet research (2026-10-12)
+
+The taker (`0x4bb95b0cD0AC55556D96D7E850a5090Cc450D60C`) has 20 USDC on Sepolia but no ETH
+on either network, and no mainnet balance on this address (it is a fresh testnet-only key) —
+so any faucet gated on mainnet ETH holdings is a dead end here. Every row below was checked
+with a real HTTP request (`curl`/fetch against the faucet's own page or docs) on 2026-10-12;
+none were signed up for and no CAPTCHA was solved — where a candidate's actual claim flow
+needed either, that step was left undone and is noted as such. "Confirmed working" means the
+faucet/its documentation page was reachable and the requirements below were read directly off
+it, not that a claim was completed.
+
+| faucet | URL | network | amount/day | requirement | confirmed working |
+|---|---|---|---|---|---|
+| **QuickNode Multi-Chain Faucet** | https://faucet.quicknode.com/ethereum/sepolia (and `/base/sepolia`) | Sepolia, Base Sepolia | base amount shown only after entering an address; one drip/network per 12 h, up to 4x with optional bonuses | **none for the base drip** — page states explicitly "no Quicknode account, no post on X and no minimum mainnet balance, so a brand new wallet can claim"; a "complete the verification" bot-check gates the actual claim (type unconfirmed — no `captcha`/`turnstile`/`recaptcha` string in the page's static HTML, may be an invisible check) | **Yes** — page reachable, requirements read directly off its own copy; the bot-check step itself was not attempted (no signup needed to reach it, but completing it was out of scope here) |
+| **pk910 Sepolia PoW Faucet** | https://sepolia-faucet.pk910.de/ | Sepolia only | self-directed: mine in-browser until balance reaches the ~0.05 ETH minimum, then claim; no fixed daily cap found | **none** — no account, no mainnet balance, no CAPTCHA; cost is browser CPU time (proof-of-work), not a web form | **Yes** — page reachable (title "Sepolia PoW Faucet"); mining itself was not run (open-ended compute time, and the task's own "do not sign up or solve CAPTCHAs" scope was read as "don't go claim funds," not just avoid CAPTCHAs specifically) |
+| Chainlink Faucets | https://faucets.chain.link/sepolia | Sepolia, Base Sepolia, 6 others | drips 0.5 ETH per network | connect a wallet (MetaMask/WalletConnect in its UI); no mainnet-balance or CAPTCHA string found in the page's static HTML, but the real claim flow is a client-rendered app that wasn't exercised | Page reachable, "Drips 0.5 ETH" read directly off it; claim flow not attempted (needs an actual wallet signature, not just an HTTP request) |
+| Alchemy Faucet | https://www.alchemy.com/faucets/ethereum-sepolia (and `/base-sepolia`) | Sepolia, Base Sepolia | 0.1 ETH / 24 h | **fails our case**: page states "No account required" but requires "at least 0.001 ETH on Ethereum Mainnet" plus "sufficient" mainnet transaction history — exactly the mainnet-balance gate we don't have | Page reachable, requirement read directly off it; not usable for this address as-is |
+| Google Cloud Web3 Faucet | https://cloud.google.com/application/web3/faucet/ethereum/sepolia (and `/base-sepolia`) | Sepolia, Base Sepolia | not published on the page | Google **sign-in** required (page's own nav links to `accounts.google.com/ServiceLogin`) **and** Google reCAPTCHA Enterprise is loaded on the page (`recaptcha/enterprise.js` in the page source) — both a login and a CAPTCHA | Page reachable; both gating requirements confirmed directly from the page's own markup, so excluded as a no-signup/no-CAPTCHA option |
+| Coinbase CDP Faucet | https://portal.cdp.coinbase.com/products/faucet (UI), https://docs.cdp.coinbase.com/faucets/introduction/quickstart (API) | Base Sepolia, Ethereum Sepolia, + ERC-20s | API: 0.0001 ETH/claim, up to 1000 claims/24 h (portal UI amount not published) | requires "Created and signed in to an existing CDP account"; the API additionally needs a CDP API key + wallet secret | Both pages reachable; account requirement read directly from Coinbase's own quickstart doc |
+| thirdweb Faucet | https://thirdweb.com/sepolia | Sepolia | not published before login | the page's own "Faucet" button is a `/login?next=/sepolia` link — thirdweb account/wallet connect required before any amount is shown | Page reachable; login-gate confirmed from the page's own link target |
+| Circle Faucet | https://faucet.circle.com | Base Sepolia (and others), USDC/EURC | n/a | reCAPTCHA present (`captcha`/`Captcha` strings in the page); this is a **USDC/EURC faucet, not an ETH one** — listed only because it was named in the request | Page reachable; not a meaningful ETH source for this address |
+| Infura Faucet | https://www.infura.io/faucet | — | — | — | **No** — the URL now just serves Infura's marketing homepage; no faucet UI remains on it |
+| fauceth.komputing.org | http://fauceth.komputing.org | — | — | — | **No** — the domain is parked (returns a bare cPanel "default web page" redirect, not a faucet) |
+| LearnWeb3 Faucet | https://learnweb3.io/faucets/sepolia | — | — | — | **No** — the URL returned HTTP 503 on a direct request |
+
+**Best two, in order:** QuickNode's multi-chain faucet first — it explicitly disclaims every
+gate we'd fail (no account, no mainnet balance, no social post) and covers both Sepolia and
+Base Sepolia from the same page, so whichever network's maker/taker funding lands first, this
+is the one to try. pk910's Sepolia-only PoW faucet second — strictly zero account/CAPTCHA/
+mainnet-balance requirement of any kind, at the cost of needing sustained browser mining
+instead of an instant claim, and it doesn't cover Base Sepolia at all.

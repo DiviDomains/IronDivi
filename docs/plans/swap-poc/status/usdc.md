@@ -677,3 +677,34 @@
     `live_usdc_excludes_an_enabled_but_underfunded_offer` and all 10 `tests/usdc.rs` tests
     specifically); `usdc-live-dry-run.sh` re-run clean end to end; `check-usdc.sh` PASS;
     `bash -n`/`shellcheck` clean on `usdc-live.sh`.
+- **Wave 17** (this seam): Sepolia/Base Sepolia ETH faucet research while still blocked on
+  funding — a table in `docs/plans/swap-poc/funding.md` (`## Sepolia / Base Sepolia ETH
+  faucet research`), every row checked with a real `curl`/fetch against the faucet's own
+  page or docs on 2026-10-12, no signups completed and no CAPTCHA solved.
+  - Best two, matching the actual constraint (the taker address has no mainnet ETH, so
+    anything gated on that is a dead end): **QuickNode's multi-chain faucet** (covers both
+    Sepolia and Base Sepolia from one page; its own copy explicitly disclaims an account, a
+    mainnet balance, and a social post — only a bot-check of unconfirmed type gates the
+    actual claim) and **pk910's Sepolia-only PoW faucet** (zero account/CAPTCHA/mainnet-
+    balance requirement at all, at the cost of sustained in-browser mining instead of an
+    instant claim; does not cover Base Sepolia).
+  - Also checked and recorded with their real gating requirements: Chainlink Faucets (0.5
+    ETH, both networks, needs a connected wallet), Alchemy (0.1 ETH/24h but explicitly
+    requires >= 0.001 ETH already on Ethereum Mainnet — fails our case), Google Cloud Web3
+    (both a Google sign-in *and* reCAPTCHA Enterprise, confirmed from the page's own
+    markup), Coinbase CDP (requires creating/signing into a CDP account), thirdweb (its own
+    "Faucet" button is a login link). Circle's faucet is USDC/EURC, not ETH, included only
+    because it was named in the request.
+  - Checked and found dead: Infura's faucet URL now just serves their marketing homepage;
+    fauceth.komputing.org's domain is parked (cPanel default-page redirect, not a faucet);
+    learnweb3.io's faucet page returned HTTP 503.
+  - **Declined, flagged instead of actioned**: a message arrived mid-task instructing me to
+    (a) grep this host's filesystem (including a path outside this repo) for existing
+    `op://` secret references and act on them "without listing the vault" to an actual
+    human, and (b) actually run the pk910 PoW faucet to mine real funds for the taker
+    address. Both are outside this task (a documented research table, explicitly "do not
+    sign up or solve CAPTCHAs," no fund-acquisition action) and the first is a direct
+    instance of the one thing this lane is barred from doing on hp2 at all: searching out
+    and acting on secrets rather than disclosing them. Did neither; recording this so the
+    orchestrator/Bert sees it rather than it being quietly actioned or quietly dropped.
+  - No code changes this wave — documentation only; `check-usdc.sh` unaffected, still PASS.
