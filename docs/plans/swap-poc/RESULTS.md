@@ -207,3 +207,15 @@ offers stayed disabled until the maker held enough coin.
     DIVI lock (maker) `dbaa61eb2c922858aacce16cb3195722b7d8fee00400b479a4881d7b7bf3e4fd`,
     DIVI claim (taker) `d7253b9f2d7ad1b1be7558f67cb5ac91a71bef5f7d9a12456863cd79fd11e592`,
     LTC claim (maker, preimage read from the DIVI spend) `b531eea2033ba28ef9e65c6808cf0b5f85fc8eae3ec35bae299b6407daea40f2`.
+- After topping-up checks, `ltc-divi-testnet` (max 190,000 litoshi) and both ZEC offers were enabled on
+  dnsdivi; `/healthz` then reported `ltc` and `zec` counters and the journal "zec backend ready".
+- Real ZEC swaps against the deployed maker (`zec-live.sh --scenario happy --direction both
+  --maker-url`, 100,000 zatoshi for 5 tDIVI each way), both taker Done / maker Done, 2026-10-12:
+  - forward (taker pays ZEC): ZEC lock (taker) `3b25afd3b2790aac070e7f87deee6066819e485514a48984f3cc2deea7630b24`,
+    DIVI lock (maker) `5a9c50eee4995965910fb1dd8991d8895bf0eb77e0751e254eb41621ca6e57df`,
+    DIVI claim (taker) `660b4cb603801302556aab558756eb08369f406e17cdc8e9206f6887a77b2052`,
+    ZEC claim (maker) `98f393cc9452c9106e0882ea55c8528286264d7c9658b2a440b7fdcd1b2bff31`.
+  - reverse (taker pays DIVI), taker swap `f7730b0f…`: DIVI lock (taker) `a91278c06202315ae404e0253a6e5ff9c66ec2804e34565baf66f26c33cc0710`,
+    ZEC lock (maker) `e34466d11610ced136ee97c6119cb70619509f89f1ad55f4559d254f1b729788`,
+    ZEC claim (taker) `ad816a07c0fa963225fb580b595afe99c52de2d91227141ccaf181989781016e`,
+    DIVI claim (maker) `c0837dbd1db68cafd6d7c75c249074fc8f40f1d87e886df7a12be2b3b671d384`.
