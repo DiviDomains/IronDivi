@@ -453,3 +453,201 @@
     redeploy-maker.sh task.
 - needs: nothing from the orchestrator right now, other than routing the
   `counter_chain_offers_and_overrides_parse` fix to whoever owns `bin/divi-swapd` currently.
+
+## Release build of divi-swapd for dnsdivi
+- done:
+  - Synced to `origin/main` (`4e0ac26`, the CI-coverage commit above), clean tree, no repo
+    files changed by this task — build/verification only.
+  - `nice -n 10 cargo build --release -p divi-swapd` on hp2 (plain `cargo`, not
+    `remote-cargo`, per `_hp2.md` rule 3), target dir already `~/swap-lanes/ltc/target ->
+    /mnt/storage1/bshuler-cargo/lane-ltc` (set up before this session — confirmed with
+    `readlink` first so nothing landed on the root disk, which the orchestrator flagged
+    this session as sitting at 93-95%). 5m21s cold, `Finished release [optimized]`.
+  - Binary is `ELF 64-bit LSB pie executable, x86-64, ... for GNU/Linux 3.2.0` (`file`
+    output) — x86_64 Linux glibc, as asked.
+  - Copied to **`/mnt/storage1/bshuler-cargo/release/divi-swapd-4e0ac26`** (20,835,504
+    bytes) with a sha256 next to it at
+    **`/mnt/storage1/bshuler-cargo/release/divi-swapd-4e0ac26.sha256`**:
+    `b5540e30e04628ab518c9ea6c8a21d594f5c4634d1ac905b31a2d3590afa60ac`.
+  - `divi-swapd-4e0ac26 --help` exits 0 and prints usage (`--config`, `--backend`).
+  - Offers check: ran it for real against a scratch copy of
+    `deploy/divi-swapd/divi-swapd.toml.example` (own `db_path`/`wallet_path`/`listen` under
+    the scratchpad, nothing under `/var/lib` or the real `18480` port) with
+    `ltc-divi-testnet`/`divi-zec-testnet`/`zec-divi-testnet`'s `enabled = false` lines
+    stripped (the shipped example disables those three), `--backend mock` (no keys, no
+    network). `curl .../offers` listed exactly the six asked for, in this order:
+    `divi-btc-testnet, btc-divi-testnet, divi-ltc-testnet, ltc-divi-testnet,
+    divi-zec-testnet, zec-divi-testnet`. Killed the process and removed the scratch dir
+    afterward — nothing left running, nothing left on disk beyond the two release files
+    above.
+  - Nothing in the repo changed, so no `ready_to_land` for this task (per the task's own
+    instruction) — this status file entry is the full record.
+- needs: nothing. Path and sha are above for the orchestrator's `scp` +
+  `redeploy-maker.sh --binary /mnt/storage1/bshuler-cargo/release/divi-swapd-4e0ac26` once
+  no swap is in flight on dnsdivi (`redeploy-maker.sh --check-only` first, as last time).
+
+## Re: "coordinator pane" / notification question
+No fabricated confirmation here: this lane has no "coordinator pane" to message and no
+notify action — the only landing mechanism in `_hp2.md`/`_common.md` is writing
+`- ready_to_land: <subject>` in this file, which the orchestrator (this conversation) reads
+and lands by hand, then removes the line (as happened for `257128d` and `4e0ac26` already,
+both confirmed back in-chat: "Landed as …, thanks"). There is nothing further for me to
+confirm or notify beyond that; I have not set `ready_to_land` this turn (see above — no
+repo files changed). If "coordinator pane" refers to something outside that documented
+flow, I don't have visibility into it from hp2 and would be guessing rather than confirming
+if I answered further.
+
+Re "do not idle, prove it with test output" — while the release build above was compiling
+in the background, re-ran (fresh, this session, not reused from memory) the abort/refund
+paths this lane actually has (BTC/LTC HTLCs only have claim and refund — "punish" is the
+XMR adaptor-signature lane's concept, not applicable to a secp256k1 HTLC chain; flagging
+rather than inventing a punish-path test here):
+- `cargo test -p divi-swap case_` (substring match): **24 passed**, 0 failed — covers
+  `case_a_taker_never_locks`, `case_b_taker_lock_invalid`, `case_c_taker_never_claims`
+  (abort/refund) and their `rev_` (reverse-direction) counterparts.
+- `cargo test -p swap-chain-ltc`: **36 passed**, 1 ignored (the live-gated one), 0 failed —
+  includes `refund_verifies_with_consensus`, `refund_rejected_before_locktime`.
+- `cargo test -p swap-chain-btc`: **25 passed**, 0 failed — same refund coverage for the
+  crate this lane also owns.
+- `cargo test -p divi-swapd e2e_mock`: **4 passed**, 0 failed — `e2e_mock_happy_path`,
+  `e2e_mock_refund`, and both reverse-direction equivalents.
+No live-run prep is blocked on me right now beyond what's already in the "left / next
+steps" notes above (all of it is either done or needs the orchestrator's keys/network from
+the Mac); nothing else is queued, so there is nothing further to advance without
+fabricating work.
+
+## Mac-side runbook: redeploy + live LTC claim/refund leg
+Written for the Mac runner (not hp2 — `_hp2.md` rule 4/5: no commit/push and no secrets on
+hp2, so none of this is executed here). Every command below is copy-pasteable as written;
+every flag/subcommand name was confirmed against `divi-swap --help`/`run --help`/
+`refund --help`/`claim --help`/`balance --help`/`txids --help` and
+`tools/swap-poc/redeploy-maker.sh --help` on this host today (`4e0ac26`), not guessed.
+
+### Preconditions
+- [ ] Mac checkout clean, at or after `4e0ac26` (`git merge-base --is-ancestor 4e0ac26 HEAD
+      && echo ok`) — the commit that shipped `redeploy-maker.sh`'s current flags and the
+      mock-checks CI job; `wave4-deploy.md`'s own precondition list (BTC reverse chaos
+      done, no second local maker on the same keys, Mac at/after the main it names) still
+      applies on top of this.
+- [ ] `dnsdivi` ssh alias reachable: `ssh dnsdivi true`.
+- [ ] A tunnel to the maker's API open for the in-flight gate, local port matching
+      whatever `--maker-url` you pass (this runbook uses the default, 18482):
+      `ssh -N -L 18482:127.0.0.1:18480 dnsdivi &` (background; `18480` is dnsdivi's own
+      bind port, confirmed in `deploy/divi-swapd/README.md` and `wave4-deploy.md`).
+- [ ] Maker currently healthy on the *old* binary before touching anything:
+      `curl -fsS http://127.0.0.1:18482/healthz | jq '{ok, version}'` → `ok: true`.
+- [ ] 1Password / secret-broker unlocked on the Mac (`op whoami`, or
+      `secret-broker status` if that's the path this runner uses) — the taker/maker keys
+      below are resolved from `op://…` refs passed as flag *values*, not environment
+      variables, so there is no key-bearing env var to set for the swap CLI itself. The
+      taker's LTC address needs funds already (`balance` in step 5 confirms this; if it
+      doesn't, this is a `- parked:` item, not something to force).
+
+### Step 1 — fetch and verify the prebuilt binary from hp2
+```sh
+scp hp2:/mnt/storage1/bshuler-cargo/release/divi-swapd-4e0ac26 ~/Downloads/
+scp hp2:/mnt/storage1/bshuler-cargo/release/divi-swapd-4e0ac26.sha256 ~/Downloads/
+(cd ~/Downloads && shasum -a 256 -c divi-swapd-4e0ac26.sha256)
+```
+**Expect:** `divi-swapd-4e0ac26: OK`. If it says FAILED, stop — re-fetch, don't proceed on
+an unverified binary. (Built+verified on hp2 2026-10-12: `--help` exits 0; `/offers` under
+`--backend mock` lists exactly `divi-btc-testnet, btc-divi-testnet, divi-ltc-testnet,
+ltc-divi-testnet, divi-zec-testnet, zec-divi-testnet` — see the release section above.)
+
+### Step 2 — in-flight gate, check-only (no build, no install, no restart)
+```sh
+tools/swap-poc/redeploy-maker.sh --check-only --maker-url http://127.0.0.1:18482
+```
+**Pass:** prints `ok: no in-flight swaps` and exits 0. **Fail:** prints `REFUSE: … swap(s)
+not in a terminal state` and each in-flight id, exit 1 — stop here; either wait for those
+swaps to reach `Done`/`Aborted`, or re-run with `--force-inflight` only after you've read
+the printed ids and decided that's intentional.
+
+### Step 3 — dry run the redeploy (prints every step, touches nothing)
+```sh
+tools/swap-poc/redeploy-maker.sh --dry-run \
+  --binary ~/Downloads/divi-swapd-4e0ac26 --maker-url http://127.0.0.1:18482
+```
+**Expect:** the gate line again, then the scp/ssh-install/health-wait commands printed
+(not run), exit 0. Read it before Step 4 — this is the actual command Step 4 runs for
+real, so anything surprising here (wrong host, wrong remote port) means stop and fix a
+flag rather than proceed.
+
+### Step 4 — real redeploy
+```sh
+tools/swap-poc/redeploy-maker.sh \
+  --binary ~/Downloads/divi-swapd-4e0ac26 --maker-url http://127.0.0.1:18482
+```
+**Pass:** ends with `ok: divi-swapd is healthy on the new binary` and a `sha256sum` line
+for `/usr/local/bin/divi-swapd` and `.prev` (the two hashes must differ, and the non-`.prev`
+one must equal Step 1's hash); exit 0. **Fail:** `FAIL: /healthz did not come up within
+300s; rolling back`, then either `rolled back to the previous binary; divi-swapd is
+healthy again` (exit 1 — the redeploy failed but the maker is still up on the old binary;
+do **not** proceed to Step 6) or a rollback failure telling you to
+`ssh dnsdivi sudo journalctl -u divi-swapd -n 50` by hand — stop and investigate, don't
+retry blindly.
+
+### Step 5 — confirm the new maker's health/offers/balance before risking funds
+```sh
+curl -fsS http://127.0.0.1:18482/healthz | jq '{ok, version, counters}'
+curl -fsS http://127.0.0.1:18482/offers | jq -c '[.[] | .id]'
+ref() { echo "op://global_secret_store/IronDivi Swap POC - $1/password"; }
+target/release/divi-swap --backend live --counter-chain ltc \
+  --divi-key "$(ref taker-divi)" --ltc-key "$(ref taker-btc)" balance
+```
+**Expect:** `/healthz` → `ok: true` (wait and re-check if `false` — the wallet scan can
+still be catching up, per `wave4-deploy.md` §4; it is not a failure by itself), a `ltc`
+entry in `counters` with `error: null`. `/offers` → includes `"divi-ltc-testnet"` and, if
+proving the reverse leg, `"ltc-divi-testnet"` (both must show `enabled = true` in
+`/etc/divi-swapd/divi-swapd.toml` on dnsdivi — confirm with the orchestrator's balance
+notes above if unsure which leg is funded right now). `balance` → prints the taker's
+`ltc_address` and a `ltc_balance_sats` large enough for the `--btc-sats` amount you intend
+in Step 6 plus fees (100,000+5,000 litoshi has been the working amount this session).
+
+### Step 6 — the live swap itself
+Forward (maker sells DIVI for LTC, offer `divi-ltc-testnet`):
+```sh
+D=~/.local/state/iron-divi-swap-poc/wave4-ltc; mkdir -p "$D"; chmod 700 "$D"
+target/release/divi-swap --db "$D/taker.db" --backend live --counter-chain ltc \
+  --divi-key "$(ref taker-divi)" --ltc-key "$(ref taker-btc)" \
+  run --maker http://127.0.0.1:18482 --offer divi-ltc-testnet --btc-sats 100000
+```
+Reverse (maker buys DIVI with LTC, offer `ltc-divi-testnet` — needs `--divi-wallet`, a
+taker DIVI coin db outside any git tree):
+```sh
+target/release/divi-swap --db "$D/taker.db" --backend live --counter-chain ltc \
+  --divi-key "$(ref taker-divi)" --ltc-key "$(ref taker-btc)" \
+  --divi-wallet "$D/taker-divi-wallet.json" \
+  run --maker http://127.0.0.1:18482 --offer ltc-divi-testnet --btc-sats 100000
+```
+Case-C proof (never claim, forces both refunds) adds `--never-claim` to either command
+above. `run` prints the local swap id when it finishes; then:
+```sh
+target/release/divi-swap --db "$D/taker.db" txids --swap <local id>
+```
+If `run` is interrupted (ctrl-C, SSH drop, timeout) **do not re-run `run`** — it would
+quote+accept a second time. Resume with the single-step subcommands against the same
+`--db`/`--swap <id>`: `divi-swap status --swap <id>` to see where it's stuck, then
+`divi-swap claim --swap <id> …` or `divi-swap refund --swap <id> …` (same `--divi-key`/
+`--ltc-key`/`--backend live --counter-chain ltc` flags as above) — this is exactly the
+by-hand recovery already used once this session ("resuming the live swap by hand with
+`divi-swap refund`").
+
+**Pass:** `txids --swap <id>` shows the maker's view at `Done` (happy) or both legs
+refunded after their locktimes (case-C), and every printed txid confirms on
+litecoinspace.org testnet (`https://litecoinspace.org/testnet/tx/<txid>`) — the same
+verification RESULTS.md already uses for every prior live leg. Paste the txids into
+`RESULTS.md` and this file once confirmed.
+**Fail:** `run`/`claim`/`refund` exits with an error before reaching `Done`/refunded that
+isn't a quiet "waiting, not yet confirmed" retry — capture the exact error text and the
+local swap id, and stop rather than retry the same command repeatedly; a repeated failure
+on the same step is an "ask the oracle" or "flag to the orchestrator" situation, not a
+force-through.
+
+### What I did not and will not do
+Did not commit or push this entry, and did not sign anything as Bert Shuler: `_hp2.md`
+rule 4 is explicit ("Never `git commit`, never push — signing lives on the Mac") and that
+holds regardless of who is asking or why — hp2 has no signing key and this lane's binding
+rules don't carve out an exception for "authorized." Landing this (and the actual live
+run above) is the orchestrator's step, from the Mac, same as every prior live leg in
+`RESULTS.md`.
