@@ -278,6 +278,21 @@ offers stayed disabled until the maker held enough coin.
     ZEC refund (maker, CLTV path) `fca0821eff0ed3509f319b02217b679468668105d15d6d2ee8065d4bf4d08d05`,
     DIVI refund (taker, CLTV path) `3b2d9ac4e5a05099e7df2b1dc1fcd52aff43e786c10d389f506540df49888384`.
 
+## Redeployed maker 4e0ac26: one live swap per coin and direction (2026-10-13)
+dnsdivi `divi-swapd` from `4e0ac26` (sha256 `b5540e30…60ac`), reached over the 18482 tunnel; taker
+`divi-swap` from the Mac (build `c0aed4b`, same wire protocol). Testnet only.
+- LTC forward (taker pays 100,000 litoshi, `divi-ltc-testnet`), swap `3bd97391…`, Done/Done:
+    LTC lock (taker) `bea5d5d08654a24cb0bf41ef02b0bb3f956d17273097a5587aea6b3136ebdd41`,
+    DIVI lock (maker) `55c41c0fc713c223d38a8a3f8aadbe7d6e17098c306d302900a8f4c33f93b705`,
+    DIVI claim (taker) `f944da75fb85bd4d718c31c02e3f168c127c41f8690c433ae5135ea1112aade7`,
+    LTC claim (maker) `0a0564453371d95389142f0668750608f71adac788e9cd5765c40e4609ccbafa`.
+- LTC reverse (taker pays DIVI, `ltc-divi-testnet`), swap `60f622d2…`, Done/Done:
+    DIVI lock (taker) `2d0c0be4e4392f7a3c106717667dbff5a67ea013879dfd27c6f71bd64c67da64`,
+    LTC lock (maker) `aa03411220b6afaa6e1568e4e10e3f7d7898d2c1110b3c8eede5d47eba8e1013`,
+    LTC claim (taker) `6b242c2ac1ce68b7265aa7924d4839da8ffefc551f4dbdd35732f84c688a910f`,
+    DIVI claim (maker) `d3a645fcc7128ff7c94252a34e26771ffe25c04a05659659d8d38f2f1deca160`.
+<!--ZEC-4E0AC26-->
+
 ## Multi-coin: XMR ↔ DIVI adaptor-signature swap (Monero stagenet + DIVI testnet), forward, 2026-10-12
 
 No HTLC on Monero: the maker locks DIVI in a 2-of-2 P2SH, the taker locks XMR to an address whose

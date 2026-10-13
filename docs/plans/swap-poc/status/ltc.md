@@ -651,3 +651,6 @@ holds regardless of who is asking or why — hp2 has no signing key and this lan
 rules don't carve out an exception for "authorized." Landing this (and the actual live
 run above) is the orchestrator's step, from the Mac, same as every prior live leg in
 `RESULTS.md`.
+
+## 2026-10-13 live on the redeployed maker (4e0ac26)
+- result: PASS — live LTC happy swap both directions against dnsdivi 4e0ac26, Done/Done each (fwd `3bd97391…`, rev `60f622d2…`); txids in RESULTS.md, all confirmed.
