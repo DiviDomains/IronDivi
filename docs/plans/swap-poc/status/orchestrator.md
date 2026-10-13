@@ -7,7 +7,10 @@
   Plan `docs/plans/swap-poc/reverse-direction.md`. Contract (`Direction`, role-based `SwapView` legs) on main `3b8bb1b`.
 - **Lanes:** rev-engine, rev-cli, rev-tools all landed (main `4ae2ed8`, CI green; check-rev-{engine,cli,tools}.sh PASS
   on main) and their panes are closed. Tab 0:6 "Divi Swap 1" holds orchestrator `pane-3f088f33…`, secret-broker `ae8a03fc…`.
-- **Deployed:** dnsdivi divi-swapd from `4ae2ed8` (v0.2.5): offers `divi-btc-testnet` + `btc-divi-testnet`; both old
+- **Deployed (2026-10-13):** dnsdivi divi-swapd from `4e0ac26` (v0.2.6, sha256 `b5540e30…60ac`), via
+  `redeploy-maker.sh --binary` after its in-flight gate passed; previous binary kept as `.prev`;
+  healthz ok after a ~10 min DIVI rescan; serves BTC, LTC and ZEC tips.
+- **Earlier:** dnsdivi divi-swapd from `4ae2ed8` (v0.2.5): offers `divi-btc-testnet` + `btc-divi-testnet`; both old
   forward swaps load as Done; healthz ok.
 - **Closed 2026-10-10:** the nine forward lane panes (engine, daemon, deploy, btc, divi, e2e-local, chaos, e2e-live,
   chaos-live) — all done, worktrees clean; tab "Divi Swap 2" emptied and gone.
