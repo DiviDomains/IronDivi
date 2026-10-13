@@ -27,6 +27,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
 use divi_swap::{Chain, ChainBackend, Maker, SwapError};
+use divi_swap_xmr::api::{SetupReply, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView};
+use divi_swap_xmr::XmrMaker;
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 
@@ -55,7 +57,16 @@ impl AppState {
 
 /// Build the router, nested under `prefix` (empty or `/seg`).
 pub fn router(state: AppState, prefix: &str) -> Router {
-    let api = Router::new()
+    router_with_xmr(state, None, prefix)
+}
+
+/// [`router`] plus, when `xmr` is given, the DIVI<->XMR adaptor-swap routes
+/// (`divi_swap_xmr`): `POST /xmr/swaps` (setup), `POST /xmr/swaps/:id/sigs`,
+/// `POST /xmr/swaps/:id/xmr-lock`, `GET /xmr/swaps[/:id]`. Its offers and quotes go through
+/// the hashlock maker's `/offers` routes (the engine is registered with
+/// `Maker::with_engine`).
+pub fn router_with_xmr(state: AppState, xmr: Option<Arc<XmrMaker>>, prefix: &str) -> Router {
+    let mut api = Router::new()
         .route("/healthz", get(healthz))
         .route("/offers", get(offers))
         .route("/offers/:id/quote", get(quote))
@@ -63,6 +74,16 @@ pub fn router(state: AppState, prefix: &str) -> Router {
         .route("/swaps/:id", get(get_swap))
         .route("/swaps/:id/lock", post(lock))
         .with_state(state);
+    if let Some(x) = xmr {
+        api = api.merge(
+            Router::new()
+                .route("/xmr/swaps", post(xmr_setup).get(xmr_list))
+                .route("/xmr/swaps/:id", get(xmr_get))
+                .route("/xmr/swaps/:id/sigs", post(xmr_sigs))
+                .route("/xmr/swaps/:id/xmr-lock", post(xmr_lock))
+                .with_state(x),
+        );
+    }
     let app = if prefix.is_empty() {
         api
     } else {
@@ -197,4 +218,40 @@ async fn lock(
     Json(notice): Json<LockNotice>,
 ) -> Result<Json<SwapView>, ApiError> {
     Ok(Json(s.maker.notify_lock(&id, notice).await?))
+}
+
+async fn xmr_setup(
+    State(x): State<Arc<XmrMaker>>,
+    Json(req): Json<SetupRequest>,
+) -> Result<(StatusCode, Json<SetupReply>), ApiError> {
+    Ok((StatusCode::CREATED, Json(x.setup(req).await?)))
+}
+
+async fn xmr_sigs(
+    State(x): State<Arc<XmrMaker>>,
+    Path(id): Path<String>,
+    Json(req): Json<SigsRequest>,
+) -> Result<Json<XmrSwapView>, ApiError> {
+    Ok(Json(x.sigs(&id, req).await?))
+}
+
+async fn xmr_lock(
+    State(x): State<Arc<XmrMaker>>,
+    Path(id): Path<String>,
+    Json(notice): Json<XmrLockNotice>,
+) -> Result<Json<XmrSwapView>, ApiError> {
+    Ok(Json(x.xmr_locked(&id, notice).await?))
+}
+
+async fn xmr_get(
+    State(x): State<Arc<XmrMaker>>,
+    Path(id): Path<String>,
+) -> Result<Json<XmrSwapView>, ApiError> {
+    x.view(&id)?
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no xmr swap {id}")))
+}
+
+async fn xmr_list(State(x): State<Arc<XmrMaker>>) -> Result<Json<Vec<XmrSwapView>>, ApiError> {
+    Ok(Json(x.list()?))
 }

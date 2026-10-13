@@ -22,9 +22,9 @@ pub mod scan;
 pub mod scheduler;
 
 pub use config::{
-    mock_counter_offers, BackendKind, BtcSection, DaemonConfig, LtcSection, UsdcSection,
-    ZecSection, MOCK_ONLY_CHAINS,
+    mock_counter_offers, mock_xmr_offers, BackendKind, BtcSection, DaemonConfig, LtcSection,
+    UsdcSection, ZecSection, MOCK_ONLY_CHAINS,
 };
-pub use routes::{router, AppState};
+pub use routes::{router, router_with_xmr, AppState};
 pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
 pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};

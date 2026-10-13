@@ -1,0 +1,34 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-swap-xmr"
+version.workspace = true
+edition.workspace = true
+description = "DIVI<->XMR adaptor-signature swap engine (xmr-design.md Option B): maker and taker state machines beside divi-swap's hashlock engine"
+
+[dependencies]
+divi-swap = { workspace = true }
+divi-primitives = { workspace = true }
+divi-crypto = { workspace = true }
+divi-script = { workspace = true }
+divi-wallet = { workspace = true }
+# The xmr lane's crates, used only through their public API.
+swap-chain-xmr = { path = "../swap-chain-xmr" }
+swap-adaptor = { path = "../swap-adaptor" }
+# Same versions swap-adaptor uses; listed here for the wire encodings: `serde` on sigma_fun
+# gives `CrossCurveDLEQProof` a serde form (feature unification, same crate instance), and
+# `CompressedEdwardsY` is how ed25519 points travel.
+sigma_fun = { version = "0.9", default-features = false, features = ["alloc", "ed25519", "serde"] }
+curve25519-dalek-ng = { version = "4", default-features = false, features = ["u64_backend"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

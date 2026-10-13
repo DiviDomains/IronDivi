@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 divi-swap = { workspace = true }
+divi-swap-xmr = { path = "../../crates/divi-swap-xmr" }
 swap-chain-divi = { workspace = true }
 swap-chain-btc = { workspace = true }
 swap-chain-ltc = { workspace = true }

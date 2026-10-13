@@ -18,7 +18,7 @@
 //! mock `divi-ltc-testnet` / `ltc-divi-testnet` offers, claimed and refunded.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use divi_swap::api::{Direction, Offer};
 use divi_swap::mock::{MockBackend, MockChain, MOCK_FEE};
@@ -31,6 +31,9 @@ use tokio::task::JoinHandle;
 
 const T0: u32 = 1_700_000_000;
 const LTC_SATS: u64 = 1_000_000;
+/// Upper bound for polling loops: wall clock, not an iteration count, so a busy build
+/// host (hp2 runs many lanes at once) slows them down instead of failing them.
+const LOADED_HOST_WAIT: Duration = Duration::from_secs(180);
 const TICK: Duration = Duration::from_millis(15);
 /// A BTC offer beside the LTC ones, for the old-client checks.
 const BTC_OFFER: &str = "divi-btc-testnet";
@@ -178,7 +181,9 @@ fn taker(w: &World, db: &std::path::Path) -> Taker {
 
 async fn wait_state(client: &MakerClient, id: &str, want: SwapState, w: &World) {
     let mut state = SwapState::Quoted;
-    for _ in 0..600 {
+    let deadline = Instant::now() + LOADED_HOST_WAIT;
+
+    while Instant::now() < deadline {
         w.mine();
         state = client.swap(id).await.unwrap().state;
         if state == want {
@@ -208,7 +213,7 @@ async fn happy(dir: Direction) {
     let taker_got_before = bal(l.maker_chain, l.taker_on_maker_leg);
 
     let opts = RunOpts {
-        timeout: Duration::from_secs(60),
+        timeout: Duration::from_secs(180), // hp2 runs many lanes at once
         poll: TICK,
     };
     let (local, state) = run_swap(
@@ -278,7 +283,9 @@ async fn refund(dir: Direction) {
     // Past the taker timeout (6 h) the taker refunds its leg.
     l.taker_chain.advance_time(7 * 3600);
     let mut state = TakerState::Locked;
-    for _ in 0..200 {
+    let deadline = Instant::now() + LOADED_HOST_WAIT;
+
+    while Instant::now() < deadline {
         w.mine();
         state = flow::step(&taker, &client, &sessions, &local)
             .await

@@ -152,6 +152,13 @@ CREATE TABLE IF NOT EXISTS taker_swaps (
     seq INTEGER NOT NULL,
     json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS docs (
+    kind TEXT NOT NULL,
+    id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (kind, id)
+);
 ";
 
 impl Store {
@@ -249,6 +256,54 @@ impl Store {
     /// All taker swaps, newest first.
     pub fn list_taker_swaps(&self) -> Result<Vec<TakerRecord>> {
         self.list_json("SELECT json FROM taker_swaps ORDER BY seq DESC")
+    }
+
+    // ---- other engines' records ----
+
+    /// Insert or replace a JSON document of `kind` (e.g. `"xmr_maker"`): storage for swap
+    /// engines that live outside this crate (the DIVI<->XMR adaptor swap) but share its
+    /// database, file mode and single-statement write-ahead property.
+    pub fn put_doc<T: Serialize>(&self, kind: &str, id: &str, doc: &T) -> Result<()> {
+        let json = serde_json::to_string(doc).map_err(storage)?;
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO docs (kind, id, seq, json)
+                 VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM docs), ?3)
+                 ON CONFLICT(kind, id) DO UPDATE SET json = excluded.json",
+                params![kind, id, json],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Fetch a document of `kind`.
+    pub fn get_doc<T: DeserializeOwned>(&self, kind: &str, id: &str) -> Result<Option<T>> {
+        let json: Option<String> = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT json FROM docs WHERE kind = ?1 AND id = ?2",
+                params![kind, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        json.map(|j| serde_json::from_str(&j).map_err(storage))
+            .transpose()
+    }
+
+    /// All documents of `kind`, newest first.
+    pub fn list_docs<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT json FROM docs WHERE kind = ?1 ORDER BY seq DESC")
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![kind], |r| r.get::<_, String>(0))
+            .map_err(storage)?;
+        rows.map(|j| serde_json::from_str(&j.map_err(storage)?).map_err(storage))
+            .collect()
     }
 
     // ---- helpers ----
@@ -388,6 +443,49 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(ids, ["b", "a"]);
+    }
+
+    #[test]
+    fn docs_round_trip_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swaps.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .put_doc("k1", "a", &serde_json::json!({"n": 1}))
+            .unwrap();
+        store
+            .put_doc("k1", "b", &serde_json::json!({"n": 2}))
+            .unwrap();
+        store
+            .put_doc("k2", "a", &serde_json::json!({"n": 3}))
+            .unwrap();
+        store
+            .put_doc("k1", "a", &serde_json::json!({"n": 4}))
+            .unwrap(); // replace keeps order
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let a: Option<serde_json::Value> = store.get_doc("k1", "a").unwrap();
+        assert_eq!(a.unwrap()["n"], 4);
+        assert_eq!(
+            store
+                .get_doc::<serde_json::Value>("k2", "a")
+                .unwrap()
+                .unwrap()["n"],
+            3
+        );
+        assert!(store
+            .get_doc::<serde_json::Value>("k3", "a")
+            .unwrap()
+            .is_none());
+        let k1: Vec<serde_json::Value> = store.list_docs("k1").unwrap();
+        assert_eq!(
+            k1.iter()
+                .map(|v| v["n"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [2, 4]
+        );
+        // The hashlock tables are untouched by documents.
+        assert!(store.list_maker_swaps().unwrap().is_empty());
     }
 
     #[cfg(unix)]

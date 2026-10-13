@@ -44,8 +44,9 @@ struct Cli {
     /// the public testnets.
     #[arg(long, global = true, value_enum, default_value = "live")]
     backend: BackendArg,
-    /// Chain swapped against DIVI: `btc`, `ltc`, `usdc` or `zec` (the offer's `counter_chain`).
-    /// `btc`, `ltc`, `usdc` and `zec` all have live backends.
+    /// Chain swapped against DIVI: `btc`, `ltc`, `usdc`, `zec` or `xmr` (the offer's
+    /// `counter_chain`). `btc`, `ltc`, `usdc` and `zec` have live backends; `xmr` (the
+    /// adaptor-signature swap) is `--backend mock` only so far.
     #[arg(long, global = true, default_value = "btc", value_parser = parse_counter_chain)]
     counter_chain: Chain,
     /// Secret reference (`op://…` or `credential:<name>`) for the taker's DIVI key.
@@ -443,6 +444,9 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let sessions = Sessions::beside(&cli.db);
+    if cli.counter_chain == Chain::Xmr {
+        return xmr_main(&cli, &sessions).await;
+    }
 
     match &cli.cmd {
         Cmd::Quote(d) => {
@@ -550,6 +554,94 @@ async fn main() -> Result<()> {
             for l in divi_swap_cli::txids::lines(&rec, &view) {
                 println!("{l}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// The taker engine for `--counter-chain xmr` (mock chains only so far: a DIVI wallet that
+/// receives the DIVI, a Monero wallet holding 10 XMR).
+fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
+    use divi_swap_xmr::mock::{MockDiviChain, MockMoneroChain};
+    if !matches!(cli.backend, BackendArg::Mock) {
+        bail!("no live xmr backend in this build yet; use --backend mock");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(1_700_000_000);
+    let divi = MockDiviChain::new(now, 60).wallet(8);
+    let xmr = MockMoneroChain::new().wallet("taker", 10_000_000_000_000);
+    Ok(divi_swap_xmr::XmrTaker::new(
+        divi_swap_xmr::XmrConfig::testnet(),
+        Arc::new(divi),
+        Arc::new(xmr),
+        Store::open(&cli.db)?,
+    )?)
+}
+
+/// `--counter-chain xmr`: the adaptor-swap taker (`divi_swap_cli::xmr_flow`).
+async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
+    use divi_swap_cli::xmr_flow;
+    match &cli.cmd {
+        Cmd::Quote(d) => {
+            let quote = MakerClient::new(&d.maker.maker)
+                .quote(&d.offer, d.btc_sats)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&quote)?);
+        }
+        Cmd::Accept(d) => {
+            let taker = xmr_taker(cli)?;
+            let local = xmr_flow::begin(
+                &taker,
+                &MakerClient::new(&d.maker.maker),
+                sessions,
+                &d.offer,
+                d.btc_sats,
+            )
+            .await?;
+            println!("{local}");
+        }
+        Cmd::Status { swap } => {
+            let s = sessions.get(swap)?;
+            let view = MakerClient::new(&s.maker_url)
+                .xmr_swap(&s.maker_swap_id)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        Cmd::Claim { swap } | Cmd::Refund { swap } => {
+            let client = MakerClient::new(&sessions.get(swap)?.maker_url);
+            let state = xmr_flow::step(&xmr_taker(cli)?, &client, sessions, swap).await?;
+            println!("{state:?}");
+        }
+        Cmd::Run {
+            deal,
+            timeout_secs,
+            poll_secs,
+            claim_not_before,
+            never_claim,
+        } => {
+            if claim_not_before.is_some() || *never_claim {
+                bail!("--claim-not-before / --never-claim are hashlock-only");
+            }
+            let opts = RunOpts {
+                timeout: Duration::from_secs(*timeout_secs),
+                poll: Duration::from_secs(*poll_secs),
+            };
+            let (local, outcome) = xmr_flow::run(
+                &xmr_taker(cli)?,
+                &MakerClient::new(&deal.maker.maker),
+                sessions,
+                &deal.offer,
+                deal.btc_sats,
+                &opts,
+                &mut || {},
+            )
+            .await?;
+            println!("{local} {outcome}");
+        }
+        Cmd::Lock { .. } | Cmd::Balance | Cmd::Txids { .. } => {
+            bail!("not available for xmr: `accept` sends the signatures, `claim` steps the swap (it locks XMR and redeems)");
         }
     }
     Ok(())

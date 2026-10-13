@@ -2278,6 +2278,7 @@ dependencies = [
  "byteorder",
  "digest 0.9.0",
  "rand_core 0.6.4",
+ "serde",
  "subtle-ng",
  "zeroize",
 ]
@@ -2799,6 +2800,7 @@ dependencies = [
  "clap",
  "divi-crypto",
  "divi-swap",
+ "divi-swap-xmr",
  "divi-wallet",
  "hex",
  "rand 0.8.8",
@@ -2820,6 +2822,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "divi-swap-xmr"
+version = "0.2.6"
+dependencies = [
+ "async-trait",
+ "curve25519-dalek-ng",
+ "divi-crypto",
+ "divi-primitives",
+ "divi-script",
+ "divi-swap",
+ "divi-wallet",
+ "hex",
+ "parking_lot",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sigma_fun",
+ "swap-adaptor",
+ "swap-chain-xmr",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "divi-swapd"
 version = "0.2.6"
 dependencies = [
@@ -2831,6 +2859,7 @@ dependencies = [
  "divi-crypto",
  "divi-swap",
  "divi-swap-cli",
+ "divi-swap-xmr",
  "divi-wallet",
  "hex",
  "http-body-util",
@@ -3285,6 +3314,7 @@ version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
+ "serde",
  "typenum",
  "version_check",
  "zeroize",
@@ -5835,6 +5865,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25996b82292a7a57ed3508f052cfff8640d38d32018784acd714758b43da9c8f"
 dependencies = [
  "secp256k1-sys 0.8.2",
+ "serde",
 ]
 
 [[package]]
@@ -5844,6 +5875,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d24b59d129cdadea20aea4fb2352fa053712e5d713eee47d700cd4b2bc002f10"
 dependencies = [
  "secp256k1-sys 0.9.2",
+ "serde",
 ]
 
 [[package]]

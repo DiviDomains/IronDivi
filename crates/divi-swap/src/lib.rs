@@ -32,7 +32,7 @@ pub use backend::ChainBackend;
 pub use config::{ChainParams, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
-pub use maker::Maker;
+pub use maker::{Maker, OfferEngine};
 pub use state::SwapState;
 pub use store::Store;
 pub use taker::{Taker, TakerState};

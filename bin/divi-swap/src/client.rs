@@ -18,6 +18,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
+use divi_swap_xmr::api::{SetupReply, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -92,5 +93,24 @@ impl MakerClient {
 
     pub async fn swap(&self, swap_id: &str) -> Result<SwapView> {
         self.get(&format!("/swaps/{swap_id}")).await
+    }
+
+    // ---- DIVI<->XMR adaptor swap (`divi_swap_xmr`) ----
+
+    pub async fn xmr_setup(&self, req: &SetupRequest) -> Result<SetupReply> {
+        self.post("/xmr/swaps", req).await
+    }
+
+    pub async fn xmr_sigs(&self, swap_id: &str, req: &SigsRequest) -> Result<XmrSwapView> {
+        self.post(&format!("/xmr/swaps/{swap_id}/sigs"), req).await
+    }
+
+    pub async fn xmr_lock(&self, swap_id: &str, notice: &XmrLockNotice) -> Result<XmrSwapView> {
+        self.post(&format!("/xmr/swaps/{swap_id}/xmr-lock"), notice)
+            .await
+    }
+
+    pub async fn xmr_swap(&self, swap_id: &str) -> Result<XmrSwapView> {
+        self.get(&format!("/xmr/swaps/{swap_id}")).await
     }
 }

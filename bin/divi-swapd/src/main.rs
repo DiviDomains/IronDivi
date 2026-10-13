@@ -27,8 +27,9 @@ use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
-    mock_counter_offers, router, run_scan, spawn_gated_scheduler, AppState, BackendKind,
-    BtcSection, DaemonConfig, LtcSection, ScanStatus, ZecSection, MOCK_ONLY_CHAINS,
+    mock_counter_offers, mock_xmr_offers, router_with_xmr, run_scan, spawn_gated_scheduler,
+    AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, ZecSection,
+    MOCK_ONLY_CHAINS,
 };
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
@@ -113,7 +114,7 @@ fn mock_backends() -> Backends {
 /// configured with `enabled = false` stays off in mock mode too).
 fn mock_offers(cfg: &DaemonConfig) -> Vec<divi_swap::api::Offer> {
     let mut offers = cfg.offers.clone();
-    for o in mock_counter_offers() {
+    for o in mock_counter_offers().into_iter().chain(mock_xmr_offers()) {
         let configured =
             offers.iter().any(|have| have.id == o.id) || cfg.disabled_offers.contains(&o.id);
         if !configured {
@@ -121,6 +122,39 @@ fn mock_offers(cfg: &DaemonConfig) -> Vec<divi_swap::api::Offer> {
         }
     }
     offers
+}
+
+/// The adaptor-swap maker over in-process chains (`--backend mock`): a DIVI chain carrying
+/// real transactions and a Monero chain, both mined here every 5 s like the other mocks.
+fn mock_xmr_engine(
+    store: Store,
+    offers: Vec<divi_swap::api::Offer>,
+) -> Result<Arc<divi_swap_xmr::XmrMaker>> {
+    use divi_swap_xmr::mock::{MockDiviChain, MockMoneroChain};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(1_700_000_000);
+    let divi = MockDiviChain::new(now, 60);
+    let xmr = MockMoneroChain::new();
+    let wallet = divi.wallet(7);
+    wallet.fund(1_000_000 * 100_000_000);
+    let engine = divi_swap_xmr::XmrMaker::new(
+        divi_swap_xmr::XmrConfig::testnet(),
+        Arc::new(wallet),
+        Arc::new(xmr.wallet("maker", 0)),
+        store,
+        offers,
+    )?;
+    tokio::spawn(async move {
+        let mut i = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            i.tick().await;
+            divi.mine(1);
+            xmr.mine(1);
+        }
+    });
+    Ok(Arc::new(engine))
 }
 
 /// Resolve a `[…].key` reference into a secp256k1 key held only in memory.
@@ -273,6 +307,14 @@ async fn live_backends(
     if !cfg.disabled_offers.is_empty() {
         tracing::info!(offers = ?cfg.disabled_offers, "offers disabled in config");
     }
+    if let Some(o) = cfg.offers.iter().find(|o| o.counter_chain.is_adaptor()) {
+        bail!(
+            "offer {}: {} swaps (adaptor-signature engine) have no live backend in this build \
+             yet; use --backend mock",
+            o.id,
+            o.counter_chain
+        );
+    }
     let known: Vec<Chain> = std::iter::once(Chain::Btc)
         .chain(others.iter().map(|b| b.chain()))
         .collect();
@@ -356,27 +398,34 @@ async fn main() -> Result<()> {
         ScanStatus::done()
     };
 
+    // XMR offers run on the adaptor engine (mock only for now); the rest on the hashlock maker.
+    let (xmr_offers, offers): (Vec<_>, Vec<_>) = offers
+        .into_iter()
+        .partition(|o| o.counter_chain.is_adaptor());
+    let xmr = (!xmr_offers.is_empty())
+        .then(|| mock_xmr_engine(store.clone(), xmr_offers))
+        .transpose()?;
     let counters = std::iter::once(btc.clone()).chain(others).collect();
-    let maker = Arc::new(Maker::with_counters(
-        cfg.swap_config()?,
-        divi.clone(),
-        counters,
-        store,
-        offers,
-    )?);
+    let mut maker =
+        Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?;
+    if let Some(x) = &xmr {
+        maker = maker.with_engine(x.clone())?;
+    }
+    let maker = Arc::new(maker);
     let _scheduler = spawn_gated_scheduler(
         maker.clone(),
         Duration::from_secs(cfg.tick_secs),
         scan.clone(),
     );
 
-    let app = router(
+    let app = router_with_xmr(
         AppState {
             maker,
             divi,
             btc,
             scan: scan.clone(),
         },
+        xmr,
         &cfg.prefix(),
     );
     let listener = tokio::net::TcpListener::bind(cfg.listen)

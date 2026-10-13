@@ -21,6 +21,7 @@ pub mod flow;
 pub mod session;
 pub mod txids;
 pub mod wallet;
+pub mod xmr_flow;
 
 pub use client::MakerClient;
 pub use flow::{run_swap, run_swap_gated, ClaimGate, ClaimPolicy, RunOpts};

@@ -52,6 +52,20 @@ enum Flow {
 
 /// Maker engine: serves quotes and drives each accepted swap through the state machine.
 ///
+/// Another swap engine sharing this maker's offer list, quote route and scheduler — the
+/// DIVI<->XMR adaptor engine (`divi-swap-xmr`), which cannot be a [`ChainBackend`]. Its own
+/// swap routes live beside the hashlock ones; only offers, quotes and ticking go through here.
+#[allow(clippy::double_must_use)]
+#[async_trait::async_trait]
+pub trait OfferEngine: Send + Sync {
+    /// The offers it serves (ids must not clash with this maker's).
+    fn offers(&self) -> Vec<Offer>;
+    /// Quote one of them.
+    async fn quote(&self, offer_id: &str, btc_sats: u64) -> Result<Quote>;
+    /// Advance its swaps (called on every [`Maker::tick`]).
+    async fn tick(&self) -> Result<()>;
+}
+
 /// Every transition — and every signed transaction — is persisted before the side effect it
 /// precedes (write-ahead), so [`Maker::step`] can be re-run after a crash at any point.
 pub struct Maker {
@@ -65,6 +79,7 @@ pub struct Maker {
     lock_wait_secs: u64,
     halt_after: Mutex<Option<SwapState>>,
     gate: tokio::sync::Mutex<()>,
+    engines: Vec<Arc<dyn OfferEngine>>,
 }
 
 impl Maker {
@@ -102,6 +117,12 @@ impl Maker {
             }
         }
         for o in &offers {
+            if o.counter_chain.is_adaptor() {
+                return Err(SwapError::InvalidParams(format!(
+                    "offer {}: {} swaps use the adaptor-signature engine, not the hashlock maker",
+                    o.id, o.counter_chain
+                )));
+            }
             if !o.counter_chain.is_counter() || !by_chain.contains_key(&o.counter_chain) {
                 return Err(SwapError::InvalidParams(format!(
                     "offer {}: no {} backend",
@@ -119,6 +140,7 @@ impl Maker {
             lock_wait_secs: DEFAULT_LOCK_WAIT_SECS,
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
+            engines: Vec::new(),
         })
     }
 
@@ -141,9 +163,31 @@ impl Maker {
         *self.halt_after.lock() = state;
     }
 
-    /// Standing offers.
+    /// Serve another engine's offers through this maker's offer list, quotes and ticks.
+    /// Fails if one of its offer ids is already taken.
+    pub fn with_engine(mut self, engine: Arc<dyn OfferEngine>) -> Result<Self> {
+        let taken = self.offers();
+        if let Some(o) = engine
+            .offers()
+            .iter()
+            .find(|o| taken.iter().any(|t| t.id == o.id))
+        {
+            return Err(SwapError::InvalidParams(format!(
+                "offer id {} served twice",
+                o.id
+            )));
+        }
+        self.engines.push(engine);
+        Ok(self)
+    }
+
+    /// Standing offers (this maker's, then each engine's).
     pub fn offers(&self) -> Vec<Offer> {
-        self.offers.clone()
+        let mut all = self.offers.clone();
+        for e in &self.engines {
+            all.extend(e.offers());
+        }
+        all
     }
 
     /// The counter chains this maker has a backend for.
@@ -159,6 +203,13 @@ impl Maker {
     /// Issue a quote for `btc_sats` counter-chain sats, valid for `cfg.quote_expiry_secs`.
     /// No coins are reserved.
     pub async fn quote(&self, offer_id: &str, btc_sats: u64) -> Result<Quote> {
+        if !self.offers.iter().any(|o| o.id == offer_id) {
+            for e in &self.engines {
+                if e.offers().iter().any(|o| o.id == offer_id) {
+                    return e.quote(offer_id, btc_sats).await;
+                }
+            }
+        }
         let offer = self
             .offers
             .iter()
@@ -338,6 +389,9 @@ impl Maker {
             if !rec.state.is_terminal() {
                 let _ = self.step(&rec.id).await;
             }
+        }
+        for e in &self.engines {
+            let _ = e.tick().await; // errors are recorded on that engine's swaps
         }
         Ok(())
     }

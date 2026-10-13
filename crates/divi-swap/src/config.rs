@@ -54,6 +54,9 @@ impl ChainParams {
             // Ethereum mainnet. No MTP smoothing on EVM (the contract itself compares against
             // the latest block's timestamp), so the lag only needs to cover block-time jitter.
             Chain::Usdc => (if mainnet { 12 } else { 3 }, if mainnet { 180 } else { 60 }),
+            // 2-minute blocks; 10 confirmations on any network is what xmr-btc-swap ships with.
+            // No CLTV on Monero: the lag only enters the shared timeout-gap bound.
+            Chain::Xmr => (10, 1800),
         };
         ChainParams {
             confirmations,

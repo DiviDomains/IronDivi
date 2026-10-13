@@ -130,7 +130,7 @@ async fn daemon_swaps_ltc_and_zec_both_ways() {
     let client = MakerClient::new(&base);
     let sessions = Sessions::beside(&tdb);
     let opts = RunOpts {
-        timeout: Duration::from_secs(60),
+        timeout: Duration::from_secs(180), // hp2 runs many lanes at once
         poll: Duration::from_millis(15),
     };
     for o in &offers {

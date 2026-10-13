@@ -233,6 +233,20 @@ pub fn mock_counter_offers() -> Vec<Offer> {
         })
         .collect()
 }
+
+/// The adaptor-swap offer `--backend mock` adds (`divi_swap_xmr`): `divi-xmr-stagenet`, the
+/// maker sells DIVI for XMR (the adaptor protocol has the maker hold DIVI, so there is no
+/// reverse offer). Amounts are 1e-8 XMR units, like every counter chain; price placeholder.
+pub fn mock_xmr_offers() -> Vec<Offer> {
+    vec![Offer {
+        id: "divi-xmr-stagenet".into(),
+        direction: Direction::TakerPaysBtc,
+        counter_chain: Chain::Xmr,
+        divi_sats_per_btc: 5_000 * 100_000_000, // 5,000 DIVI per XMR
+        min_btc_sats: 100_000,                  // 0.001 XMR
+        max_btc_sats: 100_000_000,              // 1 XMR
+    }]
+}
 fn default_tick() -> u64 {
     5
 }
@@ -329,6 +343,8 @@ impl DaemonConfig {
             Chain::Ltc => self.ltc.is_some(),
             Chain::Usdc => self.usdc.is_some(),
             Chain::Zec => self.zec.is_some(),
+            // No live XMR section yet: XMR offers run on the adaptor engine, mock only.
+            Chain::Xmr => false,
             Chain::Btc => self.btc.is_some(),
             Chain::Divi => self.divi.is_some(),
         }
@@ -342,7 +358,7 @@ impl DaemonConfig {
         let mut start = Vec::new();
         for c in Chain::ALL
             .into_iter()
-            .filter(|c| c.is_counter() && *c != Chain::Btc)
+            .filter(|c| c.is_counter() && *c != Chain::Btc && !c.is_adaptor())
         {
             let swaps = in_flight.contains(&c);
             let wanted = self.serves(c) || swaps;
@@ -548,7 +564,11 @@ key = "credential:btc"
         assert_eq!(s.confirmations(Chain::Ltc), 4);
         assert_eq!(s.chain_params(Chain::Ltc).mtp_lag_secs, 1800);
         assert_eq!(s.chain_params(Chain::Zec).mtp_lag_secs, 900);
-        assert_eq!(s.confirmations(Chain::Zec), 9); // testnet profile (NU7 block rate, 92c85ce)
+        // Unset in [swap.chains.zec]: the testnet profile's own value.
+        assert_eq!(
+            s.confirmations(Chain::Zec),
+            divi_swap::SwapConfig::profile(Profile::Testnet).confirmations(Chain::Zec)
+        );
         assert_eq!(s.confirmations(Chain::Btc), 1);
 
         let bad = format!("{GOOD}\n[swap.chains.btc]\nconfirmations = 4\n");

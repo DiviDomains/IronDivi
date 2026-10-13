@@ -30,11 +30,22 @@ pub enum Chain {
     Zec,
     /// USDC on an EVM chain (Sepolia, Base Sepolia).
     Usdc,
+    /// Monero (stagenet in the POC). Not a hashlock chain: swapped by the adaptor-signature
+    /// engine in `divi-swap-xmr` (`xmr-design.md` Option B), never through a
+    /// [`crate::ChainBackend`].
+    Xmr,
 }
 
 impl Chain {
     /// Every chain, DIVI first.
-    pub const ALL: [Chain; 5] = [Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec, Chain::Usdc];
+    pub const ALL: [Chain; 6] = [
+        Chain::Divi,
+        Chain::Btc,
+        Chain::Ltc,
+        Chain::Zec,
+        Chain::Usdc,
+        Chain::Xmr,
+    ];
 
     /// Lowercase ticker, as in serde and offer ids.
     pub fn as_str(self) -> &'static str {
@@ -44,12 +55,19 @@ impl Chain {
             Chain::Ltc => "ltc",
             Chain::Zec => "zec",
             Chain::Usdc => "usdc",
+            Chain::Xmr => "xmr",
         }
     }
 
     /// Whether this chain can be the counter chain of a swap (anything but DIVI).
     pub fn is_counter(self) -> bool {
         self != Chain::Divi
+    }
+
+    /// Whether swaps on this chain use the adaptor-signature protocol (XMR) instead of an
+    /// HTLC: such offers are served by `divi-swap-xmr`, not by [`crate::Maker`].
+    pub fn is_adaptor(self) -> bool {
+        self == Chain::Xmr
     }
 }
 
