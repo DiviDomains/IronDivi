@@ -67,3 +67,9 @@
   the long interruption; its 600 DIVI taker lock (local f4140a43) is refunded by the taker after
   the chaos run (the maker never saw the preimage, so the coins are only the taker's). The rerun
   uses `--btc-sats 6000` (180 DIVI per swap) so all four scenarios fit the taker's free DIVI.
+- 2026-10-13 status refresh (Mac DNS back): verify-results 137 checked, 0 missing, 1 excluded
+  (first run flagged LTC `bea5d5d0…` MISSING; litecoinspace shows it confirmed at 4913450 — transient
+  lookup, clean on rerun). dnsdivi maker 4e0ac26 healthz ok. Landed c84f65f (multichain: live
+  DIVI-XMR backends, not run live; maker not redeployed with XMR). LTC + ZEC live both directions
+  PASS on 4e0ac26; USDC parked on test ETH for gas; XMR live awaits Bert's explicit go. hp2 disk 95%
+  (other sessions' ~/build, ~/remote-cargo; not touched).
