@@ -1,6 +1,90 @@
 # Lane zec status
 
-- running: nothing.
+
+## Mac-side go-live runbook — `live_fund_claim_refund`
+
+**Why this runs on the Mac, not hp2**: the test needs a funded secp256k1 key
+(`SWAP_ZEC_TEST_KEY_HEX`). Rule 5 (`_hp2.md`) is absolute — no secrets on hp2, ever, no
+exceptions for "going live." hp2 can and did run every key-free pre-flight check; the funded
+run itself has to happen where the key actually lives.
+
+**Command** (from the repo root, Mac-side, with the key exported for this shell only):
+```
+SWAP_ZEC_TEST_KEY_HEX=<taker key, 64 hex chars, 32 raw bytes> \
+  cargo test -p swap-chain-zec --features live -- --ignored --nocapture live_fund_claim_refund
+```
+- `--features live`: this test is feature-gated, not just `#[ignore]`-gated (belt-and-suspenders
+  so a plain `cargo test` never touches testnet even if `--ignored` is passed by accident
+  elsewhere).
+- `--ignored`: required — the test is `#[ignore = "needs a funded testnet t-address
+  (SWAP_ZEC_TEST_KEY_HEX) and ~3 h"]` (`crates/swap-chain-zec/src/lib.rs:829`).
+- `--nocapture`: the test's only observability is its own `println!`s (listed under "expected
+  output" below) — without this flag they're swallowed on success.
+- Env var **name only**, per rule 5 — the value is never typed, pasted, or echoed on hp2, and
+  this doc never will hold it either. It's the **taker** key (the test uses one key for both
+  claim and refund pubkeys, `lib.rs:838-839`); the address it derives to must be the funded
+  taker address below.
+
+**Preconditions** (all verified from hp2, read-only, no key — see "pre-flight" below for the
+numbers from this exact check):
+1. `testnet.zec.rocks:443` (or whatever `SWAP_ZEC_LIGHTWALLETD_EXTRA` adds — see
+   `lightwalletd_endpoints` in `crates/swap-chain-zec/src/lib.rs`) answers `GetLatestBlock` with
+   a sane, advancing tip height.
+2. The taker address (`tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk`) holds enough confirmed zatoshi for
+   two fundings of `HTLC_ZATOSHI = 20_000` zat each (`lib.rs:800`) plus ZIP-317 fees on four
+   transactions (two fundings, one claim, one refund — each at least the 10,000 zat grace-action
+   floor, `tx.rs`'s `zip317_fee`) — call it ≥ 100,000 zat as a comfortable floor; the funded
+   balance below is ~123x that.
+3. `check-zec.sh` passes (crate green) before spending real-if-testnet coins on it.
+
+**Pre-flight numbers, recorded 2026-10-13 from hp2** (read-only, no key involved):
+- `testnet.zec.rocks` live: `tip=4498200 mtp=1791901922 consensus_branch_id=0x77190ad9`
+  (`cargo test -p swap-chain-zec --features live -- --ignored testnet_api_reachable --nocapture`).
+- Taker (`tmX2ki4DXm6ucGvdZY8CxSmPKdzkL8dnVdk`): **12,330,000 zat** confirmed
+  (`tools/swap-poc/balances.sh`).
+- Maker (`tmW9gJFxB1138x4xyMpk3qZ84VZNs7hypzn`): **12,530,000 zat** confirmed (not spent by this
+  test — `live_fund_claim_refund` only drives the taker key against itself — but checked
+  alongside since both addresses are this lane's funding pair).
+- `check-zec.sh`: `PASS: zec` (fmt, clippy, full unit suite, `testnet_api_reachable` live, step-0
+  decision recorded).
+
+**Expected output** (in order; each line is a literal `println!` from the test):
+1. `address <tm…> on testnet` — confirm this matches the taker address above, or the wrong key
+   was exported.
+2. `fund(claim) broadcast: <txid>` then (after up to 2h of 30s polling)
+   `fund(claim) confirmed: <txid>` — first HTLC funding.
+3. `fund(refund) broadcast: <txid>` then `fund(refund) confirmed: <txid>` — second HTLC funding.
+4. `live_fund_txid: <txid>` / `live_fund2_txid: <txid>` — both funding txids, for
+   `tools/swap-poc/verify-results.sh` bookkeeping.
+5. `claim broadcast: <txid>` then `claim confirmed: <txid>` then `live_claim_txid: <txid>` — the
+   first HTLC claimed with its preimage immediately (no locktime wait on the claim path).
+6. `refund broadcast: <txid>` — **may be preceded by a long pause**: the refund's locktime is
+   `median_time_past() + 2h` at the moment funding started (`REFUND_AHEAD_OF_MTP`, `lib.rs:801`),
+   so the test retries every 120s on `SwapError::Premature`/`SwapError::Transient` until MTP
+   catches up — this is the ~3h total runtime the `#[ignore]` reason warns about, not a hang.
+7. `refund confirmed: <txid>` then `live_refund_txid: <txid>` — test exits 0.
+
+**Pass/fail criteria**:
+- **Pass**: all seven output lines above appear in order and the process exits 0 (`cargo test`
+  reports `test result: ok. 1 passed`). The test's own assertions (`assert_eq!` on txids,
+  `assert_eq!(spend.extract_preimage(&h_claim.hash), Some(pre_claim))`) are the real correctness
+  check — a clean exit means ZIP-244 signing, the P2SH HTLC script, and the preimage/locktime
+  logic all worked against live consensus, not just the mock suite.
+- **Fail — rejected**: any `broadcast`/`wait_confirmed` call panics (`unwrap()` on a non-retryable
+  error, or 2h with no confirmation, or `Err(e) => panic!("refund rejected: {e}")` for anything
+  other than `Premature`/`Transient`) — a real consensus/logic bug, not a transient network blip.
+  Capture the full panic message and txid; that's an oracle-grade finding, not a retry-it case.
+- **Fail — environment**: `key_from_env()`'s `expect`/`unwrap` panics immediately if
+  `SWAP_ZEC_TEST_KEY_HEX` is unset, not valid hex, or not a valid secp256k1 key — distinguish
+  this from a real failure (it happens before anything touches the network).
+- **Inconclusive — already run**: per the orchestrator (2026-10-13), the Mac side reports this
+  live refund test **may already be complete, both directions refunded as intended** — i.e. this
+  may already have passed in a prior Mac-side run not reflected in this doc at the time of
+  writing (hp2 has no visibility into Mac-side runs). If so, re-running it is optional
+  (`verify-results.sh` against the recorded txids is the cheaper confirmation); this runbook
+  stays accurate either way as the procedure for the *next* time it needs to run.
+
+
 - blocked-on-human: no — **funding confirmed on the correct NU7 chain, 2026-10-11 ~19:05
   EDT.** Wave 2 (daemon+CLI wiring, merged side by side with the LTC and USDC lanes) landed
   on main as `4fdae25`. Everything buildable is done. See "done" for the confirmed balances
