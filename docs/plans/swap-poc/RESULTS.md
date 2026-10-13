@@ -264,6 +264,14 @@ offers stayed disabled until the maker held enough coin.
     DIVI claim (taker) `b435603863f867537fb92ff0126c499359977c2c598d4d99da737df02c625153`,
     ZEC claim (maker) `90d1c886b446586a31dca804b18795dab2b4a3601ced4d80ccb45fa2bab6965a`.
   `divi-swap refund` is being changed to a refund-only path; ZEC case C is being rerun.
+- ZEC case C, forward rerun (taker pays ZEC, build `c0aed4b`, deployed maker): taker never claims,
+  both sides refund, taker Done / maker Done:
+    ZEC lock (taker) `cf44ad928f28fdab09db7129102c278e1be4e1247322b191095a42dfc01dae2f`,
+    DIVI lock (maker) `965c2f4b416910dec5ea0f5c14369c06db297d44871943f5e2ceddf6766845ce`,
+    DIVI refund (maker, CLTV path) `0a24df329313757d5e368e54820323f4886450fdc26f51a0fa0473c3ffb38e4d`,
+    ZEC refund (taker, CLTV path) `75de33795507633ff414694e679e055ff0a9c761cdd6fb3bd5cb26994a03f85f`.
+  The reverse leg (taker swap `f2cff1bf…`, state `maker_lock_confirmed`) was interrupted when the
+  Mac's low-memory reaper stopped the run; its locks stay refundable and it resumes from the taker db.
 
 ## Multi-coin: XMR ↔ DIVI adaptor-signature swap (Monero stagenet + DIVI testnet), forward, 2026-10-12
 
