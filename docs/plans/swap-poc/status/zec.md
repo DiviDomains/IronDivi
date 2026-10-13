@@ -977,3 +977,6 @@ numbers from this exact check):
 - ~~needs: a decision on ZEC testnet confirmations~~ **decided and done** — see "done" below
   (the orchestrator authorized editing `config.rs`, the normally-frozen engine contract,
   for this one change specifically).
+
+## 2026-10-13 live on the redeployed maker (4e0ac26)
+- result: PASS — live ZEC happy swap both directions against dnsdivi 4e0ac26, Done/Done each (fwd `ce1cef2f…`, rev `e000c971…`); rerun because the earlier case-C refund test predates 4e0ac26's ZEC maker changes; verify-results 137/137.

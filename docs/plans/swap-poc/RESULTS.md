@@ -291,7 +291,18 @@ dnsdivi `divi-swapd` from `4e0ac26` (sha256 `b5540e30…60ac`), reached over the
     LTC lock (maker) `aa03411220b6afaa6e1568e4e10e3f7d7898d2c1110b3c8eede5d47eba8e1013`,
     LTC claim (taker) `6b242c2ac1ce68b7265aa7924d4839da8ffefc551f4dbdd35732f84c688a910f`,
     DIVI claim (maker) `d3a645fcc7128ff7c94252a34e26771ffe25c04a05659659d8d38f2f1deca160`.
-<!--ZEC-4E0AC26-->
+- ZEC forward (taker pays ZEC, `divi-zec-testnet`), swap `ce1cef2f…`, Done/Done:
+    ZEC lock (taker) `2bced67ddebc73fe9aa4f0736496a837ebead7f376d44a09f1981c7b5d72013b`,
+    DIVI lock (maker) `d31e5b717fe3d85c8a64501aec21b8fb6d5f9467401d4178d3dad6f33794f4fe`,
+    DIVI claim (taker) `4c00b640652c51b49608fe6a7f116384d65e355baea74da4ae625ebd9ac92279`,
+    ZEC claim (maker) `453eda544870c9ec04de814a19279f86a1d092399f519b8960b8457ae6827108`.
+- ZEC reverse (taker pays DIVI, `zec-divi-testnet`), swap `e000c971…`, Done/Done:
+    DIVI lock (taker) `311d83e8aa239cb8eb79e03533dbe90bd46b51475d2d3b5a296814b496cf0554`,
+    ZEC lock (maker) `642311f3cb4e0557a27f6daf1767d49bb043763636dd862a936e7b25832188f3`,
+    ZEC claim (taker) `ad6a2cdb57221b9e6012eea009987e45e00f0f5512f23f62346058afcf39faff`,
+    DIVI claim (maker) `54045e0e7f6b30f18cdd27f9de775a66d452a9f7a13f4b1ae15a5b6dee8f5149`.
+- Why ZEC was rerun rather than credited from the case-C refund test: that test ran on the previous
+  maker binary, and 4e0ac26 changes the ZEC maker path (confirmations 3 -> 9, transient-error retry).
 
 ## Multi-coin: XMR ↔ DIVI adaptor-signature swap (Monero stagenet + DIVI testnet), forward, 2026-10-12
 
