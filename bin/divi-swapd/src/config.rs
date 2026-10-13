@@ -124,6 +124,49 @@ impl UsdcSection {
     }
 }
 
+/// The live adaptor-swap engine (`divi_swap_xmr`) behind `counter_chain = "xmr"` offers:
+/// a Monero wallet (`monero-wallet-rpc`) and its own DIVI wallet. Ignored by the mock backend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct XmrSection {
+    /// `stagenet` (default), `testnet` or `mainnet`.
+    #[serde(default = "default_xmr_network")]
+    pub network: String,
+    /// `monerod` RPC: scanning for the taker's lock, fees, relaying the sweep.
+    pub monerod_url: String,
+    /// `monero-wallet-rpc` with the maker's wallet open.
+    pub wallet_rpc_url: String,
+    #[serde(default)]
+    pub wallet_rpc_user: String,
+    /// Reference (`op://…` or `credential:<name>`) to the wallet RPC password.
+    pub wallet_rpc_password: Option<String>,
+    /// The maker's own Monero address: where the swept XMR goes.
+    pub sweep_address: String,
+    /// Reference to the DIVI key funding `Tx_lock`. Must not be the `[divi]` key: two coin
+    /// sets over one key would select the same coins.
+    pub divi_key: String,
+    /// DIVI JSON-RPC proxy URL for that wallet.
+    #[serde(default = "default_divi_rpc")]
+    pub divi_rpc_url: String,
+    /// Known-UTXO file of that wallet (public data only).
+    pub divi_wallet_path: Option<PathBuf>,
+    /// Blocks below the Monero tip where the first scan for a swap's lock starts.
+    #[serde(default = "default_xmr_lookback")]
+    pub lookback_blocks: u64,
+    /// Lock/sweep journals (public data); default `<db_path>.xmr-journal`.
+    pub journal_dir: Option<PathBuf>,
+    /// Transactions paying that wallet (funding, earlier refunds) to learn its coins from at
+    /// startup; its own change is tracked as it broadcasts.
+    #[serde(default)]
+    pub divi_fund_txids: Vec<String>,
+}
+
+fn default_xmr_network() -> String {
+    "stagenet".into()
+}
+fn default_xmr_lookback() -> u64 {
+    720 // ~1 day of 2-minute blocks
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZecSection {
     /// Primary lightwalletd gRPC endpoint.
@@ -307,6 +350,9 @@ pub struct DaemonConfig {
     /// Enables a live ZEC counter backend; needed only for offers with `counter_chain =
     /// "zec"`. Ignored by the mock backend (which always simulates ZEC).
     pub zec: Option<ZecSection>,
+    /// Enables the live adaptor-swap engine; needed only for offers with `counter_chain =
+    /// "xmr"` (or xmr swaps still in flight). Ignored by the mock backend.
+    pub xmr: Option<XmrSection>,
     /// Overrides on top of `profile`.
     #[serde(default)]
     pub swap: SwapOverrides,
@@ -343,8 +389,7 @@ impl DaemonConfig {
             Chain::Ltc => self.ltc.is_some(),
             Chain::Usdc => self.usdc.is_some(),
             Chain::Zec => self.zec.is_some(),
-            // No live XMR section yet: XMR offers run on the adaptor engine, mock only.
-            Chain::Xmr => false,
+            Chain::Xmr => self.xmr.is_some(),
             Chain::Btc => self.btc.is_some(),
             Chain::Divi => self.divi.is_some(),
         }
@@ -376,6 +421,25 @@ impl DaemonConfig {
             }
         }
         Ok(start)
+    }
+
+    /// Whether to start the live adaptor-swap engine: an enabled xmr offer or `open_swaps`
+    /// unfinished xmr swaps need it, and then it needs the `[xmr]` section (same rule as
+    /// [`DaemonConfig::counter_backends_to_start`]).
+    pub fn xmr_engine_needed(&self, open_swaps: usize) -> Result<bool> {
+        let wanted = self.serves(Chain::Xmr) || open_swaps > 0;
+        match (wanted, self.xmr.is_some()) {
+            (true, true) => Ok(true),
+            (true, false) if open_swaps > 0 => bail!(
+                "{open_swaps} xmr swap(s) in flight need the [xmr] section (restore it, or the \
+                 maker cannot redeem or refund them)"
+            ),
+            (true, false) => bail!(
+                "offer on xmr is enabled but there is no [xmr] section (add one, or set \
+                 enabled = false)"
+            ),
+            (false, _) => Ok(false),
+        }
     }
 
     /// The profile's timing with `[swap]` overrides applied and validated.
@@ -432,7 +496,13 @@ impl DaemonConfig {
             .chain(self.btc.iter().map(|b| &b.key))
             .chain(self.ltc.iter().map(|l| &l.key))
             .chain(self.usdc.iter().map(|u| &u.key))
-            .chain(self.zec.iter().map(|z| &z.key));
+            .chain(self.zec.iter().map(|z| &z.key))
+            .chain(self.xmr.iter().map(|x| &x.divi_key))
+            .chain(
+                self.xmr
+                    .iter()
+                    .filter_map(|x| x.wallet_rpc_password.as_ref()),
+            );
         for r in refs {
             divi_swap::secrets::SecretRef::parse(r)
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;
@@ -646,6 +716,68 @@ key = "credential:btc"
         ))
         .unwrap();
         assert!(bare.counter_backends_to_start(&none).is_err());
+    }
+
+    const XMR: &str = r#"
+[[offers]]
+id = "divi-xmr-stagenet"
+counter_chain = "xmr"
+divi_sats_per_btc = 500000000000
+min_btc_sats = 100000
+max_btc_sats = 100000000
+"#;
+    const XMR_SECTION: &str = r#"
+[xmr]
+monerod_url = "http://127.0.0.1:38081"
+wallet_rpc_url = "http://127.0.0.1:38088"
+wallet_rpc_user = "swap"
+wallet_rpc_password = "credential:maker-xmr-wallet-rpc"
+sweep_address = "5Aaaa"
+divi_key = "credential:maker-divi-xmr"
+divi_fund_txids = ["ab"]
+"#;
+
+    #[test]
+    fn xmr_section_parses_with_defaults_and_rejects_raw_secrets() {
+        let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{XMR_SECTION}")).unwrap();
+        let x = c.xmr.as_ref().unwrap();
+        assert_eq!(x.network, "stagenet");
+        assert_eq!(x.lookback_blocks, 720);
+        assert_eq!(x.divi_rpc_url, default_divi_rpc());
+        assert!(x.journal_dir.is_none() && x.divi_wallet_path.is_none());
+        assert_eq!(x.divi_fund_txids, ["ab"]);
+        assert!(c.serves(Chain::Xmr));
+        // xmr never gets a ChainBackend.
+        assert!(c
+            .counter_backends_to_start(&BTreeSet::from([Chain::Xmr]))
+            .unwrap()
+            .is_empty());
+        for raw in [
+            XMR_SECTION.replace("credential:maker-divi-xmr", "deadbeefdeadbeef"),
+            XMR_SECTION.replace("credential:maker-xmr-wallet-rpc", "hunter2"),
+        ] {
+            assert!(DaemonConfig::parse(&format!("{GOOD}{XMR}{raw}")).is_err());
+        }
+    }
+
+    #[test]
+    fn xmr_engine_follows_offers_and_open_swaps() {
+        let parse = |t: String| DaemonConfig::parse(&t).unwrap();
+        let both = parse(format!("{GOOD}{XMR}{XMR_SECTION}"));
+        assert!(both.xmr_engine_needed(0).unwrap());
+        let off = parse(format!(
+            "{GOOD}{}{XMR_SECTION}",
+            XMR.replace("counter_chain", "enabled = false\ncounter_chain")
+        ));
+        assert!(!off.xmr_engine_needed(0).unwrap());
+        assert!(off.xmr_engine_needed(1).unwrap());
+        let no_section = parse(format!("{GOOD}{XMR}"));
+        let e = no_section.xmr_engine_needed(0).unwrap_err();
+        assert!(e.to_string().contains("no [xmr] section"), "{e}");
+        let plain = parse(GOOD.to_string());
+        assert!(!plain.xmr_engine_needed(0).unwrap());
+        let e = plain.xmr_engine_needed(2).unwrap_err();
+        assert!(e.to_string().contains("2 xmr swap(s) in flight"), "{e}");
     }
 
     #[test]

@@ -586,6 +586,16 @@ impl XmrMaker {
             .collect())
     }
 
+    /// Swaps in `store` this engine has not finished: a daemon must keep the engine (and its
+    /// chains) running while there are any, even with every xmr offer switched off.
+    pub fn open_swaps(store: &Store) -> Result<usize> {
+        Ok(store
+            .list_docs::<XmrMakerRecord>(KIND)?
+            .iter()
+            .filter(|r| !r.state.is_terminal())
+            .count())
+    }
+
     /// `step` every non-terminal swap; errors are recorded on the swap.
     pub async fn tick(&self) -> Result<()> {
         for r in self.store.list_docs::<XmrMakerRecord>(KIND)? {

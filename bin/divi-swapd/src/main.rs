@@ -28,8 +28,8 @@ use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
     mock_counter_offers, mock_xmr_offers, router_with_xmr, run_scan, spawn_gated_scheduler,
-    AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, ZecSection,
-    MOCK_ONLY_CHAINS,
+    AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, XmrSection,
+    ZecSection, MOCK_ONLY_CHAINS,
 };
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
@@ -154,6 +154,89 @@ fn mock_xmr_engine(
             xmr.mine(1);
         }
     });
+    Ok(Arc::new(engine))
+}
+
+/// Resolve a DIVI key reference into a key held only in memory.
+fn resolve_divi_key(reference: &str, what: &str) -> Result<divi_crypto::keys::SecretKey> {
+    let hex_key = SecretRef::parse(reference)
+        .and_then(|r| r.resolve())
+        .map_err(|e| anyhow::anyhow!("{what} key: {e}"))?;
+    let key = divi_crypto::keys::SecretKey::from_hex(hex_key.trim())
+        .map_err(|_| anyhow::anyhow!("{what} key is not a valid 32-byte hex key"));
+    drop(hex_key);
+    key
+}
+
+/// The adaptor-swap maker over the live chains of `[xmr]`: its own DIVI wallet (never the
+/// `[divi]` one) and the maker's Monero wallet.
+async fn live_xmr_engine(
+    cfg: &DaemonConfig,
+    xs: &XmrSection,
+    store: Store,
+    offers: Vec<divi_swap::api::Offer>,
+) -> Result<Arc<divi_swap_xmr::XmrMaker>> {
+    use divi_swap_xmr::live::{self, LiveDivi, LiveMonero, LiveMoneroConfig};
+    let network = live::parse_network(&xs.network)?;
+    if network == live::Network::Mainnet {
+        bail!("[xmr]: the adaptor engine has testnet timing only; no mainnet");
+    }
+    let sweep_to = live::parse_address(network, &xs.sweep_address)
+        .map_err(|e| anyhow::anyhow!("[xmr].sweep_address: {e}"))?;
+    let key = resolve_divi_key(&xs.divi_key, "xmr divi")?;
+    if let Some(d) = &cfg.divi {
+        if resolve_divi_key(&d.key, "divi")?.public_key() == key.public_key() {
+            bail!("[xmr].divi_key is the [divi] key: give the xmr engine its own DIVI key");
+        }
+    }
+    let address =
+        divi_wallet::address::Address::p2pkh(&key.public_key(), DiviNetwork::Testnet).to_string();
+    let wallet_rpc_password = match &xs.wallet_rpc_password {
+        Some(r) => SecretRef::parse(r)
+            .and_then(|r| r.resolve())
+            .map_err(|e| anyhow::anyhow!("[xmr].wallet_rpc_password: {e}"))?
+            .trim()
+            .to_string(),
+        None => String::new(),
+    };
+    let divi = live::LiveDiviChain::new(
+        &xs.divi_rpc_url,
+        key,
+        DiviFeePolicy::default(),
+        xs.divi_wallet_path.clone(),
+    )?;
+    for txid in &xs.divi_fund_txids {
+        let n = divi
+            .learn_utxo(txid)
+            .await
+            .with_context(|| format!("[xmr].divi_fund_txids: {txid}"))?;
+        tracing::info!(%txid, coins = n, "xmr divi wallet: learned coins");
+    }
+    let journal_dir = xs
+        .journal_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{}.xmr-journal", cfg.db_path.display())));
+    let xmr = LiveMonero::new(LiveMoneroConfig {
+        monerod_url: xs.monerod_url.clone(),
+        wallet_rpc_url: xs.wallet_rpc_url.clone(),
+        wallet_rpc_user: xs.wallet_rpc_user.clone(),
+        wallet_rpc_password,
+        network,
+        sweep_to,
+        lookback_blocks: xs.lookback_blocks,
+        journal_dir,
+    })?;
+    tracing::info!(
+        divi_address = %address, network = %xs.network, monerod = %xs.monerod_url,
+        "xmr engine ready (live)"
+    );
+    let engine = divi_swap_xmr::XmrMaker::new(
+        divi_swap_xmr::XmrConfig::testnet(),
+        Arc::new(LiveDivi::new(divi)),
+        Arc::new(xmr),
+        store,
+        offers,
+    )?;
     Ok(Arc::new(engine))
 }
 
@@ -307,21 +390,14 @@ async fn live_backends(
     if !cfg.disabled_offers.is_empty() {
         tracing::info!(offers = ?cfg.disabled_offers, "offers disabled in config");
     }
-    if let Some(o) = cfg.offers.iter().find(|o| o.counter_chain.is_adaptor()) {
-        bail!(
-            "offer {}: {} swaps (adaptor-signature engine) have no live backend in this build \
-             yet; use --backend mock",
-            o.id,
-            o.counter_chain
-        );
-    }
+    // Adaptor-swap offers run on their own engine (`live_xmr_engine`), not a ChainBackend.
     let known: Vec<Chain> = std::iter::once(Chain::Btc)
         .chain(others.iter().map(|b| b.chain()))
         .collect();
     if let Some(o) = cfg
         .offers
         .iter()
-        .find(|o| !known.contains(&o.counter_chain))
+        .find(|o| !o.counter_chain.is_adaptor() && !known.contains(&o.counter_chain))
     {
         bail!(
             "offer {}: no live {} backend in this build yet (add a [{}] section, or use --backend mock)",
@@ -331,12 +407,7 @@ async fn live_backends(
         );
     }
     let btc = live_btc(btc_cfg)?;
-    let hex_key = SecretRef::parse(&divi_cfg.key)
-        .and_then(|r| r.resolve())
-        .map_err(|e| anyhow::anyhow!("divi key: {e}"))?;
-    let key = divi_crypto::keys::SecretKey::from_hex(hex_key.trim())
-        .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
-    drop(hex_key);
+    let key = resolve_divi_key(&divi_cfg.key, "divi")?;
     let divi = DiviBackend::new(
         &divi_cfg.rpc_url,
         key,
@@ -398,13 +469,27 @@ async fn main() -> Result<()> {
         ScanStatus::done()
     };
 
-    // XMR offers run on the adaptor engine (mock only for now); the rest on the hashlock maker.
+    // XMR offers run on the adaptor engine; the rest on the hashlock maker.
     let (xmr_offers, offers): (Vec<_>, Vec<_>) = offers
         .into_iter()
         .partition(|o| o.counter_chain.is_adaptor());
-    let xmr = (!xmr_offers.is_empty())
-        .then(|| mock_xmr_engine(store.clone(), xmr_offers))
-        .transpose()?;
+    let xmr = match kind {
+        BackendKind::Mock => (!xmr_offers.is_empty())
+            .then(|| mock_xmr_engine(store.clone(), xmr_offers))
+            .transpose()?,
+        BackendKind::Live => {
+            let open = divi_swap_xmr::XmrMaker::open_swaps(&store)?;
+            if cfg.xmr_engine_needed(open)? {
+                let xs = cfg.xmr.as_ref().expect("checked by xmr_engine_needed");
+                Some(live_xmr_engine(&cfg, xs, store.clone(), xmr_offers).await?)
+            } else {
+                if cfg.xmr.is_some() {
+                    tracing::info!("no enabled xmr offer and no xmr swap in flight; not starting the [xmr] engine");
+                }
+                None
+            }
+        }
+    };
     let counters = std::iter::once(btc.clone()).chain(others).collect();
     let mut maker =
         Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?;

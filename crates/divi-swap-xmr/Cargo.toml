@@ -14,6 +14,10 @@ divi-wallet = { workspace = true }
 # The xmr lane's crates, used only through their public API.
 swap-chain-xmr = { path = "../swap-chain-xmr" }
 swap-adaptor = { path = "../swap-adaptor" }
+# Live backends (`live`): the DIVI wallet's fee policy and Monero addresses/networks, same
+# versions swap-chain-xmr uses.
+swap-chain-divi = { workspace = true }
+monero-wallet = "0.2"
 # Same versions swap-adaptor uses; listed here for the wire encodings: `serde` on sigma_fun
 # gives `CrossCurveDLEQProof` a serde form (feature unification, same crate instance), and
 # `CompressedEdwardsY` is how ed25519 points travel.

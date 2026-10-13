@@ -128,3 +128,27 @@ enabled = false
 divi_sats_per_btc = 500000000000
 min_btc_sats = 100000
 max_btc_sats = 10000000
+
+# XMR (adaptor-signature swap, divi-swap-xmr): off until the maker has a stagenet
+# monerod + monero-wallet-rpc and its own funded DIVI key. Then uncomment [xmr] and enable.
+# The maker always sells DIVI here (taker_pays_btc); amounts are in 1e-8 XMR.
+[[offers]]
+id = "divi-xmr-stagenet"
+direction = "taker_pays_btc"
+counter_chain = "xmr"
+enabled = false
+divi_sats_per_btc = 500000000000      # 5,000 DIVI per XMR
+min_btc_sats = 100000                 # 0.001 XMR
+max_btc_sats = 100000000              # 1 XMR
+
+# [xmr]
+# network = "stagenet"
+# monerod_url = "http://127.0.0.1:38081"
+# wallet_rpc_url = "http://127.0.0.1:38088"
+# wallet_rpc_user = "swap"
+# wallet_rpc_password = "credential:maker-xmr-wallet-rpc"
+# sweep_address = "<the maker wallet's stagenet address>"
+# divi_key = "credential:maker-divi-xmr"          # NOT the [divi] key
+# divi_wallet_path = "/var/lib/divi-swapd/divi-xmr-wallet.json"
+# divi_fund_txids = ["<txid paying that key's address>"]
+# lookback_blocks = 720

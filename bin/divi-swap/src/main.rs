@@ -45,8 +45,7 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value = "live")]
     backend: BackendArg,
     /// Chain swapped against DIVI: `btc`, `ltc`, `usdc`, `zec` or `xmr` (the offer's
-    /// `counter_chain`). `btc`, `ltc`, `usdc` and `zec` have live backends; `xmr` (the
-    /// adaptor-signature swap) is `--backend mock` only so far.
+    /// `counter_chain`; `xmr` is the adaptor-signature swap, live with the `--xmr-*` flags).
     #[arg(long, global = true, default_value = "btc", value_parser = parse_counter_chain)]
     counter_chain: Chain,
     /// Secret reference (`op://…` or `credential:<name>`) for the taker's DIVI key.
@@ -92,6 +91,28 @@ struct Cli {
     /// ERC-20 (USDC) token address. Defaults to Circle's test USDC for `--usdc-network`.
     #[arg(long, global = true)]
     usdc_token: Option<String>,
+    /// `monerod` RPC URL (when `--counter-chain xmr`, live).
+    #[arg(long, global = true, env = "SWAP_XMR_MONEROD_URL")]
+    xmr_monerod_url: Option<String>,
+    /// `monero-wallet-rpc` URL with the taker's wallet open: the XMR is locked from it.
+    #[arg(long, global = true, env = "SWAP_XMR_WALLET_RPC_URL")]
+    xmr_wallet_rpc_url: Option<String>,
+    /// `monero-wallet-rpc` user.
+    #[arg(long, global = true, default_value = "")]
+    xmr_wallet_rpc_user: String,
+    /// Secret reference for the `monero-wallet-rpc` password.
+    #[arg(long, global = true)]
+    xmr_wallet_rpc_password: Option<String>,
+    /// Monero network: `stagenet` (default) or `testnet`.
+    #[arg(long, global = true, default_value = "stagenet")]
+    xmr_network: String,
+    /// The taker's own Monero address: where a refund sweeps her XMR back to.
+    #[arg(long, global = true)]
+    xmr_sweep_address: Option<String>,
+    /// Blocks below the Monero tip where a scan for the swap's lock starts (each process
+    /// scans once from there, then follows the tip).
+    #[arg(long, global = true, default_value_t = 720)]
+    xmr_lookback_blocks: u64,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -559,12 +580,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The taker engine for `--counter-chain xmr` (mock chains only so far: a DIVI wallet that
-/// receives the DIVI, a Monero wallet holding 10 XMR).
+/// The taker engine for `--counter-chain xmr`. Live: the DIVI wallet of `--divi-key` (it only
+/// receives) and the Monero wallet behind `--xmr-wallet-rpc-url`; the lock journal sits next
+/// to `--db`. Mock: a DIVI wallet that receives the DIVI, a Monero wallet holding 10 XMR.
 fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     use divi_swap_xmr::mock::{MockDiviChain, MockMoneroChain};
-    if !matches!(cli.backend, BackendArg::Mock) {
-        bail!("no live xmr backend in this build yet; use --backend mock");
+    if matches!(cli.backend, BackendArg::Live) {
+        return live_xmr_taker(cli);
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -575,6 +597,67 @@ fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     Ok(divi_swap_xmr::XmrTaker::new(
         divi_swap_xmr::XmrConfig::testnet(),
         Arc::new(divi),
+        Arc::new(xmr),
+        Store::open(&cli.db)?,
+    )?)
+}
+
+/// [`xmr_taker`]'s live engine.
+fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
+    use divi_swap_xmr::live::{self, LiveDivi, LiveDiviChain, LiveMonero, LiveMoneroConfig};
+    let network = live::parse_network(&cli.xmr_network)?;
+    if network == live::Network::Mainnet {
+        bail!("--xmr-network: the adaptor engine has testnet timing only; no mainnet");
+    }
+    let need = |v: &Option<String>, flag: &str| {
+        v.clone()
+            .with_context(|| format!("live --counter-chain xmr needs {flag}"))
+    };
+    let sweep_to = live::parse_address(
+        network,
+        &need(&cli.xmr_sweep_address, "--xmr-sweep-address")?,
+    )
+    .map_err(|e| anyhow::anyhow!("--xmr-sweep-address: {e}"))?;
+    let monerod_url = need(&cli.xmr_monerod_url, "--xmr-monerod-url")?;
+    let wallet_rpc_url = need(&cli.xmr_wallet_rpc_url, "--xmr-wallet-rpc-url")?;
+    let wallet_rpc_password = match &cli.xmr_wallet_rpc_password {
+        Some(_) => secret_hex(
+            &cli.xmr_wallet_rpc_password,
+            "--xmr-wallet-rpc-password",
+            "monero-wallet-rpc password",
+        )?
+        .trim()
+        .to_string(),
+        None => String::new(),
+    };
+    let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
+    let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
+        .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
+    drop(dhex);
+    let wallet = cli
+        .divi_wallet
+        .as_deref()
+        .map(divi_swap_cli::wallet::prepare_wallet_path)
+        .transpose()?;
+    let divi = LiveDiviChain::new(
+        "https://services.divi.domains/api/testnet/rpc/",
+        dkey,
+        swap_chain_divi::FeePolicy::default(),
+        wallet,
+    )?;
+    let xmr = LiveMonero::new(LiveMoneroConfig {
+        monerod_url,
+        wallet_rpc_url,
+        wallet_rpc_user: cli.xmr_wallet_rpc_user.clone(),
+        wallet_rpc_password,
+        network,
+        sweep_to,
+        lookback_blocks: cli.xmr_lookback_blocks,
+        journal_dir: PathBuf::from(format!("{}.xmr-journal", cli.db.display())),
+    })?;
+    Ok(divi_swap_xmr::XmrTaker::new(
+        divi_swap_xmr::XmrConfig::testnet(),
+        Arc::new(LiveDivi::new(divi)),
         Arc::new(xmr),
         Store::open(&cli.db)?,
     )?)
@@ -664,6 +747,25 @@ mod tests {
             "1",
         ]);
         Cli::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn live_xmr_taker_names_what_it_is_missing_before_touching_anything() {
+        let err = |extra: &[&str]| match live_xmr_taker(&cli(extra)) {
+            Ok(_) => panic!("built a live xmr taker from {extra:?}"),
+            Err(e) => e.to_string(),
+        };
+        let e = err(&["--counter-chain", "xmr"]);
+        assert!(e.contains("--xmr-sweep-address"), "{e}");
+        let e = err(&["--counter-chain", "xmr", "--xmr-network", "mainnet"]);
+        assert!(e.contains("no mainnet"), "{e}");
+        let e = err(&[
+            "--counter-chain",
+            "xmr",
+            "--xmr-sweep-address",
+            "5notanaddress",
+        ]);
+        assert!(e.contains("monero address"), "{e}");
     }
 
     #[test]

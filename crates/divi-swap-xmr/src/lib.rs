@@ -12,7 +12,8 @@
 //! used only through their public API; this crate is the two-party protocol around it:
 //! messages, per-party state machines, persistence (in `divi_swap::Store`'s document table)
 //! and the two chain traits ([`chain::DiviChain`], [`chain::MoneroChain`]) a backend must
-//! implement, with in-process mocks ([`mock`]).
+//! implement, with in-process mocks ([`mock`]) and live backends over the xmr lane's chains
+//! ([`live`]).
 //!
 //! Roles (`xmr-design.md` `## Protocol`): the **maker** holds DIVI and buys XMR; the
 //! **taker** holds XMR and buys DIVI (offer `divi-xmr-stagenet`, `taker_pays_btc` on
@@ -44,6 +45,7 @@
 pub mod api;
 pub mod chain;
 pub mod crypto;
+pub mod live;
 pub mod maker;
 pub mod mock;
 pub mod nums;
