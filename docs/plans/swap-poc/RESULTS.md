@@ -270,8 +270,13 @@ offers stayed disabled until the maker held enough coin.
     DIVI lock (maker) `965c2f4b416910dec5ea0f5c14369c06db297d44871943f5e2ceddf6766845ce`,
     DIVI refund (maker, CLTV path) `0a24df329313757d5e368e54820323f4886450fdc26f51a0fa0473c3ffb38e4d`,
     ZEC refund (taker, CLTV path) `75de33795507633ff414694e679e055ff0a9c761cdd6fb3bd5cb26994a03f85f`.
-  The reverse leg (taker swap `f2cff1bf…`, state `maker_lock_confirmed`) was interrupted when the
-  Mac's low-memory reaper stopped the run; its locks stay refundable and it resumes from the taker db.
+- ZEC case C, reverse (taker pays DIVI, taker swap `f2cff1bf…`): interrupted at `maker_lock_confirmed`
+  by the Mac's low-memory reaper, then resumed refund-only from the taker db after both timelocks had
+  passed (no claim possible: maker locktime + safety margin long gone). Taker Done / maker Done:
+    DIVI lock (taker) `23c225bf4f3044d75070bd5a9e300b93ddf651341fbe52a37d817024615022e6`,
+    ZEC lock (maker) `12c7a85750485bade78cbf9d53fc87dc15accc1b1d249834db2efda375b4ec0f`,
+    ZEC refund (maker, CLTV path) `fca0821eff0ed3509f319b02217b679468668105d15d6d2ee8065d4bf4d08d05`,
+    DIVI refund (taker, CLTV path) `3b2d9ac4e5a05099e7df2b1dc1fcd52aff43e786c10d389f506540df49888384`.
 
 ## Multi-coin: XMR ↔ DIVI adaptor-signature swap (Monero stagenet + DIVI testnet), forward, 2026-10-12
 
