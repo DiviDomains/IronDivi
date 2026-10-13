@@ -1,5 +1,8 @@
 # Testnet funding addresses (multi-coin, 2026-10-11)
 
+Cross-project inventory (every coin, faucet, address, balance, and what is still needed):
+private repo `bshuler/testnet-coins` (`~/code/testnet-coins/README.md`).
+
 Decision: the testnet runs reuse the existing secp256k1 swap keys for every secp256k1 chain,
 so no new 1Password items are needed. LTC P2WPKH and ZEC transparent P2PKH use the same
 hash160 as the BTC address; EVM uses the same public key. Pass the BTC refs as the
