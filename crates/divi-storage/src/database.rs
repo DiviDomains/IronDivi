@@ -48,6 +48,7 @@ const KEY_BEST_BLOCK: &[u8] = b"best_block";
 const KEY_CHAIN_HEIGHT: &[u8] = b"chain_height";
 const KEY_PRUNE_HEIGHT: &[u8] = b"prune_height";
 const KEY_WINNERS_STRIP_HEIGHT: &[u8] = b"winners_strip_height";
+const KEY_SNAPSHOT_BASE: &[u8] = b"snapshot_base";
 
 #[derive(Debug, Clone)]
 pub struct UtxoStats {
@@ -855,6 +856,32 @@ impl ChainDatabase {
     }
 
     /// Execute a write batch
+    /// Create a RocksDB checkpoint (hard-linked immutable files) of this database in `dir`,
+    /// which must not exist. The source is not modified.
+    pub fn create_checkpoint(&self, dir: &Path) -> Result<(), StorageError> {
+        let cp = rocksdb::checkpoint::Checkpoint::new(&self.db)?;
+        cp.create_checkpoint(dir)?;
+        Ok(())
+    }
+
+    /// Height and hash of the snapshot this database was imported from, if any.
+    pub fn snapshot_base(&self) -> Option<(u32, Hash256)> {
+        let v = self.get_metadata(KEY_SNAPSHOT_BASE).ok().flatten()?;
+        if v.len() != 36 {
+            return None;
+        }
+        let height = u32::from_le_bytes(v[..4].try_into().ok()?);
+        let hash = Hash256::from_bytes(v[4..].try_into().ok()?);
+        Some((height, hash))
+    }
+
+    /// Record that this database was started from a snapshot at `height`/`hash`.
+    pub fn set_snapshot_base(&self, height: u32, hash: &Hash256) -> Result<(), StorageError> {
+        let mut v = height.to_le_bytes().to_vec();
+        v.extend_from_slice(hash.as_bytes());
+        self.put_metadata(KEY_SNAPSHOT_BASE, &v)
+    }
+
     pub fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.db.write(batch)?;
         Ok(())

@@ -28,6 +28,10 @@ pub enum StorageError {
     #[error("deserialization error: {0}")]
     Deserialization(String),
 
+    /// Snapshot export or import refused or failed
+    #[error("snapshot: {0}")]
+    Snapshot(String),
+
     /// Key not found
     #[error("key not found: {0}")]
     NotFound(String),

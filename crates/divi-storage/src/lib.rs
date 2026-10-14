@@ -32,6 +32,7 @@ pub mod masternode;
 pub mod pos_validation;
 pub mod prune;
 pub mod rewards;
+pub mod snapshot;
 pub mod spent_index;
 pub mod spork;
 pub mod stake_modifier;
