@@ -63,7 +63,7 @@ column families so disk space is actually reclaimed. A background task runs a pa
 
 * Consensus: validation uses the UTXO set and block index only. Kernel lookup
   for blocks at or below `prune_height` is accepted from the index without a body check.
-* `getblockheader`: works for every height (served from the block index).
+* `getblockheader` (verbose): works for every height (served from the block index). Raw hex (`verbose=false`) of a pruned version-4+ block is unavailable, because the index does not store the accumulator checkpoint; it returns the "pruned data" error.
 * `getblock` for a pruned block: clean "Block not available (pruned data)" error.
 * `getrawtransaction` / `gettransaction` for a transaction in a pruned block: "No such transaction" (as in Bitcoin Core pruning); transactions still in the mempool or in kept blocks work.
 * `getblockchaininfo`: `"pruned": true`, `"pruneheight": N`.
