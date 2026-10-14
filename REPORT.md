@@ -90,3 +90,9 @@ Mainnet CF split measured (doc §8). Lottery-winner stripping built and validate
 * Snapshot distribution channel: where do operators download snapshots, and do you want root hashes published (and by whom)?
 * Who runs the full-history (`NODE_NETWORK`) nodes, so thin nodes have something to fetch from?
 * Mainnet decision on `expire` + snapshots (everything so far is testnet only).
+
+## Thin staking: status notes (2026-10-14)
+* Snapshot staking gate built: a snapshot-imported node does not stake until its tip is past the snapshot base (live-checked on hp1).
+* `fullnode=` was not added; `addnode`/`connect` plus the `NODE_NETWORK` filter identify full peers.
+* `HistoryFetcher` is unit-tested only: no caller (getblock fallback / rescan) and no live fetch yet (doc §10 work item 4 open).
+* A wallet on a snapshot-bootstrapped node has no history before the snapshot tip.

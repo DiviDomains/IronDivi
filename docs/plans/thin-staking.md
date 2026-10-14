@@ -270,8 +270,9 @@ publishes. The wallet and txindex are never included.
 ### Trust model
 Divi headers commit to no UTXO set, so the UTXO set in a snapshot is trusted, not proven. Only the
 tip's place on the chain can be checked against other nodes. This matches the trust direction in §7.
-All blocks after the snapshot tip are fully validated. The existing stale-tip and IBD guards stop
-staking until the node has caught up. Distribution is operator-driven (no P2P snapshot message);
+All blocks after the snapshot tip are fully validated. The staker refuses to stake while the tip is at or below the
+snapshot base, so the first staked block sits on at least one fully validated block. A wallet on a
+snapshot-bootstrapped node has no history before the snapshot tip (the catch-up scan logs an error). Distribution is operator-driven (no P2P snapshot message);
 publishing root hashes from several independent operators is how trust is built.
 
 ### Testnet result

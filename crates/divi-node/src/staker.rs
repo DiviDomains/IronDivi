@@ -623,6 +623,18 @@ impl Staker {
             return StakeResult::RateLimited;
         }
 
+        // A snapshot-bootstrapped node trusts (does not prove) its UTXO set, so it must not
+        // stake until at least one block past the snapshot tip has been fully validated.
+        if let Some((base, _)) = self.chain.snapshot_base() {
+            if tip.height <= base {
+                debug!(
+                    "Skipping stake: tip {} has not advanced past snapshot base {}",
+                    tip.height, base
+                );
+                return StakeResult::RateLimited;
+            }
+        }
+
         // Don't stake on a stale tip unless the operator explicitly allows it
         // (-stakeonstaletip). Commit 34d75a0 removed this guard to let IronDivi
         // break a network-wide stall; doing that by default lets a node that has
