@@ -110,3 +110,37 @@ Honest limits to settle before building:
 Build order: (1) measure mainnet size split, (2) snapshot export/import on testnet, (3) multi-peer
 agreement check, (4) `--expire <window>` + `--trust-peers` start path, (5) testnet staking proof.
 No code written yet.
+
+## 8. Measured: mainnet size split (2026-10-14, read-only)
+
+Method: a small RocksDB tool opened the live `dnsdivi` mainnet node's `chainstate` as a **secondary
+(read-only, no lock, no writes to the datadir)** and read `rocksdb.total-sst-files-size` and
+`estimate-num-keys` per column family. Chain height about 3.83 M. Sizes are on-disk (compressed).
+
+| Column family | Size | ~Keys | Pruned by `expire`? |
+|---|---|---|---|
+| `block_index` (headers + stake modifiers + index data) | **4,231 MB** | 3.83 M | No |
+| `blocks` (bodies) | 2,678 MB | 4.10 M | **Yes** |
+| `undo` | 762 MB | 4.26 M | **Yes** |
+| `utxo` | 390 MB | 8.91 M | No (needed) |
+| everything else (`metadata`, `masternodes`, `spent_index`, `default`) | ~0 | | |
+| **chainstate total** | **8,061 MB** | | |
+| `txindex` (separate DB) | 740 MB | | No (can be turned off) |
+| `wallet` | ~10 MB | | No |
+
+What this changes:
+* `expire` removes only `blocks` + `undo` = **3.44 GB (43% of chainstate)**. A pruned mainnet datadir is
+  about **5.0 GB** (4.6 GB chainstate + 740 MB txindex), or **4.6 GB** with `txindex` off. The thin
+  floor today is therefore ~4.6 GB, not "tens of MB".
+* The biggest single item is **`block_index`: 4.2 GB, about 1.1 KB per block**, more than the bodies. A
+  bare Divi header is ~150 B, so there is roughly 7x of headroom. Cause not yet investigated (likely
+  extra per-block fields or uncompressed/duplicated data). Slimming it is the largest remaining win and
+  is independent of the trust-window question.
+* The `utxo` set is small (390 MB), so a snapshot start (section 7) would move ~0.4 GB plus the
+  headers it needs, not 8 GB.
+* The 30-day window by itself does not change these numbers: bodies/undo for 30 days are only ~25 MB
+  (3.44 GB / 3.8 M blocks x 43,200 blocks).
+
+Revised recommendation order: (1) investigate and shrink `block_index` (read the serialization in
+`divi-storage/src/block_index.rs`), (2) `thin` profile (expire + indexes off), (3) snapshot start.
+Held for Bert's pick of approach: snapshot export/import and any shim work.
