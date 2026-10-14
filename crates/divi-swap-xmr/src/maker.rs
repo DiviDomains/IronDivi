@@ -540,7 +540,9 @@ impl XmrMaker {
     }
 
     /// Step 4: the taker says she locked XMR in `notice.xmr_txid`. Verified on the Monero
-    /// chain by [`XmrMaker::step`], not trusted.
+    /// chain by [`XmrMaker::step`], not trusted. Records the notice and returns: the next
+    /// [`XmrMaker::tick`] does the verification, whose first `find_lock` can scan hundreds of
+    /// blocks on a remote monerod — longer than the taker's HTTP timeout if run in the request.
     pub async fn xmr_locked(&self, swap_id: &str, notice: XmrLockNotice) -> Result<XmrSwapView> {
         {
             let _g = self.gate.lock().await;
@@ -563,7 +565,6 @@ impl XmrMaker {
                 }
             }
         }
-        let _ = self.step(swap_id).await;
         self.view(swap_id)?
             .ok_or_else(|| SwapError::Other("swap vanished".into()))
     }

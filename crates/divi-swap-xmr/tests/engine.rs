@@ -353,6 +353,31 @@ async fn crash_and_restart_at_every_round() {
     );
 }
 
+/// The XMR lock report returns at once: verifying it (a long `find_lock` scan on a real
+/// monerod) is left to the next tick, so the taker's request cannot time out on it.
+#[tokio::test]
+async fn xmr_lock_report_does_not_step_inline() {
+    let w = W::new();
+    let (mid, tid) = w.open().await;
+    let mut notice = None;
+    for _ in 0..40 {
+        let _ = w.maker.tick().await;
+        let v = w.maker.view(&mid).unwrap();
+        let _ = w.taker.step(&tid, v.as_ref()).await;
+        notice = w.taker.lock_notice(&tid).unwrap();
+        if notice.is_some() {
+            break;
+        }
+        w.mine(1);
+    }
+    let notice = notice.expect("taker never locked XMR");
+    w.mine(10); // well past xmr_confirmations: an inline step would offer the redeem now
+    let v = w.maker.xmr_locked(&mid, notice).await.unwrap();
+    assert_eq!(v.state, XmrMakerState::XmrReported);
+    w.maker.tick().await.unwrap();
+    assert_eq!(w.maker_state(&mid), XmrMakerState::RedeemOffered);
+}
+
 #[tokio::test]
 async fn no_redeem_signature_before_the_xmr_lock_confirms() {
     let w = W::new();
