@@ -356,6 +356,15 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     DIVI redeem (maker) `0de8a0c6d5c117bf1aefa0bfd6d3c4790e7c9a52c5ee27c569858818e934307c`,
     XMR sweep (taker) `18144dad1da133a29989a9268265043a41a0923e3df0befa6dbb19609fce19b8`.
   Both XMR directions (sell and buy) have now run end to end on the same code path.
+- XMR via the deployed maker, live stagenet, 2026-10-14: first XMR swap served by `divi-swapd`
+  (dnsdivi, 8e431c0, offer `divi-xmr-stagenet`) to the `divi-swap` CLI, 0.01 sXMR → 50 tDIVI,
+  maker swap `4ad572a0-2aca-49e1-9635-e8cfd4379158`, taker outcome `redeemed`. Stagenet/testnet only
+  (DIVI lock height 349445, XMR lock height 2229048, XMR sweep height 2229059):
+    DIVI lock (maker) `9268b3c6629a0576c23b035b8d198684d37fb9cc86cfe649c887c613f978db3e`,
+    XMR lock (taker, 0.01 sXMR) `41911058aeba52c052cd5db2130a8ec94c29490a890c7b0efe0e2218948fec62`,
+    DIVI claim (taker, 50 tDIVI) `b98165cdf54c39f239c3cbf0f770315ffa5f48234db98501bb6f4d2bebe91f99`,
+    XMR sweep (maker) `8215e1669270c21d3a3d69022e84cfba5733f7666f9133bcb463dfd59fa3494c`.
+  Maker funding (500 tDIVI to its XMR-engine key) `389165405e915ca05d81af787db643c1156dcd800ace9af4f7b55e59825558d4`.
 - `tools/swap-poc/verify-results.sh`, first run from the Mac 2026-10-12: 110 unique txids, 108
   confirmed. The 2 "missing" rows are script misattributions: `1e184a6f…` is the CLTV probe the
   node rejected by design, and `1a3dd95e…` is a BTC refund (confirmed, testnet3 block 5158301)

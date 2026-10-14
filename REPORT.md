@@ -69,3 +69,8 @@ Lowercase, case-sensitive. A bare number is valid only as `-1` or `0`.
 
 `~/prune-test` and `~/prune-base` on hp3 (about 2.2G) are stopped and safe to delete.
 Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywhere real.
+
+## NEEDS HUMAN
+- ~~Monero STAGENET atomic swap, parked 2026-10-14 on `secret-broker serve`.~~ **Resolved
+  2026-10-14:** Bert started the broker; the swap ran end to end on stagenet (0.01 sXMR → 50 tDIVI,
+  outcome `redeemed`). Txids in `docs/plans/swap-poc/RESULTS.md`. Stagenet only; mainnet is a separate decision.

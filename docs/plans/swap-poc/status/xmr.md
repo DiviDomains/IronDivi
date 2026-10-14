@@ -996,3 +996,35 @@ decision. Bert's go: "Full go — live swap now."
   sweep to the hp2 mining-wallet address) + enable offer → `redeploy-maker.sh --binary` → taker.
 - Evidence caveat: maker sweep address = the taker's wallet, so proof is the lock + sweep txids and
   the taker's DIVI claim txid, not a balance delta. The maker has no XMR wallet of its own.
+- 2026-10-14 hold: waiting for `secret-broker serve` (REPORT.md `## NEEDS HUMAN`). Ready on the Mac:
+  maker binary `~/.cache/maker-8e431c0/divi-swapd` (sha256 7c4e5123…, copied from hp2), taker
+  `~/.cache/divi-swap-8e431c0`, keygen `~/.cache/irondivi-ltc-build3/target/debug/examples/keygen`.
+  `redeploy-maker.sh --check-only`: no in-flight swaps. dnsdivi's live toml has no `divi-xmr-stagenet`
+  offer yet: append it (enabled, max 0.02 XMR) with `[xmr]`. Fund 500 tDIVI from node5. Swap size 0.01 XMR → 50 DIVI.
+
+### Live stagenet swap via `divi-swapd` — DONE, 2026-10-14
+
+First XMR swap served by the deployed maker (dnsdivi `divi-swapd` 8e431c0, sha256 7c4e5123…,
+offer `divi-xmr-stagenet`) against the taker CLI on the Mac. Stagenet/testnet only; mainnet is
+separate infra and a separate decision. 0.01 sXMR → 50 tDIVI, maker swap `4ad572a0-2aca-49e1-9635-e8cfd4379158`,
+taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
+- Prep: secret-broker up (pid 54954) → keygen `| op item create` (one Touch ID) → `maker-divi-xmr`
+  provisioned to `/etc/divi-swapd/credentials` (stdin, root 0400) → unit installed (`.pre-xmr` backup)
+  → 500 tDIVI to `yCnFLYFjLBVPyRb2Ae5TcwrFLaVQvzWKvD` (`389165405e915ca05d81af787db643c1156dcd800ace9af4f7b55e59825558d4`)
+  → toml `[xmr]` + offer appended (`divi-swapd.toml.pre-xmr` backup) → `redeploy-maker.sh --binary`
+  (gate: no in-flight swaps; `.prev` = old 0.2.6 b5540e30…). Journal: `learned coins` 1, `xmr engine ready (live)`.
+- Maker states (UTC): Accepted→Locked 14:06:13, →XmrReported 14:08:59, →RedeemOffered 14:28:09
+  (10 XMR confs), →Redeemed 14:28:17, →Swept 14:28:20, →Done after the sweep mined (height 2229059).
+- Txids:
+    DIVI lock (maker, 50 tDIVI + fee, height 349445) `9268b3c6629a0576c23b035b8d198684d37fb9cc86cfe649c887c613f978db3e`,
+    XMR lock (taker, 0.01 sXMR, height 2229048) `41911058aeba52c052cd5db2130a8ec94c29490a890c7b0efe0e2218948fec62`,
+    DIVI claim (taker, 50.0 tDIVI to `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b`) `b98165cdf54c39f239c3cbf0f770315ffa5f48234db98501bb6f4d2bebe91f99`,
+    XMR sweep (maker, 0.00996952 sXMR into the hp2 mining-wallet, height 2229059) `8215e1669270c21d3a3d69022e84cfba5733f7666f9133bcb463dfd59fa3494c`.
+- Rust `digest_auth` works against epee wallet-rpc (the lock went through over the `ssh -L 38088` tunnel).
+- Two rough edges, neither lost funds:
+  1. The first taker run hit `503 wallet scan in progress`: the maker had just restarted. Pre-negotiation,
+     nothing locked (empty db kept as `taker.db.attempt1-503`). Wait for `/healthz` `divi_scan.state = done`.
+  2. `POST /xmr-lock` failed once on the taker side after the maker had already moved to XmrReported
+     (the handler runs `step` → `find_lock`, a 720-block scan of the public node, inside the request,
+     so the client times out). The retry is idempotent for the same txid and the swap carried on.
+     Follow-up: return from `xmr_locked` before stepping, or let the background loop do it.

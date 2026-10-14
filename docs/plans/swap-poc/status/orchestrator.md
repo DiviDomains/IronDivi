@@ -73,3 +73,6 @@
   DIVI-XMR backends, not run live; maker not redeployed with XMR). LTC + ZEC live both directions
   PASS on 4e0ac26; USDC parked on test ETH for gas; XMR live awaits Bert's explicit go. hp2 disk 95%
   (other sessions' ~/build, ~/remote-cargo; not touched).
+- 2026-10-14 XMR live (stagenet, Bert's go): dnsdivi maker redeployed to 8e431c0 with `[xmr]` +
+  offer `divi-xmr-stagenet` (own DIVI key `maker-divi-xmr`, 500 tDIVI). 0.01 sXMR → 50 tDIVI swap
+  `redeemed`; txids in RESULTS.md and `status/xmr.md`. Rollback: `divi-swapd.prev`, `*.pre-xmr` toml/unit.
