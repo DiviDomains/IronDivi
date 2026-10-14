@@ -365,6 +365,20 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     DIVI claim (taker, 50 tDIVI) `b98165cdf54c39f239c3cbf0f770315ffa5f48234db98501bb6f4d2bebe91f99`,
     XMR sweep (maker) `8215e1669270c21d3a3d69022e84cfba5733f7666f9133bcb463dfd59fa3494c`.
   Maker funding (500 tDIVI to its XMR-engine key) `389165405e915ca05d81af787db643c1156dcd800ace9af4f7b55e59825558d4`.
+- XMR soak (plan A8) through the deployed maker, live stagenet, 2026-10-14. dnsdivi maker f919e5c,
+  then a7cb7e9 from 18:17 UTC; taker CLI f919e5c on the Mac; 0.002 sXMR per swap; results under
+  `~/.local/state/iron-divi-swap-poc/xmr-soak/{a8-happy,a8-accept,a8-happy2,a8-lock}/results.tsv`.
+  - happy × 14 (12 at 4 in parallel, 2 more after the a7cb7e9 deploy): 14 redeemed, 807-1904 s each.
+  - maker restarts with swaps open, both resumed with no error: 16:54 (2 swaps in `xmr_reported`, 6
+    `locked`) and the 18:17 redeploy (4 `locked`).
+  - accept-only × 4 (taker never locks XMR): maker refunds after `t_cancel`. Pending.
+  - lock-only × 4 (taker locks XMR, then stops until past `t_cancel`): 3 locked; both refunds pending.
+    The 4th accept got `409 insufficient funds: need 1000100000 + fee, have 0` with nothing on
+    chain: the maker's XMR-engine DIVI wallet holds one coin, and three accepts in the same minute
+    left only unconfirmed change. A clean refusal, but a mainnet maker needs its DIVI split into
+    several coins (or to queue accepts) to serve swaps in parallel.
+  - punish was not run through dnsdivi (it means stalling the shared maker for `t_punish`); it ran
+    live on 2026-10-12, above.
 - `tools/swap-poc/verify-results.sh`, first run from the Mac 2026-10-12: 110 unique txids, 108
   confirmed. The 2 "missing" rows are script misattributions: `1e184a6f…` is the CLTV probe the
   node rejected by design, and `1a3dd95e…` is a BTC refund (confirmed, testnet3 block 5158301)
