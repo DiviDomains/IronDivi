@@ -78,7 +78,7 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
 ## Thin staking: helpers + snapshot (2026-10-14)
 Built on testnet: pruned nodes advertise `NODE_NETWORK_LIMITED` only (live bug fix); terminal lottery-winner
 lists are never stripped; snapshot export/import (`--export-snapshot`, `--import-snapshot`, `snapshotbase` in
-getblockchaininfo), live-tested hp3 copy -> hp1. Design doc §10 corrected, §11 added. `HistoryFetcher` (fetch + verify a pruned block from a full-history peer) built, unit-tested, and called from RPC `getblock` below `pruneheight` (live: hp1 fetched block 100 from hp3; refused with the peer gone); not yet called from wallet rescan; no separate `fullnode=` option (use `addnode`). Live: snapshot-imported hp1 node synced forward past the snapshot tip and pruned cleanly. Earlier stripped test copies predate the terminals fix.
+getblockchaininfo), live-tested hp3 copy -> hp1. Design doc §10 corrected, §11 added. `HistoryFetcher` (fetch + verify a pruned block from a full-history peer) built, unit-tested, and called from RPC `getblock` below `pruneheight` (live: hp1 fetched block 100 from hp3, byte-identical; refused with the peer gone; a silent full peer makes getblock wait up to 20 s per peer); not yet called from wallet rescan; no separate `fullnode=` option (use `addnode`). Live: snapshot-imported hp1 node synced forward past the snapshot tip and pruned cleanly. Earlier stripped test copies predate the terminals fix.
 
 ## Thin staking design (2026-10-14)
 Design doc: `docs/plans/thin-staking.md`. Recommendation: ship pruned staking (`expire=0`) as the

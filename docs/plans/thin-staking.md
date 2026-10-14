@@ -226,7 +226,7 @@ node accept a wrong one.
 recent blocks only". A pruning node (`expire` on, or `pruneheight > 0`) now advertises only bit 10.
 This fixed a live bug where pruned nodes claimed bit 0 and then answered `notfound`.
 C++ divid peers set bit 0, so they count as full-history peers with no new bit.
-Check still open: confirm from `their_version.services` on testnet that C++ Divi never uses bit 10.
+Checked 2026-10-14: `getpeerinfo` on the hp3 testnet node showed every C++ peer (DIVI Core 3.0.0.0) with `services` 0x5 (bits 0 and 2), so none uses bit 10 and all count as full-history.
 `PeerManager::full_history_peers()` lists peers with bit 0.
 
 ### Built (unit-tested; RPC `getblock` caller live-tested)
@@ -247,8 +247,9 @@ block comes back.
    when a thin node has no full peer.
 4. Done 2026-10-14 on testnet: a snapshot-imported hp1 node (pruneheight 346,981) with
    `--connect` to the unstripped hp3 node returned block 100 over `getblock`; the same node with no
-   reachable peer returned the pruned-data error (code -5). Not yet checked: byte-for-byte
-   comparison against a local read, and a peer that sends bad data (unit-tested only).
+   reachable peer returned the pruned-data error (code -5). The fetched block's hex was byte-identical
+   to the same `getblock` on hp3. A peer that sends bad data is unit-tested only. Note: if a full
+   peer is connected but silent, `getblock` waits up to 20 s per full peer before returning the error.
 
 ### Trade-offs
 * The network needs a few full nodes on purpose; if every operator goes thin, history is lost.
