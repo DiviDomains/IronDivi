@@ -93,5 +93,5 @@ Mainnet CF split measured (doc §8). Lottery-winner stripping built and validate
 ## Thin staking: status notes (2026-10-14)
 * Snapshot staking gate built: a snapshot-imported node does not stake until its tip is past the snapshot base (live-checked on hp1).
 * `fullnode=` was not added; `addnode`/`connect` plus the `NODE_NETWORK` filter identify full peers.
-* `HistoryFetcher` is used by RPC `getblock` and live-tested on testnet; wallet rescan, sync-peer preference for full nodes, and an operator view in `getblockchaininfo` are still open (doc §10).
+* `HistoryFetcher` is used by RPC `getblock` and live-tested on testnet; `getblockchaininfo` now shows `fullhistorypeers` and `lastblockfetch`; wallet rescan and sync-peer preference for full nodes are still open (doc §10).
 * A wallet on a snapshot-bootstrapped node has no history before the snapshot tip.

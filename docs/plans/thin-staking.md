@@ -243,8 +243,9 @@ block comes back.
 ### Work remaining
 1. Wallet rescan below `pruneheight` still has no caller (`getblock` is done).
 2. Prefer `NODE_NETWORK` peers when choosing sync peers.
-3. Operator view: full-peer count and last fetch result in `getblockchaininfo`; startup warning
-   when a thin node has no full peer.
+3. Done: `getblockchaininfo` reports `fullhistorypeers` and `lastblockfetch` (live-checked), and a
+   failed fetch logs a warning. No separate startup warning: peers are not connected at startup.
+   Sync-peer preference (item 2) left out on purpose: block retry already falls over to other peers.
 4. Done 2026-10-14 on testnet: a snapshot-imported hp1 node (pruneheight 346,981) with
    `--connect` to the unstripped hp3 node returned block 100 over `getblock`; the same node with no
    reachable peer returned the pruned-data error (code -5). The fetched block's hex was byte-identical

@@ -65,6 +65,7 @@ pub struct HistoryFetcher {
     peer_manager: Arc<PeerManager>,
     pending: Mutex<HashMap<(PeerId, Hash256), oneshot::Sender<Reply>>>,
     timeout: Duration,
+    last_result: Mutex<Option<String>>,
 }
 
 impl HistoryFetcher {
@@ -73,12 +74,18 @@ impl HistoryFetcher {
             peer_manager,
             pending: Mutex::new(HashMap::new()),
             timeout: Duration::from_secs(20),
+            last_result: Mutex::new(None),
         })
     }
 
     /// Number of connected peers that keep every block.
     pub fn full_peer_count(&self) -> usize {
         self.peer_manager.full_history_peers().len()
+    }
+
+    /// Outcome of the most recent fetch, if any.
+    pub fn last_result(&self) -> Option<String> {
+        self.last_result.lock().clone()
     }
 
     /// A block arrived from `peer`. Returns true if a fetch was waiting for it.
@@ -110,6 +117,18 @@ impl HistoryFetcher {
         hash: Hash256,
         merkle_root: Hash256,
     ) -> Result<Block, FetchError> {
+        let result = self.fetch_inner(hash, merkle_root).await;
+        *self.last_result.lock() = Some(match &result {
+            Ok(_) => format!("ok {hash}"),
+            Err(e) => {
+                tracing::warn!("history fetch of {} failed: {}", hash, e);
+                format!("failed {hash}: {e}")
+            }
+        });
+        result
+    }
+
+    async fn fetch_inner(&self, hash: Hash256, merkle_root: Hash256) -> Result<Block, FetchError> {
         let peers = self.peer_manager.full_history_peers();
         if peers.is_empty() {
             return Err(FetchError::NoFullPeers);
@@ -139,6 +158,14 @@ impl HistoryFetcher {
 }
 
 impl divi_rpc::BlockFetcher for HistoryFetcher {
+    fn full_peer_count(&self) -> usize {
+        HistoryFetcher::full_peer_count(self)
+    }
+
+    fn last_result(&self) -> Option<String> {
+        HistoryFetcher::last_result(self)
+    }
+
     /// Synchronous bridge for RPC handlers, which run on the multi-threaded runtime.
     fn fetch_block(&self, hash: Hash256, merkle_root: Hash256) -> Option<Block> {
         let handle = tokio::runtime::Handle::try_current().ok()?;

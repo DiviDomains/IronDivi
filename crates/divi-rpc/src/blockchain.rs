@@ -43,6 +43,12 @@ pub trait BlockFetcher: Send + Sync {
         hash: Hash256,
         merkle_root: Hash256,
     ) -> Option<divi_primitives::block::Block>;
+
+    /// Connected peers that keep every block
+    fn full_peer_count(&self) -> usize;
+
+    /// Outcome of the most recent fetch
+    fn last_result(&self) -> Option<String>;
 }
 
 /// Mempool statistics for RPC responses
@@ -496,6 +502,7 @@ impl BlockchainRpc {
 
     /// Get blockchain info
     pub fn get_blockchain_info(&self, _params: &Params) -> Result<Value, Error> {
+        let fetcher = self.block_fetcher.read().clone();
         let tip = self.chain.tip();
         let (height, best_hash, chain_work, mediantime, difficulty) = match &tip {
             Some(t) => (
@@ -530,6 +537,8 @@ impl BlockchainRpc {
             "pruned": self.chain.prune_height() > 0,
             "pruneheight": self.chain.prune_height(),
             "winnersstripheight": self.chain.winners_strip_height(),
+            "fullhistorypeers": fetcher.as_ref().map(|f| f.full_peer_count()),
+            "lastblockfetch": fetcher.as_ref().and_then(|f| f.last_result()),
             "snapshotbase": self.chain.snapshot_base().map(|(h, hash)| serde_json::json!({"height": h, "hash": hash.to_string()})),
             "warnings": ""
         }))
