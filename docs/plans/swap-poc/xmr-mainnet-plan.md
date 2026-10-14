@@ -32,7 +32,7 @@ Gate A: all A-items done, CI green, soak clean. Bert reviews.
 | B1 | Rollback covers toml + unit, not just the binary (`redeploy-maker.sh` keeps only `divi-swapd.prev`; 0.2.6 silently ignores `[xmr]`) | one command restores binary + toml + unit; rehearsed on stagenet |
 | B1b | The redeploy in-flight gate reads only `/swaps`, not `/xmr/swaps` (`tools/swap-poc/redeploy-maker.sh`); an XMR swap mid-flight would not block a restart | gate refuses while any `/xmr/swaps` entry is non-terminal; test in `test-redeploy-maker.sh` |
 | B2 | ~~Alerting on any XMR swap with `last_error` set or stuck past its state's deadline, and on scan lag~~ | done 2026-10-14: `deploy/divi-swapd/swap-watch/` on dnsdivi (5-min timer, Telegram). Drill: API pointed at a dead port sent the alert, the next run sent "healthy again". The monerod check is off until the maker uses the local node (A5). |
-| B3 | Runbook: stuck swap, refund, punish, monerod down, key rotation | `docs/` runbook walked through once by a human |
+| B3 | Runbook: stuck swap, refund, punish, monerod down, key rotation | `docs/` runbook walked through once by a human. Written 2026-10-14: `xmr-runbook.md`; the human walk-through is still open. |
 | B4 | Key handling: `maker-divi-xmr` and the maker's XMR wallet keys on mainnet-grade custody, separate from the test keys | separate 1Password items, separate host |
 
 ## Phase C — external security review
