@@ -57,8 +57,7 @@ cannot be lost to pruning.
 A `prune_height` watermark lives in the metadata column family. A pass deletes
 `blocks` and `undo` entries for heights `watermark+1..=cutoff` (resolved through the
 height mapping) in chunked batches, advances the watermark, and compacts those
-column families so disk space is actually reclaimed. Passes run after connecting
-blocks (at most once per 100 blocks) and once at startup after the wallet catch-up scan.
+column families so disk space is actually reclaimed. A background task runs a pass once a minute, starting after the wallet catch-up scan at startup.
 
 ## Behavior with pruned data
 
