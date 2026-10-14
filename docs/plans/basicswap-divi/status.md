@@ -42,3 +42,47 @@ Goal: a visible swap, tDIVI ↔ tBTC (Bitcoin testnet3), between two BasicSwap n
 ## Display bugs seen
 - Seller-side bid page shows the swap amounts with swapped labels, and tags the first lock as tBTC although it is the Divi lock.
 - Divi coin icon missing.
+
+## Mainnet gates (none passed; no real funds until all are)
+Tracked tasks. Tick when done and link the evidence. Owner and dates are unassigned.
+
+### G1 Replace the testnet switches
+- [ ] G1.1 Make "Secret Hash allowed for Divi" an explicit per-coin setting in code, not `strict_swap_type: false`.
+- [ ] G1.2 Decide the seed policy for the Divi wallet (separate backup, or add seed support) and replace `restrict_unknown_seed_wallets: false`.
+- [ ] G1.3 Mainnet build refuses to start with any testnet-only value; add a test.
+- [ ] G1.4 Revert the BTC `min_amount` edit on both test nodes.
+
+### G2 Independent review of the Divi code
+- [ ] G2.1 Choose the reviewer; send scope: Divi interface, lock/redeem scripts, signing, fee and address handling.
+- [ ] G2.2 Keep the 4 regtest swap tests green in CI.
+- [ ] G2.3 Add refund-path and failure-path tests (timeout, crash mid-swap, late claim).
+- [ ] G2.4 Fix findings; record each in the open.
+
+### G3 Timeout analysis
+- [ ] G3.1 Measure Divi block time and realistic reorg depth.
+- [ ] G3.2 Write the analysis that the second locker always has time to claim or refund.
+- [ ] G3.3 Set the mainnet lock durations from it and test with the numbers.
+
+### G4 Full nodes and confirmations
+- [ ] G4.1 Run a Bitcoin full node we operate; drop Electrum for mainnet.
+- [ ] G4.2 Set mainnet confirmation counts for both chains.
+
+### G5 Real message network
+- [ ] G5.1 Confirm the live Particl network is synced and relaying before the first offer.
+- [ ] G5.2 Retire the hand-made SMSG relay; confirm the repo holds none of it.
+
+### G6 Wallet backup and recovery
+- [ ] G6.1 Write the Divi wallet backup and restore procedure.
+- [ ] G6.2 Drill it: kill a node mid-swap, restore, confirm funds return.
+
+### G7 Staged real money (needs the owner's explicit go for each stage)
+- [ ] G7.1 Dust-sized swaps with a hard cap and a stop switch.
+- [ ] G7.2 Raise limits only after clean runs; pause the rollout on any failed or refunded swap.
+
+### G8 Publish findings
+- [ ] G8.1 Write up review findings and fixes, including the uncomfortable ones.
+
+### Immediate cleanup (testnet nodes)
+- [ ] Remove `maxtipage` and `minimumchainwork` from both `particl.conf` at the next particld restart.
+- [ ] Commit the bug-14 fix in `interface/divi/core.py` on the builder host; keep the `chainparams.py` edit out.
+- [ ] Recover the 36,610 stranded sats and the old bitcoind wallet on node A.
