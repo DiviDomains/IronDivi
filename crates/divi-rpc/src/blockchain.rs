@@ -1,23 +1,3 @@
-            // Rebuild the header from the block index so pruned blocks still work; the
-            // hash check guards against an index whose fields do not round-trip.
-            let mut header = divi_primitives::block::BlockHeader::new();
-            header.version = index.version;
-            header.prev_block = index.prev_hash;
-            header.merkle_root = index.merkle_root;
-            header.time = index.time;
-            header.bits = index.bits;
-            header.nonce = index.nonce;
-            if let Some(acc) = index.accumulator {
-                header.accumulator_checkpoint = acc;
-            }
-            if divi_crypto::compute_block_hash(&header) != hash {
-                let block = self
-                    .chain
-                    .get_block(&hash)?
-                    .ok_or_else(|| self.missing_block_error(&index, hash_str))?;
-                header = block.header;
-            }
-            let raw = serialize(&header);
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bert Shuler
 // IronDivi - https://github.com/DiviDomains/IronDivi
@@ -425,13 +405,26 @@ impl BlockchainRpc {
             .ok_or_else(|| RpcError::block_not_found(hash_str))?;
 
         if !verbose {
-            // Raw header hex needs the stored body; the verbose path below is index-only
-            // so headers of pruned blocks are still served.
-            let block = self
-                .chain
-                .get_block(&hash)?
-                .ok_or_else(|| self.missing_block_error(&index, hash_str))?;
-            let raw = serialize(&block.header);
+            // Rebuild the header from the block index so pruned blocks still work; the
+            // hash check guards against an index whose fields do not round-trip.
+            let mut header = divi_primitives::block::BlockHeader::new();
+            header.version = index.version;
+            header.prev_block = index.prev_hash;
+            header.merkle_root = index.merkle_root;
+            header.time = index.time;
+            header.bits = index.bits;
+            header.nonce = index.nonce;
+            if let Some(acc) = index.accumulator {
+                header.accumulator_checkpoint = acc;
+            }
+            if divi_crypto::compute_block_hash(&header) != hash {
+                let block = self
+                    .chain
+                    .get_block(&hash)?
+                    .ok_or_else(|| self.missing_block_error(&index, hash_str))?;
+                header = block.header;
+            }
+            let raw = serialize(&header);
             Ok(json!(hex::encode(raw)))
         } else {
             let mut result = json!({
