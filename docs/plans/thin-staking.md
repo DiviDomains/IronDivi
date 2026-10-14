@@ -197,3 +197,60 @@ Live run (hp1, copy of an unpruned testnet datadir at tip 349,676, `--testnet --
   advances with the tip. Zero ERROR lines; a stop/restart came back clean at the same watermark.
 * Testnet cycle is 200, so the keep window is 3,481 blocks. Mainnet (10,080) keeps 33,121 blocks.
 Mainnet figures above remain estimates.
+
+## 10. Thin staking nodes backed by full-history nodes (design, not built)
+Direction from Bert: run one or more full nodes that keep all history, and make staking nodes thin.
+A thin node keeps only what staking and validation read and fetches anything else from a full node.
+This replaces the "true remote shim" of §3: the thin node still validates, so the full node is a
+helper whose answers are checked, not a trusted oracle.
+
+### What a thin node keeps and what it fetches
+| Keeps locally | Fetches on demand from a full peer |
+|---|---|
+| Block index without old lottery lists (headers, stake modifiers, chain work) | A block body older than `pruneheight` |
+| UTXO set | The blocks of one lottery cycle, to rebuild a stripped winners list |
+| Winners lists for the recent window (3 cycles + 1 + 2,880 blocks) | Nothing else for staking |
+
+### Why fetch-and-verify is safe
+* A winners list at height H depends only on the blocks since the start of H's lottery cycle
+  (at most 10,080 on mainnet). Replaying them through `update_lottery_winners` gives the list again.
+* Every fetched block is checked against the thin node's own header chain (hash, merkle root,
+  proof of stake/work) before it is used. A lying full node can withhold a block but cannot
+  make the thin node accept a wrong one.
+* The rebuilt list is a fallback. The three readers (next-block update, `validate_lottery_payments`,
+  `is_payment_script_vetoed_for_lottery`, see §9) normally read only the recent window, which is
+  always kept. The fetch matters if the window was ever wrong, after a reorg deeper than the
+  2,880-block floor, or for a thin node that was started with a short history.
+
+### What exists today (checked in the code)
+* `getdata` for a block works on the wire, and a node that no longer has a block answers
+  `notfound` (`divi-node/src/node.rs`, "pruned or unknown"), so a requester can ask elsewhere.
+* The only service flags are `NODE_NETWORK`, `NODE_BLOOM`, `NODE_BLOOM_WITHOUT_MN`
+  (`divi-network/src/constants.rs`). There is no way to tell a full-history peer from a pruned one
+  before asking.
+
+### Work needed
+1. **Advertise history.** Add a service bit, for example `NODE_FULL_HISTORY`, set only when the
+   node has expiry off (`expire = -1`). Pruned nodes stop claiming full history.
+2. **Peer choice.** A thin node keeps a connection to at least one peer with that bit. Allow a
+   configured list of trusted full nodes (`fullnode=host:port`, repeatable) and fall back to any
+   advertising peer.
+3. **Fetch path.** An async "get old block" call that asks full peers in turn, applies the header
+   checks above, retries on `notfound` or timeout, and rate-limits itself.
+4. **Rebuild path.** Given a lottery cycle, fetch its blocks, replay the list update, hold the
+   result in memory (not written back unless the window says to keep it), and hand it to the
+   readers in §9. Mainnet worst case is one cycle of 10,080 blocks.
+5. **Failure mode.** If no full peer answers, the thin node must refuse to validate the affected
+   lottery block (stop and report) and never guess. It must not stake on a block it cannot check.
+6. **Operator view.** Expose the number of full peers and the last fetch result in
+   `getblockchaininfo`, and warn at startup when a thin node has none.
+
+### Trade-offs
+* Full nodes carry the load, so the network needs a few of them to stay reachable. If every
+  operator goes thin, history is lost. Full nodes should be run on purpose and monitored.
+* A thin node that is isolated from every full peer can still stake inside its kept window but
+  cannot recover from an unusual reorg or rebuild a list.
+* The bandwidth cost is paid only when a rebuild happens, which should be rare.
+* Test plan: on testnet, strip a node, delete one cycle of lists in a scratch copy, start it
+  against a full peer, force a lottery-block validation, and check the rebuilt list byte-for-byte
+  against the list that was deleted. Then repeat with the full peer off to confirm it refuses.
