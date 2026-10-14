@@ -1027,4 +1027,9 @@ taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
   2. `POST /xmr-lock` failed once on the taker side after the maker had already moved to XmrReported
      (the handler runs `step` → `find_lock`, a 720-block scan of the public node, inside the request,
      so the client times out). The retry is idempotent for the same txid and the swap carried on.
-     Follow-up: return from `xmr_locked` before stepping, or let the background loop do it.
+     Fixed in 93f15c9: `xmr_locked` records the notice and returns; the next tick verifies
+     (test `xmr_lock_report_does_not_step_inline`). Deployed to dnsdivi 2026-10-14 15:41Z via
+     `redeploy-maker.sh --binary` (sha256 eb879139…, built on hp2); `.prev` is the 8e431c0 XMR
+     build (7c4e5123…), and the pre-XMR 0.2.6 binary is kept as `divi-swapd.pre-xmr` (b5540e30…).
+     The gate only reads `/swaps`; `/xmr/swaps` was checked by hand (one swap, `done`).
+- Mainnet is not in scope here. What stands between this and mainnet: `../xmr-mainnet-plan.md`.
