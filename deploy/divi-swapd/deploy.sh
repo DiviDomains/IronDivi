@@ -30,7 +30,8 @@ done
 # Secret refs (not secret); written to dnsdivi as credential files.
 # One "name|ref" per line (bash 3.2 on macOS has no associative arrays).
 CRED_REFS="maker-divi|op://global_secret_store/IronDivi Swap POC - maker-divi/password
-maker-btc|op://global_secret_store/IronDivi Swap POC - maker-btc/password"
+maker-btc|op://global_secret_store/IronDivi Swap POC - maker-btc/password
+maker-divi-xmr|op://global_secret_store/IronDivi Swap POC - maker-divi-xmr/password"
 
 step() { echo "==> $*"; }
 run() {

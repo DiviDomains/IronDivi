@@ -15,6 +15,8 @@ UMask=0077
 # Keys: root:root 0400 files, exposed to the service only via $CREDENTIALS_DIRECTORY.
 LoadCredential=maker-divi:/etc/divi-swapd/credentials/maker-divi
 LoadCredential=maker-btc:/etc/divi-swapd/credentials/maker-btc
+# The [xmr] engine's own DIVI key (never the [divi] one: two coin sets over one key).
+LoadCredential=maker-divi-xmr:/etc/divi-swapd/credentials/maker-divi-xmr
 # No LoadCredential=maker-ltc: testnets reuse the BTC swap key on every secp256k1 chain
 # (docs/plans/swap-poc/funding.md, decision 64ae2a0) — [ltc].key in the config is
 # credential:maker-btc, already loaded above.

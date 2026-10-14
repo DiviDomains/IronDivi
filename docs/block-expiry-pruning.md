@@ -80,4 +80,4 @@ column families so disk space is actually reclaimed. A background task runs a pa
   catch up **before** enabling `expire`: a wallet first loaded on an already-pruned
   node cannot see coins below `pruneheight`. Pruning never passes the wallet's scanned
   height (live blocks advance it), so enabling `expire` on a caught-up wallet is safe.
-* `-reindex` is not supported on a pruned datadir (it needs the deleted bodies); resync instead.
+* IronDivi has no reindex; a pruned datadir can only be resynced from scratch.

@@ -7,9 +7,6 @@ use std::fmt;
 /// Never prune bodies/undo for this many most-recent blocks (about 2 days at 60 s).
 pub const MIN_BLOCKS_TO_KEEP: u32 = 2880;
 
-/// Run a prune pass at most once per this many connected blocks.
-pub const PRUNE_INTERVAL_BLOCKS: u32 = 100;
-
 const MONTH_SECS: u64 = 30 * 86_400;
 const YEAR_SECS: u64 = 365 * 86_400;
 

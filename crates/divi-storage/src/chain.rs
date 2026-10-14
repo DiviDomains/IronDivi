@@ -5105,19 +5105,19 @@ mod tests {
         assert_eq!(pruned, 120);
         assert_eq!(chain.prune_height(), 120);
         assert_eq!(chain.tip().unwrap().hash, tip_before.hash);
-        for h in 1..=120usize {
+        for (h, hash) in hashes.iter().enumerate().take(121).skip(1) {
             assert!(
-                chain.get_block(&hashes[h]).unwrap().is_none(),
+                chain.get_block(hash).unwrap().is_none(),
                 "body {h} pruned"
             );
             assert!(
-                chain.get_block_index(&hashes[h]).unwrap().is_some(),
+                chain.get_block_index(hash).unwrap().is_some(),
                 "index {h} kept"
             );
         }
-        for h in 121..=(n as usize) {
+        for (h, hash) in hashes.iter().enumerate().take(n as usize + 1).skip(121) {
             assert!(
-                chain.get_block(&hashes[h]).unwrap().is_some(),
+                chain.get_block(hash).unwrap().is_some(),
                 "body {h} kept"
             );
         }
