@@ -93,6 +93,9 @@ pub struct Node {
     /// Block synchronization manager
     block_sync: Arc<BlockSync>,
 
+    /// Fetches pruned blocks from full-history peers
+    history: Arc<crate::history_fetch::HistoryFetcher>,
+
     /// Transaction relay manager
     tx_relay: Arc<TxRelay>,
 
@@ -265,6 +268,7 @@ impl Node {
             mempool,
             fee_estimator,
             chain_params,
+            history: crate::history_fetch::HistoryFetcher::new(Arc::clone(&peer_manager)),
             peer_manager,
             block_sync,
             tx_relay,
@@ -312,6 +316,11 @@ impl Node {
     }
 
     /// Subscribe to node events
+    /// Fetcher for blocks this node has pruned (asks full-history peers, verifies the answer).
+    pub fn history_fetcher(&self) -> Arc<crate::history_fetch::HistoryFetcher> {
+        Arc::clone(&self.history)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
         self.event_tx.subscribe()
     }
@@ -346,6 +355,7 @@ impl Node {
         // Start peer event handler
         let event_tx = self.event_tx.clone();
         let block_sync = Arc::clone(&self.block_sync);
+        let history = Arc::clone(&self.history);
         let tx_relay = Arc::clone(&self.tx_relay);
         let spork_manager = Arc::clone(&self.spork_manager);
         let chain = Arc::clone(&self.chain);
@@ -395,6 +405,13 @@ impl Node {
                                 block_sync.handle_headers(peer_id, headers).await;
                             }
                             NetworkMessage::Block(block) => {
+                                if history.deliver(
+                                    peer_id,
+                                    compute_block_hash(&block.header),
+                                    &block,
+                                ) {
+                                    continue;
+                                }
                                 tracing::debug!(
                                     "Block message received from peer {}: {} with {} txs",
                                     peer_id,
@@ -431,6 +448,10 @@ impl Node {
                                 }
                             }
                             NetworkMessage::NotFound(items) => {
+                                let items: Vec<_> = items
+                                    .into_iter()
+                                    .filter(|i| !history.not_found(peer_id, i.hash))
+                                    .collect();
                                 // Fail block requests over to another peer now
                                 // instead of after the download timeout
                                 block_sync.handle_notfound(peer_id, items).await;

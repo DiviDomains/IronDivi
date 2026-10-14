@@ -53,6 +53,7 @@
 pub mod config;
 pub mod error;
 pub mod fee_estimator;
+pub mod history_fetch;
 pub mod mempool;
 pub mod node;
 pub mod staker;

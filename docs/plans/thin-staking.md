@@ -229,11 +229,17 @@ C++ divid peers set bit 0, so they count as full-history peers with no new bit.
 Check still open: confirm from `their_version.services` on testnet that C++ Divi never uses bit 10.
 `PeerManager::full_history_peers()` lists peers with bit 0.
 
+### Built (unit-tested; no caller yet)
+`divi-node/src/history_fetch.rs`: `HistoryFetcher::fetch_block(hash, merkle_root)` asks
+`full_history_peers()` in turn, 20 s timeout each, accepts only a block whose hash and merkle root
+match what our index says, and returns `NoFullPeers`/`NotAvailable` otherwise (never guesses). The node
+message loop hands matching `Block`/`NotFound` replies to it before normal sync handling.
+`Node::history_fetcher()` exposes it. Peers are added with the existing `addnode`/`connect`; a
+separate `fullnode=` option was not added.
+
 ### Work remaining
-1. Fetch path: ask `full_history_peers()` in turn for a block hash, verify header hash and merkle
-   root against our own index, retry on `notfound`/timeout, rate-limit, refuse (never guess) if no
-   answer. Needs routing of `NetworkMessage::Block` for requested hashes in `sync.rs`.
-2. `fullnode=host:port` (repeatable) in `divi-node` config; prefer `NODE_NETWORK` peers.
+1. A caller: RPC `getblock` fallback below `pruneheight`, and wallet rescan. Not wired yet.
+2. Prefer `NODE_NETWORK` peers when choosing sync peers.
 3. Operator view: full-peer count and last fetch result in `getblockchaininfo`; startup warning
    when a thin node has no full peer.
 4. Test: strip a node, point it at an unstripped testnet peer, force a read below `pruneheight`,
