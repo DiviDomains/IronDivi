@@ -196,4 +196,12 @@ pub struct XmrSwapView {
     pub maker_punish_sig: Option<String>,
     /// Last error the maker hit on this swap.
     pub last_error: Option<String>,
+    /// `nLockTime` of `Tx_cancel` / `Tx_refund` (unix seconds, compared with the DIVI chain's
+    /// median time past). For the operator: when this swap leaves the happy path.
+    #[serde(default)]
+    pub t_cancel: Option<u32>,
+    /// `nLockTime` of `Tx_punish`: a `cancelled` swap's `Tx_refund` must confirm before this or
+    /// the taker can take the DIVI.
+    #[serde(default)]
+    pub t_punish: Option<u32>,
 }

@@ -42,12 +42,16 @@ send() {
       --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=$1"
 }
 
+# dry-run reads the env file too when it can, so it checks what the timer's runs check
+# (MONEROD_URL, UNITS); it never needs the token.
 if [ "$mode" != dry-run ]; then
   [ -r "$ENV_FILE" ] || { echo "swap-watch: no $ENV_FILE" >&2; exit 1; }
+fi
+if [ -r "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
-  : "${TELEGRAM_BOT_TOKEN:?}" "${TELEGRAM_CHAT_ID:?}"
 fi
+[ "$mode" = dry-run ] || : "${TELEGRAM_BOT_TOKEN:?}" "${TELEGRAM_CHAT_ID:?}"
 mkdir -p "$STATE_DIR"
 
 if [ "$mode" = test ]; then
@@ -112,7 +116,7 @@ done <<<"$swaps"
 
 host=$(hostname -s)
 if [ "$mode" = dry-run ]; then
-  printf 'problem: %s\n' "${problems[@]+"${problems[@]}"}"; echo "${#problems[@]} problem(s)"; exit 0
+  for p in "${problems[@]+"${problems[@]}"}"; do echo "problem: $p"; done; echo "${#problems[@]} problem(s)"; exit 0
 fi
 key=$(printf '%s\n' "${problems[@]+"${problems[@]}"}" | sed -E 's/[0-9]+//g' | sort | md5sum | cut -c1-32)
 last_key=$(cat "$STATE_DIR/key" 2>/dev/null || echo none)

@@ -12,7 +12,7 @@ idempotent and persisted before its side effect, so a restart resumes where it s
 ```text
 accepted → locked → xmr_reported → redeem_offered → redeemed → swept → done      (happy path)
 locked … redeem_offered, past t_cancel → cancelled → refunded → done            (refund)
-                                         cancelled → punished                    (taker punished)
+                                         cancelled → punished                    (maker missed t_punish: the taker took the DIVI)
 accepted → aborted   (taker never sent her signatures within sigs_wait; nothing broadcast)
 ```
 
@@ -30,9 +30,12 @@ down across that window. Every other failure is a delay, not a loss.
 ```sh
 ssh dnsdivi 'curl -s 127.0.0.1:18480/healthz | jq .'            # backends, wallet scan state
 ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps | jq ".[] | {id,state,last_error}"'
-ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps/<id> | jq .'     # one swap, with its txids
+ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps/<id> | jq .'     # one swap, with its txids, t_cancel, t_punish
+# every cancelled swap and how long until its t_punish (seconds; DIVI median time past lags wall
+# time by up to ~30 min, so treat anything under an hour as urgent):
+ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps | jq -r ".[] | select(.state==\"cancelled\") | [.id, .t_punish - now] | @tsv"'
 ssh dnsdivi sudo journalctl -u divi-swapd --since -1h | grep 'xmr maker'   # state transitions
-ssh dnsdivi sudo /usr/local/bin/swap-watch.sh dry-run           # what the alert job sees now
+ssh dnsdivi sudo /usr/local/bin/swap-watch.sh dry-run           # what the alert job sees now (reads /etc/swap-watch.env)
 ```
 
 ## Alerts (swap-watch, Telegram, every 5 min)
@@ -46,7 +49,7 @@ when they clear.
 | `/healthz not ok` | daemon up but not answering | as above |
 | `wallet scan still scanning N min after start` | the DIVI wallet rescan after a restart is slow; takers get 503 until it finishes | wait; if it stays stuck past an hour, check the DIVI node (next row) |
 | `divi backend: …` / `btc backend: …` | the daemon cannot reach a chain node | check the node behind `[divi].rpc_url` / `[btc]` in `/etc/divi-swapd/divi-swapd.toml` (stagenet: `services.divi.domains/api/testnet/rpc/`, a remote endpoint); the daemon retries on its own |
-| `monerod-stagenet is …` / `monerod RPC not answering` | local monerod down | `systemctl restart monerod-stagenet`; `journalctl -u monerod-stagenet`. Disk full is the usual cause (`df -h /var/lib/monero-stagenet`). XMR lock checks and sweeps stall; DIVI refunds do not need monerod. |
+| `monerod-stagenet is …` / `monerod RPC not answering` | local monerod down | `systemctl restart monerod-stagenet`; `journalctl -u monerod-stagenet`. Disk full is the usual cause (`df -h /var/lib/monero-stagenet`). XMR lock checks and sweeps stall; DIVI refunds do not need monerod. Until A5's switch-over the maker uses the public stagenet node (`[xmr].monerod_url`) and this check is off (`MONEROD_URL=` in `/etc/swap-watch.env`). |
 | `monerod not synchronized: height X of Y` | monerod fell behind (or is resyncing) | it catches up by itself; if the gap grows, check peers (`get_info` → `outgoing_connections_count`) |
 | `xmr swap <id> stuck in accepted` | taker took a quote and never sent signatures | nothing: the maker aborts it after `sigs_wait`. If it stays, the daemon is not ticking: check the logs. |
 | `xmr swap <id> stuck in <state> for 12 h` | longer than any healthy path (`t_cancel` + `t_punish` is 9 h) | read the swap and the log; see the table below |
@@ -102,7 +105,7 @@ symlink, restart. Move it back to roll back.
 | Key | Where | Rotate |
 |---|---|---|
 | `maker-divi-xmr` (DIVI key that funds `Tx_lock`, signs refunds) | 1Password → `/etc/divi-swapd/credentials/` via `deploy.sh provision-secrets` | only with **no** XMR swap in flight: in-flight swaps' refund and punish paths are bound to the old key. Fund the new key's address and update `divi_fund_txids`. |
-| maker XMR wallet (sweep target) | 1Password item "IronDivi Swap POC - maker-xmr-wallet-stagenet" (spend + view key, address) | generate a new one (`cargo run -p swap-chain-xmr --example xmr_keygen`, piped into `op item create`); change `[xmr].sweep_address`; restart with nothing in `redeemed`. Sweep the old wallet's funds with `monero-wallet-cli --generate-from-keys`. |
+| maker XMR wallet (sweep target) | 1Password item "IronDivi Swap POC - maker-xmr-wallet-stagenet" (spend + view key, address) | generate a new one (`cargo run -p swap-chain-xmr --example xmr_keygen` on the build cluster, never the Mac; output piped straight into `op item create`, never to a file or the terminal); change `[xmr].sweep_address`; restart with nothing in `redeemed`. Sweep the old wallet's funds with `monero-wallet-cli --generate-from-keys`. |
 | `maker-xmr-wallet-rpc` | 1Password → credentials | `provision-secrets`, restart |
 
 Never put a key on the command line or in a file under git. Mainnet keys are separate items on a

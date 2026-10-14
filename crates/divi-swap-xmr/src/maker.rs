@@ -230,6 +230,8 @@ impl XmrMakerRecord {
             refund_txid: self.refund_signed.as_ref().map(|t| t.txid().to_hex()),
             maker_punish_sig: self.maker_punish_sig.clone(),
             last_error: self.last_error.clone(),
+            t_cancel: Some(self.t_cancel),
+            t_punish: Some(self.t_punish),
         }
     }
 }

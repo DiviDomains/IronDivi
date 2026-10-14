@@ -264,6 +264,11 @@ async fn taker_never_locks_xmr_maker_refunds() {
     for _ in 0..3 {
         w.round(&mid, &tid, false, true).await;
     }
+    // The operator's view carries both deadlines (runbook: check t_punish first).
+    let v = w.maker.view(&mid).unwrap().unwrap();
+    let (tc, tp) = (v.t_cancel.unwrap(), v.t_punish.unwrap());
+    assert!(tc > 0);
+    assert_eq!(tp - tc, cfg().punish_after_secs);
     w.divi.advance_time(cfg().cancel_after_secs);
     for _ in 0..10 {
         w.round(&mid, &tid, false, true).await;
