@@ -75,3 +75,9 @@ column families so disk space is actually reclaimed. A background task runs a pa
 
 * A pruned node cannot serve old blocks to peers, and cannot rescan history below `pruneheight`.
 * Changing `expire` from a value back to `-1` does not restore deleted blocks; resync to get them.
+* Side-chain (stale) block bodies are not pruned; only blocks on the active chain are.
+* A wallet discovers its coins by scanning block bodies. Load the wallet and let it
+  catch up **before** enabling `expire`: a wallet first loaded on an already-pruned
+  node cannot see coins below `pruneheight`. Pruning never passes the wallet's scanned
+  height (live blocks advance it), so enabling `expire` on a caught-up wallet is safe.
+* `-reindex` is not supported on a pruned datadir (it needs the deleted bodies); resync instead.

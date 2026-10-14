@@ -489,6 +489,11 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
 
 /// Build node configuration from CLI args and config file
 fn build_config(args: &Args) -> Result<NodeConfig> {
+    build_config_with_env(args, std::env::var("IRONDIVI_EXPIRE").ok())
+}
+
+/// `env_expire` is the value of `IRONDIVI_EXPIRE`; passed in so tests never mutate process env.
+fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<NodeConfig> {
     let chain_mode = parse_chain_mode(&args.mode);
 
     // Start with network-specific defaults
@@ -527,7 +532,7 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
     }
 
     // Environment overrides the config file (and is itself overridden by the CLI below)
-    if let Ok(v) = std::env::var("IRONDIVI_EXPIRE") {
+    if let Some(v) = env_expire {
         if !v.trim().is_empty() {
             config.expire = divi_storage::prune::Expire::parse(&v)
                 .map_err(|e| anyhow::anyhow!("IRONDIVI_EXPIRE: {}", e))?;
@@ -1939,6 +1944,9 @@ mod expire_tests {
     #[test]
     fn expire_precedence_cli_over_env_over_conf() {
         fn cfg(conf: Option<&str>, argv: &[&str]) -> Result<NodeConfig> {
+            cfg_env(conf, None, argv)
+        }
+        fn cfg_env(conf: Option<&str>, env: Option<&str>, argv: &[&str]) -> Result<NodeConfig> {
             let dir = tempfile::tempdir().unwrap();
             if let Some(c) = conf {
                 std::fs::write(dir.path().join("irondivi.conf"), c).unwrap();
@@ -1948,10 +1956,9 @@ mod expire_tests {
                 format!("--datadir={}", dir.path().display()),
             ];
             v.extend(argv.iter().map(|s| s.to_string()));
-            build_config(&Args::parse_from(v))
+            build_config_with_env(&Args::parse_from(v), env.map(String::from))
         }
 
-        std::env::remove_var("IRONDIVI_EXPIRE");
         // Default: disabled.
         assert_eq!(cfg(None, &[]).unwrap().expire, Expire::Never);
         // Conf only (string and bare integers).
@@ -1968,14 +1975,15 @@ mod expire_tests {
             Expire::Never
         );
         // Env beats conf.
-        std::env::set_var("IRONDIVI_EXPIRE", "1w");
         assert_eq!(
-            cfg(Some("expire = \"30d\"\n"), &[]).unwrap().expire,
+            cfg_env(Some("expire = \"30d\"\n"), Some("1w"), &[])
+                .unwrap()
+                .expire,
             Expire::Window(7 * 86_400)
         );
         // CLI beats env and conf, including negative values in both spellings.
         assert_eq!(
-            cfg(Some("expire = \"30d\"\n"), &["--expire", "2h"])
+            cfg_env(Some("expire = \"30d\"\n"), Some("1w"), &["--expire", "2h"])
                 .unwrap()
                 .expire,
             Expire::Window(7200)
@@ -1988,8 +1996,6 @@ mod expire_tests {
         assert_eq!(cfg(None, &["--expire=0"]).unwrap().expire, Expire::Minimum);
         // Invalid value on any surface is an error, not a warning.
         assert!(cfg(None, &["--expire=30"]).is_err());
-        std::env::set_var("IRONDIVI_EXPIRE", "bogus");
-        assert!(cfg(None, &[]).is_err());
-        std::env::remove_var("IRONDIVI_EXPIRE");
+        assert!(cfg_env(None, Some("bogus"), &[]).is_err());
     }
 }
