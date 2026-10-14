@@ -103,9 +103,18 @@ struct Cli {
     /// Secret reference for the `monero-wallet-rpc` password.
     #[arg(long, global = true)]
     xmr_wallet_rpc_password: Option<String>,
-    /// Monero network: `stagenet` (default) or `testnet`.
+    /// Monero network: `stagenet` (default), `testnet`, or `mainnet` (only with
+    /// `--xmr-allow-mainnet`).
     #[arg(long, global = true, default_value = "stagenet")]
     xmr_network: String,
+    /// Allow `--xmr-network mainnet`, which moves real money. Off by default
+    /// (`xmr-mainnet-plan.md` phase D).
+    #[arg(long, global = true)]
+    xmr_allow_mainnet: bool,
+    /// DIVI JSON-RPC proxy for the xmr taker's DIVI wallet. Defaults to the DIVI testnet
+    /// proxy; required on mainnet.
+    #[arg(long, global = true)]
+    xmr_divi_rpc_url: Option<String>,
     /// The taker's own Monero address: where a refund sweeps her XMR back to.
     #[arg(long, global = true)]
     xmr_sweep_address: Option<String>,
@@ -606,9 +615,15 @@ fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
 fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     use divi_swap_xmr::live::{self, LiveDivi, LiveDiviChain, LiveMonero, LiveMoneroConfig};
     let network = live::parse_network(&cli.xmr_network)?;
-    if network == live::Network::Mainnet {
-        bail!("--xmr-network: the adaptor engine has testnet timing only; no mainnet");
-    }
+    let profile = live::profile_for(network, cli.xmr_allow_mainnet)
+        .map_err(|e| anyhow::anyhow!("--xmr-network {}: {e}", cli.xmr_network))?;
+    let divi_rpc_url = match (&cli.xmr_divi_rpc_url, network) {
+        (Some(u), _) => u.clone(),
+        (None, live::Network::Mainnet) => {
+            bail!("--xmr-network mainnet needs --xmr-divi-rpc-url (the default is DIVI testnet)")
+        }
+        (None, _) => "https://services.divi.domains/api/testnet/rpc/".to_string(),
+    };
     let need = |v: &Option<String>, flag: &str| {
         v.clone()
             .with_context(|| format!("live --counter-chain xmr needs {flag}"))
@@ -640,7 +655,7 @@ fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
         .map(divi_swap_cli::wallet::prepare_wallet_path)
         .transpose()?;
     let divi = LiveDiviChain::new(
-        "https://services.divi.domains/api/testnet/rpc/",
+        &divi_rpc_url,
         dkey,
         swap_chain_divi::FeePolicy::default(),
         wallet,
@@ -656,7 +671,7 @@ fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
         journal_dir: PathBuf::from(format!("{}.xmr-journal", cli.db.display())),
     })?;
     Ok(divi_swap_xmr::XmrTaker::new(
-        divi_swap_xmr::XmrConfig::testnet(),
+        profile,
         Arc::new(LiveDivi::new(divi)),
         Arc::new(xmr),
         Store::open(&cli.db)?,
@@ -759,6 +774,14 @@ mod tests {
         assert!(e.contains("--xmr-sweep-address"), "{e}");
         let e = err(&["--counter-chain", "xmr", "--xmr-network", "mainnet"]);
         assert!(e.contains("no mainnet"), "{e}");
+        let e = err(&[
+            "--counter-chain",
+            "xmr",
+            "--xmr-network",
+            "mainnet",
+            "--xmr-allow-mainnet",
+        ]);
+        assert!(e.contains("--xmr-divi-rpc-url"), "{e}");
         let e = err(&[
             "--counter-chain",
             "xmr",

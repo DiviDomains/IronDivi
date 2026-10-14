@@ -6,21 +6,22 @@ punish paths ran live (RESULTS.md, 2026-10-12), and the deployed `divi-swapd` se
 swap on 2026-10-14. Mainnet is a separate decision Bert makes. This plan lists what stands
 between the two; `mainnet-readiness.md` §XMR is the review it builds on.
 
-Every phase ends with a gate. Nothing here flips the mainnet refusal
-(`bin/divi-swapd/src/main.rs:182`, `bin/divi-swap/src/main.rs:610`) before phase D, and nothing
-moves real funds before phase D.
+Every phase ends with a gate. Nothing moves real funds before phase D. The hard mainnet refusal
+became an explicit opt-in on 2026-10-14 (Bert's full go, decision log): mainnet now needs
+`[xmr].allow_mainnet = true` (maker) or `--xmr-allow-mainnet` (taker), both off by default, and
+nobody sets them before phase D.
 
 ## Phase A — code, testnet only (refusals stay in)
 
 | # | Item | Where | Done when |
 |---|---|---|---|
 | A1 | ~~`POST /xmr-lock` ran `step` → `find_lock` (a 720-block remote scan) inside the request; the taker's 30 s client timed out~~ | `crates/divi-swap-xmr/src/maker.rs` `xmr_locked`; `bin/divi-swap/src/client.rs:37` | done 2026-10-14: the handler records and returns, and `tick` verifies. Test `xmr_lock_report_does_not_step_inline`. |
-| A2 | Mainnet `XmrConfig` profile: DIVI depth matched to the shared engine's mainnet 10 (testnet is 3), XMR 10 (spendable age), fee margins | `crates/divi-swap-xmr/src/lib.rs:91-98`; `crates/divi-swap/src/config.rs` | `XmrConfig::mainnet()` exists with pinning tests; it is never selected while the refusals stand |
-| A3 | A real `cancel_after`/`punish_after`/`redeem_margin` schedule derived from block times and confirmation depths (like `required_gap_secs`), not fixed testnet hours | `crates/divi-swap-xmr/src/lib.rs:69-116`; `maker.rs:404-406` | `validate()` rejects any schedule where a side can lose funds to a confirmation delay; property test |
+| A2 | Mainnet `XmrConfig` profile: DIVI depth matched to the shared engine's mainnet 10 (testnet is 3), XMR 10 (spendable age), fee margins | `crates/divi-swap-xmr/src/lib.rs:91-98`; `crates/divi-swap/src/config.rs` | ~~`XmrConfig::mainnet()` exists with pinning tests~~ done 2026-10-14: DIVI 10 / XMR 10 confirmations (read from their sources), `t_cancel` 12 h, `t_punish` +12 h, margin 2 h, presigned fee 0.01 DIVI; `mainnet_profile_pinned`. Selected only through `live::profile_for(Mainnet, allow_mainnet = true)` |
+| A3 | A real `cancel_after`/`punish_after`/`redeem_margin` schedule derived from block times and confirmation depths (like `required_gap_secs`), not fixed testnet hours | `crates/divi-swap-xmr/src/lib.rs:69-116`; `maker.rs:404-406` | ~~`validate()` rejects any schedule where a side can lose funds to a confirmation delay; property test~~ done 2026-10-14: `ChainTiming` (60 s / 120 s blocks, ×3 slow blocks, 30 min MTP lag, 5 min reaction) → `min_{cancel,punish,redeem_margin}_secs`; testnet minimums 12 240 / 3 600 / 2 640 s, mainnet 20 400 / 7 200 / 3 900 s. `tests/schedule.rs`: 3 888 timings × 150 schedules against an independent worst-case timeline, plus tightness |
 | A4 | Maker-owned XMR wallet: the sweep goes to the maker's own wallet, never the taker's (stagenet sweeps into hp2's mining-wallet: a test topology) | `bin/divi-swapd/src/config.rs:143`; `main.rs:184` | maker sweep address belongs to a maker-only view key; balance-delta proof on stagenet |
 | A5 | Own monerod (not the public restricted node), with a persisted scan cursor so `find_lock` does not rescan 720 blocks after a restart | `crates/divi-swap-xmr/src/live.rs:326` (`find_lock`), `:462` (`lookback_blocks: 720`) | maker on a self-hosted stagenet monerod; restart mid-swap rescans ≤ a few blocks. **Code done 2026-10-14**: cursor persisted per lock address in the journal dir (3 tests). dnsdivi `monerod-stagenet` installed and syncing; switch-over pending its sync. A txid hint for `find_lock` (skip the scan entirely) is a possible follow-up, not needed for the gate. |
 | A6 | ~~Taker waits for the maker's `/healthz` `divi_scan.state = done`~~ | `bin/divi-swap/src/client.rs`, `xmr_flow.rs` `begin` | done 2026-10-14: polls `/healthz` up to 600 s, `failed` stops at once, the quote retries only on 503 (4 tests) |
-| A7 | One global `gate` mutex serialises every XMR swap's step, so one slow scan stalls all requests | `crates/divi-swap-xmr/src/maker.rs:265` | per-swap locking, or no network I/O held under the gate |
+| A7 | One global `gate` mutex serialises every XMR swap's step, so one slow scan stalls all requests | `crates/divi-swap-xmr/src/maker.rs:265` | ~~per-swap locking~~ done 2026-10-14: one lock per swap (pruned when unheld), plus a quote claim that closes a concurrent-`setup` double-use race; `a_stuck_scan_does_not_hold_up_other_swaps` (fails with one shared lock). The taker keeps its global gate (it steps only its own swaps); `tick` is still sequential |
 | A8 | Stagenet soak: many concurrent swaps through dnsdivi, including maker restarts mid-swap and every outcome (redeem/refund/punish) | `tools/swap-poc/` | ≥ 20 swaps, 0 stuck, 0 lost; results in RESULTS.md |
 
 Gate A: all A-items done, CI green, soak clean. Bert reviews.
@@ -58,7 +59,10 @@ project. Gate C: findings fixed or accepted in writing by Bert.
 
 ## Phase D — staged mainnet trials (needs Bert's explicit go)
 
-Separate mainnet infrastructure (not dnsdivi testnet). Remove the two refusals only in this phase.
+Separate mainnet infrastructure (not dnsdivi testnet). The refusals are an opt-in since
+2026-10-14 (`live::profile_for`); set `allow_mainnet` / `--xmr-allow-mainnet` only in this phase.
+Mainnet also needs an explicit DIVI mainnet RPC (`[xmr].divi_rpc_url`, `--xmr-divi-rpc-url`): the
+default is the testnet proxy and both binaries refuse it on mainnet.
 Dust-sized swaps first, with Bert at the keyboard, per-run confirmation, then a raised cap.
 Each trial records lock/claim/sweep txids the same way RESULTS.md does.
 

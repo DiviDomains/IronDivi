@@ -497,9 +497,58 @@ pub fn parse_network(s: &str) -> Result<Network> {
     }
 }
 
+/// The engine profile for a Monero network: [`crate::XmrConfig::testnet`] on stagenet and
+/// testnet, [`crate::XmrConfig::mainnet`] on mainnet. Mainnet moves real money, so it needs
+/// an explicit `allow_mainnet` that every binary keeps off by default (`xmr-mainnet-plan.md`
+/// phase D: only after the outside review, with Bert present).
+pub fn profile_for(network: Network, allow_mainnet: bool) -> Result<crate::XmrConfig> {
+    match network {
+        Network::Mainnet if !allow_mainnet => Err(SwapError::InvalidParams(
+            "monero mainnet moves real money: no mainnet without the explicit allow-mainnet \
+             opt-in (xmr-mainnet-plan.md phase D)"
+                .into(),
+        )),
+        Network::Mainnet => Ok(crate::XmrConfig::mainnet()),
+        _ => Ok(crate::XmrConfig::testnet()),
+    }
+}
+
+/// The DIVI address network matching a Monero network.
+pub fn divi_network(network: Network) -> divi_wallet::address::Network {
+    match network {
+        Network::Mainnet => divi_wallet::address::Network::Mainnet,
+        _ => divi_wallet::address::Network::Testnet,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mainnet_needs_the_opt_in() {
+        let e = profile_for(Network::Mainnet, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no mainnet"), "{e}");
+        assert_eq!(
+            profile_for(Network::Mainnet, true).unwrap(),
+            crate::XmrConfig::mainnet()
+        );
+        for n in [Network::Stagenet, Network::Testnet] {
+            for allow in [false, true] {
+                assert_eq!(profile_for(n, allow).unwrap(), crate::XmrConfig::testnet());
+            }
+        }
+        assert_eq!(
+            divi_network(Network::Mainnet),
+            divi_wallet::address::Network::Mainnet
+        );
+        assert_eq!(
+            divi_network(Network::Stagenet),
+            divi_wallet::address::Network::Testnet
+        );
+    }
 
     /// A stagenet address of throwaway public keys.
     fn stagenet_addr() -> String {

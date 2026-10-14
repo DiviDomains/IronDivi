@@ -178,8 +178,12 @@ async fn live_xmr_engine(
 ) -> Result<Arc<divi_swap_xmr::XmrMaker>> {
     use divi_swap_xmr::live::{self, LiveDivi, LiveMonero, LiveMoneroConfig};
     let network = live::parse_network(&xs.network)?;
-    if network == live::Network::Mainnet {
-        bail!("[xmr]: the adaptor engine has testnet timing only; no mainnet");
+    let profile = live::profile_for(network, xs.allow_mainnet)
+        .map_err(|e| anyhow::anyhow!("[xmr].network = {:?}: {e}", xs.network))?;
+    if network == live::Network::Mainnet
+        && xs.divi_rpc_url == divi_swapd::config::default_divi_rpc()
+    {
+        bail!("[xmr].divi_rpc_url: the default is the DIVI testnet RPC; set a mainnet one");
     }
     let sweep_to = live::parse_address(network, &xs.sweep_address)
         .map_err(|e| anyhow::anyhow!("[xmr].sweep_address: {e}"))?;
@@ -190,7 +194,8 @@ async fn live_xmr_engine(
         }
     }
     let address =
-        divi_wallet::address::Address::p2pkh(&key.public_key(), DiviNetwork::Testnet).to_string();
+        divi_wallet::address::Address::p2pkh(&key.public_key(), live::divi_network(network))
+            .to_string();
     let wallet_rpc_password = match &xs.wallet_rpc_password {
         Some(r) => SecretRef::parse(r)
             .and_then(|r| r.resolve())
@@ -231,7 +236,7 @@ async fn live_xmr_engine(
         "xmr engine ready (live)"
     );
     let engine = divi_swap_xmr::XmrMaker::new(
-        divi_swap_xmr::XmrConfig::testnet(),
+        profile,
         Arc::new(LiveDivi::new(divi)),
         Arc::new(xmr),
         store,

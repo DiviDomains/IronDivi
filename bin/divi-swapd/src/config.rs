@@ -131,6 +131,10 @@ pub struct XmrSection {
     /// `stagenet` (default), `testnet` or `mainnet`.
     #[serde(default = "default_xmr_network")]
     pub network: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default;
+    /// set only at phase D of `xmr-mainnet-plan.md` (after the outside review, Bert present).
+    #[serde(default)]
+    pub allow_mainnet: bool,
     /// `monerod` RPC: scanning for the taker's lock, fees, relaying the sweep.
     pub monerod_url: String,
     /// `monero-wallet-rpc` with the maker's wallet open.
@@ -178,7 +182,8 @@ pub struct ZecSection {
     pub key: String,
 }
 
-fn default_divi_rpc() -> String {
+/// The DIVI testnet RPC proxy: the default `[divi]` and `[xmr]` DIVI endpoint.
+pub fn default_divi_rpc() -> String {
     "https://services.divi.domains/api/testnet/rpc/".into()
 }
 fn default_esplora() -> String {
@@ -742,6 +747,10 @@ divi_fund_txids = ["ab"]
         let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{XMR_SECTION}")).unwrap();
         let x = c.xmr.as_ref().unwrap();
         assert_eq!(x.network, "stagenet");
+        assert!(
+            !x.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
         assert_eq!(x.lookback_blocks, 720);
         assert_eq!(x.divi_rpc_url, default_divi_rpc());
         assert!(x.journal_dir.is_none() && x.divi_wallet_path.is_none());
