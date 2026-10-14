@@ -315,12 +315,12 @@ impl Node {
         &self.chain_params
     }
 
-    /// Subscribe to node events
     /// Fetcher for blocks this node has pruned (asks full-history peers, verifies the answer).
     pub fn history_fetcher(&self) -> Arc<crate::history_fetch::HistoryFetcher> {
         Arc::clone(&self.history)
     }
 
+    /// Subscribe to node events
     pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
         self.event_tx.subscribe()
     }

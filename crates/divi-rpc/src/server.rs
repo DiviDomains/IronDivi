@@ -179,6 +179,11 @@ impl RpcServer {
         self.lite_wallet.write().set_mempool(mempool);
     }
 
+    /// Let `getblock` fetch pruned blocks from full-history peers
+    pub fn set_block_fetcher(&self, fetcher: Arc<dyn crate::blockchain::BlockFetcher>) {
+        self.blockchain.set_block_fetcher(fetcher);
+    }
+
     /// Set the spork manager that backs the `spork` RPC
     pub fn set_spork_manager(&self, sporks: Arc<divi_network::SporkManager>) {
         self.spork.set_manager(sporks);

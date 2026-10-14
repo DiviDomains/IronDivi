@@ -138,6 +138,17 @@ impl HistoryFetcher {
     }
 }
 
+impl divi_rpc::BlockFetcher for HistoryFetcher {
+    /// Synchronous bridge for RPC handlers, which run on the multi-threaded runtime.
+    fn fetch_block(&self, hash: Hash256, merkle_root: Hash256) -> Option<Block> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        tokio::task::block_in_place(|| {
+            handle.block_on(HistoryFetcher::fetch_block(self, hash, merkle_root))
+        })
+        .ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

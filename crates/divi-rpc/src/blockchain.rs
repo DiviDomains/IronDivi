@@ -30,6 +30,19 @@ pub struct BlockchainRpc {
     mempool: RwLock<Option<Arc<dyn MempoolProvider>>>,
     /// Money supply cached against the tip hash it was computed for
     money_supply_cache: RwLock<Option<(Hash256, f64)>>,
+    /// Fetches blocks this node has pruned from full-history peers
+    block_fetcher: RwLock<Option<Arc<dyn BlockFetcher>>>,
+}
+
+/// Source for block bodies this node no longer stores (to avoid a dependency on divi-node).
+///
+/// Implementations must return only a block that matches `hash` and `merkle_root`.
+pub trait BlockFetcher: Send + Sync {
+    fn fetch_block(
+        &self,
+        hash: Hash256,
+        merkle_root: Hash256,
+    ) -> Option<divi_primitives::block::Block>;
 }
 
 /// Mempool statistics for RPC responses
@@ -119,6 +132,7 @@ impl BlockchainRpc {
             chain,
             mempool: RwLock::new(None),
             money_supply_cache: RwLock::new(None),
+            block_fetcher: RwLock::new(None),
         }
     }
 
@@ -255,6 +269,29 @@ impl BlockchainRpc {
         *self.mempool.write() = Some(mempool);
     }
 
+    pub fn set_block_fetcher(&self, fetcher: Arc<dyn BlockFetcher>) {
+        *self.block_fetcher.write() = Some(fetcher);
+    }
+
+    /// Load a block body, asking a full-history peer if it is pruned locally.
+    fn load_block(
+        &self,
+        hash: &Hash256,
+        index: &divi_storage::block_index::BlockIndex,
+        hash_str: &str,
+    ) -> Result<divi_primitives::block::Block, Error> {
+        if let Some(block) = self.chain.get_block(hash)? {
+            return Ok(block);
+        }
+        if index.height <= self.chain.prune_height() {
+            let fetcher = self.block_fetcher.read().clone();
+            if let Some(block) = fetcher.and_then(|f| f.fetch_block(*hash, index.merkle_root)) {
+                return Ok(block);
+            }
+        }
+        Err(self.missing_block_error(index, hash_str))
+    }
+
     /// Get current block count (height)
     pub fn get_block_count(&self, _params: &Params) -> Result<Value, Error> {
         let height = self.chain.height();
@@ -327,10 +364,7 @@ impl BlockchainRpc {
             .get_block_index(&hash)?
             .ok_or_else(|| RpcError::block_not_found(hash_str))?;
 
-        let block = self
-            .chain
-            .get_block(&hash)?
-            .ok_or_else(|| self.missing_block_error(&index, hash_str))?;
+        let block = self.load_block(&hash, &index, hash_str)?;
 
         if !verbose {
             // Return raw hex

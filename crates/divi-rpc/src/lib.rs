@@ -61,7 +61,7 @@ pub mod staking;
 pub mod wallet;
 pub mod websocket;
 
-pub use blockchain::BlockchainRpc;
+pub use blockchain::{BlockFetcher, BlockchainRpc};
 pub use error::{Error, RpcError};
 pub use lite_wallet::LiteWalletRpc;
 pub use masternode::MasternodeRpc;

@@ -1316,6 +1316,7 @@ async fn run_daemon(
         let staker_ref = staker.clone();
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
+        let history_for_rpc = node.history_fetcher();
         let mempool_for_tx = node.mempool().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
@@ -1335,6 +1336,7 @@ async fn run_daemon(
                 peer_manager,
                 move |rpc_server| {
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
@@ -1431,6 +1433,7 @@ async fn run_daemon(
     } else {
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
+        let history_for_rpc = node.history_fetcher();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
@@ -1447,6 +1450,7 @@ async fn run_daemon(
                 peer_manager,
                 move |rpc_server| {
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
