@@ -1033,3 +1033,28 @@ taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
      build (7c4e5123…), and the pre-XMR 0.2.6 binary is kept as `divi-swapd.pre-xmr` (b5540e30…).
      The gate only reads `/swaps`; `/xmr/swaps` was checked by hand (one swap, `done`).
 - Mainnet is not in scope here. What stands between this and mainnet: `../xmr-mainnet-plan.md`.
+
+## Mainnet plan gates (orchestrator, 2026-10-14)
+
+Scope from Bert: run through Phase B and prepare the Phase C brief; test coins only; the mainnet
+block stays in (`[xmr].allow_mainnet` exists since f919e5c, off by default, set nowhere). Stop
+before any real-money swap.
+
+- **Gate A: open.**
+  - done: A1 (xmr-lock timeout), A2/A3 (mainnet profile and derived schedule), A6, A7.
+  - A4 deployed 18:17 UTC (a7cb7e9): the maker sweeps into its own stagenet wallet `5B948h…aJt`.
+    Balance proof on a view-only wallet is parked: the view-key read hit an unanswered 1Password
+    prompt. hp2 runs an empty wallet-rpc on `127.0.0.1:38099` for it; retry is
+    `scratchpad/a4-viewonly.sh start` then `balance`.
+  - A5 open: dnsdivi's own stagenet monerod is CPU-bound at height ~144k of 2.229M; the maker
+    still uses the public node.
+  - A8 in progress: 14 happy redeemed, 2 restarts with swaps open; 7 refunds land after
+    `t_cancel` (accept-only ~22:50 UTC, lock-only ~23:43 UTC; lock-only resume is scheduled). See
+    RESULTS.md.
+- **Gate B: open on people, not code.**
+  - done: B1 (rollback rehearsed), B1b, B2 (swap-watch, plus the `t_punish` margin alert).
+  - B3 needs one human walk-through of `xmr-runbook.md`.
+  - B4 mainnet keys are generated at Bert's keyboard (Phase D).
+- **Phase C brief:** `xmr-review-brief.md` (e6a6fad). Drafting it found C1-C6 (plan §Phase C);
+  C1, counterparty malleation of `Tx_cancel`, needs a protocol change or written acceptance before
+  any mainnet swap.
