@@ -605,7 +605,9 @@ impl Chain {
                         .transactions
                         .iter()
                         .any(|tx| self.compute_txid(tx) == *kernel_txid),
-                    None => false,
+                    // Body pruned: the active-chain index entry at the kernel height is
+                    // authoritative (the kernel block is an ancestor of `parent`).
+                    None => kernel_height <= self.db.prune_height(),
                 };
                 if contains {
                     return Ok(idx);
@@ -649,6 +651,66 @@ impl Chain {
     /// Get the current chain height
     pub fn height(&self) -> u32 {
         self.tip.read().as_ref().map(|t| t.height).unwrap_or(0)
+    }
+
+    /// Height below which block bodies and undo data have been pruned (0 = none).
+    pub fn prune_height(&self) -> u32 {
+        self.db.prune_height()
+    }
+
+    /// Highest height whose bodies may be pruned for `expire`, or `None` when nothing is
+    /// eligible. Never reaches into the last `MIN_BLOCKS_TO_KEEP` blocks and never goes
+    /// above `wallet_floor` (the wallet's last scanned height) when one is given.
+    pub fn prune_cutoff(
+        &self,
+        expire: crate::prune::Expire,
+        wallet_floor: Option<u32>,
+        now: u64,
+    ) -> Result<Option<u32>, StorageError> {
+        use crate::prune::{Expire, MIN_BLOCKS_TO_KEEP};
+        let tip_height = self.height();
+        let mut cutoff = tip_height.saturating_sub(MIN_BLOCKS_TO_KEEP);
+        if let Expire::Window(secs) = expire {
+            let limit = now.saturating_sub(secs);
+            // Highest height <= cutoff whose header time is older than the window
+            // (block times are monotonic enough for a binary search).
+            let (mut lo, mut hi, mut found) = (1u32, cutoff, 0u32);
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                match self.get_block_index_by_height(mid)? {
+                    Some(idx) if (idx.time as u64) < limit => {
+                        found = mid;
+                        lo = mid + 1;
+                    }
+                    _ => {
+                        if mid == 0 {
+                            break;
+                        }
+                        hi = mid - 1;
+                    }
+                }
+            }
+            cutoff = found;
+        } else if !expire.is_enabled() {
+            return Ok(None);
+        }
+        if let Some(floor) = wallet_floor {
+            cutoff = cutoff.min(floor);
+        }
+        Ok(if cutoff > 0 { Some(cutoff) } else { None })
+    }
+
+    /// Run one pruning pass. Returns the number of blocks whose data was removed.
+    pub fn prune_expired(
+        &self,
+        expire: crate::prune::Expire,
+        wallet_floor: Option<u32>,
+        now: u64,
+    ) -> Result<u32, StorageError> {
+        match self.prune_cutoff(expire, wallet_floor, now)? {
+            Some(cutoff) => self.db.prune_blocks_to(cutoff),
+            None => Ok(0),
+        }
     }
 
     /// Get the genesis block hash for this chain
@@ -5003,6 +5065,133 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(tx2_utxo2.value, Amount::from_divi(200));
+    }
+
+    // ===== Block-expiry pruning =====
+
+    /// Build `n` blocks on top of genesis by writing storage directly. `accept_block`
+    /// would demand real proof-of-stake past height 100, and pruning does not care.
+    fn build_chain_of(chain: &Chain, n: u32) -> Vec<Hash256> {
+        let (genesis_hash, genesis_time) = get_genesis_info(chain);
+        let mut prev = chain.get_block_index(&genesis_hash).unwrap().unwrap();
+        let mut hashes = vec![genesis_hash];
+        let mut t = genesis_time;
+        for h in 1..=n {
+            t += 60;
+            let block = create_child_block_with_time(prev.hash, t);
+            let mut index = BlockIndex::from_header(&block.header, h, Some(&prev));
+            index.hash = chain.compute_block_hash(&block);
+            chain.db.store_block(&index.hash, &block).unwrap();
+            chain.db.store_block_index_entry(&index).unwrap();
+            chain.db.set_height_mapping(h, &index.hash).unwrap();
+            hashes.push(index.hash);
+            prev = index;
+        }
+        chain.db.set_best_block(&prev.hash).unwrap();
+        *chain.tip.write() = Some(prev);
+        hashes
+    }
+
+    #[test]
+    fn test_prune_minimum_keeps_floor_and_chainstate() {
+        use crate::prune::{Expire, MIN_BLOCKS_TO_KEEP};
+        let (chain, _dir) = create_test_chain();
+        let n = MIN_BLOCKS_TO_KEEP + 120;
+        let hashes = build_chain_of(&chain, n);
+        let tip_before = chain.tip().unwrap();
+        assert_eq!(chain.prune_height(), 0);
+
+        let pruned = chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(pruned, 120);
+        assert_eq!(chain.prune_height(), 120);
+        assert_eq!(chain.tip().unwrap().hash, tip_before.hash);
+        for h in 1..=120usize {
+            assert!(
+                chain.get_block(&hashes[h]).unwrap().is_none(),
+                "body {h} pruned"
+            );
+            assert!(
+                chain.get_block_index(&hashes[h]).unwrap().is_some(),
+                "index {h} kept"
+            );
+        }
+        for h in 121..=(n as usize) {
+            assert!(
+                chain.get_block(&hashes[h]).unwrap().is_some(),
+                "body {h} kept"
+            );
+        }
+        // Idempotent, and never reaches into the floor.
+        assert_eq!(chain.prune_expired(Expire::Minimum, None, 0).unwrap(), 0);
+        assert!(chain.get_block(&hashes[n as usize]).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_prune_never_and_wallet_floor_and_window() {
+        use crate::prune::{Expire, MIN_BLOCKS_TO_KEEP};
+        let (chain, _dir) = create_test_chain();
+        let n = MIN_BLOCKS_TO_KEEP + 200;
+        let hashes = build_chain_of(&chain, n);
+        let genesis_time = chain.get_block_index(&hashes[0]).unwrap().unwrap().time as u64;
+
+        // -1 never prunes.
+        assert_eq!(
+            chain
+                .prune_expired(Expire::Never, None, u64::MAX / 2)
+                .unwrap(),
+            0
+        );
+        assert_eq!(chain.prune_height(), 0);
+
+        // Wallet floor limits the pass.
+        assert_eq!(
+            chain.prune_expired(Expire::Minimum, Some(50), 0).unwrap(),
+            50
+        );
+        assert!(chain.get_block(&hashes[51]).unwrap().is_some());
+
+        // Window: "now" = time of block 150 + 10 minutes, keep 5 minutes -> blocks with
+        // time < now-300 are expired, i.e. up to height 150 - 4 = 146 (60 s spacing).
+        let now = genesis_time + 150 * 60 + 600;
+        let cutoff = chain
+            .prune_cutoff(Expire::Window(300), None, now)
+            .unwrap()
+            .unwrap();
+        let t_cut = chain
+            .get_block_index_by_height(cutoff)
+            .unwrap()
+            .unwrap()
+            .time as u64;
+        let t_next = chain
+            .get_block_index_by_height(cutoff + 1)
+            .unwrap()
+            .unwrap()
+            .time as u64;
+        assert!(
+            t_cut < now - 300 && t_next >= now - 300,
+            "cutoff is the window edge"
+        );
+        chain.prune_expired(Expire::Window(300), None, now).unwrap();
+        assert!(chain.get_block(&hashes[cutoff as usize]).unwrap().is_none());
+        assert!(chain
+            .get_block(&hashes[cutoff as usize + 1])
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_kernel_lookup_survives_pruned_body() {
+        use crate::prune::{Expire, MIN_BLOCKS_TO_KEEP};
+        let (chain, _dir) = create_test_chain();
+        let hashes = build_chain_of(&chain, MIN_BLOCKS_TO_KEEP + 50);
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        let parent = chain.tip().unwrap();
+        let bogus_txid = Hash256::from_bytes([7u8; 32]);
+        // Kernel at a pruned height resolves from the index without the body.
+        let idx = chain
+            .resolve_kernel_block_index(&parent, &bogus_txid, 10)
+            .unwrap();
+        assert_eq!(idx.hash, hashes[10]);
     }
 
     #[test]

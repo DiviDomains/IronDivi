@@ -473,6 +473,18 @@ impl Node {
                                                 item.hash,
                                                 peer_id
                                             );
+                                            // Tell the peer so it can ask elsewhere (pruned or unknown).
+                                            let msg = NetworkMessage::NotFound(vec![item.clone()]);
+                                            if let Err(e) =
+                                                peer_manager.send_block_to_peer(peer_id, msg).await
+                                            {
+                                                tracing::debug!(
+                                                    "Failed to send notfound for {} to peer {}: {}",
+                                                    item.hash,
+                                                    peer_id,
+                                                    e
+                                                );
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::warn!(

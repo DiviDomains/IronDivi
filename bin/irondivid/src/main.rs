@@ -161,6 +161,13 @@ struct Args {
     #[arg(long)]
     utxocachesize: Option<u64>,
 
+    /// Discard block data older than this age so the node can stake without the full chain.
+    /// Units: s, m (minutes), h, d, w, mo (months = 30d), y (years = 365d), e.g. 30d.
+    /// -1 = never expire (default); 0 = keep only the minimum needed to stake and validate.
+    /// Also settable via IRONDIVI_EXPIRE or `expire` in irondivi.conf (flag > env > conf).
+    #[arg(long, allow_hyphen_values = true)]
+    expire: Option<String>,
+
     /// Maximum log file size in MB (default: 1)
     #[arg(long, default_value = "1")]
     maxlogsize: u32,
@@ -454,6 +461,24 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!("Invalid utxocachesize, expected integer");
                 }
             }
+            // Block-expiry pruning: "30d", "-1", "0" (a bare TOML integer -1 / 0 also works)
+            "expire" => {
+                let text = match (value.as_str(), value.as_integer()) {
+                    (Some(s), _) => s.to_string(),
+                    (None, Some(i)) => i.to_string(),
+                    _ => {
+                        eprintln!("Invalid expire in config file, expected string like \"30d\"");
+                        std::process::exit(1);
+                    }
+                };
+                match divi_storage::prune::Expire::parse(&text) {
+                    Ok(e) => config.expire = e,
+                    Err(e) => {
+                        eprintln!("config file: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             // Unknown key - log warning
             _ => {
                 warn!("Unknown configuration key in config file: {}", key);
@@ -501,6 +526,14 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
         apply_config_file(&mut config, &file_config);
     }
 
+    // Environment overrides the config file (and is itself overridden by the CLI below)
+    if let Ok(v) = std::env::var("IRONDIVI_EXPIRE") {
+        if !v.trim().is_empty() {
+            config.expire = divi_storage::prune::Expire::parse(&v)
+                .map_err(|e| anyhow::anyhow!("IRONDIVI_EXPIRE: {}", e))?;
+        }
+    }
+
     // Apply CLI overrides (these take precedence over config file)
     if let Some(rpcuser) = &args.rpcuser {
         config.rpc.username = Some(rpcuser.clone());
@@ -537,6 +570,10 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
 
     if let Some(cache_size) = args.utxocachesize {
         config.utxo_cache_size = cache_size;
+    }
+    if let Some(v) = &args.expire {
+        config.expire = divi_storage::prune::Expire::parse(v)
+            .map_err(|e| anyhow::anyhow!("--expire: {}", e))?;
     }
 
     // Add static peers from CLI (append to any from config file)
@@ -1042,6 +1079,7 @@ async fn run_daemon(
                 let chain_for_scan = node.chain().clone();
                 let wallet_for_catchup = Arc::clone(wallet_arc);
                 let mut scanned = 0u32;
+                let mut missing_blocks = 0u32;
                 for height in (last_scan + 1)..=chain_height {
                     let index = match chain_for_scan.get_block_index_by_height(height) {
                         Ok(Some(idx)) => idx,
@@ -1049,7 +1087,10 @@ async fn run_daemon(
                     };
                     let block = match chain_for_scan.get_block(&index.hash) {
                         Ok(Some(blk)) => blk,
-                        _ => continue,
+                        _ => {
+                            missing_blocks += 1;
+                            continue;
+                        }
                     };
                     wallet_for_catchup.scan_block(
                         index.hash,
@@ -1066,7 +1107,20 @@ async fn run_daemon(
                         );
                     }
                 }
-                wallet_for_catchup.set_last_scan_height(chain_height);
+                if missing_blocks > 0 {
+                    error!(
+                        "Wallet catch-up scan could not read {} block(s) in {}..={} (pruned: prune height {}). \
+                         Wallet history in that range is NOT scanned; last_scan_height left at {}. \
+                         Restore the blocks (resync) or accept the gap.",
+                        missing_blocks,
+                        last_scan + 1,
+                        chain_height,
+                        chain_for_scan.prune_height(),
+                        last_scan
+                    );
+                } else {
+                    wallet_for_catchup.set_last_scan_height(chain_height);
+                }
                 if let Err(e) = wallet_for_catchup.save() {
                     error!("Failed to save wallet after catch-up scan: {}", e);
                 }
@@ -1093,6 +1147,40 @@ async fn run_daemon(
 
         wallet
     };
+
+    // Block-expiry pruning: runs after the wallet catch-up scan above, then periodically.
+    // Bodies within MIN_BLOCKS_TO_KEEP of the tip (and above the wallet's scan height)
+    // are never touched, so a racing reorg cannot need pruned data.
+    if node.config().expire.is_enabled() {
+        let expire = node.config().expire;
+        let chain_for_prune = node.chain().clone();
+        let wallet_for_prune = wallet.clone();
+        info!("Block-expiry pruning enabled: expire={:?}", expire);
+        tokio::spawn(async move {
+            loop {
+                let floor = wallet_for_prune.as_ref().map(|w| w.last_scan_height());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let chain = chain_for_prune.clone();
+                let res =
+                    tokio::task::spawn_blocking(move || chain.prune_expired(expire, floor, now))
+                        .await;
+                match res {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => info!(
+                        "Pruned {} blocks (prune height now {})",
+                        n,
+                        chain_for_prune.prune_height()
+                    ),
+                    Ok(Err(e)) => error!("Block pruning failed: {}", e),
+                    Err(e) => error!("Block pruning task panicked: {}", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
 
     // Start staker if wallet is available
     let staker = if let Some(ref wallet_opt) = wallet {
@@ -1839,5 +1927,69 @@ mod mode_tests {
             assert_eq!(c.p2p.port, p2p, "{argv:?}");
             assert_eq!(c.rpc.port, rpc, "{argv:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod expire_tests {
+    use super::*;
+    use divi_storage::prune::Expire;
+
+    /// Env is process-global, so every precedence case runs inside this one test.
+    #[test]
+    fn expire_precedence_cli_over_env_over_conf() {
+        fn cfg(conf: Option<&str>, argv: &[&str]) -> Result<NodeConfig> {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(c) = conf {
+                std::fs::write(dir.path().join("irondivi.conf"), c).unwrap();
+            }
+            let mut v = vec![
+                "irondivid".to_string(),
+                format!("--datadir={}", dir.path().display()),
+            ];
+            v.extend(argv.iter().map(|s| s.to_string()));
+            build_config(&Args::parse_from(v))
+        }
+
+        std::env::remove_var("IRONDIVI_EXPIRE");
+        // Default: disabled.
+        assert_eq!(cfg(None, &[]).unwrap().expire, Expire::Never);
+        // Conf only (string and bare integers).
+        assert_eq!(
+            cfg(Some("expire = \"30d\"\n"), &[]).unwrap().expire,
+            Expire::Window(30 * 86_400)
+        );
+        assert_eq!(
+            cfg(Some("expire = 0\n"), &[]).unwrap().expire,
+            Expire::Minimum
+        );
+        assert_eq!(
+            cfg(Some("expire = -1\n"), &[]).unwrap().expire,
+            Expire::Never
+        );
+        // Env beats conf.
+        std::env::set_var("IRONDIVI_EXPIRE", "1w");
+        assert_eq!(
+            cfg(Some("expire = \"30d\"\n"), &[]).unwrap().expire,
+            Expire::Window(7 * 86_400)
+        );
+        // CLI beats env and conf, including negative values in both spellings.
+        assert_eq!(
+            cfg(Some("expire = \"30d\"\n"), &["--expire", "2h"])
+                .unwrap()
+                .expire,
+            Expire::Window(7200)
+        );
+        assert_eq!(
+            cfg(None, &["--expire", "-1"]).unwrap().expire,
+            Expire::Never
+        );
+        assert_eq!(cfg(None, &["--expire=-1"]).unwrap().expire, Expire::Never);
+        assert_eq!(cfg(None, &["--expire=0"]).unwrap().expire, Expire::Minimum);
+        // Invalid value on any surface is an error, not a warning.
+        assert!(cfg(None, &["--expire=30"]).is_err());
+        std::env::set_var("IRONDIVI_EXPIRE", "bogus");
+        assert!(cfg(None, &[]).is_err());
+        std::env::remove_var("IRONDIVI_EXPIRE");
     }
 }

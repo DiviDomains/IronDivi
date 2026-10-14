@@ -51,6 +51,9 @@ pub struct NodeConfig {
 
     /// UTXO cache size (number of entries). Default: 10_000_000. Set to 0 to disable.
     pub utxo_cache_size: u64,
+
+    /// Block-expiry pruning (`-1` = never, `0` = minimum, else a retention window).
+    pub expire: divi_storage::prune::Expire,
 }
 
 impl Default for NodeConfig {
@@ -66,6 +69,7 @@ impl Default for NodeConfig {
             index: IndexConfig::default(),
             log: LogConfig::default(),
             utxo_cache_size: 10_000_000,
+            expire: divi_storage::prune::Expire::Never,
         }
     }
 }

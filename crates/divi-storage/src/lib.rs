@@ -30,6 +30,7 @@ pub mod fork_activation;
 pub mod lottery;
 pub mod masternode;
 pub mod pos_validation;
+pub mod prune;
 pub mod rewards;
 pub mod spent_index;
 pub mod spork;

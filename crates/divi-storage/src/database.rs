@@ -46,6 +46,7 @@ const CF_UNDO: &str = "undo";
 /// Metadata keys
 const KEY_BEST_BLOCK: &[u8] = b"best_block";
 const KEY_CHAIN_HEIGHT: &[u8] = b"chain_height";
+const KEY_PRUNE_HEIGHT: &[u8] = b"prune_height";
 
 #[derive(Debug, Clone)]
 pub struct UtxoStats {
@@ -651,6 +652,50 @@ impl ChainDatabase {
         let cf = self.db.cf_handle(CF_UNDO).unwrap();
         self.db.delete_cf(cf, block_hash.as_bytes())?;
         Ok(())
+    }
+
+    /// Highest height whose block body / undo data have been pruned (0 = nothing pruned).
+    pub fn prune_height(&self) -> u32 {
+        self.get_metadata(KEY_PRUNE_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Delete block bodies and undo data for heights `(prune_height, cutoff]`, advance the
+    /// watermark, and compact the touched column families. Block index, UTXO set and all
+    /// other indexes are left alone. Returns the number of blocks pruned.
+    pub fn prune_blocks_to(&self, cutoff: u32) -> Result<u32, StorageError> {
+        let start = self.prune_height();
+        if cutoff <= start {
+            return Ok(0);
+        }
+        let cf_blocks = self.db.cf_handle(CF_BLOCKS).unwrap();
+        let cf_undo = self.db.cf_handle(CF_UNDO).unwrap();
+        let cf_meta = self.db.cf_handle(CF_METADATA).unwrap();
+        let mut pruned = 0u32;
+        let mut h = start + 1;
+        while h <= cutoff {
+            let chunk_end = (h + 999).min(cutoff);
+            let mut batch = WriteBatch::default();
+            for height in h..=chunk_end {
+                if let Some(hash) = self.get_height_mapping(height)? {
+                    batch.delete_cf(cf_blocks, hash.as_bytes());
+                    batch.delete_cf(cf_undo, hash.as_bytes());
+                    pruned += 1;
+                }
+            }
+            batch.put_cf(cf_meta, KEY_PRUNE_HEIGHT, chunk_end.to_le_bytes());
+            self.db.write(batch)?;
+            h = chunk_end + 1;
+        }
+        self.db
+            .compact_range_cf(cf_blocks, None::<&[u8]>, None::<&[u8]>);
+        self.db
+            .compact_range_cf(cf_undo, None::<&[u8]>, None::<&[u8]>);
+        Ok(pruned)
     }
 
     /// Atomically flush UTXO changes + undo data + tip update in a single WriteBatch.

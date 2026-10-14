@@ -286,6 +286,28 @@ impl BlockchainRpc {
         }
     }
 
+    /// Error for a block whose body is not stored: pruned vs. genuinely unknown.
+    fn missing_block_error(
+        &self,
+        index: &divi_storage::block_index::BlockIndex,
+        hash_str: &str,
+    ) -> Error {
+        if index.height <= self.chain.prune_height() {
+            RpcError::new(
+                crate::error::codes::INVALID_ADDRESS_OR_KEY,
+                format!(
+                    "Block not available (pruned data): {} at height {} (prune height {})",
+                    hash_str,
+                    index.height,
+                    self.chain.prune_height()
+                ),
+            )
+            .into()
+        } else {
+            RpcError::block_not_found(hash_str).into()
+        }
+    }
+
     /// Get block by hash
     ///
     /// Parameters:
@@ -300,15 +322,15 @@ impl BlockchainRpc {
 
         let verbose = params.get_bool(1).unwrap_or(true);
 
-        let block = self
-            .chain
-            .get_block(&hash)?
-            .ok_or_else(|| RpcError::block_not_found(hash_str))?;
-
         let index = self
             .chain
             .get_block_index(&hash)?
             .ok_or_else(|| RpcError::block_not_found(hash_str))?;
+
+        let block = self
+            .chain
+            .get_block(&hash)?
+            .ok_or_else(|| self.missing_block_error(&index, hash_str))?;
 
         if !verbose {
             // Return raw hex
@@ -377,18 +399,18 @@ impl BlockchainRpc {
         let hash = parse_hash(hash_str)?;
         let verbose = params.get_bool(1).unwrap_or(true);
 
-        let block = self
-            .chain
-            .get_block(&hash)?
-            .ok_or_else(|| RpcError::block_not_found(hash_str))?;
-
         let index = self
             .chain
             .get_block_index(&hash)?
             .ok_or_else(|| RpcError::block_not_found(hash_str))?;
 
         if !verbose {
-            // Return raw hex
+            // Raw header hex needs the stored body; the verbose path below is index-only
+            // so headers of pruned blocks are still served.
+            let block = self
+                .chain
+                .get_block(&hash)?
+                .ok_or_else(|| self.missing_block_error(&index, hash_str))?;
             let raw = serialize(&block.header);
             Ok(json!(hex::encode(raw)))
         } else {
@@ -458,7 +480,8 @@ impl BlockchainRpc {
             "mediantime": mediantime,
             "verificationprogress": 1.0,
             "chainwork": chain_work,
-            "pruned": false,
+            "pruned": self.chain.prune_height() > 0,
+            "pruneheight": self.chain.prune_height(),
             "warnings": ""
         }))
     }
