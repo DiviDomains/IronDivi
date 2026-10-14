@@ -11,7 +11,7 @@ Testnet only. No upstream PR without Bert's go.
 
 ## State at 2026-10-14
 - Done (builder): 4 regtest swap tests pass (PART↔DIVI both ways, DIVI↔BTC); divid synced on Divi testnet; interface checks on testnet.
-- **Not done: a BasicSwap swap on the public Divi testnet.** No testnet BasicSwap node had been provisioned on dev-a.
+- **Done 2026-10-14: a BasicSwap swap on the public Divi testnet.** 50 tDIVI for 0.00025 tBTC, node A (dev-a) to node B (hp2, Docker), through the web UI. Both bids reached Completed in 7 min 21 s. Bid `000000006acfc61c9ee8cecea0b27b09e0ef524a21fd37cdf726724c`; locks `fdd1dc66…5a60` (seller side) and `f1e5d11b…f696` (buyer side). Screenshots and walkthrough are in the private artifact https://claude.ai/artifact/QfunsCc9wzgMNnieWTeaHm.
 
 ## Testnet run (in progress)
 Goal: a visible swap, tDIVI ↔ tBTC (Bitcoin testnet3), between two BasicSwap nodes (a node cannot take its own offer).
@@ -30,3 +30,15 @@ Goal: a visible swap, tDIVI ↔ tBTC (Bitcoin testnet3), between two BasicSwap n
 - `gh` token scopes to verify registered signing keys.
 - `secret` CLI not installed on dev-a.
 - Official Divi coin icons (`Divi.png`, `Divi-20.png`) missing.
+
+## Testnet-only workarounds (do NOT carry to mainnet or upstream)
+- `strict_swap_type: false` and the swap type forced to Secret Hash (Divi has no SegWit).
+- `restrict_unknown_seed_wallets: false` (Divi wallet has no BasicSwap seed).
+- BTC testnet `min_amount` lowered 0.001 to 0.0001 in `chainparams.py` on both nodes (uncommitted).
+- BTC in Electrum light mode on both nodes instead of a full sync.
+- Particl testnet is dead (particld stays in initial block download, so SMSG never relays). A hand-made relay script copied SMSG messages between the nodes; the swap protocol itself is unchanged.
+- `maxtipage` and `minimumchainwork` lines added to both `particl.conf`; they had no effect and should be removed at the next particld restart.
+
+## Display bugs seen
+- Seller-side bid page shows the swap amounts with swapped labels, and tags the first lock as tBTC although it is the Divi lock.
+- Divi coin icon missing.
