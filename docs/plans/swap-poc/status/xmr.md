@@ -971,3 +971,28 @@
   side; `find_spend`'s `from_height` parameter is the one place a live `DiviChain` impl needs
   to supply something their trait signature doesn't carry — flag if a different shape is
   wanted instead.
+
+## Live stagenet swap (orchestrator, 2026-10-13) — PARKED on one 1Password approval
+Running on stagenet — project is testnet-only; mainnet would be separate infra and a separate
+decision. Bert's go: "Full go — live swap now."
+- Built: maker `divi-swapd` at 8e431c0 on hp2 (sha256 `7c4e5123b9d30e902a381130b86849ed68fbdde0120899086ad86f617fd94f1d`,
+  `/mnt/storage1/bshuler-cargo/release/divi-swapd-8e431c0`); taker `divi-swap` (divi-swap-cli) at
+  8e431c0 on the Mac (`~/.cache/divi-swap-8e431c0`).
+- Taker XMR: hp2 stagenet `monero-wallet-rpc` (127.0.0.1:38088, `mining-wallet`, not restarted or
+  moved), reached from the Mac over `ssh -L 38088`. Read-only check: 6.400088 XMR unlocked, height 2228660.
+  Its login lived only in the process argv; it now has a 1Password home,
+  `IronDivi Swap POC - taker-xmr-wallet-rpc` (username/password), copied argv → stdin → `op item create`,
+  verified equal to the live process in-memory (match only, never printed).
+- monero-wallet-rpc (epee) sends two `WWW-authenticate` challenges (MD5, MD5-sess) and binds the
+  nonce to the TCP connection; Python's urllib digest handler fails on both. Rust `digest_auth` path
+  untested live until the taker's lock.
+- Maker side needs no wallet-rpc: only `lock` calls it, and in `divi-xmr-stagenet` the taker locks.
+  `[xmr].wallet_rpc_url` is a required placeholder on dnsdivi; `wallet_rpc_password` omitted.
+- Repo: unit file + `deploy.sh` CRED_REFS carry `maker-divi-xmr`; `check-deploy.sh` PASS.
+- **PARKED:** `keygen | op item create` for `IronDivi Swap POC - maker-divi-xmr` hit
+  `authorization timeout` (unapproved Touch ID). No item was created; that key was discarded.
+  Resume: rerun keygen → provision `maker-divi-xmr` to dnsdivi (stdin) → install unit + daemon-reload →
+  fund from node5 + 1 conf → backup toml, add `[xmr]` (stagenet, monerod `http://node.monerodevs.org:38089`,
+  sweep to the hp2 mining-wallet address) + enable offer → `redeploy-maker.sh --binary` → taker.
+- Evidence caveat: maker sweep address = the taker's wallet, so proof is the lock + sweep txids and
+  the taker's DIVI claim txid, not a balance delta. The maker has no XMR wallet of its own.
