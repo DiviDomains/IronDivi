@@ -144,3 +144,41 @@ What this changes:
 Revised recommendation order: (1) investigate and shrink `block_index` (read the serialization in
 `divi-storage/src/block_index.rs`), (2) `thin` profile (expire + indexes off), (3) snapshot start.
 Held for Bert's pick of approach: snapshot export/import and any shim work.
+
+## 9. Why `block_index` is ~1 KB per block (investigated 2026-10-14)
+
+Method: read-only secondary open of the live mainnet `block_index` column family; iterated every
+entry and parsed the serialization (`BlockIndex::to_bytes`, `divi-storage/src/block_index.rs`).
+Correction to §8: the chain is at **4,258,903 blocks**, not 3.83 M (the RocksDB key count was an
+estimate). The per-block cost is therefore ~990 B including the height->hash entry, not 1.1 KB.
+
+Measured, per block (4.26 M entries):
+* Value entry: 4,012 MB raw, **average 942 B**. Height->hash entry: 5-byte key, ~37 B (158 MB total).
+* Fixed fields (hash, prev, merkle root, time, bits, nonce, accumulator, chain work, status, file
+  position, stake modifier): **~210 B**. Every entry carries the 32 B accumulator.
+* **`lottery_winners`: ~650-700 B per block, about 70% of the entry.** 4,252,366 of 4,258,903 entries
+  (99.8%) hold the full list of 11 winner records, each a 32 B tx hash plus a payment script
+  (~26 B). The list is copied forward into every block's index (`update_lottery_winners`,
+  `chain.rs`), so it is stored 4.26 M times though it changes only when a stake qualifies.
+* The data is poorly compressible (hashes), so on-disk size (4,231 MB) is close to the raw size.
+
+Who needs old copies? `is_payment_script_vetoed_for_lottery` reads winners at only three heights,
+one block before each of the last 3 lottery blocks (cycle 10,080 blocks), so everything older than
+~30,240 blocks (~21 days) plus the 2,880-block reorg floor is dead weight. The staking path does not
+read winners at all.
+
+### Fix (proposed, not built)
+Extend the expire pass: for heights below `tip - max(window, 3*10,080 + 2,880)`, rewrite the
+index entry with an empty winners list (decoder already accepts a zero count), then compact
+`block_index`. Reversible in the sense that nothing consensus-relevant is lost; winners for old
+blocks are never read. Saves about 650 B x ~4.2 M = **~2.7 GB**.
+A new-node variant stores winners only as a per-block delta or only for recent blocks.
+
+### Resulting mainnet footprint (estimate, to be confirmed on a testnet-sized run first)
+| State | chainstate | + txindex | Total |
+|---|---|---|---|
+| Today (full) | 8.06 GB | 0.74 GB | 8.4 GB |
+| `expire` only (bodies + undo gone) | 4.62 GB | 0.74 GB | ~5.4 GB (4.6 GB, index off) |
+| `expire` + winner stripping | ~1.9 GB | 0.74 GB | ~2.6 GB (**~1.9 GB**, index off) |
+Remaining after both: ~1.3 GB block_index (fixed fields) + 0.4 GB UTXO + ~0.2 GB height map.
+Further option: drop `accumulator` (32 B/block, 140 MB) for old v4 blocks; small, skip for now.
