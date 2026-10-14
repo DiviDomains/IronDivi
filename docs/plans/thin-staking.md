@@ -241,11 +241,11 @@ RPC `getblock` for a height at or below `pruneheight` asks the fetcher (`BlockFe
 block comes back.
 
 ### Work remaining
-1. Wallet rescan below `pruneheight` still has no caller (`getblock` is done).
+1. Done 2026-10-14: `rescanblockchain` fetches pruned blocks through the same path. It checks the first block of the range before clearing wallet data, so a rescan with no full peer is refused and the wallet is left alone. Live: hp1 rescanned heights 100-110 via hp3; with no peer it refused.
 2. Prefer `NODE_NETWORK` peers when choosing sync peers.
 3. Done: `getblockchaininfo` reports `fullhistorypeers` and `lastblockfetch` (live-checked), and a
    failed fetch logs a warning. No separate startup warning: peers are not connected at startup.
-   Sync-peer preference (item 2) left out on purpose: block retry already falls over to other peers.
+   Item 2 done: `order_retry_peers` puts full-history peers ahead of pruned ones (failed peers still last, announcer/assigned peer still first); unit-tested, not distinguishable live with a single peer.
 4. Done 2026-10-14 on testnet: a snapshot-imported hp1 node (pruneheight 346,981) with
    `--connect` to the unstripped hp3 node returned block 100 over `getblock`; the same node with no
    reachable peer returned the pruned-data error (code -5). The fetched block's hex was byte-identical

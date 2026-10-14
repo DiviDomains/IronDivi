@@ -51,6 +51,21 @@ pub trait BlockFetcher: Send + Sync {
     fn last_result(&self) -> Option<String>;
 }
 
+/// Load a block body, asking `fetcher` for it if it is pruned locally. `None` if unobtainable.
+pub fn load_block_or_fetch(
+    chain: &Chain,
+    fetcher: Option<&Arc<dyn BlockFetcher>>,
+    index: &divi_storage::block_index::BlockIndex,
+) -> Result<Option<divi_primitives::block::Block>, divi_storage::StorageError> {
+    if let Some(block) = chain.get_block(&index.hash)? {
+        return Ok(Some(block));
+    }
+    if index.height <= chain.prune_height() {
+        return Ok(fetcher.and_then(|f| f.fetch_block(index.hash, index.merkle_root)));
+    }
+    Ok(None)
+}
+
 /// Mempool statistics for RPC responses
 #[derive(Debug, Clone, Default)]
 pub struct MempoolStats {
@@ -282,18 +297,13 @@ impl BlockchainRpc {
     /// Load a block body, asking a full-history peer if it is pruned locally.
     fn load_block(
         &self,
-        hash: &Hash256,
+        _hash: &Hash256,
         index: &divi_storage::block_index::BlockIndex,
         hash_str: &str,
     ) -> Result<divi_primitives::block::Block, Error> {
-        if let Some(block) = self.chain.get_block(hash)? {
+        let fetcher = self.block_fetcher.read().clone();
+        if let Some(block) = load_block_or_fetch(&self.chain, fetcher.as_ref(), index)? {
             return Ok(block);
-        }
-        if index.height <= self.chain.prune_height() {
-            let fetcher = self.block_fetcher.read().clone();
-            if let Some(block) = fetcher.and_then(|f| f.fetch_block(*hash, index.merkle_root)) {
-                return Ok(block);
-            }
         }
         Err(self.missing_block_error(index, hash_str))
     }

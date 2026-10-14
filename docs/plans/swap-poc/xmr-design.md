@@ -89,8 +89,10 @@ every timelock — before funds move:
 
 Why each one is shaped this way:
 
-- **`Tx_cancel`** just moves the lock to a fresh 2-of-2 so it has an escape hatch — `Tx_lock`'s
-  own output doesn't need one since it's never spent by anything *except* `Tx_cancel`.
+- **`Tx_cancel`** kills the redeem path *before* anything reveals `s_m`. Refund cannot spend
+  `Tx_lock` directly: `Tx_refund` reveals `s_m` in the mempool, and while `Tx_redeem` is still
+  valid the taker could sweep the XMR and double-spend the refund with redeem. Its txid is also
+  what makes it malleable (C1): see `xmr-c1-design.md`.
 - **`Tx_redeem`** is the happy path: Taker wants this to go through (it pays her the DIVI), so
   *she* is the one who completes Maker's encrypted signature (she already holds the decryption
   key `s_t`) and broadcasts. Maker, watching the chain, now has both the encrypted and completed
@@ -537,6 +539,12 @@ incidental, so a force-fit attempt would be wasted effort, not a useful first tr
   harder to keep maintained than it looks, or demand is thin, or both. Budget this lane's
   downstream build (steps 2–9) as a multi-week effort, not a quick wire-up, even with the crates in
   [Crates](#crates) doing the cryptographic heavy lifting.
+- **Correction 2026-10-14 (C1):** the note below is wrong on two counts. A counterparty can
+  re-sign its own half of `Tx_cancel` with a fresh nonce, and on PoS DIVI "the miner" is any
+  staker — anyone with coins. Divi's mandatory flags are P2SH | DERSIG | REQUIRE_COINSTAKE
+  (+CLTV); LOW_S, MINIMALDATA, NULLDUMMY, SIGPUSHONLY and CLEANSTACK are relay-only, so a staker
+  can mine S-flips, non-minimal pushes, any CHECKMULTISIG dummy and extra stack items. The
+  result is a ransom, not just a liveness loss. Fix design: `xmr-c1-design.md`.
 - **Pre-segwit transaction malleability, closed against a passive relayer, not against the
   transaction's own miner.** Every presigned child in [Protocol](#protocol) references its
   parent by txid (`Tx_redeem`/`Tx_refund`/`Tx_punish` → `Tx_cancel` or `Tx_lock`), so if a

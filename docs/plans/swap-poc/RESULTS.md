@@ -382,6 +382,10 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     several coins (or to queue accepts) to serve swaps in parallel.
   - punish was not run through dnsdivi (it means stalling the shared maker for `t_punish`); it ran
     live on 2026-10-12, above.
+- XMR maker-owned wallet (plan A4), 2026-10-14. A view-only wallet built from the maker's own
+  stagenet address and view key (`generate_from_keys`, restore height 2227000, hp2) shows the two
+  swaps swept after the a7cb7e9 deploy arriving: `10033e49066b9d75…` 0.0019696 sXMR and
+  `0da938c71b88331b…` 0.00196946 sXMR, both height 2229221; balance 0.00393906 sXMR.
 - `tools/swap-poc/verify-results.sh`, first run from the Mac 2026-10-12: 110 unique txids, 108
   confirmed. The 2 "missing" rows are script misattributions: `1e184a6f…` is the CLTV probe the
   node rejected by design, and `1a3dd95e…` is a BTC refund (confirmed, testnet3 block 5158301)

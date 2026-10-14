@@ -1034,6 +1034,10 @@ taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
      The gate only reads `/swaps`; `/xmr/swaps` was checked by hand (one swap, `done`).
 - Mainnet is not in scope here. What stands between this and mainnet: `../xmr-mainnet-plan.md`.
 
+## NEEDS HUMAN
+
+- Review `docs/plans/swap-poc/xmr-c1-design.md` (C1 fix: 2P-ECDSA cancel key + unilateral punish), and say whether to land the §4.4 interim hardening first.
+
 ## Mainnet plan gates (orchestrator, 2026-10-14)
 
 Scope from Bert: run through Phase B and prepare the Phase C brief; test coins only; the mainnet
@@ -1044,9 +1048,9 @@ before any real-money swap.
   - done: A1 (xmr-lock timeout), A2/A3 (mainnet profile and derived schedule), A6, A7.
   - A4 deployed 18:17 UTC (a7cb7e9): the maker sweeps into its own stagenet wallet `5B948h…aJt`.
     The two swaps after the deploy (`a5817fa7`, `c7bbc86d`) swept under the new toml and were
-    `done` by 18:34 (the swap view carries no sweep txid). Proof of receipt on a view-only wallet is parked: the view-key read hit an unanswered 1Password
-    prompt. hp2 runs an empty wallet-rpc on `127.0.0.1:38099` for it; retry is
-    `scratchpad/a4-viewonly.sh start` then `balance`.
+    `done` by 18:34 (the swap view carries no sweep txid). **A4 proved:** a view-only wallet
+    (maker address + view key, restored on hp2 `127.0.0.1:38099`) shows both sweeps arriving,
+    `10033e49…` 0.0019696 and `0da938c7…` 0.00196946 sXMR at height 2229221, balance 0.00393906.
   - A5 open: dnsdivi's own stagenet monerod is CPU-bound at height ~144k of 2.229M; the maker
     still uses the public node.
   - A8 in progress: 14 happy redeemed, 2 restarts with swaps open; 7 refunds land after
@@ -1058,6 +1062,10 @@ before any real-money swap.
   - done: B1 (rollback rehearsed), B1b, B2 (swap-watch, plus the `t_punish` margin alert).
   - B3 needs one human walk-through of `xmr-runbook.md`.
   - B4 mainnet keys are generated at Bert's keyboard (Phase D).
+- **C1 (Bert 2026-10-14: fix C1 first, stay on stagenet).** The fix is a large protocol change
+  (2P-ECDSA joint cancel key, new `Tx_lock` script, wire changes), so it is designed, not built:
+  `xmr-c1-design.md`. It also found C7 (stakers can malleate `Tx_lock`). No mainnet keys, no
+  Phase D/B4 until C1 is implemented and passes the design's §7 stagenet tests.
 - **Phase C brief:** `xmr-review-brief.md` (e6a6fad). Drafting it found C1-C6 (plan §Phase C);
   C1, counterparty malleation of `Tx_cancel`, needs a protocol change or written acceptance before
   any mainnet swap.

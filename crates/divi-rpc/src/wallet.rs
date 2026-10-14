@@ -83,6 +83,8 @@ pub struct WalletRpc {
     height: Arc<RwLock<u32>>,
     tx_submit: RwLock<Option<TxSubmitCallback>>,
     chain: Option<Arc<Chain>>,
+    /// Fetches pruned blocks from full-history peers during rescan
+    block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
     locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
 }
 
@@ -92,9 +94,14 @@ impl WalletRpc {
             wallet: Arc::new(RwLock::new(None)),
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
+            block_fetcher: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    pub fn set_block_fetcher(&self, fetcher: Arc<dyn crate::blockchain::BlockFetcher>) {
+        *self.block_fetcher.write() = Some(fetcher);
     }
 
     pub fn with_wallet(wallet: Arc<WalletDb>) -> Self {
@@ -102,6 +109,7 @@ impl WalletRpc {
             wallet: Arc::new(RwLock::new(Some(wallet))),
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
+            block_fetcher: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -113,6 +121,7 @@ impl WalletRpc {
             wallet: Arc::new(RwLock::new(None)),
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
+            block_fetcher: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -124,6 +133,7 @@ impl WalletRpc {
             wallet: Arc::new(RwLock::new(Some(wallet))),
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
+            block_fetcher: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -789,6 +799,22 @@ impl WalletRpc {
             start_height, stop_height
         );
 
+        // Do not wipe the wallet if the first block cannot be had at all
+        let fetcher = self.block_fetcher.read().clone();
+        if let Some(first) = chain.get_block_index_by_height(start_height)? {
+            if crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &first)?.is_none() {
+                return Err(RpcError::new(
+                    codes::MISC_ERROR,
+                    format!(
+                        "Block {} is pruned and no full-history peer returned it; rescan from a later height (prune height {})",
+                        start_height,
+                        chain.prune_height()
+                    ),
+                )
+                .into());
+            }
+        }
+
         info!("Clearing existing wallet data before rescan");
         wallet.clear_transactions_and_utxos();
 
@@ -807,8 +833,12 @@ impl WalletRpc {
                 }
             };
 
-            // Get full block
-            let block = match chain.get_block(&index.hash)? {
+            // Get full block, from a full-history peer if it is pruned locally
+            let block = match crate::blockchain::load_block_or_fetch(
+                chain,
+                fetcher.as_ref(),
+                &index,
+            )? {
                 Some(blk) => blk,
                 None => {
                     info!("Block data for hash {} at height {} not found, stopping rescan (total scanned: {})", 

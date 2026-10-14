@@ -242,7 +242,10 @@ gate for all her swaps (`taker.rs:173`).
 
 ## 5. Questions for the reviewer, in priority order
 
-1. **Tx_cancel txid stability.** Tx_refund and Tx_punish spend the *signed* Tx_cancel by txid
+1. **Tx_cancel txid stability — is the C1 fix sound?** We have answered the question below
+   ourselves: yes, both counterparties and any staker can malleate Tx_cancel (and stakers can
+   malleate Tx_lock). The proposed fix is `xmr-c1-design.md`; its §8 lists what we want you to
+   check. The original question, kept for context: Tx_refund and Tx_punish spend the *signed* Tx_cancel by txid
    (`api.rs:120-145`). After step 2 the taker holds the maker's Tx_cancel signature and her own
    key; after step 3 the maker holds both signatures. Can either party re-sign its own half with
    a fresh nonce and get a different, relay-standard Tx_cancel mined after `t_cancel`? If so,

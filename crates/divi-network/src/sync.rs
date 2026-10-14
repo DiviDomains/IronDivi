@@ -257,12 +257,15 @@ enum BlockRetryOutcome {
 ///
 /// Peers that already failed this block go last (they stay as a fallback so a
 /// single-peer node can still retry). Among the rest: the announcing peer
-/// first, then the assigned peer, then everyone else rotated by `cursor`.
+/// first, then the assigned peer, then everyone else rotated by `cursor`
+/// with full-history peers (`full`) ahead of pruned ones, since a pruned
+/// peer may not have an old block.
 /// `connected` comes from a `HashMap`, so it is sorted first; without that the
 /// "rotation" would follow hash order and keep landing on the same peers.
 fn order_retry_peers(
     mut connected: Vec<PeerId>,
     failed: &HashSet<PeerId>,
+    full: &HashSet<PeerId>,
     announced_by: Option<PeerId>,
     assigned_peer: PeerId,
     cursor: usize,
@@ -274,6 +277,11 @@ fn order_retry_peers(
     if !fresh.is_empty() {
         let len = fresh.len();
         fresh.rotate_left(cursor % len);
+        // Stable: keeps the rotation order within each group
+        let (mut full_first, pruned): (Vec<PeerId>, Vec<PeerId>) =
+            fresh.into_iter().partition(|p| full.contains(p));
+        full_first.extend(pruned);
+        fresh = full_first;
     }
     for preferred in [
         assigned_peer,
@@ -2044,7 +2052,15 @@ impl BlockSync {
             None => (HashSet::new(), None),
         };
         let cursor = self.retry_cursor.fetch_add(1, Ordering::Relaxed);
-        order_retry_peers(connected, &failed, announced_by, assigned_peer, cursor)
+        let full: HashSet<PeerId> = self.peer_manager.full_history_peers().into_iter().collect();
+        order_retry_peers(
+            connected,
+            &failed,
+            &full,
+            announced_by,
+            assigned_peer,
+            cursor,
+        )
     }
 
     /// Try to connect orphan blocks to the chain
@@ -3103,23 +3119,43 @@ mod tests {
     }
 
     #[test]
+    fn test_order_retry_peers_prefers_full_history_peers() {
+        let full: HashSet<PeerId> = [2, 4].into_iter().collect();
+        for cursor in 0..4 {
+            let order =
+                order_retry_peers(vec![1, 2, 3, 4], &HashSet::new(), &full, None, 0, cursor);
+            assert!(full.contains(&order[0]) && full.contains(&order[1]));
+        }
+        // A failed full peer still goes last
+        let failed: HashSet<PeerId> = [2].into_iter().collect();
+        let order = order_retry_peers(vec![1, 2, 3, 4], &failed, &full, None, 0, 0);
+        assert_eq!(order[0], 4);
+        assert_eq!(order[3], 2);
+    }
+
+    #[test]
     fn test_order_retry_peers_skips_failed_and_prefers_announcer() {
         let failed: HashSet<PeerId> = [2].into_iter().collect();
         // The announcer leads, the failed peer is only a last resort.
-        let order = order_retry_peers(vec![3, 1, 2, 4], &failed, Some(4), 0, 0);
+        let order = order_retry_peers(vec![3, 1, 2, 4], &failed, &HashSet::new(), Some(4), 0, 0);
         assert_eq!(order[0], 4);
         assert_eq!(*order.last().unwrap(), 2);
         // A failed announcer is not preferred.
-        let order = order_retry_peers(vec![1, 2, 3], &failed, Some(2), 0, 0);
+        let order = order_retry_peers(vec![1, 2, 3], &failed, &HashSet::new(), Some(2), 0, 0);
         assert_eq!(*order.last().unwrap(), 2);
         // Without preferences the cursor rotates the start over sorted peers.
         let starts: Vec<PeerId> = (0..3)
-            .map(|c| order_retry_peers(vec![3, 1, 2], &HashSet::new(), None, 0, c)[0])
+            .map(|c| {
+                order_retry_peers(vec![3, 1, 2], &HashSet::new(), &HashSet::new(), None, 0, c)[0]
+            })
             .collect();
         assert_eq!(starts, vec![1, 2, 3]);
         // Everyone failed: still returns them all (single-peer nodes can retry).
         let all: HashSet<PeerId> = [1, 2].into_iter().collect();
-        assert_eq!(order_retry_peers(vec![2, 1], &all, None, 0, 0).len(), 2);
+        assert_eq!(
+            order_retry_peers(vec![2, 1], &all, &HashSet::new(), None, 0, 0).len(),
+            2
+        );
     }
 
     #[tokio::test]

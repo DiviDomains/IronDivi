@@ -181,6 +181,7 @@ impl RpcServer {
 
     /// Let `getblock` fetch pruned blocks from full-history peers
     pub fn set_block_fetcher(&self, fetcher: Arc<dyn crate::blockchain::BlockFetcher>) {
+        self.wallet.set_block_fetcher(fetcher.clone());
         self.blockchain.set_block_fetcher(fetcher);
     }
 
