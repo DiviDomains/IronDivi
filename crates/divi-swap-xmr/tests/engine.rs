@@ -9,17 +9,21 @@
 //! The DIVI<->XMR adaptor swap, maker and taker engines in one process over the mock chains
 //! (real DIVI transactions and script checks; Monero outputs opened only by `s·G = S`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use divi_swap::api::{Direction, Offer};
-use divi_swap::{Chain, Profile, Store, SwapConfig};
+use divi_swap::{Chain, Profile, Result, Store, SwapConfig};
+use divi_swap_xmr::chain::{MoneroChain, XmrOutput};
 use divi_swap_xmr::mock::{
     MockDiviChain, MockDiviWallet, MockMoneroChain, MockMoneroWallet, MOCK_DIVI_FEE, MOCK_XMR_FEE,
 };
 use divi_swap_xmr::{
     XmrConfig, XmrMaker, XmrMakerState, XmrTaker, XmrTakerState, PICONERO_PER_COUNTER_SAT,
 };
+use tokio::sync::Notify;
 
 const T0: u32 = 1_800_000_000;
 const XMR_UNITS: u64 = 1_000_000; // 0.01 XMR in 1e-8 units
@@ -530,4 +534,91 @@ async fn no_xmr_lock_without_a_valid_punish_signature() {
     view.maker_punish_sig = Some(good);
     w.taker.step(&tid, Some(&view)).await.unwrap();
     assert!(w.taker_rec(&tid).xmr_txid.is_some());
+}
+
+/// A Monero wallet whose next `find_lock` parks until released: a monerod scan that hangs.
+struct StallingScan {
+    inner: MockMoneroWallet,
+    armed: AtomicBool,
+    parked: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl MoneroChain for StallingScan {
+    async fn lock(&self, spend_pub: &[u8; 32], view: &[u8; 32], amount: u64) -> Result<String> {
+        self.inner.lock(spend_pub, view, amount).await
+    }
+
+    async fn find_lock(&self, spend: &[u8; 32], view: &[u8; 32]) -> Result<Option<XmrOutput>> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.parked.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.find_lock(spend, view).await
+    }
+
+    async fn sweep(&self, lock: &XmrOutput, spend: &[u8; 32], view: &[u8; 32]) -> Result<String> {
+        self.inner.sweep(lock, spend, view).await
+    }
+
+    async fn confirmations(&self, txid: &str) -> Result<Option<u32>> {
+        self.inner.confirmations(txid).await
+    }
+}
+
+/// Swaps step independently: while one swap's step is stuck in a Monero scan, another
+/// swap's step runs to completion (under the old engine-wide gate it waited).
+#[tokio::test]
+async fn a_stuck_scan_does_not_hold_up_other_swaps() {
+    let w = W::new();
+    let (ma, ta) = w.open().await;
+    w.mine(1);
+    let (mb, tb) = w.open().await;
+    let mut notices = (None, None);
+    for _ in 0..40 {
+        let _ = w.maker.tick().await;
+        for (mid, tid, n) in [(&ma, &ta, &mut notices.0), (&mb, &tb, &mut notices.1)] {
+            let v = w.maker.view(mid).unwrap();
+            let _ = w.taker.step(tid, v.as_ref()).await;
+            *n = w.taker.lock_notice(tid).unwrap();
+        }
+        if notices.0.is_some() && notices.1.is_some() {
+            break;
+        }
+        w.mine(1);
+    }
+    w.mine(10);
+    w.maker.xmr_locked(&ma, notices.0.unwrap()).await.unwrap();
+    w.maker.xmr_locked(&mb, notices.1.unwrap()).await.unwrap();
+
+    // A second maker engine over the same database, whose Monero scans can be stalled.
+    let scan = Arc::new(StallingScan {
+        inner: w.maker_xmr.clone(),
+        armed: AtomicBool::new(true),
+        parked: Notify::new(),
+        release: Notify::new(),
+    });
+    let c = w.clock.clone();
+    let maker = XmrMaker::new(
+        cfg(),
+        Arc::new(w.maker_divi.clone()),
+        scan.clone(),
+        w.store.clone(),
+        vec![offer()],
+    )
+    .unwrap()
+    .with_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+
+    let other = async {
+        scan.parked.notified().await; // swap A is now inside its scan
+        let b = tokio::time::timeout(Duration::from_secs(5), maker.step(&mb))
+            .await
+            .expect("swap B waited on swap A's scan");
+        scan.release.notify_one();
+        b
+    };
+    let (a, b) = tokio::join!(maker.step(&ma), other);
+    assert_eq!(a.unwrap(), XmrMakerState::RedeemOffered);
+    assert_eq!(b.unwrap(), XmrMakerState::RedeemOffered);
 }

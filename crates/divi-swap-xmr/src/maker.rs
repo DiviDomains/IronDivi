@@ -27,6 +27,7 @@
 //! Every transition and every signed transaction is persisted before the side effect it
 //! precedes; [`XmrMaker::step`] is idempotent and safe to re-run after a crash.
 
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -262,7 +263,37 @@ pub struct XmrMaker {
     store: Store,
     offers: Vec<Offer>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    gate: tokio::sync::Mutex<()>,
+    /// One lock per swap, held across a swap's load → `advance` → persist. It replaces a
+    /// single engine-wide gate, under which one slow Monero scan (`find_lock`) stalled every
+    /// other swap's step and every request. What that gate actually protected was this
+    /// read-modify-write: two concurrent steps of one swap (a request's `step` and the
+    /// scheduler's `tick`, or `xmr_locked` recording a txid) would each persist their own
+    /// copy and lose the other's update. Nothing it covered was shared between swaps:
+    /// - coin selection for `Tx_lock` happens in `setup`, which never took the gate; the
+    ///   live DIVI wallet selects and reserves coins under its own wallet lock
+    ///   (`swap_chain_xmr::divi_chain`), so two swaps cannot pick the same coins;
+    /// - each `Store` write is atomic under the store's connection lock, and every swap
+    ///   writes only its own document;
+    /// - the quote bookkeeping `setup` does has its own lock, `quotes_in_setup`.
+    ///
+    /// Entries are dropped once nobody holds them (`swap_lock`).
+    swap_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Quote ids a `setup` is working on. `setup` checks a quote is unused, then awaits the
+    /// DIVI wallet and chain, then marks it used; without this two concurrent setups on one
+    /// quote would both pass the check and open two swaps for it. Never held across an await.
+    quotes_in_setup: parking_lot::Mutex<HashSet<String>>,
+}
+
+/// Removes a quote id from `XmrMaker::quotes_in_setup` when `setup` returns.
+struct QuoteClaim<'a> {
+    set: &'a parking_lot::Mutex<HashSet<String>>,
+    id: String,
+}
+
+impl Drop for QuoteClaim<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.id);
+    }
 }
 
 impl XmrMaker {
@@ -291,7 +322,8 @@ impl XmrMaker {
             store,
             offers,
             clock: Arc::new(unix_now),
-            gate: tokio::sync::Mutex::new(()),
+            swap_locks: parking_lot::Mutex::new(HashMap::new()),
+            quotes_in_setup: parking_lot::Mutex::new(HashSet::new()),
         })
     }
 
@@ -349,6 +381,16 @@ impl XmrMaker {
     /// Step 1 → 2: verify the taker's DLEQ proof, generate our keys, build `Tx_lock` (not
     /// broadcast) and the presigned templates, sign `Tx_cancel` and `Tx_punish`.
     pub async fn setup(&self, req: SetupRequest) -> Result<SetupReply> {
+        let _claim = {
+            let mut set = self.quotes_in_setup.lock();
+            if !set.insert(req.quote_id.clone()) {
+                return Err(SwapError::InvalidParams("quote already being used".into()));
+            }
+            QuoteClaim {
+                set: &self.quotes_in_setup,
+                id: req.quote_id.clone(),
+            }
+        };
         let mut qr = self
             .store
             .get_quote(&req.quote_id)?
@@ -471,7 +513,8 @@ impl XmrMaker {
     /// verified before anything is broadcast; then `Tx_lock` goes out.
     pub async fn sigs(&self, swap_id: &str, req: SigsRequest) -> Result<XmrSwapView> {
         {
-            let _g = self.gate.lock().await;
+            let lock = self.swap_lock(swap_id);
+            let _g = lock.lock().await;
             let mut r = self.load(swap_id)?;
             let encsig = req.taker_refund_encsig.to_string();
             let cancel_sig = hex::encode(&req.taker_cancel_sig);
@@ -545,7 +588,8 @@ impl XmrMaker {
     /// blocks on a remote monerod — longer than the taker's HTTP timeout if run in the request.
     pub async fn xmr_locked(&self, swap_id: &str, notice: XmrLockNotice) -> Result<XmrSwapView> {
         {
-            let _g = self.gate.lock().await;
+            let lock = self.swap_lock(swap_id);
+            let _g = lock.lock().await;
             let mut r = self.load(swap_id)?;
             match (&r.xmr_txid, r.state) {
                 (Some(t), _) if *t == notice.xmr_txid => {}
@@ -597,7 +641,17 @@ impl XmrMaker {
             .count())
     }
 
-    /// `step` every non-terminal swap; errors are recorded on the swap.
+    /// The lock serializing `swap_id`'s read-modify-write. Entries nobody else holds are
+    /// pruned on the way: a strong count of 1 means no step holds or awaits that lock, so a
+    /// later call simply makes a fresh one.
+    fn swap_lock(&self, swap_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.swap_locks.lock();
+        locks.retain(|id, l| id == swap_id || Arc::strong_count(l) > 1);
+        locks.entry(swap_id.to_string()).or_default().clone()
+    }
+
+    /// `step` every non-terminal swap; errors are recorded on the swap. Sequential: each swap
+    /// has its own lock, so a request for another swap is never held up behind this loop.
     pub async fn tick(&self) -> Result<()> {
         for r in self.store.list_docs::<XmrMakerRecord>(KIND)? {
             if !r.state.is_terminal() {
@@ -609,7 +663,8 @@ impl XmrMaker {
 
     /// Advance one swap as far as it goes now. Idempotent; safe after a restart.
     pub async fn step(&self, swap_id: &str) -> Result<XmrMakerState> {
-        let _g = self.gate.lock().await;
+        let lock = self.swap_lock(swap_id);
+        let _g = lock.lock().await;
         let mut r = self.load(swap_id)?;
         if r.state.is_terminal() {
             return Ok(r.state);
