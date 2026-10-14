@@ -678,9 +678,15 @@ impl ChainDatabase {
 
     /// Clear the per-block lottery-winner list from block-index entries for heights
     /// `(winners_strip_height, cutoff]`, advance the watermark, and compact `block_index`.
-    /// Every other field of the entry is kept. The caller must pick a cutoff old enough that
-    /// consensus never reads those lists again. Returns the number of entries rewritten.
-    pub fn strip_lottery_winners_to(&self, cutoff: u32) -> Result<u32, StorageError> {
+    /// Every other field of the entry is kept, and so is the list at any height where
+    /// `keep(height)` is true (the caller passes the heights consensus reads at any depth).
+    /// The caller must pick a cutoff old enough that consensus never reads the rest again.
+    /// Returns the number of entries rewritten.
+    pub fn strip_lottery_winners_to(
+        &self,
+        cutoff: u32,
+        keep: impl Fn(u32) -> bool,
+    ) -> Result<u32, StorageError> {
         let start = self.winners_strip_height();
         if cutoff <= start {
             return Ok(0);
@@ -694,6 +700,9 @@ impl ChainDatabase {
             let mut batch = WriteBatch::default();
             let mut touched = Vec::new();
             for height in h..=chunk_end {
+                if keep(height) {
+                    continue;
+                }
                 let Some(hash) = self.get_height_mapping(height)? else {
                     continue;
                 };

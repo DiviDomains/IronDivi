@@ -705,6 +705,16 @@ impl Chain {
         self.db.winners_strip_height()
     }
 
+    /// True if consensus may read the lottery-winner list stored at `height` at any future
+    /// time: the block just before a lottery block (payment validation and the veto check
+    /// both read exactly there), or the one before the first lottery start (the veto check's
+    /// first-cycle lookup). These few lists (about 420 on mainnet) are never stripped.
+    pub fn is_winners_terminal_height(&self, height: u32) -> bool {
+        let (start, cycle) = self.get_lottery_params();
+        let next = height.saturating_add(1);
+        next == start || divi_consensus::lottery::is_lottery_block(next, start, cycle)
+    }
+
     /// Highest height whose lottery-winner list may be cleared, or `None`. Consensus reads the
     /// winners only one block before each of the last `LOTTERY_VETO_CYCLES` lottery blocks, so
     /// anything older than that many cycles plus the reorg floor is never read again.
@@ -732,7 +742,8 @@ impl Chain {
             Some(cutoff) => {
                 let pruned = self.db.prune_blocks_to(cutoff)?;
                 if let Some(strip) = self.winners_strip_cutoff(cutoff) {
-                    self.db.strip_lottery_winners_to(strip)?;
+                    self.db
+                        .strip_lottery_winners_to(strip, |h| self.is_winners_terminal_height(h))?;
                 }
                 Ok(pruned)
             }
@@ -5182,7 +5193,7 @@ mod tests {
         );
         for (h, hash) in hashes.iter().enumerate().skip(1) {
             let idx = chain.get_block_index(hash).unwrap().unwrap();
-            if (h as u32) <= strip {
+            if (h as u32) <= strip && !chain.is_winners_terminal_height(h as u32) {
                 assert!(
                     idx.lottery_winners.coinstakes.is_empty(),
                     "winners {h} stripped"
@@ -5193,6 +5204,11 @@ mod tests {
             assert_eq!(idx.height, h as u32);
             assert_eq!(idx.hash, *hash);
         }
+        // Terminal lists (the block before each lottery block) survive below the watermark.
+        let kept_terminals = (1..=strip)
+            .filter(|h| chain.is_winners_terminal_height(*h))
+            .count();
+        assert!(kept_terminals > 5, "test must cover terminals below strip");
         // Survives a round trip through the DB (not just the cache) and is idempotent.
         let raw = chain.db.get_block_index(&hashes[1]).unwrap().unwrap();
         assert!(raw.lottery_winners.coinstakes.is_empty());
