@@ -2,7 +2,7 @@
 
 Scope: the **BasicSwap DEX** (https://basicswapdex.com, github.com/basicswap/basicswap) with Divi added as a coin.
 This is separate from the Divi-native swap system (`divi-swapd`, see `../swap-poc/`).
-Testnet only. No upstream PR without Bert's go.
+Testnet only. No upstream PR without the owner's go.
 
 ## Where the work lives
 - Code: the builder host (`~/code/divi-basicswap/basicswap`) (Divi added, modelled on PIVX). Report from the first builder: `~/code/divi-basicswap/REPORT.md` there.
@@ -20,12 +20,12 @@ Goal: a visible swap, tDIVI ↔ tBTC (Bitcoin testnet3), between two BasicSwap n
 - Node B: `~/bsx-b` on a second host, in Docker (its system Python is 3.10; BasicSwap needs 3.11). Running; Divi synced. BTC deposit address `tb1ql9nn8grqmw3e6rt87z9uye643fdekqatxf49kw`.
 - tBTC for node B: sweeping the swap-poc taker wallet to that address with `btc_cltv_proof sweep` (key resolved from 1Password at run time; waits on a broker approval).
 - Waiting on: Bitcoin testnet3 and Particl header sync on both nodes (BTC ~97% at last check).
-- Next: node A offers DIVI for BTC (`ABS_LOCK_BLOCKS`), node B bids and accepts, watch the bid reach `SWAP_COMPLETED`; tunnel both web UIs (:13000) to Bert's Mac.
+- Next: node A offers DIVI for BTC (`ABS_LOCK_BLOCKS`), node B bids and accepts, watch the bid reach `SWAP_COMPLETED`; tunnel both web UIs (:13000) to the owner's machine.
 
 ## Bugs found by provisioning on a real testnet (beyond the 13 in REPORT.md)
 14. `DIVIPrepare` wrote no `rpcuser`/`rpcpassword` (divid has no cookie auth and ignores `rpcauth`) and the base class wrote a `[test]` section divid does not parse; divid exited at start with "you must set an rpcpassword". The regtest harness wrote its own conf, so tests never hit it. Fix: `prepareDataDir` override, random per-run rpc password written to both `divi.conf` and `basicswap.json`.
 
-## Open items for Bert (from REPORT.md)
+## Open items for the owner (from REPORT.md)
 - Signing identity on the builder host (commits would show Unverified on GitHub).
 - `gh` token scopes to verify registered signing keys.
 - `secret` CLI not installed on the builder host.
