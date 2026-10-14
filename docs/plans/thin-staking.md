@@ -229,21 +229,26 @@ C++ divid peers set bit 0, so they count as full-history peers with no new bit.
 Check still open: confirm from `their_version.services` on testnet that C++ Divi never uses bit 10.
 `PeerManager::full_history_peers()` lists peers with bit 0.
 
-### Built (unit-tested; no caller yet)
+### Built (unit-tested; RPC `getblock` caller live-tested)
 `divi-node/src/history_fetch.rs`: `HistoryFetcher::fetch_block(hash, merkle_root)` asks
 `full_history_peers()` in turn, 20 s timeout each, accepts only a block whose hash and merkle root
 match what our index says, and returns `NoFullPeers`/`NotAvailable` otherwise (never guesses). The node
 message loop hands matching `Block`/`NotFound` replies to it before normal sync handling.
 `Node::history_fetcher()` exposes it. Peers are added with the existing `addnode`/`connect`; a
 separate `fullnode=` option was not added.
+RPC `getblock` for a height at or below `pruneheight` asks the fetcher (`BlockFetcher` trait in
+`divi-rpc`, implemented by `HistoryFetcher`) and still returns the pruned-data error if no verified
+block comes back.
 
 ### Work remaining
-1. A caller: RPC `getblock` fallback below `pruneheight`, and wallet rescan. Not wired yet.
+1. Wallet rescan below `pruneheight` still has no caller (`getblock` is done).
 2. Prefer `NODE_NETWORK` peers when choosing sync peers.
 3. Operator view: full-peer count and last fetch result in `getblockchaininfo`; startup warning
    when a thin node has no full peer.
-4. Test: strip a node, point it at an unstripped testnet peer, force a read below `pruneheight`,
-   check bytes match; repeat with the full peer off and confirm it refuses.
+4. Done 2026-10-14 on testnet: a snapshot-imported hp1 node (pruneheight 346,981) with
+   `--connect` to the unstripped hp3 node returned block 100 over `getblock`; the same node with no
+   reachable peer returned the pruned-data error (code -5). Not yet checked: byte-for-byte
+   comparison against a local read, and a peer that sends bad data (unit-tested only).
 
 ### Trade-offs
 * The network needs a few full nodes on purpose; if every operator goes thin, history is lost.

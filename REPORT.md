@@ -78,8 +78,7 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
 ## Thin staking: helpers + snapshot (2026-10-14)
 Built on testnet: pruned nodes advertise `NODE_NETWORK_LIMITED` only (live bug fix); terminal lottery-winner
 lists are never stripped; snapshot export/import (`--export-snapshot`, `--import-snapshot`, `snapshotbase` in
-getblockchaininfo), live-tested hp3 copy -> hp1. Design doc §10 corrected, §11 added. `HistoryFetcher` (fetch + verify a pruned block from a full-history peer) built and unit-tested but
-not yet called from getblock/rescan; no separate `fullnode=` option (use `addnode`). Live: snapshot-imported hp1 node synced forward past the snapshot tip and pruned cleanly. Earlier stripped test copies predate the terminals fix.
+getblockchaininfo), live-tested hp3 copy -> hp1. Design doc §10 corrected, §11 added. `HistoryFetcher` (fetch + verify a pruned block from a full-history peer) built, unit-tested, and called from RPC `getblock` below `pruneheight` (live: hp1 fetched block 100 from hp3; refused with the peer gone); not yet called from wallet rescan; no separate `fullnode=` option (use `addnode`). Live: snapshot-imported hp1 node synced forward past the snapshot tip and pruned cleanly. Earlier stripped test copies predate the terminals fix.
 
 ## Thin staking design (2026-10-14)
 Design doc: `docs/plans/thin-staking.md`. Recommendation: ship pruned staking (`expire=0`) as the
@@ -94,5 +93,5 @@ Mainnet CF split measured (doc §8). Lottery-winner stripping built and validate
 ## Thin staking: status notes (2026-10-14)
 * Snapshot staking gate built: a snapshot-imported node does not stake until its tip is past the snapshot base (live-checked on hp1).
 * `fullnode=` was not added; `addnode`/`connect` plus the `NODE_NETWORK` filter identify full peers.
-* `HistoryFetcher` is unit-tested only: no caller (getblock fallback / rescan) and no live fetch yet (doc §10 work item 4 open).
+* `HistoryFetcher` is used by RPC `getblock` and live-tested on testnet; wallet rescan, sync-peer preference for full nodes, and an operator view in `getblockchaininfo` are still open (doc §10).
 * A wallet on a snapshot-bootstrapped node has no history before the snapshot tip.
