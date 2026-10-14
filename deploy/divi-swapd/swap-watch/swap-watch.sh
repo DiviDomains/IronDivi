@@ -14,6 +14,8 @@
 #     an XMR swap in `accepted` (nothing locked yet; the maker forgets it after sigs_wait),
 #     STUCK_MAX for every other non-terminal state (default 12 h: longer than t_cancel +
 #     t_punish on the testnet profile, so a healthy refund path never fires it).
+#   - no `cancelled`/`refunded` XMR swap is within PUNISH_MARGIN (default 1 h) of its t_punish:
+#     past it the taker can take the DIVI;
 #   - monerod's RPC answers and is synchronized (when MONEROD_URL is set).
 # Secrets: /etc/swap-watch.env (root 0600): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID. Never logged.
 # State: /var/lib/swap-watch (when each swap entered its state; the last alert).
@@ -29,6 +31,7 @@ UNITS="${UNITS:-divi-swapd monerod-stagenet}"
 SCAN_MAX="${SCAN_MAX:-3600}"
 ACCEPTED_MAX="${ACCEPTED_MAX:-3600}"
 STUCK_MAX="${STUCK_MAX:-43200}"
+PUNISH_MARGIN="${PUNISH_MARGIN:-3600}"
 ALERT_EVERY="${ALERT_EVERY:-21600}"
 STATE_DIR="${STATE_DIR:-/var/lib/swap-watch}"
 ENV_FILE="${ENV_FILE:-/etc/swap-watch.env}"
@@ -113,6 +116,15 @@ while IFS=$'\t' read -r kind id state err; do
   [ -n "$err" ] && [ "$err" = "$prev_err" ] && problems+=("$kind swap ${id:0:8} ($state): $(cut -c1-160 <<<"$err")")
 done <<<"$swaps"
 [ "$mode" = dry-run ] || printf '%s' "$new_seen" >"$seen_file"
+
+# The one deadline that costs the maker money: a cancelled swap's Tx_refund must confirm before
+# t_punish (unix seconds vs DIVI median time past, which lags wall time by up to ~30 min). The
+# text is fixed per swap so it repeats on the ALERT_EVERY rule, not every run.
+while read -r id state; do
+  [ -n "${id:-}" ] && problems+=("xmr swap $id ($state) within $((PUNISH_MARGIN / 60)) min of t_punish: refund not confirmed")
+done < <(curl -sS -m 10 "$API/xmr/swaps" 2>/dev/null | jq -r --argjson now "$now" --argjson m "$PUNISH_MARGIN" \
+  '.[]? | select((.state == "cancelled" or .state == "refunded") and .t_punish != null
+                 and .t_punish - $now < $m) | .id[:8] + " " + .state')
 
 host=$(hostname -s)
 if [ "$mode" = dry-run ]; then
