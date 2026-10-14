@@ -350,7 +350,7 @@ exercises a malleated Tx_cancel or a Tx_cancel with a reduced output value.
 |---|---|
 | Reviewer | _TBD_ |
 | Engagement dates | _TBD_ – _TBD_ |
-| Commit under review | `99e8864` (on `main`; `ab36dbc` plus the swap-view `t_cancel`/`t_punish` fields and swap-watch alerting) |
+| Commit under review | `e6a6fad` (on `main`): the first commit with this brief and the corrected `xmr-design.md` malleability note. The Rust tree is unchanged since `99e8864` (`ab36dbc` plus the swap-view `t_cancel`/`t_punish` fields and swap-watch alerting) |
 | Repository access | GitHub `DiviDomains/IronDivi` (`git remote -v`), read access _TBD_ |
 | Findings format | one entry per finding: severity, `path:line`, scenario, suggested fix |
 | Findings go to | Bert; each closed as fixed (commit) or accepted in writing, recorded in `xmr-mainnet-plan.md` decision log |

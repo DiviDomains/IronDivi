@@ -1043,14 +1043,17 @@ before any real-money swap.
 - **Gate A: open.**
   - done: A1 (xmr-lock timeout), A2/A3 (mainnet profile and derived schedule), A6, A7.
   - A4 deployed 18:17 UTC (a7cb7e9): the maker sweeps into its own stagenet wallet `5B948h…aJt`.
-    Balance proof on a view-only wallet is parked: the view-key read hit an unanswered 1Password
+    The two swaps after the deploy (`a5817fa7`, `c7bbc86d`) swept under the new toml and were
+    `done` by 18:34 (the swap view carries no sweep txid). Proof of receipt on a view-only wallet is parked: the view-key read hit an unanswered 1Password
     prompt. hp2 runs an empty wallet-rpc on `127.0.0.1:38099` for it; retry is
     `scratchpad/a4-viewonly.sh start` then `balance`.
   - A5 open: dnsdivi's own stagenet monerod is CPU-bound at height ~144k of 2.229M; the maker
     still uses the public node.
   - A8 in progress: 14 happy redeemed, 2 restarts with swaps open; 7 refunds land after
-    `t_cancel` (accept-only ~22:50 UTC, lock-only ~23:43 UTC; lock-only resume is scheduled). See
-    RESULTS.md.
+    `t_cancel` (accept-only `t_cancel` 22:44 UTC, lock-only 00:23 UTC on the 15th; the lock-only resume fires ~01:03). See
+    RESULTS.md. Punish was not run through dnsdivi (it means stalling the shared maker past
+    `t_punish`); the evidence is the 2026-10-12 live run with the CLI maker. Accept or reject that
+    at Gate A.
 - **Gate B: open on people, not code.**
   - done: B1 (rollback rehearsed), B1b, B2 (swap-watch, plus the `t_punish` margin alert).
   - B3 needs one human walk-through of `xmr-runbook.md`.

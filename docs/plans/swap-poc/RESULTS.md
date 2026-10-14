@@ -374,8 +374,11 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
   - accept-only × 4 (taker never locks XMR): maker refunds after `t_cancel`. Pending.
   - lock-only × 4 (taker locks XMR, then stops until past `t_cancel`): 3 locked; both refunds pending.
     The 4th accept got `409 insufficient funds: need 1000100000 + fee, have 0` with nothing on
-    chain: the maker's XMR-engine DIVI wallet holds one coin, and three accepts in the same minute
-    left only unconfirmed change. A clean refusal, but a mainnet maker needs its DIVI split into
+    chain. The maker's XMR-engine DIVI wallet holds one coin; each setup reserves it until its
+    lock tx is broadcast and the change comes back as the next coin
+    (`crates/swap-chain-divi/src/wallet.rs` `reserve`/`record_broadcast`). The three accepted
+    setups ran 8-10 s apart and chained on each other's change; the refused one arrived while
+    another held the reservation. A clean refusal, but a mainnet maker needs its DIVI split into
     several coins (or to queue accepts) to serve swaps in parallel.
   - punish was not run through dnsdivi (it means stalling the shared maker for `t_punish`); it ran
     live on 2026-10-12, above.
