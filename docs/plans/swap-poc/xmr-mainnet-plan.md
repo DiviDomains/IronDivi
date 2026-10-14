@@ -49,13 +49,25 @@ What the maker host must hold, and what it must not:
 
 Mainnet items are new 1Password items, never the stagenet ones renamed: `IronDivi Swap - maker-divi-xmr-mainnet`, `IronDivi Swap - maker-xmr-wallet-mainnet`, generated on Bert's machine at the keyboard (phase D). They go on a separate mainnet host, provisioned by `deploy.sh provision-secrets`. Rotation follows `xmr-runbook.md` §Keys.
 
-Code consequences for the mainnet lift: `bin/divi-swapd/src/main.rs:193` hard-codes `DiviNetwork::Testnet` for the xmr DIVI address; it must follow the configured network. `wallet_rpc_url` should become optional for the maker.
+Code consequences for the mainnet lift: the xmr DIVI address now follows the configured network (`bin/divi-swapd/src/main.rs:196-198`, done in f919e5c). `wallet_rpc_url` should become optional for the maker (`bin/divi-swapd/src/config.rs:141`).
 
 ## Phase C — external security review
 
 Hand-written adaptor signatures, the cross-group DLEQ proof, encsig recovery and the DIVI script
 templates (`crates/divi-swap-xmr/`, `crates/swap-chain-xmr/`) reviewed by someone outside the
 project. Gate C: findings fixed or accepted in writing by Bert.
+
+The reviewer's brief is `xmr-review-brief.md` (pinned to a commit in its §8). Drafting it turned
+up findings that block mainnet on their own, before any outside review:
+
+| # | Finding | Status |
+|---|---|---|
+| C1 | **Counterparty malleation of `Tx_cancel`.** `Tx_refund`/`Tx_punish` spend `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:129`); DIVI has no segwit, and each side holds the other's `Tx_cancel` signature, so either can re-sign its own half with a fresh nonce (a valid low-S signature, relayed normally) and broadcast a `Tx_cancel` with a different txid after `t_cancel`. Both presigned children are then invalid and both coins sit in a 2-of-2 neither side can spend alone: a ransom, not just a liveness risk. `xmr-design.md` §Risks covered only a miner. Needs a protocol change (or a written acceptance) before mainnet. | open, blocks D |
+| C2 | Taker does not check `Tx_cancel`'s output value (`taker.rs:277-287`); a tiny output zeroes `Tx_punish`. | open |
+| C3 | Unauthenticated setup reserves maker UTXOs that an abort never releases (`maker.rs:438`, `wallet.rs:168` `release` has no XMR caller); no auth or rate limit on XMR routes; `quote()` stores unbounded records. | open |
+| C4 | No check that the DIVI RPC is on the expected chain (`main.rs:183-187` compares only the URL); every timelock trusts its median time past. | open |
+| C5 | Taker accepts any `t_cancel`/`t_punish` upper bound (`taker.rs:289-293`): a maker can hold her XMR for years. | open |
+| C6 | Lower: `/xmr/swaps` lists every swap and anyone can post the lock notice (`maker.rs:591-606`); `find_lock` takes the first output (dust grief); one-confirmation `done`; unchecked `t_cancel + punish_after` add. | open |
 
 ## Phase D — staged mainnet trials (needs Bert's explicit go)
 

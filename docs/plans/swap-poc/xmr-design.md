@@ -566,6 +566,11 @@ incidental, so a force-fit attempt would be wasted effort, not a useful first tr
   a swap into needing manual recovery. Mitigate operationally (same posture as the BTC/DIVI HTLC
   lane already takes toward reorgs): watch for the parent's actual confirmed txid before relying
   on a presigned child, and re-sign if it doesn't match what was planned for.
+  **Correction (2026-10-14, review brief):** the above covers only third parties. The
+  counterparty can malleate `Tx_cancel` without mining: it holds the other side's signature and
+  can re-sign its own half with a fresh nonce, a valid low-S signature that relays normally.
+  Cooperative re-signing then depends on the party that caused the problem, so this is a
+  fund-ransom risk, not just liveness. Tracked as C1 in `xmr-mainnet-plan.md`.
 - **Live-chain acceptance has now run, both directions.** The forward (happy) path and the
   abort/refund path have both run live, end to end, on real DIVI testnet and Monero stagenet
   chains, through a public restricted Monero node — every txid in
