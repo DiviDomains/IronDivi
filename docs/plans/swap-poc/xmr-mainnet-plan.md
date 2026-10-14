@@ -33,7 +33,22 @@ Gate A: all A-items done, CI green, soak clean. Bert reviews.
 | B1b | The redeploy in-flight gate reads only `/swaps`, not `/xmr/swaps` (`tools/swap-poc/redeploy-maker.sh`); an XMR swap mid-flight would not block a restart | gate refuses while any `/xmr/swaps` entry is non-terminal; test in `test-redeploy-maker.sh` |
 | B2 | ~~Alerting on any XMR swap with `last_error` set or stuck past its state's deadline, and on scan lag~~ | done 2026-10-14: `deploy/divi-swapd/swap-watch/` on dnsdivi (5-min timer, Telegram). Drill: API pointed at a dead port sent the alert, the next run sent "healthy again". The monerod check is off until the maker uses the local node (A5). |
 | B3 | Runbook: stuck swap, refund, punish, monerod down, key rotation | `docs/` runbook walked through once by a human. Written 2026-10-14: `xmr-runbook.md`; the human walk-through is still open. |
-| B4 | Key handling: `maker-divi-xmr` and the maker's XMR wallet keys on mainnet-grade custody, separate from the test keys | separate 1Password items, separate host |
+| B4 | Key handling: `maker-divi-xmr` and the maker's XMR wallet keys on mainnet-grade custody, separate from the test keys | separate 1Password items, separate host. Design below (§B4 key custody); the items are created in phase D |
+
+### B4 key custody (design, 2026-10-14)
+
+What the maker host must hold, and what it must not:
+
+| Secret | On the maker host? | Why |
+|---|---|---|
+| `[xmr].divi_key` (funds `Tx_lock`, signs `Tx_cancel`/`Tx_refund`/`Tx_punish`) | yes: a hot key | the daemon signs refunds unattended, against the `t_punish` deadline. Cap the risk by funding: keep only the working float on this key (offer `max` × concurrent swaps), not a treasury |
+| per-swap secrets (`s_m`, DLEQ, encsigs) | yes, in the SQLite state | generated per swap; `/var/lib/divi-swapd` 0700; backups of the DB are as sensitive as the key |
+| maker XMR wallet spend key (sweep target) | **no** | the daemon only needs `sweep_address`. The spend key lives in 1Password (and a paper/offline copy for mainnet); a view-only wallet on another host proves receipts |
+| `wallet_rpc_*` | **no** | `monero_chain::lock` (wallet RPC) is the taker's XMR lock; the maker never sends XMR from a wallet, and sweeps with the recovered key. Drop `monero-wallet-rpc` from the mainnet maker; make `wallet_rpc_url` optional in config |
+
+Mainnet items are new 1Password items, never the stagenet ones renamed: `IronDivi Swap - maker-divi-xmr-mainnet`, `IronDivi Swap - maker-xmr-wallet-mainnet`, generated on Bert's machine at the keyboard (phase D). They go on a separate mainnet host, provisioned by `deploy.sh provision-secrets`. Rotation follows `xmr-runbook.md` §Keys.
+
+Code consequences for the mainnet lift: `bin/divi-swapd/src/main.rs:193` hard-codes `DiviNetwork::Testnet` for the xmr DIVI address; it must follow the configured network. `wallet_rpc_url` should become optional for the maker.
 
 ## Phase C — external security review
 
