@@ -79,6 +79,7 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
 - ~~Monero STAGENET atomic swap, parked 2026-10-14 on `secret-broker serve`.~~ **Resolved
   2026-10-14:** Bert started the broker; the swap ran end to end on stagenet (0.01 sXMR → 50 tDIVI,
   outcome `redeemed`). Txids in `docs/plans/swap-poc/RESULTS.md`. Stagenet only; mainnet is a separate decision.
+- XMR swap C1 (cancel ransom): review the fix design `docs/plans/swap-poc/xmr-c1-design.md`, and say whether to land its §4.4 interim hardening first. Not implemented; mainnet stays blocked.
 
 ## Thin staking: helpers + snapshot (2026-10-14)
 Built on testnet: pruned nodes advertise `NODE_NETWORK_LIMITED` only (live bug fix); terminal lottery-winner

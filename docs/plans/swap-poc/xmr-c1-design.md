@@ -60,16 +60,35 @@ counterparties (a fresh nonce is low-S) and not stakers (they mine non-standard 
 
 ### 4.1 Tx_lock
 
-`Tx_lock`'s output becomes P2SH of a two-branch script:
+`Tx_lock`'s output becomes P2SH of a three-branch script (the `t_late` branch is §4.3):
 
 ```
-OP_DEPTH <n> OP_EQUALVERIFY          # guard: exactly the expected number of stack items
-OP_IF
-    OP_2 <a> <b> OP_2 OP_CHECKMULTISIG                     # redeem (happy path), unchanged
+OP_DUP OP_1 OP_EQUAL
+OP_IF                                                       # selector bytes exactly [0x01]
+    OP_DROP OP_2 <a> <b> OP_2 OP_CHECKMULTISIG              # redeem (happy path)
 OP_ELSE
-    <t_cancel> OP_CHECKLOCKTIMEVERIFY OP_DROP <J> OP_CHECKSIG   # cancel
+    OP_DUP OP_2 OP_EQUAL
+    OP_IF                                                   # selector bytes exactly [0x02]
+        OP_DROP OP_DEPTH OP_1 OP_EQUALVERIFY                # guard: only σ_J left
+        <t_cancel> OP_CHECKLOCKTIMEVERIFY OP_DROP <J> OP_CHECKSIG   # cancel
+    OP_ELSE
+        OP_3 OP_EQUALVERIFY                                 # selector bytes exactly [0x03]
+        <t_late> OP_CHECKLOCKTIMEVERIFY OP_DROP <A> OP_CHECKSIG     # maker escape (§4.3)
+    OP_ENDIF
 OP_ENDIF
 ```
+
+Why the selectors are `OP_EQUAL` tests, not bare `OP_IF`: Divi has no MINIMALIF, so a bare
+`OP_IF` accepts infinitely many encodings of true *and* of false (any all-zero byte string, or
+one ending in 0x80, is false). `OP_EQUAL` compares exact bytes, so the cancel selector `[0x02]`
+has exactly five encodings (`OP_2`, a 1-byte direct push, `PUSHDATA1/2/4`).
+
+Why only the cancel branch has a depth guard: nothing is presigned against `Tx_redeem`'s txid
+or the `t_late` spend's txid, so their variants (including CHECKMULTISIG's unbounded dummy
+element) are harmless. The cancel branch uses `OP_CHECKSIG`, which has no dummy element.
+
+P2SH scriptSigs must be push-only even without SIGPUSHONLY (`interpreter.cpp`, the P2SH block
+of `VerifyScript`), so no `OP_NOP`s or computed values can be inserted.
 
 - `J` is a joint key held 2-of-2 by maker and taker through two-party ECDSA (2P-ECDSA). Neither
   party knows its private key.
@@ -80,13 +99,14 @@ OP_ENDIF
   because neither holds `J`'s key.
 
 **The OP_DEPTH guard** closes the unbounded staker variants (extra pushes below the stack). The
-remaining staker variants are a finite set:
+remaining staker variants of `Tx_cancel`'s scriptSig `<σ_J> <0x02> <redeem script>` are a finite
+set, by our count:
 
-- S-flip of `σ_J`: 2 variants.
-- Push encodings of `σ_J`, the branch selector and the redeem script: PUSHDATA1/2/4 versus
-  direct push, plus OP_0/OP_FALSE encodings of the selector. A small fixed number.
+- `σ_J`: S-flip (2) × push encoding (direct, `PUSHDATA1/2/4`: 4) = 8.
+- selector `[0x02]`: 5 encodings.
+- redeem script (> 75 bytes): `PUSHDATA1/2/4` = 3.
 
-The exact count is computed in the implementation and pinned by a test.
+That is 8 × 5 × 3 = 120 variants. The implementation computes the set and a test pins it.
 
 Two ways to deal with this finite set; the review should pick one:
 
@@ -124,16 +144,16 @@ txid:
   (`taker.rs:513-524`). So she loses nothing.
 - The maker's DIVI is in the `{a, b}` 2-of-2 with no valid `Tx_cancel`. The taker can ransom it.
 
-**Mitigation:** add a third, maker-unilateral branch to `Tx_lock`:
+**Mitigation:** the third, maker-unilateral branch of `Tx_lock` in §4.1, with
+`t_late > t_punish + margin`.
 
-```
-<t_late> OP_CHECKLOCKTIMEVERIFY OP_DROP <A> OP_CHECKSIG     # t_late > t_punish + margin
-```
-
-This is safe for the taker. She locks XMR only after she sees the exact `lock_outpoint`
-confirmed, and she is required to cancel, and punish if needed, before `t_late`. A taker who goes
-offline past `t_late` loses her punish claim, which is the same failure mode as today's
-`t_punish` deadline.
+This is safe for a taker who is online. She locks XMR only after she sees the exact
+`lock_outpoint` confirmed, and she can broadcast `Tx_cancel` herself from `t_cancel` on. The
+worst case for an offline taker is real loss, not just a lost punish claim: if she is offline
+from `t_cancel` through `t_late` and the maker never broadcasts `Tx_cancel`, the maker takes the
+DIVI through the `t_late` branch without revealing `s_m`, and her XMR stays locked forever.
+`t_late − t_cancel` is her defensive window and must be sized like today's `t_punish` margin
+(and watched by swap-watch).
 
 The maker also detects a malleated `Tx_lock` on confirmation and aborts before step 4.
 
@@ -209,7 +229,8 @@ All on stagenet and DIVI testnet, test coins only.
 ## 8. Open questions for the reviewer
 
 1. Is the OP_DEPTH guard plus the push-encoding list really the complete staker variant set
-   under Divi's mandatory flags? Divi also has no MINIMALIF, so check `OP_IF` argument encodings.
+   under Divi's mandatory flags (our count: 120, §4.1)? Check the `OP_EQUAL` selector scheme
+   that replaces bare `OP_IF` selectors, since Divi has no MINIMALIF.
 2. Option (a) versus (b) in §4.1.
 3. Is there a construction that meets both constraints of §3 without 2P-ECDSA on a chain with
    CLTV but no CSV and no segwit?
