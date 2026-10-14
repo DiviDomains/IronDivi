@@ -198,59 +198,78 @@ Live run (hp1, copy of an unpruned testnet datadir at tip 349,676, `--testnet --
 * Testnet cycle is 200, so the keep window is 3,481 blocks. Mainnet (10,080) keeps 33,121 blocks.
 Mainnet figures above remain estimates.
 
-## 10. Thin staking nodes backed by full-history nodes (design, not built)
+## 10. Thin staking nodes backed by full-history nodes (revised 2026-10-14)
 Direction from Bert: run one or more full nodes that keep all history, and make staking nodes thin.
-A thin node keeps only what staking and validation read and fetches anything else from a full node.
-This replaces the "true remote shim" of §3: the thin node still validates, so the full node is a
-helper whose answers are checked, not a trusted oracle.
+The thin node still validates; the full node is a helper whose answers are checked, not a trusted oracle.
 
-### What a thin node keeps and what it fetches
-| Keeps locally | Fetches on demand from a full peer |
-|---|---|
-| Block index without old lottery lists (headers, stake modifiers, chain work) | A block body older than `pruneheight` |
-| UTXO set | The blocks of one lottery cycle, to rebuild a stripped winners list |
-| Winners lists for the recent window (3 cycles + 1 + 2,880 blocks) | Nothing else for staking |
+### Correction to the first draft of this section
+The first draft said a stripped winners list could be rebuilt by replaying one lottery cycle of
+blocks, and proposed a custom `NODE_FULL_HISTORY` service bit. Both were wrong:
+* A winners list depends on the previous three cycles' lists (the payment-script veto), so one
+  cycle of blocks is not enough to rebuild it.
+* A rebuild is not needed. Consensus reads winners lists only at (a) the parent block, (b) height
+  L-1 for each lottery height L, and (c) `lastLottery - cycle*k - 1` for k = 0..2, plus
+  `start - 1` in the first cycle. Everything except the recent window is a "terminal" height
+  (the block just before a lottery block). Terminal lists are now **never stripped** (about 420 lists,
+  ~300 KB on mainnet), so forward validation never needs an old list. `Chain::is_winners_terminal_height`.
+* Nodes that stripped with the earlier build (for example the hp1 test copy) had terminals removed;
+  re-sync or import a snapshot made by the fixed build.
 
-### Why fetch-and-verify is safe
-* A winners list at height H depends only on the blocks since the start of H's lottery cycle
-  (at most 10,080 on mainnet). Replaying them through `update_lottery_winners` gives the list again.
-* Every fetched block is checked against the thin node's own header chain (hash, merkle root,
-  proof of stake/work) before it is used. A lying full node can withhold a block but cannot
-  make the thin node accept a wrong one.
-* The rebuilt list is a fallback. The three readers (next-block update, `validate_lottery_payments`,
-  `is_payment_script_vetoed_for_lottery`, see §9) normally read only the recent window, which is
-  always kept. The fetch matters if the window was ever wrong, after a reorg deeper than the
-  2,880-block floor, or for a thin node that was started with a short history.
+### What full-history peers are for
+Serving old block bodies: `getblock` below `pruneheight`, wallet rescans, and a thin node that needs a
+block it already pruned. The thin node checks every fetched block against its own header chain
+(hash, merkle root) before using it; a lying peer can withhold a block but cannot make the thin
+node accept a wrong one.
 
-### What exists today (checked in the code)
-* `getdata` for a block works on the wire, and a node that no longer has a block answers
-  `notfound` (`divi-node/src/node.rs`, "pruned or unknown"), so a requester can ask elsewhere.
-* The only service flags are `NODE_NETWORK`, `NODE_BLOOM`, `NODE_BLOOM_WITHOUT_MN`
-  (`divi-network/src/constants.rs`). There is no way to tell a full-history peer from a pruned one
-  before asking.
+### Service flags (BIP 159)
+`NODE_NETWORK` (bit 0) means "has every block". `NODE_NETWORK_LIMITED` (bit 10) means "pruned,
+recent blocks only". A pruning node (`expire` on, or `pruneheight > 0`) now advertises only bit 10.
+This fixed a live bug where pruned nodes claimed bit 0 and then answered `notfound`.
+C++ divid peers set bit 0, so they count as full-history peers with no new bit.
+Check still open: confirm from `their_version.services` on testnet that C++ Divi never uses bit 10.
+`PeerManager::full_history_peers()` lists peers with bit 0.
 
-### Work needed
-1. **Advertise history.** Add a service bit, for example `NODE_FULL_HISTORY`, set only when the
-   node has expiry off (`expire = -1`). Pruned nodes stop claiming full history.
-2. **Peer choice.** A thin node keeps a connection to at least one peer with that bit. Allow a
-   configured list of trusted full nodes (`fullnode=host:port`, repeatable) and fall back to any
-   advertising peer.
-3. **Fetch path.** An async "get old block" call that asks full peers in turn, applies the header
-   checks above, retries on `notfound` or timeout, and rate-limits itself.
-4. **Rebuild path.** Given a lottery cycle, fetch its blocks, replay the list update, hold the
-   result in memory (not written back unless the window says to keep it), and hand it to the
-   readers in §9. Mainnet worst case is one cycle of 10,080 blocks.
-5. **Failure mode.** If no full peer answers, the thin node must refuse to validate the affected
-   lottery block (stop and report) and never guess. It must not stake on a block it cannot check.
-6. **Operator view.** Expose the number of full peers and the last fetch result in
-   `getblockchaininfo`, and warn at startup when a thin node has none.
+### Work remaining
+1. Fetch path: ask `full_history_peers()` in turn for a block hash, verify header hash and merkle
+   root against our own index, retry on `notfound`/timeout, rate-limit, refuse (never guess) if no
+   answer. Needs routing of `NetworkMessage::Block` for requested hashes in `sync.rs`.
+2. `fullnode=host:port` (repeatable) in `divi-node` config; prefer `NODE_NETWORK` peers.
+3. Operator view: full-peer count and last fetch result in `getblockchaininfo`; startup warning
+   when a thin node has no full peer.
+4. Test: strip a node, point it at an unstripped testnet peer, force a read below `pruneheight`,
+   check bytes match; repeat with the full peer off and confirm it refuses.
 
 ### Trade-offs
-* Full nodes carry the load, so the network needs a few of them to stay reachable. If every
-  operator goes thin, history is lost. Full nodes should be run on purpose and monitored.
-* A thin node that is isolated from every full peer can still stake inside its kept window but
-  cannot recover from an unusual reorg or rebuild a list.
-* The bandwidth cost is paid only when a rebuild happens, which should be rare.
-* Test plan: on testnet, strip a node, delete one cycle of lists in a scratch copy, start it
-  against a full peer, force a lottery-block validation, and check the rebuilt list byte-for-byte
-  against the list that was deleted. Then repeat with the full peer off to confirm it refuses.
+* The network needs a few full nodes on purpose; if every operator goes thin, history is lost.
+* An isolated thin node can still stake inside its kept window but cannot serve or rescan old blocks.
+
+## 11. Chain-state snapshots (built 2026-10-14, testnet)
+A new thin node can start from a downloaded chain-state snapshot instead of syncing from genesis.
+
+### Format
+A directory: `MANIFEST.json` plus `chainstate/`, a RocksDB checkpoint already thinned with
+`Expire::Minimum` rules (old bodies and undo removed, old winners stripped, terminals kept). The
+manifest has format, network, tip height and hash, prune/strip watermarks, every file's size and
+SHA-256, and a `root_hash` over all of it. The root hash is the one value an operator compares or
+publishes. The wallet and txindex are never included.
+
+### Commands
+* `irondivid --export-snapshot DIR` (node stopped; source untouched). Prints the root hash.
+* `irondivid --import-snapshot DIR [--snapshot-root HEX]` installs into an empty or missing
+  chainstate. Verifies the root hash and every file hash while copying into a temporary
+  directory, opens it, checks the tip equals the manifest, records `snapshot_base`, then renames into
+  place. Any failure leaves nothing behind. Undo = delete the chainstate directory.
+* `getblockchaininfo.snapshotbase` shows `{height, hash}` of the imported tip.
+
+### Trust model
+Divi headers commit to no UTXO set, so the UTXO set in a snapshot is trusted, not proven. Only the
+tip's place on the chain can be checked against other nodes. This matches the trust direction in §7.
+All blocks after the snapshot tip are fully validated. The existing stale-tip and IBD guards stop
+staking until the node has caught up. Distribution is operator-driven (no P2P snapshot message);
+publishing root hashes from several independent operators is how trust is built.
+
+### Testnet result
+Export from a copy of the hp3 `prune-base` chainstate (tip 349,861): 190 MB snapshot. Wrong
+`--snapshot-root` refused; correct import succeeded; the imported node started with
+`pruneheight 346981`, `winnersstripheight 346380`, `snapshotbase` = the tip. Unit tests cover roundtrip,
+tampered file, wrong network, wrong hash and non-empty destination.

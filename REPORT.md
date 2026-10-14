@@ -75,10 +75,18 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
   2026-10-14:** Bert started the broker; the swap ran end to end on stagenet (0.01 sXMR → 50 tDIVI,
   outcome `redeemed`). Txids in `docs/plans/swap-poc/RESULTS.md`. Stagenet only; mainnet is a separate decision.
 
+## Thin staking: helpers + snapshot (2026-10-14)
+Built on testnet: pruned nodes advertise `NODE_NETWORK_LIMITED` only (live bug fix); terminal lottery-winner
+lists are never stripped; snapshot export/import (`--export-snapshot`, `--import-snapshot`, `snapshotbase` in
+getblockchaininfo), live-tested hp3 copy -> hp1. Design doc §10 corrected, §11 added. Not built yet: fetch-old-block
+helper and `fullnode=` config. Earlier stripped test copies predate the terminals fix.
+
 ## Thin staking design (2026-10-14)
 Design doc: `docs/plans/thin-staking.md`. Recommendation: ship pruned staking (`expire=0`) as the
 thin mode, add snapshot bootstrap, build a true remote-node shim only if still needed.
 Mainnet CF split measured (doc §8). Lottery-winner stripping built and validated on testnet (hp1 copy,
 970 MB -> 105 MB with expire 0; clean restart, 0 errors). Not deployed anywhere real. ELI5 page published as an Artifact.
 ## NEEDS HUMAN
-* Choose approach (A / A+B / D) — see the design doc.
+* Snapshot distribution channel: where do operators download snapshots, and do you want root hashes published (and by whom)?
+* Who runs the full-history (`NODE_NETWORK`) nodes, so thin nodes have something to fetch from?
+* Mainnet decision on `expire` + snapshots (everything so far is testnet only).
