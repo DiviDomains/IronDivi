@@ -74,3 +74,10 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
 - ~~Monero STAGENET atomic swap, parked 2026-10-14 on `secret-broker serve`.~~ **Resolved
   2026-10-14:** Bert started the broker; the swap ran end to end on stagenet (0.01 sXMR → 50 tDIVI,
   outcome `redeemed`). Txids in `docs/plans/swap-poc/RESULTS.md`. Stagenet only; mainnet is a separate decision.
+
+## Thin staking design (2026-10-14)
+Design doc: `docs/plans/thin-staking.md`. Recommendation: ship pruned staking (`expire=0`) as the
+thin mode, add snapshot bootstrap, build a true remote-node shim only if still needed.
+Open: per-column-family mainnet sizes unmeasured; hp3 live pruned-staking test belongs to another lane.
+## NEEDS HUMAN
+* Choose approach (A / A+B / D) — see the design doc.
