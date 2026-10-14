@@ -4,8 +4,8 @@ User documentation: `docs/block-expiry-pruning.md`.
 
 ## Status
 
-Built, tested, pushed. **Live staking at `expire=0` is DEFERRED, pending the 1Password broker.**
-It is not demonstrated and must not be described as proven.
+Built, tested, pushed. **Live staking at `expire=0` is NOT yet demonstrated:** attempts run clean, no stake was won in about 7 hours
+(expected at this weight). Do not describe it as proven.
 
 ## Config
 
@@ -39,19 +39,24 @@ Lowercase, case-sensitive. A bare number is valid only as `-1` or `0`.
   mainnet saving is unmeasured.
 * Not run live: `getrawtransaction` on a pruned tx; the wallet-floor path (nodes ran `--disablewallet`; unit-tested only).
 
-## Deferred: staking at `expire=0`
+## Staking at `expire=0`: attempts verified, no stake won (not proven)
 
-* **Why:** needs a fresh testnet wallet on hp3 funded with a few hundred tDIVI. Regtest cannot bootstrap
-  (`generateblock` / `setgenerate` are not implemented). The only coin sources are the dnsdivi testnet
-  node wallets (SSH to dnsdivi currently refused: the SSH key agent will not sign) and the hp2 swap
-  wallet (excluded: its node leaks the recovery phrase in process args).
-* **Decision (Bert):** wait for the 1Password broker, then finish in a later session.
-* **To finish:** with the broker up, send about 200 tDIVI from a dnsdivi testnet node wallet to a fresh
-  hp3 wallet, run it at `IRONDIVI_EXPIRE=0` once the wallet has caught up, wait for maturity, and confirm
-  a coinstake block produced by that node (or staker attempts on matured UTXOs with 0 errors while
-  `pruned:true`). Testnet difficulty is about 8,700, so a small balance may take a long time to win.
-* **Supporting argument only (not proof):** the staker does no block-body reads and consensus uses only
-  the UTXO set and block index.
+* Broker came up; a fresh hp3 testnet wallet was funded with 205,000 tDIVI (3 UTXOs) from a testnet wallet
+  (the hp2 swap wallet was not used). The node ran at `IRONDIVI_EXPIRE=0` and was `pruned:true`
+  (`pruneheight` 346,883 at block 349,763) with `getstakingstatus` = "Staking Active".
+* About 7 hours, 1,440+ staking attempts hashing all matured UTXOs: 0 setup failures, 0 errors, 0 modifier
+  mismatches. **Zero stakes won.** The staker log summary hard-codes "0 success"; the real markers are
+  "Hashproof SUCCESS" / "Found valid stake", and none appeared.
+* Control: an unpruned wallet node with 100,000 tDIVI ran about 3 hours, also with zero wins.
+* Why zero is expected: testnet difficulty is about 8,033, so network stake weight is about
+  d*2^20/60, roughly 140M tDIVI. 205k is about 0.15% of that, or about 0.3 expected wins per 3 hours
+  and under 1 over the whole run. A win needs days of runtime. The test is statistically too weak to
+  show either success or failure.
+* So: the staker runs correctly on a pruned node and nothing points at a pruning problem, but **a staked
+  block from a pruned node has not been observed.** Supporting argument only: the staker does no
+  block-body reads and consensus uses only the UTXO set and block index.
+* To close it: leave a pruned wallet node running for days (or hold far more testnet coins) until it
+  stakes, then confirm the coinstake block.
 
 ## Limitations
 
@@ -67,7 +72,7 @@ Lowercase, case-sensitive. A bare number is valid only as `-1` or `0`.
 
 ## Leftovers
 
-`~/prune-test` and `~/prune-base` on hp3 (about 2.2G) are stopped and safe to delete.
+`~/prune-test` and `~/prune-base` on hp3 (about 2.2G) are stopped and safe to delete (the pruned wallet holds the testnet coins; keep them).
 Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywhere real.
 
 ## NEEDS HUMAN
