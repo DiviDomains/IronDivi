@@ -110,9 +110,40 @@ pub mod services {
     /// This node can be asked for full blocks
     pub const NODE_NETWORK: u64 = 1 << 0;
 
+    /// This node keeps only the last blocks (BIP 159). It must not also set
+    /// `NODE_NETWORK`, because peers use that bit to mean "has every block".
+    pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
+
     /// This node supports bloom filters
     pub const NODE_BLOOM: u64 = 1 << 2;
 
     /// This node supports bloom but doesn't want masternode messages
     pub const NODE_BLOOM_WITHOUT_MN: u64 = 1 << 4;
+}
+
+/// Service bits to advertise: a node that prunes (or will prune) block bodies
+/// must not claim `NODE_NETWORK`, since peers read that bit as "has every block".
+pub fn advertised_services(prunes_blocks: bool) -> u64 {
+    if prunes_blocks {
+        services::NODE_NETWORK_LIMITED
+    } else {
+        services::NODE_NETWORK
+    }
+}
+
+#[cfg(test)]
+mod advertised_services_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_node_clears_network_bit() {
+        let s = advertised_services(true);
+        assert_eq!(s & services::NODE_NETWORK, 0);
+        assert_ne!(s & services::NODE_NETWORK_LIMITED, 0);
+    }
+
+    #[test]
+    fn full_node_sets_network_bit_only() {
+        assert_eq!(advertised_services(false), services::NODE_NETWORK);
+    }
 }

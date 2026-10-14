@@ -337,6 +337,12 @@ impl Node {
         // Set peer manager height
         self.peer_manager.set_height(self.chain.height());
 
+        // A pruning node must not advertise NODE_NETWORK (full history). Key it off the
+        // database too, so a node that pruned earlier stays honest if expire is later off.
+        let prunes = self.config.expire.is_enabled() || self.chain.prune_height() > 0;
+        self.peer_manager
+            .set_services(divi_network::constants::advertised_services(prunes));
+
         // Start peer event handler
         let event_tx = self.event_tx.clone();
         let block_sync = Arc::clone(&self.block_sync);

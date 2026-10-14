@@ -15,7 +15,7 @@
 //! Uses tokio-util's FramedRead for cancellation-safe message reading.
 
 use crate::codec::DiviCodec;
-use crate::constants::{services, Magic, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
+use crate::constants::{Magic, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
 use crate::error::NetworkError;
 use crate::message::NetAddr;
 use crate::peer::{
@@ -63,6 +63,8 @@ pub struct Connection {
     magic: Magic,
     /// Our best block height
     our_height: u32,
+    /// Service bits we advertise in our version message
+    our_services: u64,
     /// Channel to receive messages to send
     outbound_rx: mpsc::Receiver<NetworkMessage>,
     /// Channel to send events
@@ -79,10 +81,12 @@ pub struct Connection {
 
 impl Connection {
     /// Connect to a peer (outbound)
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         addr: SocketAddr,
         magic: Magic,
         our_height: u32,
+        our_services: u64,
         event_tx: broadcast::Sender<PeerEvent>,
         shutdown_rx: broadcast::Receiver<()>,
         total_bytes_sent: Arc<AtomicU64>,
@@ -119,6 +123,7 @@ impl Connection {
             info,
             magic,
             our_height,
+            our_services,
             outbound_rx,
             event_tx,
             shutdown_rx,
@@ -131,10 +136,12 @@ impl Connection {
     }
 
     /// Accept an inbound connection
+    #[allow(clippy::too_many_arguments)]
     pub async fn accept(
         stream: TcpStream,
         magic: Magic,
         our_height: u32,
+        our_services: u64,
         event_tx: broadcast::Sender<PeerEvent>,
         shutdown_rx: broadcast::Receiver<()>,
         total_bytes_sent: Arc<AtomicU64>,
@@ -165,6 +172,7 @@ impl Connection {
             info,
             magic,
             our_height,
+            our_services,
             outbound_rx,
             event_tx,
             shutdown_rx,
@@ -269,13 +277,13 @@ impl Connection {
     async fn send_version(&mut self) -> Result<(), NetworkError> {
         let version = VersionMessage {
             version: PROTOCOL_VERSION,
-            services: services::NODE_NETWORK,
+            services: self.our_services,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
             addr_recv: NetAddr::from_ipv4([0, 0, 0, 0], 0, 0),
-            addr_from: NetAddr::from_ipv4([0, 0, 0, 0], 0, services::NODE_NETWORK),
+            addr_from: NetAddr::from_ipv4([0, 0, 0, 0], 0, self.our_services),
             nonce: rand::random(),
             user_agent: USER_AGENT.to_string(),
             start_height: self.our_height as i32,
@@ -357,6 +365,7 @@ impl Connection {
             mut info,
             magic,
             our_height: _,
+            our_services: _,
             mut outbound_rx,
             event_tx,
             mut shutdown_rx,

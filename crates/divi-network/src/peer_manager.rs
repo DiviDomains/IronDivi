@@ -121,6 +121,8 @@ pub struct PeerManager {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
     /// Our best block height
     our_height: RwLock<u32>,
+    /// Service bits advertised in our version message
+    our_services: AtomicU64,
     /// Event channel sender
     event_tx: broadcast::Sender<PeerEvent>,
     /// Shutdown signal sender
@@ -152,6 +154,7 @@ impl PeerManager {
             config,
             peers: RwLock::new(HashMap::new()),
             our_height: RwLock::new(0),
+            our_services: AtomicU64::new(crate::constants::services::NODE_NETWORK),
             event_tx,
             shutdown_tx,
             scoring: PeerScoring::new(),
@@ -230,6 +233,30 @@ impl PeerManager {
     /// Update our best block height
     pub fn set_height(&self, height: u32) {
         *self.our_height.write() = height;
+    }
+
+    /// Set the service bits we advertise to peers. A node that has pruned
+    /// block bodies must clear `NODE_NETWORK` and set `NODE_NETWORK_LIMITED`.
+    pub fn set_services(&self, services: u64) {
+        self.our_services.store(services, Ordering::Relaxed);
+    }
+
+    /// Service bits we currently advertise
+    pub fn services(&self) -> u64 {
+        self.our_services.load(Ordering::Relaxed)
+    }
+
+    /// Connected peers that advertise `NODE_NETWORK`, i.e. keep every block
+    pub fn full_history_peers(&self) -> Vec<PeerId> {
+        self.peers
+            .read()
+            .iter()
+            .filter(|(_, p)| {
+                p.stats.services.load(Ordering::Relaxed) & crate::constants::services::NODE_NETWORK
+                    != 0
+            })
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Get current peer count
@@ -516,6 +543,7 @@ impl PeerManager {
             addr,
             self.config.magic,
             our_height,
+            self.services(),
             self.event_tx.clone(),
             self.shutdown_tx.subscribe(),
             self.bytes_sent_counter(),
@@ -572,6 +600,7 @@ impl PeerManager {
             stream,
             self.config.magic,
             our_height,
+            self.services(),
             self.event_tx.clone(),
             self.shutdown_tx.subscribe(),
             self.bytes_sent_counter(),
