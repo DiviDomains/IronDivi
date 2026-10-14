@@ -496,6 +496,7 @@ impl BlockchainRpc {
             "pruned": self.chain.prune_height() > 0,
             "pruneheight": self.chain.prune_height(),
             "winnersstripheight": self.chain.winners_strip_height(),
+            "snapshotbase": self.chain.snapshot_base().map(|(h, hash)| serde_json::json!({"height": h, "hash": hash.to_string()})),
             "warnings": ""
         }))
     }

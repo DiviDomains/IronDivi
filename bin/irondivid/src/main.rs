@@ -156,6 +156,18 @@ struct Args {
     #[arg(long, requires = "export_chain")]
     export_output: Option<PathBuf>,
 
+    /// Write a thin chain-state snapshot of this node's chainstate into DIR (node must be stopped).
+    #[arg(long, value_name = "DIR", conflicts_with = "import_snapshot")]
+    export_snapshot: Option<PathBuf>,
+
+    /// Install the snapshot in DIR as this node's chainstate (must be empty or missing), then exit.
+    #[arg(long, value_name = "DIR")]
+    import_snapshot: Option<PathBuf>,
+
+    /// With --import-snapshot: refuse unless the snapshot's root hash equals this value.
+    #[arg(long, value_name = "HEX", requires = "import_snapshot")]
+    snapshot_root: Option<String>,
+
     /// UTXO cache size in number of entries (0 = disabled, default).
     /// Use 10000000 (~500MB) for memory-constrained systems.
     #[arg(long)]
@@ -1466,6 +1478,43 @@ async fn run_daemon(
     Ok(())
 }
 
+fn storage_params(config: &NodeConfig) -> divi_storage::ChainParams {
+    let network_type = match config.network.network_type {
+        NetworkType::Mainnet => divi_storage::NetworkType::Mainnet,
+        NetworkType::Testnet => divi_storage::NetworkType::Testnet,
+        NetworkType::Regtest => divi_storage::NetworkType::Regtest,
+    };
+    divi_storage::ChainParams::for_network(network_type, config.network.chain_mode)
+}
+
+fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
+    if let Some(out) = &args.export_snapshot {
+        let m = divi_storage::snapshot::export_snapshot(
+            &config.chainstate_path(),
+            out,
+            storage_params(config),
+        )
+        .context("snapshot export failed")?;
+        println!(
+            "snapshot written to {:?}\nnetwork {} tip {} {}\nroot_hash {}",
+            out, m.network, m.tip_height, m.tip_hash, m.root_hash
+        );
+    } else if let Some(dir) = &args.import_snapshot {
+        let m = divi_storage::snapshot::import_snapshot(
+            dir,
+            &config.chainstate_path(),
+            storage_params(config),
+            args.snapshot_root.as_deref(),
+        )
+        .context("snapshot import failed")?;
+        println!(
+            "snapshot installed at {:?}\nnetwork {} tip {} {}\nroot_hash {}\nstart the node with --expire so it stays thin; blocks after the tip are fully validated",
+            config.chainstate_path(), m.network, m.tip_height, m.tip_hash, m.root_hash
+        );
+    }
+    Ok(())
+}
+
 async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     use divi_storage::{Chain, ChainDatabase, ChainParams};
 
@@ -1615,6 +1664,10 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     if args.testnet && args.regtest {
         error!("Cannot use both --testnet and --regtest");
         std::process::exit(1);
+    }
+
+    if args.export_snapshot.is_some() || args.import_snapshot.is_some() {
+        return snapshot_command(&config, &args);
     }
 
     if args.export_chain {

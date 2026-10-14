@@ -705,6 +705,11 @@ impl Chain {
         self.db.winners_strip_height()
     }
 
+    /// Tip this node was started from by `--import-snapshot`, if any.
+    pub fn snapshot_base(&self) -> Option<(u32, Hash256)> {
+        self.db.snapshot_base()
+    }
+
     /// True if consensus may read the lottery-winner list stored at `height` at any future
     /// time: the block just before a lottery block (payment validation and the veto check
     /// both read exactly there), or the one before the first lottery start (the veto check's
