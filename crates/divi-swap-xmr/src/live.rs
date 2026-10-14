@@ -15,8 +15,12 @@
 //!   starts at the block holding the spent outpoint's own transaction (nothing can spend it
 //!   earlier) and remembers how far it got; [`LiveMonero::find_lock`] starts
 //!   `lookback_blocks` below the tip the first time it sees a key, then likewise resumes.
-//!   Both resume a few blocks back ([`RESCAN_MARGIN`]) to ride out a short reorg. The
-//!   memory is per process: a restart rescans once from the same starting points.
+//!   Both resume a few blocks back ([`RESCAN_MARGIN`]) to ride out a short reorg. The DIVI
+//!   memory is per process (a restart rescans once from the outpoint's block); the Monero
+//!   cursor is also persisted per lock address in the journal directory, so a restarted
+//!   maker resumes where it stopped instead of rescanning `lookback_blocks` of a remote
+//!   `monerod`. A missing or unreadable cursor file only widens the scan back to
+//!   `lookback_blocks`; it never narrows it.
 //! - **Not repeating a send.** `MoneroChain::lock` is not idempotent and the taker engine
 //!   only checks `find_lock` (blocks, not the pool) before calling it again after a crash.
 //!   [`LiveMonero::lock`] keeps a journal file per lock address: written before the
@@ -214,6 +218,44 @@ impl LiveMonero {
             .join(format!("lock-{}.json", hex::encode(spend_pub)))
     }
 
+    fn scan_cursor(&self, spend_pub: &[u8; 32]) -> PathBuf {
+        self.cfg
+            .journal_dir
+            .join(format!("scan-{}.json", hex::encode(spend_pub)))
+    }
+
+    /// Where the next lock scan for `spend_pub` starts: the in-memory cursor, else the
+    /// persisted one, else `lookback_blocks` below `tip`.
+    fn scan_start(&self, spend_pub: &[u8; 32], tip: u64) -> u64 {
+        if let Some(h) = self.next_scan.lock().unwrap().get(spend_pub).copied() {
+            return h;
+        }
+        let path = self.scan_cursor(spend_pub);
+        let persisted = match read_cursor(&path) {
+            Ok(c) => c.map(|c| c.next),
+            Err(e) => {
+                tracing::warn!(error = %e, "ignoring an unreadable XMR scan cursor");
+                None
+            }
+        };
+        match persisted {
+            // A cursor above the tip (a different chain, or a reorg past it) is not trusted.
+            Some(h) if h <= tip => h,
+            _ => tip.saturating_sub(self.cfg.lookback_blocks),
+        }
+    }
+
+    /// Records where the next lock scan for `spend_pub` starts, in memory and on disk. A
+    /// failed write is logged, not fatal: it only costs a longer scan after a restart.
+    fn set_scan_start(&self, spend_pub: &[u8; 32], next: u64) {
+        let changed = self.next_scan.lock().unwrap().insert(*spend_pub, next) != Some(next);
+        if changed {
+            if let Err(e) = write_cursor(&self.scan_cursor(spend_pub), &ScanCursor { next }) {
+                tracing::warn!(error = %e, "could not persist the XMR scan cursor");
+            }
+        }
+    }
+
     fn sweep_journal(&self, lock_txid: &str) -> PathBuf {
         self.cfg.journal_dir.join(format!("sweep-{lock_txid}.json"))
     }
@@ -234,7 +276,30 @@ impl LiveMonero {
     }
 }
 
+/// A persisted lock-scan cursor: the next block a scan for one lock address starts at.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ScanCursor {
+    next: u64,
+}
+
+fn read_cursor(path: &Path) -> Result<Option<ScanCursor>> {
+    read_json(path)
+}
+
+fn write_cursor(path: &Path, c: &ScanCursor) -> Result<()> {
+    write_json(path, c)
+}
+
 fn read_journal(path: &Path) -> Result<Option<Journal>> {
+    read_json(path)
+}
+
+/// Writes `j` to `path` durably (temp file, fsync, rename).
+fn write_journal(path: &Path, j: &Journal) -> Result<()> {
+    write_json(path, j)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read(path) {
         Ok(b) => serde_json::from_slice(&b)
             .map(Some)
@@ -244,13 +309,13 @@ fn read_journal(path: &Path) -> Result<Option<Journal>> {
     }
 }
 
-/// Writes `j` to `path` durably (temp file, fsync, rename).
-fn write_journal(path: &Path, j: &Journal) -> Result<()> {
+/// Writes `v` to `path` durably (temp file, fsync, rename).
+fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<()> {
     use std::io::Write;
     let err = |e: std::io::Error| SwapError::Storage(format!("{}: {e}", path.display()));
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp).map_err(err)?;
-    f.write_all(&serde_json::to_vec(j).expect("journal serializes"))
+    f.write_all(&serde_json::to_vec(v).expect("journal serializes"))
         .map_err(err)?;
     f.sync_all().map_err(err)?;
     std::fs::rename(&tmp, path).map_err(err)
@@ -329,8 +394,7 @@ impl MoneroChain for LiveMonero {
         view_secret: &[u8; 32],
     ) -> Result<Option<XmrOutput>> {
         let tip = self.tip().await?;
-        let remembered = self.next_scan.lock().unwrap().get(spend_pub).copied();
-        let start = remembered.unwrap_or_else(|| tip.saturating_sub(self.cfg.lookback_blocks));
+        let start = self.scan_start(spend_pub, tip);
         let url = self.cfg.monerod_url.clone();
         let (sp, vs) = (*spend_pub, *view_secret);
         let found = contained(async move {
@@ -356,7 +420,7 @@ impl MoneroChain for LiveMonero {
                 // Its block is (tip + 1 - confirmations); keep rescanning from there so the
                 // confirmations stay current and a reorg that drops it is noticed.
                 let height = (tip + 1).saturating_sub(confirmations.max(1) as u64);
-                self.next_scan.lock().unwrap().insert(*spend_pub, height);
+                self.set_scan_start(spend_pub, height);
                 Ok(Some(XmrOutput {
                     txid: o.txid,
                     amount: o.amount_piconero,
@@ -364,10 +428,7 @@ impl MoneroChain for LiveMonero {
                 }))
             }
             None => {
-                self.next_scan
-                    .lock()
-                    .unwrap()
-                    .insert(*spend_pub, resume_height(tip, start));
+                self.set_scan_start(spend_pub, resume_height(tip, start));
                 Ok(None)
             }
         }
@@ -552,6 +613,55 @@ mod tests {
             m.sweep(&lock, &[1; 32], &[2; 32]).await.unwrap(),
             "ef".repeat(32)
         );
+    }
+
+    #[test]
+    fn lock_scan_cursor_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let other = [8u8; 32];
+        {
+            let m = chain(dir.path());
+            // Nothing remembered: the configured lookback below the tip.
+            assert_eq!(m.scan_start(&key, 10_000), 10_000 - 720);
+            assert_eq!(m.scan_start(&key, 100), 0);
+            m.set_scan_start(&key, resume_height(10_000, 10_000 - 720));
+            assert_eq!(m.scan_start(&key, 10_001), 10_000 - RESCAN_MARGIN);
+        }
+        // A new process over the same journal directory resumes there, not 720 back.
+        let m = chain(dir.path());
+        assert_eq!(m.scan_start(&key, 10_005), 10_000 - RESCAN_MARGIN);
+        // Cursors are per lock address.
+        assert_eq!(m.scan_start(&other, 10_005), 10_005 - 720);
+        assert_eq!(
+            read_cursor(&m.scan_cursor(&key)).unwrap(),
+            Some(ScanCursor {
+                next: 10_000 - RESCAN_MARGIN
+            })
+        );
+    }
+
+    #[test]
+    fn a_bad_lock_scan_cursor_only_widens_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let m = chain(dir.path());
+        std::fs::write(m.scan_cursor(&key), b"not json").unwrap();
+        assert_eq!(chain(dir.path()).scan_start(&key, 5_000), 5_000 - 720);
+        // A cursor above the tip (another chain, or a deep reorg) is not trusted either.
+        write_cursor(&m.scan_cursor(&key), &ScanCursor { next: 9_000 }).unwrap();
+        assert_eq!(chain(dir.path()).scan_start(&key, 5_000), 5_000 - 720);
+    }
+
+    #[test]
+    fn found_lock_pins_the_cursor_at_its_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let m = chain(dir.path());
+        // find_lock pins the cursor at the lock's block so its confirmations stay current;
+        // after a restart the rescan starts there (a few blocks), not at the lookback.
+        m.set_scan_start(&key, 4_990);
+        assert_eq!(chain(dir.path()).scan_start(&key, 5_000), 4_990);
     }
 
     #[tokio::test]

@@ -82,3 +82,31 @@ route is measured and found short.
 4. Only on a go-ahead: shim prototype against one fleet node, read-only first (follows tip, no
    submit), then testnet staking.
 Hard limits: no mainnet, no deletes of chain data on live hosts, no deploys without Bert's go.
+
+## 7. Bert's direction (2026-10-14): `--expire 30d` as a trust window
+
+Bert's idea: give `--expire 30d` and the node stops validating ancient history. It accepts the chain
+the network gives it, as long as it holds 30 days of history that it can cross-check against other
+nodes. This is option **E** and replaces "B then D" as the leading design.
+
+How it would work:
+1. **Start**: connect to k independent peers (default 4, incl. fleet hosts). Fetch headers, then a
+   UTXO snapshot as of (tip − window). Accept the snapshot only if a majority of peers report the
+   same snapshot hash and the same header at that height.
+2. **Window**: from the snapshot forward, validate every block fully (consensus, kernel, UTXO),
+   exactly as today. Bodies older than the window are expired (existing `expire` machinery).
+3. **Stake**: unchanged. Needs only index + UTXO + wallet.
+4. **Safety**: refuse to stake if fewer than k peers agree on the tip, or the tip is behind.
+
+Honest limits to settle before building:
+* Divi headers do not commit to the UTXO set, and PoS headers alone prove no work (the kernel
+  needs the coinstake tx). So "proved against other nodes" means **agreement of peers**, not a
+  cryptographic proof. A network-wide eclipse of the node could feed it a fake chain. Cost is missed
+  or orphaned rewards, not stolen coins (a coinstake pays the wallet's own address).
+* The P2P protocol has no snapshot message. Add one, or serve snapshots over HTTPS from the fleet
+  (simpler, same trust model: hash cross-checked among peers).
+* Reorgs deeper than the window cannot be handled; the existing 2,880-block floor stays.
+
+Build order: (1) measure mainnet size split, (2) snapshot export/import on testnet, (3) multi-peer
+agreement check, (4) `--expire <window>` + `--trust-peers` start path, (5) testnet staking proof.
+No code written yet.

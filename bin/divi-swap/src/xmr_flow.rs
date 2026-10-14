@@ -19,8 +19,9 @@ use crate::flow::RunOpts;
 use crate::session::{Session, Sessions};
 use crate::MakerClient;
 
-/// Fresh quote → prepare → `POST /xmr/swaps` → verify the maker's setup → send our
-/// signatures (the maker then broadcasts `Tx_lock`). Returns the local id.
+/// Wait for the maker's DIVI wallet scan ([`MakerClient::wait_ready`]) → fresh quote →
+/// prepare → `POST /xmr/swaps` → verify the maker's setup → send our signatures (the maker
+/// then broadcasts `Tx_lock`). Returns the local id.
 pub async fn begin(
     taker: &XmrTaker,
     client: &MakerClient,
@@ -28,7 +29,8 @@ pub async fn begin(
     offer_id: &str,
     btc_sats: u64,
 ) -> Result<String> {
-    let quote = client.quote(offer_id, btc_sats).await?;
+    client.wait_ready().await?;
+    let quote = client.quote_retrying(offer_id, btc_sats).await?;
     if quote.counter_chain != divi_swap::Chain::Xmr {
         bail!(
             "offer {offer_id} swaps DIVI against {}; this is the xmr flow",
