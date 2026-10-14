@@ -700,7 +700,28 @@ impl Chain {
         Ok(if cutoff > 0 { Some(cutoff) } else { None })
     }
 
-    /// Run one pruning pass. Returns the number of blocks whose data was removed.
+    /// Height below which block-index lottery-winner lists have been cleared (0 = none).
+    pub fn winners_strip_height(&self) -> u32 {
+        self.db.winners_strip_height()
+    }
+
+    /// Highest height whose lottery-winner list may be cleared, or `None`. Consensus reads the
+    /// winners only one block before each of the last `LOTTERY_VETO_CYCLES` lottery blocks, so
+    /// anything older than that many cycles plus the reorg floor is never read again.
+    pub fn winners_strip_cutoff(&self, prune_cutoff: u32) -> Option<u32> {
+        use crate::prune::MIN_BLOCKS_TO_KEEP;
+        const LOTTERY_VETO_CYCLES: u32 = 3;
+        let (_, cycle) = self.get_lottery_params();
+        let keep = LOTTERY_VETO_CYCLES
+            .saturating_mul(cycle)
+            .saturating_add(1)
+            .saturating_add(MIN_BLOCKS_TO_KEEP);
+        let cutoff = self.height().saturating_sub(keep).min(prune_cutoff);
+        (cutoff > 0).then_some(cutoff)
+    }
+
+    /// Run one pruning pass: drop old block bodies and undo data, and clear old lottery-winner
+    /// lists from the block index. Returns the number of blocks whose data was removed.
     pub fn prune_expired(
         &self,
         expire: crate::prune::Expire,
@@ -708,7 +729,13 @@ impl Chain {
         now: u64,
     ) -> Result<u32, StorageError> {
         match self.prune_cutoff(expire, wallet_floor, now)? {
-            Some(cutoff) => self.db.prune_blocks_to(cutoff),
+            Some(cutoff) => {
+                let pruned = self.db.prune_blocks_to(cutoff)?;
+                if let Some(strip) = self.winners_strip_cutoff(cutoff) {
+                    self.db.strip_lottery_winners_to(strip)?;
+                }
+                Ok(pruned)
+            }
             None => Ok(0),
         }
     }
@@ -5106,24 +5133,76 @@ mod tests {
         assert_eq!(chain.prune_height(), 120);
         assert_eq!(chain.tip().unwrap().hash, tip_before.hash);
         for (h, hash) in hashes.iter().enumerate().take(121).skip(1) {
-            assert!(
-                chain.get_block(hash).unwrap().is_none(),
-                "body {h} pruned"
-            );
+            assert!(chain.get_block(hash).unwrap().is_none(), "body {h} pruned");
             assert!(
                 chain.get_block_index(hash).unwrap().is_some(),
                 "index {h} kept"
             );
         }
         for (h, hash) in hashes.iter().enumerate().take(n as usize + 1).skip(121) {
-            assert!(
-                chain.get_block(hash).unwrap().is_some(),
-                "body {h} kept"
-            );
+            assert!(chain.get_block(hash).unwrap().is_some(), "body {h} kept");
         }
         // Idempotent, and never reaches into the floor.
         assert_eq!(chain.prune_expired(Expire::Minimum, None, 0).unwrap(), 0);
         assert!(chain.get_block(&hashes[n as usize]).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_prune_strips_old_lottery_winners_only() {
+        use crate::prune::{Expire, MIN_BLOCKS_TO_KEEP};
+        use divi_primitives::{LotteryCoinstake, LotteryWinners, Script};
+        let (chain, _dir) = create_test_chain();
+        let (_, cycle) = chain.get_lottery_params();
+        let n = MIN_BLOCKS_TO_KEEP + 3 * cycle + 200;
+        let hashes = build_chain_of(&chain, n);
+        let winners = |h: u32| {
+            LotteryWinners::with_coinstakes(
+                h,
+                vec![LotteryCoinstake::new(
+                    Hash256::from_bytes([h as u8; 32]),
+                    Script::from(vec![0x51]),
+                )],
+            )
+        };
+        for (h, hash) in hashes.iter().enumerate().skip(1) {
+            let mut idx = chain.get_block_index(hash).unwrap().unwrap();
+            idx.lottery_winners = winners(h as u32);
+            chain.db.store_block_index_entry(&idx).unwrap();
+        }
+        assert_eq!(chain.winners_strip_height(), 0);
+
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+
+        let strip = chain.winners_strip_height();
+        let keep = 3 * cycle + 1 + MIN_BLOCKS_TO_KEEP;
+        assert_eq!(
+            strip,
+            n - keep,
+            "strip watermark = tip - (3 cycles + floor)"
+        );
+        for (h, hash) in hashes.iter().enumerate().skip(1) {
+            let idx = chain.get_block_index(hash).unwrap().unwrap();
+            if (h as u32) <= strip {
+                assert!(
+                    idx.lottery_winners.coinstakes.is_empty(),
+                    "winners {h} stripped"
+                );
+            } else {
+                assert_eq!(idx.lottery_winners.coinstakes.len(), 1, "winners {h} kept");
+            }
+            assert_eq!(idx.height, h as u32);
+            assert_eq!(idx.hash, *hash);
+        }
+        // Survives a round trip through the DB (not just the cache) and is idempotent.
+        let raw = chain.db.get_block_index(&hashes[1]).unwrap().unwrap();
+        assert!(raw.lottery_winners.coinstakes.is_empty());
+        chain.prune_expired(Expire::Minimum, None, 0).unwrap();
+        assert_eq!(chain.winners_strip_height(), strip);
+        // Never strips without expire.
+        let (chain2, _d2) = create_test_chain();
+        build_chain_of(&chain2, n);
+        chain2.prune_expired(Expire::Never, None, 0).unwrap();
+        assert_eq!(chain2.winners_strip_height(), 0);
     }
 
     #[test]

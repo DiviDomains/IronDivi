@@ -495,6 +495,7 @@ impl BlockchainRpc {
             "chainwork": chain_work,
             "pruned": self.chain.prune_height() > 0,
             "pruneheight": self.chain.prune_height(),
+            "winnersstripheight": self.chain.winners_strip_height(),
             "warnings": ""
         }))
     }

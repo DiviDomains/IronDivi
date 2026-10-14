@@ -78,6 +78,7 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
 ## Thin staking design (2026-10-14)
 Design doc: `docs/plans/thin-staking.md`. Recommendation: ship pruned staking (`expire=0`) as the
 thin mode, add snapshot bootstrap, build a true remote-node shim only if still needed.
-Open: per-column-family mainnet sizes unmeasured; hp3 live pruned-staking test belongs to another lane.
+Mainnet CF split measured (doc §8). Lottery-winner stripping built and validated on testnet (hp1 copy,
+970 MB -> 105 MB with expire 0; clean restart, 0 errors). Not deployed anywhere real. ELI5 page published as an Artifact.
 ## NEEDS HUMAN
 * Choose approach (A / A+B / D) — see the design doc.

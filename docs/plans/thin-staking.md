@@ -167,7 +167,7 @@ one block before each of the last 3 lottery blocks (cycle 10,080 blocks), so eve
 ~30,240 blocks (~21 days) plus the 2,880-block reorg floor is dead weight. The staking path does not
 read winners at all.
 
-### Fix (proposed, not built)
+### Fix (built; see "Implementation and testnet result" below)
 Extend the expire pass: for heights below `tip - max(window, 3*10,080 + 2,880)`, rewrite the
 index entry with an empty winners list (decoder already accepts a zero count), then compact
 `block_index`. Reversible in the sense that nothing consensus-relevant is lost; winners for old
@@ -182,3 +182,18 @@ A new-node variant stores winners only as a per-block delta or only for recent b
 | `expire` + winner stripping | ~1.9 GB | 0.74 GB | ~2.6 GB (**~1.9 GB**, index off) |
 Remaining after both: ~1.3 GB block_index (fixed fields) + 0.4 GB UTXO + ~0.2 GB height map.
 Further option: drop `accumulator` (32 B/block, 140 MB) for old v4 blocks; small, skip for now.
+
+### Implementation and testnet result
+Built in `divi-storage` (`strip_lottery_winners_to`, `winners_strip_cutoff`), run from the expire
+pass, and exposed as `winnersstripheight` in `getblockchaininfo`. Winners are kept for
+`3*cycle + 1 + 2880` blocks below the tip, and the cutoff never exceeds the body-prune cutoff, so it
+is inert unless `expire` is on. Only the lottery list is emptied; `height`, `hash` and every other
+field are unchanged. Side-chain entries are untouched. Test: `test_prune_strips_old_lottery_winners_only`.
+
+Live run (hp1, copy of an unpruned testnet datadir at tip 349,676, `--testnet --expire 0`):
+* chainstate 970 MB -> 201 MB right after the pass -> **105 MB** after compaction settled. This
+  figure is bodies + undo + winners together; the winners share was not isolated on testnet.
+* `winnersstripheight` 345,743 -> 346,195 = tip - 3,481 (3*200 + 1 + 2,880), as designed, and it
+  advances with the tip. Zero ERROR lines; a stop/restart came back clean at the same watermark.
+* Testnet cycle is 200, so the keep window is 3,481 blocks. Mainnet (10,080) keeps 33,121 blocks.
+Mainnet figures above remain estimates.

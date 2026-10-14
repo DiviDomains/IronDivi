@@ -47,6 +47,7 @@ const CF_UNDO: &str = "undo";
 const KEY_BEST_BLOCK: &[u8] = b"best_block";
 const KEY_CHAIN_HEIGHT: &[u8] = b"chain_height";
 const KEY_PRUNE_HEIGHT: &[u8] = b"prune_height";
+const KEY_WINNERS_STRIP_HEIGHT: &[u8] = b"winners_strip_height";
 
 #[derive(Debug, Clone)]
 pub struct UtxoStats {
@@ -662,6 +663,64 @@ impl ChainDatabase {
             .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
             .map(u32::from_le_bytes)
             .unwrap_or(0)
+    }
+
+    /// Highest height whose block-index entry has had its lottery-winner list cleared
+    /// (0 = nothing stripped).
+    pub fn winners_strip_height(&self) -> u32 {
+        self.get_metadata(KEY_WINNERS_STRIP_HEIGHT)
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Clear the per-block lottery-winner list from block-index entries for heights
+    /// `(winners_strip_height, cutoff]`, advance the watermark, and compact `block_index`.
+    /// Every other field of the entry is kept. The caller must pick a cutoff old enough that
+    /// consensus never reads those lists again. Returns the number of entries rewritten.
+    pub fn strip_lottery_winners_to(&self, cutoff: u32) -> Result<u32, StorageError> {
+        let start = self.winners_strip_height();
+        if cutoff <= start {
+            return Ok(0);
+        }
+        let cf_index = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+        let cf_meta = self.db.cf_handle(CF_METADATA).unwrap();
+        let mut rewritten = 0u32;
+        let mut h = start + 1;
+        while h <= cutoff {
+            let chunk_end = (h + 999).min(cutoff);
+            let mut batch = WriteBatch::default();
+            let mut touched = Vec::new();
+            for height in h..=chunk_end {
+                let Some(hash) = self.get_height_mapping(height)? else {
+                    continue;
+                };
+                let Some(raw) = self.db.get_cf(cf_index, block_index_key(&hash))? else {
+                    continue;
+                };
+                let mut entry = BlockIndex::from_bytes(&raw)?;
+                if entry.lottery_winners.coinstakes.is_empty() {
+                    continue;
+                }
+                entry.lottery_winners.coinstakes.clear();
+                batch.put_cf(cf_index, block_index_key(&hash), entry.to_bytes());
+                touched.push(entry);
+                rewritten += 1;
+            }
+            batch.put_cf(cf_meta, KEY_WINNERS_STRIP_HEIGHT, chunk_end.to_le_bytes());
+            self.db.write(batch)?;
+            for entry in touched {
+                self.block_index_cache.insert(entry.hash, entry);
+            }
+            h = chunk_end + 1;
+        }
+        if rewritten > 0 {
+            self.db
+                .compact_range_cf(cf_index, None::<&[u8]>, None::<&[u8]>);
+        }
+        Ok(rewritten)
     }
 
     /// Delete block bodies and undo data for heights `(prune_height, cutoff]`, advance the
