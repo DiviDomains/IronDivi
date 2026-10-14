@@ -1,0 +1,7 @@
+[Unit]
+Description=Swap maker watch -> Telegram (deploy/divi-swapd/swap-watch)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/swap-watch.sh
