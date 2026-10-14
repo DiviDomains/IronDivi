@@ -32,7 +32,7 @@ mainnet is a separate project, tracked as these work items (one per coin, plus s
 - [ ] **LTC:** wire the mainnet HRP and endpoints (`swap-chain-ltc/src/lib.rs:52-58,111`).
 - [ ] **ZEC:** add mainnet address prefixes and a lightwalletd endpoint, and pick the v5/v6 tx format by activation height (mainnet NU7 2026-11-05) (`swap-chain-zec/src/address.rs:18-21`, `tx.rs:34-48`).
 - [ ] **USDC/EVM:** add Ethereum/Base mainnet `network.rs` variants with the canonical USDC addresses, and an audited HTLC deployment.
-- [ ] **XMR:** mainnet backends, and remove the runtime refusal only after the above (`xmr_live.rs:174-191`).
+- [ ] **XMR:** mainnet backends, and remove the runtime refusal only after the above (`xmr_live.rs:174-191`). Sequenced plan with gates: `xmr-mainnet-plan.md`.
 - [ ] **Shared:** a mainnet timeout/confirmation profile in `divi-swap/src/config.rs`, an external security review, and staged low-value mainnet trials.
 
 ## BTC
