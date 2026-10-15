@@ -1054,7 +1054,8 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
 - **C8 fixed (1841a12):** a monerod connection reset during a block scan panicked the taker (hit
   lock-only soak swap 2). It is now an `Rpc` error, and a failed fetch is no longer read as "no
   output in this block". The Mac taker is rebuilt (`~/.cache/divi-swap-c1-1841a12`, debug, Xcode
-  SDK: gmp-mpfr-sys fails with the CLT 27.0 SDK); the maker has not been redeployed with it yet.
+  SDK: gmp-mpfr-sys fails with the CLT 27.0 SDK); the maker runs it since 2026-10-15 16:29Z
+  (sha `929c9b54…`, `.prev` = `a77ec9d` `93cc44cd…`); the 5 open C1 swaps kept their state.
 - **§7 tests:**
   - 5a/5b/7 **PASS** on a private Divi 3.0.0 regtest (`c1-regtest-results.md`). Finding: high-S
     signatures are *standard* on Divi 3.0.0, for `Tx_cancel` and for `Tx_lock`'s funding input, so
@@ -1063,7 +1064,8 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
   - 6 **PASS** live (swap `87a95844`, after signing): `POST /j` → 400 "no 2P-ECDSA session for
     this swap"; `POST /sigs` with a different signature → 400 "swap is Locked, not awaiting
     signatures". The reused-`j_sid` refusal (`maker.rs`) is unit-tested, not probed live.
-  - 1 (≥5 happy) running: `87a95844` past the XMR lock; 4 more queued (`xmr-soak/c1-happy2`).
+  - 1 **PASS**: 5 of 5 happy swaps redeemed (`87a95844` + `xmr-soak/c1-happy2` × 4, 1530-2188 s
+    each, keying included). RESULTS.md.
   - 2 and 3: 2 accept-only (`c1-accept`) and 2 lock-only (`c1-lock`) swaps are parked until
     `t_cancel` (6 h after lock); then `xmr-soak.sh --resume`.
   - 4 (punish) running on a private second maker on hp2 (`c1-punish-results.md`): `Tx_cancel`

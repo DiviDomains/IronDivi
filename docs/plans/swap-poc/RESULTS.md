@@ -403,3 +403,10 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
   confirmed. The 2 "missing" rows are script misattributions: `1e184a6f…` is the CLTV probe the
   node rejected by design, and `1a3dd95e…` is a BTC refund (confirmed, testnet3 block 5158301)
   that the script looked up on DIVI. Fix sent to the usdc lane.
+- XMR C1 full fix, §7 test 1 (happy), live stagenet, 2026-10-15: dnsdivi maker `a77ec9d`, taker CLI
+  `61ca99a` (first swap) then `1841a12`; 0.002 sXMR per swap. **5 of 5 redeemed**: `87a95844`
+  (14:48Z) and batch `xmr-soak/c1-happy2` (4 × 1 at a time, 14:50-16:29Z): taker swaps `131ecd94`
+  1561 s, `4db3c259` 1530 s, `16a29889` 2188 s, `9c005552` 1730 s, each including the 2P-ECDSA
+  keying of `J` and both Paillier prime sets (taker pre-generated, maker from its pool). The swap
+  logs carry no per-step timings. Maker then redeployed to `1841a12` (sha `929c9b54…`) at 16:29Z
+  with 5 C1 swaps open; all kept their state.
