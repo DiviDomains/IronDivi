@@ -79,7 +79,7 @@ Production dnsdivi / hp1 / hp2 were never touched; expiry is not enabled anywher
 - ~~Monero STAGENET atomic swap, parked 2026-10-14 on `secret-broker serve`.~~ **Resolved
   2026-10-14:** Bert started the broker; the swap ran end to end on stagenet (0.01 sXMR → 50 tDIVI,
   outcome `redeemed`). Txids in `docs/plans/swap-poc/RESULTS.md`. Stagenet only; mainnet is a separate decision.
-- XMR swap C1 (cancel ransom): review the fix design `docs/plans/swap-poc/xmr-c1-design.md`, and say whether to land its §4.4 interim hardening first. Not implemented; mainnet stays blocked.
+- XMR swap C1 (cancel ransom): **full fix implemented 2026-10-15** (Bert: option 3) on branch `c1-impl` 3c24b32. It uses the cggmp21 library at SecurityLevel128, so `J` is a 2P-ECDSA joint key; it has the new `Tx_lock` script (cancel branch is `J` only, plus the maker's `t_late` branch) and refund encsigs for all 120 `Tx_cancel` encodings. Unit and engine tests pass (18 + 11 + 2). Daemon e2e test and stagenet deploy are in progress; the §7 stagenet tests are next. Known gaps: a retried `j` message (a lost HTTP reply) breaks the keying session; old XMR records are not read by the new build; a restart mid-keying aborts the swap. Still needed from you: the review of `docs/plans/swap-poc/xmr-c1-design.md`, which may still change the design. Mainnet stays blocked until C1 is verified on stagenet.
 
 ## Thin staking: helpers + snapshot (2026-10-14)
 Built on testnet: pruned nodes advertise `NODE_NETWORK_LIMITED` only (live bug fix); terminal lottery-winner
