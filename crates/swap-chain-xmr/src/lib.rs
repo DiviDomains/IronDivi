@@ -35,6 +35,7 @@
 pub mod adaptor_bridge;
 pub mod divi_chain;
 pub mod live_rpc;
+pub mod lock_scripts;
 pub mod monero_chain;
 pub mod monero_key_share;
 pub mod monero_sweep;
