@@ -10,19 +10,23 @@
 //! (real DIVI transactions and script checks; Monero outputs opened only by `s·G = S`).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use divi_swap::api::{Direction, Offer};
 use divi_swap::{Chain, Profile, Result, Store, SwapConfig};
-use divi_swap_xmr::chain::{MoneroChain, XmrOutput};
+use divi_swap_xmr::api::{JRoundReply, SigsRequest};
+use divi_swap_xmr::chain::{DiviChain, MoneroChain, XmrOutput};
+use divi_swap_xmr::jsig::{self, Primes};
 use divi_swap_xmr::mock::{
     MockDiviChain, MockDiviWallet, MockMoneroChain, MockMoneroWallet, MOCK_DIVI_FEE, MOCK_XMR_FEE,
 };
+use divi_swap_xmr::taker::JNext;
 use divi_swap_xmr::{
     XmrConfig, XmrMaker, XmrMakerState, XmrTaker, XmrTakerState, PICONERO_PER_COUNTER_SAT,
 };
+use swap_chain_xmr::lock_scripts;
 use tokio::sync::Notify;
 
 const T0: u32 = 1_800_000_000;
@@ -47,6 +51,31 @@ fn cfg() -> XmrConfig {
         divi_fee_sats: 10_000,
         ..XmrConfig::testnet()
     }
+}
+
+/// Paillier primes for the 2P-ECDSA sessions (one set per side), generated once per machine
+/// and cached in the temp dir: each set takes up to a minute and a half.
+fn primes() -> &'static (Primes, Primes) {
+    static P: OnceLock<(Primes, Primes)> = OnceLock::new();
+    P.get_or_init(|| {
+        let path = std::env::temp_dir().join("divi-swap-xmr-test-primes.json");
+        if let Some(p) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+        {
+            return p;
+        }
+        let p = std::thread::scope(|s| {
+            let a = s.spawn(jsig::generate_primes);
+            let b = s.spawn(jsig::generate_primes);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let tmp = path.with_extension(format!("{}", std::process::id()));
+        if std::fs::write(&tmp, serde_json::to_vec(&p).unwrap()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        p
+    })
 }
 
 struct W {
@@ -112,14 +141,16 @@ impl W {
             vec![offer()],
         )
         .unwrap()
-        .with_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+        .with_clock(Arc::new(move || c.load(Ordering::SeqCst)))
+        .with_primes(Arc::new(|| primes().1.clone()));
         let taker = XmrTaker::new(
             cfg(),
             Arc::new(td.clone()),
             Arc::new(tx.clone()),
             store.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_primes(Arc::new(|| primes().0.clone()));
         (maker, taker)
     }
 
@@ -142,19 +173,44 @@ impl W {
         self.xmr.mine(n);
     }
 
-    /// Quote → setup → verify → sigs (Tx_lock goes out). Returns (maker id, taker id).
-    async fn open(&self) -> (String, String) {
+    /// Quote → setup → the `J` exchanges (each maker reply passed through `tamper` on its way
+    /// to the taker) → the taker's signatures. Returns (maker id, taker id, sigs), or the
+    /// first error with the maker id it happened on.
+    async fn key(
+        &self,
+        tamper: &mut dyn FnMut(&mut JRoundReply),
+    ) -> std::result::Result<(String, String, SigsRequest), (String, String)> {
         let q = self
             .maker
             .quote("divi-xmr-stagenet", XMR_UNITS)
             .await
             .unwrap();
         let (tid, req) = self.taker.prepare(&q).await.unwrap();
-        let reply = self.maker.setup(req).await.unwrap();
+        let mut reply = self.maker.setup(req).await.unwrap();
         let mid = reply.swap_id.clone();
-        let sigs = self.taker.accepted(&tid, reply).await.unwrap();
+        for _ in 0..64 {
+            tamper(&mut reply);
+            match self.taker.j_step(&tid, reply).await {
+                Ok(JNext::Sigs(sigs)) => return Ok((mid, tid, sigs)),
+                Ok(JNext::Send(r)) => {
+                    reply = self
+                        .maker
+                        .j_round(&mid, r)
+                        .await
+                        .map_err(|e| (mid.clone(), e.to_string()))?
+                }
+                Err(e) => return Err((mid, e.to_string())),
+            }
+        }
+        panic!("2P-ECDSA did not finish in 64 exchanges");
+    }
+
+    /// Keying, then sigs (Tx_lock goes out). Returns (maker id, taker id).
+    async fn open(&self) -> (String, String) {
+        let (mid, tid, sigs) = self.key(&mut |_| {}).await.unwrap();
         let v = self.maker.sigs(&mid, sigs).await.unwrap();
         assert_eq!(v.state, XmrMakerState::Locked);
+        assert_eq!(self.taker_rec(&tid).state, XmrTakerState::Accepted);
         (mid, tid)
     }
 
@@ -436,39 +492,73 @@ async fn adversarial_inputs_are_refused() {
     btc_quote.counter_chain = Chain::Btc;
     assert!(w.taker.prepare(&btc_quote).await.is_err());
 
-    // A setup whose Tx_cancel pays the maker instead of the 2-of-2 is refused by the taker.
-    let (tid, req) = w.taker.prepare(&q).await.unwrap();
-    let mut reply = w.maker.setup(req).await.unwrap();
-    reply.tx_cancel.vout[0].script_pubkey = w.maker_divi.script();
-    let err = w.taker.accepted(&tid, reply).await.unwrap_err().to_string();
+    // A setup whose Tx_cancel pays the maker instead of the cancel script: the taker refuses
+    // it before signing anything under J.
+    let pay_maker = w.maker_divi.script();
+    let (_, err) = w
+        .key(&mut |r| {
+            if let Some(s) = r.setup.as_mut() {
+                s.tx_cancel.vout[0].script_pubkey = pay_maker.clone();
+            }
+        })
+        .await
+        .err()
+        .expect("refused");
     assert!(err.contains("Tx_cancel"), "{err}");
 
-    // A forged Tx_cancel signature is refused by the taker.
-    let q2 = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
-    let (tid, req) = w.taker.prepare(&q2).await.unwrap();
-    let mut reply = w.maker.setup(req).await.unwrap();
-    let mid = reply.swap_id.clone();
-    reply.maker_cancel_sig[10] ^= 1;
-    assert!(w.taker.accepted(&tid, reply).await.is_err());
+    // A setup claiming a J other than the one computed together (a key the maker alone holds,
+    // say) is refused: the taker signs nothing.
+    let (mid, err) = w
+        .key(&mut |r| {
+            if let Some(s) = r.setup.as_mut() {
+                s.joint_pubkey = s.maker_divi_pubkey;
+            }
+        })
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.contains("J is not"), "{err}");
+
+    // A corrupted 2P-ECDSA message fails the session (and nothing is signed).
+    let mut hit = false;
+    let (_, err) = w
+        .key(&mut |r| {
+            if !hit && !r.msgs.is_empty() {
+                hit = true;
+                for m in &mut r.msgs {
+                    m.body = serde_json::json!({ "garbage": true });
+                }
+            }
+        })
+        .await
+        .err()
+        .expect("refused");
+    assert!(!err.is_empty());
 
     // Bad taker signatures are refused by the maker, and nothing is broadcast.
-    let q3 = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
-    let (tid, req) = w.taker.prepare(&q3).await.unwrap();
-    let reply = w.maker.setup(req).await.unwrap();
-    let mid3 = reply.swap_id.clone();
-    let lock_txid = reply.lock_outpoint.txid.clone();
-    let mut sigs = w.taker.accepted(&tid, reply).await.unwrap();
-    sigs.taker_cancel_sig[10] ^= 1;
-    assert!(w.maker.sigs(&mid3, sigs).await.is_err());
+    let (mid3, _, sigs) = w.key(&mut |_| {}).await.unwrap();
+    let lock_txid = w.maker.record(&mid3).unwrap().unwrap().tx_lock.txid();
+    let mut bad = sigs.clone();
+    let i = bad.cancel_sig.len() / 2;
+    bad.cancel_sig[i] ^= 1;
+    assert!(w.maker.sigs(&mid3, bad).await.is_err());
+    let mut bad = sigs.clone();
+    bad.refund_encsigs.pop();
+    assert!(w.maker.sigs(&mid3, bad).await.is_err());
+    let mut bad = sigs.clone();
+    let (a, b) = (bad.refund_encsigs[0].encsig.clone(), bad.refund_encsigs[1].encsig.clone());
+    bad.refund_encsigs[0].encsig = b;
+    bad.refund_encsigs[1].encsig = a;
+    assert!(w.maker.sigs(&mid3, bad).await.is_err());
     assert_eq!(w.maker_state(&mid3), XmrMakerState::Accepted);
-    let lock = divi_primitives::hash::Hash256::from_hex(&lock_txid).unwrap();
-    assert!(w.divi.tx(&lock).is_none(), "Tx_lock never broadcast");
+    assert!(w.divi.tx(&lock_txid).is_none(), "Tx_lock never broadcast");
 
     // An accepted swap whose signatures never come is forgotten (nothing locked).
     w.clock
         .fetch_add(cfg().sigs_wait_secs + 1, Ordering::SeqCst);
     w.maker.tick().await.unwrap();
     assert_eq!(w.maker_state(&mid), XmrMakerState::Aborted);
+    assert_eq!(w.maker_state(&mid3), XmrMakerState::Aborted);
     assert_eq!(w.maker_divi.balance(), MAKER_DIVI);
 }
 
@@ -505,40 +595,53 @@ fn offer_and_config_rules() {
     assert!(hl.is_err());
 }
 
-/// The taker locks no XMR until she holds a valid maker signature on `Tx_punish` (her
-/// remedy if the maker stalls after she locks): a forged one is refused, a missing one waits.
+/// C1: `Tx_lock`'s cancel branch takes only `σ_J`, and `σ_J` exists once, so the lock has
+/// exactly one cancel transaction. Its txid still depends on how `σ_J` is encoded (anyone may
+/// re-encode it: flip `s`, re-push it); whichever of the 120 encodings is mined, the maker
+/// can refund with the taker's adaptor signature for it, and that refund hands her `s_m`.
 #[tokio::test]
-async fn no_xmr_lock_without_a_valid_punish_signature() {
+async fn a_re_encoded_tx_cancel_still_refunds_and_reveals_s_m() {
     let w = W::new();
     let (mid, tid) = w.open().await;
-    w.mine(5); // Tx_lock deeply confirmed
-    let mut view = w.maker.view(&mid).unwrap().unwrap();
-    let good = view
-        .maker_punish_sig
-        .clone()
-        .expect("published once locked");
-    // Missing: idle.
-    view.maker_punish_sig = None;
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+        if w.taker_rec(&tid).state == XmrTakerState::XmrLocked {
+            break;
+        }
+    }
+    assert_eq!(w.taker_rec(&tid).state, XmrTakerState::XmrLocked);
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    let canonical = r.cancel_signed.clone().unwrap();
+    let variants = lock_scripts::cancel_variants(&r.tx_cancel, &r.cancel_sig, &r.redeem_script);
+    assert_eq!(variants.len(), lock_scripts::CANCEL_VARIANTS);
+    // A third party (a staker, say) mines an encoding neither side would broadcast.
+    w.divi.advance_time(cfg().cancel_after_secs);
+    let mut mined = None;
+    for v in variants.iter().rev().filter(|v| v.txid() != canonical.txid()) {
+        if w.maker_divi.broadcast(v).await.is_ok() {
+            mined = Some(v.txid());
+            break;
+        }
+    }
+    let mined = mined.expect("some other encoding of Tx_cancel is valid");
+    w.mine(1);
+    for _ in 0..12 {
+        w.round(&mid, &tid, true, true).await;
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    let t = w.taker_rec(&tid);
     assert_eq!(
-        w.taker.step(&tid, Some(&view)).await.unwrap(),
-        XmrTakerState::Accepted
+        (t.state, t.outcome.as_deref()),
+        (XmrTakerState::Done, Some("refunded")),
+        "{:?}",
+        t.last_error
     );
-    // Forged: refused.
-    let mut bytes = hex::decode(&good).unwrap();
-    bytes[10] ^= 1;
-    view.maker_punish_sig = Some(hex::encode(bytes));
-    let err = w
-        .taker
-        .step(&tid, Some(&view))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("Tx_punish"), "{err}");
-    assert_eq!(w.taker_xmr.balance(), TAKER_XMR, "no XMR moved");
-    // Genuine: she locks.
-    view.maker_punish_sig = Some(good);
-    w.taker.step(&tid, Some(&view)).await.unwrap();
-    assert!(w.taker_rec(&tid).xmr_txid.is_some());
+    assert_eq!(
+        t.cancel_actual.as_ref().map(|c| c.txid()),
+        Some(mined),
+        "the refund spent the re-encoded Tx_cancel"
+    );
+    assert_eq!(w.taker_xmr.balance(), TAKER_XMR - 2 * MOCK_XMR_FEE);
 }
 
 /// A Monero wallet whose next `find_lock` parks until released: a monerod scan that hangs.

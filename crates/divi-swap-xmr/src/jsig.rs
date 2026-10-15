@@ -294,6 +294,14 @@ impl Worker {
     }
 }
 
+/// Run blocking session work (`JSession::round`/`sign`, prime generation) off the async
+/// runtime.
+pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow!("2P-ECDSA task: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

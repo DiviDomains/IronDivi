@@ -20,16 +20,21 @@
 //! `counter_chain = "xmr"`). Message order — note step 5, which is where this differs from
 //! the design doc's happy-path list (see [`maker`]'s docs):
 //!
-//! 1. Taker → maker `POST /xmr/swaps` ([`api::SetupRequest`]): her DIVI multisig pubkey `b`,
-//!    payout script, adaptor point `X = s_t·G` with her Monero share `S_t` and the DLEQ
-//!    proof binding them.
-//! 2. Maker → taker ([`api::SetupReply`]): `a`, `Y = s_m·G`, `S_m`, his DLEQ proof, the
-//!    shared Monero view key, his built-but-unbroadcast `Tx_lock`'s outpoint, unsigned
-//!    `Tx_cancel`/`Tx_refund`/`Tx_punish`, and his plain signatures on `Tx_cancel` and
-//!    `Tx_punish`.
-//! 3. Taker → maker `POST /xmr/swaps/:id/sigs` ([`api::SigsRequest`]): her plain `Tx_cancel`
-//!    signature and her `Tx_refund` signature adaptor-encrypted under `Y`. The maker verifies
-//!    both, then (and only then) broadcasts `Tx_lock`.
+//! 1. Taker → maker `POST /xmr/swaps` ([`api::SetupRequest`]): her DIVI key `b`, payout
+//!    script, adaptor point `X = s_t·G` with her Monero share `S_t` and the DLEQ proof binding
+//!    them, and the opening messages of a 2P-ECDSA session ([`jsig`]) for the joint cancel
+//!    key `J`.
+//! 2. `J` exchanges (`POST /xmr/swaps/:id/j`, [`api::JRoundReply`]) until `J` exists. The
+//!    maker then builds `Tx_lock` ([`swap_chain_xmr::lock_scripts::LockScript`]: redeem by
+//!    `a`+`b`, cancel by `J` alone after `t_cancel`, the maker's late escape after `t_late`)
+//!    and `Tx_cancel`, sends [`api::SetupReply`], and both sides jointly produce `σ_J`, the
+//!    one signature `Tx_cancel` needs. Neither side alone can sign for `J`, and nothing else
+//!    can spend the cancel branch, so no single key can take the lock to a `Tx_cancel` the
+//!    other side has no `Tx_refund` for (C1).
+//! 3. Taker → maker `POST /xmr/swaps/:id/sigs` ([`api::SigsRequest`]): `σ_J` and her
+//!    `Tx_refund` signature adaptor-encrypted under `Y`, once per consensus-valid encoding
+//!    of the signed `Tx_cancel`. The maker verifies all, then (and only then) broadcasts
+//!    `Tx_lock`.
 //! 4. Taker sees `Tx_lock` confirmed, locks XMR to `S = S_m + S_t`, and reports it
 //!    (`POST /xmr/swaps/:id/xmr-lock`, [`api::XmrLockNotice`]).
 //! 5. Maker sees that lock with enough Monero confirmations and only then publishes his
@@ -39,8 +44,9 @@
 //!
 //! Abort: past `t_cancel` either side broadcasts `Tx_cancel`; the maker then completes
 //! `Tx_refund` with `s_m` (DIVI back to him), which reveals `s_m` to the taker, who sweeps
-//! her XMR back. If the maker stalls until `t_punish`, the taker broadcasts `Tx_punish` and
-//! takes the DIVI.
+//! her XMR back. If the maker stalls until `t_punish`, the taker alone signs `Tx_punish` and
+//! takes the DIVI. If `Tx_lock` is still unspent at `t_late` (the taker never cancelled), the
+//! maker alone takes it back.
 
 pub mod api;
 pub mod chain;
@@ -53,7 +59,10 @@ pub mod nums;
 pub mod taker;
 pub mod wire;
 
-pub use api::{SetupReply, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView};
+pub use api::{
+    JRoundReply, JRoundRequest, RefundEncsig, SetupReply, SetupRequest, SigsRequest, XmrLockNotice,
+    XmrSwapView,
+};
 pub use chain::{DiviChain, MoneroChain, XmrOutput};
 pub use maker::{XmrMaker, XmrMakerState};
 pub use taker::{XmrTaker, XmrTakerState};
@@ -70,6 +79,11 @@ pub struct XmrConfig {
     pub cancel_after_secs: u32,
     /// `Tx_punish`'s `nLockTime` = `t_cancel` + this: the maker's window to refund.
     pub punish_after_secs: u32,
+    /// `Tx_lock`'s late branch opens at `t_late` = `t_punish` + this: the maker alone may then
+    /// spend a lock that is still unspent (a malleated `Tx_lock` none of the presigned cancel
+    /// variants spend, or a taker who never cancelled). The taker cancels from `t_cancel` on,
+    /// so she has the whole punish window plus this to get `Tx_cancel` buried first.
+    pub late_after_secs: u32,
     /// Margin before `t_cancel` within which neither side starts the redeem path any more
     /// (the maker stops offering his `Tx_redeem` signature, the taker stops redeeming).
     pub redeem_margin_secs: u32,
@@ -139,11 +153,12 @@ impl ChainTiming {
 impl XmrConfig {
     /// Testnet/stagenet defaults: 6 h to `t_cancel` (Monero's 10 confirmations alone take
     /// ~20 min), 3 h more to `t_punish`, 1 h redeem margin. Derived minimums under
-    /// [`ChainTiming::live`]: cancel 12 240 s, punish 3 600 s, margin 2 640 s.
+    /// [`ChainTiming::live`]: cancel 12 240 s, punish and late 3 600 s, margin 2 640 s.
     pub fn testnet() -> Self {
         XmrConfig {
             cancel_after_secs: 6 * 3600,
             punish_after_secs: 3 * 3600,
+            late_after_secs: 3 * 3600,
             redeem_margin_secs: 3600,
             divi_confirmations: 3,
             xmr_confirmations: 10,
@@ -158,12 +173,13 @@ impl XmrConfig {
     /// depth, XMR depth Monero's spendable age; timelocks mirror the shared mainnet profile
     /// (`t_cancel` = its 12 h maker timeout, `t_punish` = its 24 h taker timeout) with a 2 h
     /// redeem margin. Derived minimums under [`ChainTiming::live`]: cancel 20 400 s, punish
-    /// 7 200 s, margin 3 900 s. The presigned transactions cannot be fee-bumped, so their fee
+    /// and late 7 200 s, margin 3 900 s. The presigned transactions cannot be fee-bumped, so their fee
     /// is the DIVI wallet's 0.01 DIVI/kB rate on a full kB, about 3× a 2-of-2 spend's size.
     pub fn mainnet() -> Self {
         XmrConfig {
             cancel_after_secs: 12 * 3600,
             punish_after_secs: 12 * 3600,
+            late_after_secs: 12 * 3600,
             redeem_margin_secs: 2 * 3600,
             divi_confirmations: divi_swap::SwapConfig::profile(divi_swap::Profile::Mainnet)
                 .divi_confirmations,
@@ -216,6 +232,18 @@ impl XmrConfig {
         maker.max(self.redeem_margin_secs as u64)
     }
 
+    /// Smallest `late_after_secs` under `t`: the taker's `Tx_cancel` (broadcast from
+    /// `t_cancel`, a reaction) must be `divi_confirmations` deep before the late branch opens,
+    /// else the maker could take the DIVI through it while her XMR stays locked. She already
+    /// has the punish window for that; this window alone must cover it again, so a slow
+    /// punish window never eats into it. Never below the margin.
+    pub fn min_late_after_secs(&self, t: &ChainTiming) -> u64 {
+        let taker = t.divi_mtp_lag_secs as u64
+            + 2 * t.reaction_secs as u64
+            + t.divi_wait(self.divi_confirmations + 1);
+        taker.max(self.redeem_margin_secs as u64)
+    }
+
     /// [`XmrConfig::validate_for`] the live chains.
     pub fn validate(&self) -> divi_swap::Result<()> {
         self.validate_for(&ChainTiming::live())
@@ -247,6 +275,12 @@ impl XmrConfig {
                 self.min_punish_after_secs(t),
                 "Tx_cancel and Tx_refund to confirm before t_punish",
             ),
+            (
+                "late_after_secs",
+                self.late_after_secs,
+                self.min_late_after_secs(t),
+                "Tx_cancel to confirm before the late branch opens",
+            ),
         ];
         for (field, have, need, what) in checks {
             if (have as u64) < need {
@@ -277,6 +311,7 @@ mod tests {
             XmrConfig {
                 cancel_after_secs: 43_200,
                 punish_after_secs: 43_200,
+                late_after_secs: 43_200,
                 redeem_margin_secs: 7_200,
                 divi_confirmations: 10,
                 xmr_confirmations: 10,
@@ -303,9 +338,10 @@ mod tests {
             (
                 m.min_cancel_after_secs(&t),
                 m.min_punish_after_secs(&t),
+                m.min_late_after_secs(&t),
                 m.min_redeem_margin_secs(&t)
             ),
-            (20_400, 7_200, 3_900)
+            (20_400, 7_200, 7_200, 3_900)
         );
     }
 
@@ -328,9 +364,10 @@ mod tests {
             (
                 c.min_cancel_after_secs(&t),
                 c.min_punish_after_secs(&t),
+                c.min_late_after_secs(&t),
                 c.min_redeem_margin_secs(&t)
             ),
-            (12_240, 3_600, 2_640)
+            (12_240, 3_600, 3_600, 2_640)
         );
     }
 
@@ -353,7 +390,7 @@ mod tests {
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("cancel_after_secs"), "{e}");
 
-        let mut c = base;
+        let mut c = base.clone();
         c.redeem_margin_secs = 3900; // below the maker's own refund need of 4 380 s
         c.punish_after_secs = c.min_punish_after_secs(&t) as u32;
         assert_eq!(c.punish_after_secs, 4380);
@@ -361,6 +398,15 @@ mod tests {
         c.punish_after_secs -= 1;
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("punish_after_secs"), "{e}");
+
+        let mut c = base.clone();
+        c.redeem_margin_secs = 3900;
+        c.late_after_secs = c.min_late_after_secs(&t) as u32;
+        assert_eq!(c.late_after_secs, 4380);
+        c.validate().unwrap();
+        c.late_after_secs -= 1;
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("late_after_secs"), "{e}");
 
         let mut c = XmrConfig::testnet();
         c.xmr_confirmations = 0;
@@ -380,6 +426,7 @@ mod tests {
         let c = XmrConfig {
             cancel_after_secs: 600,
             punish_after_secs: 300,
+            late_after_secs: 300,
             redeem_margin_secs: 100,
             sigs_wait_secs: 60,
             ..XmrConfig::testnet()

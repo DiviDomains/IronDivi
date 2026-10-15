@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use swap_adaptor::adaptor::{EncryptedSignature, Point};
 use swap_adaptor::dleq::{CrossCurveDLEQProof, PointQ};
 
+use crate::jsig::JMsg;
 use crate::maker::XmrMakerState;
 use crate::wire;
 use divi_swap::api::Quote;
@@ -67,6 +68,32 @@ pub struct SetupRequest {
     pub taker_xmr_share: PointQ,
     /// Proves `X` and `S_t` share one secret.
     pub taker_proof: CrossCurveDLEQProof,
+    /// The 2P-ECDSA session id of the joint cancel key `J` (fresh random per swap; the maker
+    /// refuses one it has seen).
+    #[serde(with = "wire::b32")]
+    pub j_sid: [u8; 32],
+    /// The taker's first `J` messages.
+    pub j_msgs: Vec<JMsg>,
+}
+
+/// One `J` exchange, taker → maker (`POST /xmr/swaps/:id/j`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JRoundRequest {
+    /// The taker's messages since the last exchange.
+    pub msgs: Vec<JMsg>,
+}
+
+/// The maker's answer to `POST /xmr/swaps` and to each `POST /xmr/swaps/:id/j`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JRoundReply {
+    /// The maker's swap id.
+    pub swap_id: String,
+    /// The maker's messages for the taker.
+    pub msgs: Vec<JMsg>,
+    /// Present once `J` exists and the maker has built `Tx_lock` / `Tx_cancel` around it.
+    pub setup: Option<SetupReply>,
+    /// Whether the maker holds his `σ_J` share's output (his signing is finished).
+    pub signed: bool,
 }
 
 /// Step 2, maker → taker (the reply to `POST /xmr/swaps`).
@@ -92,7 +119,10 @@ pub struct SetupReply {
     pub xmr_view_secret: [u8; 32],
     /// XMR the taker must lock, piconero.
     pub xmr_amount: u64,
-    /// `Tx_lock`'s 2-of-2 output (built and signed by the maker, not yet broadcast).
+    /// `J`: the 2P-ECDSA joint key, the only key of `Tx_lock`'s cancel branch.
+    #[serde(with = "wire::b33")]
+    pub joint_pubkey: [u8; 33],
+    /// `Tx_lock`'s output (built and signed by the maker, not yet broadcast).
     pub lock_outpoint: WireOutpoint,
     /// Its value, sats.
     pub lock_amount: u64,
@@ -100,23 +130,24 @@ pub struct SetupReply {
     pub t_cancel: u32,
     /// `nLockTime` of `Tx_punish`.
     pub t_punish: u32,
+    /// Lock height of the maker's late branch of `Tx_lock` (unix seconds).
+    pub t_late: u32,
     /// DIVI fee each presigned transaction pays, sats.
     pub divi_fee_sats: u64,
-    /// `Tx_cancel`: lock → a 2-of-2 output; unsigned.
+    /// `Tx_cancel`: lock (cancel branch) → [`swap_chain_xmr::lock_scripts::CancelScript`];
+    /// unsigned. Both sides sign its digest with `J`.
     #[serde(with = "wire::divi_tx")]
     pub tx_cancel: Transaction,
-    /// The maker's plain signature on `Tx_cancel`.
-    #[serde(with = "wire::bytes")]
-    pub maker_cancel_sig: Vec<u8>,
-    /// Where `Tx_refund` pays the maker. `Tx_refund` and `Tx_punish` spend the *signed*
-    /// `Tx_cancel` — its txid covers both signatures (no segwit on DIVI) — so they are
-    /// built by both sides only once the taker has signed `Tx_cancel` ([`after_cancel`]).
+    /// Where `Tx_refund` pays the maker. `Tx_refund` spends the *signed* `Tx_cancel`, whose
+    /// txid covers `σ_J`'s encoding (no segwit on DIVI), so the taker encrypt-signs a
+    /// `Tx_refund` for every encoding ([`after_cancel`],
+    /// [`swap_chain_xmr::lock_scripts::cancel_variants`]).
     #[serde(with = "wire::bytes")]
     pub maker_refund_script: Vec<u8>,
 }
 
 /// `Tx_refund` and `Tx_punish` for a signed `Tx_cancel` (deterministic: both sides build the
-/// same bytes): each spends its 2-of-2 output, less one more fee, at `t_cancel` / `t_punish`.
+/// same bytes): each spends its output, less one more fee, at `t_cancel` / `t_punish`.
 pub fn after_cancel(
     tx_cancel_signed: &Transaction,
     fee: u64,
@@ -143,15 +174,24 @@ pub fn after_cancel(
     (refund, punish)
 }
 
-/// Step 3, taker → maker (`POST /xmr/swaps/:id/sigs`).
+/// One `Tx_refund` adaptor signature, for the `Tx_cancel` encoding with this txid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundEncsig {
+    /// The `Tx_cancel` variant's txid (hex).
+    pub cancel_txid: String,
+    /// The taker's signature on the `Tx_refund` spending it, adaptor-encrypted under `Y`.
+    #[serde(with = "wire::enc_sig")]
+    pub encsig: EncryptedSignature,
+}
+
+/// Step 3, taker → maker (`POST /xmr/swaps/:id/sigs`), once `J` and `σ_J` exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigsRequest {
-    /// The taker's plain signature on `Tx_cancel`.
+    /// `σ_J` on `Tx_cancel` (DER + SIGHASH_ALL): the maker keeps the taker's copy too.
     #[serde(with = "wire::bytes")]
-    pub taker_cancel_sig: Vec<u8>,
-    /// The taker's `Tx_refund` signature, adaptor-encrypted under `Y`.
-    #[serde(with = "wire::enc_sig")]
-    pub taker_refund_encsig: EncryptedSignature,
+    pub cancel_sig: Vec<u8>,
+    /// One per `Tx_cancel` encoding.
+    pub refund_encsigs: Vec<RefundEncsig>,
 }
 
 /// Step 4, taker → maker (`POST /xmr/swaps/:id/xmr-lock`).
@@ -191,9 +231,6 @@ pub struct XmrSwapView {
     pub cancel_txid: Option<String>,
     /// `Tx_refund` txid, once broadcast.
     pub refund_txid: Option<String>,
-    /// The maker's plain signature on `Tx_punish` (hex), present from `locked` on: the taker
-    /// verifies and keeps it before she locks any XMR.
-    pub maker_punish_sig: Option<String>,
     /// Last error the maker hit on this swap.
     pub last_error: Option<String>,
     /// `nLockTime` of `Tx_cancel` / `Tx_refund` (unix seconds, compared with the DIVI chain's
@@ -204,4 +241,12 @@ pub struct XmrSwapView {
     /// the taker can take the DIVI.
     #[serde(default)]
     pub t_punish: Option<u32>,
+    /// Lock time of the maker's late branch: past it the maker alone may take a lock that
+    /// was never cancelled.
+    #[serde(default)]
+    pub t_late: Option<u32>,
+    /// The maker's late-branch spend of `Tx_lock`, once broadcast (no cancel, no refund on
+    /// that path: `s_m` is never revealed).
+    #[serde(default)]
+    pub late_txid: Option<String>,
 }
