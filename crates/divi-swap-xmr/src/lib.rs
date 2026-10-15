@@ -45,6 +45,7 @@
 pub mod api;
 pub mod chain;
 pub mod crypto;
+pub mod jsig;
 pub mod live;
 pub mod maker;
 pub mod mock;
