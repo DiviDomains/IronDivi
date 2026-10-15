@@ -21,8 +21,8 @@ use divi_script::SigHashType;
 use divi_wallet::signer::sighash;
 use swap_adaptor::adaptor::{AdaptorSigner, EncryptedSignature, Point, Scalar, Signature};
 use swap_adaptor::dleq::{PointQ, ScalarQ};
-use swap_chain_xmr::{lock_scripts, multisig};
 use swap_chain_xmr::swap_templates::{divi_secret_to_adaptor_scalar, recover_secret_from_chain};
+use swap_chain_xmr::{lock_scripts, multisig};
 
 use divi_swap::{Result, SwapError};
 

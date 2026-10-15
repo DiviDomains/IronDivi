@@ -54,9 +54,7 @@ use divi_swap::{Amount as SwapAmount, Chain, Result, Store, SwapError};
 use serde::{Deserialize, Serialize};
 use swap_adaptor::adaptor::{EncryptedSignature, Point};
 use swap_adaptor::dleq::{random_clamped_secret, CrossCurveDLEQProof, PointQ, ScalarQ};
-use swap_chain_xmr::lock_scripts::{
-    self, CancelScript, LockScript, LockSpend, CANCEL_VARIANTS,
-};
+use swap_chain_xmr::lock_scripts::{self, CancelScript, LockScript, LockSpend, CANCEL_VARIANTS};
 use swap_chain_xmr::swap_templates::{maker_completes_tx_refund, maker_encrypts_tx_redeem};
 
 use crate::api::{
@@ -264,8 +262,8 @@ impl XmrMakerRecord {
             _ => None,
         };
         let broadcast = !matches!(self.state, Accepted | Aborted);
-        let cancelled = matches!(self.state, Cancelled | Refunded | Punished)
-            || self.refund_signed.is_some();
+        let cancelled =
+            matches!(self.state, Cancelled | Refunded | Punished) || self.refund_signed.is_some();
         XmrSwapView {
             id: self.id.clone(),
             state: self.state,
@@ -321,6 +319,9 @@ struct Pending {
 }
 
 /// One swap's keying, in memory only: the session holds our `J` share.
+/// One swap's keying state; the lock serializes its rounds.
+type KeyingSlot = Arc<tokio::sync::Mutex<Keying>>;
+
 struct Keying {
     session: Arc<JSession>,
     pending: Pending,
@@ -362,7 +363,7 @@ pub struct XmrMaker {
     quotes_in_setup: parking_lot::Mutex<HashSet<String>>,
     /// Swaps still keying, with their start time (pruned after `sigs_wait_secs`). The inner
     /// lock serializes one swap's rounds.
-    keying: parking_lot::Mutex<HashMap<String, (u64, Arc<tokio::sync::Mutex<Keying>>)>>,
+    keying: parking_lot::Mutex<HashMap<String, (u64, KeyingSlot)>>,
     primes: Arc<parking_lot::Mutex<Vec<Primes>>>,
     primes_fn: PrimesFn,
     primes_filling: Arc<AtomicBool>,
@@ -482,7 +483,8 @@ impl XmrMaker {
 
     /// Top the prime pool up in the background (one filler at a time).
     fn refill_primes(&self) {
-        if self.primes.lock().len() >= PRIMES_POOL || self.primes_filling.swap(true, Ordering::SeqCst)
+        if self.primes.lock().len() >= PRIMES_POOL
+            || self.primes_filling.swap(true, Ordering::SeqCst)
         {
             return;
         }
@@ -802,8 +804,7 @@ impl XmrMaker {
                     "Tx_cancel is not signed under J yet".into(),
                 ));
             }
-            if !crypto::verify_plain(&r.tx_cancel, &r.redeem_script, &r.joint_pk, &req.cancel_sig)
-            {
+            if !crypto::verify_plain(&r.tx_cancel, &r.redeem_script, &r.joint_pk, &req.cancel_sig) {
                 return Err(SwapError::InvalidParams(
                     "the Tx_cancel signature is not valid under J".into(),
                 ));
@@ -813,7 +814,8 @@ impl XmrMaker {
                 t.vin[0].script_sig = lock_scripts::cancel_sig(&r.cancel_sig, &r.redeem_script);
                 t
             };
-            let variants = lock_scripts::cancel_variants(&r.tx_cancel, &r.cancel_sig, &r.redeem_script);
+            let variants =
+                lock_scripts::cancel_variants(&r.tx_cancel, &r.cancel_sig, &r.redeem_script);
             if variants.len() != CANCEL_VARIANTS || encsigs.len() != CANCEL_VARIANTS {
                 return Err(SwapError::InvalidParams(format!(
                     "need {CANCEL_VARIANTS} encrypted Tx_refund signatures, got {}",
@@ -1050,7 +1052,16 @@ impl XmrMaker {
     /// re-encoded.
     async fn on_locked(&self, r: &mut XmrMakerRecord) -> Result<Flow> {
         if r.lock_actual.is_none() {
-            if let Some(actual) = self.malleated_lock(r).await? {
+            // Broadcasting our encoding is the cheap test: only a spent funding input refuses
+            // it. Just then look for the spender, a scan from the funding coin's height
+            // (thousands of blocks on a remote node for an old coin).
+            if let Err(e) = self.divi.broadcast(&r.tx_lock).await {
+                if !matches!(e, SwapError::Rejected(_)) {
+                    return Err(e);
+                }
+                let Some(actual) = self.malleated_lock(r).await? else {
+                    return Err(e);
+                };
                 tracing::warn!(swap = %r.id, txid = %actual.txid().to_hex(),
                     "Tx_lock was re-encoded on chain: no redeem, late branch only");
                 r.lock_actual = Some(actual);
@@ -1061,8 +1072,9 @@ impl XmrMaker {
                 self.store.put_doc(KIND, &r.id, r)?;
                 return Ok(Flow::Moved);
             }
+        } else {
+            self.divi.broadcast(&r.lock_tx().clone()).await?;
         }
-        self.divi.broadcast(&r.lock_tx().clone()).await?;
         let lock_op = r.lock_outpoint();
         if let Some(spender) = self.divi.find_spend(&lock_op).await? {
             return match lock_scripts::lock_spend_branch(&spender, &r.redeem_script) {
@@ -1082,9 +1094,7 @@ impl XmrMaker {
                         .as_deref()
                         .and_then(|s| EncryptedSignature::from_str(s).ok())
                         .ok_or_else(|| {
-                            SwapError::Other(
-                                "Tx_lock redeemed before redeem was offered".into(),
-                            )
+                            SwapError::Other("Tx_lock redeemed before redeem was offered".into())
                         })?;
                     let s_t = crypto::recover(&spender, Signer::Maker, &r.x_point, &encsig)
                         .filter(|s| crypto::ed_pub(s) == r.taker_share)

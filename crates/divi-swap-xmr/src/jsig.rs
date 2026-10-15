@@ -31,9 +31,9 @@ use cggmp21::round_based::{Incoming, MessageDestination, MessageType};
 use cggmp21::security_level::SecurityLevel128;
 use cggmp21::supported_curves::Secp256k1;
 use cggmp21::{DataToSign, ExecutionId, KeyShare, PregeneratedPrimes};
+use divi_swap::{Result, SwapError};
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
-use divi_swap::{Result, SwapError};
 use serde::{Deserialize, Serialize};
 
 macro_rules! anyhow { ($($t:tt)*) => { SwapError::Other(format!($($t)*)) } }
@@ -117,20 +117,31 @@ impl JSession {
         std::thread::Builder::new()
             .name("jsig".into())
             .spawn(move || {
-                let mut w = Worker { me, rx, pending: VecDeque::new(), out: Vec::new(), reply: None, next_id: 0 };
+                let mut w = Worker {
+                    me,
+                    rx,
+                    pending: VecDeque::new(),
+                    out: Vec::new(),
+                    reply: None,
+                    next_id: 0,
+                };
                 let r = w.run(&sid, primes);
                 if let Err(e) = r {
                     w.answer(Err(e));
                 }
             })
             .expect("spawn jsig thread");
-        JSession { tx: Mutex::new(Some(tx)) }
+        JSession {
+            tx: Mutex::new(Some(tx)),
+        }
     }
 
     fn call(&self, cmd: Cmd) -> Result<JRound> {
         let (rtx, rrx) = mpsc::channel();
         let mut g = self.tx.lock();
-        let Some(tx) = g.as_ref() else { bail!("2P-ECDSA session is over") };
+        let Some(tx) = g.as_ref() else {
+            bail!("2P-ECDSA session is over")
+        };
         if tx.send((cmd, rtx)).is_err() {
             *g = None;
             bail!("2P-ECDSA session is over");
@@ -138,7 +149,11 @@ impl JSession {
         drop(g);
         let r = rrx.recv().map_err(|_| anyhow!("2P-ECDSA session ended"))?;
         match &r {
-            Ok(JRound { status: JStatus::Signed(_), .. }) | Err(_) => *self.tx.lock() = None,
+            Ok(JRound {
+                status: JStatus::Signed(_),
+                ..
+            })
+            | Err(_) => *self.tx.lock() = None,
             _ => {}
         }
         r
@@ -179,7 +194,10 @@ impl Worker {
 
     /// Block for the next command.
     fn next(&mut self) -> Result<Cmd> {
-        let (cmd, reply) = self.rx.recv().map_err(|_| anyhow!("2P-ECDSA session dropped"))?;
+        let (cmd, reply) = self
+            .rx
+            .recv()
+            .map_err(|_| anyhow!("2P-ECDSA session dropped"))?;
         self.reply = Some(reply);
         Ok(cmd)
     }
@@ -187,7 +205,10 @@ impl Worker {
     fn take_msgs(&mut self, msgs: Vec<JMsg>, phase: Phase) -> Result<()> {
         for m in msgs {
             if m.phase < phase {
-                bail!("2P-ECDSA message for finished phase {:?} (now {phase:?})", m.phase);
+                bail!(
+                    "2P-ECDSA message for finished phase {:?} (now {phase:?})",
+                    m.phase
+                );
             }
             self.pending.push_back(m);
         }
@@ -204,7 +225,8 @@ impl Worker {
                 ProceedResult::SendMsg(o) => self.out.push(JMsg {
                     phase,
                     broadcast: matches!(o.recipient, MessageDestination::AllParties),
-                    body: serde_json::to_value(&o.msg).map_err(|e| anyhow!("2P-ECDSA encode: {e}"))?,
+                    body: serde_json::to_value(&o.msg)
+                        .map_err(|e| anyhow!("2P-ECDSA encode: {e}"))?,
                 }),
                 ProceedResult::NeedsOneMoreMessage => {
                     while !self.pending.iter().any(|m| m.phase == phase) {
@@ -220,10 +242,16 @@ impl Worker {
                     let msg = Incoming {
                         id: self.next_id,
                         sender: 1 - self.me,
-                        msg_type: if m.broadcast { MessageType::Broadcast } else { MessageType::P2P },
-                        msg: serde_json::from_value(m.body).map_err(|e| anyhow!("2P-ECDSA decode: {e}"))?,
+                        msg_type: if m.broadcast {
+                            MessageType::Broadcast
+                        } else {
+                            MessageType::P2P
+                        },
+                        msg: serde_json::from_value(m.body)
+                            .map_err(|e| anyhow!("2P-ECDSA decode: {e}"))?,
                     };
-                    sm.received_msg(msg).map_err(|_| anyhow!("2P-ECDSA {phase:?} message rejected"))?;
+                    sm.received_msg(msg)
+                        .map_err(|_| anyhow!("2P-ECDSA {phase:?} message rejected"))?;
                 }
                 ProceedResult::Yielded => {}
                 ProceedResult::Output(o) => return Ok(o),
@@ -260,7 +288,10 @@ impl Worker {
             .map_err(|e| anyhow!("2P-ECDSA key share: {e}"))?;
         let pk = share.shared_public_key;
         let enc = pk.to_bytes(true);
-        let joint: [u8; 33] = enc.as_ref().try_into().map_err(|_| anyhow!("J not 33 bytes"))?;
+        let joint: [u8; 33] = enc
+            .as_ref()
+            .try_into()
+            .map_err(|_| anyhow!("J not 33 bytes"))?;
 
         self.flush(JStatus::KeyReady(joint));
         let sighash = loop {
@@ -282,7 +313,8 @@ impl Worker {
         }
         .map_err(|e| anyhow!("2P-ECDSA signing: {e}"))?;
         drop(share);
-        sig.verify(&pk, &msg).map_err(|_| anyhow!("2P-ECDSA signature does not verify"))?;
+        sig.verify(&pk, &msg)
+            .map_err(|_| anyhow!("2P-ECDSA signature does not verify"))?;
         let mut rs = [0u8; 64];
         sig.normalize_s().write_to_slice(&mut rs);
         let mut der = divi_crypto::signature::Signature::from_compact(&rs)
@@ -296,7 +328,9 @@ impl Worker {
 
 /// Run blocking session work (`JSession::round`/`sign`, prime generation) off the async
 /// runtime.
-pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+pub async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| anyhow!("2P-ECDSA task: {e}"))?

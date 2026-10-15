@@ -14,6 +14,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use divi_primitives::hash::Hash256;
+use divi_primitives::script::Script;
+use divi_primitives::transaction::{OutPoint, Transaction, TxOut};
 use divi_swap::api::{Direction, Offer};
 use divi_swap::{Chain, Profile, Result, Store, SwapConfig};
 use divi_swap_xmr::api::{JRoundReply, SigsRequest};
@@ -502,8 +505,7 @@ async fn adversarial_inputs_are_refused() {
             }
         })
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(err.contains("Tx_cancel"), "{err}");
 
     // A setup claiming a J other than the one computed together (a key the maker alone holds,
@@ -515,8 +517,7 @@ async fn adversarial_inputs_are_refused() {
             }
         })
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(err.contains("J is not"), "{err}");
 
     // A corrupted 2P-ECDSA message fails the session (and nothing is signed).
@@ -531,8 +532,7 @@ async fn adversarial_inputs_are_refused() {
             }
         })
         .await
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(!err.is_empty());
 
     // Bad taker signatures are refused by the maker, and nothing is broadcast.
@@ -546,7 +546,10 @@ async fn adversarial_inputs_are_refused() {
     bad.refund_encsigs.pop();
     assert!(w.maker.sigs(&mid3, bad).await.is_err());
     let mut bad = sigs.clone();
-    let (a, b) = (bad.refund_encsigs[0].encsig.clone(), bad.refund_encsigs[1].encsig.clone());
+    let (a, b) = (
+        bad.refund_encsigs[0].encsig.clone(),
+        bad.refund_encsigs[1].encsig.clone(),
+    );
     bad.refund_encsigs[0].encsig = b;
     bad.refund_encsigs[1].encsig = a;
     assert!(w.maker.sigs(&mid3, bad).await.is_err());
@@ -617,7 +620,11 @@ async fn a_re_encoded_tx_cancel_still_refunds_and_reveals_s_m() {
     // A third party (a staker, say) mines an encoding neither side would broadcast.
     w.divi.advance_time(cfg().cancel_after_secs);
     let mut mined = None;
-    for v in variants.iter().rev().filter(|v| v.txid() != canonical.txid()) {
+    for v in variants
+        .iter()
+        .rev()
+        .filter(|v| v.txid() != canonical.txid())
+    {
         if w.maker_divi.broadcast(v).await.is_ok() {
             mined = Some(v.txid());
             break;
@@ -729,4 +736,86 @@ async fn a_stuck_scan_does_not_hold_up_other_swaps() {
     let (a, b) = tokio::join!(maker.step(&ma), other);
     assert_eq!(a.unwrap(), XmrMakerState::RedeemOffered);
     assert_eq!(b.unwrap(), XmrMakerState::RedeemOffered);
+}
+
+/// A DIVI node that has not seen one transaction (a lost broadcast) and counts scans for
+/// the spender of one outpoint.
+struct Forgetful {
+    inner: MockDiviWallet,
+    unseen: Hash256,
+    watched: OutPoint,
+    scans: AtomicU64,
+}
+
+#[async_trait]
+impl DiviChain for Forgetful {
+    fn payout_script(&self) -> Script {
+        self.inner.payout_script()
+    }
+
+    async fn tip_height(&self) -> Result<u64> {
+        self.inner.tip_height().await
+    }
+
+    async fn median_time_past(&self) -> Result<u32> {
+        self.inner.median_time_past().await
+    }
+
+    async fn build_funding(&self, script_pubkey: &Script, amount: u64) -> Result<Transaction> {
+        self.inner.build_funding(script_pubkey, amount).await
+    }
+
+    async fn broadcast(&self, tx: &Transaction) -> Result<()> {
+        self.inner.broadcast(tx).await
+    }
+
+    async fn confirmations(&self, txid: &Hash256) -> Result<Option<u32>> {
+        if *txid == self.unseen {
+            return Ok(None);
+        }
+        self.inner.confirmations(txid).await
+    }
+
+    async fn output(&self, at: &OutPoint) -> Result<Option<(TxOut, u32)>> {
+        if at.txid == self.unseen {
+            return Ok(None);
+        }
+        self.inner.output(at).await
+    }
+
+    async fn find_spend(&self, at: &OutPoint) -> Result<Option<Transaction>> {
+        if *at == self.watched {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.find_spend(at).await
+    }
+}
+
+/// A `Tx_lock` the node does not know is simply broadcast again: the maker does not first
+/// scan the chain for who spent its funding coin (on a remote node, a scan from an old
+/// coin's height took longer than the whole swap).
+#[tokio::test]
+async fn an_unseen_tx_lock_is_rebroadcast_without_a_scan() {
+    let w = W::new();
+    let (mid, _tid) = w.open().await;
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    let divi = Arc::new(Forgetful {
+        inner: w.maker_divi.clone(),
+        unseen: r.tx_lock.txid(),
+        watched: r.tx_lock.vin[0].prevout,
+        scans: AtomicU64::new(0),
+    });
+    let c = w.clock.clone();
+    let maker = XmrMaker::new(
+        cfg(),
+        divi.clone(),
+        Arc::new(w.maker_xmr.clone()),
+        w.store.clone(),
+        vec![offer()],
+    )
+    .unwrap()
+    .with_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+    assert_eq!(maker.step(&mid).await.unwrap(), XmrMakerState::Locked);
+    assert_eq!(divi.scans.load(Ordering::SeqCst), 0);
+    assert!(maker.record(&mid).unwrap().unwrap().lock_actual.is_none());
 }
