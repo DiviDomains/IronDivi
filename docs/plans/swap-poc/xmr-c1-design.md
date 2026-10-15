@@ -20,8 +20,10 @@ Who can do it:
 - **Any staker.** This is anyone with coins on a PoS chain, so it is not a narrow set. Real Divi's
   consensus flags are P2SH | DERSIG | REQUIRE_COINSTAKE, plus CLTV once the Aug-2023 fork is
   active (`divi-cpp-ref/divi/src/script/standard.h`, `BlockTransactionChecker.cpp:117-121`).
-  LOW_S, MINIMALDATA, NULLDUMMY, SIGPUSHONLY and CLEANSTACK are relay policy only. A staker can
-  therefore put any of these in a block:
+  MINIMALDATA, NULLDUMMY, SIGPUSHONLY and CLEANSTACK are relay policy only, and LOW_S is not
+  even that: Divi 3.0.0's `STANDARD_SCRIPT_VERIFY_FLAGS` omit it, so a high-S signature relays
+  like any other (proved on regtest 2026-10-15, `c1-regtest-results.md` tests 5a and 7). Any
+  relay node can therefore S-flip a signature, and a staker can put any of these in a block:
   - an S-flip of either signature;
   - non-minimal push opcodes;
   - any value as the CHECKMULTISIG dummy element (unbounded);
@@ -45,8 +47,10 @@ taker reads `s_m`, sweeps the XMR, and double-spends the refund with redeem. She
 both coins. `Tx_cancel` exists to **kill the redeem path before anything is revealed**. The
 rationale in `xmr-design.md` ("escape hatch") understated this and is corrected.
 
-**Low-S checks and standard relay only.** These stop third-party relayers, not the two
-counterparties (a fresh nonce is low-S) and not stakers (they mine non-standard transactions).
+**Low-S checks and standard relay only.** On Divi these do not even stop third-party relayers:
+LOW_S is not a standard flag there (2026-10-15 regtest finding), so any node can S-flip. They
+would not stop the two counterparties (a fresh nonce is low-S) or stakers (they mine non-standard
+transactions) in any case.
 
 ## 3. The two constraints any fix must meet
 

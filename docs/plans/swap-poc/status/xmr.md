@@ -1034,9 +1034,51 @@ taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
      The gate only reads `/swaps`; `/xmr/swaps` was checked by hand (one swap, `done`).
 - Mainnet is not in scope here. What stands between this and mainnet: `../xmr-mainnet-plan.md`.
 
+## C1 full fix on stagenet (orchestrator, 2026-10-15)
+
+Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix; stagenet only.
+
+- **Code:** `c1-impl`, merged to `main`. cggmp21 2P-ECDSA (SecurityLevel128) for the joint cancel
+  key `J`; the new `Tx_lock` script (cancel branch `J` only, plus the maker's `t_late` branch);
+  refund encsigs for all 120 `Tx_cancel` encodings. The maker keeps a pool of 2 Paillier prime
+  sets; the taker generates hers before quoting (`61ca99a`), since one set takes 20-90 s.
+- **Deployed** to dnsdivi 2026-10-15 14:20Z: `a77ec9d`, sha256 `93cc44cd…41ab`. `.prev` is the
+  first C1 build `61ca99a` (`4e06be9f…`). Never roll back past `61ca99a` while a C1 swap is open:
+  older builds cannot read C1 records.
+- **Bug found and fixed in the soak (a77ec9d):** a `Locked` swap whose `Tx_lock` the chain did not
+  know ran a full spend scan from the funding coin's height (1452 blocks over RPC) *before*
+  rebroadcasting, under the swap lock; `tick` steps swaps one at a time, so the whole XMR engine
+  stalled and two `Tx_lock`s (`10fc31f0…`, `c4a9ed39…`) were never broadcast. Now the maker
+  broadcasts first and scans only when the broadcast is rejected (spent funding input). Regression
+  test `an_unseen_tx_lock_is_rebroadcast_without_a_scan`. After the redeploy both swaps moved on.
+- **C8 fixed (1841a12):** a monerod connection reset during a block scan panicked the taker (hit
+  lock-only soak swap 2). It is now an `Rpc` error, and a failed fetch is no longer read as "no
+  output in this block". The Mac taker is rebuilt (`~/.cache/divi-swap-c1-1841a12`, debug, Xcode
+  SDK: gmp-mpfr-sys fails with the CLT 27.0 SDK); the maker has not been redeployed with it yet.
+- **§7 tests:**
+  - 5a/5b/7 **PASS** on a private Divi 3.0.0 regtest (`c1-regtest-results.md`). Finding: high-S
+    signatures are *standard* on Divi 3.0.0, for `Tx_cancel` and for `Tx_lock`'s funding input, so
+    any relay node (not only a staker) can S-flip. Non-minimal pushes are refused by the mempool but
+    accepted in a block. `xmr-c1-design.md` §1-2 corrected.
+  - 6 **PASS** live (swap `87a95844`, after signing): `POST /j` → 400 "no 2P-ECDSA session for
+    this swap"; `POST /sigs` with a different signature → 400 "swap is Locked, not awaiting
+    signatures". The reused-`j_sid` refusal (`maker.rs`) is unit-tested, not probed live.
+  - 1 (≥5 happy) running: `87a95844` past the XMR lock; 4 more queued (`xmr-soak/c1-happy2`).
+  - 2 and 3: 2 accept-only (`c1-accept`) and 2 lock-only (`c1-lock`) swaps are parked until
+    `t_cancel` (6 h after lock); then `xmr-soak.sh --resume`.
+  - 4 (punish) running on a private second maker on hp2 (`c1-punish-results.md`): `Tx_cancel`
+    after ~20:12Z, `Tx_punish` after ~23:12Z.
+- **Known gaps (not blocking stagenet):** a retried `j` message (lost HTTP reply) breaks the
+  keying session; pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
+  swap; the rare malleated-`Tx_lock` path still scans under the swap lock while `tick` is
+  sequential; C3's pool drain is now worse (each setup also costs a prime set).
+- **Seen on hp2, not ours, untouched:** root's `divid` (pid 3626) has a wallet mnemonic in its
+  command line, readable by any local user via `ps`. Whoever runs it should move it to a file.
+
 ## NEEDS HUMAN
 
-- Review `docs/plans/swap-poc/xmr-c1-design.md` (C1 fix: 2P-ECDSA cancel key + unilateral punish), and say whether to land the §4.4 interim hardening first.
+- Review `docs/plans/swap-poc/xmr-c1-design.md` (C1 fix: 2P-ECDSA cancel key + unilateral punish). The full fix is built and deployed to stagenet; the review may still change it.
+- hp2: root's `divid` (pid 3626) exposes a wallet mnemonic in its argv (see the C1 section above).
 
 ## Mainnet plan gates (orchestrator, 2026-10-14)
 
