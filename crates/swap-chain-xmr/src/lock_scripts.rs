@@ -304,9 +304,8 @@ pub fn push_encodings(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// secp256k1 group order, big-endian.
 const ORDER: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
-    0x41, 0x41,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
 /// The other S of an ECDSA signature (`s → n − s`), DER + the same sighash byte. Divi's
@@ -328,7 +327,11 @@ pub fn s_flip(sig: &[u8]) -> Option<Vec<u8>> {
 /// Every `Tx_cancel` a staker can mine from the signed one: the cancel scriptSig's
 /// `<σ_J> <0x02> <redeem>` over each S of `σ_J` and every push encoding of each part.
 /// `sig_joint` is `σ_J` (DER + SIGHASH_ALL), in either S form.
-pub fn cancel_variants(tx_cancel: &Transaction, sig_joint: &[u8], redeem: &[u8]) -> Vec<Transaction> {
+pub fn cancel_variants(
+    tx_cancel: &Transaction,
+    sig_joint: &[u8],
+    redeem: &[u8],
+) -> Vec<Transaction> {
     let mut sigs = vec![sig_joint.to_vec()];
     if let Some(f) = s_flip(sig_joint) {
         sigs.push(f);
@@ -436,7 +439,10 @@ mod tests {
         check(&tx, &f.lock.script_pubkey()).unwrap();
         assert_eq!(
             lock_spend_branch(&tx, &redeem),
-            Some(LockSpend::Redeem { sig_maker: sa.clone(), sig_taker: sb.clone() })
+            Some(LockSpend::Redeem {
+                sig_maker: sa.clone(),
+                sig_taker: sb.clone()
+            })
         );
         tx.vin[0].script_sig = redeem_sig(&sa, &sa, &redeem);
         assert!(check(&tx, &f.lock.script_pubkey()).is_err());
@@ -519,13 +525,19 @@ mod tests {
     fn cancel_variants_are_exactly_120() {
         let f = fx();
         let redeem = f.lock.redeem_script();
-        assert!((0x4c..=0xff).contains(&redeem.len()), "redeem push is PUSHDATA1-sized");
+        assert!(
+            (0x4c..=0xff).contains(&redeem.len()),
+            "redeem push is PUSHDATA1-sized"
+        );
         let (tx, sig) = signed_cancel(&f);
         let vs = cancel_variants(&tx, &sig, &redeem);
         assert_eq!(vs.len(), CANCEL_VARIANTS);
         let ids: HashSet<_> = vs.iter().map(|v| v.txid()).collect();
         assert_eq!(ids.len(), CANCEL_VARIANTS);
-        assert!(ids.contains(&tx.txid()), "the canonical encoding is one of them");
+        assert!(
+            ids.contains(&tx.txid()),
+            "the canonical encoding is one of them"
+        );
         let flipped = s_flip(&sig).unwrap();
         assert_ne!(flipped, sig);
         assert_eq!(s_flip(&flipped).unwrap(), sig);
@@ -538,15 +550,21 @@ mod tests {
         }
         assert_eq!(valid, CANCEL_VARIANTS / 2);
         // The set is the same whichever S form it starts from.
-        let from_flip: HashSet<_> =
-            cancel_variants(&tx, &flipped, &redeem).iter().map(|v| v.txid()).collect();
+        let from_flip: HashSet<_> = cancel_variants(&tx, &flipped, &redeem)
+            .iter()
+            .map(|v| v.txid())
+            .collect();
         assert_eq!(from_flip, ids);
     }
 
     #[test]
     fn cancel_output_refund_and_punish() {
         let f = fx();
-        let c = CancelScript { maker: pk(&f.a), taker: pk(&f.b), t_punish: T_PUNISH };
+        let c = CancelScript {
+            maker: pk(&f.a),
+            taker: pk(&f.b),
+            t_punish: T_PUNISH,
+        };
         let redeem = c.redeem_script();
         let mut refund = spend(T_CANCEL, Script::new_p2pkh(&[3; 20]));
         let (sa, sb) = (sign(&refund, &redeem, &f.a), sign(&refund, &redeem, &f.b));
@@ -572,10 +590,20 @@ mod tests {
 
     #[test]
     fn stack_items_reads_every_push_form() {
-        let s = [0x00, 0x51, 0x60, 0x4f, 0x01, 0xaa, 0x4c, 0x01, 0xbb, 0x4d, 0x01, 0x00, 0xcc];
+        let s = [
+            0x00, 0x51, 0x60, 0x4f, 0x01, 0xaa, 0x4c, 0x01, 0xbb, 0x4d, 0x01, 0x00, 0xcc,
+        ];
         assert_eq!(
             stack_items(&s).unwrap(),
-            vec![vec![], vec![1], vec![16], vec![0x81], vec![0xaa], vec![0xbb], vec![0xcc]]
+            vec![
+                vec![],
+                vec![1],
+                vec![16],
+                vec![0x81],
+                vec![0xaa],
+                vec![0xbb],
+                vec![0xcc]
+            ]
         );
         assert_eq!(stack_items(&[0x76]), None);
         assert_eq!(stack_items(&[0x02, 0x01]), None);

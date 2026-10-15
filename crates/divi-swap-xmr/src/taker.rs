@@ -40,9 +40,7 @@ use divi_swap::{Chain, Result, Store, SwapError};
 use serde::{Deserialize, Serialize};
 use swap_adaptor::adaptor::{AdaptorSigner, EncryptedSignature};
 use swap_adaptor::dleq::{random_clamped_secret, ScalarQ};
-use swap_chain_xmr::lock_scripts::{
-    self, CancelScript, LockScript, LockSpend, CANCEL_VARIANTS,
-};
+use swap_chain_xmr::lock_scripts::{self, CancelScript, LockScript, LockSpend, CANCEL_VARIANTS};
 use swap_chain_xmr::swap_templates::{taker_completes_tx_redeem, taker_encrypts_tx_refund};
 
 use crate::api::{
@@ -369,16 +367,11 @@ impl XmrTaker {
     /// soon as both it and `J` are known, before signing anything; once both sides hold
     /// `σ_J`, builds our encrypted `Tx_refund` signature for each `Tx_cancel` encoding.
     pub async fn j_step(&self, local_id: &str, reply: JRoundReply) -> Result<JNext> {
-        let entry = self
-            .keying
-            .lock()
-            .get(local_id)
-            .cloned()
-            .ok_or_else(|| {
-                SwapError::InvalidParams(
-                    "no 2P-ECDSA session for this swap (finished, or the taker restarted)".into(),
-                )
-            })?;
+        let entry = self.keying.lock().get(local_id).cloned().ok_or_else(|| {
+            SwapError::InvalidParams(
+                "no 2P-ECDSA session for this swap (finished, or the taker restarted)".into(),
+            )
+        })?;
         let mut k = entry.lock().await;
         let res = self.j_step_inner(local_id, &mut k, reply).await;
         if !matches!(res, Ok(JNext::Send(_))) {
@@ -387,7 +380,12 @@ impl XmrTaker {
         res
     }
 
-    async fn j_step_inner(&self, local_id: &str, k: &mut Keying, reply: JRoundReply) -> Result<JNext> {
+    async fn j_step_inner(
+        &self,
+        local_id: &str,
+        k: &mut Keying,
+        reply: JRoundReply,
+    ) -> Result<JNext> {
         match &k.swap_id {
             None => k.swap_id = Some(reply.swap_id.clone()),
             Some(id) if *id != reply.swap_id => {
@@ -431,7 +429,12 @@ impl XmrTaker {
 
     /// The maker's setup, checked against `J` and everything we agreed; persisted on the
     /// record (still `Prepared`). Returns `Tx_cancel`'s sighash to sign under `J`.
-    async fn verify_setup(&self, local_id: &str, reply: SetupReply, j: [u8; 33]) -> Result<[u8; 32]> {
+    async fn verify_setup(
+        &self,
+        local_id: &str,
+        reply: SetupReply,
+        j: [u8; 33],
+    ) -> Result<[u8; 32]> {
         let _g = self.gate.lock().await;
         let mut r = self.load(local_id)?;
         if r.state != XmrTakerState::Prepared {
@@ -699,8 +702,7 @@ impl XmrTaker {
                         return self.finish(r, "cancelled").map(Some);
                     }
                     return Err(SwapError::Other(
-                        "the maker took Tx_lock through the late branch with our XMR locked"
-                            .into(),
+                        "the maker took Tx_lock through the late branch with our XMR locked".into(),
                     ));
                 }
                 // Only we can complete Tx_redeem; nothing else spends it.
