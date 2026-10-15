@@ -22,8 +22,8 @@ lock_scripts.rs) was not modified.
   protocolversion 70915.
 - Chain: private `-regtest`, two nodes, datadirs
   `/mnt/storage1/bshuler-xmr/c1-regtest/{a,b}`.
-  - Node A: P2P 51990, RPC 51991. Mines and takes the RPC calls.
-  - Node B: P2P 51992, RPC 51993, `connect=127.0.0.1:51990`. A peer that
+  - Node A: RPC 51990, P2P 51991. Mines and takes the RPC calls.
+  - Node B: RPC 51992, P2P 51993, `connect=127.0.0.1:51991`. A peer that
     validates every block on its own. After each block the harness checks
     that B's tip equals A's.
   - Both nodes: `txindex=1`, `rpcuser=c1rt`, and a random `rpcpassword`
@@ -40,6 +40,41 @@ lock_scripts.rs) was not modified.
   `maker_completes_tx_refund`, `crypto::recover`, and two in-process `JSession`s
   (cggmp21 0.6.3) for J. It does not edit any of them. `spend()` copies
   `maker::spend`.
+
+### Reproduce
+
+The `divi.conf` for node A (node B is the same, but with `rpcport=51992`,
+`port=51993` and `connect=127.0.0.1:51991`):
+
+```
+regtest=1
+server=1
+listen=1
+rpcport=51990
+port=51991
+rpcallowip=127.0.0.1
+bind=127.0.0.1
+staking=0
+rpcuser=c1rt
+rpcpassword=<random, generate locally>
+txindex=1
+```
+
+On hp2:
+
+```
+D=/mnt/storage1/bshuler-xmr/c1-regtest
+nohup ~/bsx-b/bin/divi/divid -datadir=$D/a -daemon >/dev/null 2>&1 </dev/null
+nohup ~/bsx-b/bin/divi/divid -datadir=$D/b -daemon >/dev/null 2>&1 </dev/null
+# from a checkout of this branch:
+C1RT_DIR=$D cargo run --example c1_regtest -p divi-swap-xmr
+```
+
+The harness reads the RPC credentials from `$C1RT_DIR/{a,b}/divi.conf`. It
+starts from a fresh chain (wipe `$D/{a,b}/regtest` first) and mines to
+height 30 itself. Test 7 sleeps about 90 s until t_late. A full run takes a
+few minutes. Most of that is the cggmp21 keygen, plus the Paillier primes on
+the first run.
 
 ## Script flags that applied
 
@@ -214,7 +249,9 @@ t_late was set about 90 s ahead so the test could wait for it.
 - `generateblock` was used in place of a hand-ground block. See the section
   on how the block was made for why the two are equivalent.
 - The chain stayed below height 100, so every block was PoW. Block-level
-  script checks are the same for PoW and PoS blocks.
+  script flags are chosen in `BlockTransactionChecker.cpp:113-121`, and that
+  code does not branch on PoW vs PoS. So the result carries over to staked
+  blocks.
 - Every key and secret was made fresh in memory for this run. None was
   printed or written to disk. The Paillier primes cache
   (`/tmp/divi-swap-xmr-test-primes.json` on hp2) contains no swap secrets.
