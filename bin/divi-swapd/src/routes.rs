@@ -27,7 +27,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
 use divi_swap::{Chain, ChainBackend, Maker, SwapError};
-use divi_swap_xmr::api::{SetupReply, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView};
+use divi_swap_xmr::api::{
+    JRoundReply, JRoundRequest, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView,
+};
 use divi_swap_xmr::XmrMaker;
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
@@ -61,7 +63,8 @@ pub fn router(state: AppState, prefix: &str) -> Router {
 }
 
 /// [`router`] plus, when `xmr` is given, the DIVI<->XMR adaptor-swap routes
-/// (`divi_swap_xmr`): `POST /xmr/swaps` (setup), `POST /xmr/swaps/:id/sigs`,
+/// (`divi_swap_xmr`): `POST /xmr/swaps` (setup), `POST /xmr/swaps/:id/j` (the 2P-ECDSA
+/// exchanges of the joint cancel key), `POST /xmr/swaps/:id/sigs`,
 /// `POST /xmr/swaps/:id/xmr-lock`, `GET /xmr/swaps[/:id]`. Its offers and quotes go through
 /// the hashlock maker's `/offers` routes (the engine is registered with
 /// `Maker::with_engine`).
@@ -79,6 +82,7 @@ pub fn router_with_xmr(state: AppState, xmr: Option<Arc<XmrMaker>>, prefix: &str
             Router::new()
                 .route("/xmr/swaps", post(xmr_setup).get(xmr_list))
                 .route("/xmr/swaps/:id", get(xmr_get))
+                .route("/xmr/swaps/:id/j", post(xmr_j))
                 .route("/xmr/swaps/:id/sigs", post(xmr_sigs))
                 .route("/xmr/swaps/:id/xmr-lock", post(xmr_lock))
                 .with_state(x),
@@ -223,8 +227,16 @@ async fn lock(
 async fn xmr_setup(
     State(x): State<Arc<XmrMaker>>,
     Json(req): Json<SetupRequest>,
-) -> Result<(StatusCode, Json<SetupReply>), ApiError> {
+) -> Result<(StatusCode, Json<JRoundReply>), ApiError> {
     Ok((StatusCode::CREATED, Json(x.setup(req).await?)))
+}
+
+async fn xmr_j(
+    State(x): State<Arc<XmrMaker>>,
+    Path(id): Path<String>,
+    Json(req): Json<JRoundRequest>,
+) -> Result<Json<JRoundReply>, ApiError> {
+    Ok(Json(x.j_round(&id, req).await?))
 }
 
 async fn xmr_sigs(

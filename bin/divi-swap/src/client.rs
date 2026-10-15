@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
-use divi_swap_xmr::api::{SetupReply, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView};
+use divi_swap_xmr::api::{
+    JRoundReply, JRoundRequest, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +98,8 @@ impl MakerClient {
         MakerClient {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                // The xmr setup and 2P-ECDSA exchanges may wait on Paillier primes (~90 s).
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("reqwest client"),
             ready: ReadyWait::default(),
@@ -226,8 +229,12 @@ impl MakerClient {
 
     // ---- DIVI<->XMR adaptor swap (`divi_swap_xmr`) ----
 
-    pub async fn xmr_setup(&self, req: &SetupRequest) -> Result<SetupReply> {
+    pub async fn xmr_setup(&self, req: &SetupRequest) -> Result<JRoundReply> {
         self.post("/xmr/swaps", req).await
+    }
+
+    pub async fn xmr_j(&self, swap_id: &str, req: &JRoundRequest) -> Result<JRoundReply> {
+        self.post(&format!("/xmr/swaps/{swap_id}/j"), req).await
     }
 
     pub async fn xmr_sigs(&self, swap_id: &str, req: &SigsRequest) -> Result<XmrSwapView> {

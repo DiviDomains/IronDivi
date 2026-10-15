@@ -21,7 +21,7 @@ use divi_script::SigHashType;
 use divi_wallet::signer::sighash;
 use swap_adaptor::adaptor::{AdaptorSigner, EncryptedSignature, Point, Scalar, Signature};
 use swap_adaptor::dleq::{PointQ, ScalarQ};
-use swap_chain_xmr::multisig;
+use swap_chain_xmr::{lock_scripts, multisig};
 use swap_chain_xmr::swap_templates::{divi_secret_to_adaptor_scalar, recover_secret_from_chain};
 
 use divi_swap::{Result, SwapError};
@@ -129,25 +129,32 @@ pub fn verify_encrypted(
     AdaptorSigner::new().verify_encrypted_signature(&vk, enc_point, &h, enc)
 }
 
-/// Put both plain signatures into `tx`'s 2-of-2 input.
+/// Put both plain signatures into `tx`'s two-key input: `Tx_lock`'s redeem branch or
+/// `Tx_cancel`'s refund branch (the same `OP_0 <a> <b> OP_1 <redeem>` layout).
 pub fn assemble(
     mut tx: Transaction,
     redeem: &[u8],
     maker_sig: &[u8],
     taker_sig: &[u8],
 ) -> Transaction {
-    tx.vin[0].script_sig = multisig::script_sig(maker_sig, taker_sig, redeem);
+    tx.vin[0].script_sig = lock_scripts::redeem_sig(maker_sig, taker_sig, redeem);
     tx
 }
 
-/// The `who` signature in a broadcast 2-of-2 spend, as a `swap-adaptor` signature.
+/// The `who` signature in a broadcast two-key spend (`Tx_redeem` or `Tx_refund`), as a
+/// `swap-adaptor` signature. Read by stack position from the top, so any push encoding a
+/// staker re-wraps it in still parses.
 pub fn signature_in(tx: &Transaction, who: Signer) -> Option<Signature> {
-    // `script_pushes` skips the leading OP_0: [sig_maker, sig_taker, redeem_script].
-    let pushes = divi_swap::types::script_pushes(tx.vin.first()?.script_sig.as_bytes());
-    let sig = pushes.get(match who {
-        Signer::Maker => 0,
-        Signer::Taker => 1,
-    })?;
+    // Stack, top last: [.., sig_maker, sig_taker, selector, redeem].
+    let items = lock_scripts::stack_items(tx.vin.first()?.script_sig.as_bytes())?;
+    let n = items.len();
+    if n < 4 {
+        return None;
+    }
+    let sig = &items[match who {
+        Signer::Maker => n - 4,
+        Signer::Taker => n - 3,
+    }];
     let (_, der) = sig.split_last()?;
     let compact = DiviSignature::from_der(der).ok()?.to_compact();
     Signature::from_bytes(compact)
@@ -164,6 +171,22 @@ pub fn recover(
     let completed = signature_in(tx, who)?;
     let s = recover_secret_from_chain(enc_point, &completed, encrypted)?;
     ed_of(&s)
+}
+
+/// Re-encode a two-key spend completed by `swap_templates` (`OP_0 <a> <b> <redeem>`) in the
+/// branch layout every C1 script expects, `OP_0 <a> <b> OP_1 <redeem>`.
+pub fn two_key(tx: Transaction, redeem: &[u8]) -> Result<Transaction> {
+    let items = tx
+        .vin
+        .first()
+        .and_then(|i| lock_scripts::stack_items(i.script_sig.as_bytes()));
+    match items.as_deref() {
+        Some([z, a, b, r]) if z.is_empty() && r.as_slice() == redeem => {
+            let (a, b) = (a.clone(), b.clone());
+            Ok(assemble(tx, redeem, &a, &b))
+        }
+        _ => Err(SwapError::Other("not a completed 2-of-2 spend".into())),
+    }
 }
 
 #[cfg(test)]

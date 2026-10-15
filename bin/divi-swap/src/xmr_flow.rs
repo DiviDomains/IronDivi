@@ -13,15 +13,20 @@
 use std::time::Instant;
 
 use anyhow::{bail, Result};
+use divi_swap_xmr::taker::JNext;
 use divi_swap_xmr::{XmrTaker, XmrTakerState};
 
 use crate::flow::RunOpts;
 use crate::session::{Session, Sessions};
 use crate::MakerClient;
 
+/// Upper bound on `POST /xmr/swaps/:id/j` exchanges (keying and signing take about ten).
+const MAX_J_EXCHANGES: usize = 64;
+
 /// Wait for the maker's DIVI wallet scan ([`MakerClient::wait_ready`]) → fresh quote →
-/// prepare → `POST /xmr/swaps` → verify the maker's setup → send our signatures (the maker
-/// then broadcasts `Tx_lock`). Returns the local id.
+/// prepare → `POST /xmr/swaps` → the 2P-ECDSA exchanges of `J` (`POST /xmr/swaps/:id/j`;
+/// our side verifies the maker's setup before signing `Tx_cancel`) → send our signatures (the
+/// maker then broadcasts `Tx_lock`). Returns the local id.
 pub async fn begin(
     taker: &XmrTaker,
     client: &MakerClient,
@@ -30,6 +35,7 @@ pub async fn begin(
     btc_sats: u64,
 ) -> Result<String> {
     client.wait_ready().await?;
+    taker.warm_primes().await?;
     let quote = client.quote_retrying(offer_id, btc_sats).await?;
     if quote.counter_chain != divi_swap::Chain::Xmr {
         bail!(
@@ -46,8 +52,22 @@ pub async fn begin(
             maker_swap_id: reply.swap_id.clone(),
         },
     )?;
-    let sigs = taker.accepted(&local, reply).await?;
-    let id = taker.maker_swap_id(&local)?;
+    let id = reply.swap_id.clone();
+    let mut reply = reply;
+    let mut exchanges = 0;
+    let sigs = loop {
+        match taker.j_step(&local, reply).await? {
+            JNext::Sigs(sigs) => break sigs,
+            JNext::Send(req) => {
+                exchanges += 1;
+                if exchanges > MAX_J_EXCHANGES {
+                    bail!("2P-ECDSA with the maker did not finish in {MAX_J_EXCHANGES} exchanges");
+                }
+                reply = client.xmr_j(&id, &req).await?;
+            }
+        }
+    };
+    tracing::info!(swap = %local, exchanges, "joint cancel key J made and Tx_cancel signed");
     client.xmr_sigs(&id, &sigs).await?;
     Ok(local)
 }
