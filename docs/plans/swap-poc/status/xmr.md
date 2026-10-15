@@ -1066,8 +1066,9 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
     signatures". The reused-`j_sid` refusal (`maker.rs`) is unit-tested, not probed live.
   - 1 **PASS**: 5 of 5 happy swaps redeemed (`87a95844` + `xmr-soak/c1-happy2` × 4, 1530-2188 s
     each, keying included). RESULTS.md.
-  - 2 and 3: 2 accept-only (`c1-accept`) and 2 lock-only (`c1-lock`) swaps are parked until
-    `t_cancel` (6 h after lock); then `xmr-soak.sh --resume`.
+  - 2 and 3 **PASS**: past `t_cancel` the maker cancelled (`J` branch) and refunded all 4 parked
+    swaps (2 accept-only, 2 lock-only) by 20:25Z; both lock-only takers swept their XMR back
+    (stagenet heights 2230023, 2230026). Txids in RESULTS.md.
   - 4 (punish) running on a private second maker on hp2 (`c1-punish-results.md`): `Tx_cancel`
     after ~20:12Z, `Tx_punish` after ~23:12Z.
 - **Known gaps (not blocking stagenet):** a retried `j` message (lost HTTP reply) breaks the

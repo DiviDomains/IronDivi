@@ -410,3 +410,18 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
   keying of `J` and both Paillier prime sets (taker pre-generated, maker from its pool). The swap
   logs carry no per-step timings. Maker then redeployed to `1841a12` (sha `929c9b54…`) at 16:29Z
   with 5 C1 swaps open; all kept their state.
+- XMR C1 full fix, §7 tests 2 and 3 (refund), live stagenet, 2026-10-15: past `t_cancel` the
+  maker (`1841a12`) cancelled and refunded all 4 parked swaps by 20:25Z, with nobody's help. Each
+  `Tx_cancel` spends `Tx_lock:0` through the `J` branch (3-item scriptSig, 2P-ECDSA `σ_J`); each
+  `Tx_refund` spends `Tx_cancel:0` and pays the maker (`yCnFLYFj…`, 9.999 tDIVI). Confirmed (27-52
+  conf at 20:45Z):
+  - accept-only (no XMR locked): `08e3c945` lock `54b57665…`, cancel `8705f526…`, refund
+    `1f69e44e90cc83aabb2f5d34cb3e7d25118749cbfaf9317e27e9cfb4fcdf2e82`; `3d0dba8c` lock
+    `c4a9ed39…`, cancel `e7a6197f79e28ed76056bdbe1529655dda26aeec2b083827d41d6eb083e155c9`,
+    refund `e2c81e627040e52b395242cfc2bc1d5eeb18a11c12923ddc273a7345492e0a5d`.
+  - lock-only (XMR locked, nobody redeems): `2d32900d` lock `f66f40bb…`, cancel `fce5519e…`, refund
+    `0cc0bdd2…`; taker swept her XMR (lock `bb0a228e…`) back from the refund's revealed `s_m`:
+    `454bd37de8d8e1753e705e18a0a4beb71883b0b9152b4f213f9f321992c68590` (stagenet height 2230026).
+    `2aa85c13` lock `ff6eeff8…`, cancel `22a8c0a1…`, refund `65ff0149…`; XMR (lock `95470217…`)
+    swept back `a4c493d07b4c8ea91998275c59c3fd2b475fde419f16e391857a0e3550f19b8a` (height 2230023).
+    `xmr-soak.sh --resume xmr-soak/c1-lock`: both `Done`.
