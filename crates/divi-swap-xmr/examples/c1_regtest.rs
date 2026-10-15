@@ -74,7 +74,9 @@ const FUND_DIVI: f64 = 20.0;
 const CLTV_ACTIVATION_MTP: u64 = 1_692_792_000;
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -92,17 +94,29 @@ impl Node {
             .map_err(|e| format!("{name}: divi.conf: {e}"))?;
         let get = |k: &str| {
             conf.lines()
+                .rev()
                 .filter_map(|l| l.trim().strip_prefix(&format!("{k}=")))
-                .last()
+                .next()
                 .map(str::to_string)
         };
         let (user, password, port) = match (get("rpcuser"), get("rpcpassword"), get("rpcport")) {
             (Some(u), Some(p), Some(n)) => (u, p, n),
-            _ => return Err(format!("{name}: divi.conf lacks rpcuser/rpcpassword/rpcport")),
+            _ => {
+                return Err(format!(
+                    "{name}: divi.conf lacks rpcuser/rpcpassword/rpcport"
+                ))
+            }
         };
         let url = format!("http://{user}:{password}@127.0.0.1:{port}/");
-        let retry = RetryPolicy { attempts: 1, base_delay: Duration::from_millis(100) };
-        Ok(Node { name, rpc: RpcClient::new(&url, retry), password })
+        let retry = RetryPolicy {
+            attempts: 1,
+            base_delay: Duration::from_millis(100),
+        };
+        Ok(Node {
+            name,
+            rpc: RpcClient::new(&url, retry),
+            password,
+        })
     }
 
     /// One RPC call; any error text has the password redacted.
@@ -112,17 +126,29 @@ impl Node {
                 RpcError::Node { code, message } => format!("rpc {code}: {message}"),
                 RpcError::Swap(s) => s.to_string(),
             };
-            let t = if self.password.is_empty() { t } else { t.replace(&self.password, "***") };
+            let t = if self.password.is_empty() {
+                t
+            } else {
+                t.replace(&self.password, "***")
+            };
             format!("{} {method}: {t}", self.name)
         })
     }
 
     async fn height(&self) -> R<u64> {
-        self.call("getblockcount", json!([])).await?.as_u64().ok_or("height".into())
+        self.call("getblockcount", json!([]))
+            .await?
+            .as_u64()
+            .ok_or("height".into())
     }
 
     async fn tip(&self) -> R<String> {
-        Ok(self.call("getbestblockhash", json!([])).await?.as_str().unwrap_or("").to_string())
+        Ok(self
+            .call("getbestblockhash", json!([]))
+            .await?
+            .as_str()
+            .unwrap_or("")
+            .to_string())
     }
 
     /// Median of the last 11 block times.
@@ -146,7 +172,13 @@ impl Node {
         ensure!(h1 == h0 + n, "setgenerate {n}: height {h0} -> {h1}");
         let mut out = Vec::new();
         for i in h0 + 1..=h1 {
-            out.push(self.call("getblockhash", json!([i])).await?.as_str().unwrap_or("").into());
+            out.push(
+                self.call("getblockhash", json!([i]))
+                    .await?
+                    .as_str()
+                    .unwrap_or("")
+                    .into(),
+            );
         }
         Ok(out)
     }
@@ -155,13 +187,18 @@ impl Node {
     async fn mine_direct(&self, txs: &[&Transaction]) -> R<String> {
         let hexes: Vec<String> = txs.iter().map(|t| hex::encode(serialize(*t))).collect();
         let v = self
-            .call("generateblock", json!([{"extratx": hexes, "ignoreMempool": true}]))
+            .call(
+                "generateblock",
+                json!([{"extratx": hexes, "ignoreMempool": true}]),
+            )
             .await?;
         Ok(v.as_str().ok_or("generateblock: no hash")?.to_string())
     }
 
     async fn send(&self, tx: &Transaction) -> R<String> {
-        let v = self.call("sendrawtransaction", json!([hex::encode(serialize(tx))])).await?;
+        let v = self
+            .call("sendrawtransaction", json!([hex::encode(serialize(tx))]))
+            .await?;
         Ok(v.as_str().unwrap_or("").to_string())
     }
 
@@ -173,7 +210,11 @@ impl Node {
         let tx: Transaction = deserialize(&raw).map_err(|e| format!("decode {txid}: {e:?}"))?;
         let block = v["blockhash"].as_str().unwrap_or("").to_string();
         let conf = v["confirmations"].as_u64().unwrap_or(0);
-        ensure!(tx.txid().to_hex() == txid, "{txid}: node returned {}", tx.txid().to_hex());
+        ensure!(
+            tx.txid().to_hex() == txid,
+            "{txid}: node returned {}",
+            tx.txid().to_hex()
+        );
         Ok((tx, block, conf))
     }
 }
@@ -187,7 +228,10 @@ async fn synced(a: &Node, b: &Node) -> R<String> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(format!("node B did not reach A's tip {want} (B: {})", b.tip().await?))
+    Err(format!(
+        "node B did not reach A's tip {want} (B: {})",
+        b.tip().await?
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -222,7 +266,11 @@ impl Funder {
         let mut out = Vec::new();
         for t in txids {
             let (tx, _, _) = a.mined(&t).await?;
-            let vout = tx.vout.iter().position(|o| o.script_pubkey == self.spk).ok_or("no vout")?;
+            let vout = tx
+                .vout
+                .iter()
+                .position(|o| o.script_pubkey == self.spk)
+                .ok_or("no vout")?;
             out.push(Utxo {
                 op: OutPoint::new(tx.txid(), vout as u32),
                 value: tx.vout[vout].value.as_sat() as u64,
@@ -235,10 +283,13 @@ impl Funder {
     fn pay(&self, u: &Utxo, spk: &Script, amount: u64) -> R<Transaction> {
         let mut tx = Transaction {
             version: 1,
-            vin: vec![TxIn::new(u.op.clone(), Script::new(), 0xffff_ffff)],
+            vin: vec![TxIn::new(u.op, Script::new(), 0xffff_ffff)],
             vout: vec![
                 TxOut::new(Amount::from_sat(amount as i64), spk.clone()),
-                TxOut::new(Amount::from_sat((u.value - amount - FEE) as i64), self.spk.clone()),
+                TxOut::new(
+                    Amount::from_sat((u.value - amount - FEE) as i64),
+                    self.spk.clone(),
+                ),
             ],
             lock_time: 0,
         };
@@ -249,7 +300,9 @@ impl Funder {
 
     fn sig(&self, tx: &Transaction) -> R<Vec<u8>> {
         let h = sighash(tx, 0, &self.spk, SigHashType::All, false).map_err(|e| e.to_string())?;
-        let mut s = sign_hash(&self.key, h.as_bytes()).map_err(|e| e.to_string())?.to_der();
+        let mut s = sign_hash(&self.key, h.as_bytes())
+            .map_err(|e| e.to_string())?
+            .to_der();
         s.push(SigHashType::All as u8);
         Ok(s)
     }
@@ -264,7 +317,10 @@ impl Funder {
 
 fn load_primes() -> (Primes, Primes) {
     let path = std::env::temp_dir().join("divi-swap-xmr-test-primes.json");
-    if let Some(p) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+    if let Some(p) = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
         println!("primes: cached ({})", path.display());
         return p;
     }
@@ -300,7 +356,11 @@ impl J {
                 break *x;
             }
         };
-        Ok(J { taker, maker, joint })
+        Ok(J {
+            taker,
+            maker,
+            joint,
+        })
     }
 
     fn sign(&self, h: [u8; 32]) -> R<Vec<u8>> {
@@ -364,7 +424,11 @@ impl Swap {
             t_cancel,
             t_late,
         };
-        let cancel = CancelScript { maker: lock.maker, taker: lock.taker, t_punish };
+        let cancel = CancelScript {
+            maker: lock.maker,
+            taker: lock.taker,
+            t_punish,
+        };
         Swap {
             lock_redeem: lock.redeem_script(),
             cancel_redeem: cancel.redeem_script(),
@@ -392,18 +456,31 @@ impl Swap {
 
     /// The unsigned `Tx_cancel` of the lock at `lock_op` (as `persist_setup` builds it).
     fn tx_cancel(&self, lock_op: OutPoint) -> Transaction {
-        spend(lock_op, LOCK_SATS - FEE, self.cancel.script_pubkey(), self.t_cancel)
+        spend(
+            lock_op,
+            LOCK_SATS - FEE,
+            self.cancel.script_pubkey(),
+            self.t_cancel,
+        )
     }
 
     /// The taker's `finish_keying`: one refund encsig per encoding of the signed `Tx_cancel`,
     /// keyed by that encoding's txid.
-    fn taker_encsigs(&self, tx_cancel: &Transaction, sig_j: &[u8]) -> R<HashMap<String, EncryptedSignature>> {
+    fn taker_encsigs(
+        &self,
+        tx_cancel: &Transaction,
+        sig_j: &[u8],
+    ) -> R<HashMap<String, EncryptedSignature>> {
         ensure!(
             crypto::verify_plain(tx_cancel, &self.lock_redeem, &self.lock.joint, sig_j),
             "sigma_J does not verify under J"
         );
         let variants = lock_scripts::cancel_variants(tx_cancel, sig_j, &self.lock_redeem);
-        ensure!(variants.len() == CANCEL_VARIANTS, "{} variants", variants.len());
+        ensure!(
+            variants.len() == CANCEL_VARIANTS,
+            "{} variants",
+            variants.len()
+        );
         let y = self.y_point();
         let mut out = HashMap::new();
         for v in &variants {
@@ -433,12 +510,15 @@ impl Swap {
 
     /// The maker's `Tx_refund` for the mined `cancel` (maker.rs: encsig by mined txid,
     /// `after_cancel`, `maker_completes_tx_refund`, `two_key`).
-    fn maker_refund(&self, cancel: &Transaction, encsigs: &HashMap<String, EncryptedSignature>) -> R<Transaction> {
+    fn maker_refund(
+        &self,
+        cancel: &Transaction,
+        encsigs: &HashMap<String, EncryptedSignature>,
+    ) -> R<Transaction> {
         let txid = cancel.txid().to_hex();
-        let enc = encsigs
-            .get(&txid)
-            .cloned()
-            .ok_or(format!("Tx_cancel {txid} is not one of the encodings the taker signed"))?;
+        let enc = encsigs.get(&txid).cloned().ok_or(format!(
+            "Tx_cancel {txid} is not one of the encodings the taker signed"
+        ))?;
         let (unsigned, _) = after_cancel(
             cancel,
             FEE,
@@ -462,11 +542,21 @@ impl Swap {
 }
 
 /// Fund and mine a canonical `Tx_lock` for `swap`; returns it and its lock outpoint.
-async fn lock_funds(a: &Node, b: &Node, f: &Funder, u: &Utxo, swap: &Swap) -> R<(Transaction, OutPoint)> {
+async fn lock_funds(
+    a: &Node,
+    b: &Node,
+    f: &Funder,
+    u: &Utxo,
+    swap: &Swap,
+) -> R<(Transaction, OutPoint)> {
     let spk = swap.lock.script_pubkey();
     let tx = f.pay(u, &spk, LOCK_SATS)?;
     let id = a.send(&tx).await?;
-    ensure!(id == tx.txid().to_hex(), "Tx_lock txid {id} vs {}", tx.txid().to_hex());
+    ensure!(
+        id == tx.txid().to_hex(),
+        "Tx_lock txid {id} vs {}",
+        tx.txid().to_hex()
+    );
     a.mine(1).await?;
     synced(a, b).await?;
     let (_, block, conf) = a.mined(&id).await?;
@@ -517,22 +607,37 @@ async fn test5(
     let mut mal = unsigned.clone();
     mal.vin[0].script_sig = Script::from_bytes(encode(&sig_j, &swap.lock_redeem)?);
     let mal_id = mal.txid().to_hex();
-    ensure!(mal_id != canonical.txid().to_hex(), "malleation left the txid unchanged");
-    ensure!(encsigs.contains_key(&mal_id), "malleated Tx_cancel is not among the 120 variants");
+    ensure!(
+        mal_id != canonical.txid().to_hex(),
+        "malleation left the txid unchanged"
+    );
+    ensure!(
+        encsigs.contains_key(&mal_id),
+        "malleated Tx_cancel is not among the 120 variants"
+    );
     ensure!(
         lock_scripts::lock_spend_branch(&mal, &swap.lock_redeem) == Some(LockSpend::Cancel),
         "malleated Tx_cancel not classified as the cancel branch"
     );
     println!("  malleated Tx_cancel txid {mal_id}");
-    println!("  malleated scriptSig {}", hex::encode(mal.vin[0].script_sig.as_bytes()));
+    println!(
+        "  malleated scriptSig {}",
+        hex::encode(mal.vin[0].script_sig.as_bytes())
+    );
 
     let mempool = a.send(&mal).await;
-    println!("  sendrawtransaction(malleated Tx_cancel): {}", show(&mempool));
+    println!(
+        "  sendrawtransaction(malleated Tx_cancel): {}",
+        show(&mempool)
+    );
     let block = a.mine_direct(&[&mal]).await?;
     let tip = synced(a, b).await?;
     ensure!(tip == block, "tip {tip} != generated {block}");
     let (onchain, in_block, _) = a.mined(&mal_id).await?;
-    ensure!(in_block == block, "malleated Tx_cancel in {in_block}, expected {block}");
+    ensure!(
+        in_block == block,
+        "malleated Tx_cancel in {in_block}, expected {block}"
+    );
     ensure!(
         onchain.vin[0].script_sig == mal.vin[0].script_sig,
         "the mined scriptSig is not the malleated one"
@@ -543,7 +648,10 @@ async fn test5(
 
     // Maker: refund for the txid actually mined.
     let refund = swap.maker_refund(&onchain, &encsigs)?;
-    ensure!(refund.vin[0].prevout.txid.to_hex() == mal_id, "refund spends the wrong Tx_cancel");
+    ensure!(
+        refund.vin[0].prevout.txid.to_hex() == mal_id,
+        "refund spends the wrong Tx_cancel"
+    );
     let rid = a.send(&refund).await.map_err(|e| {
         format!("FINDING: the maker's Tx_refund for the mined variant is not relayable: {e}")
     })?;
@@ -552,14 +660,19 @@ async fn test5(
     let rblock = a.mine(1).await?.pop().unwrap_or_default();
     synced(a, b).await?;
     let (refund_onchain, r_in, conf) = a.mined(&rid).await?;
-    ensure!(r_in == rblock && conf >= 1, "Tx_refund in {r_in} conf {conf}, expected {rblock}");
+    ensure!(
+        r_in == rblock && conf >= 1,
+        "Tx_refund in {r_in} conf {conf}, expected {rblock}"
+    );
     let (_, b_r, _) = b.mined(&rid).await?;
     ensure!(b_r == rblock, "node B has Tx_refund in {b_r}");
     println!("  Tx_refund {rid} mined in block {rblock} (node B agrees)");
 
     // Taker: recover s_m from the mined refund with the encsig for that variant.
     let spent = refund_onchain.vin[0].prevout.txid.to_hex();
-    let enc = encsigs.get(&spent).ok_or("taker has no encsig for the spent Tx_cancel")?;
+    let enc = encsigs
+        .get(&spent)
+        .ok_or("taker has no encsig for the spent Tx_cancel")?;
     let got = crypto::recover(&refund_onchain, Signer::Taker, &swap.y_point(), enc)
         .ok_or("taker could not recover s_m")?;
     ensure!(got == swap.s_m, "recovered scalar is not s_m");
@@ -608,7 +721,10 @@ async fn test7(a: &Node, b: &Node, f: &Funder, u: &Utxo, primes: &(Primes, Prime
     let mut tx_cancel = unsigned.clone();
     tx_cancel.vin[0].script_sig = lock_scripts::cancel_sig(&sig_j, &swap.lock_redeem);
     println!("  canonical Tx_lock txid {canon_id} (never broadcast)");
-    println!("  presigned Tx_cancel {} (spends {canon_id}:0)", tx_cancel.txid().to_hex());
+    println!(
+        "  presigned Tx_cancel {} (spends {canon_id}:0)",
+        tx_cancel.txid().to_hex()
+    );
 
     // A staker re-encodes Tx_lock's own input signature: S -> n - S.
     let items = lock_scripts::stack_items(canon.vin[0].script_sig.as_bytes()).ok_or("p2pkh sig")?;
@@ -618,42 +734,64 @@ async fn test7(a: &Node, b: &Node, f: &Funder, u: &Utxo, primes: &(Primes, Prime
     let mal_id = mal.txid().to_hex();
     ensure!(mal_id != canon_id, "txid unchanged");
     println!("  malleated Tx_lock txid {mal_id}");
-    println!("  malleated scriptSig {}", hex::encode(mal.vin[0].script_sig.as_bytes()));
+    println!(
+        "  malleated scriptSig {}",
+        hex::encode(mal.vin[0].script_sig.as_bytes())
+    );
     let mempool = a.send(&mal).await;
-    println!("  sendrawtransaction(malleated Tx_lock): {}", show(&mempool));
+    println!(
+        "  sendrawtransaction(malleated Tx_lock): {}",
+        show(&mempool)
+    );
     let block = a.mine_direct(&[&mal]).await?;
     let tip = synced(a, b).await?;
     ensure!(tip == block, "tip {tip} != generated {block}");
     let (onchain, in_block, _) = a.mined(&mal_id).await?;
-    ensure!(in_block == block && onchain.vin[0].script_sig == mal.vin[0].script_sig, "not mined as sent");
+    ensure!(
+        in_block == block && onchain.vin[0].script_sig == mal.vin[0].script_sig,
+        "not mined as sent"
+    );
     println!("  malleated Tx_lock mined in block {block} (node B agrees)");
     let lock_op = OutPoint::new(onchain.txid(), 0);
 
     // The presigned Tx_cancel is now useless: its input does not exist.
-    println!("  sendrawtransaction(canonical Tx_lock): {}", show(&a.send(&canon).await));
+    println!(
+        "  sendrawtransaction(canonical Tx_lock): {}",
+        show(&a.send(&canon).await)
+    );
     let c = a.send(&tx_cancel).await;
     println!("  sendrawtransaction(presigned Tx_cancel): {}", show(&c));
     ensure!(c.is_err(), "the presigned Tx_cancel was accepted");
     let h0 = a.height().await?;
     let cb = a.mine_direct(&[&tx_cancel]).await;
     println!("  generateblock(presigned Tx_cancel): {}", show(&cb));
-    ensure!(cb.is_err() && a.height().await? == h0, "a block with the presigned Tx_cancel was accepted");
+    ensure!(
+        cb.is_err() && a.height().await? == h0,
+        "a block with the presigned Tx_cancel was accepted"
+    );
     let st = a.call("gettxout", json!([mal_id, 0])).await?;
     ensure!(!st.is_null(), "malleated lock output not unspent");
     println!("  lock output {mal_id}:0 unspent, {} DIVI", st["value"]);
 
     // The maker alone, via t_late, on the outpoint that exists.
-    let mut late = spend(lock_op.clone(), LOCK_SATS - FEE, swap.maker_refund_script(), t_late);
-    let sig = crypto::sign_plain(&late, &swap.lock_redeem, &swap.maker_key).map_err(|e| e.to_string())?;
+    let mut late = spend(lock_op, LOCK_SATS - FEE, swap.maker_refund_script(), t_late);
+    let sig =
+        crypto::sign_plain(&late, &swap.lock_redeem, &swap.maker_key).map_err(|e| e.to_string())?;
     late.vin[0].script_sig = lock_scripts::late_sig(&sig, &swap.lock_redeem);
     ensure!(
         lock_scripts::lock_spend_branch(&late, &swap.lock_redeem) == Some(LockSpend::Late),
         "late spend not classified as the late branch"
     );
     let late_id = late.txid().to_hex();
-    println!("  late spend {late_id} (lock_time {t_late}, hp2 clock {})", now());
+    println!(
+        "  late spend {late_id} (lock_time {t_late}, hp2 clock {})",
+        now()
+    );
     let early = a.send(&late).await;
-    println!("  sendrawtransaction(late spend) before t_late: {}", show(&early));
+    println!(
+        "  sendrawtransaction(late spend) before t_late: {}",
+        show(&early)
+    );
     ensure!(early.is_err(), "late spend accepted before t_late");
     let wait = (t_late as u64 + 5).saturating_sub(now());
     println!("  waiting {wait}s for t_late");
@@ -665,11 +803,20 @@ async fn test7(a: &Node, b: &Node, f: &Funder, u: &Utxo, primes: &(Primes, Prime
     let lblock = a.mine(1).await?.pop().unwrap_or_default();
     synced(a, b).await?;
     let (_, l_in, conf) = a.mined(&late_id).await?;
-    ensure!(l_in == lblock && conf >= 1, "late spend in {l_in}, expected {lblock}");
+    ensure!(
+        l_in == lblock && conf >= 1,
+        "late spend in {l_in}, expected {lblock}"
+    );
     let (_, b_l, _) = b.mined(&late_id).await?;
     ensure!(b_l == lblock, "node B has the late spend in {b_l}");
-    ensure!(a.call("gettxout", json!([mal_id, 0])).await?.is_null(), "lock still unspent");
-    println!("  late spend mined in block {lblock} (node B agrees); maker recovered {} sats", LOCK_SATS - FEE);
+    ensure!(
+        a.call("gettxout", json!([mal_id, 0])).await?.is_null(),
+        "lock still unspent"
+    );
+    println!(
+        "  late spend mined in block {lblock} (node B agrees); maker recovered {} sats",
+        LOCK_SATS - FEE
+    );
     println!("  Test 7: PASS");
     Ok(())
 }
@@ -689,8 +836,14 @@ async fn run() -> R<()> {
     let a = Node::open("A", &format!("{dir}/a"))?;
     let b = Node::open("B", &format!("{dir}/b"))?;
     let info = a.call("getinfo", json!([])).await?;
-    println!("node A: version {} protocol {}", info["version"], info["protocolversion"]);
-    println!("node B connections: {}", b.call("getconnectioncount", json!([])).await?);
+    println!(
+        "node A: version {} protocol {}",
+        info["version"], info["protocolversion"]
+    );
+    println!(
+        "node B connections: {}",
+        b.call("getconnectioncount", json!([])).await?
+    );
 
     let h = a.height().await?;
     if h < 30 {
@@ -698,18 +851,28 @@ async fn run() -> R<()> {
     }
     synced(&a, &b).await?;
     let mtp = a.mtp().await?;
-    println!("height {} mtp {mtp} (CLTV/LIMIT_TRANSFER need mtp >= {CLTV_ACTIVATION_MTP})", a.height().await?);
+    println!(
+        "height {} mtp {mtp} (CLTV/LIMIT_TRANSFER need mtp >= {CLTV_ACTIVATION_MTP})",
+        a.height().await?
+    );
     ensure!(mtp >= CLTV_ACTIVATION_MTP, "CLTV not active by MTP");
     println!("wallet balance: {}", a.call("getbalance", json!([])).await?);
 
     let key = SecretKey::new_random();
-    let f = Funder { spk: p2pkh_spk(&key), key };
+    let f = Funder {
+        spk: p2pkh_spk(&key),
+        key,
+    };
     let utxos = f.fund(&a, 3).await?;
     let primes = load_primes();
 
     let mut verdicts = Vec::new();
     for (label, u, enc) in [
-        ("a (high-S sigma_J)", &utxos[0], high_s as fn(&[u8], &[u8]) -> R<Vec<u8>>),
+        (
+            "a (high-S sigma_J)",
+            &utxos[0],
+            high_s as fn(&[u8], &[u8]) -> R<Vec<u8>>,
+        ),
         ("b (PUSHDATA1 sigma_J)", &utxos[1], pushdata1_sig),
     ] {
         let r = test5(label, &a, &b, &f, u, &primes, enc).await;
@@ -724,7 +887,11 @@ async fn run() -> R<()> {
     }
     verdicts.push(("7".into(), r.is_ok()));
 
-    println!("\nfinal height {} tip {}", a.height().await?, a.tip().await?);
+    println!(
+        "\nfinal height {} tip {}",
+        a.height().await?,
+        a.tip().await?
+    );
     for (t, ok) in &verdicts {
         println!("Test {t}: {}", if *ok { "PASS" } else { "FAIL" });
     }

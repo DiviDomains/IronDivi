@@ -33,8 +33,8 @@ fn main() {
     let title = args.next().expect(usage);
     let spend = <Ed25519 as Ciphersuite>::F::random(&mut OsRng);
     let view = <Ed25519 as Ciphersuite>::F::random(&mut OsRng);
-    let spend_pub: [u8; 32] = (Ed25519::generator() * spend).to_bytes().into();
-    let view_secret: [u8; 32] = view.to_repr().into();
+    let spend_pub: [u8; 32] = (Ed25519::generator() * spend).to_bytes();
+    let view_secret: [u8; 32] = view.to_repr();
     let address = swap_chain_xmr::monero_chain::lock_address(spend_pub, view_secret, network)
         .expect("a fresh key pair is valid")
         .to_string();
