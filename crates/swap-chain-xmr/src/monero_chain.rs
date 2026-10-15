@@ -225,6 +225,7 @@ pub async fn find_lock(
     for height in from_height..last {
         if let Some(output) = scan_block(monerod_rpc, height, view_pair.clone())
             .await
+            .map_err(MoneroChainError::Rpc)?
             .into_iter()
             .next()
         {
@@ -262,6 +263,7 @@ pub async fn sweep(
 
     let output = crate::live_rpc::scan_for_lock_output(monerod_rpc, &lock.txid, view_pair)
         .await
+        .map_err(MoneroChainError::Rpc)?
         .ok_or_else(|| MoneroChainError::LockOutputMissing(lock.txid.clone()))?;
 
     let info = monerod_get_info(monerod_rpc)

@@ -239,25 +239,32 @@ pub fn decode_point(hex_str: &str) -> Option<Point> {
 /// skips the more general "scan forward for the first V2 tx" case
 /// `monero_wallet::interface::ExpandToScannableBlock` handles, since it isn't needed
 /// here).
-pub async fn fetch_scannable_block(monerod_rpc: &str, height: usize) -> ScannableBlock {
+pub async fn fetch_scannable_block(
+    monerod_rpc: &str,
+    height: usize,
+) -> Result<ScannableBlock, String> {
     let client = reqwest::Client::new();
     let block_body: serde_json::Value = client
         .post(format!("{monerod_rpc}/json_rpc"))
         .json(&serde_json::json!({"jsonrpc":"2.0","id":"0","method":"get_block","params":{"height":height}}))
         .send()
         .await
-        .expect("get_block reachable")
+        .map_err(|e| format!("get_block at height {height}: {e}"))?
         .json()
         .await
-        .expect("get_block returns JSON");
+        .map_err(|e| format!("get_block at height {height}: {e}"))?;
     let blob = block_body["result"]["blob"]
         .as_str()
-        .expect("block has a blob");
-    let block = Block::read(&mut hex::decode(blob).expect("blob is hex").as_slice())
-        .expect("blob is a valid block");
+        .ok_or_else(|| format!("height {height}: missing (block has a blob)"))?;
+    let block = Block::read(
+        &mut hex::decode(blob)
+            .map_err(|e| format!("height {height}: blob: {e}"))?
+            .as_slice(),
+    )
+    .map_err(|e| format!("height {height}: block: {e}"))?;
     let miner_tx_hash = block_body["result"]["miner_tx_hash"]
         .as_str()
-        .expect("get_block reports miner_tx_hash")
+        .ok_or_else(|| format!("height {height}: missing (get_block reports miner_tx_hash)"))?
         .to_string();
 
     let mut hashes = vec![miner_tx_hash.clone()];
@@ -267,20 +274,24 @@ pub async fn fetch_scannable_block(monerod_rpc: &str, height: usize) -> Scannabl
         .json(&serde_json::json!({"txs_hashes": hashes, "decode_as_json": false, "prune": false}))
         .send()
         .await
-        .expect("get_transactions reachable")
+        .map_err(|e| format!("get_transactions at height {height}: {e}"))?
         .json()
         .await
-        .expect("get_transactions returns JSON");
-    let txs = txs_body["txs"].as_array().expect("txs array present");
-    assert_eq!(
-        txs.len(),
-        hashes.len(),
-        "get_transactions returned a different tx count"
-    );
+        .map_err(|e| format!("get_transactions at height {height}: {e}"))?;
+    let txs = txs_body["txs"]
+        .as_array()
+        .ok_or_else(|| format!("height {height}: missing (txs array present)"))?;
+    if txs.len() != hashes.len() {
+        return Err(format!(
+            "height {height}: get_transactions returned {} of {} txs",
+            txs.len(),
+            hashes.len()
+        ));
+    }
 
     let output_index_for_first_ringct_output = txs[0]["output_indices"][0]
         .as_u64()
-        .expect("miner tx has a first output index");
+        .ok_or_else(|| format!("height {height}: missing (miner tx has a first output index)"))?;
     // `pruned_as_hex` is empty for ordinary (non-coinbase) transactions on this node --
     // only coinbase transactions have no prunable signature data, making their pruned
     // and full forms identical, which is why that field happens to work for the miner
@@ -290,20 +301,24 @@ pub async fn fetch_scannable_block(monerod_rpc: &str, height: usize) -> Scannabl
     let transactions = txs[1..]
         .iter()
         .map(|t| {
-            let hex_str = t["as_hex"].as_str().expect("as_hex present");
+            let hex_str = t["as_hex"]
+                .as_str()
+                .ok_or_else(|| format!("height {height}: a tx has no as_hex"))?;
+            let bytes =
+                hex::decode(hex_str).map_err(|e| format!("height {height}: tx hex: {e}"))?;
             monero_wallet::transaction::Transaction::<monero_wallet::transaction::NotPruned>::read(
-                &mut hex::decode(hex_str).expect("tx hex valid").as_slice(),
+                &mut bytes.as_slice(),
             )
-            .expect("valid transaction")
-            .into()
+            .map(Into::into)
+            .map_err(|e| format!("height {height}: tx: {e}"))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
-    ScannableBlock {
+    Ok(ScannableBlock {
         block,
         transactions,
         output_index_for_first_ringct_output: Some(output_index_for_first_ringct_output),
-    }
+    })
 }
 
 /// Scans block `height` with `view_pair`, returning every output in it that belongs
@@ -315,13 +330,13 @@ pub async fn scan_block(
     monerod_rpc: &str,
     height: usize,
     view_pair: ViewPair,
-) -> Vec<WalletOutput> {
-    let block = fetch_scannable_block(monerod_rpc, height).await;
+) -> Result<Vec<WalletOutput>, String> {
+    let block = fetch_scannable_block(monerod_rpc, height).await?;
     let mut scanner = Scanner::new(view_pair);
-    match scanner.scan(block) {
+    Ok(match scanner.scan(block) {
         Ok(outputs) => outputs.not_additionally_locked(),
         Err(_) => Vec::new(),
-    }
+    })
 }
 
 /// Scans the block containing `txid` with `view_pair`, returning the one output in it
@@ -331,22 +346,29 @@ pub async fn scan_for_lock_output(
     monerod_rpc: &str,
     txid: &str,
     view_pair: ViewPair,
-) -> Option<WalletOutput> {
+) -> Result<Option<WalletOutput>, String> {
     let tx_body: serde_json::Value = reqwest::Client::new()
         .post(format!("{monerod_rpc}/get_transactions"))
         .json(&serde_json::json!({"txs_hashes": [txid], "decode_as_json": false}))
         .send()
         .await
-        .ok()?
+        .map_err(|e| format!("get_transactions: {e}"))?
         .json()
         .await
-        .ok()?;
-    let height = tx_body["txs"][0]["block_height"].as_u64()? as usize;
-    let txid_bytes: [u8; 32] = hex::decode(txid).ok()?.try_into().ok()?;
-    scan_block(monerod_rpc, height, view_pair)
-        .await
+        .map_err(|e| format!("get_transactions: {e}"))?;
+    let Some(height) = tx_body["txs"][0]["block_height"].as_u64() else {
+        return Ok(None);
+    };
+    let Some(txid_bytes) = hex::decode(txid)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(scan_block(monerod_rpc, height as usize, view_pair)
+        .await?
         .into_iter()
-        .find(|o| o.transaction() == txid_bytes)
+        .find(|o| o.transaction() == txid_bytes))
 }
 
 // No network access needed -- this re-reads a sibling crate's source text to catch
@@ -441,7 +463,9 @@ mod tests {
             .await
             .expect("get_info reachable");
         let height = info["result"]["height"].as_u64().expect("height present") as usize - 5;
-        let block = fetch_scannable_block(MONEROD_RPC_DEFAULT, height).await;
+        let block = fetch_scannable_block(MONEROD_RPC_DEFAULT, height)
+            .await
+            .unwrap();
         assert_eq!(block.block.number(), height);
         assert!(block.output_index_for_first_ringct_output.is_some());
     }
@@ -458,7 +482,9 @@ mod tests {
     /// into the forward swap's 2-of-2 lock address) specifically to exercise that path.
     #[tokio::test]
     async fn fetch_scannable_block_decodes_a_block_with_a_real_transaction() {
-        let block = fetch_scannable_block(MONEROD_RPC_DEFAULT, 2_227_378).await;
+        let block = fetch_scannable_block(MONEROD_RPC_DEFAULT, 2_227_378)
+            .await
+            .unwrap();
         assert_eq!(block.block.number(), 2_227_378);
         assert_eq!(
             block.transactions.len(),

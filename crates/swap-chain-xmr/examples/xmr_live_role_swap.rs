@@ -483,6 +483,7 @@ async fn main() {
         ViewPair::new(spend_point, state.xmr_view_key()).expect("torsion-free spend key"),
     )
     .await
+    .expect("monerod reachable")
     .expect("the confirmed lock transaction must contain a scannable output for our key");
     println!(
         "Found the lock output: {} atomic units, output index {}.",
