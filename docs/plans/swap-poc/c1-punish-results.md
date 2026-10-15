@@ -1,8 +1,8 @@
 # C1 test 4: punish path on testnet / stagenet
 
-Status: **IN PROGRESS.** Tx_lock and the XMR lock are on chain and the maker is stalled.
-Tx_cancel is due after t_cancel (2026-10-15T20:06:36Z) and Tx_punish after t_punish
-(2026-10-15T23:06:36Z). The sections marked *pending* are filled in when those happen.
+Status: **PASS** (2026-10-15 23:21Z). With the maker silent after the taker's XMR lock, the taker
+alone broadcast Tx_cancel (cancel branch, joint key J) after t_cancel and Tx_punish (her key b)
+after t_punish, and took the 10 tDIVI. No refund of Tx_cancel:0 exists. Checks below.
 
 Code: C1 as merged at `5dd9c77`, the same tree as `c1-impl` `61ca99a`. Maker binary: the lane-c1
 release `divi-swapd` (sha256 prefix `4e06be9f74558c9d`), built on hp2. Taker binary:
@@ -103,8 +103,11 @@ All three are checked against median-time-past (MTP), which runs about 5 min beh
 |---|---|---|---|
 | DIVI Tx_lock | `5631d134197999dcae4fea7498fec40f1d0827771c293b8625a9f6f886f257b4` | 350903 | 2026-10-15T14:15:06Z |
 | XMR lock (stagenet) | `fd812260498226caa597a97f6f7d9ba617e7607c1e0cd8d4f0db7bdc7bd7c891` | in pool at 14:20Z (stagenet tip 2229875) | reported 14:19:29Z |
-| Tx_cancel | *pending* | | |
-| Tx_punish | *pending* | | |
+| Tx_cancel | `47cb5c867b902660a05640c160b84e60f7e4c5cd1f31c75fd0b9e302c2656792` | 351277 | block 2026-10-15T20:19:05Z |
+| Tx_punish | `42e6fc493f6853b924b83de4fffa64cacb69880c7abbe9d194acef90d735909d` | 351450 | block 2026-10-15T23:16:59Z |
+
+The XMR lock confirmed at stagenet height 2229875. Taker step states: `Cancelled` from 20:39Z,
+`Punishing` 23:16:33Z, `Done` 23:21:33Z (`$R/step-states.log`).
 
 Tx_lock output 0 is 10.001 tDIVI to the P2SH `8ubJJw89YMPakyMWsoZ5i2pBayc26b8KAx`. Output 1 is
 change back to the maker.
@@ -114,8 +117,29 @@ watcher stopped the maker at 14:19:33Z. Its process is gone, and it was not rest
 
 ## Verification
 
-*pending*: Tx_cancel spends Tx_lock:0 with `<σ_J> OP_2 <redeem>`. Tx_punish spends Tx_cancel:0
-with `<sig_b> OP_0 <cancel_redeem>` and pays the taker. No refund of Tx_cancel:0 exists.
+All four checks hold (DIVI testnet node5, tip 351457 at 23:30Z; Tx_cancel 181 conf, Tx_punish 8):
+
+1. Tx_cancel `vin[0]` = `5631d134…:0`; scriptSig `<σ (71 B)> 2 <redeem (174 B)>`. `decodescript`
+   of that redeem gives p2sh `8ubJJw89YMPakyMWsoZ5i2pBayc26b8KAx`, Tx_lock:0's address. Selector 2
+   is the cancel branch: `<t_cancel 1792094796> OP_CLTV OP_DROP <J> OP_CHECKSIG`, with
+   `J = 03d088f8…dcea`, the taker db's `joint_pubkey`, distinct from `a = 021ba4fc…e60e` and
+   `b = 0279c008…94fe`. The branch has a single key, so the block that mined it proves the
+   signature verifies under J. nLockTime 1792094796 = t_cancel.
+2. Tx_punish `vin[0]` = `47cb5c86…:0`; scriptSig `<sig_b (72 B)> 0 <cancel_redeem (116 B)>`.
+   The cancel redeem hashes to `8kDTp5ZQXb6pWku8QuB4MQgMA5KvpuPUyh`, Tx_cancel:0's address; selector
+   0 takes `<t_punish 1792105596> OP_CLTV OP_DROP <b> OP_CHECKSIG`. nLockTime = t_punish. Its one
+   output, 9.999 tDIVI, pays `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b` = script
+   `76a914166a1461…5e9888ac`, the soak taker's payout script (the same as every happy swap's
+   Tx_redeem).
+3. `gettxout 47cb5c86… 0` is null: Tx_cancel:0 is spent, by Tx_punish. No refund exists.
+4. XMR lock `fd812260…` confirmed at stagenet height 2229875; it stays locked for good (the price
+   of the punish path).
+
+Caveats: maker `61ca99a` (`4e06be9f…`) and taker `61ca99a`, not the later `a77ec9d` / `1841a12`
+builds (the changes since touch only the broadcast order and monerod error handling, not the cancel or
+punish path). The taker logged "maker unreachable" every step from 20:59Z on, as intended. The
+Claude Code session's waiter was stopped once for low memory around 18:10Z; the stepper itself
+(pid 32372) ran throughout.
 
 ## Resume and verify (after about 23:15Z)
 

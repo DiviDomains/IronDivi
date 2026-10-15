@@ -1069,8 +1069,11 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
   - 2 and 3 **PASS**: past `t_cancel` the maker cancelled (`J` branch) and refunded all 4 parked
     swaps (2 accept-only, 2 lock-only) by 20:25Z; both lock-only takers swept their XMR back
     (stagenet heights 2230023, 2230026). Txids in RESULTS.md.
-  - 4 (punish) running on a private second maker on hp2 (`c1-punish-results.md`): `Tx_cancel`
-    after ~20:12Z, `Tx_punish` after ~23:12Z.
+  - 4 **PASS** live (`c1-punish-results.md`): private maker on hp2 stopped after the XMR lock;
+    the taker alone broadcast Tx_cancel `47cb5c86…` (J branch, 20:19Z) and Tx_punish `42e6fc49…`
+    (key b, 23:17Z) and took the 10 tDIVI. No refund of Tx_cancel:0.
+  - **All §7 tests pass** (1-4, 6 live on stagenet; 5a, 5b, 7 on regtest). C1 stays open for the
+    review of `xmr-c1-design.md`; mainnet stays blocked until then.
 - **Known gaps (not blocking stagenet):** a retried `j` message (lost HTTP reply) breaks the
   keying session; pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
   swap; the rare malleated-`Tx_lock` path still scans under the swap lock while `tick` is
