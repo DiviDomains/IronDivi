@@ -254,6 +254,12 @@ gate for all her swaps (`taker.rs:173`).
    funds? Compare `xmr-design.md:540-568`, which treats malleability as miner-only and
    liveness-only. Same question for third-party S-flip: `crypto.rs:101-117` does not check
    low-S on the counterparty's plain signature.
+1b. **Tx_lock txid stability (C7).** Tx_cancel is presigned against Tx_lock's txid before
+   Tx_lock confirms, and Tx_lock spends the maker's P2PKH coins, whose scriptSigs any staker can
+   change (no SIGPUSHONLY or LOW_S in Divi consensus). The taker is safe (she locks XMR only after
+   the exact `lock_outpoint` confirms), but the maker's DIVI is then stuck in the 2-of-2. Our fix
+   is a maker-only `t_late` branch (`xmr-c1-design.md` §4.3). Is its window sound for an offline
+   taker?
 2. **Tx_cancel output value.** The taker checks Tx_cancel's input, sequence, lock_time and
    output script, not its output value (`taker.rs:277-287`). Tx_punish's payout derives from
    it with a saturating subtraction (`api.rs:130`). Does a maker-chosen tiny value defeat

@@ -371,8 +371,21 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
   - happy × 14 (12 at 4 in parallel, 2 more after the a7cb7e9 deploy): 14 redeemed, 807-1904 s each.
   - maker restarts with swaps open, both resumed with no error: 16:54 (2 swaps in `xmr_reported`, 6
     `locked`) and the 18:17 redeploy (4 `locked`).
-  - accept-only × 4 (taker never locks XMR): maker refunds after `t_cancel`. Pending.
-  - lock-only × 4 (taker locks XMR, then stops until past `t_cancel`): 3 locked; both refunds pending.
+  - accept-only × 4 (taker never locks XMR): maker refunded after `t_cancel`, all `done` with
+    lock → cancel → refund: `76001a25` 71658caf3c36 → f79e407d0dee → 5b0d4b76199b,
+    `4e5ff034` 3a5821841797 → ebba6487a52c → 93df59744603, `e474482e` 8df064ab7781 →
+    32f44d46695b → dcef17dccd8a, `ef127823` fbf358b1d55c → 32ac6f44adbd → 1f711d006b5d.
+  - lock-only × 4 (taker locks XMR, then stops until past `t_cancel`): 3 locked, and all 3 came
+    back on both chains (resumed 2026-10-15 ~01:03 UTC). Maker DIVI lock → cancel → refund:
+    `9c6e495c` 4a43d17009d3 → a932ca8cff52 → af5f90e26763, `39488331` e033e74cf9e7 →
+    cc8749bf8790 → cf457b9f22c2, `9a36be57` d7045a0bbe4e → 42639b28ff34 → df8bd7ac0eb1.
+    Taker outcome `refunded`, XMR swept back with `s_m` read from `Tx_refund`:
+    `2f442343b7e7f31e…`, `8f3426cdea5e947f…`, `62d6611bb0a66cc4…`. Two taker runs panicked on a
+    public-node connection reset (`crates/swap-chain-xmr/src/live_rpc.rs:249` `expect`) while
+    waiting; the rerun picked up from the journal. A transient RPC error should be an error, not a
+    panic (logged as C8).
+  - total through dnsdivi: 22 maker swaps, all `done`, 0 stuck, 0 lost (14 redeemed, 4 + 3 refunded,
+    1 accept refused cleanly).
     The 4th accept got `409 insufficient funds: need 1000100000 + fee, have 0` with nothing on
     chain. The maker's XMR-engine DIVI wallet holds one coin; each setup reserves it until its
     lock tx is broadcast and the change comes back as the next coin

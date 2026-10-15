@@ -1053,9 +1053,9 @@ before any real-money swap.
     `10033e49…` 0.0019696 and `0da938c7…` 0.00196946 sXMR at height 2229221, balance 0.00393906.
   - A5 open: dnsdivi's own stagenet monerod is CPU-bound at height ~144k of 2.229M; the maker
     still uses the public node.
-  - A8 in progress: 14 happy redeemed, 2 restarts with swaps open; 7 refunds land after
-    `t_cancel` (accept-only `t_cancel` 22:44 UTC, lock-only 00:23 UTC on the 15th; the lock-only resume fires ~01:03). See
-    RESULTS.md. Punish was not run through dnsdivi (it means stalling the shared maker past
+  - **A8 done 2026-10-15:** 22 maker swaps through dnsdivi, all `done`, 0 stuck, 0 lost: 14
+    redeemed, 2 restarts with swaps open, 4 accept-only and 3 lock-only refunded (the lock-only
+    takers swept their XMR back). See RESULTS.md. Found C8 (a transient monerod error panics). Punish was not run through dnsdivi (it means stalling the shared maker past
     `t_punish`); the evidence is the 2026-10-12 live run with the CLI maker. Accept or reject that
     at Gate A.
 - **Gate B: open on people, not code.**
