@@ -251,6 +251,8 @@ pub struct XmrTaker {
     gate: tokio::sync::Mutex<()>,
     keying: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Keying>>>>,
     primes_fn: PrimesFn,
+    /// Primes made by [`XmrTaker::warm_primes`], taken by the next [`XmrTaker::prepare`].
+    warm: parking_lot::Mutex<Vec<Primes>>,
 }
 
 impl XmrTaker {
@@ -270,6 +272,7 @@ impl XmrTaker {
             gate: tokio::sync::Mutex::new(()),
             keying: parking_lot::Mutex::new(HashMap::new()),
             primes_fn: Arc::new(jsig::generate_primes),
+            warm: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -277,6 +280,16 @@ impl XmrTaker {
     pub fn with_primes(mut self, f: PrimesFn) -> Self {
         self.primes_fn = f;
         self
+    }
+
+    /// Generate the Paillier primes for the next [`XmrTaker::prepare`] now (20–90 s), so they
+    /// are ready before a quote is fetched: generating them between quote and setup can outlast
+    /// the quote.
+    pub async fn warm_primes(&self) -> Result<()> {
+        let f = self.primes_fn.clone();
+        let primes: Primes = jsig::blocking(move || Ok(f())).await?;
+        self.warm.lock().push(primes);
+        Ok(())
     }
 
     /// Step 1: generate and persist `b` and `s_t`, start our side of the `J` keying (20–90 s
@@ -315,8 +328,14 @@ impl XmrTaker {
             last_error: None,
         };
         self.store.put_doc(KIND, &rec.id, &rec)?;
-        let f = self.primes_fn.clone();
-        let primes: Primes = jsig::blocking(move || Ok(f())).await?;
+        let warm = self.warm.lock().pop();
+        let primes: Primes = match warm {
+            Some(p) => p,
+            None => {
+                let f = self.primes_fn.clone();
+                jsig::blocking(move || Ok(f())).await?
+            }
+        };
         let session = Arc::new(JSession::start(&j_sid, TAKER, primes));
         let s = session.clone();
         let first = jsig::blocking(move || s.round(Vec::new())).await?;

@@ -35,6 +35,7 @@ pub async fn begin(
     btc_sats: u64,
 ) -> Result<String> {
     client.wait_ready().await?;
+    taker.warm_primes().await?;
     let quote = client.quote_retrying(offer_id, btc_sats).await?;
     if quote.counter_chain != divi_swap::Chain::Xmr {
         bail!(
