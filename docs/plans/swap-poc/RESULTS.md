@@ -433,7 +433,21 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     each, Lindell keying of `J` and the taker's Paillier/Ñ primes included.
   - §7 test 6 **PASS** (swap `76840285` while `locked`): `POST /j` → 400 "no 2P-ECDSA session for
     this swap"; `POST /sigs` with a random signature → 400 "swap is Locked, not awaiting signatures".
-  - §7 tests 2 and 3 parked (`xmr-soak/l17-accept`: `0c956612`-group, 2 accept-only; `l17-lock`: 2
-    lock-only, XMR locked); waiting for `t_cancel` (setup + 6 h). Test 4 running on the private hp2
-    maker (same build): swap `5c0763e0` (taker local id), XMR lock `e69ec826…`, maker stalled at
-    `xmr_reported` 03:52Z.
+  - §7 tests 2 and 3 (refund) **PASS**: past `t_cancel` the maker cancelled and refunded all 4
+    parked swaps by 11:28Z with nobody's help. Each `Tx_cancel` spends `Tx_lock:0` with a 3-item
+    scriptSig, selector 2 (the `J` branch, Lindell `σ_J`); each `Tx_refund` spends `Tx_cancel:0` and
+    pays the maker `yCnFLYFj…` 9.999 tDIVI. Checked on node5 at tip 352205 (21-38 conf):
+    - accept-only (`xmr-soak/l17-accept`): `0c956612` lock `a0f2edb3…`, cancel `91fdf0a9…`, refund
+      `64dfa4c93ce1b75c443106a28a0b1bafa3cf1c3caa1c631d42d3892a4423fc08`; `a4213a7c` lock
+      `3ddcd49f…`, cancel `d5fafb7c…`, refund
+      `809f7874de7f6d24fae67134e7d405a02766f37a90ef068e7167718b4bf965d7`.
+    - lock-only (`xmr-soak/l17-lock`, XMR locked): `32135198` lock `86280b1f…`, cancel `53069896…`,
+      refund `28d5d0ff6368573eef69aabb3395ee0d535f44ae17d76b6b5d2261c106319e92`; XMR lock
+      `8cbae446…` swept back `58588c22fd6a8db182f3eb645ec09a6aa07f5b226847967bf36e42ee3f36a18f`.
+      `374e984d` lock `4d15fd15…`, cancel `3ebc1d1a…`, refund
+      `75b89297dae3aa1aa9fc988bae44699b5a8c6a4aed7e9b293bae7cf439793e4a`; XMR lock `8155c684…`
+      swept back `facc6401db5ae0b58077f0202d4256d3b37416257cfc58613ea59fc8add74c21`.
+      `xmr-soak.sh --resume xmr-soak/l17-lock`: both `Done`.
+  - §7 test 4 (punish) running on the private hp2 maker (same build): taker local id `5c0763e0`,
+    XMR lock `e69ec826…`, maker stalled at `xmr_reported` 03:52Z; Tx_cancel due ≈ 09:50Z,
+    Tx_punish ≈ 12:50Z.

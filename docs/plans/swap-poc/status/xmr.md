@@ -1087,6 +1087,9 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
   Test 6 **PASS** on this build (swap `76840285`, `locked`): `POST /j` → 400 "no 2P-ECDSA session
   for this swap"; `POST /sigs` with a random signature → 400 "swap is Locked, not awaiting
   signatures"; the swap stayed `locked`.
+  Test 1 **PASS** (5/5 happy redeemed, 2200-4447 s). Tests 2 and 3 **PASS** (2 accept-only + 2
+  lock-only refunded through the `J` branch by 11:28Z, both lock-only takers swept their XMR
+  back). Test 4 (punish, private hp2 maker) running. RESULTS.md.
 - **Known gaps (not blocking stagenet):** ~~a retried `j` message (lost HTTP reply) breaks the
   keying session~~ (closed in `5481207`); pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
   swap; the rare malleated-`Tx_lock` path still scans under the swap lock while `tick` is
