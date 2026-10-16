@@ -74,6 +74,10 @@ pub struct SetupRequest {
     pub j_sid: [u8; 32],
     /// The taker's first `J` messages.
     pub j_msgs: Vec<JMsg>,
+    /// The `J` protocol the taker speaks ([`crate::jsig::SCHEME`]); the maker refuses any
+    /// other. Absent (an older taker) reads as empty and is refused.
+    #[serde(default)]
+    pub j_scheme: String,
 }
 
 /// One `J` exchange, taker → maker (`POST /xmr/swaps/:id/j`).

@@ -359,6 +359,7 @@ impl XmrTaker {
                 taker_proof: proof,
                 j_sid,
                 j_msgs: first.outgoing,
+                j_scheme: jsig::SCHEME.to_string(),
             },
         ))
     }

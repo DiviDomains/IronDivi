@@ -33,9 +33,11 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
-# C1's joint key J: 2-of-2 ECDSA, signed once (`jsig`). Pinned; its Paillier arithmetic builds
-# GMP from source (needs m4 on the build host).
+# C1's joint key J: Lindell-2017 2P-ECDSA, signed once (`jsig`), built on the primitives
+# cggmp21 re-exports (fast-paillier, paillier-zk, generic-ec). Pinned; its Paillier arithmetic
+# builds GMP from source (needs m4 on the build host).
 cggmp21 = { version = "=0.6.3", features = ["curve-secp256k1", "state-machine"] }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

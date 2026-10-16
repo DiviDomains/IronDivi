@@ -266,44 +266,76 @@ Withholding `σ_J` instead would hurt the taker. Without it she cannot broadcast
 `t_cancel` on, which is her defence in §4.3. `σ_J`'s own variants are covered by G3 instead. No
 code change. Bert can overrule this and ask for the interim build as its own step.
 
-**G2. `J` uses cggmp21, not Lindell 2017: OPEN, being closed.** The candidate is
-`multi-party-ecdsa` `=0.8.1`, module `protocols::two_party_ecdsa::lindell_2017` (ZenGo-X):
-- License GPL-3.0-or-later, which is AGPL-3.0 compatible.
-- The repo is not archived. Its last push was 2023-09-14; its last release was 0.8.1 on 2023-06-20.
-- We cite no audit, because we found none we can point to.
+**G2. `J` uses cggmp21, not Lindell 2017: CLOSED in code (2026-10-15), stagenet rerun pending.**
+`crates/divi-swap-xmr/src/jsig.rs` is now Lindell 2017 (malicious-secure with abort), wire scheme
+`lindell17-v1`. The maker is P1 (holds the Paillier key and `x1`), the taker is P2 (holds `x2`), and
+`J = x1·x2·G`.
 
-What changes against cggmp21, and what we must add:
-- **Only P1, the Paillier key holder, learns `σ_J`.** P1 is the **maker**, so heavy keygen runs on
-  the server. The order becomes: keygen → sign → the maker sends `σ_J` → the taker verifies it
-  against `J` and the sighash → the taker sends the 120 refund encsigs → the maker broadcasts
-  `Tx_lock`. An abort before `Tx_lock` still costs nothing.
-- **Role choice.** Whoever learns `J`'s whole key can spend `Tx_lock` through the cancel
-  branch to itself once `t_cancel` passes: that branch is `<J> OP_CHECKSIG` alone, so the holder
-  can sign any `Tx_cancel`-shaped spend, paying anywhere. A maker who learns `J` sweeps the DIVI while the
-  taker's XMR stays locked; a taker who learns `J` takes the maker's DIVI. *(Correction,
-  2026-10-15: an earlier draft said a maker learning `J` could only malleate `Tx_cancel`. That was
-  wrong.)* So neither side can be trusted with less than the full proofs, and both fixes below,
-  the verifier-generated `Ñ` and the wide `ρ`, are **mandatory**, not defence in depth. P1 = maker
-  stays the choice because heavy Paillier keygen belongs on the server.
-- **Finding: the crate's PDL proof is unsound against its prover.** In `party_one::pdl_proof` the
-  prover generates its own `(Ñ, h1, h2)` (`generate_h1_h2_n_tilde`), so it knows
-  `log_{h1} h2`, and its commitments can be opened to anything. A malicious P1 could encrypt a
-  value other than `x1` and, from the one decryption in signing, read out P2's share. **Fix in our
-  wrapper:** the verifier (taker) generates `(Ñ, h1, h2)`, proves it with composite-dlog proofs in
-  both directions, and the maker proves PDL-with-slack against the taker's statement. This is the
-  GG18 pattern.
-- **Slack.** PDL-with-slack bounds the plaintext only to about `q³`, not to `[0, q)`. P2's mask
-  `ρ < q²` in `PartialSig::compute` is then too small to hide `v·(x1 + kq)`. **Fix:** P2 computes
-  its ciphertext in our wrapper with `ρ` wide enough to mask a `q³`-bounded plaintext
-  statistically, staying under the 2048-bit `N`.
-- **Checks P2 runs before signing:** dlog proofs, `verify_ni_proof_correct_key` (which also
-  checks `N` ≥ 2047 bits), and `pdl_verify` against the taker's own `Ñ`.
-- **One signature per key.** The crate has no guard. `JSession` keeps it: the shares live only in
-  the session thread, there is no re-sign API, and the thread ends at the signature. Lindell's
-  rule "P1 aborts forever after a failed signature" holds trivially with one signature per key.
-  §7 test 6 reruns against the new session.
-- The bigint backend is pure Rust (`num-bigint`, not GMP), so the Mac taker builds without libgmp.
-- Wire: `SetupRequest` gains `j_scheme`, so a cggmp21 taker gets a clean rejection.
+**Why not ZenGo `multi-party-ecdsa` 0.8.1.** That crate was the first candidate. We dropped it for
+three reasons:
+- Its `curv-kzen` 0.9 dependency no longer compiles on current Rust (`div_ceil` clash).
+- Its PDL proof is unsound against its prover. In `party_one::pdl_proof` the prover generates its
+  own `(Ñ, h1, h2)`, so it knows `log_{h1} h2`. A malicious P1 could encrypt something other than
+  `x1` and read P2's share out of the one decryption in signing.
+- The response `s1` of its PDL-with-slack proof is unbounded, and the proof's fields are private,
+  so our wrapper could neither check the bound nor rebuild the proof against a verifier-chosen `Ñ`.
+
+**What we built instead.** It uses the audited primitives `cggmp21 =0.6.3` already pulls in:
+`fast-paillier`, `paillier-zk` (Kudelski-audited along with cggmp21) and `generic-ec`. Hashing is
+SHA-256, and every Fiat–Shamir challenge and commitment is bound to the session id and its own tag.
+
+| Msg | From | Content |
+|---|---|---|
+| T1 | taker | Ring-Pedersen `Ñ = p̃q̃`, `t = r²`, `s = t^λ`, and Πprm (128 rounds, s ∈ ⟨t⟩). The taker then drops `p̃, q̃, λ`. |
+| M1 | maker | `com(Q1, pok(x1), nonce)` |
+| T2 | taker | `Q2`, Schnorr `pok(x2)` |
+| M2 | maker | Opens `Q1`. Sends `N0`, `c_key = Enc(x1)`, Πmod(N0) (Paillier–Blum), Πfac(N0) (no small factor), and Πlog\*(`c_key` encrypts `log_G Q1`, in range). Πfac and Πlog\* are proved against the **taker's** `Ñ`. |
+| M3 | maker | `com(m, R1, pok(k1), nonce)`. This commits to the sighash too. |
+| T3 | taker | `R2`, `pok(k2)` |
+| M4 | maker | Opens `R1`. |
+| T4 | taker | `c3 = Enc(ρq + k2⁻¹m) ⊕ (k2⁻¹·r·x2) ⊙ c_key` |
+| M5 | maker | `σ = (r, k1⁻¹·Dec(c3))`, low-S, checked under `J`. The taker checks it under `J` again. |
+
+How this closes the two soundness holes:
+- **Prover-chosen `Ñ`.** The taker, who verifies the proofs, generates `Ñ` and proves it with Πprm.
+  So no proof is ever checked against parameters only the prover chose. This is the GG18/CGGMP
+  pattern.
+- **Mask width.** Πlog\* bounds the plaintext `x1′` of `c_key` to `|x1′| < 2^{ℓ+ε} = 2^486`, with
+  `x1′ ≡ x1 (mod q)`. In `c3`, `v·x1′` therefore carries an unknown multiple of `q`, at most
+  `2^{256+486}`. That multiple is what a cheating maker could read. `ρ` is uniform in
+  `[0, 2^822)`, where 822 = ℓ + ε + 256 + 80. So `ρq` hides it with statistical distance at most
+  `2^{487−822} = 2^−335`. The plaintext stays below `2^1079`, far below `N0/2` (N0 ≥ 3071 bits).
+
+**Checks before `J` is accepted.**
+- Moduli are odd and 3071–4096 bits.
+- `s` and `t` are units, not 1.
+- Commitment openings, Schnorr proofs, and Πprm, Πmod, Πfac and Πlog\* on the exact wire values.
+- No point is the identity, and `J ≠ 0`.
+
+**One signature per key.** Every transition moves the secrets out of the old state. Any error, or
+the signature itself, leaves the session `Done`, and there is no re-sign API. A second `M3` aborts.
+Lindell's rule "P1 aborts forever after a failed signature" therefore holds trivially.
+
+**Signing order.** Only the maker (P1) computes `σ_J`. It sends `σ_J` to the taker in M5, and the
+taker verifies it against `J` and the sighash. The 120 refund encsigs and the `Tx_lock` broadcast
+follow, as before. An abort before `Tx_lock` still costs nothing.
+
+**Wire.**
+- `SetupRequest.j_scheme = "lindell17-v1"`. A cggmp21-era taker sends no scheme, and the maker
+  refuses it cleanly at setup.
+- The maker caches its last `j` reply and answers an identical retry with it (G4 iii).
+
+**Primes.** Both moduli still need safe primes (Πmod wants a Blum modulus), so the maker's prime
+pool stays. G4 (vi) is corrected accordingly.
+
+**Tests.** There are 7 `jsig` unit tests:
+- the two-party happy path in both message orders;
+- a bad Πprm, a tampered `c_key`, a bad `Q1` opening;
+- a sighash mismatch caught by the commitment, a tampered `c3`, a tampered `σ`;
+- out-of-order and second-`M3` aborts.
+
+The engine also has `a_retried_j_round_gets_the_same_reply`, which covers the retry cache and the
+scheme gate. All divi-swap-xmr tests pass on hp2.
 
 **G3. Exhaustive presign over 120 variants: built.** We checked four things:
 - (a) `cancel_variants` makes S-flip × 4 signature pushes × 5 selector encodings × 3
@@ -322,12 +354,13 @@ No gap.
 **G4. Outside the A spec. These are listed here; only (iii) is closed now:**
 - (i) §7 tests 5 and 7 ran on a private Divi 3.0.0 regtest, not on testnet with our own staker.
 - (ii) Pre-C1 records are not readable.
-- (iii) A retried `j` message (a lost HTTP reply) breaks keying. **Closed with G2:** the session
+- (iii) A retried `j` message (a lost HTTP reply) breaks keying. **Closed with G2:** the maker
   replays its last reply to an identical retry.
 - (iv) A maker restart mid-keying aborts that swap. That costs nothing, because it happens before
   `Tx_lock`.
 - (v) The malleated-`Tx_lock` path still scans under the swap lock while `tick` is sequential.
-- (vi) C3's pool drain: Lindell's Paillier keygen needs no safe-prime pool. It gets re-measured.
+- (vi) C3's pool drain: both Paillier moduli are still safe-prime products, so the maker's pool
+  stays. Pool drain under load gets re-measured on stagenet.
 
 **Exit:** the Lindell build passes the unit tests (6, 8), is deployed to the stagenet maker, and
 §7 tests 1–4 and 6 pass live again. Mainnet stays blocked until then.
