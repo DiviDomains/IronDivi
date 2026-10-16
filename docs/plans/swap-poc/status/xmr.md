@@ -1036,6 +1036,8 @@ taker local `bd63938c-a93c-491a-ac8e-ee9e282ef31b`, outcome `redeemed`.
 
 ## C1 full fix on stagenet (orchestrator, 2026-10-15)
 
+**Ruling (Bert, 2026-10-15): option A, the full C1 fix.** Interim hardening lands first; J uses Lindell-2017 2P-ECDSA; presign is exhaustive across all 120 staker variants. The gap list (built `61ca99a`/`929c9b54` vs A) is `xmr-c1-design.md` §9; the gaps are being closed. Mainnet stays blocked until the new build passes stagenet. Also approved: the hp2 root `divid` (pid 3626) restart with its recovery phrase moved into a root-only 0600 file, no rotation.
+
 Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix; stagenet only.
 
 - **Code:** `c1-impl`, merged to `main`. cggmp21 2P-ECDSA (SecurityLevel128) for the joint cancel
@@ -1083,7 +1085,7 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
 
 ## NEEDS HUMAN
 
-- Review `docs/plans/swap-poc/xmr-c1-design.md` (C1 fix: 2P-ECDSA cancel key + unilateral punish). The full fix is built and deployed to stagenet; the review may still change it.
+- ~~Review `xmr-c1-design.md`~~ done 2026-10-15: option A chosen (see C1 section).
 - hp2: root's `divid` (pid 3626) exposes a wallet mnemonic in its argv (see the C1 section above).
 
 ## Mainnet plan gates (orchestrator, 2026-10-14)

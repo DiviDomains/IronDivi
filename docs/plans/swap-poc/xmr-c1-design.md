@@ -1,9 +1,19 @@
 # C1 — Tx_cancel malleation: design of the fix (2026-10-14)
 
-Status: **design, awaiting review. Not implemented.** Bert's rule (2026-10-14): a large protocol
+Status: **reviewed 2026-10-15, Bert chose option A (see Ruling below). Built, gaps in §9 being closed.** Original status: design, awaiting review. Bert's rule (2026-10-14): a large protocol
 change is written up and reviewed before code. This one is large: it changes `Tx_lock`'s script,
 adds a two-party signing component, and changes the wire messages of steps 2 and 3. Mainnet stays
 blocked (`xmr-mainnet-plan.md` C1) until this is implemented and passes the stagenet tests below.
+
+## Ruling (Bert, 2026-10-15): option A, the full C1 fix
+
+Bert reviewed this document and chose **option A, the full C1 fix**. The A spec, as ruled:
+1. the interim hardening (§4.4) lands first;
+2. the joint cancel key J uses **Lindell-2017 2P-ECDSA**;
+3. presign is **exhaustive across all 120 staker variants** of `Tx_cancel` (§4.1).
+
+What is built (`61ca99a`, maker binary sha256 `929c9b54…` = `1841a12`) is compared against this spec in
+§9 (gap analysis). The gaps get closed. **Mainnet stays blocked until the new build passes stagenet.**
 
 ## 1. The flaw
 
