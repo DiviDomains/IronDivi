@@ -425,3 +425,15 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
     `2aa85c13` lock `ff6eeff8…`, cancel `22a8c0a1…`, refund `65ff0149…`; XMR (lock `95470217…`)
     swept back `a4c493d07b4c8ea91998275c59c3fd2b475fde419f16e391857a0e3550f19b8a` (height 2230023).
     `xmr-soak.sh --resume xmr-soak/c1-lock`: both `Done`.
+- XMR C1 option A rerun (Lindell-2017 `J`, `5481207`), live stagenet, 2026-10-16: dnsdivi maker
+  sha `8391f72f…e674` (deployed 03:13Z), taker CLI `~/.cache/divi-swap-c1-5481207`; 0.002 sXMR
+  per swap.
+  - §7 test 1 (happy) **PASS, 5 of 5 redeemed** (`xmr-soak/l17-happy`, 3 at a time): maker swaps
+    `76840285`, `136c0b6d`, `ed1e7cf0`, `6b3bb52e`, `b5dd0189`, all `done`; taker times 2200-4447 s
+    each, Lindell keying of `J` and the taker's Paillier/Ñ primes included.
+  - §7 test 6 **PASS** (swap `76840285` while `locked`): `POST /j` → 400 "no 2P-ECDSA session for
+    this swap"; `POST /sigs` with a random signature → 400 "swap is Locked, not awaiting signatures".
+  - §7 tests 2 and 3 parked (`xmr-soak/l17-accept`: `0c956612`-group, 2 accept-only; `l17-lock`: 2
+    lock-only, XMR locked); waiting for `t_cancel` (setup + 6 h). Test 4 running on the private hp2
+    maker (same build): swap `5c0763e0` (taker local id), XMR lock `e69ec826…`, maker stalled at
+    `xmr_reported` 03:52Z.
