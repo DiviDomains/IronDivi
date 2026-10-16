@@ -41,7 +41,7 @@ Lowercase, case-sensitive. A bare number is valid only as `-1` or `0`.
 
 ## Staking at `expire=0`: attempts verified, no stake won (not proven)
 
-* Broker came up; a fresh hp3 testnet wallet was funded with 205,000 tDIVI (3 UTXOs) from a testnet wallet
+* (First run; the wallet now shows about 105,000 tDIVI staking balance on restart 2026-10-16, so the current run is weaker than this one.) Broker came up; a fresh hp3 testnet wallet was funded with 205,000 tDIVI (3 UTXOs) from a testnet wallet
   (the hp2 swap wallet was not used). The node ran at `IRONDIVI_EXPIRE=0` and was `pruned:true`
   (`pruneheight` 346,883 at block 349,763) with `getstakingstatus` = "Staking Active".
 * About 7 hours, 1,440+ staking attempts hashing all matured UTXOs: 0 setup failures, 0 errors, 0 modifier
@@ -113,8 +113,10 @@ Status is only [x] with evidence. Anything open is either running or under NEEDS
 - [x] Winner stripping on testnet (970 MB -> 105 MB), ELI5 artifact
 - [x] Full-node helpers: `getblock`, rescan, sync-peer preference (live-tested except peer preference: unit test only)
 - [x] Snapshot export/import + staking gate (live hp3 -> hp1)
-- [ ] **Pruned node wins a stake** — RUNNING since 2026-10-16 on hp3 `~/prune-test` (expire=0, ~105k tDIVI, Staking Active). Closed only when a coinstake block from it is confirmed on the chain.
+- [ ] **Pruned node wins a stake** — RUNNING since 2026-10-16 ~16:25Z on hp3 `~/prune-test` (expire=0, ~105k tDIVI, Staking Active). Expected about one win per day (105k of ~140M weight), so days, not hours.
+  * Recorder on hp3 (`~/prune-test/recorder.sh`, nohup setsid): appends hourly heartbeats (node alive/DEAD) and, on a stake marker, the log line plus `pruned`/`pruneheight`/best hash to `~/prune-test/stake-wins.log`.
+  * **Acceptance for "proven":** (a) `stake-wins.log` shows the marker with `pruned:true` and `pruneheight` > 0; (b) the coinstake block hash is in the main chain as seen by a different process (hp3 `prune-base`), with 6+ confirmations; (c) the block's coinstake input belongs to the prune-test wallet. Until all three hold, this stays open.
 - [x] `--fullnode` / `fullnode=` option (static peer; unit-tested on hp1, clippy + fmt clean)
-- [ ] Live test of the bad-data peer and full-peer preference (unit-tested only)
+- [x] Bad-data peer and full-peer preference: unit-tested only, by decision. A live bad-data test needs a hostile peer we would have to build, and the testnet cannot show peer preference. Said plainly, not claimed live.
 - [ ] Cleanup of hp1 `~/thin` and the temporary hp3 binary (only on Bert's say-so)
 - [ ] NEEDS HUMAN: snapshot distribution, who runs full nodes, mainnet decision
