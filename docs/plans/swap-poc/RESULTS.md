@@ -448,6 +448,15 @@ run waits only on test ETH (PARKED.md #3). Clean worktree of `46e6b30`, all anvi
       `75b89297dae3aa1aa9fc988bae44699b5a8c6a4aed7e9b293bae7cf439793e4a`; XMR lock `8155c684…`
       swept back `facc6401db5ae0b58077f0202d4256d3b37416257cfc58613ea59fc8add74c21`.
       `xmr-soak.sh --resume xmr-soak/l17-lock`: both `Done`.
-  - §7 test 4 (punish) running on the private hp2 maker (same build): taker local id `5c0763e0`,
-    XMR lock `e69ec826…`, maker stalled at `xmr_reported` 03:52Z; Tx_cancel due ≈ 09:50Z,
-    Tx_punish ≈ 12:50Z.
+  - §7 test 4 (punish) **PASS** on the private hp2 maker (same build `8391f72f`): taker local id
+    `5c0763e0`, Tx_lock `4c3cc35aad46260cd683ed6286d18c25843bffb01d0b4268b4830dbf06660b62`
+    (10.001 tDIVI), XMR lock `e69ec826…`, maker stalled at `xmr_reported` 03:52Z. The taker
+    broadcast Tx_cancel
+    `6e9728742908090f33fdf2eb9a73ace64f41b1ff65ad284ec90b9cf559569672` (block 352067,
+    09:23Z): 3-item scriptSig, selector 2 (the Lindell `J` branch), nLockTime = t_cancel
+    1792141857. Then Tx_punish
+    `ced1572d6725349aed2665eca9e6dbb9c86acb7f4070c8bd24cdbca3ff909dc6` (block 352246,
+    12:22Z): selector 0 (the taker-only punish branch), nLockTime = t_punish 1792152657, paying
+    9.999 tDIVI to the soak taker `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b`. No refund exists
+    (cancel:0's only spender is the punish). The taker stepper reached `Done` at 12:25Z.
+    **All §7 tests pass on the Lindell-2017 build.**
