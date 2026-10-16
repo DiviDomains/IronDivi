@@ -819,3 +819,46 @@ async fn an_unseen_tx_lock_is_rebroadcast_without_a_scan() {
     assert_eq!(divi.scans.load(Ordering::SeqCst), 0);
     assert!(maker.record(&mid).unwrap().unwrap().lock_actual.is_none());
 }
+
+/// A taker whose HTTP reply was lost retries the same `J` request: the maker answers it
+/// again, byte for byte, instead of feeding a one-shot session twice (which would abort the
+/// swap, and after `σ_J` would leave the taker without the maker's last message). A taker
+/// speaking another `J` scheme is refused at setup.
+#[tokio::test]
+async fn a_retried_j_round_gets_the_same_reply() {
+    let w = W::new();
+    let q = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    let (_, mut old) = w.taker.prepare(&q).await.unwrap();
+    old.j_scheme = String::new();
+    assert!(w
+        .maker
+        .setup(old)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("scheme"));
+
+    let q = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    let (tid, req) = w.taker.prepare(&q).await.unwrap();
+    let mut reply = w.maker.setup(req).await.unwrap();
+    let mid = reply.swap_id.clone();
+    let mut retried = 0;
+    let sigs = loop {
+        match w.taker.j_step(&tid, reply).await.unwrap() {
+            JNext::Sigs(sigs) => break sigs,
+            JNext::Send(r) => {
+                let first = w.maker.j_round(&mid, r.clone()).await.unwrap();
+                let again = w.maker.j_round(&mid, r).await.unwrap();
+                assert_eq!(
+                    serde_json::to_string(&first).unwrap(),
+                    serde_json::to_string(&again).unwrap()
+                );
+                retried += 1;
+                reply = again;
+            }
+        }
+    };
+    assert!(retried >= 3);
+    let v = w.maker.sigs(&mid, sigs).await.unwrap();
+    assert_eq!(v.state, XmrMakerState::Locked);
+}

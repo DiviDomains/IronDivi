@@ -63,7 +63,7 @@ use crate::api::{
 };
 use crate::chain::{DiviChain, MoneroChain};
 use crate::crypto::{self, Signer};
-use crate::jsig::{self, JRound, JSession, JStatus, Primes, MAKER};
+use crate::jsig::{self, JMsg, JRound, JSession, JStatus, Primes, MAKER};
 use crate::{nums, wire, XmrConfig, PICONERO_PER_COUNTER_SAT};
 
 /// Store document kind of maker records. New with C1: records of the pre-C1 kind
@@ -329,6 +329,9 @@ struct Keying {
     setup: Option<SetupReply>,
     /// `σ_J` is out; the session (and the share) is gone.
     signed: bool,
+    /// The last request answered (a hash of its messages) and our reply: a retry of it (the
+    /// reply was lost) gets the same reply instead of aborting the one-shot session.
+    last: Option<([u8; 32], JRoundReply)>,
 }
 
 /// Prime generator (replaceable in tests).
@@ -544,6 +547,13 @@ impl XmrMaker {
                 "taker payout must be a P2PKH or P2SH script".into(),
             ));
         }
+        if req.j_scheme != jsig::SCHEME {
+            return Err(SwapError::InvalidParams(format!(
+                "unsupported 2P-ECDSA scheme {:?} (this maker speaks {:?}): upgrade the taker",
+                req.j_scheme,
+                jsig::SCHEME
+            )));
+        }
         let sid_key = hex::encode(req.j_sid);
         if self.store.get_doc::<bool>(SID_KIND, &sid_key)?.is_some() {
             return Err(SwapError::InvalidParams(
@@ -583,6 +593,7 @@ impl XmrMaker {
             },
             setup: None,
             signed: false,
+            last: None,
         }));
         self.keying
             .lock()
@@ -611,6 +622,12 @@ impl XmrMaker {
                 )
             })?;
         let mut k = entry.lock().await;
+        let key = msgs_digest(&req.msgs)?;
+        if let Some((h, reply)) = &k.last {
+            if *h == key {
+                return Ok(reply.clone());
+            }
+        }
         if k.signed {
             // A retried request after we finished: nothing more to send.
             return Ok(JRoundReply {
@@ -625,8 +642,11 @@ impl XmrMaker {
             Ok(round) => self.after_round(swap_id, &mut k, round).await,
             Err(e) => Err(e),
         };
-        if res.is_err() {
-            self.keying.lock().remove(swap_id);
+        match &res {
+            Ok(reply) => k.last = Some((key, reply.clone())),
+            Err(_) => {
+                self.keying.lock().remove(swap_id);
+            }
         }
         res
     }
@@ -1357,4 +1377,11 @@ impl divi_swap::OfferEngine for XmrMaker {
     async fn tick(&self) -> Result<()> {
         XmrMaker::tick(self).await
     }
+}
+
+/// What identifies a `J` request for the retry cache.
+fn msgs_digest(msgs: &[JMsg]) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(msgs).map_err(|e| SwapError::Other(format!("encode: {e}")))?;
+    Ok(Sha256::digest(bytes).into())
 }
