@@ -1084,17 +1084,35 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
   dnsdivi 2026-10-16 03:13Z, sha256 `8391f72f…e674`, `.prev` = `1841a12` (`929c9b54…`); the maker
   was idle (9/9 swaps done). Taker `~/.cache/divi-swap-c1-5481207`. §7 rerun on this build in
   progress (tests 1-3 via dnsdivi, test 4 via the private hp2 maker, now on the same build).
+  Test 6 **PASS** on this build (swap `76840285`, `locked`): `POST /j` → 400 "no 2P-ECDSA session
+  for this swap"; `POST /sigs` with a random signature → 400 "swap is Locked, not awaiting
+  signatures"; the swap stayed `locked`.
 - **Known gaps (not blocking stagenet):** ~~a retried `j` message (lost HTTP reply) breaks the
   keying session~~ (closed in `5481207`); pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
   swap; the rare malleated-`Tx_lock` path still scans under the swap lock while `tick` is
   sequential; C3's pool drain is now worse (each setup also costs a prime set).
-- **Seen on hp2, not ours, untouched:** root's `divid` (pid 3626) has a wallet mnemonic in its
-  command line, readable by any local user via `ps`. Whoever runs it should move it to a file.
+- **hp2 recovery-phrase fix (Bert-approved, done 2026-10-16 ~03:50Z):** root's `divid` in
+  container `divi-testnet-node2` (was pid 3626) had the wallet phrase in its argv. Pre-check: every
+  divid on hp2 is testnet/regtest (node2, the two c1-regtest nodes, `bsx-b` `testnet=1`); a
+  phrase grep of /root, /home, /etc, /opt, /usr/local, /srv, docker volumes and containers,
+  /mnt/storage1, /var/log, /tmp (names only; it hit its 50 min cap, so /mnt/storage1 is partly
+  covered) found it only in that container's own `config.v2.json` and in one Claude transcript,
+  `hp2:/home/bshuler/.claude/projects/-home-bshuler-swap-lanes-usdc/e1221284-ff5b-4bb1-b639-5f2a8c497334.jsonl`
+  (left in place, see NEEDS HUMAN). No real-value reuse found. Fix: the phrase is now a
+  `mnemonic=` line in the volume's `divi.conf` (root, 0600; pre-change copy `divi.conf.bak-pre-mnemonic`,
+  0600, no phrase); container recreated with the same image, name, hostname, volume, env and
+  restart policy, command `divid` with no arguments. Checks (counts only): 0 matches in the new
+  process's cmdline and environ, `ps -eo args`, `docker inspect`, and the new container dir; the
+  old container dir is gone. Wallet address set hash unchanged, balance unchanged (12388185),
+  txcount 9322 → 9288 after the rescan (balance-neutral). No rotation. Downtime about 6 min.
 
 ## NEEDS HUMAN
 
 - ~~Review `xmr-c1-design.md`~~ done 2026-10-15: option A chosen (see C1 section).
-- hp2: root's `divid` (pid 3626) exposes a wallet mnemonic in its argv (see the C1 section above).
+- ~~hp2: root's `divid` (pid 3626) exposes a wallet mnemonic in its argv~~ fixed 2026-10-16 (C1 section).
+- hp2: the usdc lane's Claude transcript `e1221284-….jsonl` (path in the C1 section) contains the
+  node2 recovery phrase. Delete or redact it? Not touched by this session. Note the phrase is still
+  in the 0600 `divi.conf`; rotation was declined.
 
 ## Mainnet plan gates (orchestrator, 2026-10-14)
 
