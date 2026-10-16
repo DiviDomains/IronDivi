@@ -2,11 +2,12 @@
 # C1 punish test (docs/plans/swap-poc/c1-punish-results.md): stall the PRIVATE maker on hp2
 # (~/.local/state/c1-punish, port 18483 tunnelled to the Mac) the moment it records the taker's
 # XMR lock, so it never offers redeem and never cancels or refunds. Never the dnsdivi maker.
-#   c1-punish-watch.sh <run-dir>
+#   [SKIP_IDS="id1 id2"] c1-punish-watch.sh <run-dir>   (SKIP_IDS: maker swap ids from earlier runs)
 set -euo pipefail
 out=$1 maker=${MAKER:-http://127.0.0.1:18483}
 while :; do
-  st=$(curl -s -m 10 "$maker/xmr/swaps" | jq -r '.[0] | "\(.state) \(.xmr_lock_txid // "-")"' 2>/dev/null || true)
+  st=$(curl -s -m 10 "$maker/xmr/swaps" | jq -r --arg skip "${SKIP_IDS:-}" \
+    '[.[] | select(.id as $i | ($skip | split(" ") | index($i)) | not)] | .[0] | "\(.state) \(.xmr_lock_txid // "-")"' 2>/dev/null || true)
   # States are snake_case. Stall on anything past `locked`, or as soon as a lock is recorded.
   case "$st" in
     ""|"null -"|accepted\ -|locked\ -) ;;

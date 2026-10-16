@@ -1076,8 +1076,16 @@ Bert's order: build the complete C1 design (option 3), not the §4.4 interim fix
     (key b, 23:17Z) and took the 10 tDIVI. No refund of Tx_cancel:0.
   - **All §7 tests pass** (1-4, 6 live on stagenet; 5a, 5b, 7 on regtest). C1 stays open for the
     review of `xmr-c1-design.md`; mainnet stays blocked until then.
-- **Known gaps (not blocking stagenet):** a retried `j` message (lost HTTP reply) breaks the
-  keying session; pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
+- **Option A build (Lindell-2017 J, `5481207`, merged `5d3ac73`):** J is now Lindell-2017
+  2P-ECDSA (`jsig.rs`, wire scheme `lindell17-v1`; maker = P1 with the Paillier key, taker = P2,
+  Πfac/Πlog* proved against the taker's own Ñ). The maker refuses a setup without
+  `j_scheme = lindell17-v1`, so pre-`5481207` takers are turned away. A retried `j` round gets the
+  maker's cached reply (gap closed; `a_retried_j_round_gets_the_same_reply`). **Deployed** to
+  dnsdivi 2026-10-16 03:13Z, sha256 `8391f72f…e674`, `.prev` = `1841a12` (`929c9b54…`); the maker
+  was idle (9/9 swaps done). Taker `~/.cache/divi-swap-c1-5481207`. §7 rerun on this build in
+  progress (tests 1-3 via dnsdivi, test 4 via the private hp2 maker, now on the same build).
+- **Known gaps (not blocking stagenet):** ~~a retried `j` message (lost HTTP reply) breaks the
+  keying session~~ (closed in `5481207`); pre-C1 XMR records are not readable; a maker restart mid-keying aborts that
   swap; the rare malleated-`Tx_lock` path still scans under the swap lock while `tick` is
   sequential; C3's pool drain is now worse (each setup also costs a prime set).
 - **Seen on hp2, not ours, untouched:** root's `divid` (pid 3626) has a wallet mnemonic in its
