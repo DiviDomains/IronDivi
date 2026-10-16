@@ -277,11 +277,14 @@ What changes against cggmp21, and what we must add:
   the server. The order becomes: keygen → sign → the maker sends `σ_J` → the taker verifies it
   against `J` and the sighash → the taker sends the 120 refund encsigs → the maker broadcasts
   `Tx_lock`. An abort before `Tx_lock` still costs nothing.
-- **Role choice.** P2's key share is only as safe as P1's proofs; P1's share is protected by P1
-  checking the final signature and never signing twice. With P1 = maker, a cheating P1 can at
-  worst learn `J`'s whole key. That only lets the maker malleate `Tx_cancel`, which kills his own
-  refund while the taker still punishes unilaterally (§4.2). The dangerous case is the reverse, a
-  taker who learns `J`, and against that P1 is the side the protocol proves secure.
+- **Role choice.** Whoever learns `J`'s whole key can spend `Tx_lock` through the cancel
+  branch to itself once `t_cancel` passes: that branch is `<J> OP_CHECKSIG` alone, so the holder
+  can sign any `Tx_cancel`-shaped spend, paying anywhere. A maker who learns `J` sweeps the DIVI while the
+  taker's XMR stays locked; a taker who learns `J` takes the maker's DIVI. *(Correction,
+  2026-10-15: an earlier draft said a maker learning `J` could only malleate `Tx_cancel`. That was
+  wrong.)* So neither side can be trusted with less than the full proofs, and both fixes below,
+  the verifier-generated `Ñ` and the wide `ρ`, are **mandatory**, not defence in depth. P1 = maker
+  stays the choice because heavy Paillier keygen belongs on the server.
 - **Finding: the crate's PDL proof is unsound against its prover.** In `party_one::pdl_proof` the
   prover generates its own `(Ñ, h1, h2)` (`generate_h1_h2_n_tilde`), so it knows
   `log_{h1} h2`, and its commitments can be opened to anything. A malicious P1 could encrypt a
