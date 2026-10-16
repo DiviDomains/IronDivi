@@ -249,3 +249,82 @@ All on stagenet and DIVI testnet, test coins only.
 3. Is there a construction that meets both constraints of §3 without 2P-ECDSA on a chain with
    CLTV but no CSV and no segwit?
 4. Is `t_late` sound against a taker who deliberately delays her XMR lock?
+
+## 9. Gap analysis: built (`61ca99a`, maker sha256 `929c9b54…`) versus option A (2026-10-15)
+
+Option A, as ruled: interim hardening first, Lindell-2017 2P-ECDSA for `J`, exhaustive presign
+over all 120 staker variants. What is built and live on the stagenet maker is §4.1–4.3 with option
+(a), `J` from cggmp21. Gap by gap:
+
+**G1. Interim hardening (§4.4) first: subsumed, no separate build.** An earlier controller order
+said not to build interim-only, so it never shipped as its own step. Its two parts:
+- The unilateral punish branch (§4.2) is built and passed live (§7 test 4, `c1-punish-results.md`).
+- "The maker withholds `maker_cancel_sig`" is superseded. That signature no longer exists, because
+  `Tx_cancel` is signed only by `J`.
+
+Withholding `σ_J` instead would hurt the taker. Without it she cannot broadcast `Tx_cancel` from
+`t_cancel` on, which is her defence in §4.3. `σ_J`'s own variants are covered by G3 instead. No
+code change. Bert can overrule this and ask for the interim build as its own step.
+
+**G2. `J` uses cggmp21, not Lindell 2017: OPEN, being closed.** The candidate is
+`multi-party-ecdsa` `=0.8.1`, module `protocols::two_party_ecdsa::lindell_2017` (ZenGo-X):
+- License GPL-3.0-or-later, which is AGPL-3.0 compatible.
+- The repo is not archived. Its last push was 2023-09-14; its last release was 0.8.1 on 2023-06-20.
+- We cite no audit, because we found none we can point to.
+
+What changes against cggmp21, and what we must add:
+- **Only P1, the Paillier key holder, learns `σ_J`.** P1 is the **maker**, so heavy keygen runs on
+  the server. The order becomes: keygen → sign → the maker sends `σ_J` → the taker verifies it
+  against `J` and the sighash → the taker sends the 120 refund encsigs → the maker broadcasts
+  `Tx_lock`. An abort before `Tx_lock` still costs nothing.
+- **Role choice.** P2's key share is only as safe as P1's proofs; P1's share is protected by P1
+  checking the final signature and never signing twice. With P1 = maker, a cheating P1 can at
+  worst learn `J`'s whole key. That only lets the maker malleate `Tx_cancel`, which kills his own
+  refund while the taker still punishes unilaterally (§4.2). The dangerous case is the reverse, a
+  taker who learns `J`, and against that P1 is the side the protocol proves secure.
+- **Finding: the crate's PDL proof is unsound against its prover.** In `party_one::pdl_proof` the
+  prover generates its own `(Ñ, h1, h2)` (`generate_h1_h2_n_tilde`), so it knows
+  `log_{h1} h2`, and its commitments can be opened to anything. A malicious P1 could encrypt a
+  value other than `x1` and, from the one decryption in signing, read out P2's share. **Fix in our
+  wrapper:** the verifier (taker) generates `(Ñ, h1, h2)`, proves it with composite-dlog proofs in
+  both directions, and the maker proves PDL-with-slack against the taker's statement. This is the
+  GG18 pattern.
+- **Slack.** PDL-with-slack bounds the plaintext only to about `q³`, not to `[0, q)`. P2's mask
+  `ρ < q²` in `PartialSig::compute` is then too small to hide `v·(x1 + kq)`. **Fix:** P2 computes
+  its ciphertext in our wrapper with `ρ` wide enough to mask a `q³`-bounded plaintext
+  statistically, staying under the 2048-bit `N`.
+- **Checks P2 runs before signing:** dlog proofs, `verify_ni_proof_correct_key` (which also
+  checks `N` ≥ 2047 bits), and `pdl_verify` against the taker's own `Ñ`.
+- **One signature per key.** The crate has no guard. `JSession` keeps it: the shares live only in
+  the session thread, there is no re-sign API, and the thread ends at the signature. Lindell's
+  rule "P1 aborts forever after a failed signature" holds trivially with one signature per key.
+  §7 test 6 reruns against the new session.
+- The bigint backend is pure Rust (`num-bigint`, not GMP), so the Mac taker builds without libgmp.
+- Wire: `SetupRequest` gains `j_scheme`, so a cggmp21 taker gets a clean rejection.
+
+**G3. Exhaustive presign over 120 variants: built.** We checked four things:
+- (a) `cancel_variants` makes S-flip × 4 signature pushes × 5 selector encodings × 3
+  redeem-script pushes, and `cancel_variants_are_exactly_120` pins the count.
+  `cancel_branch_rejects_extra_pushes` is test 8's OP_DEPTH half.
+- (b) The maker verifies all 120 encrypted `Tx_refund` signatures, matched by txid, before it
+  broadcasts `Tx_lock` (`maker.rs` ~817-856). The taker computes the same set.
+- (c) Answer to §8 Q1: DERSIG is consensus on Divi, so `r` and `s` have one encoding each, and
+  ECDSA's only re-signing-free variant is the S-flip. The hashtype byte is hashed into the
+  sighash, so it cannot change. P2SH forces a push-only scriptSig. The OP_DEPTH guard fixes the
+  item count. That makes the set complete.
+- (d) With Lindell, `σ_J` comes out low-S (`min(s, q−s)`), so the variant set is unchanged.
+
+No gap.
+
+**G4. Outside the A spec. These are listed here; only (iii) is closed now:**
+- (i) §7 tests 5 and 7 ran on a private Divi 3.0.0 regtest, not on testnet with our own staker.
+- (ii) Pre-C1 records are not readable.
+- (iii) A retried `j` message (a lost HTTP reply) breaks keying. **Closed with G2:** the session
+  replays its last reply to an identical retry.
+- (iv) A maker restart mid-keying aborts that swap. That costs nothing, because it happens before
+  `Tx_lock`.
+- (v) The malleated-`Tx_lock` path still scans under the swap lock while `tick` is sequential.
+- (vi) C3's pool drain: Lindell's Paillier keygen needs no safe-prime pool. It gets re-measured.
+
+**Exit:** the Lindell build passes the unit tests (6, 8), is deployed to the stagenet maker, and
+§7 tests 1–4 and 6 pass live again. Mainnet stays blocked until then.
