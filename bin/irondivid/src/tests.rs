@@ -183,6 +183,7 @@ fn test_cli_overrides_config_file() {
         port: None,
         bind: None,
         addnode: vec![],
+        fullnode: vec![],
         connect: vec![],
         debug: false,
         wallet: None,

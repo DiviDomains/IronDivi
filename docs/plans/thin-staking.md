@@ -234,8 +234,9 @@ Checked 2026-10-14: `getpeerinfo` on the hp3 testnet node showed every C++ peer 
 `full_history_peers()` in turn, 20 s timeout each, accepts only a block whose hash and merkle root
 match what our index says, and returns `NoFullPeers`/`NotAvailable` otherwise (never guesses). The node
 message loop hands matching `Block`/`NotFound` replies to it before normal sync handling.
-`Node::history_fetcher()` exposes it. Peers are added with the existing `addnode`/`connect`; a
-separate `fullnode=` option was not added.
+`Node::history_fetcher()` exposes it. Peers are added with `addnode`/`connect`, or with `--fullnode`
+/ `fullnode=` (same as `addnode`, a named way to say "keep this full-history node connected"; the peer's
+service flags, not the option, decide whether it counts as full).
 RPC `getblock` for a height at or below `pruneheight` asks the fetcher (`BlockFetcher` trait in
 `divi-rpc`, implemented by `HistoryFetcher`) and still returns the pruned-data error if no verified
 block comes back.

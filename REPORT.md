@@ -99,7 +99,7 @@ Mainnet CF split measured (doc §8). Lottery-winner stripping built and validate
 
 ## Thin staking: status notes (2026-10-14)
 * Snapshot staking gate built: a snapshot-imported node does not stake until its tip is past the snapshot base (live-checked on hp1).
-* `fullnode=` was not added; `addnode`/`connect` plus the `NODE_NETWORK` filter identify full peers.
+* `--fullnode` / `fullnode=` added 2026-10-16 as a static-peer alias; the `NODE_NETWORK` service flag still decides which peers count as full.
 * `HistoryFetcher` is used by RPC `getblock` and live-tested on testnet; `getblockchaininfo` now shows `fullhistorypeers` and `lastblockfetch`; `rescanblockchain` uses the fetch (live-tested, refuses without wiping the wallet when no full peer); sync peer choice prefers full-history peers (unit-tested). Doc §10 work list is complete. Note: the hp3 prune-base node now runs from `~/bin/irondivid` (the old build dir was gone).
 * A wallet on a snapshot-bootstrapped node has no history before the snapshot tip.
 
@@ -114,7 +114,7 @@ Status is only [x] with evidence. Anything open is either running or under NEEDS
 - [x] Full-node helpers: `getblock`, rescan, sync-peer preference (live-tested except peer preference: unit test only)
 - [x] Snapshot export/import + staking gate (live hp3 -> hp1)
 - [ ] **Pruned node wins a stake** — RUNNING since 2026-10-16 on hp3 `~/prune-test` (expire=0, ~105k tDIVI, Staking Active). Closed only when a coinstake block from it is confirmed on the chain.
-- [ ] `fullnode=` config option (optional; `addnode` works today)
+- [x] `--fullnode` / `fullnode=` option (static peer; unit-tested on hp1, clippy + fmt clean)
 - [ ] Live test of the bad-data peer and full-peer preference (unit-tested only)
 - [ ] Cleanup of hp1 `~/thin` and the temporary hp3 binary (only on Bert's say-so)
 - [ ] NEEDS HUMAN: snapshot distribution, who runs full nodes, mainnet decision

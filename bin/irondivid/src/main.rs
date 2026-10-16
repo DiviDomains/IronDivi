@@ -103,6 +103,10 @@ struct Args {
     #[arg(long = "addnode")]
     addnode: Vec<String>,
 
+    /// Keep a connection to a full-history node (a pruned node fetches old blocks from it)
+    #[arg(long = "fullnode")]
+    fullnode: Vec<String>,
+
     /// Connect only to specified node(s)
     #[arg(long = "connect")]
     connect: Vec<String>,
@@ -407,6 +411,21 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!("Invalid addnode value in config file, expected string or array");
                 }
             }
+            "fullnode" => {
+                if let Some(s) = value.as_str() {
+                    config.network.static_peers.push(s.to_string());
+                } else if let Some(arr) = value.as_array() {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            config.network.static_peers.push(s.to_string());
+                        } else {
+                            warn!("Invalid fullnode array element, expected string");
+                        }
+                    }
+                } else {
+                    warn!("Invalid fullnode value in config file, expected string or array");
+                }
+            }
             "connect" => {
                 if let Some(s) = value.as_str() {
                     config.p2p.connect.push(s.to_string());
@@ -598,8 +617,9 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
         // Connect-only: resolved by NodeConfig::peer_sources().
         config.p2p.connect.extend(args.connect.clone());
         config.p2p.enable_discovery = false; // Don't discover when using -connect
-    } else if !args.addnode.is_empty() {
+    } else {
         config.network.static_peers.extend(args.addnode.clone());
+        config.network.static_peers.extend(args.fullnode.clone());
     }
 
     Ok(config)
@@ -1765,6 +1785,13 @@ mod connect_tests {
         assert!(src.static_peers.len() > 1);
         assert!(!src.dns_seeds.is_empty());
         assert!(src.listen);
+    }
+
+    #[test]
+    fn cli_fullnode_is_a_kept_static_peer() {
+        let src = cfg(&["--fullnode=10.0.0.9:52496"]).peer_sources();
+        assert!(src.static_peers.contains(&"10.0.0.9:52496".to_string()));
+        assert!(!src.dns_seeds.is_empty());
     }
 }
 
