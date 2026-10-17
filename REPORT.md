@@ -145,6 +145,7 @@ thin mode, add snapshot bootstrap, build a true remote-node shim only if still n
 Mainnet CF split measured (doc §8). Lottery-winner stripping built and validated on testnet (hp1 copy,
 970 MB -> 105 MB with expire 0; clean restart, 0 errors). Not deployed anywhere real. ELI5 page published as an Artifact.
 ## NEEDS HUMAN
+* hp3 stake-test node swap (routed to Bert via the Open Questions relay): the node (pid 116337) runs the old build. Fixed build is commit `e068a82` on `fix/staker-stale-mempool-and-eviction`, tests green, unpushed. Swapping means a release build on hp3 plus a clean restart on `~/prune-test` with `IRONDIVI_EXPIRE=0`. Until then another stale mempool tx can lose a stake win.
 * Snapshot distribution channel: where do operators download snapshots, and do you want root hashes published (and by whom)?
 * Who runs the full-history (`NODE_NETWORK`) nodes, so thin nodes have something to fetch from?
 * Mainnet decision on `expire` + snapshots (everything so far is testnet only).
