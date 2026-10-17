@@ -5,7 +5,7 @@
 # and checks it against the `address` field recorded in the SAME 1Password item.
 # Prints the network, the public receiving address, and MATCH / NO MATCH only.
 #
-# Seed safety (binding — see specs/xmr-addition.md §4, secret-management.md):
+# Seed safety (binding — see secret-management.md §2/§4/§5/§6 in claude-standards):
 #   - The seed is resolved AT RUNTIME via the sanctioned resolver:
 #       secret get --name <item> --op-ref op://global_secret_store/<item>/seed_phrase
 #     (once per process). It is NEVER passed on argv and NEVER written to disk.
@@ -27,7 +27,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --network)   NETWORK="${2:?--network needs a value}"; shift 2;;
     --network=*) NETWORK="${1#*=}"; shift;;
-    -h|--help)   sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help)   sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "unknown argument: $1 (try --help)" >&2; exit 2;;
   esac
 done
