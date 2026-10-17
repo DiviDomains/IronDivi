@@ -477,7 +477,11 @@ impl Staker {
                                     for input in &block.transactions[1].vin {
                                         if !input.prevout.txid.is_zero() {
                                             let outpoint = &input.prevout;
-                                            if self.wallet.has_utxo(outpoint) {
+                                            // Only a coin the chain really lacks is a phantom;
+                                            // the error may name a different tx's input.
+                                            let gone =
+                                                matches!(self.chain.has_utxo(outpoint), Ok(false));
+                                            if gone && self.wallet.has_utxo(outpoint) {
                                                 self.wallet.spend_utxo(outpoint);
                                                 warn!(
                                                     "Evicted phantom UTXO {}:{} from wallet after failed self-accept",
@@ -1172,6 +1176,10 @@ impl Staker {
         let mempool_txs = self.mempool.get_block_txs(
             self.config.read().max_block_size - 1000, // Leave room for coinbase/coinstake
         );
+        // A stale mempool tx (an input already spent on chain) would make our own
+        // block fail self-accept and waste the stake, so keep only spendable ones.
+        let mempool_txs =
+            retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
         transactions.extend(mempool_txs);
 
         // Compute merkle root
@@ -1615,6 +1623,45 @@ fn encode_bip34_height(height: u32) -> Vec<u8> {
     let mut data = vec![num_bytes.len() as u8];
     data.extend_from_slice(&num_bytes);
     data
+}
+
+/// Keep only mempool transactions whose inputs are all spendable: present in the
+/// chain UTXO set (`on_chain`) or created by another kept transaction. Order is
+/// preserved; a tx that double-spends an earlier kept tx is dropped. Production
+/// side only: this changes what we put in blocks we build, not block validation.
+fn retain_spendable_txs(
+    txs: Vec<Transaction>,
+    on_chain: impl Fn(&OutPoint) -> bool,
+) -> Vec<Transaction> {
+    use std::collections::HashSet;
+    let mut remaining = txs;
+    let mut kept: Vec<Transaction> = Vec::new();
+    let mut created: HashSet<Hash256> = HashSet::new();
+    let mut spent: HashSet<OutPoint> = HashSet::new();
+    // Repeat so a child listed before its parent is still kept once the parent is.
+    loop {
+        let mut progressed = false;
+        let mut next = Vec::new();
+        for tx in remaining {
+            let ok = tx.vin.iter().all(|i| {
+                !spent.contains(&i.prevout)
+                    && (created.contains(&i.prevout.txid) || on_chain(&i.prevout))
+            });
+            if ok {
+                created.insert(tx.txid());
+                spent.extend(tx.vin.iter().map(|i| i.prevout));
+                kept.push(tx);
+                progressed = true;
+            } else {
+                next.push(tx);
+            }
+        }
+        remaining = next;
+        if !progressed || remaining.is_empty() {
+            break;
+        }
+    }
+    kept
 }
 
 /// Compute merkle root from transactions
@@ -2088,5 +2135,69 @@ mod tests {
         let c = StakingConfig::default();
         assert_eq!(c.max_tip_age_secs, 24 * 60 * 60);
         assert!(!c.allow_stale_tip);
+    }
+
+    fn spend_tx(inputs: &[OutPoint], tag: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            lock_time: tag,
+            vin: inputs
+                .iter()
+                .map(|p| TxIn {
+                    prevout: *p,
+                    script_sig: Script::default(),
+                    sequence: 0xffffffff,
+                })
+                .collect(),
+            vout: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: Script::default(),
+            }],
+        }
+    }
+
+    fn op(n: u8, vout: u32) -> OutPoint {
+        OutPoint::new(Hash256::from_bytes([n; 32]), vout)
+    }
+
+    #[test]
+    fn stale_mempool_tx_is_left_out_of_a_stake_block() {
+        let live = op(1, 0);
+        let stale = op(2, 5); // spent on chain: not in the UTXO set
+        let good = spend_tx(&[live], 1);
+        let bad = spend_tx(&[stale], 2);
+        let kept = retain_spendable_txs(vec![bad, good.clone()], |p| *p == live);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), good.txid());
+    }
+
+    #[test]
+    fn child_of_a_kept_mempool_tx_is_kept_even_when_listed_first() {
+        let live = op(1, 0);
+        let parent = spend_tx(&[live], 1);
+        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
+        let kept = retain_spendable_txs(vec![child.clone(), parent.clone()], |p| *p == live);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].txid(), parent.txid(), "parent must precede child");
+        assert_eq!(kept[1].txid(), child.txid());
+    }
+
+    #[test]
+    fn double_spend_between_mempool_txs_keeps_only_the_first() {
+        let live = op(1, 0);
+        let a = spend_tx(&[live], 1);
+        let b = spend_tx(&[live], 2);
+        let kept = retain_spendable_txs(vec![a.clone(), b], |p| *p == live);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), a.txid());
+    }
+
+    #[test]
+    fn orphan_child_of_a_dropped_tx_is_dropped() {
+        let stale = op(2, 5);
+        let parent = spend_tx(&[stale], 1);
+        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
+        let kept = retain_spendable_txs(vec![parent, child], |_| false);
+        assert!(kept.is_empty());
     }
 }
