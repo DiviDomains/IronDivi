@@ -1,4 +1,29 @@
-## RESTART NOTE (refreshed 2026-10-16 ~14:30 EDT, for a fresh session; uncommitted on purpose)
+## RESTART NOTE (refreshed 2026-10-17 ~10:00 EDT) — XMR enablement task (spec: orchestrator `specs/xmr-addition.md`)
+
+**Task (Bert):** add XMR to the Divi AtomicSwap effort. IronDivi is Tier 1 (adaptor engine + XMR backend present): VERIFY & ENABLE only; no HTLC port; no mainnet, no spend, no deploy; seed never touched.
+
+**Done and verified**
+- XMR registered at every coin-set point (checked in source): `Chain::Xmr` + `Chain::ALL` (`crates/divi-swap/src/types.rs`), `ChainParams::builtin` `Chain::Xmr => (10, 1800)` (`crates/divi-swap/src/config.rs:59`), `[xmr]` `XmrSection` + `serves()` + `xmr_engine_needed` (`bin/divi-swapd/src/config.rs`), CLI `--counter-chain xmr` with `--xmr-*` flags (`bin/divi-swap/src/main.rs`), mock offer `divi-xmr-stagenet`.
+- Rate-table gap closed (`a6ae46e`, fmt `9e599a5`, pushed): the mock price match had `_ =>` (ZEC's price) so any unlisted coin inherited it. Now `mock_divi_per_coin(Chain)` is an exhaustive const match (Divi, Btc, Ltc, Zec, Usdc, Xmr) used by `mock_counter_offers`, `mock_xmr_offers` and the BTC offers; test `every_chain_has_its_own_mock_rate`. Placeholder prices only (XMR 5,000 DIVI, USDC 100 DIVI, rest unchanged). hp3: `divi-swapd` + `divi-swap` tests all pass, clippy clean, rustfmt applied.
+- Offline refund AND punish on this HEAD (hp3): `crates/divi-swap-xmr` engine tests 13/13 (`taker_walks_away_after_locking_xmr_both_refund`, `taker_never_locks_xmr_maker_refunds`, `maker_stalls_after_xmr_lock_taker_punishes`, `a_re_encoded_tx_cancel_still_refunds_and_reveals_s_m`, ...); `divi-swapd` `e2e_xmr` 3/3 (`e2e_mock_xmr_refund`).
+- hp2 `~/swap-lanes/xmr` fast-forwarded 220dcb0 -> 9e599a5 (hp2's `origin` is the local bare `~/swap-lanes/IronDivi.git`, which I pushed to). Its uncommitted work (status/xmr.md section + `xmr_live_final.rs`) was kept via stash, pop, and a manual both-sides merge; `stash@{0}` (`pre-ff-xmr-lane`) is still there as a backup.
+
+**NOT done: live stagenet re-run of refund + punish against the shared stagenet address (`59DDm3zb...Q9wP5AF`, item `divi_xmr_swap_stagenet`).** Reason: `secret get` of the taker's wallet-rpc credential returned nothing on 2026-10-17 (the broker has 5 queued 1Password calls from another session waiting for a human), so a live taker cannot start. That is a pause, not a bug; nothing was bypassed. Evidence that stands in the meantime: `git diff 5481207 HEAD` over `divi-swap-xmr`, `swap-adaptor`, `swap-chain-xmr`, `swap-chain-divi`, `bin/divi-swap` is empty, so the engine is byte-identical to the build that passed refund (tests 2-3) and punish (test 4) live on stagenet 2026-10-16. Do not describe the live re-run as repeated.
+
+**Resume (when Bert approves the 1Password dialog / broker is clear):**
+1. `secret-broker status`; a `secret get --name taker-xmr-wallet-rpc-username --op-ref "op://global_secret_store/IronDivi Swap POC - taker-xmr-wallet-rpc/username"` must print a value (never echo it).
+2. Tunnels (Mac): maker API 18482 is up; also `ssh -N -L 38088:127.0.0.1:38088 hp2`.
+3. Refund: `tools/swap-poc/xmr-soak.sh --taker-bin ~/.cache/divi-swap-c1-5481207/<bin> --scenario lock-only --count 1 --out DIR`, wait past `t_cancel`, then `--resume DIR`. Set `XMR_TAKER_SWEEP=59DDm3zbhM1FVcWo9PJJJEZaTv79jH4sD2vsoQrjiChDY1HCwnLuJjr9NKMWFGk1FwQnfMc1GHyQfeMwA3cMR5z1Q9wP5AF` so refunds sweep to the shared address (public address only; no seed needed).
+4. Punish: private hp2 maker, `tools/swap-poc/c1-punish-step.sh` (about 4 h). Never touch the dnsdivi maker or deploy.
+5. Record txids here and in `docs/plans/swap-poc/RESULTS.md`; then ready.
+
+**Parked NEEDS HUMAN:** the 1Password approval above; the older items below (snapshot channel, mainnet decision, usdc-lane transcript, hp1/hp3 cleanup). Mainnet stays off.
+
+**Thin-staking test (unrelated, still running on hp3):** pruned node `~/prune-test`, recorder heartbeats alive through 2026-10-17 12:50Z, no win yet. Its older restart note follows unchanged.
+
+---
+
+## Earlier restart note: thin staking (refreshed 2026-10-16 ~14:30 EDT, for a fresh session; uncommitted on purpose)
 
 **What I was doing:** Thin staking (helpers + snapshot, testnet only). All code is done, committed and pushed (origin/main `2f23118` for `--fullnode`, `96fc6d3` for this report's checklist). The only open engineering item is proving a *pruned* node wins a stake.
 
