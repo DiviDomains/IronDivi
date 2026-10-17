@@ -21,6 +21,8 @@
 //!   irondivid --testnet --datadir=/path/to/data
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
+mod snapshot_sig;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use divi_crypto::compute_block_hash;
@@ -171,6 +173,20 @@ struct Args {
     /// With --import-snapshot: refuse unless the snapshot's root hash equals this value.
     #[arg(long, value_name = "HEX", requires = "import_snapshot")]
     snapshot_root: Option<String>,
+
+    /// Sign the root hash of the snapshot in DIR and write DIR/ROOT.sig. The 32-byte signing key
+    /// is read from stdin as 64 hex characters (never as an argument), then the node exits.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["export_snapshot", "import_snapshot"])]
+    sign_snapshot: Option<PathBuf>,
+
+    /// Check DIR/ROOT.sig against --snapshot-signer, then exit.
+    #[arg(long, value_name = "DIR", requires = "snapshot_signer", conflicts_with_all = ["export_snapshot", "import_snapshot", "sign_snapshot"])]
+    verify_snapshot: Option<PathBuf>,
+
+    /// Divi address whose key must have signed the snapshot's root hash. With --import-snapshot
+    /// the import is refused unless DIR/ROOT.sig verifies against this address.
+    #[arg(long, value_name = "ADDRESS")]
+    snapshot_signer: Option<String>,
 
     /// UTXO cache size in number of entries (0 = disabled, default).
     /// Use 10000000 (~500MB) for memory-constrained systems.
@@ -1512,6 +1528,34 @@ fn storage_params(config: &NodeConfig) -> divi_storage::ChainParams {
 }
 
 fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
+    if let Some(dir) = &args.sign_snapshot {
+        use std::io::Read;
+        let mut key = String::new();
+        std::io::stdin()
+            .read_to_string(&mut key)
+            .context("reading the signing key from stdin")?;
+        let m = divi_storage::snapshot::SnapshotManifest::read(dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let sig = snapshot_sig::sign_root(&m, &key)?;
+        snapshot_sig::write_sig(dir, &sig)?;
+        println!(
+            "signed root_hash {} ({}) as {}\nwrote {}",
+            m.root_hash,
+            m.network,
+            sig.signer,
+            dir.join(snapshot_sig::SIG_NAME).display()
+        );
+        return Ok(());
+    }
+    if let Some(dir) = &args.verify_snapshot {
+        let signer = args.snapshot_signer.as_deref().unwrap_or_default();
+        let m = snapshot_sig::verify_dir(dir, signer)?;
+        println!(
+            "OK: root_hash {} ({}, tip {}) is signed by {}",
+            m.root_hash, m.network, m.tip_height, signer
+        );
+        return Ok(());
+    }
     if let Some(out) = &args.export_snapshot {
         let m = divi_storage::snapshot::export_snapshot(
             &config.chainstate_path(),
@@ -1524,6 +1568,13 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
             out, m.network, m.tip_height, m.tip_hash, m.root_hash
         );
     } else if let Some(dir) = &args.import_snapshot {
+        if let Some(signer) = &args.snapshot_signer {
+            let signed = snapshot_sig::verify_dir(dir, signer)?;
+            println!(
+                "signature OK: root_hash {} signed by {}",
+                signed.root_hash, signer
+            );
+        }
         let m = divi_storage::snapshot::import_snapshot(
             dir,
             &config.chainstate_path(),
@@ -1690,7 +1741,11 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         std::process::exit(1);
     }
 
-    if args.export_snapshot.is_some() || args.import_snapshot.is_some() {
+    if args.export_snapshot.is_some()
+        || args.import_snapshot.is_some()
+        || args.sign_snapshot.is_some()
+        || args.verify_snapshot.is_some()
+    {
         return snapshot_command(&config, &args);
     }
 

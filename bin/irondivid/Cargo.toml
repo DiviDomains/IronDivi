@@ -21,6 +21,8 @@ divi-masternode = { workspace = true }
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
+base64 = "0.22"
+hex = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

@@ -3477,7 +3477,7 @@ impl WalletRpc {
 /// so the full serialized data is:
 ///   CompactSize(24) || "DarkNet Signed Message:\n" || CompactSize(len(msg)) || msg
 /// then Hash256 (double-SHA256) of that buffer.
-fn message_magic_hash(message: &[u8]) -> [u8; 32] {
+pub fn message_magic_hash(message: &[u8]) -> [u8; 32] {
     const MAGIC: &[u8] = b"DarkNet Signed Message:\n"; // 24 bytes
 
     /// Write a Bitcoin CompactSize (varint) into `buf`.

@@ -4149,6 +4149,7 @@ name = "irondivid"
 version = "0.2.6"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "dirs",
  "divi-crypto",
@@ -4158,6 +4159,7 @@ dependencies = [
  "divi-rpc",
  "divi-storage",
  "divi-wallet",
+ "hex",
  "libc",
  "serde",
  "serde_json",
