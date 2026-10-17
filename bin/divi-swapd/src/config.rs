@@ -262,12 +262,12 @@ pub const MOCK_ONLY_CHAINS: [Chain; 2] = [Chain::Ltc, Chain::Zec];
 pub const fn mock_divi_per_coin(chain: Chain) -> u64 {
     const DIVI: u64 = 100_000_000;
     match chain {
-        Chain::Divi => DIVI,           // 1 DIVI per DIVI
+        Chain::Divi => DIVI,            // 1 DIVI per DIVI
         Chain::Btc => 3_000_000 * DIVI, // 3,000,000 DIVI per BTC (the `mock_offers` price)
-        Chain::Ltc => 10_000 * DIVI,   // 10,000 DIVI per LTC
-        Chain::Zec => 5_000 * DIVI,    // 5,000 DIVI per ZEC
-        Chain::Usdc => 100 * DIVI,     // 100 DIVI per USDC
-        Chain::Xmr => 5_000 * DIVI,    // 5,000 DIVI per XMR
+        Chain::Ltc => 10_000 * DIVI,    // 10,000 DIVI per LTC
+        Chain::Zec => 5_000 * DIVI,     // 5,000 DIVI per ZEC
+        Chain::Usdc => 100 * DIVI,      // 100 DIVI per USDC
+        Chain::Xmr => 5_000 * DIVI,     // 5,000 DIVI per XMR
     }
 }
 
@@ -303,8 +303,8 @@ pub fn mock_xmr_offers() -> Vec<Offer> {
         direction: Direction::TakerPaysBtc,
         counter_chain: Chain::Xmr,
         divi_sats_per_btc: mock_divi_per_coin(Chain::Xmr),
-        min_btc_sats: 100_000,                  // 0.001 XMR
-        max_btc_sats: 100_000_000,              // 1 XMR
+        min_btc_sats: 100_000,     // 0.001 XMR
+        max_btc_sats: 100_000_000, // 1 XMR
     }]
 }
 fn default_tick() -> u64 {
@@ -542,7 +542,10 @@ mod tests {
         for c in Chain::ALL {
             assert!(mock_divi_per_coin(c) > 0, "{c} has no rate");
         }
-        assert_eq!(mock_xmr_offers()[0].divi_sats_per_btc, mock_divi_per_coin(Chain::Xmr));
+        assert_eq!(
+            mock_xmr_offers()[0].divi_sats_per_btc,
+            mock_divi_per_coin(Chain::Xmr)
+        );
     }
 
     use super::*;

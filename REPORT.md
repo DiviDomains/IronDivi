@@ -1,3 +1,30 @@
+## RESTART NOTE (refreshed 2026-10-16 ~14:30 EDT, for a fresh session; uncommitted on purpose)
+
+**What I was doing:** Thin staking (helpers + snapshot, testnet only). All code is done, committed and pushed (origin/main `2f23118` for `--fullnode`, `96fc6d3` for this report's checklist). The only open engineering item is proving a *pruned* node wins a stake.
+
+**Done and verified:** see "Thin staking: acceptance checklist" below. Built and live-tested on testnet: winner stripping, snapshot export/import plus staking gate, `HistoryFetcher` used by `getblock` and `rescanblockchain`, full-history peer preference in sync (unit test only), `--fullnode`/`fullnode=` (unit test, clippy, fmt on hp1).
+
+**IN FLIGHT right now (all on hp3, none depend on this session):**
+1. Pruned stake test: node `irondivid --testnet --datadir /home/bshuler/prune-test` (`IRONDIVI_EXPIRE=0`, binary `~/bin/irondivid`, ~105k tDIVI, "Staking Active"), started ~2026-10-16 16:25Z. Expect about one win per day.
+2. Recorder `~/prune-test/recorder.sh` (nohup setsid): hourly heartbeat plus win capture into `~/prune-test/stake-wins.log`. Only the 16:50Z heartbeat was seen at last check (next due 17:50Z).
+3. `prune-base` node (`~/prune-base`, port 52497) from `~/bin/irondivid`: the reference chain view for confirming a win.
+4. **Monitor `bogxd9lat` (latest; earlier ones `bmfxrcrbv`, `b4hl77ivh` expired; Mac side, dies with the session, expires every 30 min). Re-arm with** Monitor, timeout_ms 1800000, command:
+   `ssh -o ServerAliveInterval=30 hp3 'tail -n0 -F ~/prune-test/stake-wins.log' 2>&1 | grep -E --line-buffered "MATCH|DEAD|Connection|closed"`
+   Do NOT add `| cut` (it block-buffers and swallows the one event you need). Each re-arm loses the gap, so also read `ssh hp3 'tail -20 ~/prune-test/stake-wins.log'` on resume.
+
+**How a fresh session resumes:**
+1. `ssh hp3 'tail -20 ~/prune-test/stake-wins.log; pgrep -af "irondivid --testnet"; pgrep -af recorder.sh'`. If prune-test is DEAD, restart with `IRONDIVI_EXPIRE=0 nohup setsid ~/bin/irondivid --testnet --datadir /home/bshuler/prune-test --printtoconsole >> ~/prune-test/node.log 2>&1 < /dev/null &` (script pattern: `~/stake1.sh`); if the recorder is gone, `cd ~/prune-test && nohup setsid ./recorder.sh > recorder.out 2>&1 < /dev/null &`.
+2. Re-arm the Monitor above.
+3. If `stake-wins.log` has a MATCH, check the acceptance criteria in the checklist: `pruned:true` at that time, the coinstake block hash present on `prune-base` with 6+ confirmations, and the coinstake input belongs to the prune-test wallet. Only then tick the item and update the "Staking at expire=0" section.
+4. No win after several days: the one real question for Bert is whether to fund more tDIVI to shorten the wait.
+5. Build/test rules: never compile on the Mac; scripts via the Write tool, scp, `ssh hpN 'bash script'`; sync with `rsync -rlpc`. Push with `PATH=/opt/homebrew/bin:$PATH git push origin main`; commit as Bert Shuler, no AI attribution.
+
+**Parked NEEDS HUMAN:** snapshot distribution channel and root-hash publisher; who runs full-history nodes; mainnet decision; delete or redact the recovery phrase copy in the usdc lane's transcript on hp2; cleanup of `hp1:~/thin` and the temporary hp3 binary only on Bert's written go-ahead (never touch hp3 `~/prune-test` data).
+
+**Uncommitted work:** none in the repo apart from this note. I did not commit, push or run anything touching 1Password.
+
+---
+
 # Block-expiry pruning: report
 
 User documentation: `docs/block-expiry-pruning.md`.
