@@ -1,3 +1,22 @@
+## Thin staking item 15 (2026-10-17 evening, testnet only, nothing deployed or published)
+
+**15.1 signed snapshot root: PROVEN on testnet** with a throwaway key (not Bert's). Code: `bin/irondivid/src/snapshot_sig.rs`, commit `7bd5009` (5 unit tests, fmt/clippy clean). Run on hp1 with binary sha256 `02065cfa…1c3e`, snapshot of tip 354218, root_hash `10be2a6f…b6e4`:
+- `--sign-snapshot` (key on stdin) wrote `ROOT.sig`; `--verify-snapshot … --snapshot-signer ADDR` printed OK, exit 0.
+- Different signer address: refused ("not signed by the pinned signer"), exit 1.
+- Tampered manifest: refused ("manifest root_hash does not match its contents"), on both verify and import, exit 1.
+- `--import-snapshot … --snapshot-signer` into a fresh datadir succeeded; the node (`--expire 0`) came up `pruned:true`, `snapshotbase` 354218, synced forward to 354230 (same tip hash `e9562bcd…` as the archival nodes), and `getblock` of block 1000, far below its prune height, returned via full-history peers.
+- Not done: the real signing key. No 1Password item or op-ref exists for it.
+
+**15.2 own archival nodes: UP on testnet.** hp3 `prune-base`, hp1 and hp2 (`~/archival-test`, p2p 52500, RPC 52501) all report `pruned:false`, tip 354230, hash `e9562bcd…`, and serve the imported node (it reported 8–10 full-history peers). These are testnet-only and in my own home dirs; stopping them is `kill -TERM` of the pid in `pgrep -af archival-bin/irondivid`.
+
+**Stake:** still no accepted stake on the fixed build (`stake-wins.log` heartbeats only, last 20:50Z). Monitor stays armed.
+
+**hp3 gate investigation:** `reports/hp3-gate-investigation-2026-10-17.md` in the orchestrator folder. Approval was real; a housekeeping agent pushed to origin/main despite "do not push the branch" (flagged, not reverted).
+
+**NEEDS HUMAN (plain words in the Open Questions pane):** create the signing key in 1Password and name its op-ref; where snapshots are hosted and who publishes the signed root; who runs the long-term full-history nodes; mainnet decision (not yet); written go to delete `hp1:~/thin`, `hp1:~/snap-test`, and the temporary hp3 binary `~/bin/irondivid.pre-e068a82`; confirm push scope.
+
+---
+
 ## RESTART NOTE (refreshed 2026-10-17 ~10:00 EDT) — XMR enablement task (spec: orchestrator `specs/xmr-addition.md`)
 
 **Task (Bert):** add XMR to the Divi AtomicSwap effort. IronDivi is Tier 1 (adaptor engine + XMR backend present): VERIFY & ENABLE only; no HTLC port; no mainnet, no spend, no deploy; seed never touched.
