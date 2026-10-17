@@ -243,7 +243,7 @@ fn default_offers() -> Vec<Offer> {
         id: id.into(),
         direction,
         counter_chain: Chain::Btc,
-        divi_sats_per_btc: 300_000_000_000_000,
+        divi_sats_per_btc: mock_divi_per_coin(Chain::Btc),
         min_btc_sats: 5_000,
         max_btc_sats: 50_000,
     })
@@ -256,16 +256,28 @@ fn default_offers() -> Vec<Offer> {
 /// way, for fast hermetic local/CI coverage.)
 pub const MOCK_ONLY_CHAINS: [Chain; 2] = [Chain::Ltc, Chain::Zec];
 
+/// Placeholder DIVI-per-coin price (in DIVI base units) for every chain, as an exhaustive
+/// match: a new [`Chain`] variant fails to compile here until it is priced, so no coin
+/// silently inherits another coin's rate.
+pub const fn mock_divi_per_coin(chain: Chain) -> u64 {
+    const DIVI: u64 = 100_000_000;
+    match chain {
+        Chain::Divi => DIVI,           // 1 DIVI per DIVI
+        Chain::Btc => 3_000_000 * DIVI, // 3,000,000 DIVI per BTC (the `mock_offers` price)
+        Chain::Ltc => 10_000 * DIVI,   // 10,000 DIVI per LTC
+        Chain::Zec => 5_000 * DIVI,    // 5,000 DIVI per ZEC
+        Chain::Usdc => 100 * DIVI,     // 100 DIVI per USDC
+        Chain::Xmr => 5_000 * DIVI,    // 5,000 DIVI per XMR
+    }
+}
+
 /// The offers `--backend mock` adds for each of [`MOCK_ONLY_CHAINS`]: `divi-<c>-testnet`
 /// (maker sells DIVI) and `<c>-divi-testnet` (maker buys DIVI). Prices are placeholders.
 pub fn mock_counter_offers() -> Vec<Offer> {
     MOCK_ONLY_CHAINS
         .into_iter()
         .flat_map(|c| {
-            let price = match c {
-                Chain::Ltc => 10_000 * 100_000_000, // 10,000 DIVI per LTC
-                _ => 5_000 * 100_000_000,           // 5,000 DIVI per ZEC
-            };
+            let price = mock_divi_per_coin(c);
             [
                 (format!("divi-{c}-testnet"), Direction::TakerPaysBtc),
                 (format!("{c}-divi-testnet"), Direction::TakerPaysDivi),
@@ -290,7 +302,7 @@ pub fn mock_xmr_offers() -> Vec<Offer> {
         id: "divi-xmr-stagenet".into(),
         direction: Direction::TakerPaysBtc,
         counter_chain: Chain::Xmr,
-        divi_sats_per_btc: 5_000 * 100_000_000, // 5,000 DIVI per XMR
+        divi_sats_per_btc: mock_divi_per_coin(Chain::Xmr),
         min_btc_sats: 100_000,                  // 0.001 XMR
         max_btc_sats: 100_000_000,              // 1 XMR
     }]
@@ -521,6 +533,18 @@ impl DaemonConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_chain_has_its_own_mock_rate() {
+        assert_eq!(mock_divi_per_coin(Chain::Btc), 300_000_000_000_000);
+        assert_eq!(mock_divi_per_coin(Chain::Ltc), 10_000 * 100_000_000);
+        assert_eq!(mock_divi_per_coin(Chain::Zec), 5_000 * 100_000_000);
+        assert_eq!(mock_divi_per_coin(Chain::Xmr), 5_000 * 100_000_000);
+        for c in Chain::ALL {
+            assert!(mock_divi_per_coin(c) > 0, "{c} has no rate");
+        }
+        assert_eq!(mock_xmr_offers()[0].divi_sats_per_btc, mock_divi_per_coin(Chain::Xmr));
+    }
+
     use super::*;
 
     const GOOD: &str = r#"

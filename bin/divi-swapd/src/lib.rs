@@ -22,7 +22,7 @@ pub mod scan;
 pub mod scheduler;
 
 pub use config::{
-    mock_counter_offers, mock_xmr_offers, BackendKind, BtcSection, DaemonConfig, LtcSection,
+    mock_counter_offers, mock_divi_per_coin, mock_xmr_offers, BackendKind, BtcSection, DaemonConfig, LtcSection,
     UsdcSection, XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
 pub use routes::{router, router_with_xmr, AppState};
