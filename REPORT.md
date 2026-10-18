@@ -240,3 +240,30 @@ Status is only [x] with evidence. Anything open is either running or under NEEDS
 - [x] Bad-data peer and full-peer preference: unit-tested only, by decision. A live bad-data test needs a hostile peer we would have to build, and the testnet cannot show peer preference. Said plainly, not claimed live.
 - [ ] Cleanup of hp1 `~/thin` and the temporary hp3 binary (only on Bert's say-so)
 - [ ] NEEDS HUMAN: snapshot distribution, who runs full nodes, mainnet decision
+
+## HANDOFF (thin-staking lane, written 2026-10-18; relaunch when hp3 returns Wed 2026-10-21)
+
+**State.** Testnet only; nothing deployed or published; no mainnet; no funds moved. Branch `fix/staker-stale-mempool-and-eviction`, everything pushed to origin/main (latest `60e6783`).
+
+**Done and durable**
+- Staker fix `e068a82` (validate mempool txs in stake blocks; evict only coins the chain lacks); hp3 test node runs it (`~/bin/irondivid` sha256 `131853d9…140e`, pid 231853, datadir `~/prune-test`).
+- 15.1 signed snapshot root: `bin/irondivid/src/snapshot_sig.rs` (`7bd5009`), proven end to end on testnet (verify OK, wrong signer refused, tampered snapshot refused, import with pinned signer, sync forward, old block via full-history peers). Details in "Thin staking item 15" above.
+- Real signing key exists in 1Password (slate #27 approved): op-ref `op://global_secret_store/IronDivi Thin Staking - snapshot signing key/password`; testnet signer `yL5fBho4PWytyQv77i7QHrGrpGMDSyGaPV`; mainnet signer `DUEursJezrUPqAifSyofSBc7DHGPxoTEQB`. Key-to-address proof PASS. Generator: `bin/irondivid/examples/snapshot_keygen.rs`.
+- 15.2: hp1, hp2 (`~/archival-test`, p2p 52500 / RPC 52501) and hp3 `prune-base` are full-history, same tip.
+- Reports (orchestrator `reports/`): `hp3-gate-investigation-2026-10-17.md`, `item15-four-decisions-plain-words-2026-10-17.md`. Bert's decisions: 1=A (own key + small web server), 2=D (2-3 own nodes now, public later), 3=A (mainnet not yet).
+
+**Open**
+- No accepted stake on the fixed build yet (last check: heartbeat 05:50Z 10-18, no match). Acceptance: `stake-wins.log` marker with `pruned:true`; block on `prune-base` with 6+ confirmations; coinstake input belongs to the prune-test wallet.
+- Wallet spent-set persistence bug is unfixed: never restart prune-test without `rescanblockchain 345000` afterwards (needs its own branch and tests).
+
+**Resume steps (Wed 10-21, once hp3 is reachable)**
+1. `ssh hp3 'tail -30 ~/prune-test/stake-wins.log; pgrep -af "datadir /home/bshuler/prune-test"'`; read the log for any MATCH during the gap and check `node.log` before claiming anything. If a MATCH exists, report the first accepted stake immediately, then verify the acceptance criteria above.
+2. Re-arm the Monitor (timeout_ms 1800000, re-arm on every expiry): `ssh -o ServerAliveInterval=30 hp3 'tail -n0 -F ~/prune-test/node.log' 2>&1 | grep -E --line-buffered "Hashproof SUCCESS|self-accept|Evicted phantom|panicked|Removed .* stale UTXOs"`.
+3. Check hp1/hp2 archival nodes are still up (`pgrep -af archival-bin/irondivid`).
+4. Build rules: no compiles on the Mac; scripts via Write, scp, `ssh hpN 'bash script'`; sync with `rsync -rlpc`. Commit signed as Bert Shuler with no AI trailer; push `git push origin HEAD:main`.
+
+**NEEDS HUMAN (kept)**
+- ssh to hp3 refused ("agent refused operation" for `~/.ssh/pub/hp3_ssh.pub`) from 2026-10-18 ~05:50Z; unlock or approve the ssh agent. Not bypassed.
+- Written go to delete `hp1:~/thin`, `hp1:~/snap-test` (stop its test node first), and hp3 `~/bin/irondivid.pre-e068a82` (after the first accepted stake). Never touch hp3 `~/prune-test`.
+- Where snapshots are hosted and who publishes the signed root (decision 1=A chosen; the server and publisher still need setting up). Mainnet stays off (decision 3=A).
+- Push scope: a housekeeping agent pushed to origin/main despite "do not push the branch"; say whether pushes to main need your written go.
