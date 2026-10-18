@@ -24,6 +24,11 @@
 
 ---
 
+## LIVE PUNISH RERUN IN FLIGHT (started 2026-10-18 01:14Z; pause was lifted, broker pending=0)
+Private hp2 maker (NOT dnsdivi) restarted via `~/.local/state/c1-punish/start.sh`; tunnels from the Mac: `-L 18483 -L 38088` to hp2. Run dir (Mac): `cat ~/.local/state/iron-divi-swap-poc/p2-punish.run`. Flow: `xmr-soak.sh --scenario lock-only` -> `c1-punish-watch.sh` stalls the maker at `xmr_reported` -> `c1-punish-step.sh` steps the taker every 5 min until `Done` (t_cancel +6 h, t_punish +3 h, so about 9-10 h). Taker binary `~/.cache/divi-swap-c1-5481207`. Old maker swap ids skipped by the watcher: `3b25d217`, `06bcf298`.
+Resume if the Mac session died: check `$R/results.tsv`, `$R/stall.log`, `$R/step-states.log`; if the stall happened and no stepper runs, relaunch `tools/swap-poc/c1-punish-step.sh ~/.cache/divi-swap-c1-5481207 $R` (perl setsid, macOS has no `setsid`); the maker must stay stopped.
+Pass proof to record: Tx_cancel selector 2 (J branch), Tx_punish selector 0 paying the taker, no refund spender of cancel:0, taker `Done`.
+
 ## RESTART NOTE (refreshed 2026-10-17 ~10:00 EDT) — XMR enablement task (spec: orchestrator `specs/xmr-addition.md`)
 
 **Task (Bert):** add XMR to the Divi AtomicSwap effort. IronDivi is Tier 1 (adaptor engine + XMR backend present): VERIFY & ENABLE only; no HTLC port; no mainnet, no spend, no deploy; seed never touched.
