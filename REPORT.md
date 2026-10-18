@@ -1,3 +1,6 @@
+## NEEDS HUMAN: ssh to hp3 refused (2026-10-18, ~05:50Z onward)
+The ssh agent refused to sign for `~/.ssh/pub/hp3_ssh.pub` ("agent refused operation"), so the stake monitor on hp3 cannot run. Likely the 1Password SSH agent is locked or waiting on an approval. Not bypassed. Last good check: `stake-wins.log` heartbeat 05:50Z, no stake, prune-test pid 231853 still up. After the agent is unlocked: `ssh hp3 'tail -20 ~/prune-test/stake-wins.log'`, read it for any MATCH covering the gap, then re-arm the monitor (`tail -n0 -F ~/prune-test/node.log | grep -E "Hashproof SUCCESS|self-accept|Evicted phantom|panicked|Removed .* stale UTXOs"`).
+
 ## Thin staking item 15 (2026-10-17 evening, testnet only, nothing deployed or published)
 
 **15.1 signed snapshot root: PROVEN on testnet** with a throwaway key (not Bert's). Code: `bin/irondivid/src/snapshot_sig.rs`, commit `7bd5009` (5 unit tests, fmt/clippy clean). Run on hp1 with binary sha256 `02065cfa…1c3e`, snapshot of tip 354218, root_hash `10be2a6f…b6e4`:
