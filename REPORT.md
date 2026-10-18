@@ -43,6 +43,8 @@
 4. Punish: private hp2 maker, `tools/swap-poc/c1-punish-step.sh` (about 4 h). Never touch the dnsdivi maker or deploy.
 5. Record txids here and in `docs/plans/swap-poc/RESULTS.md`; then ready.
 
+**Full suite on main `bd79733` (2026-10-17, hp3, dispatch by orchestrator):** `cargo test --workspace --no-fail-fast` 74 test binaries, 0 failures; `cargo clippy --workspace --all-targets` clean (includes `snapshot_keygen.rs`); fmt found one diff, in my own `divi-swapd/src/lib.rs` import, fixed. Rate-table fix re-reviewed: values for LTC/ZEC/BTC/XMR unchanged, no overflow (max 3e14), mock-only (live offers come from the toml), DIVI/USDC entries are unreachable placeholders.
+
 **Parked NEEDS HUMAN:** the 1Password approval above; the older items below (snapshot channel, mainnet decision, usdc-lane transcript, hp1/hp3 cleanup). Mainnet stays off.
 
 **Thin-staking test (unrelated, still running on hp3):** pruned node `~/prune-test`, recorder heartbeats alive through 2026-10-17 12:50Z. A stake was found 13:49Z but rejected at self-accept (stale mempool tx) and the wallet evicted its 100k UTXO; restored by restart + `rescanblockchain 345000`, balance 104,999.99996. Details in the checklist item "Pruned node wins a stake". Still not proven. Re-arm: `ssh -o ServerAliveInterval=30 hp3 'tail -n0 -F ~/prune-test/node.log' 2>&1 | grep -E --line-buffered "Hashproof SUCCESS|self-accept|Evicted phantom|panicked"`.
