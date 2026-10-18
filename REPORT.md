@@ -9,6 +9,13 @@
 
 **15.2 own archival nodes: UP on testnet.** hp3 `prune-base`, hp1 and hp2 (`~/archival-test`, p2p 52500, RPC 52501) all report `pruned:false`, tip 354230, hash `e9562bcd…`, and serve the imported node (it reported 8–10 full-history peers). These are testnet-only and in my own home dirs; stopping them is `kill -TERM` of the pid in `pgrep -af archival-bin/irondivid`.
 
+**Signing key item (Bert's go: inbox 2026-10-17-2007, "Manager creates it"): SLATED, NEEDS TOUCH ID.** Generated on hp3 by `bin/irondivid/examples/snapshot_keygen.rs` and piped over ssh straight into `op item create --vault global_secret_store -`; the secret never hit stdout, a file or argv. op-guard queued it as **slate #27** (pending; `secret-broker result 27`). Nothing is created until Bert runs `secret-broker approve`. Not retried, not polled.
+- Item / op-ref (once approved): `op://global_secret_store/IronDivi Thin Staking - snapshot signing key/password`
+- Testnet signer: `yL5fBho4PWytyQv77i7QHrGrpGMDSyGaPV`
+- Mainnet signer: `DUEursJezrUPqAifSyofSBc7DHGPxoTEQB`
+- Pubkey: `027bd2ddcd2f7c6d0d27c05141580dd5228ecc20b02c4dca2e4a979b43bbc08207`
+- Key↔address proof: NOT YET RUN (needs the item to exist). After approval run `bash /private/tmp/claude-501/-Users-bshuler-code-IronDivi-crates/6602aa19-13e6-4edd-bd0f-fd693332e306/scratchpad/kg-prove.sh`: it resolves the key with `secret get`, signs a testnet snapshot copy on hp1, and verifies against the testnet address above; expect `OK: …signed by yL5f…`. If the slate is rejected or the item never appears, these addresses are void and the keygen must be re-run.
+
 **Stake:** still no accepted stake on the fixed build (`stake-wins.log` heartbeats only, last 20:50Z). Monitor stays armed.
 
 **hp3 gate investigation:** `reports/hp3-gate-investigation-2026-10-17.md` in the orchestrator folder. Approval was real; a housekeeping agent pushed to origin/main despite "do not push the branch" (flagged, not reverted).
