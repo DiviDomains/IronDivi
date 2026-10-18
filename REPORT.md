@@ -27,10 +27,15 @@ The ssh agent refused to sign for `~/.ssh/pub/hp3_ssh.pub` ("agent refused opera
 
 ---
 
-## LIVE PUNISH RERUN IN FLIGHT (started 2026-10-18 01:14Z; pause was lifted, broker pending=0)
-Private hp2 maker (NOT dnsdivi) restarted via `~/.local/state/c1-punish/start.sh`; tunnels from the Mac: `-L 18483 -L 38088` to hp2. Run dir (Mac): `cat ~/.local/state/iron-divi-swap-poc/p2-punish.run`. Flow: `xmr-soak.sh --scenario lock-only` -> `c1-punish-watch.sh` stalls the maker at `xmr_reported` -> `c1-punish-step.sh` steps the taker every 5 min until `Done` (t_cancel +6 h, t_punish +3 h, so about 9-10 h). Taker binary `~/.cache/divi-swap-c1-5481207`. Old maker swap ids skipped by the watcher: `3b25d217`, `06bcf298`.
-Resume if the Mac session died: check `$R/results.tsv`, `$R/stall.log`, `$R/step-states.log`; if the stall happened and no stepper runs, relaunch `tools/swap-poc/c1-punish-step.sh ~/.cache/divi-swap-c1-5481207 $R` (perl setsid, macOS has no `setsid`); the maker must stay stopped.
-Pass proof to record: Tx_cancel selector 2 (J branch), Tx_punish selector 0 paying the taker, no refund spender of cancel:0, taker `Done`.
+## LIVE PUNISH RE-RUN: PASS (2026-10-18 11:09Z, stagenet + DIVI testnet, nothing deployed, no mainnet)
+Build: taker `~/.cache/divi-swap-c1-5481207` (XMR crates byte-identical to HEAD); private hp2 maker (NOT dnsdivi), stalled at `xmr_reported` 01:18:55Z and never restarted. Taker local id `acc8b6eb-3f64-4f5c-b2fc-004c0b24cf0b`, maker swap `c30d6d99-a71a-4b88-ba1d-229692bab932`. Taker states: `XmrLocked` ... `Punishing` 11:08:45Z, `Done` 11:13:45Z; db outcome `punished`. Checked against the DIVI testnet node (`services.divi.domains/api/testnet/rpc`):
+- Tx_lock `15cc6ccb2c205a63920b5976755d07280770abf321b6290a23f502c76cb232f4`, height 354460; output 0 is spent (`gettxout` null).
+- Tx_cancel `61592fc898af3c08e81fd966fc5404f206c122d8e9d8fafa780db564b475e74a`: `vin[0]` = Tx_lock:0, scriptSig selector **2** (cancel branch, joint key J), locktime 1792307367 (t_cancel), height 355057, 9 conf.
+- Tx_punish `1ec5ac8faf7376c922d5eccbd6e9dd4b4c4003acd298f8eee12c5e0afb7cc292`: `vin[0]` = Tx_cancel:0, scriptSig selector **0** (taker key b), locktime 1792318167 (t_punish), one output 9.999 tDIVI to `xy2MorbDhp35NxBHytHjv3LQo7fvHE4y3b`, the taker payout address the earlier punish and happy swaps used. Same block 355057, 9 conf.
+- `gettxout` of Tx_cancel:0 is null: spent by Tx_punish, so no refund exists. The maker stayed down throughout.
+- XMR lock `58b28e77c8f689f0372d8881ab783b4060db54bf35d37a36b1297032032c06f6` confirmed at stagenet height 2231604 (308 conf at check); it stays locked, which is the punish price by design.
+Why both txs share a block: the Mac slept from about 06:16Z to 11:05Z, so no `claim` ran and both timelocks had passed when the next one did. The stepper then broadcast Tx_cancel and Tx_punish back to back. That does not change what is proven. Process note: killing the stale `sleep 300` exited the stepper (`set -e`); I relaunched it (pid 33143) and nothing else was lost.
+The live REFUND re-run is still not repeated (engine byte-identical to the 2026-10-16 live pass; offline tests 13/13 and e2e 3/3).
 
 ## RESTART NOTE (refreshed 2026-10-17 ~10:00 EDT) — XMR enablement task (spec: orchestrator `specs/xmr-addition.md`)
 
@@ -42,13 +47,13 @@ Pass proof to record: Tx_cancel selector 2 (J branch), Tx_punish selector 0 payi
 - Offline refund AND punish on this HEAD (hp3): `crates/divi-swap-xmr` engine tests 13/13 (`taker_walks_away_after_locking_xmr_both_refund`, `taker_never_locks_xmr_maker_refunds`, `maker_stalls_after_xmr_lock_taker_punishes`, `a_re_encoded_tx_cancel_still_refunds_and_reveals_s_m`, ...); `divi-swapd` `e2e_xmr` 3/3 (`e2e_mock_xmr_refund`).
 - hp2 `~/swap-lanes/xmr` fast-forwarded 220dcb0 -> 9e599a5 (hp2's `origin` is the local bare `~/swap-lanes/IronDivi.git`, which I pushed to). Its uncommitted work (status/xmr.md section + `xmr_live_final.rs`) was kept via stash, pop, and a manual both-sides merge; `stash@{0}` (`pre-ff-xmr-lane`) is still there as a backup.
 
-**NOT done: live stagenet re-run of refund + punish against the shared stagenet address (`59DDm3zb...Q9wP5AF`, item `divi_xmr_swap_stagenet`).** Reason: `secret get` of the taker's wallet-rpc credential returned nothing on 2026-10-17 (the broker has 5 queued 1Password calls from another session waiting for a human), so a live taker cannot start. That is a pause, not a bug; nothing was bypassed. Evidence that stands in the meantime: `git diff 5481207 HEAD` over `divi-swap-xmr`, `swap-adaptor`, `swap-chain-xmr`, `swap-chain-divi`, `bin/divi-swap` is empty, so the engine is byte-identical to the build that passed refund (tests 2-3) and punish (test 4) live on stagenet 2026-10-16. Do not describe the live re-run as repeated.
+**Punish re-run is DONE (PASS, see above). NOT done: live stagenet re-run of refund against the shared stagenet address (`59DDm3zb...Q9wP5AF`, item `divi_xmr_swap_stagenet`).** Reason: `secret get` of the taker's wallet-rpc credential returned nothing on 2026-10-17 (the broker has 5 queued 1Password calls from another session waiting for a human), so a live taker cannot start. That is a pause, not a bug; nothing was bypassed. Evidence that stands in the meantime: `git diff 5481207 HEAD` over `divi-swap-xmr`, `swap-adaptor`, `swap-chain-xmr`, `swap-chain-divi`, `bin/divi-swap` is empty, so the engine is byte-identical to the build that passed refund (tests 2-3) and punish (test 4) live on stagenet 2026-10-16. Do not describe the live re-run as repeated.
 
 **Resume (when Bert approves the 1Password dialog / broker is clear):**
 1. `secret-broker status`; a `secret get --name taker-xmr-wallet-rpc-username --op-ref "op://global_secret_store/IronDivi Swap POC - taker-xmr-wallet-rpc/username"` must print a value (never echo it).
 2. Tunnels (Mac): maker API 18482 is up; also `ssh -N -L 38088:127.0.0.1:38088 hp2`.
 3. Refund: `tools/swap-poc/xmr-soak.sh --taker-bin ~/.cache/divi-swap-c1-5481207/<bin> --scenario lock-only --count 1 --out DIR`, wait past `t_cancel`, then `--resume DIR`. Set `XMR_TAKER_SWEEP=59DDm3zbhM1FVcWo9PJJJEZaTv79jH4sD2vsoQrjiChDY1HCwnLuJjr9NKMWFGk1FwQnfMc1GHyQfeMwA3cMR5z1Q9wP5AF` so refunds sweep to the shared address (public address only; no seed needed).
-4. Punish: private hp2 maker, `tools/swap-poc/c1-punish-step.sh` (about 4 h). Never touch the dnsdivi maker or deploy.
+4. Punish: DONE 2026-10-18 (PASS). Never touch the dnsdivi maker or deploy.
 5. Record txids here and in `docs/plans/swap-poc/RESULTS.md`; then ready.
 
 **Full suite on main `bd79733` (2026-10-17, hp3, dispatch by orchestrator):** `cargo test --workspace --no-fail-fast` 74 test binaries, 0 failures; `cargo clippy --workspace --all-targets` clean (includes `snapshot_keygen.rs`); fmt found one diff, in my own `divi-swapd/src/lib.rs` import, fixed. Rate-table fix re-reviewed: values for LTC/ZEC/BTC/XMR unchanged, no overflow (max 3e14), mock-only (live offers come from the toml), DIVI/USDC entries are unreachable placeholders.
