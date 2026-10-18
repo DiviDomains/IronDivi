@@ -1,3 +1,24 @@
+## HANDOFF (2026-10-18, written for pane close; lane relaunches on claude.ai when hp3 returns Wed 2026-10-21)
+
+**State:** XMR enablement task for IronDivi is verified except the live refund re-run. Nothing deployed, no mainnet funds, no seed touched. No background jobs are running: the punish stepper has exited and the private hp2 maker is stopped (keep it stopped; never touch the dnsdivi maker or hp3 `prune-test`).
+
+**Done and durable (all on origin/main)**
+- XMR registered at every coin-set point (see RESTART NOTE below for file:line list).
+- Rate-table gap closed: `mock_divi_per_coin` exhaustive match + test `every_chain_has_its_own_mock_rate` (`a6ae46e`, fmt `9e599a5`, re-export fmt `944d795`).
+- Full workspace test + clippy green on `bd79733` plus my changes (hp3, 2026-10-17).
+- hp2 `~/swap-lanes/xmr` fast-forwarded to main (backup `stash@{0}` `pre-ff-xmr-lane` kept).
+- Live stagenet PUNISH re-run: PASS (`d923612`, section "LIVE PUNISH RE-RUN: PASS"). Tx_lock `15cc6ccb…32f4`, Tx_cancel `61592fc8…e74a` (selector 2, J), Tx_punish `1ec5ac8f…c292` (selector 0, pays taker), no refund spender, XMR lock `58b28e77…06f6`.
+
+**Next steps to resume (in order)**
+1. Live stagenet REFUND re-run (only open acceptance item): follow "Resume" steps 1-3 and 5 in the RESTART NOTE below. Needs `secret-broker status` clear, a `secret get` that prints a value, tunnels `-L 18482` and `-L 38088` to hp2, and `XMR_TAKER_SWEEP` set to the shared stagenet address (public address only). Takes about 6 h (t_cancel). Beware: if the Mac sleeps the stepper's `sleep 300` can stall for hours; killing it exits the script (`set -e`), so relaunch rather than kill.
+2. Record txids in REPORT.md and `docs/plans/swap-poc/RESULTS.md`, then report ready (do not deploy).
+3. Rust builds only on hp1/hp2/hp3 (`cargo_guard`); push to main from a clean worktree if the Mac checkout is on `fix/staker-stale-mempool-and-eviction`.
+
+**NEEDS HUMAN (kept)**
+- hp3 ssh refused since 2026-10-18 ~05:50Z (1Password SSH agent locked or awaiting approval); stake monitor on hp3 is down until it returns (expected Wed 2026-10-21).
+- Thin staking: snapshot channel, real signing-key rollout, hp1/hp3 cleanup, mainnet decision, usdc transcript (details in the sections below).
+- Mainnet stays off until Bert says go.
+
 ## NEEDS HUMAN: ssh to hp3 refused (2026-10-18, ~05:50Z onward)
 The ssh agent refused to sign for `~/.ssh/pub/hp3_ssh.pub` ("agent refused operation"), so the stake monitor on hp3 cannot run. Likely the 1Password SSH agent is locked or waiting on an approval. Not bypassed. Last good check: `stake-wins.log` heartbeat 05:50Z, no stake, prune-test pid 231853 still up. After the agent is unlocked: `ssh hp3 'tail -20 ~/prune-test/stake-wins.log'`, read it for any MATCH covering the gap, then re-arm the monitor (`tail -n0 -F ~/prune-test/node.log | grep -E "Hashproof SUCCESS|self-accept|Evicted phantom|panicked|Removed .* stale UTXOs"`).
 
