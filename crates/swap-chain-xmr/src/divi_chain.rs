@@ -281,6 +281,12 @@ impl LiveDiviChain {
         Ok(tx)
     }
 
+    /// Give back the coins `build_funding` reserved for `tx`, which will never be sent
+    /// (a no-op for a transaction with nothing reserved).
+    pub fn release_funding(&self, tx: &Transaction) -> Result<()> {
+        self.wallet.lock().unwrap().release(&to_txid(tx.txid()))
+    }
+
     /// `broadcast` -- idempotent: already-known is success, a premature or genuinely
     /// rejected broadcast returns the matching `SwapError` variant, same semantics
     /// (and same `classify_broadcast_error` call) as `DiviBackend::broadcast`.

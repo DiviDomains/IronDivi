@@ -44,6 +44,12 @@ pub trait DiviChain: Send + Sync {
     /// once per swap to build `Tx_lock`.
     async fn build_funding(&self, script_pubkey: &Script, amount: u64) -> Result<Transaction>;
 
+    /// Give back the coins [`DiviChain::build_funding`] reserved for `tx`, which will never be
+    /// broadcast (the swap was aborted or never reached the lock stage). Idempotent: a
+    /// transaction with nothing reserved is `Ok`. Never call it for a transaction that was
+    /// broadcast.
+    async fn release_funding(&self, tx: &Transaction) -> Result<()>;
+
     /// Broadcast. Idempotent: a transaction the chain already has returns `Ok`. One that is
     /// not final yet (`nLockTime` in the future) returns `SwapError::Premature`; one whose
     /// input another transaction already spent returns `SwapError::Rejected`.
@@ -98,11 +104,14 @@ pub trait MoneroChain: Send + Sync {
         amount: u64,
     ) -> Result<String>;
 
-    /// The output paying `spend_pub` (scanned with `view_secret`), if any.
+    /// The first output paying `spend_pub` (scanned with `view_secret`) worth at least
+    /// `min_amount` piconero, if any. Smaller outputs to that address are dust someone sent
+    /// to hide the real lock and are ignored.
     async fn find_lock(
         &self,
         spend_pub: &[u8; 32],
         view_secret: &[u8; 32],
+        min_amount: u64,
     ) -> Result<Option<XmrOutput>>;
 
     /// Spend `lock` (all of it, less the fee) to this wallet with the full spend secret

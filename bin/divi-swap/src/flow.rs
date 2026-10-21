@@ -200,6 +200,7 @@ pub async fn begin(
         Session {
             maker_url: client.base().to_string(),
             maker_swap_id: view.id.clone(),
+            swap_token: String::new(),
         },
     )?;
     taker.accepted(&local, &view).await?;

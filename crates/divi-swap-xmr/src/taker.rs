@@ -642,7 +642,11 @@ impl XmrTaker {
                 let spend_pub = r.shared_spend_key()?;
                 let view = r.setup()?.xmr_view_secret;
                 // Recover a crash between locking and persisting: the lock may already exist.
-                let txid = match self.xmr.find_lock(&spend_pub, &view).await? {
+                let txid = match self
+                    .xmr
+                    .find_lock(&spend_pub, &view, r.setup()?.xmr_amount)
+                    .await?
+                {
                     Some(o) => o.txid,
                     None => {
                         self.xmr
@@ -923,7 +927,7 @@ impl XmrTaker {
             None => {
                 let lock = self
                     .xmr
-                    .find_lock(&spend_pub, &view)
+                    .find_lock(&spend_pub, &view, r.setup()?.xmr_amount)
                     .await?
                     .ok_or_else(|| SwapError::Other("our XMR lock vanished".into()))?;
                 let full = (r.s_t + s_m).to_bytes();

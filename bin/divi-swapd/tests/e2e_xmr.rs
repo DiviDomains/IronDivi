@@ -188,18 +188,19 @@ async fn e2e_mock_xmr_happy() {
     .await
     .unwrap();
     assert_eq!(outcome, "redeemed");
-    let id = sessions.get(&local).unwrap().maker_swap_id;
+    let session = sessions.get(&local).unwrap();
+    let (id, token) = (session.maker_swap_id, session.swap_token);
     let deadline = Instant::now() + LOADED_HOST_WAIT;
 
     while Instant::now() < deadline {
         w.mine();
-        if client.xmr_swap(&id).await.unwrap().state == XmrMakerState::Done {
+        if client.xmr_swap(&id, &token).await.unwrap().state == XmrMakerState::Done {
             break;
         }
         tokio::time::sleep(TICK).await;
     }
     assert_eq!(
-        client.xmr_swap(&id).await.unwrap().state,
+        client.xmr_swap(&id, &token).await.unwrap().state,
         XmrMakerState::Done
     );
     assert_eq!(w.taker_divi.balance(), quoted_divi());
@@ -248,20 +249,26 @@ async fn e2e_mock_xmr_refund() {
     xmr_flow::step(&taker, &client, &sessions, &local)
         .await
         .unwrap();
-    let id = sessions.get(&local).unwrap().maker_swap_id;
-    assert!(client.xmr_swap(&id).await.unwrap().xmr_lock_txid.is_some());
+    let session = sessions.get(&local).unwrap();
+    let (id, token) = (session.maker_swap_id, session.swap_token);
+    assert!(client
+        .xmr_swap(&id, &token)
+        .await
+        .unwrap()
+        .xmr_lock_txid
+        .is_some());
 
     w.divi.advance_time(cfg().cancel_after_secs);
     let deadline = Instant::now() + LOADED_HOST_WAIT;
 
     while Instant::now() < deadline {
         w.mine();
-        if client.xmr_swap(&id).await.unwrap().state == XmrMakerState::Done {
+        if client.xmr_swap(&id, &token).await.unwrap().state == XmrMakerState::Done {
             break;
         }
         tokio::time::sleep(TICK).await;
     }
-    let v = client.xmr_swap(&id).await.unwrap();
+    let v = client.xmr_swap(&id, &token).await.unwrap();
     assert_eq!(v.state, XmrMakerState::Done);
     assert!(v.cancel_txid.is_some() && v.refund_txid.is_some());
 
@@ -320,9 +327,89 @@ async fn xmr_and_hashlock_routes_do_not_cross() {
         .unwrap();
     assert_eq!(all.as_array().unwrap().len(), 0);
     assert!(d.xmr.list().unwrap().is_empty());
+    // There is no listing route at all.
+    let r = reqwest::get(format!("{}/xmr/swaps", d.base)).await.unwrap();
+    assert_eq!(r.status().as_u16(), 405);
     // An unknown xmr swap is a 404.
     let r = reqwest::get(format!("{}/xmr/swaps/nope", d.base))
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 404);
+}
+
+/// C3d/C6a: every route of one XMR swap needs its `X-Swap-Token`; a wrong or missing token is
+/// the same 404 an unknown id gets, and there is no unauthenticated listing.
+#[tokio::test]
+async fn xmr_swap_routes_need_the_swap_token() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let tdb = tmp.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+        .await
+        .unwrap();
+    let session = sessions.get(&local).unwrap();
+    let (id, token) = (session.maker_swap_id, session.swap_token);
+    assert_eq!(token.len(), 64);
+
+    let http = reqwest::Client::new();
+    let url = format!("{}/xmr/swaps/{id}", d.base);
+    let status = |r: reqwest::Response| r.status().as_u16();
+    assert_eq!(
+        status(http.get(&url).send().await.unwrap()),
+        404,
+        "no token"
+    );
+    let wrong = "0".repeat(64);
+    let r = http.get(&url).header("X-Swap-Token", &wrong).send().await;
+    assert_eq!(status(r.unwrap()), 404, "wrong token");
+    let r = http.get(&url).header("X-Swap-Token", &token).send().await;
+    assert_eq!(status(r.unwrap()), 200, "right token");
+    // A mutating route refuses a wrong token too, before looking at the body.
+    let notice = serde_json::json!({ "xmr_txid": "00" });
+    for tail in ["xmr-lock", "sigs", "j"] {
+        let r = http
+            .post(format!("{url}/{tail}"))
+            .header("X-Swap-Token", &wrong)
+            .json(&notice)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status(r), 404, "{tail} with a wrong token");
+    }
+    // Another swap's id with this swap's token: nothing.
+    let r = http
+        .get(format!("{}/xmr/swaps/nope", d.base))
+        .header("X-Swap-Token", &token)
+        .send()
+        .await;
+    assert_eq!(status(r.unwrap()), 404);
+}
+
+/// C3c: past the per-IP limit the setup route answers 429 (a body that fails to parse is
+/// still counted: the limiter runs first).
+#[tokio::test]
+async fn xmr_setup_is_rate_limited_per_ip() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/xmr/swaps", d.base);
+    let mut limited = None;
+    for n in 1..=divi_swapd::RATE_LIMIT_PER_WINDOW + 1 {
+        let r = http.post(&url).json(&serde_json::json!({})).send().await;
+        let code = r.unwrap().status().as_u16();
+        if code == 429 {
+            limited = Some(n);
+            break;
+        }
+        assert_eq!(
+            code, 422,
+            "request {n} is parsed (and refused), not limited"
+        );
+    }
+    assert_eq!(limited, Some(divi_swapd::RATE_LIMIT_PER_WINDOW + 1));
 }

@@ -50,9 +50,11 @@ pub async fn begin(
         Session {
             maker_url: client.base().to_string(),
             maker_swap_id: reply.swap_id.clone(),
+            swap_token: reply.swap_token.clone(),
         },
     )?;
     let id = reply.swap_id.clone();
+    let token = reply.swap_token.clone();
     let mut reply = reply;
     let mut exchanges = 0;
     let sigs = loop {
@@ -63,12 +65,12 @@ pub async fn begin(
                 if exchanges > MAX_J_EXCHANGES {
                     bail!("2P-ECDSA with the maker did not finish in {MAX_J_EXCHANGES} exchanges");
                 }
-                reply = client.xmr_j(&id, &req).await?;
+                reply = client.xmr_j(&id, &token, &req).await?;
             }
         }
     };
     tracing::info!(swap = %local, exchanges, "joint cancel key J made and Tx_cancel signed");
-    client.xmr_sigs(&id, &sigs).await?;
+    client.xmr_sigs(&id, &token, &sigs).await?;
     Ok(local)
 }
 
@@ -80,8 +82,9 @@ pub async fn step(
     sessions: &Sessions,
     local: &str,
 ) -> Result<XmrTakerState> {
-    let id = sessions.get(local)?.maker_swap_id;
-    let view = match client.xmr_swap(&id).await {
+    let session = sessions.get(local)?;
+    let (id, token) = (session.maker_swap_id, session.swap_token);
+    let view = match client.xmr_swap(&id, &token).await {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(error = %e, "maker unreachable; stepping without its view");
@@ -91,7 +94,7 @@ pub async fn step(
     let state = taker.step(local, view.as_ref()).await?;
     if let Some(notice) = taker.lock_notice(local)? {
         if view.as_ref().is_some_and(|v| v.xmr_lock_txid.is_none()) {
-            client.xmr_lock(&id, &notice).await?;
+            client.xmr_lock(&id, &token, &notice).await?;
         }
     }
     Ok(state)

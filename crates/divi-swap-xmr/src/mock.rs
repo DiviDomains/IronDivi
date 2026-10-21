@@ -57,6 +57,9 @@ struct DiviState {
     spends: HashMap<OutPoint, Hash256>,
     offline: bool,
     minted: u64,
+    /// Coins `build_funding` picked for a transaction that is not broadcast (yet): not
+    /// offered to the next `build_funding`, like the live wallet's reservations.
+    reserved: HashMap<Hash256, Vec<OutPoint>>,
     /// What `getblockchaininfo` would call this chain.
     name: String,
 }
@@ -211,6 +214,11 @@ impl MockDiviChain {
         v
     }
 
+    /// Coins currently reserved for unbroadcast funding transactions.
+    pub fn reserved_count(&self) -> usize {
+        self.st.lock().reserved.values().map(Vec::len).sum()
+    }
+
     fn broadcast_tx(&self, tx: &Transaction) -> Result<()> {
         let mut s = self.st.lock();
         if s.offline {
@@ -280,6 +288,11 @@ impl MockDiviWallet {
         self.chain.balance(&self.script())
     }
 
+    /// Coins reserved for unbroadcast funding transactions (chain-wide).
+    pub fn reserved_count(&self) -> usize {
+        self.chain.reserved_count()
+    }
+
     /// The chain.
     pub fn chain(&self) -> &MockDiviChain {
         &self.chain
@@ -320,7 +333,19 @@ impl DiviChain for MockDiviWallet {
         let mine = self.script();
         let mut picked = Vec::new();
         let mut total = 0u64;
+        let reserved: Vec<OutPoint> = self
+            .chain
+            .st
+            .lock()
+            .reserved
+            .values()
+            .flatten()
+            .copied()
+            .collect();
         for (op, out) in self.chain.unspent_paying(&mine) {
+            if reserved.contains(&op) {
+                continue;
+            }
             if total >= amount + MOCK_DIVI_FEE {
                 break;
             }
@@ -360,7 +385,17 @@ impl DiviChain for MockDiviWallet {
         for (i, sig) in sigs.iter().enumerate() {
             tx.vin[i].script_sig = create_p2pkh_script_sig(sig, &pubkey);
         }
+        self.chain
+            .st
+            .lock()
+            .reserved
+            .insert(tx.txid(), tx.vin.iter().map(|i| i.prevout).collect());
         Ok(tx)
+    }
+
+    async fn release_funding(&self, tx: &Transaction) -> Result<()> {
+        self.chain.st.lock().reserved.remove(&tx.txid());
+        Ok(())
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
@@ -534,6 +569,7 @@ impl MoneroChain for MockMoneroWallet {
         &self,
         spend_pub: &[u8; 32],
         view_secret: &[u8; 32],
+        min_amount: u64,
     ) -> Result<Option<XmrOutput>> {
         let s = self.chain.st.lock();
         if s.offline {
@@ -541,7 +577,7 @@ impl MoneroChain for MockMoneroWallet {
         }
         Ok(s.outputs
             .iter()
-            .find(|o| &o.spend_pub == spend_pub && &o.view == view_secret)
+            .find(|o| &o.spend_pub == spend_pub && &o.view == view_secret && o.amount >= min_amount)
             .map(|o| XmrOutput {
                 txid: o.txid.clone(),
                 amount: o.amount,

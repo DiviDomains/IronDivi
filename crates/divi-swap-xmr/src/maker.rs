@@ -51,6 +51,7 @@ use divi_swap::api::{Direction, Offer, Quote};
 use divi_swap::htlc::REFUND_SEQUENCE;
 use divi_swap::store::QuoteRecord;
 use divi_swap::{Amount as SwapAmount, Chain, Result, Store, SwapError};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use swap_adaptor::adaptor::{EncryptedSignature, Point};
 use swap_adaptor::dleq::{random_clamped_secret, CrossCurveDLEQProof, PointQ, ScalarQ};
@@ -72,6 +73,12 @@ pub const KIND: &str = "xmr_maker_c1";
 
 /// Store document kind marking a 2P-ECDSA session id as used (never reused, across restarts).
 const SID_KIND: &str = "xmr_maker_jsid";
+
+/// Most XMR quotes the store keeps. A quote is a stored record issued to anyone who asks, so
+/// the count is bounded: at the cap the oldest expired quote goes first, else the one that
+/// expires soonest. 1 000 is far above what honest takers (one quote per swap, 60 s of
+/// validity) can have outstanding behind the per-IP rate limit.
+pub const MAX_XMR_QUOTES: usize = 1_000;
 
 /// Paillier primes kept ready, so a setup does not wait 20–90 s generating them.
 const PRIMES_POOL: usize = 2;
@@ -122,6 +129,11 @@ impl XmrMakerState {
 pub struct XmrMakerRecord {
     /// Swap id.
     pub id: String,
+    /// Per-swap bearer token (hex of 32 random bytes) the taker presents with every later
+    /// request for this swap (`X-Swap-Token`). Empty in records written before it existed:
+    /// those match no token, so nobody can reach them over HTTP.
+    #[serde(default)]
+    pub swap_token: String,
     /// Wall clock when accepted.
     pub created_at: u64,
     /// Current state.
@@ -300,6 +312,47 @@ pub(crate) fn spend(prevout: OutPoint, value: u64, to: Script, lock_time: u32) -
     }
 }
 
+/// A fresh per-swap token: 32 random bytes from the same RNG the setup keys come from, hex.
+fn new_swap_token() -> String {
+    let mut b = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
+}
+
+/// `given == expected` without an early exit on the first differing byte; an empty
+/// `expected` (a record from before tokens) matches nothing.
+fn token_matches(expected: &str, given: &str) -> bool {
+    let (e, g) = (expected.as_bytes(), given.as_bytes());
+    if e.is_empty() || e.len() != g.len() {
+        return false;
+    }
+    e.iter().zip(g).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// `Tx_cancel`, `Tx_punish` and late-branch `nLockTime`s from the DIVI median time past.
+/// Overflowing `u32` unix times wrap into the past (a lock that is spendable at once), so every
+/// add is checked; each delay is also held to the bound the taker enforces on the maker
+/// ([`crate::MAX_CANCEL_AFTER_SECS`], [`crate::MAX_PUNISH_AFTER_SECS`]).
+fn deadlines(mtp: u32, cfg: &XmrConfig, bounded: bool) -> Result<(u32, u32, u32)> {
+    let bad = |what: &str| SwapError::InvalidParams(format!("{what} out of range"));
+    if bounded && cfg.cancel_after_secs > crate::MAX_CANCEL_AFTER_SECS {
+        return Err(bad("cancel_after_secs"));
+    }
+    if bounded && cfg.punish_after_secs > crate::MAX_PUNISH_AFTER_SECS {
+        return Err(bad("punish_after_secs"));
+    }
+    let t_cancel = mtp
+        .checked_add(cfg.cancel_after_secs)
+        .ok_or_else(|| bad("t_cancel"))?;
+    let t_punish = t_cancel
+        .checked_add(cfg.punish_after_secs)
+        .ok_or_else(|| bad("t_punish"))?;
+    let t_late = t_punish
+        .checked_add(cfg.late_after_secs)
+        .ok_or_else(|| bad("t_late"))?;
+    Ok((t_cancel, t_punish, t_late))
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -308,6 +361,7 @@ fn unix_now() -> u64 {
 
 /// What a setup holds before `J` exists (nothing persisted yet).
 struct Pending {
+    swap_token: String,
     quote: Quote,
     req: SetupRequest,
     divi_key: SecretKey,
@@ -364,12 +418,15 @@ pub struct XmrMaker {
     /// DIVI wallet and chain, then marks it used; without this two concurrent setups on one
     /// quote would both pass the check and open two swaps for it. Never held across an await.
     quotes_in_setup: parking_lot::Mutex<HashSet<String>>,
-    /// Swaps still keying, with their start time (pruned after `sigs_wait_secs`). The inner
-    /// lock serializes one swap's rounds.
-    keying: parking_lot::Mutex<HashMap<String, (u64, KeyingSlot)>>,
+    /// Swaps still keying, with their start time (pruned after `sigs_wait_secs`) and swap
+    /// token. The inner lock serializes one swap's rounds.
+    keying: parking_lot::Mutex<HashMap<String, (u64, KeyingSlot, String)>>,
     primes: Arc<parking_lot::Mutex<Vec<Primes>>>,
     primes_fn: PrimesFn,
     primes_filling: Arc<AtomicBool>,
+    /// Hold `cancel_after_secs`/`punish_after_secs` to the taker's bounds (always, outside
+    /// the test that needs a maker the taker must still refuse).
+    bounded_deadlines: bool,
 }
 
 /// Removes a quote id from `XmrMaker::quotes_in_setup` when `setup` returns.
@@ -416,12 +473,21 @@ impl XmrMaker {
             primes: Arc::new(parking_lot::Mutex::new(Vec::new())),
             primes_fn: Arc::new(jsig::generate_primes),
             primes_filling: Arc::new(AtomicBool::new(false)),
+            bounded_deadlines: true,
         })
     }
 
     /// Replace the wall clock (quote expiry, the signatures wait).
     pub fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Test hook: a maker that does not hold its own schedule to the taker's upper bounds
+    /// (overflow is still refused), to prove the taker refuses such a maker.
+    #[doc(hidden)]
+    pub fn without_deadline_bounds(mut self) -> Self {
+        self.bounded_deadlines = false;
         self
     }
 
@@ -469,11 +535,38 @@ impl XmrMaker {
             btc_confirmations: self.cfg.xmr_confirmations,
             divi_confirmations: self.cfg.divi_confirmations,
         };
+        self.make_room_for_quote()?;
         self.store.put_quote(&QuoteRecord {
             quote: quote.clone(),
             used: false,
         })?;
         Ok(quote)
+    }
+
+    /// Keep the XMR quotes at [`MAX_XMR_QUOTES`] after one more is added: drop every expired
+    /// quote, then (still at the cap) the one that expires soonest. A quote a `setup` is
+    /// working on is never dropped.
+    fn make_room_for_quote(&self) -> Result<()> {
+        let now = (self.clock)();
+        let busy = self.quotes_in_setup.lock().clone();
+        let mut live: Vec<(u64, String)> = Vec::new();
+        for rec in self.store.list_quotes()? {
+            let q = rec.quote;
+            if q.counter_chain != Chain::Xmr || busy.contains(&q.id) {
+                continue;
+            }
+            if q.expires_at < now {
+                self.store.delete_quote(&q.id)?;
+            } else {
+                live.push((q.expires_at, q.id));
+            }
+        }
+        live.sort();
+        let excess = (live.len() + 1).saturating_sub(MAX_XMR_QUOTES);
+        for (_, id) in live.into_iter().take(excess) {
+            self.store.delete_quote(&id)?;
+        }
+        Ok(())
     }
 
     async fn take_primes(&self) -> Result<Primes> {
@@ -575,6 +668,7 @@ impl XmrMaker {
 
         let primes = self.take_primes().await?;
         let id = uuid::Uuid::new_v4().to_string();
+        let swap_token = new_swap_token();
         let session = Arc::new(JSession::start(&req.j_sid, MAKER, primes));
         let first = req.j_msgs.clone();
         let s = session.clone();
@@ -582,6 +676,7 @@ impl XmrMaker {
         let entry = Arc::new(tokio::sync::Mutex::new(Keying {
             session,
             pending: Pending {
+                swap_token: swap_token.clone(),
                 quote,
                 req,
                 divi_key,
@@ -595,13 +690,16 @@ impl XmrMaker {
             signed: false,
             last: None,
         }));
-        self.keying
-            .lock()
-            .insert(id.clone(), ((self.clock)(), entry.clone()));
+        self.keying.lock().insert(
+            id.clone(),
+            ((self.clock)(), entry.clone(), swap_token.clone()),
+        );
         let mut k = entry.lock().await;
         let res = self.after_round(&id, &mut k, round).await;
+        drop(k);
         if res.is_err() {
             self.keying.lock().remove(&id);
+            self.abort_setup(&id, "setup failed").await;
         }
         res
     }
@@ -614,7 +712,7 @@ impl XmrMaker {
             .keying
             .lock()
             .get(swap_id)
-            .map(|(_, e)| e.clone())
+            .map(|(_, e, _)| e.clone())
             .ok_or_else(|| {
                 SwapError::InvalidParams(
                     "no 2P-ECDSA session for this swap (finished, expired, or the maker restarted)"
@@ -632,6 +730,7 @@ impl XmrMaker {
             // A retried request after we finished: nothing more to send.
             return Ok(JRoundReply {
                 swap_id: swap_id.to_string(),
+                swap_token: k.pending.swap_token.clone(),
                 msgs: Vec::new(),
                 setup: k.setup.clone(),
                 signed: true,
@@ -648,7 +747,44 @@ impl XmrMaker {
                 self.keying.lock().remove(swap_id);
             }
         }
+        drop(k);
+        if res.is_err() {
+            self.abort_setup(swap_id, "a 2P-ECDSA round failed").await;
+        }
         res
+    }
+
+    /// Whether `token` is `swap_id`'s swap token. An unknown swap, a swap from before tokens
+    /// existed and a wrong token are the same `false`: callers answer all three with a 404, so
+    /// a probe learns nothing about which swap ids exist.
+    pub fn authorize(&self, swap_id: &str, token: &str) -> bool {
+        let expected = match self.keying.lock().get(swap_id) {
+            Some((_, _, t)) => t.clone(),
+            None => match self.store.get_doc::<XmrMakerRecord>(KIND, swap_id) {
+                Ok(Some(r)) => r.swap_token,
+                _ => return false,
+            },
+        };
+        token_matches(&expected, token)
+    }
+
+    /// Setup failed after `Tx_lock` was built (nothing was broadcast): end the swap and give
+    /// its coins back now instead of leaving them reserved until the signatures wait runs out.
+    /// A no-op when no record exists or it has moved past `Accepted`.
+    async fn abort_setup(&self, id: &str, why: &str) {
+        let lock = self.swap_lock(id);
+        let _g = lock.lock().await;
+        let Ok(mut r) = self.load(id) else { return };
+        if r.state != XmrMakerState::Accepted {
+            return;
+        }
+        if let Err(e) = self.divi.release_funding(&r.tx_lock).await {
+            // Still Accepted: the signatures-wait timeout in `advance` retries the release.
+            tracing::warn!(swap = %id, error = %e, "xmr maker: releasing the reserved coins failed");
+            return;
+        }
+        r.last_error = Some(format!("aborted: {why}"));
+        let _ = self.enter(&mut r, XmrMakerState::Aborted);
     }
 
     async fn after_round(&self, id: &str, k: &mut Keying, round: JRound) -> Result<JRoundReply> {
@@ -679,6 +815,7 @@ impl XmrMaker {
         }
         Ok(JRoundReply {
             swap_id: id.to_string(),
+            swap_token: k.pending.swap_token.clone(),
             msgs,
             setup: k.setup.clone(),
             signed: k.signed,
@@ -698,11 +835,7 @@ impl XmrMaker {
         let fee = self.cfg.divi_fee_sats;
         let lock_amount = p.quote.divi_amount.0 + fee;
         let mtp = self.divi.median_time_past().await?;
-        let t_cancel = mtp
-            .checked_add(self.cfg.cancel_after_secs)
-            .ok_or_else(|| SwapError::InvalidParams("t_cancel overflow".into()))?;
-        let t_punish = t_cancel + self.cfg.punish_after_secs;
-        let t_late = t_punish + self.cfg.late_after_secs;
+        let (t_cancel, t_punish, t_late) = deadlines(mtp, &self.cfg, self.bounded_deadlines)?;
         let lock = LockScript {
             maker: maker_pk,
             taker: taker_pk,
@@ -717,79 +850,91 @@ impl XmrMaker {
         };
         let (redeem, spk) = (lock.redeem_script(), lock.script_pubkey());
         let tx_lock = self.divi.build_funding(&spk, lock_amount).await?;
-        let lock_vout = tx_lock
-            .vout
-            .iter()
-            .position(|o| o.script_pubkey == spk && o.value.as_sat() as u64 == lock_amount)
-            .ok_or_else(|| SwapError::Other("Tx_lock lacks the lock output".into()))?
-            as u32;
-        let lock_op = OutPoint::new(tx_lock.txid(), lock_vout);
-        let tx_cancel = spend(lock_op, lock_amount - fee, cancel.script_pubkey(), t_cancel);
-        let digest = crypto::digest(&tx_cancel, &redeem)?;
-        let refund_script = self.divi.payout_script().as_bytes().to_vec();
-        let rec = XmrMakerRecord {
-            id: id.to_string(),
-            created_at: (self.clock)(),
-            state: XmrMakerState::Accepted,
-            quote: p.quote.clone(),
-            divi_key: p.divi_key.clone(),
-            s_m: p.s_m,
-            view_secret: p.view_secret,
-            taker_pk,
-            taker_payout: p.req.taker_payout_script.clone(),
-            x_point: p.req.x_point,
-            taker_share: p.req.taker_xmr_share,
-            xmr_amount: p.quote.btc_amount.0 * PICONERO_PER_COUNTER_SAT,
-            j_sid: p.req.j_sid,
-            joint_pk,
-            redeem_script: redeem,
-            cancel_redeem: cancel.redeem_script(),
-            tx_lock,
-            lock_actual: None,
-            lock_vout,
-            lock_amount,
-            t_cancel,
-            t_punish,
-            t_late,
-            tx_cancel: tx_cancel.clone(),
-            cancel_sig: Vec::new(),
-            refund_script: refund_script.clone(),
-            cancel_signed: None,
-            cancel_actual: None,
-            taker_cancel_sig: None,
-            refund_encsigs: BTreeMap::new(),
-            xmr_txid: None,
-            tx_redeem: None,
-            redeem_encsig: None,
-            s_t: None,
-            sweep_txid: None,
-            refund_signed: None,
-            late_signed: None,
-            last_error: None,
-        };
-        self.store.put_doc(KIND, &rec.id, &rec)?;
-        Ok((
-            SetupReply {
-                swap_id: rec.id.clone(),
-                quote: rec.quote.clone(),
-                maker_divi_pubkey: maker_pk,
-                y_point: p.y_point,
-                maker_xmr_share: p.maker_share,
-                maker_proof: p.maker_proof.clone(),
-                xmr_view_secret: p.view_secret,
-                xmr_amount: rec.xmr_amount,
-                joint_pubkey: joint_pk,
-                lock_outpoint: WireOutpoint::of(&lock_op),
+        // `build_funding` reserved the coins: from here a failure before the record is
+        // persisted gives them back (once it is, `abort_setup` and the signatures-wait
+        // timeout in `advance` do).
+        let built = (|| -> Result<(SetupReply, [u8; 32])> {
+            let lock_vout = tx_lock
+                .vout
+                .iter()
+                .position(|o| o.script_pubkey == spk && o.value.as_sat() as u64 == lock_amount)
+                .ok_or_else(|| SwapError::Other("Tx_lock lacks the lock output".into()))?
+                as u32;
+            let lock_op = OutPoint::new(tx_lock.txid(), lock_vout);
+            let tx_cancel = spend(lock_op, lock_amount - fee, cancel.script_pubkey(), t_cancel);
+            let digest = crypto::digest(&tx_cancel, &redeem)?;
+            let refund_script = self.divi.payout_script().as_bytes().to_vec();
+            let rec = XmrMakerRecord {
+                id: id.to_string(),
+                swap_token: p.swap_token.clone(),
+                created_at: (self.clock)(),
+                state: XmrMakerState::Accepted,
+                quote: p.quote.clone(),
+                divi_key: p.divi_key.clone(),
+                s_m: p.s_m,
+                view_secret: p.view_secret,
+                taker_pk,
+                taker_payout: p.req.taker_payout_script.clone(),
+                x_point: p.req.x_point,
+                taker_share: p.req.taker_xmr_share,
+                xmr_amount: p.quote.btc_amount.0 * PICONERO_PER_COUNTER_SAT,
+                j_sid: p.req.j_sid,
+                joint_pk,
+                redeem_script: redeem,
+                cancel_redeem: cancel.redeem_script(),
+                tx_lock: tx_lock.clone(),
+                lock_actual: None,
+                lock_vout,
                 lock_amount,
                 t_cancel,
                 t_punish,
                 t_late,
-                divi_fee_sats: fee,
-                tx_cancel,
-                maker_refund_script: refund_script,
-            },
-            digest,
-        ))
+                tx_cancel: tx_cancel.clone(),
+                cancel_sig: Vec::new(),
+                refund_script: refund_script.clone(),
+                cancel_signed: None,
+                cancel_actual: None,
+                taker_cancel_sig: None,
+                refund_encsigs: BTreeMap::new(),
+                xmr_txid: None,
+                tx_redeem: None,
+                redeem_encsig: None,
+                s_t: None,
+                sweep_txid: None,
+                refund_signed: None,
+                late_signed: None,
+                last_error: None,
+            };
+            self.store.put_doc(KIND, &rec.id, &rec)?;
+            Ok((
+                SetupReply {
+                    swap_id: rec.id.clone(),
+                    quote: rec.quote.clone(),
+                    maker_divi_pubkey: maker_pk,
+                    y_point: p.y_point,
+                    maker_xmr_share: p.maker_share,
+                    maker_proof: p.maker_proof.clone(),
+                    xmr_view_secret: p.view_secret,
+                    xmr_amount: rec.xmr_amount,
+                    joint_pubkey: joint_pk,
+                    lock_outpoint: WireOutpoint::of(&lock_op),
+                    lock_amount,
+                    t_cancel,
+                    t_punish,
+                    t_late,
+                    divi_fee_sats: fee,
+                    tx_cancel,
+                    maker_refund_script: refund_script,
+                },
+                digest,
+            ))
+        })();
+        if built.is_err() {
+            if let Err(e) = self.divi.release_funding(&tx_lock).await {
+                tracing::warn!(swap = %id, error = %e, "xmr maker: releasing the reserved coins failed");
+            }
+        }
+        built
     }
 
     /// Step 3: the taker's `Tx_cancel` signature (`σ_J`) and her encrypted `Tx_refund`
@@ -962,7 +1107,7 @@ impl XmrMaker {
         let wait = self.cfg.sigs_wait_secs;
         self.keying
             .lock()
-            .retain(|_, (at, k)| now <= *at + wait || k.try_lock().is_err());
+            .retain(|_, (at, k, _)| now <= *at + wait || k.try_lock().is_err());
         self.refill_primes();
         for r in self.store.list_docs::<XmrMakerRecord>(KIND)? {
             if !r.state.is_terminal() {
@@ -1015,8 +1160,12 @@ impl XmrMaker {
         use XmrMakerState::*;
         match r.state {
             Accepted => {
+                // The reservation on `Tx_lock`'s coins expires with the signatures wait
+                // (`sigs_wait_secs`, the profile's setup timeout): a swap that never reached
+                // the lock stage gives its coins back here. Nothing was broadcast.
                 if (self.clock)() > r.created_at + self.cfg.sigs_wait_secs {
                     self.keying.lock().remove(&r.id);
+                    self.divi.release_funding(&r.tx_lock).await?;
                     r.last_error = Some("aborted: the taker never sent her signatures".into());
                     return self.enter(r, Aborted);
                 }
@@ -1026,7 +1175,9 @@ impl XmrMaker {
             Redeemed => self.on_redeemed(r).await,
             Swept => {
                 let txid = r.sweep_txid.clone().unwrap_or_default();
-                if self.xmr.confirmations(&txid).await?.unwrap_or(0) >= 1 {
+                // Final only at the profile's Monero depth, the one the maker waited for
+                // on the taker's lock: one confirmation is reorg-able.
+                if self.xmr.confirmations(&txid).await?.unwrap_or(0) >= self.cfg.xmr_confirmations {
                     return self.enter(r, Done);
                 }
                 Ok(Flow::Idle)
@@ -1155,7 +1306,7 @@ impl XmrMaker {
         if r.state == XmrMakerState::XmrReported {
             let found = self
                 .xmr
-                .find_lock(&r.shared_spend_key(), &r.view_secret)
+                .find_lock(&r.shared_spend_key(), &r.view_secret, r.xmr_amount)
                 .await?;
             let ok = found.as_ref().is_some_and(|o| {
                 o.amount >= r.xmr_amount && o.confirmations >= self.cfg.xmr_confirmations
@@ -1208,7 +1359,9 @@ impl XmrMaker {
 
     async fn on_reclaimed(&self, r: &mut XmrMakerRecord) -> Result<Flow> {
         if let Some(sp) = self.divi.find_spend(&r.lock_outpoint()).await? {
-            if self.divi.confirmations(&sp.txid()).await?.unwrap_or(0) >= 1 {
+            if self.divi.confirmations(&sp.txid()).await?.unwrap_or(0)
+                >= self.cfg.divi_confirmations
+            {
                 r.late_signed = Some(sp);
                 return self.enter(r, XmrMakerState::Done);
             }
@@ -1230,7 +1383,7 @@ impl XmrMaker {
             .ok_or_else(|| SwapError::Other("Redeemed without s_t".into()))?;
         let lock = self
             .xmr
-            .find_lock(&r.shared_spend_key(), &r.view_secret)
+            .find_lock(&r.shared_spend_key(), &r.view_secret, r.xmr_amount)
             .await?
             .ok_or_else(|| SwapError::Other("the XMR lock vanished".into()))?;
         let full = (r.s_m + s_t).to_bytes();
@@ -1339,7 +1492,9 @@ impl XmrMaker {
                 r.last_error = Some("the taker punished: Tx_punish took the DIVI".into());
                 return self.enter(r, XmrMakerState::Punished);
             }
-            if self.divi.confirmations(&sp.txid()).await?.unwrap_or(0) >= 1 {
+            if self.divi.confirmations(&sp.txid()).await?.unwrap_or(0)
+                >= self.cfg.divi_confirmations
+            {
                 r.refund_signed = Some(sp);
                 return self.enter(r, XmrMakerState::Done);
             }
@@ -1384,4 +1539,61 @@ fn msgs_digest(msgs: &[JMsg]) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(msgs).map_err(|e| SwapError::Other(format!("encode: {e}")))?;
     Ok(Sha256::digest(bytes).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadlines_are_checked_and_bounded() {
+        let cfg = XmrConfig::testnet();
+        let (c, p, l) = deadlines(1_000, &cfg, true).unwrap();
+        assert_eq!(
+            (c, p, l),
+            (
+                1_000 + cfg.cancel_after_secs,
+                1_000 + cfg.cancel_after_secs + cfg.punish_after_secs,
+                1_000 + cfg.cancel_after_secs + cfg.punish_after_secs + cfg.late_after_secs
+            )
+        );
+        // Each add overflows in turn.
+        let near = u32::MAX - cfg.cancel_after_secs + 1;
+        assert!(deadlines(near, &cfg, true).is_err(), "t_cancel");
+        let near = u32::MAX - cfg.cancel_after_secs - cfg.punish_after_secs + 1;
+        assert!(deadlines(near, &cfg, true).is_err(), "t_punish");
+        let near =
+            u32::MAX - cfg.cancel_after_secs - cfg.punish_after_secs - cfg.late_after_secs + 1;
+        assert!(deadlines(near, &cfg, true).is_err(), "t_late");
+        assert!(
+            deadlines(near - 1, &cfg, true).is_ok(),
+            "exactly at u32::MAX"
+        );
+        // Above the taker's bounds.
+        let long = XmrConfig {
+            cancel_after_secs: crate::MAX_CANCEL_AFTER_SECS + 1,
+            ..cfg.clone()
+        };
+        assert!(deadlines(1_000, &long, true).is_err());
+        assert!(
+            deadlines(1_000, &long, false).is_ok(),
+            "test hook lifts the bound"
+        );
+        let long = XmrConfig {
+            punish_after_secs: crate::MAX_PUNISH_AFTER_SECS + 1,
+            ..cfg
+        };
+        assert!(deadlines(1_000, &long, true).is_err());
+    }
+
+    #[test]
+    fn tokens_compare_whole_and_never_match_empty() {
+        let t = new_swap_token();
+        assert_eq!(t.len(), 64);
+        assert_ne!(t, new_swap_token());
+        assert!(token_matches(&t, &t));
+        assert!(!token_matches(&t, &t[1..]));
+        assert!(!token_matches(&t, &format!("{}0", &t[..63])) || t.ends_with('0'));
+        assert!(!token_matches("", ""), "pre-token records match nothing");
+    }
 }

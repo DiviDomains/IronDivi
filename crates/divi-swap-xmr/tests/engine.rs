@@ -100,7 +100,11 @@ impl W {
         let xmr = MockMoneroChain::new();
         let maker_divi = divi.wallet(1);
         let taker_divi = divi.wallet(2);
-        maker_divi.fund(MAKER_DIVI);
+        // Several coins: a setup reserves one, and a swap the taker refuses keeps it until
+        // the signatures wait runs out.
+        for _ in 0..10 {
+            maker_divi.fund(MAKER_DIVI / 10);
+        }
         let maker_xmr = xmr.wallet("maker", 0);
         let taker_xmr = xmr.wallet("taker", TAKER_XMR);
         let store = Store::in_memory().unwrap();
@@ -461,7 +465,7 @@ async fn no_redeem_signature_before_the_xmr_lock_confirms() {
                 &divi_swap_xmr::crypto::ed_pub(&rec.s_t),
             );
             let view = rec.setup.as_ref().unwrap().xmr_view_secret;
-            let lock = divi_swap_xmr::MoneroChain::find_lock(&w.maker_xmr, &spend, &view)
+            let lock = divi_swap_xmr::MoneroChain::find_lock(&w.maker_xmr, &spend, &view, 0)
                 .await
                 .unwrap()
                 .unwrap();
@@ -665,12 +669,17 @@ impl MoneroChain for StallingScan {
         self.inner.lock(spend_pub, view, amount).await
     }
 
-    async fn find_lock(&self, spend: &[u8; 32], view: &[u8; 32]) -> Result<Option<XmrOutput>> {
+    async fn find_lock(
+        &self,
+        spend: &[u8; 32],
+        view: &[u8; 32],
+        min_amount: u64,
+    ) -> Result<Option<XmrOutput>> {
         if self.armed.swap(false, Ordering::SeqCst) {
             self.parked.notify_one();
             self.release.notified().await;
         }
-        self.inner.find_lock(spend, view).await
+        self.inner.find_lock(spend, view, min_amount).await
     }
 
     async fn sweep(&self, lock: &XmrOutput, spend: &[u8; 32], view: &[u8; 32]) -> Result<String> {
@@ -767,6 +776,10 @@ impl DiviChain for Forgetful {
 
     async fn build_funding(&self, script_pubkey: &Script, amount: u64) -> Result<Transaction> {
         self.inner.build_funding(script_pubkey, amount).await
+    }
+
+    async fn release_funding(&self, tx: &Transaction) -> Result<()> {
+        self.inner.release_funding(tx).await
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
@@ -899,7 +912,9 @@ fn with_maker_cfg(w: &mut W, c: XmrConfig) {
     )
     .unwrap()
     .with_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
-    .with_primes(Arc::new(|| primes().1.clone()));
+    .with_primes(Arc::new(|| primes().1.clone()))
+    // C5 tests the taker's bound, so the maker here must not refuse first.
+    .without_deadline_bounds();
 }
 
 /// C5: `t_cancel` and `t_punish` have upper bounds. Accepted exactly at the bound, refused
@@ -1037,4 +1052,173 @@ async fn the_late_branch_stays_idle_on_the_normal_path() {
     let r = w.maker.record(&mid).unwrap().unwrap();
     assert!(r.lock_actual.is_none(), "no re-encoding seen");
     assert!(r.late_signed.is_none(), "late branch never signed");
+}
+
+/// C3a: the coins `Tx_lock` reserved at setup are released when the swap never reaches the
+/// lock stage (the signatures wait runs out), and a swap that does lock keeps them reserved.
+#[tokio::test]
+async fn an_aborted_setup_releases_its_coins_and_a_locked_swap_keeps_them() {
+    let w = W::new();
+    assert_eq!(w.maker_divi.reserved_count(), 0);
+
+    // Setup, then the taker goes quiet.
+    let (mid, _, _) = w.key(&mut |_| {}).await.unwrap();
+    assert_eq!(w.maker_divi.reserved_count(), 1, "setup reserved the coins");
+    w.maker.tick().await.unwrap();
+    assert_eq!(
+        w.maker_state(&mid),
+        XmrMakerState::Accepted,
+        "not yet expired"
+    );
+    assert_eq!(w.maker_divi.reserved_count(), 1);
+    w.clock
+        .fetch_add(cfg().sigs_wait_secs + 1, Ordering::SeqCst);
+    w.maker.tick().await.unwrap();
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Aborted);
+    assert_eq!(
+        w.maker_divi.reserved_count(),
+        0,
+        "abort gave the coins back"
+    );
+    // Reservable again.
+    let (mid2, tid2) = w.open().await;
+    assert_eq!(w.maker_state(&mid2), XmrMakerState::Locked);
+
+    // Once locked, ticks past the signatures wait do not release the swap's coins.
+    w.clock
+        .fetch_add(cfg().sigs_wait_secs + 1, Ordering::SeqCst);
+    for _ in 0..3 {
+        w.round(&mid2, &tid2, true, true).await;
+    }
+    assert_eq!(
+        w.maker_divi.reserved_count(),
+        1,
+        "a locked swap keeps its coins"
+    );
+    assert!(w.maker.record(&mid2).unwrap().unwrap().state != XmrMakerState::Aborted);
+}
+
+/// C3b: the quote store is bounded; at the cap the oldest expired quote goes first.
+#[tokio::test]
+async fn the_quote_store_is_bounded() {
+    use divi_swap_xmr::maker::MAX_XMR_QUOTES;
+    let w = W::new();
+    for _ in 0..MAX_XMR_QUOTES + 1 {
+        w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    }
+    assert_eq!(w.store.list_quotes().unwrap().len(), MAX_XMR_QUOTES);
+
+    // Let every quote expire, then ask for one more: the expired ones are swept.
+    w.clock
+        .fetch_add(cfg().quote_expiry_secs as u64 + 10_000, Ordering::SeqCst);
+    let fresh = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    let left = w.store.list_quotes().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].quote.id, fresh.id);
+}
+
+/// C3d: a swap's token comes with setup; another swap's, a wrong one and none are refused.
+#[tokio::test]
+async fn the_swap_token_gates_a_swap() {
+    let w = W::new();
+    let q = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    let (_, req) = w.taker.prepare(&q).await.unwrap();
+    let reply = w.maker.setup(req).await.unwrap();
+    let (id, token) = (reply.swap_id.clone(), reply.swap_token.clone());
+    assert_eq!(token.len(), 64, "32 bytes, hex");
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    assert!(w.maker.authorize(&id, &token), "the right token");
+    assert!(!w.maker.authorize(&id, ""), "no token");
+    assert!(!w.maker.authorize(&id, &"0".repeat(64)), "a wrong token");
+    assert!(!w.maker.authorize(&id, &token[..63]), "a truncated token");
+    assert!(!w.maker.authorize("nope", &token), "an unknown swap");
+
+    // After J exists the record carries the same token, and a second swap has its own.
+    let (mid, _, _) = w.key(&mut |_| {}).await.unwrap();
+    let token2 = w.maker.record(&mid).unwrap().unwrap().swap_token;
+    assert_ne!(token2, token);
+    assert!(w.maker.authorize(&mid, &token2));
+    assert!(!w.maker.authorize(&mid, &token), "swap 1's token on swap 2");
+}
+
+/// C6b: an output below the lock amount to the lock address (dust sent to hide the real lock)
+/// is not selected, wherever it sits.
+#[tokio::test]
+async fn find_lock_skips_dust_to_the_lock_address() {
+    let w = W::new();
+    let attacker = w.xmr.wallet("attacker", 1_000_000_000);
+    let (spend, view) = ([5u8; 32], [6u8; 32]);
+    let lock = 500_000_000u64;
+    attacker.lock(&spend, &view, 1).await.unwrap(); // dust first
+    let real = w.taker_xmr.lock(&spend, &view, lock).await.unwrap();
+    attacker.lock(&spend, &view, 2).await.unwrap(); // dust after
+    w.mine(1);
+
+    let found = w.maker_xmr.find_lock(&spend, &view, lock).await.unwrap();
+    assert_eq!(
+        found.unwrap().txid,
+        real,
+        "the real lock, not the first output"
+    );
+    assert!(
+        w.maker_xmr
+            .find_lock(&spend, &view, lock + 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing is big enough"
+    );
+}
+
+/// C6c: `Done` after the sweep waits for the profile's Monero depth, not one confirmation.
+#[tokio::test]
+async fn done_waits_for_the_profiles_confirmation_depth() {
+    let w = W::new();
+    let (mid, tid) = w.open().await;
+    let mut sweep = None;
+    for _ in 0..60 {
+        w.round(&mid, &tid, true, true).await;
+        let r = w.maker.record(&mid).unwrap().unwrap();
+        if let Some(txid) = r.sweep_txid.clone() {
+            sweep = Some(txid);
+            break;
+        }
+    }
+    let txid = sweep.expect("maker swept");
+    let mut saw_shallow = false;
+    for _ in 0..40 {
+        w.maker.tick().await.unwrap();
+        let confs = w.maker_xmr.confirmations(&txid).await.unwrap().unwrap_or(0);
+        let state = w.maker_state(&mid);
+        if state == XmrMakerState::Done {
+            assert!(
+                confs >= cfg().xmr_confirmations,
+                "Done at {confs} confirmations"
+            );
+            assert!(saw_shallow, "stayed Swept while shallow");
+            return;
+        }
+        if confs >= 1 && confs < cfg().xmr_confirmations {
+            assert_eq!(
+                state,
+                XmrMakerState::Swept,
+                "{confs} confirmations: not done"
+            );
+            saw_shallow = true;
+        }
+        w.mine(1);
+    }
+    panic!("never Done");
+}
+
+/// C6d: a schedule that overflows `u32` unix time is refused, not wrapped into the past.
+#[tokio::test]
+async fn setup_refuses_overflowing_timelocks() {
+    let w = W::new();
+    // MTP so close to u32::MAX that t_cancel (mtp + 6 h) overflows.
+    w.divi.advance_time(u32::MAX - T0 - 100);
+    let (_, err) = w.key(&mut |_| {}).await.expect_err("refused");
+    assert!(err.contains("t_cancel out of range"), "{err}");
+    assert_eq!(w.maker_divi.reserved_count(), 0, "nothing reserved");
 }

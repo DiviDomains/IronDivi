@@ -49,6 +49,9 @@ impl WireOutpoint {
     }
 }
 
+/// Header carrying a swap's token ([`JRoundReply::swap_token`]) on every request after setup.
+pub const SWAP_TOKEN_HEADER: &str = "x-swap-token";
+
 /// Step 1, taker → maker (`POST /xmr/swaps`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupRequest {
@@ -92,6 +95,11 @@ pub struct JRoundRequest {
 pub struct JRoundReply {
     /// The maker's swap id.
     pub swap_id: String,
+    /// The swap's bearer token: the taker sends it as the `X-Swap-Token` header on every
+    /// later request for this swap (`/j`, `/sigs`, `/xmr-lock`, `GET`). Anyone without it
+    /// gets a 404.
+    #[serde(default)]
+    pub swap_token: String,
     /// The maker's messages for the taker.
     pub msgs: Vec<JMsg>,
     /// Present once `J` exists and the maker has built `Tx_lock` / `Tx_cancel` around it.

@@ -526,7 +526,11 @@ async fn main() -> Result<()> {
             run_scan(&*job.divi, job.from, &scan, SCAN_CHUNK, SCAN_RETRY).await;
         });
     }
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

@@ -197,13 +197,30 @@ async fn digest_auth_post_json(
         .map_err(|e| MoneroChainError::Rpc(e.to_string()))
 }
 
+/// Index of the first of `amounts` that is at least `min_amount`. Smaller outputs to the lock
+/// address are dust somebody else sent (they cannot be the swap's lock) and are logged, not
+/// selected: taking the first output unconditionally let one dust output hide the real lock.
+fn first_at_least(amounts: &[u64], min_amount: u64) -> Option<usize> {
+    for (i, a) in amounts.iter().enumerate() {
+        if *a >= min_amount {
+            return Some(i);
+        }
+        eprintln!(
+            "swap-chain-xmr: ignoring an output of {a} piconero to the lock address \
+             (the lock is at least {min_amount})"
+        );
+    }
+    None
+}
+
 /// Scans blocks `from_height..` (capped at `max_blocks_to_scan`, so a wrong/ancient
 /// `from_height` can't turn into an unbounded crawl) for an output paying `spend_pub`,
 /// scannable with `view_secret` -- `divi-swap-xmr::chain::MoneroChain::find_lock`'s
 /// trait method takes no height hint at all, but a real wallet always scans from a
 /// known restore point rather than genesis; callers should pass the height around when
 /// the swap's Monero leg was negotiated, same as any wallet's own restore height.
-/// Returns the first match, confirmations computed against the chain's tip at scan
+/// Returns the first output paying `spend_pub` worth at least `min_amount` piconero (in tx
+/// order), confirmations computed against the chain's tip at scan
 /// time. `None` if nothing paying `spend_pub` is found in the window (not yet sent, or
 /// sent below `from_height` -- rescan with an earlier `from_height` if so).
 pub async fn find_lock(
@@ -212,6 +229,7 @@ pub async fn find_lock(
     view_secret: [u8; 32],
     from_height: usize,
     max_blocks_to_scan: usize,
+    min_amount: u64,
 ) -> Result<Option<XmrLockOutput>, MoneroChainError> {
     let view_pair = view_pair_from(spend_pub, view_secret)?;
     let info = monerod_get_info(monerod_rpc)
@@ -223,12 +241,12 @@ pub async fn find_lock(
         as usize;
     let last = (from_height + max_blocks_to_scan).min(tip);
     for height in from_height..last {
-        if let Some(output) = scan_block(monerod_rpc, height, view_pair.clone())
+        let outputs = scan_block(monerod_rpc, height, view_pair.clone())
             .await
-            .map_err(MoneroChainError::Rpc)?
-            .into_iter()
-            .next()
-        {
+            .map_err(MoneroChainError::Rpc)?;
+        let amounts: Vec<u64> = outputs.iter().map(|o| o.commitment().amount).collect();
+        if let Some(i) = first_at_least(&amounts, min_amount) {
+            let output = &outputs[i];
             return Ok(Some(XmrLockOutput {
                 txid: hex::encode(output.transaction()),
                 amount_piconero: output.commitment().amount,
@@ -506,6 +524,15 @@ mod tests {
         assert_eq!(confirmations(&server.uri(), &"d".repeat(64)).await, Some(7));
     }
 
+    #[test]
+    fn a_dust_output_before_the_real_lock_is_not_selected() {
+        // Tx order: dust, the real lock, more than the lock.
+        assert_eq!(first_at_least(&[1, 5_000, 9_000], 5_000), Some(1));
+        assert_eq!(first_at_least(&[4_999, 1], 5_000), None);
+        assert_eq!(first_at_least(&[], 5_000), None);
+        assert_eq!(first_at_least(&[7], 0), Some(0));
+    }
+
     #[tokio::test]
     async fn find_lock_returns_none_when_nothing_matches_in_the_window() {
         let server = MockServer::start().await;
@@ -529,6 +556,7 @@ mod tests {
             valid_view_secret(),
             100,
             0,
+            1,
         )
         .await
         .unwrap();

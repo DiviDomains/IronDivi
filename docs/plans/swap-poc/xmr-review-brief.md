@@ -14,7 +14,7 @@ spend-key share. The design write-up is `docs/plans/swap-poc/xmr-design.md`.
 
 **Gate C** (`xmr-mainnet-plan.md` §Phase C): every **unfixed** finding is accepted in writing by
 Bert; a finding fixed in code leaves the gate with its commit reference (Bert, 2026-10-21). Open today:
-C3, C6 (C1, C2, C4, C5, C7, C8 are fixed — see the plan's Fixed table). No mainnet or real-funds swap
+none (C1–C8 are all fixed — see the plan's Fixed table). No mainnet or real-funds swap
 runs before then (`xmr-mainnet-plan.md` §Phase D).
 
 | In scope | Out of scope |
@@ -304,8 +304,9 @@ gate for all her swaps (`taker.rs:173`).
 11. **Mainnet opt-in bypass.** Can a mainnet XMR swap run against a DIVI testnet node, or
     the reverse, without `allow_mainnet`? Startup checks: `bin/divi-swapd/src/main.rs:180-198`,
     `bin/divi-swap/src/main.rs:615-626`, `live.rs:504-522`.
-12. **Denial of service.** Unauthenticated `setup` reserves maker coins
-    (`divi_chain.rs:268`); abort at `maker.rs:708-711`; unbounded quote records.
+12. **Denial of service.** C3 is fixed (reservation release/expiry, quote cap, per-IP limit,
+    per-swap token); try to defeat it: reservations that survive an abort, quote flooding past the
+    cap, token bypass via routes or the keying phase.
 
 ## 6. Known limitations (already accepted or open in the plan)
 
@@ -320,8 +321,8 @@ gate for all her swaps (`taker.rs:173`).
 | B4 key custody; `wallet_rpc_url` still required by the maker config | design only | plan §B4, `bin/divi-swapd/src/config.rs:141` |
 | Presigned fees cannot be bumped | by design | `lib.rs:157-160` |
 | Punish leaves the taker's XMR locked forever | by design | `RESULTS.md:342-350` |
-| Aborted swaps do not release the coins `setup` reserved; no xmr code calls `release` | open | `crates/swap-chain-divi/src/wallet.rs:168`, `maker.rs:708-711` |
-| No auth or rate limit on quote/setup | open | `routes.rs:68-83` |
+| Aborted swaps released no coins; no auth or rate limit on quote/setup (C3) | fixed 2026-10-21 | tests `an_aborted_setup_releases_its_coins_and_a_locked_swap_keeps_them`, `the_swap_token_gates_a_swap`, `the_quote_store_is_bounded` in `crates/divi-swap-xmr/tests/engine.rs`; `xmr_swap_routes_need_the_swap_token`, `xmr_setup_is_rate_limited_per_ip` in `bin/divi-swapd/tests/e2e_xmr.rs` |
+| Listing, dust `find_lock`, one-confirmation done, unchecked timelock add (C6) | fixed 2026-10-21 | `find_lock_skips_dust_to_the_lock_address`, `done_waits_for_the_profiles_confirmation_depth`, `setup_refuses_overflowing_timelocks` in `engine.rs`; `deadlines_are_checked_and_bounded` in `maker.rs` |
 | No Tx_cancel output-key rotation (`a'`, `b'`) | differs from design | `taker.rs:269`, `xmr-design.md:221-224` |
 
 ## 7. Test evidence

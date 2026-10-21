@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
 use divi_swap_xmr::api::{
     JRoundReply, JRoundRequest, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView,
+    SWAP_TOKEN_HEADER,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -233,21 +234,63 @@ impl MakerClient {
         self.post("/xmr/swaps", req).await
     }
 
-    pub async fn xmr_j(&self, swap_id: &str, req: &JRoundRequest) -> Result<JRoundReply> {
-        self.post(&format!("/xmr/swaps/{swap_id}/j"), req).await
-    }
-
-    pub async fn xmr_sigs(&self, swap_id: &str, req: &SigsRequest) -> Result<XmrSwapView> {
-        self.post(&format!("/xmr/swaps/{swap_id}/sigs"), req).await
-    }
-
-    pub async fn xmr_lock(&self, swap_id: &str, notice: &XmrLockNotice) -> Result<XmrSwapView> {
-        self.post(&format!("/xmr/swaps/{swap_id}/xmr-lock"), notice)
+    pub async fn xmr_j(
+        &self,
+        swap_id: &str,
+        token: &str,
+        req: &JRoundRequest,
+    ) -> Result<JRoundReply> {
+        self.post_with_token(&format!("/xmr/swaps/{swap_id}/j"), token, req)
             .await
     }
 
-    pub async fn xmr_swap(&self, swap_id: &str) -> Result<XmrSwapView> {
-        self.get(&format!("/xmr/swaps/{swap_id}")).await
+    pub async fn xmr_sigs(
+        &self,
+        swap_id: &str,
+        token: &str,
+        req: &SigsRequest,
+    ) -> Result<XmrSwapView> {
+        self.post_with_token(&format!("/xmr/swaps/{swap_id}/sigs"), token, req)
+            .await
+    }
+
+    pub async fn xmr_lock(
+        &self,
+        swap_id: &str,
+        token: &str,
+        notice: &XmrLockNotice,
+    ) -> Result<XmrSwapView> {
+        self.post_with_token(&format!("/xmr/swaps/{swap_id}/xmr-lock"), token, notice)
+            .await
+    }
+
+    pub async fn xmr_swap(&self, swap_id: &str, token: &str) -> Result<XmrSwapView> {
+        let path = format!("/xmr/swaps/{swap_id}");
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header(SWAP_TOKEN_HEADER, token)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::decode(resp).await
+    }
+
+    async fn post_with_token<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &str,
+        body: &B,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header(SWAP_TOKEN_HEADER, token)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        Self::decode(resp).await
     }
 }
 

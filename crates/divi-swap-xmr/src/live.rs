@@ -112,6 +112,10 @@ impl DiviChain for LiveDivi {
         self.chain.build_funding(script_pubkey, amount).await
     }
 
+    async fn release_funding(&self, tx: &Transaction) -> Result<()> {
+        self.chain.release_funding(tx)
+    }
+
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.chain.broadcast(tx).await
     }
@@ -396,6 +400,7 @@ impl MoneroChain for LiveMonero {
         &self,
         spend_pub: &[u8; 32],
         view_secret: &[u8; 32],
+        min_amount: u64,
     ) -> Result<Option<XmrOutput>> {
         let tip = self.tip().await?;
         let start = self.scan_start(spend_pub, tip);
@@ -408,6 +413,7 @@ impl MoneroChain for LiveMonero {
                 vs,
                 start as usize,
                 (tip + 1).saturating_sub(start) as usize,
+                min_amount,
             )
             .await
             .map_err(map_err)
@@ -737,7 +743,7 @@ mod tests {
     async fn dead_monerod_is_transient_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let m = chain(dir.path());
-        let e = m.find_lock(&[7; 32], &[1; 32]).await.unwrap_err();
+        let e = m.find_lock(&[7; 32], &[1; 32], 1).await.unwrap_err();
         assert!(matches!(e, SwapError::Transient(_)), "{e}");
         assert_eq!(m.confirmations("00").await.unwrap(), None);
     }

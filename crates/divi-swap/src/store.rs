@@ -206,6 +206,26 @@ impl Store {
         self.get_json("SELECT json FROM quotes WHERE id = ?1", id)
     }
 
+    /// Every stored quote (any order).
+    pub fn list_quotes(&self) -> Result<Vec<QuoteRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT json FROM quotes").map_err(storage)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage)?;
+        rows.map(|j| serde_json::from_str(&j.map_err(storage)?).map_err(storage))
+            .collect()
+    }
+
+    /// Drop a quote (a no-op for an unknown id).
+    pub fn delete_quote(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM quotes WHERE id = ?1", params![id])
+            .map_err(storage)?;
+        Ok(())
+    }
+
     // ---- maker swaps ----
 
     /// Insert or replace a maker swap.

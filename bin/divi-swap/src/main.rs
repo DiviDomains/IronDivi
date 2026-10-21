@@ -707,7 +707,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
         Cmd::Status { swap } => {
             let s = sessions.get(swap)?;
             let view = MakerClient::new(&s.maker_url)
-                .xmr_swap(&s.maker_swap_id)
+                .xmr_swap(&s.maker_swap_id, &s.swap_token)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }

@@ -28,6 +28,9 @@ use serde::{Deserialize, Serialize};
 pub struct Session {
     pub maker_url: String,
     pub maker_swap_id: String,
+    /// The xmr maker's per-swap token (`X-Swap-Token`); empty for hashlock sessions.
+    #[serde(default)]
+    pub swap_token: String,
 }
 
 pub struct Sessions {
@@ -80,6 +83,7 @@ mod tests {
         let v = Session {
             maker_url: "http://m".into(),
             maker_swap_id: "x".into(),
+            swap_token: String::new(),
         };
         s.put("a", v.clone()).unwrap();
         assert_eq!(s.get("a").unwrap(), v);
