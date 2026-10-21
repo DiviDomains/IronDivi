@@ -1,5 +1,14 @@
 # Rules for multi-coin lanes running on hp2
 
+> **hp1 and hp3 (provisioned 2026-10-21) follow these rules unchanged.** Each has its own
+> signing-only `~/.ssh/agent-signing` registered on GitHub as a Bert *signing* key, the same
+> global git config, a local bare `~/swap-lanes/IronDivi.git`, and `claude_auto` in `~/.local/bin`
+> (hp3 also has `gh` logged in over HTTPS as bshuler with the credential helper and remote
+> `private`; **hp1 has no GitHub access** — a lane there pushes to its local bare `origin` and
+> the orchestrator fetches and lands it)
+> (export `PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH` in non-login ssh shells). Read "hp2"
+> below as "the host you are on".
+
 You are a lane of `docs/plans/swap-poc/multi-coin.md`, a Claude session on **hp2** (Linux,
 32 cores) in the checkout `~/swap-lanes/<coin>`. Bert watches you through an Avada pane on his
 Mac and may type into it; answer him, then carry on. Read `_common.md` too — its rules apply
