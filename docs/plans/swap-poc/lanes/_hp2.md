@@ -15,12 +15,18 @@ Mac and may type into it; answer him, then carry on. Read `_common.md` too — i
    resulting `Cargo.lock` changes; never the root `Cargo.toml`.
 3. **Build with plain `cargo` on hp2** (it is the build box). Keep it niced:
    `nice -n 10 cargo …`. Do not run `remote-cargo`.
-4. **Never `git commit`, never push.** Signing lives on the Mac. At each verified seam
-   (`cargo fmt`, `cargo clippy -p <crate> --all-targets --all-features -- -D warnings`,
-   `cargo test -p <crate>` all green) write `- ready_to_land: <conventional commit subject>` in
-   your status file. The orchestrator lands it signed on `main`, then removes that line. After it
-   is gone, run `tools/swap-poc/lane-sync.sh` to pull `main` under your work. Keep working while
-   you wait; don't block on landing.
+4. **Commit on your lane branch, signed as Bert, and push to `private` only.** hp2 has its own
+   signing-only key (`~/.ssh/agent-signing`, registered on GitHub as a *signing* key) and global git
+   config already sets author `Bert Shuler <BertShuler@proton.me>`, `gpg.format ssh`,
+   `commit.gpgsign true`; every commit must show `git verify-commit HEAD` → Good. At each verified
+   seam (`cargo fmt`, `cargo clippy -p <crate> --all-targets --all-features -- -D warnings`,
+   `cargo test -p <crate>` all green) commit with a conventional subject, `git push private
+   <your lane branch>`, and write `- ready_to_land: <conventional commit subject>` in your status
+   file. The orchestrator lands it on `main`, then removes that line. After it is gone, run
+   `tools/swap-poc/lane-sync.sh` to pull `main` under your work. Keep working while you wait; don't
+   block on landing. `private` is `https://github.com/bshuler/IronDivi.git` (the private repo):
+   never add or push to the public `DiviDomains/IronDivi`, never force-push, never push `main`
+   yourself.
 5. **No secrets on hp2, ever.** No 1Password, no funded keys. Tests use freshly generated keys.
    Live tests are `#[ignore]` + `--features live` and read their key from the env var named in
    your brief; the orchestrator runs them from the Mac. You may call public testnet APIs
