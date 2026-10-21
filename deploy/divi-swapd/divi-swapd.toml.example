@@ -13,13 +13,15 @@ wallet_path = "/var/lib/divi-swapd/divi-wallet.json"  # known UTXOs (public data
 scan_from_height = 339800
 
 [btc]
-network = "signet"
+network = "signet"         # or "testnet"; "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 esplora_url = "https://mempool.space/signet/api"
 fallback_esplora_url = "https://blockstream.info/signet/api"
 key = "credential:maker-btc"
 
 [ltc]
-network = "testnet"
+network = "testnet"        # "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 esplora_url = "https://litecoinspace.org/testnet/api"
 # No independent secondary mirror of this API shape is known (swap-chain-ltc lane status,
 # decisions, 2026-10-11); fallback_esplora_url is left unset.

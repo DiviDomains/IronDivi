@@ -50,29 +50,71 @@ pub struct DiviSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BtcSection {
+    /// `signet` (default), `testnet` or `mainnet`.
     #[serde(default = "default_network")]
     pub network: String,
-    /// Primary Esplora API base.
-    #[serde(default = "default_esplora")]
-    pub esplora_url: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// Primary Esplora API base. When absent, [`BtcSection::endpoints`] falls back to
+    /// `swap_chain_btc::esplora_endpoints(network)` and `fallback_esplora_url` is not consulted.
+    pub esplora_url: Option<String>,
     /// Fallback Esplora API base.
     pub fallback_esplora_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's BTC key.
     pub key: String,
 }
 
+impl BtcSection {
+    /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
+    /// set, else `network`'s defaults (`swap_chain_btc::esplora_endpoints`).
+    pub fn endpoints(&self) -> Result<Vec<String>> {
+        Ok(match &self.esplora_url {
+            Some(primary) => {
+                let mut eps = vec![primary.clone()];
+                eps.extend(self.fallback_esplora_url.clone());
+                eps
+            }
+            None => swap_chain_btc::esplora_endpoints(&self.network)
+                .map_err(|e| anyhow::anyhow!("[btc].network: {e}"))?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LtcSection {
+    /// `testnet` (default) or `mainnet`.
     #[serde(default = "default_ltc_network")]
     pub network: String,
-    /// Primary Esplora API base.
-    #[serde(default = "default_ltc_esplora")]
-    pub esplora_url: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// Primary Esplora API base. When absent, [`LtcSection::endpoints`] falls back to
+    /// `swap_chain_ltc::esplora_endpoints(network)` and `fallback_esplora_url` is not consulted.
+    pub esplora_url: Option<String>,
     /// Fallback Esplora API base, if one exists (none known as of 2026-10-11 — see
     /// `swap-chain-ltc`'s lane status).
     pub fallback_esplora_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's LTC key.
     pub key: String,
+}
+
+impl LtcSection {
+    /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
+    /// set, else `network`'s defaults (`swap_chain_ltc::esplora_endpoints`).
+    pub fn endpoints(&self) -> Result<Vec<String>> {
+        Ok(match &self.esplora_url {
+            Some(primary) => {
+                let mut eps = vec![primary.clone()];
+                eps.extend(self.fallback_esplora_url.clone());
+                eps
+            }
+            None => swap_chain_ltc::esplora_endpoints(&self.network)
+                .map_err(|e| anyhow::anyhow!("[ltc].network: {e}"))?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,17 +259,11 @@ impl ZecSection {
 pub fn default_divi_rpc() -> String {
     "https://services.divi.domains/api/testnet/rpc/".into()
 }
-fn default_esplora() -> String {
-    "https://mempool.space/signet/api".into()
-}
 fn default_network() -> String {
     "signet".into()
 }
 fn default_ltc_network() -> String {
     "testnet".into()
-}
-fn default_ltc_esplora() -> String {
-    swap_chain_ltc::LITECOINSPACE_TESTNET.into()
 }
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8480".parse().expect("static address")
@@ -523,6 +559,39 @@ impl DaemonConfig {
         }
     }
 
+    /// The `[btc]`/`[ltc]` network gate, same rules and wording as `[zec]`: a known network
+    /// name, `mainnet` only with `allow_mainnet = true`, and the network must agree with the
+    /// swap timing `profile`.
+    fn validate_mainnet_gate(
+        &self,
+        section: &str,
+        network: &str,
+        allow_mainnet: bool,
+        test_networks: &[&str],
+    ) -> Result<()> {
+        if network != "mainnet" && !test_networks.contains(&network) {
+            bail!(
+                "[{section}].network must be {} or mainnet, got {network:?}",
+                test_networks.join(", ")
+            );
+        }
+        if network == "mainnet" && !allow_mainnet {
+            bail!(
+                "[{section}].network = \"mainnet\": {section} mainnet moves real money: no mainnet \
+                 without the explicit allow_mainnet opt-in (mainnet-readiness.md §{})",
+                section.to_uppercase()
+            );
+        }
+        if (network == "mainnet") != (self.profile == Profile::Mainnet) {
+            bail!(
+                "[{section}].network = {network:?} disagrees with profile = {:?}: the swap timing \
+                 profile and the {section} backend must run on the same network",
+                self.profile
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.tick_secs == 0 {
             bail!("tick_secs must be > 0");
@@ -559,6 +628,12 @@ impl DaemonConfig {
         }
         if let Some(u) = &self.usdc {
             u.network()?;
+        }
+        if let Some(b) = &self.btc {
+            self.validate_mainnet_gate("btc", &b.network, b.allow_mainnet, &["signet", "testnet"])?;
+        }
+        if let Some(l) = &self.ltc {
+            self.validate_mainnet_gate("ltc", &l.network, l.allow_mainnet, &["testnet"])?;
         }
         if let Some(z) = &self.zec {
             match z.network.as_str() {
@@ -619,6 +694,15 @@ key = "op://v/i/f"
 key = "credential:btc"
 "#;
 
+    /// `GOOD` with its `[btc]` section on mainnet (allowed), for tests that set
+    /// `profile = "mainnet"`: every live section must agree with the profile.
+    fn good_mainnet_btc() -> String {
+        GOOD.replace(
+            "[btc]\nkey",
+            "[btc]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        )
+    }
+
     #[test]
     fn parses_and_normalises_prefix() {
         let c = DaemonConfig::parse(GOOD).unwrap();
@@ -643,7 +727,10 @@ key = "credential:btc"
         assert!(b.fallback_esplora_url.is_some());
         let l = c.ltc.unwrap();
         assert_eq!(l.network, "testnet");
-        assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
+        assert_eq!(
+            l.endpoints().unwrap()[0],
+            swap_chain_ltc::LITECOINSPACE_TESTNET
+        );
         // Reuses the BTC swap key (funding.md decision 64ae2a0); no maker-ltc item exists.
         assert_eq!(l.key, "credential:maker-btc");
         let ltc_ids: Vec<_> = c
@@ -872,6 +959,97 @@ divi_fund_txids = ["ab"]
     }
 
     #[test]
+    fn btc_ltc_sections_default_to_test_networks_without_mainnet() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\n")).unwrap();
+        let b = c.btc.unwrap();
+        assert_eq!(b.network, "signet");
+        assert!(
+            !b.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
+        let l = c.ltc.unwrap();
+        assert_eq!(l.network, "testnet");
+        assert!(!l.allow_mainnet);
+    }
+
+    #[test]
+    fn btc_ltc_mainnet_without_allow_is_rejected() {
+        for section in ["btc", "ltc"] {
+            let text = if section == "btc" {
+                "[btc]\nnetwork = \"mainnet\"\nkey = \"credential:btc\"\n".to_string()
+            } else {
+                format!("{GOOD}\n[ltc]\nnetwork = \"mainnet\"\nkey = \"credential:btc\"\n")
+            };
+            let text = if section == "btc" {
+                GOOD.replace("[btc]\nkey = \"credential:btc\"\n", &text)
+            } else {
+                text
+            };
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("no mainnet without the explicit allow_mainnet"),
+                "{section}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn btc_ltc_mainnet_with_allow_and_matching_profile_is_ok_with_crate_default_endpoints() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:btc\"\n",
+            good_mainnet_btc()
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let b = c.btc.unwrap();
+        assert!(b.allow_mainnet);
+        assert_eq!(b.endpoints().unwrap()[0], "https://mempool.space/api");
+        let l = c.ltc.unwrap();
+        assert_eq!(
+            l.endpoints().unwrap(),
+            vec!["https://litecoinspace.org/api"]
+        );
+    }
+
+    #[test]
+    fn btc_ltc_network_disagreeing_with_profile_is_rejected() {
+        // Default profile is testnet; an allowed mainnet section still disagrees.
+        let text = GOOD.replace(
+            "[btc]\nkey",
+            "[btc]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(e.to_string().contains("disagrees with profile"), "{e}");
+        // Reverse: mainnet profile with a test-network [ltc] section.
+        let text = format!("profile = \"mainnet\"\n{GOOD}\n[ltc]\nkey = \"credential:btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[btc].network = \"signet\" disagrees with profile"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn btc_ltc_bad_network_is_rejected() {
+        let text = GOOD.replace("[btc]\nkey", "[btc]\nnetwork = \"regtest\"\nkey");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[btc].network must be signet, testnet or mainnet"),
+            "{e}"
+        );
+        let text = format!("{GOOD}\n[ltc]\nnetwork = \"signet\"\nkey = \"credential:btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[ltc].network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn zec_section_defaults_to_testnet() {
         let text = format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n");
         let c = DaemonConfig::parse(&text).unwrap();
@@ -901,8 +1079,9 @@ divi_fund_txids = ["ab"]
         // `profile` is a bare top-level key: it must come before GOOD's first `[table]`
         // header, or TOML scopes it into GOOD's last section ([btc]) instead.
         let text = format!(
-            "profile = \"mainnet\"\n{GOOD}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
-             key = \"credential:maker-btc\"\n"
+            "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n",
+            good_mainnet_btc()
         );
         let c = DaemonConfig::parse(&text).unwrap();
         let z = c.zec.unwrap();
@@ -941,8 +1120,9 @@ divi_fund_txids = ["ab"]
     #[test]
     fn zec_absent_lightwalletd_url_resolves_networks_probed_defaults() {
         let text = format!(
-            "profile = \"mainnet\"\n{GOOD}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
-             key = \"credential:maker-btc\"\n"
+            "profile = \"mainnet\"\n{}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n",
+            good_mainnet_btc()
         );
         let c = DaemonConfig::parse(&text).unwrap();
         let eps = c.zec.unwrap().endpoints().unwrap();
@@ -994,7 +1174,10 @@ divi_fund_txids = ["ab"]
         );
         assert_eq!(c.disabled_offers, ["divi-zec-testnet", "zec-divi-testnet"]);
         let l = c.ltc.as_ref().unwrap();
-        assert_eq!(l.esplora_url, swap_chain_ltc::LITECOINSPACE_TESTNET);
+        assert_eq!(
+            l.endpoints().unwrap()[0],
+            swap_chain_ltc::LITECOINSPACE_TESTNET
+        );
         assert_eq!(l.key, "credential:maker-btc");
         assert!(c.zec.is_some() && !c.serves(Chain::Zec));
         assert!(c.usdc.is_none(), "wave 4 does not touch usdc");

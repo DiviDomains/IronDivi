@@ -28,8 +28,8 @@ testnets", and mainnet was never in its scope. So the missing mainnet support be
 deliberate, not a defect, and nothing in this repo should be run with real funds. Moving to
 mainnet is a separate project, tracked as these work items (one per coin, plus shared):
 
-- [ ] **BTC:** add a mainnet `Network` and esplora endpoint list (`swap-chain-btc/src/lib.rs:48-55,107`); raise mainnet confirmations above 2.
-- [ ] **LTC:** wire the mainnet HRP and endpoints (`swap-chain-ltc/src/lib.rs:52-58,111`).
+- [x] **BTC:** mainnet `Network` + esplora endpoint list — done on `lane/btc-ltc-mainnet-wiring` (`swap-chain-btc/src/lib.rs:46-69,132-150`), gated by `[btc].allow_mainnet` / `--allow-mainnet`. Still open: raise mainnet confirmations above 2.
+- [x] **LTC:** mainnet HRP and endpoint — done on `lane/btc-ltc-mainnet-wiring` (`swap-chain-ltc/src/lib.rs:50-69,133-152`), gated by `[ltc].allow_mainnet` / `--allow-mainnet`. Still open: no second mainnet mirror is known.
 - [x] **ZEC:** add mainnet address prefixes and a lightwalletd endpoint, and pick the v5/v6 tx format by activation height — done in `71ed663` on `lane/zec-mainnet-readiness`: `address.rs:30-36`, `lib.rs:61-77`, `tx.rs:59-80`. The format switch is the **NU6.3** activation height (not NU7): see ZEC §Facts.
 - [ ] **USDC/EVM:** add Ethereum/Base mainnet `network.rs` variants with the canonical USDC addresses, and an audited HTLC deployment.
 - [ ] **XMR:** mainnet backends, and remove the runtime refusal only after the above (`xmr_live.rs:174-191`). Sequenced plan with gates: `xmr-mainnet-plan.md`.
@@ -228,8 +228,8 @@ Findings (no code change — not my crate, and the real gap here isn't a wrong c
 
 | Coin | Mainnet endpoint exists? | Mainnet address/tx format exists? | Any code fixed this review? |
 |---|---|---|---|
-| BTC | no (`swap-chain-btc/src/lib.rs:48-55`) | no (`lib.rs:107`, hardcoded `Network::Signet`) | no — finding only |
-| LTC | no (`swap-chain-ltc/src/lib.rs:52-58`) | no (`lib.rs:111`, mainnet HRP defined but unwired) | no — finding only |
+| BTC | **yes** (`lane/btc-ltc-mainnet-wiring`): `esplora_endpoints("mainnet")` = `mempool.space/api` then `blockstream.info/api` (`crates/swap-chain-btc/src/lib.rs:46-49,67-69`); both answered `/blocks/tip/height` = 972518 at 2026-10-21T19:10Z (`verified`) | **yes**: `bitcoin_network()` maps `mainnet`→`Network::Bitcoin` (`lib.rs:54-64`), `BtcBackend::new_on(network, …)` builds the `bc1q` address (`lib.rs:132-150`); signet/testnet3 `tb1q` unchanged (test `mainnet_address_is_bc1q_and_test_networks_stay_tb1q`) | **yes — wired behind `[btc].allow_mainnet` (default false, `bin/divi-swapd/src/config.rs:55-59,565-600`) and `--btc-network mainnet` + `--allow-mainnet` (`bin/divi-swap/src/main.rs:70-78,384-412`)** |
+| LTC | **yes** (`lane/btc-ltc-mainnet-wiring`): `esplora_endpoints("mainnet")` = `litecoinspace.org/api` only (`crates/swap-chain-ltc/src/lib.rs:50-52,67-69`; no independent mirror known); answered `/blocks/tip/height` = 3199195 at 2026-10-21T19:10Z (`verified`) | **yes**: `hrp_for()` maps `mainnet`→`LTC_HRP` = `ltc` (`lib.rs:54-64`; source: litecoin `src/chainparams.cpp` `bech32_hrp = "ltc"` / `"tltc"`, https://github.com/litecoin-project/litecoin/blob/master/src/chainparams.cpp), `LtcBackend::new_on` builds the `ltc1q` address (`lib.rs:133-152`) and `build_send` rejects a destination whose HRP is not the backend's (`lib.rs:216-223`) | **yes — wired behind `[ltc].allow_mainnet` (default false, `config.rs:89-93,565-600`) and `--ltc-network mainnet` + `--allow-mainnet` (`main.rs:79-86,384-412`)** |
 | ZEC | yes (`swap-chain-zec/src/lib.rs:61-77`) | yes (`address.rs:26-36`); v5/v6 chosen by NU6.3 height (`tx.rs:59-80`) | **yes — dust floor (`tx.rs:50-56`), test added and verified failing→passing** |
 | USDC/EVM | no (`swap-chain-evm/src/network.rs:24-62`, own test pins the rejection) | backend is network-agnostic; just needs a config variant | no — finding only |
 | XMR | no, and actively refused at runtime (`xmr_live.rs:174-191`) | no mainnet refusal guard needed — not in the shared engine at all | no — finding only (not my crate) |

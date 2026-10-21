@@ -28,6 +28,8 @@ Build happens on dnsdivi (no cross toolchain; needs rustup for `ubuntu` there). 
 `[zec].network` defaults to `testnet`; switching it to `mainnet` also needs `allow_mainnet = true`
 and a matching top-level `profile = "mainnet"`, so a mainnet cutover is never a one-line config
 edit.
+`[btc]` and `[ltc]` follow the same rule: `network = "mainnet"` needs `allow_mainnet = true` and `profile = "mainnet"`,
+and with `esplora_url` unset the mainnet endpoints come from the crate defaults.
 
 ## Secrets
 

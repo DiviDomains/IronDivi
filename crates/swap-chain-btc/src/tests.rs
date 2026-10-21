@@ -736,3 +736,65 @@ mod live {
         println!("live_refund_txid: {}", refund.txid.to_rpc_hex());
     }
 }
+
+// ---- explicit network selection (mainnet wiring) ----
+
+#[test]
+fn mainnet_endpoints_are_non_empty_with_mempool_first() {
+    let eps = crate::esplora_endpoints("mainnet").unwrap();
+    assert_eq!(
+        eps,
+        vec![
+            "https://mempool.space/api".to_string(),
+            "https://blockstream.info/api".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_network_endpoints_are_unchanged() {
+    assert_eq!(
+        crate::esplora_endpoints("signet").unwrap(),
+        vec![
+            "https://mempool.space/signet/api".to_string(),
+            "https://blockstream.info/signet/api".to_string()
+        ]
+    );
+    assert_eq!(
+        crate::esplora_endpoints("testnet").unwrap(),
+        vec![
+            "https://mempool.space/testnet/api".to_string(),
+            "https://blockstream.info/testnet/api".to_string()
+        ]
+    );
+}
+
+#[test]
+fn unknown_btc_network_is_rejected() {
+    let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+    assert!(crate::esplora_endpoints("regtest").is_err());
+    assert!(BtcBackend::for_network("regtest", key, FeePolicy::Fixed(2)).is_err());
+}
+
+#[test]
+fn mainnet_address_is_bc1q_and_test_networks_stay_tb1q() {
+    let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let main = BtcBackend::for_network("mainnet", key, FeePolicy::Fixed(2)).unwrap();
+    assert!(
+        main.address().to_string().starts_with("bc1q"),
+        "{}",
+        main.address()
+    );
+    let sig = BtcBackend::for_network("signet", key, FeePolicy::Fixed(2)).unwrap();
+    let tst = BtcBackend::for_network("testnet", key, FeePolicy::Fixed(2)).unwrap();
+    assert!(sig.address().to_string().starts_with("tb1q"));
+    // Same key, same witness program: signet and testnet3 give the identical string, as before.
+    assert_eq!(sig.address().to_string(), tst.address().to_string());
+    // `new` keeps its signet behaviour.
+    assert_eq!(
+        backend(vec!["http://127.0.0.1:1".into()], [7u8; 32])
+            .address()
+            .to_string(),
+        sig.address().to_string()
+    );
+}

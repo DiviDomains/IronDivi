@@ -19,7 +19,7 @@ use divi_swap::SwapError;
 
 /// Litecoin testnet bech32 HRP.
 pub const TLTC_HRP: &str = "tltc";
-/// Litecoin mainnet bech32 HRP (unused in the POC; kept so the HRP is a single switch).
+/// Litecoin mainnet bech32 HRP.
 pub const LTC_HRP: &str = "ltc";
 
 /// Encode a segwit v0 witness program (20 bytes for P2WPKH, 32 for P2WSH) as a bech32

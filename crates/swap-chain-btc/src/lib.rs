@@ -43,14 +43,34 @@ pub const MEMPOOL_TESTNET: &str = "https://mempool.space/testnet/api";
 /// Testnet3 secondary Esplora endpoint.
 pub const BLOCKSTREAM_TESTNET: &str = "https://blockstream.info/testnet/api";
 
-/// Default Esplora endpoints (primary first) for a test network name: `signet` or `testnet`
-/// (testnet3). Both use `tb1` addresses, so only the endpoints differ.
+/// Mainnet primary Esplora endpoint.
+pub const MEMPOOL_MAINNET: &str = "https://mempool.space/api";
+/// Mainnet secondary Esplora endpoint.
+pub const BLOCKSTREAM_MAINNET: &str = "https://blockstream.info/api";
+
+/// The `bitcoin` network (address HRP) for a network name: `mainnet`, `signet` or `testnet`.
+/// Signet and testnet3 share the `tb1` HRP, so only the endpoints differ between them;
+/// mainnet uses `bc1`.
+pub fn bitcoin_network(network: &str) -> Result<Network> {
+    match network {
+        "mainnet" => Ok(Network::Bitcoin),
+        "signet" => Ok(Network::Signet),
+        "testnet" => Ok(Network::Testnet),
+        other => Err(SwapError::InvalidParams(format!(
+            "btc network {other:?} unsupported: mainnet, signet or testnet"
+        ))),
+    }
+}
+
+/// Default Esplora endpoints (primary first) for a network name: `mainnet`, `signet` or
+/// `testnet` (testnet3). Callers gate `mainnet` behind an explicit opt-in (`allow_mainnet`).
 pub fn esplora_endpoints(network: &str) -> Result<Vec<String>> {
     match network {
+        "mainnet" => Ok(vec![MEMPOOL_MAINNET.into(), BLOCKSTREAM_MAINNET.into()]),
         "signet" => Ok(vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()]),
         "testnet" => Ok(vec![MEMPOOL_TESTNET.into(), BLOCKSTREAM_TESTNET.into()]),
         other => Err(SwapError::InvalidParams(format!(
-            "btc network {other:?} unsupported: signet or testnet"
+            "btc network {other:?} unsupported: mainnet, signet or testnet"
         ))),
     }
 }
@@ -76,7 +96,7 @@ impl Default for FeePolicy {
 /// Blocks scanned per `find_spend` call when falling back to block scanning.
 const MAX_SCAN_BLOCKS: u64 = 200;
 
-/// Bitcoin signet [`ChainBackend`].
+/// Bitcoin [`ChainBackend`] (signet by default; see [`BtcBackend::new_on`]).
 pub struct BtcBackend {
     esplora: EsploraClient,
     secp: Secp256k1<All>,
@@ -95,16 +115,31 @@ impl std::fmt::Debug for BtcBackend {
 }
 
 impl BtcBackend {
-    /// `endpoints`: Esplora base URLs, primary first. `key` is resolved by the caller.
+    /// Signet backend on explicit `endpoints`: Esplora base URLs, primary first. `key` is
+    /// resolved by the caller. Other networks: [`BtcBackend::new_on`].
     pub fn new(
         endpoints: Vec<String>,
         key: SecretKey,
         fees: FeePolicy,
         retry: RetryPolicy,
     ) -> Result<Self> {
+        Self::new_on("signet", endpoints, key, fees, retry)
+    }
+
+    /// Like [`BtcBackend::new`] for the named `network` (`mainnet`, `signet`, `testnet`):
+    /// the network picks the address HRP (`bc1` vs `tb1`). Not gated here — the daemon and
+    /// CLI refuse `mainnet` unless explicitly allowed.
+    pub fn new_on(
+        network: &str,
+        endpoints: Vec<String>,
+        key: SecretKey,
+        fees: FeePolicy,
+        retry: RetryPolicy,
+    ) -> Result<Self> {
+        let network = bitcoin_network(network)?;
         let secp = Secp256k1::new();
         let pubkey = CompressedPublicKey(key.public_key(&secp));
-        let address = Address::p2wpkh(&pubkey, Network::Signet);
+        let address = Address::p2wpkh(&pubkey, network);
         Ok(Self {
             esplora: EsploraClient::new(endpoints, retry)?,
             secp,
@@ -120,9 +155,10 @@ impl BtcBackend {
         Self::for_network("signet", key, fees)
     }
 
-    /// Default endpoints for `signet` or `testnet` (see [`esplora_endpoints`]).
+    /// Default endpoints for `mainnet`, `signet` or `testnet` (see [`esplora_endpoints`]).
     pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
-        Self::new(
+        Self::new_on(
+            network,
             esplora_endpoints(network)?,
             key,
             fees,
@@ -130,7 +166,7 @@ impl BtcBackend {
         )
     }
 
-    /// The key's P2WPKH `tb1` address (same string on signet and testnet3; where funding coins live and spends land).
+    /// The key's P2WPKH address (`bc1` on mainnet; the same `tb1` string on signet and testnet3; where funding coins live and spends land).
     pub fn address(&self) -> &Address {
         &self.address
     }

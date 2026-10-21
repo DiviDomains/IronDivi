@@ -47,13 +47,29 @@ type Result<T> = std::result::Result<T, SwapError>;
 /// fallback logic itself against synthetic servers.
 pub const LITECOINSPACE_TESTNET: &str = "https://litecoinspace.org/testnet/api";
 
-/// Default Esplora endpoints (primary first) for a test network name: currently only
-/// `testnet`.
+/// Litecoin mainnet Esplora endpoint (same operator as the testnet one; no independent
+/// mainnet mirror is listed).
+pub const LITECOINSPACE_MAINNET: &str = "https://litecoinspace.org/api";
+
+/// The bech32 HRP for a network name: `ltc` on `mainnet`, `tltc` on `testnet`.
+pub fn hrp_for(network: &str) -> Result<&'static str> {
+    match network {
+        "mainnet" => Ok(LTC_HRP),
+        "testnet" => Ok(TLTC_HRP),
+        other => Err(SwapError::InvalidParams(format!(
+            "ltc network {other:?} unsupported: mainnet or testnet"
+        ))),
+    }
+}
+
+/// Default Esplora endpoints (primary first) for a network name: `mainnet` or `testnet`.
+/// Callers gate `mainnet` behind an explicit opt-in (`allow_mainnet`).
 pub fn esplora_endpoints(network: &str) -> Result<Vec<String>> {
     match network {
+        "mainnet" => Ok(vec![LITECOINSPACE_MAINNET.into()]),
         "testnet" => Ok(vec![LITECOINSPACE_TESTNET.into()]),
         other => Err(SwapError::InvalidParams(format!(
-            "ltc network {other:?} unsupported: testnet"
+            "ltc network {other:?} unsupported: mainnet or testnet"
         ))),
     }
 }
@@ -80,13 +96,14 @@ impl Default for FeePolicy {
 /// Blocks scanned per `find_spend` call when falling back to block scanning.
 const MAX_SCAN_BLOCKS: u64 = 200;
 
-/// Litecoin testnet [`ChainBackend`].
+/// Litecoin [`ChainBackend`] (testnet by default; see [`LtcBackend::new_on`]).
 pub struct LtcBackend {
     esplora: EsploraClient,
     secp: Secp256k1<All>,
     key: SecretKey,
     pubkey: CompressedPublicKey,
     address: String,
+    hrp: &'static str,
     fees: FeePolicy,
 }
 
@@ -99,29 +116,46 @@ impl std::fmt::Debug for LtcBackend {
 }
 
 impl LtcBackend {
-    /// `endpoints`: Esplora base URLs, primary first. `key` is resolved by the caller.
+    /// Testnet backend on explicit `endpoints`: Esplora base URLs, primary first. `key` is
+    /// resolved by the caller. Other networks: [`LtcBackend::new_on`].
     pub fn new(
         endpoints: Vec<String>,
         key: SecretKey,
         fees: FeePolicy,
         retry: RetryPolicy,
     ) -> Result<Self> {
+        Self::new_on("testnet", endpoints, key, fees, retry)
+    }
+
+    /// Like [`LtcBackend::new`] for the named `network` (`mainnet`, `testnet`): the network
+    /// picks the address HRP (`ltc` vs `tltc`). Not gated here — the daemon and CLI refuse
+    /// `mainnet` unless explicitly allowed.
+    pub fn new_on(
+        network: &str,
+        endpoints: Vec<String>,
+        key: SecretKey,
+        fees: FeePolicy,
+        retry: RetryPolicy,
+    ) -> Result<Self> {
+        let hrp = hrp_for(network)?;
         let secp = Secp256k1::new();
         let pubkey = CompressedPublicKey(key.public_key(&secp));
-        let address = encode_segwit_v0(TLTC_HRP, pubkey.wpubkey_hash().as_byte_array())?;
+        let address = encode_segwit_v0(hrp, pubkey.wpubkey_hash().as_byte_array())?;
         Ok(Self {
             esplora: EsploraClient::new(endpoints, retry)?,
             secp,
             key,
             pubkey,
             address,
+            hrp,
             fees,
         })
     }
 
-    /// Default endpoints for `testnet` (see [`esplora_endpoints`]).
+    /// Default endpoints for `mainnet` or `testnet` (see [`esplora_endpoints`]).
     pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
-        Self::new(
+        Self::new_on(
+            network,
             esplora_endpoints(network)?,
             key,
             fees,
@@ -129,7 +163,7 @@ impl LtcBackend {
         )
     }
 
-    /// The key's P2WPKH `tltc` address string (where funding coins live and spends land).
+    /// The key's P2WPKH address string (`ltc1…` on mainnet, `tltc1…` on testnet) (where funding coins live and spends land).
     pub fn address(&self) -> &str {
         &self.address
     }
@@ -198,7 +232,13 @@ impl LtcBackend {
     /// moving funds directly between wallets, e.g. to unblock a swap direction without a
     /// faucet (`docs/plans/swap-poc/funding.md`).
     pub async fn build_send(&self, to: &str, sats: u64) -> Result<SignedTx> {
-        let (_, program) = decode_segwit_v0(to)?;
+        let (hrp, program) = decode_segwit_v0(to)?;
+        if hrp != self.hrp {
+            return Err(SwapError::InvalidParams(format!(
+                "destination HRP {hrp:?} does not match this backend's network ({:?})",
+                self.hrp
+            )));
+        }
         let to_program: [u8; 20] = program.try_into().map_err(|p: Vec<u8>| {
             SwapError::InvalidParams(format!(
                 "destination is not a P2WPKH (20-byte) address: {} bytes",

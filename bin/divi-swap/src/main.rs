@@ -67,7 +67,8 @@ struct Cli {
     /// DIVI height to start scanning for the taker's coins when the wallet has no cursor yet.
     #[arg(long, global = true)]
     divi_scan_from: Option<u64>,
-    /// BTC test network: `signet` or `testnet` (testnet3).
+    /// BTC network: `signet` (default), `testnet` (testnet3) or `mainnet` (only with
+    /// `--allow-mainnet`).
     #[arg(
         long,
         global = true,
@@ -75,12 +76,20 @@ struct Cli {
         default_value = "signet"
     )]
     btc_network: String,
+    /// Litecoin network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
+    #[arg(
+        long,
+        global = true,
+        env = "SWAP_LTC_NETWORK",
+        default_value = "testnet"
+    )]
+    ltc_network: String,
     /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(long, global = true, default_value = "testnet")]
     zec_network: String,
-    /// Allow `--zec-network mainnet`, which moves real money. Off by default, mirroring
-    /// `--xmr-allow-mainnet` (no shared mainnet-guard flag exists across arms today; this one
-    /// is zec-only).
+    /// Allow `--zec-network`, `--btc-network` or `--ltc-network` `mainnet`, which moves real
+    /// money. Off by default, mirroring `--xmr-allow-mainnet` (one shared flag for the
+    /// zec/btc/ltc arms; xmr keeps its own).
     #[arg(long, global = true)]
     allow_mainnet: bool,
     /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
@@ -246,13 +255,13 @@ impl CounterLive {
     }
 
     /// Confirmed plus pending balance, in the chain's smallest unit.
-    async fn balance_sats(&self, btc_network: &str) -> Result<i64> {
+    async fn balance_sats(&self, btc_network: &str, ltc_network: &str) -> Result<i64> {
         match self {
             CounterLive::Zec(z) => Ok(z.balance_zatoshi().await? as i64),
             CounterLive::Btc(_) | CounterLive::Ltc(_) => {
                 let endpoints = match self {
                     CounterLive::Btc(_) => swap_chain_btc::esplora_endpoints(btc_network)?,
-                    CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints("testnet")?,
+                    CounterLive::Ltc(_) => swap_chain_ltc::esplora_endpoints(ltc_network)?,
                     CounterLive::Zec(_) => unreachable!(),
                 };
                 chain_balance(&endpoints, &self.address()).await
@@ -369,7 +378,41 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
     )?))
 }
 
+/// Refuse `mainnet` for the btc/ltc arms without `--allow-mainnet`, and an unknown network
+/// name outright — before any key is resolved or any network call is made. Same wording as
+/// the zec guard.
+fn guard_network(flag: &str, network: &str, test_networks: &[&str], allow: bool) -> Result<()> {
+    if network != "mainnet" && !test_networks.contains(&network) {
+        bail!(
+            "{flag} must be {} or mainnet, got {network:?}",
+            test_networks.join(", ")
+        );
+    }
+    if network == "mainnet" && !allow {
+        bail!(
+            "{flag} mainnet moves real money: no mainnet without the explicit \
+             --allow-mainnet opt-in"
+        );
+    }
+    Ok(())
+}
+
 fn live_backends(cli: &Cli) -> Result<Backends> {
+    match cli.counter_chain {
+        Chain::Btc => guard_network(
+            "--btc-network",
+            &cli.btc_network,
+            &["signet", "testnet"],
+            cli.allow_mainnet,
+        )?,
+        Chain::Ltc => guard_network(
+            "--ltc-network",
+            &cli.ltc_network,
+            &["testnet"],
+            cli.allow_mainnet,
+        )?,
+        _ => {}
+    }
     if cli.counter_chain == Chain::Zec {
         match cli.zec_network.as_str() {
             "testnet" | "mainnet" => {}
@@ -419,7 +462,7 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         Chain::Ltc => {
             let lkey = secp_key(&cli.ltc_key, "--ltc-key", "ltc")?;
             let backend = Arc::new(LtcBackend::for_network(
-                "testnet",
+                &cli.ltc_network,
                 lkey,
                 swap_chain_ltc::FeePolicy::default(),
             )?);
@@ -591,7 +634,9 @@ async fn main() -> Result<()> {
             println!(
                 "{}_balance_sats={}",
                 cli.counter_chain,
-                counter.balance_sats(&cli.btc_network).await?
+                counter
+                    .balance_sats(&cli.btc_network, &cli.ltc_network)
+                    .await?
             );
         }
         Cmd::Txids { swap } => {
@@ -825,6 +870,45 @@ mod tests {
                 .contains("--zec-network must be testnet or mainnet"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn btc_and_ltc_networks_default_to_the_test_networks() {
+        assert_eq!(cli(&[]).btc_network, "signet");
+        assert_eq!(cli(&[]).ltc_network, "testnet");
+    }
+
+    #[test]
+    fn btc_ltc_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        for (chain, flag) in [("btc", "--btc-network"), ("ltc", "--ltc-network")] {
+            let e = match live_backends(&cli(&["--counter-chain", chain, flag, "mainnet"])) {
+                Ok(_) => panic!("built a live {chain} backend on mainnet without --allow-mainnet"),
+                Err(e) => e,
+            };
+            assert!(e.to_string().contains("--allow-mainnet"), "{chain}: {e}");
+            assert!(e.to_string().contains(flag), "{chain}: {e}");
+        }
+    }
+
+    #[test]
+    fn btc_ltc_bad_network_is_rejected_before_any_network_call() {
+        for (chain, flag) in [("btc", "--btc-network"), ("ltc", "--ltc-network")] {
+            let e = match live_backends(&cli(&["--counter-chain", chain, flag, "regtest"])) {
+                Ok(_) => panic!("built a live {chain} backend on an unknown network"),
+                Err(e) => e,
+            };
+            assert!(
+                e.to_string().contains(&format!("{flag} must be")),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_guard_passes_with_allow_mainnet() {
+        guard_network("--btc-network", "mainnet", &["signet", "testnet"], true).unwrap();
+        guard_network("--ltc-network", "mainnet", &["testnet"], true).unwrap();
+        guard_network("--btc-network", "signet", &["signet", "testnet"], false).unwrap();
     }
 
     #[tokio::test]

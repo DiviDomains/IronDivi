@@ -259,23 +259,28 @@ fn resolve_key(reference: &str, what: &str) -> Result<bitcoin::secp256k1::Secret
 }
 
 fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
-    // Validates the name; the endpoints themselves come from the config.
-    swap_chain_btc::esplora_endpoints(&cfg.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Network name and the mainnet opt-in are validated at config load; the network also
+    // picks the address format (`bc1` vs `tb1`).
+    let endpoints = cfg.endpoints()?;
     let key = resolve_key(&cfg.key, "btc")?;
-    let mut endpoints = vec![cfg.esplora_url.clone()];
-    endpoints.extend(cfg.fallback_esplora_url.clone());
-    let backend = BtcBackend::new(endpoints, key, FeePolicy::default(), RetryPolicy::default())?;
+    let backend = BtcBackend::new_on(
+        &cfg.network,
+        endpoints,
+        key,
+        FeePolicy::default(),
+        RetryPolicy::default(),
+    )?;
     tracing::info!(address = %backend.address(), network = %cfg.network, "btc backend ready");
     Ok(Arc::new(backend))
 }
 
 fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
-    // Validates the name; the endpoints themselves come from the config.
-    swap_chain_ltc::esplora_endpoints(&cfg.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Network name and the mainnet opt-in are validated at config load; the network also
+    // picks the address HRP (`ltc` vs `tltc`).
+    let endpoints = cfg.endpoints()?;
     let key = resolve_key(&cfg.key, "ltc")?;
-    let mut endpoints = vec![cfg.esplora_url.clone()];
-    endpoints.extend(cfg.fallback_esplora_url.clone());
-    let backend = LtcBackend::new(
+    let backend = LtcBackend::new_on(
+        &cfg.network,
         endpoints,
         key,
         swap_chain_ltc::FeePolicy::default(),

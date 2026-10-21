@@ -843,3 +843,46 @@ mod live {
         println!("live_refund_txid: {}", refund.txid.to_rpc_hex());
     }
 }
+
+// ---- explicit network selection (mainnet wiring) ----
+
+#[test]
+fn mainnet_endpoint_list_is_non_empty_and_testnet_unchanged() {
+    assert_eq!(
+        crate::esplora_endpoints("mainnet").unwrap(),
+        vec!["https://litecoinspace.org/api".to_string()]
+    );
+    assert_eq!(
+        crate::esplora_endpoints("testnet").unwrap(),
+        vec!["https://litecoinspace.org/testnet/api".to_string()]
+    );
+}
+
+#[test]
+fn unknown_ltc_network_is_rejected() {
+    let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+    assert!(crate::esplora_endpoints("signet").is_err());
+    assert!(LtcBackend::for_network("signet", key, FeePolicy::default()).is_err());
+}
+
+#[test]
+fn mainnet_address_is_ltc1q_and_testnet_stays_tltc1q() {
+    let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let main = LtcBackend::for_network("mainnet", key, FeePolicy::default()).unwrap();
+    assert!(main.address().starts_with("ltc1q"), "{}", main.address());
+    let test = LtcBackend::for_network("testnet", key, FeePolicy::default()).unwrap();
+    assert!(test.address().starts_with("tltc1q"), "{}", test.address());
+    assert_eq!(
+        backend(vec!["http://127.0.0.1:1".into()], [7u8; 32]).address(),
+        test.address()
+    );
+}
+
+#[tokio::test]
+async fn build_send_rejects_a_destination_on_the_other_network() {
+    let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+    let main = LtcBackend::for_network("mainnet", key, FeePolicy::default()).unwrap();
+    let test_addr = encode_segwit_v0(TLTC_HRP, &[0x11u8; 20]).unwrap();
+    let err = main.build_send(&test_addr, 20_000).await.unwrap_err();
+    assert!(err.to_string().contains("does not match"), "{err}");
+}

@@ -675,3 +675,24 @@ run above) is the orchestrator's step, from the Mac, same as every prior live le
   superseded by this round. `live_fund_claim_refund` (`#[ignore] --features live`) remains an optional
   third check and needs `SWAP_LTC_TEST_KEY_HEX` from the taker-btc item.
 - needs: nothing.
+
+## Round: explicit mainnet wiring (builder P, 2026-10-21)
+
+- done: `swap-chain-ltc` accepts `network = "mainnet"` end to end — endpoints ``https://litecoinspace.org/api` (single operator, no independent mirror known)`, address HRP ``ltc``
+  via ``LtcBackend::new_on("mainnet", …)` / `for_network("mainnet", …)`; `build_send` now refuses a destination whose HRP is not the backend's own`; signet/testnet behaviour is byte-for-byte unchanged (pinned by test). The daemon's
+  `[ltc]` section gained `allow_mainnet` (default `false`): `network = "mainnet"` without it, an
+  unknown network name, or a network that disagrees with the top-level `profile` is a config-load
+  error with the same wording as `[zec]` (`bin/divi-swapd/src/config.rs` `validate_mainnet_gate`).
+  `esplora_url` is now optional and falls back to the crate's defaults for `network`. The CLI
+  gates `--ltc-network mainnet` behind the shared `--allow-mainnet` flag before any key is resolved or any
+  network call is made (`bin/divi-swap/src/main.rs` `guard_network`); the CLI gained `--ltc-network` (env `SWAP_LTC_NETWORK`, default `testnet`) where it previously hardcoded `"testnet"`, and `balance_sats` uses it.
+- proof (read-only, no wallet, no key, no funds):
+  - LTC mainnet tip `https://litecoinspace.org/api/blocks/tip/height` → `3199195` (HTTP 200, 2026-10-21T19:10:41Z); verdict `verified`.
+  - fee endpoint `https://litecoinspace.org/api/v1/fees/recommended` answered at 2026-10-21T19:33:51Z (`halfHourFee` 1); verdict `verified`.
+  - HRP source: litecoin `src/chainparams.cpp` `bech32_hrp = "ltc"` (main) / `"tltc"` (test) (https://github.com/litecoin-project/litecoin/blob/master/src/chainparams.cpp); verdict `verified`.
+  - tests added: `mainnet_endpoint_list_is_non_empty_and_testnet_unchanged`, `unknown_ltc_network_is_rejected`, `mainnet_address_is_ltc1q_and_testnet_stays_tltc1q`, `build_send_rejects_a_destination_on_the_other_network` (crate); daemon/CLI tests as listed in `status/btc.md`.
+  - `cargo fmt --check`, `cargo clippy -p swap-chain-btc -p swap-chain-ltc -p divi-swapd -p divi-swap
+    --all-targets -- -D warnings`, and `cargo test` on the same four packages: green (counts in
+    `~/swap-lanes/builders/P/STATUS.md` on hp1 and in the lane commit message).
+- left: still a single mainnet data source (`litecoinspace.org`); no live mainnet run of any kind was made.
+- needs: nothing. Mainnet funds remain the only money gate; nothing here turns `allow_mainnet` on.
