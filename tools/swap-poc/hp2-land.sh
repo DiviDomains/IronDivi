@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # hp2-land.sh <coin> — orchestrator (Mac) lands an hp2 lane's ready seam as a signed commit on
-# main. Lanes never commit (signing needs 1Password on the Mac): this copies the lane's diff
-# against its base, applies it to a clean main, commits with the subject from the lane's
-# `- ready_to_land:` line, pushes GitHub and the hp2 mirror, and clears the line on hp2.
+# signed/main of the PRIVATE repo (remote `private` = bshuler/IronDivi). Lanes never commit
+# (signing needs 1Password on the Mac): this copies the lane's diff against its base, applies it
+# to a clean signed/main, commits with the subject from the lane's `- ready_to_land:` line, pushes
+# the private repo and the hp2 mirror, and clears the line on hp2. It never pushes to the public
+# DiviDomains mirror and refuses to run if the push remote points there.
+# For lanes already checkpointed as commits on the private repo use land-private.sh instead.
 set -euo pipefail
 coin="$1"
 lane="swap-lanes/$coin"
+remote=private
+branch=signed/main
 ssh_=(ssh -o BatchMode=yes hp2)
 root="$(git rev-parse --show-toplevel)"; cd "$root"
+push_url="$(git remote get-url --push "$remote" 2>/dev/null || true)"
+[[ -n "$push_url" ]] || { echo "hp2-land: remote '$remote' is missing (git remote add $remote git@github.com:bshuler/IronDivi.git)"; exit 1; }
+if grep -qi 'dividomains' <<<"$push_url"; then echo "hp2-land: refusing: '$remote' push URL is the PUBLIC repo ($push_url)"; exit 1; fi
+[[ "$push_url" =~ ^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)bshuler/IronDivi(\.git)?/?$ ]] \
+  || { echo "hp2-land: refusing: '$remote' push URL is not bshuler/IronDivi ($push_url)"; exit 1; }
 [[ -z "$(git status --porcelain)" ]] || { echo "hp2-land: working tree not clean"; exit 1; }
-git pull -q --rebase origin main
+git checkout -q "$branch"
+git pull -q --rebase "$remote" "$branch"
 subject="$("${ssh_[@]}" "grep -E '^- *ready_to_land:' ~/$lane/docs/plans/swap-poc/status/$coin.md | head -1 | sed -E 's/^- *ready_to_land: *//'")"
 [[ -n "$subject" ]] || { echo "hp2-land: $coin has no ready_to_land line"; exit 1; }
 # The line becomes the commit subject verbatim, so it must read like one ("swap(zec): …"),
@@ -41,7 +52,9 @@ if [[ $lock_excluded == 1 ]]; then
 fi
 git add -A
 git -c user.name="Bert Shuler" -c user.email=BertShuler@proton.me commit -q -m "$subject"
-git push -q origin HEAD:main
+git verify-commit HEAD >/dev/null 2>&1 || { echo "hp2-land: git verify-commit failed on HEAD; not pushing"; exit 1; }
+git push -q "$remote" "HEAD:refs/heads/$branch"
+git push -q "$remote" "HEAD:refs/heads/signed/$coin"
 git push -q hp2:swap-lanes/IronDivi.git HEAD:main
 "${ssh_[@]}" "sed -i -E '/^- *ready_to_land:/d' ~/$lane/docs/plans/swap-poc/status/$coin.md"
 git log --oneline -1
