@@ -34,18 +34,49 @@ type Result<T> = std::result::Result<T, SwapError>;
 pub const NU5_VERSION_GROUP_ID: u32 = 0x26A7_270A;
 /// `nVersion = 5`, with the overwinter high bit set, as serialized in `nVersion` LE32.
 pub const V5_VERSION_BYTES: u32 = 0x8000_0005;
-/// NU6.3 (Ironwood) `nVersionGroupId` for v6 transactions — [ZIP 229]'s mandated constant,
+/// NU6.3 `nVersionGroupId` for v6 transactions — [ZIP 229]'s mandated constant ("If the
+/// transaction version number is 6 then the version group ID MUST be `0xD884B698`"), also
 /// confirmed against live testnet transactions (lane zec, 2026-10-11): every transaction
 /// seen on `testnet.zec.rocks` over a 2000-block window is v6, this exact version group id.
+/// ("Ironwood" is the shielded pool NU6.3 introduces, not the upgrade's name.)
 ///
 /// [ZIP 229]: https://zips.z.cash/zip-0229
 pub const V6_VERSION_GROUP_ID: u32 = 0xD884_B698;
-/// `nVersion = 6`, with the overwinter high bit set, as serialized in `nVersion` LE32. This
-/// backend builds v6 transactions: the live testnet relays/mines v6 exclusively post-NU6.3
-/// (see [`V6_VERSION_GROUP_ID`]), even for plain transparent transfers with no Ironwood
-/// component — v5 is still consensus-valid per ZIP 229, but not what the network actually
-/// accepts in practice right now.
+/// `nVersion = 6`, with the overwinter high bit set, as serialized in `nVersion` LE32. From
+/// NU6.3 activation ([`NU6_3_MAINNET_ACTIVATION_HEIGHT`] / [`NU6_3_TESTNET_ACTIVATION_HEIGHT`])
+/// this backend builds v6 ([`tx_version_for`]): the live testnet relays/mines v6 exclusively
+/// post-NU6.3 (see [`V6_VERSION_GROUP_ID`]), even for plain transparent transfers with no
+/// Ironwood component — v5 stays consensus-valid per ZIP 258 but is not what the network
+/// accepts in practice.
 pub const V6_VERSION_BYTES: u32 = 0x8000_0006;
+
+/// NU6.3 mainnet activation height — [ZIP 258] "ACTIVATION_HEIGHT (NU6.3) … Mainnet: 3428143"
+/// (fetched 2026-10-21). NU6.3 is the upgrade that deploys the v6 format; NU7 ([ZIP 259])
+/// "introduces no new transaction format", so v6 is **not** keyed to NU7.
+///
+/// [ZIP 258]: https://zips.z.cash/zip-0258
+/// [ZIP 259]: https://zips.z.cash/zip-0259
+pub const NU6_3_MAINNET_ACTIVATION_HEIGHT: u32 = 3_428_143;
+/// NU6.3 testnet activation height — [ZIP 258] "Testnet: 4134000" (fetched 2026-10-21).
+///
+/// [ZIP 258]: https://zips.z.cash/zip-0258
+pub const NU6_3_TESTNET_ACTIVATION_HEIGHT: u32 = 4_134_000;
+
+/// The transaction version (5 or 6) to build for a block at `height` on `network`
+/// (`"mainnet"` / `"testnet"`): v5 below the network's NU6.3 activation height, v6 at or
+/// above it. `height` is the height the transaction can first be mined at (chain tip + 1).
+pub fn tx_version_for(network: &str, height: u32) -> Result<u32> {
+    let activation = match network {
+        "mainnet" => NU6_3_MAINNET_ACTIVATION_HEIGHT,
+        "testnet" => NU6_3_TESTNET_ACTIVATION_HEIGHT,
+        other => {
+            return Err(SwapError::InvalidParams(format!(
+                "zec network {other:?} unsupported: mainnet, testnet"
+            )))
+        }
+    };
+    Ok(if height >= activation { 6 } else { 5 })
+}
 
 /// Outputs below this are uneconomical to spend. Equal to [`ZIP317_MARGINAL_FEE`] (defined
 /// below): under ZIP 317 every spend costs at least one marginal fee, so an output worth
@@ -220,7 +251,7 @@ const PERS_SCRIPTS: &[u8; 16] = b"ZTxTrScriptsHash";
 const PERS_TXIN: &[u8; 16] = b"Zcash___TxInHash";
 const PERS_TXID_PREFIX: &[u8; 12] = b"ZcashTxHash_";
 
-// ZIP 229 (v6 / Ironwood): `orchard_digest` gets a new personalization for v6 (even when
+// ZIP 229 (v6, NU6.3; Ironwood pool): `orchard_digest` gets a new personalization for v6 (even when
 // empty — the ZIP changes it unconditionally, "personalizations must be changed when what
 // is hashed at that node changes", since v6 also drops the anchor into auth data), and the
 // new Ironwood component digest reuses Orchard's sub-digest shape with its own
@@ -588,10 +619,9 @@ fn transparent_sig_digest(
 }
 
 /// S.2 / T.3: the full ZIP-244 signature digest (equal to the txid digest when
-/// `signed_index` is `None` and `hash_type` is `SIGHASH_ALL`). v5 only — this backend builds
-/// v6 transactions ([`signature_digest_v6`]); this function is kept to validate the v5
-/// algorithm against the official ZIP-244 test vectors (`zip244_sighash_vectors`).
-#[cfg(test)]
+/// `signed_index` is `None` and `hash_type` is `SIGHASH_ALL`). v5 only — v6 transactions use
+/// [`signature_digest_v6`]. Also validated against the official ZIP-244 test vectors
+/// (`zip244_sighash_vectors`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn signature_digest(
     header: [u8; 32],
@@ -646,14 +676,19 @@ pub(crate) const SIGHASH_ALL: u8 = 0x01;
 
 // ---- A transparent-only v6 transaction we build ourselves --------------------------------
 
-/// A Zcash v6 ([ZIP 229] / NU6.3 "Ironwood") transaction with empty Sapling, Orchard and
-/// Ironwood bundles: every transaction this backend ever builds (funding, claim, refund).
-/// v6, not v5: the live testnet relays/mines only v6 transactions post-NU6.3, even plain
-/// transparent transfers — see [`V6_VERSION_BYTES`].
+/// A Zcash v5 ([ZIP 225]) or v6 ([ZIP 229], NU6.3) transaction with empty shielded bundles:
+/// every transaction this backend ever builds (funding, claim, refund). `version` comes
+/// from [`tx_version_for`]: v5 before NU6.3 activation, v6 after (the live testnet
+/// relays/mines only v6 post-NU6.3, even plain transparent transfers — see
+/// [`V6_VERSION_BYTES`]).
+///
+/// [ZIP 225]: https://zips.z.cash/zip-0225
 ///
 /// [ZIP 229]: https://zips.z.cash/zip-0229
 #[derive(Debug, Clone)]
 pub struct ZecTx {
+    /// 5 or 6, from [`tx_version_for`].
+    pub version: u32,
     /// Read from the chain at build time (never hard-coded — brief, lane zec).
     pub consensus_branch_id: u32,
     /// `nLockTime`.
@@ -670,8 +705,23 @@ impl ZecTx {
     /// Full consensus serialization.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend(V6_VERSION_BYTES.to_le_bytes());
-        out.extend(V6_VERSION_GROUP_ID.to_le_bytes());
+        let v6 = self.version >= 6;
+        out.extend(
+            if v6 {
+                V6_VERSION_BYTES
+            } else {
+                V5_VERSION_BYTES
+            }
+            .to_le_bytes(),
+        );
+        out.extend(
+            if v6 {
+                V6_VERSION_GROUP_ID
+            } else {
+                NU5_VERSION_GROUP_ID
+            }
+            .to_le_bytes(),
+        );
         out.extend(self.consensus_branch_id.to_le_bytes());
         out.extend(self.lock_time.to_le_bytes());
         out.extend(self.expiry_height.to_le_bytes());
@@ -686,14 +736,25 @@ impl ZecTx {
         out.push(0); // nSpendsSapling = 0
         out.push(0); // nOutputsSapling = 0
         out.push(0); // nActionsOrchard = 0
-        out.push(0); // nActionsIronwood = 0 (ZIP 229, new in v6)
+        if v6 {
+            out.push(0); // nActionsIronwood = 0 (ZIP 229, new in v6)
+        }
         out
     }
 
     fn header_digest(&self) -> [u8; 32] {
+        let v6 = self.version >= 6;
         header_digest(
-            V6_VERSION_BYTES,
-            V6_VERSION_GROUP_ID,
+            if v6 {
+                V6_VERSION_BYTES
+            } else {
+                V5_VERSION_BYTES
+            },
+            if v6 {
+                V6_VERSION_GROUP_ID
+            } else {
+                NU5_VERSION_GROUP_ID
+            },
             self.consensus_branch_id,
             self.lock_time,
             self.expiry_height,
@@ -702,6 +763,15 @@ impl ZecTx {
 
     /// The transaction id.
     pub fn txid(&self) -> [u8; 32] {
+        if self.version < 6 {
+            return combine_txid(
+                self.header_digest(),
+                transparent_digest(&self.vin, &self.vout),
+                empty_digest(PERS_SAPLING),
+                empty_digest(PERS_ORCHARD),
+                self.consensus_branch_id,
+            );
+        }
         combine_txid_v6(
             self.header_digest(),
             transparent_digest(&self.vin, &self.vout),
@@ -715,6 +785,19 @@ impl ZecTx {
     /// The `SIGHASH_ALL` digest for signing/verifying input `index`. `sig_inputs` has one
     /// entry per `vin`, in order (value + scriptCode of the output each input spends).
     pub fn signature_digest(&self, index: usize, sig_inputs: &[SigInput]) -> [u8; 32] {
+        if self.version < 6 {
+            return signature_digest(
+                self.header_digest(),
+                self.consensus_branch_id,
+                &self.vin,
+                &self.vout,
+                SIGHASH_ALL,
+                Some(index),
+                sig_inputs,
+                empty_digest(PERS_SAPLING),
+                empty_digest(PERS_ORCHARD),
+            );
+        }
         signature_digest_v6(
             self.header_digest(),
             self.consensus_branch_id,
@@ -733,7 +816,7 @@ impl ZecTx {
 /// A transaction read off the chain (ours or a counterparty's): fully parsed transparent
 /// parts, Sapling/Orchard/Ironwood bundles reduced to their digests (we never need their
 /// content, only whether the txid matches). Accepts both v5 (NU5) and v6 ([ZIP 229],
-/// NU6.3 "Ironwood") transactions — the live testnet currently mints only v6, but v5 remains
+/// NU6.3) transactions — the live testnet currently mints only v6, but v5 remains
 /// consensus-valid, so a counterparty's spend could in principle still be v5.
 ///
 /// [ZIP 229]: https://zips.z.cash/zip-0229
@@ -1058,6 +1141,7 @@ pub fn build_funding_tx(
     coins: &[Coin],
     htlc: &HtlcParams,
     amount: u64,
+    version: u32,
     consensus_branch_id: u32,
     zats_per_byte: u64,
 ) -> Result<BuiltFunding> {
@@ -1077,13 +1161,13 @@ pub fn build_funding_tx(
     // and `total < needed` wrongly passing, which then underflows `needed - amount` below.
     let mut needed = amount
         + probe_fee(
-            &funding_probe(&chosen, &htlc_spk, amount, Some(0), &my_spk),
+            &funding_probe(version, &chosen, &htlc_spk, amount, Some(0), &my_spk),
             zats_per_byte,
         );
     for c in sorted {
         chosen.push(c);
         total += chosen.last().unwrap().value;
-        let probe = funding_probe(&chosen, &htlc_spk, amount, Some(0), &my_spk);
+        let probe = funding_probe(version, &chosen, &htlc_spk, amount, Some(0), &my_spk);
         needed = amount + probe_fee(&probe, zats_per_byte);
         if total >= needed {
             break;
@@ -1122,6 +1206,7 @@ pub fn build_funding_tx(
         })
         .collect();
     let mut tx = ZecTx {
+        version,
         consensus_branch_id,
         lock_time: 0,
         expiry_height: 0,
@@ -1152,6 +1237,7 @@ pub fn build_funding_tx(
 /// A funding tx with dummy (but correctly-sized) P2PKH scriptSigs, for fee sizing before
 /// the real coin selection is final.
 fn funding_probe(
+    version: u32,
     chosen: &[Coin],
     htlc_spk: &[u8],
     amount: u64,
@@ -1172,6 +1258,7 @@ fn funding_probe(
         });
     }
     ZecTx {
+        version,
         consensus_branch_id: 0,
         lock_time: 0,
         expiry_height: 0,
@@ -1213,6 +1300,7 @@ pub fn build_spend_tx(
     at: OutPoint,
     amount: u64,
     spend: Spend<'_>,
+    version: u32,
     consensus_branch_id: u32,
     zats_per_byte: u64,
 ) -> Result<ZecTx> {
@@ -1247,6 +1335,7 @@ pub fn build_spend_tx(
 
     let dummy_script_sig = script_sig_for(vec![0u8; DUMMY_SIG_LEN]);
     let probe = ZecTx {
+        version,
         consensus_branch_id,
         lock_time,
         expiry_height: 0,
@@ -1267,6 +1356,7 @@ pub fn build_spend_tx(
     })?;
 
     let mut tx = ZecTx {
+        version,
         consensus_branch_id,
         lock_time,
         expiry_height: 0,
@@ -1535,6 +1625,7 @@ mod tests {
             outpoint(),
             20_000,
             Spend::Claim(&pre),
+            6,
             BRANCH_ID,
             2,
         )
@@ -1589,6 +1680,7 @@ mod tests {
             outpoint(),
             20_000,
             Spend::Refund,
+            6,
             BRANCH_ID,
             2,
         )
@@ -1625,6 +1717,7 @@ mod tests {
             outpoint(),
             20_000,
             Spend::Claim(&wrong),
+            6,
             BRANCH_ID,
             2,
         )
@@ -1643,6 +1736,7 @@ mod tests {
             outpoint(),
             20_000,
             Spend::Claim(&pre),
+            6,
             BRANCH_ID,
             2,
         )
@@ -1679,7 +1773,8 @@ mod tests {
 
         // 95,000 needs the two smaller coins (largest-first selection): the biggest of the
         // two (60,000) alone can't cover 95,000 + the 10,000 fee.
-        let f = build_funding_tx(&secp, &sk, &pk, &coins[..2], &h, 95_000, BRANCH_ID, 2).unwrap();
+        let f =
+            build_funding_tx(&secp, &sk, &pk, &coins[..2], &h, 95_000, 6, BRANCH_ID, 2).unwrap();
         assert_eq!(f.tx.vin.len(), 2);
         assert_eq!(f.htlc_vout, 0);
         assert_eq!(f.tx.vout[0].value, 95_000);
@@ -1696,37 +1791,131 @@ mod tests {
 
         // A remainder below dust (250 < 294) is folded into the fee instead of a change
         // output: 60,000 − 49,750 − 10,000 fee = 250.
-        let f2 = build_funding_tx(&secp, &sk, &pk, &coins[1..2], &h, 49_750, BRANCH_ID, 2).unwrap();
+        let f2 =
+            build_funding_tx(&secp, &sk, &pk, &coins[1..2], &h, 49_750, 6, BRANCH_ID, 2).unwrap();
         assert_eq!(f2.tx.vin.len(), 1);
         assert_eq!(f2.tx.vout.len(), 1, "no dust change");
         assert_eq!(f2.fee, 10_250);
 
         // Largest-first selection: a single big coin covers a request smaller than it.
-        let f3 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 150_000, BRANCH_ID, 2).unwrap();
+        let f3 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 150_000, 6, BRANCH_ID, 2).unwrap();
         assert_eq!(f3.tx.vin.len(), 1);
         assert_eq!(f3.fee, 10_000);
 
         // More than the biggest coin holds (less its fee) pulls in the next-largest too.
-        let f4 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 195_000, BRANCH_ID, 2).unwrap();
+        let f4 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 195_000, 6, BRANCH_ID, 2).unwrap();
         assert_eq!(f4.tx.vin.len(), 2);
         assert_eq!(f4.fee, 10_000);
 
         // More than the two biggest coins hold pulls in all three — and 3 inputs (444 bytes)
         // crosses into a 3rd ZIP 317 action, so the fee itself rises to 15,000.
-        let f5 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 255_000, BRANCH_ID, 2).unwrap();
+        let f5 = build_funding_tx(&secp, &sk, &pk, &coins, &h, 255_000, 6, BRANCH_ID, 2).unwrap();
         assert_eq!(f5.tx.vin.len(), 3);
         assert_eq!(f5.fee, 15_000, "3 inputs crosses into a 3rd logical action");
 
         // Insufficient funds is reported as such.
         let err =
-            build_funding_tx(&secp, &sk, &pk, &coins, &h, 5_000_000, BRANCH_ID, 2).unwrap_err();
+            build_funding_tx(&secp, &sk, &pk, &coins, &h, 5_000_000, 6, BRANCH_ID, 2).unwrap_err();
         assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
 
         // A completely empty coin list (a fresh, never-funded address) must also report
         // InsufficientFunds, not panic with a subtract-with-overflow (the live dry run
         // example found this: `needed` must not stay seeded at 0 when the loop never runs).
-        let err = build_funding_tx(&secp, &sk, &pk, &[], &h, 20_000, BRANCH_ID, 2).unwrap_err();
+        let err = build_funding_tx(&secp, &sk, &pk, &[], &h, 20_000, 6, BRANCH_ID, 2).unwrap_err();
         assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+    }
+
+    #[test]
+    fn tx_version_for_switches_at_each_networks_nu6_3_height() {
+        for (net, h) in [
+            ("mainnet", NU6_3_MAINNET_ACTIVATION_HEIGHT),
+            ("testnet", NU6_3_TESTNET_ACTIVATION_HEIGHT),
+        ] {
+            assert_eq!(tx_version_for(net, h - 1).unwrap(), 5, "{net} below");
+            assert_eq!(tx_version_for(net, h).unwrap(), 6, "{net} at");
+            assert_eq!(tx_version_for(net, h + 1).unwrap(), 6, "{net} above");
+        }
+        assert_eq!(tx_version_for("mainnet", 0).unwrap(), 5);
+        // The networks' heights differ, so a height between them is v6 on one only.
+        let between = NU6_3_MAINNET_ACTIVATION_HEIGHT + 1;
+        assert_eq!(tx_version_for("mainnet", between).unwrap(), 6);
+        assert_eq!(tx_version_for("testnet", between).unwrap(), 5);
+        assert!(tx_version_for("regtest", 1).is_err());
+    }
+
+    fn sample_tx(version: u32) -> ZecTx {
+        ZecTx {
+            version,
+            consensus_branch_id: BRANCH_ID,
+            lock_time: 0,
+            expiry_height: 0,
+            vin: vec![TxIn {
+                prevout: outpoint(),
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+            }],
+            vout: vec![TxOut {
+                value: 10_000,
+                script_pubkey: vec![0x51],
+            }],
+        }
+    }
+
+    #[test]
+    fn v5_build_uses_v5_group_id_and_omits_the_ironwood_section() {
+        let v5 = sample_tx(5).serialize();
+        let v6 = sample_tx(6).serialize();
+        assert_eq!(&v5[..4], &V5_VERSION_BYTES.to_le_bytes());
+        assert_eq!(&v5[4..8], &NU5_VERSION_GROUP_ID.to_le_bytes());
+        assert_eq!(&v6[..4], &V6_VERSION_BYTES.to_le_bytes());
+        assert_eq!(&v6[4..8], &V6_VERSION_GROUP_ID.to_le_bytes());
+        // Same body; v6 only appends the trailing nActionsIronwood byte.
+        assert_eq!(v6.len(), v5.len() + 1);
+        assert_eq!(&v6[8..v6.len() - 1], &v5[8..]);
+        assert_eq!(*v6.last().unwrap(), 0);
+        assert_ne!(sample_tx(5).txid(), sample_tx(6).txid());
+    }
+
+    #[test]
+    fn v5_and_v6_builds_parse_back_with_matching_txid() {
+        for v in [5u32, 6] {
+            let t = sample_tx(v);
+            let parsed = ParsedTx::parse(&t.serialize()).unwrap();
+            assert_eq!(parsed.version, v);
+            assert_eq!(parsed.txid(), t.txid(), "v{v}");
+        }
+    }
+
+    #[test]
+    fn v5_spend_and_funding_build_and_self_verify() {
+        let secp = Secp256k1::new();
+        let (pre, hash) = new_preimage();
+        let h = htlc(hash);
+        let sk = SecretKey::from_slice(&TAKER_KEY).unwrap();
+        let pk = pubkey_of(&TAKER_KEY);
+        let spend = build_spend_tx(
+            &secp,
+            &sk,
+            &pk,
+            &h,
+            outpoint(),
+            20_000,
+            Spend::Claim(&pre),
+            5,
+            BRANCH_ID,
+            2,
+        )
+        .unwrap();
+        assert_eq!(spend.version, 5);
+        assert_eq!(ParsedTx::parse(&spend.serialize()).unwrap().version, 5);
+        let coin = Coin {
+            outpoint: outpoint(),
+            value: 100_000,
+            script_pubkey: TransparentAddress::p2pkh(&pk).script_pubkey(),
+        };
+        let f = build_funding_tx(&secp, &sk, &pk, &[coin], &h, 50_000, 5, BRANCH_ID, 2).unwrap();
+        assert_eq!(f.tx.version, 5);
+        assert_eq!(f.tx.serialize()[..4], V5_VERSION_BYTES.to_le_bytes());
     }
 
     /// Pins the [ZIP 317](https://zips.z.cash/zip-0317) conventional fee for the tx shapes

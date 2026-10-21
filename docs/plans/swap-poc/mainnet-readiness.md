@@ -7,9 +7,9 @@ every value. Code changes are in-scope only for `crates/swap-chain-zec` and
 
 Headline result: **three of the five coins (BTC, LTC, XMR) have no mainnet network support at
 all** — their endpoint/address code only knows how to talk to a test network, by construction,
-not by a disableable flag. **ZEC additionally cannot produce a mainnet-valid transaction right
-now even if it had an endpoint**: it hardcodes the NU7 v6 transaction format, and NU7 is
-testnet-only until 2026-11-05 (confirmed via the `oracle` agent, see ZEC §Confirmations/reorg).
+not by a disableable flag. (ZEC was in that group until 2026-10-21: it now has mainnet address
+prefixes, a mainnet lightwalletd list, and picks v5/v6 by the NU6.3 activation height — see
+ZEC §Facts. An earlier version of this paragraph blamed NU7; that was wrong.)
 EVM is the only coin whose backend is architecturally mainnet-capable today (it just isn't
 *pointed* at mainnet). None of this is a surprise regression — every one of these crates was
 built, by design, against test networks (docs/plans/swap-poc/multi-coin.md) — but "mainnet
@@ -30,7 +30,7 @@ mainnet is a separate project, tracked as these work items (one per coin, plus s
 
 - [ ] **BTC:** add a mainnet `Network` and esplora endpoint list (`swap-chain-btc/src/lib.rs:48-55,107`); raise mainnet confirmations above 2.
 - [ ] **LTC:** wire the mainnet HRP and endpoints (`swap-chain-ltc/src/lib.rs:52-58,111`).
-- [ ] **ZEC:** add mainnet address prefixes and a lightwalletd endpoint, and pick the v5/v6 tx format by activation height (mainnet NU7 2026-11-05) (`swap-chain-zec/src/address.rs:18-21`, `tx.rs:34-48`).
+- [x] **ZEC:** add mainnet address prefixes and a lightwalletd endpoint, and pick the v5/v6 tx format by activation height — done in `71ed663` on `lane/zec-mainnet-readiness`: `address.rs:30-36`, `lib.rs:61-77`, `tx.rs:59-80`. The format switch is the **NU6.3** activation height (not NU7): see ZEC §Facts.
 - [ ] **USDC/EVM:** add Ethereum/Base mainnet `network.rs` variants with the canonical USDC addresses, and an audited HTLC deployment.
 - [ ] **XMR:** mainnet backends, and remove the runtime refusal only after the above (`xmr_live.rs:174-191`). Sequenced plan with gates: `xmr-mainnet-plan.md`.
 - [ ] **Shared:** a mainnet timeout/confirmation profile in `divi-swap/src/config.rs`, an external security review, and staged low-value mainnet trials.
@@ -89,10 +89,10 @@ Findings (no code change — not my crate):
 | Fee policy | `FeePolicy::Fixed(2)` zat/byte, but every spend pays `max(rate*size, zip317_fee(...))` — the ZIP-317 conventional fee always wins for these tx sizes | `crates/swap-chain-zec/src/lib.rs:46-63`; `crates/swap-chain-zec/src/tx.rs:1188,1020-1030` | ok — ZIP-317-safe by construction regardless of the fixed rate |
 | ZIP-317 constants | marginal fee 5000 zat/action, grace 2 actions, in-weight 150B, out-weight 34B | `crates/swap-chain-zec/src/tx.rs:1001,1004,1007,1009` | ok — pinned against Zebra's live NU7-testnet mempool rejection message, see `tx.rs:1727-1730` |
 | **Dust limit** | **was** 294 zat (byte-based, borrowed from Bitcoin); **now** 5000 zat (= `ZIP317_MARGINAL_FEE`) | `crates/swap-chain-zec/src/tx.rs:50-56` | **was risky, now fixed** — see below |
-| Transaction version | **always** v6 (NU7/ZIP-229-ish; the real spec per the `oracle` agent is ZIP 230, "Withdrawn", and the real upgrade name is **NU7**, not the crate's internal nickname "NU6.3 Ironwood" — citation worth double-checking, see note) | `crates/swap-chain-zec/src/tx.rs:34-48,644-648` | **risky: critical, time-boxed** — see below |
+| Transaction version | v5 below the network's **NU6.3** activation height, v6 at/above (mainnet 3428143, testnet 4134000), via `tx_version_for(network, tip+1)`; v6 is [ZIP 229](https://zips.z.cash/zip-0229) (Draft), deployed by NU6.3 ([ZIP 258](https://zips.z.cash/zip-0258), Final); NU7 adds no tx format | `crates/swap-chain-zec/src/tx.rs:37-80,679-760`; `lib.rs:239-244` | **fixed** — see Facts; naming settled (NU6.3; "Ironwood" is the pool) |
 | Reorg depth assumption | = confirmations (10 blocks) | `crates/divi-swap/src/config.rs:50` | ok either side of NU7 mainnet activation — see note |
-| Public backends | `TESTNET_LIGHTWALLETD = "https://testnet.zec.rocks:443"` — the only one; **"No working fallback has been found yet"** (own comment) | `crates/swap-chain-zec/src/lib.rs:35-38` | **risky: single endpoint, no fallback, no mainnet option** |
-| Address prefixes | `tm…`/`t2…` only (testnet Base58Check version bytes); **no mainnet prefix constants exist in this file at all** | `crates/swap-chain-zec/src/address.rs:18-21` | **risky: structurally cannot produce a mainnet address** |
+| Public backends | `MAINNET_LIGHTWALLETD` = `zec.rocks`, `na.zec.rocks`, `eu.zec.rocks` (:443, each TLS+ALPN h2 verified 2026-10-21); testnet still the single `testnet.zec.rocks` (20-min re-search found no second one) | `crates/swap-chain-zec/src/lib.rs:61-77` | **mainnet fixed; testnet single-endpoint remains** (env `SWAP_ZEC_LIGHTWALLETD_EXTRA` still extends) |
+| Address prefixes | testnet `tm…`/`t2…` `[0x1d,0x25]`/`[0x1c,0xba]`; mainnet `t1…`/`t3…` `[0x1c,0xb8]`/`[0x1c,0xbd]`; `encode_for`/`decode_for(network)` reject the other network | `crates/swap-chain-zec/src/address.rs:26-36` | **fixed** (librustzcash `zcash_protocol` constants; protocol-spec cross-check: could not verify) |
 
 ### Dust limit — fixed this review
 
@@ -114,53 +114,45 @@ fix. All 18 existing `swap-chain-zec` unit tests still pass unchanged (every com
 below-dust-folds-into-fee boundary of 250, which is below *either* threshold, so no test
 assumed a value in the 294-5000 gap).
 
-### Transaction version — critical, time-boxed finding (no code change: this is a protocol
-calendar fact, not a wrong constant)
+### Facts (checked 2026-10-21 against zips.z.cash, fetched with curl on hp2)
 
-`crates/swap-chain-zec` **always** builds Zcash v6 transactions
-(`V6_VERSION_GROUP_ID`/`V6_VERSION_BYTES`, `tx.rs:37-48`; `build_tx`/the funding/claim/refund
-builders never produce v5, `tx.rs:644-648`). This is *correct* against Zcash testnet today,
-which has run NU7-only since activating it — but it is a live, current problem for mainnet:
+| Claim | Verdict | URL |
+|---|---|---|
+| ZIP 229 "Version 6 Transaction Format" (status Draft) defines v6; "This transaction format is deployed at NU6.3"; "If the transaction version number is 6 then the version group ID MUST be `0xD884B698`" | verified | https://zips.z.cash/zip-0229 |
+| ZIP 230 "Withdrawn Version 6 Transaction Format" is Withdrawn and obsoleted by ZIP 229 — it is **not** the live spec (the earlier oracle citation of ZIP 230 was wrong) | verified | https://zips.z.cash/zip-0230 , https://zips.z.cash/ |
+| Upgrade that deploys v6 is **NU6.3** (ZIP 258, Final); "Ironwood" is the shielded pool it introduces, not an upgrade name; there is no upgrade called "NU6.3 Ironwood" | verified | https://zips.z.cash/zip-0258 |
+| NU6.3 consensus branch ID `0x37A5165B`; activation height testnet **4134000**, mainnet **3428143** | verified | https://zips.z.cash/zip-0258 |
+| NU6.3 leaves v5 transactions valid ("version 5 and version 6 transactions remain valid" restrictions apply to both) | verified | https://zips.z.cash/zip-0258 |
+| NU7 = ZIP 259 "Deployment of the NU7 Network Upgrade", status **Draft**; "NU7 introduces no new transaction format"; v4 becomes invalid, v5/v6 stay valid; branch ID `0x77190AD9`; blocks 75s→25s | verified | https://zips.z.cash/zip-0259 |
+| NU7 testnet activation height 4465026 | verified (ZIP 259 text) | https://zips.z.cash/zip-0259 |
+| NU7 mainnet activation height | **could not verify** — ZIP 259 says "TBD (To be set on OCT 20)"; no height, no date in the ZIP | https://zips.z.cash/zip-0259 |
+| Mainnet NU7 date 2026-11-05 and the 2026-10-20 go/no-go outcome | **could not verify** — z.cash/upgrade/ names NU7 but gives no height, date or decision; ZIP 259 gives none either | https://z.cash/upgrade/ , https://zips.z.cash/zip-0259 |
+| Mainnet transparent Base58Check prefixes `[0x1c,0xb8]` (t1) / `[0x1c,0xbd]` (t3); testnet `[0x1d,0x25]` / `[0x1c,0xba]` | verified in librustzcash constants; protocol.pdf §5.6.1.1 could not verify (no extractable text layer) | https://raw.githubusercontent.com/zcash/librustzcash/main/components/zcash_protocol/src/constants/mainnet.rs , .../testnet.rs |
+| Mainnet chain tip is currently >= 3428143 (NU6.3 already live on mainnet) | **could not verify** (no tip query run); ZIP 258 is Final | https://zips.z.cash/zip-0258 |
 
-> Escalated to the `oracle` agent (hard consensus/protocol-activation question, per lane rule
-> 7). Verbatim finding, high confidence, sources from the last few days: **NU7 (the upgrade
-> that introduces the v6 transaction format) is testnet-only right now. Zcash testnet activated
-> it 2026-10-04 at block 4,465,026; mainnet activation is targeted for 2026-11-05 (go/no-go
-> decision 2026-10-20), not yet live.** Pre-NU7 mainnet nodes enforce NU5-era consensus rules
-> and would reject a v6 transaction outright.
+**Consequence — the premise of this line item was wrong.** v6 is a NU6.3 feature, not NU7. The
+backend therefore switches at the **NU6.3** height per network (`NU6_3_MAINNET_ACTIVATION_HEIGHT =
+3428143`, `NU6_3_TESTNET_ACTIVATION_HEIGHT = 4134000`, `tx.rs:59,63`), and NU7's mainnet
+height does not affect the transaction format at all. (The earlier text here that "every
+transaction this backend builds would be rejected by mainnet until NU7" is withdrawn.) NU7 still
+matters for fees/timing — 25s blocks, ZIP 317 revision, and v4 invalidation — but needs no
+code change here. **Before pointing the crate at mainnet:** confirm the mainnet tip is above
+3428143 (otherwise it builds v5, which is the correct fallback either way).
 
-Practical effect: **every transaction this backend builds today would be rejected by Zcash
-mainnet**, independent of and in addition to the missing-endpoint/missing-address-prefix gaps
-above. This is strictly more severe than "no mainnet RPC configured" — it means the backend
-cannot be *made* mainnet-functional today even by someone willing to hand-configure a mainnet
-endpoint and mainnet address prefixes themselves, because the wire format itself is rejected.
-It is also self-resolving on a known date: nothing to fix in code *now*, since hardcoding v6 is
-the right behavior for the network this crate actually targets (testnet) and the only
-"mainnet-safe value" is a date (2026-11-05, not yet confirmed final) that this crate has no way
-to observe at build time (and shouldn't guess at). **Action for whoever flips this crate to
-mainnet: re-verify NU7 mainnet activation is actually live before pointing it at a mainnet
-endpoint — do not rely on this document's date without rechecking.**
+Status of tests: `tx_version_for_switches_at_each_networks_nu6_3_height`,
+`v5_build_uses_v5_group_id_and_omits_the_ironwood_section`,
+`v5_and_v6_builds_parse_back_with_matching_txid`, `v5_spend_and_funding_build_and_self_verify`;
+the existing v6 vectors are unchanged.
 
-Secondary, low-severity note from the same oracle check: the crate's own comments cite "ZIP
-229" and nickname the upgrade "NU6.3 Ironwood" (`tx.rs:37,44`; `lib.rs:530`;
-`docs/plans/swap-poc/status/zec.md`'s own "NU6.3/NU7" phrasing). The oracle's read is that the
-real spec is **ZIP 230** (marked "Withdrawn" — the format shipped but the standalone ZIP was
-folded elsewhere) and the official upgrade name is **NU7**; "NU6.3" appears to be this
-codebase's internal nickname, not the real one. The `V6_VERSION_GROUP_ID` *value* itself was
-independently confirmed against live testnet transactions (`tx.rs:38`) and is not in question —
-only the ZIP-number citation in the doc comments might be wrong. Not fixed here: changing a
-citation without being fully certain risks swapping one wrong citation for another; flagging
-for whoever next touches these comments to confirm against zips.z.cash directly.
-
-### Confirmations/reorg depth — not risky, despite the NU7 timing above
+### Confirmations/reorg depth — not risky, despite the NU7 timing
 
 `ChainParams::builtin`'s ZEC mainnet confirmations (10, `config.rs:50`) was tuned against a
 measured ~25s/block NU7 rate to land on ~225s of finality depth (see the "done" entry in
 `docs/plans/swap-poc/status/zec.md` for the 3→9 testnet history of this same reasoning). Given
-the oracle finding above — mainnet is still pre-NU7 today, running at Zcash's traditional ~75s
-block time — using confirmations=10 against *today's* mainnet would actually give ~750s of
-depth: three times the intended margin, not less. The number stays safe on both sides of the
-2026-11-05 activation: too conservative before it, on-target after. No finding, no fix needed.
+the Facts above — mainnet NU7 has no published height (ZIP 259: TBD), so mainnet is presumably
+still at Zcash's traditional ~75s block time (not verified) — confirmations=10 against *today's*
+mainnet would give ~750s of depth: three times the intended margin, not less. The number stays
+safe on both sides of NU7 activation (whenever it is set): too conservative before it, on-target after. No finding, no fix needed.
 
 ## USDC/EVM
 
@@ -235,7 +227,7 @@ Findings (no code change — not my crate, and the real gap here isn't a wrong c
 |---|---|---|---|
 | BTC | no (`swap-chain-btc/src/lib.rs:48-55`) | no (`lib.rs:107`, hardcoded `Network::Signet`) | no — finding only |
 | LTC | no (`swap-chain-ltc/src/lib.rs:52-58`) | no (`lib.rs:111`, mainnet HRP defined but unwired) | no — finding only |
-| ZEC | no (`swap-chain-zec/src/lib.rs:35-38`) | no (`address.rs:18-21`); **also wire-format-incompatible with mainnet until 2026-11-05** (`tx.rs:34-48`) | **yes — dust floor (`tx.rs:50-56`), test added and verified failing→passing** |
+| ZEC | yes (`swap-chain-zec/src/lib.rs:61-77`) | yes (`address.rs:26-36`); v5/v6 chosen by NU6.3 height (`tx.rs:59-80`) | **yes — dust floor (`tx.rs:50-56`), test added and verified failing→passing** |
 | USDC/EVM | no (`swap-chain-evm/src/network.rs:24-62`, own test pins the rejection) | backend is network-agnostic; just needs a config variant | no — finding only |
 | XMR | no, and actively refused at runtime (`xmr_live.rs:174-191`) | no mainnet refusal guard needed — not in the shared engine at all | no — finding only (not my crate) |
 

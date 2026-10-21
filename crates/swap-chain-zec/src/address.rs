@@ -6,9 +6,16 @@
 // it under the terms of the GNU Affero General Public License as published
 // by the Free Software Foundation, version 3.
 
-//! Zcash testnet transparent addresses: Base58Check with a 2-byte version prefix (one byte
-//! more than Bitcoin's), `tm…` for P2PKH and `t2…` for P2SH. Prefixes from zcashd
-//! `src/chainparams.cpp` `CChainParams::Base58Prefixes` for `CBaseChainParams::TESTNET`.
+//! Zcash transparent addresses: Base58Check with a 2-byte version prefix (one byte more than
+//! Bitcoin's). Testnet is `tm…` (P2PKH) / `t2…` (P2SH), mainnet is `t1…` / `t3…`.
+//!
+//! Prefix source (verified 2026-10-21): librustzcash `zcash_protocol` constants,
+//! <https://raw.githubusercontent.com/zcash/librustzcash/main/components/zcash_protocol/src/constants/mainnet.rs>
+//! and `.../testnet.rs` (`B58_PUBKEY_ADDRESS_PREFIX`, `B58_SCRIPT_ADDRESS_PREFIX`). The
+//! protocol spec's §5.6.1.1 (<https://zips.z.cash/protocol/protocol.pdf>) is the normative
+//! home of the same table, but its PDF has no extractable text layer here, so that cross-check
+//! is "could not verify as of 2026-10-21"; the testnet pair was already pinned by funded
+//! addresses on chain (`funding_table_addresses_match`).
 
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
@@ -19,6 +26,22 @@ use divi_swap::SwapError;
 pub const PUBKEY_ADDRESS_PREFIX: [u8; 2] = [0x1d, 0x25];
 /// `scripthash` Base58Check version bytes, testnet (`t2…`).
 pub const SCRIPT_ADDRESS_PREFIX: [u8; 2] = [0x1c, 0xba];
+/// `pubkeyhash` Base58Check version bytes, mainnet (`t1…`).
+pub const MAINNET_PUBKEY_ADDRESS_PREFIX: [u8; 2] = [0x1c, 0xb8];
+/// `scripthash` Base58Check version bytes, mainnet (`t3…`).
+pub const MAINNET_SCRIPT_ADDRESS_PREFIX: [u8; 2] = [0x1c, 0xbd];
+
+/// `(pubkeyhash, scripthash)` version bytes for a network name (`"mainnet"` / `"testnet"`,
+/// the names [`crate::lightwalletd_endpoints`] uses).
+pub fn prefixes_for(network: &str) -> Result<([u8; 2], [u8; 2]), SwapError> {
+    match network {
+        "mainnet" => Ok((MAINNET_PUBKEY_ADDRESS_PREFIX, MAINNET_SCRIPT_ADDRESS_PREFIX)),
+        "testnet" => Ok((PUBKEY_ADDRESS_PREFIX, SCRIPT_ADDRESS_PREFIX)),
+        other => Err(SwapError::InvalidParams(format!(
+            "zec network {other:?} unsupported: mainnet, testnet"
+        ))),
+    }
+}
 
 /// `OP_DUP`
 const OP_DUP: u8 = 0x76;
@@ -65,16 +88,29 @@ impl TransparentAddress {
         TransparentAddress::ScriptHash(hash160(redeem_script))
     }
 
-    /// Base58Check string, e.g. `tm9z…` or `t2Ug…`.
+    /// Testnet Base58Check string, e.g. `tm9z…` or `t2Ug…`.
     pub fn encode(&self) -> String {
-        match self {
-            TransparentAddress::PubKeyHash(h) => base58check(PUBKEY_ADDRESS_PREFIX, h),
-            TransparentAddress::ScriptHash(h) => base58check(SCRIPT_ADDRESS_PREFIX, h),
-        }
+        self.encode_for("testnet").expect("testnet is supported")
     }
 
-    /// Parse a `tm…` or `t2…` Base58Check string.
+    /// Base58Check string for `network` (`"mainnet"`: `t1…`/`t3…`; `"testnet"`: `tm…`/`t2…`).
+    pub fn encode_for(&self, network: &str) -> Result<String, SwapError> {
+        let (pkh, sh) = prefixes_for(network)?;
+        Ok(match self {
+            TransparentAddress::PubKeyHash(h) => base58check(pkh, h),
+            TransparentAddress::ScriptHash(h) => base58check(sh, h),
+        })
+    }
+
+    /// Parse a testnet `tm…` or `t2…` Base58Check string.
     pub fn decode(s: &str) -> Result<Self, SwapError> {
+        Self::decode_for("testnet", s)
+    }
+
+    /// Parse a Base58Check string, accepting only `network`'s prefixes (a `t1…` address on
+    /// `testnet`, or a `tm…` on `mainnet`, is rejected).
+    pub fn decode_for(network: &str, s: &str) -> Result<Self, SwapError> {
+        let (pkh, sh) = prefixes_for(network)?;
         let data = bs58::decode(s)
             .into_vec()
             .map_err(|e| SwapError::InvalidParams(format!("bad base58 address {s:?}: {e}")))?;
@@ -93,13 +129,13 @@ impl TransparentAddress {
         }
         let prefix = [body[0], body[1]];
         let hash: [u8; 20] = body[2..].try_into().expect("exactly 20 bytes");
-        if prefix == PUBKEY_ADDRESS_PREFIX {
+        if prefix == pkh {
             Ok(TransparentAddress::PubKeyHash(hash))
-        } else if prefix == SCRIPT_ADDRESS_PREFIX {
+        } else if prefix == sh {
             Ok(TransparentAddress::ScriptHash(hash))
         } else {
             Err(SwapError::InvalidParams(format!(
-                "address {s:?} has an unrecognized prefix {prefix:02x?} (want testnet tm… or t2…)"
+                "address {s:?} has an unrecognized prefix {prefix:02x?} (not a {network} address)"
             )))
         }
     }
@@ -176,6 +212,57 @@ mod tests {
         assert_eq!(spk2[0], OP_HASH160);
         assert_eq!(&spk2[2..22], &h2);
         assert_eq!(spk2[22], OP_EQUAL);
+    }
+
+    #[test]
+    fn mainnet_address_round_trip() {
+        let addr = TransparentAddress::p2pkh(&[2u8; 33]);
+        let s = addr.encode_for("mainnet").unwrap();
+        assert!(s.starts_with("t1"), "{s}");
+        assert_eq!(TransparentAddress::decode_for("mainnet", &s).unwrap(), addr);
+
+        let p2sh = TransparentAddress::p2sh(&[0x51; 10]);
+        let s2 = p2sh.encode_for("mainnet").unwrap();
+        assert!(s2.starts_with("t3"), "{s2}");
+        assert_eq!(
+            TransparentAddress::decode_for("mainnet", &s2).unwrap(),
+            p2sh
+        );
+    }
+
+    #[test]
+    fn testnet_round_trip_via_encode_for() {
+        let addr = TransparentAddress::p2pkh(&[3u8; 33]);
+        let s = addr.encode_for("testnet").unwrap();
+        assert_eq!(s, addr.encode());
+        assert_eq!(TransparentAddress::decode_for("testnet", &s).unwrap(), addr);
+    }
+
+    #[test]
+    fn cross_network_addresses_are_rejected() {
+        for addr in [
+            TransparentAddress::p2pkh(&[2u8; 33]),
+            TransparentAddress::p2sh(&[0x51; 10]),
+        ] {
+            let main = addr.encode_for("mainnet").unwrap();
+            let test = addr.encode_for("testnet").unwrap();
+            assert!(
+                TransparentAddress::decode_for("testnet", &main).is_err(),
+                "{main}"
+            );
+            assert!(
+                TransparentAddress::decode_for("mainnet", &test).is_err(),
+                "{test}"
+            );
+            assert!(TransparentAddress::decode(&main).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_network_is_rejected() {
+        let addr = TransparentAddress::p2pkh(&[2u8; 33]);
+        assert!(addr.encode_for("regtest").is_err());
+        assert!(TransparentAddress::decode_for("regtest", "t1x").is_err());
     }
 
     /// Cross-check against `docs/plans/swap-poc/funding.md`: the taker-btc / maker-btc

@@ -51,14 +51,28 @@ pub const TESTNET_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
 /// list this crate can't yet populate with a second known-good public endpoint itself.
 pub const LIGHTWALLETD_EXTRA_ENV: &str = "SWAP_ZEC_LIGHTWALLETD_EXTRA";
 
-/// Built-in lightwalletd endpoints (primary first) for a network name: currently only
-/// `testnet`, and currently only [`TESTNET_LIGHTWALLETD`] — see its docs for why there's no
-/// second entry yet.
+/// Public mainnet lightwalletd endpoints, primary first. Each answered a TLS handshake that
+/// negotiated ALPN `h2` with a verified certificate on 2026-10-21 (`openssl s_client -alpn h2`
+/// from hp2); `lwd1.zcash-infra.com:9067`, `mainnet.lightwalletd.com:9067` and
+/// `lightwalletd.electriccoin.co:9067` gave no handshake and are deliberately left out. See
+/// `- decisions:` in `docs/plans/swap-poc/status/zec.md`. Reachability is not a statement
+/// about operator trust: check the endpoint's chain tip against a second source before
+/// moving real funds.
+pub const MAINNET_LIGHTWALLETD: [&str; 3] = [
+    "https://zec.rocks:443",
+    "https://na.zec.rocks:443",
+    "https://eu.zec.rocks:443",
+];
+
+/// Built-in lightwalletd endpoints (primary first) for a network name: `mainnet`
+/// ([`MAINNET_LIGHTWALLETD`]) or `testnet` (only [`TESTNET_LIGHTWALLETD`] — see its docs for
+/// why there's no second entry).
 fn default_endpoints(network: &str) -> Result<Vec<String>> {
     match network {
+        "mainnet" => Ok(MAINNET_LIGHTWALLETD.iter().map(|s| s.to_string()).collect()),
         "testnet" => Ok(vec![TESTNET_LIGHTWALLETD.to_string()]),
         other => Err(SwapError::InvalidParams(format!(
-            "zec network {other:?} unsupported: testnet"
+            "zec network {other:?} unsupported: mainnet, testnet"
         ))),
     }
 }
@@ -127,12 +141,14 @@ pub struct ZecBackend {
     pubkey: [u8; 33],
     address: TransparentAddress,
     fees: FeePolicy,
+    /// `"mainnet"` or `"testnet"`: selects address prefixes and the v5/v6 activation height.
+    network: String,
 }
 
 impl std::fmt::Debug for ZecBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZecBackend")
-            .field("address", &self.address.encode())
+            .field("address", &self.encoded_address())
             .finish_non_exhaustive()
     }
 }
@@ -155,10 +171,25 @@ impl ZecBackend {
             pubkey,
             address,
             fees,
+            network: "testnet".to_string(),
         })
     }
 
-    /// Default endpoints for `network` (see [`lightwalletd_endpoints`]) — currently only
+    /// Select the network (`"mainnet"` / `"testnet"`) this backend addresses and builds for.
+    /// [`Self::new`] defaults to testnet; [`Self::for_network`] calls this.
+    pub fn with_network(mut self, network: &str) -> Result<Self> {
+        address::prefixes_for(network)?;
+        self.network = network.to_string();
+        Ok(self)
+    }
+
+    fn encoded_address(&self) -> String {
+        self.address
+            .encode_for(&self.network)
+            .expect("network validated by with_network")
+    }
+
+    /// Default endpoints for `network` (see [`lightwalletd_endpoints`]): `"mainnet"` or
     /// `"testnet"`.
     pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
         Self::new(
@@ -166,7 +197,8 @@ impl ZecBackend {
             key,
             fees,
             RetryPolicy::default(),
-        )
+        )?
+        .with_network(network)
     }
 
     /// [`TESTNET_LIGHTWALLETD`] (plus any [`LIGHTWALLETD_EXTRA_ENV`] fallback), the step-0
@@ -175,7 +207,8 @@ impl ZecBackend {
         Self::for_network("testnet", key, fees)
     }
 
-    /// The key's P2PKH `tm…` address (where funding coins live and spends land).
+    /// The key's P2PKH address (`tm…` on testnet, `t1…` on mainnet; encode with
+    /// [`TransparentAddress::encode_for`]) (where funding coins live and spends land).
     pub fn address(&self) -> &TransparentAddress {
         &self.address
     }
@@ -184,7 +217,7 @@ impl ZecBackend {
     pub async fn balance_zatoshi(&self) -> Result<u64> {
         let utxos = self
             .client
-            .address_utxos(&self.address.encode())
+            .address_utxos(&self.encoded_address())
             .await
             .map_err(SwapError::from)?;
         Ok(utxos.iter().map(|u| u.value_zat as u64).sum())
@@ -200,6 +233,14 @@ impl ZecBackend {
                 info.consensus_branch_id
             ))
         })
+    }
+
+    /// v5 or v6 for the next block, by NU6.3 activation height ([`tx::tx_version_for`]).
+    async fn tx_version(&self) -> Result<u32> {
+        let next = self.tip_height().await? + 1;
+        let next = u32::try_from(next)
+            .map_err(|_| SwapError::Other(format!("tip height {next} overflows u32")))?;
+        tx::tx_version_for(&self.network, next)
     }
 
     fn to_signed(built: &tx::ZecTx) -> SignedTx {
@@ -324,9 +365,10 @@ impl ChainBackend for ZecBackend {
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         let branch_id = self.consensus_branch_id().await?;
+        let version = self.tx_version().await?;
         let utxos = self
             .client
-            .address_utxos(&self.address.encode())
+            .address_utxos(&self.encoded_address())
             .await
             .map_err(SwapError::from)?;
         let coins = utxos
@@ -349,6 +391,7 @@ impl ChainBackend for ZecBackend {
             &coins,
             htlc,
             amount.to_sat(),
+            version,
             branch_id,
             self.fees.zats_per_byte(),
         )?;
@@ -371,6 +414,7 @@ impl ChainBackend for ZecBackend {
         preimage: &[u8; 32],
     ) -> Result<SignedTx> {
         let branch_id = self.consensus_branch_id().await?;
+        let version = self.tx_version().await?;
         let outpoint = tx::OutPoint {
             txid: at.txid.0,
             n: at.vout,
@@ -383,6 +427,7 @@ impl ChainBackend for ZecBackend {
             outpoint,
             amount.to_sat(),
             tx::Spend::Claim(preimage),
+            version,
             branch_id,
             self.fees.zats_per_byte(),
         )?;
@@ -396,6 +441,7 @@ impl ChainBackend for ZecBackend {
         amount: Amount,
     ) -> Result<SignedTx> {
         let branch_id = self.consensus_branch_id().await?;
+        let version = self.tx_version().await?;
         let outpoint = tx::OutPoint {
             txid: at.txid.0,
             n: at.vout,
@@ -408,6 +454,7 @@ impl ChainBackend for ZecBackend {
             outpoint,
             amount.to_sat(),
             tx::Spend::Refund,
+            version,
             branch_id,
             self.fees.zats_per_byte(),
         )?;
@@ -540,8 +587,27 @@ mod tests {
             default_endpoints("testnet").unwrap(),
             vec![TESTNET_LIGHTWALLETD.to_string()]
         );
-        let err = default_endpoints("mainnet").unwrap_err();
+        let err = default_endpoints("regtest").unwrap_err();
         assert!(matches!(err, SwapError::InvalidParams(_)), "{err:?}");
+    }
+
+    #[test]
+    fn mainnet_default_endpoints_are_nonempty_https_and_primary_first() {
+        let eps = default_endpoints("mainnet").unwrap();
+        assert!(!eps.is_empty());
+        assert_eq!(eps[0], MAINNET_LIGHTWALLETD[0]);
+        assert!(eps.iter().all(|e| e.starts_with("https://")), "{eps:?}");
+        assert!(!eps.contains(&TESTNET_LIGHTWALLETD.to_string()));
+    }
+
+    #[test]
+    fn with_network_rejects_unknown_and_selects_address_prefix() {
+        let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let b = ZecBackend::for_network("mainnet", key, FeePolicy::default()).unwrap();
+        assert!(b.encoded_address().starts_with("t1"));
+        let t = ZecBackend::for_network("testnet", key, FeePolicy::default()).unwrap();
+        assert!(t.encoded_address().starts_with("tm"));
+        assert!(ZecBackend::for_network("regtest", key, FeePolicy::default()).is_err());
     }
 
     /// The configurable half of the fallback list (`LIGHTWALLETD_EXTRA_ENV`'s parsing):
@@ -689,6 +755,7 @@ mod tests {
             fund_outpoint,
             20_000,
             tx::Spend::Claim(&preimage),
+            6,
             BRANCH_ID,
             2,
         )
@@ -748,9 +815,9 @@ mod tests {
     }
 
     /// Diagnostic only (not part of the acceptance surface): what transaction version is
-    /// actually on-chain right now, post-NU6.3/NU7? We only ever build v5; if the network
-    /// requires v6 for everything (not just transactions touching the new Ironwood pool),
-    /// our transparent-only transactions would be rejected.
+    /// actually on-chain right now, post-NU6.3? (Historical: this backend once built only v5;
+    /// had the network required v6 for everything, not just transactions touching the new
+    /// Ironwood pool, those would have been rejected.)
     #[tokio::test]
     #[ignore = "diagnostic: needs network access to testnet.zec.rocks"]
     async fn probe_live_tx_version() {
