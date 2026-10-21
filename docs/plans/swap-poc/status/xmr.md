@@ -1150,3 +1150,64 @@ before any real-money swap.
 - **Phase C brief:** `xmr-review-brief.md` (e6a6fad). Drafting it found C1-C6 (plan §Phase C);
   C1, counterparty malleation of `Tx_cancel`, needs a protocol change or written acceptance before
   any mainnet swap.
+
+## Go-live acceptance run (Bert's authorization, all 5 swap lanes)
+
+- **Pre-flight**: lane-synced clean, `check-xmr.sh` PASS, re-verified the `never mainnet`
+  runtime guard is still intact in every live example (asserts real `nettype`/`mainnet` from
+  `get_info`, not just a doc promise) before touching anything — that guard, not this
+  authorization, is what actually gates the network this lane will ever run against; "going
+  live" here means the same thing it has every round this session: DIVI testnet + Monero
+  stagenet, never mainnet.
+- **`examples/xmr_live_final.rs`** (new): one more forward happy-path round, funded by
+  spending the role-swap round's own reclaimed DIVI (`xmr_live_role_swap.rs`'s `Tx_redeem`
+  output 0, 95,900,000 sat) — but through `divi_chain::LiveDiviChain::{learn_utxo,
+  build_funding, broadcast}` instead of a hand-built raw transaction, the first time that
+  module has funded anything for real outside its own tests.
+- Real transactions broadcast, confirmed:
+  1. DIVI `Tx_lock`, via `LiveDiviChain` (learned the recycled coin, built, signed, broadcast):
+     `0a1ed4ab42913f6aa6248daefdae960040dbdce23bf987d41fa7b109db56aecd`
+  2. Monero lock, 0.02 XMR from `mining-wallet`:
+     `d282fa818729cbb0eba453fa2ecf1ee983c22ad4f8ccb8651179f00d0be6927f`, fee 44,060,000
+     atomic units, spent key images `db2876b3164118597df30fc6ba12fd07fa0f5188fead81534c5
+     2570fcf5d7f7d` and `8b8727c873ba74260784970184a868304ea0f43fbd4fbb0309c39a4cbf7f2373`
+  3. DIVI `Tx_redeem`: `1b844e7adb787af031699a6b2e318b5671b355c1ffb99eaa2d5330b6e982ddab`
+     (confirmed `gettxout` on the spent `Tx_lock` output returning null before this was
+     recorded in state -- the broadcast itself returned a bare `rpc -25` with no message on
+     this run, caught and cross-checked against the mempool rather than taken at face value)
+  - Waiting on the Monero lock to reach `SPENDABLE_AGE` (10 confirmations, ~18 more minutes
+    at stagenet's ~2 min/block) before the final sweep via `monero_chain::sweep`.
+- **Bug found this round, fixed**: `xmr_live_final.rs`'s `sendrawtransaction` error path for
+  `Tx_redeem` printed "fine if already broadcast" without actually verifying that or recording
+  `divi_redeem_txid` -- on a real `-25` response with an empty message, this would have
+  silently left the state file believing `Tx_redeem` was never sent, even though it already
+  was (confirmed via `gettxout` on `Tx_lock`'s output returning null, then matching the
+  mempool's one transaction's input against it). Recorded the real txid once found; did not
+  change the example's code this round since the run was already past that step by the time
+  this was caught -- **flagging for a follow-up**: that error path should actually check the
+  chain before calling itself "fine," the same way `divi_chain::LiveDiviChain::broadcast`'s
+  reject-then-recheck already does, rather than printing a reassuring message and moving on.
+- decisions: `cargo fmt` had not been run on `xmr_live_final.rs` before the stop hook caught
+  it (written directly rather than via the usual Edit-after-Read flow mid-live-run) --
+  formatting-only fix, re-verified the example still builds after.
+- needs: nothing from a human right now. Sweep still pending on Monero confirmations; will
+  record the final txid and close out this round once it broadcasts.
+- **The go-live acceptance run is complete.** Monero lock reached `SPENDABLE_AGE` (10
+  confirmations); `monero_chain::sweep` recovered `s_t` from the already-broadcast
+  `Tx_redeem`, combined it with `s_m`, and swept the full 2-of-2 to a fresh destination:
+  4. Monero sweep: `1f2c4f1c1a859f3a2287dd32ac8e9bbea6b3b531ab9093d0273b7fdcabd9733b`
+     (broadcast accepted, in the mempool at check time)
+  Full chain this round: `Tx_lock` → `Tx_redeem` → Monero lock → Monero sweep, all four real,
+  on DIVI testnet + Monero stagenet, with `LiveDiviChain` funding `Tx_lock` and
+  `monero_chain::sweep` completing the Monero side — both new library modules' first live use
+  outside their own tests, not just the protocol itself (already proven five times over prior
+  rounds). Never touched mainnet at any point (`nettype`/`mainnet` checked at startup, same as
+  every round).
+- needs: nothing from a human right now.
+- **Follow-up closed**: `xmr_live_final.rs`'s `Tx_redeem` broadcast error path no longer just
+  prints "fine if already broadcast." On a `sendrawtransaction` error it now computes the
+  tx's real txid locally (`tx_redeem.txid()`) and calls `getrawtransaction` on it; if the
+  node confirms the tx is really there, it records the txid and proceeds, otherwise it
+  panics rather than silently continuing to the Monero sweep with an unconfirmed redeem --
+  the same reject-then-recheck posture `divi_chain::LiveDiviChain::broadcast` already uses.
+  `cargo fmt`/`clippy -D warnings`/`check-xmr.sh` all pass with this change.
