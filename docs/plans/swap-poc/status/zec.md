@@ -980,3 +980,10 @@ numbers from this exact check):
 
 ## 2026-10-13 live on the redeployed maker (4e0ac26)
 - result: PASS — live ZEC happy swap both directions against dnsdivi 4e0ac26, Done/Done each (fwd `ce1cef2f…`, rev `e000c971…`); rerun because the earlier case-C refund test predates 4e0ac26's ZEC maker changes; verify-results 137/137.
+
+## 2026-10-21 independent ZIP-244 P2SH cross-check (option b)
+- done: generated one v5 and one v6 transaction with a single P2SH input (HTLC-shaped 114-byte redeem script, scriptPubKey != redeem) with librustzcash, out-of-tree in `tools/swap-poc/zec-vector-gen/` (own `[workspace]` root + committed `Cargo.lock`; zcash_primitives 0.30.1, zcash_transparent 0.10.0, zcash_protocol 0.10.6; resolved first try). Embedded both in `zip244_vectors.rs` (`P2SH_VECTORS`, all six hash types each) with `zip244_p2sh_crosscheck_vector_from_librustzcash`.
+- proof: the crate's own `signature_digest` (v5) and `signature_digest_v6` reproduce every librustzcash digest and the txid; hashing the redeem script instead gives a different digest for every hash type (the 90d857c bug shape). librustzcash 0.30.1 does support the v6/NU6.3 format, so the v6 vector is included too (NU7 `zcash_unstable` not used). fmt/clippy clean; swap-chain-zec 20 -> 21 tests; `check-zec.sh` PASS.
+- decisions: closes the `zcash_primitives` cross-check "needs:" above with option (b); the workspace still does not depend on `zcash_primitives` (see the earlier decision on why).
+- left: nothing for this item.
+- needs: nothing.
