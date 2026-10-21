@@ -43,10 +43,13 @@
 #
 # Keys: reused from the BTC swap keys per docs/plans/swap-poc/funding.md (no new 1Password
 # items). `sepolia_ops` (crates/swap-chain-evm/examples/sepolia_ops.rs) takes a raw hex key
-# via SWAP_EVM_KEY_HEX, so this script resolves `op://` refs to that with `op read` and
-# unsets the variable immediately after each call; divi-swapd/divi-swap resolve their own
-# `op://` key references internally (same as e2e.sh), so those get the reference string,
-# never a resolved secret.
+# via SWAP_EVM_KEY_HEX, so this script resolves the taker-btc `op://` ref to that exactly
+# once per run through the `secret get` proxy (cache -> secret-broker; the raw 1Password CLI
+# is refused by the op-guard, and every raw call would be a fresh Touch ID dialog) and passes
+# it only in the environment of the sepolia_ops/cargo-test child processes, never on a
+# command line and never printed; divi-swapd/divi-swap resolve their own `op://` key
+# references internally (same as e2e.sh), so those get the reference string, never a
+# resolved secret.
 #
 # State (config, logs, txids) goes to $E2E_STATE_DIR/usdc-live-<scenario>-<network-or-deployed>/
 # <direction> (outside the repo, like e2e.sh/ltc-live.sh). The taker-divi wallet is shared
@@ -210,6 +213,13 @@ else
       die "cannot read the $k key (1Password locked, or secret-broker not running). Rerun once it is up."
     fi
   done
+  # The one key this script itself hands to a child process (sepolia_ops deploy/send-*, and
+  # the live_*_lock_claim test): resolved once, via the proxy (same --name as the preflight,
+  # so it is served from the cache the preflight just warmed), held in a shell variable and
+  # passed only through the child's environment.
+  taker_evm_key_hex="$(secret get --name irondivi-swap-poc-taker-btc-password --op-ref "$(ref taker-btc)")" \
+    || die "cannot resolve the taker-btc key through secret get (secret-broker status)"
+  [[ -n "$taker_evm_key_hex" ]] || die "secret get returned an empty taker-btc key"
 
   echo "usdc-live: building divi-swapd, divi-swap and swap-chain-evm's sepolia_ops example"
   cargo build -q -p divi-swapd -p divi-swap-cli
@@ -222,9 +232,7 @@ else
 
   if [[ -z "$htlc" ]]; then
     echo "usdc-live: no --htlc given — deploying a fresh Erc20Htlc from the taker key"
-    key_hex="$(op read "$(ref taker-btc)")"
-    out="$(SWAP_EVM_KEY_HEX="$key_hex" ops deploy)"
-    unset key_hex
+    out="$(SWAP_EVM_KEY_HEX="$taker_evm_key_hex" ops deploy)"
     htlc="$(sed -n 's/^htlc_address: //p' <<<"$out")"
     deploy_tx="$(sed -n 's/^tx: //p' <<<"$out")"
     [[ -n "$htlc" ]] || die "deploy failed: $out"
@@ -242,18 +250,14 @@ else
     maker_usdc="$(sed -n 's/^usdc_units: //p' <<<"$bal")"
     if (( maker_eth < maker_eth_target )); then
       echo "usdc-live: funding maker with $maker_eth_target wei gas"
-      key_hex="$(op read "$(ref taker-btc)")"
-      tx="$(SWAP_EVM_KEY_HEX="$key_hex" ops send-eth --to "$maker_addr" --wei "$maker_eth_target" | sed -n 's/^tx: //p')"
-      unset key_hex
+      tx="$(SWAP_EVM_KEY_HEX="$taker_evm_key_hex" ops send-eth --to "$maker_addr" --wei "$maker_eth_target" | sed -n 's/^tx: //p')"
       print_tx "fund maker ETH" "$tx"
     else
       echo "usdc-live: maker already has $maker_eth wei, skipping ETH funding"
     fi
     if (( maker_usdc < maker_usdc_target )); then
       echo "usdc-live: funding maker with $maker_usdc_target USDC base units"
-      key_hex="$(op read "$(ref taker-btc)")"
-      tx="$(SWAP_EVM_KEY_HEX="$key_hex" ops --token "$usdc_token" send-usdc --to "$maker_addr" --units "$maker_usdc_target" | sed -n 's/^tx: //p')"
-      unset key_hex
+      tx="$(SWAP_EVM_KEY_HEX="$taker_evm_key_hex" ops --token "$usdc_token" send-usdc --to "$maker_addr" --units "$maker_usdc_target" | sed -n 's/^tx: //p')"
       print_tx "fund maker USDC" "$tx"
     else
       echo "usdc-live: maker already has $maker_usdc USDC base units, skipping USDC funding"
@@ -265,10 +269,9 @@ else
     base-sepolia) lock_claim_test=live_base_sepolia_lock_claim; lock_claim_rpc_var=SWAP_EVM_BASE_SEPOLIA_RPC ;;
   esac
   echo "usdc-live: $lock_claim_test (self-contained UsdcBackend sanity check)"
-  key_hex="$(op read "$(ref taker-btc)")"
-  SWAP_EVM_TEST_KEY_HEX="$key_hex" env "$lock_claim_rpc_var=$rpc_url" \
+  SWAP_EVM_TEST_KEY_HEX="$taker_evm_key_hex" env "$lock_claim_rpc_var=$rpc_url" \
     cargo test -p swap-chain-evm --features live -- --ignored "$lock_claim_test" --nocapture
-  unset key_hex
+  unset taker_evm_key_hex
 
   bin_dir="$ROOT/target/debug"
   swapd="$bin_dir/divi-swapd"

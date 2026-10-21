@@ -18,7 +18,9 @@
 //! ```sh
 //! cargo run -p swap-chain-evm --features live --example sepolia_ops -- balances --addr 0x...
 //!
-//! SWAP_EVM_KEY_HEX="$(op read 'op://.../password')" \
+//! # resolve through the secret proxy (the raw 1Password CLI is refused from agent shells):
+//! SWAP_EVM_KEY_HEX="$(secret get --name irondivi-swap-poc-taker-btc-password \
+//!     --op-ref 'op://global_secret_store/IronDivi Swap POC - taker-btc/password')" \
 //!   cargo run -p swap-chain-evm --features live --example sepolia_ops -- deploy
 //!
 //! SWAP_EVM_KEY_HEX=<hex> cargo run -p swap-chain-evm --features live --example sepolia_ops \
