@@ -654,3 +654,24 @@ run above) is the orchestrator's step, from the Mac, same as every prior live le
 
 ## 2026-10-13 live on the redeployed maker (4e0ac26)
 - result: PASS — live LTC happy swap both directions against dnsdivi 4e0ac26, Done/Done each (fwd `3bd97391…`, rev `60f622d2…`); txids in RESULTS.md; verify-results 137/137.
+
+## Round: case-c closed live, both directions (orchestrator, 2026-10-21)
+
+- done: `ltc-live.sh --scenario case-c --maker-url` (deployed maker, divi-swapd 0.2.6) ran to
+  `taker_state=Refunded`, `maker_state=Done` in both directions; results in
+  `~/.local/state/iron-divi-swap-poc/ltc-case-c-deployed/{forward,reverse}/results.txt` and already
+  recorded in `RESULTS.md`. Re-verified on chain 2026-10-21 13:40 UTC (reads only):
+  - forward (taker pays LTC): LTC lock `b7e7d75e8ea4a398552970f1e0fcbdae7c8d7af351acff394c27ba5eab563025`
+    (testnet4 block 4912601), DIVI lock `7f5588a43db9e5af6371411735e1263e5c394744390c6bd9ca46baf96194e03f`,
+    DIVI spend by maker `19f58c6bcfc60f565b6815b4d0a561ddde5c63f23aef9535ada74c9752205056`,
+    LTC refund by taker `504b901f831c34948adede119b1180f97399b1a816199f06cd986c4e2708e7fe` (block 4912684).
+  - reverse (taker pays DIVI): DIVI lock `fae5fc620d355e189c82aa94278f36e366234e778c0d3ea76547b541e83d04e3`,
+    LTC lock by maker `1a95af0e7e2be26f6e3821366f124cd88ddb5c4e8516da7a2b86069a679b8cff` (block 4912672),
+    LTC spend by maker `98b734ea734ea1f3011f66a73e25bef7f017b8f17889a7bba45579f2ffda3e16` (block 4912710),
+    DIVI refund by taker `02073185c8884f7f23d4196118db565ca0171dca826db714de6164bb71d05e1e`.
+  - LTC legs via `litecoinspace.org/testnet/api/tx/<txid>/status` (all `confirmed: true`); DIVI legs via
+    `divi-cli getrawtransaction` on the testnet node, 13,070–13,733 confirmations.
+- left: none for the LTC lane. The "case-c still pending" lines in the earlier rounds above are
+  superseded by this round. `live_fund_claim_refund` (`#[ignore] --features live`) remains an optional
+  third check and needs `SWAP_LTC_TEST_KEY_HEX` from the taker-btc item.
+- needs: nothing.
