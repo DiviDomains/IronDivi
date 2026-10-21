@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::scan::{ScanInfo, ScanState, ScanStatus};
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,7 +41,8 @@ use tower_http::trace::TraceLayer;
 /// Requests one IP may make to a rate-limited route (quote, XMR setup) per
 /// [`RATE_WINDOW`]. An honest taker makes one quote and one setup per swap, so 20 a minute is
 /// generous; each setup costs the maker a Paillier-prime generation and reserved coins.
-/// Behind a reverse proxy every client shares the proxy's address: limit at the proxy then.
+/// Behind a reverse proxy every client shares the proxy's address unless `trust_proxy_headers`
+/// is set (see [`client_ip`]).
 pub const RATE_LIMIT_PER_WINDOW: u32 = 20;
 /// Length of the fixed window [`RATE_LIMIT_PER_WINDOW`] counts in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -85,14 +86,46 @@ impl RateLimiter {
     }
 }
 
-/// 429 past the limit. The peer address comes from the connection (`ConnectInfo`); a router
-/// served without it (in-process tests) shares one unspecified-address bucket.
-async fn rate_limit(State(l): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {
-    let ip = req
+/// The limiter and whether its key may come from proxy headers.
+#[derive(Clone)]
+struct RateState {
+    limiter: Arc<RateLimiter>,
+    trust_proxy_headers: bool,
+}
+
+/// The address a request is rate limited under. The peer address comes from the connection
+/// (`ConnectInfo`); a router served without it (in-process tests) shares one
+/// unspecified-address bucket. With `trust_proxy_headers` the first address in
+/// `X-Forwarded-For` (else `X-Real-IP`) wins when it parses, else the peer address. Without
+/// it the headers are never read: any client can send them, so honouring them by default
+/// would let it pick its own bucket and defeat the limit.
+fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy_headers: bool) -> IpAddr {
+    let peer = peer.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    if !trust_proxy_headers {
+        return peer;
+    }
+    let header_ip = |name: &str, first_of_list: bool| -> Option<IpAddr> {
+        let v = headers.get(name)?.to_str().ok()?;
+        let v = if first_of_list {
+            v.split(',').next()?
+        } else {
+            v
+        };
+        v.trim().parse().ok()
+    };
+    header_ip("x-forwarded-for", true)
+        .or_else(|| header_ip("x-real-ip", false))
+        .unwrap_or(peer)
+}
+
+/// 429 past the limit.
+async fn rate_limit(State(l): State<RateState>, req: Request, next: Next) -> Response {
+    let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| c.0.ip());
-    if l.allow(ip, Instant::now()) {
+        .map(|c| c.0.ip());
+    let ip = client_ip(req.headers(), peer, l.trust_proxy_headers);
+    if l.limiter.allow(ip, Instant::now()) {
         next.run(req).await
     } else {
         ApiError(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()).into_response()
@@ -158,8 +191,23 @@ pub fn router(state: AppState, prefix: &str) -> Router {
 /// the hashlock maker's `/offers` routes (the engine is registered with
 /// `Maker::with_engine`).
 pub fn router_with_xmr(state: AppState, xmr: Option<Arc<XmrMaker>>, prefix: &str) -> Router {
-    let limiter = Arc::new(RateLimiter::new(RATE_LIMIT_PER_WINDOW, RATE_WINDOW));
-    let limited = || middleware::from_fn_with_state(limiter.clone(), rate_limit);
+    router_with_proxy(state, xmr, prefix, false)
+}
+
+/// [`router_with_xmr`] with `trust_proxy_headers`: key the rate limit on the client address
+/// a reverse proxy you control puts in `X-Forwarded-For`/`X-Real-IP` instead of the socket
+/// peer (which is the proxy's own address for every client).
+pub fn router_with_proxy(
+    state: AppState,
+    xmr: Option<Arc<XmrMaker>>,
+    prefix: &str,
+    trust_proxy_headers: bool,
+) -> Router {
+    let rate = RateState {
+        limiter: Arc::new(RateLimiter::new(RATE_LIMIT_PER_WINDOW, RATE_WINDOW)),
+        trust_proxy_headers,
+    };
+    let limited = || middleware::from_fn_with_state(rate.clone(), rate_limit);
     let mut api = Router::new()
         .route("/healthz", get(healthz))
         .route("/offers", get(offers))
@@ -373,5 +421,71 @@ mod tests {
         assert!(l.allow(b, t0), "another address has its own count");
         assert!(!l.allow(a, t0 + Duration::from_secs(59)));
         assert!(l.allow(a, t0 + Duration::from_secs(60)), "a new window");
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn proxy_headers_are_ignored_unless_trusted() {
+        let peer: IpAddr = "10.0.0.9".parse().unwrap();
+        let h = headers(&[
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-real-ip", "203.0.113.8"),
+        ]);
+        assert_eq!(
+            client_ip(&h, Some(peer), false),
+            peer,
+            "default: spoofable, so unread"
+        );
+        assert_eq!(
+            client_ip(&h, None, false),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_headers_pick_the_client_and_garbage_falls_back() {
+        let peer: IpAddr = "10.0.0.9".parse().unwrap();
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let xff = headers(&[("x-forwarded-for", "203.0.113.7, 10.1.1.1")]);
+        assert_eq!(
+            client_ip(&xff, Some(peer), true),
+            ip("203.0.113.7"),
+            "first hop"
+        );
+        let v6 = headers(&[("x-forwarded-for", " 2001:db8::1 ")]);
+        assert_eq!(client_ip(&v6, Some(peer), true), ip("2001:db8::1"));
+        let real = headers(&[("x-real-ip", "203.0.113.8")]);
+        assert_eq!(client_ip(&real, Some(peer), true), ip("203.0.113.8"));
+        let both = headers(&[
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-real-ip", "203.0.113.8"),
+        ]);
+        assert_eq!(
+            client_ip(&both, Some(peer), true),
+            ip("203.0.113.7"),
+            "XFF first"
+        );
+        let bad_xff = headers(&[
+            ("x-forwarded-for", "nonsense"),
+            ("x-real-ip", "203.0.113.8"),
+        ]);
+        assert_eq!(client_ip(&bad_xff, Some(peer), true), ip("203.0.113.8"));
+        let garbage = headers(&[("x-forwarded-for", "nonsense"), ("x-real-ip", "also,bad")]);
+        assert_eq!(
+            client_ip(&garbage, Some(peer), true),
+            peer,
+            "socket address"
+        );
+        assert_eq!(client_ip(&HeaderMap::new(), Some(peer), true), peer);
     }
 }

@@ -27,7 +27,7 @@ use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
-    mock_counter_offers, mock_xmr_offers, router_with_xmr, run_scan, spawn_gated_scheduler,
+    mock_counter_offers, mock_xmr_offers, router_with_proxy, run_scan, spawn_gated_scheduler,
     AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, XmrSection,
     ZecSection, MOCK_ONLY_CHAINS,
 };
@@ -509,7 +509,7 @@ async fn main() -> Result<()> {
         scan.clone(),
     );
 
-    let app = router_with_xmr(
+    let app = router_with_proxy(
         AppState {
             maker,
             divi,
@@ -518,6 +518,7 @@ async fn main() -> Result<()> {
         },
         xmr,
         &cfg.prefix(),
+        cfg.trust_proxy_headers,
     );
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await

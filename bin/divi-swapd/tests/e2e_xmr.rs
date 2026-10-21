@@ -30,7 +30,7 @@ use divi_swap_xmr::mock::{
     MockDiviChain, MockDiviWallet, MockMoneroChain, MockMoneroWallet, MOCK_DIVI_FEE, MOCK_XMR_FEE,
 };
 use divi_swap_xmr::{XmrConfig, XmrMaker, XmrMakerState, XmrTaker, XmrTakerState};
-use divi_swapd::{mock_xmr_offers, router_with_xmr, spawn_scheduler, AppState, ScanStatus};
+use divi_swapd::{mock_xmr_offers, router_with_proxy, spawn_scheduler, AppState, ScanStatus};
 use tokio::task::JoinHandle;
 
 const T0: u32 = 1_700_000_000;
@@ -107,6 +107,10 @@ impl Drop for Daemon {
 
 /// A BTC hashlock maker (serving nothing) with the xmr engine registered, under `/swap`.
 async fn serve(w: &World, db: &std::path::Path) -> Daemon {
+    serve_with(w, db, false).await
+}
+
+async fn serve_with(w: &World, db: &std::path::Path, trust_proxy_headers: bool) -> Daemon {
     let store = Store::open(db).unwrap();
     let xmr = Arc::new(
         XmrMaker::new(
@@ -140,7 +144,7 @@ async fn serve(w: &World, db: &std::path::Path) -> Daemon {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
-    let app = router_with_xmr(state, Some(xmr.clone()), "/swap");
+    let app = router_with_proxy(state, Some(xmr.clone()), "/swap", trust_proxy_headers);
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -412,4 +416,60 @@ async fn xmr_setup_is_rate_limited_per_ip() {
         );
     }
     assert_eq!(limited, Some(divi_swapd::RATE_LIMIT_PER_WINDOW + 1));
+}
+
+/// Posts `n` unparseable setups, each with the given `X-Forwarded-For` (or none), and returns
+/// the status codes. Served without `ConnectInfo`, so every socket peer is one bucket.
+async fn setup_posts(d: &Daemon, xff: impl Fn(u32) -> Option<String>, n: u32) -> Vec<u16> {
+    let http = reqwest::Client::new();
+    let url = format!("{}/xmr/swaps", d.base);
+    let mut codes = Vec::new();
+    for i in 0..n {
+        let mut req = http.post(&url).json(&serde_json::json!({}));
+        if let Some(v) = xff(i) {
+            req = req.header("x-forwarded-for", v);
+        }
+        codes.push(req.send().await.unwrap().status().as_u16());
+    }
+    codes
+}
+
+/// Gate C left-over: with `trust_proxy_headers` off (the default) a client cannot pick its
+/// own bucket by sending `X-Forwarded-For`.
+#[tokio::test]
+async fn spoofed_forwarded_for_is_ignored_by_default() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let n = divi_swapd::RATE_LIMIT_PER_WINDOW + 1;
+    let codes = setup_posts(&d, |i| Some(format!("203.0.113.{}", i + 1)), n).await;
+    assert_eq!(
+        codes.last(),
+        Some(&429),
+        "a fresh header every time is still one bucket"
+    );
+}
+
+/// With it on, two `X-Forwarded-For` values are two buckets.
+#[tokio::test]
+async fn forwarded_for_selects_the_bucket_when_trusted() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve_with(&w, &tmp.path().join("m.db"), true).await;
+    let max = divi_swapd::RATE_LIMIT_PER_WINDOW;
+    let a = setup_posts(&d, |_| Some("203.0.113.1".into()), max + 1).await;
+    assert_eq!(a.last(), Some(&429), "client A is over its limit");
+    let b = setup_posts(&d, |_| Some("203.0.113.2".into()), 1).await;
+    assert_eq!(b, vec![422], "client B has its own bucket");
+}
+
+/// With it on, a header that is not an address falls back to the socket address's bucket.
+#[tokio::test]
+async fn garbage_forwarded_for_falls_back_to_the_socket() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve_with(&w, &tmp.path().join("m.db"), true).await;
+    let n = divi_swapd::RATE_LIMIT_PER_WINDOW + 1;
+    let codes = setup_posts(&d, |i| Some(format!("not-an-ip-{i}")), n).await;
+    assert_eq!(codes.last(), Some(&429), "garbage shares the socket bucket");
 }

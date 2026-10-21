@@ -22,6 +22,7 @@ use divi_swap::{Chain, Profile, Result, Store, SwapConfig};
 use divi_swap_xmr::api::{JRoundReply, SigsRequest};
 use divi_swap_xmr::chain::{DiviChain, MoneroChain, XmrOutput};
 use divi_swap_xmr::jsig::{self, Primes};
+use divi_swap_xmr::maker::KIND;
 use divi_swap_xmr::mock::{
     MockDiviChain, MockDiviWallet, MockMoneroChain, MockMoneroWallet, MOCK_DIVI_FEE, MOCK_XMR_FEE,
 };
@@ -782,6 +783,10 @@ impl DiviChain for Forgetful {
         self.inner.release_funding(tx).await
     }
 
+    async fn release_orphan_funding(&self, keep: &[Hash256]) -> Result<Vec<Hash256>> {
+        self.inner.release_orphan_funding(keep).await
+    }
+
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.inner.broadcast(tx).await
     }
@@ -1096,6 +1101,86 @@ async fn an_aborted_setup_releases_its_coins_and_a_locked_swap_keeps_them() {
         "a locked swap keeps its coins"
     );
     assert!(w.maker.record(&mid2).unwrap().unwrap().state != XmrMakerState::Aborted);
+}
+
+/// Gate C left-over 1: the wallet persists a reservation, so one made just before a crash
+/// (no swap record) outlives the process. The first `tick` of a restarted maker releases it,
+/// and keeps the reservation a persisted swap refers to.
+#[tokio::test]
+async fn a_restart_sweeps_a_reservation_with_no_record_and_keeps_one_with_a_record() {
+    let mut w = W::new();
+    let (mid, _, _) = w.key(&mut |_| {}).await.unwrap();
+    assert_eq!(w.maker_divi.reserved_count(), 1, "the swap's reservation");
+    // The crash window: coins reserved by `build_funding`, the record never stored.
+    w.maker_divi
+        .build_funding(&w.maker_divi.payout_script(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(w.maker_divi.reserved_count(), 2);
+
+    w.restart();
+    assert_eq!(
+        w.maker_divi.reserved_count(),
+        2,
+        "construction alone sweeps nothing"
+    );
+    w.maker.tick().await.unwrap();
+    assert_eq!(w.maker_divi.reserved_count(), 1, "the orphan is released");
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Accepted);
+    let lock = w.maker.record(&mid).unwrap().unwrap().tx_lock;
+    assert_eq!(
+        w.maker_divi
+            .release_orphan_funding(&[lock.txid()])
+            .await
+            .unwrap(),
+        Vec::<Hash256>::new(),
+        "the swap's reservation is the only one left"
+    );
+    // A swap that starts after the sweep is not swept by later ticks.
+    let (mid2, _, _) = w.key(&mut |_| {}).await.unwrap();
+    w.maker.tick().await.unwrap();
+    assert_eq!(w.maker_divi.reserved_count(), 2);
+    assert_eq!(w.maker_state(&mid2), XmrMakerState::Accepted);
+}
+
+/// Gate C left-over 2: a record written before swap tokens existed gets a token minted on the
+/// next tick (so the token-gated routes can reach it) and is still driven to completion.
+#[tokio::test]
+async fn a_pre_token_record_gets_a_token_and_still_completes() {
+    let mut w = W::new();
+    let (mid, tid) = w.open().await;
+    let mut rec = w.maker.record(&mid).unwrap().unwrap();
+    assert!(w.maker.authorize(&mid, &rec.swap_token));
+    rec.swap_token = String::new();
+    w.store.put_doc(KIND, &mid, &rec).unwrap();
+    w.restart();
+    assert!(
+        !w.maker.authorize(&mid, ""),
+        "no token matches before the migration"
+    );
+
+    w.maker.tick().await.unwrap();
+    let minted = w.maker.record(&mid).unwrap().unwrap().swap_token;
+    assert_eq!(minted.len(), 64, "32 random bytes, hex");
+    assert!(
+        w.maker.authorize(&mid, &minted),
+        "reachable with the new token"
+    );
+    assert!(!w.maker.authorize(&mid, ""));
+    w.maker.tick().await.unwrap();
+    assert_eq!(
+        w.maker.record(&mid).unwrap().unwrap().swap_token,
+        minted,
+        "minted once"
+    );
+
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+        if w.maker_state(&mid) == XmrMakerState::Done {
+            break;
+        }
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
 }
 
 /// C3b: the quote store is bounded; at the cap the oldest expired quote goes first.

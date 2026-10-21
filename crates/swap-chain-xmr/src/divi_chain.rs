@@ -287,6 +287,16 @@ impl LiveDiviChain {
         self.wallet.lock().unwrap().release(&to_txid(tx.txid()))
     }
 
+    /// Give back every reservation whose funding transaction is not in `keep`: the sweep for
+    /// a reservation orphaned by a crash between `build_funding` and the swap record being
+    /// persisted (the wallet file keeps reservations across restarts). Returns the txids
+    /// released.
+    pub fn release_orphan_funding(&self, keep: &[Hash256]) -> Result<Vec<Hash256>> {
+        let keep: Vec<Txid> = keep.iter().map(|h| to_txid(*h)).collect();
+        let released = self.wallet.lock().unwrap().release_unreferenced(&keep)?;
+        Ok(released.into_iter().map(from_txid).collect())
+    }
+
     /// `broadcast` -- idempotent: already-known is success, a premature or genuinely
     /// rejected broadcast returns the matching `SwapError` variant, same semantics
     /// (and same `classify_broadcast_error` call) as `DiviBackend::broadcast`.

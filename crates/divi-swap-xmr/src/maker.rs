@@ -45,6 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use divi_crypto::keys::SecretKey;
 use divi_primitives::amount::Amount;
+use divi_primitives::hash::Hash256;
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use divi_swap::api::{Direction, Offer, Quote};
@@ -424,6 +425,12 @@ pub struct XmrMaker {
     primes: Arc<parking_lot::Mutex<Vec<Primes>>>,
     primes_fn: PrimesFn,
     primes_filling: Arc<AtomicBool>,
+    /// Read-held by `persist_setup` from `build_funding` until the record is persisted; the
+    /// orphan sweep takes it for writing, so it never sees a reservation whose record is
+    /// still on its way to the store.
+    funding_gate: tokio::sync::RwLock<()>,
+    /// The startup sweep of orphaned reservations has run (first successful `tick`).
+    swept: AtomicBool,
     /// Hold `cancel_after_secs`/`punish_after_secs` to the taker's bounds (always, outside
     /// the test that needs a maker the taker must still refuse).
     bounded_deadlines: bool,
@@ -473,6 +480,8 @@ impl XmrMaker {
             primes: Arc::new(parking_lot::Mutex::new(Vec::new())),
             primes_fn: Arc::new(jsig::generate_primes),
             primes_filling: Arc::new(AtomicBool::new(false)),
+            funding_gate: tokio::sync::RwLock::new(()),
+            swept: AtomicBool::new(false),
             bounded_deadlines: true,
         })
     }
@@ -849,10 +858,13 @@ impl XmrMaker {
             t_punish,
         };
         let (redeem, spk) = (lock.redeem_script(), lock.script_pubkey());
+        let _funding = self.funding_gate.read().await;
         let tx_lock = self.divi.build_funding(&spk, lock_amount).await?;
         // `build_funding` reserved the coins: from here a failure before the record is
         // persisted gives them back (once it is, `abort_setup` and the signatures-wait
-        // timeout in `advance` do).
+        // timeout in `advance` do). The wallet persists the reservation, so a crash in this
+        // window outlives the process: `sweep_orphan_reservations` (first `tick`) releases
+        // it, and `_funding` keeps that sweep out until the record is stored.
         let built = (|| -> Result<(SetupReply, [u8; 32])> {
             let lock_vout = tx_lock
                 .vout
@@ -1109,11 +1121,59 @@ impl XmrMaker {
             .lock()
             .retain(|_, (at, k, _)| now <= *at + wait || k.try_lock().is_err());
         self.refill_primes();
+        self.sweep_orphan_reservations().await;
         for r in self.store.list_docs::<XmrMakerRecord>(KIND)? {
+            if r.swap_token.is_empty() {
+                let _ = self.migrate_pre_token(&r.id).await;
+            }
             if !r.state.is_terminal() {
                 let _ = self.step(&r.id).await;
             }
         }
+        Ok(())
+    }
+
+    /// Once per process: release every wallet reservation no persisted swap refers to. A
+    /// crash between `build_funding` and the record being stored leaves such a reservation in
+    /// the wallet file. Retried on the next tick if the DIVI wallet is unreachable.
+    async fn sweep_orphan_reservations(&self) {
+        if self.swept.load(Ordering::Acquire) {
+            return;
+        }
+        let _gate = self.funding_gate.write().await;
+        let keep: Vec<Hash256> = match self.store.list_docs::<XmrMakerRecord>(KIND) {
+            Ok(rs) => rs.iter().map(|r| r.tx_lock.txid()).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "xmr maker: orphan reservation sweep skipped");
+                return;
+            }
+        };
+        match self.divi.release_orphan_funding(&keep).await {
+            Ok(orphans) => {
+                for t in &orphans {
+                    tracing::warn!(tx_lock = %t.to_hex(),
+                        "xmr maker: released a reservation with no swap record (crash during setup)");
+                }
+                self.swept.store(true, Ordering::Release);
+            }
+            Err(e) => tracing::warn!(error = %e, "xmr maker: orphan reservation sweep failed"),
+        }
+    }
+
+    /// A record written before swap tokens existed gets one minted and persisted, so no
+    /// stored swap is left without a token. The engine drives it as before (`tick` needs no
+    /// token); only the HTTP routes check it.
+    async fn migrate_pre_token(&self, id: &str) -> Result<()> {
+        let lock = self.swap_lock(id);
+        let _g = lock.lock().await;
+        // Reloaded under the swap lock: a request may have updated the record since the list.
+        let mut r = self.load(id)?;
+        if !r.swap_token.is_empty() {
+            return Ok(());
+        }
+        r.swap_token = new_swap_token();
+        self.store.put_doc(KIND, &r.id, &r)?;
+        tracing::info!(swap = %r.id, "xmr maker: minted a swap token for a pre-token record");
         Ok(())
     }
 

@@ -116,6 +116,10 @@ impl DiviChain for LiveDivi {
         self.chain.release_funding(tx)
     }
 
+    async fn release_orphan_funding(&self, keep: &[Hash256]) -> Result<Vec<Hash256>> {
+        self.chain.release_orphan_funding(keep)
+    }
+
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.chain.broadcast(tx).await
     }

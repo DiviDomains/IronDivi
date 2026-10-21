@@ -50,6 +50,18 @@ ssh dnsdivi sudo systemctl status divi-swapd
 Logs go to the journal; cap with `SystemMaxUse=200M` in `/etc/systemd/journald.conf.d/`. The
 logrotate file (10 MB, 5 rotations) applies only if the config sets a log file.
 
+### Rate limit behind a reverse proxy
+
+The quote and XMR setup routes are limited to 20 requests a minute per client address. By
+default that address is the socket peer, so behind nginx every client shares the proxy's bucket.
+Set `trust_proxy_headers = true` in `divi-swapd.toml` and the limiter keys on the first address in
+`X-Forwarded-For` (else `X-Real-IP`; an unparseable value falls back to the socket peer). Turn it
+on only behind a proxy you control that overwrites those headers (`proxy_set_header
+X-Forwarded-For $remote_addr;`, not `$proxy_add_x_forwarded_for`) and with the daemon reachable
+only through it: if clients can reach the daemon directly, or the proxy passes their own header
+through, each can choose its own bucket and the limit is void. It is off by default and the example
+config ships it commented out.
+
 ## Rollback
 
 `deploy.sh rollback` restores `/usr/local/bin/divi-swapd.prev` and restarts. The DB is not

@@ -398,6 +398,20 @@ impl DiviChain for MockDiviWallet {
         Ok(())
     }
 
+    async fn release_orphan_funding(&self, keep: &[Hash256]) -> Result<Vec<Hash256>> {
+        let mut s = self.chain.st.lock();
+        let orphans: Vec<Hash256> = s
+            .reserved
+            .keys()
+            .filter(|t| !keep.contains(t))
+            .copied()
+            .collect();
+        for t in &orphans {
+            s.reserved.remove(t);
+        }
+        Ok(orphans)
+    }
+
     async fn broadcast(&self, tx: &Transaction) -> Result<()> {
         self.chain.broadcast_tx(tx)
     }

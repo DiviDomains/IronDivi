@@ -174,6 +174,25 @@ impl Wallet {
         self.utxos.extend(back);
         self.persist()
     }
+
+    /// Give back every reservation whose transaction is not in `keep` (reservations are
+    /// persisted, so one made just before a crash outlives the process). Returns the
+    /// distinct transactions released, in reservation order.
+    pub fn release_unreferenced(&mut self, keep: &[Txid]) -> Result<Vec<Txid>, SwapError> {
+        let all = std::mem::take(&mut self.reserved);
+        let (kept, orphan): (Vec<Reservation>, Vec<Reservation>) =
+            all.into_iter().partition(|r| keep.contains(&r.by));
+        let mut released: Vec<Txid> = Vec::new();
+        for r in &orphan {
+            if !released.contains(&r.by) {
+                released.push(r.by);
+            }
+        }
+        self.reserved = kept;
+        self.utxos.extend(orphan.into_iter().map(|r| r.utxo));
+        self.persist()?;
+        Ok(released)
+    }
 }
 
 impl Wallet {
@@ -191,5 +210,46 @@ impl Wallet {
             self.add(*u);
         }
         self.persist()
+    }
+}
+
+#[cfg(test)]
+mod orphan_tests {
+    use super::*;
+
+    fn coin(n: u8, value: u64) -> Utxo {
+        Utxo {
+            outpoint: Outpoint {
+                txid: Txid([n; 32]),
+                vout: 0,
+            },
+            value,
+        }
+    }
+
+    #[test]
+    fn release_unreferenced_frees_only_reservations_outside_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let (a, b, c) = (Txid([0xa; 32]), Txid([0xb; 32]), Txid([0xc; 32]));
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        w.utxos = vec![coin(1, 10), coin(2, 20), coin(3, 30)];
+        w.reserve(&[coin(1, 10)], a).unwrap();
+        w.reserve(&[coin(2, 20), coin(3, 30)], b).unwrap();
+        // Reloaded from disk: what a restarted process sees.
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        assert_eq!(w.reserved_count(), 3);
+        assert_eq!(w.release_unreferenced(&[a, c]).unwrap(), vec![b]);
+        assert_eq!(w.reserved_count(), 1, "a's coin stays reserved");
+        assert_eq!(w.balance(), 50, "b's two coins are spendable again");
+        assert!(
+            w.release_unreferenced(&[a]).unwrap().is_empty(),
+            "idempotent"
+        );
+        assert_eq!(
+            Wallet::open(Some(path)).unwrap().reserved_count(),
+            1,
+            "persisted"
+        );
     }
 }

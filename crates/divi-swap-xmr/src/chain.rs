@@ -50,6 +50,12 @@ pub trait DiviChain: Send + Sync {
     /// broadcast.
     async fn release_funding(&self, tx: &Transaction) -> Result<()>;
 
+    /// Release every reservation whose funding transaction is not in `keep` and return their
+    /// txids. The maker calls it once after a restart with the `Tx_lock` of every persisted
+    /// swap: a reservation outlives the process (the wallet file keeps it), so one made just
+    /// before a crash, with no record to refer to it, would otherwise lock those coins forever.
+    async fn release_orphan_funding(&self, keep: &[Hash256]) -> Result<Vec<Hash256>>;
+
     /// Broadcast. Idempotent: a transaction the chain already has returns `Ok`. One that is
     /// not final yet (`nLockTime` in the future) returns `SwapError::Premature`; one whose
     /// input another transaction already spent returns `SwapError::Rejected`.
