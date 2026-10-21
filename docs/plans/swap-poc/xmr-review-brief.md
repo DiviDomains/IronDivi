@@ -12,8 +12,10 @@ xmr-btc-swap shape: a DIVI 2-of-2 with presigned children, one ECDSA adaptor sig
 child, and a cross-group DLEQ proof tying each party's secp256k1 adaptor point to its Monero
 spend-key share. The design write-up is `docs/plans/swap-poc/xmr-design.md`.
 
-**Gate C** (`xmr-mainnet-plan.md:54-58`): every finding is fixed or accepted in writing by
-Bert. No mainnet or real-funds swap runs before then (`xmr-mainnet-plan.md:72-74`).
+**Gate C** (`xmr-mainnet-plan.md` §Phase C): every **unfixed** finding is accepted in writing by
+Bert; a finding fixed in code leaves the gate with its commit reference (Bert, 2026-10-21). Open today:
+C3, C4, C5, C6 (C1, C2, C7, C8 are fixed — see the plan's Fixed table). No mainnet or real-funds swap
+runs before then (`xmr-mainnet-plan.md` §Phase D).
 
 | In scope | Out of scope |
 |---|---|
@@ -350,8 +352,10 @@ For the primitives and templates add `-p swap-adaptor -p swap-chain-xmr`.
 Live runs on DIVI testnet and Monero stagenet, with txids, are in `RESULTS.md:307-367`: redeem,
 refund and punish paths and the roles-swapped direction (2026-10-12, harnesses in
 `crates/swap-chain-xmr/examples/`), and one swap served by the deployed `divi-swapd`
-(2026-10-14). The engine tests use mock chains (`crates/divi-swap-xmr/src/mock.rs`); no test
-exercises a malleated Tx_cancel or a Tx_cancel with a reduced output value.
+(2026-10-14). The engine tests use mock chains (`crates/divi-swap-xmr/src/mock.rs`). The C1/C7
+malleation cases are covered by `xmr-c1-design.md` §7 (tests 5a/5b/7 on regtest, 1–4 and 6 on
+stagenet, all PASS); the reduced-value `Tx_cancel` check (C2, `taker.rs:492`) has no unit regression
+test yet (assigned 2026-10-21).
 
 ## 8. Logistics
 

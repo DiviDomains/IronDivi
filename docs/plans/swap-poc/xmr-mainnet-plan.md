@@ -55,21 +55,32 @@ Code consequences for the mainnet lift: the xmr DIVI address now follows the con
 
 Hand-written adaptor signatures, the cross-group DLEQ proof, encsig recovery and the DIVI script
 templates (`crates/divi-swap-xmr/`, `crates/swap-chain-xmr/`) reviewed by someone outside the
-project. Gate C: findings fixed or accepted in writing by Bert.
+project. Gate C: every **unfixed** finding accepted in writing by Bert. A finding fixed in code
+leaves the gate when its fix lands (Bert, 2026-10-21: "if it is fixed, then revise it, no reason to
+list fixed problems"); the fix reference stays in the Fixed table below, not in the gate. Gate list
+today: C3, C4, C5, C6. Bert's acceptance is asked for only when a mainnet XMR swap is actually proposed.
 
 The reviewer's brief is `xmr-review-brief.md` (pinned to a commit in its §8). Drafting it turned
-up findings that block mainnet on their own, before any outside review:
+up findings that block mainnet on their own, before any outside review. The gate is the first
+table only.
+
+**Open — the Gate C list (2026-10-21):**
 
 | # | Finding | Status |
 |---|---|---|
-| C1 | **Counterparty malleation of `Tx_cancel`.** `Tx_refund`/`Tx_punish` spend `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:129`); DIVI has no segwit, and each side holds the other's `Tx_cancel` signature, so either can re-sign its own half with a fresh nonce (a valid low-S signature, relayed normally) and broadcast a `Tx_cancel` with a different txid after `t_cancel`. Both presigned children are then invalid and both coins sit in a 2-of-2 neither side can spend alone: a ransom, not just a liveness risk. `xmr-design.md` §Risks covered only a miner. Needs a protocol change (or a written acceptance) before mainnet. Stakers can malleate too (NULLDUMMY/SIGPUSHONLY/CLEANSTACK/MINIMALDATA are relay-only), and any relay node can S-flip: Divi 3.0.0 does not make LOW_S standard (regtest 2026-10-15). | **design written 2026-10-14** (`xmr-c1-design.md`: 2P-ECDSA joint cancel key, OP_DEPTH guard, unilateral punish branch); **implemented 2026-10-15** (`c1-impl`, cggmp21), deployed to the stagenet maker (1841a12 since 2026-10-15 16:29Z); **all §7 tests PASS**: 5a/5b/7 on regtest (`c1-regtest-results.md`), 1-4 and 6 live on stagenet (RESULTS.md, `c1-punish-results.md`); **reviewed 2026-10-15: Bert chose option A** (interim first, Lindell-2017 J, exhaustive 120-variant presign); gaps vs built in `xmr-c1-design.md` §9 being closed; blocks D until the new build passes stagenet |
-| C2 | Taker does not check `Tx_cancel`'s output value (`taker.rs:277-287`); a tiny output zeroes `Tx_punish`. | open |
 | C3 | Unauthenticated setup reserves maker UTXOs that an abort never releases (`maker.rs:438`, `wallet.rs:168` `release` has no XMR caller); no auth or rate limit on XMR routes; `quote()` stores unbounded records. | open |
 | C4 | No check that the DIVI RPC is on the expected chain (`main.rs:183-187` compares only the URL); every timelock trusts its median time past. | open |
 | C5 | Taker accepts any `t_cancel`/`t_punish` upper bound (`taker.rs:289-293`): a maker can hold her XMR for years. | open |
 | C6 | Lower: `/xmr/swaps` lists every swap and anyone can post the lock notice (`maker.rs:591-606`); `find_lock` takes the first output (dust grief); one-confirmation `done`; unchecked `t_cancel + punish_after` add. | open |
-| C8 | A transient monerod connection error panics a taker task (`crates/swap-chain-xmr/src/live_rpc.rs:249` `expect("get_block reachable")`); seen twice in A8 on the public node and again in the C1 soak. The rerun resumed from the journal, but it must be an error, not a panic. | **fixed 2026-10-15** (1841a12: `fetch_scannable_block`/`scan_block`/`scan_for_lock_output` return errors; `find_lock`/`sweep` map them to `MoneroChainError::Rpc`, not "no output in this block"); taker rebuilt; maker redeployed to dnsdivi 2026-10-15 16:29Z (sha `929c9b54…`) |
-| C7 | Staker malleation of `Tx_lock`: `Tx_cancel` is presigned against `Tx_lock`'s txid before it confirms, and its P2PKH inputs are malleable by any staker. A malleated `Tx_lock` leaves the maker's DIVI in the 2-of-2 with no cancel (the taker locks nothing). | design: maker-unilateral `t_late` branch, `xmr-c1-design.md` §4.3; blocks D |
+
+**Fixed — off the gate, kept as the changelog:**
+
+| # | Finding | Fix |
+|---|---|---|
+| C1 | **Counterparty malleation of `Tx_cancel`.** `Tx_refund`/`Tx_punish` spend `Tx_cancel` by txid (`crates/divi-swap-xmr/src/api.rs:129`); DIVI has no segwit, and each side holds the other's `Tx_cancel` signature, so either can re-sign its own half with a fresh nonce (a valid low-S signature, relayed normally) and broadcast a `Tx_cancel` with a different txid after `t_cancel`. Both presigned children are then invalid and both coins sit in a 2-of-2 neither side can spend alone: a ransom, not just a liveness risk. `xmr-design.md` §Risks covered only a miner. Needs a protocol change (or a written acceptance) before mainnet. Stakers can malleate too (NULLDUMMY/SIGPUSHONLY/CLEANSTACK/MINIMALDATA are relay-only), and any relay node can S-flip: Divi 3.0.0 does not make LOW_S standard (regtest 2026-10-15). | **fixed 2026-10-15** — 2P-ECDSA joint cancel key (Lindell-2017 J), OP_DEPTH guard, unilateral punish branch: `xmr-c1-design.md`; commits 3c24b32 / 5481207, stagenet maker 1841a12; all §7 tests PASS (`c1-regtest-results.md`, RESULTS.md, `c1-punish-results.md`); Bert chose option A 2026-10-15 |
+| C2 | Taker does not check `Tx_cancel`'s output value (`taker.rs:277-287`); a tiny output zeroes `Tx_punish`. | **fixed in code 2026-10-15** (3c24b32: `taker.rs:492` rejects `tx_cancel.vout[0].value + divi_fee_sats != lock_amount`); regression test assigned (builder I, 2026-10-21) |
+| C7 | Staker malleation of `Tx_lock`: `Tx_cancel` is presigned against `Tx_lock`'s txid before it confirms, and its P2PKH inputs are malleable by any staker. A malleated `Tx_lock` leaves the maker's DIVI in the 2-of-2 with no cancel (the taker locks nothing). | **fixed 2026-10-15** (3c24b32: maker-unilateral `t_late` branch, `maker.rs:181/282/705`, `taker.rs:502`; design `xmr-c1-design.md` §4.3; C1-design §7 test 7 "Malleated Tx_lock" PASS on regtest) |
+| C8 | A transient monerod connection error panics a taker task (`crates/swap-chain-xmr/src/live_rpc.rs:249` `expect("get_block reachable")`); seen twice in A8 on the public node and again in the C1 soak. The rerun resumed from the journal, but it must be an error, not a panic. | **fixed 2026-10-15** (1841a12: `fetch_scannable_block`/`scan_block`/`scan_for_lock_output` return errors; `find_lock`/`sweep` map them to `MoneroChainError::Rpc`); maker redeployed to dnsdivi 2026-10-15 16:29Z (sha `929c9b54…`) |
 
 ## Phase D — staged mainnet trials (needs Bert's explicit go)
 
@@ -82,6 +93,10 @@ Each trial records lock/claim/sweep txids the same way RESULTS.md does.
 
 ## Decision log
 
+- 2026-10-21, Bert (via the Manager, 14:05Z): "if it is fixed, then revise it, no reason to list fixed
+  problems. if it is fixed, why do you need me?" — Gate C lists only unfixed findings; C1, C2, C7, C8 moved
+  to the Fixed table with their commits; C3–C6 remain open; acceptance is asked for only when a mainnet
+  XMR swap is proposed.
 - 2026-10-14, Bert: **full go** — phases A and B, and the code change that lifts the mainnet
   refusal. Hard stop before any real-money swap: phase C needs an outside reviewer, phase D needs
   Bert at the keyboard. No mainnet or real-funds swap is run by an agent. Report at each gate.
