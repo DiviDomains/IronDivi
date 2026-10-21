@@ -183,7 +183,8 @@ impl ZecBackend {
         Ok(self)
     }
 
-    fn encoded_address(&self) -> String {
+    /// Base58Check address for this backend's network (`t1…` mainnet, `tm…` testnet).
+    pub fn encoded_address(&self) -> String {
         self.address
             .encode_for(&self.network)
             .expect("network validated by with_network")
@@ -605,6 +606,9 @@ mod tests {
         let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
         let b = ZecBackend::for_network("mainnet", key, FeePolicy::default()).unwrap();
         assert!(b.encoded_address().starts_with("t1"));
+        // `address().encode()` is testnet-only; callers (CLI/daemon) must use `encoded_address()`.
+        assert!(b.address().encode().starts_with("tm"));
+        assert_ne!(b.encoded_address(), b.address().encode());
         let t = ZecBackend::for_network("testnet", key, FeePolicy::default()).unwrap();
         assert!(t.encoded_address().starts_with("tm"));
         assert!(ZecBackend::for_network("regtest", key, FeePolicy::default()).is_err());

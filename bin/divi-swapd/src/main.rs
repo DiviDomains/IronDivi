@@ -357,7 +357,7 @@ fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
     )?
     .with_network(&cfg.network)?;
     tracing::info!(
-        address = %backend.address().encode(), network = %cfg.network, "zec backend ready"
+        address = %backend.encoded_address(), network = %cfg.network, "zec backend ready"
     );
     Ok(Arc::new(backend))
 }

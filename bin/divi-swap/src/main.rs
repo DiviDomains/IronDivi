@@ -241,7 +241,7 @@ impl CounterLive {
         match self {
             CounterLive::Btc(b) => b.address().to_string(),
             CounterLive::Ltc(b) => b.address().to_string(),
-            CounterLive::Zec(z) => z.address().encode(),
+            CounterLive::Zec(z) => z.encoded_address(),
         }
     }
 

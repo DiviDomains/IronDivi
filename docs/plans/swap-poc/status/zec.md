@@ -1002,3 +1002,9 @@ numbers from this exact check):
 - decisions: no shared mainnet-guard CLI flag exists across arms (BTC has none at all, XMR's `--xmr-allow-mainnet` is xmr-only) — added `--allow-mainnet` as a new, zec-only flag rather than overload `--xmr-allow-mainnet` or BTC's absence of one; the `[zec].network`-vs-`profile` consistency check lives in `DaemonConfig::validate` (config-load time) rather than at backend-construction time (where xmr's `profile_for` runs) since zec has no per-chain engine-profile type to thread the check through — `divi_swap::Profile` (testnet/mainnet) is the only profile concept zec's `ChainBackend` shares with the rest of the engine.
 - left: (b) NU7 mainnet height unpublished — no code depends on it, unchanged from the prior round.
 - needs: nothing.
+
+## 2026-10-21 mainnet read-only smoke of divi-swapd and divi-swap (builder O)
+- done: CLI and daemon started in mainnet mode against the default lightwalletd with a throwaway zero-balance key; all three gates (no `--allow-mainnet`, `allow_mainnet = false`, profile/network mismatch) refuse with their config errors. Fixed a bug the smoke found: `divi-swap balance` and the daemon startup log printed a `tm…` testnet address on mainnet (`address().encode()`); both now use `ZecBackend::encoded_address` (`t1…`).
+- proof: daemon `/healthz` zec tip 3525840 at 2026-10-21T19:02Z; fmt, clippy -D warnings clean; tests green (`encoded_address` prefix covered by `with_network_rejects_unknown_and_selects_address_prefix`); `check-zec.sh` PASS. Rows in `mainnet-readiness.md` §ZEC.
+- left: `divi-swap` has no tip subcommand (only `balance`), so the CLI smoke records no tip; the tip comes from the daemon.
+- needs: nothing.

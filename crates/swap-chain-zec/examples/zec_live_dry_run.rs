@@ -47,7 +47,7 @@ fn key() -> SecretKey {
 #[tokio::main]
 async fn main() {
     let backend = ZecBackend::testnet(key(), FeePolicy::default()).expect("construct ZecBackend");
-    println!("address: {}", backend.address().encode());
+    println!("address: {}", backend.encoded_address());
 
     let tip = backend
         .tip_height()
