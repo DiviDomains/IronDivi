@@ -1211,3 +1211,37 @@ before any real-money swap.
   panics rather than silently continuing to the Monero sweep with an unconfirmed redeem --
   the same reject-then-recheck posture `divi_chain::LiveDiviChain::broadcast` already uses.
   `cargo fmt`/`clippy -D warnings`/`check-xmr.sh` all pass with this change.
+
+## Gate C shrink: C4 + C5 fixed, C2/C7 regression tests (builder I on hp2, 2026-10-21)
+
+Base `0c6e721` (`signed/main`), branch `lane/xmr-gate-shrink`. Testnet/mock only; no chain was touched.
+
+- done: **C4** — `DiviChain::chain_name` (`getblockchaininfo.chain`); `check_divi_chain` runs at XMR
+  startup in `divi-swapd` (`[xmr].divi_rpc_url`) and in `divi-swap`'s live taker
+  (`--xmr-divi-rpc-url`) and refuses a node on another chain than the configured Monero network
+  needs (`live::divi_chain_name`: mainnet → `main`, stagenet/testnet → `test`). The mock chain
+  names itself (`MockDiviChain::set_chain_name`). **C5** — the taker rejects
+  `t_cancel > mtp + MAX_CANCEL_AFTER_SECS` (24 h) and `t_punish > t_cancel + MAX_PUNISH_AFTER_SECS`
+  (12 h), the largest `cancel_h`/`punish_h` the `tests/schedule.rs` grid considers (the mainnet
+  profile uses 12 h / 12 h). **C2/C7 regression tests** in `crates/divi-swap-xmr/tests/engine.rs`:
+  `the_taker_checks_tx_cancels_output_value` (reduced and dust `Tx_cancel` refused, exact value
+  accepted); `a_malleated_tx_lock_is_reclaimed_after_t_late` (`MockDiviChain::malleate` re-encodes
+  the unconfirmed `Tx_lock`'s scriptSigs — new txid, same signatures; the maker records
+  `lock_actual`, offers no redeem, waits through `t_cancel`, signs the late spend past `t_late`)
+  and `the_late_branch_stays_idle_on_the_normal_path`. Also
+  `divi_chain_check_accepts_a_match_and_refuses_a_mismatch` (C4, offline node is not assumed to
+  match), `the_taker_bounds_t_cancel_and_t_punish_from_above` (C5, at the bound / one second above,
+  each field), `chain_name_reads_getblockchaininfo` / `chain_name_errors_without_a_chain_field`
+  (`swap-chain-xmr`), `divi_chain_names_follow_the_monero_network` (`live.rs`). Code commit
+  `f3d343d`. Plan: C4 and C5 moved from the gate to the Fixed table; gate list is now C3, C6;
+  review brief §7 cites the test paths instead of "no unit regression test yet".
+- proof: `cargo fmt --check` clean; `cargo clippy -p divi-swap-xmr -p divi-swapd -p divi-swap-cli
+  --all-targets -- -D warnings` clean; `cargo test -p divi-swap-xmr -p divi-swapd -p divi-swap-cli
+  -p swap-chain-xmr`: 170 passed, 0 failed (162 before, 8 added); `tools/swap-poc/check-xmr.sh`
+  PASS. No new dependencies (root `Cargo.toml` untouched).
+- decisions: the chain check lives behind the `DiviChain` trait (not a raw RPC call at the
+  binaries) so the mock engine tests cover it; `live_xmr_taker` became `async` for the check, and
+  its missing-flag test still fails before any network call. Upper bounds are taker-side
+  constants, not profile fields, since the taker must not trust a maker-supplied profile.
+- left: C3 and C6 (auth/rate-limit design, out of scope here).
+- needs: nothing from a human.

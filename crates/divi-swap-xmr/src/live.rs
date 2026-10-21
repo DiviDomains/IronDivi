@@ -96,6 +96,10 @@ impl DiviChain for LiveDivi {
         self.chain.payout_script()
     }
 
+    async fn chain_name(&self) -> Result<String> {
+        self.chain.chain_name().await
+    }
+
     async fn tip_height(&self) -> Result<u64> {
         self.chain.tip_height().await
     }
@@ -513,6 +517,15 @@ pub fn profile_for(network: Network, allow_mainnet: bool) -> Result<crate::XmrCo
     }
 }
 
+/// The DIVI `getblockchaininfo` chain name matching a Monero network: stagenet and testnet
+/// run against DIVI testnet.
+pub fn divi_chain_name(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "main",
+        _ => "test",
+    }
+}
+
 /// The DIVI address network matching a Monero network.
 pub fn divi_network(network: Network) -> divi_wallet::address::Network {
     match network {
@@ -524,6 +537,13 @@ pub fn divi_network(network: Network) -> divi_wallet::address::Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn divi_chain_names_follow_the_monero_network() {
+        assert_eq!(divi_chain_name(Network::Mainnet), "main");
+        assert_eq!(divi_chain_name(Network::Testnet), "test");
+        assert_eq!(divi_chain_name(Network::Stagenet), "test");
+    }
 
     #[test]
     fn mainnet_needs_the_opt_in() {

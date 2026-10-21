@@ -231,17 +231,16 @@ async fn live_xmr_engine(
         lookback_blocks: xs.lookback_blocks,
         journal_dir,
     })?;
+    let divi = LiveDivi::new(divi);
+    divi_swap_xmr::check_divi_chain(&divi, live::divi_chain_name(network))
+        .await
+        .map_err(|e| anyhow::anyhow!("[xmr].divi_rpc_url: {e}"))?;
     tracing::info!(
         divi_address = %address, network = %xs.network, monerod = %xs.monerod_url,
         "xmr engine ready (live)"
     );
-    let engine = divi_swap_xmr::XmrMaker::new(
-        profile,
-        Arc::new(LiveDivi::new(divi)),
-        Arc::new(xmr),
-        store,
-        offers,
-    )?;
+    let engine =
+        divi_swap_xmr::XmrMaker::new(profile, Arc::new(divi), Arc::new(xmr), store, offers)?;
     Ok(Arc::new(engine))
 }
 

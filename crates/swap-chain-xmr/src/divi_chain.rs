@@ -157,6 +157,18 @@ impl LiveDiviChain {
             .ok_or_else(|| SwapError::Transient("getblockcount: not a number".into()))
     }
 
+    /// The `chain` field of `getblockchaininfo` (`main`, `test`, `regtest`): which network
+    /// this node is on.
+    pub async fn chain_name(&self) -> Result<String> {
+        self.rpc
+            .call_ok("getblockchaininfo", json!([]))
+            .await?
+            .get("chain")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| SwapError::Transient("getblockchaininfo: no chain field".into()))
+    }
+
     /// `median_time_past` -- the node reports `mediantime: null` on this proxy, so
     /// this takes the median of the last 11 block times itself, same as
     /// `DiviBackend::median_time_past`.
@@ -490,6 +502,22 @@ mod tests {
         let pubkey = test_key().public_key().serialize_compressed();
         let expected = Script::new_p2pkh(divi_crypto::hash::hash160(&pubkey).as_bytes());
         assert_eq!(chain.payout_script(), expected);
+    }
+
+    #[tokio::test]
+    async fn chain_name_reads_getblockchaininfo() {
+        let server = MockServer::start().await;
+        mock_rpc(&server, json!({"chain": "test", "blocks": 5})).await;
+        let chain = chain_against(&server.uri());
+        assert_eq!(chain.chain_name().await.unwrap(), "test");
+    }
+
+    #[tokio::test]
+    async fn chain_name_errors_without_a_chain_field() {
+        let server = MockServer::start().await;
+        mock_rpc(&server, json!({"blocks": 5})).await;
+        let chain = chain_against(&server.uri());
+        assert!(chain.chain_name().await.is_err());
     }
 
     #[tokio::test]

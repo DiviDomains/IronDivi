@@ -57,6 +57,8 @@ struct DiviState {
     spends: HashMap<OutPoint, Hash256>,
     offline: bool,
     minted: u64,
+    /// What `getblockchaininfo` would call this chain.
+    name: String,
 }
 
 /// A simulated DIVI chain shared by several wallets.
@@ -73,9 +75,44 @@ impl MockDiviChain {
             block_secs,
             st: Arc::new(Mutex::new(DiviState {
                 mtp,
+                name: "test".into(),
                 ..DiviState::default()
             })),
         }
+    }
+
+    /// Re-encode the unconfirmed `txid` the way a staker can: a no-op prefix (`OP_0 OP_DROP`)
+    /// in each P2PKH scriptSig, which keeps every signature valid (DIVI has no segwit and
+    /// signs no scriptSigs) and changes the txid. The old encoding leaves the mempool, the
+    /// new one takes its inputs. Returns the new transaction.
+    pub fn malleate(&self, txid: &Hash256) -> Result<Transaction> {
+        let mut s = self.st.lock();
+        let (tx, mined) = s
+            .txs
+            .get(txid)
+            .cloned()
+            .ok_or_else(|| SwapError::Rejected("malleate: unknown transaction".into()))?;
+        if mined.is_some() {
+            return Err(SwapError::Rejected("malleate: already in a block".into()));
+        }
+        let mut m = tx.clone();
+        for input in &mut m.vin {
+            let mut sig = vec![0x00, 0x75];
+            sig.extend_from_slice(input.script_sig.as_bytes());
+            input.script_sig = Script::from_bytes(sig);
+        }
+        s.txs.remove(txid);
+        let new = m.txid();
+        for input in &tx.vin {
+            s.spends.insert(input.prevout, new);
+        }
+        s.txs.insert(new, (m.clone(), None));
+        Ok(m)
+    }
+
+    /// Rename the chain (`main`, `test`, `regtest`), as `getblockchaininfo` reports it.
+    pub fn set_chain_name(&self, name: &str) {
+        self.st.lock().name = name.into();
     }
 
     /// Mine `n` blocks: confirms the mempool, advances height and MTP.
@@ -253,6 +290,14 @@ impl MockDiviWallet {
 impl DiviChain for MockDiviWallet {
     fn payout_script(&self) -> Script {
         self.script()
+    }
+
+    async fn chain_name(&self) -> Result<String> {
+        let s = self.chain.st.lock();
+        if s.offline {
+            return Err(transient());
+        }
+        Ok(s.name.clone())
     }
 
     async fn tip_height(&self) -> Result<u64> {

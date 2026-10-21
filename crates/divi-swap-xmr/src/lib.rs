@@ -63,13 +63,22 @@ pub use api::{
     JRoundReply, JRoundRequest, RefundEncsig, SetupReply, SetupRequest, SigsRequest, XmrLockNotice,
     XmrSwapView,
 };
-pub use chain::{DiviChain, MoneroChain, XmrOutput};
+pub use chain::{check_divi_chain, DiviChain, MoneroChain, XmrOutput};
 pub use maker::{XmrMaker, XmrMakerState};
 pub use taker::{XmrTaker, XmrTakerState};
 
 /// Piconero per "counter sat" (1e-8 XMR): quotes keep the engine-wide convention that the
 /// counter amount is in 1e-8 units of the coin, Monero itself counts 1e-12.
 pub const PICONERO_PER_COUNTER_SAT: u64 = 10_000;
+
+/// Largest `t_cancel − mtp` the taker accepts from a maker's setup: 24 h, the longest
+/// `cancel_after_secs` `tests/schedule.rs` still considers (the mainnet profile uses 12 h).
+/// Without an upper bound a maker could hold her XMR for years.
+pub const MAX_CANCEL_AFTER_SECS: u32 = 24 * 3600;
+
+/// Largest `t_punish − t_cancel` the taker accepts: 12 h, the longest `punish_after_secs`
+/// `tests/schedule.rs` considers (the mainnet profile uses 12 h).
+pub const MAX_PUNISH_AFTER_SECS: u32 = 12 * 3600;
 
 /// Timing and confirmations of the adaptor swap. All times in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

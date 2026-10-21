@@ -28,6 +28,11 @@ pub trait DiviChain: Send + Sync {
     /// `Tx_refund` payout).
     fn payout_script(&self) -> Script;
 
+    /// The network the DIVI node is on, as `getblockchaininfo` names it (`main`, `test`,
+    /// `regtest`). Every timelock trusts this node's median time past, so the engines check
+    /// it against the configured network at startup ([`check_divi_chain`]).
+    async fn chain_name(&self) -> Result<String>;
+
     /// Current best height.
     async fn tip_height(&self) -> Result<u64>;
 
@@ -52,6 +57,19 @@ pub trait DiviChain: Send + Sync {
 
     /// The transaction spending `at` (mempool or block), if any.
     async fn find_spend(&self, at: &OutPoint) -> Result<Option<Transaction>>;
+}
+
+/// Refuse a DIVI node that is not on the `expected` chain (`main` / `test` / `regtest`): a
+/// mainnet swap over a testnet node (or the reverse) would run every timelock off the wrong
+/// chain's clock.
+pub async fn check_divi_chain(divi: &dyn DiviChain, expected: &str) -> Result<()> {
+    let got = divi.chain_name().await?;
+    if got != expected {
+        return Err(divi_swap::SwapError::InvalidParams(format!(
+            "the DIVI RPC is on chain {got:?}, but the configured network needs {expected:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// A Monero output paying the swap's shared 2-of-2 key.

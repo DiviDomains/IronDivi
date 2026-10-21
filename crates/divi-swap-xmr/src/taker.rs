@@ -505,6 +505,12 @@ impl XmrTaker {
                 "timelocks leave no room to redeem, to punish, or to cancel before t_late",
             ));
         }
+        // Upper bounds: a maker must not be able to park the taker's XMR for years.
+        if reply.t_cancel > mtp.saturating_add(crate::MAX_CANCEL_AFTER_SECS)
+            || reply.t_punish > reply.t_cancel.saturating_add(crate::MAX_PUNISH_AFTER_SECS)
+        {
+            return Err(bad("timelocks are further out than the schedule allows"));
+        }
         let digest = crypto::digest(tx_cancel, &lock.redeem_script())?;
         r.setup = Some(reply);
         self.store.put_doc(KIND, &r.id, &r)?;

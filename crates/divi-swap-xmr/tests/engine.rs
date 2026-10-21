@@ -753,6 +753,10 @@ impl DiviChain for Forgetful {
         self.inner.payout_script()
     }
 
+    async fn chain_name(&self) -> Result<String> {
+        self.inner.chain_name().await
+    }
+
     async fn tip_height(&self) -> Result<u64> {
         self.inner.tip_height().await
     }
@@ -861,4 +865,176 @@ async fn a_retried_j_round_gets_the_same_reply() {
     assert!(retried >= 3);
     let v = w.maker.sigs(&mid, sigs).await.unwrap();
     assert_eq!(v.state, XmrMakerState::Locked);
+}
+
+/// C4: the engines refuse a DIVI node on another chain than the configured network.
+#[tokio::test]
+async fn divi_chain_check_accepts_a_match_and_refuses_a_mismatch() {
+    use divi_swap_xmr::check_divi_chain;
+    let divi = MockDiviChain::new(T0, 60);
+    let wallet = divi.wallet(1);
+    // The mock reports `test`, like a stagenet/testnet configuration expects.
+    check_divi_chain(&wallet, "test").await.unwrap();
+    let e = check_divi_chain(&wallet, "main").await.unwrap_err();
+    assert!(e.to_string().contains("\"test\""), "{e}");
+    assert!(e.to_string().contains("\"main\""), "{e}");
+    // A node that renames itself (a mainnet node behind a testnet config) is refused.
+    divi.set_chain_name("main");
+    check_divi_chain(&wallet, "main").await.unwrap();
+    assert!(check_divi_chain(&wallet, "test").await.is_err());
+    // A node that cannot answer is not assumed to match.
+    divi.set_offline(true);
+    assert!(check_divi_chain(&wallet, "main").await.is_err());
+}
+
+/// The maker of `w`, rebuilt with `c` as its schedule (same wallets, store, offer).
+fn with_maker_cfg(w: &mut W, c: XmrConfig) {
+    let clock = w.clock.clone();
+    w.maker = XmrMaker::new(
+        c,
+        Arc::new(w.maker_divi.clone()),
+        Arc::new(w.maker_xmr.clone()),
+        w.store.clone(),
+        vec![offer()],
+    )
+    .unwrap()
+    .with_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
+    .with_primes(Arc::new(|| primes().1.clone()));
+}
+
+/// C5: `t_cancel` and `t_punish` have upper bounds. Accepted exactly at the bound, refused
+/// one second above, for each.
+#[tokio::test]
+async fn the_taker_bounds_t_cancel_and_t_punish_from_above() {
+    use divi_swap_xmr::{MAX_CANCEL_AFTER_SECS, MAX_PUNISH_AFTER_SECS};
+    let cases = [
+        (
+            "t_cancel at the bound",
+            XmrConfig {
+                cancel_after_secs: MAX_CANCEL_AFTER_SECS,
+                ..cfg()
+            },
+            true,
+        ),
+        (
+            "t_cancel one second above",
+            XmrConfig {
+                cancel_after_secs: MAX_CANCEL_AFTER_SECS + 1,
+                ..cfg()
+            },
+            false,
+        ),
+        (
+            "t_punish at the bound",
+            XmrConfig {
+                punish_after_secs: MAX_PUNISH_AFTER_SECS,
+                ..cfg()
+            },
+            true,
+        ),
+        (
+            "t_punish one second above",
+            XmrConfig {
+                punish_after_secs: MAX_PUNISH_AFTER_SECS + 1,
+                ..cfg()
+            },
+            false,
+        ),
+    ];
+    for (what, c, ok) in cases {
+        let mut w = W::new();
+        with_maker_cfg(&mut w, c);
+        match w.key(&mut |_| {}).await {
+            Ok(_) => assert!(ok, "{what}: accepted"),
+            Err((_, e)) => {
+                assert!(!ok, "{what}: refused: {e}");
+                assert!(e.contains("further out"), "{what}: {e}");
+            }
+        }
+    }
+}
+
+/// C2: a setup whose `Tx_cancel` output is worth less than `lock_amount − divi_fee_sats` is
+/// refused by the taker (a tiny output would zero `Tx_punish`); the exact value is accepted.
+#[tokio::test]
+async fn the_taker_checks_tx_cancels_output_value() {
+    let w = W::new();
+    let (_, err) = w
+        .key(&mut |r| {
+            if let Some(s) = r.setup.as_mut() {
+                let v = s.tx_cancel.vout[0].value.as_sat();
+                s.tx_cancel.vout[0].value = divi_primitives::amount::Amount::from_sat(v - 1);
+            }
+        })
+        .await
+        .expect_err("reduced Tx_cancel value accepted");
+    assert!(err.contains("Tx_cancel"), "{err}");
+    let (_, err) = w
+        .key(&mut |r| {
+            if let Some(s) = r.setup.as_mut() {
+                s.tx_cancel.vout[0].value = divi_primitives::amount::Amount::from_sat(1);
+            }
+        })
+        .await
+        .expect_err("dust Tx_cancel accepted");
+    assert!(err.contains("Tx_cancel"), "{err}");
+    // Untouched: lock_amount − divi_fee_sats exactly.
+    w.key(&mut |_| {}).await.expect("exact value refused");
+}
+
+/// C7: a staker re-encodes `Tx_lock` before the maker's broadcast confirms (same inputs and
+/// outputs, other txid). The presigned `Tx_cancel` is void; the maker must offer no redeem
+/// and take the lock back alone after `t_late`.
+#[tokio::test]
+async fn a_malleated_tx_lock_is_reclaimed_after_t_late() {
+    let w = W::new();
+    let (mid, tid) = w.open().await;
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    assert!(r.lock_actual.is_none());
+    // A staker's block carries another encoding of Tx_lock: same inputs and outputs, other
+    // txid. (The mock re-encodes the mempool copy in place.)
+    let m = w.divi.malleate(&r.tx_lock.txid()).expect("malleate");
+    assert_ne!(m.txid(), r.tx_lock.txid());
+    // The maker finds it, records it, and does not move to Cancelled or RedeemOffered even
+    // with the taker active and the XMR side confirmed.
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+    }
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    assert_eq!(r.lock_actual.as_ref().map(|t| t.txid()), Some(m.txid()));
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Locked);
+    assert!(w.maker.view(&mid).unwrap().unwrap().redeem.is_none());
+    // Before t_late (even past t_cancel) it waits.
+    w.divi.advance_time(cfg().cancel_after_secs + 1);
+    w.round(&mid, &tid, false, true).await;
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Locked);
+    // Past t_late the late branch fires.
+    w.divi
+        .advance_time(cfg().punish_after_secs + cfg().late_after_secs);
+    for _ in 0..10 {
+        w.round(&mid, &tid, false, true).await;
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    let late = r.late_signed.expect("late spend");
+    assert_eq!(late.vin[0].prevout.txid, m.txid());
+}
+
+/// C7, the other half: the normal path (`Tx_lock` confirms under the presigned txid) never
+/// touches the late branch.
+#[tokio::test]
+async fn the_late_branch_stays_idle_on_the_normal_path() {
+    let w = W::new();
+    let (mid, tid) = w.open().await;
+    for _ in 0..40 {
+        w.round(&mid, &tid, true, true).await;
+        if w.maker_state(&mid) == XmrMakerState::Done {
+            break;
+        }
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    assert_eq!(w.taker_rec(&tid).outcome.as_deref(), Some("redeemed"));
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    assert!(r.lock_actual.is_none(), "no re-encoding seen");
+    assert!(r.late_signed.is_none(), "late branch never signed");
 }

@@ -592,10 +592,10 @@ async fn main() -> Result<()> {
 /// The taker engine for `--counter-chain xmr`. Live: the DIVI wallet of `--divi-key` (it only
 /// receives) and the Monero wallet behind `--xmr-wallet-rpc-url`; the lock journal sits next
 /// to `--db`. Mock: a DIVI wallet that receives the DIVI, a Monero wallet holding 10 XMR.
-fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
+async fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     use divi_swap_xmr::mock::{MockDiviChain, MockMoneroChain};
     if matches!(cli.backend, BackendArg::Live) {
-        return live_xmr_taker(cli);
+        return live_xmr_taker(cli).await;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -612,7 +612,7 @@ fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
 }
 
 /// [`xmr_taker`]'s live engine.
-fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
+async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     use divi_swap_xmr::live::{self, LiveDivi, LiveDiviChain, LiveMonero, LiveMoneroConfig};
     let network = live::parse_network(&cli.xmr_network)?;
     let profile = live::profile_for(network, cli.xmr_allow_mainnet)
@@ -670,9 +670,13 @@ fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
         lookback_blocks: cli.xmr_lookback_blocks,
         journal_dir: PathBuf::from(format!("{}.xmr-journal", cli.db.display())),
     })?;
+    let divi = LiveDivi::new(divi);
+    divi_swap_xmr::check_divi_chain(&divi, live::divi_chain_name(network))
+        .await
+        .map_err(|e| anyhow::anyhow!("--xmr-divi-rpc-url: {e}"))?;
     Ok(divi_swap_xmr::XmrTaker::new(
         profile,
-        Arc::new(LiveDivi::new(divi)),
+        Arc::new(divi),
         Arc::new(xmr),
         Store::open(&cli.db)?,
     )?)
@@ -689,7 +693,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&quote)?);
         }
         Cmd::Accept(d) => {
-            let taker = xmr_taker(cli)?;
+            let taker = xmr_taker(cli).await?;
             let local = xmr_flow::begin(
                 &taker,
                 &MakerClient::new(&d.maker.maker),
@@ -709,7 +713,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
         }
         Cmd::Claim { swap } | Cmd::Refund { swap } => {
             let client = MakerClient::new(&sessions.get(swap)?.maker_url);
-            let state = xmr_flow::step(&xmr_taker(cli)?, &client, sessions, swap).await?;
+            let state = xmr_flow::step(&xmr_taker(cli).await?, &client, sessions, swap).await?;
             println!("{state:?}");
         }
         Cmd::Run {
@@ -727,7 +731,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
                 poll: Duration::from_secs(*poll_secs),
             };
             let (local, outcome) = xmr_flow::run(
-                &xmr_taker(cli)?,
+                &xmr_taker(cli).await?,
                 &MakerClient::new(&deal.maker.maker),
                 sessions,
                 &deal.offer,
@@ -764,15 +768,18 @@ mod tests {
         Cli::try_parse_from(argv).unwrap()
     }
 
-    #[test]
-    fn live_xmr_taker_names_what_it_is_missing_before_touching_anything() {
-        let err = |extra: &[&str]| match live_xmr_taker(&cli(extra)) {
-            Ok(_) => panic!("built a live xmr taker from {extra:?}"),
-            Err(e) => e.to_string(),
-        };
-        let e = err(&["--counter-chain", "xmr"]);
+    #[tokio::test]
+    async fn live_xmr_taker_names_what_it_is_missing_before_touching_anything() {
+        // The failures asserted here all come before any network call.
+        async fn err(extra: &[&str]) -> String {
+            match live_xmr_taker(&cli(extra)).await {
+                Ok(_) => panic!("built a live xmr taker from {extra:?}"),
+                Err(e) => e.to_string(),
+            }
+        }
+        let e = err(&["--counter-chain", "xmr"]).await;
         assert!(e.contains("--xmr-sweep-address"), "{e}");
-        let e = err(&["--counter-chain", "xmr", "--xmr-network", "mainnet"]);
+        let e = err(&["--counter-chain", "xmr", "--xmr-network", "mainnet"]).await;
         assert!(e.contains("no mainnet"), "{e}");
         let e = err(&[
             "--counter-chain",
@@ -780,14 +787,16 @@ mod tests {
             "--xmr-network",
             "mainnet",
             "--xmr-allow-mainnet",
-        ]);
+        ])
+        .await;
         assert!(e.contains("--xmr-divi-rpc-url"), "{e}");
         let e = err(&[
             "--counter-chain",
             "xmr",
             "--xmr-sweep-address",
             "5notanaddress",
-        ]);
+        ])
+        .await;
         assert!(e.contains("monero address"), "{e}");
     }
 

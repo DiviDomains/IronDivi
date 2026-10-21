@@ -14,7 +14,7 @@ spend-key share. The design write-up is `docs/plans/swap-poc/xmr-design.md`.
 
 **Gate C** (`xmr-mainnet-plan.md` §Phase C): every **unfixed** finding is accepted in writing by
 Bert; a finding fixed in code leaves the gate with its commit reference (Bert, 2026-10-21). Open today:
-C3, C4, C5, C6 (C1, C2, C7, C8 are fixed — see the plan's Fixed table). No mainnet or real-funds swap
+C3, C6 (C1, C2, C4, C5, C7, C8 are fixed — see the plan's Fixed table). No mainnet or real-funds swap
 runs before then (`xmr-mainnet-plan.md` §Phase D).
 
 | In scope | Out of scope |
@@ -354,8 +354,12 @@ refund and punish paths and the roles-swapped direction (2026-10-12, harnesses i
 `crates/swap-chain-xmr/examples/`), and one swap served by the deployed `divi-swapd`
 (2026-10-14). The engine tests use mock chains (`crates/divi-swap-xmr/src/mock.rs`). The C1/C7
 malleation cases are covered by `xmr-c1-design.md` §7 (tests 5a/5b/7 on regtest, 1–4 and 6 on
-stagenet, all PASS); the reduced-value `Tx_cancel` check (C2, `taker.rs:492`) has no unit regression
-test yet (assigned 2026-10-21).
+stagenet, all PASS); the reduced-value `Tx_cancel` check (C2, `taker.rs:492`) has the unit regression
+test `the_taker_checks_tx_cancels_output_value`, and the maker's `t_late` branch (C7) has
+`a_malleated_tx_lock_is_reclaimed_after_t_late` and `the_late_branch_stays_idle_on_the_normal_path`
+(all in `crates/divi-swap-xmr/tests/engine.rs`). C4 (DIVI RPC chain check) and C5 (`t_cancel`/`t_punish`
+upper bounds) are fixed with tests `divi_chain_check_accepts_a_match_and_refuses_a_mismatch` and
+`the_taker_bounds_t_cancel_and_t_punish_from_above` in the same file.
 
 ## 8. Logistics
 
