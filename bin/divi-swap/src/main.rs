@@ -75,6 +75,14 @@ struct Cli {
         default_value = "signet"
     )]
     btc_network: String,
+    /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
+    #[arg(long, global = true, default_value = "testnet")]
+    zec_network: String,
+    /// Allow `--zec-network mainnet`, which moves real money. Off by default, mirroring
+    /// `--xmr-allow-mainnet` (no shared mainnet-guard flag exists across arms today; this one
+    /// is zec-only).
+    #[arg(long, global = true)]
+    allow_mainnet: bool,
     /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
     #[arg(long, global = true)]
     usdc_key: Option<String>,
@@ -362,6 +370,18 @@ fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
 }
 
 fn live_backends(cli: &Cli) -> Result<Backends> {
+    if cli.counter_chain == Chain::Zec {
+        match cli.zec_network.as_str() {
+            "testnet" | "mainnet" => {}
+            other => bail!("--zec-network must be testnet or mainnet, got {other:?}"),
+        }
+        if cli.zec_network == "mainnet" && !cli.allow_mainnet {
+            bail!(
+                "--zec-network mainnet moves real money: no mainnet without the explicit \
+                 --allow-mainnet opt-in"
+            );
+        }
+    }
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
         .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
@@ -407,7 +427,8 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         }
         Chain::Zec => {
             let zkey = secp_key(&cli.zec_key, "--zec-key", "zec")?;
-            let backend = Arc::new(ZecBackend::testnet(
+            let backend = Arc::new(ZecBackend::for_network(
+                &cli.zec_network,
                 zkey,
                 swap_chain_zec::FeePolicy::default(),
             )?);
@@ -766,6 +787,44 @@ mod tests {
             "1",
         ]);
         Cli::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn zec_network_defaults_to_testnet() {
+        assert_eq!(cli(&[]).zec_network, "testnet");
+        assert!(!cli(&[]).allow_mainnet);
+    }
+
+    #[test]
+    fn zec_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "zec",
+            "--zec-network",
+            "mainnet",
+        ])) {
+            Ok(_) => panic!("built a live zec backend without --allow-mainnet"),
+            Err(e) => e,
+        };
+        assert!(e.to_string().contains("--allow-mainnet"), "{e}");
+    }
+
+    #[test]
+    fn zec_bad_network_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&[
+            "--counter-chain",
+            "zec",
+            "--zec-network",
+            "regtest",
+        ])) {
+            Ok(_) => panic!("built a live zec backend with an unknown network"),
+            Err(e) => e,
+        };
+        assert!(
+            e.to_string()
+                .contains("--zec-network must be testnet or mainnet"),
+            "{e}"
+        );
     }
 
     #[tokio::test]

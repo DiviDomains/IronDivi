@@ -8,7 +8,7 @@
 - done: live backends wired in divi-swapd and divi-swap CLI (DiviBackend + BtcBackend, keys via SecretRef); JSON logs; check-daemon.sh PASS
 - running: nothing
 - left: nothing; a full live swap against a real taker is the integration lane's job
-- needs: Cargo.lock lines for new direct deps (divi-crypto, divi-wallet in both bins; bitcoin, zeroize in divi-swap-cli); orchestrator to land
+- needs: nothing — verified 2026-10-21 (builder L): `Cargo.lock` has `divi-crypto` 0.2.6, `divi-wallet` 0.2.6, `bitcoin` 0.32.11, `zeroize` 1.8.2 (all present, `grep -n '^name = "<dep>"' Cargo.lock`); `cargo metadata --format-version 1` resolves the whole workspace cleanly (exit 0)
 - decisions: divi scan_from_height is applied at startup via DiviBackend::scan_blocks (failure is a warning); CLI live backend uses the default testnet RPC URL
 - smoke: 2026-10-08 live run with op:// maker keys on port 18481: GET /healthz -> {"ok":true,"version":"0.2.4","divi":{"tip":339964,"error":null},"btc":{"tip":325424,"error":null}}; maker DIVI wallet scanned from 339800, balance 24799.91965 DIVI
 - last_sha: 031504f

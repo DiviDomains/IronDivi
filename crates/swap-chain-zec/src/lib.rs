@@ -814,6 +814,29 @@ mod tests {
         println!("testnet.zec.rocks: tip={tip} mtp={mtp} consensus_branch_id={info:#010x}");
     }
 
+    /// Read-only chain-tip fact (no funds, no key material spent): proves NU6.3 (mainnet
+    /// activation height 3428143, `tx::NU6_3_MAINNET_ACTIVATION_HEIGHT`) is live on mainnet,
+    /// closing `docs/plans/swap-poc/mainnet-readiness.md`'s "could not verify (no tip query
+    /// run)" row.
+    #[tokio::test]
+    #[ignore = "needs network access to zec.rocks (mainnet)"]
+    async fn mainnet_tip_reachable() {
+        let sk = SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let backend = ZecBackend::for_network("mainnet", sk, FeePolicy::default()).unwrap();
+        let tip = backend.tip_height().await.unwrap();
+        assert!(
+            tip >= tx::NU6_3_MAINNET_ACTIVATION_HEIGHT as u64,
+            "mainnet tip {tip} is below the NU6.3 activation height \
+             {}",
+            tx::NU6_3_MAINNET_ACTIVATION_HEIGHT
+        );
+        println!(
+            "{}: mainnet tip={tip} (NU6.3 active: {})",
+            MAINNET_LIGHTWALLETD[0],
+            tip >= tx::NU6_3_MAINNET_ACTIVATION_HEIGHT as u64
+        );
+    }
+
     /// Diagnostic only (not part of the acceptance surface): what transaction version is
     /// actually on-chain right now, post-NU6.3? (Historical: this backend once built only v5;
     /// had the network required v6 for everything, not just transactions touching the new

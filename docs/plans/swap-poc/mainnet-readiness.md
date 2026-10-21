@@ -93,6 +93,7 @@ Findings (no code change — not my crate):
 | Reorg depth assumption | = confirmations (10 blocks) | `crates/divi-swap/src/config.rs:50` | ok either side of NU7 mainnet activation — see note |
 | Public backends | `MAINNET_LIGHTWALLETD` = `zec.rocks`, `na.zec.rocks`, `eu.zec.rocks` (:443, each TLS+ALPN h2 verified 2026-10-21); testnet still the single `testnet.zec.rocks` (20-min re-search found no second one) | `crates/swap-chain-zec/src/lib.rs:61-77` | **mainnet fixed; testnet single-endpoint remains** (env `SWAP_ZEC_LIGHTWALLETD_EXTRA` still extends) |
 | Address prefixes | testnet `tm…`/`t2…` `[0x1d,0x25]`/`[0x1c,0xba]`; mainnet `t1…`/`t3…` `[0x1c,0xb8]`/`[0x1c,0xbd]`; `encode_for`/`decode_for(network)` reject the other network | `crates/swap-chain-zec/src/address.rs:26-36` | **fixed** (librustzcash `zcash_protocol` constants; protocol-spec cross-check: could not verify) |
+| Daemon/CLI network selection | `[zec].network` (default `testnet`) + `[zec].allow_mainnet` (default `false`), validated against the daemon's `profile` at config load; `--zec-network`/`--allow-mainnet` on the CLI, validated before any network call | `bin/divi-swapd/src/config.rs:175-213` (`ZecSection`), `:558-579` (`DaemonConfig::validate`'s zec check); `bin/divi-swapd/src/main.rs:349-362` (`live_zec`); `bin/divi-swap/src/main.rs:372-384` (`live_backends`'s zec guard) | **fixed** (builder L, 2026-10-21) |
 
 ### Dust limit — fixed this review
 
@@ -128,7 +129,7 @@ assumed a value in the 294-5000 gap).
 | NU7 mainnet activation height | **could not verify** — ZIP 259 says "TBD (To be set on OCT 20)"; no height, no date in the ZIP | https://zips.z.cash/zip-0259 |
 | Mainnet NU7 date 2026-11-05 and the 2026-10-20 go/no-go outcome | **could not verify** — z.cash/upgrade/ names NU7 but gives no height, date or decision; ZIP 259 gives none either | https://z.cash/upgrade/ , https://zips.z.cash/zip-0259 |
 | Mainnet transparent Base58Check prefixes `[0x1c,0xb8]` (t1) / `[0x1c,0xbd]` (t3); testnet `[0x1d,0x25]` / `[0x1c,0xba]` | verified in librustzcash constants; protocol.pdf §5.6.1.1 could not verify (no extractable text layer) | https://raw.githubusercontent.com/zcash/librustzcash/main/components/zcash_protocol/src/constants/mainnet.rs , .../testnet.rs |
-| Mainnet chain tip is currently >= 3428143 (NU6.3 already live on mainnet) | **could not verify** (no tip query run); ZIP 258 is Final | https://zips.z.cash/zip-0258 |
+| Mainnet chain tip is currently >= 3428143 (NU6.3 already live on mainnet) | **verified** 2026-10-21T16:40:06Z: tip 3525726 from `https://zec.rocks:443` (`crates/swap-chain-zec/src/lib.rs` `tests::mainnet_tip_reachable`, builder L) | https://zips.z.cash/zip-0258 |
 
 **Consequence — the premise of this line item was wrong.** v6 is a NU6.3 feature, not NU7. The
 backend therefore switches at the **NU6.3** height per network (`NU6_3_MAINNET_ACTIVATION_HEIGHT =

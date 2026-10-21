@@ -25,6 +25,10 @@ deploy/divi-swapd/deploy.sh               # sync source, build ON dnsdivi, insta
 Build happens on dnsdivi (no cross toolchain; needs rustup for `ubuntu` there). Add the
 `include` line to nginx once, then `sudo nginx -t && sudo systemctl reload nginx`.
 
+`[zec].network` defaults to `testnet`; switching it to `mainnet` also needs `allow_mainnet = true`
+and a matching top-level `profile = "mainnet"`, so a mainnet cutover is never a one-line config
+edit.
+
 ## Secrets
 
 Keys never touch disk locally or argv. `provision-secrets` runs `op read` and pipes the value

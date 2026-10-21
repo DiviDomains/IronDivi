@@ -348,15 +348,17 @@ async fn live_usdc(
 
 fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
     let key = resolve_key(&cfg.key, "zec")?;
-    let mut endpoints = vec![cfg.lightwalletd_url.clone()];
-    endpoints.extend(cfg.fallback_lightwalletd_url.clone());
+    let endpoints = cfg.endpoints()?;
     let backend = ZecBackend::new(
         endpoints,
         key,
         ZecFeePolicy::default(),
         ZecRetryPolicy::default(),
-    )?;
-    tracing::info!(address = %backend.address().encode(), "zec backend ready");
+    )?
+    .with_network(&cfg.network)?;
+    tracing::info!(
+        address = %backend.address().encode(), network = %cfg.network, "zec backend ready"
+    );
     Ok(Arc::new(backend))
 }
 

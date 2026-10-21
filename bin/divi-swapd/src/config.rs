@@ -173,13 +173,44 @@ fn default_xmr_lookback() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZecSection {
-    /// Primary lightwalletd gRPC endpoint.
-    #[serde(default = "default_lightwalletd")]
-    pub lightwalletd_url: String,
-    /// Fallback lightwalletd gRPC endpoint.
+    /// `testnet` (default) or `mainnet`, mirroring `[xmr].network`.
+    #[serde(default = "default_zec_network")]
+    pub network: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[xmr].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// Primary lightwalletd gRPC endpoint. When absent, [`ZecSection::endpoints`] falls back
+    /// to `swap_chain_zec::lightwalletd_endpoints(network)` (the probed defaults for
+    /// `network`, plus whatever `SWAP_ZEC_LIGHTWALLETD_EXTRA` adds) and
+    /// `fallback_lightwalletd_url` is not consulted.
+    pub lightwalletd_url: Option<String>,
+    /// Fallback lightwalletd gRPC endpoint, used only when `lightwalletd_url` is set (comes
+    /// after it).
     pub fallback_lightwalletd_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's ZEC key.
     pub key: String,
+}
+
+fn default_zec_network() -> String {
+    "testnet".into()
+}
+
+impl ZecSection {
+    /// Lightwalletd endpoints, primary first: `lightwalletd_url` (then
+    /// `fallback_lightwalletd_url` if also set) when present, else `network`'s probed
+    /// defaults (`swap_chain_zec::lightwalletd_endpoints`).
+    pub fn endpoints(&self) -> Result<Vec<String>> {
+        Ok(match &self.lightwalletd_url {
+            Some(primary) => {
+                let mut eps = vec![primary.clone()];
+                eps.extend(self.fallback_lightwalletd_url.clone());
+                eps
+            }
+            None => swap_chain_zec::lightwalletd_endpoints(&self.network)
+                .map_err(|e| anyhow::anyhow!("[zec].network: {e}"))?,
+        })
+    }
 }
 
 /// The DIVI testnet RPC proxy: the default `[divi]` and `[xmr]` DIVI endpoint.
@@ -188,9 +219,6 @@ pub fn default_divi_rpc() -> String {
 }
 fn default_esplora() -> String {
     "https://mempool.space/signet/api".into()
-}
-fn default_lightwalletd() -> String {
-    swap_chain_zec::TESTNET_LIGHTWALLETD.to_string()
 }
 fn default_network() -> String {
     "signet".into()
@@ -527,6 +555,28 @@ impl DaemonConfig {
         if let Some(u) = &self.usdc {
             u.network()?;
         }
+        if let Some(z) = &self.zec {
+            match z.network.as_str() {
+                "testnet" | "mainnet" => {}
+                other => bail!("[zec].network must be testnet or mainnet, got {other:?}"),
+            }
+            if z.network == "mainnet" && !z.allow_mainnet {
+                bail!(
+                    "[zec].network = \"mainnet\": zec mainnet moves real money: no mainnet \
+                     without the explicit allow_mainnet opt-in (mainnet-readiness.md §ZEC)"
+                );
+            }
+            let zec_mainnet = z.network == "mainnet";
+            let profile_mainnet = self.profile == Profile::Mainnet;
+            if zec_mainnet != profile_mainnet {
+                bail!(
+                    "[zec].network = {:?} disagrees with profile = {:?}: the swap timing \
+                     profile and the zec backend must run on the same network",
+                    z.network,
+                    self.profile
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -814,6 +864,101 @@ divi_fund_txids = ["ab"]
         assert!(!plain.xmr_engine_needed(0).unwrap());
         let e = plain.xmr_engine_needed(2).unwrap_err();
         assert!(e.to_string().contains("2 xmr swap(s) in flight"), "{e}");
+    }
+
+    #[test]
+    fn zec_section_defaults_to_testnet() {
+        let text = format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n");
+        let c = DaemonConfig::parse(&text).unwrap();
+        let z = c.zec.unwrap();
+        assert_eq!(z.network, "testnet");
+        assert!(
+            !z.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
+        assert!(z.lightwalletd_url.is_none());
+    }
+
+    #[test]
+    fn zec_mainnet_without_allow_is_rejected() {
+        let text =
+            format!("{GOOD}\n[zec]\nnetwork = \"mainnet\"\nkey = \"credential:maker-btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("no mainnet without the explicit allow_mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn zec_mainnet_with_allow_and_matching_profile_is_ok() {
+        // `profile` is a bare top-level key: it must come before GOOD's first `[table]`
+        // header, or TOML scopes it into GOOD's last section ([btc]) instead.
+        let text = format!(
+            "profile = \"mainnet\"\n{GOOD}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let z = c.zec.unwrap();
+        assert_eq!(z.network, "mainnet");
+        assert!(z.allow_mainnet);
+    }
+
+    #[test]
+    fn zec_bad_network_is_rejected() {
+        let text =
+            format!("{GOOD}\n[zec]\nnetwork = \"regtest\"\nkey = \"credential:maker-btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("[zec].network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn zec_network_disagreeing_with_profile_is_rejected() {
+        // Default profile is testnet; a mainnet [zec] section (even allowed) disagrees.
+        let text = format!(
+            "{GOOD}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n"
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(e.to_string().contains("disagrees with profile"), "{e}");
+        // And the reverse: mainnet profile with a testnet [zec] section.
+        let text =
+            format!("profile = \"mainnet\"\n{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n");
+        let e = DaemonConfig::parse(&text).unwrap_err();
+        assert!(e.to_string().contains("disagrees with profile"), "{e}");
+    }
+
+    #[test]
+    fn zec_absent_lightwalletd_url_resolves_networks_probed_defaults() {
+        let text = format!(
+            "profile = \"mainnet\"\n{GOOD}\n[zec]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:maker-btc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let eps = c.zec.unwrap().endpoints().unwrap();
+        assert!(!eps.is_empty());
+        assert_eq!(eps[0], "https://zec.rocks:443");
+
+        let t = DaemonConfig::parse(&format!("{GOOD}\n[zec]\nkey = \"credential:maker-btc\"\n"))
+            .unwrap();
+        let eps = t.zec.unwrap().endpoints().unwrap();
+        assert_eq!(eps, vec![swap_chain_zec::TESTNET_LIGHTWALLETD.to_string()]);
+    }
+
+    #[test]
+    fn zec_explicit_lightwalletd_url_stays_primary_with_fallback_after() {
+        let text = format!(
+            "{GOOD}\n[zec]\nlightwalletd_url = \"https://primary:443\"\n\
+             fallback_lightwalletd_url = \"https://fallback:443\"\nkey = \"credential:maker-btc\"\n"
+        );
+        let c = DaemonConfig::parse(&text).unwrap();
+        let eps = c.zec.unwrap().endpoints().unwrap();
+        assert_eq!(eps, vec!["https://primary:443", "https://fallback:443"]);
     }
 
     #[test]
