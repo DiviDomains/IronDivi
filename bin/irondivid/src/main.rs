@@ -149,6 +149,14 @@ struct Args {
     #[arg(long)]
     stakeonstaletip: bool,
 
+    /// Misbehaviour score at which a peer is disconnected and banned (C++ -banscore, default 100)
+    #[arg(long)]
+    banscore: Option<u32>,
+
+    /// Seconds a misbehaving peer stays banned (C++ -bantime, default 86400)
+    #[arg(long)]
+    bantime: Option<u64>,
+
     /// Stake split threshold in DIVI, reported by getstakingstatus (C++ -stakesplitthreshold, default 20000)
     #[arg(long)]
     stakesplitthreshold: Option<f64>,
@@ -338,7 +346,8 @@ fn conf_kind(key: &str) -> Option<ConfKind> {
     use ConfKind::*;
     Some(match key {
         "rpcuser" | "rpcpassword" | "rpcbind" | "bind" | "proxy" | "mode" | "expire" => Str,
-        "rpcport" | "port" | "checkblocks" | "maxlogsize" | "maxlogfiles" | "utxocachesize" => Int,
+        "rpcport" | "port" | "checkblocks" | "maxlogsize" | "maxlogfiles" | "utxocachesize"
+        | "banscore" | "bantime" => Int,
         "listen" | "testnet" | "regtest" | "daemon" | "printtoconsole" | "staking"
         | "stakeonstaletip" | "txindex" | "spentindex" | "addressindex" | "disablewallet" => Bool,
         "addnode" | "fullnode" | "connect" => List,
@@ -595,6 +604,16 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!("Invalid staking value in config file, expected boolean or integer");
                 }
             }
+            "banscore" => match value.as_integer() {
+                Some(i) if i >= 0 => config.p2p.ban_score = i.min(u32::MAX as i64) as u32,
+                _ => {
+                    warn!("Invalid banscore value in config file, expected a non-negative integer")
+                }
+            },
+            "bantime" => match value.as_integer() {
+                Some(i) if i >= 0 => config.p2p.ban_time = i as u64,
+                _ => warn!("Invalid bantime value in config file, expected a non-negative integer"),
+            },
             "stakeonstaletip" => {
                 if let Some(b) = value.as_bool() {
                     config.staking.stake_on_stale_tip = b;
@@ -857,6 +876,12 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     }
     if args.stakeonstaletip {
         config.staking.stake_on_stale_tip = true;
+    }
+    if let Some(score) = args.banscore {
+        config.p2p.ban_score = score;
+    }
+    if let Some(secs) = args.bantime {
+        config.p2p.ban_time = secs;
     }
     if let Some(divi) = args.stakesplitthreshold {
         config.staking.split_threshold = (divi * 100_000_000.0).round() as i64;

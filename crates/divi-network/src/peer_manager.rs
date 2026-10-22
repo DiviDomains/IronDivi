@@ -18,7 +18,7 @@ use crate::constants::Magic;
 use crate::error::NetworkError;
 use crate::message::{InvItem, InvType};
 use crate::peer::{PeerEvent, PeerHandle, PeerId};
-use crate::scoring::{Misbehavior, PeerScoring};
+use crate::scoring::{Misbehavior, MisbehaviourOutcome, PeerScoring};
 use crate::NetworkMessage;
 use divi_primitives::hash::Hash256;
 
@@ -150,6 +150,30 @@ impl PeerManager {
         }
     }
 
+    /// Divi Core's `Misbehaving`: add a misbehaviour score to a peer (0 does
+    /// nothing); a peer reaching the ban threshold is disconnected and,
+    /// unless local, banned for the ban time
+    pub fn report_misbehavior_score(
+        &self,
+        peer_id: PeerId,
+        score: u32,
+        cause: &str,
+    ) -> MisbehaviourOutcome {
+        let ip = self.scoring.get_stats(peer_id).map(|s| s.ip);
+        let outcome = self.scoring.record_misbehavior_score(
+            peer_id,
+            score.min(i32::MAX as u32) as i32,
+            cause,
+        );
+        match (outcome, ip) {
+            // Every connection from the banned address goes
+            (MisbehaviourOutcome::Banned, Some(ip)) => self.disconnect_ip(ip),
+            (MisbehaviourOutcome::Scored, _) => {}
+            _ => self.disconnect(peer_id),
+        }
+        outcome
+    }
+
     /// Check if an IP is banned
     pub fn is_banned(&self, ip: &std::net::IpAddr) -> bool {
         self.scoring.is_banned(ip)
@@ -158,8 +182,11 @@ impl PeerManager {
     /// Ban an IP address
     pub fn ban_ip(&self, ip: std::net::IpAddr, duration: Duration, reason: impl Into<String>) {
         self.scoring.ban_ip(ip, duration, reason);
+        self.disconnect_ip(ip);
+    }
 
-        // Disconnect any peers from this IP
+    /// Disconnect every peer connected from `ip`
+    fn disconnect_ip(&self, ip: std::net::IpAddr) {
         let peers_to_disconnect: Vec<_> = self
             .peers
             .read()

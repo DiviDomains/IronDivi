@@ -641,10 +641,13 @@ impl Chain {
         kernel_height: u32,
     ) -> Result<BlockIndex, StorageError> {
         if kernel_height > parent.height {
-            return Err(StorageError::InvalidBlock(format!(
-                "Kernel height {} above parent height {}",
-                kernel_height, parent.height
-            )));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Kernel height {} above parent height {}",
+                    kernel_height, parent.height
+                ),
+            ));
         }
         // Fast path only applies when `parent` is the active-chain block at its
         // height; a side-branch parent is resolved by walking its own ancestry.
@@ -688,11 +691,14 @@ impl Chain {
         let mut cur = parent.clone();
         while cur.height > kernel_height {
             cur = self.db.get_block_index(&cur.prev_hash)?.ok_or_else(|| {
-                StorageError::InvalidBlock(format!(
-                    "Kernel lookup: missing ancestor {} at height {}",
-                    cur.prev_hash,
-                    cur.height.saturating_sub(1)
-                ))
+                StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "Kernel lookup: missing ancestor {} at height {}",
+                        cur.prev_hash,
+                        cur.height.saturating_sub(1)
+                    ),
+                )
             })?;
         }
         Ok(cur)
@@ -1155,10 +1161,10 @@ impl Chain {
             // Divi Core AcceptBlockHeader (ChainExtensionService.cpp): a known
             // block marked failed is rejected, never re-evaluated.
             if existing_index.failed() {
-                return Err(StorageError::InvalidBlock(format!(
-                    "block {} is marked invalid",
-                    hash
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!("block {} is marked invalid", hash),
+                ));
             }
             // We already have this block - update best_known_block in case
             // this was stored as a side-chain block and now participates in
@@ -1237,14 +1243,17 @@ impl Chain {
                 debug!("  ├─ Header-only context validation (side chain)");
                 // Minimal validation: timestamp and parent linkage only
                 if block.header.prev_block != parent.hash {
-                    return Err(StorageError::InvalidBlock("wrong parent".into()));
+                    return Err(StorageError::invalid_block_scored(0, "wrong parent".into()));
                 }
                 let mtp = self.get_median_time_past(parent)?;
                 if block.header.time <= mtp {
-                    return Err(StorageError::InvalidBlock(format!(
-                        "block timestamp {} is not greater than median time past {}",
-                        block.header.time, mtp
-                    )));
+                    return Err(StorageError::invalid_block_scored(
+                        0,
+                        format!(
+                            "block timestamp {} is not greater than median time past {}",
+                            block.header.time, mtp
+                        ),
+                    ));
                 }
                 debug!("  ├─ Header validation: ✅ PASS (full validation deferred to reorg)");
             }
@@ -1778,6 +1787,7 @@ impl Chain {
         matches!(
             err,
             StorageError::InvalidBlock(_)
+                | StorageError::InvalidBlockScored { .. }
                 | StorageError::UtxoNotFound(_)
                 | StorageError::DoubleSpend(_)
         )
@@ -1892,7 +1902,8 @@ impl Chain {
             .get_block_index(hash)?
             .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
         if target.height == 0 {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "cannot invalidate the genesis block".into(),
             ));
         }
@@ -2259,7 +2270,10 @@ impl Chain {
     fn check_block_header(&self, block: &Block) -> Result<(), StorageError> {
         // Check version
         if block.header.version < 1 {
-            return Err(StorageError::InvalidBlock("invalid version".into()));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                "invalid version".into(),
+            ));
         }
 
         // Check timestamp not too far in the future (2 hours)
@@ -2268,7 +2282,8 @@ impl Chain {
             .map_err(|e| StorageError::ChainState(format!("System time error: {}", e)))?
             .as_secs() as u32;
         if block.header.time > now + 2 * 60 * 60 {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "timestamp too far in future".into(),
             ));
         }
@@ -2288,15 +2303,18 @@ impl Chain {
     /// Check block context (relative to parent)
     fn check_block_context(&self, block: &Block, parent: &BlockIndex) -> Result<(), StorageError> {
         if block.header.prev_block != parent.hash {
-            return Err(StorageError::InvalidBlock("wrong parent".into()));
+            return Err(StorageError::invalid_block_scored(0, "wrong parent".into()));
         }
 
         let mtp = self.get_median_time_past(parent)?;
         if block.header.time <= mtp {
-            return Err(StorageError::InvalidBlock(format!(
-                "block timestamp {} is not greater than median time past {}",
-                block.header.time, mtp
-            )));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "block timestamp {} is not greater than median time past {}",
+                    block.header.time, mtp
+                ),
+            ));
         }
 
         // Validate proof-of-stake if this is a PoS block
@@ -2328,7 +2346,8 @@ impl Chain {
         // PoW blocks must have an empty signature
         if !block.is_proof_of_stake() {
             if !block.block_sig.is_empty() {
-                return Err(StorageError::InvalidBlock(
+                return Err(StorageError::invalid_block_scored(
+                    0,
                     "PoW block must have empty signature".into(),
                 ));
             }
@@ -2337,7 +2356,8 @@ impl Chain {
 
         // PoS blocks must have a non-empty signature
         if block.block_sig.is_empty() {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "PoS block must have a signature".into(),
             ));
         }
@@ -2347,7 +2367,8 @@ impl Chain {
 
         // Get coinstake's second output (vout[1]) — the staking output with the key
         if coinstake.vout.len() < 2 {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "coinstake must have at least 2 outputs for signature verification".into(),
             ));
         }
@@ -2365,37 +2386,38 @@ impl Chain {
                 // P2PKH: Use recoverable signature verification
                 // Recover pubkey from compact signature, check hash160 matches
                 if solutions.is_empty() || solutions[0].len() != 20 {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "invalid P2PKH script in coinstake output".into(),
                     ));
                 }
 
-                let expected_hash: [u8; 20] = solutions[0]
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StorageError::InvalidBlock("invalid pubkey hash length".into()))?;
+                let expected_hash: [u8; 20] = solutions[0].as_slice().try_into().map_err(|_| {
+                    StorageError::invalid_block_scored(0, "invalid pubkey hash length".into())
+                })?;
 
                 let recoverable_sig =
                     divi_crypto::RecoverableSig::from_compact_with_recovery(&block.block_sig)
                         .map_err(|e| {
-                            StorageError::InvalidBlock(format!(
-                                "invalid block signature format: {}",
-                                e
-                            ))
+                            StorageError::invalid_block_scored(
+                                0,
+                                format!("invalid block signature format: {}", e),
+                            )
                         })?;
 
                 let recovered_pubkey = recoverable_sig
                     .recover_from_hash(block_hash.as_bytes())
                     .map_err(|e| {
-                        StorageError::InvalidBlock(format!(
-                            "failed to recover pubkey from block signature: {}",
-                            e
-                        ))
+                        StorageError::invalid_block_scored(
+                            0,
+                            format!("failed to recover pubkey from block signature: {}", e),
+                        )
                     })?;
 
                 let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
                 if *recovered_hash.as_bytes() != expected_hash {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "block signature: recovered pubkey does not match coinstake P2PKH output"
                             .into(),
                     ));
@@ -2405,29 +2427,31 @@ impl Chain {
             divi_script::ScriptType::PubKey => {
                 // P2PK: Standard ECDSA verify with the pubkey from the script
                 if solutions.is_empty() {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "invalid P2PK script in coinstake output".into(),
                     ));
                 }
 
                 let pubkey = divi_crypto::PublicKey::from_bytes(&solutions[0]).map_err(|e| {
-                    StorageError::InvalidBlock(format!(
-                        "invalid pubkey in coinstake P2PK output: {}",
-                        e
-                    ))
+                    StorageError::invalid_block_scored(
+                        0,
+                        format!("invalid pubkey in coinstake P2PK output: {}", e),
+                    )
                 })?;
 
                 // For P2PK, the block_sig is a standard DER-encoded signature
                 let signature =
                     divi_crypto::Signature::from_der(&block.block_sig).map_err(|e| {
-                        StorageError::InvalidBlock(format!(
-                            "invalid DER block signature for P2PK: {}",
-                            e
-                        ))
+                        StorageError::invalid_block_scored(
+                            0,
+                            format!("invalid DER block signature for P2PK: {}", e),
+                        )
                     })?;
 
                 if !divi_crypto::verify_hash(&pubkey, &signature, block_hash.as_bytes()) {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "block signature: ECDSA verify failed for coinstake P2PK output".into(),
                     ));
                 }
@@ -2437,46 +2461,51 @@ impl Chain {
                 // Vault: Use recoverable signature with the vault manager's key hash
                 // solutions[1] is the vault pubkey hash (manager key)
                 if solutions.len() < 2 || solutions[1].len() != 20 {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "invalid vault script in coinstake output".into(),
                     ));
                 }
 
                 let vault_hash: [u8; 20] = solutions[1].as_slice().try_into().map_err(|_| {
-                    StorageError::InvalidBlock("invalid vault pubkey hash length".into())
+                    StorageError::invalid_block_scored(0, "invalid vault pubkey hash length".into())
                 })?;
 
                 let recoverable_sig =
                     divi_crypto::RecoverableSig::from_compact_with_recovery(&block.block_sig)
                         .map_err(|e| {
-                            StorageError::InvalidBlock(format!(
-                                "invalid block signature format for vault: {}",
-                                e
-                            ))
+                            StorageError::invalid_block_scored(
+                                0,
+                                format!("invalid block signature format for vault: {}", e),
+                            )
                         })?;
 
                 let recovered_pubkey = recoverable_sig
                     .recover_from_hash(block_hash.as_bytes())
                     .map_err(|e| {
-                        StorageError::InvalidBlock(format!(
-                            "failed to recover pubkey from vault block signature: {}",
-                            e
-                        ))
+                        StorageError::invalid_block_scored(
+                            0,
+                            format!("failed to recover pubkey from vault block signature: {}", e),
+                        )
                     })?;
 
                 let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
                 if *recovered_hash.as_bytes() != vault_hash {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "block signature: recovered pubkey does not match vault manager key".into(),
                     ));
                 }
             }
 
             _ => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "unsupported coinstake output script type for block signature: {:?}",
-                    script_type
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "unsupported coinstake output script type for block signature: {:?}",
+                        script_type
+                    ),
+                ));
             }
         }
 
@@ -2647,8 +2676,9 @@ impl Chain {
         }
 
         let coinstake = &block.transactions[1];
-        crate::pos_validation::validate_coinstake_transaction(coinstake)
-            .map_err(|e| StorageError::InvalidBlock(format!("Invalid coinstake: {}", e)))?;
+        crate::pos_validation::validate_coinstake_transaction(coinstake).map_err(|e| {
+            StorageError::invalid_block_scored(0, format!("Invalid coinstake: {}", e))
+        })?;
 
         // Validate all inputs pay to the same script
         let chain_ref = self;
@@ -2666,7 +2696,10 @@ impl Chain {
 
         crate::pos_validation::validate_coinstake_inputs_same_script(coinstake, &get_utxo)
             .map_err(|e| {
-                StorageError::InvalidBlock(format!("Coinstake inputs validation failed: {}", e))
+                StorageError::invalid_block_scored(
+                    0,
+                    format!("Coinstake inputs validation failed: {}", e),
+                )
             })?;
 
         let expected_stake_reward = Self::stake_reward(&self.block_rewards(parent.height + 1));
@@ -2687,10 +2720,13 @@ impl Chain {
 
         // Get UTXO being staked
         let kernel_utxo = self.db.get_utxo(&kernel_input.prevout)?.ok_or_else(|| {
-            StorageError::InvalidBlock(format!(
-                "Kernel UTXO not found: {}:{}",
-                kernel_input.prevout.txid, kernel_input.prevout.vout
-            ))
+            StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Kernel UTXO not found: {}:{}",
+                    kernel_input.prevout.txid, kernel_input.prevout.vout
+                ),
+            )
         })?;
 
         // Use the UTXO's height field directly instead of calling find_transaction,
@@ -2737,7 +2773,9 @@ impl Chain {
             &staking_data,
             block.header.time,
         )
-        .map_err(|e| StorageError::InvalidBlock(format!("PoS verification failed: {}", e)))?;
+        .map_err(|e| {
+            StorageError::invalid_block_scored(0, format!("PoS verification failed: {}", e))
+        })?;
 
         debug!("  computed_hash: {}", hash_proof);
         debug!("  meets_target: {}", meets_target);
@@ -2748,10 +2786,13 @@ impl Chain {
             //    for correct Hash256 comparison (matching C++ uint256 semantics)
             // 2. PoS detection uses is_proof_of_stake flag (based on vtx[1].is_coinstake())
             // 3. Selection hash >> 32 shift corrected (right shift, not left)
-            return Err(StorageError::InvalidBlock(format!(
-                "Proof-of-stake hash does not meet target. Hash: {}, Target bits: {}",
-                hash_proof, block.header.bits
-            )));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Proof-of-stake hash does not meet target. Hash: {}, Target bits: {}",
+                    hash_proof, block.header.bits
+                ),
+            ));
         }
 
         Ok(())
@@ -3126,11 +3167,14 @@ impl Chain {
                                 ScriptFlags::pos(),
                             )
                             .map_err(|e| {
-                                StorageError::InvalidBlock(format!(
-                                    "VerifySignature failed on coinstake {} ({})",
-                                    txid,
-                                    e.core_message()
-                                ))
+                                StorageError::invalid_block_scored(
+                                    0,
+                                    format!(
+                                        "VerifySignature failed on coinstake {} ({})",
+                                        txid,
+                                        e.core_message()
+                                    ),
+                                )
                             })?;
                         }
                     }
@@ -3321,7 +3365,7 @@ impl Chain {
         let charity_script = treasury::get_charity_script(is_mainnet);
 
         let coinstake = block.transactions.get(1).ok_or_else(|| {
-            StorageError::InvalidBlock("Treasury block missing coinstake".to_string())
+            StorageError::invalid_block_scored(0, "Treasury block missing coinstake".to_string())
         })?;
 
         // Use transition-aware payment cycle (matches C++ GetTreasuryBlockPaymentCycle)
@@ -3348,32 +3392,38 @@ impl Chain {
 
         match treasury_found {
             None => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} missing treasury payment",
-                    height
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!("Treasury block {} missing treasury payment", height),
+                ));
             }
             Some(actual) if actual != expected_treasury => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} has incorrect treasury payment: expected {}, got {}",
-                    height, expected_treasury, actual
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "Treasury block {} has incorrect treasury payment: expected {}, got {}",
+                        height, expected_treasury, actual
+                    ),
+                ));
             }
             Some(_) => {}
         }
 
         match charity_found {
             None => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} missing charity payment",
-                    height
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!("Treasury block {} missing charity payment", height),
+                ));
             }
             Some(actual) if actual != expected_charity => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} has incorrect charity payment: expected {}, got {}",
-                    height, expected_charity, actual
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "Treasury block {} has incorrect charity payment: expected {}, got {}",
+                        height, expected_charity, actual
+                    ),
+                ));
             }
             Some(_) => {}
         }
@@ -3583,10 +3633,13 @@ impl Chain {
                 .any(|out| out.script_pubkey == *expected_script && out.value == expected_reward);
 
             if !found {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Lottery block {} missing payment for winner {}: expected {} to script",
-                    height, i, expected_reward
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "Lottery block {} missing payment for winner {}: expected {} to script",
+                        height, i, expected_reward
+                    ),
+                ));
             }
         }
 
@@ -4091,10 +4144,13 @@ impl divi_masternode::UtxoProvider for ChainDatabase {
 fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError> {
     for tx in &block.transactions {
         if !tx.is_final(height, block.header.time) {
-            return Err(StorageError::InvalidBlock(format!(
-                "bad-txns-nonfinal: block at height {} contains a non-final transaction",
-                height
-            )));
+            return Err(StorageError::invalid_block_scored(
+                10,
+                format!(
+                    "bad-txns-nonfinal: block at height {} contains a non-final transaction",
+                    height
+                ),
+            ));
         }
     }
     Ok(())

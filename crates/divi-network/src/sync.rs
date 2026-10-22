@@ -22,7 +22,7 @@ use divi_crypto::compute_block_hash;
 use divi_primitives::block::{Block, BlockHeader};
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::Transaction;
-use divi_storage::Chain;
+use divi_storage::{Chain, StorageError};
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -297,6 +297,10 @@ fn order_retry_peers(
     fresh
 }
 
+/// Cap on remembered block sources (blocks downloaded but not yet accepted
+/// or refused); past it the map starts over
+const MAX_TRACKED_BLOCK_SOURCES: usize = 10_000;
+
 /// Orphan block tracking
 struct OrphanBlock {
     /// The orphan block
@@ -337,6 +341,9 @@ pub struct BlockSync {
     blocks_in_flight: RwLock<HashMap<Hash256, BlockRequest>>,
     /// Blocks that have been downloaded but not yet connected
     downloaded_blocks: RwLock<HashMap<Hash256, Block>>,
+    /// Which peer sent each downloaded block not yet accepted or refused,
+    /// so a refused block can be scored against it
+    block_sources: RwLock<HashMap<Hash256, PeerId>>,
     /// Orphan blocks (blocks whose parent we don't have yet)
     orphan_blocks: RwLock<HashMap<Hash256, OrphanBlock>>,
     /// Blocks we've requested from each peer
@@ -397,6 +404,7 @@ impl BlockSync {
             pending_headers: RwLock::new(VecDeque::new()),
             blocks_in_flight: RwLock::new(HashMap::new()),
             downloaded_blocks: RwLock::new(HashMap::new()),
+            block_sources: RwLock::new(HashMap::new()),
             orphan_blocks: RwLock::new(HashMap::new()),
             peer_block_requests: RwLock::new(HashMap::new()),
             pending_block_requests: RwLock::new(VecDeque::new()),
@@ -1036,6 +1044,30 @@ impl BlockSync {
         }
     }
 
+    /// A block was accepted: it no longer needs its source
+    fn note_block_accepted(&self, hash: &Hash256) {
+        self.block_sources.write().remove(hash);
+    }
+
+    /// A block was refused. As Divi Core's ProcessMessage ("Bad block
+    /// processed"), the peer that sent it gets the refusal's misbehaviour score.
+    /// Returns true when the block is invalid (scored), so callers drop it
+    /// instead of retrying; an orphan or a local error scores 0 and is kept.
+    fn note_block_rejected(&self, hash: &Hash256, err: &StorageError) -> bool {
+        let score = err.misbehaviour_score();
+        if score == 0 {
+            return false;
+        }
+        if let Some(peer_id) = self.block_sources.write().remove(hash) {
+            self.peer_manager.report_misbehavior_score(
+                peer_id,
+                score,
+                &format!("bad block {}: {}", hash, err),
+            );
+        }
+        true
+    }
+
     /// Handle received block
     pub async fn handle_block(&self, peer_id: PeerId, block: Block) {
         let hash = compute_block_hash(&block.header);
@@ -1052,6 +1084,13 @@ impl BlockSync {
         self.block_retry.write().remove(&hash);
 
         // Store in downloaded blocks
+        {
+            let mut sources = self.block_sources.write();
+            if sources.len() >= MAX_TRACKED_BLOCK_SOURCES {
+                sources.clear();
+            }
+            sources.insert(hash, peer_id);
+        }
         self.downloaded_blocks.write().insert(hash, block);
         self.stats.write().blocks_downloaded += 1;
 
@@ -1111,6 +1150,7 @@ impl BlockSync {
                         self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                     }
                     let height = self.chain.height();
+                    self.note_block_accepted(&hash);
                     // Remove from pending headers
                     self.pending_headers.write().pop_front();
                     debug!("Connected block {} at height {}", hash, height);
@@ -1122,6 +1162,7 @@ impl BlockSync {
                 }
                 Err(e) => {
                     error!("Failed to connect block {}: {}", hash, e);
+                    self.note_block_rejected(&hash, &e);
                     break;
                 }
             }
@@ -1229,6 +1270,7 @@ impl BlockSync {
                         self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                     }
                     let height = self.chain.height();
+                    self.note_block_accepted(&hash);
                     debug!("Connected block {} at height {}", hash, height);
                     self.stats.write().blocks_connected += 1;
 
@@ -1239,6 +1281,7 @@ impl BlockSync {
                 }
                 Err(e) => {
                     error!("Failed to connect block {}: {}", hash, e);
+                    self.note_block_rejected(&hash, &e);
                     break;
                 }
             }
@@ -1275,6 +1318,7 @@ impl BlockSync {
                         }
                         // Remove from downloaded if it was accepted
                         self.downloaded_blocks.write().remove(&hash);
+                        self.note_block_accepted(&hash);
                         made_progress = true;
 
                         // Check if our height changed (reorg happened)
@@ -1292,9 +1336,14 @@ impl BlockSync {
                         }
                     }
                     Err(e) => {
-                        // Block couldn't be accepted (orphan or invalid)
-                        // Keep it for now, might be usable after we get more blocks
-                        debug!("Block {} not accepted yet: {}", hash, e);
+                        // An invalid block is scored and dropped; an orphan is
+                        // kept, it might be usable after we get more blocks
+                        if self.note_block_rejected(&hash, &e) {
+                            self.downloaded_blocks.write().remove(&hash);
+                            warn!("Dropped invalid block {}: {}", hash, e);
+                        } else {
+                            debug!("Block {} not accepted yet: {}", hash, e);
+                        }
                     }
                 }
             }
@@ -1413,6 +1462,7 @@ impl BlockSync {
             *self.sync_peer.write() = None;
             self.downloaded_blocks.write().clear();
             self.orphan_blocks.write().clear();
+            self.block_sources.write().clear();
             self.request_headers().await;
             return;
         }
@@ -1514,6 +1564,7 @@ impl BlockSync {
 
                 // Clear downloaded blocks now that we've saved them as orphans
                 self.downloaded_blocks.write().clear();
+                self.block_sources.write().clear();
 
                 // Try to request missing blocks to fill the gap
                 self.request_missing_blocks_for_orphans().await;
@@ -2105,6 +2156,7 @@ impl BlockSync {
 
                         // Remove from orphans
                         self.orphan_blocks.write().remove(&hash);
+                        self.note_block_accepted(&hash);
 
                         // Update stats
                         self.stats.write().blocks_connected += 1;
@@ -2117,7 +2169,12 @@ impl BlockSync {
                         connected_any = true;
                     }
                     Err(e) => {
-                        debug!("Failed to connect orphan block {}: {}", hash, e);
+                        if self.note_block_rejected(&hash, &e) {
+                            self.orphan_blocks.write().remove(&hash);
+                            warn!("Dropped invalid orphan block {}: {}", hash, e);
+                        } else {
+                            debug!("Failed to connect orphan block {}: {}", hash, e);
+                        }
                     }
                 }
             }
@@ -3251,5 +3308,109 @@ mod tests {
         assert_eq!(getdata_recipients(&mut rxs, hash), vec![2]);
         assert_eq!(in_flight_peer(&sync, &hash), Some(2));
         assert_eq!(sync.block_retry.read()[&hash].attempts, 1);
+    }
+
+    /// A regtest chain at genesis, its BlockSync, and a peer at a
+    /// non-loopback address registered with the peer manager
+    fn sync_with_peer() -> (Arc<BlockSync>, tempfile::TempDir, PeerId, std::net::IpAddr) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let peer_manager = PeerManager::new(Default::default());
+        let ip: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let peer_id: PeerId = 7;
+        peer_manager.scoring().register_peer(peer_id, ip);
+        (BlockSync::new(chain, peer_manager), dir, peer_id, ip)
+    }
+
+    /// A PoW block on `chain`'s tip with a coinbase only
+    fn next_block(chain: &Chain) -> Block {
+        use divi_primitives::amount::Amount;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let tip = chain.tip().unwrap();
+        let mut tag = vec![4u8];
+        tag.extend_from_slice(&(tip.height + 1).to_le_bytes());
+        let mut block = Block::default();
+        block.header.version = 1;
+        block.header.prev_block = tip.hash;
+        block.header.time = tip.time + 60;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1250 * 100_000_000),
+                Script::new_p2pkh(&[3u8; 20]),
+            )],
+            lock_time: 0,
+        });
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        block
+    }
+
+    fn score(sync: &BlockSync, peer_id: PeerId) -> i32 {
+        sync.peer_manager
+            .scoring()
+            .get_stats(peer_id)
+            .map_or(0, |s| s.misbehavior_score)
+    }
+
+    #[tokio::test]
+    async fn peer_relaying_an_invalid_block_is_banned() {
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        let mut block = next_block(&sync.chain);
+        // Merkle root that does not match the transactions: Divi Core scores 100
+        block.header.merkle_root = Hash256::from_bytes([9u8; 32]);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 0);
+        assert!(sync.peer_manager.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn valid_block_does_not_score_its_peer() {
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        assert!(sync.chain.is_ibd());
+        let block = next_block(&sync.chain);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 1);
+        assert_eq!(score(&sync, peer_id), 0);
+        assert!(!sync.peer_manager.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn orphan_block_does_not_score_its_peer() {
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        let mut block = next_block(&sync.chain);
+        block.header.prev_block = Hash256::from_bytes([5u8; 32]);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 0);
+        assert_eq!(score(&sync, peer_id), 0);
+        assert!(!sync.peer_manager.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn block_from_the_future_does_not_score_its_peer() {
+        // Divi Core records a too-far-future timestamp as state.Invalid (score 0)
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        let mut block = next_block(&sync.chain);
+        block.header.time = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 24 * 3600) as u32;
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 0);
+        assert_eq!(score(&sync, peer_id), 0);
+        assert!(!sync.peer_manager.is_banned(&ip));
     }
 }

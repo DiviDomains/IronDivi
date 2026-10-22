@@ -311,9 +311,11 @@ impl NetworkRpc {
 
         match command.to_lowercase().as_str() {
             "add" => {
-                // Get ban time (default 24 hours)
-                let ban_time = params.get_u64(2).unwrap_or(86400);
-                let duration = Duration::from_secs(ban_time);
+                // Ban time: missing or 0 means the node's -bantime (default 24 hours)
+                let duration = match params.get_u64(2) {
+                    Some(secs) if secs > 0 => Duration::from_secs(secs),
+                    _ => peer_manager.scoring().ban_policy().1,
+                };
 
                 peer_manager.ban_ip(ip, duration, "Manually banned via RPC");
                 Ok(serde_json::Value::Null)
@@ -340,13 +342,18 @@ impl NetworkRpc {
         };
 
         let bans = peer_manager.scoring().list_bans();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let result: Vec<serde_json::Value> = bans
             .iter()
             .map(|ban| {
                 serde_json::json!({
                     "address": ban.ip.to_string(),
-                    "ban_created": ban.created_at.elapsed().as_secs(),
-                    "banned_until": ban.remaining().as_secs(),
+                    // Unix times, as in Bitcoin Core's listbanned
+                    "ban_created": now.saturating_sub(ban.created_at.elapsed().as_secs()),
+                    "banned_until": now + ban.remaining().as_secs(),
                     "ban_reason": ban.reason,
                 })
             })
