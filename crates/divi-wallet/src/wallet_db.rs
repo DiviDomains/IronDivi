@@ -3196,8 +3196,10 @@ mod tests {
         let addr = wallet.new_receiving_address().unwrap();
         let expected = wallet.get_key_by_address(&addr).unwrap().secret.unwrap();
         wallet.lock();
+        // What a lock before the next block left on disk: the public-key-only
+        // record (written by the next save while locked) and no encrypted secret
+        wallet.save().unwrap();
         {
-            // What a lock before the next block left on disk
             let db = wallet.db.as_ref().unwrap();
             let mut suffixed = addr.hash.as_bytes().to_vec();
             suffixed.push(crate::persistence::ENCRYPTED_SECRET_SUFFIX);
