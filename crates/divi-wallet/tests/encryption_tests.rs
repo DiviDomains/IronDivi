@@ -74,10 +74,11 @@ fn encrypt_removes_plaintext_and_locks() {
     // Public side still works while locked, the private side is gone
     assert!(wallet.is_mine(&addr));
     assert!(wallet.get_key_by_address(&addr).unwrap().secret.is_none());
-    assert!(matches!(
-        wallet.new_receiving_address(),
-        Err(WalletError::WalletLocked)
-    ));
+    // A locked wallet hands out a keypool key; its secret stays locked away
+    let pooled = wallet.new_receiving_address().unwrap();
+    assert_ne!(pooled, addr);
+    assert!(wallet.is_mine(&pooled) && !wallet.is_watch_only(&pooled));
+    assert!(wallet.get_key_by_address(&pooled).unwrap().secret.is_none());
 
     drop(wallet);
     assert!(

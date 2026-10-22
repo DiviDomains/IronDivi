@@ -1108,29 +1108,45 @@ impl WalletDb {
 
     /// Generate a new receiving address
     pub fn new_receiving_address(&self) -> Result<Address, WalletError> {
-        // Held until the key is stored, so a concurrent lock() cannot strip it first
-        let locked = self.locked.read();
-        if *locked {
-            return Err(WalletError::WalletLocked);
-        }
-        let addr = self.keystore.new_receiving_address()?;
-        self.dirty.write().keys = true;
-        self.dirty.write().metadata = true; // receiving_index changed
-        self.persist_keys(&[addr.hash])?;
-        Ok(addr)
+        self.new_address(false)
     }
 
     /// Generate a new change address
     pub fn new_change_address(&self) -> Result<Address, WalletError> {
+        self.new_address(true)
+    }
+
+    /// Hand out the next receiving or change key. As in Divi Core, a locked
+    /// wallet hands out a pre-generated keypool key (its secret is already on
+    /// disk, encrypted) and fails with `KeypoolRanOut` when none is left; an
+    /// unlocked wallet derives the key and tops the keypool up. The key and the
+    /// advanced index are stored before the address is returned.
+    fn new_address(&self, is_change: bool) -> Result<Address, WalletError> {
+        // Held until the key is stored, so a concurrent lock() cannot strip it first
         let locked = self.locked.read();
-        if *locked {
-            return Err(WalletError::WalletLocked);
-        }
-        let addr = self.keystore.new_change_address()?;
+        let mut store = Vec::new();
+        let addr = if *locked {
+            self.keystore.take_from_keypool(is_change)?
+        } else {
+            let addr = if is_change {
+                self.keystore.new_change_address()?
+            } else {
+                self.keystore.new_receiving_address()?
+            };
+            store = self.keystore.top_up_keypool(None).unwrap_or_default();
+            addr
+        };
         self.dirty.write().keys = true;
-        self.dirty.write().metadata = true; // change_index changed
-        self.persist_keys(&[addr.hash])?;
+        self.dirty.write().metadata = true; // receiving/change index changed
+        store.push(addr.hash);
+        self.persist_keys(&store)?;
         Ok(addr)
+    }
+
+    /// Derive the missing keypool keys (the seed must be in memory) and store
+    /// them. Returns the number of keys added.
+    pub fn top_up_keypool(&self) -> Result<u32, WalletError> {
+        self.refill_keypool(None)
     }
 
     /// Get all wallet addresses
@@ -1804,6 +1820,18 @@ impl WalletDb {
             }
         }
 
+        // As Divi Core's walletpassphrase: top the keypool up while the seed is
+        // here, so getnewaddress keeps working after the wallet is locked again
+        match self.keystore.top_up_keypool(None) {
+            Ok(added) if !added.is_empty() => {
+                if let Err(e) = self.persist_keys(&added) {
+                    warn!("Failed to store keypool keys: {}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => debug!("Keypool not topped up on unlock: {}", e),
+        }
+
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
             Some(Instant::now() + std::time::Duration::from_secs(timeout_secs as u64))
@@ -1955,6 +1983,12 @@ impl WalletDb {
         let passphrase_key = Zeroizing::new(derive_key_from_passphrase(passphrase, &salt));
         let sealed_master = seal_master_key(&master_key, &passphrase_key);
 
+        // Fill the keypool while the seed is still in the clear: the pool keys go
+        // into the batch below, and a locked wallet hands out only pool keys
+        if let Err(e) = self.keystore.top_up_keypool(None) {
+            debug!("Keypool not topped up before encryption: {}", e);
+        }
+
         // One atomic batch: either the wallet becomes encrypted or nothing changes.
         let mut batch = db.create_batch();
         for (hash, mut entry) in self.keystore.get_all_keys_with_hashes() {
@@ -2096,19 +2130,12 @@ impl WalletDb {
     /// Returns the number of keys generated
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
         let _locked = self.locked.read();
-        let generated = self.keystore.refill_keypool(new_size)?;
-        if generated > 0 {
+        let added = self.keystore.top_up_keypool(new_size)?;
+        if !added.is_empty() {
             self.dirty.write().keys = true;
-            let hd_keys: Vec<Hash160> = self
-                .keystore
-                .get_all_keys_with_hashes()
-                .into_iter()
-                .filter(|(_, e)| e.hd_path.is_some() && e.secret.is_some())
-                .map(|(h, _)| h)
-                .collect();
-            self.persist_keys(&hd_keys)?;
+            self.persist_keys(&added)?;
         }
-        Ok(generated)
+        Ok(added.len() as u32)
     }
 
     /// Scan a block for wallet transactions
@@ -2742,6 +2769,38 @@ impl WalletDb {
             .or_default()
             .push(addr_str);
         self.dirty.write().accounts = true;
+    }
+
+    /// Set the account (label) of `address` and store it before returning, so a
+    /// label given with a new key survives a restart before the next block.
+    pub fn set_label(&self, address: &Address, label: &str) -> Result<(), WalletError> {
+        let old = self.get_account(address);
+        self.set_account(address, label);
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+        let mut batch = db.create_batch();
+        {
+            let accounts = self.accounts.read();
+            for account in [old.as_str(), label] {
+                let addresses = accounts.get(account).cloned().unwrap_or_default();
+                let value = serde_json::to_string(&addresses).map_err(|e| {
+                    WalletError::Storage(format!("Failed to serialize account: {}", e))
+                })?;
+                batch.put_cf(
+                    db.cf_accounts(),
+                    format!("acc_{}", account).as_bytes(),
+                    value.as_bytes(),
+                );
+            }
+        }
+        batch.put_cf(
+            db.cf_accounts(),
+            format!("addr_{}", address).as_bytes(),
+            label.as_bytes(),
+        );
+        db.write_batch_sync(batch)
     }
 
     pub fn get_account(&self, address: &Address) -> String {

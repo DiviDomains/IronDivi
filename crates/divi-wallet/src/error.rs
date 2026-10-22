@@ -48,6 +48,10 @@ pub enum WalletError {
     #[error("wallet is locked")]
     WalletLocked,
 
+    /// No pre-generated key left to hand out while the wallet is locked
+    #[error("keypool ran out")]
+    KeypoolRanOut,
+
     /// Wrong passphrase
     #[error("wrong passphrase")]
     WrongPassphrase,

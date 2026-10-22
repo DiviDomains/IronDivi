@@ -100,6 +100,21 @@ fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
     Ok(())
 }
 
+/// RPC error for a failed getnewaddress-style key request, as Divi Core
+fn new_key_error(e: divi_wallet::WalletError) -> Error {
+    match e {
+        divi_wallet::WalletError::KeypoolRanOut => RpcError::new(
+            codes::WALLET_KEYPOOL_RAN_OUT,
+            "Error: Keypool ran out, please call keypoolrefill first",
+        ),
+        divi_wallet::WalletError::WalletLocked => {
+            RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
+        }
+        _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
+    }
+    .into()
+}
+
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
     let invalid = || RpcError::new(codes::TYPE_ERROR, "Invalid amount");
     let divi = value.as_f64().ok_or_else(invalid)?;
@@ -524,17 +539,16 @@ impl WalletRpc {
     }
 
     /// getnewaddress - Generate a new receiving address
+    ///
+    /// Works while the wallet is locked, from the keypool, as in Divi Core.
     pub fn get_new_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        // Optional label parameter (ignored for now)
-        let _label = params.get_str(0).unwrap_or("");
+        let label = params.get_str(0).unwrap_or("");
 
-        let address = wallet.new_receiving_address().map_err(|e| match e {
-            divi_wallet::WalletError::WalletLocked => {
-                RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
-            }
-            _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
+        let address = wallet.new_receiving_address().map_err(new_key_error)?;
+        wallet.set_label(&address, label).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
         debug!("Generated new address: {}", address);
@@ -545,12 +559,7 @@ impl WalletRpc {
     pub fn get_raw_change_address(&self, _params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        let address = wallet.new_change_address().map_err(|e| match e {
-            divi_wallet::WalletError::WalletLocked => {
-                RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
-            }
-            _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
-        })?;
+        let address = wallet.new_change_address().map_err(new_key_error)?;
 
         debug!("Generated new change address: {}", address);
         Ok(serde_json::json!(address.to_string()))
@@ -565,27 +574,36 @@ impl WalletRpc {
         match self.decode_address(addr_str) {
             Ok(addr) => {
                 let wallet_guard = self.wallet.read();
-                let is_mine = wallet_guard
+                let known = wallet_guard
                     .as_ref()
                     .map(|w| w.is_mine(&addr))
                     .unwrap_or(false);
+                let is_watch_only = wallet_guard
+                    .as_ref()
+                    .map(|w| w.is_watch_only(&addr))
+                    .unwrap_or(false);
+                // Divi Core: ismine means spendable; a watched address is
+                // iswatchonly only
+                let is_mine = known && !is_watch_only;
 
                 let mut result = serde_json::json!({
                     "isvalid": true,
                     "address": addr_str,
                     "scriptPubKey": format!("76a914{}88ac", hex::encode(addr.hash.as_bytes())),
                     "ismine": is_mine,
-                    "iswatchonly": false,
+                    "iswatchonly": is_watch_only,
                     "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
                 });
 
+                if let (true, Some(wallet)) = (known, wallet_guard.as_ref()) {
+                    result["account"] = serde_json::json!(wallet.get_account(&addr));
+                }
                 if is_mine {
                     if let Some(wallet) = wallet_guard.as_ref() {
                         if let Some(key_entry) = wallet.get_key_by_address(&addr) {
                             let pubkey_hex = hex::encode(key_entry.public.to_bytes());
                             result["pubkey"] = serde_json::json!(pubkey_hex);
                             result["iscompressed"] = serde_json::json!(true);
-                            result["account"] = serde_json::json!("");
 
                             if let Some(ref hd_path) = key_entry.hd_path {
                                 result["hdkeypath"] = serde_json::json!(hd_path);
@@ -617,8 +635,14 @@ impl WalletRpc {
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
 
         let wallet = self.get_wallet()?;
-        let is_mine = wallet.is_mine(&addr);
+        let known = wallet.is_mine(&addr);
         let is_watch_only = wallet.is_watch_only(&addr);
+        let is_mine = known && !is_watch_only;
+        let labels: Vec<String> = if known {
+            vec![wallet.get_account(&addr)]
+        } else {
+            Vec::new()
+        };
 
         // Get HD key path if available
         let hd_key_path = wallet
@@ -632,7 +656,7 @@ impl WalletRpc {
             "iswatchonly": is_watch_only,
             "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
             "ischange": wallet.is_change_address(&addr),
-            "labels": [],
+            "labels": labels,
         });
 
         // Add hdkeypath field if present
@@ -723,10 +747,7 @@ impl WalletRpc {
             "immature_balance": divi_immature,
             "txcount": wallet.get_transactions(None).len(),
             "keypoololdest": wallet.keypool_oldest(),
-            // Report keypool_target (100) as a minimum when the keypool hasn't been
-            // explicitly pre-generated; HD wallets derive keys on demand so the
-            // effective available key count is always at least the target size.
-            "keypoolsize": std::cmp::max(wallet.keypool_size(), 100u32),
+            "keypoolsize": wallet.keypool_size(),
             "unlocked_until": wallet.unlocked_until(),
             "paytxfee": 0.0001,
             "hdmasterkeyid": wallet.hd_master_key_id()
@@ -1135,8 +1156,7 @@ impl WalletRpc {
         // Optional label parameter
         let label = params.get_str(1).map(|s| s.to_string());
 
-        // Optional rescan parameter (default true, but we don't implement rescan yet)
-        let _rescan = params.get_bool(2).unwrap_or(true);
+        let rescan = params.get_bool(2).unwrap_or(true);
 
         let wallet = self.get_wallet()?;
 
@@ -1158,17 +1178,102 @@ impl WalletRpc {
             )
         })?;
 
-        // Import the key
-        let address = wallet.import_key(secret, label);
-
-        info!("Imported private key for address: {}", address);
+        // As Divi Core: the label is set even for a key already held, and a key
+        // already held is not imported or rescanned again
+        let address = Address::p2pkh(&secret.public_key(), wallet.network());
+        let held = wallet.is_mine(&address) && !wallet.is_watch_only(&address);
+        if !held {
+            wallet.import_key(secret, label.clone());
+            info!("Imported private key for address: {}", address);
+        }
+        wallet
+            .set_label(&address, label.as_deref().unwrap_or(""))
+            .map_err(|e| {
+                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+            })?;
+        if held {
+            return Ok(serde_json::Value::Null);
+        }
 
         wallet.save().map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
         })?;
 
-        // Note: rescan not implemented - caller should manually rescan if needed
+        // A WIF carries no birth time, so the scan starts at genesis
+        if rescan {
+            self.rescan_after_import(&wallet)?;
+        }
         Ok(serde_json::Value::Null)
+    }
+
+    /// Rescan blocks `start_height..=stop_height` into the wallet and save it.
+    /// Returns the number of blocks scanned. Shared by `rescanblockchain` and the
+    /// import RPCs.
+    fn rescan_range(
+        &self,
+        wallet: &WalletDb,
+        chain: &Arc<Chain>,
+        start_height: u32,
+        stop_height: u32,
+    ) -> Result<u32, Error> {
+        // Do not wipe the wallet if the first block cannot be had at all
+        let fetcher = self.block_fetcher.read().clone();
+        if let Some(first) = chain.get_block_index_by_height(start_height)? {
+            if crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &first)?.is_none() {
+                return Err(RpcError::new(
+                    codes::MISC_ERROR,
+                    format!(
+                        "Block {} is pruned and no full-history peer returned it; rescan from a later height (prune height {})",
+                        start_height,
+                        chain.prune_height()
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let current_height = chain.height();
+
+        // A full rescan rebuilds the wallet; a partial one replaces only what
+        // the range recorded. Block notifications wait on the wallet's scan
+        // lock meanwhile, so none is scanned out of order.
+        let (scanned, unreadable) =
+            wallet.rescan(start_height, stop_height, current_height, |height| {
+                let index = chain.get_block_index_by_height(height).ok().flatten()?;
+                let block = crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &index)
+                    .ok()
+                    .flatten()?;
+                Some((index.hash, block))
+            });
+        if let Some(height) = unreadable {
+            info!(
+                "Block at height {} not available, stopping rescan (total scanned: {})",
+                height, scanned
+            );
+        }
+
+        info!("Rescan complete: scanned {} blocks", scanned);
+
+        wallet.save().map_err(|e| {
+            RpcError::new(
+                codes::WALLET_ERROR,
+                format!("Failed to save wallet after rescan: {}", e),
+            )
+        })?;
+        Ok(scanned)
+    }
+
+    /// Rescan the whole chain after an import, as Divi Core's
+    /// `ScanForWalletTransactions(chainActive.Genesis())`. Without a chain (a
+    /// wallet-only handler) there is nothing to scan.
+    fn rescan_after_import(&self, wallet: &WalletDb) -> Result<(), Error> {
+        let Some(chain) = self.chain.as_ref() else {
+            return Ok(());
+        };
+        let tip = chain.height();
+        info!("Rescanning blocks 0 to {} after import", tip);
+        self.rescan_range(wallet, chain, 0, tip)?;
+        Ok(())
     }
 
     /// rescanblockchain - Rescan the blockchain for wallet transactions
@@ -1214,48 +1319,7 @@ impl WalletRpc {
             start_height, stop_height
         );
 
-        // Do not wipe the wallet if the first block cannot be had at all
-        let fetcher = self.block_fetcher.read().clone();
-        if let Some(first) = chain.get_block_index_by_height(start_height)? {
-            if crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &first)?.is_none() {
-                return Err(RpcError::new(
-                    codes::MISC_ERROR,
-                    format!(
-                        "Block {} is pruned and no full-history peer returned it; rescan from a later height (prune height {})",
-                        start_height,
-                        chain.prune_height()
-                    ),
-                )
-                .into());
-            }
-        }
-
-        // A full rescan rebuilds the wallet; a partial one replaces only what
-        // the range recorded. Block notifications wait on the wallet's scan
-        // lock meanwhile, so none is scanned out of order.
-        let (scanned, unreadable) =
-            wallet.rescan(start_height, stop_height, current_height, |height| {
-                let index = chain.get_block_index_by_height(height).ok().flatten()?;
-                let block = crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &index)
-                    .ok()
-                    .flatten()?;
-                Some((index.hash, block))
-            });
-        if let Some(height) = unreadable {
-            info!(
-                "Block at height {} not available, stopping rescan (total scanned: {})",
-                height, scanned
-            );
-        }
-
-        info!("Rescan complete: scanned {} blocks", scanned);
-
-        wallet.save().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to save wallet after rescan: {}", e),
-            )
-        })?;
+        let scanned = self.rescan_range(&wallet, chain, start_height, stop_height)?;
 
         let actual_stop = if scanned > 0 {
             start_height + scanned - 1
@@ -1861,19 +1925,23 @@ impl WalletRpc {
     }
 
     /// getaddressesbylabel - Get addresses with a label
-    pub fn get_addresses_by_label(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    pub fn get_addresses_by_label(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let label = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::invalid_params("Label required"))?;
         let wallet = self.get_wallet()?;
 
-        // For now, return all addresses (labels not implemented)
-        let addresses = wallet.get_addresses();
+        let addresses = wallet.get_addresses_by_account(label);
+        if addresses.is_empty() {
+            return Err(RpcError::new(
+                codes::WALLET_INVALID_ACCOUNT_NAME,
+                format!("No addresses with label {}", label),
+            )
+            .into());
+        }
         let result: serde_json::Map<String, serde_json::Value> = addresses
-            .iter()
-            .map(|addr| {
-                (
-                    addr.to_string(),
-                    serde_json::json!({ "purpose": "receive" }),
-                )
-            })
+            .into_iter()
+            .map(|addr| (addr, serde_json::json!({ "purpose": "receive" })))
             .collect();
 
         Ok(serde_json::json!(result))
@@ -1893,11 +1961,15 @@ impl WalletRpc {
             .iter()
             .map(|(addr, (amount, confs))| {
                 let divi = *amount as f64 / 100_000_000.0;
+                let label = Address::from_base58(addr)
+                    .map(|a| wallet.get_account(&a))
+                    .unwrap_or_default();
                 serde_json::json!({
                     "address": addr,
+                    "account": label,
                     "amount": divi,
                     "confirmations": confs,
-                    "label": "",
+                    "label": label,
                 })
             })
             .collect();
@@ -3407,18 +3479,19 @@ impl WalletRpc {
             })?;
 
         info!("Imported watch-only address: {}", addr);
-
-        // Rescan blockchain if requested
-        if rescan {
-            info!("Note: Blockchain rescan for watch-only address not yet fully implemented");
-            // TODO: Trigger blockchain rescan to find historical transactions
-            // For now, only new transactions will be tracked
-        }
+        wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+        })?;
 
         // Save wallet
         wallet.save().map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
         })?;
+
+        // Past coins to the address show only after a scan, as in Divi Core
+        if rescan {
+            self.rescan_after_import(&wallet)?;
+        }
 
         Ok(serde_json::Value::Null)
     }
@@ -4192,17 +4265,10 @@ impl WalletRpc {
             return Ok(serde_json::json!(existing_addr));
         }
 
-        let new_addr = wallet.new_receiving_address().map_err(|e| match e {
-            divi_wallet::WalletError::WalletLocked => {
-                RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
-            }
-            _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
-        })?;
+        let new_addr = wallet.new_receiving_address().map_err(new_key_error)?;
 
-        wallet.set_account(&new_addr, account);
-
-        wallet.save().map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
+        wallet.set_label(&new_addr, account).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
         Ok(serde_json::json!(new_addr.to_string()))
@@ -4504,11 +4570,8 @@ mod tests {
             rpc_code(rpc.encrypt_wallet(&p(&["again"])).unwrap_err()),
             codes::WALLET_WRONG_ENC_STATE
         );
-        // Locked wallet cannot hand out new addresses
-        assert_eq!(
-            rpc_code(rpc.get_new_address(&Params::None).unwrap_err()),
-            codes::WALLET_UNLOCK_NEEDED
-        );
+        // A locked wallet hands out new addresses from its keypool, as Divi Core
+        assert!(rpc.get_new_address(&Params::None).is_ok());
 
         // Wrong passphrase, then right one
         let unlock = |pass: &str| {
@@ -4837,10 +4900,14 @@ mod tests {
                 serde_json::json!(true),
             ]))
             .unwrap();
+        // getnewaddress put the account-address under "" as well, as Divi Core
         let list = received_list.as_array().unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0]["account"], "testaccount");
-        assert_eq!(list[0]["amount"], 0.0);
+        let entry: Vec<_> = list
+            .iter()
+            .filter(|e| e["account"] == "testaccount")
+            .collect();
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry[0]["amount"], 0.0);
     }
 
     #[test]
@@ -5059,10 +5126,19 @@ mod tests {
         }
 
         let wallet = Arc::new(WalletDb::open(&path, Network::Regtest).unwrap());
+        // The keypool holds change keys too; take the one handed out
+        let (_, issued) = wallet.keystore().get_indices();
+        assert_eq!(issued, 1);
         let change: Vec<Address> = wallet
             .get_addresses()
             .into_iter()
             .filter(|a| wallet.is_change_address(a))
+            .filter(|a| {
+                wallet
+                    .get_key_by_address(a)
+                    .and_then(|e| e.hd_path)
+                    .is_some_and(|path| path.ends_with("/1/0"))
+            })
             .collect();
         assert_eq!(change.len(), 1, "change key not stored");
         let rpc = WalletRpc::with_wallet(wallet);
@@ -5180,9 +5256,7 @@ mod send_unlock_regression {
     #[test]
     fn ir16_staking_only_unlock_refuses_sends_and_exports() {
         let (_dir, rpc, db, sent) = encrypted_rpc();
-        let own = rpc.get_new_address(&Params::None);
-        assert!(own.is_err(), "wallet should start locked");
-        assert_eq!(status(&rpc), "locked");
+        assert_eq!(status(&rpc), "locked", "wallet should start locked");
 
         unlock(&rpc, 0, true).unwrap();
         assert_eq!(status(&rpc), "unlocked-for-staking");
