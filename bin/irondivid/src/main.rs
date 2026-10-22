@@ -1714,6 +1714,7 @@ async fn run_daemon(
                             &mempool_for_submit,
                         )
                         .map_err(submit_error)?;
+                        // The mempool checks inputs and scripts (Node's validator)
                         mempool_for_submit.add(tx, fee).map_err(submit_error)?;
 
                         // Announce to peers (async, fire-and-forget)

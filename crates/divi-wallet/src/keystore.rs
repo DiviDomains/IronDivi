@@ -37,6 +37,10 @@ pub struct KeyEntry {
     pub hd_path: Option<String>,
     /// Whether this is a watch-only address
     pub is_watch_only: bool,
+    /// Whether the public key is used in its 33-byte compressed form (all keys
+    /// the wallet makes). An imported uncompressed WIF sets false: its address
+    /// is hash160 of the 65-byte key, and it signs with that key, as in Core.
+    pub compressed: bool,
 }
 
 impl KeyEntry {
@@ -53,7 +57,15 @@ impl KeyEntry {
             label: None,
             hd_path: None,
             is_watch_only: false,
+            compressed: true,
         }
+    }
+
+    /// Create an entry for an imported key, keeping the WIF's compression flag
+    pub fn imported(secret: SecretKey, compressed: bool) -> Self {
+        let mut entry = Self::new(secret);
+        entry.compressed = compressed;
+        entry
     }
 
     /// Create with HD path
@@ -75,18 +87,28 @@ impl KeyEntry {
             label,
             hd_path: None,
             is_watch_only: true,
+            compressed: true,
+        }
+    }
+
+    /// The public key as it appears in scripts and signatures: 33 bytes, or 65
+    /// for an uncompressed key
+    pub fn pubkey_bytes(&self) -> Vec<u8> {
+        if self.compressed {
+            self.public.to_bytes()
+        } else {
+            self.public.serialize_uncompressed().to_vec()
         }
     }
 
     /// Get the public key hash
     pub fn pubkey_hash(&self) -> Hash160 {
-        let compressed = self.public.to_bytes();
-        hash160(&compressed)
+        hash160(&self.pubkey_bytes())
     }
 
     /// Get address for network
     pub fn address(&self, network: Network) -> Address {
-        Address::p2pkh(&self.public, network)
+        Address::from_pubkey_hash(self.pubkey_hash(), network)
     }
 }
 
@@ -263,7 +285,17 @@ impl KeyStore {
 
     /// Import a private key
     pub fn import_key(&self, secret: SecretKey, label: Option<String>) -> Address {
-        let mut entry = KeyEntry::new(secret);
+        self.import_key_with_compression(secret, true, label)
+    }
+
+    /// Import a private key in its compressed or uncompressed form (the WIF's flag)
+    pub fn import_key_with_compression(
+        &self,
+        secret: SecretKey,
+        compressed: bool,
+        label: Option<String>,
+    ) -> Address {
+        let mut entry = KeyEntry::imported(secret, compressed);
         entry.label = label;
         let address = entry.address(self.network);
         self.add_key(entry);

@@ -143,30 +143,54 @@ pub fn sign_input(
     secret_key: &SecretKey,
     sighash_type: SigHashType,
 ) -> Result<Vec<u8>, WalletError> {
-    let hash = sighash(tx, input_index, script_pubkey, sighash_type, false)?;
+    sign_input_with_flags(
+        tx,
+        input_index,
+        script_pubkey,
+        secret_key,
+        sighash_type,
+        false,
+    )
+}
+
+/// Sign a single transaction input, optionally with SIGHASH_ANYONECANPAY
+pub fn sign_input_with_flags(
+    tx: &Transaction,
+    input_index: usize,
+    script_pubkey: &Script,
+    secret_key: &SecretKey,
+    sighash_type: SigHashType,
+    anyone_can_pay: bool,
+) -> Result<Vec<u8>, WalletError> {
+    let hash = sighash(tx, input_index, script_pubkey, sighash_type, anyone_can_pay)?;
 
     let signature = sign_hash(secret_key, hash.as_bytes())
         .map_err(|e| WalletError::TransactionError(e.to_string()))?;
 
     // Append sighash type byte to DER signature
     let mut sig_bytes = signature.to_der();
-    sig_bytes.push(sighash_type as u8);
+    let acp = if anyone_can_pay { 0x80 } else { 0 };
+    sig_bytes.push(sighash_type as u8 | acp);
 
     Ok(sig_bytes)
 }
 
 /// Create a P2PKH script sig from signature and public key
 pub fn create_p2pkh_script_sig(signature: &[u8], pubkey: &PublicKey) -> Script {
+    create_p2pkh_script_sig_with_pubkey(signature, &pubkey.to_bytes())
+}
+
+/// Create a P2PKH script sig from a signature and serialized public key (33 or 65 bytes)
+pub fn create_p2pkh_script_sig_with_pubkey(signature: &[u8], pubkey_bytes: &[u8]) -> Script {
     let mut script_data = Vec::new();
 
     // Push signature
     script_data.push(signature.len() as u8);
     script_data.extend_from_slice(signature);
 
-    // Push public key (compressed)
-    let pubkey_bytes = pubkey.to_bytes();
+    // Push public key
     script_data.push(pubkey_bytes.len() as u8);
-    script_data.extend_from_slice(&pubkey_bytes);
+    script_data.extend_from_slice(pubkey_bytes);
 
     Script::from_bytes(script_data)
 }
@@ -175,16 +199,20 @@ pub fn create_p2pkh_script_sig(signature: &[u8], pubkey: &PublicKey) -> Script {
 ///
 /// OP_TRUE (0x51) selects the IF branch of the vault script, which is the owner path.
 pub fn create_vault_owner_script_sig(signature: &[u8], pubkey: &PublicKey) -> Script {
+    create_vault_owner_script_sig_with_pubkey(signature, &pubkey.to_bytes())
+}
+
+/// Vault owner scriptSig from a serialized public key (33 or 65 bytes)
+pub fn create_vault_owner_script_sig_with_pubkey(signature: &[u8], pubkey_bytes: &[u8]) -> Script {
     let mut script_data = Vec::new();
 
     // Push signature
     script_data.push(signature.len() as u8);
     script_data.extend_from_slice(signature);
 
-    // Push public key (compressed)
-    let pubkey_bytes = pubkey.to_bytes();
+    // Push public key
     script_data.push(pubkey_bytes.len() as u8);
-    script_data.extend_from_slice(&pubkey_bytes);
+    script_data.extend_from_slice(pubkey_bytes);
 
     // OP_TRUE (= OP_1 = 0x51) — selects the IF (owner) branch
     script_data.push(0x51);
@@ -192,15 +220,29 @@ pub fn create_vault_owner_script_sig(signature: &[u8], pubkey: &PublicKey) -> Sc
     Script::from_bytes(script_data)
 }
 
+/// A signature (with its hash type byte) and the serialized public key that made it
+type SignatureAndPubkey = (Vec<u8>, Vec<u8>);
+
 /// Transaction signer that uses keystore for signing
 pub struct TransactionSigner<'a> {
     keystore: &'a KeyStore,
+    /// Hash type and ANYONECANPAY flag used by sign_and_merge_input
+    hash_type: (SigHashType, bool),
 }
 
 impl<'a> TransactionSigner<'a> {
     /// Create a new transaction signer
     pub fn new(keystore: &'a KeyStore) -> Self {
-        TransactionSigner { keystore }
+        TransactionSigner {
+            keystore,
+            hash_type: (SigHashType::All, false),
+        }
+    }
+
+    /// Sign with this hash type (signrawtransaction's sighashtype) instead of ALL
+    pub fn with_hash_type(mut self, sighash_type: SigHashType, anyone_can_pay: bool) -> Self {
+        self.hash_type = (sighash_type, anyone_can_pay);
+        self
     }
 
     /// Sign a transaction input using a specific address's key
@@ -228,7 +270,7 @@ impl<'a> TransactionSigner<'a> {
         })?;
 
         let sig = sign_input(tx, input_index, script_pubkey, secret, SigHashType::All)?;
-        let script_sig = create_p2pkh_script_sig(&sig, &entry.public);
+        let script_sig = create_p2pkh_script_sig_with_pubkey(&sig, &entry.pubkey_bytes());
 
         tx.vin[input_index].script_sig = script_sig;
         Ok(())
@@ -262,7 +304,8 @@ impl<'a> TransactionSigner<'a> {
 
                     let secret = entry.secret.as_ref().unwrap();
                     let sig = sign_input(tx, i, script, secret, SigHashType::All)?;
-                    let script_sig = create_p2pkh_script_sig(&sig, &entry.public);
+                    let script_sig =
+                        create_p2pkh_script_sig_with_pubkey(&sig, &entry.pubkey_bytes());
                     tx.vin[i].script_sig = script_sig;
                     signed += 1;
                 }
@@ -279,7 +322,8 @@ impl<'a> TransactionSigner<'a> {
                     // The sighash uses the full vault script as script_code
                     let sig = sign_input(tx, i, script, secret, SigHashType::All)?;
                     // scriptSig: <sig> <pubkey> OP_TRUE  (selects the owner/IF branch)
-                    let script_sig = create_vault_owner_script_sig(&sig, &entry.public);
+                    let script_sig =
+                        create_vault_owner_script_sig_with_pubkey(&sig, &entry.pubkey_bytes());
                     tx.vin[i].script_sig = script_sig;
                     signed += 1;
                 }
@@ -360,15 +404,17 @@ impl<'a> TransactionSigner<'a> {
         index: usize,
         script_code: &Script,
         hash: &Hash160,
-    ) -> Result<Option<(Vec<u8>, PublicKey)>, WalletError> {
+    ) -> Result<Option<SignatureAndPubkey>, WalletError> {
         let Some(entry) = self.keystore.get_key(hash) else {
             return Ok(None);
         };
         let Some(secret) = entry.secret.as_ref().filter(|_| !entry.is_watch_only) else {
             return Ok(None);
         };
-        let sig = sign_input(tx, index, script_code, secret, SigHashType::All)?;
-        Ok(Some((sig, entry.public)))
+        let (sighash_type, anyone_can_pay) = self.hash_type;
+        let sig =
+            sign_input_with_flags(tx, index, script_code, secret, sighash_type, anyone_can_pay)?;
+        Ok(Some((sig, entry.pubkey_bytes())))
     }
 
     /// Divi Core's SignSignature/Solver: the scriptSig our keys can produce (maybe partial)
@@ -389,7 +435,7 @@ impl<'a> TransactionSigner<'a> {
                 let hash = hash160_from_slice(&solutions[0]);
                 if let Some((sig, public)) = self.sign_with(tx, index, script, &hash)? {
                     push_data(&mut out, &sig);
-                    push_data(&mut out, &public.to_bytes());
+                    push_data(&mut out, &public);
                 }
             }
             ScriptType::PubKey => {
@@ -397,7 +443,7 @@ impl<'a> TransactionSigner<'a> {
                 if let Some((sig, public)) =
                     self.sign_with(tx, index, script, &hash160_of(pubkey))?
                 {
-                    if public.to_bytes().as_slice() == pubkey.as_slice() {
+                    if public == *pubkey {
                         push_data(&mut out, &sig);
                     }
                 }
@@ -413,7 +459,7 @@ impl<'a> TransactionSigner<'a> {
                     if let Some((sig, public)) =
                         self.sign_with(tx, index, script, &hash160_of(pubkey))?
                     {
-                        if public.to_bytes().as_slice() == pubkey.as_slice() {
+                        if public == *pubkey {
                             push_data(&mut out, &sig);
                             signed += 1;
                         }
@@ -424,7 +470,7 @@ impl<'a> TransactionSigner<'a> {
                 if let Some(vault) = StakingVaultScript::from_script(script) {
                     let owner = Hash160::from_bytes(vault.owner_pubkey_hash);
                     if let Some((sig, public)) = self.sign_with(tx, index, script, &owner)? {
-                        out = create_vault_owner_script_sig(&sig, &public).into_bytes();
+                        out = create_vault_owner_script_sig_with_pubkey(&sig, &public).into_bytes();
                     }
                 }
             }

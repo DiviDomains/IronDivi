@@ -517,10 +517,9 @@ mod tests {
         }
     }
 
-    /// The variant set: exactly [`CANCEL_VARIANTS`] distinct txids, every low-S one valid
-    /// under consensus flags (IronDivi's checker rejects high-S outright, which Divi's
-    /// consensus does not, so those are checked for shape only), and every one read back
-    /// as the cancel branch.
+    /// The variant set: exactly [`CANCEL_VARIANTS`] distinct txids, every one valid under
+    /// consensus flags (Divi Core, and IronDivi's checker since it follows Core, accept
+    /// high-S signatures), and every one read back as the cancel branch.
     #[test]
     fn cancel_variants_are_exactly_120() {
         let f = fx();
@@ -548,7 +547,7 @@ mod tests {
                 valid += 1;
             }
         }
-        assert_eq!(valid, CANCEL_VARIANTS / 2);
+        assert_eq!(valid, CANCEL_VARIANTS);
         // The set is the same whichever S form it starts from.
         let from_flip: HashSet<_> = cancel_variants(&tx, &flipped, &redeem)
             .iter()

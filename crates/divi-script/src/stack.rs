@@ -399,6 +399,12 @@ impl Stack {
         &self.data
     }
 
+    /// The elements, for the interpreter, which applies Core's limits itself
+    /// (combined stack size after each operation, push size per push)
+    pub(crate) fn raw_mut(&mut self) -> &mut Vec<Vec<u8>> {
+        &mut self.data
+    }
+
     /// Take ownership of the data
     pub fn into_data(self) -> Vec<Vec<u8>> {
         self.data
