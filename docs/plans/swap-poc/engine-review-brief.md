@@ -350,6 +350,8 @@ no funds, no keys.
 2. **Self-stated MTP:** `check_maker_leg_locktime_exact` bounds a maker's stated `maker_mtp_at_lock` to
    a plausibility window. Can a maker pick a stated value inside the window that shortens its own
    locktime below what the taker needs to claim safely?
+
+   **Answer (2026-10-22): no.** The stated MTP only ever adds a refusal; it never relaxes the tolerant floor or the 1800 s claim margin, both of which are checked against the taker's own reads (`taker.rs:407`, `:421`, `:466`). The lowest in-window value (`taker_locktime − taker_timeout − tol − lag`) makes the exact floor equal the tolerant floor, i.e. exactly what a maker that states nothing gets; higher values only raise it, and out-of-window values are refused. Worst remaining claim window (locktime − observed maker-chain MTP) across all mainnet hashlock pairs, with taker-chain MTP lagging by its full lag and the maximum accept drift, is `maker_timeout − 2×1800 − 2×max lag`: 32400 s for any pair containing BTC (lag 3600), 36000 s for DIVI/LTC/ZEC pairs, against a margin of 1800 s (profile claim margin 3600 s). No change to `taker.rs`. Pinned by `tests/taker_stated_mtp_window.rs`.
 3. **No `OP_SIZE`:** is omitting a preimage-length check safe here, given the taker generates the
    preimage and the script is SHA-256 only? Any cross-chain concern (a longer preimage is valid on one
    chain and not on another)?
@@ -359,6 +361,8 @@ no funds, no keys.
    that? Is a token on the hashlock routes warranted before mainnet?
 5. **Opt-in floors:** a taker built without `with_profile_floor` takes the maker's terms as offered.
    Is any shipped entry point (CLI, daemon) able to construct one on mainnet?
+
+   **Answer (2026-10-22): no.** Every taker construction in shipped code is in `bin/divi-swap/src/main.rs` (`Taker::new` at `:928` and `:1016`, `XmrTaker::new` at `:1087` and `:1169`) and each chains `.with_profile_floor(cli.profile)`. `divi-swapd` builds no taker (it is maker-only); `flow.rs`/`xmr_flow.rs` only receive a built `&Taker`. `--profile` defaults to `testnet` (`:116`), and `guard_profile` (`:453`) refuses a mainnet chain under a testnet profile (and the reverse), so a mainnet taker always carries the mainnet floor. The only floor-less construction sites are tests and examples. Pinned by `tests/taker_floor_entry_points.rs`, which fails if a new construction site appears or one drops the floor.
 6. **Single data source per chain:** which chain's single-source assumption is the most dangerous
    (lying confirmations, hidden spend, wrong MTP), and what is the cheapest mitigation?
 7. **Reorg after maker lock (F2):** is the absence of a maker re-broadcast after `MakerLockConfirmed`
