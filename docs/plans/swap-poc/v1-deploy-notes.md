@@ -59,3 +59,5 @@ Guard: `tools/swap-poc/test-rollback-v1-gate.sh` (every non-terminal state refus
 
 Before any rollback, also confirm no taker CLI DB on any machine you control holds a non-terminal
 swap, and do not run an older `divi-swap` binary against a DB that does.
+
+**2026-10-22 — swap DB schema-version marker.** `Store::open` now stamps `PRAGMA user_version = 2` (`STORE_SCHEMA_VERSION`; 1 = every DB before V1 scripts) and refuses a database stamped newer than the binary knows (`SwapError::StoreTooNew { found, supported }`), before any write; `open_read_only` refuses the same way and never writes. This protects the rollback case builder BM proved: an old binary on a DB holding V1 (`script_version`) records drops the field and rebuilds a V0 script (wrong address, cannot claim or refund). Binaries deployed before this marker have no check, so they still open a V1 DB silently: the deploy rule "never roll back across V1 with in-flight swaps" stays in force until every binary that can touch a swap DB carries the marker.

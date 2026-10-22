@@ -257,6 +257,32 @@ CREATE TABLE IF NOT EXISTS docs (
 );
 ";
 
+/// Schema version this binary writes and understands, kept in SQLite's `PRAGMA user_version`
+/// (a header integer: no table, no `SCHEMA` change, and a pre-marker binary ignores it).
+/// 0 = no marker; 1 = everything before V1 scripts (what an unmarked DB is); 2 = this marker.
+/// A binary refuses a database stamped with a larger number, because an older reader silently
+/// drops fields it does not know (a V1 `script_version` becomes a V0 script: wrong address).
+pub const STORE_SCHEMA_VERSION: u32 = 2;
+
+fn read_marker(conn: &Connection) -> Result<u32> {
+    let v: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(storage)?;
+    Ok(u32::try_from(v).unwrap_or(u32::MAX))
+}
+
+/// Refuse a database stamped newer than this binary. Reads only.
+fn check_marker(conn: &Connection) -> Result<u32> {
+    let found = read_marker(conn)?;
+    if found > STORE_SCHEMA_VERSION {
+        return Err(SwapError::StoreTooNew {
+            found,
+            supported: STORE_SCHEMA_VERSION,
+        });
+    }
+    Ok(found)
+}
+
 /// One maker swap per hashlock. The hash lives in the record JSON (`$.hash`, a 32-number
 /// array), so this is an expression index; `put_maker_swap` of a second swap for a hash fails
 /// even if the engine's gate were bypassed.
@@ -303,6 +329,8 @@ impl Store {
         }
         tighten_existing(path)?;
         let conn = Connection::open(path).map_err(storage)?;
+        // Before any pragma or schema write: a too-new file must be left untouched.
+        check_marker(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(storage)?;
         conn.pragma_update(None, "synchronous", "FULL")
@@ -318,6 +346,7 @@ impl Store {
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(storage)?;
+        check_marker(&conn)?;
         Ok(Store {
             conn: std::sync::Arc::new(parking_lot::Mutex::new(conn)),
         })
@@ -329,8 +358,14 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        let found = check_marker(&conn)?;
         conn.execute_batch(SCHEMA).map_err(storage)?;
         ensure_unique_hash(&conn)?;
+        // Unmarked (0) or older: stamp in place. Safe, V0 records stay V0.
+        if found != STORE_SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)
+                .map_err(storage)?;
+        }
         Ok(Store {
             conn: std::sync::Arc::new(parking_lot::Mutex::new(conn)),
         })
@@ -822,5 +857,82 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    // ---- schema version marker ----
+
+    fn marker(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    fn stamp(path: &Path, v: i64) {
+        Connection::open(path)
+            .unwrap()
+            .pragma_update(None, "user_version", v)
+            .unwrap();
+    }
+
+    #[test]
+    fn fresh_database_is_stamped_with_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        drop(Store::open(&path).unwrap());
+        assert_eq!(marker(&path), 2);
+        assert_eq!(STORE_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn unmarked_database_opens_and_is_stamped_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[with_hash("a", 1, [1; 32])]);
+        assert_eq!(marker(&path), 0);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 1);
+        drop(s);
+        assert_eq!(marker(&path), 2);
+    }
+
+    #[test]
+    fn older_marker_is_bumped_and_the_current_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[]);
+        stamp(&path, 1);
+        drop(Store::open(&path).unwrap());
+        assert_eq!(marker(&path), 2);
+        drop(Store::open(&path).unwrap());
+        assert_eq!(marker(&path), 2);
+    }
+
+    #[test]
+    fn too_new_database_is_refused_by_both_opens_and_not_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[with_hash("a", 1, [1; 32])]);
+        stamp(&path, 3);
+        let before = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let want = SwapError::StoreTooNew {
+            found: 3,
+            supported: 2,
+        };
+        assert_eq!(Store::open(&path).err().unwrap(), want);
+        assert_eq!(Store::open_read_only(&path).err().unwrap(), want);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file bytes changed");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(marker(&path), 3);
+        // No sidecar was created by the refused opens.
+        assert!(!dir.path().join("swap.db-wal").exists());
+        let msg = want.to_string();
+        assert!(
+            msg.contains("newer") && msg.contains('3') && msg.contains('2'),
+            "{msg}"
+        );
     }
 }

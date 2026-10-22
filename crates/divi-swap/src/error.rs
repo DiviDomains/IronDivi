@@ -38,6 +38,13 @@ pub enum SwapError {
     /// Persistence (SQLite) failure.
     #[error("storage error: {0}")]
     Storage(String),
+    /// The swap database was written by a newer binary than this one. Opening it would let
+    /// this binary silently drop fields it does not know (a V1 script read back as V0).
+    #[error(
+        "swap database schema version {found} is newer than this binary supports ({supported}): \
+         run the newer divi-swap/divi-swapd binary that wrote it; refusing to open"
+    )]
+    StoreTooNew { found: u32, supported: u32 },
     /// A secret could not be resolved. Never contains the secret itself.
     #[error("secret unavailable: {0}")]
     Secret(String),

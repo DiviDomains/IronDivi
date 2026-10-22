@@ -334,3 +334,9 @@
 - left: (1) shellcheck is not installed on hp1, so it was not run. (2) The test relies on the stubs shadowing any `op` on the script's own PATH prefix; it sets HOME to a temp dir, but a Mac with a Homebrew `op` would resolve that first (the stub `secret` is the thing under test, and the test still asserts the script's source has no raw `op` call). (3) The other `tools/swap-poc/*.sh` have no raw `op` calls (they use `secret get` or only mention `op://` refs), so nothing else needed the change. (4) No live USDC run was made (no funds, no keys on hp1).
 - needs: nothing
 - decisions: cache via a dynamically named shell variable (bash 3.2 on the Mac has no associative arrays); `--check-secrets` rather than reusing `--dry-run`, because `--dry-run` deliberately resolves no keys.
+
+## 2026-10-22 — round: swap DB schema-version marker (builder BS, `lane/store-schema-marker`)
+- done: `crates/divi-swap/src/store.rs`: `STORE_SCHEMA_VERSION = 2` kept in `PRAGMA user_version` (a header integer: no new table, `SCHEMA` unchanged, pre-marker binaries ignore it). Read-write open checks the marker right after connecting, before the WAL/synchronous pragmas and any schema write: newer is refused with `SwapError::StoreTooNew`; unmarked or older is stamped to 2 in place (V0 records stay V0). Read-only open refuses too-new and never writes. The XMR store has no open path of its own (it persists in `divi_swap::Store` docs table), so it inherits the check.
+- proof: tests in `store.rs`: fresh DB stamped 2; unmarked DB opens and is stamped; older marker bumped; a DB stamped 3 refused by both opens with bytes, mtime and marker unchanged and no `-wal` created. Counts and the fail-before run are in `builders/BS/STATUS.md`.
+- left: binaries deployed before this change have no check; the "no rollback across V1 with in-flight swaps" deploy rule stays.
+- needs: nothing

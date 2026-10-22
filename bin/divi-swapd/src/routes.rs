@@ -412,9 +412,10 @@ impl From<SwapError> for ApiError {
             SwapError::InvalidParams(_) => StatusCode::BAD_REQUEST,
             SwapError::Transient(_) | SwapError::Premature(_) => StatusCode::SERVICE_UNAVAILABLE,
             SwapError::Rejected(_) | SwapError::InsufficientFunds(_) => StatusCode::CONFLICT,
-            SwapError::Storage(_) | SwapError::Secret(_) | SwapError::Other(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            SwapError::Storage(_)
+            | SwapError::StoreTooNew { .. }
+            | SwapError::Secret(_)
+            | SwapError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(status, e.to_string())
     }
