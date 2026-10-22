@@ -407,7 +407,7 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         let height = self.current_height();
-        let balance = wallet.get_immature_balance(height, 100); // 100 block maturity
+        let balance = wallet.get_immature_balance(height, wallet.coinbase_maturity());
         let divi = balance.as_sat() as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
     }
@@ -417,9 +417,10 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         let height = self.current_height();
-        let balance = wallet.get_confirmed_balance(height, 1);
+        // Same figures as getbalance, getunconfirmedbalance, getimmaturebalance
+        let balance = wallet.get_balance();
         let unconfirmed = wallet.get_unconfirmed_balance();
-        let immature = wallet.get_immature_balance(height, 100);
+        let immature = wallet.get_immature_balance(height, wallet.coinbase_maturity());
 
         let divi_balance = balance.as_sat() as f64 / 100_000_000.0;
         let divi_unconfirmed = unconfirmed.as_sat() as f64 / 100_000_000.0;
@@ -983,11 +984,9 @@ impl WalletRpc {
 
         let height = self.current_height();
 
-        // Get spendable UTXOs (1 confirmation minimum)
-        let mut utxos = wallet.get_spendable_utxos(height, 1);
-
-        // Sort by value descending for simple coin selection
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
+        // Confirmed coins first (largest first), then our own unconfirmed
+        // change, which getbalance counts (Core's spendzeroconfchange)
+        let utxos = wallet.get_send_candidates(height, 1);
 
         // Fee estimation: ~1000 satoshis per input + 500 per output
         let base_fee = Amount::from_sat(1000);
@@ -2704,9 +2703,9 @@ impl WalletRpc {
             return Err(RpcError::invalid_params("No recipients specified").into());
         }
 
-        // Get spendable UTXOs
-        let mut utxos = wallet.get_spendable_utxos(height, min_conf);
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
+        // Coins with min_conf first, then (at the default minconf) our own
+        // unconfirmed change, as in Core
+        let utxos = wallet.get_send_candidates(height, min_conf);
 
         // Simple coin selection
         let base_fee = Amount::from_sat(1000);
@@ -3244,8 +3243,8 @@ impl WalletRpc {
         }
 
         // Get UTXOs only from account addresses
-        let all_utxos = wallet.get_spendable_utxos(height, min_conf);
-        let mut utxos: Vec<_> = if account.is_empty() {
+        let all_utxos = wallet.get_send_candidates(height, min_conf);
+        let utxos: Vec<_> = if account.is_empty() {
             // Empty account means default account - use all addresses
             all_utxos
         } else {
@@ -3256,8 +3255,6 @@ impl WalletRpc {
                 .filter(|utxo| account_addr_set.contains(&utxo.address))
                 .collect()
         };
-
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Fee estimation
         let base_fee = Amount::from_sat(1000);
@@ -4943,5 +4940,86 @@ mod accounting_tests {
             .unwrap();
         assert_eq!(tx["amount"], json!(1250.0));
         assert_eq!(tx["fee"], serde_json::Value::Null);
+    }
+
+    fn stranger_address() -> String {
+        Address::from_pubkey_hash(
+            divi_primitives::hash::Hash160::from_bytes([0xaa; 20]),
+            Network::Regtest,
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn send_can_use_own_unconfirmed_change_that_getbalance_counts() {
+        let f = fixture();
+        // Our own tx spends every confirmed coin: 100 DIVI change comes back
+        // unconfirmed (trusted, as all inputs are ours)
+        let coins = f.wallet.get_utxos();
+        let total: i64 = coins.iter().map(|u| u.value.as_sat()).sum();
+        let own = Transaction {
+            version: 1,
+            vin: coins
+                .iter()
+                .map(|u| TxIn::new(u.outpoint(), Script::default(), 0xffffffff))
+                .collect(),
+            vout: vec![
+                TxOut::new(Amount::from_sat(total - 100 * COIN - 1_000_000), stranger()),
+                TxOut::new(Amount::from_sat(100 * COIN), script_of(&f.miner)),
+            ],
+            lock_time: 0,
+        };
+        assert!(f.wallet.add_mempool_tx(&own));
+        assert_eq!(
+            f.rpc.get_balance(&Params::Array(vec![])).unwrap(),
+            json!(100.0)
+        );
+
+        let submitted = Arc::new(parking_lot::Mutex::new(None));
+        let sink = submitted.clone();
+        f.rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            *sink.lock() = Some(tx);
+            Ok(txid)
+        }));
+        f.rpc
+            .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
+            .expect("getbalance says 100, so a 10 DIVI send must find the coins");
+        let tx = submitted.lock().clone().unwrap();
+        assert_eq!(tx.vin.len(), 1);
+        assert_eq!(tx.vin[0].prevout.txid, own.txid());
+    }
+
+    #[test]
+    fn balances_leave_out_immature_rewards() {
+        let f = fixture();
+        // A fresh coinbase to us at the tip is immature (regtest maturity 1)
+        mine(&f.chain, script_of(&f.miner), &[]);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        let none = || Params::Array(vec![]);
+
+        assert_eq!(
+            f.rpc.get_balance(&none()).unwrap(),
+            json!(BALANCE as f64 / 1e8)
+        );
+        assert_eq!(
+            f.rpc
+                .get_balance(&Params::Array(vec![json!("*"), json!(1)]))
+                .unwrap(),
+            json!(BALANCE as f64 / 1e8)
+        );
+        assert_eq!(f.rpc.get_immature_balance(&none()).unwrap(), json!(1250.0));
+        let info = f.rpc.get_wallet_info(&none()).unwrap();
+        assert_eq!(info["balance"], json!(BALANCE as f64 / 1e8));
+        assert_eq!(info["immature_balance"], json!(1250.0));
+
+        // getbalance matches what a send can select
+        let selectable: i64 = f
+            .wallet
+            .get_spendable_utxos(f.chain.height(), 1)
+            .iter()
+            .map(|u| u.value.as_sat())
+            .sum();
+        assert_eq!(selectable, BALANCE);
     }
 }

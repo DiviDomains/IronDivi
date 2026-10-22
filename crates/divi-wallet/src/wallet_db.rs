@@ -1321,12 +1321,47 @@ impl WalletDb {
         select::select_minimum(&available_utxos, target, fee_rate, num_outputs)
     }
 
+    /// Whether a coin can be spent at all once selected: mature and not
+    /// watch-only. Balances count only such coins, like Core's
+    /// GetAvailableCredit (immature rewards are getimmaturebalance's).
+    fn is_spendable_coin(&self, utxo: &WalletUtxo, current_height: u32) -> bool {
+        let watch_only = Address::from_base58(&utxo.address)
+            .map(|addr| self.is_watch_only(&addr))
+            .unwrap_or(false);
+        utxo.is_mature(current_height, self.coinbase_maturity()) && !watch_only
+    }
+
+    /// Coins a send may use, in the order it should try them: coins with at
+    /// least `min_confirmations` (largest first), then, when `min_confirmations`
+    /// is 0 or 1, our own unconfirmed change (largest first). This is Core's
+    /// CreateTransaction with spendzeroconfchange: confirmed coins first, then
+    /// trusted 0-conf coins, which getbalance already counts.
+    pub fn get_send_candidates(
+        &self,
+        current_height: u32,
+        min_confirmations: u32,
+    ) -> Vec<WalletUtxo> {
+        let mut confirmed = self.get_spendable_utxos(current_height, min_confirmations.max(1));
+        confirmed.sort_by_key(|u| std::cmp::Reverse(u.value));
+        if min_confirmations <= 1 {
+            let mut change: Vec<_> = self
+                .get_spendable_utxos(current_height, 0)
+                .into_iter()
+                .filter(|u| u.confirmations(current_height) == 0)
+                .collect();
+            change.sort_by_key(|u| std::cmp::Reverse(u.value));
+            confirmed.extend(change);
+        }
+        confirmed
+    }
+
     /// Get total balance: Core's GetBalance, i.e. trusted coins only
-    /// (confirmed, plus our own unconfirmed change)
+    /// (confirmed, plus our own unconfirmed change), mature and not watch-only
     pub fn get_balance(&self) -> Amount {
+        let height = self.last_scan_height();
         self.effective_utxos()
             .into_iter()
-            .filter(|(_, source)| source.is_trusted())
+            .filter(|(u, source)| source.is_trusted() && self.is_spendable_coin(u, height))
             .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
@@ -1339,6 +1374,7 @@ impl WalletDb {
     pub fn get_confirmed_balance(&self, current_height: u32, min_confirmations: u32) -> Amount {
         self.effective_utxos()
             .into_iter()
+            .filter(|(utxo, _)| self.is_spendable_coin(utxo, current_height))
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.confirmations(current_height) >= min_confirmations,
                 CoinSource::Mempool { trusted } => *trusted || min_confirmations == 0,
@@ -3497,6 +3533,51 @@ mod tests {
                     (OutPoint::new(incoming.txid(), 0), None),
                 ])
             );
+        }
+
+        #[test]
+        fn send_candidates_take_confirmed_coins_before_own_change() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let small = tx(
+                &[(Hash256::from_bytes([7u8; 32]), 0)],
+                vec![(COIN, mine(&wallet.new_receiving_address().unwrap()))],
+            );
+            scan(&wallet, 1, &[fund, small.clone()]);
+            assert!(wallet.add_mempool_tx(&send));
+
+            let order: Vec<OutPoint> = wallet
+                .get_send_candidates(1, 1)
+                .iter()
+                .map(|u| u.outpoint())
+                .collect();
+            assert_eq!(
+                order,
+                vec![
+                    OutPoint::new(small.txid(), 0),
+                    OutPoint::new(send.txid(), 1)
+                ]
+            );
+            // An explicit higher minconf does not fall back to 0-conf change
+            assert!(wallet.get_send_candidates(1, 2).is_empty());
+            assert_eq!(wallet.get_balance().as_sat(), COIN + CHANGE);
+        }
+
+        #[test]
+        fn balance_leaves_out_watch_only_coins() {
+            let wallet = create_test_wallet();
+            let watched =
+                Address::from_pubkey_hash(Hash160::from_bytes([0xbb; 20]), Network::Mainnet);
+            wallet.import_watch_only_address(&watched, None).unwrap();
+            let pay = tx(
+                &[(Hash256::from_bytes([7u8; 32]), 0)],
+                vec![(5 * COIN, Script::new_p2pkh(watched.hash.as_bytes()))],
+            );
+            scan(&wallet, 1, std::slice::from_ref(&pay));
+            assert_eq!(wallet.get_utxos().len(), 1);
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+            assert_eq!(wallet.get_confirmed_balance(1, 1).as_sat(), 0);
+            assert!(wallet.get_send_candidates(1, 1).is_empty());
         }
 
         #[test]
