@@ -33,9 +33,9 @@ use divi_wallet::{
 };
 use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Parse a DIVI amount parameter the way Core's AmountFromValue does
 /// (JsonTxHelpers.cpp): reject negatives, values above MaxMoneyOut, and zero
@@ -136,7 +136,67 @@ pub struct WalletRpc {
     mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
 }
 
+/// A history entry's amount as Core shows it: the net change to the wallet
+/// without the fee, which is reported separately (`fee`). A 1 DIVI send with a
+/// 0.00003 fee is amount -1, fee -0.00003.
+fn amount_without_fee(tx: &divi_wallet::WalletTx) -> f64 {
+    let fee = tx.fee.map_or(0, |f| f.as_sat());
+    (tx.amount + fee) as f64 / 100_000_000.0
+}
+
+/// Scan the active chain into the wallet, in order, from its last scanned
+/// height up to the tip (rolling back first if the chain switched under it).
+/// Returns the heights whose block could not be read (pruned); they are
+/// skipped.
+pub fn sync_wallet_with_chain(wallet: &WalletDb, chain: &Chain) -> Vec<u32> {
+    wallet.sync_to_tip(
+        chain.height(),
+        |height| {
+            chain
+                .get_block_index_by_height(height)
+                .ok()
+                .flatten()
+                .map(|index| index.hash)
+        },
+        |height| {
+            let index = chain.get_block_index_by_height(height).ok().flatten()?;
+            let block = chain.get_block(&index.hash).ok().flatten()?;
+            Some((index.hash, block))
+        },
+    )
+}
+
 impl WalletRpc {
+    /// Amount received per address over all outputs the wallet received at
+    /// `min_conf` or more, spent or not, with the fewest confirmations among
+    /// them. Coinbase outputs are left out, as in Core's received-by RPCs.
+    fn received_by_address(&self, wallet: &WalletDb, min_conf: u32) -> HashMap<String, (i64, u32)> {
+        let height = self.current_height();
+        let mut by_addr: HashMap<String, (i64, u32)> = HashMap::new();
+        for output in wallet.received_outputs() {
+            let confs = output.confirmations(height);
+            if output.is_coinbase || confs < min_conf {
+                continue;
+            }
+            let entry = by_addr.entry(output.address).or_insert((0, u32::MAX));
+            entry.0 += output.value.as_sat();
+            entry.1 = entry.1.min(confs);
+        }
+        by_addr
+    }
+
+    /// Bring the wallet up to the active chain after the chain moved without
+    /// a block notification (invalidateblock, reconsiderblock)
+    pub fn sync_with_chain(&self) {
+        let (Some(chain), Ok(wallet)) = (self.chain.as_ref(), self.get_wallet()) else {
+            return;
+        };
+        sync_wallet_with_chain(&wallet, chain);
+        if let Err(e) = wallet.save_incremental() {
+            warn!("Failed to save wallet after chain sync: {}", e);
+        }
+    }
+
     pub fn new() -> Self {
         WalletRpc {
             wallet: Arc::new(RwLock::new(None)),
@@ -426,7 +486,7 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         let height = self.current_height();
-        let balance = wallet.get_immature_balance(height, 100); // 100 block maturity
+        let balance = wallet.get_immature_balance(height, wallet.coinbase_maturity());
         let divi = balance.as_sat() as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
     }
@@ -436,9 +496,10 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         let height = self.current_height();
-        let balance = wallet.get_confirmed_balance(height, 1);
+        // Same figures as getbalance, getunconfirmedbalance, getimmaturebalance
+        let balance = wallet.get_balance();
         let unconfirmed = wallet.get_unconfirmed_balance();
-        let immature = wallet.get_immature_balance(height, 100);
+        let immature = wallet.get_immature_balance(height, wallet.coinbase_maturity());
 
         // Core: spendable_balance excludes every vault, vaulted_balance is the
         // coins in vaults we own (a managed vault is in neither)
@@ -482,6 +543,39 @@ impl WalletRpc {
         let min_conf = params.get_u64(0).unwrap_or(1) as u32;
         let max_conf = params.get_u64(1).unwrap_or(9999999) as u32;
 
+        // Optional ["address", ...] filter. As in Core, a bad address is -5
+        // and a repeated one is -8.
+        let addresses: Option<HashSet<String>> = match params.get(2) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(items)) => {
+                let mut set = HashSet::new();
+                for item in items {
+                    let addr = item
+                        .as_str()
+                        .filter(|a| Address::from_base58(a).is_ok())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                codes::INVALID_ADDRESS_OR_KEY,
+                                format!("Invalid Divi address: {}", item.as_str().unwrap_or("")),
+                            )
+                        })?;
+                    if !set.insert(addr.to_string()) {
+                        return Err(RpcError::new(
+                            codes::INVALID_PARAMETER,
+                            format!("Invalid parameter, duplicated address: {}", addr),
+                        )
+                        .into());
+                    }
+                }
+                Some(set)
+            }
+            Some(_) => {
+                return Err(
+                    RpcError::new(codes::TYPE_ERROR, "Expected type array for addresses").into(),
+                )
+            }
+        };
+
         let height = self.current_height();
         let utxos = wallet.get_utxos();
 
@@ -490,6 +584,14 @@ impl WalletRpc {
             .filter(|utxo| {
                 let confs = utxo.confirmations(height);
                 confs >= min_conf && confs <= max_conf
+            })
+            // Vault outputs are not listed, as in Core (AvailableCoins with
+            // ALL_SPENDABLE_COINS); getcoinavailability reports them
+            .filter(|utxo| StakingVaultScript::from_script(&utxo.script_pubkey).is_none())
+            .filter(|utxo| {
+                addresses
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&utxo.address))
             })
             .map(|utxo| {
                 let divi = utxo.value.as_sat() as f64 / 100_000_000.0;
@@ -547,7 +649,7 @@ impl WalletRpc {
             _ => 0,
         };
 
-        let divi_amount = tx.amount as f64 / 100_000_000.0;
+        let divi_amount = amount_without_fee(&tx);
         // Fee is shown as negative for sent transactions (C++ Divi convention)
         let divi_fee = tx.fee.map(|f| -(f.as_sat() as f64 / 100_000_000.0));
 
@@ -561,9 +663,16 @@ impl WalletRpc {
             "txid": tx.txid.to_string(),
             "time": tx.timestamp,
             "timereceived": tx.timestamp,
-            "details": [{
-                "category": tx.category,
-                "amount": divi_amount,
+            "details": [match divi_fee {
+                Some(fee) => serde_json::json!({
+                    "category": tx.category,
+                    "amount": divi_amount,
+                    "fee": fee,
+                }),
+                None => serde_json::json!({
+                    "category": tx.category,
+                    "amount": divi_amount,
+                }),
             }],
         }))
     }
@@ -597,7 +706,7 @@ impl WalletRpc {
                     Some(h) if height >= h => height - h + 1,
                     _ => 0,
                 };
-                let divi_amount = tx.amount as f64 / 100_000_000.0;
+                let divi_amount = amount_without_fee(tx);
 
                 let mut entry = serde_json::json!({
                     "category": tx.category,
@@ -670,7 +779,7 @@ impl WalletRpc {
                     Some(h) if current_height >= h => current_height - h + 1,
                     _ => 0,
                 };
-                let divi_amount = tx.amount as f64 / 100_000_000.0;
+                let divi_amount = amount_without_fee(tx);
 
                 let mut entry = serde_json::json!({
                     "category": tx.category,
@@ -914,57 +1023,22 @@ impl WalletRpc {
             }
         }
 
-        info!("Clearing existing wallet data before rescan");
-        wallet.clear_transactions_and_utxos();
-
-        // Iterate through blocks and scan
-        let mut scanned = 0;
-        for height in start_height..=stop_height {
-            // Get block index
-            let index = match chain.get_block_index_by_height(height)? {
-                Some(idx) => idx,
-                None => {
-                    info!(
-                        "Block index at height {} not found, stopping rescan (total scanned: {})",
-                        height, scanned
-                    );
-                    break;
-                }
-            };
-
-            // Get full block, from a full-history peer if it is pruned locally
-            let block = match crate::blockchain::load_block_or_fetch(
-                chain,
-                fetcher.as_ref(),
-                &index,
-            )? {
-                Some(blk) => blk,
-                None => {
-                    info!("Block data for hash {} at height {} not found, stopping rescan (total scanned: {})", 
-                          index.hash, height, scanned);
-                    break;
-                }
-            };
-
-            // Check if block has transactions
-            if block.transactions.is_empty() {
-                debug!("Block at height {} has no transactions, skipping", height);
-                scanned += 1;
-                continue;
-            }
-
-            // Scan the block
-            wallet.scan_block(index.hash, height, index.time, &block.transactions);
-            scanned += 1;
-
-            // Log progress every 1000 blocks
-            if scanned % 1000 == 0 {
-                info!(
-                    "Rescan progress: {}/{} blocks",
-                    scanned,
-                    stop_height - start_height + 1
-                );
-            }
+        // A full rescan rebuilds the wallet; a partial one replaces only what
+        // the range recorded. Block notifications wait on the wallet's scan
+        // lock meanwhile, so none is scanned out of order.
+        let (scanned, unreadable) =
+            wallet.rescan(start_height, stop_height, current_height, |height| {
+                let index = chain.get_block_index_by_height(height).ok().flatten()?;
+                let block = crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &index)
+                    .ok()
+                    .flatten()?;
+                Some((index.hash, block))
+            });
+        if let Some(height) = unreadable {
+            info!(
+                "Block at height {} not available, stopping rescan (total scanned: {})",
+                height, scanned
+            );
         }
 
         info!("Rescan complete: scanned {} blocks", scanned);
@@ -1013,11 +1087,9 @@ impl WalletRpc {
 
         let height = self.current_height();
 
-        // Get spendable UTXOs (1 confirmation minimum)
-        let mut utxos = wallet.get_spendable_utxos(height, 1);
-
-        // Sort by value descending for simple coin selection
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
+        // Confirmed coins first (largest first), then our own unconfirmed
+        // change, which getbalance counts (Core's spendzeroconfchange)
+        let utxos = wallet.get_send_candidates(height, 1);
 
         // Fee estimation: ~1000 satoshis per input + 500 per output
         let base_fee = Amount::from_sat(1000);
@@ -1662,23 +1734,8 @@ impl WalletRpc {
         let min_conf = params.get_u64(0).unwrap_or(1) as u32;
         let _include_empty = params.get_bool(1).unwrap_or(false);
 
-        let height = self.current_height();
-        let utxos = wallet.get_utxos();
-
-        // Aggregate by address
-        let mut by_addr: std::collections::HashMap<String, (i64, u32)> =
-            std::collections::HashMap::new();
-
-        for utxo in utxos {
-            let confs = utxo.confirmations(height);
-            if confs >= min_conf {
-                let entry = by_addr.entry(utxo.address.clone()).or_insert((0, u32::MAX));
-                entry.0 += utxo.value.as_sat();
-                if confs < entry.1 {
-                    entry.1 = confs;
-                }
-            }
-        }
+        // Aggregate by address, including coins since spent
+        let by_addr = self.received_by_address(&wallet, min_conf);
 
         let result: Vec<_> = by_addr
             .iter()
@@ -2896,9 +2953,9 @@ impl WalletRpc {
             return Err(RpcError::invalid_params("No recipients specified").into());
         }
 
-        // Get spendable UTXOs
-        let mut utxos = wallet.get_spendable_utxos(height, min_conf);
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
+        // Coins with min_conf first, then (at the default minconf) our own
+        // unconfirmed change, as in Core
+        let utxos = wallet.get_send_candidates(height, min_conf);
 
         // Simple coin selection
         let base_fee = Amount::from_sat(1000);
@@ -3133,16 +3190,11 @@ impl WalletRpc {
             return Ok(serde_json::json!(0.0));
         }
 
-        let height = self.current_height();
-        let utxos = wallet.get_utxos();
-
-        // Sum all UTXOs for this address with sufficient confirmations
-        let mut total = 0i64;
-        for utxo in utxos {
-            if utxo.address == addr_str && utxo.confirmations(height) >= min_conf {
-                total += utxo.value.as_sat();
-            }
-        }
+        // Everything received at the address, including coins since spent
+        let total = self
+            .received_by_address(&wallet, min_conf)
+            .get(addr_str)
+            .map_or(0, |(amount, _)| *amount);
 
         let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
@@ -3445,8 +3497,8 @@ impl WalletRpc {
         }
 
         // Get UTXOs only from account addresses
-        let all_utxos = wallet.get_spendable_utxos(height, min_conf);
-        let mut utxos: Vec<_> = if account.is_empty() {
+        let all_utxos = wallet.get_send_candidates(height, min_conf);
+        let utxos: Vec<_> = if account.is_empty() {
             // Empty account means default account - use all addresses
             all_utxos
         } else {
@@ -3457,8 +3509,6 @@ impl WalletRpc {
                 .filter(|utxo| account_addr_set.contains(&utxo.address))
                 .collect()
         };
-
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Fee estimation
         let base_fee = Amount::from_sat(1000);
@@ -4090,24 +4140,16 @@ impl WalletRpc {
         let min_conf = params.get_u64(1).unwrap_or(1) as u32;
 
         let wallet = self.get_wallet()?;
-        let height = self.current_height();
+        let received = self.received_by_address(&wallet, min_conf);
 
-        let addresses = wallet.get_addresses_by_account(account);
-        let mut total = Amount::ZERO;
+        let total: i64 = wallet
+            .get_addresses_by_account(account)
+            .iter()
+            .filter_map(|addr| received.get(addr))
+            .map(|(amount, _)| amount)
+            .sum();
 
-        for addr_str in addresses {
-            let utxos = wallet.get_utxos();
-            for utxo in utxos {
-                if utxo.address == addr_str {
-                    let confs = utxo.confirmations(height);
-                    if confs >= min_conf {
-                        total += utxo.value;
-                    }
-                }
-            }
-        }
-
-        let divi = total.as_sat() as f64 / 100_000_000.0;
+        let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
     }
 
@@ -4118,8 +4160,8 @@ impl WalletRpc {
         let include_empty = params.get_bool(1).unwrap_or(false);
         let _include_watchonly = params.get_bool(2).unwrap_or(false);
 
-        let height = self.current_height();
         let accounts = wallet.list_accounts();
+        let received = self.received_by_address(&wallet, min_conf);
 
         let mut result = Vec::new();
 
@@ -4128,17 +4170,9 @@ impl WalletRpc {
             let mut min_confirmations = u32::MAX;
 
             for addr_str in addresses {
-                let utxos = wallet.get_utxos();
-                for utxo in utxos {
-                    if utxo.address == addr_str {
-                        let confs = utxo.confirmations(height);
-                        if confs >= min_conf {
-                            account_total += utxo.value;
-                            if confs < min_confirmations {
-                                min_confirmations = confs;
-                            }
-                        }
-                    }
+                if let Some((amount, confs)) = received.get(&addr_str) {
+                    account_total += Amount::from_sat(*amount);
+                    min_confirmations = min_confirmations.min(*confs);
                 }
             }
 
@@ -5220,5 +5254,520 @@ mod send_unlock_regression {
                 name
             );
         }
+    }
+}
+
+/// Wallet accounting over a real (regtest) chain: rescans, received totals,
+/// UTXO filters and history amounts
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use divi_primitives::block::Block;
+    use divi_primitives::transaction::{TxIn, TxOut};
+    use divi_primitives::ChainMode;
+    use divi_storage::{ChainDatabase, ChainParams, NetworkType};
+    use divi_wallet::{HdWallet, Network};
+    use serde_json::json;
+
+    const COIN: i64 = 100_000_000;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        chain: Arc<Chain>,
+        wallet: Arc<WalletDb>,
+        rpc: WalletRpc,
+        /// Paid by the coinbases of blocks 1-4
+        miner: String,
+        /// Paid 249.99 by `spend` in block 5
+        second: String,
+        /// Block 5's send: block 1's coin, 1000 to a stranger, 249.99 to `second`
+        spend: Transaction,
+    }
+
+    fn stranger() -> Script {
+        Script::new_p2pkh(&[0xaa; 20])
+    }
+
+    fn script_of(addr: &str) -> Script {
+        let a = Address::from_base58(addr).unwrap();
+        Script::new_p2pkh(a.hash.as_bytes())
+    }
+
+    /// Mine a block on the tip: a coinbase paying `payee`, then `txs`
+    fn mine(chain: &Chain, payee: Script, txs: &[Transaction]) -> Block {
+        let tip = chain.tip().unwrap();
+        let height = tip.height + 1;
+        let mut sig = vec![4u8];
+        sig.extend_from_slice(&height.to_le_bytes());
+        let coinbase = Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+            vout: vec![TxOut::new(Amount::from_sat(1250 * COIN), payee)],
+            lock_time: 0,
+        };
+        let mut block = Block::default();
+        block.header.version = 1;
+        block.header.prev_block = tip.hash;
+        block.header.time = tip.time + 60;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(coinbase);
+        block.transactions.extend_from_slice(txs);
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        chain.accept_block(block.clone()).unwrap();
+        block
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with(|_| {
+            let hd = HdWallet::new(ChainMode::Divi).unwrap();
+            WalletDb::with_hd_wallet(Network::Regtest, hd)
+        })
+    }
+
+    fn fixture_with(make_wallet: impl FnOnce(&std::path::Path) -> WalletDb) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+        let chain = Arc::new(
+            Chain::new(
+                db,
+                ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+            )
+            .unwrap(),
+        );
+        let wallet = Arc::new(make_wallet(dir.path()));
+        let miner = wallet.new_receiving_address().unwrap().to_string();
+        let second = wallet.new_receiving_address().unwrap().to_string();
+
+        let first = mine(&chain, script_of(&miner), &[]);
+        for _ in 2..=4 {
+            mine(&chain, script_of(&miner), &[]);
+        }
+        let spend = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                divi_primitives::transaction::OutPoint::new(first.transactions[0].txid(), 0),
+                Script::default(),
+                0xffffffff,
+            )],
+            vout: vec![
+                TxOut::new(Amount::from_sat(1000 * COIN), stranger()),
+                TxOut::new(Amount::from_sat(250 * COIN - 1_000_000), script_of(&second)),
+            ],
+            lock_time: 0,
+        };
+        mine(&chain, stranger(), std::slice::from_ref(&spend));
+        assert_eq!(chain.height(), 5);
+
+        let rpc = WalletRpc::with_wallet_and_chain(wallet.clone(), chain.clone());
+        rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        Fixture {
+            _dir: dir,
+            chain,
+            wallet,
+            rpc,
+            miner,
+            second,
+            spend,
+        }
+    }
+
+    /// Balance after the fixture's blocks: three 1250 coinbases plus 249.99
+    const BALANCE: i64 = 3 * 1250 * COIN + 250 * COIN - 1_000_000;
+
+    #[test]
+    fn partial_rescan_keeps_coins_below_start() {
+        let f = fixture();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+        assert_eq!(f.chain.height(), 5);
+
+        for start in [3, 5, 1] {
+            let r = f
+                .rpc
+                .rescan_blockchain(&Params::Array(vec![json!(start)]))
+                .unwrap();
+            assert_eq!(r["start_height"], json!(start));
+            assert_eq!(r["stop_height"], json!(5));
+            assert_eq!(
+                f.wallet.get_balance().as_sat(),
+                BALANCE,
+                "after rescanblockchain {}",
+                start
+            );
+        }
+        // The send recorded in block 5 is still a single send
+        let sent = f.wallet.get_transaction(&f.spend.txid()).unwrap();
+        assert_eq!(sent.block_height, Some(5));
+        assert_eq!(sent.category, "send");
+    }
+
+    #[test]
+    fn partial_rescan_with_stop_keeps_coins_above_stop() {
+        let f = fixture();
+        f.rpc
+            .rescan_blockchain(&Params::Array(vec![json!(2), json!(3)]))
+            .unwrap();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+        assert_eq!(f.wallet.get_utxos().len(), 4);
+        assert!(f.wallet.get_utxos().iter().any(|u| u.address == f.second));
+    }
+
+    #[test]
+    fn full_rescan_repair_survives_restart() {
+        let f = fixture_with(|dir| {
+            let hd = HdWallet::new(ChainMode::Divi).unwrap();
+            WalletDb::create_persistent(&dir.join("wallet"), Network::Regtest, hd).unwrap()
+        });
+        f.wallet.save().unwrap();
+        // A coin wrongly marked spent (e.g. by a block that was later orphaned)
+        let coin = f
+            .wallet
+            .get_utxos()
+            .into_iter()
+            .find(|u| u.address == f.miner)
+            .unwrap()
+            .outpoint();
+        f.wallet.spend_utxo(&coin).unwrap();
+        f.wallet.save().unwrap();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE - 1250 * COIN);
+
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+
+        let path = f._dir.path().join("wallet");
+        drop(f.rpc);
+        drop(f.wallet);
+        let reopened = WalletDb::open(&path, Network::Regtest).unwrap();
+        assert!(reopened.has_utxo(&coin));
+        assert_eq!(reopened.get_balance().as_sat(), BALANCE);
+    }
+
+    #[test]
+    fn full_rescans_agree() {
+        let f = fixture();
+        let utxos = |w: &WalletDb| {
+            let mut v: Vec<_> = w
+                .get_utxos()
+                .iter()
+                .map(|u| (u.outpoint(), u.value.as_sat()))
+                .collect();
+            v.sort_by_key(|(o, _)| (o.txid, o.vout));
+            v
+        };
+        let before = utxos(&f.wallet);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        let first = utxos(&f.wallet);
+        f.rpc
+            .rescan_blockchain(&Params::Array(vec![json!(0)]))
+            .unwrap();
+        let second = utxos(&f.wallet);
+        assert_eq!(first, before);
+        assert_eq!(second, first);
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+    }
+
+    /// Spend `second`'s 249.99 coin to a stranger in block 6 and rescan
+    fn spend_second(f: &Fixture) {
+        let coin = f
+            .wallet
+            .get_utxos()
+            .into_iter()
+            .find(|u| u.address == f.second)
+            .unwrap();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin.outpoint(), Script::default(), 0xffffffff)],
+            vout: vec![TxOut::new(
+                Amount::from_sat(coin.value.as_sat() - 1_000_000),
+                stranger(),
+            )],
+            lock_time: 0,
+        };
+        mine(&f.chain, stranger(), &[tx]);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        assert!(!f.wallet.get_utxos().iter().any(|u| u.address == f.second));
+    }
+
+    #[test]
+    fn received_by_address_counts_spent_coins() {
+        let f = fixture();
+        spend_second(&f);
+        let received = |addr: &str, minconf: u32| {
+            f.rpc
+                .get_received_by_address(&Params::Array(vec![json!(addr), json!(minconf)]))
+                .unwrap()
+        };
+        // Received in block 5, spent in block 6: still received
+        assert_eq!(received(&f.second, 1), json!(249.99));
+        assert_eq!(received(&f.second, 2), json!(249.99));
+        // Block 5 has 2 confirmations at height 6
+        assert_eq!(received(&f.second, 3), json!(0.0));
+        // Coinbase outputs are not counted (Core skips coinbase transactions)
+        assert_eq!(received(&f.miner, 1), json!(0.0));
+    }
+
+    #[test]
+    fn received_by_lists_and_accounts_count_spent_coins() {
+        let f = fixture();
+        f.rpc
+            .set_account(&Params::Array(vec![json!(f.second), json!("savings")]))
+            .unwrap();
+        spend_second(&f);
+
+        let list = f
+            .rpc
+            .list_received_by_address(&Params::Array(vec![json!(1)]))
+            .unwrap();
+        let entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["address"] == json!(f.second))
+            .expect("second address listed");
+        assert_eq!(entry["amount"], json!(249.99));
+        assert_eq!(entry["confirmations"], json!(2));
+
+        assert_eq!(
+            f.rpc
+                .get_received_by_account(&Params::Array(vec![json!("savings"), json!(1)]))
+                .unwrap(),
+            json!(249.99)
+        );
+        let accounts = f
+            .rpc
+            .list_received_by_account(&Params::Array(vec![json!(1)]))
+            .unwrap();
+        let savings = accounts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["account"] == json!("savings"))
+            .expect("savings account listed");
+        assert_eq!(savings["amount"], json!(249.99));
+    }
+
+    #[test]
+    fn list_unspent_filters_by_address() {
+        let f = fixture();
+        let list = |params: Vec<serde_json::Value>| {
+            f.rpc
+                .list_unspent(&Params::Array(params))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["address"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(list(vec![]).len(), 4);
+
+        let only_second = list(vec![json!(1), json!(9999999), json!([f.second])]);
+        assert_eq!(only_second, vec![f.second.clone()]);
+
+        let only_miner = list(vec![json!(1), json!(9999999), json!([f.miner])]);
+        assert_eq!(only_miner.len(), 3);
+        assert!(only_miner.iter().all(|a| *a == f.miner));
+
+        assert_eq!(
+            list(vec![json!(1), json!(9999999), json!([f.miner, f.second])]).len(),
+            4
+        );
+        assert!(list(vec![json!(1), json!(9999999), json!([])]).is_empty());
+    }
+
+    #[test]
+    fn list_unspent_rejects_bad_address_filter() {
+        let f = fixture();
+        let code = |filter: serde_json::Value| match f.rpc.list_unspent(&Params::Array(vec![
+            json!(1),
+            json!(9999999),
+            filter,
+        ])) {
+            Err(Error::Rpc(e)) => e.code,
+            other => panic!("expected an RPC error, got {:?}", other),
+        };
+        assert_eq!(code(json!(["notanaddress"])), codes::INVALID_ADDRESS_OR_KEY);
+        assert_eq!(code(json!([f.second, f.second])), codes::INVALID_PARAMETER);
+        assert_eq!(code(json!(f.second)), codes::TYPE_ERROR);
+    }
+
+    #[test]
+    fn history_amount_excludes_fee() {
+        let f = fixture();
+        let txid = f.spend.txid().to_string();
+        // Block 5's send: 1000 to a stranger, 0.01 fee, change to our address
+        let tx = f
+            .rpc
+            .get_transaction(&Params::Array(vec![json!(txid)]))
+            .unwrap();
+        assert_eq!(tx["amount"], json!(-1000.0));
+        assert_eq!(tx["fee"], json!(-0.01));
+        assert_eq!(tx["details"][0]["amount"], json!(-1000.0));
+        assert_eq!(tx["details"][0]["fee"], json!(-0.01));
+
+        let listed = f
+            .rpc
+            .list_transactions(&Params::Array(vec![json!("*"), json!(100)]))
+            .unwrap();
+        let entry = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["txid"] == json!(txid))
+            .expect("send listed");
+        assert_eq!(entry["amount"], json!(-1000.0));
+        assert_eq!(entry["fee"], json!(-0.01));
+
+        let since = f.rpc.list_since_block(&Params::Array(vec![])).unwrap();
+        let entry = since["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["txid"] == json!(txid))
+            .expect("send in listsinceblock");
+        assert_eq!(entry["amount"], json!(-1000.0));
+        assert_eq!(entry["fee"], json!(-0.01));
+
+        // A receive has no fee and its amount is unchanged
+        let coinbase = f
+            .wallet
+            .get_transactions(None)
+            .into_iter()
+            .find(|t| t.category == "coinbase")
+            .unwrap();
+        let tx = f
+            .rpc
+            .get_transaction(&Params::Array(vec![json!(coinbase.txid.to_string())]))
+            .unwrap();
+        assert_eq!(tx["amount"], json!(1250.0));
+        assert_eq!(tx["fee"], serde_json::Value::Null);
+    }
+
+    fn stranger_address() -> String {
+        Address::from_pubkey_hash(
+            divi_primitives::hash::Hash160::from_bytes([0xaa; 20]),
+            Network::Regtest,
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn send_can_use_own_unconfirmed_change_that_getbalance_counts() {
+        let f = fixture();
+        // Our own tx spends every confirmed coin: 100 DIVI change comes back
+        // unconfirmed (trusted, as all inputs are ours)
+        let coins = f.wallet.get_utxos();
+        let total: i64 = coins.iter().map(|u| u.value.as_sat()).sum();
+        let own = Transaction {
+            version: 1,
+            vin: coins
+                .iter()
+                .map(|u| TxIn::new(u.outpoint(), Script::default(), 0xffffffff))
+                .collect(),
+            vout: vec![
+                TxOut::new(Amount::from_sat(total - 100 * COIN - 1_000_000), stranger()),
+                TxOut::new(Amount::from_sat(100 * COIN), script_of(&f.miner)),
+            ],
+            lock_time: 0,
+        };
+        assert!(f.wallet.add_mempool_tx(&own));
+        assert_eq!(
+            f.rpc.get_balance(&Params::Array(vec![])).unwrap(),
+            json!(100.0)
+        );
+
+        let submitted = Arc::new(parking_lot::Mutex::new(None));
+        let sink = submitted.clone();
+        f.rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            *sink.lock() = Some(tx);
+            Ok(txid)
+        }));
+        f.rpc
+            .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
+            .expect("getbalance says 100, so a 10 DIVI send must find the coins");
+        let tx = submitted.lock().clone().unwrap();
+        assert_eq!(tx.vin.len(), 1);
+        assert_eq!(tx.vin[0].prevout.txid, own.txid());
+    }
+
+    #[test]
+    fn balances_leave_out_immature_rewards() {
+        let f = fixture();
+        // A fresh coinbase to us at the tip is immature (regtest maturity 1)
+        mine(&f.chain, script_of(&f.miner), &[]);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        let none = || Params::Array(vec![]);
+
+        assert_eq!(
+            f.rpc.get_balance(&none()).unwrap(),
+            json!(BALANCE as f64 / 1e8)
+        );
+        assert_eq!(
+            f.rpc
+                .get_balance(&Params::Array(vec![json!("*"), json!(1)]))
+                .unwrap(),
+            json!(BALANCE as f64 / 1e8)
+        );
+        assert_eq!(f.rpc.get_immature_balance(&none()).unwrap(), json!(1250.0));
+        let info = f.rpc.get_wallet_info(&none()).unwrap();
+        assert_eq!(info["balance"], json!(BALANCE as f64 / 1e8));
+        assert_eq!(info["immature_balance"], json!(1250.0));
+
+        // getbalance matches what a send can select
+        let selectable: i64 = f
+            .wallet
+            .get_spendable_utxos(f.chain.height(), 1)
+            .iter()
+            .map(|u| u.value.as_sat())
+            .sum();
+        assert_eq!(selectable, BALANCE);
+    }
+
+    #[test]
+    fn list_unspent_leaves_out_vault_outputs() {
+        let f = fixture();
+        // A vault managed by our `second` key, funded with 50 DIVI in block 6
+        let manager = Address::from_base58(&f.second).unwrap();
+        let mut owner = [0u8; 20];
+        owner.copy_from_slice(&[0xcc; 20]);
+        let vault = StakingVaultScript::new(owner, *manager.hash.as_bytes()).to_script();
+        f.wallet.store_vault(divi_wallet::wallet_db::VaultMetadata {
+            owner_address: String::new(),
+            manager_address: f.second.clone(),
+            vault_script: vault.as_bytes().to_vec(),
+            funding_txid: [0u8; 32],
+        });
+        let coin = f
+            .wallet
+            .get_utxos()
+            .into_iter()
+            .find(|u| u.address == f.miner)
+            .unwrap();
+        let fund = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin.outpoint(), Script::default(), 0xffffffff)],
+            vout: vec![
+                TxOut::new(Amount::from_sat(50 * COIN), vault.clone()),
+                TxOut::new(
+                    Amount::from_sat(1200 * COIN - 1_000_000),
+                    script_of(&f.miner),
+                ),
+            ],
+            lock_time: 0,
+        };
+        mine(&f.chain, stranger(), &[fund]);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        assert!(f
+            .wallet
+            .get_utxos()
+            .iter()
+            .any(|u| u.script_pubkey == vault));
+
+        let listed = f.rpc.list_unspent(&Params::Array(vec![])).unwrap();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 4);
+        assert!(listed
+            .iter()
+            .all(|u| u["scriptPubKey"] != json!(hex::encode(vault.as_bytes()))));
     }
 }

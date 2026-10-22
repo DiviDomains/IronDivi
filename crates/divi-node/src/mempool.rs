@@ -300,6 +300,45 @@ impl Mempool {
         }
     }
 
+    /// Remove transactions that spend a coin also spent by one of a connected
+    /// block's transactions, together with their descendants. They can never
+    /// confirm; left in place they kept a double spend in the local mempool
+    /// (and the wallet's pending view) forever. Returns how many were removed.
+    pub fn remove_conflicts(&self, block_txs: &[Transaction]) -> usize {
+        let mut doomed: Vec<Hash256> = {
+            let spenders = self.spenders.read();
+            block_txs
+                .iter()
+                .flat_map(|tx| {
+                    let txid = tx.txid();
+                    tx.vin
+                        .iter()
+                        .filter_map(|input| {
+                            spenders
+                                .get(&(input.prevout.txid, input.prevout.vout))
+                                .copied()
+                        })
+                        .filter(move |spender| *spender != txid)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut removed = 0;
+        while let Some(txid) = doomed.pop() {
+            if let Some(entry) = self.remove(&txid) {
+                removed += 1;
+                tracing::info!("Removed tx {} from mempool: conflicts with a block", txid);
+                let spenders = self.spenders.read();
+                for vout in 0..entry.tx.vout.len() as u32 {
+                    if let Some(child) = spenders.get(&(txid, vout)) {
+                        doomed.push(*child);
+                    }
+                }
+            }
+        }
+        removed
+    }
+
     /// Get transactions for a new block, sorted by fee rate
     pub fn get_block_txs(&self, max_size: usize) -> Vec<Transaction> {
         let txs = self.txs.read();
@@ -849,6 +888,30 @@ mod tests {
         assert!(!mempool.contains(&txid1));
         assert!(!mempool.contains(&txid2));
         assert!(mempool.contains(&txid3));
+    }
+
+    #[test]
+    fn remove_conflicts_drops_double_spends_of_block_inputs() {
+        let mempool = Mempool::new(test_config());
+
+        // `stale` spends coin [1; 32] in the mempool, `child` spends `stale`;
+        // `other` spends an unrelated coin
+        let stale = create_test_tx([1u8; 32], 50);
+        let child = create_test_tx(stale.txid().as_bytes().to_owned(), 40);
+        let other = create_test_tx([2u8; 32], 50);
+        mempool.add(stale.clone(), Amount::from_sat(10000)).unwrap();
+        mempool.add(child.clone(), Amount::from_sat(10000)).unwrap();
+        mempool.add(other.clone(), Amount::from_sat(10000)).unwrap();
+
+        // A block spends coin [1; 32] with a different tx (e.g. a coinstake)
+        let winner = create_test_tx([1u8; 32], 49);
+        mempool.remove_for_block(&[winner.txid()]);
+        assert_eq!(mempool.remove_conflicts(&[winner]), 2);
+
+        assert!(!mempool.contains(&stale.txid()));
+        assert!(!mempool.contains(&child.txid()));
+        assert!(mempool.contains(&other.txid()));
+        assert!(!mempool.is_spent(&Hash256::from_bytes([1u8; 32]), 0));
     }
 
     #[test]

@@ -972,6 +972,7 @@ async fn run_daemon(
         let mempool_for_callback = node.mempool().clone();
         let fee_estimator_for_callback = node.fee_estimator().clone();
         let tx_relay_for_callback = node.tx_relay().clone();
+        let chain_for_callback = node.chain().clone();
         block_sync.set_block_connected_callback(Arc::new(move |block, height| {
             let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
             for tx in block.transactions.iter().skip(1) {
@@ -981,6 +982,7 @@ async fn run_daemon(
             }
             let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
             mempool_for_callback.remove_for_block(&txids);
+            evict_block_conflicts(&mempool_for_callback, &chain_for_callback, block);
             for txid in &txids {
                 tx_relay_for_callback.mark_seen(*txid);
             }
@@ -1008,20 +1010,17 @@ async fn run_daemon(
             let mempool_for_callback = node.mempool().clone();
             let fee_estimator_for_callback = node.fee_estimator().clone();
             let tx_relay_for_callback = node.tx_relay().clone();
+            let chain_for_scan = node.chain().clone();
             block_sync.set_block_connected_callback(Arc::new(move |block, height| {
                 let block_hash = compute_block_hash(&block.header);
 
-                // 1. Scan block for wallet transactions (adds new UTXOs, removes spent ones).
+                // 1. Bring the wallet up to the active tip (adds new UTXOs, removes spent
+                // ones). The block handed in may be one of several connected by a reorg,
+                // or a side-chain block, so scan the active chain itself, in order.
                 // This runs before the mempool cleanup below so the wallet's mempool
                 // entries for this block are replaced by confirmed records in one step;
                 // otherwise a send would briefly show its inputs as unspent again.
-                wallet_for_scan.scan_block(
-                    block_hash,
-                    height,
-                    block.header.time,
-                    &block.transactions,
-                );
-                wallet_for_scan.set_last_scan_height(height);
+                sync_wallet_to_tip(&wallet_for_scan, &chain_for_scan);
 
                 // 2. Calculate fees from mempool entries and clean mempool
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
@@ -1032,6 +1031,7 @@ async fn run_daemon(
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
                 mempool_for_callback.remove_for_block(&txids);
+                evict_block_conflicts(&mempool_for_callback, &chain_for_scan, block);
                 for txid in &txids {
                     tx_relay_for_callback.mark_seen(*txid);
                 }
@@ -1173,7 +1173,9 @@ async fn run_daemon(
             }
             info!("Orphaned transaction callback registered");
 
-            // Catch-up scan: process blocks between last_scan_height and current chain tip
+            // Catch-up scan: process blocks between last_scan_height and current chain tip.
+            // Block notifications may already be arriving; they share the wallet's scan
+            // lock and its scan height, so neither side skips or reorders a block.
             let last_scan = wallet_arc.last_scan_height();
             let chain_height = node.chain().height();
             if last_scan < chain_height {
@@ -1182,55 +1184,14 @@ async fn run_daemon(
                     last_scan + 1,
                     chain_height
                 );
-                let chain_for_scan = node.chain().clone();
-                let wallet_for_catchup = Arc::clone(wallet_arc);
-                let mut scanned = 0u32;
-                let mut missing_blocks = 0u32;
-                for height in (last_scan + 1)..=chain_height {
-                    let index = match chain_for_scan.get_block_index_by_height(height) {
-                        Ok(Some(idx)) => idx,
-                        _ => continue,
-                    };
-                    let block = match chain_for_scan.get_block(&index.hash) {
-                        Ok(Some(blk)) => blk,
-                        _ => {
-                            missing_blocks += 1;
-                            continue;
-                        }
-                    };
-                    wallet_for_catchup.scan_block(
-                        index.hash,
-                        height,
-                        block.header.time,
-                        &block.transactions,
-                    );
-                    scanned += 1;
-                    if scanned.is_multiple_of(1000) {
-                        info!(
-                            "Catch-up scan progress: {}/{} blocks",
-                            scanned,
-                            chain_height - last_scan
-                        );
-                    }
-                }
-                if missing_blocks > 0 {
-                    error!(
-                        "Wallet catch-up scan could not read {} block(s) in {}..={} (pruned: prune height {}). \
-                         Wallet history in that range is NOT scanned; last_scan_height left at {}. \
-                         Restore the blocks (resync) or accept the gap.",
-                        missing_blocks,
-                        last_scan + 1,
-                        chain_height,
-                        chain_for_scan.prune_height(),
-                        last_scan
-                    );
-                } else {
-                    wallet_for_catchup.set_last_scan_height(chain_height);
-                }
-                if let Err(e) = wallet_for_catchup.save() {
+                sync_wallet_to_tip(wallet_arc, node.chain());
+                if let Err(e) = wallet_arc.save() {
                     error!("Failed to save wallet after catch-up scan: {}", e);
                 }
-                info!("Wallet catch-up scan complete ({} blocks scanned)", scanned);
+                info!(
+                    "Wallet catch-up scan complete (scan height {})",
+                    wallet_arc.last_scan_height()
+                );
             }
 
             // Reconcile wallet UTXOs against the chain UTXO set.
@@ -1330,18 +1291,13 @@ async fn run_daemon(
             let mempool_for_staker = node.mempool().clone();
             let fee_estimator_for_staker = node.fee_estimator().clone();
             let tx_relay_for_staker = node.tx_relay().clone();
+            let chain_for_staker_scan = node.chain().clone();
             staker.set_block_connected_callback(Arc::new(move |block, height| {
                 let block_hash = compute_block_hash(&block.header);
 
-                // 1. Scan block for wallet transactions, before the mempool cleanup
+                // 1. Bring the wallet up to the active tip, before the mempool cleanup
                 // (see the block-connected callback for why)
-                wallet_for_staker.scan_block(
-                    block_hash,
-                    height,
-                    block.header.time,
-                    &block.transactions,
-                );
-                wallet_for_staker.set_last_scan_height(height);
+                sync_wallet_to_tip(&wallet_for_staker, &chain_for_staker_scan);
 
                 // 2. Calculate fees from mempool entries and clean mempool
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
@@ -1352,6 +1308,7 @@ async fn run_daemon(
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
                 mempool_for_staker.remove_for_block(&txids);
+                evict_block_conflicts(&mempool_for_staker, &chain_for_staker_scan, block);
                 for txid in &txids {
                     tx_relay_for_staker.mark_seen(*txid);
                 }
@@ -1411,6 +1368,7 @@ async fn run_daemon(
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let mempool_for_tx = node.mempool().clone();
+        let chain_for_tx = node.chain().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
@@ -1445,8 +1403,16 @@ async fn run_daemon(
                     // Wire up transaction submission (mempool + relay)
                     let mempool_for_submit = mempool_for_tx.clone();
                     let tx_relay_for_submit = tx_relay_for_tx.clone();
+                    let chain_for_submit = chain_for_tx.clone();
                     rpc_server.wallet().set_tx_submit(Arc::new(move |tx: Transaction| {
                         let txid = tx.txid();
+
+                        // Every input must be unspent in the chain or an output of a
+                        // mempool tx, as for relayed txs. Without this a tx spending a
+                        // coin already spent on chain sat in the local mempool, and the
+                        // wallet counted it as pending instead of reporting the error.
+                        Node::calculate_transaction_fee(&tx, &chain_for_submit, &mempool_for_submit)
+                            .map_err(|e| format!("Mempool rejected: {}", e))?;
 
                         // For locally submitted transactions, calculate fee generously
                         // to pass mempool relay fee check. The actual fee is embedded
@@ -1615,6 +1581,42 @@ fn blockchain_synced(chain: &divi_storage::Chain) -> bool {
         && chain
             .tip()
             .is_some_and(|t| now.saturating_sub(t.time as u64) <= 600)
+}
+
+/// Drop mempool txs that double-spend an input of `block`, if the block is on
+/// the active chain (the callbacks are also handed side-chain blocks).
+fn evict_block_conflicts(
+    mempool: &divi_node::Mempool,
+    chain: &divi_storage::Chain,
+    block: &divi_primitives::block::Block,
+) {
+    let hash = compute_block_hash(&block.header);
+    let active = chain
+        .get_block_index(&hash)
+        .ok()
+        .flatten()
+        .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
+        .is_some_and(|index| index.hash == hash);
+    if active {
+        mempool.remove_conflicts(&block.transactions);
+    }
+}
+
+/// Scan the active chain into the wallet, in order, from its last scanned
+/// height up to the tip. Blocks that cannot be read (pruned) are skipped and
+/// reported.
+fn sync_wallet_to_tip(wallet: &WalletDb, chain: &divi_storage::Chain) {
+    let missing = divi_rpc::wallet::sync_wallet_with_chain(wallet, chain);
+    if let (Some(first), Some(last)) = (missing.first(), missing.last()) {
+        error!(
+            "Wallet scan could not read {} block(s) in {}..={} (pruned: prune height {}). \
+             Wallet history in that range is NOT scanned. Restore the blocks (resync) or accept the gap.",
+            missing.len(),
+            first,
+            last,
+            chain.prune_height()
+        );
+    }
 }
 
 fn storage_params(config: &NodeConfig) -> divi_storage::ChainParams {
