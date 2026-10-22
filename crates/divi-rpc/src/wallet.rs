@@ -32,7 +32,7 @@ use divi_wallet::{
 };
 use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -111,6 +111,24 @@ pub fn sync_wallet_with_chain(wallet: &WalletDb, chain: &Chain) -> Vec<u32> {
 }
 
 impl WalletRpc {
+    /// Amount received per address over all outputs the wallet received at
+    /// `min_conf` or more, spent or not, with the fewest confirmations among
+    /// them. Coinbase outputs are left out, as in Core's received-by RPCs.
+    fn received_by_address(&self, wallet: &WalletDb, min_conf: u32) -> HashMap<String, (i64, u32)> {
+        let height = self.current_height();
+        let mut by_addr: HashMap<String, (i64, u32)> = HashMap::new();
+        for output in wallet.received_outputs() {
+            let confs = output.confirmations(height);
+            if output.is_coinbase || confs < min_conf {
+                continue;
+            }
+            let entry = by_addr.entry(output.address).or_insert((0, u32::MAX));
+            entry.0 += output.value.as_sat();
+            entry.1 = entry.1.min(confs);
+        }
+        by_addr
+    }
+
     /// Bring the wallet up to the active chain after the chain moved without
     /// a block notification (invalidateblock, reconsiderblock)
     pub fn sync_with_chain(&self) {
@@ -1561,23 +1579,8 @@ impl WalletRpc {
         let min_conf = params.get_u64(0).unwrap_or(1) as u32;
         let _include_empty = params.get_bool(1).unwrap_or(false);
 
-        let height = self.current_height();
-        let utxos = wallet.get_utxos();
-
-        // Aggregate by address
-        let mut by_addr: std::collections::HashMap<String, (i64, u32)> =
-            std::collections::HashMap::new();
-
-        for utxo in utxos {
-            let confs = utxo.confirmations(height);
-            if confs >= min_conf {
-                let entry = by_addr.entry(utxo.address.clone()).or_insert((0, u32::MAX));
-                entry.0 += utxo.value.as_sat();
-                if confs < entry.1 {
-                    entry.1 = confs;
-                }
-            }
-        }
+        // Aggregate by address, including coins since spent
+        let by_addr = self.received_by_address(&wallet, min_conf);
 
         let result: Vec<_> = by_addr
             .iter()
@@ -2880,16 +2883,11 @@ impl WalletRpc {
             return Ok(serde_json::json!(0.0));
         }
 
-        let height = self.current_height();
-        let utxos = wallet.get_utxos();
-
-        // Sum all UTXOs for this address with sufficient confirmations
-        let mut total = 0i64;
-        for utxo in utxos {
-            if utxo.address == addr_str && utxo.confirmations(height) >= min_conf {
-                total += utxo.value.as_sat();
-            }
-        }
+        // Everything received at the address, including coins since spent
+        let total = self
+            .received_by_address(&wallet, min_conf)
+            .get(addr_str)
+            .map_or(0, |(amount, _)| *amount);
 
         let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
@@ -3835,24 +3833,16 @@ impl WalletRpc {
         let min_conf = params.get_u64(1).unwrap_or(1) as u32;
 
         let wallet = self.get_wallet()?;
-        let height = self.current_height();
+        let received = self.received_by_address(&wallet, min_conf);
 
-        let addresses = wallet.get_addresses_by_account(account);
-        let mut total = Amount::ZERO;
+        let total: i64 = wallet
+            .get_addresses_by_account(account)
+            .iter()
+            .filter_map(|addr| received.get(addr))
+            .map(|(amount, _)| amount)
+            .sum();
 
-        for addr_str in addresses {
-            let utxos = wallet.get_utxos();
-            for utxo in utxos {
-                if utxo.address == addr_str {
-                    let confs = utxo.confirmations(height);
-                    if confs >= min_conf {
-                        total += utxo.value;
-                    }
-                }
-            }
-        }
-
-        let divi = total.as_sat() as f64 / 100_000_000.0;
+        let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
     }
 
@@ -3863,8 +3853,8 @@ impl WalletRpc {
         let include_empty = params.get_bool(1).unwrap_or(false);
         let _include_watchonly = params.get_bool(2).unwrap_or(false);
 
-        let height = self.current_height();
         let accounts = wallet.list_accounts();
+        let received = self.received_by_address(&wallet, min_conf);
 
         let mut result = Vec::new();
 
@@ -3873,17 +3863,9 @@ impl WalletRpc {
             let mut min_confirmations = u32::MAX;
 
             for addr_str in addresses {
-                let utxos = wallet.get_utxos();
-                for utxo in utxos {
-                    if utxo.address == addr_str {
-                        let confs = utxo.confirmations(height);
-                        if confs >= min_conf {
-                            account_total += utxo.value;
-                            if confs < min_confirmations {
-                                min_confirmations = confs;
-                            }
-                        }
-                    }
+                if let Some((amount, confs)) = received.get(&addr_str) {
+                    account_total += Amount::from_sat(*amount);
+                    min_confirmations = min_confirmations.min(*confs);
                 }
             }
 
@@ -4731,5 +4713,85 @@ mod accounting_tests {
         assert_eq!(first, before);
         assert_eq!(second, first);
         assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+    }
+
+    /// Spend `second`'s 249.99 coin to a stranger in block 6 and rescan
+    fn spend_second(f: &Fixture) {
+        let coin = f
+            .wallet
+            .get_utxos()
+            .into_iter()
+            .find(|u| u.address == f.second)
+            .unwrap();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin.outpoint(), Script::default(), 0xffffffff)],
+            vout: vec![TxOut::new(
+                Amount::from_sat(coin.value.as_sat() - 1_000_000),
+                stranger(),
+            )],
+            lock_time: 0,
+        };
+        mine(&f.chain, stranger(), &[tx]);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        assert!(!f.wallet.get_utxos().iter().any(|u| u.address == f.second));
+    }
+
+    #[test]
+    fn received_by_address_counts_spent_coins() {
+        let f = fixture();
+        spend_second(&f);
+        let received = |addr: &str, minconf: u32| {
+            f.rpc
+                .get_received_by_address(&Params::Array(vec![json!(addr), json!(minconf)]))
+                .unwrap()
+        };
+        // Received in block 5, spent in block 6: still received
+        assert_eq!(received(&f.second, 1), json!(249.99));
+        assert_eq!(received(&f.second, 2), json!(249.99));
+        // Block 5 has 2 confirmations at height 6
+        assert_eq!(received(&f.second, 3), json!(0.0));
+        // Coinbase outputs are not counted (Core skips coinbase transactions)
+        assert_eq!(received(&f.miner, 1), json!(0.0));
+    }
+
+    #[test]
+    fn received_by_lists_and_accounts_count_spent_coins() {
+        let f = fixture();
+        f.rpc
+            .set_account(&Params::Array(vec![json!(f.second), json!("savings")]))
+            .unwrap();
+        spend_second(&f);
+
+        let list = f
+            .rpc
+            .list_received_by_address(&Params::Array(vec![json!(1)]))
+            .unwrap();
+        let entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["address"] == json!(f.second))
+            .expect("second address listed");
+        assert_eq!(entry["amount"], json!(249.99));
+        assert_eq!(entry["confirmations"], json!(2));
+
+        assert_eq!(
+            f.rpc
+                .get_received_by_account(&Params::Array(vec![json!("savings"), json!(1)]))
+                .unwrap(),
+            json!(249.99)
+        );
+        let accounts = f
+            .rpc
+            .list_received_by_account(&Params::Array(vec![json!(1)]))
+            .unwrap();
+        let savings = accounts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["account"] == json!("savings"))
+            .expect("savings account listed");
+        assert_eq!(savings["amount"], json!(249.99));
     }
 }

@@ -1174,6 +1174,33 @@ impl WalletDb {
         result
     }
 
+    /// Every output the wallet has received, spent or not: confirmed coins
+    /// still held, confirmed coins since spent, and outputs of wallet
+    /// transactions in the mempool (height None). Core's received-by totals
+    /// (getreceivedbyaddress and friends) sum over all of these.
+    pub fn received_outputs(&self) -> Vec<WalletUtxo> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for u in self.utxos.read().values() {
+            if seen.insert(u.outpoint()) {
+                out.push(u.clone());
+            }
+        }
+        for (u, _) in self.spent_utxo_data.read().values() {
+            if seen.insert(u.outpoint()) {
+                out.push(u.clone());
+            }
+        }
+        for entry in self.mempool_txs.read().values() {
+            for u in &entry.outputs {
+                if seen.insert(u.outpoint()) {
+                    out.push(u.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Outpoints spent by wallet transactions in the mempool
     fn mempool_spent(&self) -> HashSet<OutPoint> {
         self.mempool_txs
@@ -3443,6 +3470,33 @@ mod tests {
             assert_eq!(again.amount, first.amount);
             assert_eq!(again.fee, first.fee);
             assert_eq!(again.category, "send");
+        }
+
+        #[test]
+        fn received_outputs_include_spent_and_mempool_coins() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            let incoming = tx(
+                &[(Hash256::from_bytes([8u8; 32]), 0)],
+                vec![(5 * COIN, mine(&wallet.new_receiving_address().unwrap()))],
+            );
+            assert!(wallet.add_mempool_tx(&incoming));
+
+            let received: HashMap<OutPoint, Option<u32>> = wallet
+                .received_outputs()
+                .iter()
+                .map(|u| (u.outpoint(), u.height))
+                .collect();
+            assert_eq!(
+                received,
+                HashMap::from([
+                    (OutPoint::new(fund.txid(), 0), Some(1)),
+                    (OutPoint::new(send.txid(), 1), Some(2)),
+                    (OutPoint::new(incoming.txid(), 0), None),
+                ])
+            );
         }
 
         #[test]
