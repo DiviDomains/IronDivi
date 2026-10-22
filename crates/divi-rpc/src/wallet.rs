@@ -1257,44 +1257,112 @@ impl WalletRpc {
             )
         })?;
 
-        // Optional: prevtxs array with previous outputs for signing
-        let prevtxs = params.get(1).and_then(|v| v.as_array());
-
-        // Build list of previous output scripts
-        let mut prev_scripts: Vec<Script> = Vec::new();
-
-        if let Some(prevtxs) = prevtxs {
+        // Previous outputs given in the call, matched to inputs by outpoint, and any
+        // redeem scripts given with P2SH outputs
+        let mut given: std::collections::HashMap<OutPoint, Script> = Default::default();
+        let mut redeem_scripts: std::collections::HashMap<Hash160, Script> = Default::default();
+        if let Some(prevtxs) = params.get(1).filter(|v| !v.is_null()) {
+            let prevtxs = prevtxs
+                .as_array()
+                .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "prevtxs must be an array"))?;
             for prevtx in prevtxs {
+                let bad = || {
+                    RpcError::new(
+                        codes::DESERIALIZATION_ERROR,
+                        "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}",
+                    )
+                };
+                let txid = prevtx
+                    .get("txid")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(bad)
+                    .and_then(|t| {
+                        Hash256::from_hex(t).map_err(|_| {
+                            RpcError::new(codes::INVALID_PARAMETER, "txid must be hexadecimal")
+                        })
+                    })?;
+                let vout = prevtx
+                    .get("vout")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(bad)?;
+                if vout < 0 {
+                    return Err(RpcError::new(
+                        codes::DESERIALIZATION_ERROR,
+                        "vout must be positive",
+                    )
+                    .into());
+                }
                 let script_hex = prevtx
                     .get("scriptPubKey")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| RpcError::invalid_params("prevtx scriptPubKey required"))?;
+                    .ok_or_else(bad)?;
+                let script_pubkey = Script::from_bytes(hex::decode(script_hex).map_err(|_| {
+                    RpcError::new(codes::INVALID_PARAMETER, "scriptPubKey must be hexadecimal")
+                })?);
 
-                let script_bytes = hex::decode(script_hex)
-                    .map_err(|_| RpcError::invalid_params("Invalid scriptPubKey hex"))?;
-
-                prev_scripts.push(Script::from_bytes(script_bytes));
-            }
-        } else {
-            // Try to look up UTXOs from wallet
-            for input in &tx.vin {
-                let outpoint = OutPoint::new(input.prevout.txid, input.prevout.vout);
-                if let Some(utxo) = wallet.get_utxo(&outpoint) {
-                    prev_scripts.push(utxo.script_pubkey);
-                } else {
-                    // Unknown UTXO, use empty script (signing will fail for this input)
-                    prev_scripts.push(Script::new());
+                if let Some(rs_hex) = prevtx.get("redeemScript").filter(|v| !v.is_null()) {
+                    let rs_bytes = rs_hex
+                        .as_str()
+                        .and_then(|h| hex::decode(h).ok())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                codes::INVALID_PARAMETER,
+                                "redeemScript must be hexadecimal",
+                            )
+                        })?;
+                    let rs_hash = divi_crypto::hash160(&rs_bytes);
+                    if script_pubkey.extract_p2sh_hash() != Some(*rs_hash.as_bytes()) {
+                        return Err(RpcError::new(
+                            codes::INVALID_PARAMETER,
+                            "redeemScript does not match scriptPubKey",
+                        )
+                        .into());
+                    }
+                    redeem_scripts.insert(rs_hash, Script::from_bytes(rs_bytes));
                 }
+                given.insert(OutPoint::new(txid, vout as u32), script_pubkey);
             }
         }
 
-        // Sign inputs
+        // Sign what we can and merge with the signatures already present
+        let mempool = self.mempool.read().clone();
+        let redeem_script = |h: &Hash160| {
+            redeem_scripts
+                .get(h)
+                .cloned()
+                .or_else(|| wallet.get_script(h))
+        };
         let signer = TransactionSigner::new(wallet.keystore());
-        let signed = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| RpcError::new(codes::WALLET_ERROR, format!("Failed to sign: {}", e)))?;
-
-        let complete = signed == tx.vin.len();
+        let mut complete = true;
+        for i in 0..tx.vin.len() {
+            let outpoint = tx.vin[i].prevout;
+            let script_pubkey = given
+                .get(&outpoint)
+                .cloned()
+                .or_else(|| wallet.get_utxo(&outpoint).map(|u| u.script_pubkey))
+                .or_else(|| {
+                    let chain = self.chain.as_ref()?;
+                    chain
+                        .get_utxo(&outpoint)
+                        .ok()
+                        .flatten()
+                        .map(|u| u.script_pubkey)
+                })
+                .or_else(|| {
+                    let tx = mempool.as_ref()?.get_transaction(&outpoint.txid)?;
+                    Some(tx.vout.get(outpoint.vout as usize)?.script_pubkey.clone())
+                });
+            let Some(script_pubkey) = script_pubkey else {
+                complete = false;
+                continue;
+            };
+            let verified = signer
+                .sign_and_merge_input(&mut tx, i, &script_pubkey, &redeem_script)
+                .map_err(|e| {
+                    RpcError::new(codes::WALLET_ERROR, format!("Failed to sign: {}", e))
+                })?;
+            complete &= verified;
+        }
 
         // Serialize signed transaction
         let raw = serialize(&tx);
