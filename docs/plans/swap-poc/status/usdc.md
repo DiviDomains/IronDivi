@@ -789,3 +789,19 @@
 - **needs:** nothing from the human.
 - **decisions:** USDC blacklist/pause/freeze risks are documented, not mitigated: an owner key or upgrade path in the
   HTLC would be worse. No funds, no public network.
+
+## 2026-10-22 — Last Erc20Htlc branch covered, pinned Aderyn run (hp1, branch `lane/usdc-htlc-coverage`, builder AI)
+
+- **done:** identified the uncovered branch from `forge coverage --report lcov` (`BRDA:136,9,0,-`): the "no such swap"
+  require in `Erc20Htlc.refund` (`src/Erc20Htlc.sol:136`), reachable, never exercised. Added
+  `test_refundOfUnknownIdRejected` (exact revert reason for a near-miss id and `bytes32(0)`, no state created, no tokens
+  moved). Ran Aderyn 0.6.8 (Cyfrin release binary, pinned by version and sha256) on `contracts/htlc`: High 0, Low 1
+  (`Unsafe ERC20 Operation` x2, false positive; one `for auditor` note). Contract and artifact unchanged.
+- **proof:** `forge test` 44 -> 45 passed; branches 29/30 -> **30/30** (lines, statements, functions stay 100%).
+  `cargo test -p swap-chain-evm` with the pinned anvil on `PATH`: 21 passed, 0 failed (3 anvil tests included); no Rust
+  or `src/` file touched, so the count is unchanged from the base. Tooling and Aderyn triage in `usdc-htlc-preaudit.md`.
+- **left:** outside audit of a real deployment (still open); `forge fmt --check` already reports diffs in `src/` and
+  two existing test spots on the base (not touched here); Slither not re-run (digest was not local).
+- **needs:** nothing from the human.
+- **decisions:** Aderyn's L-1 is not "fixed" by swapping in OpenZeppelin: no new dependency and no contract change in
+  this lane; the hand-rolled `SafeTransfer` is covered by no-return and false-return token tests.

@@ -242,6 +242,23 @@ contract Erc20HtlcPreauditTest is Test {
         htlc.claim(id, preimage);
     }
 
+    /// `refund` of an id that was never locked reverts (src/Erc20Htlc.sol:136), moves nothing,
+    /// and does not create state; the same holds for a real id with one parameter changed.
+    function test_refundOfUnknownIdRejected() public {
+        bytes32 id = _lock(IERC20(address(token)), 5e6);
+        bytes32 unknown = htlc.swapId(sender, receiver, address(token), 5e6, hashlock, timelock + 1);
+        assertTrue(unknown != id);
+        vm.warp(timelock + 2);
+        vm.expectRevert("Erc20Htlc: no such swap");
+        htlc.refund(unknown);
+        vm.expectRevert("Erc20Htlc: no such swap");
+        htlc.refund(bytes32(0));
+        (address s,,,,,,,) = htlc.swaps(unknown);
+        assertEq(s, address(0));
+        assertEq(token.balanceOf(address(htlc)), 5e6);
+        assertEq(token.balanceOf(sender), 1_000_000e6 - 5e6);
+    }
+
     // ---- USDC blacklist / pause -------------------------------------------------------
 
     /// Receiver blacklisted after lock: claim reverts (preimage stays unrevealed on-chain), the

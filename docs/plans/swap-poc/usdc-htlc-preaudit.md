@@ -11,7 +11,7 @@ throwaway local `anvil` (or Foundry's in-process EVM).
 |---|---|---|
 | Foundry (forge, anvil) | `ghcr.io/foundry-rs/foundry:v1.3.0` (forge/anvil 1.3.0, commit b918f9b) | `sha256:74a831a6046e7f04412802ee9eecfdce7009e983727c0cb7a91fe950ad203306` |
 | Slither 0.11.6 | `ghcr.io/crytic/slither` (tag `latest` when pulled; pinned by digest) | `sha256:89d4127ec3bfeba9725a863c58dd96b01781ff73737871dd3b07606ebc4cf16b` |
-| Aderyn | no pinned image located | not run |
+| Aderyn 0.6.8 | Cyfrin release binary `aderyn-x86_64-unknown-linux-gnu.tar.xz`, https://github.com/Cyfrin/aderyn/releases/tag/aderyn-v0.6.8 (published 2026-01-22; 88 detectors) | tarball `sha256:ffd6ca658962e211a3ac821c646f69c8e14bf1b1001cbfe091bcd4535a691e46` (matches the release's own `.sha256` file and the GitHub asset digest); extracted binary `sha256:a268d616826901e17717b1bc6368d8b2c063045a46fb99a0c0f657f102d977ca` |
 
 `anvil`/`forge` binaries were copied out of the pinned Foundry image into the builder's own directory (not a
 system location) so the Rust anvil tests, which spawn `anvil` from `PATH`, could run on hp1.
@@ -23,11 +23,16 @@ tests deploy it and pass.
 
 | | before | after |
 |---|---|---|
-| `forge test` | 26 passed | **44 passed** (+18, file `test/Erc20HtlcPreaudit.t.sol`) |
-| `src/Erc20Htlc.sol` lines / statements / branches / funcs | 100% / 100% / 90.0% (27/30) / 100% | 100% / 100% / **96.7% (29/30)** / 100% |
+| `forge test` | 26 passed | **44 passed** (+18, file `test/Erc20HtlcPreaudit.t.sol`); **45 passed** after the coverage round (+1, `test_refundOfUnknownIdRejected`) |
+| `src/Erc20Htlc.sol` lines / statements / branches / funcs | 100% / 100% / 90.0% (27/30) / 100% | 100% / 100% / **96.7% (29/30)** / 100%; **100% (30/30)** after the coverage round |
 | Rust `cargo test -p swap-chain-evm -p divi-swap -p divi-swapd` (anvil on PATH) | 250 passed, 0 failed (3 packages) | **280 passed**, 0 failed (those plus `divi-swap-cli`, 30 tests); 295 after rebasing onto `signed/main` 42d8493, which brought other lanes tests |
 
-One branch of 30 is still uncovered; it was not identified in this lane (`forge coverage` summary only).
+All 30 branches are covered. The last one was identified from `forge coverage --report lcov`
+(`BRDA:136,9,0,-`): the `require(s.sender != address(0), "Erc20Htlc: no such swap")` in `refund`
+(`src/Erc20Htlc.sol:136`). It is reachable (any id that was never locked) and was simply never exercised, because
+`claim`'s equivalent at :123 was. `test_refundOfUnknownIdRejected` now covers it: it asserts the exact revert
+reason for an id differing from a real swap in one parameter and for `bytes32(0)`, and that no state is created and
+no tokens move.
 
 ## Checklist
 
@@ -58,6 +63,7 @@ Verdicts: `ok` / `risky` / `defect`. Sources are file:line in this repo unless a
 | 21 | Owner / upgradeability of the HTLC | none: no owner, no proxy, no selfdestruct, no delegatecall (file read in full) | source read | ok |
 | 22 | Solvency | contract balance = sum of unsettled amounts | `invariant_balanceEqualsOpenSwaps` (64 runs x depth 32, handler lock/claim/refund/warp) | ok |
 | 23 | Upgradeability of USDC itself | `FiatTokenProxy is AdminUpgradeabilityProxy`; its admin can call `upgradeTo`/`upgradeToAndCall` (`ifAdmin`, AdminUpgradeabilityProxy.sol:107,121), so Circle can change token logic, blacklist and pause rules at any time. **verified** (https://github.com/circlefin/stablecoin-evm/blob/master/contracts/upgradeability/AdminUpgradeabilityProxy.sol, contracts/v1/FiatTokenProxy.sol:29, read 2026-10-22) | **risky** (outside the HTLC's control) |
+| 24 | Static-analysis second opinion (Aderyn 0.6.8) | `L-1 Unsafe ERC20 Operation` x2 at :21, :27 (see Aderyn triage) | `test_lockClaimWorksWithNoReturnValueToken`, `test_lockRejectsFalseReturningToken` | ok (false positive; code-less-token reasoning marked `for auditor`) |
 
 Counts: ok 20, risky 3 (rows 8, 9, 23), defect 0.
 
@@ -82,6 +88,18 @@ Counts: ok 20, risky 3 (rows 8, 9, 23), defect 0.
 
 By class: High 1 (false positive), Low 5 (3 false positive, 2 accepted), Informational 2 (accepted).
 Zero findings left open.
+
+## Aderyn triage (0.6.8, `aderyn contracts/htlc`, scope `src/` = `Erc20Htlc.sol`, 99 nSLOC, 88 detectors)
+
+Result: High 0, Low 1 (2 instances). Verbatim report summary: `L-1: Unsafe ERC20 Operation` at `src/Erc20Htlc.sol:21`
+and `:27`.
+
+| Detector | Location | Verdict | Reason |
+|---|---|---|---|
+| L-1 Unsafe ERC20 Operation (Low) | `SafeTransfer.safeTransfer` :21, `safeTransferFrom` :27 | false positive | The detector flags any raw `.call` of `transfer`/`transferFrom` and advises OpenZeppelin SafeERC20. `SafeTransfer` is the same pattern: it requires `ok` and either empty return data or a decoded `true` (:22, :28). Exercised by `test_lockClaimWorksWithNoReturnValueToken`, `test_lockRefundWorksWithNoReturnValueToken`, `test_lockRejectsFalseReturningToken` and the USDC revert mocks. Not replaced by OZ on purpose (no dependency); the same call sites are Slither `low-level-calls` (accepted above). One residual point for the auditor: `SafeTransfer` does not check `token.code.length` after the call, so a token address with no code would appear to succeed. `lock` rejects that case (`test_lockRejectsTokenWithoutCode`, via the balance-delta check at :112-115), and `claim`/`refund` only use tokens that already passed `lock`. `for auditor` (confirm the reasoning). |
+
+Aderyn found nothing that Slither had not; no finding needed a contract change or a new test. The report is
+reproducible: `aderyn .` in `contracts/htlc` with the pinned binary.
 
 ## Local end-to-end through the Rust client
 
