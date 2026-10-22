@@ -71,6 +71,7 @@ pub use server::{
     create_router, start_server, start_server_with_peer_manager,
     start_server_with_peer_manager_and_setup, start_server_with_wallet_and_peer_manager,
     start_server_with_wallet_peer_and_staker, LogConfigInfo, RpcConfig, RpcServer,
+    ShutdownCallback,
 };
 pub use staking::{StakingInfo, StakingRpc};
 pub use wallet::WalletRpc;

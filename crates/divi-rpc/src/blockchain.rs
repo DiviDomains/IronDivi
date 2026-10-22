@@ -119,6 +119,14 @@ pub trait MempoolProvider: Send + Sync {
         false
     }
 
+    /// The pool's copy of a transaction, if it holds `txid`
+    fn get_transaction(
+        &self,
+        _txid: &Hash256,
+    ) -> Option<divi_primitives::transaction::Transaction> {
+        None
+    }
+
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()
@@ -378,7 +386,14 @@ impl BlockchainRpc {
 
         let hash = parse_hash(hash_str)?;
 
-        let verbose = params.get_bool(1).unwrap_or(true);
+        // 0/false = hex, 1/true = JSON with txids, 2 = JSON with decoded transactions
+        let verbosity = match params.get(1) {
+            None | Some(Value::Null) => 1,
+            Some(Value::Bool(b)) => i64::from(*b),
+            Some(_) => params.get_i64(1).ok_or_else(|| {
+                RpcError::invalid_params("verbosity must be 0, 1, 2, true or false")
+            })?,
+        };
 
         let index = self
             .chain
@@ -387,30 +402,40 @@ impl BlockchainRpc {
 
         let block = self.load_block(&hash, &index, hash_str)?;
 
-        if !verbose {
+        if verbosity <= 0 {
             // Return raw hex
             let raw = serialize(&block);
             Ok(json!(hex::encode(raw)))
         } else {
             // Return JSON object
-            let txids: Vec<String> = block
+            let confirmations = self.get_confirmations(&index);
+            let txs: Vec<Value> = block
                 .transactions
                 .iter()
                 .map(|tx| {
-                    let tx_bytes = serialize(tx);
-                    let txid = divi_crypto::hash256(&tx_bytes);
-                    txid.to_string()
+                    if verbosity >= 2 {
+                        // Same shape as `getrawtransaction <txid> 1`
+                        let mut obj = crate::wallet::tx_to_json(tx, self.address_network());
+                        obj["blockhash"] = json!(hash.to_string());
+                        obj["confirmations"] = json!(confirmations);
+                        obj["time"] = json!(index.time);
+                        obj["blocktime"] = json!(index.time);
+                        obj["height"] = json!(index.height);
+                        obj
+                    } else {
+                        json!(tx.txid().to_string())
+                    }
                 })
                 .collect();
 
             let mut result = json!({
                 "hash": hash.to_string(),
-                "confirmations": self.get_confirmations(&index),
+                "confirmations": confirmations,
                 "size": serialize(&block).len(),
                 "height": index.height,
                 "version": index.version,
                 "merkleroot": index.merkle_root.to_string(),
-                "tx": txids,
+                "tx": txs,
                 "time": index.time,
                 "mediantime": self.get_median_time(&index),
                 "nonce": index.nonce,

@@ -505,6 +505,10 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
         self.get_txids()
     }
 
+    fn get_transaction(&self, txid: &Hash256) -> Option<Transaction> {
+        self.get(txid).map(|entry| entry.tx)
+    }
+
     fn prioritise_transaction(&self, txid: &Hash256, priority_delta: f64, fee_delta: i64) -> bool {
         self.prioritise_transaction(txid, priority_delta, fee_delta)
     }

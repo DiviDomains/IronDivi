@@ -944,6 +944,7 @@ async fn run_daemon(
     config: NodeConfig,
     wallet_path: Option<PathBuf>,
     disable_wallet: bool,
+    shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
@@ -1357,6 +1358,17 @@ async fn run_daemon(
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
 
+    // RPC `stop` takes the same path as SIGTERM. The short delay lets the
+    // "Divi server stopping" reply reach the client before the server is dropped.
+    let rpc_stop: divi_rpc::ShutdownCallback = Arc::new(move || {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = tx.send(());
+        });
+    });
+    let wallet_for_shutdown = wallet.clone();
+
     if let Some(wallet) = wallet {
         // Setup staker callbacks if enabled
         let staker_ref = staker.clone();
@@ -1386,6 +1398,7 @@ async fn run_daemon(
                 wallet,
                 peer_manager,
                 move |rpc_server| {
+                    rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
@@ -1498,6 +1511,7 @@ async fn run_daemon(
                 chain,
                 peer_manager,
                 move |rpc_server| {
+                    rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
@@ -1526,6 +1540,13 @@ async fn run_daemon(
     // Stop the node
     info!("Stopping node...");
     node.stop().await.with_context(|| "Failed to stop node")?;
+
+    if let Some(wallet) = wallet_for_shutdown {
+        match wallet.save() {
+            Ok(()) => info!("Wallet saved"),
+            Err(e) => error!("Failed to save wallet on shutdown: {}", e),
+        }
+    }
 
     info!("Node stopped");
     Ok(())
@@ -1890,7 +1911,15 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     });
 
     // Run the daemon
-    if let Err(e) = run_daemon(config, args.wallet, args.disablewallet, shutdown_rx).await {
+    if let Err(e) = run_daemon(
+        config,
+        args.wallet,
+        args.disablewallet,
+        shutdown_tx,
+        shutdown_rx,
+    )
+    .await
+    {
         error!("Daemon error: {:#}", e);
         // Print the full error chain
         let mut source: Option<&(dyn StdError + 'static)> = e.source();

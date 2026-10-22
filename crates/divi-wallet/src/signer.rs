@@ -290,6 +290,251 @@ impl<'a> TransactionSigner<'a> {
     }
 }
 
+/// Append a minimal data push to a script
+fn push_data(script: &mut Vec<u8>, data: &[u8]) {
+    match data.len() {
+        0 => script.push(0x00),
+        n @ 1..=75 => script.push(n as u8),
+        n @ 76..=255 => script.extend_from_slice(&[0x4c, n as u8]),
+        n => {
+            script.push(0x4d);
+            script.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+    }
+    script.extend_from_slice(data);
+}
+
+/// The data pushes of a push-only scriptSig (None if it holds any other opcode)
+fn script_pushes(script: &Script) -> Option<Vec<Vec<u8>>> {
+    use divi_script::ScriptItem;
+    divi_script::ScriptIterator::new(script.as_bytes())
+        .map(|item| match item {
+            ScriptItem::PushData(d) => Some(d),
+            ScriptItem::Opcode(op) if (0x51..=0x60).contains(&op) => Some(vec![op - 0x50]),
+            _ => None,
+        })
+        .collect()
+}
+
+fn script_of(pushes: &[Vec<u8>]) -> Script {
+    let mut out = Vec::new();
+    for p in pushes {
+        push_data(&mut out, p);
+    }
+    Script::from_bytes(out)
+}
+
+fn hash160_of(data: &[u8]) -> Hash160 {
+    divi_crypto::hash160(data)
+}
+
+impl<'a> TransactionSigner<'a> {
+    /// Sign input `index` the way Divi Core's signrawtransaction does: produce the
+    /// signatures our keys allow for `script_pubkey` (P2PKH, P2PK, bare multisig, vault
+    /// owner, and P2SH wrapping any of them, with the redeem script from `redeem_script`),
+    /// merge them with the signatures already in the input, and return whether the input
+    /// now verifies.
+    pub fn sign_and_merge_input(
+        &self,
+        tx: &mut Transaction,
+        index: usize,
+        script_pubkey: &Script,
+        redeem_script: &dyn Fn(&Hash160) -> Option<Script>,
+    ) -> Result<bool, WalletError> {
+        if index >= tx.vin.len() {
+            return Err(WalletError::TransactionError(format!(
+                "Input {} out of range",
+                index
+            )));
+        }
+        let existing = std::mem::take(&mut tx.vin[index].script_sig);
+        let ours = self.produce(tx, index, script_pubkey, redeem_script, true)?;
+        tx.vin[index].script_sig = combine_signatures(tx, index, script_pubkey, &ours, &existing);
+        Ok(divi_script::verify_input(tx, index, script_pubkey, Amount::ZERO).is_ok())
+    }
+
+    /// Signature for `script_code` with the key for `hash`, if we hold its private key
+    fn sign_with(
+        &self,
+        tx: &Transaction,
+        index: usize,
+        script_code: &Script,
+        hash: &Hash160,
+    ) -> Result<Option<(Vec<u8>, PublicKey)>, WalletError> {
+        let Some(entry) = self.keystore.get_key(hash) else {
+            return Ok(None);
+        };
+        let Some(secret) = entry.secret.as_ref().filter(|_| !entry.is_watch_only) else {
+            return Ok(None);
+        };
+        let sig = sign_input(tx, index, script_code, secret, SigHashType::All)?;
+        Ok(Some((sig, entry.public)))
+    }
+
+    /// Divi Core's SignSignature/Solver: the scriptSig our keys can produce (maybe partial)
+    fn produce(
+        &self,
+        tx: &Transaction,
+        index: usize,
+        script: &Script,
+        redeem_script: &dyn Fn(&Hash160) -> Option<Script>,
+        allow_p2sh: bool,
+    ) -> Result<Script, WalletError> {
+        use divi_script::standard::{extract_script_type, ScriptType};
+
+        let (script_type, solutions) = extract_script_type(script.as_bytes());
+        let mut out = Vec::new();
+        match script_type {
+            ScriptType::PubKeyHash => {
+                let hash = hash160_from_slice(&solutions[0]);
+                if let Some((sig, public)) = self.sign_with(tx, index, script, &hash)? {
+                    push_data(&mut out, &sig);
+                    push_data(&mut out, &public.to_bytes());
+                }
+            }
+            ScriptType::PubKey => {
+                let pubkey = &solutions[0];
+                if let Some((sig, public)) =
+                    self.sign_with(tx, index, script, &hash160_of(pubkey))?
+                {
+                    if public.to_bytes().as_slice() == pubkey.as_slice() {
+                        push_data(&mut out, &sig);
+                    }
+                }
+            }
+            ScriptType::Multisig => {
+                let required = solutions[0][0] as usize;
+                let mut signed = 0;
+                out.push(0x00); // CHECKMULTISIG pops one item too many
+                for pubkey in &solutions[1..solutions.len() - 1] {
+                    if signed == required {
+                        break;
+                    }
+                    if let Some((sig, public)) =
+                        self.sign_with(tx, index, script, &hash160_of(pubkey))?
+                    {
+                        if public.to_bytes().as_slice() == pubkey.as_slice() {
+                            push_data(&mut out, &sig);
+                            signed += 1;
+                        }
+                    }
+                }
+            }
+            ScriptType::Vault => {
+                if let Some(vault) = StakingVaultScript::from_script(script) {
+                    let owner = Hash160::from_bytes(vault.owner_pubkey_hash);
+                    if let Some((sig, public)) = self.sign_with(tx, index, script, &owner)? {
+                        out = create_vault_owner_script_sig(&sig, &public).into_bytes();
+                    }
+                }
+            }
+            ScriptType::ScriptHash if allow_p2sh => {
+                let hash = hash160_from_slice(&solutions[0]);
+                if let Some(redeem) = redeem_script(&hash) {
+                    let inner = self.produce(tx, index, &redeem, redeem_script, false)?;
+                    out = inner.into_bytes();
+                    push_data(&mut out, redeem.as_bytes());
+                }
+            }
+            _ => {}
+        }
+        Ok(Script::from_bytes(out))
+    }
+}
+
+fn hash160_from_slice(bytes: &[u8]) -> Hash160 {
+    let mut h = [0u8; 20];
+    h.copy_from_slice(&bytes[..20]);
+    Hash160::from_bytes(h)
+}
+
+/// Divi Core's CombineSignatures: merge two scriptSigs for the same input
+fn combine_signatures(
+    tx: &Transaction,
+    index: usize,
+    script_pubkey: &Script,
+    ours: &Script,
+    theirs: &Script,
+) -> Script {
+    use divi_script::standard::{extract_script_type, ScriptType};
+
+    let (Some(sigs1), Some(sigs2)) = (script_pushes(ours), script_pushes(theirs)) else {
+        return if ours.is_empty() {
+            theirs.clone()
+        } else {
+            ours.clone()
+        };
+    };
+    let first_empty = |s: &[Vec<u8>]| s.first().is_none_or(|x| x.is_empty());
+    let last_empty = |s: &[Vec<u8>]| s.last().is_none_or(|x| x.is_empty());
+
+    let (script_type, solutions) = extract_script_type(script_pubkey.as_bytes());
+    match script_type {
+        ScriptType::Multisig => {
+            combine_multisig(tx, index, script_pubkey, &solutions, &sigs1, &sigs2)
+        }
+        ScriptType::ScriptHash => {
+            if last_empty(&sigs1) {
+                return theirs.clone();
+            }
+            if last_empty(&sigs2) {
+                return ours.clone();
+            }
+            // Both carry the redeem script: merge what sits below it
+            let redeem = Script::from_bytes(sigs1[sigs1.len() - 1].clone());
+            let inner1 = script_of(&sigs1[..sigs1.len() - 1]);
+            let inner2 = script_of(&sigs2[..sigs2.len() - 1]);
+            let mut merged = combine_signatures(tx, index, &redeem, &inner1, &inner2).into_bytes();
+            push_data(&mut merged, redeem.as_bytes());
+            Script::from_bytes(merged)
+        }
+        _ => {
+            // Signatures are bigger than placeholders or empty scripts
+            if first_empty(&sigs1) {
+                theirs.clone()
+            } else {
+                ours.clone()
+            }
+        }
+    }
+}
+
+/// Divi Core's CombineMultisig: every valid signature, in pubkey order, padded with OP_0
+fn combine_multisig(
+    tx: &Transaction,
+    index: usize,
+    script: &Script,
+    solutions: &[Vec<u8>],
+    sigs1: &[Vec<u8>],
+    sigs2: &[Vec<u8>],
+) -> Script {
+    use divi_script::SignatureChecker;
+
+    let checker = divi_script::TransactionSignatureChecker::new(tx, index, Amount::ZERO);
+    let required = solutions[0][0] as usize;
+    let pubkeys = &solutions[1..solutions.len() - 1];
+    let mut by_key: Vec<Option<&Vec<u8>>> = vec![None; pubkeys.len()];
+    for sig in sigs1.iter().chain(sigs2).filter(|s| !s.is_empty()) {
+        for (k, pubkey) in pubkeys.iter().enumerate() {
+            if by_key[k].is_none() && checker.check_sig(sig, pubkey, script) {
+                by_key[k] = Some(sig);
+                break;
+            }
+        }
+    }
+    let mut out = vec![0x00];
+    let mut have = 0;
+    for sig in by_key.into_iter().flatten() {
+        if have == required {
+            break;
+        }
+        push_data(&mut out, sig);
+        have += 1;
+    }
+    out.resize(out.len() + (required - have), 0x00);
+    Script::from_bytes(out)
+}
+
 /// Simple transaction builder for creating unsigned transactions
 pub struct TransactionBuilder {
     version: i32,

@@ -74,6 +74,9 @@ pub struct LogConfigInfo {
     pub print_to_console: bool,
 }
 
+/// Callback that starts a clean node shutdown (the same path as SIGTERM)
+pub type ShutdownCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// RPC server state
 pub struct RpcServer {
     blockchain: BlockchainRpc,
@@ -84,6 +87,7 @@ pub struct RpcServer {
     masternode: MasternodeRpc,
     spork: SporkRpc,
     log_config: RwLock<Option<LogConfigInfo>>,
+    shutdown: RwLock<Option<ShutdownCallback>>,
 }
 
 impl RpcServer {
@@ -98,6 +102,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -112,6 +117,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -126,6 +132,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -144,6 +151,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -209,6 +217,11 @@ impl RpcServer {
     /// Update chain height (for wallet confirmations)
     pub fn set_height(&self, height: u32) {
         self.wallet.set_height(height);
+    }
+
+    /// Set the hook that the `stop` RPC uses to shut the node down
+    pub fn set_shutdown_callback(&self, callback: ShutdownCallback) {
+        *self.shutdown.write() = Some(callback);
     }
 
     /// Set the log configuration for RPC queries
@@ -580,7 +593,7 @@ impl RpcServer {
                 "getblockcount" => "getblockcount\n\nReturns the number of blocks in the longest blockchain.",
                 "getbestblockhash" => "getbestblockhash\n\nReturns the hash of the best (tip) block in the longest blockchain.",
                 "getblockhash" => "getblockhash height\n\nReturns hash of block in best-block-chain at height provided.",
-                "getblock" => "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns hex-encoded data.\nIf verbosity is 1 (default), returns a JSON object.\nIf verbosity is 2, returns JSON object with transaction data.",
+                "getblock" => "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0 or false, returns hex-encoded data.\nIf verbosity is 1 or true (default), returns a JSON object with the transaction ids.\nIf verbosity is 2, returns a JSON object whose \"tx\" holds each transaction decoded as getrawtransaction <txid> 1 shows it.",
                 "getblockheader" => "getblockheader \"blockhash\" ( verbose )\n\nIf verbose is false, returns hex-encoded data.\nIf verbose is true (default), returns a JSON object.",
                 "getblockchaininfo" => "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing.",
                 "getchaintips" => "getchaintips\n\nReturn information about all known tips in the block tree.",
@@ -591,6 +604,11 @@ impl RpcServer {
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.",
                 "generateblock" => "generateblock ( options )\n\nTry to generate a single block with extra options (regtest only - not yet implemented).",
                 "setgenerate" => "setgenerate numberofblocks\n\nGenerate blocks immediately (regtest only - not yet implemented).",
+                "getinfo" => "getinfo\n\nReturns an object containing various state info (version, blocks, connections, difficulty, balance, staking status).",
+                "getinvalid" => "getinvalid ( \"all\" )\n\nGet a summary of invalidated outpoints.\n\nArguments:\n1. all   (string, optional) return a full list of outpoints even if they are spent",
+                "invalidateblock" => "invalidateblock \"hash\"\n\nPermanently marks a block as invalid, as if it violated a consensus rule.\n\nArguments:\n1. hash   (string, required) the hash of the block to mark as invalid",
+                "reconsiderblock" => "reconsiderblock \"hash\"\n\nRemoves invalidity status of a block and its descendants, reconsider them for activation.\nThis can be used to undo the effects of invalidateblock.\n\nArguments:\n1. hash   (string, required) the hash of the block to reconsider",
+                "reverseblocktransactions" => "reverseblocktransactions \"hash\"\n\nRolls the block's transactions back out of the coin database and connects them again.\n\nArguments:\n1. hash   (string, required) the hash of the block",
                 // Network
                 "getnetworkinfo" => "getnetworkinfo\n\nReturns an object containing various state info regarding P2P networking.",
                 "getpeerinfo" => "getpeerinfo\n\nReturns data about each connected network node as a json array of objects.",
@@ -603,6 +621,8 @@ impl RpcServer {
                 "listbanned" => "listbanned\n\nList all banned IPs/subnets.",
                 "clearbanned" => "clearbanned\n\nClear all banned IPs.",
                 "disconnectnode" => "disconnectnode \"address\"\n\nDisconnects a peer by address.\n\nArguments:\n1. \"address\"  (string, required) The IP address:port of the node",
+                "ban" => "ban \"ip_address\"\n\nBans the connected peer with this IP address.\n('outdated' is refused: peer versions are not recorded after the handshake.)\n\nArguments:\n1. \"ip_address\"  (string, required) The IP address of a connected peer",
+                "setmocktime" => "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only).\nThis node has no mock clock, so the call always returns an error.\n\nArguments:\n1. timestamp  (integer, required) Unix seconds-since-epoch timestamp",
                 "getpeerscores" => "getpeerscores\n\nReturns peer scoring and reliability information for debugging.",
                 // Wallet
                 "getnewaddress" => "getnewaddress ( \"label\" )\n\nReturns a new Divi address for receiving payments.",
@@ -623,6 +643,10 @@ impl RpcServer {
                 "dumpprivkey" => "dumpprivkey \"address\"\n\nReveals the private key corresponding to 'address'.",
                 "dumphdinfo" => "dumphdinfo\n\nReturns an object containing sensitive private info about this HD wallet.",
                 "importprivkey" => "importprivkey \"privkey\" ( \"label\" rescan )\n\nAdds a private key to your wallet.",
+                "rescanblockchain" => "rescanblockchain ( start_height stop_height )\n\nRescan the local blockchain for wallet related transactions.\n\nArguments:\n1. start_height  (numeric, optional, default=0) block height where the rescan should start\n2. stop_height   (numeric, optional, default=tip) the last block height that should be scanned",
+                "backupwallet" => "backupwallet \"destination\"\n\nSafely copies the wallet to destination, which can be a directory or a path with filename.\n\nArguments:\n1. \"destination\"   (string) The destination directory or file",
+                "signmessage" => "signmessage \"diviaddress\" \"message\"\n\nSign a message with the private key of an address.\nRequires the wallet to be unlocked if it is encrypted.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address to use for the private key.\n2. \"message\"      (string, required) The message to create a signature of.\n\nResult:\n\"signature\"        (string) The signature of the message encoded in base 64",
+                "verifymessage" => "verifymessage \"diviaddress\" \"signature\" \"message\"\n\nVerify a signed message.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address to use for the signature.\n2. \"signature\"    (string, required) The signature provided by the signer in base 64 encoding (see signmessage).\n3. \"message\"      (string, required) The message that was signed.\n\nResult:\ntrue|false   (boolean) If the signature is verified or not.",
                 "sendtoaddress" => "sendtoaddress \"address\" amount\n\nSend an amount to a given address.",
                 "getaddressesbylabel" => "getaddressesbylabel \"label\"\n\nReturns the list of addresses assigned the specified label.",
                 "listreceivedbyaddress" => "listreceivedbyaddress ( minconf include_empty )\n\nList balances by receiving address.",
@@ -649,8 +673,9 @@ impl RpcServer {
                 "getspentinfo" => "getspentinfo {txid:,index:}\n\nReturns the txid and index where an output is spent.\n\nArguments:\n{\n  \"txid\" (string) The hex string of the txid\n  \"index\" (number) The start block height\n}\n\nResult:\n{\n  \"txid\"  (string) The transaction id\n  \"index\"  (number) The spending input index\n  ,...\n}\n\nExamples:\n> divi-cli getspentinfo '{\"txid\": \"0437cd7f8525ceed2324359c2d0ba26006d92d856a9c20fa0241106ee5a597c9\", \"index\": 0}'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getspentinfo\", \"params\": [{\"txid\": \"0437cd7f8525ceed2324359c2d0ba26006d92d856a9c20fa0241106ee5a597c9\", \"index\": 0}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/",
                 // Raw transactions
                 "createrawtransaction" => "createrawtransaction [{\"txid\":\"...\",\"vout\":n},...] {\"address\":amount,...}\n\nCreate an unsigned raw transaction.",
-                "signrawtransaction" => "signrawtransaction \"hexstring\" ( [{\"txid\":\"...\",\"scriptPubKey\":\"...\"},...] )\n\nSign a raw transaction with wallet keys.",
-                "signrawtransactionwithwallet" => "signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"...\",\"scriptPubKey\":\"...\"},...] )\n\nSign a raw transaction with wallet keys.",
+                "signrawtransaction" => "signrawtransaction \"hexstring\" ( [{\"txid\":\"id\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\"},...] [\"privatekey\",...] )\n\nSign the inputs of a raw transaction with wallet keys and merge with the signatures already in it.\nA P2SH input needs its redeemScript, given here or stored in the wallet (addmultisigaddress).\nIf private keys (WIF) are given, only those keys sign, the wallet is not used and need not be unlocked.\n\nResult:\n{\n  \"hex\": \"value\",   (string) The raw transaction with signature(s)\n  \"complete\": true|false   (boolean) If the transaction has a complete set of signatures\n}",
+                "signrawtransactionwithwallet" => "signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"id\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\"},...] [\"privatekey\",...] )\n\nSign the inputs of a raw transaction with wallet keys and merge with the signatures already in it.\nA P2SH input needs its redeemScript, given here or stored in the wallet (addmultisigaddress).\nIf private keys (WIF) are given, only those keys sign, the wallet is not used and need not be unlocked.\n\nResult:\n{\n  \"hex\": \"value\",   (string) The raw transaction with signature(s)\n  \"complete\": true|false   (boolean) If the transaction has a complete set of signatures\n}",
+                "signtransactionwithaddresskey" => "signtransactionwithaddresskey \"hexstring\" \"address\" inputindex\n\nSigns one input with the wallet key of an address (SIGHASH_SINGLE) and returns the signature script as asm.\n\nArguments:\n1. \"hexstring\"  (string, required) The transaction hex string\n2. \"address\"    (string, required) The wallet address whose key signs\n3. inputindex    (numeric, required) The input to sign",
                 "sendrawtransaction" => "sendrawtransaction \"hexstring\"\n\nSubmit a raw transaction to the network.",
                 "getrawtransaction" => "getrawtransaction \"txid\" ( verbose )\n\nReturn the raw transaction data.",
                 "decoderawtransaction" => "decoderawtransaction \"hexstring\"\n\nReturn a JSON object representing the serialized transaction.",
@@ -667,6 +692,7 @@ impl RpcServer {
                 "getaddresshistory" => "getaddresshistory \"address\" ( skip limit )\n\nReturns transaction history for an external address.\nDoes not require a local wallet.",
                 "gettxindex" => "gettxindex \"txid\"\n\nReturns block location info for a transaction.",
                 "estimatefee" => "estimatefee ( nblocks )\n\nEstimates the fee per kilobyte needed for confirmation in nblocks.",
+                "estimatepriority" => "estimatepriority nblocks\n\nDeprecated. Always returns -1.",
                 "estimatesmartfee" => "estimatesmartfee ( nblocks )\n\nEstimates the smart fee per kilobyte needed for confirmation.",
                 "getmempoolinfo" => "getmempoolinfo\n\nReturns details on the active state of the mempool.",
                 "validateaddresses" => "validateaddresses [\"address\",...]\n\nValidates multiple addresses at once.",
@@ -690,6 +716,7 @@ impl RpcServer {
                 "verifychain" => "verifychain ( numblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. numblocks    (numeric, optional, default=288, 0=all) The number of blocks to check.\n\nResult:\ntrue|false       (boolean) Verified or not",
                 "getmininginfo" => "getmininginfo\n\nReturns a json object containing mining-related information.\n\nResult:\n{\n  \"blocks\": nnn,             (numeric) The current block\n  \"currentblocksize\": nnn,   (numeric) The last block size\n  \"difficulty\": xxx.xxxxx    (numeric) The current difficulty\n  \"errors\": \"...\"          (string) Current errors\n  \"pooledtx\": n              (numeric) The size of the mem pool\n  \"chain\": \"xxxx\"         (string) current network name\n}",
                 "bip38encrypt" => "bip38encrypt \"diviaddress\" \"passphrase\"\n\nEncrypts a private key with a passphrase using BIP38.\n\nArguments:\n1. \"diviaddress\"   (string, required) The divi address\n2. \"passphrase\"    (string, required) The passphrase\n\nResult:\n\"key\"                (string) The encrypted private key",
+                "bip38paperwallet" => "bip38paperwallet \"passphrase\"\n\nCreates a new key that is not stored in the wallet and returns its address and the key encrypted with BIP38.\nRequires the wallet to be unlocked if it is encrypted.\n\nArguments:\n1. \"passphrase\"    (string, required) The passphrase that encrypts the key\n\nResult:\n{\n  \"Address\": \"address\",        (string) The divi address of the new key\n  \"Encrypted Key\": \"key\"       (string) The BIP38 encrypted private key\n}",
                 "bip38decrypt" => "bip38decrypt \"bip38key\" \"passphrase\"\n\nDecrypts a BIP38 encrypted private key.\n\nArguments:\n1. \"bip38key\"      (string, required) The encrypted private key\n2. \"passphrase\"    (string, required) The passphrase\n\nResult:\n\"key\"                (string) The decrypted private key in WIF format",
                 "loadwallet" => "loadwallet \"filename\"\n\nNot supported by IronDivi: irondivid opens one wallet when it starts and keeps it until it stops. To use another wallet, stop irondivid and start it with --wallet=<wallet directory>. Always returns an error.\n\nArguments:\n1. \"filename\"       (string, required) The wallet that would be loaded.",
                 "getlotteryblockwinners" => "getlotteryblockwinners [block_height]\n\nReturns the lottery candidates recorded at a block.\n\nArguments:\n1. block_height    (numeric, optional) The block height (default and maximum: the tip)",
@@ -726,6 +753,7 @@ impl RpcServer {
                 "reverseblocktransactions",
                 "getdifficulty",
                 "getinfo",
+                "getinvalid",
                 "getmininginfo",
                 "getrawmempool",
                 "gettxout",
@@ -760,6 +788,7 @@ impl RpcServer {
                 "== Wallet ==",
                 "addmultisigaddress",
                 "allocatefunds",
+                "backupwallet",
                 "bip38decrypt",
                 "bip38encrypt",
                 "bip38paperwallet",
@@ -791,10 +820,12 @@ impl RpcServer {
                 "listtransactions",
                 "listunspent",
                 "loadwallet",
+                "rescanblockchain",
                 "sendfrom",
                 "sendmany",
                 "sendtoaddress",
                 "setaccount",
+                "signmessage",
                 "validateaddress",
                 "encryptwallet",
                 "walletlock",
@@ -803,6 +834,8 @@ impl RpcServer {
                 "",
                 "== Util ==",
                 "createmultisig",
+                "setmocktime",
+                "verifymessage",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction",
@@ -814,6 +847,7 @@ impl RpcServer {
                 "sendrawtransaction",
                 "signrawtransaction",
                 "signrawtransactionwithwallet",
+                "signtransactionwithaddresskey",
                 "",
                 "== Staking ==",
                 "getmintinginfo",
@@ -823,6 +857,7 @@ impl RpcServer {
                 "",
                 "== Lite Wallet ==",
                 "estimatefee",
+                "estimatepriority",
                 "estimatesmartfee",
                 "getaddressbalance",
                 "getaddresshistory",
@@ -869,8 +904,16 @@ impl RpcServer {
         }
     }
 
-    /// Stop server (placeholder)
+    /// Stop server: hand off to the node's shutdown path, then answer as Divi Core does
     fn stop(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+        let shutdown = self.shutdown.read().clone();
+        let Some(shutdown) = shutdown else {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "stop is not available on this server").into(),
+            );
+        };
+        info!("RPC stop received, shutting down");
+        shutdown();
         Ok(serde_json::Value::String(
             "Divi server stopping".to_string(),
         ))
@@ -1311,6 +1354,23 @@ mod tests {
             method: method.to_string(),
             params,
         })
+    }
+
+    #[test]
+    fn stop_calls_the_shutdown_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (server, _dir) = create_test_server();
+        // No hook: refuse instead of claiming to stop
+        assert!(call(&server, "stop", Params::None).error.is_some());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        server.set_shutdown_callback(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let r = call(&server, "stop", Params::None);
+        assert_eq!(r.result, Some(serde_json::json!("Divi server stopping")));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
