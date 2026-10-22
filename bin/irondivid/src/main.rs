@@ -24,6 +24,7 @@
 mod snapshot_sig;
 
 use anyhow::{Context, Result};
+use clap::builder::BoolishValueParser;
 use clap::Parser;
 use divi_crypto::compute_block_hash;
 use divi_node::config::{LogConfig, NetworkType, NodeConfig};
@@ -43,7 +44,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// IronDivi Daemon - Rust implementation of Divi node
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "irondivid")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "IronDivi daemon - Rust implementation of Divi full node")]
@@ -66,8 +67,8 @@ struct Args {
     regtest: bool,
 
     /// Chain mode: divi (default) or privatedivi
-    #[arg(long, default_value = "divi", value_parser = ["divi", "privatedivi"])]
-    mode: String,
+    #[arg(long, value_parser = ["divi", "privatedivi"])]
+    mode: Option<String>,
 
     /// Run in background as daemon
     #[arg(long)]
@@ -134,9 +135,10 @@ struct Args {
     #[arg(long)]
     disablewallet: bool,
 
-    /// Enable transaction index (required for PoS validation and getrawtransaction RPC)
-    #[arg(long, default_value = "true")]
-    txindex: bool,
+    /// Enable transaction index (required for PoS validation and getrawtransaction RPC;
+    /// default on). Unset keeps the config-file value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
+    txindex: Option<bool>,
 
     /// Start the staker at boot (`--staking=false` = C++ `-staking=0`; RPC setstaking can still start it)
     #[arg(long)]
@@ -147,13 +149,13 @@ struct Args {
     #[arg(long)]
     stakeonstaletip: bool,
 
-    /// Enable spent index for gettxout RPC
-    #[arg(long)]
-    spentindex: bool,
+    /// Enable spent index for gettxout RPC. Unset keeps the config-file value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
+    spentindex: Option<bool>,
 
-    /// Enable address index for address-based queries
-    #[arg(long)]
-    addressindex: bool,
+    /// Enable address index for address-based queries. Unset keeps the config-file value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
+    addressindex: Option<bool>,
 
     /// Export blockchain to JSON format (requires start and end height, and output directory)
     #[arg(long)]
@@ -210,12 +212,18 @@ struct Args {
     expire: Option<String>,
 
     /// Maximum log file size in MB (default: 1)
-    #[arg(long, default_value = "1")]
-    maxlogsize: u32,
+    #[arg(long)]
+    maxlogsize: Option<u32>,
 
     /// Number of log files to keep (default: 5)
-    #[arg(long, default_value = "5")]
-    maxlogfiles: u32,
+    #[arg(long)]
+    maxlogfiles: Option<u32>,
+}
+
+impl Args {
+    fn chain_mode(&self) -> ChainMode {
+        parse_chain_mode(self.mode.as_deref().unwrap_or("divi"))
+    }
 }
 
 fn parse_chain_mode(mode: &str) -> ChainMode {
@@ -247,18 +255,199 @@ fn default_data_dir() -> PathBuf {
     }
 }
 
-/// Load configuration from file if it exists
+/// Load configuration from file if it exists.
+///
+/// Both formats are read: TOML (`rpcuser = "foo"`, what IronDivi documented) and the
+/// Divi Core / Bitcoin `key=value` format (`rpcuser=foo`, `addnode=` repeated). A file
+/// that parses as TOML is read as TOML, so existing files keep their meaning.
 fn load_config_file(path: &PathBuf) -> Result<Option<toml::Table>> {
     if path.exists() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {:?}", path))?;
-        let table: toml::Table = content
-            .parse()
-            .with_context(|| format!("Failed to parse config file: {:?}", path))?;
-        Ok(Some(table))
+        let table = match content.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(_) => parse_divi_config(&content),
+        };
+        Ok(Some(normalize_config(table)))
     } else {
         Ok(None)
     }
+}
+
+/// Parse a Divi Core style config file: one `key=value` per line, `#` starts a comment,
+/// surrounding whitespace is ignored, a bare `key` means `key=1`, a repeated key becomes
+/// a list, and settings under a `[section]` header are ignored (C++ ReadConfigFile with
+/// boost's config parser).
+fn parse_divi_config(content: &str) -> toml::Table {
+    let mut table = toml::Table::new();
+    let mut section: Option<String> = None;
+    for (n, raw) in content.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            warn!(
+                "config file line {}: section {} is not supported; its settings are ignored",
+                n + 1,
+                line
+            );
+            section = Some(line.to_string());
+            continue;
+        }
+        // Divi Core 3.0 ignores settings under a section header too
+        if section.is_some() {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (line, "1"),
+        };
+        if key.is_empty() {
+            warn!("config file line {}: no key, ignored", n + 1);
+            continue;
+        }
+        let value = toml::Value::String(value.trim_matches('"').to_string());
+        match table.get_mut(key) {
+            Some(toml::Value::Array(list)) => list.push(value),
+            Some(first) => {
+                let first = first.clone();
+                table.insert(key.to_string(), toml::Value::Array(vec![first, value]));
+            }
+            None => {
+                table.insert(key.to_string(), value);
+            }
+        }
+    }
+    table
+}
+
+#[derive(Clone, Copy)]
+enum ConfKind {
+    Str,
+    Int,
+    Bool,
+    List,
+}
+
+fn conf_kind(key: &str) -> Option<ConfKind> {
+    use ConfKind::*;
+    Some(match key {
+        "rpcuser" | "rpcpassword" | "rpcbind" | "bind" | "proxy" | "mode" | "expire" => Str,
+        "rpcport" | "port" | "checkblocks" | "maxlogsize" | "maxlogfiles" | "utxocachesize" => Int,
+        "listen" | "testnet" | "regtest" | "daemon" | "printtoconsole" | "staking"
+        | "stakeonstaletip" | "txindex" | "spentindex" | "addressindex" | "disablewallet" => Bool,
+        "addnode" | "fullnode" | "connect" => List,
+        _ => return None,
+    })
+}
+
+/// Give every known key the value type `apply_config_file` expects, whichever format the
+/// file was in: `txindex=1` / `"1"` / `true` all become a boolean, `rpcport="51473"` an
+/// integer, `rpcpassword = 12345` a string. A repeated single-value key keeps its last
+/// value, as in C++. Values that do not convert are left for `apply_config_file` to warn about.
+fn normalize_config(table: toml::Table) -> toml::Table {
+    use toml::Value;
+    let scalar_text = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Integer(i) => Some(i.to_string()),
+        Value::Boolean(b) => Some(if *b { "1" } else { "0" }.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        _ => None,
+    };
+    table
+        .into_iter()
+        .map(|(key, value)| {
+            let Some(kind) = conf_kind(&key) else {
+                return (key, value);
+            };
+            let value = match (kind, value) {
+                (ConfKind::List, v) => v,
+                (_, Value::Array(list)) if !list.is_empty() => list.last().cloned().unwrap(),
+                (_, v) => v,
+            };
+            let converted = match kind {
+                ConfKind::List => None,
+                ConfKind::Str => match &value {
+                    Value::String(_) => None,
+                    v => scalar_text(v).map(Value::String),
+                },
+                ConfKind::Int => match &value {
+                    Value::String(s) => s.trim().parse::<i64>().ok().map(Value::Integer),
+                    _ => None,
+                },
+                ConfKind::Bool => match &value {
+                    Value::Integer(i) => Some(Value::Boolean(*i != 0)),
+                    Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                        "1" | "true" | "yes" | "on" => Some(Value::Boolean(true)),
+                        "0" | "false" | "no" | "off" => Some(Value::Boolean(false)),
+                        other => other.parse::<i64>().ok().map(|i| Value::Boolean(i != 0)),
+                    },
+                    _ => None,
+                },
+            };
+            (key, converted.unwrap_or(value))
+        })
+        .collect()
+}
+
+/// Where the config file is: `--conf`, else `irondivi.conf` in the data directory
+fn config_path(args: &Args) -> PathBuf {
+    args.conf
+        .clone()
+        .unwrap_or_else(|| compute_data_dir(args).join("irondivi.conf"))
+}
+
+/// Fill the options that are needed before the node config exists (network, chain mode,
+/// daemon, console and log-file settings) from the config file when the command line does
+/// not set them; the command line always wins. Pins `conf` to the file read, so a network
+/// chosen by the file does not make the node look for a different file.
+fn resolve_args(mut args: Args) -> Result<Args> {
+    let path = config_path(&args);
+    let Some(table) = load_config_file(&path)? else {
+        return Ok(args);
+    };
+    let flag = |key: &str| table.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if !args.testnet && !args.regtest {
+        args.testnet = flag("testnet");
+        args.regtest = flag("regtest");
+    }
+    if args.mode.is_none() {
+        args.mode = table
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .filter(|m| matches!(*m, "divi" | "privatedivi"))
+            .map(String::from);
+    }
+    args.daemon |= flag("daemon");
+    args.printtoconsole |= flag("printtoconsole");
+    args.disablewallet |= flag("disablewallet");
+    // C++ debug= takes a category (debug=1, debug=net); anything but 0 turns debug logging on
+    args.debug |= table
+        .get("debug")
+        .and_then(|v| match v {
+            toml::Value::String(s) => Some(!matches!(s.trim(), "" | "0")),
+            toml::Value::Integer(i) => Some(*i != 0),
+            toml::Value::Boolean(b) => Some(*b),
+            toml::Value::Array(list) => Some(!list.is_empty()),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let positive = |key: &str| {
+        table
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .filter(|i| *i > 0 && *i <= u32::MAX as i64)
+            .map(|i| i as u32)
+    };
+    if args.maxlogsize.is_none() {
+        args.maxlogsize = positive("maxlogsize");
+    }
+    if args.maxlogfiles.is_none() {
+        args.maxlogfiles = positive("maxlogfiles").filter(|n| *n <= 100);
+    }
+    args.conf = Some(path);
+    Ok(args)
 }
 
 /// Apply configuration values from TOML table to NodeConfig
@@ -380,6 +569,8 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     }
                 }
             }
+            // Read before the node config is built (resolve_args)
+            "disablewallet" | "debug" => {}
             "printtoconsole" => {
                 if let Some(b) = value.as_bool() {
                     if b {
@@ -569,7 +760,8 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
 
 /// `env_expire` is the value of `IRONDIVI_EXPIRE`; passed in so tests never mutate process env.
 fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<NodeConfig> {
-    let chain_mode = parse_chain_mode(&args.mode);
+    let args = &resolve_args(args.clone())?;
+    let chain_mode = args.chain_mode();
 
     // Start with network-specific defaults
     let mut config = if args.regtest {
@@ -583,7 +775,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     // Set data directory
     let data_dir = args.datadir.clone().unwrap_or_else(|| {
         let mut dir = default_data_dir();
-        if parse_chain_mode(&args.mode) == ChainMode::PrivateDivi {
+        if args.chain_mode() == ChainMode::PrivateDivi {
             dir = dir.join("privatedivi");
         }
         if args.testnet {
@@ -650,9 +842,16 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     if args.stakeonstaletip {
         config.staking.stake_on_stale_tip = true;
     }
-    config.index.txindex = args.txindex;
-    config.index.spentindex = args.spentindex;
-    config.index.addressindex = args.addressindex;
+    // Only flags given on the command line override the config file
+    if let Some(b) = args.txindex {
+        config.index.txindex = b;
+    }
+    if let Some(b) = args.spentindex {
+        config.index.spentindex = b;
+    }
+    if let Some(b) = args.addressindex {
+        config.index.addressindex = b;
+    }
 
     if let Some(cache_size) = args.utxocachesize {
         config.utxo_cache_size = cache_size;
@@ -679,7 +878,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
 fn compute_data_dir(args: &Args) -> PathBuf {
     args.datadir.clone().unwrap_or_else(|| {
         let mut dir = default_data_dir();
-        if parse_chain_mode(&args.mode) == ChainMode::PrivateDivi {
+        if args.chain_mode() == ChainMode::PrivateDivi {
             dir = dir.join("privatedivi");
         }
         if args.testnet {
@@ -1665,8 +1864,14 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    // Parse CLI arguments
-    let args = Args::parse();
+    // Parse CLI arguments, completed from the config file where they are unset
+    let args = match resolve_args(Args::parse()) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Compute data directory early (needed for daemonization and logging)
     let data_dir = compute_data_dir(&args);
@@ -1753,8 +1958,8 @@ fn main() -> Result<()> {
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Build log config from CLI args
     let log_config = LogConfig {
-        max_file_size: args.maxlogsize as u64 * 1_048_576, // Convert MB to bytes
-        max_files: args.maxlogfiles,
+        max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
+        max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
         print_to_console: args.printtoconsole,
     };
@@ -1928,6 +2133,133 @@ mod connect_tests {
 }
 
 #[cfg(test)]
+mod config_format_tests {
+    use super::*;
+
+    fn cfg(conf: &str, extra: &[&str]) -> Result<NodeConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("irondivi.conf"), conf).unwrap();
+        let mut argv = vec![
+            "irondivid".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(argv))
+    }
+
+    /// A Divi Core divi.conf used to stop irondivid ("Failed to parse config file"):
+    /// the file was read only as TOML.
+    #[test]
+    fn divi_format_config_file_is_read() {
+        let c = cfg(
+            "# Divi Core style\n\
+             rpcuser=foo\n\
+             rpcpassword=12345abc   # inline comment\n\
+             rpcport=19999\n\
+             regtest=1\n\
+             listen=0\n\
+             addnode=10.0.0.1:51476\n\
+             addnode=10.0.0.2:51476\n\
+             spentindex=1\n\
+             server=1\n",
+            &[],
+        )
+        .expect("Divi-format file must load");
+        assert_eq!(c.rpc.username.as_deref(), Some("foo"));
+        assert_eq!(c.rpc.password.as_deref(), Some("12345abc"));
+        assert_eq!(c.rpc.port, 19999);
+        assert_eq!(c.p2p.port, 51476, "regtest=1 in the file selects regtest");
+        assert_eq!(c.p2p.listen, Some(false));
+        assert!(c.index.spentindex);
+        for peer in ["10.0.0.1:51476", "10.0.0.2:51476"] {
+            assert!(c.network.static_peers.contains(&peer.to_string()), "{peer}");
+        }
+    }
+
+    /// Files in the TOML format IronDivi documented keep working unchanged.
+    #[test]
+    fn toml_config_file_still_read() {
+        let c = cfg(
+            "rpcuser = \"foo\"\nrpcport = 19998\naddnode = [\"10.0.0.1:1\", \"10.0.0.2:2\"]\n\
+             txindex = false\nrpcpassword = 12345\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("foo"));
+        assert_eq!(c.rpc.port, 19998);
+        assert!(c.network.static_peers.contains(&"10.0.0.2:2".to_string()));
+        assert!(!c.index.txindex);
+        assert_eq!(c.rpc.password.as_deref(), Some("12345"));
+    }
+
+    /// The index flags in the file used to be overwritten by the command-line defaults
+    /// (txindex true, spentindex/addressindex false), set or not.
+    #[test]
+    fn unset_index_flags_keep_the_config_file_value() {
+        let c = cfg("txindex=0\nspentindex=1\naddressindex=1\n", &[]).unwrap();
+        assert!(!c.index.txindex);
+        assert!(c.index.spentindex);
+        assert!(c.index.addressindex);
+        // Given on the command line, they win
+        let c = cfg(
+            "txindex=0\nspentindex=1\n",
+            &["--txindex", "--spentindex=0", "--addressindex=true"],
+        )
+        .unwrap();
+        assert!(c.index.txindex);
+        assert!(!c.index.spentindex);
+        assert!(c.index.addressindex);
+        // No file and no flag: defaults
+        let c = cfg("", &[]).unwrap();
+        assert!(c.index.txindex && !c.index.spentindex && !c.index.addressindex);
+    }
+
+    /// testnet=1 in the file was logged and ignored, so the node ran mainnet on that datadir.
+    #[test]
+    fn network_from_config_file_unless_given_on_the_command_line() {
+        assert_eq!(cfg("testnet=1\n", &[]).unwrap().p2p.port, 51474);
+        assert_eq!(cfg("testnet = true\n", &[]).unwrap().p2p.port, 51474);
+        assert_eq!(cfg("testnet=1\n", &["--regtest"]).unwrap().p2p.port, 51476);
+        assert_eq!(cfg("", &[]).unwrap().p2p.port, 51472);
+    }
+
+    /// Divi Core 3.0 does not read [section] settings; they must not leak into the main ones.
+    #[test]
+    fn section_settings_are_not_applied() {
+        let c = cfg("rpcuser=foo\n[test]\nrpcport=1\nrpcuser=bar\n", &[]).unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("foo"));
+        assert_eq!(c.rpc.port, 51471);
+    }
+
+    /// Log-file and console settings in the file reach the logger (they were overwritten
+    /// by the command-line defaults before the file was read).
+    #[test]
+    fn early_options_come_from_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("irondivi.conf"),
+            "maxlogsize=7\nmaxlogfiles=9\nprinttoconsole=1\nmode=privatedivi\n\
+             disablewallet=1\ndebug=net\n",
+        )
+        .unwrap();
+        let dd = format!("--datadir={}", dir.path().display());
+        let a = resolve_args(Args::parse_from(["irondivid", dd.as_str()])).unwrap();
+        assert_eq!((a.maxlogsize, a.maxlogfiles), (Some(7), Some(9)));
+        assert!(a.printtoconsole && a.disablewallet && a.debug);
+        assert_eq!(a.chain_mode(), ChainMode::PrivateDivi);
+        let a = resolve_args(Args::parse_from([
+            "irondivid",
+            dd.as_str(),
+            "--maxlogsize=2",
+            "--mode=divi",
+        ]))
+        .unwrap();
+        assert_eq!(a.maxlogsize, Some(2));
+        assert_eq!(a.chain_mode(), ChainMode::Divi);
+    }
+}
+
+#[cfg(test)]
 mod wallet_log_tests {
     use super::*;
 
@@ -2077,7 +2409,7 @@ mod mode_tests {
     #[test]
     fn mode_defaults_to_divi() {
         assert_eq!(
-            parse_chain_mode(&Args::parse_from(["irondivid"]).mode),
+            Args::parse_from(["irondivid"]).chain_mode(),
             ChainMode::Divi
         );
         assert_eq!(parse_chain_mode("privatedivi"), ChainMode::PrivateDivi);
