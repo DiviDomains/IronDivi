@@ -80,10 +80,11 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connect to a peer (outbound)
+    /// Connect to a peer (outbound), through the SOCKS5 `proxy` when one is given
     #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         addr: SocketAddr,
+        proxy: Option<SocketAddr>,
         magic: Magic,
         our_height: u32,
         our_services: u64,
@@ -92,13 +93,23 @@ impl Connection {
         total_bytes_sent: Arc<AtomicU64>,
         total_bytes_recv: Arc<AtomicU64>,
     ) -> Result<(Self, PeerHandle), NetworkError> {
-        info!("Connecting to peer {}", addr);
-
-        // Establish TCP connection with timeout
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| NetworkError::Timeout)?
-            .map_err(|e| NetworkError::Connection(e.to_string()))?;
+        // Establish TCP connection with timeout; never fall back to a direct
+        // connection when the proxy fails
+        let stream = match proxy {
+            Some(proxy) => {
+                info!("Connecting to peer {} via proxy {}", addr, proxy);
+                timeout(CONNECT_TIMEOUT, crate::socks5::connect(proxy, addr))
+                    .await
+                    .map_err(|_| NetworkError::Timeout)??
+            }
+            None => {
+                info!("Connecting to peer {}", addr);
+                timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| NetworkError::Timeout)?
+                    .map_err(|e| NetworkError::Connection(e.to_string()))?
+            }
+        };
 
         // Set TCP options
         stream.set_nodelay(true)?;

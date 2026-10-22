@@ -177,6 +177,13 @@ impl Node {
                 peer_sources.listen
             );
         }
+        let proxy = config
+            .p2p
+            .proxy_addr()
+            .map_err(|e| NodeError::Init(format!("-proxy: {}", e)))?;
+        if let Some(proxy) = proxy {
+            tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
+        }
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,
@@ -191,6 +198,12 @@ impl Node {
                         return Some(addr);
                     }
                     // If that fails, try to resolve as hostname:port
+                    if proxy.is_some() {
+                        tracing::warn!(
+                            "Resolving peer {} with local DNS, outside the proxy; give an IP address to avoid this",
+                            s
+                        );
+                    }
                     use std::net::ToSocketAddrs;
                     match s.to_socket_addrs() {
                         Ok(mut addrs) => {
@@ -213,6 +226,7 @@ impl Node {
                 None
             },
             default_port: config.network.default_p2p_port(),
+            proxy,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
 

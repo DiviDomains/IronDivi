@@ -341,6 +341,43 @@ pub struct P2pConfig {
 
     /// User agent string
     pub user_agent: String,
+
+    /// SOCKS5 proxy for outbound connections (`-proxy=<ip:port>`, port 9050 if omitted)
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+impl P2pConfig {
+    /// The `proxy` setting as a socket address: `ip:port`, `host:port`, or a bare IP
+    /// or host with the Tor default port 9050 (C++ `-proxy` accepts the same).
+    pub fn proxy_addr(&self) -> Result<Option<SocketAddr>, String> {
+        let Some(raw) = self
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        if let Ok(addr) = raw.parse::<SocketAddr>() {
+            return Ok(Some(addr));
+        }
+        if let Ok(ip) = raw.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            return Ok(Some(SocketAddr::new(ip, 9050)));
+        }
+        use std::net::ToSocketAddrs;
+        let with_port = if raw.contains(':') {
+            raw.to_string()
+        } else {
+            format!("{raw}:9050")
+        };
+        with_port
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .map(Some)
+            .ok_or_else(|| format!("invalid proxy address '{raw}'"))
+    }
 }
 
 impl Default for P2pConfig {
@@ -355,6 +392,7 @@ impl Default for P2pConfig {
             listen: None,
             ban_time: 86400, // 24 hours
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
+            proxy: None,
         }
     }
 }
@@ -701,6 +739,33 @@ mod tests {
         assert_eq!(config.network.magic, [0x70, 0xd1, 0x76, 0x13]);
         assert_eq!(config.p2p.port, 52476);
         assert_eq!(config.rpc.port, 52475);
+    }
+
+    #[test]
+    fn proxy_addr_accepts_c_plus_plus_forms() {
+        let with = |v: &str| P2pConfig {
+            proxy: Some(v.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(P2pConfig::default().proxy_addr(), Ok(None));
+        assert_eq!(with("").proxy_addr(), Ok(None));
+        assert_eq!(
+            with("127.0.0.1:9150").proxy_addr(),
+            Ok(Some("127.0.0.1:9150".parse().unwrap()))
+        );
+        assert_eq!(
+            with("127.0.0.1").proxy_addr(),
+            Ok(Some("127.0.0.1:9050".parse().unwrap()))
+        );
+        assert_eq!(
+            with("[::1]:9050").proxy_addr(),
+            Ok(Some("[::1]:9050".parse().unwrap()))
+        );
+        assert_eq!(
+            with("::1").proxy_addr(),
+            Ok(Some("[::1]:9050".parse().unwrap()))
+        );
+        assert!(with("not a proxy!").proxy_addr().is_err());
     }
 
     #[test]

@@ -50,6 +50,10 @@ impl NetworkRpc {
         let connections = pm.map(|pm| pm.peer_count()).unwrap_or(0);
         let connections_in = pm.map(|pm| pm.inbound_count()).unwrap_or(0);
         let connections_out = pm.map(|pm| pm.outbound_count()).unwrap_or(0);
+        let proxy = pm
+            .and_then(|pm| pm.proxy())
+            .map(|p| p.to_string())
+            .unwrap_or_default();
         let local_services = pm
             .map(|pm| pm.services())
             .unwrap_or(divi_network::constants::services::NODE_NETWORK);
@@ -68,17 +72,18 @@ impl NetworkRpc {
                     "name": "ipv4",
                     "limited": false,
                     "reachable": true,
-                    "proxy": "",
+                    "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
-                    "limited": true,
+                    "limited": false,
                     "reachable": true,
-                    "proxy": "",
+                    "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
+                    // .onion peers cannot be addressed (peer addresses are IP only)
                     "name": "onion",
                     "limited": true,
                     "reachable": false,
@@ -593,6 +598,27 @@ mod tests {
         assert!(inbound["bytesrecv"].as_u64().unwrap() > 0);
         client.disconnect_all();
         server.disconnect_all();
+    }
+
+    #[test]
+    fn test_network_info_reports_proxy() {
+        let proxy: std::net::SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let pm = PeerManager::new(divi_network::PeerManagerConfig {
+            proxy: Some(proxy),
+            ..quiet_config()
+        });
+        let ni = NetworkRpc::with_peer_manager(pm)
+            .get_network_info(&Params::None)
+            .unwrap();
+        let nets = ni["networks"].as_array().unwrap();
+        assert_eq!(nets[0]["name"], "ipv4");
+        assert_eq!(nets[0]["proxy"], "127.0.0.1:9050");
+        assert_eq!(nets[1]["proxy"], "127.0.0.1:9050");
+        assert_eq!(nets[2]["reachable"], false);
+        let ni = NetworkRpc::with_peer_manager(PeerManager::new(quiet_config()))
+            .get_network_info(&Params::None)
+            .unwrap();
+        assert_eq!(ni["networks"][0]["proxy"], "");
     }
 
     #[test]
