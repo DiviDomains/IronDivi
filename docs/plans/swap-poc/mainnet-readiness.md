@@ -196,21 +196,15 @@ local to that crate; there is no shared-config row to cite.
 | Dimension | Value | file:line | Verdict |
 |---|---|---|---|
 | Confirmations (XMR side) | `SPENDABLE_AGE = 10` (Monero's real `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE`, a protocol constant, not a tunable choice); a separate 1-confirmation check exists for "did the funding tx land" (`check_xmr_confirmed`), correctly distinct from spendability (`check_xmr_spendable`) | `crates/swap-chain-xmr/src/live_rpc.rs:63-70,78-107` | ok — matches Monero's own protocol minimum; discovered live after a real rejection (`"invalid_input": true`) against a 1-confirmation output |
-| **Confirmations (DIVI side of this swap)** | hardcoded `>= 1` | `crates/swap-chain-xmr/src/live_rpc.rs:53-60` | **risky: inconsistent — 10x thinner than the shared engine's DIVI mainnet depth** (`divi_confirmations: 10`, `config.rs:100`) used for every other coin's DIVI leg |
+| Confirmations (DIVI side of this swap) | `check_divi_confirmed` / `check_divi_confirmed_n` use `DIVI_CONFIRMATIONS_MAINNET = 10`, a mirror of the shared engine's DIVI mainnet depth (`swap-chain-xmr` cannot import `divi-swap`); the drift-alarm test `mainnet_divi_confirmations_matches_the_engines_config` re-reads `crates/divi-swap/src/config.rs` and fails if the two diverge | `crates/swap-chain-xmr/src/live_rpc.rs:212,216,231,570` | ok — matches the engine's DIVI leg depth for every other coin; drift is caught by a test |
 | Timeouts/margins (`t_refund`, `t_punish`, `lock_time`) | no built-in schedule anywhere — plain function **parameters** on every template builder | `crates/swap-chain-xmr/src/swap_templates.rs:74-81,140-150`; `crates/swap-chain-xmr/src/multisig.rs:108-124` | **risky: no mainnet-safe margin scheme exists to review** — see below |
 | Fee policy | `fee_rate: FeeRate` is a parameter; the one live example sources it from the daemon's live `get_fee_estimate` RPC | `crates/swap-chain-xmr/src/monero_sweep.rs:83-91`; `crates/swap-chain-xmr/examples/xmr_live.rs:435-450` | ok — dynamically sourced, not hardcoded, when actually used live |
 | Dust limit | not applicable — Monero RingCT outputs have no byte-size "dust" relay rule the way UTXO chains do; nothing resembling one exists in this crate | — | n/a |
-| Reorg depth assumption | = `SPENDABLE_AGE` (10 blocks) on the XMR side; **1 confirmation** on the DIVI side (same gap as above) | `crates/swap-chain-xmr/src/live_rpc.rs:70,53-60` | risky, same finding as DIVI-side confirmations |
-| Public backends | `MONEROD_RPC_DEFAULT = "http://node.monerodevs.org:38089"` (public, **restricted**, **stagenet**), documented fallback `stagenet.xmr-tw.org:38081` (also stagenet); the one live example actively **refuses to run** unless `nettype == "stagenet" && !mainnet` | `crates/swap-chain-xmr/src/live_rpc.rs:29-36`; `crates/swap-chain-xmr/examples/xmr_live.rs:174-191` | **risky: no mainnet endpoint; code explicitly guards against ever being pointed at one** |
+| Reorg depth assumption | = `SPENDABLE_AGE` (10 blocks) on the XMR side; `DIVI_CONFIRMATIONS_MAINNET` (10) on the DIVI side, same mirror and drift-alarm test as the row above | `crates/swap-chain-xmr/src/live_rpc.rs:212,570` | ok |
+| Public backends / network selection | Network is chosen by `[xmr].network` + `allow_mainnet` (default false; mainnet refused without it) in the daemon and `--xmr-network` + `--xmr-allow-mainnet` in the CLI; the node URL is configuration (`[xmr].monerod_url` / `--xmr-monerod-url`), the stagenet default being `MONEROD_RPC_DEFAULT = "http://node.monerodevs.org:38089"`. **New nettype guard:** before any wallet work, `live_xmr_engine` and `live_xmr_taker` ask the node `get_info` and refuse to start unless its `nettype` equals the configured network (and, for mainnet, `allow_mainnet` is set). Public mainnet restricted nodes that answered `get_info` with `nettype = "mainnet"` on 2026-10-21 (`verified`, see `status/xmr.md`): `node.monerodevs.org:18089`, `xmr-node.cakewallet.com:18081` | `bin/divi-swapd/src/config.rs:172-179`; `bin/divi-swap/src/main.rs:122-130`; guard: `crates/swap-chain-xmr/src/live_rpc.rs:79,111,120`, `crates/divi-swap-xmr/src/live.rs:533,552`, called at `bin/divi-swapd/src/main.rs:189`, `bin/divi-swap/src/main.rs:705` | ok for network selection and node/network mismatch; **mainnet use stays gated on `xmr-mainnet-plan.md` phase D** |
 
 Findings (no code change — not my crate, and the real gap here isn't a wrong constant):
-- The DIVI-side 1-confirmation check (`check_divi_confirmed`, `live_rpc.rs:53-60`) is the
-  single clearest "missing/unsafe value" in this coin's review, and it *would* be in scope for
-  a pinning test if this were my crate — it isn't (`swap-chain-xmr` belongs to lane `xmr`). The
-  fix shape, for whoever owns that crate: either take the DIVI confirmation depth as a
-  parameter sourced from `SwapConfig`/`ChainParams::builtin(Chain::Divi, ...)` the same way the
-  other four coins do, or hardcode the same mainnet value (10) directly — right now it's
-  neither, just an independent `1`.
+- The DIVI-side confirmation gap found in the first review is closed: the check now mirrors `DIVI_CONFIRMATIONS_MAINNET` (10) with a drift-alarm test.
 - The complete absence of a `t_refund`/`t_punish` computation (as opposed to accepting them as
   parameters) means there is no single "mainnet value" to cite or pin for XMR's timeout
   margins — only the two live examples' demo numbers exist (`height + 5`, `height + 7`
@@ -220,9 +214,7 @@ Findings (no code change — not my crate, and the real gap here isn't a wrong c
   (`xmr_live_refund.rs:10`: "deliberately **short** DIVI timelocks... not production safe
   margins"). Building a real schedule (analogous to `required_gap_secs` for the shared engine)
   is a feature the `xmr` lane would need to design, not a constant this review can pin.
-- Both the stagenet-only endpoint and the mainnet refusal in `xmr_live.rs` are deliberate
-  safety guards, not oversights — but they confirm there is currently no path to even
-  *attempting* XMR on mainnet, independent of the protocol-readiness questions above.
+- `examples/xmr_live.rs:174-191` still refuses anything but stagenet (an example, deliberately). The production paths no longer have a mainnet *option* gap: network selection exists and a node on the wrong network is refused at start. What remains before mainnet is the phase-D design work (timeouts/margins) and review, not wiring.
 
 ## Summary table
 
@@ -232,7 +224,7 @@ Findings (no code change — not my crate, and the real gap here isn't a wrong c
 | LTC | **yes** (`lane/btc-ltc-mainnet-wiring`): `esplora_endpoints("mainnet")` = `litecoinspace.org/api` only (`crates/swap-chain-ltc/src/lib.rs:50-52,67-69`; no independent mirror known); answered `/blocks/tip/height` = 3199195 at 2026-10-21T19:10Z (`verified`) | **yes**: `hrp_for()` maps `mainnet`→`LTC_HRP` = `ltc` (`lib.rs:55-63`; source: litecoin `src/chainparams.cpp` `bech32_hrp = "ltc"` / `"tltc"`, https://github.com/litecoin-project/litecoin/blob/master/src/chainparams.cpp), `LtcBackend::new_on` builds the `ltc1q` address (`lib.rs:133-152`) and `build_send` rejects a destination whose HRP is not the backend's (`lib.rs:234-241`) | **yes — wired behind `[ltc].allow_mainnet` (default false, `config.rs:89-93,565-593`) and `--ltc-network mainnet` + `--allow-mainnet` (`main.rs:79-86,384-412`)** |
 | ZEC | yes (`swap-chain-zec/src/lib.rs:61-77`) | yes (`address.rs:26-36`); v5/v6 chosen by NU6.3 height (`tx.rs:59-80`) | **yes — dust floor (`tx.rs:50-56`), test added and verified failing→passing** |
 | USDC/EVM | no (`swap-chain-evm/src/network.rs:24-62`, own test pins the rejection) | backend is network-agnostic; just needs a config variant | no — finding only |
-| XMR | no, and actively refused at runtime (`xmr_live.rs:174-191`) | no mainnet refusal guard needed — not in the shared engine at all | no — finding only (not my crate) |
+| XMR | **yes, by configuration**: `[xmr].network`/`allow_mainnet` and `--xmr-network`/`--xmr-allow-mainnet` select the network and `monerod_url` the node; a mainnet restricted node answered `get_info` (`nettype = "mainnet"`, 2026-10-21, `verified`); the nettype guard refuses a node on the wrong network (`live.rs:533,552`) | yes — Monero addresses are parsed per network (`live::parse_address`); DIVI leg uses the shared mainnet depth (10) | **yes — nettype guard added (`lane/xmr-nettype-guard`)**; mainnet itself stays gated on `xmr-mainnet-plan.md` phase D |
 
 All citations above were re-read from the working tree at the stated line numbers as of this
 review (2026-10-12); `crates/divi-swap/src/config.rs` and `crates/swap-chain-zec/src/tx.rs`

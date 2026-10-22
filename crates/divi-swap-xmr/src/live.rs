@@ -527,6 +527,53 @@ pub fn profile_for(network: Network, allow_mainnet: bool) -> Result<crate::XmrCo
     }
 }
 
+/// Whether what a monerod reports about itself fits the configured network: `Err` carries
+/// the reason (no prefix, no URL -- [`ensure_monerod_network`] adds those). Mainnet is
+/// refused without `allow_mainnet` even when the node agrees with the config.
+pub fn check_nettype(
+    configured: &str,
+    allow_mainnet: bool,
+    reported: &swap_chain_xmr::live_rpc::MonerodNet,
+) -> std::result::Result<(), String> {
+    let expected =
+        swap_chain_xmr::live_rpc::expected_nettype(configured).map_err(|e| e.to_string())?;
+    if reported.nettype != expected {
+        return Err(format!("reports nettype {:?}", reported.nettype));
+    }
+    if reported.mainnet && !allow_mainnet {
+        return Err("is a mainnet node, which needs the explicit allow-mainnet opt-in".into());
+    }
+    Ok(())
+}
+
+/// Asks the monerod at `monerod_url` what network it is on and refuses unless it is the
+/// configured one (see [`check_nettype`]). Call before anything that touches a wallet. `what`
+/// names the setting for the error (`[xmr].network`, `--xmr-network`).
+pub async fn ensure_monerod_network(
+    what: &str,
+    configured: &str,
+    allow_mainnet: bool,
+    monerod_url: &str,
+) -> Result<swap_chain_xmr::live_rpc::MonerodNet> {
+    let reported = swap_chain_xmr::live_rpc::monerod_nettype(monerod_url)
+        .await
+        .map_err(|e| {
+            SwapError::InvalidParams(format!(
+                "{what} = {configured:?}: cannot confirm the network of monerod at {monerod_url}: {e} \u{2014} refusing to start"
+            ))
+        })?;
+    check_nettype(configured, allow_mainnet, &reported).map_err(|why| {
+        SwapError::InvalidParams(format!(
+            "{what} = {configured:?} but monerod at {monerod_url} {why} \u{2014} refusing to start"
+        ))
+    })?;
+    tracing::info!(
+        nettype = %reported.nettype, height = reported.height, monerod = %monerod_url,
+        "monerod network matches the configuration"
+    );
+    Ok(reported)
+}
+
 /// The DIVI `getblockchaininfo` chain name matching a Monero network: stagenet and testnet
 /// run against DIVI testnet.
 pub fn divi_chain_name(network: Network) -> &'static str {
@@ -547,6 +594,66 @@ pub fn divi_network(network: Network) -> divi_wallet::address::Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reported(nettype: &str, mainnet: bool) -> swap_chain_xmr::live_rpc::MonerodNet {
+        swap_chain_xmr::live_rpc::MonerodNet {
+            nettype: nettype.into(),
+            mainnet,
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn nettype_matching_the_config_passes() {
+        check_nettype("stagenet", false, &reported("stagenet", false)).unwrap();
+        check_nettype("testnet", false, &reported("testnet", false)).unwrap();
+        check_nettype("mainnet", true, &reported("mainnet", true)).unwrap();
+    }
+
+    #[test]
+    fn every_nettype_mismatch_is_refused() {
+        for configured in ["stagenet", "testnet", "mainnet"] {
+            for (nettype, mainnet) in [("stagenet", false), ("testnet", false), ("mainnet", true)] {
+                if nettype == configured {
+                    continue;
+                }
+                let e = check_nettype(configured, true, &reported(nettype, mainnet)).unwrap_err();
+                assert!(
+                    e.contains(&format!("{nettype:?}")),
+                    "{configured}/{nettype}: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stagenet_config_against_a_mainnet_node_is_refused() {
+        let e = check_nettype("stagenet", false, &reported("mainnet", true)).unwrap_err();
+        assert!(e.contains("\"mainnet\""), "{e}");
+    }
+
+    #[test]
+    fn mainnet_without_allow_mainnet_is_refused_even_when_the_node_agrees() {
+        let e = check_nettype("mainnet", false, &reported("mainnet", true)).unwrap_err();
+        assert!(e.contains("allow-mainnet"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_configured_network_is_an_error() {
+        assert!(check_nettype("main", true, &reported("mainnet", true)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_monerod_is_refused_with_the_setting_and_url() {
+        // Port 1 on loopback: connection refused, no real network traffic.
+        let e = ensure_monerod_network("[xmr].network", "stagenet", false, "http://127.0.0.1:1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[xmr].network = \"stagenet\""), "{e}");
+        assert!(e.contains("http://127.0.0.1:1"), "{e}");
+        assert!(e.contains("refusing to start"), "{e}");
+    }
 
     #[test]
     fn divi_chain_names_follow_the_monero_network() {

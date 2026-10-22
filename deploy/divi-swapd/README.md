@@ -52,6 +52,10 @@ ssh dnsdivi sudo systemctl status divi-swapd
 Logs go to the journal; cap with `SystemMaxUse=200M` in `/etc/systemd/journald.conf.d/`. The
 logrotate file (10 MB, 5 rotations) applies only if the config sets a log file.
 
+### XMR network check
+
+With an `[xmr]` section the daemon asks the configured `monerod` for its `nettype` at start and refuses to start when it disagrees with `[xmr].network` (or reports mainnet without `allow_mainnet`).
+
 ### Rate limit behind a reverse proxy
 
 The quote and XMR setup routes are limited to 20 requests a minute per client address. By

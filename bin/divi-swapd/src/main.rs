@@ -185,6 +185,15 @@ async fn live_xmr_engine(
     {
         bail!("[xmr].divi_rpc_url: the default is the DIVI testnet RPC; set a mainnet one");
     }
+    // Before anything that touches a wallet: the node must be on the configured network.
+    live::ensure_monerod_network(
+        "[xmr].network",
+        &xs.network,
+        xs.allow_mainnet,
+        &xs.monerod_url,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let sweep_to = live::parse_address(network, &xs.sweep_address)
         .map_err(|e| anyhow::anyhow!("[xmr].sweep_address: {e}"))?;
     let key = resolve_divi_key(&xs.divi_key, "xmr divi")?;

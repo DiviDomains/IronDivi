@@ -701,6 +701,15 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     .map_err(|e| anyhow::anyhow!("--xmr-sweep-address: {e}"))?;
     let monerod_url = need(&cli.xmr_monerod_url, "--xmr-monerod-url")?;
     let wallet_rpc_url = need(&cli.xmr_wallet_rpc_url, "--xmr-wallet-rpc-url")?;
+    // Before any secret or wallet work: the node must be on the network --xmr-network names.
+    live::ensure_monerod_network(
+        "--xmr-network",
+        &cli.xmr_network,
+        cli.xmr_allow_mainnet,
+        &monerod_url,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     let wallet_rpc_password = match &cli.xmr_wallet_rpc_password {
         Some(_) => secret_hex(
             &cli.xmr_wallet_rpc_password,
@@ -941,6 +950,29 @@ mod tests {
         ])
         .await;
         assert!(e.contains("monero address"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn live_xmr_taker_refuses_a_monerod_it_cannot_confirm_the_network_of() {
+        // Valid args, monerod on a closed loopback port: refused before any wallet work.
+        let sweep = "53hWE4DtPhFAvGj998ShM5D47iQ7hC6L2FhtiNiaHzX54dqQgtDemNoAdsYQHiS1C5Uqejdhe6D9bTAtcCT2jtwE6wyf2mn";
+        let e = match live_xmr_taker(&cli(&[
+            "--counter-chain",
+            "xmr",
+            "--xmr-sweep-address",
+            sweep,
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+            "--xmr-wallet-rpc-url",
+            "http://127.0.0.1:1",
+        ]))
+        .await
+        {
+            Ok(_) => panic!("built a live xmr taker against an unreachable monerod"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("--xmr-network = \"stagenet\""), "{e}");
+        assert!(e.contains("refusing to start"), "{e}");
     }
 
     #[test]
