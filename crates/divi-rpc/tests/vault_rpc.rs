@@ -727,3 +727,97 @@ fn reclaim_unknown_fee_mode_is_refused() {
     }
     assert!(s.net.submitted.lock().is_empty());
 }
+
+// ---------------------------------------------------------------- IR-12
+
+/// debitvaultbyname pays from the named vault only, with the owner key alone,
+/// and the rest stays in that vault (Divi Core sets the change to the vault).
+#[test]
+fn debitvaultbyname_spends_only_the_named_vault() {
+    let mut s = setup();
+    let rpc = s.net.rpc(&s.owner);
+    // A second vault of the same owner with another manager
+    let other_manager = s.net.wallet().new_receiving_address().unwrap();
+    let other_encoding = format!("{}:{}", s.owner_addr, other_manager);
+    rpc.fund_vault(&p(vec![json!(other_encoding), json!(5.0)]))
+        .unwrap();
+    s.net.mine_submitted(&s.manager_plain);
+    let other_vault = vault_script(&s.owner_addr, &other_manager);
+
+    let dest = s.manager.new_receiving_address().unwrap();
+    let txid = rpc
+        .debit_vault_by_name(&p(vec![
+            json!(s.encoding),
+            json!(dest.to_string()),
+            json!(30.0),
+        ]))
+        .unwrap_or_else(|e| panic!("debitvaultbyname failed: {}", error_message(e)));
+    let tx = submitted_tx(&s);
+    assert_eq!(txid, json!(tx.txid().to_string()));
+    assert_eq!(tx.vin.len(), 1);
+    assert_eq!(
+        OutPoint::new(tx.vin[0].prevout.txid, tx.vin[0].prevout.vout),
+        OutPoint::new(s.fund_txid, 0)
+    );
+    assert_eq!(
+        output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
+        vec![30 * COIN]
+    );
+    let back = output_to(&tx, &s.vault);
+    assert_eq!(back.len(), 1);
+    assert!(back[0] > (VAULT_DIVI - 31) * COIN && back[0] < (VAULT_DIVI - 30) * COIN);
+    assert!(output_to(&tx, &other_vault).is_empty());
+    s.net.mine_submitted(&s.owner_addr);
+
+    // receiver_pays works here too
+    rpc.debit_vault_by_name(&p(vec![
+        json!(other_encoding),
+        json!(dest.to_string()),
+        json!(2.0),
+        json!("receiver_pays"),
+    ]))
+    .unwrap();
+    let tx = submitted_tx(&s);
+    assert_eq!(output_to(&tx, &other_vault), vec![3 * COIN]);
+}
+
+/// Without the owner key (the manager) it is refused as in Divi Core, and a
+/// malformed encoding is -5.
+#[test]
+fn debitvaultbyname_needs_owner_key() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let dest = s.manager.new_receiving_address().unwrap();
+    let e = rpc
+        .debit_vault_by_name(&p(vec![
+            json!(s.encoding),
+            json!(dest.to_string()),
+            json!(1.0),
+        ]))
+        .unwrap_err();
+    match e {
+        divi_rpc::Error::Rpc(r) => {
+            assert_eq!(r.code, -5);
+            assert!(
+                r.message.starts_with("Vault owner key is unknown"),
+                "{}",
+                r.message
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+    let e = rpc
+        .debit_vault_by_name(&p(vec![
+            json!(s.manager_addr.to_string()),
+            json!(dest.to_string()),
+            json!(1.0),
+        ]))
+        .unwrap_err();
+    match e {
+        divi_rpc::Error::Rpc(r) => {
+            assert_eq!((r.code, r.message.as_str()), (-5, "Invalid Vault Encoding"))
+        }
+        other => panic!("{:?}", other),
+    }
+    assert!(s.net.submitted.lock().is_empty());
+}

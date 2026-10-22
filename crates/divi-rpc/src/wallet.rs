@@ -2360,7 +2360,8 @@ impl WalletRpc {
         Ok((txid, received, fee))
     }
 
-    /// Debit vault by name - Withdraws funds from vault using vault manager key (coinstake only)
+    /// Debit vault by name - pay out of one vault with the owner key; the rest
+    /// stays in that vault (Divi Core sets the change script to the vault)
     pub fn debit_vault_by_name(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let vault_encoding = params.get_str(0).ok_or_else(|| {
             RpcError::invalid_params("Missing required parameter: vault-encoding")
@@ -2368,35 +2369,68 @@ impl WalletRpc {
         let destination = params
             .get_str(1)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: diviaddress"))?;
-        let amount = params
-            .get(2)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?;
-        let _fee_mode = params.get_str(3);
+        let send_amount = amount_from_value(
+            params
+                .get(2)
+                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
+            false,
+        )?;
 
-        let (owner_addr, manager_addr) = self.parse_vault_encoding(vault_encoding)?;
-        let _ = Address::from_base58(destination)
-            .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
+        let invalid_encoding = || -> Error {
+            RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid Vault Encoding").into()
+        };
+        let (owner_addr, manager_addr) = self
+            .parse_vault_encoding(vault_encoding)
+            .map_err(|_| invalid_encoding())?;
+        let owner_addr = owner_addr.ok_or_else(invalid_encoding)?;
+        let owner_hash = self
+            .address_to_hash160(&owner_addr)
+            .map_err(|_| invalid_encoding())?;
+        let manager_hash = self
+            .address_to_hash160(&manager_addr)
+            .map_err(|_| invalid_encoding())?;
+        let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
 
-        let owner_hash = if let Some(ref addr) = owner_addr {
-            self.address_to_hash160(addr)?
-        } else {
-            return Err(RpcError::invalid_params(
-                "Owner address is required. Use format: owner_address:manager_address",
+        let wallet = self.get_wallet()?;
+        if wallet.vault_role(&vault_script) != Some(divi_wallet::wallet_db::VaultRole::Owned) {
+            return Err(RpcError::new(
+                codes::INVALID_ADDRESS_OR_KEY,
+                format!("Vault owner key is unknown: address={}", owner_addr),
             )
             .into());
-        };
-        let manager_hash = self.address_to_hash160(&manager_addr)?;
+        }
 
-        let _vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+        let dest_addr = Address::from_base58(destination)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        let mode = Self::parse_vault_fee_mode(params.get_str(3), false)?;
 
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            format!(
-                "debitvaultbyname not yet implemented. This command requires coinstake creation, which is outside the current scope. The vault manager can ONLY spend vault funds via coinstake transactions (OP_REQUIRE_COINSTAKE enforces this). This command would create a coinstake spending {} DIVI from vault {} to {}. Full implementation requires: (1) Coinstake transaction building, (2) Kernel hash computation, (3) Proof-of-stake validation",
-                amount, vault_encoding, destination
+        if wallet.is_locked() {
+            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
+        }
+
+        let height = self.current_height();
+        let candidates: Vec<_> = wallet
+            .get_owned_vault_utxos(height, 1)
+            .into_iter()
+            .filter(|u| u.script_pubkey == vault_script)
+            .collect();
+        if candidates.is_empty() {
+            return Err(RpcError::new(
+                codes::WALLET_INSUFFICIENT_FUNDS,
+                format!("No funds available in vault {}", vault_encoding),
             )
-        ).into())
+            .into());
+        }
+
+        let (txid, _, _) = self.spend_owned_vault_utxos(
+            &wallet,
+            candidates,
+            &dest_addr,
+            send_amount,
+            mode,
+            Some(vault_script),
+        )?;
+        Ok(json!(txid.to_string()))
     }
 
     /// Reclaim vault funds - Withdraw from vault using owner key (can spend anytime)
