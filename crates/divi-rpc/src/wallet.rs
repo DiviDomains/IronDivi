@@ -4524,4 +4524,78 @@ mod tests {
             "Imported non-HD key should not have hdkeypath field"
         );
     }
+
+    /// A change key made by sendtoaddress must be on disk before the call returns:
+    /// lock right after the send and restart, with no block in between.
+    #[test]
+    fn test_send_change_key_survives_lock_and_restart() {
+        use divi_wallet::wallet_db::WalletUtxo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let p = |v: Vec<serde_json::Value>| Params::Array(v);
+        {
+            let hd = HdWallet::from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                None,
+                ChainMode::Divi,
+            )
+            .unwrap();
+            let wallet = WalletDb::create_persistent(&path, Network::Regtest, hd).unwrap();
+            wallet.save().unwrap();
+            wallet.encrypt_wallet("pw").unwrap();
+            wallet.unlock("pw", 60).unwrap();
+            let funding = wallet.new_receiving_address().unwrap();
+            wallet.save().unwrap();
+            wallet.lock();
+            let mut utxo = WalletUtxo::new(
+                Hash256::from_bytes([7u8; 32]),
+                0,
+                Amount::from_divi(100),
+                Script::from_bytes(
+                    hex::decode(format!(
+                        "76a914{}88ac",
+                        hex::encode(funding.hash.as_bytes())
+                    ))
+                    .unwrap(),
+                ),
+                funding.to_string(),
+            );
+            utxo.height = Some(1);
+            wallet.add_utxo(utxo);
+
+            let rpc = WalletRpc::with_wallet(Arc::new(wallet));
+            rpc.set_height(10);
+            rpc.set_tx_submit(Arc::new(|tx: Transaction| Ok(tx.txid())));
+            rpc.wallet_passphrase(&p(vec![json!("pw"), json!(60)]))
+                .unwrap();
+            let dest = Address::p2pkh(
+                &divi_crypto::keys::SecretKey::new_random().public_key(),
+                Network::Regtest,
+            );
+            rpc.send_to_address(&p(vec![json!(dest.to_string()), json!(1.0)]))
+                .unwrap();
+            rpc.wallet_lock(&Params::None).unwrap();
+        }
+
+        let wallet = Arc::new(WalletDb::open(&path, Network::Regtest).unwrap());
+        let change: Vec<Address> = wallet
+            .get_addresses()
+            .into_iter()
+            .filter(|a| wallet.is_change_address(a))
+            .collect();
+        assert_eq!(change.len(), 1, "change key not stored");
+        let rpc = WalletRpc::with_wallet(wallet);
+        let info = rpc
+            .validate_address(&p(vec![json!(change[0].to_string())]))
+            .unwrap();
+        assert_eq!(info["ismine"], true);
+        assert_eq!(info["iswatchonly"], false);
+        rpc.wallet_passphrase(&p(vec![json!("pw"), json!(60)]))
+            .unwrap();
+        let wif = rpc
+            .dump_privkey(&p(vec![json!(change[0].to_string())]))
+            .unwrap();
+        assert!(!wif.as_str().unwrap().is_empty());
+    }
 }

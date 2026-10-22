@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use zeroize::Zeroizing;
 
 /// Wallet UTXO
@@ -625,6 +625,40 @@ impl WalletDb {
         }
     }
 
+    /// Write the given keys (with the encrypted secret, on an encrypted wallet) and
+    /// the HD indices in one synced batch. Every key the wallet creates or imports
+    /// goes through here before it is handed out: the per-block `save_incremental`
+    /// is too late, a lock or restart before the next block would lose the key.
+    fn persist_keys(&self, hashes: &[Hash160]) -> Result<(), WalletError> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+        let entries: Vec<_> = hashes
+            .iter()
+            .filter_map(|h| self.keystore.get_key(h).map(|e| (*h, e)))
+            .collect();
+        if *self.encrypted.read()
+            && self.decrypted_master_key.read().is_none()
+            && entries.iter().any(|(_, e)| e.secret.is_some())
+        {
+            // put_key would drop the secret; refuse rather than store a key without it
+            return Err(WalletError::WalletLocked);
+        }
+        let mut batch = db.create_batch();
+        for (hash, entry) in &entries {
+            self.put_key(&mut batch, db, hash, entry);
+        }
+        let (receiving, change) = self.keystore.get_indices();
+        batch.put_cf(
+            db.cf_metadata(),
+            b"receiving_index",
+            receiving.to_le_bytes(),
+        );
+        batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
+        db.write_batch_sync(batch)
+    }
+
     /// Save wallet data to database
     pub fn save(&self) -> Result<(), WalletError> {
         let db = match &self.db {
@@ -864,23 +898,28 @@ impl WalletDb {
 
     /// Generate a new receiving address
     pub fn new_receiving_address(&self) -> Result<Address, WalletError> {
-        if *self.locked.read() {
+        // Held until the key is stored, so a concurrent lock() cannot strip it first
+        let locked = self.locked.read();
+        if *locked {
             return Err(WalletError::WalletLocked);
         }
         let addr = self.keystore.new_receiving_address()?;
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // receiving_index changed
+        self.persist_keys(&[addr.hash])?;
         Ok(addr)
     }
 
     /// Generate a new change address
     pub fn new_change_address(&self) -> Result<Address, WalletError> {
-        if *self.locked.read() {
+        let locked = self.locked.read();
+        if *locked {
             return Err(WalletError::WalletLocked);
         }
         let addr = self.keystore.new_change_address()?;
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // change_index changed
+        self.persist_keys(&[addr.hash])?;
         Ok(addr)
     }
 
@@ -907,6 +946,9 @@ impl WalletDb {
     ) -> Address {
         let addr = self.keystore.import_watch_only(pubkey, label);
         self.dirty.write().keys = true;
+        if let Err(e) = self.persist_keys(&[addr.hash]) {
+            error!("Failed to store watch-only key {}: {}", addr, e);
+        }
         addr
     }
 
@@ -939,6 +981,7 @@ impl WalletDb {
         let entry = crate::keystore::KeyEntry::watch_only(public, label);
         self.keystore.add_key_with_hash(address.hash, entry);
         self.dirty.write().keys = true;
+        self.persist_keys(&[address.hash])?;
 
         Ok(())
     }
@@ -1311,16 +1354,39 @@ impl WalletDb {
 
     /// Lock the wallet
     pub fn lock(&self) {
-        *self.locked.write() = true;
-        // Clear decrypted master key from memory
-        *self.decrypted_master_key.write() = None;
-        *self.unlock_until.write() = None;
+        // Held throughout, so no key is created between storing and stripping
+        let mut locked = self.locked.write();
+        *locked = true;
         // An encrypted wallet also drops every private key and the HD seed; they
         // are restored from their encrypted copies on unlock. An unencrypted
         // wallet has no other copy, so it only gets the flag.
         if *self.encrypted.read() {
-            self.keystore.strip_secrets();
+            // Store every in-memory secret encrypted while the master key is still
+            // here: unlock can only bring back what is on disk. If that write fails,
+            // keep the keys in memory rather than lose them.
+            let held: Vec<Hash160> = self
+                .keystore
+                .get_all_keys_with_hashes()
+                .into_iter()
+                .filter(|(_, e)| e.secret.is_some())
+                .map(|(h, _)| h)
+                .collect();
+            match self.persist_keys(&held) {
+                Ok(()) => self.keystore.strip_secrets(),
+                Err(e) => {
+                    error!(
+                        "Could not store private keys before locking ({}); keeping {} keys in memory",
+                        e,
+                        held.len()
+                    );
+                    self.keystore.clear_hd_wallet();
+                }
+            }
         }
+        // Clear decrypted master key from memory
+        *self.decrypted_master_key.write() = None;
+        *self.unlock_until.write() = None;
+        drop(locked);
         info!("Wallet locked");
     }
 
@@ -1381,6 +1447,18 @@ impl WalletDb {
 
         // Keep the decrypted master key in memory so new keys can be stored encrypted
         *self.decrypted_master_key.write() = Some(master_key);
+
+        // HD keys stored without their secret by older builds: derive them again
+        let healed = self.keystore.restore_missing_hd_secrets();
+        if !healed.is_empty() {
+            info!(
+                "Re-derived {} HD private keys that had no stored secret",
+                healed.len()
+            );
+            if let Err(e) = self.persist_keys(&healed) {
+                warn!("Failed to store re-derived private keys: {}", e);
+            }
+        }
 
         // Set unlock expiration time
         let expiration = if timeout_secs > 0 {
@@ -1516,6 +1594,13 @@ impl WalletDb {
             );
             batch.delete_cf(db.cf_metadata(), b"mnemonic");
         }
+        let (receiving, change) = self.keystore.get_indices();
+        batch.put_cf(
+            db.cf_metadata(),
+            b"receiving_index",
+            receiving.to_le_bytes(),
+        );
+        batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
         batch.put_cf(db.cf_metadata(), b"encryption_salt", &salt);
         batch.put_cf(db.cf_metadata(), b"encrypted_master_key", &sealed_master);
         batch.put_cf(db.cf_metadata(), b"encrypted", [1u8]);
@@ -1526,6 +1611,8 @@ impl WalletDb {
 
         *encrypted = true;
         drop(encrypted);
+        // Every secret is in the batch above; lock() has nothing left to store
+        self.keystore.strip_secrets();
         self.lock();
         info!("Wallet encrypted; it is now locked");
         Ok(())
@@ -1571,6 +1658,10 @@ impl WalletDb {
     ) -> Address {
         let address = self.keystore.import_key(secret, label);
         self.dirty.write().keys = true;
+        if let Err(e) = self.persist_keys(&[address.hash]) {
+            // Still held in memory; save() and lock() retry the write
+            error!("Failed to store imported key {}: {}", address, e);
+        }
         info!("Imported key for address {}", address);
         address
     }
@@ -1607,7 +1698,20 @@ impl WalletDb {
     ///
     /// Returns the number of keys generated
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
-        self.keystore.refill_keypool(new_size)
+        let _locked = self.locked.read();
+        let generated = self.keystore.refill_keypool(new_size)?;
+        if generated > 0 {
+            self.dirty.write().keys = true;
+            let hd_keys: Vec<Hash160> = self
+                .keystore
+                .get_all_keys_with_hashes()
+                .into_iter()
+                .filter(|(_, e)| e.hd_path.is_some() && e.secret.is_some())
+                .map(|(h, _)| h)
+                .collect();
+            self.persist_keys(&hd_keys)?;
+        }
+        Ok(generated)
     }
 
     /// Scan a block for wallet transactions
@@ -3075,5 +3179,50 @@ mod tests {
             assert!(wallet.get_utxos().is_empty());
             assert!(wallet.get_transaction(&tx.txid()).is_none());
         }
+    }
+
+    /// A wallet damaged by an older build holds an HD key with no encrypted
+    /// secret (the stored record is public-key only). Unlock re-derives the
+    /// secret from the HD path and stores it, so the key is owned again.
+    #[test]
+    fn unlock_rederives_hd_key_stored_without_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(&path, Network::Testnet, hd).unwrap();
+        wallet.save().unwrap();
+        wallet.encrypt_wallet("pw").unwrap();
+        wallet.unlock("pw", 60).unwrap();
+        let addr = wallet.new_receiving_address().unwrap();
+        let expected = wallet.get_key_by_address(&addr).unwrap().secret.unwrap();
+        wallet.lock();
+        // What a lock before the next block left on disk: the public-key-only
+        // record (written by the next save while locked) and no encrypted secret
+        wallet.save().unwrap();
+        {
+            let db = wallet.db.as_ref().unwrap();
+            let mut suffixed = addr.hash.as_bytes().to_vec();
+            suffixed.push(crate::persistence::ENCRYPTED_SECRET_SUFFIX);
+            let mut batch = db.create_batch();
+            batch.delete_cf(db.cf_keys(), &suffixed);
+            db.write_batch(batch).unwrap();
+        }
+        drop(wallet);
+
+        for _ in 0..2 {
+            let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+            assert!(wallet.is_mine(&addr));
+            wallet.unlock("pw", 60).unwrap();
+            let secret = wallet.get_key_by_address(&addr).unwrap().secret.unwrap();
+            assert_eq!(secret.as_bytes(), expected.as_bytes());
+        }
+        // The healed secret is on disk now, not just re-derived each time
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        assert!(db
+            .load_encrypted_secrets()
+            .unwrap()
+            .iter()
+            .any(|(h, _)| *h == addr.hash));
     }
 }

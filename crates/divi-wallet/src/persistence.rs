@@ -709,6 +709,16 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(e.to_string()))
     }
 
+    /// Write a batch atomically and fsync the WAL before returning, so the batch
+    /// survives a crash or power loss right after the call
+    pub fn write_batch_sync(&self, batch: WriteBatch) -> Result<(), WalletError> {
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(batch, &opts)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     /// Get a column family handle by name
     pub fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(name).unwrap()
