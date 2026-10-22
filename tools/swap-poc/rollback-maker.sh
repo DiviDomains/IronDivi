@@ -5,8 +5,10 @@
 # daemon-reload, restart and wait for /healthz. Run from the Mac, like redeploy-maker.sh.
 #
 # A rollback restarts the maker, so it runs redeploy-maker.sh's in-flight gate first
-# (`--check-only`, against /swaps and /xmr/swaps over the same tunnel). If the maker is down,
-# the gate cannot read it and refuses: pass --force-inflight once you have checked by hand.
+# (`--check-only`: /swaps over the same tunnel, and the XMR swaps by running the installed
+# `divi-swapd --xmr-inflight` on the host over ssh; there is no XMR listing over HTTP). If the
+# maker is down the /swaps half cannot be read and the gate refuses: pass --force-inflight
+# once you have checked by hand. An installed binary too old to know --xmr-inflight refuses too.
 # The set it replaces is snapshotted first as <backup-dir>/<UTC timestamp>/, so a rollback
 # can itself be undone with --to <that timestamp>; prev/ is left as it was.
 #
@@ -21,6 +23,7 @@
 #     [--remote-unit PATH]         installed unit (default: /etc/systemd/system/divi-swapd.service)
 #     [--backup-dir PATH]          snapshot root on dnsdivi (default: /var/backups/divi-swapd)
 #     [--service NAME]             systemd unit name (default: divi-swapd)
+#     [--service-user USER]        user the XMR in-flight read runs as (default: divi-swapd)
 #     [--health-timeout SECONDS]   total time to wait for /healthz after restart (default: 300)
 #     [--health-interval SECONDS]  poll interval while waiting (default: 5)
 #
@@ -31,7 +34,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '13,28p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '15,28p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -47,6 +50,7 @@ REMOTE_TOML=/etc/divi-swapd/divi-swapd.toml
 REMOTE_UNIT=/etc/systemd/system/divi-swapd.service
 BACKUP_DIR=/var/backups/divi-swapd
 SERVICE=divi-swapd
+SERVICE_USER=divi-swapd
 HEALTH_TIMEOUT=300
 HEALTH_INTERVAL=5
 DRY=0
@@ -65,6 +69,7 @@ while (($#)); do
     --remote-unit) REMOTE_UNIT="${2:?}"; shift 2 ;;
     --backup-dir) BACKUP_DIR="${2:?}"; shift 2 ;;
     --service) SERVICE="${2:?}"; shift 2 ;;
+    --service-user) SERVICE_USER="${2:?}"; shift 2 ;;
     --health-timeout) HEALTH_TIMEOUT="${2:?}"; shift 2 ;;
     --health-interval) HEALTH_INTERVAL="${2:?}"; shift 2 ;;
     -h | --help) usage ;;
@@ -107,7 +112,8 @@ done"
 fi
 
 # --- the in-flight gate (same as a redeploy's) ------------------------------------------
-gate=("$HERE/redeploy-maker.sh" --check-only --maker-url "$MAKER_URL" --host "$HOST" --remote-port "$REMOTE_PORT")
+gate=("$HERE/redeploy-maker.sh" --check-only --maker-url "$MAKER_URL" --host "$HOST" --remote-port "$REMOTE_PORT"
+  --remote-bin "$REMOTE_BIN" --remote-toml "$REMOTE_TOML" --service-user "$SERVICE_USER")
 ((FORCE_INFLIGHT)) && gate+=(--force-inflight)
 ((DRY)) && gate+=(--dry-run)
 "${gate[@]}" | grep -v '^DRY RUN:' || {

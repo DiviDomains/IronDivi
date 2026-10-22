@@ -34,7 +34,7 @@ down across that window. Every other failure is a delay, not a loss.
 >   fourth `curl` lines below, and the `jq` over `.[]`, will not work. `GET /xmr/swaps/<id>` now needs
 >   the swap's `X-Swap-Token` header and answers 404 without it (`swap_token_gate`, `routes.rs:138`;
 >   C3, commit 92b933b). Use `journalctl` (state transitions) and the SQLite state in
->   `/var/lib/divi-swapd` to list swaps; a supported operator command that replaces the list: could not verify.
+>   `/var/lib/divi-swapd` to list swaps, or the read-only `--xmr-inflight` command in the gate bullet below (in-flight swaps only).
 > - **`/healthz`, `/swaps`, `/swaps/<id>` still exist** (`routes.rs:212-216`).
 > - **New state** after C1: `reclaimed` (the maker used the `t_late` branch of `Tx_lock`, no cancel
 >   needed; `XmrMakerState`, `maker.rs:90-114`). The state diagram above predates it. `t_late` =
@@ -42,10 +42,15 @@ down across that window. Every other failure is a delay, not a loss.
 >   1 h times, `xmr_confirmations` 10 and `sigs_wait` 30 min (1800 s) are unchanged.
 > - **The maker no longer signs `Tx_punish`**; the taker signs her own. The "refund and punish paths
 >   are bound to the old key" wording under Keys holds for the refund path only.
-> - **`tools/swap-poc/redeploy-maker.sh` and `rollback-maker.sh` gate on `GET /xmr/swaps`**
->   (`redeploy-maker.sh:176`). With no GET route that should be a 405 (not run), which the script treats as unreadable (the `*)`
->   branch), so the gate refuses until the script is changed or `--force-inflight` is used. A script
->   change is out of scope for this docs lane; see `status/engine.md`.
+> - **`redeploy-maker.sh` and `rollback-maker.sh` no longer gate on `GET /xmr/swaps`** (2026-10-22, lane
+>   `redeploy-xmr-gate`; before that they read the 405 as "unreadable" and always refused). The XMR half of the
+>   gate runs `divi-swapd --config <toml> --xmr-inflight` on the host over ssh as `divi-swapd`: a read-only
+>   read of the maker's SQLite store that lists the non-terminal swaps (`XmrMakerState::is_terminal`: done,
+>   aborted, punished are terminal) as `<id> <state>` plus a count. Nothing new is exposed over HTTP. The
+>   same command is the supported way to list in-flight XMR swaps (first bullet): `ssh dnsdivi sudo -u
+>   divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight` (it needs
+>   a binary that has the flag; a full redeploy checks with the new binary it is about to install). Not yet
+>   run against the real maker: that is an operator step.
 > - `deploy.sh` lives at `deploy/divi-swapd/deploy.sh`, not under `tools/swap-poc/`.
 >
 > Checked and unchanged: flags `--check-only`, `--binary`, `--force-inflight` (`redeploy-maker.sh:15-18`),

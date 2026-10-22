@@ -104,3 +104,11 @@
 - left: the value of `L`; the shipped default keeps today's behaviour exactly.
 - needs: Bert: pick `L` (0 / 360 s recommended / 1800 s); then set `maker_mtp_trail_secs` in the two profile constructors.
 - decisions: no wire change; no confirmation count, timeout, margin or `sigs_wait_secs` changed; a taker without a floor does not read the extra MTP.
+
+
+## 2026-10-22 — redeploy-xmr-gate (builder AQ)
+- done: `redeploy-maker.sh` and `rollback-maker.sh` no longer read the removed `GET /xmr/swaps`. The XMR half of the in-flight gate runs `divi-swapd --config <toml> --xmr-inflight` on the host over ssh as `divi-swapd` (`sudo -n -u`, never root): a read-only open of the SQLite store (`Store::open_read_only`, `XmrMaker::in_flight`, the same `is_terminal` as before) that prints `xmr_configured yes|no`, `in_flight N` and one `<id> <state>` per non-terminal swap. A missing db is an error and creates nothing; truncated or foreign output, a nonzero exit or an old binary refuse unless `--force-inflight`. A full redeploy copies the NEW binary to the host first and gates with it, so the first use works against an installed binary that predates the flag. Nothing new is exposed over HTTP. `c1-punish-watch.sh` carries a dated note (broken since C3, needs `xmr_lock_txid`, not repaired). Runbook and `xmr-mainnet-plan.md` B1b updated.
+- proof: five new `divi-swapd` tests (`xmr_inflight_lists_only_non_terminal_swaps`, `xmr_inflight_all_terminal_and_empty_store_report_zero`, `xmr_inflight_without_xmr_config_still_reads_the_store`, `xmr_inflight_missing_store_is_an_error_and_creates_nothing`, `xmr_inflight_does_not_write_the_store`); `divi-swapd` + `divi-swap` + `divi-swap-xmr` 346 passed before, 351 after, 0 failed; `test-redeploy-maker.sh` 44 ok before, 58 ok after (ssh stub, mock HTTP server with no `/xmr/*` route); fmt and clippy `-D warnings` clean.
+- left: the fixed gate has not been run against the real maker (operator step, and its first run exercises the ship-then-gate bootstrap). The `/swaps` half still needs the tunnel and could move into the subcommand. `xmr-soak.sh:26` has a stale comment (out of scope).
+- needs: nothing
+- decisions: no confirmation count, timeout, margin or rate limit changed; no new route, no new dependency, root `Cargo.toml` untouched; `Store::open` (frozen behaviour) left alone, a separate read-only constructor added.

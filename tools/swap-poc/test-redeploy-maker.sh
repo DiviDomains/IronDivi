@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Bash-level tests for redeploy-maker.sh's in-flight gate (/swaps and /xmr/swaps) and for
-# the --dry-run plans of redeploy-maker.sh and rollback-maker.sh, against a real mock HTTP server
-# (stdlib python, matching tools/swap-poc/chaos/proxy.py's style) — no ssh, no build, no
-# dnsdivi needed. Not wired into check-ltc.sh: lane rules forbid editing check scripts: run
-# by hand, or have the orchestrator run it from the Mac alongside redeploy-maker.sh itself.
+# Bash-level tests for redeploy-maker.sh's in-flight gate (/swaps over HTTP, XMR swaps via
+# `divi-swapd --xmr-inflight` over ssh) and for the --dry-run plans of redeploy-maker.sh and
+# rollback-maker.sh. The HTTP side is a real mock server (stdlib python, matching
+# tools/swap-poc/chaos/proxy.py's style); ssh is a stub on PATH that returns canned output and logs
+# its argv, so no host, build or dnsdivi is needed. Not wired into check-ltc.sh: lane rules forbid
+# editing check scripts: run by hand, or have the orchestrator run it alongside redeploy-maker.sh.
 #
 #   tools/swap-poc/test-redeploy-maker.sh
 set -uo pipefail
@@ -26,20 +27,31 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# start_mock <body> <port> [status] [xmr_body] [xmr_status]: serves <body> (a JSON string)
-# with <status> for GET /swaps, and <xmr_body>/<xmr_status> for GET /xmr/swaps (default: 404,
-# a maker with no XMR engine, so the /swaps-only cases keep their meaning).
+# ssh stub: logs argv to $FAKE_SSH_LOG, prints $FAKE_SSH_OUT (printf %b), exits $FAKE_SSH_RC.
+mkdir -p "$tmp/bin"
+cat >"$tmp/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_SSH_LOG"
+[[ -z "${FAKE_SSH_OUT:-}" ]] || printf '%b' "$FAKE_SSH_OUT"
+exit "${FAKE_SSH_RC:-0}"
+STUB
+chmod +x "$tmp/bin/ssh"
+export FAKE_SSH_LOG="$tmp/ssh.log"
+: >"$FAKE_SSH_LOG"
+export PATH="$tmp/bin:$PATH"
+ZERO='xmr_configured yes\nin_flight 0\n'
+export FAKE_SSH_OUT="$ZERO" FAKE_SSH_RC=0
+
+# start_mock <body> <port> [status]: serves <body> (a JSON string) with <status> for GET /swaps.
+# There is deliberately no /xmr/swaps route: C3 removed it, and the gate must not ask for it.
 start_mock() {
-  local body="$1" port="$2" status="${3:-200}" xmr_body="${4:-not found}" xmr_status="${5:-404}"
-  python3 - "$port" "$status" "$body" "$xmr_status" "$xmr_body" <<'PY' &
+  local body="$1" port="$2" status="${3:-200}"
+  python3 - "$port" "$status" "$body" <<'PY' &
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port = int(sys.argv[1])
-routes = {
-    "/swaps": (int(sys.argv[2]), sys.argv[3].encode()),
-    "/xmr/swaps": (int(sys.argv[4]), sys.argv[5].encode()),
-}
+routes = {"/swaps": (int(sys.argv[2]), sys.argv[3].encode())}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -47,7 +59,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        status, body = routes.get(self.path, (404, b"not found"))
+        status, body = routes.get(self.path, (405 if self.path.startswith("/xmr/") else 404, b"nope"))
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -127,99 +139,114 @@ rc=$?
 stop_mock
 if ((rc == 0)); then pass "empty swap list: gate exits 0"; else fail "empty swap list: gate exited $rc: $out"; fi
 
-# 8. --check-only never builds or installs: with no remote-cargo and an unresolvable host,
-#    a passing gate still exits 0 immediately (no later step runs).
+# 8. --check-only never builds or installs: its only ssh is the read-only --xmr-inflight read
+: >"$FAKE_SSH_LOG"
 start_mock '[{"id":"done-3","state":"Done"}]' "$PORT" || exit 1
-out="$(PATH=/usr/bin:/bin "$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" --host no-such-host-xyz 2>&1)"
+out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" --host no-such-host-xyz 2>&1)"
 rc=$?
 stop_mock
-if ((rc == 0)); then pass "--check-only: stops after the gate, never touches --host"
-else fail "--check-only: unexpectedly tried to go further: $out"; fi
+nlog="$(wc -l <"$FAKE_SSH_LOG" | tr -d ' ')"
+if ((rc == 0)) && [[ "$nlog" == 1 ]] && grep -q -e "--xmr-inflight" "$FAKE_SSH_LOG"; then
+  pass "--check-only: stops after the gate; one ssh, the --xmr-inflight read"
+else fail "--check-only: rc=$rc ssh calls=$nlog: $out"; fi
+if grep -q "sudo -n -u divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight" "$FAKE_SSH_LOG"; then
+  pass "--check-only: reads as the service user with the installed binary and config, never root"
+else fail "--check-only: unexpected ssh argv: $(cat "$FAKE_SSH_LOG")"; fi
 
-# --- /xmr/swaps (B1b) ---------------------------------------------------------------------
+# --- XMR swaps via ssh `divi-swapd --xmr-inflight` ------------------------------------------
 TERMINAL='[{"id":"done-x","state":"Done"}]'
+check() { "$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" "$@" 2>&1; }
 
 # 9. a non-terminal XMR swap -> refuses and prints its id, though /swaps is all terminal
-start_mock "$TERMINAL" "$PORT" 200 '[{"id":"xmr-done","state":"done"},{"id":"xmr-flight-1","state":"xmr_reported"}]' 200 || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
+start_mock "$TERMINAL" "$PORT" || exit 1
+out="$(FAKE_SSH_OUT='xmr_configured yes\nin_flight 1\nxmr-flight-1 xmr_reported\n' check)"
 rc=$?
 stop_mock
 if ((rc != 0)); then pass "xmr in-flight: gate refuses (exit $rc)"; else fail "xmr in-flight: gate did not refuse: $out"; fi
-if grep -q "xmr-flight-1" <<<"$out"; then pass "xmr in-flight: id xmr-flight-1 printed"
+if grep -q "xmr .*xmr-flight-1 xmr_reported" <<<"$out"; then pass "xmr in-flight: id and state printed"
 else fail "xmr in-flight: id not printed: $out"; fi
-if ! grep -q "xmr-done" <<<"$out"; then pass "xmr in-flight: terminal xmr id not listed"
-else fail "xmr in-flight: terminal id listed: $out"; fi
 
-# 10. every XMR swap done/aborted/punished -> passes
-start_mock "$TERMINAL" "$PORT" 200 '[{"id":"x1","state":"done"},{"id":"x2","state":"aborted"},{"id":"x3","state":"punished"}]' 200 || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
-rc=$?
-stop_mock
-if ((rc == 0)); then pass "xmr all terminal: gate exits 0"; else fail "xmr all terminal: gate exited $rc: $out"; fi
-
-# 11. refunded is not terminal (XmrMakerState::is_terminal) -> refuses
-start_mock "$TERMINAL" "$PORT" 200 '[{"id":"xmr-refunded","state":"refunded"}]' 200 || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
-rc=$?
-stop_mock
-if ((rc != 0)) && grep -q "xmr-refunded" <<<"$out"; then pass "xmr refunded: gate refuses and names it"
-else fail "xmr refunded: rc=$rc: $out"; fi
-
-# 12. /xmr/swaps 404 (no XMR engine) -> passes, and says why
+# 10. in_flight 0 on an XMR-enabled maker -> passes
 start_mock "$TERMINAL" "$PORT" || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
+out="$(check)"
 rc=$?
 stop_mock
-if ((rc == 0)) && grep -q "no XMR engine" <<<"$out"; then pass "xmr 404: gate passes with a note"
-else fail "xmr 404: rc=$rc: $out"; fi
+if ((rc == 0)) && grep -q "ok: no in-flight swaps" <<<"$out"; then pass "xmr none in flight: gate exits 0"
+else fail "xmr none in flight: rc=$rc: $out"; fi
 
-# 13. /xmr/swaps 500 -> refuses (cannot confirm), unless --force-inflight
-start_mock "$TERMINAL" "$PORT" 200 'boom' 500 || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
-rc=$?
-out_forced="$("$TARGET" --check-only --force-inflight --maker-url "http://127.0.0.1:$PORT" 2>&1)"
-rc_forced=$?
-stop_mock
-if ((rc != 0)) && grep -q "HTTP 500" <<<"$out"; then pass "xmr 500: gate refuses"
-else fail "xmr 500: rc=$rc: $out"; fi
-if ((rc_forced == 0)); then pass "xmr 500 + --force-inflight: proceeds"
-else fail "xmr 500 + --force-inflight: still refused: $out_forced"; fi
-
-# 14. /xmr/swaps 200 but not a list -> refuses rather than reading it as "no swaps"
-start_mock "$TERMINAL" "$PORT" 200 '{"error":"nope"}' 200 || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
+# 11. no XMR engine configured and nothing in the store -> passes, and says why
+start_mock "$TERMINAL" "$PORT" || exit 1
+out="$(FAKE_SSH_OUT='xmr_configured no\nin_flight 0\n' check)"
 rc=$?
 stop_mock
-if ((rc != 0)); then pass "xmr non-list body: gate refuses"; else fail "xmr non-list body: gate passed: $out"; fi
+if ((rc == 0)) && grep -q "no XMR engine" <<<"$out"; then pass "xmr not configured: gate passes with a note"
+else fail "xmr not configured: rc=$rc: $out"; fi
 
-# 15. --force-inflight with an in-flight XMR swap -> proceeds, still lists it
-start_mock "$TERMINAL" "$PORT" 200 '[{"id":"xmr-flight-2","state":"locked"}]' 200 || exit 1
-out="$("$TARGET" --check-only --force-inflight --maker-url "http://127.0.0.1:$PORT" 2>&1)"
+# 12. read failures all refuse (cannot confirm), unless --force-inflight
+start_mock "$TERMINAL" "$PORT" || exit 1
+for case in \
+  "ssh fails:255:ssh: Could not resolve hostname" \
+  "store missing:1:Error: no swap store at /var/lib/divi-swapd/swaps.db" \
+  "old binary:2:error: unexpected argument '--xmr-inflight' found" \
+  "empty output:0:" \
+  "garbage output:0:hello\nworld\n" \
+  "count mismatch:0:xmr_configured yes\nin_flight 2\nonly-one done_not\n" \
+  "truncated:0:xmr_configured yes\n"; do
+  name="${case%%:*}"; rest="${case#*:}"; crc="${rest%%:*}"; cout="${rest#*:}"
+  out="$(FAKE_SSH_RC=$crc FAKE_SSH_OUT="$cout" check)"; rc=$?
+  outf="$(FAKE_SSH_RC=$crc FAKE_SSH_OUT="$cout" check --force-inflight)"; rcf=$?
+  if ((rc != 0)) && grep -q "REFUSE\|cannot read\|unreadable" <<<"$out"; then pass "xmr $name: gate refuses"
+  else fail "xmr $name: rc=$rc: $out"; fi
+  if ((rcf == 0)); then pass "xmr $name + --force-inflight: proceeds"; else fail "xmr $name + --force-inflight: rc=$rcf: $outf"; fi
+done
+stop_mock
+
+# 13. an old installed binary gets a hint about the flag
+start_mock "$TERMINAL" "$PORT" || exit 1
+out="$(FAKE_SSH_RC=2 FAKE_SSH_OUT="error: unexpected argument '--xmr-inflight' found" check)"
+stop_mock
+if grep -q "too old" <<<"$out"; then pass "xmr old binary: says it is too old"; else fail "xmr old binary: no hint: $out"; fi
+
+# 14. --force-inflight with an in-flight XMR swap -> proceeds, still lists it
+start_mock "$TERMINAL" "$PORT" || exit 1
+out="$(FAKE_SSH_OUT='xmr_configured yes\nin_flight 1\nxmr-flight-2 locked\n' check --force-inflight)"
 rc=$?
 stop_mock
 if ((rc == 0)) && grep -q "xmr-flight-2" <<<"$out"; then pass "xmr --force-inflight: proceeds and lists the id"
 else fail "xmr --force-inflight: rc=$rc: $out"; fi
 
-# 16. in-flight on both lists -> both ids printed, labelled by list
-start_mock '[{"id":"htlc-1","state":"MakerLocked"}]' "$PORT" 200 '[{"id":"xmr-3","state":"redeem_offered"}]' 200 || exit 1
-out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"
+# 15. in-flight on both lists -> both ids printed, labelled by source
+start_mock '[{"id":"htlc-1","state":"MakerLocked"}]' "$PORT" || exit 1
+out="$(FAKE_SSH_OUT='xmr_configured yes\nin_flight 1\nxmr-3 redeem_offered\n' check)"
 rc=$?
 stop_mock
-if ((rc != 0)) && grep -q "/swaps .*htlc-1" <<<"$out" && grep -q "/xmr/swaps .*xmr-3" <<<"$out"; then
-  pass "both lists in flight: both ids, labelled"
-else fail "both lists in flight: rc=$rc: $out"; fi
+if ((rc != 0)) && grep -q "/swaps .*htlc-1" <<<"$out" && grep -q "xmr .*xmr-3" <<<"$out"; then
+  pass "both sources in flight: both ids, labelled"
+else fail "both sources in flight: rc=$rc: $out"; fi
 
-# --- dry-run plans (B1): no ssh is run, so an unresolvable host is fine ------------------
+# 16. the gate never asks for the removed listing: the mock answers /xmr/* with 405, so a gate
+#     that still read it would refuse the all-terminal case above; also assert no HTTP-ish XMR text
+if ! grep -v '^[[:space:]]*#' "$TARGET" | grep -q 'curl.*xmr/swaps'; then pass "redeploy-maker.sh does not curl /xmr/swaps"
+else fail "redeploy-maker.sh still references a curl of /xmr/swaps"; fi
+
+# --- dry-run plans: zero ssh --------------------------------------------------------------
 NOHOST=no-such-host-xyz
 # 17. redeploy --dry-run snapshots all three before installing; its rollback restores all three
-out="$(PATH=/usr/bin:/bin "$TARGET" --dry-run --binary /nonexistent/divi-swapd --host "$NOHOST" 2>&1)"
+: >"$FAKE_SSH_LOG"
+out="$("$TARGET" --dry-run --binary /nonexistent/divi-swapd --host "$NOHOST" 2>&1)"
 rc=$?
-if ((rc == 0)); then pass "redeploy --dry-run: exits 0 without ssh"; else fail "redeploy --dry-run: exit $rc: $out"; fi
+if ((rc == 0)) && [[ ! -s "$FAKE_SSH_LOG" ]]; then pass "redeploy --dry-run: exits 0 and runs no ssh"
+else fail "redeploy --dry-run: exit $rc, ssh log: $(cat "$FAKE_SSH_LOG"): $out"; fi
 snap_line="$(grep -n 'cp -p /etc/divi-swapd/divi-swapd.toml /var/backups/divi-swapd/' <<<"$out" | head -1 | cut -d: -f1)"
 install_line="$(grep -n 'install -m 0755 /tmp/divi-swapd.redeploy-new /usr/local/bin/divi-swapd' <<<"$out" | head -1 | cut -d: -f1)"
 if [[ -n "$snap_line" && -n "$install_line" ]] && ((snap_line < install_line)); then
   pass "redeploy --dry-run: snapshot comes before install"
 else fail "redeploy --dry-run: snapshot/install order wrong or missing: $out"; fi
+scp_line="$(grep -n 'scp .*divi-swapd.redeploy-new' <<<"$out" | head -1 | cut -d: -f1)"
+gate_line="$(grep -n 'sudo -n -u divi-swapd /tmp/divi-swapd.redeploy-new --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight' <<<"$out" | head -1 | cut -d: -f1)"
+if [[ -n "$scp_line" && -n "$gate_line" && -n "$snap_line" ]] && ((scp_line < gate_line && gate_line < snap_line)); then
+  pass "redeploy --dry-run: ships the new binary, gates with it, then snapshots"
+else fail "redeploy --dry-run: ship/gate/snapshot order wrong or missing ($scp_line/$gate_line/$snap_line): $out"; fi
 for want in "cp -p /usr/local/bin/divi-swapd /var/backups/divi-swapd/" \
   "cp -p /etc/systemd/system/divi-swapd.service /var/backups/divi-swapd/" \
   "/var/backups/divi-swapd/prev" "SHA256SUMS" \
@@ -231,15 +258,17 @@ for want in "cp -p /usr/local/bin/divi-swapd /var/backups/divi-swapd/" \
 done
 
 # 18. rollback --dry-run restores all three, reloads, restarts, health-checks; no ssh
-out="$(PATH=/usr/bin:/bin "$ROLLBACK" --dry-run --host "$NOHOST" 2>&1)"
+: >"$FAKE_SSH_LOG"
+out="$("$ROLLBACK" --dry-run --host "$NOHOST" 2>&1)"
 rc=$?
-if ((rc == 0)); then pass "rollback --dry-run: exits 0 without ssh"; else fail "rollback --dry-run: exit $rc: $out"; fi
+if ((rc == 0)) && [[ ! -s "$FAKE_SSH_LOG" ]]; then pass "rollback --dry-run: exits 0 and runs no ssh"
+else fail "rollback --dry-run: exit $rc, ssh log: $(cat "$FAKE_SSH_LOG"): $out"; fi
 for want in "cp -p /var/backups/divi-swapd/prev/divi-swapd /usr/local/bin/divi-swapd.rollback" \
   "cp -p /var/backups/divi-swapd/prev/divi-swapd.toml /etc/divi-swapd/divi-swapd.toml.rollback" \
   "cp -p /var/backups/divi-swapd/prev/divi-swapd.service /etc/systemd/system/divi-swapd.service.rollback" \
   "sha256sum -c --quiet SHA256SUMS" "systemctl daemon-reload" "systemctl restart divi-swapd" \
-  "/healthz" "checking for in-flight swaps"; do
-  if grep -qF "$want" <<<"$out"; then pass "rollback --dry-run: has '$want'"
+  "/healthz" "checking for in-flight swaps" "--xmr-inflight"; do
+  if grep -qF -e "$want" <<<"$out"; then pass "rollback --dry-run: has '$want'"
   else fail "rollback --dry-run: missing '$want': $out"; fi
 done
 
@@ -255,13 +284,15 @@ if ((rc != 0)) && ! grep -q "ssh" <<<"$out"; then pass "rollback --to junk: reje
 else fail "rollback --to junk: rc=$rc: $out"; fi
 
 # 20. rollback's gate is the real one: an in-flight XMR swap refuses it before any restore
-start_mock "$TERMINAL" "$PORT" 200 '[{"id":"xmr-flight-4","state":"swept"}]' 200 || exit 1
-out="$(PATH=/usr/bin:/bin "$ROLLBACK" --maker-url "http://127.0.0.1:$PORT" --host "$NOHOST" 2>&1)"
+start_mock "$TERMINAL" "$PORT" || exit 1
+: >"$FAKE_SSH_LOG"
+out="$(FAKE_SSH_OUT='xmr_configured yes\nin_flight 1\nxmr-flight-4 swept\n' "$ROLLBACK" --maker-url "http://127.0.0.1:$PORT" --host "$NOHOST" 2>&1)"
 rc=$?
 stop_mock
-if ((rc != 0)) && grep -q "xmr-flight-4" <<<"$out" && ! grep -q "==> restore" <<<"$out"; then
-  pass "rollback gate: refuses on an in-flight XMR swap before restoring"
-else fail "rollback gate: rc=$rc: $out"; fi
+if ((rc != 0)) && grep -q "xmr-flight-4" <<<"$out" && ! grep -q "==> restore" <<<"$out" \
+  && [[ "$(wc -l <"$FAKE_SSH_LOG" | tr -d ' ')" == 1 ]]; then
+  pass "rollback gate: refuses on an in-flight XMR swap before restoring (only the read ran)"
+else fail "rollback gate: rc=$rc ssh=$(cat "$FAKE_SSH_LOG"): $out"; fi
 
 if ((FAILS == 0)); then echo "PASS: test-redeploy-maker"; exit 0; fi
 echo "$FAILS check(s) failing"

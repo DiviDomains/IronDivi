@@ -1096,11 +1096,23 @@ impl XmrMaker {
     /// Swaps in `store` this engine has not finished: a daemon must keep the engine (and its
     /// chains) running while there are any, even with every xmr offer switched off.
     pub fn open_swaps(store: &Store) -> Result<usize> {
+        Ok(Self::in_flight(store)?.len())
+    }
+
+    /// `(id, state)` of every swap in `store` that is not terminal (`XmrMakerState::is_terminal`),
+    /// newest first. Reads only those two fields, so it is not tied to the rest of the record.
+    pub fn in_flight(store: &Store) -> Result<Vec<(String, XmrMakerState)>> {
+        #[derive(Deserialize)]
+        struct Row {
+            id: String,
+            state: XmrMakerState,
+        }
         Ok(store
-            .list_docs::<XmrMakerRecord>(KIND)?
-            .iter()
+            .list_docs::<Row>(KIND)?
+            .into_iter()
             .filter(|r| !r.state.is_terminal())
-            .count())
+            .map(|r| (r.id, r.state))
+            .collect())
     }
 
     /// The lock serializing `swap_id`'s read-modify-write. Entries nobody else holds are

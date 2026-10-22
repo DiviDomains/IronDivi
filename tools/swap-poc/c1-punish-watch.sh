@@ -3,6 +3,11 @@
 # (~/.local/state/c1-punish, port 18483 tunnelled to the Mac) the moment it records the taker's
 # XMR lock, so it never offers redeem and never cancels or refunds. Never the dnsdivi maker.
 #   [SKIP_IDS="id1 id2"] c1-punish-watch.sh <run-dir>   (SKIP_IDS: maker swap ids from earlier runs)
+# NOTE 2026-10-22: broken since C3 removed `GET /xmr/swaps` (405 with an XMR engine, 404 without): the
+# poll below never sees a swap, so it never stalls the maker. One-off harness for the finished C1 run
+# (c1-punish-results.md) on the private hp2 maker; not repaired on purpose, because it needs
+# `xmr_lock_txid`, which no production read exposes (`divi-swapd --xmr-inflight` prints id and state
+# only). To rerun: read the swap with its token, `GET /xmr/swaps/<id>` + `X-Swap-Token`.
 set -euo pipefail
 out=$1 maker=${MAKER:-http://127.0.0.1:18483}
 while :; do

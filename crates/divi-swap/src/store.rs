@@ -180,6 +180,17 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Open an existing database read-only: no file is created, no pragma or schema is
+    /// written (so it is safe next to a running daemon, and an absent `path` is an error,
+    /// never an empty store). For inspection tools such as `divi-swapd --xmr-inflight`.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(storage)?;
+        Ok(Store {
+            conn: std::sync::Arc::new(parking_lot::Mutex::new(conn)),
+        })
+    }
+
     /// A throwaway in-memory database (tests).
     pub fn in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory().map_err(storage)?)

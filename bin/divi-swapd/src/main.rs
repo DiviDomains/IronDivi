@@ -46,6 +46,12 @@ struct Args {
     /// offers added), `live` uses the public testnets.
     #[arg(long, value_parser = parse_backend)]
     backend: Option<BackendKind>,
+    /// Print the XMR swaps still in flight, read straight from the swap store, and exit.
+    /// Read-only: nothing is created or written, no chain or key is touched, no HTTP.
+    /// Output (stdout only): `xmr_configured yes|no`, `in_flight N`, then one `<id> <state>`
+    /// per non-terminal swap. Exit 0 iff the store was readable. Run it as the service user.
+    #[arg(long)]
+    xmr_inflight: bool,
 }
 
 fn parse_backend(s: &str) -> Result<BackendKind, String> {
@@ -454,9 +460,35 @@ async fn live_backends(
     Ok((backends, job, offers))
 }
 
+/// `--xmr-inflight`: the in-flight XMR swaps in `db_path`, as the lines documented on `Args`.
+/// The store must already exist: a wrong path is an error, never an empty store.
+fn xmr_inflight_report(cfg: &DaemonConfig) -> Result<String> {
+    let store = Store::open_read_only(&cfg.db_path)
+        .with_context(|| format!("opening swap database {}", cfg.db_path.display()))?;
+    let open = divi_swap_xmr::XmrMaker::in_flight(&store)?;
+    let mut out = format!(
+        "xmr_configured {}\nin_flight {}\n",
+        if cfg.xmr.is_some() { "yes" } else { "no" },
+        open.len()
+    );
+    for (id, state) in open {
+        let state = serde_json::to_value(state)?;
+        out.push_str(&format!("{id} {}\n", state.as_str().unwrap_or("?")));
+    }
+    Ok(out)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.xmr_inflight {
+        // Before the log subscriber: its default writer is stdout, which scripts parse.
+        print!(
+            "{}",
+            xmr_inflight_report(&DaemonConfig::load(&args.config)?)?
+        );
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -648,5 +680,96 @@ mod tests {
             std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
         assert_eq!(underfunded, vec!["usdc-divi-sepolia".to_string()]);
+    }
+
+    fn inflight_cfg(db: &std::path::Path, xmr: bool) -> DaemonConfig {
+        let mut text = format!("db_path = \"{}\"\n", db.display());
+        if xmr {
+            text.push_str(
+                "[xmr]\nmonerod_url = \"http://127.0.0.1:38081\"\n\
+                 wallet_rpc_url = \"http://127.0.0.1:38088\"\nwallet_rpc_user = \"swap\"\n\
+                 wallet_rpc_password = \"credential:maker-xmr-wallet-rpc\"\n\
+                 sweep_address = \"5Aaaa\"\ndivi_key = \"credential:maker-divi-xmr\"\n\
+                 divi_fund_txids = [\"ab\"]\n",
+            );
+        }
+        DaemonConfig::parse(&text).unwrap()
+    }
+
+    fn put_xmr(store: &Store, id: &str, state: &str) {
+        let doc = serde_json::json!({ "id": id, "state": state, "extra": "ignored" });
+        store.put_doc(divi_swap_xmr::maker::KIND, id, &doc).unwrap();
+    }
+
+    #[test]
+    fn xmr_inflight_lists_only_non_terminal_swaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        put_xmr(&store, "d", "done");
+        put_xmr(&store, "a", "aborted");
+        put_xmr(&store, "p", "punished");
+        put_xmr(&store, "l", "locked");
+        put_xmr(&store, "c", "cancelled");
+        let out = xmr_inflight_report(&inflight_cfg(&db, true)).unwrap();
+        let mut lines: Vec<&str> = out.lines().collect();
+        assert_eq!(&lines[..2], ["xmr_configured yes", "in_flight 2"]);
+        lines.drain(..2);
+        lines.sort();
+        assert_eq!(lines, ["c cancelled", "l locked"]);
+    }
+
+    #[test]
+    fn xmr_inflight_all_terminal_and_empty_store_report_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            xmr_inflight_report(&inflight_cfg(&db, true)).unwrap(),
+            "xmr_configured yes\nin_flight 0\n"
+        );
+        put_xmr(&store, "d", "done");
+        put_xmr(&store, "p", "punished");
+        assert_eq!(
+            xmr_inflight_report(&inflight_cfg(&db, true)).unwrap(),
+            "xmr_configured yes\nin_flight 0\n"
+        );
+    }
+
+    #[test]
+    fn xmr_inflight_without_xmr_config_still_reads_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            xmr_inflight_report(&inflight_cfg(&db, false)).unwrap(),
+            "xmr_configured no\nin_flight 0\n"
+        );
+        // A leftover swap with the section removed is still reported (the daemon refuses to
+        // start in that state; the redeploy gate must not call it clean).
+        put_xmr(&store, "x", "xmr_reported");
+        assert_eq!(
+            xmr_inflight_report(&inflight_cfg(&db, false)).unwrap(),
+            "xmr_configured no\nin_flight 1\nx xmr_reported\n"
+        );
+    }
+
+    #[test]
+    fn xmr_inflight_missing_store_is_an_error_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("typo.db");
+        assert!(xmr_inflight_report(&inflight_cfg(&db, true)).is_err());
+        assert!(!db.exists(), "a read must never create the store");
+    }
+
+    #[test]
+    fn xmr_inflight_does_not_write_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        put_xmr(&store, "l", "locked");
+        let ro = Store::open_read_only(&db).unwrap();
+        assert!(ro.put_doc("k", "i", &1u8).is_err(), "read-only handle");
+        assert_eq!(divi_swap_xmr::XmrMaker::in_flight(&ro).unwrap().len(), 1);
     }
 }
