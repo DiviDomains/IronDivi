@@ -113,6 +113,42 @@ impl MockDiviChain {
         Ok(m)
     }
 
+    /// Reorg: `txid` (and every mined tx spending its outputs) goes back to the mempool.
+    /// Test-only; an unknown id is ignored.
+    pub fn unconfirm(&self, txid: &Hash256) {
+        let mut s = self.st.lock();
+        for id in Self::with_dependents(&s, txid) {
+            if let Some((_, mined)) = s.txs.get_mut(&id) {
+                *mined = None;
+            }
+        }
+    }
+
+    /// Reorg: `txid` (and every tx spending its outputs) is gone from chain and mempool and
+    /// the inputs it took are free again, so its bytes can be broadcast anew. Test-only.
+    pub fn forget(&self, txid: &Hash256) {
+        let mut s = self.st.lock();
+        for id in Self::with_dependents(&s, txid) {
+            s.txs.remove(&id);
+            s.spends.retain(|_, spender| *spender != id);
+        }
+    }
+
+    fn with_dependents(s: &DiviState, txid: &Hash256) -> Vec<Hash256> {
+        let mut ids = vec![*txid];
+        let mut i = 0;
+        while i < ids.len() {
+            let parent = ids[i];
+            for (id, (tx, _)) in &s.txs {
+                if !ids.contains(id) && tx.vin.iter().any(|v| v.prevout.txid == parent) {
+                    ids.push(*id);
+                }
+            }
+            i += 1;
+        }
+        ids
+    }
+
     /// Rename the chain (`main`, `test`, `regtest`), as `getblockchaininfo` reports it.
     pub fn set_chain_name(&self, name: &str) {
         self.st.lock().name = name.into();

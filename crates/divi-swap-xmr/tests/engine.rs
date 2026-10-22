@@ -1545,3 +1545,30 @@ async fn a_maker_shortening_t_cancel_is_refused_exactly_once_it_states_its_mtp()
     assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
     assert_eq!(w.taker_rec(&tid).outcome.as_deref(), Some("redeemed"));
 }
+
+/// q6: the XMR maker sends `Tx_lock` again on every pass of `on_locked`, so a lock the DIVI
+/// chain dropped after it confirmed (or sent back to the mempool) is re-sent, byte for byte,
+/// with no extra watcher: there is no no-rebroadcast-after-confirm gap here.
+#[tokio::test]
+async fn a_reorged_tx_lock_is_resent_by_the_locked_pass() {
+    let w = W::new();
+    let (mid, _tid) = w.open().await;
+    let r = w.maker.record(&mid).unwrap().unwrap();
+    let lock = r.tx_lock.txid();
+    w.divi.mine(cfg().divi_confirmations as u64 + 1);
+    assert_eq!(w.maker.step(&mid).await.unwrap(), XmrMakerState::Locked);
+    assert!(w.maker_divi.confirmations(&lock).await.unwrap().unwrap() >= 1);
+    // Sent back to the mempool, then dropped altogether.
+    w.divi.unconfirm(&lock);
+    assert_eq!(w.maker_divi.confirmations(&lock).await.unwrap(), Some(0));
+    assert_eq!(w.maker.step(&mid).await.unwrap(), XmrMakerState::Locked);
+    w.divi.forget(&lock);
+    assert_eq!(w.maker_divi.confirmations(&lock).await.unwrap(), None);
+    assert_eq!(w.maker.step(&mid).await.unwrap(), XmrMakerState::Locked);
+    assert_eq!(w.maker_divi.confirmations(&lock).await.unwrap(), Some(0));
+    let after = w.maker.record(&mid).unwrap().unwrap();
+    assert_eq!(after.tx_lock, r.tx_lock, "never re-signed");
+    assert!(after.lock_actual.is_none() && after.last_error.is_none());
+    w.divi.mine(1);
+    assert!(w.maker_divi.confirmations(&lock).await.unwrap().unwrap() >= 1);
+}

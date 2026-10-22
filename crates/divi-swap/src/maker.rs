@@ -706,12 +706,14 @@ impl Maker {
         let (htlc, funding) = self.maker_leg(r)?;
         let mk = self.mk(r)?.clone();
         let confs = mk.confirmations(&funding.tx.txid).await?;
+        // The node sees the lock again (mempool or chain): it is no longer dropped, so a later
+        // drop gets a fresh re-send instead of the stale flag.
+        if confs.is_some() && r.maker_lock_dropped {
+            r.maker_lock_dropped = false;
+            r.last_error = None;
+            self.store.put_maker_swap(r)?;
+        }
         if confs.is_some_and(|c| c >= self.maker_leg_confs(r)) {
-            if r.maker_lock_dropped {
-                r.maker_lock_dropped = false;
-                r.last_error = None;
-                self.store.put_maker_swap(r)?;
-            }
             return Ok(Flow::Idle);
         }
         let remaining = htlc.locktime.saturating_sub(mk.median_time_past().await?);

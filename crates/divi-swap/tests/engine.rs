@@ -1879,3 +1879,89 @@ zec_rev!(
     zec_rev_late_reorg_refunds_early,
     late_reorg_refunds_early_body
 );
+
+// ---- reorg follow-ups q3 / q4 (maker-rebroadcast-design.md §5) ----
+
+/// q3: the re-send was refused (inputs spent) and the lock is flagged dropped. Once the node
+/// sees the lock again (relayed by another node), the flag and error clear, so a second drop
+/// is re-sent instead of staying stuck behind the stale flag. Fails on the base: the flag
+/// only cleared at full depth, so a lock back in the mempool kept the stale error and a
+/// later drop was never re-sent.
+async fn dropped_flag_clears_when_lock_returns_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let funding = h.maker_rec().maker_leg_funding.unwrap();
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    assert!(h.maker_rec().maker_lock_dropped);
+    // Another node relays the lock: back in the mempool, below `maker_leg_confs`.
+    h.m_ml().broadcast(&funding.tx).await.unwrap();
+    assert_eq!(h.lock_confs(&lock).await, Some(0));
+    h.maker.tick().await.unwrap();
+    let rec = h.maker_rec();
+    assert!(!rec.maker_lock_dropped, "stale dropped flag");
+    assert!(rec.last_error.is_none(), "stale error");
+    // Dropped again: re-sent this time.
+    h.ml_chain().forget(&lock);
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.lock_confs(&lock).await, Some(0), "lock was not re-sent");
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+}
+both!(
+    dropped_flag_clears_when_lock_returns,
+    rev_dropped_flag_clears_when_lock_returns,
+    dropped_flag_clears_when_lock_returns_body
+);
+
+/// q4: a backend that cannot look the lock up (no txindex: `confirmations` and `htlc_output`
+/// say `None`) but whose node still has it: the re-broadcast answers already-known, so the
+/// watcher records nothing, flags nothing and changes no state. Pinned, not fixed.
+async fn blind_node_is_not_a_dropped_lock_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let before = h.maker_rec();
+    h.ml_chain().blind(&lock);
+    assert_eq!(h.lock_confs(&lock).await, None);
+    for _ in 0..3 {
+        h.maker.tick().await.unwrap();
+    }
+    assert_eq!(h.maker_rec(), before);
+    assert!(!h.maker_rec().maker_lock_dropped);
+}
+both!(
+    blind_node_is_not_a_dropped_lock,
+    rev_blind_node_is_not_a_dropped_lock,
+    blind_node_is_not_a_dropped_lock_body
+);
+
+/// q3 tail: the lock is gone for good (inputs spent) and the locktime passes. The swap goes
+/// to `MakerRefundable` and stays there, reporting an error each pass; it is never made
+/// terminal, because "gone for good" cannot be told from "this node cannot see it" (q4).
+async fn gone_lock_past_locktime_stays_refundable_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    assert!(h.maker_rec().maker_lock_dropped);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    for _ in 0..4 {
+        let _ = h.maker.tick().await;
+        ml.mine(1);
+        assert_eq!(h.maker_state(), SwapState::MakerRefundable);
+    }
+    assert!(!h.maker_state().is_terminal());
+    assert!(
+        h.maker_rec().maker_leg_refund.is_none(),
+        "dead refund bytes kept"
+    );
+    assert_eq!(h.lock_confs(&lock).await, None);
+}
+both!(
+    gone_lock_past_locktime_stays_refundable,
+    rev_gone_lock_past_locktime_stays_refundable,
+    gone_lock_past_locktime_stays_refundable_body
+);

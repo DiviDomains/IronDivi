@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -65,6 +65,9 @@ struct ChainState {
     /// One-shot: the next `broadcast()` call fails with `SwapError::Rejected` instead of
     /// whatever it would otherwise do, then clears itself.
     reject_next_broadcast: bool,
+    /// Txids the node cannot look up (no txindex): `confirmations`/`htlc_output` say `None`
+    /// although the tx stays in the chain and `broadcast` still answers already-known.
+    blind: HashSet<Txid>,
 }
 
 /// A simulated chain shared by several backends.
@@ -130,6 +133,12 @@ impl MockChain {
                 *s.balances.entry(from).or_default() += amount.0 + MOCK_FEE.0;
             }
         }
+    }
+
+    /// The node cannot look `txid` up (a backend without txindex), though it is in the chain.
+    /// Test-only.
+    pub fn blind(&self, txid: &Txid) {
+        self.state.lock().blind.insert(*txid);
     }
 
     fn with_dependents(s: &ChainState, txid: &Txid) -> Vec<Txid> {
@@ -415,6 +424,9 @@ impl ChainBackend for MockBackend {
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
         self.check_online()?;
         let s = self.chain.state.lock();
+        if s.blind.contains(txid) {
+            return Ok(None);
+        }
         Ok(s.txs.get(txid).map(|(_, mined)| match mined {
             Some(h) => (s.height - h + 1) as u32,
             None => 0,
@@ -424,6 +436,9 @@ impl ChainBackend for MockBackend {
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
         self.check_online()?;
         let s = self.chain.state.lock();
+        if s.blind.contains(&at.txid) {
+            return Ok(None);
+        }
         Ok(htlc_amount(&s, htlc, at).map(|amount| {
             let mined = s.txs[&at.txid].1;
             LockedOutput {
