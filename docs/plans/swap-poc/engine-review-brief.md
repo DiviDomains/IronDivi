@@ -179,7 +179,7 @@ above. See Q2.
 | Store file and its WAL/SHM files are mode 0600; `synchronous=FULL`, `journal_mode=WAL` | `store.rs:171-182`, `:366-376` | `store_file_mode_0600` (`store.rs:517`) |
 | State transitions are validated; coins are reserved only on the `TakerLockConfirmed → MakerLocked` edge | `state.rs:76-111`, `maker.rs:408` `enter` | `no_coins_before_maker_locked`, `terminal_states_have_no_exits` (`state.rs`) |
 | Maker and taker steps are serialized by a `tokio` mutex | `gate`: `maker.rs:324,363`; `taker.rs:161,203,239,267` | none directly |
-| **`Maker::accept` does not take the gate** | `maker.rs:252-319` | none (finding F1) |
+| **`Maker::accept` takes the gate** (fixed on lane/maker-accept-serialized, see status/engine.md 2026-10-22; was F1) | `maker.rs:252-319` | `tests/maker_accept_race.rs` (fails on the base, passes with the gate) |
 | The preimage, hashes and keys are stored in plaintext in the DB (file mode 0600 only) | `store.rs` schema | `could not verify` host-level disk encryption on any deployment |
 
 ### 3.9 Daemon HTTP surface, auth and rate limits
@@ -239,7 +239,7 @@ For each adversary: what they can do, what stops them, what the reviewer should 
   in 60 s on mainnet.
 - Funds, then claims the maker leg and does not let the maker claim: the maker reads the preimage from
   the chain spend (`maker.rs:725`) and claims within its window (`taker_window_too_short`).
-- Replays a hash or a quote: `accept` refuses a used quote and a reused hash, but not atomically (F1).
+- Replays a hash or a quote: `accept` refuses a used quote and a reused hash, and now atomically: fixed on lane/maker-accept-serialized, see status/engine.md 2026-10-22 (F1). No unique index on the hash.
 - Funds too little or with too few confirmations: the maker re-checks amount and confirmations on
   `TakerLockConfirmed` (`maker.rs:553-584`).
 
@@ -284,7 +284,7 @@ Linked, not restated.
 
 New observations from this review (each also a `left:` line in `status/engine.md`); none is fixed:
 
-- **F1 — `Maker::accept` is not serialized.** `maker.rs:252-319` does not take `gate`. It checks
+- **F1 — `Maker::accept` was not serialized (fixed on lane/maker-accept-serialized, see status/engine.md 2026-10-22; the text below is the finding as reviewed; what remains: no unique index on the hash, by design, see the status round).** `maker.rs:252-319` does not take `gate`. It checks
   `qr.used` and scans `list_maker_swaps()` for the hash, then awaits `median_time_past()`
   (`maker.rs:276`), then writes `qr.used = true`. Two concurrent accepts of one quote can both pass.
   `maker_swaps` has no unique index on the hash. The daemon route calls it straight
@@ -344,7 +344,7 @@ no funds, no keys.
 
 ## 7. Questions for the reviewer
 
-1. **F1:** confirm `Maker::accept` cannot be turned into a loss of funds by concurrent accepts of one
+1. **F1 (fixed on lane/maker-accept-serialized, see status/engine.md 2026-10-22; `accept` now holds `gate`; left: no unique index on the hash):** confirm `Maker::accept` cannot be turned into a loss of funds by concurrent accepts of one
    quote, or one hash. Is a unique index on the hash plus taking `gate` the right fix?
 2. **Self-stated MTP:** `check_maker_leg_locktime_exact` bounds a maker's stated `maker_mtp_at_lock` to
    a plausibility window. Can a maker pick a stated value inside the window that shortens its own

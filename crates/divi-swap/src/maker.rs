@@ -249,7 +249,12 @@ impl Maker {
     }
 
     /// Accept an unexpired quote: fixes the taker-leg HTLC the taker must fund.
+    ///
+    /// Holds `gate` from the used-quote and hash checks through the writes, across the one
+    /// `median_time_past` read: two accepts of one quote, or of one hash on two quotes, cannot
+    /// both pass the checks.
     pub async fn accept(&self, req: AcceptRequest) -> Result<SwapView> {
+        let _g = self.gate.lock().await;
         let mut qr = self
             .store
             .get_quote(&req.quote_id)?
