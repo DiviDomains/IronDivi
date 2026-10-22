@@ -14,9 +14,9 @@ or config was changed; the recommendation below is a proposal for Bert, not appl
 | Lookup by chain | `SwapConfig::confirmations(chain)` → `chain_params` | `crates/divi-swap/src/config.rs:161-162` |
 | Offer terms carry the count | `OfferedTerms.divi_confirmations` | `crates/divi-swap/src/config.rs:279,288` |
 | Taker refuses an offer below its profile floor | `divi_confirmations` vs `floor.confirmations(chain)` | `crates/divi-swap/src/config.rs:323-343` |
-| Daemon override (TOML `[swap] divi_confirmations`) | `c.divi_confirmations = o.divi_confirmations.unwrap_or(..)`; `[swap.chains.divi]` is rejected | `bin/divi-swapd/src/config.rs:572-576` |
-| Used by the maker/taker flow | `self.cfg.confirmations(counter)`, `cfg.divi_confirmations` | `crates/divi-swap/src/maker.rs:241`, `crates/divi-swap-xmr/src/maker.rs:1423,1556`, `crates/divi-swap-xmr/src/taker.rs:777` |
-| XMR leg mirrors the mainnet figure, checked by a test | `DIVI_CONFIRMATIONS_MAINNET` parsed from config.rs | `crates/swap-chain-xmr/src/live_rpc.rs:204,550-573` |
+| Daemon override (TOML `[swap] divi_confirmations`) | `c.divi_confirmations = o.divi_confirmations.unwrap_or(..)`; `[swap.chains.divi]` is rejected | `bin/divi-swapd/src/config.rs:589,592` |
+| Used by the maker/taker flow | `self.cfg.confirmations(counter)`, `cfg.divi_confirmations` | `crates/divi-swap/src/maker.rs:241`, `crates/divi-swap-xmr/src/maker.rs:1423,1556`, `crates/divi-swap-xmr/src/taker.rs:783` |
+| XMR leg mirrors the mainnet figure, checked by a test | `DIVI_CONFIRMATIONS_MAINNET` parsed from config.rs | `crates/swap-chain-xmr/src/live_rpc.rs:212,550-573` |
 | Chain constants | target spacing 60 s; coinbase maturity 20 | `crates/divi-storage/src/difficulty.rs:47`, `crates/divi-primitives/src/lib.rs:82` |
 
 Readiness doc today: `mainnet-readiness.md` §DIVI says the count is "unchanged by this lane / not touched"; its BTC/LTC/ZEC

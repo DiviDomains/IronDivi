@@ -27,6 +27,33 @@ down across that window. Every other failure is a delay, not a loss.
 
 ## Look at things
 
+> **2026-10-22 re-anchor note (docs-only, checked against `signed/main` 4ea4f94).** The commands
+> below were written before C1 and C3. What changed, each checked in code:
+> - **`GET /xmr/swaps` (the list) no longer exists** (`bin/divi-swapd/src/routes.rs:222`: `/xmr/swaps` is
+>   POST only; the doc comment at `routes.rs:189` says "there is no listing"). The first, third and
+>   fourth `curl` lines below, and the `jq` over `.[]`, will not work. `GET /xmr/swaps/<id>` now needs
+>   the swap's `X-Swap-Token` header and answers 404 without it (`swap_token_gate`, `routes.rs:138`;
+>   C3, commit 92b933b). Use `journalctl` (state transitions) and the SQLite state in
+>   `/var/lib/divi-swapd` to list swaps; a supported operator command that replaces the list: could not verify.
+> - **`/healthz`, `/swaps`, `/swaps/<id>` still exist** (`routes.rs:212-216`).
+> - **New state** after C1: `reclaimed` (the maker used the `t_late` branch of `Tx_lock`, no cancel
+>   needed; `XmrMakerState`, `maker.rs:90-114`). The state diagram above predates it. `t_late` =
+>   `t_punish` + 3 h on the testnet profile (`late_after_secs`, `lib.rs:166-176`). The 6 h / 3 h /
+>   1 h times, `xmr_confirmations` 10 and `sigs_wait` 30 min (1800 s) are unchanged.
+> - **The maker no longer signs `Tx_punish`**; the taker signs her own. The "refund and punish paths
+>   are bound to the old key" wording under Keys holds for the refund path only.
+> - **`tools/swap-poc/redeploy-maker.sh` and `rollback-maker.sh` gate on `GET /xmr/swaps`**
+>   (`redeploy-maker.sh:176`). With no GET route that should be a 405 (not run), which the script treats as unreadable (the `*)`
+>   branch), so the gate refuses until the script is changed or `--force-inflight` is used. A script
+>   change is out of scope for this docs lane; see `status/engine.md`.
+> - `deploy.sh` lives at `deploy/divi-swapd/deploy.sh`, not under `tools/swap-poc/`.
+>
+> Checked and unchanged: flags `--check-only`, `--binary`, `--force-inflight` (`redeploy-maker.sh:15-18`),
+> `rollback-maker.sh`, `swap-watch.sh dry-run` (`deploy/divi-swapd/swap-watch/swap-watch.sh:25`),
+> `deploy.sh provision-secrets` (`deploy/divi-swapd/README.md:21`), the `xmr_keygen` example
+> (`crates/swap-chain-xmr/examples/xmr_keygen.rs`), config keys `sweep_address` and `divi_fund_txids`
+> (`bin/divi-swapd/src/config.rs:237,254`), the 18482 to 18480 tunnel (`redeploy-maker.sh:16-17`).
+
 ```sh
 ssh dnsdivi 'curl -s 127.0.0.1:18480/healthz | jq .'            # backends, wallet scan state
 ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps | jq ".[] | {id,state,last_error}"'
@@ -104,7 +131,7 @@ symlink, restart. Move it back to roll back.
 
 | Key | Where | Rotate |
 |---|---|---|
-| `maker-divi-xmr` (DIVI key that funds `Tx_lock`, signs refunds) | 1Password → `/etc/divi-swapd/credentials/` via `deploy.sh provision-secrets` | only with **no** XMR swap in flight: in-flight swaps' refund and punish paths are bound to the old key. Fund the new key's address and update `divi_fund_txids`. |
+| `maker-divi-xmr` (DIVI key that funds `Tx_lock`, signs refunds) | 1Password → `/etc/divi-swapd/credentials/` via `deploy.sh provision-secrets` (`deploy/divi-swapd/deploy.sh`, noted 2026-10-22) | only with **no** XMR swap in flight: in-flight swaps' refund and punish paths are bound to the old key. Fund the new key's address and update `divi_fund_txids`. |
 | maker XMR wallet (sweep target) | 1Password item "IronDivi Swap POC - maker-xmr-wallet-stagenet" (spend + view key, address) | generate a new one (`cargo run -p swap-chain-xmr --example xmr_keygen` on the build cluster, never the Mac; output piped straight into `op item create`, never to a file or the terminal); change `[xmr].sweep_address`; restart with nothing in `redeemed`. Sweep the old wallet's funds with `monero-wallet-cli --generate-from-keys`. |
 | `maker-xmr-wallet-rpc` | 1Password → credentials | `provision-secrets`, restart |
 

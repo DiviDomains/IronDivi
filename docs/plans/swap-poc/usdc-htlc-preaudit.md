@@ -113,7 +113,7 @@ On hp1 (anvil from the pinned image on `PATH`) `anvil_lock_claim`, `anvil_lock_r
 
 1. **CLI `balance` answered "needs --backend live" with the flag given — fixed.** Root cause:
    `bin/divi-swap/src/main.rs` `live_backends` returned `live: None` for `--counter-chain usdc` (the `Chain::Usdc` early
-   return, ~:497), and `Cmd::Balance` (~:676) treats `live: None` as "not the live backend" and bails with that
+   return, :556), and `Cmd::Balance` (:939) treats `live: None` as "not the live backend" and bails with that
    message. USDC has no `CounterLive` handle (it is an EVM account, not a UTXO address). Fix: `Cmd::Balance` takes its
    own arm for USDC-live (`is_usdc_live`), builds the `UsdcBackend` and prints address, ETH (wei) and token units via
    the existing `gas_and_token_balance`; `UsdcBackend::address()` added. Unit test
