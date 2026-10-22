@@ -199,6 +199,108 @@ impl XmrConfig {
         }
     }
 
+    /// The engine profile for a swap [`divi_swap::Profile`]: [`XmrConfig::testnet`] or
+    /// [`XmrConfig::mainnet`]. Selecting the mainnet numbers does not lift the runtime
+    /// mainnet refusal (`live::profile_for`, `xmr-mainnet-plan.md` phase D).
+    pub fn for_profile(profile: divi_swap::Profile) -> Self {
+        match profile {
+            divi_swap::Profile::Mainnet => Self::mainnet(),
+            _ => Self::testnet(),
+        }
+    }
+
+    /// Refuse a maker's quote whose terms are weaker than `self` (the taker's own floor):
+    /// the maker's quote carries `maker_timeout_secs = cancel_after_secs`,
+    /// `taker_timeout_secs = cancel_after_secs + punish_after_secs`, `btc_confirmations =
+    /// xmr_confirmations` and `divi_confirmations` (`maker.rs` `quote`). `Err` names the
+    /// term, the offered value and the floor.
+    pub fn check_quote_terms(&self, q: &divi_swap::api::Quote) -> std::result::Result<(), String> {
+        let refuse = |term: &str, offered: u64, min: u64| {
+            Err(format!(
+                "maker's {term} is {offered}, below the {min} floor of this taker's profile; \
+                 refusing the offer"
+            ))
+        };
+        let terms = [
+            (
+                "divi_confirmations",
+                q.divi_confirmations as u64,
+                self.divi_confirmations as u64,
+            ),
+            (
+                "btc_confirmations (xmr lock)",
+                q.btc_confirmations as u64,
+                self.xmr_confirmations as u64,
+            ),
+            (
+                "maker_timeout_secs (cancel_after_secs)",
+                q.maker_timeout_secs as u64,
+                self.cancel_after_secs as u64,
+            ),
+            (
+                "taker_timeout_secs (cancel_after_secs + punish_after_secs)",
+                q.taker_timeout_secs as u64,
+                self.cancel_after_secs as u64 + self.punish_after_secs as u64,
+            ),
+        ];
+        for (term, offered, min) in terms {
+            if offered < min {
+                return refuse(term, offered, min);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a maker's setup timelocks weaker than `self` (the taker's own floor), given the
+    /// DIVI median time past `mtp` the taker reads now. The maker set `t_cancel = mtp_setup +
+    /// cancel_after_secs`; the taker reads `mtp` after the `J` rounds, so `t_cancel` may have
+    /// lost up to `sigs_wait_secs` (the longest a setup is kept open) of that span. The
+    /// punish and late windows are exact differences.
+    pub fn check_setup_timelocks(
+        &self,
+        mtp: u32,
+        t_cancel: u32,
+        t_punish: u32,
+        t_late: u32,
+    ) -> std::result::Result<(), String> {
+        let slack = self.sigs_wait_secs.min(u32::MAX as u64) as u32;
+        let cancel_min = mtp
+            .saturating_add(self.cancel_after_secs)
+            .saturating_sub(slack);
+        let punish_min = t_cancel.saturating_add(self.punish_after_secs);
+        let late_min = t_punish.saturating_add(self.late_after_secs);
+        let refuse = |term: &str, offered: String, min: String| {
+            Err(format!(
+                "maker's {term} is {offered}, below the {min} floor of this taker's profile"
+            ))
+        };
+        if t_cancel < cancel_min {
+            return refuse(
+                "t_cancel",
+                format!("{}s after the DIVI MTP", t_cancel.saturating_sub(mtp)),
+                format!(
+                    "{}s",
+                    self.cancel_after_secs as u64 - slack.min(self.cancel_after_secs) as u64
+                ),
+            );
+        }
+        if t_punish < punish_min {
+            return refuse(
+                "t_punish − t_cancel",
+                format!("{}s", t_punish.saturating_sub(t_cancel)),
+                format!("{}s", self.punish_after_secs),
+            );
+        }
+        if t_late < late_min {
+            return refuse(
+                "t_late − t_punish",
+                format!("{}s", t_late.saturating_sub(t_punish)),
+                format!("{}s", self.late_after_secs),
+            );
+        }
+        Ok(())
+    }
+
     /// Smallest `redeem_margin_secs` under `t`: the taker completes `Tx_redeem` while
     /// `t_cancel` is more than the margin away, and it must be `divi_confirmations` deep
     /// before `Tx_cancel` becomes valid (a `Tx_cancel` mined first would let the maker refund
@@ -311,6 +413,134 @@ impl XmrConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quote_at(c: &XmrConfig) -> divi_swap::api::Quote {
+        divi_swap::api::Quote {
+            id: "q".into(),
+            offer_id: "o".into(),
+            direction: divi_swap::api::Direction::TakerPaysBtc,
+            counter_chain: divi_swap::Chain::Xmr,
+            btc_amount: divi_swap::Amount(1),
+            divi_amount: divi_swap::Amount(1),
+            expires_at: 0,
+            maker_btc_pubkey: [2; 33],
+            maker_divi_pubkey: [2; 33],
+            taker_timeout_secs: c.cancel_after_secs + c.punish_after_secs,
+            maker_timeout_secs: c.cancel_after_secs,
+            btc_confirmations: c.xmr_confirmations,
+            divi_confirmations: c.divi_confirmations,
+        }
+    }
+
+    const PROFILES: [divi_swap::Profile; 2] =
+        [divi_swap::Profile::Testnet, divi_swap::Profile::Mainnet];
+
+    #[test]
+    fn for_profile_selects_the_two_configs() {
+        assert_eq!(
+            XmrConfig::for_profile(divi_swap::Profile::Testnet),
+            XmrConfig::testnet()
+        );
+        assert_eq!(
+            XmrConfig::for_profile(divi_swap::Profile::Mainnet),
+            XmrConfig::mainnet()
+        );
+    }
+
+    #[test]
+    fn quote_terms_at_the_floor_or_stronger_are_accepted() {
+        for p in PROFILES {
+            let f = XmrConfig::for_profile(p);
+            let mut q = quote_at(&f);
+            f.check_quote_terms(&q).unwrap();
+            q.divi_confirmations += 1;
+            q.btc_confirmations += 1;
+            q.maker_timeout_secs += 60;
+            q.taker_timeout_secs += 60;
+            f.check_quote_terms(&q).unwrap();
+        }
+        // A testnet taker takes the stronger mainnet maker.
+        XmrConfig::testnet()
+            .check_quote_terms(&quote_at(&XmrConfig::mainnet()))
+            .unwrap();
+    }
+
+    #[test]
+    fn each_quote_term_below_the_floor_is_refused_per_profile() {
+        for p in PROFILES {
+            let f = XmrConfig::for_profile(p);
+            type Weaken = fn(&mut divi_swap::api::Quote);
+            let cases: [(&str, Weaken); 4] = [
+                ("divi_confirmations", |q| q.divi_confirmations -= 1),
+                ("btc_confirmations (xmr lock)", |q| q.btc_confirmations -= 1),
+                ("maker_timeout_secs", |q| q.maker_timeout_secs -= 1),
+                ("taker_timeout_secs", |q| q.taker_timeout_secs -= 1),
+            ];
+            for (term, weaken) in cases {
+                let mut q = quote_at(&f);
+                weaken(&mut q);
+                let e = f.check_quote_terms(&q).unwrap_err();
+                assert!(e.contains(term) && e.contains("below the"), "{p}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_testnet_maker_is_refused_by_a_mainnet_floor() {
+        let e = XmrConfig::mainnet()
+            .check_quote_terms(&quote_at(&XmrConfig::testnet()))
+            .unwrap_err();
+        assert!(e.contains("below the"), "{e}");
+    }
+
+    #[test]
+    fn setup_timelocks_at_the_floor_or_stronger_are_accepted() {
+        for p in PROFILES {
+            let f = XmrConfig::for_profile(p);
+            let mtp = 1_800_000_000;
+            let (c, pu) = (
+                mtp + f.cancel_after_secs,
+                mtp + f.cancel_after_secs + f.punish_after_secs,
+            );
+            f.check_setup_timelocks(mtp, c, pu, pu + f.late_after_secs)
+                .unwrap();
+            f.check_setup_timelocks(mtp, c + 1, pu + 2, pu + 2 + f.late_after_secs + 1)
+                .unwrap();
+            // The taker read its MTP up to sigs_wait_secs after the maker set t_cancel.
+            let later = mtp + f.sigs_wait_secs as u32;
+            f.check_setup_timelocks(later, c, pu, pu + f.late_after_secs)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn each_setup_timelock_below_the_floor_is_refused_per_profile() {
+        for p in PROFILES {
+            let f = XmrConfig::for_profile(p);
+            let mtp = 1_800_000_000u32;
+            let c = mtp + f.cancel_after_secs;
+            let pu = c + f.punish_after_secs;
+            let late = pu + f.late_after_secs;
+            let slack = f.sigs_wait_secs as u32;
+            // t_cancel just below mtp + cancel_after − slack
+            let e = f
+                .check_setup_timelocks(mtp, c - slack - 1, pu, late)
+                .unwrap_err();
+            assert!(e.contains("t_cancel"), "{p}: {e}");
+            let e = f.check_setup_timelocks(mtp, c, pu - 1, late).unwrap_err();
+            assert!(e.contains("t_punish"), "{p}: {e}");
+            let e = f.check_setup_timelocks(mtp, c, pu, late - 1).unwrap_err();
+            assert!(e.contains("t_late"), "{p}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_numbers_are_the_existing_ones() {
+        // This lane enforces the profiles' values; it must not move them.
+        assert_eq!(XmrConfig::testnet().cancel_after_secs, 6 * 3600);
+        assert_eq!(XmrConfig::testnet().punish_after_secs, 3 * 3600);
+        assert_eq!(XmrConfig::mainnet().cancel_after_secs, 43_200);
+    }
 
     #[test]
     fn mainnet_profile_pinned() {

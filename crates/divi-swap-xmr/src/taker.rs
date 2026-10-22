@@ -243,6 +243,9 @@ struct Keying {
 /// Taker engine for `counter_chain = "xmr"` quotes.
 pub struct XmrTaker {
     cfg: XmrConfig,
+    /// Terms every maker quote and setup must meet (`None`: taken as offered, `cfg`'s own
+    /// margins and window sizes still apply in `verify_setup`).
+    floor: Option<XmrConfig>,
     divi: Arc<dyn DiviChain>,
     xmr: Arc<dyn MoneroChain>,
     store: Store,
@@ -264,6 +267,7 @@ impl XmrTaker {
         cfg.validate()?;
         Ok(XmrTaker {
             cfg,
+            floor: None,
             divi,
             xmr,
             store,
@@ -272,6 +276,15 @@ impl XmrTaker {
             primes_fn: Arc::new(jsig::generate_primes),
             warm: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Refuse, in [`XmrTaker::prepare`] (before any key is generated or anything persisted)
+    /// and again in the setup check, maker terms weaker than `profile`'s own
+    /// ([`XmrConfig::for_profile`]): confirmation depths, `t_cancel`, `t_punish`, `t_late`.
+    /// Without it the taker takes the terms as offered.
+    pub fn with_profile_floor(mut self, profile: divi_swap::Profile) -> Self {
+        self.floor = Some(XmrConfig::for_profile(profile));
+        self
     }
 
     /// Replace the Paillier prime generator (tests hand out precomputed ones).
@@ -295,6 +308,10 @@ impl XmrTaker {
     pub async fn prepare(&self, quote: &Quote) -> Result<(String, SetupRequest)> {
         if quote.counter_chain != Chain::Xmr {
             return Err(SwapError::InvalidParams("not an xmr quote".into()));
+        }
+        if let Some(f) = &self.floor {
+            f.check_quote_terms(quote)
+                .map_err(SwapError::InvalidParams)?;
         }
         let (divi_key, s_t, proof, x_point, share, j_sid) = {
             let mut rng = rand::thread_rng();
@@ -504,6 +521,10 @@ impl XmrTaker {
             return Err(bad(
                 "timelocks leave no room to redeem, to punish, or to cancel before t_late",
             ));
+        }
+        if let Some(f) = &self.floor {
+            f.check_setup_timelocks(mtp, reply.t_cancel, reply.t_punish, reply.t_late)
+                .map_err(|e| bad(&e))?;
         }
         // Upper bounds: a maker must not be able to park the taker's XMR for years.
         if reply.t_cancel > mtp.saturating_add(crate::MAX_CANCEL_AFTER_SECS)

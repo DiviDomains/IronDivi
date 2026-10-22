@@ -91,6 +91,7 @@ Each trial records lock/claim/sweep txids the same way RESULTS.md does.
 
 ## Decision log
 
+- 2026-10-22: the XMR taker now refuses maker quotes and setups weaker than its own `--profile` floors (`XmrTaker::with_profile_floor`, `crates/divi-swap-xmr/src/taker.rs`) before any key or lock; no gate status, value or refusal changed.
 - 2026-10-21, Bert (via the Manager, 14:05Z): "if it is fixed, then revise it, no reason to list fixed
   problems. if it is fixed, why do you need me?" — Gate C lists only unfixed findings; C1, C2, C7, C8 moved
   to the Fixed table with their commits; C3–C6 remained open then (C3 and C6 fixed later the same day); acceptance is asked for only when a mainnet

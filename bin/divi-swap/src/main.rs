@@ -723,11 +723,12 @@ async fn xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     let divi = MockDiviChain::new(now, 60).wallet(8);
     let xmr = MockMoneroChain::new().wallet("taker", 10_000_000_000_000);
     Ok(divi_swap_xmr::XmrTaker::new(
-        divi_swap_xmr::XmrConfig::testnet(),
+        divi_swap_xmr::XmrConfig::for_profile(cli.profile),
         Arc::new(divi),
         Arc::new(xmr),
         Store::open(&cli.db)?,
-    )?)
+    )?
+    .with_profile_floor(cli.profile))
 }
 
 /// [`xmr_taker`]'s live engine.
@@ -808,7 +809,8 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
         Arc::new(divi),
         Arc::new(xmr),
         Store::open(&cli.db)?,
-    )?)
+    )?
+    .with_profile_floor(cli.profile))
 }
 
 /// `--counter-chain xmr`: the adaptor-swap taker (`divi_swap_cli::xmr_flow`).
