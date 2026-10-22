@@ -744,3 +744,22 @@
   `tools/swap-poc/usdc-live.sh --network sepolia --scenario happy --direction both`
   (it deploys the HTLC and funds the maker itself), then the `usdc-deploy.md` §2–§4
   maker config on dnsdivi with the deployed address, then `--scenario case-c`.
+
+## 2026-10-21 — mainnet network variants behind allow_mainnet (hp3, branch `lane/usdc-mainnet-wiring`)
+
+- **done:** `UsdcNetwork::Ethereum` (`"ethereum"`, chain 1) and `UsdcNetwork::Base` (`"base"`, chain 8453) with
+  `is_mainnet()`, Circle's native USDC addresses (source: developers.circle.com/stablecoins/usdc-contract-addresses)
+  and public default RPCs; `"mainnet"` still rejected, the error names the four accepted strings. Daemon:
+  `[usdc].allow_mainnet` (default off) plus the profile-agreement check. CLI: `--usdc-network ethereum|base`
+  requires `--allow-mainnet`, checked before any key or network use. Example config, deploy README and
+  `mainnet-readiness.md` §USDC/EVM updated.
+- **proof:** `cargo test -p swap-chain-evm -p divi-swapd -p divi-swap` 237 passed, 0 failed (230 before, +7);
+  fmt and `clippy -D warnings` clean. Read-only mainnet facts: ethereum height 26243153, base height 52911267,
+  USDC `decimals()` 6 / `symbol()` `USDC` on both. Daemon smoke logged `usdc backend ready` with zero balances
+  on both networks; the three gate refusals fired (see readiness doc).
+- **left:** no audited mainnet `Erc20Htlc` deployment; `check-usdc.sh` has one failing check that predates this
+  change (see STATUS); the CLI success-path smoke was not completed (`balance` answered "needs --backend live"
+  although the flag was given), the guard itself is unit-tested and the refusal run live.
+- **needs:** nothing from the human for this change.
+- **decisions:** only the networks `ethereum`/`base` are mainnets; a mainnet `[usdc]` under a testnet profile is
+  refused, but a testnet `[usdc]` under `profile = "mainnet"` is not (unlike `[zec]`), so existing mixed configs keep working.

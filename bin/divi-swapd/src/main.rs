@@ -337,7 +337,7 @@ async fn live_usdc(
         .await
         .map_err(|e| anyhow::anyhow!("usdc balance check: {e}"))?;
     tracing::info!(
-        %address, network = %cfg.network, htlc = %cfg.htlc, token = %token_str,
+        %address, network = %cfg.network, mainnet = cfg.network()?.is_mainnet(), htlc = %cfg.htlc, token = %token_str,
         %eth_wei, %usdc_units, "usdc backend ready"
     );
     let mut underfunded = Vec::new();
@@ -629,6 +629,7 @@ mod tests {
 
         let cfg = divi_swapd::UsdcSection {
             network: "sepolia".into(),
+            allow_mainnet: false,
             rpc_url: Some(endpoint.clone()),
             htlc: format!("{htlc}"),
             token: Some(format!("{token}")),

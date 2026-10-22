@@ -87,9 +87,10 @@ struct Cli {
     /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(long, global = true, default_value = "testnet")]
     zec_network: String,
-    /// Allow `--zec-network`, `--btc-network` or `--ltc-network` `mainnet`, which moves real
-    /// money. Off by default, mirroring `--xmr-allow-mainnet` (one shared flag for the
-    /// zec/btc/ltc arms; xmr keeps its own).
+    /// Allow `--zec-network`, `--btc-network`, `--ltc-network` or `--usdc-network` mainnet
+    /// (`mainnet`, or `ethereum`/`base` for usdc), which moves real money. Off by default,
+    /// mirroring `--xmr-allow-mainnet` (one shared flag for the zec/btc/ltc/usdc arms; xmr
+    /// keeps its own).
     #[arg(long, global = true)]
     allow_mainnet: bool,
     /// Swap timing profile the networks must agree with: `testnet` (default) or `mainnet`.
@@ -101,7 +102,8 @@ struct Cli {
     /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
     #[arg(long, global = true)]
     usdc_key: Option<String>,
-    /// Which EVM testnet: `sepolia` (default) or `base-sepolia`. Only picks defaults for
+    /// Which EVM network: `sepolia` (default), `base-sepolia`, or the mainnets `ethereum` and
+    /// `base` (only with `--allow-mainnet`). Only picks defaults for
     /// `--usdc-rpc-url`/`--usdc-token` below when they are left unset.
     #[arg(long, global = true, default_value = "sepolia")]
     usdc_network: String,
@@ -357,6 +359,12 @@ fn usdc_endpoints(cli: &Cli) -> Result<(swap_chain_evm::UsdcNetwork, String, Str
         .usdc_network
         .parse()
         .map_err(|e: String| anyhow::anyhow!("--usdc-network: {e}"))?;
+    if network.is_mainnet() && !cli.allow_mainnet {
+        bail!(
+            "--usdc-network {network} moves real money: no mainnet without the explicit \
+             --allow-mainnet opt-in"
+        );
+    }
     let rpc_url = cli
         .usdc_rpc_url
         .clone()
@@ -1125,6 +1133,36 @@ mod tests {
             swap_chain_evm::UsdcNetwork::BaseSepolia.default_rpc_url()
         );
         assert_eq!(token, swap_chain_evm::BASE_SEPOLIA_USDC);
+    }
+
+    #[test]
+    fn usdc_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        for net in ["ethereum", "base"] {
+            let e = usdc_endpoints(&cli(&["--usdc-network", net])).unwrap_err();
+            assert!(e.to_string().contains("--allow-mainnet"), "{net}: {e}");
+        }
+    }
+
+    #[test]
+    fn usdc_mainnet_with_allow_mainnet_returns_mainnet_defaults() {
+        for (net, want, token) in [
+            (
+                "ethereum",
+                swap_chain_evm::UsdcNetwork::Ethereum,
+                swap_chain_evm::ETHEREUM_USDC,
+            ),
+            (
+                "base",
+                swap_chain_evm::UsdcNetwork::Base,
+                swap_chain_evm::BASE_USDC,
+            ),
+        ] {
+            let (network, rpc_url, tok) =
+                usdc_endpoints(&cli(&["--usdc-network", net, "--allow-mainnet"])).unwrap();
+            assert_eq!(network, want);
+            assert_eq!(rpc_url, want.default_rpc_url());
+            assert_eq!(tok, token);
+        }
     }
 
     #[test]

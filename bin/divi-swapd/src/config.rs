@@ -119,14 +119,19 @@ impl LtcSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsdcSection {
-    /// Which EVM testnet this backend runs on: `"sepolia"` (default) or `"base-sepolia"`
-    /// (`swap_chain_evm::UsdcNetwork`). Only a label plus a source of defaults for
+    /// Which EVM network this backend runs on: `"sepolia"` (default), `"base-sepolia"`,
+    /// `"ethereum"` or `"base"` (`swap_chain_evm::UsdcNetwork`; the last two are mainnets and
+    /// need `allow_mainnet` below). Only a label plus a source of defaults for
     /// `rpc_url`/`token` below when they are left unset — the backend itself is
     /// network-agnostic, so setting both explicitly works on any EVM chain regardless of
     /// `network`. A single `[usdc]` section (and so a single `Chain::Usdc` backend) serves
     /// one network at a time; running both concurrently needs a second counter chain.
     #[serde(default = "default_usdc_network")]
     pub network: String,
+    /// Must be `true` for a mainnet `network` (`"ethereum"`, `"base"`), which moves real
+    /// money. Off by default, mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
     /// EVM JSON-RPC URL. Defaults to a free public endpoint for `network`.
     pub rpc_url: Option<String>,
     /// Deployed `Erc20Htlc` contract address.
@@ -627,7 +632,22 @@ impl DaemonConfig {
                 .map_err(|e| anyhow::anyhow!("bad secret reference: {e}"))?;
         }
         if let Some(u) = &self.usdc {
-            u.network()?;
+            let network = u.network()?;
+            if network.is_mainnet() && !u.allow_mainnet {
+                bail!(
+                    "[usdc].network = {:?}: usdc mainnet moves real money: no mainnet \
+                     without the explicit allow_mainnet opt-in (mainnet-readiness.md §USDC/EVM)",
+                    u.network
+                );
+            }
+            if network.is_mainnet() && self.profile != Profile::Mainnet {
+                bail!(
+                    "[usdc].network = {:?} disagrees with profile = {:?}: the swap timing \
+                     profile and the usdc backend must run on the same network",
+                    u.network,
+                    self.profile
+                );
+            }
         }
         if let Some(b) = &self.btc {
             self.validate_mainnet_gate("btc", &b.network, b.allow_mainnet, &["signet", "testnet"])?;
@@ -1106,6 +1126,66 @@ divi_fund_txids = ["ab"]
         let z = c.zec.unwrap();
         assert_eq!(z.network, "mainnet");
         assert!(z.allow_mainnet);
+    }
+
+    const USDC_KEY: &str =
+        "key = \"credential:maker-usdc\"\nhtlc = \"0x1111111111111111111111111111111111111111\"\n";
+
+    #[test]
+    fn usdc_section_defaults_to_sepolia_with_mainnet_off() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[usdc]\n{USDC_KEY}")).unwrap();
+        let u = c.usdc.unwrap();
+        assert_eq!(u.network, "sepolia");
+        assert!(
+            !u.allow_mainnet,
+            "mainnet must stay off unless the config says so"
+        );
+        assert!(!u.network().unwrap().is_mainnet());
+    }
+
+    #[test]
+    fn usdc_mainnet_without_allow_is_rejected() {
+        for net in ["ethereum", "base"] {
+            // Even with the matching profile: the opt-in is a separate gate.
+            let text = format!(
+                "profile = \"mainnet\"\n{}\n[usdc]\nnetwork = \"{net}\"\n{USDC_KEY}",
+                good_mainnet_btc()
+            );
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("no mainnet without the explicit allow_mainnet"),
+                "{net}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn usdc_mainnet_with_allow_and_matching_profile_is_ok() {
+        for net in ["ethereum", "base"] {
+            let text = format!(
+                "profile = \"mainnet\"\n{}\n[usdc]\nnetwork = \"{net}\"\n\
+                 allow_mainnet = true\n{USDC_KEY}",
+                good_mainnet_btc()
+            );
+            let u = DaemonConfig::parse(&text).unwrap().usdc.unwrap();
+            assert_eq!(u.network, net);
+            assert!(u.allow_mainnet && u.network().unwrap().is_mainnet());
+        }
+    }
+
+    #[test]
+    fn usdc_mainnet_disagreeing_with_profile_is_rejected() {
+        for net in ["ethereum", "base"] {
+            // Default profile is testnet; an allowed mainnet [usdc] section disagrees.
+            let text =
+                format!("{GOOD}\n[usdc]\nnetwork = \"{net}\"\nallow_mainnet = true\n{USDC_KEY}");
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string().contains("disagrees with profile"),
+                "{net}: {e}"
+            );
+        }
     }
 
     #[test]

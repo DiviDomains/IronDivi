@@ -31,11 +31,13 @@ esplora_url = "https://litecoinspace.org/testnet/api"
 key = "credential:maker-btc"
 
 [usdc]
-# network defaults to "sepolia" if omitted; "base-sepolia" is the only other option
-# (swap_chain_evm::UsdcNetwork). It only picks defaults for rpc_url/token below when they
+# network defaults to "sepolia" if omitted. Options (swap_chain_evm::UsdcNetwork):
+# "sepolia", "base-sepolia" (testnets) and "ethereum", "base" (MAINNETS, real money: need
+# allow_mainnet = true below and a matching top-level profile = "mainnet"). It only picks defaults for rpc_url/token below when they
 # are left unset — a single [usdc] section (one Chain::Usdc backend) serves one EVM network
 # at a time, so switching network here moves the whole backend, it doesn't add a second one.
 network = "sepolia"
+# allow_mainnet = false      # default; mainnet moves real money — off until a reviewed mainnet cutover
 rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
 # Placeholder until Erc20Htlc is deployed to Sepolia (orchestrator, funded key) — fill in
 # the real address before enabling a usdc offer.

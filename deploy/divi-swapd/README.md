@@ -32,6 +32,9 @@ edit.
 and with `esplora_url` unset the mainnet endpoints come from the crate defaults.
 `profile` (default `testnet`) must agree with every configured coin section (`[btc]`, `[ltc]`, `[zec]`, `[xmr]`, `[usdc]`): a mainnet profile with a test network, a mainnet network without `allow_mainnet`, or a testnet profile with a mainnet network is refused at config load.
 
+`[usdc].network` defaults to `sepolia`; the mainnets `ethereum` and `base` likewise need
+`allow_mainnet = true` and a matching top-level `profile = "mainnet"`.
+
 ## Secrets
 
 Keys never touch disk locally or argv. `provision-secrets` runs `op read` and pipes the value
