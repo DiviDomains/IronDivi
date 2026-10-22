@@ -14,7 +14,7 @@
 //! Manages unconfirmed transactions waiting to be included in blocks.
 
 use crate::config::MempoolConfig;
-use crate::error::NodeError;
+use crate::error::{reject, NodeError};
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::Transaction;
@@ -109,6 +109,23 @@ impl Ord for PriorityEntry {
 /// Listener notified when a transaction enters or leaves the mempool
 pub type MempoolListener = Arc<dyn Fn(&Transaction) + Send + Sync>;
 
+/// Returns the current chain tip height
+pub type TipHeightProvider = Arc<dyn Fn() -> u32 + Send + Sync>;
+
+/// Divi Core `IsFinalTx` as used by the mempool (MempoolConsensus.cpp): a height
+/// lock is compared with the next block's height and a time lock with the
+/// current time.
+pub fn is_final_for_next_block(tx: &Transaction, tip_height: u32, now: u32) -> bool {
+    tx.is_final(tip_height.saturating_add(1), now)
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -134,6 +151,9 @@ pub struct Mempool {
 
     /// Called after a transaction is removed for any reason (outside any mempool lock)
     on_removed: RwLock<Option<MempoolListener>>,
+
+    /// Chain tip height, for the finality of height-locked transactions
+    tip_height: RwLock<Option<TipHeightProvider>>,
 }
 
 impl Mempool {
@@ -148,6 +168,21 @@ impl Mempool {
             priority_deltas: RwLock::new(HashMap::new()),
             on_added: RwLock::new(None),
             on_removed: RwLock::new(None),
+            tip_height: RwLock::new(None),
+        }
+    }
+
+    /// Register the chain tip height source used for finality checks
+    pub fn set_tip_height_provider(&self, provider: TipHeightProvider) {
+        *self.tip_height.write() = Some(provider);
+    }
+
+    /// Height of the chain tip. Without a provider every height lock counts as
+    /// not yet reached.
+    fn tip_height(&self) -> u32 {
+        match self.tip_height.read().as_ref() {
+            Some(provider) => provider(),
+            None => 0,
         }
     }
 
@@ -187,7 +222,8 @@ impl Mempool {
         *self.total_size.read()
     }
 
-    /// Add a transaction to the mempool
+    /// Add a transaction to the mempool. Policy refusals are
+    /// `NodeError::TxRejected` with Divi Core's reject code and reason.
     pub fn add(&self, tx: Transaction, fee: Amount) -> Result<Hash256, NodeError> {
         let entry = MempoolEntry::new(tx.clone(), fee);
         let txid = entry.txid;
@@ -197,6 +233,11 @@ impl Mempool {
             return Ok(txid);
         }
 
+        // A transaction that cannot be in the next block is not accepted or relayed
+        if !is_final_for_next_block(&tx, self.tip_height(), unix_now()) {
+            return Err(NodeError::NonFinal);
+        }
+
         // Check size limits
         let new_size = *self.total_size.read() + entry.size;
         if new_size > self.config.max_size {
@@ -204,11 +245,26 @@ impl Mempool {
             self.evict_for_space(entry.size)?;
         }
 
+        // Divi Core AcceptToMemoryPool: block-reward transactions are only
+        // valid inside a block
+        if tx.is_coinbase() {
+            return Err(rejected(reject::INVALID, "coinbase"));
+        }
+        if tx.is_coinstake() {
+            return Err(rejected(reject::INVALID, "coinstake"));
+        }
+
         // Check fee rate
         if entry.fee_rate < self.config.min_relay_fee as f64 {
-            return Err(NodeError::TransactionValidation(
-                "Fee rate below minimum relay fee".into(),
-            ));
+            return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient fee"));
+        }
+
+        // Divi Core IsStandard: a transaction with a dust output is not relayed by
+        // any node, so it is not accepted here either. Locally created sends must
+        // not reach the wallet through the mempool when the network will refuse them.
+        let relay_fee_per_kb = self.config.min_relay_fee * 1000;
+        if tx.vout.iter().any(|out| out.is_dust_at(relay_fee_per_kb)) {
+            return Err(rejected(reject::NONSTANDARD, "dust"));
         }
 
         // Check for conflicts (double spends)
@@ -285,11 +341,84 @@ impl Mempool {
         Some(entry)
     }
 
-    /// Remove transactions that are now confirmed in a block
+    /// Remove transactions that are now confirmed in a block, then any that
+    /// can no longer be mined in the next block (after a reorg to a lower tip)
     pub fn remove_for_block(&self, txids: &[Hash256]) {
         for txid in txids {
             self.remove(txid);
         }
+        self.remove_non_final();
+    }
+
+    /// Remove transactions that are not final for the next block, together
+    /// with the mempool transactions that spend their outputs
+    pub fn remove_non_final(&self) -> usize {
+        let tip_height = self.tip_height();
+        let now = unix_now();
+        let mut to_remove: Vec<Hash256> = self
+            .txs
+            .read()
+            .values()
+            .filter(|entry| !is_final_for_next_block(&entry.tx, tip_height, now))
+            .map(|entry| entry.txid)
+            .collect();
+
+        let mut removed = 0;
+        while let Some(txid) = to_remove.pop() {
+            if let Some(entry) = self.remove(&txid) {
+                removed += 1;
+                let spenders = self.spenders.read();
+                for vout in 0..entry.tx.vout.len() as u32 {
+                    if let Some(child) = spenders.get(&(txid, vout)) {
+                        to_remove.push(*child);
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            tracing::info!("Removed {} non-final transaction(s) from mempool", removed);
+        }
+        removed
+    }
+
+    /// Remove transactions that spend a coin also spent by one of a connected
+    /// block's transactions, together with their descendants. They can never
+    /// confirm; left in place they kept a double spend in the local mempool
+    /// (and the wallet's pending view) forever. Returns how many were removed.
+    pub fn remove_conflicts(&self, block_txs: &[Transaction]) -> usize {
+        let mut doomed: Vec<Hash256> = {
+            let spenders = self.spenders.read();
+            block_txs
+                .iter()
+                .flat_map(|tx| {
+                    let txid = tx.txid();
+                    tx.vin
+                        .iter()
+                        .filter_map(|input| {
+                            spenders
+                                .get(&(input.prevout.txid, input.prevout.vout))
+                                .copied()
+                        })
+                        .filter(move |spender| *spender != txid)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut removed = 0;
+        while let Some(txid) = doomed.pop() {
+            if let Some(entry) = self.remove(&txid) {
+                removed += 1;
+                tracing::info!("Removed tx {} from mempool: conflicts with a block", txid);
+                let spenders = self.spenders.read();
+                for vout in 0..entry.tx.vout.len() as u32 {
+                    if let Some(child) = spenders.get(&(txid, vout)) {
+                        doomed.push(*child);
+                    }
+                }
+            }
+        }
+        removed
     }
 
     /// Get transactions for a new block, sorted by fee rate
@@ -458,8 +587,16 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
         self.get_txids()
     }
 
+    fn get_transaction(&self, txid: &Hash256) -> Option<Transaction> {
+        self.get(txid).map(|entry| entry.tx)
+    }
+
     fn prioritise_transaction(&self, txid: &Hash256, priority_delta: f64, fee_delta: i64) -> bool {
         self.prioritise_transaction(txid, priority_delta, fee_delta)
+    }
+
+    fn is_spent(&self, outpoint: &divi_primitives::transaction::OutPoint) -> bool {
+        self.is_spent(&outpoint.txid, outpoint.vout)
     }
 
     fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
@@ -530,6 +667,13 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
     }
 }
 
+fn rejected(code: u8, reason: &str) -> NodeError {
+    NodeError::TxRejected {
+        code,
+        reason: reason.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +702,124 @@ mod tests {
             )],
             lock_time: 0,
         }
+    }
+
+    fn locked_tx(prevout_txid: [u8; 32], lock_time: u32, sequence: u32) -> Transaction {
+        let mut tx = create_test_tx(prevout_txid, 1);
+        tx.lock_time = lock_time;
+        tx.vin[0].sequence = sequence;
+        tx
+    }
+
+    fn mempool_at_height(height: Arc<std::sync::atomic::AtomicU32>) -> Mempool {
+        let mempool = Mempool::new(test_config());
+        mempool.set_tip_height_provider(Arc::new(move || {
+            height.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        mempool
+    }
+
+    #[test]
+    fn test_non_final_time_locked_tx_rejected() {
+        // a tx time-locked far in the future with a non-final input
+        // must not enter the mempool (Divi Core: -26 "64: non-final").
+        let mempool = Mempool::new(test_config());
+        let tx = locked_tx([7u8; 32], 4_000_000_000, 0);
+        let result = mempool.add(tx, Amount::from_sat(10000));
+        let err = result.expect_err("non-final tx was accepted").to_string();
+        assert_eq!(err, "64: non-final");
+        assert_eq!(mempool.size(), 0);
+    }
+
+    #[test]
+    fn test_locked_tx_with_final_sequences_accepted() {
+        // All inputs final means the lock time is ignored
+        let mempool = Mempool::new(test_config());
+        let tx = locked_tx([8u8; 32], 4_000_000_000, SEQUENCE_FINAL);
+        assert!(mempool.add(tx, Amount::from_sat(10000)).is_ok());
+    }
+
+    #[test]
+    fn test_past_time_lock_accepted() {
+        let mempool = Mempool::new(test_config());
+        let tx = locked_tx([9u8; 32], 600_000_000, 0);
+        assert!(mempool.add(tx, Amount::from_sat(10000)).is_ok());
+    }
+
+    #[test]
+    fn test_height_locked_tx_waits_for_next_block() {
+        let height = Arc::new(std::sync::atomic::AtomicU32::new(199));
+        let mempool = mempool_at_height(Arc::clone(&height));
+        let tx = locked_tx([10u8; 32], 200, 0);
+
+        // Next block is 200: lock 200 is not below it yet
+        assert!(matches!(
+            mempool.add(tx.clone(), Amount::from_sat(10000)),
+            Err(NodeError::NonFinal)
+        ));
+
+        height.store(200, std::sync::atomic::Ordering::SeqCst);
+        assert!(mempool.add(tx, Amount::from_sat(10000)).is_ok());
+    }
+
+    #[test]
+    fn test_reorg_evicts_non_final_tx_and_its_spender() {
+        let height = Arc::new(std::sync::atomic::AtomicU32::new(300));
+        let mempool = mempool_at_height(Arc::clone(&height));
+        let parent = locked_tx([11u8; 32], 250, 0);
+        let parent_txid = mempool.add(parent, Amount::from_sat(10000)).unwrap();
+        let child = create_test_tx(*parent_txid.as_bytes(), 1);
+        mempool.add(child, Amount::from_sat(10000)).unwrap();
+        let unrelated = mempool
+            .add(create_test_tx([12u8; 32], 1), Amount::from_sat(10000))
+            .unwrap();
+        assert_eq!(mempool.size(), 3);
+
+        // Reorg to a chain whose tip is below the lock height
+        height.store(240, std::sync::atomic::Ordering::SeqCst);
+        mempool.remove_for_block(&[]);
+
+        assert_eq!(mempool.size(), 1);
+        assert!(mempool.contains(&unrelated));
+        assert!(!mempool.contains(&parent_txid));
+    }
+
+    #[test]
+    fn test_mempool_refuses_dust_output() {
+        // Default relay fee (10 sat/byte): Divi Core's dust limit is 5460 sat for P2PKH
+        let mempool = Mempool::new(MempoolConfig::default());
+        let mut tx = create_test_tx([9u8; 32], 1);
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(5459),
+            Script::new_p2pkh(&[1u8; 20]),
+        ));
+        assert!(matches!(
+            mempool.add(tx.clone(), Amount::from_sat(100_000)),
+            Err(NodeError::TxRejected { code: 0x40, ref reason }) if reason == "dust"
+        ));
+        assert_eq!(mempool.size(), 0);
+
+        tx.vout[1].value = Amount::from_sat(5460);
+        assert!(mempool.add(tx, Amount::from_sat(100_000)).is_ok());
+    }
+
+    #[test]
+    fn test_mempool_rejects_with_divi_core_codes() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        // 1 sat for ~85 bytes is below 10 sat/byte
+        let tx = create_test_tx([8u8; 32], 1);
+        assert!(matches!(
+            mempool.add(tx, Amount::from_sat(1)),
+            Err(NodeError::TxRejected { code: 0x42, ref reason }) if reason == "insufficient fee"
+        ));
+        // A coinstake is only valid in a block
+        let mut stake = create_test_tx([7u8; 32], 1);
+        stake.vout.insert(0, TxOut::empty());
+        assert!(stake.is_coinstake());
+        assert!(matches!(
+            mempool.add(stake, Amount::from_sat(100_000)),
+            Err(NodeError::TxRejected { code: 0x10, ref reason }) if reason == "coinstake"
+        ));
     }
 
     #[test]
@@ -821,6 +1083,30 @@ mod tests {
         assert!(!mempool.contains(&txid1));
         assert!(!mempool.contains(&txid2));
         assert!(mempool.contains(&txid3));
+    }
+
+    #[test]
+    fn remove_conflicts_drops_double_spends_of_block_inputs() {
+        let mempool = Mempool::new(test_config());
+
+        // `stale` spends coin [1; 32] in the mempool, `child` spends `stale`;
+        // `other` spends an unrelated coin
+        let stale = create_test_tx([1u8; 32], 50);
+        let child = create_test_tx(stale.txid().as_bytes().to_owned(), 40);
+        let other = create_test_tx([2u8; 32], 50);
+        mempool.add(stale.clone(), Amount::from_sat(10000)).unwrap();
+        mempool.add(child.clone(), Amount::from_sat(10000)).unwrap();
+        mempool.add(other.clone(), Amount::from_sat(10000)).unwrap();
+
+        // A block spends coin [1; 32] with a different tx (e.g. a coinstake)
+        let winner = create_test_tx([1u8; 32], 49);
+        mempool.remove_for_block(&[winner.txid()]);
+        assert_eq!(mempool.remove_conflicts(&[winner]), 2);
+
+        assert!(!mempool.contains(&stale.txid()));
+        assert!(!mempool.contains(&child.txid()));
+        assert!(mempool.contains(&other.txid()));
+        assert!(!mempool.is_spent(&Hash256::from_bytes([1u8; 32]), 0));
     }
 
     #[test]

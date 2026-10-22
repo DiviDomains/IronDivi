@@ -67,4 +67,24 @@ pub enum NodeError {
     /// Transaction validation error
     #[error("transaction validation failed: {0}")]
     TransactionValidation(String),
+
+    /// The mempool refused a transaction, with Divi Core's reject code and
+    /// reason (e.g. 64 "dust", 66 "insufficient fee")
+    #[error("{code}: {reason}")]
+    TxRejected { code: u8, reason: String },
+
+    /// A transaction spends a coin that is neither in the chain nor the mempool
+    #[error("missing inputs")]
+    MissingInputs,
+
+    /// Transaction cannot be mined in the next block (Divi Core reject code 64)
+    #[error("64: non-final")]
+    NonFinal,
+}
+
+/// Divi Core reject codes (defaultValues.h)
+pub mod reject {
+    pub const INVALID: u8 = 0x10;
+    pub const NONSTANDARD: u8 = 0x40;
+    pub const INSUFFICIENT_FEE: u8 = 0x42;
 }

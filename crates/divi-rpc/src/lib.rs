@@ -48,6 +48,7 @@
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+pub mod auth_cookie;
 pub mod blockchain;
 pub mod error;
 pub mod lite_wallet;
@@ -61,6 +62,7 @@ pub mod staking;
 pub mod wallet;
 pub mod websocket;
 
+pub use auth_cookie::{resolve_rpc_auth, AuthCookie, COOKIE_AUTH_USER};
 pub use blockchain::{BlockFetcher, BlockchainRpc};
 pub use error::{Error, RpcError};
 pub use lite_wallet::LiteWalletRpc;
@@ -68,10 +70,11 @@ pub use masternode::MasternodeRpc;
 pub use network::NetworkRpc;
 pub use protocol::{Params, Request, RequestId, Response};
 pub use server::{
-    create_router, start_server, start_server_with_peer_manager,
+    create_router_with_auth, start_server, start_server_with_peer_manager,
     start_server_with_peer_manager_and_setup, start_server_with_wallet_and_peer_manager,
     start_server_with_wallet_peer_and_staker, LogConfigInfo, RpcConfig, RpcServer,
+    ShutdownCallback,
 };
 pub use staking::{StakingInfo, StakingRpc};
-pub use wallet::WalletRpc;
+pub use wallet::{TxSubmitError, WalletRpc};
 pub use websocket::{ws_handler, Notification, NotificationHub, WsState};

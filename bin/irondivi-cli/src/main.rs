@@ -109,7 +109,8 @@ CONFIGURATION:
   /privatedivi and /testnet or /regtest as for irondivid)/irondivi.conf.
   Falls back to the Divi Core file: ~/.divi/divi.conf, or
   ~/.privatedivi/privatedivi.conf with --mode privatedivi
-  Cookie auth from the Core directory (or --datadir) is used if no rpcuser/rpcpassword
+  Without rpcuser/rpcpassword the .cookie file is used: <datadir>/.cookie (irondivid),
+  else irondivid's default data dir, else the Divi Core directory
 
 EXIT CODES:
   0   Success
@@ -168,7 +169,9 @@ struct Args {
     #[arg(long)]
     stdinrpcpass: bool,
 
-    /// Read wallet passphrase from stdin
+    /// Read the wallet passphrase from stdin (one line; for walletpassphrasechange
+    /// the old then the new passphrase on two lines) for walletpassphrase,
+    /// walletpassphrasechange and encryptwallet. Not echoed when stdin is a terminal.
     #[arg(long)]
     stdinwalletpassphrase: bool,
 
@@ -452,21 +455,41 @@ fn read_config(path: &Path, network: &str) -> Config {
     config
 }
 
-/// Read cookie file for authentication
-fn read_cookie(base: &Path, network: &str) -> Option<(String, String)> {
-    use std::fs;
+/// The cookie irondivid writes in its own data directory (`--datadir`, or
+/// its default per mode and network).
+fn irondivi_cookie_path(
+    home: &Path,
+    datadir: Option<&Path>,
+    privatedivi: bool,
+    network: &str,
+) -> PathBuf {
+    match datadir {
+        Some(dir) => dir.join(".cookie"),
+        None => irondivi_data_dir(home, privatedivi, network).join(".cookie"),
+    }
+}
 
-    let path = match network {
+/// The cookie of a Divi Core-style node: a network subdirectory of
+/// `--datadir`, or of the Core directory.
+fn core_cookie_path(
+    home: &Path,
+    datadir: Option<&Path>,
+    privatedivi: bool,
+    network: &str,
+) -> PathBuf {
+    let base = datadir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| chain_home(home, privatedivi));
+    match network {
         "testnet" => base.join("testnet3").join(".cookie"),
         "regtest" => base.join("regtest").join(".cookie"),
         _ => base.join(".cookie"),
-    };
-
-    if !path.exists() {
-        return None;
     }
+}
 
-    let contents = fs::read_to_string(&path).ok()?;
+/// Read cookie file for authentication
+fn read_cookie(path: &Path) -> Option<(String, String)> {
+    let contents = std::fs::read_to_string(path).ok()?;
     let (user, pass) = contents.trim().split_once(':')?;
     Some((user.to_string(), pass.to_string()))
 }
@@ -481,6 +504,17 @@ fn handle_stdin(args: &mut Args) -> Result<(), CliError> {
             .read_line(&mut pass)
             .map_err(|e| CliError::General(e.to_string()))?;
         args.rpcpassword = Some(pass.trim().to_string());
+    }
+
+    // Then the wallet passphrase(s), inserted as the method's first argument(s)
+    if args.stdinwalletpassphrase {
+        let method = args.args.first().map(String::as_str).unwrap_or("");
+        let stdin = io::stdin();
+        let terminal = io::IsTerminal::is_terminal(&stdin);
+        let passphrases = read_wallet_passphrases(method, &mut stdin.lock(), terminal)?;
+        for (i, passphrase) in passphrases.into_iter().enumerate() {
+            args.args.insert(1 + i, passphrase);
+        }
     }
 
     // Then read remaining lines for command args
@@ -498,6 +532,226 @@ fn handle_stdin(args: &mut Args) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Wallet passphrases `method` takes as its first arguments
+fn wallet_passphrase_count(method: &str) -> Option<usize> {
+    match method {
+        "walletpassphrase" | "encryptwallet" => Some(1),
+        "walletpassphrasechange" => Some(2),
+        _ => None,
+    }
+}
+
+/// Which positional arguments are JSON (numbers, booleans, arrays, objects),
+/// per method, as bitcoin-cli's and PIVX's `vRPCConvertParams`. Divi Core 3.0.0's
+/// divi-cli dropped its table and parses every argument as JSON when it can,
+/// which turns a label, account, comment or passphrase like "1234" or "true" into
+/// a number or boolean that the server then refuses. The positions here follow
+/// what each IronDivi handler reads as a number, boolean, amount, array or
+/// object; every other argument of a listed method is sent as a string.
+const CONVERT_PARAMS: &[(&str, &[usize])] = &[
+    // blockchain
+    ("getblockcount", &[]),
+    ("getbestblockhash", &[]),
+    ("getblockhash", &[0]),
+    ("getblock", &[1]),
+    ("getblockheader", &[1]),
+    ("getblockchaininfo", &[]),
+    ("getinfo", &[]),
+    ("getchaintips", &[]),
+    ("invalidateblock", &[]),
+    ("reconsiderblock", &[]),
+    ("reverseblocktransactions", &[]),
+    ("getdifficulty", &[]),
+    ("gettxoutsetinfo", &[]),
+    ("getrawmempool", &[0]),
+    ("prioritisetransaction", &[1, 2]),
+    ("gettxout", &[1, 2]),
+    ("decodescript", &[]),
+    ("verifychain", &[0, 1]),
+    ("getmininginfo", &[]),
+    ("getaddressdeltas", &[0, 1]),
+    ("getaddresstxids", &[0, 1]),
+    ("getspentinfo", &[0]),
+    ("generateblock", &[0]),
+    ("setgenerate", &[0, 1]),
+    ("getlotteryblockwinners", &[0]),
+    // network
+    ("getnetworkinfo", &[]),
+    ("getpeerinfo", &[]),
+    ("getconnectioncount", &[]),
+    ("ping", &[]),
+    ("getnettotals", &[]),
+    ("addnode", &[]),
+    ("getaddednodeinfo", &[0]),
+    ("setban", &[2, 3]),
+    ("ban", &[]),
+    ("setmocktime", &[0]),
+    ("getinvalid", &[]),
+    ("listbanned", &[]),
+    ("clearbanned", &[]),
+    ("disconnectnode", &[]),
+    ("getpeerscores", &[]),
+    // wallet
+    ("getnewaddress", &[]),
+    ("getrawchangeaddress", &[]),
+    ("validateaddress", &[]),
+    ("getaddressinfo", &[]),
+    ("getbalance", &[0, 1, 2]),
+    ("getunconfirmedbalance", &[]),
+    ("getimmaturebalance", &[]),
+    ("getwalletinfo", &[]),
+    ("listunspent", &[0, 1, 2]),
+    ("gettransaction", &[1]),
+    ("listtransactions", &[1, 2, 3]),
+    ("listsinceblock", &[1, 2]),
+    ("walletpassphrase", &[1, 2]),
+    ("walletpassphrasechange", &[]),
+    ("encryptwallet", &[]),
+    ("walletlock", &[]),
+    ("dumpprivkey", &[]),
+    ("dumphdinfo", &[]),
+    ("importprivkey", &[2]),
+    ("importaddress", &[2, 3]),
+    ("rescanblockchain", &[0, 1]),
+    ("sendtoaddress", &[1]),
+    ("sendfrom", &[2, 3]),
+    ("sendmany", &[1, 2, 4]),
+    ("getaddressesbylabel", &[]),
+    ("listreceivedbyaddress", &[0, 1, 2]),
+    ("getreceivedbyaddress", &[1]),
+    ("backupwallet", &[]),
+    ("signmessage", &[]),
+    ("verifymessage", &[]),
+    ("createmultisig", &[0, 1]),
+    ("addmultisigaddress", &[0, 1]),
+    ("getaccount", &[]),
+    ("setaccount", &[]),
+    ("getaccountaddress", &[]),
+    ("getaddressesbyaccount", &[]),
+    ("listaccounts", &[0, 1]),
+    ("getreceivedbyaccount", &[1]),
+    ("listreceivedbyaccount", &[0, 1, 2]),
+    ("keypoolrefill", &[0]),
+    ("getkeypoolsize", &[]),
+    ("loadwallet", &[]),
+    ("allocatefunds", &[1]),
+    ("listlockunspent", &[]),
+    ("lockunspent", &[0, 1]),
+    // raw transactions
+    ("createrawtransaction", &[0, 1]),
+    ("signrawtransaction", &[1, 2]),
+    ("signrawtransactionwithwallet", &[1, 2]),
+    ("signtransactionwithaddresskey", &[2]),
+    ("sendrawtransaction", &[1]),
+    ("getrawtransaction", &[1]),
+    ("decoderawtransaction", &[]),
+    // staking
+    ("getstakingstatus", &[]),
+    ("getmintinginfo", &[]),
+    ("setstaking", &[0]),
+    ("reservebalance", &[0, 1]),
+    // address index / lite wallet
+    ("getaddressbalance", &[0, 1]),
+    ("getaddressutxos", &[0, 1, 2]),
+    ("getaddresshistory", &[0, 1, 2]),
+    ("gettxindex", &[]),
+    ("estimatefee", &[0]),
+    ("estimatesmartfee", &[0]),
+    ("estimatepriority", &[0]),
+    ("getmempoolinfo", &[]),
+    ("validateaddresses", &[0]),
+    ("getlitewalletinfo", &[]),
+    // masternodes and sporks
+    ("getmasternodecount", &[]),
+    ("getmasternodestatus", &[]),
+    ("getmasternodewinners", &[0]),
+    ("listmasternodes", &[]),
+    ("setupmasternode", &[]),
+    ("startmasternode", &[]),
+    ("broadcaststartmasternode", &[]),
+    ("signmnbroadcast", &[]),
+    ("importmnbroadcast", &[]),
+    ("listmnbroadcasts", &[]),
+    ("verifymasternodesetup", &[]),
+    ("mnsync", &[]),
+    ("spork", &[1]),
+    // vaults
+    ("addvault", &[]),
+    ("removevault", &[]),
+    ("getcoinavailability", &[0]),
+    ("fundvault", &[1]),
+    ("debitvaultbyname", &[2]),
+    ("reclaimvaultfunds", &[1]),
+    // node
+    ("getlogconfig", &[]),
+    ("setlogconfig", &[0]),
+    ("help", &[]),
+    ("stop", &[]),
+];
+
+/// Whether argument `index` of `method` is sent as JSON. Methods missing from
+/// `CONVERT_PARAMS` keep the old behaviour: every argument that parses as JSON.
+fn converts_param(method: &str, index: usize) -> bool {
+    CONVERT_PARAMS
+        .iter()
+        .find(|(m, _)| *m == method)
+        .is_none_or(|(_, positions)| positions.contains(&index))
+}
+
+/// `--stdinwalletpassphrase` (bitcoin-cli `-stdinwalletpassphrase`): read one
+/// passphrase per line, prompting on stderr with echo off when `terminal`.
+fn read_wallet_passphrases(
+    method: &str,
+    input: &mut impl BufRead,
+    terminal: bool,
+) -> Result<Vec<String>, CliError> {
+    let count = wallet_passphrase_count(method).ok_or_else(|| {
+        CliError::InvalidParams(
+            "--stdinwalletpassphrase is only applicable for walletpassphrase, \
+             walletpassphrasechange and encryptwallet"
+                .to_string(),
+        )
+    })?;
+    let prompts = if count == 2 {
+        ["Old wallet passphrase> ", "New wallet passphrase> "].as_slice()
+    } else {
+        ["Wallet passphrase> "].as_slice()
+    };
+    let mut passphrases = Vec::with_capacity(count);
+    for prompt in prompts {
+        if terminal {
+            eprint!("{}", prompt);
+            set_terminal_echo(false);
+        }
+        let mut line = String::new();
+        let read = input.read_line(&mut line);
+        if terminal {
+            set_terminal_echo(true);
+            eprintln!();
+        }
+        let n = read.map_err(|e| CliError::General(e.to_string()))?;
+        if n == 0 {
+            return Err(CliError::General(
+                "--stdinwalletpassphrase specified but failed to read from standard input"
+                    .to_string(),
+            ));
+        }
+        // Only the line ending is removed: spaces belong to the passphrase
+        let len = line.trim_end_matches(['\n', '\r']).len();
+        line.truncate(len);
+        passphrases.push(line);
+    }
+    Ok(passphrases)
+}
+
+/// Turn terminal echo on stdin on or off (Unix `stty`)
+fn set_terminal_echo(on: bool) {
+    let _ = std::process::Command::new("stty")
+        .arg(if on { "echo" } else { "-echo" })
+        .stdin(std::process::Stdio::inherit())
+        .status();
 }
 
 /// Handle -getinfo special command (aggregates multiple RPC calls)
@@ -519,11 +773,20 @@ fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
     println!("Difficulty: {}", blockchain["difficulty"]);
     println!();
     println!("Network: {}", network["subversion"].as_str().unwrap_or(""));
+    let (conn_in, conn_out) = match (
+        network["connections_in"].as_u64(),
+        network["connections_out"].as_u64(),
+    ) {
+        (Some(i), Some(o)) => (i, o),
+        // Older servers do not report the split: count it from the peer list
+        _ => {
+            let peers = client.call("getpeerinfo", Value::Array(vec![]))?;
+            connection_split(&peers)
+        }
+    };
     println!(
         "Connections: {} (in: {}, out: {})",
-        network["connections"],
-        network["connections_in"].as_u64().unwrap_or(0),
-        network["connections_out"].as_u64().unwrap_or(0)
+        network["connections"], conn_in, conn_out
     );
 
     if let Some(w) = wallet {
@@ -533,6 +796,16 @@ fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// (inbound, outbound) connection counts from a `getpeerinfo` result
+fn connection_split(peers: &Value) -> (u64, u64) {
+    let peers = peers.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let inbound = peers
+        .iter()
+        .filter(|p| p["inbound"].as_bool().unwrap_or(false))
+        .count() as u64;
+    (inbound, peers.len() as u64 - inbound)
 }
 
 /// Handle -netinfo special command (shows peer connection summary)
@@ -696,22 +969,34 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
         .or(config.rpcport)
         .unwrap_or_else(|| default_rpc_port(testnet, regtest, privatedivi));
 
-    // Determine credentials (CLI > config > cookie file)
+    // Determine credentials: CLI > irondivi.conf (or --conf) > irondivid's
+    // cookie > the Divi Core fallback conf > a Core-layout cookie. irondivid's
+    // own cookie beats ~/.divi/divi.conf credentials, which belong to divid.
+    let datadir = args.datadir.as_deref();
+    let conf_is_core_fallback =
+        args.conf.is_none() && conf_path == default_conf_path(home, privatedivi);
+    let conf_creds = match (config.rpcuser, config.rpcpassword) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
     let (rpc_user, rpc_password) = match (&args.rpcuser, &args.rpcpassword) {
         (Some(u), Some(p)) => (Some(u.clone()), Some(p.clone())),
-        _ => match (config.rpcuser, config.rpcpassword) {
-            (Some(u), Some(p)) => (Some(u), Some(p)),
-            _ => {
-                let base = args
-                    .datadir
-                    .clone()
-                    .unwrap_or_else(|| chain_home(home, privatedivi));
-                match read_cookie(&base, network) {
-                    Some((u, p)) => (Some(u), Some(p)),
-                    None => (args.rpcuser.clone(), args.rpcpassword.clone()),
+        _ => {
+            let found = match conf_creds {
+                Some(creds) if !conf_is_core_fallback => Some(creds),
+                core_creds => {
+                    read_cookie(&irondivi_cookie_path(home, datadir, privatedivi, network))
+                        .or(core_creds)
+                        .or_else(|| {
+                            read_cookie(&core_cookie_path(home, datadir, privatedivi, network))
+                        })
                 }
+            };
+            match found {
+                Some((u, p)) => (Some(u), Some(p)),
+                None => (args.rpcuser.clone(), args.rpcpassword.clone()),
             }
-        },
+        }
     };
 
     Endpoint {
@@ -793,7 +1078,11 @@ fn run() -> Result<(), CliError> {
         Value::Array(
             method_args
                 .iter()
-                .map(|arg| {
+                .enumerate()
+                .map(|(index, arg)| {
+                    if !converts_param(method, index) {
+                        return json!(arg);
+                    }
                     // Try to parse as JSON first (for objects/arrays)
                     serde_json::from_str(arg).unwrap_or_else(|_| {
                         // If not valid JSON, try as number
@@ -964,6 +1253,94 @@ mod endpoint_tests {
     }
 
     #[test]
+    fn cookie_in_irondivid_datadir_is_used() {
+        // irondivid writes <datadir>/.cookie; the CLI must find it with
+        // the same --datadir and no credentials.
+        let home = tempfile::tempdir().unwrap();
+        let datadir = home.path().join("node");
+        fs::create_dir_all(&datadir).unwrap();
+        fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--regtest",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("feedbeef"));
+    }
+
+    #[test]
+    fn cookie_in_default_irondivi_dir_is_used() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = irondivi_data_dir(home.path(), false, "regtest");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".cookie"), "__cookie__:c0ffee").unwrap();
+        let args = Args::parse_from(["irondivi-cli", "--regtest", "getblockcount"]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("c0ffee"));
+    }
+
+    #[test]
+    fn core_layout_cookie_still_found() {
+        let home = tempfile::tempdir().unwrap();
+        let datadir = home.path().join("core");
+        fs::create_dir_all(datadir.join("testnet3")).unwrap();
+        fs::write(datadir.join("testnet3/.cookie"), "__cookie__:abc").unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--testnet",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_password.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn irondivid_cookie_beats_divi_core_conf_credentials() {
+        // A host that also runs divid has ~/.divi/divi.conf with rpcuser and
+        // rpcpassword; they must not shadow irondivid's own cookie.
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".divi")).unwrap();
+        fs::write(
+            home.path().join(".divi/divi.conf"),
+            "rpcuser=core\nrpcpassword=corepw\n",
+        )
+        .unwrap();
+        let datadir = home.path().join("node");
+        fs::create_dir_all(&datadir).unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--regtest",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        // No cookie: the Core conf is still the fallback
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("core"));
+
+        fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("feedbeef"));
+
+        // Credentials in the node's own irondivi.conf still win
+        fs::write(
+            datadir.join("irondivi.conf"),
+            "rpcuser = \"u\"\nrpcpassword = \"p\"\n",
+        )
+        .unwrap();
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("u"));
+    }
+
+    #[test]
     fn explicit_rpcport_wins() {
         let home = home_with_divi_conf();
         let args = Args::parse_from(["irondivi-cli", "--rpcport", "1234", "getblockcount"]);
@@ -986,5 +1363,57 @@ mod endpoint_tests {
         assert_eq!(unquote("alice"), "alice");
         assert_eq!(unquote("\""), "\"");
         assert_eq!(unquote("51491"), "51491");
+    }
+}
+
+#[cfg(test)]
+mod stdin_passphrase_tests {
+    use super::*;
+
+    #[test]
+    fn reads_one_passphrase_line_keeping_spaces() {
+        let mut input = io::Cursor::new(b"  my pass phrase \r\nnext\n".to_vec());
+        let got = read_wallet_passphrases("walletpassphrase", &mut input, false).unwrap();
+        assert_eq!(got, vec!["  my pass phrase ".to_string()]);
+        let mut input = io::Cursor::new(b"pw\n".to_vec());
+        assert_eq!(
+            read_wallet_passphrases("encryptwallet", &mut input, false).unwrap(),
+            vec!["pw".to_string()]
+        );
+    }
+
+    #[test]
+    fn walletpassphrasechange_reads_old_then_new() {
+        let mut input = io::Cursor::new(b"old one\nnew one\n".to_vec());
+        let got = read_wallet_passphrases("walletpassphrasechange", &mut input, false).unwrap();
+        assert_eq!(got, vec!["old one".to_string(), "new one".to_string()]);
+    }
+
+    #[test]
+    fn refuses_other_methods_and_empty_input() {
+        let mut input = io::Cursor::new(b"pw\n".to_vec());
+        assert!(read_wallet_passphrases("getbalance", &mut input, false).is_err());
+        let mut input = io::Cursor::new(Vec::new());
+        assert!(read_wallet_passphrases("walletpassphrase", &mut input, false).is_err());
+    }
+
+    #[test]
+    fn passphrase_params_stay_strings() {
+        assert!(!converts_param("walletpassphrase", 0));
+        assert!(converts_param("walletpassphrase", 1));
+        assert!(!converts_param("walletpassphrasechange", 1));
+        assert!(!converts_param("encryptwallet", 0));
+        assert!(!converts_param("getblock", 0));
+        assert!(converts_param("getblock", 1));
+    }
+
+    #[test]
+    fn convert_table_has_no_duplicates_and_unknown_methods_convert() {
+        let mut names: Vec<_> = CONVERT_PARAMS.iter().map(|(m, _)| *m).collect();
+        names.sort();
+        let len = names.len();
+        names.dedup();
+        assert_eq!(names.len(), len, "a method is listed twice");
+        assert!(converts_param("someunlistedmethod", 0));
     }
 }

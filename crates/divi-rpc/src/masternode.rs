@@ -167,7 +167,7 @@ impl MasternodeRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string"))?;
         match &ctx.wallet {
-            Some(w) if w.is_locked() => {
+            Some(w) if !w.is_fully_unlocked() => {
                 return Err(RpcError::new(
                     codes::WALLET_UNLOCK_NEEDED,
                     "Error: Please enter the wallet passphrase with walletpassphrase first.",

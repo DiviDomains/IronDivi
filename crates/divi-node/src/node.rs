@@ -143,8 +143,28 @@ impl Node {
         });
 
         // Initialize chain state
-        let mut chain = Chain::new(db.clone(), chain_params.clone())
-            .map_err(|e| NodeError::Init(format!("Failed to initialize chain state: {}", e)))?;
+        let damaged = |e: divi_storage::StorageError| {
+            NodeError::Init(format!(
+                "Chain database {} cannot be used: {}. Stopping instead of building on it. \
+                 To recover, stop irondivid, move that directory aside and start again to \
+                 resync (or use --import-snapshot).",
+                config.chainstate_path().display(),
+                e
+            ))
+        };
+        let mut chain = Chain::new(db.clone(), chain_params.clone()).map_err(damaged)?;
+
+        // C++ checks the newest blocks at every start (-checkblocks); a damaged
+        // database otherwise goes unnoticed until the bad record is read.
+        let started = std::time::Instant::now();
+        let checked = chain
+            .verify_recent_blocks(config.check_blocks)
+            .map_err(damaged)?;
+        tracing::info!(
+            "Verified the last {} blocks in {} ms",
+            checked,
+            started.elapsed().as_millis()
+        );
 
         if config.index.txindex {
             let txindex_path = config.data_dir.join("txindex");
@@ -177,6 +197,13 @@ impl Node {
                 peer_sources.listen
             );
         }
+        let proxy = config
+            .p2p
+            .proxy_addr()
+            .map_err(|e| NodeError::Init(format!("-proxy: {}", e)))?;
+        if let Some(proxy) = proxy {
+            tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
+        }
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,
@@ -191,6 +218,12 @@ impl Node {
                         return Some(addr);
                     }
                     // If that fails, try to resolve as hostname:port
+                    if proxy.is_some() {
+                        tracing::warn!(
+                            "Resolving peer {} with local DNS, outside the proxy; give an IP address to avoid this",
+                            s
+                        );
+                    }
                     use std::net::ToSocketAddrs;
                     match s.to_socket_addrs() {
                         Ok(mut addrs) => {
@@ -213,11 +246,16 @@ impl Node {
                 None
             },
             default_port: config.network.default_p2p_port(),
+            proxy,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
 
         // Create chain Arc for sharing
         let chain = Arc::new(chain);
+
+        // Height locks are checked against the chain tip on every path into the mempool
+        let chain_for_mempool = Arc::clone(&chain);
+        mempool.set_tip_height_provider(Arc::new(move || chain_for_mempool.height()));
 
         // Create block sync manager
         let block_sync = BlockSync::new(Arc::clone(&chain), Arc::clone(&peer_manager));
@@ -881,6 +919,17 @@ impl Node {
         // Remove confirmed transactions from mempool and mark as seen in relay
         let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
         self.mempool.remove_for_block(&txids);
+        // Double spends of the block's inputs can never confirm, if the block
+        // is on the active chain
+        let active = self
+            .chain
+            .get_block_index_by_height(self.chain.height())
+            .ok()
+            .flatten()
+            .is_some_and(|tip| tip.hash == hash);
+        if active {
+            self.mempool.remove_conflicts(&block.transactions);
+        }
         for txid in &txids {
             self.tx_relay.mark_seen(*txid);
         }
@@ -972,16 +1021,10 @@ impl Node {
                         if (input.prevout.vout as usize) < mempool_entry.tx.vout.len() {
                             total_input += mempool_entry.tx.vout[input.prevout.vout as usize].value;
                         } else {
-                            return Err(NodeError::TransactionValidation(format!(
-                                "Input {}:{} output index out of bounds",
-                                input.prevout.txid, input.prevout.vout
-                            )));
+                            return Err(NodeError::MissingInputs);
                         }
                     } else {
-                        return Err(NodeError::TransactionValidation(format!(
-                            "Input {}:{} not found in UTXO set",
-                            input.prevout.txid, input.prevout.vout
-                        )));
+                        return Err(NodeError::MissingInputs);
                     }
                 }
                 Err(e) => {
@@ -1040,9 +1083,10 @@ impl Node {
         Ok(fee)
     }
 
-    /// Calculate transaction fee from UTXO lookups
-    /// This is a static helper that can be called from spawned tasks
-    fn calculate_transaction_fee(
+    /// Calculate transaction fee from UTXO lookups (inputs from the chain or the
+    /// mempool, minus outputs). A static helper usable from spawned tasks and
+    /// from the RPC submit path.
+    pub fn calculate_transaction_fee(
         tx: &Transaction,
         chain: &Arc<Chain>,
         mempool: &Arc<Mempool>,
@@ -1062,16 +1106,10 @@ impl Node {
                         if (input.prevout.vout as usize) < mempool_entry.tx.vout.len() {
                             total_input += mempool_entry.tx.vout[input.prevout.vout as usize].value;
                         } else {
-                            return Err(NodeError::TransactionValidation(format!(
-                                "Input {}:{} output index out of bounds",
-                                input.prevout.txid, input.prevout.vout
-                            )));
+                            return Err(NodeError::MissingInputs);
                         }
                     } else {
-                        return Err(NodeError::TransactionValidation(format!(
-                            "Input {}:{} not found in UTXO set",
-                            input.prevout.txid, input.prevout.vout
-                        )));
+                        return Err(NodeError::MissingInputs);
                     }
                 }
                 Err(e) => {
@@ -1299,6 +1337,84 @@ mod tests {
         let mut config = NodeConfig::testnet(ChainMode::Divi);
         config.data_dir = temp_dir.keep();
         config
+    }
+
+    /// Write `n` regtest blocks to the node's chain database and flush the block bodies
+    /// to their own table file; returns the path of that file.
+    fn regtest_chain_on_disk(config: &NodeConfig, n: u32) -> std::path::PathBuf {
+        use divi_primitives::amount::Amount;
+        use divi_primitives::block::Block;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{Transaction, TxIn, TxOut};
+        let db = Arc::new(ChainDatabase::open(config.chainstate_path()).unwrap());
+        let chain = Chain::new(
+            db.clone(),
+            ChainParams::for_network(StorageNetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap();
+        let mut parent = chain.tip().unwrap();
+        for i in 0..n {
+            let mut block = Block::default();
+            block.header.version = 1;
+            block.header.prev_block = parent.hash;
+            block.header.time = parent.time + 60;
+            block.header.bits = 0x207fffff;
+            block.transactions.push(Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+                vout: vec![TxOut::new(
+                    Amount::from_sat(1250_00000000),
+                    Script::new_p2pkh(&[i as u8 + 1; 20]),
+                )],
+                lock_time: 0,
+            });
+            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            chain.accept_block(block).unwrap();
+            parent = chain.tip().unwrap();
+        }
+        assert_eq!(chain.height(), n);
+        let raw = db.inner_db();
+        for cf in ["blocks", "block_index", "metadata", "undo", "utxo"] {
+            raw.flush_cf(&raw.cf_handle(cf).unwrap()).unwrap();
+        }
+        let file = raw
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.column_family_name == "blocks")
+            .expect("block bodies flushed to a table file");
+        config
+            .chainstate_path()
+            .join(file.name.trim_start_matches('/'))
+    }
+
+    /// A damaged block table must stop the node at start with a clear error, as C++
+    /// -checkblocks does. It used to start and run on (testnet: 8 KB overwritten in a
+    /// chainstate file, no error). --checkblocks=0 checks every block, as in C++.
+    #[test]
+    fn test_damaged_block_data_is_caught_at_start() {
+        let dir = tempdir().unwrap();
+        let mut config = NodeConfig::regtest(ChainMode::Divi);
+        config.data_dir = dir.path().to_path_buf();
+        let table = regtest_chain_on_disk(&config, 10);
+        drop(Node::new(config.clone()).expect("healthy database starts"));
+
+        // Overwrite bytes inside the first data block (the bodies of all 10 blocks)
+        let mut bytes = std::fs::read(&table).unwrap();
+        for b in &mut bytes[16..48] {
+            *b ^= 0x5a;
+        }
+        std::fs::write(&table, bytes).unwrap();
+
+        let err = match Node::new(config.clone()) {
+            Ok(_) => panic!("node started on a damaged chain database"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("damaged at height"), "{err}");
+        assert!(err.contains("move that directory aside"), "{err}");
+
+        config.check_blocks = 0;
+        assert!(Node::new(config).is_err());
     }
 
     #[test]
@@ -1529,10 +1645,6 @@ mod tests {
         };
 
         let result = node.validate_transaction(&tx);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in UTXO set"));
+        assert!(matches!(result, Err(NodeError::MissingInputs)));
     }
 }

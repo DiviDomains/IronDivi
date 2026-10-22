@@ -69,6 +69,7 @@ pub mod peer;
 pub mod peer_manager;
 pub mod relay;
 pub mod scoring;
+pub mod socks5;
 pub mod spork;
 pub mod sync;
 

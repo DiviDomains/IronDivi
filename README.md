@@ -49,6 +49,28 @@ The codebase is organized as a Cargo workspace with clearly separated concerns. 
 
 ## Getting Started
 
+### Install a Release Build
+
+Download a tarball from [Releases](https://github.com/DiviDomains/IronDivi/releases) and compare its `sha256sum` with the sha256 GitHub shows for that asset. Each one holds `irondivid` and `irondivi-cli`.
+
+| System | Tarball |
+|---|---|
+| Any 64-bit x86 Linux (static, no glibc needed) | `irondivi-x86_64-linux-musl.tar.gz` |
+| Any 64-bit ARM Linux, e.g. Raspberry Pi OS 64-bit (static) | `irondivi-aarch64-linux-musl.tar.gz` |
+| x86 Linux with glibc 2.31+ (Debian 11+, Ubuntu 20.04+) | `irondivi-x86_64-linux-gnu.tar.gz` |
+| 64-bit ARM Linux with glibc 2.31+ | `irondivi-aarch64-linux-gnu.tar.gz` |
+| 32-bit ARM Linux with glibc 2.31+, e.g. Raspberry Pi OS 32-bit Bullseye or newer | `irondivi-armv7-linux-gnueabihf.tar.gz` |
+| Other Linux CPUs (glibc 2.31+) | `irondivi-{i686,powerpc64le,s390x,riscv64}-linux-gnu.tar.gz` |
+| macOS (Intel / Apple silicon) | `irondivi-x86_64-macos.tar.gz` / `irondivi-aarch64-macos.tar.gz` |
+| FreeBSD | `irondivi-x86_64-freebsd.tar.gz` |
+
+On Linux the musl builds run on any distribution. Use a `-gnu` build only if you prefer it; `ldd --version` shows your glibc.
+
+```bash
+tar xzf irondivi-x86_64-linux-musl.tar.gz
+./irondivi-x86_64-linux-musl/irondivid --version
+```
+
 ### Prerequisites
 
 - **Rust 1.75+** (install via [rustup](https://rustup.rs/))

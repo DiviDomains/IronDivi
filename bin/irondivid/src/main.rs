@@ -24,6 +24,7 @@
 mod snapshot_sig;
 
 use anyhow::{Context, Result};
+use clap::builder::BoolishValueParser;
 use clap::Parser;
 use divi_crypto::compute_block_hash;
 use divi_node::config::{LogConfig, NetworkType, NodeConfig};
@@ -43,7 +44,7 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// IronDivi Daemon - Rust implementation of Divi node
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "irondivid")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "IronDivi daemon - Rust implementation of Divi full node")]
@@ -66,8 +67,8 @@ struct Args {
     regtest: bool,
 
     /// Chain mode: divi (default) or privatedivi
-    #[arg(long, default_value = "divi", value_parser = ["divi", "privatedivi"])]
-    mode: String,
+    #[arg(long, value_parser = ["divi", "privatedivi"])]
+    mode: Option<String>,
 
     /// Run in background as daemon
     #[arg(long)]
@@ -113,6 +114,15 @@ struct Args {
     #[arg(long = "connect")]
     connect: Vec<String>,
 
+    /// How many of the newest blocks to check at start (default 100; 0 = all blocks)
+    #[arg(long, value_name = "N")]
+    checkblocks: Option<u32>,
+
+    /// Make outbound P2P connections through this SOCKS5 proxy (ip:port, port 9050 if
+    /// omitted). DNS seeds are then not resolved locally.
+    #[arg(long, value_name = "IP:PORT")]
+    proxy: Option<String>,
+
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
@@ -125,9 +135,10 @@ struct Args {
     #[arg(long)]
     disablewallet: bool,
 
-    /// Enable transaction index (required for PoS validation and getrawtransaction RPC)
-    #[arg(long, default_value = "true")]
-    txindex: bool,
+    /// Enable transaction index (required for PoS validation and getrawtransaction RPC;
+    /// default on). Unset keeps the config-file value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
+    txindex: Option<bool>,
 
     /// Start the staker at boot (`--staking=false` = C++ `-staking=0`; RPC setstaking can still start it)
     #[arg(long)]
@@ -138,13 +149,17 @@ struct Args {
     #[arg(long)]
     stakeonstaletip: bool,
 
-    /// Enable spent index for gettxout RPC
+    /// Stake split threshold in DIVI, reported by getstakingstatus (C++ -stakesplitthreshold, default 20000)
     #[arg(long)]
-    spentindex: bool,
+    stakesplitthreshold: Option<f64>,
 
-    /// Enable address index for address-based queries
-    #[arg(long)]
-    addressindex: bool,
+    /// Enable spent index for gettxout RPC. Unset keeps the config-file value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
+    spentindex: Option<bool>,
+
+    /// Enable address index for address-based queries. Unset keeps the config-file value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
+    addressindex: Option<bool>,
 
     /// Export blockchain to JSON format (requires start and end height, and output directory)
     #[arg(long)]
@@ -201,12 +216,18 @@ struct Args {
     expire: Option<String>,
 
     /// Maximum log file size in MB (default: 1)
-    #[arg(long, default_value = "1")]
-    maxlogsize: u32,
+    #[arg(long)]
+    maxlogsize: Option<u32>,
 
     /// Number of log files to keep (default: 5)
-    #[arg(long, default_value = "5")]
-    maxlogfiles: u32,
+    #[arg(long)]
+    maxlogfiles: Option<u32>,
+}
+
+impl Args {
+    fn chain_mode(&self) -> ChainMode {
+        parse_chain_mode(self.mode.as_deref().unwrap_or("divi"))
+    }
 }
 
 fn parse_chain_mode(mode: &str) -> ChainMode {
@@ -238,18 +259,199 @@ fn default_data_dir() -> PathBuf {
     }
 }
 
-/// Load configuration from file if it exists
+/// Load configuration from file if it exists.
+///
+/// Both formats are read: TOML (`rpcuser = "foo"`, what IronDivi documented) and the
+/// Divi Core / Bitcoin `key=value` format (`rpcuser=foo`, `addnode=` repeated). A file
+/// that parses as TOML is read as TOML, so existing files keep their meaning.
 fn load_config_file(path: &PathBuf) -> Result<Option<toml::Table>> {
     if path.exists() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {:?}", path))?;
-        let table: toml::Table = content
-            .parse()
-            .with_context(|| format!("Failed to parse config file: {:?}", path))?;
-        Ok(Some(table))
+        let table = match content.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(_) => parse_divi_config(&content),
+        };
+        Ok(Some(normalize_config(table)))
     } else {
         Ok(None)
     }
+}
+
+/// Parse a Divi Core style config file: one `key=value` per line, `#` starts a comment,
+/// surrounding whitespace is ignored, a bare `key` means `key=1`, a repeated key becomes
+/// a list, and settings under a `[section]` header are ignored (C++ ReadConfigFile with
+/// boost's config parser).
+fn parse_divi_config(content: &str) -> toml::Table {
+    let mut table = toml::Table::new();
+    let mut section: Option<String> = None;
+    for (n, raw) in content.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            warn!(
+                "config file line {}: section {} is not supported; its settings are ignored",
+                n + 1,
+                line
+            );
+            section = Some(line.to_string());
+            continue;
+        }
+        // Divi Core 3.0 ignores settings under a section header too
+        if section.is_some() {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (line, "1"),
+        };
+        if key.is_empty() {
+            warn!("config file line {}: no key, ignored", n + 1);
+            continue;
+        }
+        let value = toml::Value::String(value.trim_matches('"').to_string());
+        match table.get_mut(key) {
+            Some(toml::Value::Array(list)) => list.push(value),
+            Some(first) => {
+                let first = first.clone();
+                table.insert(key.to_string(), toml::Value::Array(vec![first, value]));
+            }
+            None => {
+                table.insert(key.to_string(), value);
+            }
+        }
+    }
+    table
+}
+
+#[derive(Clone, Copy)]
+enum ConfKind {
+    Str,
+    Int,
+    Bool,
+    List,
+}
+
+fn conf_kind(key: &str) -> Option<ConfKind> {
+    use ConfKind::*;
+    Some(match key {
+        "rpcuser" | "rpcpassword" | "rpcbind" | "bind" | "proxy" | "mode" | "expire" => Str,
+        "rpcport" | "port" | "checkblocks" | "maxlogsize" | "maxlogfiles" | "utxocachesize" => Int,
+        "listen" | "testnet" | "regtest" | "daemon" | "printtoconsole" | "staking"
+        | "stakeonstaletip" | "txindex" | "spentindex" | "addressindex" | "disablewallet" => Bool,
+        "addnode" | "fullnode" | "connect" => List,
+        _ => return None,
+    })
+}
+
+/// Give every known key the value type `apply_config_file` expects, whichever format the
+/// file was in: `txindex=1` / `"1"` / `true` all become a boolean, `rpcport="51473"` an
+/// integer, `rpcpassword = 12345` a string. A repeated single-value key keeps its last
+/// value, as in C++. Values that do not convert are left for `apply_config_file` to warn about.
+fn normalize_config(table: toml::Table) -> toml::Table {
+    use toml::Value;
+    let scalar_text = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Integer(i) => Some(i.to_string()),
+        Value::Boolean(b) => Some(if *b { "1" } else { "0" }.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        _ => None,
+    };
+    table
+        .into_iter()
+        .map(|(key, value)| {
+            let Some(kind) = conf_kind(&key) else {
+                return (key, value);
+            };
+            let value = match (kind, value) {
+                (ConfKind::List, v) => v,
+                (_, Value::Array(list)) if !list.is_empty() => list.last().cloned().unwrap(),
+                (_, v) => v,
+            };
+            let converted = match kind {
+                ConfKind::List => None,
+                ConfKind::Str => match &value {
+                    Value::String(_) => None,
+                    v => scalar_text(v).map(Value::String),
+                },
+                ConfKind::Int => match &value {
+                    Value::String(s) => s.trim().parse::<i64>().ok().map(Value::Integer),
+                    _ => None,
+                },
+                ConfKind::Bool => match &value {
+                    Value::Integer(i) => Some(Value::Boolean(*i != 0)),
+                    Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                        "1" | "true" | "yes" | "on" => Some(Value::Boolean(true)),
+                        "0" | "false" | "no" | "off" => Some(Value::Boolean(false)),
+                        other => other.parse::<i64>().ok().map(|i| Value::Boolean(i != 0)),
+                    },
+                    _ => None,
+                },
+            };
+            (key, converted.unwrap_or(value))
+        })
+        .collect()
+}
+
+/// Where the config file is: `--conf`, else `irondivi.conf` in the data directory
+fn config_path(args: &Args) -> PathBuf {
+    args.conf
+        .clone()
+        .unwrap_or_else(|| compute_data_dir(args).join("irondivi.conf"))
+}
+
+/// Fill the options that are needed before the node config exists (network, chain mode,
+/// daemon, console and log-file settings) from the config file when the command line does
+/// not set them; the command line always wins. Pins `conf` to the file read, so a network
+/// chosen by the file does not make the node look for a different file.
+fn resolve_args(mut args: Args) -> Result<Args> {
+    let path = config_path(&args);
+    let Some(table) = load_config_file(&path)? else {
+        return Ok(args);
+    };
+    let flag = |key: &str| table.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if !args.testnet && !args.regtest {
+        args.testnet = flag("testnet");
+        args.regtest = flag("regtest");
+    }
+    if args.mode.is_none() {
+        args.mode = table
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .filter(|m| matches!(*m, "divi" | "privatedivi"))
+            .map(String::from);
+    }
+    args.daemon |= flag("daemon");
+    args.printtoconsole |= flag("printtoconsole");
+    args.disablewallet |= flag("disablewallet");
+    // C++ debug= takes a category (debug=1, debug=net); anything but 0 turns debug logging on
+    args.debug |= table
+        .get("debug")
+        .and_then(|v| match v {
+            toml::Value::String(s) => Some(!matches!(s.trim(), "" | "0")),
+            toml::Value::Integer(i) => Some(*i != 0),
+            toml::Value::Boolean(b) => Some(*b),
+            toml::Value::Array(list) => Some(!list.is_empty()),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let positive = |key: &str| {
+        table
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .filter(|i| *i > 0 && *i <= u32::MAX as i64)
+            .map(|i| i as u32)
+    };
+    if args.maxlogsize.is_none() {
+        args.maxlogsize = positive("maxlogsize");
+    }
+    if args.maxlogfiles.is_none() {
+        args.maxlogfiles = positive("maxlogfiles").filter(|n| *n <= 100);
+    }
+    args.conf = Some(path);
+    Ok(args)
 }
 
 /// Apply configuration values from TOML table to NodeConfig
@@ -308,6 +510,25 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!("Invalid bind value in config file, expected string");
                 }
             }
+            "checkblocks" => {
+                if let Some(i) = value
+                    .as_integer()
+                    .filter(|i| (0..=u32::MAX as i64).contains(i))
+                {
+                    config.check_blocks = i as u32;
+                } else {
+                    warn!(
+                        "Invalid checkblocks value in config file, expected a non-negative integer"
+                    );
+                }
+            }
+            "proxy" => {
+                if let Some(s) = value.as_str() {
+                    config.p2p.proxy = Some(s.to_string());
+                } else {
+                    warn!("Invalid proxy value in config file, expected string");
+                }
+            }
             "listen" => {
                 if let Some(b) = value.as_bool() {
                     config.p2p.listen = Some(b);
@@ -352,6 +573,8 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     }
                 }
             }
+            // Read before the node config is built (resolve_args)
+            "disablewallet" | "debug" => {}
             "printtoconsole" => {
                 if let Some(b) = value.as_bool() {
                     if b {
@@ -381,6 +604,18 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!(
                         "Invalid stakeonstaletip value in config file, expected boolean or integer"
                     );
+                }
+            }
+            "stakesplitthreshold" => {
+                let divi = value
+                    .as_float()
+                    .or_else(|| value.as_integer().map(|i| i as f64))
+                    .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
+                match divi {
+                    Some(d) if d >= 0.0 => {
+                        config.staking.split_threshold = (d * 100_000_000.0).round() as i64
+                    }
+                    _ => warn!("Invalid stakesplitthreshold value in config file, expected DIVI"),
                 }
             }
             // Index settings
@@ -541,7 +776,8 @@ fn build_config(args: &Args) -> Result<NodeConfig> {
 
 /// `env_expire` is the value of `IRONDIVI_EXPIRE`; passed in so tests never mutate process env.
 fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<NodeConfig> {
-    let chain_mode = parse_chain_mode(&args.mode);
+    let args = &resolve_args(args.clone())?;
+    let chain_mode = args.chain_mode();
 
     // Start with network-specific defaults
     let mut config = if args.regtest {
@@ -555,7 +791,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     // Set data directory
     let data_dir = args.datadir.clone().unwrap_or_else(|| {
         let mut dir = default_data_dir();
-        if parse_chain_mode(&args.mode) == ChainMode::PrivateDivi {
+        if args.chain_mode() == ChainMode::PrivateDivi {
             dir = dir.join("privatedivi");
         }
         if args.testnet {
@@ -605,6 +841,12 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     if let Some(bind) = &args.bind {
         config.p2p.listen_addr = bind.clone();
     }
+    if let Some(n) = args.checkblocks {
+        config.check_blocks = n;
+    }
+    if let Some(proxy) = &args.proxy {
+        config.p2p.proxy = Some(proxy.clone());
+    }
     if args.debug {
         config.debug.debug_logging = true;
         config.debug.log_rpc = true;
@@ -616,9 +858,19 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     if args.stakeonstaletip {
         config.staking.stake_on_stale_tip = true;
     }
-    config.index.txindex = args.txindex;
-    config.index.spentindex = args.spentindex;
-    config.index.addressindex = args.addressindex;
+    if let Some(divi) = args.stakesplitthreshold {
+        config.staking.split_threshold = (divi * 100_000_000.0).round() as i64;
+    }
+    // Only flags given on the command line override the config file
+    if let Some(b) = args.txindex {
+        config.index.txindex = b;
+    }
+    if let Some(b) = args.spentindex {
+        config.index.spentindex = b;
+    }
+    if let Some(b) = args.addressindex {
+        config.index.addressindex = b;
+    }
 
     if let Some(cache_size) = args.utxocachesize {
         config.utxo_cache_size = cache_size;
@@ -645,7 +897,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
 fn compute_data_dir(args: &Args) -> PathBuf {
     args.datadir.clone().unwrap_or_else(|| {
         let mut dir = default_data_dir();
-        if parse_chain_mode(&args.mode) == ChainMode::PrivateDivi {
+        if args.chain_mode() == ChainMode::PrivateDivi {
             dir = dir.join("privatedivi");
         }
         if args.testnet {
@@ -821,6 +1073,14 @@ fn load_or_create_wallet_from(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
+        // As Divi Core at start: fill the keypool while the seed is in memory
+        // (an encrypted wallet starts locked and is topped up on unlock)
+        if !wallet.is_locked() {
+            if let Err(e) = wallet.top_up_keypool() {
+                warn!("Could not top up the keypool: {}", e);
+            }
+        }
+
         info!("Wallet loaded successfully");
         return Ok(Arc::new(wallet));
     }
@@ -879,6 +1139,13 @@ fn load_or_create_wallet_from(
         info!("Pre-generated {} addresses", generated);
     }
 
+    // A new wallet starts with a full keypool, as in Divi Core
+    if restoring.is_none() {
+        wallet
+            .top_up_keypool()
+            .with_context(|| "Failed to fill the keypool")?;
+    }
+
     // Save immediately
     wallet.save().with_context(|| "Failed to save wallet")?;
 
@@ -886,11 +1153,63 @@ fn load_or_create_wallet_from(
     Ok(Arc::new(wallet))
 }
 
+/// Put the wallet's unconfirmed transactions back into the mempool after a
+/// restart (Core's ReacceptWalletTransactions), so a send made before the
+/// node stopped can still confirm. Runs after the catch-up scan, which has
+/// already dropped the ones mined meanwhile. A transaction whose inputs are
+/// neither unspent on chain nor outputs of a transaction in the mempool can
+/// never confirm (spent by another transaction while we were down): the
+/// wallet forgets it, as it does when the mempool evicts one.
+fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
+    let txs = wallet.unconfirmed_transactions();
+    if txs.is_empty() {
+        return;
+    }
+    let chain = node.chain();
+    let mempool = node.mempool();
+    let mut resubmitted = 0;
+    for tx in txs {
+        let txid = tx.txid();
+        let inputs_available = tx.vin.iter().all(|input| {
+            mempool.contains(&input.prevout.txid)
+                || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
+        });
+        // Same generous fee as a local RPC send (see set_tx_submit below)
+        let fee = Amount::from_sat((tx.size() as i64) * 10_000);
+        let result = if inputs_available {
+            mempool.add(tx, fee).map_err(|e| e.to_string())
+        } else {
+            Err("inputs no longer available".to_string())
+        };
+        match result {
+            Ok(_) => {
+                resubmitted += 1;
+                let relay = node.tx_relay().clone();
+                tokio::spawn(async move {
+                    relay.announce_tx(txid).await;
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "Unconfirmed wallet tx {} cannot be resubmitted ({}); forgetting it",
+                    txid, e
+                );
+                wallet.remove_mempool_tx(&txid);
+            }
+        }
+    }
+    info!(
+        "Resubmitted {} unconfirmed wallet transaction(s) to the mempool",
+        resubmitted
+    );
+}
+
 /// Run the daemon
 async fn run_daemon(
     config: NodeConfig,
     wallet_path: Option<PathBuf>,
     disable_wallet: bool,
+    shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
@@ -919,6 +1238,7 @@ async fn run_daemon(
         let mempool_for_callback = node.mempool().clone();
         let fee_estimator_for_callback = node.fee_estimator().clone();
         let tx_relay_for_callback = node.tx_relay().clone();
+        let chain_for_callback = node.chain().clone();
         block_sync.set_block_connected_callback(Arc::new(move |block, height| {
             let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
             for tx in block.transactions.iter().skip(1) {
@@ -928,6 +1248,7 @@ async fn run_daemon(
             }
             let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
             mempool_for_callback.remove_for_block(&txids);
+            evict_block_conflicts(&mempool_for_callback, &chain_for_callback, block);
             for txid in &txids {
                 tx_relay_for_callback.mark_seen(*txid);
             }
@@ -955,20 +1276,17 @@ async fn run_daemon(
             let mempool_for_callback = node.mempool().clone();
             let fee_estimator_for_callback = node.fee_estimator().clone();
             let tx_relay_for_callback = node.tx_relay().clone();
+            let chain_for_scan = node.chain().clone();
             block_sync.set_block_connected_callback(Arc::new(move |block, height| {
                 let block_hash = compute_block_hash(&block.header);
 
-                // 1. Scan block for wallet transactions (adds new UTXOs, removes spent ones).
+                // 1. Bring the wallet up to the active tip (adds new UTXOs, removes spent
+                // ones). The block handed in may be one of several connected by a reorg,
+                // or a side-chain block, so scan the active chain itself, in order.
                 // This runs before the mempool cleanup below so the wallet's mempool
                 // entries for this block are replaced by confirmed records in one step;
                 // otherwise a send would briefly show its inputs as unspent again.
-                wallet_for_scan.scan_block(
-                    block_hash,
-                    height,
-                    block.header.time,
-                    &block.transactions,
-                );
-                wallet_for_scan.set_last_scan_height(height);
+                sync_wallet_to_tip(&wallet_for_scan, &chain_for_scan);
 
                 // 2. Calculate fees from mempool entries and clean mempool
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
@@ -979,6 +1297,7 @@ async fn run_daemon(
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
                 mempool_for_callback.remove_for_block(&txids);
+                evict_block_conflicts(&mempool_for_callback, &chain_for_scan, block);
                 for txid in &txids {
                     tx_relay_for_callback.mark_seen(*txid);
                 }
@@ -1115,12 +1434,16 @@ async fn run_daemon(
                                 }
                             }
                         }
+                        // The tip may now be lower: drop what can no longer be mined
+                        mempool_for_orphans.remove_non_final();
                     },
                 ));
             }
             info!("Orphaned transaction callback registered");
 
-            // Catch-up scan: process blocks between last_scan_height and current chain tip
+            // Catch-up scan: process blocks between last_scan_height and current chain tip.
+            // Block notifications may already be arriving; they share the wallet's scan
+            // lock and its scan height, so neither side skips or reorders a block.
             let last_scan = wallet_arc.last_scan_height();
             let chain_height = node.chain().height();
             if last_scan < chain_height {
@@ -1129,55 +1452,14 @@ async fn run_daemon(
                     last_scan + 1,
                     chain_height
                 );
-                let chain_for_scan = node.chain().clone();
-                let wallet_for_catchup = Arc::clone(wallet_arc);
-                let mut scanned = 0u32;
-                let mut missing_blocks = 0u32;
-                for height in (last_scan + 1)..=chain_height {
-                    let index = match chain_for_scan.get_block_index_by_height(height) {
-                        Ok(Some(idx)) => idx,
-                        _ => continue,
-                    };
-                    let block = match chain_for_scan.get_block(&index.hash) {
-                        Ok(Some(blk)) => blk,
-                        _ => {
-                            missing_blocks += 1;
-                            continue;
-                        }
-                    };
-                    wallet_for_catchup.scan_block(
-                        index.hash,
-                        height,
-                        block.header.time,
-                        &block.transactions,
-                    );
-                    scanned += 1;
-                    if scanned.is_multiple_of(1000) {
-                        info!(
-                            "Catch-up scan progress: {}/{} blocks",
-                            scanned,
-                            chain_height - last_scan
-                        );
-                    }
-                }
-                if missing_blocks > 0 {
-                    error!(
-                        "Wallet catch-up scan could not read {} block(s) in {}..={} (pruned: prune height {}). \
-                         Wallet history in that range is NOT scanned; last_scan_height left at {}. \
-                         Restore the blocks (resync) or accept the gap.",
-                        missing_blocks,
-                        last_scan + 1,
-                        chain_height,
-                        chain_for_scan.prune_height(),
-                        last_scan
-                    );
-                } else {
-                    wallet_for_catchup.set_last_scan_height(chain_height);
-                }
-                if let Err(e) = wallet_for_catchup.save() {
+                sync_wallet_to_tip(wallet_arc, node.chain());
+                if let Err(e) = wallet_arc.save() {
                     error!("Failed to save wallet after catch-up scan: {}", e);
                 }
-                info!("Wallet catch-up scan complete ({} blocks scanned)", scanned);
+                info!(
+                    "Wallet catch-up scan complete (scan height {})",
+                    wallet_arc.last_scan_height()
+                );
             }
 
             // Reconcile wallet UTXOs against the chain UTXO set.
@@ -1196,6 +1478,8 @@ async fn run_daemon(
                     error!("Failed to save wallet after UTXO reconciliation: {}", e);
                 }
             }
+
+            resubmit_wallet_txs(&node, wallet_arc);
         }
 
         wallet
@@ -1245,6 +1529,7 @@ async fn run_daemon(
         // Use regtest-friendly staking config
         let mut staking_config = StakingConfig {
             allow_stale_tip: config.staking.stake_on_stale_tip,
+            stake_split_threshold: config.staking.split_threshold,
             ..StakingConfig::default()
         };
         if staking_config.allow_stale_tip {
@@ -1277,18 +1562,13 @@ async fn run_daemon(
             let mempool_for_staker = node.mempool().clone();
             let fee_estimator_for_staker = node.fee_estimator().clone();
             let tx_relay_for_staker = node.tx_relay().clone();
+            let chain_for_staker_scan = node.chain().clone();
             staker.set_block_connected_callback(Arc::new(move |block, height| {
                 let block_hash = compute_block_hash(&block.header);
 
-                // 1. Scan block for wallet transactions, before the mempool cleanup
+                // 1. Bring the wallet up to the active tip, before the mempool cleanup
                 // (see the block-connected callback for why)
-                wallet_for_staker.scan_block(
-                    block_hash,
-                    height,
-                    block.header.time,
-                    &block.transactions,
-                );
-                wallet_for_staker.set_last_scan_height(height);
+                sync_wallet_to_tip(&wallet_for_staker, &chain_for_staker_scan);
 
                 // 2. Calculate fees from mempool entries and clean mempool
                 let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
@@ -1299,6 +1579,7 @@ async fn run_daemon(
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
                 mempool_for_staker.remove_for_block(&txids);
+                evict_block_conflicts(&mempool_for_staker, &chain_for_staker_scan, block);
                 for txid in &txids {
                     tx_relay_for_staker.mark_seen(*txid);
                 }
@@ -1335,11 +1616,28 @@ async fn run_daemon(
         None
     };
 
-    // Start RPC server
+    // Start RPC server. RPC always requires authentication: without a complete
+    // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie
+    // (mode 0600) for local clients; `_rpc_cookie` removes it when we return.
+    let (rpc_user, rpc_password, _rpc_cookie) = divi_rpc::resolve_rpc_auth(
+        config.rpc.username.as_deref(),
+        config.rpc.password.as_deref(),
+        &config.data_dir,
+    )
+    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))?;
+    match &_rpc_cookie {
+        Some(cookie) => {
+            if config.rpc.username.is_some() || config.rpc.password.is_some() {
+                warn!("Only one of rpcuser/rpcpassword is set; using cookie authentication");
+            }
+            info!("RPC cookie authentication: {:?}", cookie.path());
+        }
+        None => info!("RPC authentication: rpcuser/rpcpassword"),
+    }
     let rpc_config = RpcConfig {
         bind_address: config.rpc.socket_addr(),
-        username: config.rpc.username.clone(),
-        password: config.rpc.password.clone(),
+        username: Some(rpc_user),
+        password: Some(rpc_password),
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -1347,9 +1645,24 @@ async fn run_daemon(
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
 
+    // RPC `stop` takes the same path as SIGTERM. The short delay lets the
+    // "Divi server stopping" reply reach the client before the server is dropped.
+    let rpc_stop: divi_rpc::ShutdownCallback = Arc::new(move || {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = tx.send(());
+        });
+    });
+    let wallet_for_shutdown = wallet.clone();
+
     if let Some(wallet) = wallet {
         // Setup staker callbacks if enabled
         let staker_ref = staker.clone();
+        let wallet_for_staking_status = Arc::clone(&wallet);
+        let chain_for_staking_status = Arc::clone(&chain);
+        let peers_for_staking_status = Arc::clone(&peer_manager);
+        let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -1371,6 +1684,7 @@ async fn run_daemon(
                 wallet,
                 peer_manager,
                 move |rpc_server| {
+                    rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
@@ -1388,16 +1702,19 @@ async fn run_daemon(
                     // Wire up transaction submission (mempool + relay)
                     let mempool_for_submit = mempool_for_tx.clone();
                     let tx_relay_for_submit = tx_relay_for_tx.clone();
+                    let chain_for_submit = Arc::clone(&chain_for_staking_status);
                     rpc_server.wallet().set_tx_submit(Arc::new(move |tx: Transaction| {
                         let txid = tx.txid();
 
-                        // For locally submitted transactions, calculate fee generously
-                        // to pass mempool relay fee check. The actual fee is embedded
-                        // in the tx (inputs - outputs) and was set by the wallet.
-                        let fee = Amount::from_sat(
-                            (tx.size() as i64) * 10_000
-                        );
-                        mempool_for_submit.add(tx, fee).map_err(|e| format!("Mempool rejected: {}", e))?;
+                        // The real fee (inputs - outputs), so the mempool's relay
+                        // fee check sees what peers will see
+                        let fee = Node::calculate_transaction_fee(
+                            &tx,
+                            &chain_for_submit,
+                            &mempool_for_submit,
+                        )
+                        .map_err(submit_error)?;
+                        mempool_for_submit.add(tx, fee).map_err(submit_error)?;
 
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();
@@ -1414,31 +1731,21 @@ async fn run_daemon(
                     if let Some(ref staker_arc) = staker_ref {
                         let staker_for_status = Arc::clone(staker_arc);
                         let staker_for_control = Arc::clone(staker_arc);
+                        let wallet_for_status = Arc::clone(&wallet_for_staking_status);
+                        let chain_for_status = Arc::clone(&chain_for_staking_status);
+                        let peers_for_status = Arc::clone(&peers_for_staking_status);
 
                         // Register status callback
                         rpc_server.staking().set_status_callback(Arc::new(move || {
-                            let status = staker_for_status.get_status();
-                            divi_rpc::StakingInfo {
-                                enabled: status.enabled,
-                                staking: status.staking,
-                                errors: None,
-                                current_block_size: 0,
-                                current_block_tx: 0,
-                                pooled_tx: 0,
-                                difficulty: 0.000244140625,
-                                search_interval: 500,
-                                weight: status.stake_weight,
-                                netstakeweight: status.stake_weight,
-                                expected_time: status.expected_time,
-                                staking_balance: status.stake_weight as f64 / 100_000_000.0,
-                                wallet_unlocked: true,
-                                have_connections: true,
-                                valid_time: true,
-                                mintable_coins: status.staking,
-                                enough_coins: status.stake_weight > 0,
-                                mnsync: true,
-                                blocks: status.blocks,
-                            }
+                            let tip_time = chain_for_status.tip().map(|t| t.time).unwrap_or(0);
+                            staking_info(
+                                &staker_for_status.get_status(),
+                                wallet_for_status.is_locked(),
+                                peers_for_status.peer_count(),
+                                tip_time,
+                                blockchain_synced(&chain_for_status),
+                                split_threshold_divi,
+                            )
                         }));
 
                         // Register control callback
@@ -1453,6 +1760,17 @@ async fn run_daemon(
                             }
                             Ok(())
                         }));
+
+                        // set/getstakesplitthreshold
+                        let staker_for_split = Arc::clone(staker_arc);
+                        rpc_server
+                            .staking()
+                            .set_split_threshold_control(Arc::new(move |new| {
+                                if let Some(threshold) = new {
+                                    staker_for_split.set_stake_split_threshold(threshold);
+                                }
+                                staker_for_split.stake_split_threshold()
+                            }));
 
                         info!("Staking RPC callbacks registered");
                     }
@@ -1485,6 +1803,7 @@ async fn run_daemon(
                 chain,
                 peer_manager,
                 move |rpc_server| {
+                    rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
@@ -1514,8 +1833,118 @@ async fn run_daemon(
     info!("Stopping node...");
     node.stop().await.with_context(|| "Failed to stop node")?;
 
+    if let Some(wallet) = wallet_for_shutdown {
+        match wallet.save() {
+            Ok(()) => info!("Wallet saved"),
+            Err(e) => error!("Failed to save wallet on shutdown: {}", e),
+        }
+    }
+
     info!("Node stopped");
     Ok(())
+}
+
+/// How a mempool refusal of a locally submitted transaction reaches the RPC
+fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
+    use divi_node::NodeError;
+    use divi_rpc::TxSubmitError;
+    match e {
+        NodeError::TxRejected { code, reason } => TxSubmitError::Rejected { code, reason },
+        NodeError::MissingInputs => TxSubmitError::UnknownInputs,
+        NodeError::NonFinal => TxSubmitError::Rejected {
+            code: divi_node::error::reject::NONSTANDARD,
+            reason: "non-final".to_string(),
+        },
+        other => TxSubmitError::Failed(other.to_string()),
+    }
+}
+
+/// getstakingstatus/getmintinginfo data. Each field has the meaning Divi Core's
+/// getstakingstatus gives it (rpcmisc.cpp).
+fn staking_info(
+    status: &divi_node::StakingStatus,
+    wallet_locked: bool,
+    peer_count: usize,
+    tip_time: u32,
+    synced: bool,
+    split_threshold_divi: f64,
+) -> divi_rpc::StakingInfo {
+    divi_rpc::StakingInfo {
+        enabled: status.enabled,
+        staking: status.staking,
+        errors: None,
+        current_block_size: 0,
+        current_block_tx: 0,
+        pooled_tx: 0,
+        difficulty: 0.000244140625,
+        search_interval: 500,
+        weight: status.stake_weight,
+        netstakeweight: status.stake_weight,
+        expected_time: status.expected_time,
+        staking_balance: status.stake_weight as f64 / 100_000_000.0,
+        // !IsLocked(): also true when unlocked for staking only
+        wallet_unlocked: !wallet_locked,
+        have_connections: peer_count > 0,
+        // Tip time after the PoS start, 2016-08-18 (1471482000)
+        valid_time: tip_time > 1_471_482_000,
+        mintable_coins: status.mintable_coins,
+        enough_coins: status.stake_weight > 0,
+        // IronDivi keeps no masternode list sync of its own; Divi Core's
+        // starts once the chain is synced
+        mnsync: synced,
+        blocks: status.blocks,
+        stake_split_threshold: split_threshold_divi,
+    }
+}
+
+/// Divi Core `IsBlockchainSynced`, which its masternode sync waits for: not in
+/// initial block download and the tip is at most ten minutes old. IronDivi has no
+/// masternode list sync of its own, so getstakingstatus `mnsync` reports this.
+fn blockchain_synced(chain: &divi_storage::Chain) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    !chain.is_ibd()
+        && chain
+            .tip()
+            .is_some_and(|t| now.saturating_sub(t.time as u64) <= 600)
+}
+
+/// Drop mempool txs that double-spend an input of `block`, if the block is on
+/// the active chain (the callbacks are also handed side-chain blocks).
+fn evict_block_conflicts(
+    mempool: &divi_node::Mempool,
+    chain: &divi_storage::Chain,
+    block: &divi_primitives::block::Block,
+) {
+    let hash = compute_block_hash(&block.header);
+    let active = chain
+        .get_block_index(&hash)
+        .ok()
+        .flatten()
+        .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
+        .is_some_and(|index| index.hash == hash);
+    if active {
+        mempool.remove_conflicts(&block.transactions);
+    }
+}
+
+/// Scan the active chain into the wallet, in order, from its last scanned
+/// height up to the tip. Blocks that cannot be read (pruned) are skipped and
+/// reported.
+fn sync_wallet_to_tip(wallet: &WalletDb, chain: &divi_storage::Chain) {
+    let missing = divi_rpc::wallet::sync_wallet_with_chain(wallet, chain);
+    if let (Some(first), Some(last)) = (missing.first(), missing.last()) {
+        error!(
+            "Wallet scan could not read {} block(s) in {}..={} (pruned: prune height {}). \
+             Wallet history in that range is NOT scanned. Restore the blocks (resync) or accept the gap.",
+            missing.len(),
+            first,
+            last,
+            chain.prune_height()
+        );
+    }
 }
 
 fn storage_params(config: &NodeConfig) -> divi_storage::ChainParams {
@@ -1631,8 +2060,14 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    // Parse CLI arguments
-    let args = Args::parse();
+    // Parse CLI arguments, completed from the config file where they are unset
+    let args = match resolve_args(Args::parse()) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Compute data directory early (needed for daemonization and logging)
     let data_dir = compute_data_dir(&args);
@@ -1719,8 +2154,8 @@ fn main() -> Result<()> {
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Build log config from CLI args
     let log_config = LogConfig {
-        max_file_size: args.maxlogsize as u64 * 1_048_576, // Convert MB to bytes
-        max_files: args.maxlogfiles,
+        max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
+        max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
         print_to_console: args.printtoconsole,
     };
@@ -1789,7 +2224,15 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     });
 
     // Run the daemon
-    if let Err(e) = run_daemon(config, args.wallet, args.disablewallet, shutdown_rx).await {
+    if let Err(e) = run_daemon(
+        config,
+        args.wallet,
+        args.disablewallet,
+        shutdown_tx,
+        shutdown_rx,
+    )
+    .await
+    {
         error!("Daemon error: {:#}", e);
         // Print the full error chain
         let mut source: Option<&(dyn StdError + 'static)> = e.source();
@@ -1843,10 +2286,180 @@ mod connect_tests {
     }
 
     #[test]
+    fn proxy_from_cli_and_config_file() {
+        assert_eq!(cfg(&[]).p2p.proxy, None);
+        assert_eq!(
+            cfg(&["--proxy=127.0.0.1:9050"]).p2p.proxy_addr(),
+            Ok(Some("127.0.0.1:9050".parse().unwrap()))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("irondivi.conf"),
+            "proxy = \"127.0.0.1:9150\"\n",
+        )
+        .unwrap();
+        let argv = |extra: &[&str]| {
+            let mut v = vec![
+                "irondivid".to_string(),
+                "--regtest".to_string(),
+                format!("--datadir={}", dir.path().display()),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            Args::parse_from(v)
+        };
+        let from_file = build_config(&argv(&[])).unwrap();
+        assert_eq!(from_file.p2p.proxy.as_deref(), Some("127.0.0.1:9150"));
+        // The command line wins over the file
+        let both = build_config(&argv(&["--proxy=127.0.0.1:9050"])).unwrap();
+        assert_eq!(both.p2p.proxy.as_deref(), Some("127.0.0.1:9050"));
+    }
+
+    #[test]
+    fn checkblocks_default_cli_and_config_file() {
+        assert_eq!(cfg(&[]).check_blocks, 100);
+        assert_eq!(cfg(&["--checkblocks=0"]).check_blocks, 0);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("irondivi.conf"), "checkblocks = 500\n").unwrap();
+        let args = Args::parse_from([
+            "irondivid".to_string(),
+            "--regtest".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ]);
+        assert_eq!(build_config(&args).unwrap().check_blocks, 500);
+    }
+
+    #[test]
     fn cli_fullnode_is_a_kept_static_peer() {
         let src = cfg(&["--fullnode=10.0.0.9:52496"]).peer_sources();
         assert!(src.static_peers.contains(&"10.0.0.9:52496".to_string()));
         assert!(!src.dns_seeds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod config_format_tests {
+    use super::*;
+
+    fn cfg(conf: &str, extra: &[&str]) -> Result<NodeConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("irondivi.conf"), conf).unwrap();
+        let mut argv = vec![
+            "irondivid".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(argv))
+    }
+
+    /// A Divi Core divi.conf used to stop irondivid ("Failed to parse config file"):
+    /// the file was read only as TOML.
+    #[test]
+    fn divi_format_config_file_is_read() {
+        let c = cfg(
+            "# Divi Core style\n\
+             rpcuser=foo\n\
+             rpcpassword=12345abc   # inline comment\n\
+             rpcport=19999\n\
+             regtest=1\n\
+             listen=0\n\
+             addnode=10.0.0.1:51476\n\
+             addnode=10.0.0.2:51476\n\
+             spentindex=1\n\
+             server=1\n",
+            &[],
+        )
+        .expect("Divi-format file must load");
+        assert_eq!(c.rpc.username.as_deref(), Some("foo"));
+        assert_eq!(c.rpc.password.as_deref(), Some("12345abc"));
+        assert_eq!(c.rpc.port, 19999);
+        assert_eq!(c.p2p.port, 51476, "regtest=1 in the file selects regtest");
+        assert_eq!(c.p2p.listen, Some(false));
+        assert!(c.index.spentindex);
+        for peer in ["10.0.0.1:51476", "10.0.0.2:51476"] {
+            assert!(c.network.static_peers.contains(&peer.to_string()), "{peer}");
+        }
+    }
+
+    /// Files in the TOML format IronDivi documented keep working unchanged.
+    #[test]
+    fn toml_config_file_still_read() {
+        let c = cfg(
+            "rpcuser = \"foo\"\nrpcport = 19998\naddnode = [\"10.0.0.1:1\", \"10.0.0.2:2\"]\n\
+             txindex = false\nrpcpassword = 12345\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("foo"));
+        assert_eq!(c.rpc.port, 19998);
+        assert!(c.network.static_peers.contains(&"10.0.0.2:2".to_string()));
+        assert!(!c.index.txindex);
+        assert_eq!(c.rpc.password.as_deref(), Some("12345"));
+    }
+
+    /// The index flags in the file used to be overwritten by the command-line defaults
+    /// (txindex true, spentindex/addressindex false), set or not.
+    #[test]
+    fn unset_index_flags_keep_the_config_file_value() {
+        let c = cfg("txindex=0\nspentindex=1\naddressindex=1\n", &[]).unwrap();
+        assert!(!c.index.txindex);
+        assert!(c.index.spentindex);
+        assert!(c.index.addressindex);
+        // Given on the command line, they win
+        let c = cfg(
+            "txindex=0\nspentindex=1\n",
+            &["--txindex", "--spentindex=0", "--addressindex=true"],
+        )
+        .unwrap();
+        assert!(c.index.txindex);
+        assert!(!c.index.spentindex);
+        assert!(c.index.addressindex);
+        // No file and no flag: defaults
+        let c = cfg("", &[]).unwrap();
+        assert!(c.index.txindex && !c.index.spentindex && !c.index.addressindex);
+    }
+
+    /// testnet=1 in the file was logged and ignored, so the node ran mainnet on that datadir.
+    #[test]
+    fn network_from_config_file_unless_given_on_the_command_line() {
+        assert_eq!(cfg("testnet=1\n", &[]).unwrap().p2p.port, 51474);
+        assert_eq!(cfg("testnet = true\n", &[]).unwrap().p2p.port, 51474);
+        assert_eq!(cfg("testnet=1\n", &["--regtest"]).unwrap().p2p.port, 51476);
+        assert_eq!(cfg("", &[]).unwrap().p2p.port, 51472);
+    }
+
+    /// Divi Core 3.0 does not read [section] settings; they must not leak into the main ones.
+    #[test]
+    fn section_settings_are_not_applied() {
+        let c = cfg("rpcuser=foo\n[test]\nrpcport=1\nrpcuser=bar\n", &[]).unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("foo"));
+        assert_eq!(c.rpc.port, 51471);
+    }
+
+    /// Log-file and console settings in the file reach the logger (they were overwritten
+    /// by the command-line defaults before the file was read).
+    #[test]
+    fn early_options_come_from_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("irondivi.conf"),
+            "maxlogsize=7\nmaxlogfiles=9\nprinttoconsole=1\nmode=privatedivi\n\
+             disablewallet=1\ndebug=net\n",
+        )
+        .unwrap();
+        let dd = format!("--datadir={}", dir.path().display());
+        let a = resolve_args(Args::parse_from(["irondivid", dd.as_str()])).unwrap();
+        assert_eq!((a.maxlogsize, a.maxlogfiles), (Some(7), Some(9)));
+        assert!(a.printtoconsole && a.disablewallet && a.debug);
+        assert_eq!(a.chain_mode(), ChainMode::PrivateDivi);
+        let a = resolve_args(Args::parse_from([
+            "irondivid",
+            dd.as_str(),
+            "--maxlogsize=2",
+            "--mode=divi",
+        ]))
+        .unwrap();
+        assert_eq!(a.maxlogsize, Some(2));
+        assert_eq!(a.chain_mode(), ChainMode::Divi);
     }
 }
 
@@ -2000,7 +2613,7 @@ mod mode_tests {
     #[test]
     fn mode_defaults_to_divi() {
         assert_eq!(
-            parse_chain_mode(&Args::parse_from(["irondivid"]).mode),
+            Args::parse_from(["irondivid"]).chain_mode(),
             ChainMode::Divi
         );
         assert_eq!(parse_chain_mode("privatedivi"), ChainMode::PrivateDivi);
@@ -2136,5 +2749,40 @@ mod expire_tests {
         // Invalid value on any surface is an error, not a warning.
         assert!(cfg(None, &["--expire=30"]).is_err());
         assert!(cfg_env(None, Some("bogus"), &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod staking_status_tests {
+    use super::*;
+
+    /// getstakingstatus used to hardcode walletunlocked, haveconnections,
+    /// validtime, mnsync, mintablecoins and the split threshold
+    #[test]
+    fn staking_info_reports_real_state() {
+        let status = divi_node::StakingStatus {
+            enabled: true,
+            staking: true,
+            mintable_coins: false,
+            utxo_count: 1,
+            stake_weight: 12_000 * 100_000_000,
+            expected_time: None,
+            last_stake_time: 0,
+            blocks: 100,
+        };
+        let info = staking_info(&status, true, 0, 0, false, 5000.0);
+        assert!(!info.wallet_unlocked, "locked wallet reported unlocked");
+        assert!(!info.have_connections, "no peers reported as connections");
+        assert!(!info.valid_time);
+        assert!(
+            !info.mintable_coins,
+            "mintablecoins copied the staking flag"
+        );
+        assert!(!info.mnsync);
+        assert_eq!(info.stake_split_threshold, 5000.0);
+        assert!(info.enough_coins);
+
+        let info = staking_info(&status, false, 3, 1_761_000_000, true, 20000.0);
+        assert!(info.wallet_unlocked && info.have_connections && info.valid_time && info.mnsync);
     }
 }

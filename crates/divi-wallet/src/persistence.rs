@@ -15,7 +15,7 @@
 
 use crate::address::Network;
 use crate::error::WalletError;
-use crate::keystore::KeyEntry;
+use crate::keystore::{HdPublicIds, KeyEntry};
 use crate::wallet_db::{WalletTx, WalletUtxo};
 
 use divi_crypto::keys::SecretKey;
@@ -55,9 +55,18 @@ const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
 const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
 const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
 
 /// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
 pub(crate) const ENCRYPTED_SECRET_SUFFIX: u8 = 0x01;
+
+/// master key id (20 bytes) followed by chain id (32 bytes)
+pub(crate) fn encode_hd_public_ids(ids: &HdPublicIds) -> Vec<u8> {
+    let mut data = Vec::with_capacity(52);
+    data.extend_from_slice(&ids.master_key_id);
+    data.extend_from_slice(&ids.chain_id);
+    data
+}
 
 /// Salt and encrypted master key pair
 type EncryptionMetadata = (Vec<u8>, Vec<u8>);
@@ -237,6 +246,39 @@ impl WalletDatabase {
                 };
                 Ok(Some(mode))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Store the HD chain's public ids, which an encrypted wallet cannot derive
+    /// while locked
+    pub fn store_hd_public_ids(&self, ids: &HdPublicIds) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_HD_PUBLIC_IDS, encode_hd_public_ids(ids))
+            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the HD chain's public ids
+    pub fn load_hd_public_ids(&self) -> Result<Option<HdPublicIds>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        match self
+            .db
+            .get_cf(cf, KEY_HD_PUBLIC_IDS)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(data) if data.len() == 52 => {
+                let mut master_key_id = [0u8; 20];
+                let mut chain_id = [0u8; 32];
+                master_key_id.copy_from_slice(&data[..20]);
+                chain_id.copy_from_slice(&data[20..]);
+                Ok(Some(HdPublicIds {
+                    master_key_id,
+                    chain_id,
+                }))
+            }
+            Some(_) => Err(WalletError::Storage("Invalid HD public ids".into())),
             None => Ok(None),
         }
     }
@@ -709,6 +751,16 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(e.to_string()))
     }
 
+    /// Write a batch atomically and fsync the WAL before returning, so the batch
+    /// survives a crash or power loss right after the call
+    pub fn write_batch_sync(&self, batch: WriteBatch) -> Result<(), WalletError> {
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(batch, &opts)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     /// Get a column family handle by name
     pub fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(name).unwrap()
@@ -819,6 +871,88 @@ impl WalletDatabase {
             }
         }
 
+        Ok(results)
+    }
+
+    /// Number of write batches in the WAL written after sequence number `seq`
+    #[cfg(test)]
+    pub(crate) fn write_batches_since(&self, seq: u64) -> Result<usize, WalletError> {
+        let mut count = 0;
+        for item in self
+            .db
+            .get_updates_since(seq)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_sequence_number(&self) -> u64 {
+        self.db.latest_sequence_number()
+    }
+
+    // ========== Unconfirmed wallet transactions ==========
+    //
+    // Kept in the default column family, which nothing else uses, so a wallet
+    // written by this version still opens with an older one (RocksDB refuses
+    // to open a database with an unknown column family).
+
+    /// Key prefix of unconfirmed wallet transactions
+    const UNCONFIRMED_TX_PREFIX: &'static [u8] = b"unconfirmed_tx_";
+
+    fn unconfirmed_tx_key(txid: &Hash256) -> Vec<u8> {
+        let mut key = Self::UNCONFIRMED_TX_PREFIX.to_vec();
+        key.extend_from_slice(txid.as_bytes());
+        key
+    }
+
+    /// Store an unconfirmed wallet transaction (raw bytes) and the time the
+    /// wallet first saw it. Synced: callers rely on it surviving a crash
+    /// right after they return.
+    pub fn store_unconfirmed_tx(
+        &self,
+        txid: &Hash256,
+        timestamp: u64,
+        raw_tx: &[u8],
+    ) -> Result<(), WalletError> {
+        let mut value = Vec::with_capacity(8 + raw_tx.len());
+        value.extend_from_slice(&timestamp.to_le_bytes());
+        value.extend_from_slice(raw_tx);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_DEFAULT), Self::unconfirmed_tx_key(txid), &value);
+        self.write_batch_sync(batch)
+    }
+
+    /// Forget an unconfirmed wallet transaction (confirmed, evicted or conflicted)
+    pub fn remove_unconfirmed_tx(&self, txid: &Hash256) -> Result<(), WalletError> {
+        self.db
+            .delete_cf(self.cf(CF_DEFAULT), Self::unconfirmed_tx_key(txid))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load every stored unconfirmed wallet transaction as (timestamp, raw tx)
+    pub fn load_unconfirmed_txs(&self) -> Result<Vec<(u64, Vec<u8>)>, WalletError> {
+        let iter = self.db.iterator_cf(
+            self.cf(CF_DEFAULT),
+            rocksdb::IteratorMode::From(Self::UNCONFIRMED_TX_PREFIX, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if !key.starts_with(Self::UNCONFIRMED_TX_PREFIX) {
+                break;
+            }
+            if value.len() < 8 {
+                debug!("Skipping corrupt unconfirmed tx entry");
+                continue;
+            }
+            let mut ts = [0u8; 8];
+            ts.copy_from_slice(&value[..8]);
+            results.push((u64::from_le_bytes(ts), value[8..].to_vec()));
+        }
         Ok(results)
     }
 }

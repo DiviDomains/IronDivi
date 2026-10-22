@@ -38,7 +38,7 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// RPC server configuration
 #[derive(Debug, Clone)]
@@ -74,6 +74,9 @@ pub struct LogConfigInfo {
     pub print_to_console: bool,
 }
 
+/// Callback that starts a clean node shutdown (the same path as SIGTERM)
+pub type ShutdownCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// RPC server state
 pub struct RpcServer {
     blockchain: BlockchainRpc,
@@ -84,6 +87,7 @@ pub struct RpcServer {
     masternode: MasternodeRpc,
     spork: SporkRpc,
     log_config: RwLock<Option<LogConfigInfo>>,
+    shutdown: RwLock<Option<ShutdownCallback>>,
 }
 
 impl RpcServer {
@@ -92,12 +96,13 @@ impl RpcServer {
         RpcServer {
             blockchain: BlockchainRpc::new(chain.clone()),
             network: RwLock::new(NetworkRpc::new()),
-            wallet: WalletRpc::with_chain(chain),
+            wallet: WalletRpc::with_chain(chain.clone()),
             staking: StakingRpc::new(),
-            lite_wallet: RwLock::new(LiteWalletRpc::new()),
+            lite_wallet: RwLock::new(LiteWalletRpc::for_chain(chain.clone())),
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -106,12 +111,13 @@ impl RpcServer {
         RpcServer {
             blockchain: BlockchainRpc::new(chain.clone()),
             network: RwLock::new(NetworkRpc::new()),
-            wallet: WalletRpc::with_wallet_and_chain(wallet, chain),
+            wallet: WalletRpc::with_wallet_and_chain(wallet, chain.clone()),
             staking: StakingRpc::new(),
-            lite_wallet: RwLock::new(LiteWalletRpc::new()),
+            lite_wallet: RwLock::new(LiteWalletRpc::for_chain(chain.clone())),
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -120,12 +126,13 @@ impl RpcServer {
         RpcServer {
             blockchain: BlockchainRpc::new(chain.clone()),
             network: RwLock::new(NetworkRpc::with_peer_manager(peer_manager)),
-            wallet: WalletRpc::with_chain(chain),
+            wallet: WalletRpc::with_chain(chain.clone()),
             staking: StakingRpc::new(),
-            lite_wallet: RwLock::new(LiteWalletRpc::new()),
+            lite_wallet: RwLock::new(LiteWalletRpc::for_chain(chain.clone())),
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -138,12 +145,13 @@ impl RpcServer {
         RpcServer {
             blockchain: BlockchainRpc::new(chain.clone()),
             network: RwLock::new(NetworkRpc::with_peer_manager(peer_manager)),
-            wallet: WalletRpc::with_wallet_and_chain(wallet, chain),
+            wallet: WalletRpc::with_wallet_and_chain(wallet, chain.clone()),
             staking: StakingRpc::new(),
-            lite_wallet: RwLock::new(LiteWalletRpc::new()),
+            lite_wallet: RwLock::new(LiteWalletRpc::for_chain(chain.clone())),
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -176,6 +184,7 @@ impl RpcServer {
 
     pub fn set_mempool(&self, mempool: Arc<dyn crate::blockchain::MempoolProvider>) {
         self.blockchain.set_mempool(mempool.clone());
+        self.wallet.set_mempool(mempool.clone());
         self.lite_wallet.write().set_mempool(mempool);
     }
 
@@ -208,6 +217,11 @@ impl RpcServer {
     /// Update chain height (for wallet confirmations)
     pub fn set_height(&self, height: u32) {
         self.wallet.set_height(height);
+    }
+
+    /// Set the hook that the `stop` RPC uses to shut the node down
+    pub fn set_shutdown_callback(&self, callback: ShutdownCallback) {
+        *self.shutdown.write() = Some(callback);
     }
 
     /// Set the log configuration for RPC queries
@@ -371,7 +385,10 @@ impl RpcServer {
             "getinfo" => self.get_info(params),
             "getchaintips" => self.blockchain.get_chain_tips(params),
             "invalidateblock" | "reconsiderblock" | "reverseblocktransactions" => {
-                self.blockchain.invalidate_block_family(method, params)
+                let result = self.blockchain.invalidate_block_family(method, params);
+                // The active chain may have changed without a block notification
+                self.wallet.sync_with_chain();
+                result
             }
             "getdifficulty" => self.blockchain.get_difficulty(params),
             "gettxoutsetinfo" => self.blockchain.get_txout_set_info(params),
@@ -481,6 +498,8 @@ impl RpcServer {
             "getmintinginfo" => self.staking.get_minting_info(params),
             "setstaking" => self.staking.set_staking(params),
             "reservebalance" => self.staking.reserve_balance(params),
+            "getstakesplitthreshold" => self.staking.get_stake_split_threshold(params),
+            "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
             // Lite wallet methods (external address queries)
             "getaddressbalance" => self.lite_wallet.read().get_address_balance(params),
@@ -576,7 +595,7 @@ impl RpcServer {
                 "getblockcount" => "getblockcount\n\nReturns the number of blocks in the longest blockchain.",
                 "getbestblockhash" => "getbestblockhash\n\nReturns the hash of the best (tip) block in the longest blockchain.",
                 "getblockhash" => "getblockhash height\n\nReturns hash of block in best-block-chain at height provided.",
-                "getblock" => "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns hex-encoded data.\nIf verbosity is 1 (default), returns a JSON object.\nIf verbosity is 2, returns JSON object with transaction data.",
+                "getblock" => "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0 or false, returns hex-encoded data.\nIf verbosity is 1 or true (default), returns a JSON object with the transaction ids.\nIf verbosity is 2, returns a JSON object whose \"tx\" holds each transaction decoded as getrawtransaction <txid> 1 shows it.",
                 "getblockheader" => "getblockheader \"blockhash\" ( verbose )\n\nIf verbose is false, returns hex-encoded data.\nIf verbose is true (default), returns a JSON object.",
                 "getblockchaininfo" => "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing.",
                 "getchaintips" => "getchaintips\n\nReturn information about all known tips in the block tree.",
@@ -587,6 +606,11 @@ impl RpcServer {
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.",
                 "generateblock" => "generateblock ( options )\n\nTry to generate a single block with extra options (regtest only - not yet implemented).",
                 "setgenerate" => "setgenerate numberofblocks\n\nGenerate blocks immediately (regtest only - not yet implemented).",
+                "getinfo" => "getinfo\n\nReturns an object containing various state info (version, blocks, connections, difficulty, balance, staking status).",
+                "getinvalid" => "getinvalid ( \"all\" )\n\nGet a summary of invalidated outpoints.\n\nArguments:\n1. all   (string, optional) return a full list of outpoints even if they are spent",
+                "invalidateblock" => "invalidateblock \"hash\"\n\nPermanently marks a block as invalid, as if it violated a consensus rule.\n\nArguments:\n1. hash   (string, required) the hash of the block to mark as invalid",
+                "reconsiderblock" => "reconsiderblock \"hash\"\n\nRemoves invalidity status of a block and its descendants, reconsider them for activation.\nThis can be used to undo the effects of invalidateblock.\n\nArguments:\n1. hash   (string, required) the hash of the block to reconsider",
+                "reverseblocktransactions" => "reverseblocktransactions \"hash\"\n\nRolls the block's transactions back out of the coin database and connects them again.\n\nArguments:\n1. hash   (string, required) the hash of the block",
                 // Network
                 "getnetworkinfo" => "getnetworkinfo\n\nReturns an object containing various state info regarding P2P networking.",
                 "getpeerinfo" => "getpeerinfo\n\nReturns data about each connected network node as a json array of objects.",
@@ -599,6 +623,8 @@ impl RpcServer {
                 "listbanned" => "listbanned\n\nList all banned IPs/subnets.",
                 "clearbanned" => "clearbanned\n\nClear all banned IPs.",
                 "disconnectnode" => "disconnectnode \"address\"\n\nDisconnects a peer by address.\n\nArguments:\n1. \"address\"  (string, required) The IP address:port of the node",
+                "ban" => "ban \"ip_address\"\n\nBans the connected peer with this IP address.\n('outdated' is refused: peer versions are not recorded after the handshake.)\n\nArguments:\n1. \"ip_address\"  (string, required) The IP address of a connected peer",
+                "setmocktime" => "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only).\nThis node has no mock clock, so the call always returns an error.\n\nArguments:\n1. timestamp  (integer, required) Unix seconds-since-epoch timestamp",
                 "getpeerscores" => "getpeerscores\n\nReturns peer scoring and reliability information for debugging.",
                 // Wallet
                 "getnewaddress" => "getnewaddress ( \"label\" )\n\nReturns a new Divi address for receiving payments.",
@@ -613,12 +639,16 @@ impl RpcServer {
                 "gettransaction" => "gettransaction \"txid\"\n\nGet detailed information about an in-wallet transaction.",
                 "listtransactions" => "listtransactions ( count skip )\n\nReturns up to 'count' most recent transactions.",
                 "listsinceblock" => "listsinceblock ( \"blockhash\" target_confirmations )\n\nGet all transactions in blocks since block [blockhash], or all transactions if omitted.",
-                "walletpassphrase" => "walletpassphrase \"passphrase\" timeout\n\nUnlocks the wallet for 'timeout' seconds.",
+                "walletpassphrase" => "walletpassphrase \"passphrase\" timeout ( stakingOnly )\n\nUnlocks the wallet for 'timeout' seconds (0: until walletlock).\nWith stakingOnly true the keys are only used for staking: sends, signing and key exports are refused.",
                 "encryptwallet" => "encryptwallet \"passphrase\"\n\nEncrypts the wallet with 'passphrase'. This is for first time encryption; after that, use walletpassphrasechange. The wallet is left locked, and a private-key or seed operation then needs walletpassphrase first.\n\nArguments:\n1. \"passphrase\"  (string, required) The passphrase to encrypt the wallet with.",
                 "walletlock" => "walletlock\n\nLocks the wallet.",
                 "dumpprivkey" => "dumpprivkey \"address\"\n\nReveals the private key corresponding to 'address'.",
                 "dumphdinfo" => "dumphdinfo\n\nReturns an object containing sensitive private info about this HD wallet.",
                 "importprivkey" => "importprivkey \"privkey\" ( \"label\" rescan )\n\nAdds a private key to your wallet.",
+                "rescanblockchain" => "rescanblockchain ( start_height stop_height )\n\nRescan the local blockchain for wallet related transactions.\n\nArguments:\n1. start_height  (numeric, optional, default=0) block height where the rescan should start\n2. stop_height   (numeric, optional, default=tip) the last block height that should be scanned",
+                "backupwallet" => "backupwallet \"destination\"\n\nSafely copies the wallet to destination, which can be a directory or a path with filename.\n\nArguments:\n1. \"destination\"   (string) The destination directory or file",
+                "signmessage" => "signmessage \"diviaddress\" \"message\"\n\nSign a message with the private key of an address.\nRequires the wallet to be unlocked if it is encrypted.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address to use for the private key.\n2. \"message\"      (string, required) The message to create a signature of.\n\nResult:\n\"signature\"        (string) The signature of the message encoded in base 64",
+                "verifymessage" => "verifymessage \"diviaddress\" \"signature\" \"message\"\n\nVerify a signed message.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address to use for the signature.\n2. \"signature\"    (string, required) The signature provided by the signer in base 64 encoding (see signmessage).\n3. \"message\"      (string, required) The message that was signed.\n\nResult:\ntrue|false   (boolean) If the signature is verified or not.",
                 "sendtoaddress" => "sendtoaddress \"address\" amount\n\nSend an amount to a given address.",
                 "getaddressesbylabel" => "getaddressesbylabel \"label\"\n\nReturns the list of addresses assigned the specified label.",
                 "listreceivedbyaddress" => "listreceivedbyaddress ( minconf include_empty )\n\nList balances by receiving address.",
@@ -645,8 +675,9 @@ impl RpcServer {
                 "getspentinfo" => "getspentinfo {txid:,index:}\n\nReturns the txid and index where an output is spent.\n\nArguments:\n{\n  \"txid\" (string) The hex string of the txid\n  \"index\" (number) The start block height\n}\n\nResult:\n{\n  \"txid\"  (string) The transaction id\n  \"index\"  (number) The spending input index\n  ,...\n}\n\nExamples:\n> divi-cli getspentinfo '{\"txid\": \"0437cd7f8525ceed2324359c2d0ba26006d92d856a9c20fa0241106ee5a597c9\", \"index\": 0}'\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getspentinfo\", \"params\": [{\"txid\": \"0437cd7f8525ceed2324359c2d0ba26006d92d856a9c20fa0241106ee5a597c9\", \"index\": 0}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/",
                 // Raw transactions
                 "createrawtransaction" => "createrawtransaction [{\"txid\":\"...\",\"vout\":n},...] {\"address\":amount,...}\n\nCreate an unsigned raw transaction.",
-                "signrawtransaction" => "signrawtransaction \"hexstring\" ( [{\"txid\":\"...\",\"scriptPubKey\":\"...\"},...] )\n\nSign a raw transaction with wallet keys.",
-                "signrawtransactionwithwallet" => "signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"...\",\"scriptPubKey\":\"...\"},...] )\n\nSign a raw transaction with wallet keys.",
+                "signrawtransaction" => "signrawtransaction \"hexstring\" ( [{\"txid\":\"id\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\"},...] [\"privatekey\",...] )\n\nSign the inputs of a raw transaction with wallet keys and merge with the signatures already in it.\nA P2SH input needs its redeemScript, given here or stored in the wallet (addmultisigaddress).\nIf private keys (WIF) are given, only those keys sign, the wallet is not used and need not be unlocked.\n\nResult:\n{\n  \"hex\": \"value\",   (string) The raw transaction with signature(s)\n  \"complete\": true|false   (boolean) If the transaction has a complete set of signatures\n}",
+                "signrawtransactionwithwallet" => "signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"id\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\"},...] [\"privatekey\",...] )\n\nSign the inputs of a raw transaction with wallet keys and merge with the signatures already in it.\nA P2SH input needs its redeemScript, given here or stored in the wallet (addmultisigaddress).\nIf private keys (WIF) are given, only those keys sign, the wallet is not used and need not be unlocked.\n\nResult:\n{\n  \"hex\": \"value\",   (string) The raw transaction with signature(s)\n  \"complete\": true|false   (boolean) If the transaction has a complete set of signatures\n}",
+                "signtransactionwithaddresskey" => "signtransactionwithaddresskey \"hexstring\" \"address\" inputindex\n\nSigns one input with the wallet key of an address (SIGHASH_SINGLE) and returns the signature script as asm.\n\nArguments:\n1. \"hexstring\"  (string, required) The transaction hex string\n2. \"address\"    (string, required) The wallet address whose key signs\n3. inputindex    (numeric, required) The input to sign",
                 "sendrawtransaction" => "sendrawtransaction \"hexstring\"\n\nSubmit a raw transaction to the network.",
                 "getrawtransaction" => "getrawtransaction \"txid\" ( verbose )\n\nReturn the raw transaction data.",
                 "decoderawtransaction" => "decoderawtransaction \"hexstring\"\n\nReturn a JSON object representing the serialized transaction.",
@@ -657,12 +688,15 @@ impl RpcServer {
                 "getmintinginfo" => "getmintinginfo\n\nReturns detailed staking/minting information.",
                 "setstaking" => "setstaking true|false\n\nEnable or disable staking.",
                 "reservebalance" => "reservebalance ( true|false amount )\n\nShow or set reserve balance for staking.",
+                "getstakesplitthreshold" => "getstakesplitthreshold\n\nReturns the stake split threshold in DIVI (startup value: -stakesplitthreshold, default 20000).",
+                "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
                 "getaddressbalance" => "getaddressbalance \"address\" ( minconf )\n\nReturns the balance for an external address.\nDoes not require a local wallet.",
                 "getaddressutxos" => "getaddressutxos \"address\" ( minconf maxconf )\n\nReturns UTXOs for an external address.\nDoes not require a local wallet.",
                 "getaddresshistory" => "getaddresshistory \"address\" ( skip limit )\n\nReturns transaction history for an external address.\nDoes not require a local wallet.",
                 "gettxindex" => "gettxindex \"txid\"\n\nReturns block location info for a transaction.",
                 "estimatefee" => "estimatefee ( nblocks )\n\nEstimates the fee per kilobyte needed for confirmation in nblocks.",
+                "estimatepriority" => "estimatepriority nblocks\n\nDeprecated. Always returns -1.",
                 "estimatesmartfee" => "estimatesmartfee ( nblocks )\n\nEstimates the smart fee per kilobyte needed for confirmation.",
                 "getmempoolinfo" => "getmempoolinfo\n\nReturns details on the active state of the mempool.",
                 "validateaddresses" => "validateaddresses [\"address\",...]\n\nValidates multiple addresses at once.",
@@ -686,13 +720,14 @@ impl RpcServer {
                 "verifychain" => "verifychain ( numblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. numblocks    (numeric, optional, default=288, 0=all) The number of blocks to check.\n\nResult:\ntrue|false       (boolean) Verified or not",
                 "getmininginfo" => "getmininginfo\n\nReturns a json object containing mining-related information.\n\nResult:\n{\n  \"blocks\": nnn,             (numeric) The current block\n  \"currentblocksize\": nnn,   (numeric) The last block size\n  \"difficulty\": xxx.xxxxx    (numeric) The current difficulty\n  \"errors\": \"...\"          (string) Current errors\n  \"pooledtx\": n              (numeric) The size of the mem pool\n  \"chain\": \"xxxx\"         (string) current network name\n}",
                 "bip38encrypt" => "bip38encrypt \"diviaddress\" \"passphrase\"\n\nEncrypts a private key with a passphrase using BIP38.\n\nArguments:\n1. \"diviaddress\"   (string, required) The divi address\n2. \"passphrase\"    (string, required) The passphrase\n\nResult:\n\"key\"                (string) The encrypted private key",
+                "bip38paperwallet" => "bip38paperwallet \"passphrase\"\n\nCreates a new key that is not stored in the wallet and returns its address and the key encrypted with BIP38.\nRequires the wallet to be unlocked if it is encrypted.\n\nArguments:\n1. \"passphrase\"    (string, required) The passphrase that encrypts the key\n\nResult:\n{\n  \"Address\": \"address\",        (string) The divi address of the new key\n  \"Encrypted Key\": \"key\"       (string) The BIP38 encrypted private key\n}",
                 "bip38decrypt" => "bip38decrypt \"bip38key\" \"passphrase\"\n\nDecrypts a BIP38 encrypted private key.\n\nArguments:\n1. \"bip38key\"      (string, required) The encrypted private key\n2. \"passphrase\"    (string, required) The passphrase\n\nResult:\n\"key\"                (string) The decrypted private key in WIF format",
-                "loadwallet" => "loadwallet \"filename\"\n\nLoads wallet into memory.\n\nArguments:\n1. \"filename\"       (string, required) The filename of the wallet.dat to be loaded.",
+                "loadwallet" => "loadwallet \"filename\"\n\nNot supported by IronDivi: irondivid opens one wallet when it starts and keeps it until it stops. To use another wallet, stop irondivid and start it with --wallet=<wallet directory>. Always returns an error.\n\nArguments:\n1. \"filename\"       (string, required) The wallet that would be loaded.",
                 "getlotteryblockwinners" => "getlotteryblockwinners [block_height]\n\nReturns the lottery candidates recorded at a block.\n\nArguments:\n1. block_height    (numeric, optional) The block height (default and maximum: the tip)",
                 "allocatefunds" => "allocatefunds purpose alias tier ( \"pay wallet\" ( \"voting wallet\" ) )\n\nAllocates treasury funds for governance purposes.\n\nArguments:\n1. purpose    (string, required) The purpose of allocation\n2. alias      (string, required) Identifier for this allocation",
                 // Vault
                 "addvault" => "addvault \"<owner_address>:<manager_address>\" funding_txhash\n\nAllows vault manager to accept to stake the indicated vault script.\n\nArguments:\n1. \"<owner_address>:<manager_address>\"  (string, required) Vault representation as a pair of addresses.\n2. \"tx_hash\"  (string, required) The transaction hash to search for the initial funding.",
-                "removevault" => "removevault \"<owner_address>:<manager_address>\" tx_hash\n\nAllows vault manager to reject staking the indicated vault script.\n\nArguments:\n1. \"<owner_address>:<manager_address>\"  (string, required) Vault representation as a pair of addresses.\n2. \"tx_hash\"  (string, required) The transaction hash to search for the initial funding.",
+                "removevault" => "removevault \"<owner_address>:<manager_address>\" ( tx_hash )\n\nAllows vault manager to reject staking the indicated vault script.\n\nArguments:\n1. \"<owner_address>:<manager_address>\"  (string, required) Vault representation as a pair of addresses.\n2. \"tx_hash\"  (string, optional) Ignored; accepted for older IronDivi callers.",
                 "getcoinavailability" => "getcoinavailability\n\nReturns available vault funds breakdown by vault type.\n\nResult:\n{\n  \"vaults\": [\n    {\n      \"owner\": \"address\",      (string) Owner address\n      \"manager\": \"address\",    (string) Manager address\n      \"balance\": x.xxx,         (numeric) Balance in DIVI\n      \"balance_sat\": n          (numeric) Balance in satoshis\n    }\n  ],\n  \"total_vaults\": n            (numeric) Total number of vaults\n}",
                 "fundvault" => "fundvault \"[owner_address:]manager_address\" amount\n\nSend an amount to a given vault manager address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"[owner_address:]manager_address\" (string, required)\n   \"owner_address\" -> The address of the key owning the vault funds. Needs ':' separator if used.\n   \"manager_address\" -> The divi address owned by the vault manager.\n2. \"amount\"      (numeric, required) The amount in DIVI to send. eg 0.1",
                 "debitvaultbyname" => "debitvaultbyname vault-encoding destination amount (feeMode)\n\nWithdraw an amount from a specific vaults to a destination address. The amount is a real and is rounded to the nearest 0.00000001\n\nRequires wallet passphrase to be set with walletpassphrase call.\nArguments:\n1. \"vault-encoding\"  (string, required) The vault encoding to withdraw from.\n2. \"diviaddress\"  (string, required) The divi address of your choosing to send to.\n3. \"amount\"      (numeric, required) The amount in DIVI to move. eg 0.1\n4. \"fee mode\"      (string, optional) The fee + change output calculation mode\n\nResult:\n\"transactionid\"  (string) The transaction id.",
@@ -722,6 +757,7 @@ impl RpcServer {
                 "reverseblocktransactions",
                 "getdifficulty",
                 "getinfo",
+                "getinvalid",
                 "getmininginfo",
                 "getrawmempool",
                 "gettxout",
@@ -756,6 +792,7 @@ impl RpcServer {
                 "== Wallet ==",
                 "addmultisigaddress",
                 "allocatefunds",
+                "backupwallet",
                 "bip38decrypt",
                 "bip38encrypt",
                 "bip38paperwallet",
@@ -787,10 +824,12 @@ impl RpcServer {
                 "listtransactions",
                 "listunspent",
                 "loadwallet",
+                "rescanblockchain",
                 "sendfrom",
                 "sendmany",
                 "sendtoaddress",
                 "setaccount",
+                "signmessage",
                 "validateaddress",
                 "encryptwallet",
                 "walletlock",
@@ -799,6 +838,8 @@ impl RpcServer {
                 "",
                 "== Util ==",
                 "createmultisig",
+                "setmocktime",
+                "verifymessage",
                 "",
                 "== Rawtransactions ==",
                 "createrawtransaction",
@@ -810,15 +851,19 @@ impl RpcServer {
                 "sendrawtransaction",
                 "signrawtransaction",
                 "signrawtransactionwithwallet",
+                "signtransactionwithaddresskey",
                 "",
                 "== Staking ==",
                 "getmintinginfo",
                 "getstakingstatus",
                 "reservebalance",
+                "getstakesplitthreshold",
+                "setstakesplitthreshold",
                 "setstaking",
                 "",
                 "== Lite Wallet ==",
                 "estimatefee",
+                "estimatepriority",
                 "estimatesmartfee",
                 "getaddressbalance",
                 "getaddresshistory",
@@ -865,8 +910,16 @@ impl RpcServer {
         }
     }
 
-    /// Stop server (placeholder)
+    /// Stop server: hand off to the node's shutdown path, then answer as Divi Core does
     fn stop(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+        let shutdown = self.shutdown.read().clone();
+        let Some(shutdown) = shutdown else {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "stop is not available on this server").into(),
+            );
+        };
+        info!("RPC stop received, shutting down");
+        shutdown();
         Ok(serde_json::Value::String(
             "Divi server stopping".to_string(),
         ))
@@ -961,13 +1014,10 @@ async fn handle_wallet_rpc(
     )
 }
 
-/// Create the axum router for RPC, without authentication.
-pub fn create_router(server: Arc<RpcServer>) -> Router {
-    build_router(server, None)
-}
-
-/// Create the axum router for RPC, enforcing HTTP Basic authentication when
-/// `config` carries both a username and a password.
+/// Create the axum router for RPC, enforcing HTTP Basic authentication.
+/// Without both a username and a password every request is refused: the RPC
+/// is never served open (irondivid fills in cookie credentials when none are
+/// configured, see [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
     build_router(server, rpc_credentials(config))
 }
@@ -983,48 +1033,46 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
         .route("/wallet/:wallet_name", post(handle_wallet_rpc))
         .with_state(server);
 
-    let router = match credentials {
-        Some(creds) => router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
-            let creds = creds.clone();
-            async move {
-                let authorization = req
-                    .headers()
-                    .get(header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok());
-                if basic_auth_matches(authorization, &creds.0, &creds.1) {
-                    next.run(req).await
-                } else {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        [(
-                            header::WWW_AUTHENTICATE,
-                            HeaderValue::from_static("Basic realm=\"jsonrpc\""),
-                        )],
-                    )
-                        .into_response()
-                }
+    // No credentials means no request can authenticate, never an open server.
+    let router = router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
+        let creds = credentials.clone();
+        async move {
+            let authorization = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            let authorized = creds
+                .as_ref()
+                .is_some_and(|c| basic_auth_matches(authorization, &c.0, &c.1));
+            if authorized {
+                next.run(req).await
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        header::WWW_AUTHENTICATE,
+                        HeaderValue::from_static("Basic realm=\"jsonrpc\""),
+                    )],
+                )
+                    .into_response()
             }
-        })),
-        None => router,
-    };
+        }
+    }));
 
     // CORS stays outermost so preflight requests are answered without credentials.
     router.layer(cors)
 }
 
-/// The credentials to enforce: both must be set, or the server runs open.
+/// The credentials to enforce: both must be set. `None` means no request can
+/// authenticate.
 fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
     match (&config.username, &config.password) {
         (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
             info!("RPC authentication enabled");
             Some(Arc::new((u.clone(), p.clone())))
         }
-        (None, None) => {
-            warn!("RPC authentication disabled: rpcuser/rpcpassword not set");
-            None
-        }
         _ => {
-            warn!("RPC authentication disabled: set both rpcuser and rpcpassword");
+            error!("RPC has no complete rpcuser/rpcpassword: every request will be refused");
             None
         }
     }
@@ -1310,6 +1358,23 @@ mod tests {
     }
 
     #[test]
+    fn stop_calls_the_shutdown_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (server, _dir) = create_test_server();
+        // No hook: refuse instead of claiming to stop
+        assert!(call(&server, "stop", Params::None).error.is_some());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        server.set_shutdown_callback(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let r = call(&server, "stop", Params::None);
+        assert_eq!(r.result, Some(serde_json::json!("Divi server stopping")));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn test_getinfo_parity_fields() {
         let (server, _dir) = create_test_server();
         let r = call(&server, "getinfo", Params::None).result.unwrap();
@@ -1552,12 +1617,96 @@ mod tests {
     }
 
     #[test]
-    fn auth_is_enforced_only_with_both_credentials() {
+    fn credentials_need_both_user_and_password() {
         let mut config = RpcConfig::default();
         assert!(rpc_credentials(&config).is_none());
         config.username = Some("alice".into());
         assert!(rpc_credentials(&config).is_none());
         config.password = Some("s3cret".into());
         assert!(rpc_credentials(&config).is_some());
+    }
+
+    /// Serve `router` on a loopback port and POST one getblockcount to it.
+    async fn status_of(router: Router, authorization: Option<String>) -> StatusCode {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+        let auth_line = authorization
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n{auth_line}Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let code: u16 = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("bad HTTP response: {response:?}"));
+        StatusCode::from_u16(code).unwrap()
+    }
+
+    fn basic(user: &str, password: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        )
+    }
+
+    #[tokio::test]
+    async fn rpc_without_credentials_is_never_open() {
+        // no rpcuser/rpcpassword must not mean an unauthenticated RPC
+        for (user, pass) in [(None, None), (Some("alice"), None), (Some(""), Some(""))] {
+            let (server, _dir) = create_test_server();
+            let config = RpcConfig {
+                username: user.map(String::from),
+                password: pass.map(String::from),
+                ..RpcConfig::default()
+            };
+            let router = create_router_with_auth(server, &config);
+            assert_eq!(
+                status_of(router.clone(), None).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                status_of(router, Some(basic("", ""))).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cookie_credentials_authenticate() {
+        let (server, dir) = create_test_server();
+        let (user, password, cookie) =
+            crate::auth_cookie::resolve_rpc_auth(None, None, dir.path()).unwrap();
+        assert!(cookie.is_some());
+        let config = RpcConfig {
+            username: Some(user.clone()),
+            password: Some(password.clone()),
+            ..RpcConfig::default()
+        };
+        let router = create_router_with_auth(server, &config);
+        assert_eq!(
+            status_of(router.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(router.clone(), Some(basic(&user, "wrong"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // What a client reads from the cookie file works
+        let contents = std::fs::read_to_string(cookie.as_ref().unwrap().path()).unwrap();
+        let (u, p) = contents.split_once(':').unwrap();
+        assert_eq!(status_of(router, Some(basic(u, p))).await, StatusCode::OK);
     }
 }

@@ -16,7 +16,7 @@
 use crate::version::VersionMessage;
 use crate::NetworkMessage;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -88,8 +88,10 @@ pub struct PeerInfo {
     pub ping_nonce: Option<u64>,
     /// Last ping time
     pub ping_time: Option<Instant>,
-    /// Ping latency in milliseconds
-    pub ping_latency_ms: Option<u64>,
+    /// Last ping round trip in microseconds
+    pub ping_latency_us: Option<u64>,
+    /// Peer clock minus ours, in seconds, from its version message
+    pub time_offset: i64,
     /// Misbehavior score (for banning)
     pub misbehavior_score: u32,
     /// Last message command received (for debugging)
@@ -117,7 +119,8 @@ impl PeerInfo {
             bytes_sent: 0,
             ping_nonce: None,
             ping_time: None,
-            ping_latency_ms: None,
+            ping_latency_us: None,
+            time_offset: 0,
             misbehavior_score: 0,
             last_message_command: None,
             last_message_size: 0,
@@ -201,6 +204,10 @@ pub struct LivePeerStats {
     pub conn_time: AtomicU64,
     /// Last ping round trip in microseconds (0 = none yet)
     pub ping_us: AtomicU64,
+    /// Unix time in microseconds the outstanding ping was sent (0 = none outstanding)
+    pub ping_sent_us: AtomicU64,
+    /// Peer clock minus ours, in seconds, from its version message
+    pub time_offset: AtomicI64,
     /// Peer's advertised protocol version
     pub version: AtomicU64,
     /// Peer's advertised services
@@ -212,9 +219,14 @@ pub struct LivePeerStats {
 }
 
 fn unix_now() -> u64 {
+    unix_now_us() / 1_000_000
+}
+
+/// Current Unix time in microseconds
+pub fn unix_now_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
 }
 
@@ -227,10 +239,20 @@ impl PeerInfo {
         live.bytes_recv.store(self.bytes_recv, Ordering::Relaxed);
         live.last_send.store(ago(self.last_send), Ordering::Relaxed);
         live.last_recv.store(ago(self.last_recv), Ordering::Relaxed);
-        live.conn_time
-            .store(ago(self.connected_at), Ordering::Relaxed);
+        // Set once: recomputing from an Instant each time would jitter by a second
+        if live.conn_time.load(Ordering::Relaxed) == 0 {
+            live.conn_time
+                .store(ago(self.connected_at), Ordering::Relaxed);
+        }
         live.ping_us
-            .store(self.ping_latency_ms.unwrap_or(0) * 1000, Ordering::Relaxed);
+            .store(self.ping_latency_us.unwrap_or(0), Ordering::Relaxed);
+        let now_us = unix_now_us();
+        let ping_sent_us = match (self.ping_nonce, self.ping_time) {
+            (Some(_), Some(t)) => now_us.saturating_sub(t.elapsed().as_micros() as u64),
+            _ => 0,
+        };
+        live.ping_sent_us.store(ping_sent_us, Ordering::Relaxed);
+        live.time_offset.store(self.time_offset, Ordering::Relaxed);
         live.services.store(self.services, Ordering::Relaxed);
         live.start_height
             .store(self.start_height as u64, Ordering::Relaxed);

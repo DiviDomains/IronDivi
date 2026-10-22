@@ -49,6 +49,9 @@ pub struct PeerManagerConfig {
     pub listen_addr: Option<SocketAddr>,
     /// Default P2P port for DNS seed resolution
     pub default_port: u16,
+    /// SOCKS5 proxy for every outbound connection (C++ `-proxy`). When set, no
+    /// outbound connection is made directly and DNS seeds are not resolved locally.
+    pub proxy: Option<SocketAddr>,
 }
 
 impl Default for PeerManagerConfig {
@@ -65,6 +68,7 @@ impl Default for PeerManagerConfig {
             ],
             listen_addr: None,
             default_port: 51472, // Mainnet P2P port
+            proxy: None,
         }
     }
 }
@@ -78,39 +82,6 @@ pub struct AddedNode {
     pub connected: bool,
     /// Whether connection attempt is in progress
     pub connecting: bool,
-}
-
-/// Statistics for a connected peer (for RPC getpeerinfo)
-#[derive(Debug, Clone)]
-pub struct PeerStatistics {
-    /// Peer ID
-    pub id: PeerId,
-    /// Remote address
-    pub addr: SocketAddr,
-    /// Whether this is an inbound connection
-    pub inbound: bool,
-    /// Connection establishment time (seconds since epoch)
-    pub conntime: u64,
-    /// Last message sent time (seconds since epoch)
-    pub lastsend: u64,
-    /// Last message received time (seconds since epoch)
-    pub lastrecv: u64,
-    /// Bytes sent to this peer
-    pub bytessent: u64,
-    /// Bytes received from this peer
-    pub bytesrecv: u64,
-    /// Last ping round-trip time in seconds (None if no pong received yet)
-    pub pingtime: Option<f64>,
-    /// Ping wait time in seconds (time since ping sent, waiting for pong)
-    pub pingwait: Option<f64>,
-    /// Services offered by the peer
-    pub services: u64,
-    /// Protocol version
-    pub version: u32,
-    /// User agent string
-    pub subver: String,
-    /// Starting height of the peer
-    pub startingheight: i32,
 }
 
 /// Manages connections to multiple peers
@@ -441,10 +412,23 @@ impl PeerManager {
         Ok(())
     }
 
+    /// SOCKS5 proxy used for outbound connections, if any
+    pub fn proxy(&self) -> Option<SocketAddr> {
+        self.config.proxy
+    }
+
     /// Discover peers from DNS seeds
     async fn discover_peers(self: Arc<Self>) {
         if self.config.dns_seeds.is_empty() {
             debug!("No DNS seeds configured; skipping DNS peer discovery");
+            return;
+        }
+        if let Some(proxy) = self.config.proxy {
+            // A local lookup would reveal the node outside the proxy
+            info!(
+                "Proxy {} set: not resolving DNS seeds locally; using configured peers only",
+                proxy
+            );
             return;
         }
         info!(
@@ -541,6 +525,7 @@ impl PeerManager {
 
         let result = Connection::connect(
             addr,
+            self.config.proxy,
             self.config.magic,
             our_height,
             self.services(),
@@ -666,6 +651,12 @@ impl PeerManager {
         }
     }
 
+    /// Queue a timed ping to every connected peer (the `ping` RPC); each pong updates
+    /// that peer's pingtime
+    pub fn ping_all(&self) {
+        self.broadcast(NetworkMessage::Ping(0));
+    }
+
     /// Relay a raw C++-format masternode broadcast (`mnb`) to all connected peers
     pub fn broadcast_masternode_broadcast(&self, bytes: Vec<u8>) {
         self.broadcast(NetworkMessage::MasternodeBroadcast(bytes));
@@ -762,41 +753,6 @@ impl PeerManager {
     pub fn disconnect_all(&self) {
         let _ = self.shutdown_tx.send(());
         self.peers.write().clear();
-    }
-
-    /// Get the best height among all connected peers
-    pub fn best_peer_height(&self) -> u32 {
-        // Note: We don't track heights per peer after handshake currently
-        // This would need to be updated when we receive inv messages
-        0
-    }
-
-    /// Get detailed statistics for all connected peers (for RPC getpeerinfo)
-    pub fn get_peer_statistics(&self) -> Vec<PeerStatistics> {
-        self.peers
-            .read()
-            .values()
-            .map(|handle| {
-                // Note: We only have access to basic handle info here
-                // Full statistics would require storing PeerInfo in PeerManager
-                PeerStatistics {
-                    id: handle.id,
-                    addr: handle.addr,
-                    inbound: handle.inbound,
-                    conntime: 0, // Would need to track connection time
-                    lastsend: 0,
-                    lastrecv: 0,
-                    bytessent: 0, // Updated below via accessor
-                    bytesrecv: 0, // Updated below via accessor
-                    pingtime: None,
-                    pingwait: None,
-                    services: 0,
-                    version: 0,
-                    subver: String::new(),
-                    startingheight: 0,
-                }
-            })
-            .collect()
     }
 
     /// Get network traffic totals across all peers
@@ -1280,19 +1236,78 @@ mod tests {
         }
     }
 
+    fn local_only(listen_addr: Option<SocketAddr>, proxy: Option<SocketAddr>) -> PeerManagerConfig {
+        PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            dns_seeds: vec![],
+            static_peers: vec![],
+            listen_addr,
+            proxy,
+            ..Default::default()
+        }
+    }
+
+    /// With a proxy set, the outbound P2P connection goes through it (SOCKS5 CONNECT
+    /// to the peer) and completes the handshake end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_outbound_connection_goes_through_socks5_proxy() {
+        let listen: SocketAddr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let server = PeerManager::new(local_only(Some(listen), None));
+        tokio::spawn(Arc::clone(&server).start());
+        let (proxy, seen) = crate::socks5::stub::start().await;
+        let client = PeerManager::new(local_only(None, Some(proxy)));
+        assert_eq!(client.proxy(), Some(proxy));
+
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "could not connect through the proxy");
+        // Handshake done over the proxied stream: the server sees one inbound peer
+        let mut inbound = 0;
+        for _ in 0..50 {
+            inbound = server.inbound_count();
+            if inbound == 1 && client.outbound_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(inbound, 1);
+        assert_eq!(client.outbound_count(), 1);
+        assert!(!seen.lock().is_empty() && seen.lock().iter().all(|t| *t == listen));
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
+    /// A dead proxy must fail the connection, never fall back to connecting directly.
+    #[tokio::test]
+    async fn test_dead_proxy_does_not_fall_back_to_direct() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let dead_proxy = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let client = PeerManager::new(local_only(None, Some(dead_proxy)));
+        let err = Arc::clone(&client).connect_to_peer(target_addr).await;
+        assert!(err.is_err());
+        let direct = tokio::time::timeout(Duration::from_millis(300), target.accept()).await;
+        assert!(direct.is_err(), "connected to the peer directly");
+    }
+
     #[test]
     fn test_net_totals_start_at_zero() {
         let pm = PeerManager::new(PeerManagerConfig::default());
         let (sent, recv) = pm.get_net_totals();
         assert_eq!(sent, 0);
         assert_eq!(recv, 0);
-    }
-
-    #[test]
-    fn test_peer_statistics_empty() {
-        let pm = PeerManager::new(PeerManagerConfig::default());
-        let stats = pm.get_peer_statistics();
-        assert!(stats.is_empty());
     }
 
     #[test]

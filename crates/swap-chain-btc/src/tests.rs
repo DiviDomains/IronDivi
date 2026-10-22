@@ -39,6 +39,30 @@ fn backend(urls: Vec<String>, key: [u8; 32]) -> BtcBackend {
     .unwrap()
 }
 
+#[test]
+fn regtest_network_is_supported() {
+    // regtest maps to bcrt1 addresses and a local Esplora
+    let key = SecretKey::from_slice(&MAKER_KEY).unwrap();
+    let b = BtcBackend::for_network("regtest", key, FeePolicy::Fixed(1)).unwrap();
+    assert!(
+        b.address().to_string().starts_with("bcrt1q"),
+        "{}",
+        b.address()
+    );
+    assert_eq!(
+        esplora_endpoints("regtest").unwrap(),
+        vec![LOCAL_REGTEST_ESPLORA.to_string()]
+    );
+
+    // signet and testnet keep tb1, mainnet stays refused
+    for net in ["signet", "testnet"] {
+        let b = BtcBackend::for_network(net, key, FeePolicy::Fixed(1)).unwrap();
+        assert!(b.address().to_string().starts_with("tb1q"));
+    }
+    assert!(esplora_endpoints("mainnet").is_err());
+    assert!(btc_network("bitcoin").is_err());
+}
+
 /// HTLC where the taker key claims and the maker key refunds.
 fn htlc(hash: [u8; 32]) -> HtlcParams {
     let secp = Secp256k1::new();
