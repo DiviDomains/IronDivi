@@ -590,7 +590,7 @@ impl RpcServer {
                 "getblockcount" => "getblockcount\n\nReturns the number of blocks in the longest blockchain.",
                 "getbestblockhash" => "getbestblockhash\n\nReturns the hash of the best (tip) block in the longest blockchain.",
                 "getblockhash" => "getblockhash height\n\nReturns hash of block in best-block-chain at height provided.",
-                "getblock" => "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns hex-encoded data.\nIf verbosity is 1 (default), returns a JSON object.\nIf verbosity is 2, returns JSON object with transaction data.",
+                "getblock" => "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0 or false, returns hex-encoded data.\nIf verbosity is 1 or true (default), returns a JSON object with the transaction ids.\nIf verbosity is 2, returns a JSON object whose \"tx\" holds each transaction decoded as getrawtransaction <txid> 1 shows it.",
                 "getblockheader" => "getblockheader \"blockhash\" ( verbose )\n\nIf verbose is false, returns hex-encoded data.\nIf verbose is true (default), returns a JSON object.",
                 "getblockchaininfo" => "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing.",
                 "getchaintips" => "getchaintips\n\nReturn information about all known tips in the block tree.",
