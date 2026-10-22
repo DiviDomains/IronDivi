@@ -1445,15 +1445,18 @@ async fn run_daemon(
                     // Wire up transaction submission (mempool + relay)
                     let mempool_for_submit = mempool_for_tx.clone();
                     let tx_relay_for_submit = tx_relay_for_tx.clone();
+                    let chain_for_submit = Arc::clone(&chain_for_staking_status);
                     rpc_server.wallet().set_tx_submit(Arc::new(move |tx: Transaction| {
                         let txid = tx.txid();
 
-                        // For locally submitted transactions, calculate fee generously
-                        // to pass mempool relay fee check. The actual fee is embedded
-                        // in the tx (inputs - outputs) and was set by the wallet.
-                        let fee = Amount::from_sat(
-                            (tx.size() as i64) * 10_000
-                        );
+                        // The real fee (inputs - outputs), so the mempool's relay
+                        // fee check sees what peers will see
+                        let fee = Node::calculate_transaction_fee(
+                            &tx,
+                            &chain_for_submit,
+                            &mempool_for_submit,
+                        )
+                        .map_err(|e| format!("Mempool rejected: {}", e))?;
                         mempool_for_submit.add(tx, fee).map_err(|e| format!("Mempool rejected: {}", e))?;
 
                         // Announce to peers (async, fire-and-forget)

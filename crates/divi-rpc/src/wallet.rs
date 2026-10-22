@@ -55,6 +55,30 @@ fn ensure_not_dust(value: Amount, script: &Script) -> Result<(), Error> {
     Ok(())
 }
 
+/// Upper bound on the serialized size of a wallet transaction with `inputs`
+/// P2PKH or vault inputs (scriptSig at most 73 + 34 + 2 bytes) paying `outputs`
+fn max_tx_size(inputs: usize, outputs: &[Script]) -> usize {
+    let outputs: usize = outputs.iter().map(|s| 9 + s.len()).sum();
+    // version, lock time and the two counts (varints up to 3 bytes)
+    14 + 150 * inputs + outputs
+}
+
+/// Fee a wallet send pays: the flat schedule IronDivi always used (1000 sat plus
+/// 1000 per input and 500 per output), raised to the relay minimum (Divi Core
+/// minRelayTxFee, 10000 sat/kB) of the largest size the transaction can have, so
+/// a send with many inputs is never below what the mempool and peers accept.
+fn wallet_fee(inputs: usize, outputs: &[Script]) -> Amount {
+    let flat = 1000 + 1000 * inputs as i64 + 500 * outputs.len() as i64;
+    let relay = DEFAULT_MIN_RELAY_FEE_PER_KB * max_tx_size(inputs, outputs) as i64 / 1000;
+    Amount::from_sat(flat.max(relay))
+}
+
+/// Script shape of a change output (P2PKH), for fee estimates before the change
+/// address is taken
+fn change_script_template() -> Script {
+    Script::new_p2pkh(&[0; 20])
+}
+
 /// Smallest change output worth creating. Less than this would be dust, which
 /// no node relays, so it goes to the fee instead, as in Divi Core. Change always
 /// pays a P2PKH address.
@@ -1019,10 +1043,8 @@ impl WalletRpc {
         // Sort by value descending for simple coin selection
         utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
-        // Fee estimation: ~1000 satoshis per input + 500 per output
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = vec![dest_addr.script_pubkey(), change_script_template()];
 
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
@@ -1034,11 +1056,7 @@ impl WalletRpc {
             total_input += utxo.value;
 
             // Calculate required amount (send + fee estimate)
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = send_amount + est_fee;
 
             if total_input >= required {
@@ -1047,9 +1065,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2);
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = send_amount + fee;
 
         if total_input < required {
@@ -2141,10 +2157,8 @@ impl WalletRpc {
         // Sort by value descending for simple coin selection
         utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
-        // Fee estimation: ~1000 satoshis per input + 500 per output
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = vec![vault_script.clone(), change_script_template()];
 
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
@@ -2156,11 +2170,7 @@ impl WalletRpc {
             total_input += utxo.value;
 
             // Calculate required amount (send + fee estimate)
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = send_amount + est_fee;
 
             if total_input >= required {
@@ -2169,9 +2179,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2);
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = send_amount + fee;
 
         if total_input < required {
@@ -2291,8 +2299,17 @@ impl WalletRpc {
         mode: VaultFeeMode,
         change_script: Option<Script>,
     ) -> Result<(Hash256, Amount, Amount), Error> {
+        // Change goes back to a vault script; every vault script has the same size
+        let vault_template = change_script
+            .clone()
+            .or_else(|| candidates.first().map(|u| u.script_pubkey.clone()))
+            .unwrap_or_default();
         let fee_for = |inputs: usize, outputs: usize| {
-            Amount::from_sat(1000 + 1000 * inputs as i64 + 500 * outputs as i64)
+            let mut scripts = vec![dest.script_pubkey()];
+            if outputs > 1 {
+                scripts.push(vault_template.clone());
+            }
+            wallet_fee(inputs, &scripts)
         };
         let total_of = |us: &[divi_wallet::wallet_db::WalletUtxo]| {
             us.iter().fold(Amount::ZERO, |a, u| a + u.value)
@@ -2901,23 +2918,21 @@ impl WalletRpc {
         utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         // Simple coin selection
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = outputs
+            .iter()
+            .map(|(a, _)| a.script_pubkey())
+            .chain(std::iter::once(change_script_template()))
+            .collect();
 
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let num_outputs = outputs.len() as i64 + 1; // +1 for change
 
         for utxo in utxos {
             selected.push(utxo.clone());
             total_input += utxo.value;
 
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * num_outputs,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = total_send + est_fee;
 
             if total_input >= required {
@@ -2926,11 +2941,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(
-                per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * num_outputs,
-            );
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = total_send + fee;
 
         if total_input < required {
@@ -3460,10 +3471,8 @@ impl WalletRpc {
 
         utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
-        // Fee estimation
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = vec![dest_addr.script_pubkey(), change_script_template()];
 
         // Simple coin selection
         let mut selected = Vec::new();
@@ -3474,11 +3483,7 @@ impl WalletRpc {
             selected.push(utxo.clone());
             total_input += utxo.value;
 
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = send_amount + est_fee;
 
             if total_input >= required {
@@ -3487,9 +3492,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds from this account
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2);
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = send_amount + fee;
 
         if total_input < required {
@@ -5094,6 +5097,50 @@ mod send_unlock_regression {
         rpc.send_to_address(&p(vec![json!(to), json!(0.0000546)]))
             .unwrap();
         assert_eq!(sent.lock().len(), 1);
+    }
+
+    /// A send that needs many inputs must still pay the relay minimum
+    /// (10000 sat/kB) for its real size, or no node relays it
+    #[test]
+    fn ir50_many_input_send_pays_relay_fee() {
+        let (rpc, db) = rpc_on(Network::Testnet);
+        for i in 0..12u8 {
+            let addr = db.new_receiving_address().unwrap();
+            db.add_utxo(divi_wallet::WalletUtxo {
+                txid: Hash256::from_bytes([40 + i; 32]),
+                vout: 0,
+                value: Amount::from_divi(1),
+                script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+                height: Some(100),
+                is_coinbase: false,
+                is_coinstake: false,
+                address: addr.to_string(),
+            });
+        }
+        rpc.set_height(200);
+        let sent: Sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = sent.clone();
+        rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            capture.lock().push(tx);
+            Ok(txid)
+        }));
+        let to = address(8, Network::Testnet);
+        rpc.send_to_address(&p(vec![json!(to), json!(11.5)]))
+            .unwrap();
+        let sent = sent.lock();
+        let tx = &sent[0];
+        assert_eq!(tx.vin.len(), 12);
+        let out: i64 = tx.vout.iter().map(|o| o.value.as_sat()).sum();
+        let fee = 12 * 100_000_000 - out;
+        let min = DEFAULT_MIN_RELAY_FEE_PER_KB * tx.size() as i64 / 1000;
+        assert!(
+            fee >= min,
+            "fee {} sat for {} bytes is below the relay minimum {}",
+            fee,
+            tx.size(),
+            min
+        );
     }
 
     #[test]
