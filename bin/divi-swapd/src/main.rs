@@ -52,6 +52,11 @@ struct Args {
     /// per non-terminal swap. Exit 0 iff the store was readable. Run it as the service user.
     #[arg(long)]
     xmr_inflight: bool,
+    /// With `--xmr-inflight`: append the taker's reported XMR lock txid to every swap line
+    /// (`<id> <state> <txid>`, `-` until a lock is recorded). The `xmr_configured` and
+    /// `in_flight` lines are unchanged; without this flag the output is byte-identical to before.
+    #[arg(long, requires = "xmr_inflight")]
+    xmr_lock_txids: bool,
 }
 
 fn parse_backend(s: &str) -> Result<BackendKind, String> {
@@ -462,18 +467,23 @@ async fn live_backends(
 
 /// `--xmr-inflight`: the in-flight XMR swaps in `db_path`, as the lines documented on `Args`.
 /// The store must already exist: a wrong path is an error, never an empty store.
-fn xmr_inflight_report(cfg: &DaemonConfig) -> Result<String> {
+/// With `lock_txids`, each swap line gets a third field: the reported XMR lock txid, or `-`.
+fn xmr_inflight_report(cfg: &DaemonConfig, lock_txids: bool) -> Result<String> {
     let store = Store::open_read_only(&cfg.db_path)
         .with_context(|| format!("opening swap database {}", cfg.db_path.display()))?;
-    let open = divi_swap_xmr::XmrMaker::in_flight(&store)?;
+    let open = divi_swap_xmr::XmrMaker::in_flight_locks(&store)?;
     let mut out = format!(
         "xmr_configured {}\nin_flight {}\n",
         if cfg.xmr.is_some() { "yes" } else { "no" },
         open.len()
     );
-    for (id, state) in open {
+    for (id, state, txid) in open {
         let state = serde_json::to_value(state)?;
-        out.push_str(&format!("{id} {}\n", state.as_str().unwrap_or("?")));
+        out.push_str(&format!("{id} {}", state.as_str().unwrap_or("?")));
+        if lock_txids {
+            out.push_str(&format!(" {}", txid.as_deref().unwrap_or("-")));
+        }
+        out.push('\n');
     }
     Ok(out)
 }
@@ -485,7 +495,7 @@ async fn main() -> Result<()> {
         // Before the log subscriber: its default writer is stdout, which scripts parse.
         print!(
             "{}",
-            xmr_inflight_report(&DaemonConfig::load(&args.config)?)?
+            xmr_inflight_report(&DaemonConfig::load(&args.config)?, args.xmr_lock_txids)?
         );
         return Ok(());
     }
@@ -711,7 +721,7 @@ mod tests {
         put_xmr(&store, "p", "punished");
         put_xmr(&store, "l", "locked");
         put_xmr(&store, "c", "cancelled");
-        let out = xmr_inflight_report(&inflight_cfg(&db, true)).unwrap();
+        let out = xmr_inflight_report(&inflight_cfg(&db, true), false).unwrap();
         let mut lines: Vec<&str> = out.lines().collect();
         assert_eq!(&lines[..2], ["xmr_configured yes", "in_flight 2"]);
         lines.drain(..2);
@@ -720,18 +730,55 @@ mod tests {
     }
 
     #[test]
+    fn xmr_inflight_lock_txids_appends_a_third_field_and_changes_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        put_xmr(&store, "a", "accepted");
+        let doc = serde_json::json!({ "id": "x", "state": "xmr_reported", "xmr_txid": "ab12" });
+        store
+            .put_doc(divi_swap_xmr::maker::KIND, "x", &doc)
+            .unwrap();
+        put_xmr(&store, "d", "done");
+        let plain = xmr_inflight_report(&inflight_cfg(&db, true), false).unwrap();
+        let with = xmr_inflight_report(&inflight_cfg(&db, true), true).unwrap();
+        let mut plain_lines: Vec<&str> = plain.lines().collect();
+        let mut with_lines: Vec<&str> = with.lines().collect();
+        assert_eq!(&with_lines[..2], &plain_lines[..2]);
+        plain_lines.drain(..2);
+        with_lines.drain(..2);
+        plain_lines.sort();
+        with_lines.sort();
+        assert_eq!(plain_lines, ["a accepted", "x xmr_reported"]);
+        assert_eq!(with_lines, ["a accepted -", "x xmr_reported ab12"]);
+    }
+
+    #[test]
+    fn xmr_lock_txids_requires_xmr_inflight() {
+        assert!(Args::try_parse_from(["divi-swapd", "--config", "c", "--xmr-lock-txids"]).is_err());
+        assert!(Args::try_parse_from([
+            "divi-swapd",
+            "--config",
+            "c",
+            "--xmr-inflight",
+            "--xmr-lock-txids"
+        ])
+        .is_ok());
+    }
+
+    #[test]
     fn xmr_inflight_all_terminal_and_empty_store_report_zero() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("swaps.db");
         let store = Store::open(&db).unwrap();
         assert_eq!(
-            xmr_inflight_report(&inflight_cfg(&db, true)).unwrap(),
+            xmr_inflight_report(&inflight_cfg(&db, true), false).unwrap(),
             "xmr_configured yes\nin_flight 0\n"
         );
         put_xmr(&store, "d", "done");
         put_xmr(&store, "p", "punished");
         assert_eq!(
-            xmr_inflight_report(&inflight_cfg(&db, true)).unwrap(),
+            xmr_inflight_report(&inflight_cfg(&db, true), false).unwrap(),
             "xmr_configured yes\nin_flight 0\n"
         );
     }
@@ -742,14 +789,14 @@ mod tests {
         let db = dir.path().join("swaps.db");
         let store = Store::open(&db).unwrap();
         assert_eq!(
-            xmr_inflight_report(&inflight_cfg(&db, false)).unwrap(),
+            xmr_inflight_report(&inflight_cfg(&db, false), false).unwrap(),
             "xmr_configured no\nin_flight 0\n"
         );
         // A leftover swap with the section removed is still reported (the daemon refuses to
         // start in that state; the redeploy gate must not call it clean).
         put_xmr(&store, "x", "xmr_reported");
         assert_eq!(
-            xmr_inflight_report(&inflight_cfg(&db, false)).unwrap(),
+            xmr_inflight_report(&inflight_cfg(&db, false), false).unwrap(),
             "xmr_configured no\nin_flight 1\nx xmr_reported\n"
         );
     }
@@ -758,7 +805,7 @@ mod tests {
     fn xmr_inflight_missing_store_is_an_error_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("typo.db");
-        assert!(xmr_inflight_report(&inflight_cfg(&db, true)).is_err());
+        assert!(xmr_inflight_report(&inflight_cfg(&db, true), false).is_err());
         assert!(!db.exists(), "a read must never create the store");
     }
 

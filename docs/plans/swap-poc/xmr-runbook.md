@@ -51,6 +51,11 @@ down across that window. Every other failure is a delay, not a loss.
 >   divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight` (it needs
 >   a binary that has the flag; a full redeploy checks with the new binary it is about to install). Not yet
 >   run against the real maker: that is an operator step.
+> - **Still reading the removed listing** (found 2026-10-22, lane `xmr-ops-scripts-followup`):
+> `deploy/divi-swapd/swap-watch/swap-watch.sh:99,125` curls `GET /xmr/swaps`, so the alert job sees no XMR swap
+> (no stuck-swap alert, no `t_punish` margin alert) until it is moved off it. `c1-punish-watch.sh` and the
+> `xmr-soak.sh` instructions now use `divi-swapd --xmr-inflight --xmr-lock-txids` (appends the XMR lock txid
+> to each swap line; without the flag the output is unchanged).
 > - `deploy.sh` lives at `deploy/divi-swapd/deploy.sh`, not under `tools/swap-poc/`.
 >
 > Checked and unchanged: flags `--check-only`, `--binary`, `--force-inflight` (`redeploy-maker.sh:15-18`),
@@ -61,11 +66,12 @@ down across that window. Every other failure is a delay, not a loss.
 
 ```sh
 ssh dnsdivi 'curl -s 127.0.0.1:18480/healthz | jq .'            # backends, wallet scan state
-ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps | jq ".[] | {id,state,last_error}"'
+# swaps still in flight (the list route is gone; read-only read of the store, `<id> <state> <xmr lock txid or ->`):
+ssh dnsdivi sudo -n -u divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight --xmr-lock-txids
 ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps/<id> | jq .'     # one swap, with its txids, t_cancel, t_punish
-# every cancelled swap and how long until its t_punish (seconds; DIVI median time past lags wall
-# time by up to ~30 min, so treat anything under an hour as urgent):
-ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps | jq -r ".[] | select(.state==\"cancelled\") | [.id, .t_punish - now] | @tsv"'
+# how long a cancelled swap has until its t_punish (seconds; DIVI median time past lags wall time by
+# up to ~30 min, so treat anything under an hour as urgent): pick the cancelled ids from the line above,
+# then read each with its token, as in the line before: jq '.t_punish - now'. No listing shows t_punish.
 ssh dnsdivi sudo journalctl -u divi-swapd --since -1h | grep 'xmr maker'   # state transitions
 ssh dnsdivi sudo /usr/local/bin/swap-watch.sh dry-run           # what the alert job sees now (reads /etc/swap-watch.env)
 ```
@@ -105,7 +111,7 @@ when they clear.
 ## Restart / redeploy
 
 Never restart over an in-flight swap without a reason. `redeploy-maker.sh` refuses while any
-hashlock (`/swaps`) or XMR (`/xmr/swaps`) swap is non-terminal (B1b):
+hashlock (`/swaps`) or XMR (`--xmr-inflight` over ssh; there is no `/xmr/swaps` listing) swap is non-terminal (B1b):
 
 ```sh
 ssh -N -L 18482:127.0.0.1:18480 dnsdivi &        # tunnel for the in-flight gate

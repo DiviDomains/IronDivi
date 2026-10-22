@@ -1102,16 +1102,27 @@ impl XmrMaker {
     /// `(id, state)` of every swap in `store` that is not terminal (`XmrMakerState::is_terminal`),
     /// newest first. Reads only those two fields, so it is not tied to the rest of the record.
     pub fn in_flight(store: &Store) -> Result<Vec<(String, XmrMakerState)>> {
+        Ok(Self::in_flight_locks(store)?
+            .into_iter()
+            .map(|(id, state, _)| (id, state))
+            .collect())
+    }
+
+    /// `in_flight` plus the taker's reported XMR lock txid (`xmr_txid`), `None` until recorded.
+    /// A public chain id, not a secret; reads three fields of the record.
+    pub fn in_flight_locks(store: &Store) -> Result<Vec<(String, XmrMakerState, Option<String>)>> {
         #[derive(Deserialize)]
         struct Row {
             id: String,
             state: XmrMakerState,
+            #[serde(default)]
+            xmr_txid: Option<String>,
         }
         Ok(store
             .list_docs::<Row>(KIND)?
             .into_iter()
             .filter(|r| !r.state.is_terminal())
-            .map(|r| (r.id, r.state))
+            .map(|r| (r.id, r.state, r.xmr_txid))
             .collect())
     }
 

@@ -23,7 +23,11 @@
 #
 # Output: DIR/results.tsv (n, scenario, local id, exit, outcome, seconds) and one log
 # per swap. The maker's own view is the record of truth: compare with
-#   curl -s 127.0.0.1:18482/xmr/swaps | jq -r '.[] | [.id,.state,.last_error] | @tsv'
+#   ssh dnsdivi sudo -n -u divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight --xmr-lock-txids
+# (`GET /xmr/swaps` no longer lists swaps, C3.) That read-only command prints the swaps still in
+# flight as `<id> <state> <xmr lock txid or ->`; a swap that is not listed has finished, and
+# results.tsv has its outcome. It needs a divi-swapd that knows `--xmr-lock-txids`; without that
+# flag, `--xmr-inflight` prints `<id> <state>` only.
 set -euo pipefail
 
 taker_bin="" count=20 parallel=4 btc_sats=200000 scenario=happy out="" dry=0 resume=""
