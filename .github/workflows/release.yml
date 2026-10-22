@@ -25,11 +25,52 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Native builds (GitHub-hosted runners) ──────────────────────
+          # ── linux-gnu builds: inside ubuntu:20.04 so they need glibc <= 2.31 ──
+          # (built on ubuntu-latest they needed glibc 2.38 and failed on
+          # Debian 12, Ubuntu 22.04 and Raspberry Pi OS Bookworm)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: irondivi-x86_64-linux-gnu
             use_cross: false
+            gnu: true
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-aarch64-linux-gnu
+            use_cross: false
+            gnu: true
+
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            artifact: irondivi-armv7-linux-gnueabihf
+            use_cross: false
+            gnu: true
+
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-i686-linux-gnu
+            use_cross: false
+            gnu: true
+
+          - target: powerpc64le-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-powerpc64le-linux-gnu
+            use_cross: false
+            gnu: true
+
+          - target: s390x-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-s390x-linux-gnu
+            use_cross: false
+            gnu: true
+
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: irondivi-riscv64-linux-gnu
+            use_cross: false
+            gnu: true
+
+          # ── Native builds (GitHub-hosted runners) ──────────────────────
 
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -42,16 +83,7 @@ jobs:
             use_cross: false
 
           # ── Cross-compiled builds (ubuntu-latest + cross-rs) ──────────
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: irondivi-aarch64-linux-gnu
-            use_cross: true
-
-          - target: armv7-unknown-linux-gnueabihf
-            os: ubuntu-latest
-            artifact: irondivi-armv7-linux-gnueabihf
-            use_cross: true
-
+          # musl builds are static: no glibc needed, they run on any Linux
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: irondivi-x86_64-linux-musl
@@ -60,26 +92,6 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             artifact: irondivi-aarch64-linux-musl
-            use_cross: true
-
-          - target: i686-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: irondivi-i686-linux-gnu
-            use_cross: true
-
-          - target: powerpc64le-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: irondivi-powerpc64le-linux-gnu
-            use_cross: true
-
-          - target: s390x-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: irondivi-s390x-linux-gnu
-            use_cross: true
-
-          - target: riscv64gc-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: irondivi-riscv64-linux-gnu
             use_cross: true
 
           - target: x86_64-unknown-freebsd
@@ -104,11 +116,19 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        continue-on-error: true
+        # The static musl builds are the any-Linux download: never skip them silently
+        continue-on-error: ${{ !contains(matrix.target, 'musl') }}
         run: cross build --release --target ${{ matrix.target }} --bin irondivid --bin irondivi-cli
 
+      - name: Build (linux-gnu, ubuntu:20.04)
+        if: matrix.gnu
+        run: |
+          docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target \
+            ubuntu:20.04 .github/scripts/build-linux-gnu.sh ${{ matrix.target }}
+          sudo chown -R "$(id -u):$(id -g)" target
+
       - name: Build (native)
-        if: "!matrix.use_cross"
+        if: "!matrix.use_cross && !matrix.gnu"
         run: cargo build --release --target ${{ matrix.target }} --bin irondivid --bin irondivi-cli
 
       # Package Unix builds
