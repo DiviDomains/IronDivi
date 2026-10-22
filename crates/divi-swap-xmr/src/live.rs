@@ -609,6 +609,7 @@ mod tests {
             nettype: nettype.into(),
             mainnet,
             height: 1,
+            top_block_hash: None,
         }
     }
 

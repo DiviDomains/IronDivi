@@ -57,6 +57,9 @@ pub struct MonerodNet {
     pub nettype: String,
     pub mainnet: bool,
     pub height: u64,
+    /// `get_info`'s `top_block_hash` (64 hex characters); `None` if the daemon did not send a
+    /// well-formed one.
+    pub top_block_hash: Option<String>,
 }
 
 /// Why [`monerod_nettype`] could not say what network a daemon is on.
@@ -99,10 +102,16 @@ pub fn parse_nettype(info: &serde_json::Value) -> Result<MonerodNet, NettypeErro
     if mainnet != (nettype == "mainnet") {
         return Err(NettypeError::Inconsistent { nettype, mainnet });
     }
+    let top_block_hash = result
+        .get("top_block_hash")
+        .and_then(|v| v.as_str())
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase);
     Ok(MonerodNet {
         nettype,
         mainnet,
         height,
+        top_block_hash,
     })
 }
 
@@ -145,9 +154,23 @@ mod nettype_tests {
             MonerodNet {
                 nettype: "stagenet".into(),
                 mainnet: false,
-                height: 2_227_400
+                height: 2_227_400,
+                top_block_hash: None,
             }
         );
+    }
+
+    #[test]
+    fn top_block_hash_is_kept_only_when_well_formed() {
+        let hash = "A".repeat(64);
+        let mut i = info(json!("stagenet"), json!(false));
+        i["result"]["top_block_hash"] = json!(hash);
+        assert_eq!(
+            parse_nettype(&i).unwrap().top_block_hash,
+            Some("a".repeat(64))
+        );
+        i["result"]["top_block_hash"] = json!("nothex");
+        assert_eq!(parse_nettype(&i).unwrap().top_block_hash, None);
     }
 
     #[test]

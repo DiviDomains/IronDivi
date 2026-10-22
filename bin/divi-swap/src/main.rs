@@ -261,7 +261,7 @@ enum Cmd {
     },
     /// Print the taker's DIVI and BTC addresses and balances (live backend; no keys).
     Balance,
-    /// Print each chain's tip height as the swap code sees it, one `chain network height`
+    /// Print each chain's tip as the swap code sees it, one `chain network height hash`
     /// line per chain (read-only; the same network flags and mainnet guards as `balance`).
     Tip {
         /// `divi`, `btc`, `ltc`, `zec`, `xmr` or `all`. `xmr` needs `--xmr-monerod-url`; `all`
@@ -792,14 +792,20 @@ async fn tip_report(entries: Vec<TipEntry>, xmr_allow_mainnet: bool) -> (Vec<Str
     let mut lines = Vec::new();
     let mut failures = 0;
     for (chain, network, backend) in entries {
-        let height = match backend {
-            TipSource::Backend(Err(e)) => Err(format!("{e:#}")),
+        let (height, hash) = match backend {
+            TipSource::Backend(Err(e)) => (Err(format!("{e:#}")), Ok(String::new())),
             TipSource::Backend(Ok(b)) => {
-                match tokio::time::timeout(TIP_TIMEOUT, b.tip_height()).await {
+                let height = match tokio::time::timeout(TIP_TIMEOUT, b.tip_height()).await {
                     Ok(Ok(h)) => Ok(h),
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
-                }
+                };
+                let hash = match tokio::time::timeout(TIP_TIMEOUT, b.tip_hash()).await {
+                    Ok(Ok(h)) => Ok(h),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                };
+                (height, hash)
             }
             // `get_info` supplies both the nettype and the height; the network must match the
             // selected one before the height is printed.
@@ -811,21 +817,40 @@ async fn tip_report(entries: Vec<TipEntry>, xmr_allow_mainnet: bool) -> (Vec<Str
                     &url,
                 );
                 match tokio::time::timeout(TIP_TIMEOUT, r).await {
-                    Ok(Ok(net)) => Ok(net.height),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                    Ok(Ok(net)) => (
+                        Ok(net.height),
+                        Ok(net.top_block_hash.unwrap_or_else(|| "-".to_string())),
+                    ),
+                    Ok(Err(e)) => (Err(e.to_string()), Ok(String::new())),
+                    Err(_) => (
+                        Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                        Ok(String::new()),
+                    ),
                 }
             }
         };
-        match height {
-            Ok(h) => lines.push(format!("{chain} {network} {h}")),
-            Err(e) => {
-                failures += 1;
-                lines.push(format!("{chain} {network} error: {e}"));
-            }
-        }
+        let (line, failed) = tip_line(chain, &network, height, hash);
+        failures += usize::from(failed);
+        lines.push(line);
     }
     (lines, failures)
+}
+
+/// One output line, `chain network height hash`. The first three fields are the original
+/// format. A height that cannot be read prints `chain network error: …`; a hash that cannot
+/// be read after a good height prints `chain network height hash-error: …` so the height is
+/// not lost. Returns the line and whether it counts as a failure.
+fn tip_line(
+    chain: Chain,
+    network: &str,
+    height: Result<u64, String>,
+    hash: Result<String, String>,
+) -> (String, bool) {
+    match (height, hash) {
+        (Ok(h), Ok(x)) => (format!("{chain} {network} {h} {x}"), false),
+        (Ok(h), Err(e)) => (format!("{chain} {network} {h} hash-error: {e}"), true),
+        (Err(e), _) => (format!("{chain} {network} error: {e}"), true),
+    }
 }
 
 async fn tip_main(cli: &Cli, chain: &str) -> Result<()> {
@@ -1238,10 +1263,74 @@ mod tests {
         assert_eq!(lines.len(), 4);
         for (line, chain) in lines.iter().zip(["divi", "btc", "ltc", "zec"]) {
             let f: Vec<&str> = line.split(' ').collect();
-            assert_eq!(f.len(), 3, "{line}");
+            assert_eq!(f.len(), 4, "{line}");
             assert_eq!((f[0], f[1]), (chain, "mock"));
             f[2].parse::<u64>().unwrap();
+            assert_eq!(f[3].len(), 64, "{line}");
+            assert!(f[3].bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
         }
+    }
+
+    /// A parser written for the old `chain network height` line (first three fields) still
+    /// reads every line, and the hash is the mock's own tip hash.
+    #[tokio::test]
+    async fn tip_height_only_parser_still_reads_the_first_three_fields() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        let chains = tip_chains("all", false).unwrap();
+        let (lines, _) = tip_report(tip_backends(&cli, &chains), false).await;
+        for line in &lines {
+            let mut it = line.split_whitespace();
+            let (chain, network, height) = (it.next(), it.next(), it.next());
+            assert!(chain.is_some() && network == Some("mock"), "{line}");
+            height.unwrap().parse::<u64>().unwrap();
+        }
+        let want = MockChain::new(Chain::Btc, 1_700_000_000, 60)
+            .backend(3, Amount(0))
+            .tip_hash()
+            .await
+            .unwrap();
+        assert_eq!(lines[1].split(' ').nth(3), Some(want.as_str()));
+    }
+
+    /// One chain whose backend is down prints a named error; the others still print a
+    /// full four-field line, in `--chain all` order.
+    #[tokio::test]
+    async fn tip_reports_one_chain_error_while_the_others_still_print() {
+        let mk = |chain: Chain, offline: bool| {
+            let c = MockChain::new(chain, 1_700_000_000, 60);
+            c.set_offline(offline);
+            let b: Arc<dyn ChainBackend> = Arc::new(c.backend(3, Amount(0)));
+            (chain, "mock".to_string(), TipSource::Backend(Ok(b)))
+        };
+        let entries = vec![
+            mk(Chain::Divi, false),
+            mk(Chain::Btc, true),
+            mk(Chain::Ltc, false),
+            mk(Chain::Zec, false),
+        ];
+        let (lines, failures) = tip_report(entries, false).await;
+        assert_eq!(failures, 1);
+        let order: Vec<&str> = lines.iter().map(|l| l.split(' ').next().unwrap()).collect();
+        assert_eq!(order, ["divi", "btc", "ltc", "zec"]);
+        assert!(lines[1].starts_with("btc mock error: "), "{}", lines[1]);
+        for i in [0, 2, 3] {
+            assert_eq!(lines[i].split(' ').count(), 4, "{}", lines[i]);
+        }
+    }
+
+    #[test]
+    fn tip_line_keeps_the_height_when_only_the_hash_fails() {
+        let (line, failed) = tip_line(
+            Chain::Btc,
+            "mainnet",
+            Ok(7),
+            Err("endpoint down".to_string()),
+        );
+        assert!(failed);
+        assert_eq!(line, "btc mainnet 7 hash-error: endpoint down");
+        let (line, failed) = tip_line(Chain::Xmr, "stagenet", Ok(9), Ok("-".to_string()));
+        assert!(!failed);
+        assert_eq!(line, "xmr stagenet 9 -");
     }
 
     #[test]
@@ -1303,12 +1392,27 @@ mod tests {
 
     /// A monerod answering `get_info` with `nettype`/`height`; returns its base URL.
     async fn fake_monerod(nettype: &'static str, height: u64) -> String {
+        fake_monerod_with_hash(nettype, height, Some(XMR_HASH)).await
+    }
+
+    const XMR_HASH: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+
+    /// As [`fake_monerod`], with `get_info`'s `top_block_hash` present or absent.
+    async fn fake_monerod_with_hash(
+        nettype: &'static str,
+        height: u64,
+        hash: Option<&'static str>,
+    ) -> String {
         let app = axum::Router::new().route(
             "/json_rpc",
             axum::routing::post(move || async move {
-                axum::Json(serde_json::json!({"id":"0","jsonrpc":"2.0","result":{
+                let mut result = serde_json::json!({
                     "nettype": nettype, "mainnet": nettype == "mainnet",
-                    "height": height, "status": "OK"}}))
+                    "height": height, "status": "OK"});
+                if let Some(h) = hash {
+                    result["top_block_hash"] = serde_json::json!(h);
+                }
+                axum::Json(serde_json::json!({"id":"0","jsonrpc":"2.0","result":result}))
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1328,7 +1432,15 @@ mod tests {
         let url = fake_monerod("stagenet", 2_227_400).await;
         let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
         assert_eq!(failures, 0);
-        assert_eq!(lines, vec!["xmr stagenet 2227400".to_string()]);
+        assert_eq!(lines, vec![format!("xmr stagenet 2227400 {XMR_HASH}")]);
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_prints_a_dash_when_monerod_sends_no_hash() {
+        let url = fake_monerod_with_hash("stagenet", 2_227_400, None).await;
+        let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
+        assert_eq!(failures, 0);
+        assert_eq!(lines, vec!["xmr stagenet 2227400 -".to_string()]);
     }
 
     #[tokio::test]
