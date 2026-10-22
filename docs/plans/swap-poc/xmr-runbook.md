@@ -51,10 +51,12 @@ down across that window. Every other failure is a delay, not a loss.
 >   divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight` (it needs
 >   a binary that has the flag; a full redeploy checks with the new binary it is about to install). Not yet
 >   run against the real maker: that is an operator step.
-> - **Still reading the removed listing** (found 2026-10-22, lane `xmr-ops-scripts-followup`):
-> `deploy/divi-swapd/swap-watch/swap-watch.sh:99,125` curls `GET /xmr/swaps`, so the alert job sees no XMR swap
-> (no stuck-swap alert, no `t_punish` margin alert) until it is moved off it. `c1-punish-watch.sh` and the
-> `xmr-soak.sh` instructions now use `divi-swapd --xmr-inflight --xmr-lock-txids` (appends the XMR lock txid
+> - **Was still reading the removed listing** (found 2026-10-22, lane `xmr-ops-scripts-followup`;
+> fixed by lane `swap-watch-xmr`): `swap-watch.sh` curled `GET /xmr/swaps`, so the alert job saw no XMR swap
+> (no stuck-swap alert, no `t_punish` margin alert). It now runs `divi-swapd --xmr-inflight --xmr-watch`
+> (read-only) and raises `XMR swap state unreadable: …` if that fails. It needs the new binary and script
+> installed (see the README's swap-watch section). `c1-punish-watch.sh` and the
+> `xmr-soak.sh` instructions use `divi-swapd --xmr-inflight --xmr-lock-txids` (appends the XMR lock txid
 > to each swap line; without the flag the output is unchanged).
 > - `deploy.sh` lives at `deploy/divi-swapd/deploy.sh`, not under `tools/swap-poc/`.
 >
@@ -71,7 +73,8 @@ ssh dnsdivi sudo -n -u divi-swapd /usr/local/bin/divi-swapd --config /etc/divi-s
 ssh dnsdivi 'curl -s 127.0.0.1:18480/xmr/swaps/<id> | jq .'     # one swap, with its txids, t_cancel, t_punish
 # how long a cancelled swap has until its t_punish (seconds; DIVI median time past lags wall time by
 # up to ~30 min, so treat anything under an hour as urgent): pick the cancelled ids from the line above,
-# then read each with its token, as in the line before: jq '.t_punish - now'. No listing shows t_punish.
+# then read each with its token, as in the line before: jq '.t_punish - now'. Or, without a token,
+# `--xmr-inflight --xmr-watch` prints `<id> TAB <state> TAB <t_punish or -> TAB <last_error>` per swap.
 ssh dnsdivi sudo journalctl -u divi-swapd --since -1h | grep 'xmr maker'   # state transitions
 ssh dnsdivi sudo /usr/local/bin/swap-watch.sh dry-run           # what the alert job sees now (reads /etc/swap-watch.env)
 ```
@@ -91,6 +94,8 @@ when they clear.
 | `monerod not synchronized: height X of Y` | monerod fell behind (or is resyncing) | it catches up by itself; if the gap grows, check peers (`get_info` → `outgoing_connections_count`) |
 | `xmr swap <id> stuck in accepted` | taker took a quote and never sent signatures | nothing: the maker aborts it after `sigs_wait`. If it stays, the daemon is not ticking: check the logs. |
 | `xmr swap <id> stuck in <state> for 12 h` | longer than any healthy path (`t_cancel` + `t_punish` is 9 h) | read the swap and the log; see the table below |
+| `xmr swap <id> (cancelled) within 60 min of t_punish: refund not confirmed` | `Tx_refund` has not confirmed and `t_punish` is under `PUNISH_MARGIN` away: the one deadline that loses the DIVI | see the `cancelled` row below; check `divi-swapd` is running and the DIVI node answers. Same text for `refunded`. |
+| `XMR swap state unreadable: …` | the job could not run `divi-swapd --xmr-inflight --xmr-watch` (binary missing or too old to know `--xmr-watch`, database unreadable, `sudo -n -u divi-swapd` refused): **XMR stuck and `t_punish` alerts are blind** | install the current `divi-swapd` and `swap-watch.sh` (README, swap-watch); run the quoted command by hand as `divi-swapd` |
 | `xmr swap <id> (<state>): <error>` | the same `last_error` on two runs in a row | read it; most are a node timeout that is retried. Persistent ones: see below |
 
 ### A stuck swap, by state

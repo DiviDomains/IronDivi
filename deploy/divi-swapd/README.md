@@ -76,3 +76,20 @@ config ships it commented out.
 
 `deploy.sh rollback` restores `/usr/local/bin/divi-swapd.prev` and restarts. The DB is not
 migrated down; use a prior binary only if its schema matches.
+
+## swap-watch (Telegram alerts)
+
+`swap-watch/swap-watch.sh` runs every 5 minutes (`swap-watch.timer`, oneshot service as root). It reads
+hashlock swaps from `GET /swaps` and XMR swaps from the swap database through the installed binary:
+`divi-swapd --config /etc/divi-swapd/divi-swapd.toml --xmr-inflight --xmr-watch`, run as `divi-swapd`
+(`sudo -n -u`, since the database is 0600). That flag opens the store read-only (no write, no migration,
+no pragma), so it cannot block the running daemon. It prints the usual `xmr_configured` and `in_flight`
+lines, then `<id> TAB <state> TAB <t_punish or -> TAB <last_error>` for each non-terminal swap
+(`cancelled` and `refunded` included; backslash, tab and newline in `last_error` are escaped). If the call fails
+the job alerts `XMR swap state unreadable: …` instead of reporting no swaps. Overrides in
+`/etc/swap-watch.env`: `SWAPD_BIN`, `SWAPD_CONFIG`, `SWAPD_USER` (empty runs it as the invoking user).
+
+Install order on the maker host: (1) install the new `divi-swapd` binary (`tools/swap-poc/redeploy-maker.sh`);
+(2) copy `swap-watch.sh` to `/usr/local/bin/swap-watch.sh`; (3) check with
+`sudo /usr/local/bin/swap-watch.sh dry-run`. Installing the script first only gives the `unreadable`
+alert, never a silent miss. Test: `tools/swap-poc/test-swap-watch.sh` (stubs, no network).

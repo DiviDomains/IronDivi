@@ -8,7 +8,8 @@
 #   - the units in UNITS are active (divi-swapd, monerod-stagenet);
 #   - GET /healthz answers ok, and its divi_scan is not still scanning SCAN_MAX seconds after the
 #     daemon started;
-#   - no swap (hashlock /swaps or XMR /xmr/swaps) has had the same last_error for two runs in a row
+#   - no swap (hashlock GET /swaps, or XMR via `divi-swapd --xmr-inflight --xmr-watch`) has had the
+#     same last_error for two runs in a row
 #     (one run's error is usually transient: a node timeout the next poll retries);
 #   - no non-terminal swap has sat in the same state for longer than its limit: ACCEPTED_MAX for
 #     an XMR swap in `accepted` (nothing locked yet; the maker forgets it after sigs_wait),
@@ -16,7 +17,10 @@
 #     t_punish on the testnet profile, so a healthy refund path never fires it).
 #   - no `cancelled`/`refunded` XMR swap is within PUNISH_MARGIN (default 1 h) of its t_punish:
 #     past it the taker can take the DIVI;
-#   - monerod's RPC answers and is synchronized (when MONEROD_URL is set).
+#   - monerod's RPC answers and is synchronized (when MONEROD_URL is set);
+#   - the XMR swap state is readable at all: there is no XMR listing over HTTP, so the job runs
+#     the installed `divi-swapd` read-only against the maker's database. If that fails (binary
+#     missing, too old to know --xmr-watch, database unreadable) it says so instead of seeing no swaps.
 # Secrets: /etc/swap-watch.env (root 0600): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID. Never logged.
 # State: /var/lib/swap-watch (when each swap entered its state; the last alert).
 #
@@ -32,6 +36,10 @@ SCAN_MAX="${SCAN_MAX:-3600}"
 ACCEPTED_MAX="${ACCEPTED_MAX:-3600}"
 STUCK_MAX="${STUCK_MAX:-43200}"
 PUNISH_MARGIN="${PUNISH_MARGIN:-3600}"
+SWAPD_BIN="${SWAPD_BIN:-/usr/local/bin/divi-swapd}"
+SWAPD_CONFIG="${SWAPD_CONFIG:-/etc/divi-swapd/divi-swapd.toml}"
+# The service user owns the 0600 database: run the read as it when started as another user.
+SWAPD_USER="${SWAPD_USER-divi-swapd}"
 ALERT_EVERY="${ALERT_EVERY:-21600}"
 STATE_DIR="${STATE_DIR:-/var/lib/swap-watch}"
 ENV_FILE="${ENV_FILE:-/etc/swap-watch.env}"
@@ -93,10 +101,24 @@ if [ -n "$MONEROD_URL" ]; then
   fi
 fi
 
+# XMR swaps: `divi-swapd --xmr-inflight --xmr-watch` prints `xmr_configured yes|no`, `in_flight N`,
+# then one `<id> TAB <state> TAB <t_punish or -> TAB <last_error, \\ \t \n escaped>` line per
+# non-terminal swap (cancelled and refunded included). Read-only open of the maker's database.
+xmr_rows=""
+swapd=("$SWAPD_BIN" --config "$SWAPD_CONFIG" --xmr-inflight --xmr-watch)
+if [ -n "$SWAPD_USER" ] && [ "$(id -un)" != "$SWAPD_USER" ]; then
+  swapd=(sudo -n -u "$SWAPD_USER" "${swapd[@]}")
+fi
+if xmr_out=$("${swapd[@]}" 2>&1) && [[ "$xmr_out" == xmr_configured\ * ]]; then
+  xmr_rows=$(tail -n +3 <<<"$xmr_out")
+else
+  problems+=("XMR swap state unreadable: $(head -n 1 <<<"${xmr_out:-no output}" | cut -c1-140)")
+fi
+
 # One line per swap: kind id state last_error. Hashlock states are PascalCase, XMR snake_case.
 swaps=$( {
   curl -sS -m 10 "$API/swaps" 2>/dev/null | jq -r '.[]? | ["htlc", .id, .state, (.last_error // "")] | @tsv'
-  curl -sS -m 10 "$API/xmr/swaps" 2>/dev/null | jq -r '.[]? | ["xmr", .id, .state, (.last_error // "")] | @tsv'
+  [ -n "$xmr_rows" ] && awk -F'\t' -v OFS='\t' '{ print "xmr", $1, $2, $4 }' <<<"$xmr_rows"
 } )
 seen_file="$STATE_DIR/seen.tsv"   # kind id state since last_error
 touch "$seen_file"
@@ -120,11 +142,13 @@ done <<<"$swaps"
 # The one deadline that costs the maker money: a cancelled swap's Tx_refund must confirm before
 # t_punish (unix seconds vs DIVI median time past, which lags wall time by up to ~30 min). The
 # text is fixed per swap so it repeats on the ALERT_EVERY rule, not every run.
-while read -r id state; do
-  [ -n "${id:-}" ] && problems+=("xmr swap $id ($state) within $((PUNISH_MARGIN / 60)) min of t_punish: refund not confirmed")
-done < <(curl -sS -m 10 "$API/xmr/swaps" 2>/dev/null | jq -r --argjson now "$now" --argjson m "$PUNISH_MARGIN" \
-  '.[]? | select((.state == "cancelled" or .state == "refunded") and .t_punish != null
-                 and .t_punish - $now < $m) | .id[:8] + " " + .state')
+while IFS=$'\t' read -r id state t_punish _; do
+  [ -n "${id:-}" ] || continue
+  case "$state" in cancelled|refunded) ;; *) continue ;; esac
+  [[ "$t_punish" =~ ^[0-9]+$ ]] || continue
+  [ $((t_punish - now)) -lt "$PUNISH_MARGIN" ] &&
+    problems+=("xmr swap ${id:0:8} ($state) within $((PUNISH_MARGIN / 60)) min of t_punish: refund not confirmed")
+done <<<"$xmr_rows"
 
 host=$(hostname -s)
 if [ "$mode" = dry-run ]; then

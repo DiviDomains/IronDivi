@@ -124,6 +124,19 @@ impl XmrMakerState {
     }
 }
 
+/// One in-flight swap as the alert job reads it (`XmrMaker::in_flight_watch`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InFlightWatch {
+    /// Swap id.
+    pub id: String,
+    /// Current state.
+    pub state: XmrMakerState,
+    /// `nLockTime` of `Tx_punish` (unix seconds); `None` if the record has none.
+    pub t_punish: Option<u32>,
+    /// Last error the maker hit on this swap.
+    pub last_error: Option<String>,
+}
+
 /// The maker's persisted view of one swap (holds the maker's per-swap secrets: the store is
 /// mode 0600, like the hashlock taker's preimage). Never holds the `J` share.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1123,6 +1136,32 @@ impl XmrMaker {
             .into_iter()
             .filter(|r| !r.state.is_terminal())
             .map(|r| (r.id, r.state, r.xmr_txid))
+            .collect())
+    }
+
+    /// `(id, state, t_punish, last_error)` of every swap in `store` that is not terminal, in the
+    /// order of `in_flight`. For the alert job: `Cancelled` and `Refunded` are not terminal, so
+    /// the `t_punish` check sees them. Reads only those four fields; no key material.
+    pub fn in_flight_watch(store: &Store) -> Result<Vec<InFlightWatch>> {
+        #[derive(Deserialize)]
+        struct Row {
+            id: String,
+            state: XmrMakerState,
+            #[serde(default)]
+            t_punish: Option<u32>,
+            #[serde(default)]
+            last_error: Option<String>,
+        }
+        Ok(store
+            .list_docs::<Row>(KIND)?
+            .into_iter()
+            .filter(|r| !r.state.is_terminal())
+            .map(|r| InFlightWatch {
+                id: r.id,
+                state: r.state,
+                t_punish: r.t_punish,
+                last_error: r.last_error,
+            })
             .collect())
     }
 
