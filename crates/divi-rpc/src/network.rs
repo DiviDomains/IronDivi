@@ -46,35 +46,44 @@ impl NetworkRpc {
 
     /// Get network info
     pub fn get_network_info(&self, _params: &Params) -> Result<serde_json::Value, Error> {
-        let connections = self
-            .peer_manager
-            .as_ref()
-            .map(|pm| pm.peer_count())
-            .unwrap_or(0);
+        let pm = self.peer_manager.as_ref();
+        let connections = pm.map(|pm| pm.peer_count()).unwrap_or(0);
+        let connections_in = pm.map(|pm| pm.inbound_count()).unwrap_or(0);
+        let connections_out = pm.map(|pm| pm.outbound_count()).unwrap_or(0);
+        let proxy = pm
+            .and_then(|pm| pm.proxy())
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        let local_services = pm
+            .map(|pm| pm.services())
+            .unwrap_or(divi_network::constants::services::NODE_NETWORK);
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
             "subversion": format!("/IronDivi:{}/", env!("CARGO_PKG_VERSION")),
             "protocolversion": 70920,
-            "localservices": "0000000000000005",
-            "timeoffset": 0,
+            "localservices": format!("{:016x}", local_services),
+            "timeoffset": self.time_offset(),
             "connections": connections,
+            "connections_in": connections_in,
+            "connections_out": connections_out,
             "networks": [
                 {
                     "name": "ipv4",
                     "limited": false,
                     "reachable": true,
-                    "proxy": "",
+                    "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
-                    "limited": true,
+                    "limited": false,
                     "reachable": true,
-                    "proxy": "",
+                    "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
+                    // .onion peers cannot be addressed (peer addresses are IP only)
                     "name": "onion",
                     "limited": true,
                     "reachable": false,
@@ -85,6 +94,25 @@ impl NetworkRpc {
             "relayfee": 0.0001,
             "localaddresses": []
         }))
+    }
+
+    /// Network-adjusted time offset in seconds: the median of the connected peers'
+    /// clock offsets, used once at least 5 peers are known (C++ `GetTimeOffset`)
+    fn time_offset(&self) -> i64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(pm) = &self.peer_manager else {
+            return 0;
+        };
+        let mut offsets: Vec<i64> = pm
+            .get_peer_details()
+            .iter()
+            .map(|(_, _, _, st, _)| st.time_offset.load(Relaxed))
+            .collect();
+        if offsets.len() < 5 {
+            return 0;
+        }
+        offsets.sort_unstable();
+        offsets[offsets.len() / 2]
     }
 
     /// Get peer info
@@ -100,8 +128,9 @@ impl NetworkRpc {
             .iter()
             .map(|(id, addr, inbound, st, banscore)| {
                 let ping_us = st.ping_us.load(Relaxed);
+                let ping_sent_us = st.ping_sent_us.load(Relaxed);
                 let subver = st.subver.lock().clone();
-                serde_json::json!({
+                let mut info = serde_json::json!({
                     "id": id,
                     "addr": addr.to_string(),
                     "services": format!("{:016x}", st.services.load(Relaxed)),
@@ -120,7 +149,13 @@ impl NetworkRpc {
                     "whitelisted": false,
                     "synced_headers": -1,
                     "synced_blocks": -1
-                })
+                });
+                // Like C++, pingwait is only present while a ping is unanswered
+                if ping_sent_us != 0 {
+                    let wait_us = divi_network::peer::unix_now_us().saturating_sub(ping_sent_us);
+                    info["pingwait"] = serde_json::json!(wait_us as f64 / 1_000_000.0);
+                }
+                info
             })
             .collect();
 
@@ -481,6 +516,109 @@ mod tests {
         let rpc = NetworkRpc::new();
         let result = rpc.get_connection_count(&Params::None).unwrap();
         assert_eq!(result, serde_json::json!(0));
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn quiet_config() -> divi_network::PeerManagerConfig {
+        divi_network::PeerManagerConfig {
+            dns_seeds: vec![],
+            static_peers: vec![],
+            listen_addr: None,
+            ..Default::default()
+        }
+    }
+
+    /// Two nodes on localhost: the per-peer counters and the in/out split must be real.
+    /// getpeerinfo used to show pingtime 0 (no ping until 30 s in, then rounded to whole
+    /// milliseconds) and getnetworkinfo had no in/out split, so `-getinfo` printed 0/0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_peer_counters_and_connection_split_are_real() {
+        use std::time::Duration;
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let server = PeerManager::new(divi_network::PeerManagerConfig {
+            listen_addr: Some(listen),
+            ..quiet_config()
+        });
+        tokio::spawn(Arc::clone(&server).start());
+        let client = PeerManager::new(quiet_config());
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "client could not reach the local listener");
+
+        let client_rpc = NetworkRpc::with_peer_manager(Arc::clone(&client));
+        let server_rpc = NetworkRpc::with_peer_manager(Arc::clone(&server));
+        let mut peer = serde_json::Value::Null;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let peers = client_rpc.get_peer_info(&Params::None).unwrap();
+            if let Some(p) = peers.as_array().and_then(|a| a.first()) {
+                if p["pingtime"].as_f64().unwrap_or(0.0) > 0.0 {
+                    peer = p.clone();
+                    break;
+                }
+            }
+        }
+        assert!(
+            peer["pingtime"].as_f64().unwrap_or(0.0) > 0.0,
+            "pingtime still 0 after 5 s"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let conntime = peer["conntime"].as_u64().unwrap();
+        assert!(conntime > 0 && conntime <= now && now - conntime < 60);
+        // version + verack + pong at least: 126 + 24 + 32 bytes on the wire
+        assert!(peer["bytesrecv"].as_u64().unwrap() >= 182, "{peer}");
+        assert!(peer["bytessent"].as_u64().unwrap() > 0);
+        assert_eq!(peer["inbound"], false);
+
+        let ni = client_rpc.get_network_info(&Params::None).unwrap();
+        assert_eq!(ni["connections"], 1);
+        assert_eq!(ni["connections_in"], 0);
+        assert_eq!(ni["connections_out"], 1);
+        let ni = server_rpc.get_network_info(&Params::None).unwrap();
+        assert_eq!(ni["connections_in"], 1);
+        assert_eq!(ni["connections_out"], 0);
+        let inbound = &server_rpc.get_peer_info(&Params::None).unwrap()[0];
+        assert_eq!(inbound["inbound"], true);
+        assert!(inbound["bytesrecv"].as_u64().unwrap() > 0);
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
+    #[test]
+    fn test_network_info_reports_proxy() {
+        let proxy: std::net::SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let pm = PeerManager::new(divi_network::PeerManagerConfig {
+            proxy: Some(proxy),
+            ..quiet_config()
+        });
+        let ni = NetworkRpc::with_peer_manager(pm)
+            .get_network_info(&Params::None)
+            .unwrap();
+        let nets = ni["networks"].as_array().unwrap();
+        assert_eq!(nets[0]["name"], "ipv4");
+        assert_eq!(nets[0]["proxy"], "127.0.0.1:9050");
+        assert_eq!(nets[1]["proxy"], "127.0.0.1:9050");
+        assert_eq!(nets[2]["reachable"], false);
+        let ni = NetworkRpc::with_peer_manager(PeerManager::new(quiet_config()))
+            .get_network_info(&Params::None)
+            .unwrap();
+        assert_eq!(ni["networks"][0]["proxy"], "");
     }
 
     #[test]

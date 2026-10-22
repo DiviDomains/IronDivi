@@ -34,6 +34,8 @@ pub struct DiviCodec {
     magic: Magic,
     /// Current decode state
     state: DecodeState,
+    /// Bytes taken off the wire since the last `take_bytes_consumed`
+    bytes_consumed: u64,
 }
 
 /// State machine for message decoding
@@ -51,7 +53,14 @@ impl DiviCodec {
         Self {
             magic,
             state: DecodeState::Header,
+            bytes_consumed: 0,
         }
+    }
+
+    /// Bytes consumed from the stream (headers, payloads and skipped garbage) since
+    /// the last call, then reset to zero
+    pub fn take_bytes_consumed(&mut self) -> u64 {
+        std::mem::take(&mut self.bytes_consumed)
     }
 }
 
@@ -91,6 +100,7 @@ impl Decoder for DiviCodec {
                                 );
                                 // Discard bytes before magic
                                 src.advance(pos);
+                                self.bytes_consumed += pos as u64;
                                 // Continue to try parsing header again
                                 continue;
                             }
@@ -104,6 +114,7 @@ impl Decoder for DiviCodec {
                                     discard
                                 );
                                 src.advance(discard);
+                                self.bytes_consumed += discard as u64;
                             }
                             return Ok(None);
                         }
@@ -125,6 +136,7 @@ impl Decoder for DiviCodec {
 
                     // Consume header bytes
                     src.advance(HEADER_SIZE);
+                    self.bytes_consumed += HEADER_SIZE as u64;
 
                     // Transition to payload state
                     self.state = DecodeState::Payload { header };
@@ -178,6 +190,7 @@ impl Decoder for DiviCodec {
 
                     // Consume payload bytes
                     src.advance(payload_size);
+                    self.bytes_consumed += payload_size as u64;
 
                     // Reset state for next message
                     self.state = DecodeState::Header;
@@ -203,6 +216,24 @@ impl Encoder<NetworkMessage> for DiviCodec {
 mod tests {
     use super::*;
     use crate::constants::MAINNET_MAGIC;
+
+    /// getpeerinfo bytesrecv comes from this count, so it must be the exact wire size
+    /// (it used to be re-serialised from the decoded message, an estimate).
+    #[test]
+    fn test_codec_counts_exact_bytes_consumed() {
+        let mut codec = DiviCodec::new(MAINNET_MAGIC);
+        let mut buf = BytesMut::new();
+        let ping = NetworkMessage::Ping(7).to_bytes(MAINNET_MAGIC).unwrap();
+        let verack = NetworkMessage::Verack.to_bytes(MAINNET_MAGIC).unwrap();
+        buf.extend_from_slice(&[0xde, 0xad]); // garbage before the magic is skipped
+        buf.extend_from_slice(&ping);
+        buf.extend_from_slice(&verack);
+        assert!(codec.decode(&mut buf).unwrap().is_some());
+        assert_eq!(codec.take_bytes_consumed(), 2 + ping.len() as u64);
+        assert!(codec.decode(&mut buf).unwrap().is_some());
+        assert_eq!(codec.take_bytes_consumed(), verack.len() as u64);
+        assert_eq!(codec.take_bytes_consumed(), 0);
+    }
 
     #[test]
     fn test_codec_decode_ping() {

@@ -113,6 +113,15 @@ struct Args {
     #[arg(long = "connect")]
     connect: Vec<String>,
 
+    /// How many of the newest blocks to check at start (default 100; 0 = all blocks)
+    #[arg(long, value_name = "N")]
+    checkblocks: Option<u32>,
+
+    /// Make outbound P2P connections through this SOCKS5 proxy (ip:port, port 9050 if
+    /// omitted). DNS seeds are then not resolved locally.
+    #[arg(long, value_name = "IP:PORT")]
+    proxy: Option<String>,
+
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
@@ -306,6 +315,25 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     config.p2p.listen_addr = s.to_string();
                 } else {
                     warn!("Invalid bind value in config file, expected string");
+                }
+            }
+            "checkblocks" => {
+                if let Some(i) = value
+                    .as_integer()
+                    .filter(|i| (0..=u32::MAX as i64).contains(i))
+                {
+                    config.check_blocks = i as u32;
+                } else {
+                    warn!(
+                        "Invalid checkblocks value in config file, expected a non-negative integer"
+                    );
+                }
+            }
+            "proxy" => {
+                if let Some(s) = value.as_str() {
+                    config.p2p.proxy = Some(s.to_string());
+                } else {
+                    warn!("Invalid proxy value in config file, expected string");
                 }
             }
             "listen" => {
@@ -604,6 +632,12 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     }
     if let Some(bind) = &args.bind {
         config.p2p.listen_addr = bind.clone();
+    }
+    if let Some(n) = args.checkblocks {
+        config.check_blocks = n;
+    }
+    if let Some(proxy) = &args.proxy {
+        config.p2p.proxy = Some(proxy.clone());
     }
     if args.debug {
         config.debug.debug_logging = true;
@@ -1840,6 +1874,49 @@ mod connect_tests {
         assert!(src.static_peers.len() > 1);
         assert!(!src.dns_seeds.is_empty());
         assert!(src.listen);
+    }
+
+    #[test]
+    fn proxy_from_cli_and_config_file() {
+        assert_eq!(cfg(&[]).p2p.proxy, None);
+        assert_eq!(
+            cfg(&["--proxy=127.0.0.1:9050"]).p2p.proxy_addr(),
+            Ok(Some("127.0.0.1:9050".parse().unwrap()))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("irondivi.conf"),
+            "proxy = \"127.0.0.1:9150\"\n",
+        )
+        .unwrap();
+        let argv = |extra: &[&str]| {
+            let mut v = vec![
+                "irondivid".to_string(),
+                "--regtest".to_string(),
+                format!("--datadir={}", dir.path().display()),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            Args::parse_from(v)
+        };
+        let from_file = build_config(&argv(&[])).unwrap();
+        assert_eq!(from_file.p2p.proxy.as_deref(), Some("127.0.0.1:9150"));
+        // The command line wins over the file
+        let both = build_config(&argv(&["--proxy=127.0.0.1:9050"])).unwrap();
+        assert_eq!(both.p2p.proxy.as_deref(), Some("127.0.0.1:9050"));
+    }
+
+    #[test]
+    fn checkblocks_default_cli_and_config_file() {
+        assert_eq!(cfg(&[]).check_blocks, 100);
+        assert_eq!(cfg(&["--checkblocks=0"]).check_blocks, 0);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("irondivi.conf"), "checkblocks = 500\n").unwrap();
+        let args = Args::parse_from([
+            "irondivid".to_string(),
+            "--regtest".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ]);
+        assert_eq!(build_config(&args).unwrap().check_blocks, 500);
     }
 
     #[test]
