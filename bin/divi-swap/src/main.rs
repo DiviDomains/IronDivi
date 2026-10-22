@@ -264,7 +264,8 @@ enum Cmd {
     /// Print each chain's tip height as the swap code sees it, one `chain network height`
     /// line per chain (read-only; the same network flags and mainnet guards as `balance`).
     Tip {
-        /// `divi`, `btc`, `ltc`, `zec` or `all`.
+        /// `divi`, `btc`, `ltc`, `zec`, `xmr` or `all`. `xmr` needs `--xmr-monerod-url`; `all`
+        /// includes it only when that URL is given.
         #[arg(long, default_value = "all")]
         chain: String,
     },
@@ -602,15 +603,23 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
 /// instead of stalling the whole report.
 const TIP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The chains `tip --chain <name>` reports, in print order.
-fn tip_chains(name: &str) -> Result<Vec<Chain>> {
+/// The chains `tip --chain <name>` reports, in print order. `all` adds XMR only when a
+/// monerod URL was given (`xmr_url`); otherwise `tip_main` prints a skip note.
+fn tip_chains(name: &str, xmr_url: bool) -> Result<Vec<Chain>> {
     match name.to_ascii_lowercase().as_str() {
-        "all" => Ok(vec![Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec]),
+        "all" => {
+            let mut chains = vec![Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec];
+            if xmr_url {
+                chains.push(Chain::Xmr);
+            }
+            Ok(chains)
+        }
+        "xmr" => Ok(vec![Chain::Xmr]),
         "divi" => Ok(vec![Chain::Divi]),
         "btc" => Ok(vec![Chain::Btc]),
         "ltc" => Ok(vec![Chain::Ltc]),
         "zec" => Ok(vec![Chain::Zec]),
-        other => bail!("--chain must be divi, btc, ltc, zec or all, got {other:?}"),
+        other => bail!("--chain must be divi, btc, ltc, zec, xmr or all, got {other:?}"),
     }
 }
 
@@ -623,6 +632,7 @@ fn tip_network(cli: &Cli, chain: Chain) -> &str {
         Chain::Btc => &cli.btc_network,
         Chain::Ltc => &cli.ltc_network,
         Chain::Zec => &cli.zec_network,
+        Chain::Xmr => &cli.xmr_network,
         _ => &cli.divi_network,
     }
 }
@@ -650,6 +660,19 @@ fn tip_guards(cli: &Cli, chains: &[Chain]) -> Result<()> {
                 &["testnet"],
                 cli.allow_mainnet,
             )?,
+            // XMR keeps its own mainnet opt-in, as in `guard_profile`.
+            Chain::Xmr => {
+                guard_network(
+                    "--xmr-network",
+                    &cli.xmr_network,
+                    &["stagenet", "testnet"],
+                    cli.xmr_allow_mainnet,
+                )
+                .map_err(|e| anyhow::anyhow!("{e} (for xmr: --xmr-allow-mainnet)"))?;
+                if cli.xmr_monerod_url.is_none() {
+                    bail!("tip --chain xmr needs --xmr-monerod-url");
+                }
+            }
             _ => guard_network(
                 "--divi-network",
                 &cli.divi_network,
@@ -657,9 +680,14 @@ fn tip_guards(cli: &Cli, chains: &[Chain]) -> Result<()> {
                 cli.allow_mainnet,
             )?,
         }
+        let allow = if chain == Chain::Xmr {
+            cli.xmr_allow_mainnet
+        } else {
+            cli.allow_mainnet
+        };
         divi_swap::config::check_profile_networks(
             cli.profile,
-            &[(chain, tip_network(cli, chain), Some(cli.allow_mainnet))],
+            &[(chain, tip_network(cli, chain), Some(allow))],
         )
         .map_err(anyhow::Error::msg)?;
     }
@@ -706,8 +734,15 @@ fn tip_backend(cli: &Cli, chain: Chain) -> Result<Arc<dyn ChainBackend>> {
     })
 }
 
-/// A chain, its network label and its backend (or why it could not be built).
-type TipEntry = (Chain, String, Result<Arc<dyn ChainBackend>>);
+/// Where a chain's tip comes from: a `ChainBackend`, or (XMR, which bypasses `ChainBackend`)
+/// the height of a monerod after `ensure_monerod_network` confirmed its network.
+enum TipSource {
+    Backend(Result<Arc<dyn ChainBackend>>),
+    Monerod { url: String, network: String },
+}
+
+/// A chain, its network label and its tip source.
+type TipEntry = (Chain, String, TipSource);
 
 /// One backend per selected chain (a mock chain per chain under `--backend mock`). A chain
 /// whose backend cannot be built keeps its error so it is reported by name.
@@ -716,6 +751,21 @@ fn tip_backends(cli: &Cli, chains: &[Chain]) -> Vec<TipEntry> {
         .iter()
         .map(|&chain| {
             let backend = match cli.backend {
+                _ if chain == Chain::Xmr => {
+                    return (
+                        chain,
+                        cli.xmr_network.clone(),
+                        match &cli.xmr_monerod_url {
+                            Some(url) => TipSource::Monerod {
+                                url: url.clone(),
+                                network: cli.xmr_network.clone(),
+                            },
+                            None => {
+                                TipSource::Backend(Err(anyhow::anyhow!("no --xmr-monerod-url")))
+                            }
+                        },
+                    );
+                }
                 BackendArg::Mock => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -727,24 +777,45 @@ fn tip_backends(cli: &Cli, chains: &[Chain]) -> Vec<TipEntry> {
                 }
                 BackendArg::Live => tip_backend(cli, chain),
             };
-            (chain, tip_network(cli, chain).to_string(), backend)
+            (
+                chain,
+                tip_network(cli, chain).to_string(),
+                TipSource::Backend(backend),
+            )
         })
         .collect()
 }
 
 /// Read every chain's tip: `(lines, failures)`. A chain that cannot be reached prints
 /// `chain network error: …` and counts as a failure; the others still print.
-async fn tip_report(entries: Vec<TipEntry>) -> (Vec<String>, usize) {
+async fn tip_report(entries: Vec<TipEntry>, xmr_allow_mainnet: bool) -> (Vec<String>, usize) {
     let mut lines = Vec::new();
     let mut failures = 0;
     for (chain, network, backend) in entries {
         let height = match backend {
-            Err(e) => Err(format!("{e:#}")),
-            Ok(b) => match tokio::time::timeout(TIP_TIMEOUT, b.tip_height()).await {
-                Ok(Ok(h)) => Ok(h),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
-            },
+            TipSource::Backend(Err(e)) => Err(format!("{e:#}")),
+            TipSource::Backend(Ok(b)) => {
+                match tokio::time::timeout(TIP_TIMEOUT, b.tip_height()).await {
+                    Ok(Ok(h)) => Ok(h),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                }
+            }
+            // `get_info` supplies both the nettype and the height; the network must match the
+            // selected one before the height is printed.
+            TipSource::Monerod { url, network } => {
+                let r = divi_swap_xmr::live::ensure_monerod_network(
+                    "--xmr-network",
+                    &network,
+                    xmr_allow_mainnet,
+                    &url,
+                );
+                match tokio::time::timeout(TIP_TIMEOUT, r).await {
+                    Ok(Ok(net)) => Ok(net.height),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+                }
+            }
         };
         match height {
             Ok(h) => lines.push(format!("{chain} {network} {h}")),
@@ -758,16 +829,20 @@ async fn tip_report(entries: Vec<TipEntry>) -> (Vec<String>, usize) {
 }
 
 async fn tip_main(cli: &Cli, chain: &str) -> Result<()> {
-    let chains = tip_chains(chain)?;
+    let chains = tip_chains(chain, cli.xmr_monerod_url.is_some())?;
     if matches!(cli.backend, BackendArg::Live) {
         tip_guards(cli, &chains)?;
     }
-    let (lines, failures) = tip_report(tip_backends(cli, &chains)).await;
+    let (mut lines, failures) = tip_report(tip_backends(cli, &chains), cli.xmr_allow_mainnet).await;
+    let reported = lines.len();
+    if chain.eq_ignore_ascii_case("all") && cli.xmr_monerod_url.is_none() {
+        lines.push("xmr skipped (no --xmr-monerod-url)".to_string());
+    }
     for line in &lines {
         println!("{line}");
     }
     if failures > 0 {
-        bail!("{failures} of {} chain tips could not be read", lines.len());
+        bail!("{failures} of {reported} chain tips could not be read");
     }
     Ok(())
 }
@@ -1157,8 +1232,8 @@ mod tests {
     #[tokio::test]
     async fn tip_prints_one_line_per_chain_on_the_mock_backend() {
         let cli = tip_cli(&["--backend", "mock"]);
-        let chains = tip_chains("all").unwrap();
-        let (lines, failures) = tip_report(tip_backends(&cli, &chains)).await;
+        let chains = tip_chains("all", false).unwrap();
+        let (lines, failures) = tip_report(tip_backends(&cli, &chains), false).await;
         assert_eq!(failures, 0);
         assert_eq!(lines.len(), 4);
         for (line, chain) in lines.iter().zip(["divi", "btc", "ltc", "zec"]) {
@@ -1171,9 +1246,13 @@ mod tests {
 
     #[test]
     fn tip_chain_selector_names_what_it_accepts() {
-        assert_eq!(tip_chains("zec").unwrap(), vec![Chain::Zec]);
-        let e = tip_chains("xmr").unwrap_err().to_string();
-        assert!(e.contains("divi, btc, ltc, zec or all"), "{e}");
+        assert_eq!(tip_chains("zec", false).unwrap(), vec![Chain::Zec]);
+        assert_eq!(tip_chains("xmr", false).unwrap(), vec![Chain::Xmr]);
+        let e = tip_chains("doge", false).unwrap_err().to_string();
+        assert!(e.contains("divi, btc, ltc, zec, xmr or all"), "{e}");
+        // `all` carries XMR only with a monerod URL.
+        assert!(!tip_chains("all", false).unwrap().contains(&Chain::Xmr));
+        assert_eq!(tip_chains("all", true).unwrap().last(), Some(&Chain::Xmr));
     }
 
     #[test]
@@ -1185,7 +1264,7 @@ mod tests {
             ("divi", "--divi-network"),
         ] {
             let cli = tip_cli(&[flag, "mainnet", "--profile", "mainnet"]);
-            let e = tip_guards(&cli, &tip_chains(chain).unwrap())
+            let e = tip_guards(&cli, &tip_chains(chain, false).unwrap())
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1214,11 +1293,106 @@ mod tests {
     async fn tip_names_the_unreachable_chain_and_still_prints_the_rest() {
         let cli = tip_cli(&["--backend", "mock"]);
         let mut entries = tip_backends(&cli, &[Chain::Divi, Chain::Ltc, Chain::Zec]);
-        entries[1].2 = Err(anyhow::anyhow!("esplora unreachable"));
-        let (lines, failures) = tip_report(entries).await;
+        entries[1].2 = TipSource::Backend(Err(anyhow::anyhow!("esplora unreachable")));
+        let (lines, failures) = tip_report(entries, false).await;
         assert_eq!(failures, 1);
         assert!(lines[0].starts_with("divi mock "), "{lines:?}");
         assert_eq!(lines[1], "ltc mock error: esplora unreachable");
+        assert!(lines[2].starts_with("zec mock "), "{lines:?}");
+    }
+
+    /// A monerod answering `get_info` with `nettype`/`height`; returns its base URL.
+    async fn fake_monerod(nettype: &'static str, height: u64) -> String {
+        let app = axum::Router::new().route(
+            "/json_rpc",
+            axum::routing::post(move || async move {
+                axum::Json(serde_json::json!({"id":"0","jsonrpc":"2.0","result":{
+                    "nettype": nettype, "mainnet": nettype == "mainnet",
+                    "height": height, "status": "OK"}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn xmr_tip(extra: &[&str]) -> (Vec<String>, usize) {
+        let cli = tip_cli(extra);
+        let chains = tip_chains("xmr", true).unwrap();
+        tip_report(tip_backends(&cli, &chains), cli.xmr_allow_mainnet).await
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_prints_the_monerod_height() {
+        let url = fake_monerod("stagenet", 2_227_400).await;
+        let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
+        assert_eq!(failures, 0);
+        assert_eq!(lines, vec!["xmr stagenet 2227400".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_refuses_a_node_on_another_network() {
+        let url = fake_monerod("mainnet", 3_000_000).await;
+        let (lines, failures) = xmr_tip(&["--xmr-monerod-url", &url]).await;
+        assert_eq!(failures, 1);
+        assert!(
+            lines[0].starts_with("xmr stagenet error: ") && lines[0].contains("mainnet"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("3000000"), "{lines:?}");
+    }
+
+    #[test]
+    fn tip_xmr_refuses_mainnet_without_the_opt_in_before_any_network_call() {
+        let cli = tip_cli(&[
+            "--xmr-network",
+            "mainnet",
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+            "--profile",
+            "mainnet",
+        ]);
+        let e = tip_guards(&cli, &[Chain::Xmr]).unwrap_err().to_string();
+        assert!(e.contains("--xmr-allow-mainnet"), "{e}");
+        let ok = tip_cli(&[
+            "--xmr-network",
+            "mainnet",
+            "--xmr-allow-mainnet",
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+            "--profile",
+            "mainnet",
+        ]);
+        tip_guards(&ok, &[Chain::Xmr]).unwrap();
+        let none = tip_cli(&[]);
+        let e = tip_guards(&none, &[Chain::Xmr]).unwrap_err().to_string();
+        assert!(e.contains("--xmr-monerod-url"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn tip_all_without_a_monerod_url_skips_xmr_with_a_note() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        assert!(cli.xmr_monerod_url.is_none());
+        tip_main(&cli, "all").await.unwrap();
+        // The note itself is printed by `tip_main`; `all` must not have built an XMR entry.
+        assert!(!tip_chains("all", false).unwrap().contains(&Chain::Xmr));
+    }
+
+    #[tokio::test]
+    async fn tip_xmr_names_an_unreachable_monerod_and_still_prints_the_rest() {
+        let cli = tip_cli(&[
+            "--backend",
+            "mock",
+            "--xmr-monerod-url",
+            "http://127.0.0.1:1",
+        ]);
+        let chains = [Chain::Divi, Chain::Xmr, Chain::Zec];
+        let (lines, failures) = tip_report(tip_backends(&cli, &chains), false).await;
+        assert_eq!(failures, 1);
+        assert!(lines[0].starts_with("divi mock "), "{lines:?}");
+        assert!(lines[1].starts_with("xmr stagenet error: "), "{lines:?}");
+        assert!(lines[1].contains("127.0.0.1:1"), "{lines:?}");
         assert!(lines[2].starts_with("zec mock "), "{lines:?}");
     }
 
