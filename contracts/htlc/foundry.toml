@@ -14,3 +14,7 @@ fuzz = { runs = 256 }
 exclude_lints = ["block-timestamp", "missing-events-access-control"]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+[invariant]
+runs = 64
+depth = 32

@@ -187,6 +187,11 @@ impl UsdcBackend {
         })
     }
 
+    /// The EVM address this backend signs from.
+    pub fn address(&self) -> Address {
+        self.client.address()
+    }
+
     /// This backend's own ETH (gas) and `self.token` (USDC) balances — e.g. to check a
     /// maker is actually funded before serving an offer that would need to sign a
     /// transaction on this chain.

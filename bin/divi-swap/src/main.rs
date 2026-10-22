@@ -378,7 +378,7 @@ fn usdc_endpoints(cli: &Cli) -> Result<(swap_chain_evm::UsdcNetwork, String, Str
 
 /// The `--counter-chain usdc` live backend. `Backends.live` stays `None` for it (that tuple
 /// is concretely `(DiviBackend, CounterLive)`, used only by `Balance`).
-fn live_usdc_backend(cli: &Cli) -> Result<Arc<dyn ChainBackend>> {
+fn live_usdc_backend(cli: &Cli) -> Result<Arc<swap_chain_evm::UsdcBackend>> {
     let hex_key = secret_hex(&cli.usdc_key, "--usdc-key", "usdc")?;
     let key: swap_chain_evm::PrivateKeySigner = hex_key
         .trim()
@@ -420,6 +420,12 @@ fn guard_network(flag: &str, network: &str, test_networks: &[&str], allow: bool)
 }
 
 /// The engine profile must agree with the network of the counter chain in use.
+/// USDC has no `CounterLive` handle (it is an EVM account, not a UTXO address), so `balance`
+/// takes its own path instead of the `Backends::live` one.
+fn is_usdc_live(cli: &Cli) -> bool {
+    cli.counter_chain == Chain::Usdc && matches!(cli.backend, BackendArg::Live)
+}
+
 fn guard_profile(cli: &Cli) -> Result<()> {
     let coin = match cli.counter_chain {
         Chain::Btc => (
@@ -673,6 +679,14 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("{local} {state:?}");
+        }
+        Cmd::Balance if is_usdc_live(&cli) => {
+            guard_profile(&cli)?;
+            let usdc = live_usdc_backend(&cli)?;
+            let (eth, units) = usdc.gas_and_token_balance().await?;
+            println!("usdc_address={}", usdc.address());
+            println!("usdc_eth_wei={eth}");
+            println!("usdc_balance_units={units}");
         }
         Cmd::Balance => {
             let b = backends(&cli)?;
@@ -1113,6 +1127,32 @@ mod tests {
         };
         assert!(e.contains("--xmr-network = \"stagenet\""), "{e}");
         assert!(e.contains("refusing to start"), "{e}");
+    }
+
+    #[test]
+    fn balance_routes_usdc_live_to_its_own_path() {
+        assert!(is_usdc_live(&cli(&[
+            "--backend",
+            "live",
+            "--counter-chain",
+            "usdc"
+        ])));
+        assert!(
+            is_usdc_live(&cli(&["--counter-chain", "usdc"])),
+            "live is the default"
+        );
+        assert!(!is_usdc_live(&cli(&[
+            "--backend",
+            "mock",
+            "--counter-chain",
+            "usdc"
+        ])));
+        assert!(!is_usdc_live(&cli(&[
+            "--backend",
+            "live",
+            "--counter-chain",
+            "btc"
+        ])));
     }
 
     #[test]

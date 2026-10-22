@@ -763,3 +763,29 @@
 - **needs:** nothing from the human for this change.
 - **decisions:** only the networks `ethereum`/`base` are mainnets; a mainnet `[usdc]` under a testnet profile is
   refused, but a testnet `[usdc]` under `profile = "mainnet"` is not (unlike `[zec]`), so existing mixed configs keep working.
+
+## 2026-10-22 — Erc20Htlc pre-audit and two R defects (hp1, branch `lane/usdc-htlc-preaudit`, builder Y)
+
+- **done:** pre-audit of `contracts/htlc/src/Erc20Htlc.sol` against a 23-row hazard checklist (20 ok, 3 risky, 0 defect;
+  the risky rows are USDC blacklist, pause and token upgradeability, outside the HTLC's control). 18 new Foundry tests
+  (`test/Erc20HtlcPreaudit.t.sol`: USDC-style blacklist/pause mock, reentrant lock, replay, who-may-call, fuzz, solvency
+  invariant); contract unchanged. Slither 0.11.6: 8 results, all triaged (false positive or accepted), none open.
+  Local anvil end-to-end through the Rust `swap-chain-evm` tests (lock-claim, lock-refund, log scan, swap id) passes.
+  Defect 1 (CLI `balance` said "needs --backend live"): `live_backends` returns `live: None` for `--counter-chain usdc`
+  and `Cmd::Balance` bailed on that; USDC-live now has its own arm reading ETH and token balance (`main.rs`
+  `is_usdc_live`, `UsdcBackend::address`). Defect 2 (`check-usdc.sh`): not reproducible on hp1, prints `PASS: usdc`;
+  recorded as environment, script not edited.
+- **proof:** `usdc-htlc-preaudit.md` (checklist, Slither triage, coverage, digests). `forge test` 26 → 44 passed;
+  `src/Erc20Htlc.sol` coverage lines 100%, branches 90.0% → 96.7%. Rust: 250 passed before (`-p swap-chain-evm -p
+  divi-swap -p divi-swapd`), 280 passed after (295 once rebased onto signed/main 42d8493, other lanes tests) over those plus `divi-swap-cli` (not like-for-like: the extra package
+  adds 30 tests, one of them the new `balance_routes_usdc_live_to_its_own_path`), 0 failed. `cargo fmt --check` and clippy
+  `--all-targets -D warnings` clean on the touched packages. CLI balance against a local anvil: before `Error: balance
+  needs --backend live`, after `usdc_address=0xf39F…2266 usdc_eth_wei=9999998789807667221346 usdc_balance_units=0`.
+  Images: foundry v1.3.0 `sha256:74a831a6046e7f04412802ee9eecfdce7009e983727c0cb7a91fe950ad203306`, slither
+  `sha256:89d4127ec3bfeba9725a863c58dd96b01781ff73737871dd3b07606ebc4cf16b`.
+- **left:** outside audit of a real deployment (still open); Aderyn not run (no pinned image found);
+  the `check-usdc.sh` failure R saw was not reproduced
+  (cause on that host unknown); one branch of `Erc20Htlc.sol` is uncovered and was not identified.
+- **needs:** nothing from the human.
+- **decisions:** USDC blacklist/pause/freeze risks are documented, not mitigated: an owner key or upgrade path in the
+  HTLC would be worse. No funds, no public network.
