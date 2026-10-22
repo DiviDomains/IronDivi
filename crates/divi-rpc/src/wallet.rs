@@ -2432,16 +2432,34 @@ impl WalletRpc {
         Ok(json!(wif))
     }
 
-    /// Load wallet from file
+    /// loadwallet "filename" — refused: the wallet cannot be swapped on a running node.
+    ///
+    /// irondivid hands its one wallet to the block, mempool and reorg callbacks, the
+    /// staker and the pruner at start, so replacing it here would leave them writing to
+    /// the old one. The error says how to switch wallets today.
     pub fn load_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let _filename = params
+        let filename = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: filename"))?;
 
+        let current = self
+            .wallet
+            .read()
+            .as_ref()
+            .map(|w| w.database_path().display().to_string());
+        let now = match current {
+            Some(path) => format!("this node's wallet is {}", path),
+            None => "this node runs without a wallet".to_string(),
+        };
         Err(RpcError::new(
             codes::WALLET_ERROR,
-            "Multiple wallet support not yet implemented. IronDivi currently supports one active wallet at a time. To use a different wallet, restart IronDivi with the -wallet=<filename> option. Multi-wallet support will be added in a future release."
-        ).into())
+            format!(
+                "loadwallet is not supported: irondivid opens one wallet when it starts and \
+                 keeps it until it stops ({now}). To use \"{filename}\" instead, stop irondivid \
+                 and start it again with --wallet=<path to that wallet's directory>."
+            ),
+        )
+        .into())
     }
 
     /// Allocate treasury funds
@@ -3995,6 +4013,35 @@ mod tests {
         assert_eq!(
             rpc_code(rpc.sign_transaction_with_address_key(&oob).unwrap_err()),
             codes::WALLET_ERROR
+        );
+    }
+
+    /// loadwallet used to say "restart IronDivi with the -wallet=<filename> option", but
+    /// irondivid's option is --wallet=<directory>. The refusal must name the real option
+    /// and the wallet in use, and must not switch or create anything.
+    #[test]
+    fn loadwallet_refusal_names_the_real_option_and_current_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_dir = dir.path().join("w");
+        let hd = HdWallet::new(ChainMode::Divi).unwrap();
+        let db = WalletDb::create_persistent(&wallet_dir, Network::Testnet, hd).unwrap();
+        let rpc = WalletRpc::with_wallet(Arc::new(db));
+        let before = rpc.get_wallet_info(&Params::None).unwrap();
+        let p = Params::Array(vec![serde_json::json!("heir.dat")]);
+        let err = rpc.load_wallet(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--wallet="), "{msg}");
+        assert!(!msg.contains("-wallet=<filename>"), "{msg}");
+        assert!(msg.contains(&wallet_dir.display().to_string()), "{msg}");
+        assert!(msg.contains("heir.dat"), "{msg}");
+        assert_eq!(rpc_code(err), codes::WALLET_ERROR);
+        assert!(!dir.path().join("heir.dat").exists());
+        assert_eq!(rpc.get_wallet_info(&Params::None).unwrap(), before);
+
+        let msg = WalletRpc::new().load_wallet(&p).unwrap_err().to_string();
+        assert!(
+            msg.contains("without a wallet") && msg.contains("--wallet="),
+            "{msg}"
         );
     }
 
