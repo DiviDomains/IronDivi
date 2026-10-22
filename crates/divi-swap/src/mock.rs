@@ -104,6 +104,45 @@ impl MockChain {
         }
     }
 
+    /// Reorg: `txid` (and every mined tx that spends its outputs) goes back to the mempool.
+    /// Test-only; unknown ids are ignored.
+    pub fn unconfirm(&self, txid: &Txid) {
+        let mut s = self.state.lock();
+        let ids = Self::with_dependents(&s, txid);
+        for id in ids {
+            if let Some((_, mined)) = s.txs.get_mut(&id) {
+                *mined = None;
+            }
+        }
+    }
+
+    /// Reorg: `txid` (and every tx that spends its outputs) is gone from chain and mempool,
+    /// and a dropped funding tx gives its inputs back, so rebroadcasting it works again.
+    /// Test-only; unknown ids are ignored.
+    pub fn forget(&self, txid: &Txid) {
+        let mut s = self.state.lock();
+        for id in Self::with_dependents(&s, txid) {
+            let Some((tx, _)) = s.txs.remove(&id) else {
+                continue;
+            };
+            s.spends.retain(|_, spender| *spender != id);
+            if let MockTx::Fund { from, amount, .. } = tx {
+                *s.balances.entry(from).or_default() += amount.0 + MOCK_FEE.0;
+            }
+        }
+    }
+
+    fn with_dependents(s: &ChainState, txid: &Txid) -> Vec<Txid> {
+        let mut ids = vec![*txid];
+        ids.extend(
+            s.spends
+                .iter()
+                .filter(|(at, _)| at.txid == *txid)
+                .map(|(_, spender)| *spender),
+        );
+        ids
+    }
+
     /// Move MTP forward without mining (models a slow chain).
     pub fn advance_time(&self, secs: u32) {
         self.state.lock().mtp += secs;

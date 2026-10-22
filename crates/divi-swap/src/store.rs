@@ -88,6 +88,10 @@ pub struct MakerRecord {
     pub taker_leg_claim: Option<SignedTx>,
     /// Last error the scheduler hit.
     pub last_error: Option<String>,
+    /// Set once a re-broadcast of the maker lock was refused for good (its inputs are gone):
+    /// the watcher stops re-sending and keeps reporting one error. Absent in older records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maker_lock_dropped: bool,
 }
 
 /// The taker's persisted view of one swap (role-based legs, see [`MakerRecord`]).
@@ -160,6 +164,7 @@ impl std::fmt::Debug for MakerRecord {
             preimage,
             taker_leg_claim,
             last_error,
+            maker_lock_dropped,
         } = self;
         f.debug_struct("MakerRecord")
             .field("id", id)
@@ -179,6 +184,7 @@ impl std::fmt::Debug for MakerRecord {
             .field("preimage", &preimage.as_ref().map(|_| REDACTED))
             .field("taker_leg_claim", taker_leg_claim)
             .field("last_error", last_error)
+            .field("maker_lock_dropped", maker_lock_dropped)
             .finish()
     }
 }
@@ -615,6 +621,7 @@ mod tests {
             preimage: None,
             taker_leg_claim: None,
             last_error: None,
+            maker_lock_dropped: false,
         }
     }
 

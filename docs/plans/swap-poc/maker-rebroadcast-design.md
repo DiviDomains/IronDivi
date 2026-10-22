@@ -1,6 +1,6 @@
 # Maker lock re-broadcast after a reorg (F2) — design
 
-Status: design only, no code. Base `ff4401a` (`private/signed/main`). Review brief: `engine-review-brief.md` §4 Reorg, question 7.
+Status: sections 3 and 4 implemented on lane/maker-rebroadcast (status/engine.md 2026-10-22 maker-rebroadcast); sections 1, 2 and 5 are the analysis. Base `ff4401a` (`private/signed/main`). Review brief: `engine-review-brief.md` §4 Reorg, question 7.
 Paths are relative to the repo root; line numbers are on the base.
 
 ## 1. The gap
@@ -37,7 +37,7 @@ Consequences by who is hurt:
 
 `confirmations` going back to 0 is therefore the normal reorg signal on every UTXO chain; `None` is the ambiguous one (reorged and not re-added, or the index lags).
 
-## 3. Proposed watcher
+## 3. Proposed watcher (IMPLEMENTED: `maker.rs` `watch_maker_lock`, called from `on_maker_lock_confirmed`)
 
 **Where.** One new arm in `on_maker_lock_confirmed` (and the same check in `on_taker_claimed` is not needed: once the preimage is known the maker only needs the taker leg). No new state; no new table.
 
@@ -58,7 +58,7 @@ Consequences by who is hurt:
 
 **Persistence.** None needed for correctness: the signed tx and the lock outpoint are already persisted write-ahead (`enter` persists on every transition, `maker.rs:408-417`). Optionally record `last_error = "maker lock dropped by a reorg, re-broadcasting"` (and clear it when `c >= maker_leg_confs`) so the operator sees the event; `last_error` is already on `MakerRecord`/`SwapView`.
 
-## 4. Test plan (mock backends only)
+## 4. Test plan (mock backends only) (IMPLEMENTED: `tests/engine.rs`, F2 section; `MockChain::unconfirm` and `forget` added)
 
 The mock has no reorg primitive today (`crates/divi-swap/src/mock.rs:80-143`: `mine`, `advance_time`, `set_offline`, `reject_next_broadcast`). Add test-only `MockChain::unconfirm(txid)` (puts a mined tx back to the mempool) and `MockChain::forget(txid)` (drops it). Tests in `crates/divi-swap/tests/engine.rs`, per counter chain as the existing `on_counter!` macro does (`engine.rs:1307-1312`):
 
@@ -72,6 +72,8 @@ The mock has no reorg primitive today (`crates/divi-swap/src/mock.rs:80-143`: `m
 8. Crash after the re-broadcast and before the next tick: no state to lose; verify with `halt_after`.
 
 ## 5. Open questions
+
+Answers from the implementation (2026-10-22): q1 kept forward-only (no backward transition). q2 `claim_margin_secs`, no new margin. q5 any drop below `maker_leg_confs`. q3, q4, q6, q7 not answered by the code: still open.
 
 1. Should the watcher also run in `MakerLocked` past `maker_leg_confs`, i.e. is `MakerLockConfirmed` ever re-entered backwards? Proposed: no, keep the state forward-only (`can_transition_to`, `maker.rs:408-419`).
 2. Early-refund threshold near the locktime (§3): `claim_margin_secs` or a dedicated margin? No margin is changed by this design.

@@ -50,6 +50,9 @@ pub const GATE_BOUND_SECS: u64 = 20;
 /// Upper bound on transitions one `step` call performs (a swap has far fewer).
 const MAX_TRANSITIONS_PER_STEP: usize = 32;
 
+/// Reported once when the maker lock was reorged out and cannot be re-sent.
+const MAKER_LOCK_DROPPED: &str = "maker lock dropped by a reorg and its inputs were spent";
+
 /// What one pass of the state machine did.
 enum Flow {
     /// Nothing to do until something changes on chain or the clock moves.
@@ -359,6 +362,7 @@ impl Maker {
             preimage: None,
             taker_leg_claim: None,
             last_error: None,
+            maker_lock_dropped: false,
         };
         qr.used = true;
         self.store.put_quote(&qr)?;
@@ -690,6 +694,43 @@ impl Maker {
         }
         if self.maker_leg_timed_out(r).await? {
             return self.enter(r, SwapState::MakerRefundable);
+        }
+        self.watch_maker_lock(r).await
+    }
+
+    /// F2: a reorg can drop the confirmed maker lock. While it is not `maker_leg_confs` deep,
+    /// re-send the persisted signed bytes (never re-sign: the txid is the outpoint the taker
+    /// watches). A late lock the taker would refuse to claim is not worth waiting for: go
+    /// to `MakerRefundable` early. Runs after the preimage and locktime checks.
+    async fn watch_maker_lock(&self, r: &mut MakerRecord) -> Result<Flow> {
+        let (htlc, funding) = self.maker_leg(r)?;
+        let mk = self.mk(r)?.clone();
+        let confs = mk.confirmations(&funding.tx.txid).await?;
+        if confs.is_some_and(|c| c >= self.maker_leg_confs(r)) {
+            if r.maker_lock_dropped {
+                r.maker_lock_dropped = false;
+                r.last_error = None;
+                self.store.put_maker_swap(r)?;
+            }
+            return Ok(Flow::Idle);
+        }
+        let remaining = htlc.locktime.saturating_sub(mk.median_time_past().await?);
+        if remaining < self.cfg.claim_margin_secs {
+            return self.enter(r, SwapState::MakerRefundable);
+        }
+        if r.maker_lock_dropped {
+            // `step` clears the error each pass; keep reporting it without a new write.
+            r.last_error = Some(MAKER_LOCK_DROPPED.into());
+            return Ok(Flow::Idle);
+        }
+        match mk.broadcast(&funding.tx).await {
+            Ok(_) => {}
+            Err(SwapError::Rejected(why)) => {
+                r.maker_lock_dropped = true;
+                r.last_error = Some(format!("{MAKER_LOCK_DROPPED}: {why}"));
+                self.store.put_maker_swap(r)?;
+            }
+            Err(e) => return Err(e),
         }
         Ok(Flow::Idle)
     }

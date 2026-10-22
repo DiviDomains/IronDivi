@@ -1598,3 +1598,284 @@ zec_fwd!(
     zec_fwd_maker_refuses_v0_taker_leg,
     maker_refuses_v0_taker_leg_body
 );
+
+// ---- F2: the maker re-sends a lock a reorg dropped, and stops early when it is too late ----
+
+/// Drive the maker alone to `MakerLockConfirmed`; returns the maker lock's txid.
+async fn to_maker_lock_confirmed(h: &mut H) -> Txid {
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    for _ in 0..30 {
+        h.maker.tick().await.unwrap();
+        h.mine_all(1);
+        if h.maker_state() == SwapState::MakerLockConfirmed {
+            break;
+        }
+    }
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+    h.maker_rec().maker_leg_funding.unwrap().tx.txid
+}
+
+impl H {
+    fn maker_rec(&self) -> MakerRecord {
+        self.store.get_maker_swap(&self.maker_id).unwrap().unwrap()
+    }
+
+    fn maker_leg_needed(&self) -> u32 {
+        self.cfg.confirmations(self.dir.maker_chain())
+    }
+
+    async fn lock_confs(&self, lock: &Txid) -> Option<u32> {
+        self.m_ml().confirmations(lock).await.unwrap()
+    }
+
+    /// Mine and tick the maker until the lock is `maker_leg_needed` deep again.
+    async fn redeepen(&self, lock: &Txid) {
+        for _ in 0..30 {
+            self.ml_chain().mine(1);
+            self.maker.tick().await.unwrap();
+            if self
+                .lock_confs(lock)
+                .await
+                .is_some_and(|c| c >= self.maker_leg_needed())
+            {
+                return;
+            }
+        }
+        panic!("lock never got {} confirmations", self.maker_leg_needed());
+    }
+}
+
+/// Lock confirmed → reorged back to the mempool: same bytes, no new coin selection, same
+/// state; once mined deep again nothing else happens.
+async fn reorged_lock_unconfirmed_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let before = h.maker_rec();
+    let calls = h.m_ml().funding_calls();
+    h.ml_chain().unconfirm(&lock);
+    assert_eq!(h.lock_confs(&lock).await, Some(0));
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+    h.redeepen(&lock).await;
+    let after = h.maker_rec();
+    assert_eq!(
+        after.maker_leg_funding, before.maker_leg_funding,
+        "never re-signed"
+    );
+    assert_eq!(h.m_ml().funding_calls(), calls);
+    assert_eq!(after.state, SwapState::MakerLockConfirmed);
+    assert!(after.last_error.is_none() && !after.maker_lock_dropped);
+}
+both!(
+    reorged_lock_unconfirmed,
+    rev_reorged_lock_unconfirmed,
+    reorged_lock_unconfirmed_body
+);
+
+/// Lock confirmed → dropped from chain and mempool (`confirmations` is `None`): one tick
+/// re-sends the same signed bytes, mining confirms them. Fails on the base: nothing re-sends.
+async fn reorged_lock_is_resent_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let funding = h.maker_rec().maker_leg_funding.unwrap();
+    h.ml_chain().forget(&lock);
+    assert_eq!(h.lock_confs(&lock).await, None);
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.lock_confs(&lock).await, Some(0), "lock was not re-sent");
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+    h.redeepen(&lock).await;
+    assert_eq!(h.maker_rec().maker_leg_funding.unwrap(), funding);
+}
+both!(
+    reorged_lock_is_resent,
+    rev_reorged_lock_is_resent,
+    reorged_lock_is_resent_body
+);
+
+/// The re-send is refused for good (inputs spent): one error, state unchanged, no retry loop.
+async fn dropped_lock_rejected_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    let first = h.maker_rec();
+    assert!(first.maker_lock_dropped);
+    let msg = first.last_error.clone().unwrap();
+    assert!(msg.contains("dropped by a reorg"), "{msg}");
+    assert_eq!(first.state, SwapState::MakerLockConfirmed);
+    for _ in 0..3 {
+        h.maker.tick().await.unwrap();
+        assert_eq!(
+            h.maker_rec(),
+            first,
+            "the error is recorded once, not per tick"
+        );
+    }
+    assert_eq!(h.lock_confs(&lock).await, None, "no further re-broadcast");
+    assert_eq!(
+        h.maker.view(&h.maker_id).unwrap().unwrap().last_error,
+        Some(msg)
+    );
+}
+both!(
+    dropped_lock_rejected,
+    rev_dropped_lock_rejected,
+    dropped_lock_rejected_body
+);
+
+/// The taker's claim is already in the mempool when the lock is orphaned: the maker sees the
+/// preimage first and does not re-send the lock.
+async fn claim_in_mempool_wins_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    for _ in 0..40 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        if h.taker_state() == TakerState::Claimed {
+            break;
+        }
+        h.mine_all(1);
+    }
+    assert_eq!(h.taker_state(), TakerState::Claimed);
+    h.ml_chain().unconfirm(&lock);
+    h.maker.tick().await.unwrap();
+    let rec = h.maker_rec();
+    assert!(rec.preimage.is_some());
+    assert_ne!(rec.state, SwapState::MakerLockConfirmed);
+    assert!(!rec.maker_lock_dropped);
+}
+both!(
+    claim_in_mempool_wins,
+    rev_claim_in_mempool_wins,
+    claim_in_mempool_wins_body
+);
+
+/// Reorg near the locktime: a late lock cannot be claimed, so the maker stops waiting and
+/// refunds as soon as the locktime allows.
+async fn late_reorg_refunds_early_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().unconfirm(&lock);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime - h.cfg.claim_margin_secs / 2 - ml.mtp());
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_state(), SwapState::MakerRefundable);
+    ml.advance_time(h.cfg.claim_margin_secs);
+    for _ in 0..30 {
+        h.maker.tick().await.unwrap();
+        ml.mine(1);
+        if h.maker_state().is_terminal() {
+            break;
+        }
+    }
+    assert_eq!(h.maker_state(), SwapState::Done);
+    assert!(h.maker_rec().maker_leg_refund.is_some());
+}
+both!(
+    late_reorg_refunds_early,
+    rev_late_reorg_refunds_early,
+    late_reorg_refunds_early_body
+);
+
+/// A lock that is confirmed is never abandoned early, however close the locktime is.
+async fn confirmed_lock_not_refunded_early_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    assert!(h.lock_confs(&lock).await.unwrap() >= h.maker_leg_needed());
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime - 10 - ml.mtp());
+    h.maker.tick().await.unwrap();
+    let rec = h.maker_rec();
+    assert_eq!(rec.state, SwapState::MakerLockConfirmed);
+    assert!(rec.maker_leg_refund.is_none());
+}
+both!(
+    confirmed_lock_not_refunded_early,
+    rev_confirmed_lock_not_refunded_early,
+    confirmed_lock_not_refunded_early_body
+);
+
+/// The lock is gone and never returns: at the locktime the maker is `MakerRefundable` and
+/// reports a stable error, not a growing one.
+async fn lost_lock_past_locktime_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap(); // lock dropped, flagged
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime - ml.mtp());
+    assert!(h.maker.tick().await.is_ok()); // tick records errors, never returns them
+    let first = h.maker_rec();
+    assert_eq!(first.state, SwapState::MakerRefundable);
+    assert!(first.last_error.is_some());
+    for _ in 0..3 {
+        h.maker.tick().await.unwrap();
+        let again = h.maker_rec();
+        assert_eq!(again.state, SwapState::MakerRefundable);
+        assert_eq!(again.last_error, first.last_error);
+    }
+}
+both!(
+    lost_lock_past_locktime,
+    rev_lost_lock_past_locktime,
+    lost_lock_past_locktime_body
+);
+
+/// Crash (restart) between the re-send and the next tick loses nothing.
+async fn restart_after_resend_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    h.ml_chain().forget(&lock);
+    h.maker.tick().await.unwrap();
+    h.restart();
+    h.redeepen(&lock).await;
+    assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
+}
+both!(
+    restart_after_resend,
+    rev_restart_after_resend,
+    restart_after_resend_body
+);
+
+/// A record written before this change (no `maker_lock_dropped` key) loads unchanged and a
+/// step leaves it alone.
+async fn old_record_resumes_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let _ = to_maker_lock_confirmed(&mut h).await;
+    let rec = h.maker_rec();
+    let mut json = serde_json::to_value(&rec).unwrap();
+    assert!(json
+        .as_object_mut()
+        .unwrap()
+        .remove("maker_lock_dropped")
+        .is_none());
+    let old: MakerRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(old, rec);
+    h.store.put_maker_swap(&old).unwrap();
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_rec(), rec);
+}
+both!(
+    old_record_resumes,
+    rev_old_record_resumes,
+    old_record_resumes_body
+);
+
+ltc_rev!(ltc_rev_reorged_lock_is_resent, reorged_lock_is_resent_body);
+ltc_fwd!(ltc_fwd_reorged_lock_is_resent, reorged_lock_is_resent_body);
+zec_fwd!(zec_fwd_reorged_lock_is_resent, reorged_lock_is_resent_body);
+zec_rev!(zec_rev_reorged_lock_is_resent, reorged_lock_is_resent_body);
+ltc_fwd!(
+    ltc_fwd_late_reorg_refunds_early,
+    late_reorg_refunds_early_body
+);
+zec_rev!(
+    zec_rev_late_reorg_refunds_early,
+    late_reorg_refunds_early_body
+);

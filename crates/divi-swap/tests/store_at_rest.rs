@@ -66,6 +66,7 @@ fn maker() -> MakerRecord {
         preimage: Some(PREIMAGE),
         taker_leg_claim: None,
         last_error: None,
+        maker_lock_dropped: false,
     }
 }
 
