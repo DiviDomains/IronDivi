@@ -49,7 +49,7 @@ What the maker host must hold, and what it must not:
 
 Mainnet items are new 1Password items, never the stagenet ones renamed: `IronDivi Swap - maker-divi-xmr-mainnet`, `IronDivi Swap - maker-xmr-wallet-mainnet`, generated on Bert's machine at the keyboard (phase D). They go on a separate mainnet host, provisioned by `deploy.sh provision-secrets`. Rotation follows `xmr-runbook.md` §Keys.
 
-Code consequences for the mainnet lift: the xmr DIVI address now follows the configured network (`bin/divi-swapd/src/main.rs:196-198`, done in f919e5c). `wallet_rpc_url` should become optional for the maker (`bin/divi-swapd/src/config.rs:141`).
+Code consequences for the mainnet lift: the xmr DIVI address now follows the configured network (`bin/divi-swapd/src/main.rs:196-198`, done in f919e5c). `wallet_rpc_url` / `wallet_rpc_user` / `wallet_rpc_password` are now optional for the maker — **done 2026-10-22** (`bin/divi-swapd/src/config.rs`, `XmrSection.wallet_rpc_url: Option<String>`; `crates/divi-swap-xmr/src/live.rs`, `LiveMoneroConfig.wallet_rpc_url: Option<String>`, `lock` fails with a named error when it is unset). The taker CLI still requires `--xmr-wallet-rpc-url`.
 
 ## Phase C — external security review
 

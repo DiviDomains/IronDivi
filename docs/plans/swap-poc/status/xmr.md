@@ -1276,3 +1276,14 @@ Base `0d12f57`, branch `lane/xmr-nettype-guard`. Read-only `get_info` against pu
 - left: the crate has no ignored `get_info` test (its live tests sit behind `--features live` and do not match `get_info`), so none was run; the mismatch path against a real wrong-network node is covered by the pure-fn tests, not a live run. Timeouts/margins row untouched (phase D).
 - needs: nothing from a human.
 - decisions: the pure check lives in `divi-swap-xmr::live` (shared by daemon and CLI) rather than in `divi-swapd`.
+
+## XMR maker runs without monero-wallet-rpc (builder AG on hp3, 2026-10-22)
+
+Base `789dcee`, branch `lane/xmr-maker-no-wallet-rpc`. Pure code + tests + docs; no funds, keys, wallets or network.
+
+- done: `[xmr].wallet_rpc_url` is `Option<String>` (`bin/divi-swapd/src/config.rs`, serde default); `LiveMoneroConfig.wallet_rpc_url` is `Option<String>` (`crates/divi-swap-xmr/src/live.rs`); `LiveMonero::lock` returns `SwapError::InvalidParams("… wallet_rpc_url is not configured …")` before touching the journal or the network; the taker CLI (`bin/divi-swap/src/main.rs`) still requires `--xmr-wallet-rpc-url`. `wallet_rpc_password` is resolved only when present (unchanged).
+- proof: the maker never calls the wallet RPC — the only caller of `MoneroChain::lock` is `crates/divi-swap-xmr/src/taker.rs:674`; the maker sweeps with the recovered key through monerod. `cargo fmt --check` clean; `cargo clippy -p divi-swap-xmr -p divi-swapd -p divi-swap-cli --all-targets -- -D warnings` clean; `cargo test` same three packages: 195 passed before, 197 after.
+- tests added: `xmr_section_without_wallet_rpc_keys_loads` (divi-swapd; also checks configs with the keys set parse as before), `lock_without_a_wallet_rpc_fails_named_and_writes_no_journal` (divi-swap-xmr). Maker swap to `done` and to refund with mock backends is covered by the existing maker tests, whose mock chain has no wallet RPC at all.
+- left: the runbook does not tell the maker operator to run monero-wallet-rpc (only the `maker-xmr-wallet-rpc` credential row), so it is unchanged.
+- needs: nothing from a human.
+- decisions: the named error is `InvalidParams` so the engine does not retry it as transient.

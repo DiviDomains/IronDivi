@@ -869,7 +869,7 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     )?;
     let xmr = LiveMonero::new(LiveMoneroConfig {
         monerod_url,
-        wallet_rpc_url,
+        wallet_rpc_url: Some(wallet_rpc_url),
         wallet_rpc_user: cli.xmr_wallet_rpc_user.clone(),
         wallet_rpc_password,
         network,

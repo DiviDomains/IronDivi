@@ -158,6 +158,8 @@ max_btc_sats = 100000000              # 1 XMR
 # [xmr]
 # network = "stagenet"
 # monerod_url = "http://127.0.0.1:38081"
+# The three wallet_rpc_* keys are optional and taker-only (the taker locks XMR through
+# monero-wallet-rpc). A maker omits them: it never sends XMR, it sweeps with the recovered key.
 # wallet_rpc_url = "http://127.0.0.1:38088"
 # wallet_rpc_user = "swap"
 # wallet_rpc_password = "credential:maker-xmr-wallet-rpc"

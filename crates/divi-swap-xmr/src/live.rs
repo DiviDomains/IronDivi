@@ -159,7 +159,9 @@ pub struct LiveMoneroConfig {
     /// `monerod` RPC (read-only use: scanning, fees, relaying the sweep).
     pub monerod_url: String,
     /// `monero-wallet-rpc` with this party's wallet open (the taker's `lock` spends from it).
-    pub wallet_rpc_url: String,
+    /// `None` on a maker host: the maker never sends XMR from a wallet, and `lock` then
+    /// fails with a named error instead of dialling anything.
+    pub wallet_rpc_url: Option<String>,
     pub wallet_rpc_user: String,
     /// Held in memory only; resolved from a secret reference by the caller.
     pub wallet_rpc_password: String,
@@ -355,12 +357,19 @@ impl MoneroChain for LiveMonero {
             }
             None => {}
         }
+        let Some(wallet_rpc_url) = self.cfg.wallet_rpc_url.clone() else {
+            return Err(SwapError::InvalidParams(
+                "XMR lock needs a monero-wallet-rpc, but wallet_rpc_url is not configured \
+                 (a maker never locks XMR; only the taker does)"
+                    .into(),
+            ));
+        };
         write_journal(&path, &Journal { txid: None })?;
         let c = self.cfg.clone();
         let (sp, vs) = (*spend_pub, *view_secret);
         let sent = contained(async move {
             monero_chain::lock(
-                &c.wallet_rpc_url,
+                &wallet_rpc_url,
                 &c.wallet_rpc_user,
                 &c.wallet_rpc_password,
                 sp,
@@ -701,7 +710,7 @@ mod tests {
     fn chain(dir: &Path) -> LiveMonero {
         LiveMonero::new(LiveMoneroConfig {
             monerod_url: "http://127.0.0.1:9".into(),
-            wallet_rpc_url: "http://127.0.0.1:9".into(),
+            wallet_rpc_url: Some("http://127.0.0.1:9".into()),
             wallet_rpc_user: "u".into(),
             wallet_rpc_password: "p".into(),
             network: Network::Stagenet,
@@ -710,6 +719,32 @@ mod tests {
             journal_dir: dir.join("journal"),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lock_without_a_wallet_rpc_fails_named_and_writes_no_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = LiveMonero::new(LiveMoneroConfig {
+            monerod_url: "http://127.0.0.1:9".into(),
+            wallet_rpc_url: None,
+            wallet_rpc_user: String::new(),
+            wallet_rpc_password: String::new(),
+            network: Network::Stagenet,
+            sweep_to: parse_address(Network::Stagenet, &stagenet_addr()).unwrap(),
+            lookback_blocks: 720,
+            journal_dir: dir.path().join("journal"),
+        })
+        .unwrap();
+        let key = curve25519_dalek_ng::constants::ED25519_BASEPOINT_POINT
+            .compress()
+            .to_bytes();
+        let e = m.lock(&key, &[1; 32], 5).await.unwrap_err();
+        assert!(matches!(e, SwapError::InvalidParams(_)), "{e}");
+        assert!(
+            e.to_string().contains("wallet_rpc_url is not configured"),
+            "{e}"
+        );
+        assert!(read_journal(&m.lock_journal(&key)).unwrap().is_none());
     }
 
     #[test]

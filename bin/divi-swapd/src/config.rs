@@ -225,8 +225,10 @@ pub struct XmrSection {
     pub allow_mainnet: bool,
     /// `monerod` RPC: scanning for the taker's lock, fees, relaying the sweep.
     pub monerod_url: String,
-    /// `monero-wallet-rpc` with the maker's wallet open.
-    pub wallet_rpc_url: String,
+    /// `monero-wallet-rpc` URL. Taker-only: the maker never sends XMR from a wallet (it
+    /// sweeps with the recovered key), so a maker leaves the three `wallet_rpc_*` keys out.
+    #[serde(default)]
+    pub wallet_rpc_url: Option<String>,
     #[serde(default)]
     pub wallet_rpc_user: String,
     /// Reference (`op://…` or `credential:<name>`) to the wallet RPC password.
@@ -1097,6 +1099,24 @@ sweep_address = "5Aaaa"
 divi_key = "credential:maker-divi-xmr"
 divi_fund_txids = ["ab"]
 "#;
+
+    #[test]
+    fn xmr_section_without_wallet_rpc_keys_loads() {
+        let section = XMR_SECTION
+            .lines()
+            .filter(|l| !l.starts_with("wallet_rpc_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{section}")).unwrap();
+        let x = c.xmr.as_ref().unwrap();
+        assert!(x.wallet_rpc_url.is_none() && x.wallet_rpc_password.is_none());
+        assert!(x.wallet_rpc_user.is_empty());
+        // Keys that are present are still parsed and checked as before.
+        let c = DaemonConfig::parse(&format!("{GOOD}{XMR}{XMR_SECTION}")).unwrap();
+        let x = c.xmr.as_ref().unwrap();
+        assert_eq!(x.wallet_rpc_url.as_deref(), Some("http://127.0.0.1:38088"));
+        assert_eq!(x.wallet_rpc_user, "swap");
+    }
 
     #[test]
     fn xmr_section_parses_with_defaults_and_rejects_raw_secrets() {
