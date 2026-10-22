@@ -114,6 +114,14 @@ pub trait MempoolProvider: Send + Sync {
 
     fn prioritise_transaction(&self, txid: &Hash256, priority_delta: f64, fee_delta: i64) -> bool;
 
+    /// The pool's copy of a transaction, if it holds `txid`
+    fn get_transaction(
+        &self,
+        _txid: &Hash256,
+    ) -> Option<divi_primitives::transaction::Transaction> {
+        None
+    }
+
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()

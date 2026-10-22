@@ -74,6 +74,87 @@ fn bare_txid(tx: &Transaction) -> Hash256 {
     stripped.txid()
 }
 
+/// Decoded transaction as `getrawtransaction <txid> 1` shows it (without the block fields),
+/// with addresses encoded for `network`.
+pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Value {
+    use divi_script::{extract_destinations, extract_script_type, get_script_type_name, to_asm};
+
+    let vin: Vec<serde_json::Value> = tx
+        .vin
+        .iter()
+        .map(|input| {
+            if input.prevout.txid == Hash256::zero() && input.prevout.vout == 0xffffffff {
+                return json!({
+                    "coinbase": hex::encode(input.script_sig.as_bytes()),
+                    "sequence": input.sequence,
+                });
+            }
+            json!({
+                "txid": input.prevout.txid.to_string(),
+                "vout": input.prevout.vout,
+                "scriptSig": {
+                    "asm": to_asm(input.script_sig.as_bytes()),
+                    "hex": hex::encode(input.script_sig.as_bytes()),
+                },
+                "sequence": input.sequence,
+            })
+        })
+        .collect();
+
+    let vout: Vec<serde_json::Value> = tx
+        .vout
+        .iter()
+        .enumerate()
+        .map(|(n, output)| {
+            let script_bytes = output.script_pubkey.as_bytes();
+            let (script_type, _solutions) = extract_script_type(script_bytes);
+            let mut script_obj = json!({
+                "asm": to_asm(script_bytes),
+                "hex": hex::encode(script_bytes),
+                "type": get_script_type_name(script_type),
+            });
+            if let Some((_stype, destinations, req_sigs)) = extract_destinations(script_bytes) {
+                if req_sigs > 1 {
+                    script_obj["reqSigs"] = json!(req_sigs);
+                }
+                let addresses: Vec<String> = destinations
+                    .iter()
+                    .map(|dest| match dest {
+                        divi_script::Destination::PubKeyHash(pkh) => {
+                            Address::from_pubkey_hash(Hash160::from_bytes(*pkh), network)
+                                .to_base58()
+                        }
+                        divi_script::Destination::ScriptHash(sh) => {
+                            Address::p2sh(Hash160::from_bytes(*sh), network).to_base58()
+                        }
+                    })
+                    .collect();
+                if !addresses.is_empty() {
+                    script_obj["addresses"] = json!(addresses);
+                }
+            }
+            json!({
+                "value": output.value.as_divi_f64(),
+                "valueSat": output.value.as_sat(),
+                "n": n,
+                "scriptPubKey": script_obj,
+            })
+        })
+        .collect();
+
+    let hex_value = hex::encode(serialize(tx));
+    json!({
+        "hex": hex_value,
+        "txid": tx.txid().to_string(),
+        "baretxid": bare_txid(tx).to_string(),
+        "version": tx.version,
+        "locktime": tx.lock_time,
+        "size": hex_value.len() / 2,
+        "vin": vin,
+        "vout": vout,
+    })
+}
+
 /// Callback for submitting transactions to the mempool and network
 pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
 
@@ -85,6 +166,7 @@ pub struct WalletRpc {
     chain: Option<Arc<Chain>>,
     /// Fetches pruned blocks from full-history peers during rescan
     block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
+    mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
     locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
 }
 
@@ -95,6 +177,7 @@ impl WalletRpc {
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
+            mempool: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -104,12 +187,34 @@ impl WalletRpc {
         *self.block_fetcher.write() = Some(fetcher);
     }
 
+    /// Let `getrawtransaction` find transactions that are still in the mempool
+    pub fn set_mempool(&self, mempool: Arc<dyn crate::blockchain::MempoolProvider>) {
+        *self.mempool.write() = Some(mempool);
+    }
+
+    /// Address-encoding network of the chain this node runs on
+    fn address_network(&self) -> Network {
+        use divi_storage::chain::NetworkType;
+        match self.chain.as_ref().map(|c| c.network_type()) {
+            Some(NetworkType::Mainnet) => Network::Mainnet,
+            Some(NetworkType::Testnet) => Network::Testnet,
+            Some(NetworkType::Regtest) => Network::Regtest,
+            None => self
+                .wallet
+                .read()
+                .as_ref()
+                .map(|w| w.network())
+                .unwrap_or(Network::Mainnet),
+        }
+    }
+
     pub fn with_wallet(wallet: Arc<WalletDb>) -> Self {
         WalletRpc {
             wallet: Arc::new(RwLock::new(Some(wallet))),
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
+            mempool: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -122,6 +227,7 @@ impl WalletRpc {
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
+            mempool: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -134,6 +240,7 @@ impl WalletRpc {
             height: Arc::new(RwLock::new(0)),
             tx_submit: RwLock::new(None),
             block_fetcher: RwLock::new(None),
+            mempool: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -1254,10 +1361,10 @@ impl WalletRpc {
     }
 
     /// getrawtransaction - Get raw transaction data
+    ///
+    /// Looks in the mempool first, then the transaction index, as Divi Core's
+    /// GetTransaction does.
     pub fn get_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        use divi_script::{
-            extract_destinations, extract_script_type, get_script_type_name, to_asm,
-        };
         let txid_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("txid required"))?;
@@ -1279,34 +1386,36 @@ impl WalletRpc {
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available"))?;
 
+        let in_mempool = self
+            .mempool
+            .read()
+            .as_ref()
+            .and_then(|m| m.get_transaction(&txid));
+        let (tx, location) = match in_mempool {
+            Some(tx) => (tx, None),
+            None => {
+                let (tx, location) = chain
+                    .get_transaction_with_location(&txid)
+                    .map_err(|e| {
+                        RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
+                    })?
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            codes::INVALID_ADDRESS_OR_KEY,
+                            "No information available about transaction",
+                        )
+                    })?;
+                (tx, Some(location))
+            }
+        };
+
         if !verbose {
-            let tx = chain
-                .get_transaction(&txid)
-                .map_err(|e| {
-                    RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
-                })?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Transaction not found")
-                })?;
+            return Ok(serde_json::json!(hex::encode(serialize(&tx))));
+        }
 
-            let hex = hex::encode(serialize(&tx));
-            Ok(serde_json::json!(hex))
-        } else {
-            let result = chain
-                .get_transaction_with_location(&txid)
-                .map_err(|e| {
-                    RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
-                })?
-                .ok_or_else(|| {
-                    RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Transaction not found")
-                })?;
-
-            let (tx, location) = result;
-            let txid_value = tx.txid().to_string();
-            let baretxid_value = bare_txid(&tx).to_string();
-            let hex_value = hex::encode(serialize(&tx));
-            let size = hex_value.len() / 2;
-
+        let mut result = tx_to_json(&tx, self.address_network());
+        // A mempool transaction has no block fields, as in Divi Core
+        if let Some(location) = location {
             let block_index = chain
                 .get_block_index(&location.block_hash)
                 .map_err(|e| {
@@ -1320,110 +1429,17 @@ impl WalletRpc {
             } else {
                 0
             };
-
-            let vin: Vec<serde_json::Value> = tx
-                .vin
-                .iter()
-                .map(|input| {
-                    if input.prevout.txid == Hash256::zero() && input.prevout.vout == 0xffffffff {
-                        return serde_json::json!({
-                            "coinbase": hex::encode(input.script_sig.as_bytes()),
-                            "sequence": input.sequence,
-                        });
-                    }
-                    serde_json::json!({
-                        "txid": input.prevout.txid.to_string(),
-                        "vout": input.prevout.vout,
-                        "scriptSig": {
-                            "hex": hex::encode(input.script_sig.as_bytes()),
-                        },
-                        "sequence": input.sequence,
-                    })
-                })
-                .collect();
-
-            let vout: Vec<serde_json::Value> = tx
-                .vout
-                .iter()
-                .enumerate()
-                .map(|(n, output)| {
-                    let script_bytes = output.script_pubkey.as_bytes();
-                    let (script_type, _solutions) = extract_script_type(script_bytes);
-                    let type_name = get_script_type_name(script_type);
-                    let asm = to_asm(script_bytes);
-
-                    let mut script_obj = serde_json::json!({
-                        "asm": asm,
-                        "hex": hex::encode(script_bytes),
-                        "type": type_name,
-                    });
-
-                    // Extract addresses if available
-                    if let Some((_stype, destinations, req_sigs)) =
-                        extract_destinations(script_bytes)
-                    {
-                        if req_sigs > 1 {
-                            script_obj["reqSigs"] = serde_json::json!(req_sigs);
-                        }
-
-                        let addresses: Vec<String> = destinations
-                            .iter()
-                            .map(|dest| match dest {
-                                divi_script::Destination::PubKeyHash(pkh) => {
-                                    let mut bytes = [0u8; 20];
-                                    bytes.copy_from_slice(&pkh[..]);
-                                    let addr = Address::from_pubkey_hash(
-                                        Hash160::from_bytes(bytes),
-                                        Network::Mainnet,
-                                    );
-                                    addr.to_base58()
-                                }
-                                divi_script::Destination::ScriptHash(sh) => {
-                                    let mut bytes = [0u8; 20];
-                                    bytes.copy_from_slice(&sh[..]);
-                                    let addr =
-                                        Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
-                                    addr.to_base58()
-                                }
-                            })
-                            .collect();
-
-                        if !addresses.is_empty() {
-                            script_obj["addresses"] = serde_json::json!(addresses);
-                        }
-                    }
-
-                    serde_json::json!({
-                        "value": output.value.as_divi_f64(),
-                        "valueSat": output.value.as_sat(),
-                        "n": n,
-                        "scriptPubKey": script_obj,
-                    })
-                })
-                .collect();
-
-            Ok(serde_json::json!({
-                "hex": hex_value,
-                "txid": txid_value,
-                "baretxid": baretxid_value,
-                "version": tx.version,
-                "locktime": tx.lock_time,
-                "size": size,
-                "vin": vin,
-                "vout": vout,
-                "blockhash": location.block_hash.to_string(),
-                "confirmations": confirmations,
-                "time": block_index.time,
-                "blocktime": block_index.time,
-                "height": block_index.height,
-            }))
+            result["blockhash"] = json!(location.block_hash.to_string());
+            result["confirmations"] = json!(confirmations);
+            result["time"] = json!(block_index.time);
+            result["blocktime"] = json!(block_index.time);
+            result["height"] = json!(block_index.height);
         }
+        Ok(result)
     }
 
+    /// decoderawtransaction - Decode a raw transaction hex string
     pub fn decode_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        use divi_script::{
-            extract_destinations, extract_script_type, get_script_type_name, to_asm,
-        };
         let hex_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("hex string required"))?;
@@ -1439,101 +1455,12 @@ impl WalletRpc {
                 )
             })?;
 
-        let txid_value = tx.txid().to_string();
-        let baretxid_value = bare_txid(&tx).to_string();
-
-        let vin: Vec<serde_json::Value> = tx
-            .vin
-            .iter()
-            .map(|input| {
-                if input.prevout.txid == Hash256::zero() && input.prevout.vout == 0xffffffff {
-                    serde_json::json!({
-                        "coinbase": hex::encode(input.script_sig.as_bytes()),
-                        "sequence": input.sequence,
-                    })
-                } else {
-                    let script_bytes = input.script_sig.as_bytes();
-                    let asm = to_asm(script_bytes);
-
-                    serde_json::json!({
-                        "txid": input.prevout.txid.to_string(),
-                        "vout": input.prevout.vout,
-                        "scriptSig": {
-                            "asm": asm,
-                            "hex": hex::encode(script_bytes),
-                        },
-                        "sequence": input.sequence,
-                    })
-                }
-            })
-            .collect();
-
-        let vout: Vec<serde_json::Value> = tx
-            .vout
-            .iter()
-            .enumerate()
-            .map(|(n, output)| {
-                let script_bytes = output.script_pubkey.as_bytes();
-                let (script_type, _solutions) = extract_script_type(script_bytes);
-                let type_name = get_script_type_name(script_type);
-                let asm = to_asm(script_bytes);
-
-                let mut script_obj = serde_json::json!({
-                    "asm": asm,
-                    "hex": hex::encode(script_bytes),
-                    "type": type_name,
-                });
-
-                // Extract addresses if available
-                if let Some((_stype, destinations, req_sigs)) = extract_destinations(script_bytes) {
-                    if req_sigs > 1 {
-                        script_obj["reqSigs"] = serde_json::json!(req_sigs);
-                    }
-
-                    let addresses: Vec<String> = destinations
-                        .iter()
-                        .map(|dest| match dest {
-                            divi_script::Destination::PubKeyHash(pkh) => {
-                                let mut bytes = [0u8; 20];
-                                bytes.copy_from_slice(&pkh[..]);
-                                let addr = Address::from_pubkey_hash(
-                                    Hash160::from_bytes(bytes),
-                                    Network::Mainnet,
-                                );
-                                addr.to_base58()
-                            }
-                            divi_script::Destination::ScriptHash(sh) => {
-                                let mut bytes = [0u8; 20];
-                                bytes.copy_from_slice(&sh[..]);
-                                let addr =
-                                    Address::p2sh(Hash160::from_bytes(bytes), Network::Mainnet);
-                                addr.to_base58()
-                            }
-                        })
-                        .collect();
-
-                    if !addresses.is_empty() {
-                        script_obj["addresses"] = serde_json::json!(addresses);
-                    }
-                }
-
-                serde_json::json!({
-                    "value": output.value.as_divi_f64(),
-                    "valueSat": output.value.as_sat(),
-                    "n": n,
-                    "scriptPubKey": script_obj,
-                })
-            })
-            .collect();
-
-        Ok(serde_json::json!({
-            "txid": txid_value,
-            "baretxid": baretxid_value,
-            "version": tx.version,
-            "locktime": tx.lock_time,
-            "vin": vin,
-            "vout": vout,
-        }))
+        let mut result = tx_to_json(&tx, self.address_network());
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("hex");
+            obj.remove("size");
+        }
+        Ok(result)
     }
 
     /// getaddressesbylabel - Get addresses with a label
