@@ -63,7 +63,7 @@ Tx_cancel's outputs (`taker.rs:269`, `:282`).
 |---|---|---|---|---|
 | 0 | `GET /offers/:id/quote` | taker → maker | quote id, amounts, expiry 60 s | `routes.rs:72`, `maker.rs:345` |
 | 1 | `POST /xmr/swaps` | taker → maker | `SetupRequest`: `b`, payout script, `X`, `S_t`, DLEQ proof | `api.rs:53-71`, `maker.rs:385` |
-| 2 | reply | maker → taker | `SetupReply`: `a`, `Y`, `S_m`, DLEQ proof, `v`, amounts, lock outpoint, `t_cancel`, `t_punish`, unsigned Tx_cancel + maker sig, refund script | `api.rs:74-116`, `taker.rs:243` |
+| 2 | reply | maker → taker | `SetupReply`: `a`, `Y`, `S_m`, DLEQ proof, `v`, amounts, lock outpoint, `t_cancel`, `t_punish`, `maker_mtp` (optional: the DIVI MTP `t_cancel` was derived from; omitted by older makers, ignored by older takers), unsigned Tx_cancel + maker sig, refund script | `api.rs:74-116`, `taker.rs:243` |
 | 3 | `POST /xmr/swaps/:id/sigs` | taker → maker | taker sig on Tx_cancel, Tx_refund encsig under `Y` | `api.rs:148-155`, `maker.rs:516` |
 | — | maker signs Tx_punish, persists, broadcasts Tx_lock | | maker's punish sig appears in the swap view | `maker.rs:573-582`, `api.rs:196-198` |
 | 4 | taker locks XMR, then `POST /xmr/swaps/:id/xmr-lock` | taker → maker | Monero txid (a hint; the maker verifies by scan) | `taker.rs:479-528`, `maker.rs:591` |

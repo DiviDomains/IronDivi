@@ -935,6 +935,7 @@ impl XmrMaker {
                     t_punish,
                     t_late,
                     divi_fee_sats: fee,
+                    maker_mtp: Some(mtp),
                     tx_cancel,
                     maker_refund_script: refund_script,
                 },

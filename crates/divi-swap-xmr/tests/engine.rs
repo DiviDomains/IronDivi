@@ -1307,3 +1307,175 @@ async fn setup_refuses_overflowing_timelocks() {
     assert!(err.contains("t_cancel out of range"), "{err}");
     assert_eq!(w.maker_divi.reserved_count(), 0, "nothing reserved");
 }
+
+/// AB: the engine config of the floor tests: `cfg()`'s fee with the testnet profile's depths,
+/// which a testnet-profile floor requires of the maker.
+fn floor_cfg() -> XmrConfig {
+    XmrConfig {
+        divi_fee_sats: 10_000,
+        ..XmrConfig::testnet()
+    }
+}
+
+/// AB: `w` with both engines on `floor_cfg()` and the taker holding the testnet profile floor.
+fn with_testnet_floor(w: &mut W) {
+    let c = w.clock.clone();
+    w.maker = XmrMaker::new(
+        floor_cfg(),
+        Arc::new(w.maker_divi.clone()),
+        Arc::new(w.maker_xmr.clone()),
+        w.store.clone(),
+        vec![offer()],
+    )
+    .unwrap()
+    .with_clock(Arc::new(move || c.load(Ordering::SeqCst)))
+    .with_primes(Arc::new(|| primes().1.clone()));
+    w.taker = XmrTaker::new(
+        floor_cfg(),
+        Arc::new(w.taker_divi.clone()),
+        Arc::new(w.taker_xmr.clone()),
+        w.store.clone(),
+    )
+    .unwrap()
+    .with_primes(Arc::new(|| primes().0.clone()))
+    .with_profile_floor(Profile::Testnet);
+}
+
+/// The maker's reply that first carries the `SetupReply`, not yet handed to the taker.
+async fn setup_reply(w: &W) -> (String, JRoundReply) {
+    let mut q = w.maker.quote("divi-xmr-stagenet", XMR_UNITS).await.unwrap();
+    // A shortening maker still advertises the floor's timeouts; only its setup is short.
+    q.maker_timeout_secs = floor_cfg().cancel_after_secs;
+    q.taker_timeout_secs = floor_cfg().cancel_after_secs + floor_cfg().punish_after_secs;
+    let (tid, req) = w.taker.prepare(&q).await.unwrap();
+    let mut reply = w.maker.setup(req).await.unwrap();
+    let mid = reply.swap_id.clone();
+    for _ in 0..64 {
+        if reply.setup.is_some() {
+            return (tid, reply);
+        }
+        match w.taker.j_step(&tid, reply).await.unwrap() {
+            JNext::Send(r) => reply = w.maker.j_round(&mid, r).await.unwrap(),
+            JNext::Sigs(_) => panic!("signed without a setup"),
+        }
+    }
+    panic!("no setup in 64 exchanges");
+}
+
+/// AB: `maker_mtp` is optional on the wire. The old `SetupReply` (copied here, without the
+/// field) parses a new message; a message without the field parses into the new struct.
+#[tokio::test]
+async fn maker_mtp_is_optional_on_the_wire_both_ways() {
+    use divi_swap_xmr::api::SetupReply;
+    /// `SetupReply` as it was before `maker_mtp` (no `deny_unknown_fields`, as today).
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldSetupReply {
+        swap_id: String,
+        quote: divi_swap::api::Quote,
+        xmr_amount: u64,
+        lock_amount: u64,
+        t_cancel: u32,
+        t_punish: u32,
+        t_late: u32,
+        divi_fee_sats: u64,
+        joint_pubkey: serde_json::Value,
+        tx_cancel: serde_json::Value,
+        maker_refund_script: serde_json::Value,
+    }
+    let mut w = W::new();
+    with_testnet_floor(&mut w);
+    let (_, first) = setup_reply(&w).await;
+    let reply = first.setup.unwrap();
+    let mtp = w.maker_divi.median_time_past().await.unwrap();
+    assert_eq!(
+        reply.maker_mtp,
+        Some(mtp),
+        "the maker states the MTP it used"
+    );
+    assert_eq!(reply.t_cancel, mtp + floor_cfg().cancel_after_secs);
+
+    // New message → old struct.
+    let json = serde_json::to_value(&reply).unwrap();
+    assert_eq!(json["maker_mtp"], serde_json::json!(mtp));
+    let old: OldSetupReply = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(old.t_cancel, reply.t_cancel);
+
+    // Old message → new struct: the field is absent and reads as `None`.
+    let mut legacy = json;
+    legacy.as_object_mut().unwrap().remove("maker_mtp");
+    let parsed: SetupReply = serde_json::from_value(legacy).unwrap();
+    assert_eq!(parsed.maker_mtp, None);
+    assert_eq!(parsed.t_cancel, reply.t_cancel);
+
+    // A `None` is not written at all, so an old peer sees today's bytes.
+    let none = SetupReply {
+        maker_mtp: None,
+        ..reply
+    };
+    assert!(serde_json::to_value(&none)
+        .unwrap()
+        .get("maker_mtp")
+        .is_none());
+}
+
+/// AB: a maker that shortens `t_cancel` by less than `sigs_wait_secs` slipped under the
+/// tolerant floor; with its MTP stated it is refused at the setup, before the taker stores the
+/// setup, signs, or locks, and before the maker broadcasts `Tx_lock`. An older maker (no MTP)
+/// is still held to the tolerant floor only, and an honest maker completes.
+#[tokio::test]
+async fn a_maker_shortening_t_cancel_is_refused_exactly_once_it_states_its_mtp() {
+    let short = XmrConfig {
+        cancel_after_secs: floor_cfg().cancel_after_secs - 900,
+        ..floor_cfg()
+    };
+    assert!(900 < floor_cfg().sigs_wait_secs, "inside Z's tolerance");
+
+    let mut w = W::new();
+    with_testnet_floor(&mut w);
+    with_maker_cfg(&mut w, short.clone());
+    let (tid, first) = setup_reply(&w).await;
+    let s = first.setup.clone().unwrap();
+    assert_eq!(s.t_cancel, s.maker_mtp.unwrap() + short.cancel_after_secs);
+    let lock_txid = w.maker.record(&s.swap_id).unwrap().unwrap().tx_lock.txid();
+    let err = w
+        .taker
+        .j_step(&tid, first)
+        .await
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        err.contains("t_cancel") && err.contains("maker's stated MTP"),
+        "{err}"
+    );
+    assert!(w.taker_rec(&tid).setup.is_none(), "setup not stored");
+    assert!(w.divi.tx(&lock_txid).is_none(), "Tx_lock never broadcast");
+    assert_eq!(w.taker_xmr.balance(), TAKER_XMR, "no XMR locked");
+
+    // The same short maker, as an older one that omits the MTP, passes the tolerant floor.
+    let mut w = W::new();
+    with_testnet_floor(&mut w);
+    with_maker_cfg(&mut w, short);
+    let (tid, mut first) = setup_reply(&w).await;
+    first.setup.as_mut().unwrap().maker_mtp = None;
+    w.taker
+        .j_step(&tid, first)
+        .await
+        .expect("older maker: tolerant floor only");
+
+    // An honest maker that states its MTP completes the swap.
+    let mut w = W::new();
+    with_testnet_floor(&mut w);
+    let (mid, tid) = w.open().await;
+    for _ in 0..60 {
+        w.round(&mid, &tid, true, true).await;
+        if w.maker_state(&mid) == XmrMakerState::Done
+            && w.taker_rec(&tid).state == XmrTakerState::Done
+        {
+            break;
+        }
+    }
+    assert_eq!(w.maker_state(&mid), XmrMakerState::Done);
+    assert_eq!(w.taker_rec(&tid).outcome.as_deref(), Some("redeemed"));
+}

@@ -523,8 +523,14 @@ impl XmrTaker {
             ));
         }
         if let Some(f) = &self.floor {
-            f.check_setup_timelocks(mtp, reply.t_cancel, reply.t_punish, reply.t_late)
-                .map_err(|e| bad(&e))?;
+            f.check_setup_timelocks(
+                mtp,
+                reply.maker_mtp,
+                reply.t_cancel,
+                reply.t_punish,
+                reply.t_late,
+            )
+            .map_err(|e| bad(&e))?;
         }
         // Upper bounds: a maker must not be able to park the taker's XMR for years.
         if reply.t_cancel > mtp.saturating_add(crate::MAX_CANCEL_AFTER_SECS)

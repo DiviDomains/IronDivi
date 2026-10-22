@@ -146,6 +146,12 @@ pub struct SetupReply {
     pub t_late: u32,
     /// DIVI fee each presigned transaction pays, sats.
     pub divi_fee_sats: u64,
+    /// The DIVI median time past (unix seconds) the maker derived `t_cancel` from
+    /// (`t_cancel = maker_mtp + cancel_after_secs`). Optional on the wire: a maker that
+    /// predates it omits it (the taker then keeps the tolerant `t_cancel` floor), and a peer
+    /// that predates it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_mtp: Option<u32>,
     /// `Tx_cancel`: lock (cancel branch) → [`swap_chain_xmr::lock_scripts::CancelScript`];
     /// unsigned. Both sides sign its digest with `J`.
     #[serde(with = "wire::divi_tx")]

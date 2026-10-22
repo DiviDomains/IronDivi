@@ -253,20 +253,46 @@ impl XmrConfig {
 
     /// Refuse a maker's setup timelocks weaker than `self` (the taker's own floor), given the
     /// DIVI median time past `mtp` the taker reads now. The maker set `t_cancel = mtp_setup +
-    /// cancel_after_secs`; the taker reads `mtp` after the `J` rounds, so `t_cancel` may have
-    /// lost up to `sigs_wait_secs` (the longest a setup is kept open) of that span. The
-    /// punish and late windows are exact differences.
+    /// cancel_after_secs`.
+    ///
+    /// Without `maker_mtp` (an older maker) the taker cannot tell a short `t_cancel` from an
+    /// older reading: it reads `mtp` after the `J` rounds, so `t_cancel` may have lost up to
+    /// `sigs_wait_secs` (the longest a setup is kept open) of that span, and the floor
+    /// tolerates it. With `maker_mtp` (the MTP the maker says it used) the floor is exact,
+    /// `t_cancel − maker_mtp ≥ cancel_after_secs`, provided the stated MTP is not ahead of
+    /// `mtp` and not older than `sigs_wait_secs` (the same staleness bound). The punish and
+    /// late windows are exact differences either way.
     pub fn check_setup_timelocks(
         &self,
         mtp: u32,
+        maker_mtp: Option<u32>,
         t_cancel: u32,
         t_punish: u32,
         t_late: u32,
     ) -> std::result::Result<(), String> {
         let slack = self.sigs_wait_secs.min(u32::MAX as u64) as u32;
-        let cancel_min = mtp
-            .saturating_add(self.cancel_after_secs)
-            .saturating_sub(slack);
+        let cancel_min = match maker_mtp {
+            None => mtp
+                .saturating_add(self.cancel_after_secs)
+                .saturating_sub(slack),
+            Some(m) => {
+                if m > mtp {
+                    return Err(format!(
+                        "maker states a DIVI MTP of {m}, {}s ahead of this taker's {mtp}; \
+                         refusing the setup",
+                        m - mtp
+                    ));
+                }
+                if mtp - m > slack {
+                    return Err(format!(
+                        "maker states a DIVI MTP of {m}, {}s behind this taker's {mtp}, \
+                         beyond the {slack}s a setup may take; refusing the setup",
+                        mtp - m
+                    ));
+                }
+                m.saturating_add(self.cancel_after_secs)
+            }
+        };
         let punish_min = t_cancel.saturating_add(self.punish_after_secs);
         let late_min = t_punish.saturating_add(self.late_after_secs);
         let refuse = |term: &str, offered: String, min: String| {
@@ -275,14 +301,24 @@ impl XmrConfig {
             ))
         };
         if t_cancel < cancel_min {
-            return refuse(
-                "t_cancel",
-                format!("{}s after the DIVI MTP", t_cancel.saturating_sub(mtp)),
-                format!(
-                    "{}s",
-                    self.cancel_after_secs as u64 - slack.min(self.cancel_after_secs) as u64
+            return match maker_mtp {
+                Some(m) => refuse(
+                    "t_cancel",
+                    format!(
+                        "{}s after the maker's stated MTP",
+                        t_cancel.saturating_sub(m)
+                    ),
+                    format!("{}s", self.cancel_after_secs),
                 ),
-            );
+                None => refuse(
+                    "t_cancel",
+                    format!("{}s after the DIVI MTP", t_cancel.saturating_sub(mtp)),
+                    format!(
+                        "{}s",
+                        self.cancel_after_secs as u64 - slack.min(self.cancel_after_secs) as u64
+                    ),
+                ),
+            };
         }
         if t_punish < punish_min {
             return refuse(
@@ -502,15 +538,75 @@ mod tests {
                 mtp + f.cancel_after_secs,
                 mtp + f.cancel_after_secs + f.punish_after_secs,
             );
-            f.check_setup_timelocks(mtp, c, pu, pu + f.late_after_secs)
+            f.check_setup_timelocks(mtp, None, c, pu, pu + f.late_after_secs)
                 .unwrap();
-            f.check_setup_timelocks(mtp, c + 1, pu + 2, pu + 2 + f.late_after_secs + 1)
+            f.check_setup_timelocks(mtp, None, c + 1, pu + 2, pu + 2 + f.late_after_secs + 1)
                 .unwrap();
             // The taker read its MTP up to sigs_wait_secs after the maker set t_cancel.
             let later = mtp + f.sigs_wait_secs as u32;
-            f.check_setup_timelocks(later, c, pu, pu + f.late_after_secs)
+            f.check_setup_timelocks(later, None, c, pu, pu + f.late_after_secs)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn t_cancel_is_floored_exactly_against_the_makers_stated_mtp() {
+        for p in PROFILES {
+            let f = XmrConfig::for_profile(p);
+            let mtp = 1_800_000_000u32;
+            // The maker read its MTP up to sigs_wait_secs before the taker read hers.
+            for lag in [0, 1, f.sigs_wait_secs as u32] {
+                let m = mtp - lag;
+                let c = m + f.cancel_after_secs;
+                let pu = c + f.punish_after_secs;
+                let late = pu + f.late_after_secs;
+                f.check_setup_timelocks(mtp, Some(m), c, pu, late).unwrap();
+                f.check_setup_timelocks(mtp, Some(m), c + 1, pu + 1, late + 1)
+                    .unwrap();
+                // One second under the exact floor: refused, naming the term, however
+                // much of the tolerant slack is left.
+                let e = f
+                    .check_setup_timelocks(mtp, Some(m), c - 1, pu, late)
+                    .unwrap_err();
+                assert!(
+                    e.contains("t_cancel") && e.contains("maker's stated MTP"),
+                    "{p}: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stated_mtp_ahead_of_the_takers_or_too_stale_is_refused() {
+        for p in PROFILES {
+            let f = XmrConfig::for_profile(p);
+            let mtp = 1_800_000_000u32;
+            let ok = |m: u32| {
+                let c = m + f.cancel_after_secs;
+                let pu = c + f.punish_after_secs;
+                f.check_setup_timelocks(mtp, Some(m), c, pu, pu + f.late_after_secs)
+            };
+            ok(mtp).unwrap();
+            let e = ok(mtp + 1).unwrap_err();
+            assert!(e.contains("ahead"), "{p}: {e}");
+            ok(mtp - f.sigs_wait_secs as u32).unwrap();
+            let e = ok(mtp - f.sigs_wait_secs as u32 - 1).unwrap_err();
+            assert!(e.contains("behind") && e.contains("MTP"), "{p}: {e}");
+        }
+    }
+
+    #[test]
+    fn without_a_stated_mtp_the_tolerant_floor_is_kept() {
+        let f = XmrConfig::testnet();
+        let mtp = 1_800_000_000u32;
+        let slack = f.sigs_wait_secs as u32;
+        let c = mtp + f.cancel_after_secs - slack;
+        let pu = c + f.punish_after_secs;
+        f.check_setup_timelocks(mtp, None, c, pu, pu + f.late_after_secs)
+            .unwrap();
+        assert!(f
+            .check_setup_timelocks(mtp, None, c - 1, pu, pu + f.late_after_secs)
+            .is_err());
     }
 
     #[test]
@@ -524,12 +620,16 @@ mod tests {
             let slack = f.sigs_wait_secs as u32;
             // t_cancel just below mtp + cancel_after − slack
             let e = f
-                .check_setup_timelocks(mtp, c - slack - 1, pu, late)
+                .check_setup_timelocks(mtp, None, c - slack - 1, pu, late)
                 .unwrap_err();
             assert!(e.contains("t_cancel"), "{p}: {e}");
-            let e = f.check_setup_timelocks(mtp, c, pu - 1, late).unwrap_err();
+            let e = f
+                .check_setup_timelocks(mtp, None, c, pu - 1, late)
+                .unwrap_err();
             assert!(e.contains("t_punish"), "{p}: {e}");
-            let e = f.check_setup_timelocks(mtp, c, pu, late - 1).unwrap_err();
+            let e = f
+                .check_setup_timelocks(mtp, None, c, pu, late - 1)
+                .unwrap_err();
             assert!(e.contains("t_late"), "{p}: {e}");
         }
     }
