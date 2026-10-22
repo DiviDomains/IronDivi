@@ -36,3 +36,39 @@ fn p2sh_address_is_paid_with_p2sh_script() {
         assert_eq!(tx.vout[1].script_pubkey, Script::new_p2pkh(&[0x5a; 20]));
     }
 }
+
+/// hdmasterkeyid and hdchainid are public; they must survive lock and a restart
+/// of an encrypted (locked) wallet
+#[test]
+fn hd_ids_are_kept_while_locked_and_after_restart() {
+    use divi_primitives::ChainMode;
+    use divi_wallet::{HdWallet, WalletDb};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w");
+    let (master_id, chain_id) = {
+        let wallet = WalletDb::create_persistent(
+            &path,
+            Network::Testnet,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap();
+        let ids = (wallet.hd_master_key_id(), wallet.get_hd_chain_id());
+        assert_eq!(ids.0.len(), 40);
+        assert!(ids.1.is_some());
+
+        wallet.encrypt_wallet("pw").unwrap();
+        assert!(wallet.is_locked());
+        assert_eq!(wallet.hd_master_key_id(), ids.0, "empty while locked");
+        assert_eq!(wallet.get_hd_chain_id(), ids.1);
+        wallet.unlock("pw", 0).unwrap();
+        wallet.lock();
+        assert_eq!(wallet.hd_master_key_id(), ids.0, "empty after walletlock");
+        ids
+    };
+
+    let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+    assert!(wallet.is_locked());
+    assert_eq!(wallet.hd_master_key_id(), master_id, "empty after restart");
+    assert_eq!(wallet.get_hd_chain_id(), chain_id);
+}

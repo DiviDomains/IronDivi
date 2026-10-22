@@ -457,6 +457,9 @@ impl WalletDb {
                 "Restored HD wallet from mnemonic (chain_mode={:?})",
                 chain_mode
             );
+        } else if let Some(ids) = db.load_hd_public_ids()? {
+            // Encrypted wallet: the seed stays locked, its public ids do not
+            self.keystore.set_hd_public_ids(ids);
         }
 
         // Load HD indices
@@ -1401,6 +1404,12 @@ impl WalletDb {
 
         if let Some(hd) = hd_wallet {
             self.keystore.set_hd_wallet(hd);
+            // Wallets encrypted before the ids were stored get them on first unlock
+            if db.load_hd_public_ids()?.is_none() {
+                if let Some(ids) = self.keystore.hd_public_ids() {
+                    db.store_hd_public_ids(&ids)?;
+                }
+            }
         }
         for (hash, secret) in secrets {
             self.keystore.restore_secret(&hash, secret);
@@ -1587,6 +1596,14 @@ impl WalletDb {
                 encrypt_blob(&master_key, mnemonic.as_bytes()),
             );
             batch.delete_cf(db.cf_metadata(), b"mnemonic");
+        }
+        // The seed is about to be locked away; keep its public ids readable
+        if let Some(ids) = self.keystore.hd_public_ids() {
+            batch.put_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_HD_PUBLIC_IDS,
+                crate::persistence::encode_hd_public_ids(&ids),
+            );
         }
         batch.put_cf(db.cf_metadata(), b"encryption_salt", &salt);
         batch.put_cf(db.cf_metadata(), b"encrypted_master_key", &sealed_master);

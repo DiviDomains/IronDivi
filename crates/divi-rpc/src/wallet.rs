@@ -4735,6 +4735,17 @@ mod send_unlock_regression {
     }
 
     #[test]
+    fn ir20_hdmasterkeyid_shown_while_locked() {
+        let (_dir, rpc, _db, _sent) = encrypted_rpc();
+        assert_eq!(status(&rpc), "locked");
+        let locked = rpc.get_wallet_info(&Params::None).unwrap()["hdmasterkeyid"].clone();
+        unlock(&rpc, 0, false).unwrap();
+        let unlocked = rpc.get_wallet_info(&Params::None).unwrap()["hdmasterkeyid"].clone();
+        assert_ne!(unlocked, json!(""));
+        assert_eq!(locked, unlocked);
+    }
+
+    #[test]
     fn ir17_short_unlock_falls_back_to_staking_only() {
         let (_dir, rpc, db, _sent) = encrypted_rpc();
         unlock(&rpc, 0, true).unwrap();
