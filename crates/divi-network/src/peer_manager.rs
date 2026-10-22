@@ -651,6 +651,12 @@ impl PeerManager {
         }
     }
 
+    /// Queue a timed ping to every connected peer (the `ping` RPC); each pong updates
+    /// that peer's pingtime
+    pub fn ping_all(&self) {
+        self.broadcast(NetworkMessage::Ping(0));
+    }
+
     /// Relay a raw C++-format masternode broadcast (`mnb`) to all connected peers
     pub fn broadcast_masternode_broadcast(&self, bytes: Vec<u8>) {
         self.broadcast(NetworkMessage::MasternodeBroadcast(bytes));
