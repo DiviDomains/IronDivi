@@ -114,7 +114,12 @@ fn script_err(what: &str, e: impl std::fmt::Debug) -> SwapError {
 
 /// P2SH scriptPubKey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> Script {
-    Script::new_p2sh(divi_crypto::hash::hash160(&htlc.redeem_script()).as_bytes())
+    htlc_script_pubkey_v(htlc, divi_swap::htlc::ScriptVersion::V0)
+}
+
+/// P2SH scriptPubKey of an HTLC redeem script of the given version.
+pub fn htlc_script_pubkey_v(htlc: &HtlcParams, version: divi_swap::htlc::ScriptVersion) -> Script {
+    Script::new_p2sh(divi_crypto::hash::hash160(&htlc.redeem_script_v(version)).as_bytes())
 }
 
 impl DiviBackend {

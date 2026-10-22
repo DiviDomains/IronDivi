@@ -862,3 +862,21 @@ async fn tip_hash_live_smoke() {
         println!("SMOKE BTC {net} {before} {hash} {after}");
     }
 }
+
+#[test]
+fn v1_script_pubkey_wraps_the_size_checked_script() {
+    use divi_swap::htlc::ScriptVersion;
+    let h = htlc([7; 32]);
+    // V0 is the in-flight script, untouched.
+    assert_eq!(
+        tx::htlc_script_pubkey(&h),
+        tx::htlc_script_pubkey_v(&h, ScriptVersion::V0)
+    );
+    let v1 = tx::htlc_script_pubkey_v(&h, ScriptVersion::V1);
+    assert_ne!(v1, tx::htlc_script_pubkey(&h));
+    let want = bitcoin::ScriptBuf::new_p2wsh(
+        &bitcoin::ScriptBuf::from_bytes(h.redeem_script_v(ScriptVersion::V1)).wscript_hash(),
+    );
+    assert_eq!(v1, want);
+    assert_eq!(h.redeem_script_v(ScriptVersion::V1).len(), 118);
+}

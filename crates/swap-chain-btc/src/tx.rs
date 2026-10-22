@@ -19,6 +19,7 @@ use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+use divi_swap::htlc::ScriptVersion;
 use divi_swap::htlc::REFUND_SEQUENCE;
 use divi_swap::{HtlcParams, SwapError};
 use sha2::{Digest, Sha256};
@@ -42,7 +43,12 @@ pub struct Coin {
 
 /// The P2WSH script pubkey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> ScriptBuf {
-    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(htlc.redeem_script()).wscript_hash())
+    htlc_script_pubkey_v(htlc, ScriptVersion::V0)
+}
+
+/// The P2WSH script pubkey of an HTLC redeem script of the given version.
+pub fn htlc_script_pubkey_v(htlc: &HtlcParams, version: ScriptVersion) -> ScriptBuf {
+    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(htlc.redeem_script_v(version)).wscript_hash())
 }
 
 /// Result of a funding build.

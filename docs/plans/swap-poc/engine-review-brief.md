@@ -294,8 +294,7 @@ New observations from this review (each also a `left:` line in `status/engine.md
   reserve only at `MakerLocked`, so this reads as a duplicate-record and accounting defect rather than
   a theft path. No test: `could not verify` any test of quote reuse.
 - **F2 — no maker re-broadcast after the maker lock confirms.** See §4 (Reorg).
-- **F3 — no `OP_SIZE` preimage-length check in the script** (`htlc.rs:116-128`). The taker chooses the
-  preimage, so a maker cannot pick a long one; Q3.
+- **F3 — no `OP_SIZE` preimage-length check in the script** (`htlc.rs:116-128`). Exploitable with the V0 script: the taker (any client, not ours) picks a non-32-byte preimage; every script leg claims with it but our maker code is 32-byte only, so the maker cannot claim the taker leg. Partly fixed on lane/preimage-size, see status/engine.md 2026-10-22: `ScriptVersion::V1` (`OP_SIZE 32 OP_EQUALVERIFY`) exists and is proven; it is not yet used for new swaps (needs `maker.rs`/`store.rs`, left). Q3 answered.
 - **F4 — rate limiting.** Default config puts every client behind nginx in one bucket; the shipped nginx
   snippet was wrong for `trust_proxy_headers = true` (§3.9). Only `quote` was limited; `accept`, `lock`,
   `GET /swaps` and `GET /swaps/:id` now are too, and the limit keys on the address nginx sets (fixed on lane/route-rate-limits, see status/engine.md 2026-10-22).
@@ -354,6 +353,7 @@ no funds, no keys.
 3. **No `OP_SIZE`:** is omitting a preimage-length check safe here, given the taker generates the
    preimage and the script is SHA-256 only? Any cross-chain concern (a longer preimage is valid on one
    chain and not on another)?
+   **Answer (2026-10-22): no, not safe.** Our taker generates 32 bytes, but the maker never sees that code: a hostile taker chooses the preimage and the hash. A non-32-byte preimage claims the maker leg on a script chain (DIVI P2SH takes up to 520 bytes), while the maker's claim path (`claim_script_sig`, `extract_preimage`, `build_claim`) only handles 32 bytes, and the EVM contract takes `bytes32`. Fixed in the V1 script; see F3 and status/engine.md.
 4. **Unauthenticated routes:** `GET /swaps` and `GET /swaps/:id` expose swap ids, HTLC keys and states,
    and `POST /swaps/:id/lock` accepts a notice from anyone. What can an observer or griefer do with
    that? Is a token on the hashlock routes warranted before mainnet?
