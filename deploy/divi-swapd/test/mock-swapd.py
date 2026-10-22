@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Mock divi-swapd for the nginx test. stdlib only. Usage: mock-swapd.py PORT [ready|scanning] [several|empty|hostile]
+"""Mock divi-swapd for the site tests. stdlib only.
+Usage: mock-swapd.py PORT [ready|scanning|error] [several|empty|hostile]
 Every response echoes the request path in X-Mock-Path so a test can prove what reached it."""
 import json, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port = int(sys.argv[1]); health_mode = sys.argv[2] if len(sys.argv) > 2 else "ready"
 offers_mode = sys.argv[3] if len(sys.argv) > 3 else "several"
 OFF = {"id": "divi-btc-testnet", "direction": "taker_pays_btc", "counter_chain": "btc",
        "divi_sats_per_btc": 300000000000000, "min_btc_sats": 5000, "max_btc_sats": 50000}
-HOSTILE = dict(OFF, id="<script>alert(1)</script>", counter_chain="<img src=x onerror=alert(1)>")
-HEALTH = {"ok": True, "version": "0.2.6", "divi": {"tip": 1, "error": None}, "btc": {"tip": 2, "error": None},
-          "counters": {"ltc": {"tip": 3, "error": None}}, "divi_scan": {"state": "done", "next_height": 9, "target_height": 9}}
+HOSTILE = dict(OFF, id="<script>alert(1)</script>", counter_chain="<img src=x onerror=alert(1)>",
+               direction='"><img src=x onerror=alert(1)>')
+HEALTH = {"ok": True, "version": "0.2.6", "divi": {"tip": 361372, "error": None}, "btc": {"tip": 5196098, "error": None},
+          "counters": {"ltc": {"tip": 4929790, "error": None}, "zec": {"tip": 4530020, "error": None}},
+          "divi_scan": {"state": "done", "next_height": 361358, "target_height": 361357}}
 if health_mode == "scanning":
     HEALTH.update(ok=False, divi_scan={"state": "scanning", "next_height": 355190, "target_height": 361301})
-OFFERS = {"several": [OFF, dict(OFF, id="ltc-divi-testnet", direction="taker_pays_divi", counter_chain="ltc")],
+if health_mode == "error":
+    HEALTH.update(ok=False)
+    HEALTH["counters"]["ltc"] = {"tip": None, "error": "<script>alert(1)</script> rpc down"}
+OFFERS = {"several": [OFF, dict(OFF, id="ltc-divi-testnet", direction="taker_pays_divi", counter_chain="ltc"),
+                      dict(OFF, id="divi-xmr-stagenet", counter_chain="xmr", min_btc_sats=100000)],
           "empty": [], "hostile": [HOSTILE]}[offers_mode]
 
 class H(BaseHTTPRequestHandler):
@@ -25,10 +32,10 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz": self._send(HEALTH)
         elif self.path == "/offers": self._send(OFFERS)
-        elif self.path.startswith("/swaps/") or self.path.startswith("/xmr/swaps"): self._send({"mock": "api", "path": self.path})
+        elif self.path.startswith(("/swaps", "/xmr/swaps", "/offers/")): self._send({"mock": "api", "path": self.path})
         else: self._send({"error": "not found"}, 404)
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", 0))); self._send({"mock": "post", "path": self.path})
     def log_message(self, *a): pass
 
-HTTPServer(("127.0.0.1", port), H).serve_forever()
+ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()

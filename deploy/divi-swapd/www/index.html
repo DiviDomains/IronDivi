@@ -3,36 +3,38 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DIVI Atomic Swap Maker (testnet)</title>
-<link rel="stylesheet" href="landing.css">
-<script src="landing.js" defer></script>
+<title>Home - IronDivi Swaps (testnet)</title>
+<link rel="stylesheet" href="site/site.css">
+<script src="site/site.js" defer></script>
 </head>
-<body>
-<h1>DIVI Atomic Swap Maker &mdash; testnet</h1>
-<p class="banner">Practice network only. These are test coins with no value. Nothing here touches real money.</p>
+<body data-api="">
+<header>
+<p class="brand">IronDivi Swaps</p>
+<nav><a href="./" aria-current="page">Home</a><a href="site/how-to-swap.html">How to swap</a><a href="site/safety.html">How it works and safety</a><a href="site/status.html">Status</a><a href="site/faq.html">FAQ</a></nav>
+</header>
+<p class="banner"><strong>Practice network only.</strong> Everything here uses test coins that have no value. Nothing on this site touches real money.</p>
+<main>
+<h1>Trade DIVI for other coins, with no exchange in the middle</h1>
+<p>IronDivi Swaps lets you swap DIVI for Bitcoin (BTC), Litecoin (LTC), Zcash (ZEC), Monero (XMR) or USDC straight from your own wallet. No exchange ever holds your coins. Each trade is an <em>atomic swap</em>: either both sides get what they agreed to, or both sides get their own coins back.</p>
+<p class="note">Right now this runs on <strong>test networks only</strong>. It is a practice run so the software can be proven before any real money is involved.</p>
 
-<h2>What this is (testnet)</h2>
-<p>This is a swap maker for DIVI. It trades DIVI test coins directly against other test coins (Bitcoin, Litecoin, Zcash and Monero test networks) with no exchange in the middle. Each swap is an atomic swap: either both sides complete or both sides get their coins back.</p>
+<h2>Is the swap maker running?</h2>
+<div class="live" id="status" data-live="status" data-state="loading">Checking&hellip;</div>
+<noscript><p class="note">This section needs JavaScript. With JavaScript off you can still read the rest of the page.</p></noscript>
+<p><a href="site/status.html">Full status per chain</a></p>
 
-<h2>Status (testnet)</h2>
-<div id="status" data-state="loading">Checking&hellip;</div>
-<noscript><p>This page needs JavaScript to show live status and offers.</p></noscript>
+<h2>Current offers</h2>
+<div class="live scroll" id="offers" data-live="offers">Loading&hellip;</div>
+<noscript><p class="note">This section needs JavaScript. With JavaScript off you can still read the rest of the page.</p></noscript>
+<p>Amounts are in whole coins. The smallest and largest swap are given in the other coin (not DIVI).</p>
 
-<h2>Current offers (testnet)</h2>
-<div id="offers">Loading&hellip;</div>
-<p>Amounts are in whole coins. A smallest and largest swap are given on the counter coin's side.</p>
-
-<h2>How to swap (testnet)</h2>
-<ol>
-<li>Get test coins from the faucet: <a href="https://services.divi.domains/testnet/faucet" rel="noopener noreferrer">https://services.divi.domains/testnet/faucet</a></li>
-<li>Get the <code>divi-swap</code> taker app. <strong>The taker app is not published yet</strong>, so there is no download link on this page.</li>
-<li>Pick an offer id from the table above and run, on the test networks (the default profile):</li>
-</ol>
-<pre>divi-swap --maker https://divi.cx/swap quote --offer OFFER_ID --btc-sats AMOUNT
-divi-swap --maker https://divi.cx/swap run   --offer OFFER_ID --btc-sats AMOUNT</pre>
-<p><code>AMOUNT</code> is the counter-coin amount in satoshis (1 coin = 100,000,000). <code>quote</code> only prints a price. <code>run</code> does the whole swap. Add <code>--counter-chain ltc</code> or <code>zec</code> for offers on those coins. Other steps, if you want them one at a time: <code>accept</code>, <code>lock</code>, <code>status</code>, <code>claim</code>, <code>refund</code>.</p>
-
-<h2>About this page (testnet)</h2>
-<p>This page is read-only. It has no forms, no wallet, no keys, no cookies and no analytics. It only reads <code>healthz</code> and <code>offers</code> from this maker.</p>
+<h2>Where to go next</h2>
+<ul>
+<li><a href="site/how-to-swap.html">How to swap</a> &ndash; the commands, step by step.</li>
+<li><a href="site/safety.html">How it works and safety</a> &ndash; who can take their coins back, and when.</li>
+<li><a href="site/faq.html">FAQ</a> &ndash; limits, fees, risks.</li>
+</ul>
+</main>
+<footer><p>This site is read-only: no sign-in, no wallet, no keys, no forms, no cookies, no analytics. It only reads <code>healthz</code> and <code>offers</code> from the swap maker. Testnet only.</p></footer>
 </body>
 </html>

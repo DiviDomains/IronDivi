@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to swap - IronDivi Swaps (testnet)</title>
+<link rel="stylesheet" href="site.css">
+<script src="site.js" defer></script>
+</head>
+<body data-api="../">
+<header>
+<p class="brand">IronDivi Swaps</p>
+<nav><a href="../">Home</a><a href="how-to-swap.html" aria-current="page">How to swap</a><a href="safety.html">How it works and safety</a><a href="status.html">Status</a><a href="faq.html">FAQ</a></nav>
+</header>
+<p class="banner"><strong>Practice network only.</strong> Everything here uses test coins that have no value. Nothing on this site touches real money.</p>
+<main>
+<h1>How to swap (testnet)</h1>
+
+<h2>1. Get test coins</h2>
+<p>Test coins are free. Get DIVI test coins from the faucet: <a href="https://services.divi.domains/testnet/faucet" rel="noopener noreferrer">services.divi.domains/testnet/faucet</a>. For the other coin you need test coins on that chain too (Bitcoin signet, Litecoin testnet, Zcash testnet or Monero stagenet).</p>
+
+<h2>2. Get the taker app</h2>
+<p><strong>The taker app (<code>divi-swap</code>) is not published yet.</strong> There is no download link on this site because there is nothing to link to. When it is published, the link will be added here.</p>
+
+<h2>3. Pick an offer</h2>
+<p>Open the <a href="../">Home page</a> and note an offer id, for example <code>divi-ltc-testnet</code>. The offer says which coin you pay and which you get, and the smallest and largest swap.</p>
+
+<h2>4. Run the swap</h2>
+<p>The amount is given in the <em>other</em> coin, in its smallest unit (1 coin = 100,000,000 units). To see a price without committing to anything:</p>
+<pre>divi-swap quote --maker https://divi.cx/swap --offer OFFER_ID --btc-sats AMOUNT</pre>
+<p>For an offer on Litecoin, Zcash, Monero or USDC add <code>--counter-chain ltc</code> (or <code>zec</code>, <code>xmr</code>, <code>usdc</code>) as well. The command needs your own test keys, given as <code>--divi-key</code> and the key flag for the other coin; run <code>divi-swap --help</code> for the full list. The default network settings are the test networks.</p>
+
+<p>To do the whole swap in one command:</p>
+<pre>divi-swap run --maker https://divi.cx/swap --offer OFFER_ID --btc-sats AMOUNT</pre>
+
+<p>Or one step at a time:</p>
+<ol>
+<li><code>quote</code> &ndash; prints a fresh price. Quotes expire after 60 seconds.</li>
+<li><code>accept --maker &hellip; --offer &hellip; --btc-sats &hellip;</code> &ndash; takes a new quote and accepts it. It prints a swap id.</li>
+<li><code>lock --swap SWAP_ID</code> &ndash; puts your coins into the swap lock and tells the maker.</li>
+<li><code>status --swap SWAP_ID</code> &ndash; shows what the maker sees.</li>
+<li><code>claim --swap SWAP_ID</code> &ndash; once the maker has locked its side and it is confirmed, collects your new coins.</li>
+<li><code>refund --swap SWAP_ID</code> &ndash; if the swap stalls, takes your own coins back once the waiting time has passed. See <a href="safety.html">how it works and safety</a>.</li>
+</ol>
+<p><code>run</code> does all of this for you and picks between claim and refund by itself.</p>
+<p class="note">The commands above are taken from the <code>divi-swap</code> command-line source. Nothing here is a real-money instruction: the default is the test networks, and mainnet needs an explicit extra flag that this site does not describe.</p>
+</main>
+<footer><p>This site is read-only: no sign-in, no wallet, no keys, no forms, no cookies, no analytics. It only reads <code>healthz</code> and <code>offers</code> from the swap maker. Testnet only.</p></footer>
+</body>
+</html>

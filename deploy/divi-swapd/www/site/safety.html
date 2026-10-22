@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works and safety - IronDivi Swaps (testnet)</title>
+<link rel="stylesheet" href="site.css">
+<script src="site.js" defer></script>
+</head>
+<body data-api="../">
+<header>
+<p class="brand">IronDivi Swaps</p>
+<nav><a href="../">Home</a><a href="how-to-swap.html">How to swap</a><a href="safety.html" aria-current="page">How it works and safety</a><a href="status.html">Status</a><a href="faq.html">FAQ</a></nav>
+</header>
+<p class="banner"><strong>Practice network only.</strong> Everything here uses test coins that have no value. Nothing on this site touches real money.</p>
+<main>
+<h1>How it works and safety</h1>
+<p class="note">All numbers on this page are the <strong>testnet</strong> settings used by the code today. A real-money version would use longer waits, and this page would be updated first.</p>
+
+<h2>The swap, in plain words (Bitcoin, Litecoin, Zcash, USDC)</h2>
+<p>This is a <em>hashlock swap</em>. You and the maker each put coins into a lock on your own chain. Both locks open with the same secret word. Only you know the secret to start with.</p>
+<ol>
+<li>You lock your coins. They can only be opened with the secret, or taken back by you after a deadline.</li>
+<li>The maker sees your lock confirmed and locks its coins the same way, with a <em>shorter</em> deadline.</li>
+<li>You use the secret to collect the maker's coins. Doing so shows the secret on that chain.</li>
+<li>The maker reads the secret and collects yours.</li>
+</ol>
+<p>Your deadline is longer than the maker's on purpose: you always have time to refund after the maker has had its chance to.</p>
+
+<h2>The Monero swap, in plain words</h2>
+<p>Monero cannot hold this kind of lock, so the Monero swap uses <em>adaptor signatures</em> instead. The DIVI side sits in a lock that needs both of your signatures; the Monero side is sent to an address that only you and the maker together can spend. Handing over a signature to collect the DIVI reveals exactly what the maker needs to collect the Monero. If someone stops, a cancel and refund path exists, and a punish path exists for a side that stalls after cancel. You never have to trust the maker to be honest or online for your coins to be safe.</p>
+
+<h2>Who can take the coins back, and when</h2>
+<table>
+<tr><th>Swap</th><th>Your refund opens</th><th>Maker's refund opens</th></tr>
+<tr><td>BTC, LTC, ZEC, USDC</td><td>6 hours after locking</td><td>3 hours after locking</td></tr>
+<tr><td>XMR</td><td>6 hours (cancel), then refund</td><td>3 more hours after cancel (punish window)</td></tr>
+</table>
+<p>Source: the testnet profile sets a 6 hour taker timeout and a 3 hour maker timeout (<code>crates/divi-swap/src/config.rs</code>, lines 119&ndash;121). The Monero swap uses a 6 hour cancel time, a 3 hour punish window and a 1 hour redeem margin (<code>crates/divi-swap-xmr/src/lib.rs</code>, lines 176&ndash;179).</p>
+
+<h2>Confirmations the code waits for</h2>
+<p>A lock must be buried under this many blocks before the other side acts on it (testnet):</p>
+<table>
+<tr><th>Chain</th><th>Confirmations</th></tr>
+<tr><td>DIVI</td><td>3</td></tr>
+<tr><td>BTC</td><td>1</td></tr>
+<tr><td>LTC</td><td>2</td></tr>
+<tr><td>ZEC</td><td>9</td></tr>
+<tr><td>USDC</td><td>3</td></tr>
+<tr><td>XMR</td><td>10</td></tr>
+</table>
+<p>Source: <code>crates/divi-swap/src/config.rs</code>, lines 52&ndash;70 and 119&ndash;123.</p>
+
+<h2>If someone disappears</h2>
+<ul>
+<li><strong>The maker disappears before locking:</strong> nothing of yours is spent beyond your own lock. After your deadline, run <code>refund</code> and your coins come back.</li>
+<li><strong>The maker disappears after locking:</strong> you can still collect its coins with <code>claim</code> while its lock is open. If it is too late to claim safely, refund your own side instead.</li>
+<li><strong>You disappear:</strong> the maker takes its coins back after its (shorter) deadline. Nobody can take your coins without the secret, and you keep your refund right until you claim.</li>
+<li><strong>The website disappears:</strong> nothing changes. The swap runs between the taker app and the maker, not through this site.</li>
+</ul>
+
+<h2>What this site never does</h2>
+<ul>
+<li>It never asks for keys, seed words, passwords or a sign-in.</li>
+<li>It has no wallet and cannot move coins.</li>
+<li>It has no forms, cookies or analytics, and loads nothing from other sites.</li>
+<li>It only reads two public lists from the maker: its health and its offers.</li>
+</ul>
+</main>
+<footer><p>This site is read-only: no sign-in, no wallet, no keys, no forms, no cookies, no analytics. It only reads <code>healthz</code> and <code>offers</code> from the swap maker. Testnet only.</p></footer>
+</body>
+</html>

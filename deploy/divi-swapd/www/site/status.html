@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status - IronDivi Swaps (testnet)</title>
+<link rel="stylesheet" href="site.css">
+<script src="site.js" defer></script>
+</head>
+<body data-api="../">
+<header>
+<p class="brand">IronDivi Swaps</p>
+<nav><a href="../">Home</a><a href="how-to-swap.html">How to swap</a><a href="safety.html">How it works and safety</a><a href="status.html" aria-current="page">Status</a><a href="faq.html">FAQ</a></nav>
+</header>
+<p class="banner"><strong>Practice network only.</strong> Everything here uses test coins that have no value. Nothing on this site touches real money.</p>
+<main>
+<h1>Status</h1>
+<p>Live from the swap maker's <code>healthz</code>. It refreshes every 30 seconds.</p>
+<h2>Overall</h2>
+<div class="live" id="status" data-live="status" data-state="loading">Checking&hellip;</div>
+<h2>Chains</h2>
+<div class="live scroll" id="chains" data-live="chains">Loading&hellip;</div>
+<h2>DIVI scan</h2>
+<div class="live" id="scan" data-live="scan">Loading&hellip;</div>
+<h2>Maker version</h2>
+<div class="live" id="version" data-live="version">Loading&hellip;</div>
+<noscript><p class="note">This section needs JavaScript. With JavaScript off you can still read the rest of the page.</p></noscript>
+</main>
+<footer><p>This site is read-only: no sign-in, no wallet, no keys, no forms, no cookies, no analytics. It only reads <code>healthz</code> and <code>offers</code> from the swap maker. Testnet only.</p></footer>
+</body>
+</html>

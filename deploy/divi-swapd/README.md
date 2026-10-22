@@ -115,13 +115,16 @@ Install order on the maker host: (1) install the new `divi-swapd` binary (`tools
 `sudo /usr/local/bin/swap-watch.sh dry-run`. Installing the script first only gives the `unreadable`
 alert, never a silent miss. Test: `tools/swap-poc/test-swap-watch.sh` (stubs, no network).
 
-## Landing page at /swap/ (testnet, read-only)
+## Website at /swap/ (testnet, read-only, not installed)
 
-A static page (`www/index.html`, `landing.js`, `landing.css`) served by nginx; no daemon change. It reads `healthz` and `offers` from the same origin.
-Install adds ONLY the marked block in `landing.fragment` to the live snippet `/etc/nginx/snippets/divi-swapd.conf`; the existing `location /swap/ { ... }` proxy block stays byte-identical. Do not fold the repo `nginx-swap.conf` X-Forwarded-For change into this install.
+Five static pages (Home, How to swap, How it works and safety, Status, FAQ) in `www/`, one stylesheet and one same-origin script (`www/site/site.css`, `site.js`). No daemon change, no dependencies, no forms. The pages are generated from `gen-site.py` (`python3 gen-site.py www`); edit that, not the HTML. Third-party claims are listed in `FACTS-site.md`.
 
-    deploy/divi-swapd/landing-install.sh install            # dry run: prints the steps
-    deploy/divi-swapd/landing-install.sh install --apply    # backup, copy page, append block, nginx -t, reload
-    deploy/divi-swapd/landing-install.sh rollback --apply   # restore backup, nginx -t, reload
+Layout: the home page is the exact location `= /swap/`; every other site file lives under `location ^~ /swap/site/` (alias `/var/www/divi-swap/site/`). `site` is not a daemon route, so no API path can collide. `/swap` without a slash gets nginx's usual 301 to `/swap/`. Every site response carries a strict CSP (self only), `nosniff` and `Referrer-Policy: no-referrer`; API data is inserted with `textContent` only.
 
-Tests: `deploy/divi-swapd/test/run.sh` (node --test, then a docker nginx proof against a mock daemon).
+Install adds ONLY the marked block in `site.fragment` to the live snippet `/etc/nginx/snippets/divi-swapd.conf`; the existing `location /swap/ { ... }` proxy block stays byte-identical. Do not fold the repo `nginx-swap.conf` X-Forwarded-For change into this install.
+
+    deploy/divi-swapd/site-install.sh install            # dry run: prints the steps
+    deploy/divi-swapd/site-install.sh install --apply    # backup, copy site, append block, nginx -t, reload
+    deploy/divi-swapd/site-install.sh rollback --apply   # restore backup, nginx -t, reload, remove site files
+
+Tests: `deploy/divi-swapd/test/run.sh` (node --test on the render functions, then a docker nginx proof against a mock daemon); add `--browser` for the headless-browser run (official Playwright image, 390 and 1280 px, fails on console errors or CSP violations; `SHOTS_DEST=dir` saves PNGs). Local preview: `deploy/divi-swapd/test/preview.sh [ready|scanning|error] [several|empty|hostile]` serves on `127.0.0.1:18490`.

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FAQ - IronDivi Swaps (testnet)</title>
+<link rel="stylesheet" href="site.css">
+<script src="site.js" defer></script>
+</head>
+<body data-api="../">
+<header>
+<p class="brand">IronDivi Swaps</p>
+<nav><a href="../">Home</a><a href="how-to-swap.html">How to swap</a><a href="safety.html">How it works and safety</a><a href="status.html">Status</a><a href="faq.html" aria-current="page">FAQ</a></nav>
+</header>
+<p class="banner"><strong>Practice network only.</strong> Everything here uses test coins that have no value. Nothing on this site touches real money.</p>
+<main>
+<h1>FAQ</h1>
+
+<h2>Is this real money?</h2>
+<p>No. Everything here runs on test networks (Bitcoin signet, Litecoin testnet, Zcash testnet, Monero stagenet, DIVI testnet). The coins have no value. A mainnet version would be announced separately and does not exist yet.</p>
+
+<h2>How much can I swap?</h2>
+<p>Each offer has a smallest and a largest swap, shown here live. Amounts are in whole coins of the <em>other</em> coin.</p>
+<div class="live scroll" id="limits" data-live="offers">Loading&hellip;</div>
+<noscript><p class="note">This section needs JavaScript. With JavaScript off you can still read the rest of the page.</p></noscript>
+<p>The maker also limits how fast one address can ask: 20 quotes or new swaps per minute and 300 status reads per minute (<code>bin/divi-swapd/src/routes.rs</code>, lines 51&ndash;62). A quote is only valid for 60 seconds.</p>
+
+<h2>What does it cost?</h2>
+<p>The price is the one in the offer; read it as "DIVI per 1 coin of the other chain". On top of that, each lock and each claim pays that chain's normal network fee. The Monero swap also pays a 0.001 DIVI network fee on the DIVI side (<code>crates/divi-swap-xmr/src/lib.rs</code>, line 181).</p>
+
+<h2>What can go wrong?</h2>
+<ul>
+<li>A swap can stall if either side goes offline. The refund rules on <a href="safety.html">how it works and safety</a> cover this: you get your own coins back after the deadline.</li>
+<li>You must be online to claim in time. Do not start a swap you cannot supervise for a few hours.</li>
+<li>This is new software on test networks. Bugs are expected, which is why it is not on real money.</li>
+</ul>
+
+<h2>Testnet or mainnet?</h2>
+<p>Testnet only. The taker app refuses mainnet unless you pass an extra flag, and this site does not recommend it.</p>
+
+<h2>Where do I get the taker app and the source?</h2>
+<p>The taker app (<code>divi-swap</code>) is not published yet, and there is no public source link to give. When either exists, it will be listed here.</p>
+
+<h2>Where are my test coins?</h2>
+<p>Free DIVI test coins: <a href="https://services.divi.domains/testnet/faucet" rel="noopener noreferrer">services.divi.domains/testnet/faucet</a>.</p>
+</main>
+<footer><p>This site is read-only: no sign-in, no wallet, no keys, no forms, no cookies, no analytics. It only reads <code>healthz</code> and <code>offers</code> from the swap maker. Testnet only.</p></footer>
+</body>
+</html>

@@ -221,7 +221,7 @@ claude_auto --model opus "Read docs/plans/atomic-swap-poc.md. You are the orches
 
 ## 9. IronDivi Swaps website (Bert 2026-10-22 17:00: "i want a website to be in the plan for IronDivi Swaps")
 
-Status: planned, builder dispatched. Going live is a separate yes/no card for Bert, not part of this item.
+Status 2026-10-22: built and tested on branch `lane/swap-website` (five pages, install/rollback script, docker nginx and headless-browser proof), NOT installed; the taker app has no public download so the how-to page says so. Was: planned, builder dispatched. Going live is a separate yes/no card for Bert, not part of this item.
 The one-page `/swap/` landing page (`622220d`, `deploy/divi-swapd/www/`) stays built and **not installed**;
 the website replaces it.
 
