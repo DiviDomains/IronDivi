@@ -939,6 +939,57 @@ fn load_or_create_wallet_from(
     Ok(Arc::new(wallet))
 }
 
+/// Put the wallet's unconfirmed transactions back into the mempool after a
+/// restart (Core's ReacceptWalletTransactions), so a send made before the
+/// node stopped can still confirm. Runs after the catch-up scan, which has
+/// already dropped the ones mined meanwhile. A transaction whose inputs are
+/// neither unspent on chain nor outputs of a transaction in the mempool can
+/// never confirm (spent by another transaction while we were down): the
+/// wallet forgets it, as it does when the mempool evicts one.
+fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
+    let txs = wallet.unconfirmed_transactions();
+    if txs.is_empty() {
+        return;
+    }
+    let chain = node.chain();
+    let mempool = node.mempool();
+    let mut resubmitted = 0;
+    for tx in txs {
+        let txid = tx.txid();
+        let inputs_available = tx.vin.iter().all(|input| {
+            mempool.contains(&input.prevout.txid)
+                || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
+        });
+        // Same generous fee as a local RPC send (see set_tx_submit below)
+        let fee = Amount::from_sat((tx.size() as i64) * 10_000);
+        let result = if inputs_available {
+            mempool.add(tx, fee).map_err(|e| e.to_string())
+        } else {
+            Err("inputs no longer available".to_string())
+        };
+        match result {
+            Ok(_) => {
+                resubmitted += 1;
+                let relay = node.tx_relay().clone();
+                tokio::spawn(async move {
+                    relay.announce_tx(txid).await;
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "Unconfirmed wallet tx {} cannot be resubmitted ({}); forgetting it",
+                    txid, e
+                );
+                wallet.remove_mempool_tx(&txid);
+            }
+        }
+    }
+    info!(
+        "Resubmitted {} unconfirmed wallet transaction(s) to the mempool",
+        resubmitted
+    );
+}
+
 /// Run the daemon
 async fn run_daemon(
     config: NodeConfig,
@@ -1211,6 +1262,8 @@ async fn run_daemon(
                     error!("Failed to save wallet after UTXO reconciliation: {}", e);
                 }
             }
+
+            resubmit_wallet_txs(&node, wallet_arc);
         }
 
         wallet
