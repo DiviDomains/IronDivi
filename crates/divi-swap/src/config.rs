@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::api::Quote;
 use crate::error::{Result, SwapError};
 use crate::types::Chain;
 
@@ -22,6 +23,15 @@ pub enum Profile {
     Mainnet,
     /// Public testnets (DIVI testnet, BTC signet).
     Testnet,
+}
+
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Profile::Mainnet => "mainnet",
+            Profile::Testnet => "testnet",
+        })
+    }
 }
 
 /// Settings of one counter chain other than BTC (BTC and DIVI keep their own fields in
@@ -254,9 +264,121 @@ pub fn check_profile_networks(
     Ok(())
 }
 
+/// The terms a maker puts in a quote that bind the taker's money: how long each leg is
+/// locked and how deep each lock must be before the other side acts. All durations in
+/// seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferedTerms {
+    /// Taker-leg HTLC lifetime.
+    pub taker_timeout_secs: u32,
+    /// Maker-leg HTLC lifetime.
+    pub maker_timeout_secs: u32,
+    /// Confirmations required on a lock on the counter chain.
+    pub counter_confirmations: u32,
+    /// Confirmations required on a DIVI lock.
+    pub divi_confirmations: u32,
+}
+
+impl From<&Quote> for OfferedTerms {
+    fn from(q: &Quote) -> Self {
+        OfferedTerms {
+            taker_timeout_secs: q.taker_timeout_secs,
+            maker_timeout_secs: q.maker_timeout_secs,
+            counter_confirmations: q.btc_confirmations,
+            divi_confirmations: q.divi_confirmations,
+        }
+    }
+}
+
+/// Refuse maker terms weaker than the taker's own `profile`. The maker is the untrusted
+/// party, so a taker started under `--profile mainnet` must not accept testnet-short
+/// timeouts or shallow confirmation depths. `chains` is the (taker-leg chain, maker-leg
+/// chain) pair of the swap; the floors are [`SwapConfig::profile`] and
+/// [`ChainParams::builtin`] values, never new numbers.
+///
+/// Refused, naming the term, the offered value and the floor:
+/// * a confirmation depth below the profile's for either leg's chain;
+/// * a taker-leg or maker-leg timeout shorter than the profile's;
+/// * a taker timeout that does not exceed the maker timeout by at least the profile's gap
+///   for this pair (`max(3 h, 2 × the larger MTP lag + claim margin)`).
+///
+/// ```
+/// use divi_swap::config::{check_terms_against_profile, OfferedTerms};
+/// use divi_swap::{Chain, Profile};
+/// let t = OfferedTerms {
+///     taker_timeout_secs: 6 * 3600,
+///     maker_timeout_secs: 3 * 3600,
+///     counter_confirmations: 1,
+///     divi_confirmations: 3,
+/// };
+/// let pair = (Chain::Btc, Chain::Divi);
+/// assert!(check_terms_against_profile(Profile::Testnet, pair, &t).is_ok());
+/// assert!(check_terms_against_profile(Profile::Mainnet, pair, &t).is_err());
+/// ```
+pub fn check_terms_against_profile(
+    profile: Profile,
+    chains: (Chain, Chain),
+    terms: &OfferedTerms,
+) -> std::result::Result<(), String> {
+    let floor = SwapConfig::profile(profile);
+    let (taker_chain, maker_chain) = chains;
+    let refuse = |term: &str, offered: u32, min: u32, unit: &str| {
+        Err(format!(
+            "maker's {term} is {offered}{unit}, below the {min}{unit} floor of this taker's \
+             --profile {profile}; refusing the offer"
+        ))
+    };
+    for chain in [taker_chain, maker_chain] {
+        let (term, offered) = if chain == Chain::Divi {
+            ("divi_confirmations", terms.divi_confirmations)
+        } else {
+            ("btc_confirmations", terms.counter_confirmations)
+        };
+        let min = floor.confirmations(chain);
+        if offered < min {
+            return refuse(&format!("{term} ({chain} lock)"), offered, min, "");
+        }
+    }
+    if terms.taker_timeout_secs < floor.taker_timeout_secs {
+        return refuse(
+            "taker_timeout_secs",
+            terms.taker_timeout_secs,
+            floor.taker_timeout_secs,
+            "s",
+        );
+    }
+    if terms.maker_timeout_secs < floor.maker_timeout_secs {
+        return refuse(
+            "maker_timeout_secs",
+            terms.maker_timeout_secs,
+            floor.maker_timeout_secs,
+            "s",
+        );
+    }
+    let lag = floor
+        .chain_params(taker_chain)
+        .mtp_lag_secs
+        .max(floor.chain_params(maker_chain).mtp_lag_secs);
+    let need = SwapConfig::MIN_TIMEOUT_GAP_SECS.max(2 * lag + floor.claim_margin_secs);
+    let gap = terms
+        .taker_timeout_secs
+        .saturating_sub(terms.maker_timeout_secs);
+    if gap < need {
+        return Err(format!(
+            "maker's timeouts leave a gap (taker_timeout_secs {} − maker_timeout_secs {}) of \
+             {gap}s, below the {need}s floor of this taker's --profile {profile} for \
+             {taker_chain}/{maker_chain}; refusing the offer",
+            terms.taker_timeout_secs, terms.maker_timeout_secs
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Direction;
+    use crate::types::Amount;
 
     #[test]
     fn both_profiles_valid() {
@@ -415,5 +537,195 @@ quote_expiry_secs = 60
                 "{e}"
             );
         }
+    }
+
+    fn terms_of(p: Profile, counter: Chain) -> OfferedTerms {
+        let c = SwapConfig::profile(p);
+        OfferedTerms {
+            taker_timeout_secs: c.taker_timeout_secs,
+            maker_timeout_secs: c.maker_timeout_secs,
+            counter_confirmations: c.confirmations(counter),
+            divi_confirmations: c.divi_confirmations,
+        }
+    }
+
+    const COUNTERS: [Chain; 4] = [Chain::Btc, Chain::Ltc, Chain::Zec, Chain::Usdc];
+
+    fn pairs(counter: Chain) -> [(Chain, Chain); 2] {
+        [(counter, Chain::Divi), (Chain::Divi, counter)]
+    }
+
+    #[test]
+    fn terms_exactly_at_the_profile_floor_are_accepted() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            for c in COUNTERS {
+                for pair in pairs(c) {
+                    check_terms_against_profile(p, pair, &terms_of(p, c)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stronger_terms_than_the_floor_are_accepted() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            let mut t = terms_of(p, Chain::Btc);
+            t.taker_timeout_secs += 3600;
+            t.maker_timeout_secs += 600;
+            t.counter_confirmations += 1;
+            t.divi_confirmations += 1;
+            check_terms_against_profile(p, (Chain::Btc, Chain::Divi), &t).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_testnet_maker_is_refused_by_a_mainnet_taker_naming_the_term() {
+        let t = terms_of(Profile::Testnet, Chain::Btc);
+        let e = check_terms_against_profile(Profile::Mainnet, (Chain::Btc, Chain::Divi), &t)
+            .unwrap_err();
+        // Confirmations are checked first: BTC 1 < 2.
+        assert!(
+            e.contains("btc_confirmations (btc lock) is 1, below the 2 floor"),
+            "{e}"
+        );
+        assert!(e.contains("--profile mainnet"), "{e}");
+    }
+
+    #[test]
+    fn each_confirmation_depth_below_the_floor_is_refused_per_profile() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            for c in COUNTERS {
+                for pair in pairs(c) {
+                    let ok = terms_of(p, c);
+                    let floor = SwapConfig::profile(p);
+
+                    let mut t = ok;
+                    t.counter_confirmations -= 1;
+                    let e = check_terms_against_profile(p, pair, &t).unwrap_err();
+                    let want = format!(
+                        "btc_confirmations ({c} lock) is {}, below the {} floor",
+                        t.counter_confirmations,
+                        floor.confirmations(c)
+                    );
+                    assert!(e.contains(&want), "{e} / {want}");
+
+                    let mut t = ok;
+                    t.divi_confirmations -= 1;
+                    let e = check_terms_against_profile(p, pair, &t).unwrap_err();
+                    let want = format!(
+                        "divi_confirmations (divi lock) is {}, below the {} floor",
+                        t.divi_confirmations, floor.divi_confirmations
+                    );
+                    assert!(e.contains(&want), "{e} / {want}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shorter_timeout_than_the_floor_is_refused_per_profile() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            let floor = SwapConfig::profile(p);
+            let ok = terms_of(p, Chain::Btc);
+            let pair = (Chain::Btc, Chain::Divi);
+
+            let mut t = ok;
+            t.taker_timeout_secs -= 1;
+            let e = check_terms_against_profile(p, pair, &t).unwrap_err();
+            assert!(
+                e.contains(&format!(
+                    "taker_timeout_secs is {}s, below the {}s floor",
+                    t.taker_timeout_secs, floor.taker_timeout_secs
+                )),
+                "{e}"
+            );
+
+            let mut t = ok;
+            t.maker_timeout_secs -= 1;
+            let e = check_terms_against_profile(p, pair, &t).unwrap_err();
+            assert!(
+                e.contains(&format!(
+                    "maker_timeout_secs is {}s, below the {}s floor",
+                    t.maker_timeout_secs, floor.maker_timeout_secs
+                )),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timeout_gap_below_the_floor_is_refused_per_profile() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            for c in COUNTERS {
+                for pair in pairs(c) {
+                    // Both timeouts at or above their floors, but too close together.
+                    let ok = terms_of(p, c);
+                    let mut t = ok;
+                    t.maker_timeout_secs = t.taker_timeout_secs - 1;
+                    let e = check_terms_against_profile(p, pair, &t).unwrap_err();
+                    assert!(e.contains("gap") && e.contains("floor"), "{e}");
+                    assert!(e.contains("1s, below the"), "{e}");
+                    // Exactly the needed gap passes.
+                    let lag = SwapConfig::profile(p)
+                        .chain_params(pair.0)
+                        .mtp_lag_secs
+                        .max(SwapConfig::profile(p).chain_params(pair.1).mtp_lag_secs);
+                    let need = SwapConfig::MIN_TIMEOUT_GAP_SECS
+                        .max(2 * lag + SwapConfig::profile(p).claim_margin_secs);
+                    t.maker_timeout_secs = t.taker_timeout_secs - need;
+                    if t.maker_timeout_secs >= ok.maker_timeout_secs {
+                        check_terms_against_profile(p, pair, &t).unwrap();
+                    }
+                    t.maker_timeout_secs += 1;
+                    if t.maker_timeout_secs >= ok.maker_timeout_secs {
+                        assert!(check_terms_against_profile(p, pair, &t).is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_taker_timeout_below_the_maker_timeout_is_refused_not_wrapped() {
+        let mut t = terms_of(Profile::Testnet, Chain::Btc);
+        t.taker_timeout_secs = t.maker_timeout_secs - 1;
+        assert!(
+            check_terms_against_profile(Profile::Testnet, (Chain::Btc, Chain::Divi), &t).is_err()
+        );
+    }
+
+    #[test]
+    fn a_mainnet_floor_is_the_unchanged_btc_two_confirmations() {
+        let t = terms_of(Profile::Mainnet, Chain::Btc);
+        assert_eq!(t.counter_confirmations, 2);
+        check_terms_against_profile(Profile::Mainnet, (Chain::Btc, Chain::Divi), &t).unwrap();
+    }
+
+    #[test]
+    fn quote_converts_to_offered_terms() {
+        let q = Quote {
+            id: "q".into(),
+            offer_id: "o".into(),
+            direction: Direction::TakerPaysBtc,
+            counter_chain: Chain::Ltc,
+            btc_amount: Amount(1),
+            divi_amount: Amount(1),
+            expires_at: 0,
+            maker_btc_pubkey: [2; 33],
+            maker_divi_pubkey: [2; 33],
+            taker_timeout_secs: 7,
+            maker_timeout_secs: 5,
+            btc_confirmations: 3,
+            divi_confirmations: 4,
+        };
+        assert_eq!(
+            OfferedTerms::from(&q),
+            OfferedTerms {
+                taker_timeout_secs: 7,
+                maker_timeout_secs: 5,
+                counter_confirmations: 3,
+                divi_confirmations: 4,
+            }
+        );
     }
 }

@@ -576,7 +576,7 @@ async fn chain_balance(endpoints: &[String], address: &str) -> Result<i64> {
 async fn taker(cli: &Cli) -> Result<Taker> {
     let b = backends(cli)?;
     sync_divi(cli, &b).await?;
-    Ok(Taker::new(b.divi, b.btc, Store::open(&cli.db)?))
+    Ok(Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile))
 }
 
 #[tokio::main]
@@ -659,7 +659,8 @@ async fn main() -> Result<()> {
                 divi: b.divi.clone(),
                 btc: b.btc.clone(),
             };
-            let taker = Taker::new(b.divi, b.btc, Store::open(&cli.db)?);
+            let taker =
+                Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile);
             let (local, state) = flow::run_swap_gated(
                 &taker,
                 &MakerClient::new(&deal.maker.maker),

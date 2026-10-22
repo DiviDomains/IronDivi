@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::api::{AcceptRequest, LockNotice, Quote, SwapView};
 use crate::backend::ChainBackend;
+use crate::config::{check_terms_against_profile, OfferedTerms, Profile};
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
@@ -60,6 +61,8 @@ pub struct Taker {
     /// Counter-chain backends, by `chain()`.
     counters: BTreeMap<Chain, Arc<dyn ChainBackend>>,
     store: Store,
+    /// Profile whose floors every quote's terms must meet (`None`: terms are taken as offered).
+    profile_floor: Option<Profile>,
     halt_after: Mutex<Option<TakerState>>,
     gate: tokio::sync::Mutex<()>,
 }
@@ -82,9 +85,19 @@ impl Taker {
             divi,
             counters: counters.into_iter().map(|b| (b.chain(), b)).collect(),
             store,
+            profile_floor: None,
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Refuse, in [`Taker::prepare`] and so before anything is signed or funded, any quote
+    /// whose confirmation depths or timeouts are weaker than `profile`'s own
+    /// ([`check_terms_against_profile`]). Without it the taker takes the maker's terms as
+    /// offered.
+    pub fn with_profile_floor(mut self, profile: Profile) -> Self {
+        self.profile_floor = Some(profile);
+        self
     }
 
     /// The counter chains this taker holds a key on.
@@ -102,6 +115,14 @@ impl Taker {
     /// Generate + persist a preimage for `quote`; returns a local swap id and the request
     /// to `POST /swaps`.
     pub async fn prepare(&self, quote: &Quote) -> Result<(String, AcceptRequest)> {
+        if let Some(p) = self.profile_floor {
+            check_terms_against_profile(
+                p,
+                (quote.taker_chain(), quote.maker_chain()),
+                &OfferedTerms::from(quote),
+            )
+            .map_err(SwapError::InvalidParams)?;
+        }
         let (preimage, hash) = new_preimage();
         let req = AcceptRequest {
             quote_id: quote.id.clone(),
