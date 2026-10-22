@@ -293,3 +293,10 @@
 - left: design test 7 (idempotent broadcast per backend) is covered by existing backend tests, not new ones. The refund of a vanished lock still errors each step (existing behaviour, pinned by `lost_lock_past_locktime`). Taker `claim_declined` stays final (q7). q3 (wallet reuse of lock inputs), q4 (DIVI no-txindex `None`), q6 (XMR) unanswered. `taker.rs` untouched.
 - needs: nothing
 - decisions: forward-only states; `claim_margin_secs` reused; re-send on any drop below `maker_leg_confs`; no confirmation count, timeout, margin, rate limit or route changed.
+
+## 2026-10-22 round: website item in the plan (orchestrator)
+- done: `docs/plans/atomic-swap-poc.md` section 9 adds the IronDivi Swaps website as a planned work item (pages, hosting, rules, done) and lists "website?" as an open option for the other three swap lanes, no work started on them. The `/swap/` landing page (`622220d`) stays built and not installed (Bert 2026-10-22 17:00: not approved).
+- proof: docs only.
+- left: the site build itself (builder BQ); going live is a later yes/no card.
+- needs: nothing
+- decisions: the site is static under the existing nginx at `/swap/`, replacing the one-page landing page.

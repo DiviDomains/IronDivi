@@ -218,3 +218,45 @@ reserved-coin list, free-option mitigations (deposit, reputation).
 cd ~/code/IronDivi
 claude_auto --model opus "Read docs/plans/atomic-swap-poc.md. You are the orchestrator. Run Wave 0, then launch Wave 1 lanes per §4."
 ```
+
+## 9. IronDivi Swaps website (Bert 2026-10-22 17:00: "i want a website to be in the plan for IronDivi Swaps")
+
+Status: planned, builder dispatched. Going live is a separate yes/no card for Bert, not part of this item.
+The one-page `/swap/` landing page (`622220d`, `deploy/divi-swapd/www/`) stays built and **not installed**;
+the website replaces it.
+
+**Where.** Static files served by the existing nginx on dnsdivi at `https://divi.cx/swap/` from
+`/var/www/divi-swap/`. The live `location /swap/` proxy block stays byte-identical; the site adds only its own
+locations, and every API path (`healthz`, `offers`, `offers/:id/quote`, `swaps*`, `xmr/*`) still reaches
+`divi-swapd` unchanged. No new daemon route, no restart; rollback = restore the snippet backup and reload nginx
+(the `landing-install.sh` install/rollback pattern).
+
+**Pages (plain words, testnet wording on every page until a mainnet card says otherwise).**
+1. **Home**: what IronDivi Swaps is (trade DIVI for BTC/LTC/ZEC/XMR/USDC without an exchange holding your
+   coins), a "practice network only" banner, live status from `/healthz` (ready / catching up with progress /
+   unreachable), and the current offers from `/offers`.
+2. **How to swap**: how to get the `divi-swap` taker app (only what really exists; if it is not published, say
+   so), then a step-by-step testnet walkthrough with the real CLI commands (quote, accept, lock, status, claim,
+   refund), and the faucet link `https://services.divi.domains/testnet/faucet`.
+3. **How it works and safety**: the hashlock swap and the XMR adaptor swap in plain words; who can take the
+   coins back and when (timelocks, refunds), the confirmation counts the code really uses (cite them), what
+   happens if either side disappears, and what the site never does (no keys, no wallet, no sign-in).
+4. **Status**: per-chain tips and errors, the DIVI scan progress, and the maker version, from `/healthz`.
+5. **FAQ**: limits and rates (from `/offers`), fees, risks, testnet vs mainnet, where the source is.
+
+**Rules.** Static HTML/CSS and plain same-origin JS only: no dependencies, CDN, web fonts, analytics or forms.
+Strict CSP (self only), API data inserted with `textContent` only (offers are untrusted), readable at phone width,
+works with JS off (the status and offers sections then say so).
+
+**Done for this item** = built, tested and landed signed: a mock `divi-swapd` plus a real nginx in docker proves
+the pages and that the API paths are unchanged, `node --test` covers the render logic including hostile
+strings, headless-browser screenshots at phone and desktop width are committed under `docs/`, and the
+orchestrator has looked at it in a real browser through an ssh tunnel. Nothing is installed on dnsdivi.
+
+**Other swap lanes, open option only (Bert: "For the other 3 lanes, maybe"; no work started):**
+
+| Lane | Website? Pro | Con |
+|---|---|---|
+| Divi KDF (Komodo DeFi) | Komodo Wallet already has a GUI, so one page of DIVI setup steps would get people trading with little build work. | The iguana weak-seed hard gate is still open; a public page would invite mainnet funds before that is fixed. |
+| Divi BasicSwap | BasicSwap already has its own web UI, so a short "trade DIVI on BasicSwap" guide is cheap. | The public BasicSwap cannot list DIVI until the upstream pull request is merged, so the page would describe something nobody can do yet. |
+| DEX Test | One page could compare all the DIVI swap routes side by side. | It duplicates the other pages and is one more thing to keep accurate while no route is on mainnet. |
