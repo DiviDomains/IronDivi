@@ -919,6 +919,7 @@ async fn run_daemon(
         let mempool_for_callback = node.mempool().clone();
         let fee_estimator_for_callback = node.fee_estimator().clone();
         let tx_relay_for_callback = node.tx_relay().clone();
+        let chain_for_callback = node.chain().clone();
         block_sync.set_block_connected_callback(Arc::new(move |block, height| {
             let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
             for tx in block.transactions.iter().skip(1) {
@@ -928,6 +929,7 @@ async fn run_daemon(
             }
             let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
             mempool_for_callback.remove_for_block(&txids);
+            evict_block_conflicts(&mempool_for_callback, &chain_for_callback, block);
             for txid in &txids {
                 tx_relay_for_callback.mark_seen(*txid);
             }
@@ -976,6 +978,7 @@ async fn run_daemon(
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
                 mempool_for_callback.remove_for_block(&txids);
+                evict_block_conflicts(&mempool_for_callback, &chain_for_scan, block);
                 for txid in &txids {
                     tx_relay_for_callback.mark_seen(*txid);
                 }
@@ -1252,6 +1255,7 @@ async fn run_daemon(
                 }
                 let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
                 mempool_for_staker.remove_for_block(&txids);
+                evict_block_conflicts(&mempool_for_staker, &chain_for_staker_scan, block);
                 for txid in &txids {
                     tx_relay_for_staker.mark_seen(*txid);
                 }
@@ -1478,6 +1482,25 @@ async fn run_daemon(
 
     info!("Node stopped");
     Ok(())
+}
+
+/// Drop mempool txs that double-spend an input of `block`, if the block is on
+/// the active chain (the callbacks are also handed side-chain blocks).
+fn evict_block_conflicts(
+    mempool: &divi_node::Mempool,
+    chain: &divi_storage::Chain,
+    block: &divi_primitives::block::Block,
+) {
+    let hash = compute_block_hash(&block.header);
+    let active = chain
+        .get_block_index(&hash)
+        .ok()
+        .flatten()
+        .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
+        .is_some_and(|index| index.hash == hash);
+    if active {
+        mempool.remove_conflicts(&block.transactions);
+    }
 }
 
 /// Scan the active chain into the wallet, in order, from its last scanned
