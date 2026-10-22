@@ -874,6 +874,11 @@ impl Chain {
         self.db.winners_strip_height()
     }
 
+    /// The chain parameters this chain was opened with
+    pub fn params(&self) -> &ChainParams {
+        &self.params
+    }
+
     /// Tip this node was started from by `--import-snapshot`, if any.
     pub fn snapshot_base(&self) -> Option<(u32, Hash256)> {
         self.db.snapshot_base()

@@ -1987,15 +1987,29 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
         return Ok(());
     }
     if let Some(out) = &args.export_snapshot {
-        let m = divi_storage::snapshot::export_snapshot(
+        let (m, state_hash) = divi_storage::snapshot::export_snapshot_with_state(
             &config.chainstate_path(),
             out,
             storage_params(config),
         )
         .context("snapshot export failed")?;
         println!(
-            "snapshot written to {:?}\nnetwork {} tip {} {}\nroot_hash {}",
-            out, m.network, m.tip_height, m.tip_hash, m.root_hash
+            "snapshot written to {:?}\nnetwork {} tip {} {}\nroot_hash {}\nstate_hash {}\n\
+             Other nodes import it only once a release lists this state. If this node validated \
+             the chain from genesis, the entry for divi_storage::snapshot::KNOWN_STATES is:\n  \
+             KnownState {{ chain_mode: ChainMode::{:?}, network: NetworkType::{:?}, height: {}, \
+             block_hash: \"{}\", state_hash: \"{}\" }},",
+            out,
+            m.network,
+            m.tip_height,
+            m.tip_hash,
+            m.root_hash,
+            state_hash,
+            config.network.chain_mode,
+            storage_params(config).network_type,
+            m.tip_height,
+            m.tip_hash,
+            state_hash
         );
     } else if let Some(dir) = &args.import_snapshot {
         if let Some(signer) = &args.snapshot_signer {
@@ -2013,7 +2027,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
         )
         .context("snapshot import failed")?;
         println!(
-            "snapshot installed at {:?}\nnetwork {} tip {} {}\nroot_hash {}\nstart the node with --expire so it stays thin; blocks after the tip are fully validated",
+            "snapshot installed at {:?}\nnetwork {} tip {} {}\nroot_hash {}\nthe chain state at the tip matches the one this release knows; history below it was not validated by this node\nstart the node with --expire so it stays thin; blocks after the tip are fully validated",
             config.chainstate_path(), m.network, m.tip_height, m.tip_hash, m.root_hash
         );
     }

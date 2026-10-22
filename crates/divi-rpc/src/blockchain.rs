@@ -579,7 +579,13 @@ impl BlockchainRpc {
             "winnersstripheight": self.chain.winners_strip_height(),
             "fullhistorypeers": fetcher.as_ref().map(|f| f.full_peer_count()),
             "lastblockfetch": fetcher.as_ref().and_then(|f| f.last_result()),
-            "snapshotbase": self.chain.snapshot_base().map(|(h, hash)| serde_json::json!({"height": h, "hash": hash.to_string()})),
+            // History below a snapshot base was checked only against a state this release
+            // knows, not validated block by block on this node
+            "snapshotbase": self.chain.snapshot_base().map(|(h, hash)| serde_json::json!({
+                "height": h,
+                "hash": hash.to_string(),
+                "historyvalidated": false
+            })),
             "warnings": ""
         }))
     }
