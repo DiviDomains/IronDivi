@@ -166,6 +166,32 @@ impl Address {
             hash: Hash160::from_bytes(hash_bytes),
         })
     }
+
+    /// Decode an address and require it to belong to `network`.
+    ///
+    /// `from_base58` accepts the version bytes of every network. Anything that
+    /// takes an address from a user must use this instead: Divi Core's
+    /// `CBitcoinAddress::IsValid()` only accepts the active chain's prefixes,
+    /// so a mainnet-form address is invalid on testnet and the other way round.
+    /// Regtest uses the testnet prefixes.
+    pub fn from_base58_for_network(s: &str, network: Network) -> Result<Self, WalletError> {
+        let address = Self::from_base58(s)?;
+        if address.uses_prefixes_of(network) {
+            Ok(address)
+        } else {
+            Err(WalletError::AddressNotFound(format!(
+                "Address version {} is not a {:?} address",
+                address.version_byte(),
+                network
+            )))
+        }
+    }
+
+    /// True if this address's version byte is one `network` uses
+    pub fn uses_prefixes_of(&self, network: Network) -> bool {
+        let mainnet_form = self.network == Network::Mainnet;
+        mainnet_form == (network == Network::Mainnet)
+    }
 }
 
 impl std::fmt::Display for Address {
@@ -429,6 +455,27 @@ mod tests {
         assert_eq!(decoded.addr_type, AddressType::P2SH);
         assert_eq!(decoded.network, Network::Testnet);
         assert_eq!(decoded.hash, hash);
+    }
+
+    #[test]
+    fn test_from_base58_for_network_checks_version_byte() {
+        let hash = Hash160::from_bytes([0x42u8; 20]);
+        let main_p2pkh = Address::from_pubkey_hash(hash, Network::Mainnet).to_base58();
+        let main_p2sh = Address::p2sh(hash, Network::Mainnet).to_base58();
+        let test_p2pkh = Address::from_pubkey_hash(hash, Network::Testnet).to_base58();
+        let test_p2sh = Address::p2sh(hash, Network::Testnet).to_base58();
+
+        for s in [&main_p2pkh, &main_p2sh] {
+            assert!(Address::from_base58_for_network(s, Network::Mainnet).is_ok());
+            assert!(Address::from_base58_for_network(s, Network::Testnet).is_err());
+            assert!(Address::from_base58_for_network(s, Network::Regtest).is_err());
+        }
+        for s in [&test_p2pkh, &test_p2sh] {
+            assert!(Address::from_base58_for_network(s, Network::Mainnet).is_err());
+            assert!(Address::from_base58_for_network(s, Network::Testnet).is_ok());
+            assert!(Address::from_base58_for_network(s, Network::Regtest).is_ok());
+        }
+        assert!(Address::from_base58_for_network("not an address", Network::Testnet).is_err());
     }
 
     #[test]
