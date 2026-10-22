@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use secp256k1::{All, Secp256k1, SecretKey};
 
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx, SpendInfo,
-    SwapError, Txid,
+    Amount, Chain, ChainBackend, Funding, HtlcParams, InputReservations, LockedOutput, Outpoint,
+    SignedTx, SpendInfo, SwapError, Txid,
 };
 
 use address::TransparentAddress;
@@ -141,6 +141,7 @@ pub struct ZecBackend {
     pubkey: [u8; 33],
     address: TransparentAddress,
     fees: FeePolicy,
+    reservations: Option<InputReservations>,
     /// `"mainnet"` or `"testnet"`: selects address prefixes and the v5/v6 activation height.
     network: String,
 }
@@ -171,8 +172,76 @@ impl ZecBackend {
             pubkey,
             address,
             fees,
+            reservations: None,
             network: "testnet".to_string(),
         })
+    }
+
+    /// Keep the inputs of broadcast wallet transactions out of coin selection until they
+    /// confirm (see [`InputReservations`]). Without it selection reads `GetAddressUtxos`
+    /// only, so a lock that dropped out of the mempool can lose its inputs to a second swap.
+    /// The handle is the daemon's swap database; tests and one-shot tools omit it.
+    pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
+        self.reservations = Some(reservations);
+        self
+    }
+
+    /// `coins` without those reserved by a broadcast transaction that has not confirmed.
+    fn unreserved(&self, coins: Vec<tx::Coin>) -> Result<Vec<tx::Coin>> {
+        let Some(res) = &self.reservations else {
+            return Ok(coins);
+        };
+        let held = res.reserved(Chain::Zec)?;
+        Ok(coins
+            .into_iter()
+            .filter(|c| {
+                !held.contains(&Outpoint {
+                    txid: Txid(c.outpoint.txid),
+                    vout: c.outpoint.n,
+                })
+            })
+            .collect())
+    }
+
+    /// Before `signed_tx` is sent: reserve the wallet inputs it spends. Only a transaction
+    /// whose inputs are all this key's P2PKH coins (a lock funding) is reserved; a claim or
+    /// refund spends an HTLC output, never in the address UTXO list, so it is left alone and
+    /// a store fault cannot hold up a refund. An error blocks the broadcast.
+    fn reserve_inputs(&self, signed_tx: &SignedTx) -> Result<()> {
+        let Some(res) = &self.reservations else {
+            return Ok(());
+        };
+        let parsed = tx::ParsedTx::parse(&signed_tx.raw)?;
+        // P2PKH scriptSig: <sig> <33-byte pubkey>. An HTLC spend ends in its redeem script.
+        let own_p2pkh = |i: &tx::TxIn| {
+            let s = &i.script_sig;
+            s.len() > 34 && s[s.len() - 34] == 0x21 && s[s.len() - 33..] == self.pubkey
+        };
+        if parsed.vin.is_empty() || !parsed.vin.iter().all(own_p2pkh) {
+            return Ok(());
+        }
+        let inputs: Vec<Outpoint> = parsed
+            .vin
+            .iter()
+            .map(|i| Outpoint {
+                txid: Txid(i.prevout.txid),
+                vout: i.prevout.n,
+            })
+            .collect();
+        res.reserve(Chain::Zec, &signed_tx.txid, &inputs)
+    }
+
+    /// The transaction is on chain: its inputs are spent, so the reservation has done its
+    /// job. A store fault here is only logged; the next poll releases again.
+    fn release_confirmed(&self, txid: &Txid, confs: u32) {
+        if confs == 0 {
+            return;
+        }
+        if let Some(res) = &self.reservations {
+            if let Err(e) = res.release_tx(Chain::Zec, txid) {
+                tracing::warn!(%txid, error = %e, "could not release confirmed input reservation");
+            }
+        }
     }
 
     /// Select the network (`"mainnet"` / `"testnet"`) this backend addresses and builds for.
@@ -390,6 +459,7 @@ impl ChainBackend for ZecBackend {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let coins = self.unreserved(coins)?;
         let built = tx::build_funding_tx(
             &self.secp,
             &self.key,
@@ -468,6 +538,7 @@ impl ChainBackend for ZecBackend {
     }
 
     async fn broadcast(&self, signed_tx: &SignedTx) -> Result<Txid> {
+        self.reserve_inputs(signed_tx)?;
         match self.client.send_transaction(&signed_tx.raw).await {
             Ok(resp) if resp.error_code == 0 => Ok(signed_tx.txid),
             Ok(resp) => {
@@ -501,7 +572,9 @@ impl ChainBackend for ZecBackend {
             return Ok(Some(0));
         }
         let tip = self.tip_height().await?;
-        Ok(Some((tip.saturating_sub(raw.height) + 1) as u32))
+        let confs = (tip.saturating_sub(raw.height) + 1) as u32;
+        self.release_confirmed(txid, confs);
+        Ok(Some(confs))
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
@@ -1039,5 +1112,173 @@ mod tests {
             wait_confirmed(&b, &refund.txid, "refund").await;
             println!("live_refund_txid: {}", refund.txid.to_rpc_hex());
         }
+    }
+
+    // ---- input reservations (a dropped lock's inputs are not handed to the next swap) ----
+
+    const RES_MAKER_KEY: [u8; 32] = [0x11; 32];
+    const RES_TAKER_KEY: [u8; 32] = [0x22; 32];
+    const RES_BRANCH_ID: u32 = 0xc2d6_d0b4;
+
+    fn res_db(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "swap-chain-zec-{tag}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
+
+    fn rm_db(path: &std::path::Path) {
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// A backend whose endpoint is unreachable: nothing here may need the network.
+    fn res_backend(key: [u8; 32]) -> ZecBackend {
+        ZecBackend::new(
+            vec!["http://127.0.0.1:1".to_string()],
+            SecretKey::from_slice(&key).unwrap(),
+            FeePolicy::default(),
+            RetryPolicy::default(),
+        )
+        .unwrap()
+    }
+
+    fn res_htlc(b: &ZecBackend) -> HtlcParams {
+        let (_, hash) = new_preimage();
+        HtlcParams {
+            hash,
+            claim_pubkey: b.pubkey(),
+            refund_pubkey: b.pubkey(),
+            locktime: 1_900_000_000,
+            script_version: Default::default(),
+        }
+    }
+
+    fn res_coin(b: &ZecBackend, n: u8, value: u64) -> tx::Coin {
+        tx::Coin {
+            outpoint: tx::OutPoint {
+                txid: [n; 32],
+                n: 0,
+            },
+            value,
+            script_pubkey: crate::address::TransparentAddress::p2pkh(&b.pubkey()).script_pubkey(),
+        }
+    }
+
+    /// What `build_funding` does after the UTXO query, minus the network: filter, then build.
+    fn fund(b: &ZecBackend, coins: &[tx::Coin], htlc: &HtlcParams) -> (SignedTx, Vec<[u8; 32]>) {
+        let coins = b.unreserved(coins.to_vec()).unwrap();
+        let built = tx::build_funding_tx(
+            &b.secp,
+            &b.key,
+            &b.pubkey,
+            &coins,
+            htlc,
+            5_000,
+            6,
+            RES_BRANCH_ID,
+            2,
+        )
+        .unwrap();
+        let spent = built.tx.vin.iter().map(|i| i.prevout.txid).collect();
+        (ZecBackend::to_signed(&built.tx), spent)
+    }
+
+    #[test]
+    fn a_dropped_locks_inputs_are_skipped_until_the_lock_confirms() {
+        let res = InputReservations::in_memory().unwrap();
+        let b = res_backend(RES_MAKER_KEY).with_input_reservations(res.clone());
+        let coins = [res_coin(&b, 1, 200_000), res_coin(&b, 2, 150_000)];
+        let h = res_htlc(&b);
+
+        let (lock1, spent1) = fund(&b, &coins, &h);
+        assert_eq!(spent1, vec![[1u8; 32]], "largest coin first");
+        b.reserve_inputs(&lock1).unwrap();
+
+        // The lock dropped from the mempool; the UTXO query still lists both coins.
+        let (_, spent2) = fund(&b, &coins, &h);
+        assert_eq!(
+            spent2,
+            vec![[2u8; 32]],
+            "coin 1 is reserved by the dropped lock"
+        );
+        // "Not seen" (0 confirmations is mempool; absence is never reported here) never releases.
+        b.release_confirmed(&lock1.txid, 0);
+        let (_, spent3) = fund(&b, &coins, &h);
+        assert_eq!(spent3, vec![[2u8; 32]]);
+
+        b.release_confirmed(&lock1.txid, 1);
+        assert!(res.reserved(Chain::Zec).unwrap().is_empty());
+        let (_, spent4) = fund(&b, &coins, &h);
+        assert_eq!(spent4, vec![[1u8; 32]]);
+    }
+
+    #[test]
+    fn reserved_inputs_survive_a_restart() {
+        let db = res_db("restart");
+        let b = res_backend(RES_MAKER_KEY)
+            .with_input_reservations(InputReservations::open(&db).unwrap());
+        let coins = [res_coin(&b, 1, 200_000), res_coin(&b, 2, 150_000)];
+        let h = res_htlc(&b);
+        let (lock, _) = fund(&b, &coins, &h);
+        b.reserve_inputs(&lock).unwrap();
+        drop(b);
+
+        let b2 = res_backend(RES_MAKER_KEY)
+            .with_input_reservations(InputReservations::open(&db).unwrap());
+        let (_, spent) = fund(&b2, &coins, &h);
+        assert_eq!(spent, vec![[2u8; 32]]);
+        drop(b2);
+        rm_db(&db);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reservation_write_blocks_the_lock_broadcast() {
+        let db = res_db("failclosed");
+        InputReservations::open(&db).unwrap();
+        let b = res_backend(RES_MAKER_KEY)
+            .with_input_reservations(InputReservations::open_read_only(&db).unwrap());
+        let coins = [res_coin(&b, 1, 200_000)];
+        let (lock, _) = fund(&b, &coins, &res_htlc(&b));
+        // The endpoint is unreachable, so a Storage error proves we stopped before the network.
+        let err = b.broadcast(&lock).await.unwrap_err();
+        assert!(matches!(err, SwapError::Storage(_)), "{err:?}");
+        rm_db(&db);
+    }
+
+    #[test]
+    fn claims_and_refunds_are_never_reserved() {
+        let res = InputReservations::in_memory().unwrap();
+        let b = res_backend(RES_TAKER_KEY).with_input_reservations(res.clone());
+        let (pre, hash) = new_preimage();
+        let h = HtlcParams {
+            hash,
+            ..res_htlc(&b)
+        };
+        for spend in [tx::Spend::Claim(&pre), tx::Spend::Refund] {
+            let built = tx::build_spend_tx(
+                &b.secp,
+                &b.key,
+                &b.pubkey,
+                &h,
+                tx::OutPoint {
+                    txid: [9; 32],
+                    n: 1,
+                },
+                50_000,
+                spend,
+                6,
+                RES_BRANCH_ID,
+                2,
+            )
+            .unwrap();
+            b.reserve_inputs(&ZecBackend::to_signed(&built)).unwrap();
+        }
+        assert!(res.reserved(Chain::Zec).unwrap().is_empty());
     }
 }

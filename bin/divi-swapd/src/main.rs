@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
-use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
+use divi_swap::{Amount, Chain, ChainBackend, InputReservations, Maker, Store};
 use divi_swapd::{
     mock_counter_offers, mock_xmr_offers, router_with_auth, run_scan, spawn_gated_scheduler,
     AppState, BackendKind, BtcSection, DaemonConfig, HashlockAuth, LtcSection, ScanStatus,
@@ -285,7 +285,7 @@ fn resolve_key(reference: &str, what: &str) -> Result<bitcoin::secp256k1::Secret
     key.map_err(|_| anyhow::anyhow!("{what} key is not a valid secp256k1 key"))
 }
 
-fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
+fn live_btc(cfg: &BtcSection, reservations: &InputReservations) -> Result<Arc<dyn ChainBackend>> {
     // Network name and the mainnet opt-in are validated at config load; the network also
     // picks the address format (`bc1` vs `tb1`).
     let endpoints = cfg.endpoints()?;
@@ -296,12 +296,16 @@ fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
         key,
         FeePolicy::default(),
         RetryPolicy::default(),
-    )?;
+    )?
+    .with_input_reservations(reservations.clone());
     tracing::info!(address = %backend.address(), network = %cfg.network, "btc backend ready");
     Ok(Arc::new(backend))
 }
 
-async fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
+async fn live_ltc(
+    cfg: &LtcSection,
+    reservations: &InputReservations,
+) -> Result<Arc<dyn ChainBackend>> {
     // Network name and the mainnet opt-in are validated at config load; the network also
     // picks the address HRP (`ltc` vs `tltc`).
     let endpoints = cfg.endpoints()?;
@@ -312,7 +316,8 @@ async fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
         key,
         swap_chain_ltc::FeePolicy::default(),
         swap_chain_ltc::RetryPolicy::default(),
-    )?;
+    )?
+    .with_input_reservations(reservations.clone());
     tracing::info!(address = %backend.address(), network = %cfg.network, "ltc backend ready");
     // Opt-in (`[ltc].crosscheck`): a primary that disagrees with the independent source
     // refuses to start; an unreachable source only warns.
@@ -381,7 +386,7 @@ async fn live_usdc(
     Ok((Arc::new(backend), underfunded))
 }
 
-fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
+fn live_zec(cfg: &ZecSection, reservations: &InputReservations) -> Result<Arc<dyn ChainBackend>> {
     let key = resolve_key(&cfg.key, "zec")?;
     let endpoints = cfg.endpoints()?;
     let backend = ZecBackend::new(
@@ -390,7 +395,8 @@ fn live_zec(cfg: &ZecSection) -> Result<Arc<dyn ChainBackend>> {
         ZecFeePolicy::default(),
         ZecRetryPolicy::default(),
     )?
-    .with_network(&cfg.network)?;
+    .with_network(&cfg.network)?
+    .with_input_reservations(reservations.clone());
     tracing::info!(
         address = %backend.encoded_address(), network = %cfg.network, "zec backend ready"
     );
@@ -404,18 +410,24 @@ async fn live_backends(
     let (Some(divi_cfg), Some(btc_cfg)) = (&cfg.divi, &cfg.btc) else {
         bail!("live backend needs both [divi] and [btc] sections");
     };
+    // BTC, LTC and ZEC select coins from a live address query; this table keeps the inputs of
+    // a broadcast lock out of the next swap's selection until the lock confirms.
+    let reservations =
+        InputReservations::open(&cfg.db_path).context("opening input reservations")?;
     let mut others: Vec<Arc<dyn ChainBackend>> = Vec::new();
     let mut underfunded_offers: Vec<String> = Vec::new();
     for c in cfg.counter_backends_to_start(in_flight)? {
         others.push(match c {
-            Chain::Ltc => live_ltc(cfg.ltc.as_ref().expect("checked by config")).await?,
+            Chain::Ltc => {
+                live_ltc(cfg.ltc.as_ref().expect("checked by config"), &reservations).await?
+            }
             Chain::Usdc => {
                 let (backend, underfunded) =
                     live_usdc(cfg.usdc.as_ref().expect("checked by config"), &cfg.offers).await?;
                 underfunded_offers.extend(underfunded);
                 backend
             }
-            Chain::Zec => live_zec(cfg.zec.as_ref().expect("checked by config"))?,
+            Chain::Zec => live_zec(cfg.zec.as_ref().expect("checked by config"), &reservations)?,
             other => bail!("no live {other} backend in this build"),
         });
     }
@@ -447,7 +459,7 @@ async fn live_backends(
             o.counter_chain
         );
     }
-    let btc = live_btc(btc_cfg)?;
+    let btc = live_btc(btc_cfg, &reservations)?;
     let key = resolve_divi_key(&divi_cfg.key, "divi")?;
     let divi_network = divi_cfg.network()?;
     let mut divi = DiviBackend::new(

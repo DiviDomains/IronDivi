@@ -902,3 +902,177 @@ fn script_pubkey_follows_the_params_version() {
     assert_ne!(tx::htlc_script_pubkey(&v0), tx::htlc_script_pubkey(&v1));
     assert_eq!(v1.redeem_script().len(), 118);
 }
+
+// ---- input reservations (a dropped lock's inputs are not handed to the next swap) ----
+
+fn reservation_db(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "swap-chain-btc-{tag}-{}-{nanos}.db",
+        std::process::id()
+    ))
+}
+
+fn rm_db(path: &std::path::Path) {
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+    }
+}
+
+/// The wallet owns coin A (20,000) and coin B (15,000); the address query keeps listing both,
+/// as it does once a broadcast lock has dropped out of the mempool.
+async fn two_coin_wallet(key: [u8; 32]) -> (MockServer, BtcBackend, [u8; 32], [u8; 32]) {
+    let server = MockServer::start().await;
+    let b = backend(vec![server.uri()], key);
+    let (a, c) = ([1u8; 32], [2u8; 32]);
+    Mock::given(method("GET"))
+        .and(path(format!("/address/{}/utxo", b.address())))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"txid": hex::encode(a), "vout": 0, "value": 20_000, "status": {"confirmed": true}},
+            {"txid": hex::encode(c), "vout": 0, "value": 15_000, "status": {"confirmed": true}}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tx"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    (server, b, a, c)
+}
+
+fn spent_txids(f: &Funding) -> Vec<[u8; 32]> {
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&f.tx.raw).unwrap();
+    tx.input
+        .iter()
+        .map(|i| i.previous_output.txid.to_byte_array())
+        .collect()
+}
+
+fn posts(reqs: &[wiremock::Request]) -> usize {
+    reqs.iter().filter(|r| r.method.as_str() == "POST").count()
+}
+
+async fn mock_confirmed(server: &MockServer, txid: &Txid) {
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/height"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("110"))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/tx/{}/status", txid.to_rpc_hex())))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"confirmed": true, "block_height": 109})),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_dropped_locks_inputs_are_skipped_until_the_lock_confirms() {
+    let (server, b, a, c) = two_coin_wallet(MAKER_KEY).await;
+    let res = InputReservations::in_memory().unwrap();
+    let b = b.with_input_reservations(res.clone());
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+
+    let lock1 = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    assert_eq!(spent_txids(&lock1), vec![a], "largest coin first");
+    b.broadcast(&lock1.tx).await.unwrap();
+
+    // The lock is not on the node (dropped): a second swap must not take coin A.
+    assert_eq!(b.confirmations(&lock1.tx.txid).await.unwrap(), None);
+    let lock2 = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    assert_eq!(
+        spent_txids(&lock2),
+        vec![c],
+        "A is reserved by the dropped lock"
+    );
+    // Still not seen: still reserved, a "not seen" never releases.
+    let lock3 = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    assert_eq!(spent_txids(&lock3), vec![c]);
+
+    // Seen confirmed: released (the inputs are spent on chain anyway).
+    mock_confirmed(&server, &lock1.tx.txid).await;
+    assert_eq!(b.confirmations(&lock1.tx.txid).await.unwrap(), Some(2));
+    assert!(res.reserved(Chain::Btc).unwrap().is_empty());
+    let lock4 = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    assert_eq!(spent_txids(&lock4), vec![a]);
+}
+
+#[tokio::test]
+async fn a_rebroadcast_of_the_same_lock_keeps_its_one_reservation() {
+    let (_server, b, a, _) = two_coin_wallet(MAKER_KEY).await;
+    let res = InputReservations::in_memory().unwrap();
+    let b = b.with_input_reservations(res.clone());
+    let (_, hash) = new_preimage();
+    let lock = b
+        .build_funding(&htlc(hash), Amount::from_sat(5_000))
+        .await
+        .unwrap();
+    b.broadcast(&lock.tx).await.unwrap();
+    b.broadcast(&lock.tx).await.unwrap();
+    let held = res.reserved(Chain::Btc).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held.iter().next().unwrap().txid.0, a);
+}
+
+#[tokio::test]
+async fn reserved_inputs_survive_a_restart() {
+    let db = reservation_db("restart");
+    let (_server, b, a, c) = two_coin_wallet(MAKER_KEY).await;
+    let (_, hash) = new_preimage();
+    let h = htlc(hash);
+    let b = b.with_input_reservations(InputReservations::open(&db).unwrap());
+    let lock = b.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    assert_eq!(spent_txids(&lock), vec![a]);
+    b.broadcast(&lock.tx).await.unwrap();
+    drop(b);
+
+    // New process: fresh backend, reservations reopened from the file.
+    let (_server2, b2, _, _) = two_coin_wallet(MAKER_KEY).await;
+    let b2 = b2.with_input_reservations(InputReservations::open(&db).unwrap());
+    let lock2 = b2.build_funding(&h, Amount::from_sat(5_000)).await.unwrap();
+    assert_eq!(spent_txids(&lock2), vec![c]);
+    drop(b2);
+    rm_db(&db);
+}
+
+#[tokio::test]
+async fn a_failed_reservation_write_blocks_the_lock_broadcast() {
+    let db = reservation_db("failclosed");
+    InputReservations::open(&db).unwrap();
+    let (server, b, _, _) = two_coin_wallet(MAKER_KEY).await;
+    let b = b.with_input_reservations(InputReservations::open_read_only(&db).unwrap());
+    let (_, hash) = new_preimage();
+    let lock = b
+        .build_funding(&htlc(hash), Amount::from_sat(5_000))
+        .await
+        .unwrap();
+    let err = b.broadcast(&lock.tx).await.unwrap_err();
+    assert!(matches!(err, SwapError::Storage(_)), "{err:?}");
+    assert_eq!(posts(&server.received_requests().await.unwrap()), 0);
+    rm_db(&db);
+}
+
+#[tokio::test]
+async fn claims_and_refunds_are_never_reserved_or_blocked_by_the_store() {
+    let db = reservation_db("spends");
+    InputReservations::open(&db).unwrap();
+    let (server, b, _, _) = two_coin_wallet(TAKER_KEY).await;
+    let b = b.with_input_reservations(InputReservations::open_read_only(&db).unwrap());
+    let (pre, hash) = new_preimage();
+    let h = htlc(hash);
+    let claim = b
+        .build_claim(&h, &outpoint(), Amount::from_sat(20_000), &pre)
+        .await
+        .unwrap();
+    // A read-only store would fail any write; the claim still goes out.
+    assert_eq!(b.broadcast(&claim).await.unwrap(), claim.txid);
+    assert_eq!(posts(&server.received_requests().await.unwrap()), 1);
+    rm_db(&db);
+}

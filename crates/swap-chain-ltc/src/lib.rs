@@ -40,8 +40,8 @@ use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
 use crosscheck::enforce;
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx, SpendInfo,
-    SwapError, Txid,
+    Amount, Chain, ChainBackend, Funding, HtlcParams, InputReservations, LockedOutput, Outpoint,
+    SignedTx, SpendInfo, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -111,6 +111,7 @@ pub struct LtcBackend {
     address: String,
     hrp: &'static str,
     fees: FeePolicy,
+    reservations: Option<InputReservations>,
 }
 
 impl std::fmt::Debug for LtcBackend {
@@ -122,6 +123,74 @@ impl std::fmt::Debug for LtcBackend {
 }
 
 impl LtcBackend {
+    /// Keep the inputs of broadcast wallet transactions out of coin selection until they
+    /// confirm (see [`InputReservations`]). Without it selection reads the live address
+    /// query only, so a lock that dropped out of the mempool can lose its inputs to a second
+    /// swap. The handle is the daemon's swap database; tests and one-shot tools omit it.
+    pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
+        self.reservations = Some(reservations);
+        self
+    }
+
+    /// `coins` without those reserved by a broadcast transaction that has not confirmed.
+    fn unreserved(&self, coins: Vec<Coin>) -> Result<Vec<Coin>> {
+        let Some(res) = &self.reservations else {
+            return Ok(coins);
+        };
+        let held = res.reserved(Chain::Ltc)?;
+        Ok(coins
+            .into_iter()
+            .filter(|c| {
+                !held.contains(&Outpoint {
+                    txid: Txid(c.outpoint.txid.to_byte_array()),
+                    vout: c.outpoint.vout,
+                })
+            })
+            .collect())
+    }
+
+    /// Before `tx` is posted: reserve the wallet inputs it spends. Only a transaction whose
+    /// inputs are all this key's P2WPKH coins (a lock funding, a plain send) is reserved; a
+    /// claim or refund spends an HTLC output, never in the address UTXO list, so it is left
+    /// alone and a store fault cannot hold up a refund. An error blocks the broadcast.
+    fn reserve_inputs(&self, tx: &SignedTx) -> Result<()> {
+        let Some(res) = &self.reservations else {
+            return Ok(());
+        };
+        let parsed: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&tx.raw).map_err(|e| {
+                SwapError::Other(format!("cannot read own transaction to reserve: {e}"))
+            })?;
+        let ours = self.pubkey.to_bytes();
+        let own_p2wpkh =
+            |i: &bitcoin::TxIn| i.witness.len() == 2 && i.witness.last() == Some(ours.as_slice());
+        if parsed.input.is_empty() || !parsed.input.iter().all(own_p2wpkh) {
+            return Ok(());
+        }
+        let inputs: Vec<Outpoint> = parsed
+            .input
+            .iter()
+            .map(|i| Outpoint {
+                txid: Txid(i.previous_output.txid.to_byte_array()),
+                vout: i.previous_output.vout,
+            })
+            .collect();
+        res.reserve(Chain::Ltc, &tx.txid, &inputs)
+    }
+
+    /// The transaction is on chain: its inputs are spent, so the reservation has done its
+    /// job. A store fault here is only logged; the next poll releases again.
+    fn release_confirmed(&self, txid: &Txid, confs: u32) {
+        if confs == 0 {
+            return;
+        }
+        if let Some(res) = &self.reservations {
+            if let Err(e) = res.release_tx(Chain::Ltc, txid) {
+                tracing::warn!(%txid, error = %e, "could not release confirmed input reservation");
+            }
+        }
+    }
+
     /// The raw `/blocks/tip/hash` body, shared by `tip_hash` and `median_time_past`.
     async fn tip_hash_raw(&self) -> Result<String> {
         Ok(self.esplora.get("/blocks/tip/hash").await?)
@@ -160,6 +229,7 @@ impl LtcBackend {
             address,
             hrp,
             fees,
+            reservations: None,
         })
     }
 
@@ -221,12 +291,12 @@ impl LtcBackend {
         }
     }
 
-    /// This backend's own UTXOs, from the Esplora address endpoint.
+    /// This backend's own UTXOs, from the Esplora address endpoint, less those reserved.
     async fn my_utxos(&self) -> Result<Vec<Coin>> {
         let utxos = self
             .get_json(&format!("/address/{}/utxo", self.address))
             .await?;
-        utxos
+        let coins: Vec<Coin> = utxos
             .as_array()
             .ok_or_else(|| {
                 SwapError::Transient("utxo response is not an array (malformed?)".into())
@@ -243,7 +313,8 @@ impl LtcBackend {
                     confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        self.unreserved(coins)
     }
 
     /// Build, sign and consensus-verify a plain P2WPKH send of `sats` to `to` (any bech32
@@ -505,6 +576,7 @@ impl ChainBackend for LtcBackend {
     }
 
     async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
+        self.reserve_inputs(tx)?;
         match self.esplora.post("/tx", hex::encode(&tx.raw)).await {
             Ok(_) => Ok(tx.txid),
             Err(ClientError::Http(f)) => {
@@ -535,7 +607,9 @@ impl ChainBackend for LtcBackend {
             return Ok(Some(0));
         }
         let tip = self.tip_height().await?;
-        Ok(Some(Self::confs_from_status(&status, tip)))
+        let confs = Self::confs_from_status(&status, tip);
+        self.release_confirmed(txid, confs);
+        Ok(Some(confs))
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
