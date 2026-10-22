@@ -704,3 +704,19 @@ run above) is the orchestrator's step, from the Mac, same as every prior live le
 - left: `litecoinspace.org` is still the only LTC endpoint (`crates/swap-chain-ltc/src/lib.rs:69`); the CLI has no `tip` subcommand (tip checked by curl); a live `[ltc]` section needs `[divi]` + `[btc]` and an enabled ltc offer (`bin/divi-swapd/src/main.rs:382-384`); the DIVI backend is built on `DiviNetwork::Testnet` whatever the profile (`bin/divi-swapd/src/main.rs:430-436`, `bin/divi-swap/src/main.rs:487-494`).
 - needs: nothing.
 - decisions: no code change, no confirmation/MTP/timeout/margin change.
+
+## Round: LTC second-mirror survey (builder AC, 2026-10-22)
+
+LTC second-mirror survey. Backend paths (`crates/swap-chain-ltc/src/lib.rs`): `/v1/fees/recommended` :176, `/address/{a}/utxo` :204, `/block-height/{h}` :290, `/block/{hash}/txs/{start}` :296, `/blocks/tip/height` :397, `/blocks/tip/hash` :410, `/block/{hash}` :411, `POST /tx` :481, `/tx/{id}/status` :502, `/tx/{id}` :516, `/tx/{prev}/outspend/{vout}` :544.
+
+- done: surveyed public LTC mainnet APIs from hp3 (read-only GET, 2026-10-22T12:1xZ). Esplora probe `GET <base>/blocks/tip/height` on 17 candidate bases, `/block-height/3199000` where it answered:
+  - `https://litecoinspace.org/api` (primary, litecoinspace.org, Litecoin Foundation mempool.space port): 3199581, `/block-height/3199000` → `6417df70…93f2`. Baseline.
+  - `https://blockstream.info/litecoin/api`, `https://mempool.space/litecoin/api`, `https://mempool.space/ltc/api`: HTTP 200 but an HTML SPA page (Bitcoin explorer), not API → `missing` on every path.
+  - `https://litecoin.mempool.space/api`: answers `972614` (a Bitcoin height) and `Block not found` for LTC block 3199000 → not Litecoin, `differs`.
+  - ltc.mempool.space, mempool.litecoin.net, electrs.litecoin.net, ltcspace.org, litecoin.space, ltc.blockstream.info, esplora.litecoin.net, api.litecoinspace.org, ltc-electrs.bitaps.com, mempool.ltc.dev: no connection (HTTP 000) → `missing`. `ltc.nownodes.io`: 401 key required; `explorer.litecoin.net`: 301.
+  - Non-Esplora, completeness only: Blockbook `https://litecoinblockexplorer.net/api/v2/block/3199000` → same hash `6417df70…93f2` (`same`, different shape; status bestHeight 3199581); BlockCypher `https://api.blockcypher.com/v1/ltc/main/blocks/3199000` → same hash, tip hash `d1251386…fa37` equal to litecoinspace tip (`same`, different shape, rate limited); Blockchair `api.blockchair.com/litecoin/...` → HTTP 430 from hp3 IP (key needed); SoChain v2 retired, v3 key needed; ltc1/ltc2.trezor.io → HTML.
+  - Verdict: no candidate is Esplora-compatible on the paths the backend uses → no code change.
+- proof: raw curl commands/outputs in `~/swap-lanes/builders/AC/STATUS.md`; litecoind size from Blockbook status `https://litecoinblockexplorer.net/api/` → `backend.sizeOnDisk` 268274359429 B, `blockbook.dbSize` 288734518625 B (`verified`, that operator's own node).
+- left: cheapest independent option = a non-Esplora tip-hash cross-check against Blockbook (`litecoinblockexplorer.net`) or BlockCypher: ~no disk, but needs new client code for a second API shape and cannot serve UTXO/spend lookups (read-only sanity check only). Self-hosted electrs on hp3 needs an UNPRUNED litecoind (electrs indexes from block files; Litecoin Core `-prune` is incompatible with `-txindex`, source: git.boxtec.ch litecoind.1 mirror; whether electrs works on a pruned node: `could not verify`): ~268 GB node alone (measured on another operator's node, above) vs hp3 ≈52 GB free → infeasible without new disk; sync time `could not verify` (no Litecoin figure found; not guessed). Not built.
+- needs: nothing for this round; any second-source code is a new lane.
+- decisions: no code change; no confirmation/MTP/timeout/margin change.
