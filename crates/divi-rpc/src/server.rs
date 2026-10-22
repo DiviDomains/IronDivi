@@ -74,6 +74,9 @@ pub struct LogConfigInfo {
     pub print_to_console: bool,
 }
 
+/// Callback that starts a clean node shutdown (the same path as SIGTERM)
+pub type ShutdownCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// RPC server state
 pub struct RpcServer {
     blockchain: BlockchainRpc,
@@ -84,6 +87,7 @@ pub struct RpcServer {
     masternode: MasternodeRpc,
     spork: SporkRpc,
     log_config: RwLock<Option<LogConfigInfo>>,
+    shutdown: RwLock<Option<ShutdownCallback>>,
 }
 
 impl RpcServer {
@@ -98,6 +102,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -112,6 +117,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -126,6 +132,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -144,6 +151,7 @@ impl RpcServer {
             masternode: MasternodeRpc::new(),
             spork: SporkRpc::new(),
             log_config: RwLock::new(None),
+            shutdown: RwLock::new(None),
         }
     }
 
@@ -208,6 +216,11 @@ impl RpcServer {
     /// Update chain height (for wallet confirmations)
     pub fn set_height(&self, height: u32) {
         self.wallet.set_height(height);
+    }
+
+    /// Set the hook that the `stop` RPC uses to shut the node down
+    pub fn set_shutdown_callback(&self, callback: ShutdownCallback) {
+        *self.shutdown.write() = Some(callback);
     }
 
     /// Set the log configuration for RPC queries
@@ -865,8 +878,16 @@ impl RpcServer {
         }
     }
 
-    /// Stop server (placeholder)
+    /// Stop server: hand off to the node's shutdown path, then answer as Divi Core does
     fn stop(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+        let shutdown = self.shutdown.read().clone();
+        let Some(shutdown) = shutdown else {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "stop is not available on this server").into(),
+            );
+        };
+        info!("RPC stop received, shutting down");
+        shutdown();
         Ok(serde_json::Value::String(
             "Divi server stopping".to_string(),
         ))
@@ -1307,6 +1328,23 @@ mod tests {
             method: method.to_string(),
             params,
         })
+    }
+
+    #[test]
+    fn stop_calls_the_shutdown_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (server, _dir) = create_test_server();
+        // No hook: refuse instead of claiming to stop
+        assert!(call(&server, "stop", Params::None).error.is_some());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        server.set_shutdown_callback(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let r = call(&server, "stop", Params::None);
+        assert_eq!(r.result, Some(serde_json::json!("Divi server stopping")));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
