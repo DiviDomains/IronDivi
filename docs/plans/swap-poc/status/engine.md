@@ -130,3 +130,7 @@
 - left: single-source backends (LTC one Esplora URL; BTC MTP and confirmations from one explorer), and the deepest DIVI reorg could not be verified.
 - needs: Bert: DIVI confirmations 10 vs 20 (`divi-confirmations.md`) and the XMR `L` value, both already open; nothing new.
 - decisions: findings are reported, not fixed (docs-only lane); F1 is framed as a duplicate-record defect, not theft, pending the reviewer.
+
+### 2026-10-22 engine-review-brief follow-up (orchestrator, from AT's unpushed amend 5ab6767)
+- done: engine-review-brief.md counts the 5 doc-tests in divi-swap (173 -> 178 passed) and names the three in-scope files changed since 88c85b2 that were not re-verified (live_rpc.rs is out of scope).
+- proof: docs only; diff 8eb0f46..5ab6767 applied unchanged.

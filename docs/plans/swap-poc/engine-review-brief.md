@@ -4,7 +4,7 @@ State of this document: 2026-10-22, builder AT, written against commit **88c85b2
 (`private/signed/main`). Every `path:line` below was opened on that commit. A statement that could
 not be checked is marked `could not verify`. If the tree has moved, re-anchor with
 `git diff 88c85b2..HEAD -- crates/divi-swap crates/swap-chain-* bin/` and re-open the cited lines.
-Since 88c85b2, `private/signed/main` (d433f25) changed four in-scope files that were **not** re-verified here: `bin/divi-swap/src/main.rs`, `bin/divi-swapd/src/main.rs`, `crates/divi-swap/src/store.rs`, `crates/swap-chain-xmr/src/live_rpc.rs`. Line numbers into those files may have shifted.
+Since 88c85b2, `private/signed/main` (d433f25) changed three in-scope files that were **not** re-verified here: `bin/divi-swap/src/main.rs`, `bin/divi-swapd/src/main.rs`, `crates/divi-swap/src/store.rs` (a fourth change, in out-of-scope `crates/swap-chain-xmr/src/live_rpc.rs`, is irrelevant). Line numbers into those files may have shifted.
 This is a docs-only brief: nothing in code, confirmation counts, timeouts or margins was changed.
 No funds, keys, wallets or swaps were used to produce it.
 
@@ -319,11 +319,11 @@ cargo fmt --all --check
 Results on 88c85b2, hp3 (recorded 2026-10-22):
 
 `cargo test --no-fail-fast` exited 0. `cargo fmt --all --check` exited 0. Passed / failed / ignored,
-per package (unit + integration; doc-tests separate):
+per package (unit, integration and doc-tests):
 
 | Package | Passed | Failed | Ignored | Notes |
 |---|---|---|---|---|
-| `divi-swap` | 173 | 0 | 0 | lib 44; `engine` 93; `multichain` 10; `usdc` 10; `taker_*` 16; doc-tests 5 |
+| `divi-swap` | 178 | 0 | 0 | lib 44; `engine` 93; `multichain` 10; `usdc` 10; `taker_*` 16; doc-tests 5 |
 | `divi-swapd` | 89 | 0 | 0 | lib 52; bin 1; `api` 8; `e2e` 4; `e2e_gated` 4; `e2e_ltc` 8; `e2e_xmr` 8; `multichain` 1; `scan` 3 |
 | `divi-swap-cli` | 46 | 0 | 0 | lib 9; bin 37 |
 | `swap-chain-btc` | 32 | 0 | 1 | |
