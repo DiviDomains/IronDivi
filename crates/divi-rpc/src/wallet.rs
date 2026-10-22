@@ -447,6 +447,39 @@ impl WalletRpc {
         let min_conf = params.get_u64(0).unwrap_or(1) as u32;
         let max_conf = params.get_u64(1).unwrap_or(9999999) as u32;
 
+        // Optional ["address", ...] filter. As in Core, a bad address is -5
+        // and a repeated one is -8.
+        let addresses: Option<HashSet<String>> = match params.get(2) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(items)) => {
+                let mut set = HashSet::new();
+                for item in items {
+                    let addr = item
+                        .as_str()
+                        .filter(|a| Address::from_base58(a).is_ok())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                codes::INVALID_ADDRESS_OR_KEY,
+                                format!("Invalid Divi address: {}", item.as_str().unwrap_or("")),
+                            )
+                        })?;
+                    if !set.insert(addr.to_string()) {
+                        return Err(RpcError::new(
+                            codes::INVALID_PARAMETER,
+                            format!("Invalid parameter, duplicated address: {}", addr),
+                        )
+                        .into());
+                    }
+                }
+                Some(set)
+            }
+            Some(_) => {
+                return Err(
+                    RpcError::new(codes::TYPE_ERROR, "Expected type array for addresses").into(),
+                )
+            }
+        };
+
         let height = self.current_height();
         let utxos = wallet.get_utxos();
 
@@ -455,6 +488,11 @@ impl WalletRpc {
             .filter(|utxo| {
                 let confs = utxo.confirmations(height);
                 confs >= min_conf && confs <= max_conf
+            })
+            .filter(|utxo| {
+                addresses
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&utxo.address))
             })
             .map(|utxo| {
                 let divi = utxo.value.as_sat() as f64 / 100_000_000.0;
@@ -4793,5 +4831,50 @@ mod accounting_tests {
             .find(|e| e["account"] == json!("savings"))
             .expect("savings account listed");
         assert_eq!(savings["amount"], json!(249.99));
+    }
+
+    #[test]
+    fn list_unspent_filters_by_address() {
+        let f = fixture();
+        let list = |params: Vec<serde_json::Value>| {
+            f.rpc
+                .list_unspent(&Params::Array(params))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["address"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(list(vec![]).len(), 4);
+
+        let only_second = list(vec![json!(1), json!(9999999), json!([f.second])]);
+        assert_eq!(only_second, vec![f.second.clone()]);
+
+        let only_miner = list(vec![json!(1), json!(9999999), json!([f.miner])]);
+        assert_eq!(only_miner.len(), 3);
+        assert!(only_miner.iter().all(|a| *a == f.miner));
+
+        assert_eq!(
+            list(vec![json!(1), json!(9999999), json!([f.miner, f.second])]).len(),
+            4
+        );
+        assert!(list(vec![json!(1), json!(9999999), json!([])]).is_empty());
+    }
+
+    #[test]
+    fn list_unspent_rejects_bad_address_filter() {
+        let f = fixture();
+        let code = |filter: serde_json::Value| match f.rpc.list_unspent(&Params::Array(vec![
+            json!(1),
+            json!(9999999),
+            filter,
+        ])) {
+            Err(Error::Rpc(e)) => e.code,
+            other => panic!("expected an RPC error, got {:?}", other),
+        };
+        assert_eq!(code(json!(["notanaddress"])), codes::INVALID_ADDRESS_OR_KEY);
+        assert_eq!(code(json!([f.second, f.second])), codes::INVALID_PARAMETER);
+        assert_eq!(code(json!(f.second)), codes::TYPE_ERROR);
     }
 }
