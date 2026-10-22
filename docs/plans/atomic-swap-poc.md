@@ -221,7 +221,10 @@ claude_auto --model opus "Read docs/plans/atomic-swap-poc.md. You are the orches
 
 ## 9. IronDivi Swaps website (Bert 2026-10-22 17:00: "i want a website to be in the plan for IronDivi Swaps")
 
-Status 2026-10-22: built and tested on branch `lane/swap-website` (five pages, install/rollback script, docker nginx and headless-browser proof), NOT installed; the taker app has no public download so the how-to page says so. Was: planned, builder dispatched. Going live is a separate yes/no card for Bert, not part of this item.
+Status 2026-10-22 21:30: **wording approved** (Bert: "keep it not published yet"): the pages keep "the taker app is not
+published yet" until §10 or §11 ships something a person can download. Landed as `72ec52d`, still NOT installed;
+installing it is its own yes/no card.
+Earlier status 2026-10-22: built and tested on branch `lane/swap-website` (five pages, install/rollback script, docker nginx and headless-browser proof), NOT installed; the taker app has no public download so the how-to page says so. Was: planned, builder dispatched. Going live is a separate yes/no card for Bert, not part of this item.
 The one-page `/swap/` landing page (`622220d`, `deploy/divi-swapd/www/`) stays built and **not installed**;
 the website replaces it.
 
@@ -260,3 +263,85 @@ orchestrator has looked at it in a real browser through an ssh tunnel. Nothing i
 | Divi KDF (Komodo DeFi) | Komodo Wallet already has a GUI, so one page of DIVI setup steps would get people trading with little build work. | The iguana weak-seed hard gate is still open; a public page would invite mainnet funds before that is fixed. |
 | Divi BasicSwap | BasicSwap already has its own web UI, so a short "trade DIVI on BasicSwap" guide is cheap. | The public BasicSwap cannot list DIVI until the upstream pull request is merged, so the page would describe something nobody can do yet. |
 | DEX Test | One page could compare all the DIVI swap routes side by side. | It duplicates the other pages and is one more thing to keep accurate while no route is on mainnet. |
+
+## 10. A swap library other developers can use (Bert 2026-10-22 21:30: "we will publish a library others can use to integrte")
+
+Status 2026-10-22: **planned only.** Nothing built, nothing public.
+
+**Scope.** The taker side of a DIVI swap, as a library a wallet or app embeds: list offers and get a quote from a
+maker, run a swap end to end (lock, watch, claim) and get coins back on timeout (refund), with the state saved so a
+restart resumes. Pairs: DIVI with BTC, LTC, ZEC, USDC and XMR, the same as `divi-swap` today. Testnet by default;
+mainnet only with the same explicit opt-in the CLI has. The maker (`divi-swapd`) is not part of the library.
+
+**Built from what exists.** `crates/divi-swap` (engine, state machine, store with the schema marker),
+`crates/swap-adaptor` (XMR adaptor signatures) and `crates/swap-chain-{divi,btc,ltc,zec,evm,xmr}` (chain backends).
+The `divi-swap` CLI becomes the first user of the library, so the library is proven by the same tests.
+
+**API surface (first cut).**
+- `MakerClient`: `offers()`, `quote(offer, amount)`, `swap_status(id)`.
+- `Swap`: `start(quote, keys)`, `step()` (advance one state; safe to call again after a crash), `claim()`,
+  `refund()`, `status()`, events for each state change.
+- `Store` trait with the SQLite store as default and an in-memory one for tests; the app can bring its own
+  (IndexedDB in browsers, the platform store on phones).
+- `ChainBackend` trait per coin, with the existing Esplora/RPC/light-client backends as defaults.
+- Keys: the library never stores or exports a key. The wallet hands in a signer callback (sign this tx / this
+  message), so keys stay inside the wallet that already guards them.
+
+**Language and packaging.**
+1. Rust crate (core).
+2. WebAssembly + TypeScript package for the web wallet, the browser extension and the Telegram Mini App (all are
+   JavaScript). XMR needs a Monero wallet that may not fit in a browser; the first JS release may leave XMR out
+   and say so.
+3. Kotlin and Swift bindings (UniFFI or the C ABI the mobile wallet already uses for its crypto library).
+
+**License (decision for Bert, a yes/no card before the repo goes public).** IronDivi is AGPL-3.0 with a commercial
+license; AGPL in a library makes most wallets unable to use it. Recommended: the library alone under a permissive
+license (MIT or Apache-2.0); Bert owns the code so he can relicense it. Alternatives: keep AGPL + commercial, or
+LGPL.
+
+**Steps to a public repo.**
+- [ ] 10.1 Split the library into its own crate set with the API above; `divi-swap` CLI uses it (private repo).
+- [ ] 10.2 WASM/TypeScript package and the mobile bindings build and pass the same swap tests on testnet (private).
+- [ ] 10.3 New **private** repo with a fresh history (no IronDivi history, no deploy files, no hostnames or
+  keys); secret scan; license files; README with a testnet example.
+- [ ] 10.4 Security review of the library (key handling, refund timing, untrusted maker data).
+- [ ] 10.5 **CARD (Bert yes/no): license choice.**
+- [ ] 10.6 **CARD (Bert yes/no): make the library repo public.** A new repo only; IronDivi stays private.
+- [ ] 10.7 **CARD (Bert yes/no): publish the packages** (crates.io, npm, Maven/Swift package), testnet default.
+
+## 11. Swap built into every IronDivi wallet (Bert 2026-10-22 21:30: "publish this integrated into all the wallets, IronDivi Web, Browser, Telegram")
+
+Status 2026-10-22: **planned only.** Nothing built, nothing released. Each wallet uses the §10 library; no wallet
+gets its own copy of the swap logic.
+
+**The wallets (found 2026-10-22 by reading the repos).**
+
+| # | Wallet | Where the code is | Notes |
+|---|---|---|---|
+| 1 | IronDivi Web wallet | `DiviDomains/divi-infrastructure` `divi-wallet/` (live at `https://services.divi.domains/wallet/`) | Plain JS PWA; shares `packages/divi-vault` and `packages/shared-ui` with the Telegram Mini App. |
+| 2 | Browser extension | `bshuler/irondivi-browser-extension` | Chrome, Firefox and Safari (Safari ships inside a small macOS app). TypeScript. |
+| 3 | Telegram Mini App | `divi-infrastructure` `services/telegram-wallet-app/` | Vite JS app opened from Telegram. |
+| 4 | Telegram bot | `divi-infrastructure` `services/telegram-bot/` | Chat commands; swap as commands (quote, status, claim, refund) per the bot command-parity design. |
+| 5 | Mobile wallet | `bshuler/divi-mobile-wallet` | Android (Kotlin/Compose) and iOS (SwiftUI), native C crypto, SPV. |
+| 6 | Command line | IronDivi `irondivi-cli` / `irondivid` wallet, and the `divi-swap` CLI | `divi-swap` is already the swap app; the node wallet gets swap RPCs that call the library. |
+
+Not in the list: the PrivateDivi extension (`divi-infrastructure/pdivi-extension`) is a different coin; the old
+Divi Core desktop app is not an IronDivi wallet. There is no IronDivi desktop wallet today; if one is built, swap
+ships in it too.
+
+**What each wallet gets.** A Swap screen (or bot commands): pick a coin, see the quote, confirm, watch progress,
+claim; refund offered automatically after the timeout; swaps resume after the app restarts. Testnet first with the
+same "practice network" banner as the website; mainnet only after the existing mainnet cards.
+
+**Steps per wallet (W = 1..6 above).**
+- [ ] 11.W.1 Integrate the §10 library behind a testnet-only switch (private branch).
+- [ ] 11.W.2 End-to-end test: a full swap and a refund against the testnet maker, in that wallet's own test rig
+  (Playwright for web, extension and Mini App; bot test harness; Android/iOS UI tests; CLI scripts).
+- [ ] 11.W.3 Security review of the wallet's swap screen (approval prompts, what a web page can trigger in the
+  extension, untrusted maker data).
+- [ ] 11.W.4 **CARD (Bert yes/no): release this wallet with swap** (web deploy, each browser store, Telegram app
+  deploy, each phone store, CLI release). One card per wallet and store.
+
+**Order.** Web wallet and Telegram Mini App together (shared packages), then the browser extension, then the
+Telegram bot, then mobile, then the CLI RPCs. Any release before §10.6 means the wallet ships the library inside
+its own build; the library repo still stays private until its own card.
