@@ -109,6 +109,23 @@ impl Ord for PriorityEntry {
 /// Listener notified when a transaction enters or leaves the mempool
 pub type MempoolListener = Arc<dyn Fn(&Transaction) + Send + Sync>;
 
+/// Returns the current chain tip height
+pub type TipHeightProvider = Arc<dyn Fn() -> u32 + Send + Sync>;
+
+/// Divi Core `IsFinalTx` as used by the mempool (MempoolConsensus.cpp): a height
+/// lock is compared with the next block's height and a time lock with the
+/// current time.
+pub fn is_final_for_next_block(tx: &Transaction, tip_height: u32, now: u32) -> bool {
+    tx.is_final(tip_height.saturating_add(1), now)
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -134,6 +151,9 @@ pub struct Mempool {
 
     /// Called after a transaction is removed for any reason (outside any mempool lock)
     on_removed: RwLock<Option<MempoolListener>>,
+
+    /// Chain tip height, for the finality of height-locked transactions
+    tip_height: RwLock<Option<TipHeightProvider>>,
 }
 
 impl Mempool {
@@ -148,6 +168,21 @@ impl Mempool {
             priority_deltas: RwLock::new(HashMap::new()),
             on_added: RwLock::new(None),
             on_removed: RwLock::new(None),
+            tip_height: RwLock::new(None),
+        }
+    }
+
+    /// Register the chain tip height source used for finality checks
+    pub fn set_tip_height_provider(&self, provider: TipHeightProvider) {
+        *self.tip_height.write() = Some(provider);
+    }
+
+    /// Height of the chain tip. Without a provider every height lock counts as
+    /// not yet reached.
+    fn tip_height(&self) -> u32 {
+        match self.tip_height.read().as_ref() {
+            Some(provider) => provider(),
+            None => 0,
         }
     }
 
@@ -195,6 +230,11 @@ impl Mempool {
         // Check if already exists
         if self.contains(&txid) {
             return Ok(txid);
+        }
+
+        // A transaction that cannot be in the next block is not accepted or relayed
+        if !is_final_for_next_block(&tx, self.tip_height(), unix_now()) {
+            return Err(NodeError::NonFinal);
         }
 
         // Check size limits
@@ -285,11 +325,45 @@ impl Mempool {
         Some(entry)
     }
 
-    /// Remove transactions that are now confirmed in a block
+    /// Remove transactions that are now confirmed in a block, then any that
+    /// can no longer be mined in the next block (after a reorg to a lower tip)
     pub fn remove_for_block(&self, txids: &[Hash256]) {
         for txid in txids {
             self.remove(txid);
         }
+        self.remove_non_final();
+    }
+
+    /// Remove transactions that are not final for the next block, together
+    /// with the mempool transactions that spend their outputs
+    pub fn remove_non_final(&self) -> usize {
+        let tip_height = self.tip_height();
+        let now = unix_now();
+        let mut to_remove: Vec<Hash256> = self
+            .txs
+            .read()
+            .values()
+            .filter(|entry| !is_final_for_next_block(&entry.tx, tip_height, now))
+            .map(|entry| entry.txid)
+            .collect();
+
+        let mut removed = 0;
+        while let Some(txid) = to_remove.pop() {
+            if let Some(entry) = self.remove(&txid) {
+                removed += 1;
+                let spenders = self.spenders.read();
+                for vout in 0..entry.tx.vout.len() as u32 {
+                    if let Some(child) = spenders.get(&(txid, vout)) {
+                        to_remove.push(*child);
+                    }
+                }
+            }
+        }
+
+        if removed > 0 {
+            tracing::info!("Removed {} non-final transaction(s) from mempool", removed);
+        }
+        removed
     }
 
     /// Get transactions for a new block, sorted by fee rate
@@ -558,6 +632,86 @@ mod tests {
             )],
             lock_time: 0,
         }
+    }
+
+    fn locked_tx(prevout_txid: [u8; 32], lock_time: u32, sequence: u32) -> Transaction {
+        let mut tx = create_test_tx(prevout_txid, 1);
+        tx.lock_time = lock_time;
+        tx.vin[0].sequence = sequence;
+        tx
+    }
+
+    fn mempool_at_height(height: Arc<std::sync::atomic::AtomicU32>) -> Mempool {
+        let mempool = Mempool::new(test_config());
+        mempool.set_tip_height_provider(Arc::new(move || {
+            height.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        mempool
+    }
+
+    #[test]
+    fn test_non_final_time_locked_tx_rejected() {
+        // IR-41: a tx time-locked far in the future with a non-final input
+        // must not enter the mempool (Divi Core: -26 "64: non-final").
+        let mempool = Mempool::new(test_config());
+        let tx = locked_tx([7u8; 32], 4_000_000_000, 0);
+        let result = mempool.add(tx, Amount::from_sat(10000));
+        let err = result.expect_err("non-final tx was accepted").to_string();
+        assert_eq!(err, "64: non-final");
+        assert_eq!(mempool.size(), 0);
+    }
+
+    #[test]
+    fn test_locked_tx_with_final_sequences_accepted() {
+        // All inputs final means the lock time is ignored
+        let mempool = Mempool::new(test_config());
+        let tx = locked_tx([8u8; 32], 4_000_000_000, SEQUENCE_FINAL);
+        assert!(mempool.add(tx, Amount::from_sat(10000)).is_ok());
+    }
+
+    #[test]
+    fn test_past_time_lock_accepted() {
+        let mempool = Mempool::new(test_config());
+        let tx = locked_tx([9u8; 32], 600_000_000, 0);
+        assert!(mempool.add(tx, Amount::from_sat(10000)).is_ok());
+    }
+
+    #[test]
+    fn test_height_locked_tx_waits_for_next_block() {
+        let height = Arc::new(std::sync::atomic::AtomicU32::new(199));
+        let mempool = mempool_at_height(Arc::clone(&height));
+        let tx = locked_tx([10u8; 32], 200, 0);
+
+        // Next block is 200: lock 200 is not below it yet
+        assert!(matches!(
+            mempool.add(tx.clone(), Amount::from_sat(10000)),
+            Err(NodeError::NonFinal)
+        ));
+
+        height.store(200, std::sync::atomic::Ordering::SeqCst);
+        assert!(mempool.add(tx, Amount::from_sat(10000)).is_ok());
+    }
+
+    #[test]
+    fn test_reorg_evicts_non_final_tx_and_its_spender() {
+        let height = Arc::new(std::sync::atomic::AtomicU32::new(300));
+        let mempool = mempool_at_height(Arc::clone(&height));
+        let parent = locked_tx([11u8; 32], 250, 0);
+        let parent_txid = mempool.add(parent, Amount::from_sat(10000)).unwrap();
+        let child = create_test_tx(*parent_txid.as_bytes(), 1);
+        mempool.add(child, Amount::from_sat(10000)).unwrap();
+        let unrelated = mempool
+            .add(create_test_tx([12u8; 32], 1), Amount::from_sat(10000))
+            .unwrap();
+        assert_eq!(mempool.size(), 3);
+
+        // Reorg to a chain whose tip is below the lock height
+        height.store(240, std::sync::atomic::Ordering::SeqCst);
+        mempool.remove_for_block(&[]);
+
+        assert_eq!(mempool.size(), 1);
+        assert!(mempool.contains(&unrelated));
+        assert!(!mempool.contains(&parent_txid));
     }
 
     #[test]

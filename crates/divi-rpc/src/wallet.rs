@@ -184,7 +184,7 @@ impl WalletRpc {
             RpcError::new(codes::MISC_ERROR, "Transaction submission not configured")
         })?;
 
-        callback(tx).map_err(|e| RpcError::new(codes::VERIFY_ERROR, e).into())
+        callback(tx).map_err(|e| RpcError::new(submit_error_code(&e), e).into())
     }
 
     /// getnewaddress - Generate a new receiving address
@@ -3909,6 +3909,18 @@ impl Default for WalletRpc {
     }
 }
 
+/// RPC code for a rejected submission: Divi Core reports mempool policy
+/// rejections as RPC_TRANSACTION_REJECTED (-26) with a "<code>: <reason>"
+/// message (e.g. "64: non-final"); anything else stays a verify error.
+fn submit_error_code(message: &str) -> i32 {
+    match message.split_once(": ") {
+        Some((code, _)) if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) => {
+            codes::VERIFY_REJECTED
+        }
+        _ => codes::VERIFY_ERROR,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3926,6 +3938,46 @@ mod tests {
             Error::Rpc(r) => r.code,
             other => panic!("expected an RPC error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn sendrawtransaction_non_final_is_rejected_with_26() {
+        // IR-41: Divi Core answers -26 "64: non-final"; other submit failures stay -25
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let rpc = create_test_wallet_rpc();
+        rpc.set_tx_submit(Arc::new(|_tx: Transaction| -> Result<Hash256, String> {
+            Err("64: non-final".to_string())
+        }));
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([7; 32]), 0),
+                Script::new(),
+                0,
+            )],
+            vout: vec![TxOut::new(
+                divi_primitives::amount::Amount::from_sat(1000),
+                Script::new(),
+            )],
+            lock_time: 4_000_000_000,
+        };
+        let hex = hex::encode(divi_primitives::serialize::serialize(&tx));
+        let err = rpc
+            .send_raw_transaction(&Params::Array(vec![serde_json::json!(hex)]))
+            .unwrap_err();
+        match err {
+            Error::Rpc(r) => {
+                assert_eq!(r.code, codes::VERIFY_REJECTED);
+                assert_eq!(r.message, "64: non-final");
+            }
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+
+        assert_eq!(
+            submit_error_code("Mempool rejected: x"),
+            codes::VERIFY_ERROR
+        );
+        assert_eq!(submit_error_code("64: non-final"), codes::VERIFY_REJECTED);
     }
 
     #[test]

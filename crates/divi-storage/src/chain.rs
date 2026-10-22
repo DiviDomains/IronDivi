@@ -2791,6 +2791,10 @@ impl Chain {
             block.header.prev_block
         );
 
+        // Divi Core ContextualCheckBlock: every transaction must be final at
+        // this block's height and time ("bad-txns-nonfinal").
+        check_block_txs_final(block, height)?;
+
         // IMPORTANT: Validate treasury payments BEFORE modifying any state
         // This prevents UTXO corruption if validation fails
         debug!(
@@ -3878,6 +3882,20 @@ impl divi_masternode::UtxoProvider for ChainDatabase {
     }
 }
 
+/// Divi Core `ContextualCheckBlock` finality rule: a block may only contain
+/// transactions that are final at its own height and timestamp.
+fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError> {
+    for tx in &block.transactions {
+        if !tx.is_final(height, block.header.time) {
+            return Err(StorageError::InvalidBlock(format!(
+                "bad-txns-nonfinal: block at height {} contains a non-final transaction",
+                height
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4046,6 +4064,38 @@ mod tests {
         let _hash2 = chain.accept_block(block2).unwrap().hash;
 
         assert_eq!(chain.height(), 2);
+    }
+
+    #[test]
+    fn test_block_with_non_final_tx_rejected() {
+        // IR-41 (consensus side): Divi Core rejects a block holding a tx that is
+        // not final at the block's height ("bad-txns-nonfinal").
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+
+        let mut block1 = create_child_block(genesis_hash, genesis_time);
+        block1.transactions[0].lock_time = 1; // height 1 is not below 1
+        block1.transactions[0].vin[0].sequence = 0;
+        block1.header.merkle_root = compute_merkle_root(&block1.transactions);
+
+        let result = chain.accept_block(block1);
+        assert!(result.is_err(), "block with a non-final tx was accepted");
+        assert_eq!(chain.height(), 0);
+    }
+
+    #[test]
+    fn test_block_with_reached_lock_time_accepted() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+
+        let mut block1 = create_child_block(genesis_hash, genesis_time);
+        // A time lock below the block's own timestamp is final
+        block1.transactions[0].lock_time = genesis_time;
+        block1.transactions[0].vin[0].sequence = 0;
+        block1.header.merkle_root = compute_merkle_root(&block1.transactions);
+
+        chain.accept_block(block1).unwrap();
+        assert_eq!(chain.height(), 1);
     }
 
     #[test]

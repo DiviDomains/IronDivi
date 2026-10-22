@@ -67,4 +67,8 @@ pub enum NodeError {
     /// Transaction validation error
     #[error("transaction validation failed: {0}")]
     TransactionValidation(String),
+
+    /// Transaction cannot be mined in the next block (Divi Core reject code 64)
+    #[error("64: non-final")]
+    NonFinal,
 }

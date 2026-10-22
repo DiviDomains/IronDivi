@@ -1115,6 +1115,8 @@ async fn run_daemon(
                                 }
                             }
                         }
+                        // The tip may now be lower: drop what can no longer be mined
+                        mempool_for_orphans.remove_non_final();
                     },
                 ));
             }
@@ -1397,7 +1399,11 @@ async fn run_daemon(
                         let fee = Amount::from_sat(
                             (tx.size() as i64) * 10_000
                         );
-                        mempool_for_submit.add(tx, fee).map_err(|e| format!("Mempool rejected: {}", e))?;
+                        mempool_for_submit.add(tx, fee).map_err(|e| match e {
+                            // Divi Core's "<code>: <reason>" form, mapped to RPC -26
+                            divi_node::NodeError::NonFinal => e.to_string(),
+                            e => format!("Mempool rejected: {}", e),
+                        })?;
 
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();

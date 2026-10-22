@@ -1180,7 +1180,13 @@ impl Staker {
         // block fail self-accept and waste the stake, so keep only spendable ones.
         let mempool_txs =
             retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
-        transactions.extend(mempool_txs);
+        // Every tx must be final at this block's height and time, or the block
+        // is invalid (Divi Core ContextualCheckBlock "bad-txns-nonfinal").
+        transactions.extend(
+            mempool_txs
+                .into_iter()
+                .filter(|tx| tx.is_final(height, timestamp)),
+        );
 
         // Compute merkle root
         let merkle_root = compute_merkle_root(&transactions);
