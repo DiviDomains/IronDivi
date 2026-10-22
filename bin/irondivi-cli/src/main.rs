@@ -109,7 +109,8 @@ CONFIGURATION:
   /privatedivi and /testnet or /regtest as for irondivid)/irondivi.conf.
   Falls back to the Divi Core file: ~/.divi/divi.conf, or
   ~/.privatedivi/privatedivi.conf with --mode privatedivi
-  Cookie auth from the Core directory (or --datadir) is used if no rpcuser/rpcpassword
+  Without rpcuser/rpcpassword the .cookie file is used: <datadir>/.cookie (irondivid),
+  else irondivid's default data dir, else the Divi Core directory
 
 EXIT CODES:
   0   Success
@@ -452,23 +453,36 @@ fn read_config(path: &Path, network: &str) -> Config {
     config
 }
 
-/// Read cookie file for authentication
-fn read_cookie(base: &Path, network: &str) -> Option<(String, String)> {
-    use std::fs;
-
-    let path = match network {
+/// Cookie files to try, first match wins: irondivid writes `.cookie` in its
+/// own data directory (`--datadir`, or its default per network); Divi
+/// Core-style nodes keep it in a network subdirectory of the Core directory.
+fn cookie_paths(
+    home: &Path,
+    datadir: Option<&Path>,
+    privatedivi: bool,
+    network: &str,
+) -> Vec<PathBuf> {
+    let core_subdir = |base: &Path| match network {
         "testnet" => base.join("testnet3").join(".cookie"),
         "regtest" => base.join("regtest").join(".cookie"),
         _ => base.join(".cookie"),
     };
-
-    if !path.exists() {
-        return None;
+    match datadir {
+        Some(dir) => vec![dir.join(".cookie"), core_subdir(dir)],
+        None => vec![
+            irondivi_data_dir(home, privatedivi, network).join(".cookie"),
+            core_subdir(&chain_home(home, privatedivi)),
+        ],
     }
+}
 
-    let contents = fs::read_to_string(&path).ok()?;
-    let (user, pass) = contents.trim().split_once(':')?;
-    Some((user.to_string(), pass.to_string()))
+/// Read cookie file for authentication
+fn read_cookie(paths: &[PathBuf]) -> Option<(String, String)> {
+    paths.iter().find_map(|path| {
+        let contents = std::fs::read_to_string(path).ok()?;
+        let (user, pass) = contents.trim().split_once(':')?;
+        Some((user.to_string(), pass.to_string()))
+    })
 }
 
 /// Handle stdin input (CRITICAL: Read password FIRST when both flags used)
@@ -702,11 +716,8 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
         _ => match (config.rpcuser, config.rpcpassword) {
             (Some(u), Some(p)) => (Some(u), Some(p)),
             _ => {
-                let base = args
-                    .datadir
-                    .clone()
-                    .unwrap_or_else(|| chain_home(home, privatedivi));
-                match read_cookie(&base, network) {
+                let paths = cookie_paths(home, args.datadir.as_deref(), privatedivi, network);
+                match read_cookie(&paths) {
                     Some((u, p)) => (Some(u), Some(p)),
                     None => (args.rpcuser.clone(), args.rpcpassword.clone()),
                 }
@@ -961,6 +972,55 @@ mod endpoint_tests {
         );
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(base, Path::new("/h/.irondivi"));
+    }
+
+    #[test]
+    fn cookie_in_irondivid_datadir_is_used() {
+        // IR-44: irondivid writes <datadir>/.cookie; the CLI must find it with
+        // the same --datadir and no credentials.
+        let home = tempfile::tempdir().unwrap();
+        let datadir = home.path().join("node");
+        fs::create_dir_all(&datadir).unwrap();
+        fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--regtest",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("feedbeef"));
+    }
+
+    #[test]
+    fn cookie_in_default_irondivi_dir_is_used() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = irondivi_data_dir(home.path(), false, "regtest");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".cookie"), "__cookie__:c0ffee").unwrap();
+        let args = Args::parse_from(["irondivi-cli", "--regtest", "getblockcount"]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("c0ffee"));
+    }
+
+    #[test]
+    fn core_layout_cookie_still_found() {
+        let home = tempfile::tempdir().unwrap();
+        let datadir = home.path().join("core");
+        fs::create_dir_all(datadir.join("testnet3")).unwrap();
+        fs::write(datadir.join("testnet3/.cookie"), "__cookie__:abc").unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--testnet",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_password.as_deref(), Some("abc"));
     }
 
     #[test]

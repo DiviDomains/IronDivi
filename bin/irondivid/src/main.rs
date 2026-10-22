@@ -1337,11 +1337,28 @@ async fn run_daemon(
         None
     };
 
-    // Start RPC server
+    // Start RPC server. RPC always requires authentication: without a complete
+    // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie
+    // (mode 0600) for local clients; `_rpc_cookie` removes it when we return.
+    let (rpc_user, rpc_password, _rpc_cookie) = divi_rpc::resolve_rpc_auth(
+        config.rpc.username.as_deref(),
+        config.rpc.password.as_deref(),
+        &config.data_dir,
+    )
+    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))?;
+    match &_rpc_cookie {
+        Some(cookie) => {
+            if config.rpc.username.is_some() || config.rpc.password.is_some() {
+                warn!("Only one of rpcuser/rpcpassword is set; using cookie authentication");
+            }
+            info!("RPC cookie authentication: {:?}", cookie.path());
+        }
+        None => info!("RPC authentication: rpcuser/rpcpassword"),
+    }
     let rpc_config = RpcConfig {
         bind_address: config.rpc.socket_addr(),
-        username: config.rpc.username.clone(),
-        password: config.rpc.password.clone(),
+        username: Some(rpc_user),
+        password: Some(rpc_password),
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);

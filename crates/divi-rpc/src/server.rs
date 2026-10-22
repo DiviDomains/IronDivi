@@ -38,7 +38,7 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// RPC server configuration
 #[derive(Debug, Clone)]
@@ -961,13 +961,10 @@ async fn handle_wallet_rpc(
     )
 }
 
-/// Create the axum router for RPC, without authentication.
-pub fn create_router(server: Arc<RpcServer>) -> Router {
-    build_router(server, None)
-}
-
-/// Create the axum router for RPC, enforcing HTTP Basic authentication when
-/// `config` carries both a username and a password.
+/// Create the axum router for RPC, enforcing HTTP Basic authentication.
+/// Without both a username and a password every request is refused: the RPC
+/// is never served open (irondivid fills in cookie credentials when none are
+/// configured, see [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
     build_router(server, rpc_credentials(config))
 }
@@ -983,48 +980,46 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
         .route("/wallet/:wallet_name", post(handle_wallet_rpc))
         .with_state(server);
 
-    let router = match credentials {
-        Some(creds) => router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
-            let creds = creds.clone();
-            async move {
-                let authorization = req
-                    .headers()
-                    .get(header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok());
-                if basic_auth_matches(authorization, &creds.0, &creds.1) {
-                    next.run(req).await
-                } else {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        [(
-                            header::WWW_AUTHENTICATE,
-                            HeaderValue::from_static("Basic realm=\"jsonrpc\""),
-                        )],
-                    )
-                        .into_response()
-                }
+    // No credentials means no request can authenticate, never an open server.
+    let router = router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
+        let creds = credentials.clone();
+        async move {
+            let authorization = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            let authorized = creds
+                .as_ref()
+                .is_some_and(|c| basic_auth_matches(authorization, &c.0, &c.1));
+            if authorized {
+                next.run(req).await
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        header::WWW_AUTHENTICATE,
+                        HeaderValue::from_static("Basic realm=\"jsonrpc\""),
+                    )],
+                )
+                    .into_response()
             }
-        })),
-        None => router,
-    };
+        }
+    }));
 
     // CORS stays outermost so preflight requests are answered without credentials.
     router.layer(cors)
 }
 
-/// The credentials to enforce: both must be set, or the server runs open.
+/// The credentials to enforce: both must be set. `None` means no request can
+/// authenticate.
 fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
     match (&config.username, &config.password) {
         (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
             info!("RPC authentication enabled");
             Some(Arc::new((u.clone(), p.clone())))
         }
-        (None, None) => {
-            warn!("RPC authentication disabled: rpcuser/rpcpassword not set");
-            None
-        }
         _ => {
-            warn!("RPC authentication disabled: set both rpcuser and rpcpassword");
+            error!("RPC has no complete rpcuser/rpcpassword: every request will be refused");
             None
         }
     }
@@ -1552,12 +1547,96 @@ mod tests {
     }
 
     #[test]
-    fn auth_is_enforced_only_with_both_credentials() {
+    fn credentials_need_both_user_and_password() {
         let mut config = RpcConfig::default();
         assert!(rpc_credentials(&config).is_none());
         config.username = Some("alice".into());
         assert!(rpc_credentials(&config).is_none());
         config.password = Some("s3cret".into());
         assert!(rpc_credentials(&config).is_some());
+    }
+
+    /// Serve `router` on a loopback port and POST one getblockcount to it.
+    async fn status_of(router: Router, authorization: Option<String>) -> StatusCode {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+        let auth_line = authorization
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n{auth_line}Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let code: u16 = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("bad HTTP response: {response:?}"));
+        StatusCode::from_u16(code).unwrap()
+    }
+
+    fn basic(user: &str, password: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        )
+    }
+
+    #[tokio::test]
+    async fn rpc_without_credentials_is_never_open() {
+        // IR-44: no rpcuser/rpcpassword must not mean an unauthenticated RPC
+        for (user, pass) in [(None, None), (Some("alice"), None), (Some(""), Some(""))] {
+            let (server, _dir) = create_test_server();
+            let config = RpcConfig {
+                username: user.map(String::from),
+                password: pass.map(String::from),
+                ..RpcConfig::default()
+            };
+            let router = create_router_with_auth(server, &config);
+            assert_eq!(
+                status_of(router.clone(), None).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                status_of(router, Some(basic("", ""))).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cookie_credentials_authenticate() {
+        let (server, dir) = create_test_server();
+        let (user, password, cookie) =
+            crate::auth_cookie::resolve_rpc_auth(None, None, dir.path()).unwrap();
+        assert!(cookie.is_some());
+        let config = RpcConfig {
+            username: Some(user.clone()),
+            password: Some(password.clone()),
+            ..RpcConfig::default()
+        };
+        let router = create_router_with_auth(server, &config);
+        assert_eq!(
+            status_of(router.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(router.clone(), Some(basic(&user, "wrong"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // What a client reads from the cookie file works
+        let contents = std::fs::read_to_string(cookie.as_ref().unwrap().path()).unwrap();
+        let (u, p) = contents.split_once(':').unwrap();
+        assert_eq!(status_of(router, Some(basic(u, p))).await, StatusCode::OK);
     }
 }
