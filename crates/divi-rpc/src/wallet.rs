@@ -76,6 +76,21 @@ fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
     Ok(())
 }
 
+/// RPC error for a failed getnewaddress-style key request, as Divi Core
+fn new_key_error(e: divi_wallet::WalletError) -> Error {
+    match e {
+        divi_wallet::WalletError::KeypoolRanOut => RpcError::new(
+            codes::WALLET_KEYPOOL_RAN_OUT,
+            "Error: Keypool ran out, please call keypoolrefill first",
+        ),
+        divi_wallet::WalletError::WalletLocked => {
+            RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
+        }
+        _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
+    }
+    .into()
+}
+
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
     let invalid = || RpcError::new(codes::TYPE_ERROR, "Invalid amount");
     let divi = value.as_f64().ok_or_else(invalid)?;
@@ -266,17 +281,16 @@ impl WalletRpc {
     }
 
     /// getnewaddress - Generate a new receiving address
+    ///
+    /// Works while the wallet is locked, from the keypool, as in Divi Core.
     pub fn get_new_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        // Optional label parameter (ignored for now)
-        let _label = params.get_str(0).unwrap_or("");
+        let label = params.get_str(0).unwrap_or("");
 
-        let address = wallet.new_receiving_address().map_err(|e| match e {
-            divi_wallet::WalletError::WalletLocked => {
-                RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
-            }
-            _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
+        let address = wallet.new_receiving_address().map_err(new_key_error)?;
+        wallet.set_label(&address, label).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
         debug!("Generated new address: {}", address);
@@ -287,12 +301,7 @@ impl WalletRpc {
     pub fn get_raw_change_address(&self, _params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        let address = wallet.new_change_address().map_err(|e| match e {
-            divi_wallet::WalletError::WalletLocked => {
-                RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
-            }
-            _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
-        })?;
+        let address = wallet.new_change_address().map_err(new_key_error)?;
 
         debug!("Generated new change address: {}", address);
         Ok(serde_json::json!(address.to_string()))
@@ -464,10 +473,7 @@ impl WalletRpc {
             "immature_balance": divi_immature,
             "txcount": wallet.get_transactions(None).len(),
             "keypoololdest": wallet.keypool_oldest(),
-            // Report keypool_target (100) as a minimum when the keypool hasn't been
-            // explicitly pre-generated; HD wallets derive keys on demand so the
-            // effective available key count is always at least the target size.
-            "keypoolsize": std::cmp::max(wallet.keypool_size(), 100u32),
+            "keypoolsize": wallet.keypool_size(),
             "unlocked_until": wallet.unlocked_until(),
             "paytxfee": 0.0001,
             "hdmasterkeyid": wallet.hd_master_key_id()
@@ -1637,19 +1643,23 @@ impl WalletRpc {
     }
 
     /// getaddressesbylabel - Get addresses with a label
-    pub fn get_addresses_by_label(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    pub fn get_addresses_by_label(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let label = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::invalid_params("Label required"))?;
         let wallet = self.get_wallet()?;
 
-        // For now, return all addresses (labels not implemented)
-        let addresses = wallet.get_addresses();
+        let addresses = wallet.get_addresses_by_account(label);
+        if addresses.is_empty() {
+            return Err(RpcError::new(
+                codes::WALLET_INVALID_ACCOUNT_NAME,
+                format!("No addresses with label {}", label),
+            )
+            .into());
+        }
         let result: serde_json::Map<String, serde_json::Value> = addresses
-            .iter()
-            .map(|addr| {
-                (
-                    addr.to_string(),
-                    serde_json::json!({ "purpose": "receive" }),
-                )
-            })
+            .into_iter()
+            .map(|addr| (addr, serde_json::json!({ "purpose": "receive" })))
             .collect();
 
         Ok(serde_json::json!(result))
@@ -1684,11 +1694,15 @@ impl WalletRpc {
             .iter()
             .map(|(addr, (amount, confs))| {
                 let divi = *amount as f64 / 100_000_000.0;
+                let label = Address::from_base58(addr)
+                    .map(|a| wallet.get_account(&a))
+                    .unwrap_or_default();
                 serde_json::json!({
                     "address": addr,
+                    "account": label,
                     "amount": divi,
                     "confirmations": confs,
-                    "label": "",
+                    "label": label,
                 })
             })
             .collect();
@@ -4018,17 +4032,10 @@ impl WalletRpc {
             return Ok(serde_json::json!(existing_addr));
         }
 
-        let new_addr = wallet.new_receiving_address().map_err(|e| match e {
-            divi_wallet::WalletError::WalletLocked => {
-                RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked")
-            }
-            _ => RpcError::new(codes::WALLET_ERROR, e.to_string()),
-        })?;
+        let new_addr = wallet.new_receiving_address().map_err(new_key_error)?;
 
-        wallet.set_account(&new_addr, account);
-
-        wallet.save().map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
+        wallet.set_label(&new_addr, account).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
         Ok(serde_json::json!(new_addr.to_string()))
@@ -4307,11 +4314,8 @@ mod tests {
             rpc_code(rpc.encrypt_wallet(&p(&["again"])).unwrap_err()),
             codes::WALLET_WRONG_ENC_STATE
         );
-        // Locked wallet cannot hand out new addresses
-        assert_eq!(
-            rpc_code(rpc.get_new_address(&Params::None).unwrap_err()),
-            codes::WALLET_UNLOCK_NEEDED
-        );
+        // A locked wallet hands out new addresses from its keypool, as Divi Core
+        assert!(rpc.get_new_address(&Params::None).is_ok());
 
         // Wrong passphrase, then right one
         let unlock = |pass: &str| {
@@ -4640,10 +4644,14 @@ mod tests {
                 serde_json::json!(true),
             ]))
             .unwrap();
+        // getnewaddress put the account-address under "" as well, as Divi Core
         let list = received_list.as_array().unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0]["account"], "testaccount");
-        assert_eq!(list[0]["amount"], 0.0);
+        let entry: Vec<_> = list
+            .iter()
+            .filter(|e| e["account"] == "testaccount")
+            .collect();
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry[0]["amount"], 0.0);
     }
 
     #[test]
@@ -4862,10 +4870,19 @@ mod tests {
         }
 
         let wallet = Arc::new(WalletDb::open(&path, Network::Regtest).unwrap());
+        // The keypool holds change keys too; take the one handed out
+        let (_, issued) = wallet.keystore().get_indices();
+        assert_eq!(issued, 1);
         let change: Vec<Address> = wallet
             .get_addresses()
             .into_iter()
             .filter(|a| wallet.is_change_address(a))
+            .filter(|a| {
+                wallet
+                    .get_key_by_address(a)
+                    .and_then(|e| e.hd_path)
+                    .is_some_and(|path| path.ends_with("/1/0"))
+            })
             .collect();
         assert_eq!(change.len(), 1, "change key not stored");
         let rpc = WalletRpc::with_wallet(wallet);
@@ -4983,9 +5000,7 @@ mod send_unlock_regression {
     #[test]
     fn ir16_staking_only_unlock_refuses_sends_and_exports() {
         let (_dir, rpc, db, sent) = encrypted_rpc();
-        let own = rpc.get_new_address(&Params::None);
-        assert!(own.is_err(), "wallet should start locked");
-        assert_eq!(status(&rpc), "locked");
+        assert_eq!(status(&rpc), "locked", "wallet should start locked");
 
         unlock(&rpc, 0, true).unwrap();
         assert_eq!(status(&rpc), "unlocked-for-staking");

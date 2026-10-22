@@ -235,9 +235,7 @@ impl KeyStore {
         let index = *self.receiving_index.read();
         let key = wallet.derive_receiving(0, index)?;
         let secret = key.secret_key()?;
-        let path = format!("m/44'/301'/0'/0/{}", index);
-
-        let entry = KeyEntry::with_hd_path(secret, path);
+        let entry = KeyEntry::with_hd_path(secret, hd_key_path(false, index));
         let address = entry.address(self.network);
         self.add_key(entry);
 
@@ -255,9 +253,7 @@ impl KeyStore {
         let index = *self.change_index.read();
         let key = wallet.derive_change(0, index)?;
         let secret = key.secret_key()?;
-        let path = format!("m/44'/301'/0'/1/{}", index);
-
-        let entry = KeyEntry::with_hd_path(secret, path);
+        let entry = KeyEntry::with_hd_path(secret, hd_key_path(true, index));
         let address = entry.address(self.network);
         self.add_key(entry);
 
@@ -431,22 +427,18 @@ impl KeyStore {
 
     /// Get the current keypool size (number of pre-generated unused keys)
     ///
-    /// For an HD wallet, this is the number of keys generated that haven't
-    /// been returned via new_receiving_address() or new_change_address()
+    /// For an HD wallet, this is the number of derived keys at or past the next
+    /// receiving or change index, i.e. not yet handed out
     pub fn keypool_size(&self) -> u32 {
-        // Count only HD-derived keys (those with hd_path)
-        // Imported keys don't count toward keypool
-        let keys = self.keys.read();
-        let hd_key_count = keys
+        // Imported keys have no HD path and don't count toward the keypool
+        let (receiving, change) = self.get_indices();
+        self.keys
+            .read()
             .values()
-            .filter(|entry| entry.hd_path.is_some())
-            .count() as u32;
-
-        // Keys that have been "issued" (returned to caller)
-        let issued = *self.receiving_index.read() + *self.change_index.read();
-
-        // Keypool is HD keys pre-generated but not yet issued
-        hd_key_count.saturating_sub(issued)
+            .filter(|entry| !entry.is_watch_only)
+            .filter_map(|entry| hd_chain_index(entry.hd_path.as_deref()?))
+            .filter(|&(is_change, i)| i >= if is_change { change } else { receiving })
+            .count() as u32
     }
 
     /// Get the timestamp of the oldest key in the keypool
@@ -473,47 +465,54 @@ impl KeyStore {
     ///
     /// Returns the number of keys generated
     pub fn refill_keypool(&self, new_size: Option<u32>) -> Result<u32, WalletError> {
+        Ok(self.top_up_keypool(new_size)?.len() as u32)
+    }
+
+    /// Derive the keypool keys still missing: target/2 receiving and target/2
+    /// change keys past the next index of each chain. Keys already derived are
+    /// left alone. Returns the hashes of the keys added.
+    pub fn top_up_keypool(&self, new_size: Option<u32>) -> Result<Vec<Hash160>, WalletError> {
         let wallet = self.hd_wallet.read();
         let wallet = wallet
             .as_ref()
             .ok_or(WalletError::KeyNotFound("No HD wallet configured".into()))?;
 
-        let target = new_size.unwrap_or(*self.keypool_target.read());
         if let Some(new) = new_size {
             *self.keypool_target.write() = new;
         }
+        let target = *self.keypool_target.read();
 
-        let mut generated = 0u32;
-        let current_receiving = *self.receiving_index.read();
-        let current_change = *self.change_index.read();
+        let held: std::collections::HashSet<(bool, u32)> = self
+            .keys
+            .read()
+            .values()
+            .filter(|entry| !entry.is_watch_only && entry.secret.is_some())
+            .filter_map(|entry| hd_chain_index(entry.hd_path.as_deref()?))
+            .collect();
+        let (receiving, change) = self.get_indices();
 
-        // Pre-generate receiving addresses
-        // We generate up to target/2 receiving and target/2 change addresses
-        let receive_target = current_receiving + target / 2;
-        let change_target = current_change + target / 2;
-
-        // Generate receiving keys
-        for i in current_receiving..receive_target {
-            let key = wallet.derive_receiving(0, i)?;
-            let secret = key.secret_key()?;
-            let path = format!("m/44'/301'/0'/0/{}", i);
-            let entry = KeyEntry::with_hd_path(secret, path);
-            self.add_key(entry);
-            generated += 1;
-        }
-
-        // Generate change keys
-        for i in current_change..change_target {
-            let key = wallet.derive_change(0, i)?;
-            let secret = key.secret_key()?;
-            let path = format!("m/44'/301'/0'/1/{}", i);
-            let entry = KeyEntry::with_hd_path(secret, path);
-            self.add_key(entry);
-            generated += 1;
+        let mut added = Vec::new();
+        for (is_change, start, count) in [
+            (false, receiving, target.div_ceil(2)),
+            (true, change, target / 2),
+        ] {
+            for i in start..start.saturating_add(count) {
+                if held.contains(&(is_change, i)) {
+                    continue;
+                }
+                let key = if is_change {
+                    wallet.derive_change(0, i)?
+                } else {
+                    wallet.derive_receiving(0, i)?
+                };
+                let entry = KeyEntry::with_hd_path(key.secret_key()?, hd_key_path(is_change, i));
+                added.push(entry.pubkey_hash());
+                self.add_key(entry);
+            }
         }
 
         // Update oldest timestamp if this is the first fill
-        if *self.keypool_oldest.read() == 0 && generated > 0 {
+        if *self.keypool_oldest.read() == 0 && !added.is_empty() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -521,7 +520,47 @@ impl KeyStore {
             *self.keypool_oldest.write() = now;
         }
 
-        Ok(generated)
+        Ok(added)
+    }
+
+    /// Hand out the next pre-generated key of the receiving or change chain
+    /// without the HD seed, as Divi Core does from its keypool while the wallet
+    /// is locked. The key's secret was stored encrypted when it was derived.
+    pub fn take_from_keypool(&self, is_change: bool) -> Result<Address, WalletError> {
+        let counter = if is_change {
+            &self.change_index
+        } else {
+            &self.receiving_index
+        };
+        let mut index = counter.write();
+        let address = self
+            .keys
+            .read()
+            .values()
+            .filter(|entry| !entry.is_watch_only)
+            .find(|entry| {
+                entry.hd_path.as_deref().and_then(hd_chain_index) == Some((is_change, *index))
+            })
+            .map(|entry| entry.address(self.network))
+            .ok_or(WalletError::KeypoolRanOut)?;
+        *index += 1;
+        Ok(address)
+    }
+}
+
+/// Path of the HD key at `index` of the receiving or change chain
+fn hd_key_path(is_change: bool, index: u32) -> String {
+    format!("m/44'/301'/0'/{}/{}", u8::from(is_change), index)
+}
+
+/// Chain (true for change) and index of an HD key path `…/0/i` or `…/1/i`
+fn hd_chain_index(path: &str) -> Option<(bool, u32)> {
+    let mut parts = path.rsplit('/');
+    let index = parts.next()?.parse().ok()?;
+    match parts.next()? {
+        "0" => Some((false, index)),
+        "1" => Some((true, index)),
+        _ => None,
     }
 }
 

@@ -874,6 +874,14 @@ fn load_or_create_wallet_from(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
+        // As Divi Core at start: fill the keypool while the seed is in memory
+        // (an encrypted wallet starts locked and is topped up on unlock)
+        if !wallet.is_locked() {
+            if let Err(e) = wallet.top_up_keypool() {
+                warn!("Could not top up the keypool: {}", e);
+            }
+        }
+
         info!("Wallet loaded successfully");
         return Ok(Arc::new(wallet));
     }
@@ -930,6 +938,13 @@ fn load_or_create_wallet_from(
             .refill_keypool(Some(lookahead * 2))
             .with_context(|| "Failed to pre-generate recovery keys")?;
         info!("Pre-generated {} addresses", generated);
+    }
+
+    // A new wallet starts with a full keypool, as in Divi Core
+    if restoring.is_none() {
+        wallet
+            .top_up_keypool()
+            .with_context(|| "Failed to fill the keypool")?;
     }
 
     // Save immediately

@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bert Shuler
+// IronDivi - https://github.com/DiviDomains/IronDivi
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, version 3.
+//
+// Portions derived from Divi Core (https://github.com/DiviProject/Divi)
+// licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
+
+//! Key RPCs on a locked wallet and import rescans, against Divi Core 3.0.0
+//! behaviour (rpcwallet.cpp, rpcdump.cpp).
+
+use divi_primitives::ChainMode;
+use divi_rpc::{Error, Params, WalletRpc};
+use divi_wallet::{HdWallet, Network, WalletDb};
+use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::Arc;
+
+const PASS: &str = "correct horse battery staple";
+
+fn p(v: Vec<Value>) -> Params {
+    Params::Array(v)
+}
+
+fn rpc_code(e: Error) -> (i32, String) {
+    match e {
+        Error::Rpc(r) => (r.code, r.message),
+        other => panic!("expected an RPC error, got {:?}", other),
+    }
+}
+
+/// An encrypted, locked wallet on disk, as `encryptwallet` leaves it
+fn encrypted_rpc(path: &Path) -> (WalletRpc, Arc<WalletDb>) {
+    let db = Arc::new(
+        WalletDb::create_persistent(
+            path,
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    );
+    let rpc = WalletRpc::with_wallet(db.clone());
+    rpc.encrypt_wallet(&p(vec![json!(PASS)])).unwrap();
+    assert_eq!(
+        rpc.get_wallet_info(&Params::None).unwrap()["encryption_status"],
+        "locked"
+    );
+    (rpc, db)
+}
+
+#[test]
+fn ir21_getnewaddress_while_locked_keeps_label_and_key_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w");
+    let (addr, change) = {
+        let (rpc, _db) = encrypted_rpc(&path);
+        let addr = rpc
+            .get_new_address(&p(vec![json!("lab")]))
+            .expect("getnewaddress on a locked wallet");
+        assert_eq!(rpc.get_account(&p(vec![addr.clone()])).unwrap(), "lab");
+        assert_eq!(
+            rpc.get_addresses_by_account(&p(vec![json!("lab")]))
+                .unwrap(),
+            json!([addr.clone()])
+        );
+        let change = rpc
+            .get_raw_change_address(&Params::None)
+            .expect("getrawchangeaddress on a locked wallet");
+        (addr, change)
+    };
+
+    // Restart: no save, no block in between
+    let db = Arc::new(WalletDb::open(&path, Network::Regtest).unwrap());
+    let rpc = WalletRpc::with_wallet(db.clone());
+    for a in [&addr, &change] {
+        let info = rpc.validate_address(&p(vec![a.clone()])).unwrap();
+        assert_eq!(info["ismine"], true, "{} lost", a);
+        assert_eq!(info["iswatchonly"], false, "{} turned watch-only", a);
+    }
+    assert_eq!(rpc.get_account(&p(vec![addr.clone()])).unwrap(), "lab");
+
+    // The private key is there after unlock
+    rpc.wallet_passphrase(&p(vec![json!(PASS), json!(60)]))
+        .unwrap();
+    let wif = rpc.dump_privkey(&p(vec![addr.clone()])).unwrap();
+    let key = divi_wallet::decode_wif(wif.as_str().unwrap()).unwrap();
+    let secret = divi_crypto::keys::SecretKey::from_bytes(&key.key_bytes).unwrap();
+    assert_eq!(
+        divi_wallet::Address::p2pkh(&secret.public_key(), Network::Regtest).to_string(),
+        addr.as_str().unwrap()
+    );
+    // Not handed out a second time
+    assert_ne!(rpc.get_new_address(&Params::None).unwrap(), addr);
+}
+
+#[test]
+fn ir21_locked_keypool_runs_out_with_minus_12() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, _db) = encrypted_rpc(&dir.path().join("w"));
+    let keypoolsize = |rpc: &WalletRpc| {
+        rpc.get_wallet_info(&Params::None).unwrap()["keypoolsize"]
+            .as_u64()
+            .unwrap()
+    };
+    let full = keypoolsize(&rpc);
+
+    let mut handed = 0u64;
+    let err = loop {
+        match rpc.get_new_address(&Params::None) {
+            Ok(_) => handed += 1,
+            Err(e) => break rpc_code(e),
+        }
+        assert!(handed <= full, "more keys handed out than the pool held");
+    };
+    assert_eq!(
+        err,
+        (
+            -12,
+            "Error: Keypool ran out, please call keypoolrefill first".to_string()
+        )
+    );
+    assert!(handed > 0);
+    // getwalletinfo reports the real pool, not a constant
+    assert_eq!(keypoolsize(&rpc), full - handed);
+
+    // keypoolrefill needs the passphrase, then getnewaddress works locked again
+    assert_eq!(
+        rpc_code(rpc.keypool_refill(&Params::None).unwrap_err()).0,
+        -13
+    );
+    rpc.wallet_passphrase(&p(vec![json!(PASS), json!(60)]))
+        .unwrap();
+    rpc.keypool_refill(&Params::None).unwrap();
+    rpc.wallet_lock(&Params::None).unwrap();
+    assert_eq!(keypoolsize(&rpc), full);
+    rpc.get_new_address(&Params::None).unwrap();
+}
