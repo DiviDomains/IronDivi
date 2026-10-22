@@ -832,6 +832,26 @@ impl WalletDatabase {
         Ok(results)
     }
 
+    /// Number of write batches in the WAL written after sequence number `seq`
+    #[cfg(test)]
+    pub(crate) fn write_batches_since(&self, seq: u64) -> Result<usize, WalletError> {
+        let mut count = 0;
+        for item in self
+            .db
+            .get_updates_since(seq)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_sequence_number(&self) -> u64 {
+        self.db.latest_sequence_number()
+    }
+
     // ========== Unconfirmed wallet transactions ==========
     //
     // Kept in the default column family, which nothing else uses, so a wallet

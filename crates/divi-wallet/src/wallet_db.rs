@@ -695,73 +695,100 @@ impl WalletDb {
             Some(db) => db,
             None => return Ok(()), // No persistence
         };
+        use crate::persistence::{outpoint_key, serialize_tx, serialize_utxo};
+
+        // One synced batch: a crash or kill during the save leaves the previous
+        // save or this one on disk, never a mix of the two (e.g. a coin gone
+        // from the UTXO table without the transaction that spent it)
+        let mut batch = db.create_batch();
 
         // Save mnemonic (an encrypted wallet keeps only the encrypted copy)
         if !*self.encrypted.read() {
             if let Some(mnemonic) = self.keystore.mnemonic() {
-                db.store_mnemonic(&mnemonic)?;
+                batch.put_cf(db.cf_metadata(), b"mnemonic", mnemonic.as_bytes());
             }
         }
 
         // Save network
-        db.store_network(self.network)?;
+        let network_val = match self.network {
+            Network::Mainnet => b"mainnet".as_slice(),
+            Network::Testnet => b"testnet".as_slice(),
+            Network::Regtest => b"regtest".as_slice(),
+        };
+        batch.put_cf(db.cf_metadata(), b"network", network_val);
 
         // Save HD indices
         let (receiving, change) = self.keystore.get_indices();
-        db.store_indices(receiving, change)?;
+        batch.put_cf(
+            db.cf_metadata(),
+            b"receiving_index",
+            receiving.to_le_bytes(),
+        );
+        batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
 
         // Save keys
-        let mut key_batch = db.create_batch();
         for (hash, entry) in self.keystore.get_all_keys_with_hashes() {
-            self.put_key(&mut key_batch, db, &hash, &entry);
+            self.put_key(&mut batch, db, &hash, &entry);
         }
-        db.write_batch(key_batch)?;
 
         // Save UTXOs and remove spent ones from the UTXO table.
         // First, delete any spent outpoints from the UTXO column family so they
         // don't reappear when the wallet is loaded next time.
         for outpoint in self.spent.read().iter() {
-            db.remove_utxo(outpoint)?;
-            db.mark_spent(outpoint)?;
+            let key = outpoint_key(outpoint);
+            batch.delete_cf(db.cf_utxos(), &key);
+            batch.put_cf(db.cf_spent(), &key, [1]);
         }
 
         // Then save current (unspent) UTXOs
         for (outpoint, utxo) in self.utxos.read().iter() {
-            db.store_utxo(outpoint, utxo)?;
+            batch.put_cf(db.cf_utxos(), outpoint_key(outpoint), serialize_utxo(utxo));
         }
 
         // Save transactions
         for tx in self.transactions.read().values() {
-            db.store_transaction(tx)?;
+            batch.put_cf(db.cf_transactions(), tx.txid.as_bytes(), serialize_tx(tx));
         }
 
         // Save used addresses
         for addr in self.used_addresses.read().iter() {
-            db.mark_address_used(addr)?;
+            batch.put_cf(db.cf_addresses(), addr.as_bytes(), [1]);
         }
 
         // Save encrypted flag
-        db.store_encrypted(*self.encrypted.read())?;
+        batch.put_cf(
+            db.cf_metadata(),
+            b"encrypted",
+            [*self.encrypted.read() as u8],
+        );
 
         // Save last scan height
-        db.store_last_scan_height(*self.last_scan_height.read())?;
+        batch.put_cf(
+            db.cf_metadata(),
+            b"last_scan_height",
+            self.last_scan_height.read().to_le_bytes(),
+        );
 
         // Save accounts
         for (account, addresses) in self.accounts.read().iter() {
-            db.store_account(account, addresses)?;
+            let key = format!("acc_{}", account);
+            let value = serde_json::to_string(addresses)
+                .map_err(|e| WalletError::Storage(format!("Failed to serialize account: {}", e)))?;
+            batch.put_cf(db.cf_accounts(), key.as_bytes(), value.as_bytes());
         }
 
         // Save address to account mappings
         for (address, account) in self.address_accounts.read().iter() {
-            db.store_address_account(address, account)?;
+            let key = format!("addr_{}", address);
+            batch.put_cf(db.cf_accounts(), key.as_bytes(), account.as_bytes());
         }
 
         for (hash, script) in self.scripts.read().iter() {
-            db.store_script(hash, script)?;
+            batch.put_cf(db.cf_scripts(), hash.as_bytes(), script.as_bytes());
         }
 
-        // Flush to disk
-        db.flush()?;
+        // Synced, so it is on disk when this returns; no memtable flush needed
+        db.write_batch_sync(batch)?;
 
         // Clear dirty flags since everything was just written
         self.dirty.write().clear();
@@ -2898,6 +2925,46 @@ mod tests {
     }
 
     // -------- UTXO confirmations helper --------
+
+    #[test]
+    fn save_is_one_atomic_write() {
+        // A save made of separate writes can be cut short by a crash or kill,
+        // leaving part of it on disk; one batch is all or nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(dir.path(), Network::Mainnet, hd).unwrap();
+        let addr = wallet.new_receiving_address().unwrap();
+        wallet.add_utxo(WalletUtxo::new(
+            Hash256::from_bytes([1u8; 32]),
+            0,
+            Amount::from_sat(5_000),
+            Script::new_p2pkh(addr.hash.as_bytes()),
+            addr.to_string(),
+        ));
+        wallet.add_utxo(WalletUtxo::new(
+            Hash256::from_bytes([2u8; 32]),
+            0,
+            Amount::from_sat(7_000),
+            Script::new_p2pkh(addr.hash.as_bytes()),
+            addr.to_string(),
+        ));
+        wallet.spend_utxo(&OutPoint::new(Hash256::from_bytes([2u8; 32]), 0));
+        wallet.set_account(&addr, "label");
+        wallet.set_last_scan_height(7);
+
+        let db = wallet.db.as_ref().unwrap();
+        let seq = db.latest_sequence_number();
+        wallet.save().unwrap();
+        // WAL records written after `seq`
+        assert_eq!(db.write_batches_since(seq).unwrap(), 1);
+
+        drop(wallet);
+        let wallet = WalletDb::open(dir.path(), Network::Mainnet).unwrap();
+        assert_eq!(wallet.last_scan_height(), 7);
+        assert_eq!(wallet.get_utxos().len(), 1);
+        assert_eq!(wallet.get_account(&addr), "label");
+        assert!(wallet.is_mine(&addr));
+    }
 
     #[test]
     fn test_utxo_confirmations_confirmed() {
