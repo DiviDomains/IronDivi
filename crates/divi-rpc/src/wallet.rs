@@ -849,57 +849,22 @@ impl WalletRpc {
             }
         }
 
-        info!("Clearing existing wallet data before rescan");
-        wallet.clear_transactions_and_utxos();
-
-        // Iterate through blocks and scan
-        let mut scanned = 0;
-        for height in start_height..=stop_height {
-            // Get block index
-            let index = match chain.get_block_index_by_height(height)? {
-                Some(idx) => idx,
-                None => {
-                    info!(
-                        "Block index at height {} not found, stopping rescan (total scanned: {})",
-                        height, scanned
-                    );
-                    break;
-                }
-            };
-
-            // Get full block, from a full-history peer if it is pruned locally
-            let block = match crate::blockchain::load_block_or_fetch(
-                chain,
-                fetcher.as_ref(),
-                &index,
-            )? {
-                Some(blk) => blk,
-                None => {
-                    info!("Block data for hash {} at height {} not found, stopping rescan (total scanned: {})", 
-                          index.hash, height, scanned);
-                    break;
-                }
-            };
-
-            // Check if block has transactions
-            if block.transactions.is_empty() {
-                debug!("Block at height {} has no transactions, skipping", height);
-                scanned += 1;
-                continue;
-            }
-
-            // Scan the block
-            wallet.scan_block(index.hash, height, index.time, &block.transactions);
-            scanned += 1;
-
-            // Log progress every 1000 blocks
-            if scanned % 1000 == 0 {
-                info!(
-                    "Rescan progress: {}/{} blocks",
-                    scanned,
-                    stop_height - start_height + 1
-                );
-            }
+        // A full rescan rebuilds the wallet; a partial one replaces only what
+        // the range recorded. Block notifications wait on the wallet's scan
+        // lock meanwhile, so none is scanned out of order.
+        let (scanned, unreadable) =
+            wallet.rescan(start_height, stop_height, current_height, |height| {
+                let index = chain.get_block_index_by_height(height).ok().flatten()?;
+                let block = crate::blockchain::load_block_or_fetch(chain, fetcher.as_ref(), &index)
+                    .ok()
+                    .flatten()?;
+                Some((index.hash, block))
+            });
+        if let Some(height) = unreadable {
+            info!(
+                "Block at height {} not available, stopping rescan (total scanned: {})",
+                height, scanned
+            );
         }
 
         info!("Rescan complete: scanned {} blocks", scanned);
@@ -4557,5 +4522,214 @@ mod tests {
             result.get("hdkeypath").is_none(),
             "Imported non-HD key should not have hdkeypath field"
         );
+    }
+}
+
+/// Wallet accounting over a real (regtest) chain: rescans, received totals,
+/// UTXO filters and history amounts
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use divi_primitives::block::Block;
+    use divi_primitives::transaction::{TxIn, TxOut};
+    use divi_primitives::ChainMode;
+    use divi_storage::{ChainDatabase, ChainParams, NetworkType};
+    use divi_wallet::{HdWallet, Network};
+    use serde_json::json;
+
+    const COIN: i64 = 100_000_000;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        chain: Arc<Chain>,
+        wallet: Arc<WalletDb>,
+        rpc: WalletRpc,
+        /// Paid by the coinbases of blocks 1-4
+        miner: String,
+        /// Paid 249.99 by `spend` in block 5
+        second: String,
+        /// Block 5's send: block 1's coin, 1000 to a stranger, 249.99 to `second`
+        spend: Transaction,
+    }
+
+    fn stranger() -> Script {
+        Script::new_p2pkh(&[0xaa; 20])
+    }
+
+    fn script_of(addr: &str) -> Script {
+        let a = Address::from_base58(addr).unwrap();
+        Script::new_p2pkh(a.hash.as_bytes())
+    }
+
+    /// Mine a block on the tip: a coinbase paying `payee`, then `txs`
+    fn mine(chain: &Chain, payee: Script, txs: &[Transaction]) -> Block {
+        let tip = chain.tip().unwrap();
+        let height = tip.height + 1;
+        let mut sig = vec![4u8];
+        sig.extend_from_slice(&height.to_le_bytes());
+        let coinbase = Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+            vout: vec![TxOut::new(Amount::from_sat(1250 * COIN), payee)],
+            lock_time: 0,
+        };
+        let mut block = Block::default();
+        block.header.version = 1;
+        block.header.prev_block = tip.hash;
+        block.header.time = tip.time + 60;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(coinbase);
+        block.transactions.extend_from_slice(txs);
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        chain.accept_block(block.clone()).unwrap();
+        block
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with(|_| {
+            let hd = HdWallet::new(ChainMode::Divi).unwrap();
+            WalletDb::with_hd_wallet(Network::Regtest, hd)
+        })
+    }
+
+    fn fixture_with(make_wallet: impl FnOnce(&std::path::Path) -> WalletDb) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+        let chain = Arc::new(
+            Chain::new(
+                db,
+                ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+            )
+            .unwrap(),
+        );
+        let wallet = Arc::new(make_wallet(dir.path()));
+        let miner = wallet.new_receiving_address().unwrap().to_string();
+        let second = wallet.new_receiving_address().unwrap().to_string();
+
+        let first = mine(&chain, script_of(&miner), &[]);
+        for _ in 2..=4 {
+            mine(&chain, script_of(&miner), &[]);
+        }
+        let spend = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                divi_primitives::transaction::OutPoint::new(first.transactions[0].txid(), 0),
+                Script::default(),
+                0xffffffff,
+            )],
+            vout: vec![
+                TxOut::new(Amount::from_sat(1000 * COIN), stranger()),
+                TxOut::new(Amount::from_sat(250 * COIN - 1_000_000), script_of(&second)),
+            ],
+            lock_time: 0,
+        };
+        mine(&chain, stranger(), std::slice::from_ref(&spend));
+        assert_eq!(chain.height(), 5);
+
+        let rpc = WalletRpc::with_wallet_and_chain(wallet.clone(), chain.clone());
+        rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        Fixture {
+            _dir: dir,
+            chain,
+            wallet,
+            rpc,
+            miner,
+            second,
+            spend,
+        }
+    }
+
+    /// Balance after the fixture's blocks: three 1250 coinbases plus 249.99
+    const BALANCE: i64 = 3 * 1250 * COIN + 250 * COIN - 1_000_000;
+
+    #[test]
+    fn partial_rescan_keeps_coins_below_start() {
+        let f = fixture();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+        assert_eq!(f.chain.height(), 5);
+
+        for start in [3, 5, 1] {
+            let r = f
+                .rpc
+                .rescan_blockchain(&Params::Array(vec![json!(start)]))
+                .unwrap();
+            assert_eq!(r["start_height"], json!(start));
+            assert_eq!(r["stop_height"], json!(5));
+            assert_eq!(
+                f.wallet.get_balance().as_sat(),
+                BALANCE,
+                "after rescanblockchain {}",
+                start
+            );
+        }
+        // The send recorded in block 5 is still a single send
+        let sent = f.wallet.get_transaction(&f.spend.txid()).unwrap();
+        assert_eq!(sent.block_height, Some(5));
+        assert_eq!(sent.category, "send");
+    }
+
+    #[test]
+    fn partial_rescan_with_stop_keeps_coins_above_stop() {
+        let f = fixture();
+        f.rpc
+            .rescan_blockchain(&Params::Array(vec![json!(2), json!(3)]))
+            .unwrap();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+        assert_eq!(f.wallet.get_utxos().len(), 4);
+        assert!(f.wallet.get_utxos().iter().any(|u| u.address == f.second));
+    }
+
+    #[test]
+    fn full_rescan_repair_survives_restart() {
+        let f = fixture_with(|dir| {
+            let hd = HdWallet::new(ChainMode::Divi).unwrap();
+            WalletDb::create_persistent(&dir.join("wallet"), Network::Regtest, hd).unwrap()
+        });
+        f.wallet.save().unwrap();
+        // A coin wrongly marked spent (e.g. by a block that was later orphaned)
+        let coin = f
+            .wallet
+            .get_utxos()
+            .into_iter()
+            .find(|u| u.address == f.miner)
+            .unwrap()
+            .outpoint();
+        f.wallet.spend_utxo(&coin).unwrap();
+        f.wallet.save().unwrap();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE - 1250 * COIN);
+
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
+
+        let path = f._dir.path().join("wallet");
+        drop(f.rpc);
+        drop(f.wallet);
+        let reopened = WalletDb::open(&path, Network::Regtest).unwrap();
+        assert!(reopened.has_utxo(&coin));
+        assert_eq!(reopened.get_balance().as_sat(), BALANCE);
+    }
+
+    #[test]
+    fn full_rescans_agree() {
+        let f = fixture();
+        let utxos = |w: &WalletDb| {
+            let mut v: Vec<_> = w
+                .get_utxos()
+                .iter()
+                .map(|u| (u.outpoint(), u.value.as_sat()))
+                .collect();
+            v.sort_by_key(|(o, _)| (o.txid, o.vout));
+            v
+        };
+        let before = utxos(&f.wallet);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        let first = utxos(&f.wallet);
+        f.rpc
+            .rescan_blockchain(&Params::Array(vec![json!(0)]))
+            .unwrap();
+        let second = utxos(&f.wallet);
+        assert_eq!(first, before);
+        assert_eq!(second, first);
+        assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
     }
 }
