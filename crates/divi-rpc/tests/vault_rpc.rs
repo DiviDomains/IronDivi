@@ -103,6 +103,19 @@ impl Net {
             )],
             lock_time: 0,
         });
+        // The chain only warns on a bad input script, so check every
+        // signature here: a test must not pass on an unsigned spend
+        for tx in &txs {
+            for (i, input) in tx.vin.iter().enumerate() {
+                let prev = self
+                    .chain
+                    .get_utxo(&input.prevout)
+                    .unwrap()
+                    .expect("input spends an unknown coin");
+                divi_script::verify_input(tx, i, &prev.script_pubkey, prev.value)
+                    .unwrap_or_else(|e| panic!("input {} of {} fails: {:?}", i, tx.txid(), e));
+            }
+        }
         block.transactions.extend(txs);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
         let time = block.header.time;
@@ -346,4 +359,59 @@ fn manager_listunspent_vault_not_spendable() {
     for u in vault_rows {
         assert_eq!(u["spendable"], json!(false), "{}", u);
     }
+}
+
+// ---------------------------------------------------------------- IR-11
+
+/// The owner wallet alone (no manager key, vault never registered there) sees
+/// its vault output and reclaims from it.
+#[test]
+fn owner_only_wallet_sees_and_reclaims_vault() {
+    let s = setup();
+    assert!(!s.owner.is_mine(&s.manager_addr));
+    assert!(s.owner.get_all_vaults().is_empty());
+    let rpc = s.net.rpc(&s.owner);
+
+    let vault_hex = hex::encode(s.vault.as_bytes());
+    let lu = rpc.list_unspent(&Params::None).unwrap();
+    let row = lu
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["scriptPubKey"] == json!(vault_hex))
+        .unwrap_or_else(|| panic!("owner does not see its vault: {}", lu))
+        .clone();
+    assert_eq!(divi(&row["amount"]), VAULT_DIVI as f64);
+    assert_eq!(row["spendable"], json!(true));
+
+    let dest = s.owner.new_receiving_address().unwrap();
+    rpc.reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
+        .unwrap_or_else(|e| panic!("owner reclaim failed: {}", error_message(e)));
+    let tx = s.net.submitted.lock()[0].clone();
+    let vault_outpoint = OutPoint::new(s.fund_txid, 0);
+    assert!(tx
+        .vin
+        .iter()
+        .any(|i| OutPoint::new(i.prevout.txid, i.prevout.vout) == vault_outpoint));
+    s.net.mine_submitted(&s.manager_plain);
+    // The owner's signature verified (Net::mine) and the vault output is spent
+    assert!(s.net.chain.get_utxo(&vault_outpoint).unwrap().is_none());
+    assert!(s
+        .owner
+        .get_utxos()
+        .iter()
+        .any(|u| u.address == dest.to_string() && u.value.as_sat() == 40 * COIN));
+}
+
+/// The manager key alone gives nothing to reclaim (Divi Core: 0 available).
+#[test]
+fn manager_cannot_reclaim_vault() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let dest = s.manager.new_receiving_address().unwrap();
+    let e = rpc
+        .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(1.0)]))
+        .unwrap_err();
+    assert!(error_message(e).contains("No vault funds available to reclaim"));
+    assert!(s.net.submitted.lock().is_empty());
 }

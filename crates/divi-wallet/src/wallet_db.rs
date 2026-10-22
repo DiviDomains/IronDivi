@@ -109,6 +109,18 @@ pub struct VaultMetadata {
     pub funding_txid: [u8; 32],
 }
 
+/// How the wallet relates to a vault output (Divi Core's ISMINE_OWNED_VAULT
+/// and ISMINE_MANAGED_VAULT)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultRole {
+    /// We hold the owner key: the coins are ours and can be reclaimed at any
+    /// time; no registration is needed
+    Owned,
+    /// We hold the manager key and registered the vault with addvault: we may
+    /// only stake it
+    Managed,
+}
+
 /// Tracks which categories of wallet data have been modified since last save
 #[derive(Default, Clone)]
 struct DirtyFlags {
@@ -984,18 +996,28 @@ impl WalletDb {
             }
         }
 
-        // Try vault script: registered vault AND we have the manager key
-        if let Some(vault) = divi_script::StakingVaultScript::from_script(script) {
-            let script_bytes = script.as_bytes().to_vec();
-            if self.vaults.read().contains_key(&script_bytes) {
-                let manager_hash = Hash160::from_bytes(vault.vault_pubkey_hash);
-                if self.keystore.have_key(&manager_hash) {
-                    return true;
-                }
-            }
-        }
+        self.vault_role(script).is_some()
+    }
 
-        false
+    /// Our role for a vault script, as Divi Core's IsMine: the owner key makes
+    /// it ours whether or not it is registered; the manager key counts only
+    /// for a vault registered with addvault. None for any other script.
+    pub fn vault_role(&self, script: &Script) -> Option<VaultRole> {
+        let vault = divi_script::StakingVaultScript::from_script(script)?;
+        let has_signing_key = |hash: [u8; 20]| {
+            self.keystore
+                .get_key(&Hash160::from_bytes(hash))
+                .is_some_and(|entry| !entry.is_watch_only)
+        };
+        if has_signing_key(vault.owner_pubkey_hash) {
+            return Some(VaultRole::Owned);
+        }
+        if has_signing_key(vault.vault_pubkey_hash)
+            && self.vaults.read().contains_key(script.as_bytes())
+        {
+            return Some(VaultRole::Managed);
+        }
+        None
     }
 
     /// Add a UTXO to the wallet
@@ -2228,10 +2250,29 @@ impl WalletDb {
             .collect()
     }
 
+    /// Vault outputs we own (owner key held), confirmed and mature, not spent
+    /// by a mempool transaction: what reclaimvaultfunds may spend
+    pub fn get_owned_vault_utxos(
+        &self,
+        current_height: u32,
+        min_confirmations: u32,
+    ) -> Vec<WalletUtxo> {
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(_, source)| source.is_trusted())
+            .map(|(utxo, _)| utxo)
+            .filter(|utxo| {
+                utxo.confirmations(current_height) >= min_confirmations
+                    && utxo.is_mature(current_height, self.coinbase_maturity())
+            })
+            .filter(|utxo| self.vault_role(&utxo.script_pubkey) == Some(VaultRole::Owned))
+            .collect()
+    }
+
     /// Get vault UTXOs suitable for staking, with their parsed vault script
     ///
     /// Returns (utxo, vault_script_parsed) pairs where the vault is registered
-    /// and we have the manager key.
+    /// and we have the manager key (an owner-only wallet cannot stake it).
     pub fn get_stakeable_vault_utxos(
         &self,
         current_height: u32,
@@ -2265,6 +2306,13 @@ impl WalletDb {
                 vault_scripts
                     .get(&script_bytes)
                     .map(|vault| (utxo.clone(), vault.clone()))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|(_, vault)| {
+                self.keystore
+                    .get_key(&Hash160::from_bytes(vault.vault_pubkey_hash))
+                    .is_some_and(|entry| !entry.is_watch_only)
             })
             .collect()
     }
@@ -3320,6 +3368,49 @@ mod tests {
             // and the deletion reached the disk
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
             assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
+        }
+
+        /// IR-11: the owner key alone makes a vault output ours (registered
+        /// or not), outside the plain spendable set and not stakeable.
+        #[test]
+        fn owner_key_alone_tracks_vault_as_owned() {
+            let wallet = create_test_wallet();
+            let owner = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new(hash20(&owner), [0x44; 20]).to_script();
+            let tx = pay(vec![(300 * COIN, vault.clone())]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([4; 32])), Some(10), None);
+
+            assert!(wallet.is_mine_script(&vault));
+            assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Owned));
+            assert_eq!(wallet.get_utxos().len(), 1);
+            assert!(wallet.get_spendable_utxos(20, 1).is_empty());
+            assert_eq!(wallet.get_owned_vault_utxos(20, 1).len(), 1);
+            assert!(wallet.get_stakeable_vault_utxos(20, 1).is_empty());
+
+            // Registering it (fundvault does) does not let the owner stake it
+            register(
+                &wallet,
+                hash20(&owner),
+                &Address::from_pubkey_hash(Hash160::from_bytes([0x44; 20]), wallet.network()),
+                &vault,
+            );
+            assert!(wallet.get_stakeable_vault_utxos(20, 1).is_empty());
+            // and removevault does not drop the owner's coins
+            assert!(wallet.remove_vault(vault.as_bytes()));
+            assert_eq!(wallet.get_owned_vault_utxos(20, 1).len(), 1);
+        }
+
+        /// The manager key counts only for a registered vault.
+        #[test]
+        fn manager_key_needs_registration() {
+            let wallet = create_test_wallet();
+            let manager = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new([0x55; 20], hash20(&manager)).to_script();
+            assert_eq!(wallet.vault_role(&vault), None);
+            register(&wallet, [0x55; 20], &manager, &vault);
+            assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Managed));
         }
     }
 }

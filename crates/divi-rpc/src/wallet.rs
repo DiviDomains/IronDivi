@@ -2186,47 +2186,16 @@ impl WalletRpc {
         let dest_addr = Address::from_base58(destination)
             .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
 
-        let chain = self
-            .chain
-            .as_ref()
-            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available"))?;
-        let height = chain.height();
+        let height = self.current_height();
 
-        let vault_utxos = wallet.get_vault_utxos(height, 1);
+        // Vault outputs whose owner key we hold, registered or not (Divi Core's
+        // OWNED_VAULT_COINS); a manager key alone gives nothing to reclaim
+        let owned_vault_utxos = wallet.get_owned_vault_utxos(height, 1);
 
-        if vault_utxos.is_empty() {
+        if owned_vault_utxos.is_empty() {
             return Err(
                 RpcError::new(codes::WALLET_ERROR, "No vault funds available to reclaim").into(),
             );
-        }
-
-        // Filter vault UTXOs to only those where we have the owner's private key
-        let keystore = wallet.keystore();
-        let owned_vault_utxos: Vec<_> = vault_utxos
-            .into_iter()
-            .filter(|utxo| {
-                if let Some(vault) =
-                    divi_script::StakingVaultScript::from_script(&utxo.script_pubkey)
-                {
-                    let owner_hash =
-                        divi_primitives::hash::Hash160::from_bytes(vault.owner_pubkey_hash);
-                    if let Some(entry) = keystore.get_key(&owner_hash) {
-                        !entry.is_watch_only && entry.secret.is_some()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        if owned_vault_utxos.is_empty() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                "No vault funds available to reclaim (no owner keys found for any vaults)",
-            )
-            .into());
         }
 
         let mut selected = Vec::new();
