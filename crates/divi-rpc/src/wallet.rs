@@ -4734,6 +4734,28 @@ mod send_unlock_regression {
         assert_eq!(sent.lock().len(), 1);
     }
 
+    #[test]
+    fn ir17_short_unlock_falls_back_to_staking_only() {
+        let (_dir, rpc, db, _sent) = encrypted_rpc();
+        unlock(&rpc, 0, true).unwrap();
+        unlock(&rpc, 1, false).unwrap();
+        assert_eq!(status(&rpc), "unlocked");
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        assert_eq!(status(&rpc), "unlocked-for-staking");
+        assert!(
+            !db.is_locked(),
+            "staking stopped when the short unlock ended"
+        );
+
+        // Without a staking unlock before it, a timed unlock ends locked
+        rpc.wallet_lock(&Params::None).unwrap();
+        assert_eq!(status(&rpc), "locked");
+        unlock(&rpc, 1, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        assert_eq!(status(&rpc), "locked");
+        assert!(db.is_locked());
+    }
+
     fn dust_error() -> (i32, String) {
         (
             codes::WALLET_ERROR,

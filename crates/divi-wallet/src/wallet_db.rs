@@ -253,6 +253,8 @@ struct UnlockState {
     until: Option<Instant>,
     /// Keys are in memory for staking only: sends and key exports are refused
     staking_only: bool,
+    /// When `until` passes, go back to staking-only instead of locking
+    revert_to_staking: bool,
 }
 
 impl WalletDb {
@@ -1341,6 +1343,10 @@ impl WalletDb {
 
     /// Unlock the wallet, fully or for staking only (`walletpassphrase` with
     /// stakingOnly). A timeout of 0 lasts until `walletlock`.
+    ///
+    /// As in Divi Core, a timed unlock given while the wallet is unlocked for
+    /// staking only goes back to staking-only when it ends, rather than locking
+    /// the wallet, so a short unlock to send does not stop staking.
     pub fn unlock_for(
         &self,
         passphrase: &str,
@@ -1409,9 +1415,11 @@ impl WalletDb {
         } else {
             None // Unlimited
         };
+        let was_staking_only = self.is_unlocked_for_staking_only();
         *self.unlock.write() = UnlockState {
             until: expiration,
             staking_only,
+            revert_to_staking: was_staking_only && expiration.is_some(),
         };
 
         *self.locked.write() = false;
@@ -1436,9 +1444,30 @@ impl WalletDb {
 
         // Check if unlock has expired
         if self.is_auto_lock_expired() {
-            // Auto-lock on timeout
-            self.lock();
-            return true;
+            let reverted = {
+                let mut state = self.unlock.write();
+                let expired = state.until.is_some_and(|t| Instant::now() >= t);
+                if !expired {
+                    None // another caller already handled it
+                } else if state.revert_to_staking {
+                    *state = UnlockState {
+                        staking_only: true,
+                        ..UnlockState::default()
+                    };
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            };
+            match reverted {
+                Some(true) => info!("Wallet unlock timed out; unlocked for staking only again"),
+                Some(false) => {
+                    // Auto-lock on timeout
+                    self.lock();
+                    return true;
+                }
+                None => {}
+            }
         }
 
         *self.locked.read()
