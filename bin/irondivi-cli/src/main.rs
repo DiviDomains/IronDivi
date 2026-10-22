@@ -522,10 +522,161 @@ fn wallet_passphrase_count(method: &str) -> Option<usize> {
     }
 }
 
-/// Parameters sent as strings whatever they look like, so a passphrase such as
-/// "1234" or "true" is not turned into a number or a boolean
-fn is_string_param(method: &str, index: usize) -> bool {
-    wallet_passphrase_count(method).is_some_and(|n| index < n)
+/// Which positional arguments are JSON (numbers, booleans, arrays, objects),
+/// per method, as bitcoin-cli's and PIVX's `vRPCConvertParams`. Divi Core 3.0.0's
+/// divi-cli dropped its table and parses every argument as JSON when it can,
+/// which turns a label, account, comment or passphrase like "1234" or "true" into
+/// a number or boolean that the server then refuses. The positions here follow
+/// what each IronDivi handler reads as a number, boolean, amount, array or
+/// object; every other argument of a listed method is sent as a string.
+const CONVERT_PARAMS: &[(&str, &[usize])] = &[
+    // blockchain
+    ("getblockcount", &[]),
+    ("getbestblockhash", &[]),
+    ("getblockhash", &[0]),
+    ("getblock", &[1]),
+    ("getblockheader", &[1]),
+    ("getblockchaininfo", &[]),
+    ("getinfo", &[]),
+    ("getchaintips", &[]),
+    ("invalidateblock", &[]),
+    ("reconsiderblock", &[]),
+    ("reverseblocktransactions", &[]),
+    ("getdifficulty", &[]),
+    ("gettxoutsetinfo", &[]),
+    ("getrawmempool", &[0]),
+    ("prioritisetransaction", &[1, 2]),
+    ("gettxout", &[1, 2]),
+    ("decodescript", &[]),
+    ("verifychain", &[0, 1]),
+    ("getmininginfo", &[]),
+    ("getaddressdeltas", &[0, 1]),
+    ("getaddresstxids", &[0, 1]),
+    ("getspentinfo", &[0]),
+    ("generateblock", &[0]),
+    ("setgenerate", &[0, 1]),
+    ("getlotteryblockwinners", &[0]),
+    // network
+    ("getnetworkinfo", &[]),
+    ("getpeerinfo", &[]),
+    ("getconnectioncount", &[]),
+    ("ping", &[]),
+    ("getnettotals", &[]),
+    ("addnode", &[]),
+    ("getaddednodeinfo", &[0]),
+    ("setban", &[2, 3]),
+    ("ban", &[]),
+    ("setmocktime", &[0]),
+    ("getinvalid", &[]),
+    ("listbanned", &[]),
+    ("clearbanned", &[]),
+    ("disconnectnode", &[]),
+    ("getpeerscores", &[]),
+    // wallet
+    ("getnewaddress", &[]),
+    ("getrawchangeaddress", &[]),
+    ("validateaddress", &[]),
+    ("getaddressinfo", &[]),
+    ("getbalance", &[0, 1, 2]),
+    ("getunconfirmedbalance", &[]),
+    ("getimmaturebalance", &[]),
+    ("getwalletinfo", &[]),
+    ("listunspent", &[0, 1, 2]),
+    ("gettransaction", &[1]),
+    ("listtransactions", &[1, 2, 3]),
+    ("listsinceblock", &[1, 2]),
+    ("walletpassphrase", &[1, 2]),
+    ("walletpassphrasechange", &[]),
+    ("encryptwallet", &[]),
+    ("walletlock", &[]),
+    ("dumpprivkey", &[]),
+    ("dumphdinfo", &[]),
+    ("importprivkey", &[2]),
+    ("importaddress", &[2, 3]),
+    ("rescanblockchain", &[0, 1]),
+    ("sendtoaddress", &[1]),
+    ("sendfrom", &[2, 3]),
+    ("sendmany", &[1, 2, 4]),
+    ("getaddressesbylabel", &[]),
+    ("listreceivedbyaddress", &[0, 1, 2]),
+    ("getreceivedbyaddress", &[1]),
+    ("backupwallet", &[]),
+    ("signmessage", &[]),
+    ("verifymessage", &[]),
+    ("createmultisig", &[0, 1]),
+    ("addmultisigaddress", &[0, 1]),
+    ("getaccount", &[]),
+    ("setaccount", &[]),
+    ("getaccountaddress", &[]),
+    ("getaddressesbyaccount", &[]),
+    ("listaccounts", &[0, 1]),
+    ("getreceivedbyaccount", &[1]),
+    ("listreceivedbyaccount", &[0, 1, 2]),
+    ("keypoolrefill", &[0]),
+    ("getkeypoolsize", &[]),
+    ("loadwallet", &[]),
+    ("allocatefunds", &[1]),
+    ("listlockunspent", &[]),
+    ("lockunspent", &[0, 1]),
+    // raw transactions
+    ("createrawtransaction", &[0, 1]),
+    ("signrawtransaction", &[1, 2]),
+    ("signrawtransactionwithwallet", &[1, 2]),
+    ("signtransactionwithaddresskey", &[2]),
+    ("sendrawtransaction", &[1]),
+    ("getrawtransaction", &[1]),
+    ("decoderawtransaction", &[]),
+    // staking
+    ("getstakingstatus", &[]),
+    ("getmintinginfo", &[]),
+    ("setstaking", &[0]),
+    ("reservebalance", &[0, 1]),
+    // address index / lite wallet
+    ("getaddressbalance", &[0, 1]),
+    ("getaddressutxos", &[0, 1, 2]),
+    ("getaddresshistory", &[0, 1, 2]),
+    ("gettxindex", &[]),
+    ("estimatefee", &[0]),
+    ("estimatesmartfee", &[0]),
+    ("estimatepriority", &[0]),
+    ("getmempoolinfo", &[]),
+    ("validateaddresses", &[0]),
+    ("getlitewalletinfo", &[]),
+    // masternodes and sporks
+    ("getmasternodecount", &[]),
+    ("getmasternodestatus", &[]),
+    ("getmasternodewinners", &[0]),
+    ("listmasternodes", &[]),
+    ("setupmasternode", &[]),
+    ("startmasternode", &[]),
+    ("broadcaststartmasternode", &[]),
+    ("signmnbroadcast", &[]),
+    ("importmnbroadcast", &[]),
+    ("listmnbroadcasts", &[]),
+    ("verifymasternodesetup", &[]),
+    ("mnsync", &[]),
+    ("spork", &[1]),
+    // vaults
+    ("addvault", &[]),
+    ("removevault", &[]),
+    ("getcoinavailability", &[0]),
+    ("fundvault", &[1]),
+    ("debitvaultbyname", &[2]),
+    ("reclaimvaultfunds", &[1]),
+    // node
+    ("getlogconfig", &[]),
+    ("setlogconfig", &[0]),
+    ("help", &[]),
+    ("stop", &[]),
+];
+
+/// Whether argument `index` of `method` is sent as JSON. Methods missing from
+/// `CONVERT_PARAMS` keep the old behaviour: every argument that parses as JSON.
+fn converts_param(method: &str, index: usize) -> bool {
+    CONVERT_PARAMS
+        .iter()
+        .find(|(m, _)| *m == method)
+        .is_none_or(|(_, positions)| positions.contains(&index))
 }
 
 /// `--stdinwalletpassphrase` (bitcoin-cli `-stdinwalletpassphrase`): read one
@@ -896,7 +1047,7 @@ fn run() -> Result<(), CliError> {
                 .iter()
                 .enumerate()
                 .map(|(index, arg)| {
-                    if is_string_param(method, index) {
+                    if !converts_param(method, index) {
                         return json!(arg);
                     }
                     // Try to parse as JSON first (for objects/arrays)
@@ -1127,10 +1278,21 @@ mod stdin_passphrase_tests {
 
     #[test]
     fn passphrase_params_stay_strings() {
-        assert!(is_string_param("walletpassphrase", 0));
-        assert!(!is_string_param("walletpassphrase", 1));
-        assert!(is_string_param("walletpassphrasechange", 1));
-        assert!(is_string_param("encryptwallet", 0));
-        assert!(!is_string_param("getblock", 0));
+        assert!(!converts_param("walletpassphrase", 0));
+        assert!(converts_param("walletpassphrase", 1));
+        assert!(!converts_param("walletpassphrasechange", 1));
+        assert!(!converts_param("encryptwallet", 0));
+        assert!(!converts_param("getblock", 0));
+        assert!(converts_param("getblock", 1));
+    }
+
+    #[test]
+    fn convert_table_has_no_duplicates_and_unknown_methods_convert() {
+        let mut names: Vec<_> = CONVERT_PARAMS.iter().map(|(m, _)| *m).collect();
+        names.sort();
+        let len = names.len();
+        names.dedup();
+        assert_eq!(names.len(), len, "a method is listed twice");
+        assert!(converts_param("someunlistedmethod", 0));
     }
 }

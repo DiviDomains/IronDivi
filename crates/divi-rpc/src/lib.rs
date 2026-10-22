@@ -74,5 +74,5 @@ pub use server::{
     ShutdownCallback,
 };
 pub use staking::{StakingInfo, StakingRpc};
-pub use wallet::WalletRpc;
+pub use wallet::{TxSubmitError, WalletRpc};
 pub use websocket::{ws_handler, Notification, NotificationHub, WsState};

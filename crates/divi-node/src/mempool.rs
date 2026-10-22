@@ -14,7 +14,7 @@
 //! Manages unconfirmed transactions waiting to be included in blocks.
 
 use crate::config::MempoolConfig;
-use crate::error::NodeError;
+use crate::error::{reject, NodeError};
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::Transaction;
@@ -187,7 +187,8 @@ impl Mempool {
         *self.total_size.read()
     }
 
-    /// Add a transaction to the mempool
+    /// Add a transaction to the mempool. Policy refusals are
+    /// `NodeError::TxRejected` with Divi Core's reject code and reason.
     pub fn add(&self, tx: Transaction, fee: Amount) -> Result<Hash256, NodeError> {
         let entry = MempoolEntry::new(tx.clone(), fee);
         let txid = entry.txid;
@@ -204,11 +205,18 @@ impl Mempool {
             self.evict_for_space(entry.size)?;
         }
 
+        // Divi Core AcceptToMemoryPool: block-reward transactions are only
+        // valid inside a block
+        if tx.is_coinbase() {
+            return Err(rejected(reject::INVALID, "coinbase"));
+        }
+        if tx.is_coinstake() {
+            return Err(rejected(reject::INVALID, "coinstake"));
+        }
+
         // Check fee rate
         if entry.fee_rate < self.config.min_relay_fee as f64 {
-            return Err(NodeError::TransactionValidation(
-                "Fee rate below minimum relay fee".into(),
-            ));
+            return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient fee"));
         }
 
         // Divi Core IsStandard: a transaction with a dust output is not relayed by
@@ -216,7 +224,7 @@ impl Mempool {
         // not reach the wallet through the mempool when the network will refuse them.
         let relay_fee_per_kb = self.config.min_relay_fee * 1000;
         if tx.vout.iter().any(|out| out.is_dust_at(relay_fee_per_kb)) {
-            return Err(NodeError::TransactionValidation("dust".into()));
+            return Err(rejected(reject::NONSTANDARD, "dust"));
         }
 
         // Check for conflicts (double spends)
@@ -585,6 +593,13 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
     }
 }
 
+fn rejected(code: u8, reason: &str) -> NodeError {
+    NodeError::TxRejected {
+        code,
+        reason: reason.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,11 +639,33 @@ mod tests {
             Amount::from_sat(5459),
             Script::new_p2pkh(&[1u8; 20]),
         ));
-        assert!(mempool.add(tx.clone(), Amount::from_sat(100_000)).is_err());
+        assert!(matches!(
+            mempool.add(tx.clone(), Amount::from_sat(100_000)),
+            Err(NodeError::TxRejected { code: 0x40, ref reason }) if reason == "dust"
+        ));
         assert_eq!(mempool.size(), 0);
 
         tx.vout[1].value = Amount::from_sat(5460);
         assert!(mempool.add(tx, Amount::from_sat(100_000)).is_ok());
+    }
+
+    #[test]
+    fn test_mempool_rejects_with_divi_core_codes() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        // 1 sat for ~85 bytes is below 10 sat/byte
+        let tx = create_test_tx([8u8; 32], 1);
+        assert!(matches!(
+            mempool.add(tx, Amount::from_sat(1)),
+            Err(NodeError::TxRejected { code: 0x42, ref reason }) if reason == "insufficient fee"
+        ));
+        // A coinstake is only valid in a block
+        let mut stake = create_test_tx([7u8; 32], 1);
+        stake.vout.insert(0, TxOut::empty());
+        assert!(stake.is_coinstake());
+        assert!(matches!(
+            mempool.add(stake, Amount::from_sat(100_000)),
+            Err(NodeError::TxRejected { code: 0x10, ref reason }) if reason == "coinstake"
+        ));
     }
 
     #[test]

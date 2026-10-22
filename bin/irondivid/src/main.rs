@@ -1632,7 +1632,6 @@ async fn run_daemon(
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let mempool_for_tx = node.mempool().clone();
-        let chain_for_tx = node.chain().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
@@ -1668,24 +1667,19 @@ async fn run_daemon(
                     // Wire up transaction submission (mempool + relay)
                     let mempool_for_submit = mempool_for_tx.clone();
                     let tx_relay_for_submit = tx_relay_for_tx.clone();
-                    let chain_for_submit = chain_for_tx.clone();
+                    let chain_for_submit = Arc::clone(&chain_for_staking_status);
                     rpc_server.wallet().set_tx_submit(Arc::new(move |tx: Transaction| {
                         let txid = tx.txid();
 
-                        // Every input must be unspent in the chain or an output of a
-                        // mempool tx, as for relayed txs. Without this a tx spending a
-                        // coin already spent on chain sat in the local mempool, and the
-                        // wallet counted it as pending instead of reporting the error.
-                        Node::calculate_transaction_fee(&tx, &chain_for_submit, &mempool_for_submit)
-                            .map_err(|e| format!("Mempool rejected: {}", e))?;
-
-                        // For locally submitted transactions, calculate fee generously
-                        // to pass mempool relay fee check. The actual fee is embedded
-                        // in the tx (inputs - outputs) and was set by the wallet.
-                        let fee = Amount::from_sat(
-                            (tx.size() as i64) * 10_000
-                        );
-                        mempool_for_submit.add(tx, fee).map_err(|e| format!("Mempool rejected: {}", e))?;
+                        // The real fee (inputs - outputs), so the mempool's relay
+                        // fee check sees what peers will see
+                        let fee = Node::calculate_transaction_fee(
+                            &tx,
+                            &chain_for_submit,
+                            &mempool_for_submit,
+                        )
+                        .map_err(submit_error)?;
+                        mempool_for_submit.add(tx, fee).map_err(submit_error)?;
 
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();
@@ -1802,6 +1796,17 @@ async fn run_daemon(
 
     info!("Node stopped");
     Ok(())
+}
+
+/// How a mempool refusal of a locally submitted transaction reaches the RPC
+fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
+    use divi_node::NodeError;
+    use divi_rpc::TxSubmitError;
+    match e {
+        NodeError::TxRejected { code, reason } => TxSubmitError::Rejected { code, reason },
+        NodeError::MissingInputs => TxSubmitError::UnknownInputs,
+        other => TxSubmitError::Failed(other.to_string()),
+    }
 }
 
 /// getstakingstatus/getmintinginfo data. Each field has the meaning Divi Core's

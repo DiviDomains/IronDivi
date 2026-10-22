@@ -848,3 +848,43 @@ fn removevault_one_and_two_arguments() {
     assert_eq!(res["tx_hash"], json!(s.fund_txid.to_string()));
     assert!(s.manager.get_all_vaults().is_empty());
 }
+
+// ------------------------------------------------- vault change dust limit
+
+/// Change that goes back to a vault is checked against the vault script's own
+/// dust limit (larger than the P2PKH one): 5460 sat of change would be dust
+/// there, so it goes to the fee instead of making the send unrelayable.
+#[test]
+fn reclaim_drops_change_below_the_vault_dust_limit() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let vault_limit = TxOut::new(Amount::ZERO, s.vault.clone()).min_non_dust_value(10_000);
+    assert!(
+        vault_limit.as_sat() > 5460,
+        "vault limit {}",
+        vault_limit.as_sat()
+    );
+
+    // One vault input, payment plus change: the fee is 3000 sat
+    let change = 5460;
+    let amount = VAULT_DIVI * COIN - 3000 - change;
+    let dest = s.owner.new_receiving_address().unwrap();
+    rpc.reclaim_vault_funds(&p(vec![
+        json!(dest.to_string()),
+        json!(amount as f64 / COIN as f64),
+    ]))
+    .unwrap();
+    let tx = submitted_tx(&s);
+    assert_eq!(
+        output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
+        vec![amount]
+    );
+    for out in &tx.vout {
+        assert!(
+            !out.is_dust_at(10_000),
+            "dust output of {} sat",
+            out.value.as_sat()
+        );
+    }
+    assert!(output_to(&tx, &s.vault).is_empty());
+}

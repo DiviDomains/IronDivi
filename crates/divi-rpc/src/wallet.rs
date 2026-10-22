@@ -55,6 +55,30 @@ fn ensure_not_dust(value: Amount, script: &Script) -> Result<(), Error> {
     Ok(())
 }
 
+/// Upper bound on the serialized size of a wallet transaction with `inputs`
+/// P2PKH or vault inputs (scriptSig at most 73 + 34 + 2 bytes) paying `outputs`
+fn max_tx_size(inputs: usize, outputs: &[Script]) -> usize {
+    let outputs: usize = outputs.iter().map(|s| 9 + s.len()).sum();
+    // version, lock time and the two counts (varints up to 3 bytes)
+    14 + 150 * inputs + outputs
+}
+
+/// Fee a wallet send pays: the flat schedule IronDivi always used (1000 sat plus
+/// 1000 per input and 500 per output), raised to the relay minimum (Divi Core
+/// minRelayTxFee, 10000 sat/kB) of the largest size the transaction can have, so
+/// a send with many inputs is never below what the mempool and peers accept.
+fn wallet_fee(inputs: usize, outputs: &[Script]) -> Amount {
+    let flat = 1000 + 1000 * inputs as i64 + 500 * outputs.len() as i64;
+    let relay = DEFAULT_MIN_RELAY_FEE_PER_KB * max_tx_size(inputs, outputs) as i64 / 1000;
+    Amount::from_sat(flat.max(relay))
+}
+
+/// Script shape of a change output (P2PKH), for fee estimates before the change
+/// address is taken
+fn change_script_template() -> Script {
+    Script::new_p2pkh(&[0; 20])
+}
+
 /// Smallest change output worth creating. Less than this would be dust, which
 /// no node relays, so it goes to the fee instead, as in Divi Core. Change always
 /// pays a P2PKH address.
@@ -234,7 +258,31 @@ fn decode_base64_like_core(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Callback for submitting transactions to the mempool and network
-pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
+pub type TxSubmitCallback =
+    Arc<dyn Fn(Transaction) -> Result<Hash256, TxSubmitError> + Send + Sync>;
+
+/// Why the node refused a transaction handed to the submit callback
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxSubmitError {
+    /// Refused by the mempool with Divi Core's reject code and reason;
+    /// RPC -26 "<code>: <reason>"
+    Rejected { code: u8, reason: String },
+    /// An input is neither in the chain nor the mempool; RPC -26
+    /// "Unknown inputs being spent"
+    UnknownInputs,
+    /// Any other failure; RPC -25 with the message
+    Failed(String),
+}
+
+impl From<String> for TxSubmitError {
+    fn from(message: String) -> Self {
+        TxSubmitError::Failed(message)
+    }
+}
+
+/// Divi Core DEFAULT_TRANSACTION_MAXFEE: sendrawtransaction refuses a higher fee
+/// unless allowhighfees is given
+const MAX_TX_FEE: Amount = Amount::from_sat(100 * 100_000_000);
 
 /// Who pays the fee when spending from a vault (Divi Core's TransactionFeeMode)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,7 +511,16 @@ impl WalletRpc {
             RpcError::new(codes::MISC_ERROR, "Transaction submission not configured")
         })?;
 
-        callback(tx).map_err(|e| RpcError::new(codes::VERIFY_ERROR, e).into())
+        // Divi Core sendrawtransaction (rpcrawtransaction.cpp) codes and texts
+        callback(tx).map_err(|e| match e {
+            TxSubmitError::Rejected { code, reason } => {
+                RpcError::new(codes::VERIFY_REJECTED, format!("{}: {}", code, reason)).into()
+            }
+            TxSubmitError::UnknownInputs => {
+                RpcError::new(codes::VERIFY_REJECTED, "Unknown inputs being spent").into()
+            }
+            TxSubmitError::Failed(message) => RpcError::new(codes::VERIFY_ERROR, message).into(),
+        })
     }
 
     /// getnewaddress - Generate a new receiving address
@@ -966,7 +1023,7 @@ impl WalletRpc {
             if !wallet.is_encrypted() {
                 return Err(RpcError::new(
                     codes::WALLET_WRONG_ENC_STATE,
-                    "Error: running with an unencrypted wallet, but this call needs an encrypted one.",
+                    "Error: running with an unencrypted wallet, but walletpassphrase was called.",
                 )
                 .into());
             }
@@ -983,9 +1040,11 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         if !wallet.is_encrypted() {
-            return Err(
-                RpcError::new(codes::WALLET_WRONG_ENC_STATE, "Wallet is not encrypted").into(),
-            );
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrase was called.",
+            )
+            .into());
         }
 
         if staking_only && wallet.is_unlocked_for_staking_only() {
@@ -998,8 +1057,13 @@ impl WalletRpc {
 
         wallet
             .unlock_for(passphrase, timeout as u32, staking_only)
-            .map_err(|_| {
-                RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
+            .map_err(|e| match e {
+                divi_wallet::WalletError::WrongPassphrase
+                | divi_wallet::WalletError::InvalidPassphrase => RpcError::new(
+                    codes::WALLET_PASSPHRASE_INCORRECT,
+                    "Error: The wallet passphrase entered was incorrect.",
+                ),
+                other => RpcError::new(codes::WALLET_ERROR, other.to_string()),
             })?;
 
         Ok(serde_json::Value::Null)
@@ -1010,9 +1074,11 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         if !wallet.is_encrypted() {
-            return Err(
-                RpcError::new(codes::WALLET_WRONG_ENC_STATE, "Wallet is not encrypted").into(),
-            );
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletlock was called.",
+            )
+            .into());
         }
 
         wallet.lock();
@@ -1232,10 +1298,8 @@ impl WalletRpc {
         // change, which getbalance counts (Core's spendzeroconfchange)
         let utxos = wallet.get_send_candidates(height, 1);
 
-        // Fee estimation: ~1000 satoshis per input + 500 per output
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = vec![dest_addr.script_pubkey(), change_script_template()];
 
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
@@ -1247,11 +1311,7 @@ impl WalletRpc {
             total_input += utxo.value;
 
             // Calculate required amount (send + fee estimate)
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = send_amount + est_fee;
 
             if total_input >= required {
@@ -1260,9 +1320,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2);
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = send_amount + fee;
 
         if total_input < required {
@@ -1657,6 +1715,39 @@ impl WalletRpc {
         })?;
 
         let txid = tx.txid();
+        let allow_high_fees = params.get_bool(1).unwrap_or(false);
+
+        if let Some(ref chain) = self.chain {
+            // Divi Core: an output of the txid in the UTXO set means it is
+            // already confirmed
+            let in_chain = (0..tx.vout.len() as u32)
+                .any(|n| matches!(chain.get_utxo(&OutPoint::new(txid, n)), Ok(Some(_))));
+            if in_chain {
+                return Err(RpcError::new(
+                    codes::VERIFY_ALREADY_IN_CHAIN,
+                    "transaction already in block chain",
+                )
+                .into());
+            }
+            // Fee cap. Inputs still in the mempool are not visible here; such a
+            // transaction is checked by the mempool only.
+            let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
+                .get_utxo(&i.prevout)
+            {
+                Ok(Some(u)) => Some(sum + u.value),
+                _ => None,
+            });
+            if let Some(inputs) = inputs {
+                let outputs = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
+                if !allow_high_fees && inputs - outputs > MAX_TX_FEE {
+                    return Err(RpcError::new(
+                        codes::VERIFY_REJECTED,
+                        "Fees being paid are in excess of maximum fee, but fee override is not provided",
+                    )
+                    .into());
+                }
+            }
+        }
 
         // Submit to mempool and broadcast
         self.submit_transaction(tx)?;
@@ -2259,10 +2350,8 @@ impl WalletRpc {
         // Sort by value descending for simple coin selection
         utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
 
-        // Fee estimation: ~1000 satoshis per input + 500 per output
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = vec![vault_script.clone(), change_script_template()];
 
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
@@ -2274,11 +2363,7 @@ impl WalletRpc {
             total_input += utxo.value;
 
             // Calculate required amount (send + fee estimate)
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = send_amount + est_fee;
 
             if total_input >= required {
@@ -2287,9 +2372,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2);
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = send_amount + fee;
 
         if total_input < required {
@@ -2409,8 +2492,17 @@ impl WalletRpc {
         mode: VaultFeeMode,
         change_script: Option<Script>,
     ) -> Result<(Hash256, Amount, Amount), Error> {
+        // Change goes back to a vault script; every vault script has the same size
+        let vault_template = change_script
+            .clone()
+            .or_else(|| candidates.first().map(|u| u.script_pubkey.clone()))
+            .unwrap_or_default();
         let fee_for = |inputs: usize, outputs: usize| {
-            Amount::from_sat(1000 + 1000 * inputs as i64 + 500 * outputs as i64)
+            let mut scripts = vec![dest.script_pubkey()];
+            if outputs > 1 {
+                scripts.push(vault_template.clone());
+            }
+            wallet_fee(inputs, &scripts)
         };
         let total_of = |us: &[divi_wallet::wallet_db::WalletUtxo]| {
             us.iter().fold(Amount::ZERO, |a, u| a + u.value)
@@ -2468,7 +2560,6 @@ impl WalletRpc {
         }
 
         let total_input = total_of(&selected);
-        let min_output = min_change_value();
         let (fee, received, change) = match mode {
             VaultFeeMode::SweepFunds => {
                 let fee = fee_for(selected.len(), 1);
@@ -2483,7 +2574,8 @@ impl WalletRpc {
                 (fee, amount, total_input - amount - fee)
             }
         };
-        if received < min_output {
+        // The payment is checked against the destination's own dust limit
+        if TxOut::new(received, dest.script_pubkey()).is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
                 format!(
@@ -2494,21 +2586,24 @@ impl WalletRpc {
             )
             .into());
         }
+        let change_script = change_script.unwrap_or_else(|| {
+            selected
+                .iter()
+                .max_by_key(|u| u.value)
+                .map(|u| u.script_pubkey.clone())
+                .expect("at least one input")
+        });
 
         let mut builder = TransactionBuilder::new();
         for utxo in &selected {
             builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
         }
         builder = builder.add_output_to_address(received, dest);
-        if change >= min_output {
-            let change_script = change_script.unwrap_or_else(|| {
-                selected
-                    .iter()
-                    .max_by_key(|u| u.value)
-                    .map(|u| u.script_pubkey.clone())
-                    .expect("at least one input")
-            });
-            builder = builder.add_output(change, change_script);
+        // Change returns to a vault script, whose dust limit is above the P2PKH
+        // one; dust change goes to the fee, as for ordinary sends
+        let change_out = TxOut::new(change, change_script);
+        if !change_out.is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
+            builder = builder.add_output(change_out.value, change_out.script_pubkey);
         }
 
         let (mut tx, prev_scripts) = builder.build();
@@ -2537,15 +2632,10 @@ impl WalletRpc {
         }
 
         let txid = tx.txid();
-        self.submit_transaction(tx)?;
         // A dropped (dust) change is part of the fee
-        let fee = total_input
-            - received
-            - if change >= min_output {
-                change
-            } else {
-                Amount::ZERO
-            };
+        let paid_out = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
+        let fee = total_input - paid_out;
+        self.submit_transaction(tx)?;
         Ok((txid, received, fee))
     }
 
@@ -3007,23 +3097,21 @@ impl WalletRpc {
         let utxos = wallet.get_send_candidates(height, min_conf);
 
         // Simple coin selection
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = outputs
+            .iter()
+            .map(|(a, _)| a.script_pubkey())
+            .chain(std::iter::once(change_script_template()))
+            .collect();
 
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let num_outputs = outputs.len() as i64 + 1; // +1 for change
 
         for utxo in utxos {
             selected.push(utxo.clone());
             total_input += utxo.value;
 
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * num_outputs,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = total_send + est_fee;
 
             if total_input >= required {
@@ -3032,11 +3120,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(
-                per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * num_outputs,
-            );
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = total_send + fee;
 
         if total_input < required {
@@ -3140,7 +3224,7 @@ impl WalletRpc {
             if !wallet.is_encrypted() {
                 return Err(RpcError::new(
                     codes::WALLET_WRONG_ENC_STATE,
-                    "Error: running with an unencrypted wallet, but this call needs an encrypted one.",
+                    "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
                 )
                 .into());
             }
@@ -3153,15 +3237,22 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("New passphrase required"))?;
 
         if old_passphrase.is_empty() || new_passphrase.is_empty() {
-            return Err(RpcError::invalid_params("Passphrases cannot be empty").into());
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "walletpassphrasechange <oldpassphrase> <newpassphrase>\n\
+                 Changes the wallet passphrase from <oldpassphrase> to <newpassphrase>.",
+            )
+            .into());
         }
 
         let wallet = self.get_wallet()?;
 
         if !wallet.is_encrypted() {
-            return Err(
-                RpcError::new(codes::WALLET_WRONG_ENC_STATE, "Wallet is not encrypted").into(),
-            );
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
+            )
+            .into());
         }
 
         // Change the passphrase
@@ -3193,7 +3284,11 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("encryptwallet \"passphrase\""))?;
         if passphrase.is_empty() {
-            return Err(RpcError::invalid_params("passphrase can not be empty").into());
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "encryptwallet <passphrase>\nEncrypts the wallet with <passphrase>.",
+            )
+            .into());
         }
 
         let wallet = self.get_wallet()?;
@@ -3547,7 +3642,7 @@ impl WalletRpc {
 
         // Get UTXOs only from account addresses
         let all_utxos = wallet.get_send_candidates(height, min_conf);
-        let utxos: Vec<_> = if account.is_empty() {
+        let mut utxos: Vec<_> = if account.is_empty() {
             // Empty account means default account - use all addresses
             all_utxos
         } else {
@@ -3559,10 +3654,10 @@ impl WalletRpc {
                 .collect()
         };
 
-        // Fee estimation
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
+        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
+
+        // Fee: see wallet_fee; the outputs include a change output
+        let fee_outputs: Vec<Script> = vec![dest_addr.script_pubkey(), change_script_template()];
 
         // Simple coin selection
         let mut selected = Vec::new();
@@ -3573,11 +3668,7 @@ impl WalletRpc {
             selected.push(utxo.clone());
             total_input += utxo.value;
 
-            let num_inputs = selected.len() as i64;
-            let est_fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2,
-                );
+            let est_fee = wallet_fee(selected.len(), &fee_outputs);
             let required = send_amount + est_fee;
 
             if total_input >= required {
@@ -3586,9 +3677,7 @@ impl WalletRpc {
         }
 
         // Check if we have enough funds from this account
-        let num_inputs = selected.len() as i64;
-        let fee = base_fee
-            + Amount::from_sat(per_input_fee.as_sat() * num_inputs + per_output_fee.as_sat() * 2);
+        let fee = wallet_fee(selected.len(), &fee_outputs);
         let required = send_amount + fee;
 
         if total_input < required {
@@ -5163,6 +5252,145 @@ mod send_unlock_regression {
         rpc.send_to_address(&p(vec![json!(to), json!(0.0000546)]))
             .unwrap();
         assert_eq!(sent.lock().len(), 1);
+    }
+
+    /// A send that needs many inputs must still pay the relay minimum
+    /// (10000 sat/kB) for its real size, or no node relays it
+    #[test]
+    fn ir50_many_input_send_pays_relay_fee() {
+        let (rpc, db) = rpc_on(Network::Testnet);
+        for i in 0..12u8 {
+            let addr = db.new_receiving_address().unwrap();
+            db.add_utxo(divi_wallet::WalletUtxo {
+                txid: Hash256::from_bytes([40 + i; 32]),
+                vout: 0,
+                value: Amount::from_divi(1),
+                script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+                height: Some(100),
+                is_coinbase: false,
+                is_coinstake: false,
+                address: addr.to_string(),
+            });
+        }
+        rpc.set_height(200);
+        let sent: Sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = sent.clone();
+        rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            capture.lock().push(tx);
+            Ok(txid)
+        }));
+        let to = address(8, Network::Testnet);
+        rpc.send_to_address(&p(vec![json!(to), json!(11.5)]))
+            .unwrap();
+        let sent = sent.lock();
+        let tx = &sent[0];
+        assert_eq!(tx.vin.len(), 12);
+        let out: i64 = tx.vout.iter().map(|o| o.value.as_sat()).sum();
+        let fee = 12 * 100_000_000 - out;
+        let min = DEFAULT_MIN_RELAY_FEE_PER_KB * tx.size() as i64 / 1000;
+        assert!(
+            fee >= min,
+            "fee {} sat for {} bytes is below the relay minimum {}",
+            fee,
+            tx.size(),
+            min
+        );
+    }
+
+    /// Mempool refusals reach the RPC as Divi Core's sendrawtransaction errors
+    #[test]
+    fn ir51_submit_errors_use_divi_core_codes() {
+        let cases = [
+            (
+                TxSubmitError::Rejected {
+                    code: 64,
+                    reason: "dust".into(),
+                },
+                (codes::VERIFY_REJECTED, "64: dust"),
+            ),
+            (
+                TxSubmitError::Rejected {
+                    code: 66,
+                    reason: "insufficient fee".into(),
+                },
+                (codes::VERIFY_REJECTED, "66: insufficient fee"),
+            ),
+            (
+                TxSubmitError::UnknownInputs,
+                (codes::VERIFY_REJECTED, "Unknown inputs being spent"),
+            ),
+            (
+                TxSubmitError::Failed("boom".into()),
+                (codes::VERIFY_ERROR, "boom"),
+            ),
+        ];
+        for (error, (want_code, want_message)) in cases {
+            let (rpc, _) = rpc_on(Network::Testnet);
+            rpc.set_tx_submit(Arc::new(move |_tx: Transaction| Err(error.clone())));
+            let tx = Transaction {
+                version: 1,
+                vin: vec![],
+                vout: vec![],
+                lock_time: 0,
+            };
+            let hex = hex::encode(serialize(&tx));
+            assert_eq!(
+                err(rpc.send_raw_transaction(&p(vec![json!(hex)]))),
+                (want_code, want_message.to_string())
+            );
+        }
+    }
+
+    /// Passphrase RPC errors use Divi Core's codes and texts (rpcwallet.cpp)
+    #[test]
+    fn ir52_passphrase_errors_match_divi_core() {
+        let (rpc, _) = rpc_on(Network::Testnet);
+        let unencrypted = |call: &str| {
+            format!(
+                "Error: running with an unencrypted wallet, but {} was called.",
+                call
+            )
+        };
+        assert_eq!(
+            err(rpc.wallet_passphrase(&p(vec![json!("x"), json!(60)]))),
+            (
+                codes::WALLET_WRONG_ENC_STATE,
+                unencrypted("walletpassphrase")
+            )
+        );
+        assert_eq!(
+            err(rpc.wallet_lock(&Params::None)),
+            (codes::WALLET_WRONG_ENC_STATE, unencrypted("walletlock"))
+        );
+        assert_eq!(
+            err(rpc.wallet_passphrase_change(&p(vec![json!("a"), json!("b")]))),
+            (
+                codes::WALLET_WRONG_ENC_STATE,
+                unencrypted("walletpassphrasechange")
+            )
+        );
+        assert_eq!(
+            err(rpc.encrypt_wallet(&p(vec![json!("")]))),
+            (
+                codes::MISC_ERROR,
+                "encryptwallet <passphrase>\nEncrypts the wallet with <passphrase>.".to_string()
+            )
+        );
+
+        let (_dir, rpc, _db, _sent) = encrypted_rpc();
+        let incorrect = (
+            codes::WALLET_PASSPHRASE_INCORRECT,
+            "Error: The wallet passphrase entered was incorrect.".to_string(),
+        );
+        assert_eq!(
+            err(rpc.wallet_passphrase(&p(vec![json!("not it"), json!(60)]))),
+            incorrect
+        );
+        assert_eq!(
+            err(rpc.wallet_passphrase_change(&p(vec![json!("not it"), json!("new")]))),
+            incorrect
+        );
     }
 
     #[test]
