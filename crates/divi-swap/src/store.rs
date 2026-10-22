@@ -164,6 +164,39 @@ CREATE TABLE IF NOT EXISTS docs (
 );
 ";
 
+/// One maker swap per hashlock. The hash lives in the record JSON (`$.hash`, a 32-number
+/// array), so this is an expression index; `put_maker_swap` of a second swap for a hash fails
+/// even if the engine's gate were bypassed.
+const UNIQUE_HASH_INDEX: &str = "maker_swaps_hash_unique";
+
+/// Create the unique-hash index (idempotent). A database that already holds two swaps for one
+/// hash cannot take it: that is logged loudly and the store runs without the index (the
+/// engine's gate is then the only guard, as before) rather than refusing to start.
+fn ensure_unique_hash(conn: &Connection) -> Result<()> {
+    let dup: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT json_extract(json, '$.hash'), COUNT(*) FROM maker_swaps
+             GROUP BY json_extract(json, '$.hash') HAVING COUNT(*) > 1 LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some((hash, n)) = dup {
+        tracing::error!(
+            %hash, swaps = n,
+            "maker_swaps holds several swaps for one hashlock: NOT creating the unique-hash index; \
+             one swap per hash is enforced only by the engine gate until the duplicates are resolved"
+        );
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {UNIQUE_HASH_INDEX}
+         ON maker_swaps (json_extract(json, '$.hash'))"
+    ))
+    .map_err(storage)
+}
+
 impl Store {
     /// Open (creating if needed) the database at `path`, migrating the schema.
     ///
@@ -198,6 +231,7 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA).map_err(storage)?;
+        ensure_unique_hash(&conn)?;
         Ok(Store {
             conn: std::sync::Arc::new(parking_lot::Mutex::new(conn)),
         })
@@ -459,7 +493,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let rec = maker_rec("a", 10);
         store.put_maker_swap(&rec).unwrap();
-        store.put_maker_swap(&maker_rec("b", 20)).unwrap();
+        store.put_maker_swap(&with_hash("b", 20, [2; 32])).unwrap();
         let q = QuoteRecord {
             quote: quote("q1"),
             used: false,
@@ -536,5 +570,118 @@ mod tests {
             let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{:?}", entry.path());
         }
+    }
+
+    // ---- unique maker hash ----
+
+    fn has_hash_index(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![UNIQUE_HASH_INDEX],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    fn with_hash(id: &str, created_at: u64, hash: [u8; 32]) -> MakerRecord {
+        let mut r = maker_rec(id, created_at);
+        r.hash = hash;
+        r.taker_leg_htlc.hash = hash;
+        r
+    }
+
+    /// A database as the previous binary left it: the schema without the index, rows in it.
+    fn old_db(path: &Path, recs: &[MakerRecord]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        for r in recs {
+            conn.execute(
+                "INSERT INTO maker_swaps (id, created_at, state, json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    r.id,
+                    r.created_at as i64,
+                    r.state.as_str(),
+                    serde_json::to_string(r).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn second_maker_swap_for_one_hash_is_refused_by_the_store() {
+        let s = Store::in_memory().unwrap();
+        s.put_maker_swap(&with_hash("a", 1, [7; 32])).unwrap();
+        let err = s.put_maker_swap(&with_hash("b", 2, [7; 32])).unwrap_err();
+        assert!(matches!(err, SwapError::Storage(_)), "{err:?}");
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 1);
+        // The same swap updated, and another hash, are fine.
+        let mut a = with_hash("a", 1, [7; 32]);
+        a.last_error = Some("x".into());
+        s.put_maker_swap(&a).unwrap();
+        s.put_maker_swap(&with_hash("c", 3, [8; 32])).unwrap();
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_on_a_database_with_rows_adds_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(
+            &path,
+            &[with_hash("a", 1, [1; 32]), with_hash("b", 2, [2; 32])],
+        );
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 2);
+        assert!(has_hash_index(&Connection::open(&path).unwrap()));
+        assert!(s.put_maker_swap(&with_hash("c", 3, [1; 32])).is_err());
+        // Idempotent: a second open is fine.
+        drop(s);
+        Store::open(&path).unwrap();
+    }
+
+    #[test]
+    fn migration_on_a_database_with_a_duplicate_hash_keeps_running_without_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(
+            &path,
+            &[with_hash("a", 1, [9; 32]), with_hash("b", 2, [9; 32])],
+        );
+        let s = Store::open(&path).unwrap(); // must not refuse to start
+        assert!(!has_hash_index(&Connection::open(&path).unwrap()));
+        assert_eq!(s.list_maker_swaps().unwrap().len(), 2);
+        // Existing rows stay writable, the store keeps working.
+        let mut a = with_hash("a", 1, [9; 32]);
+        a.last_error = Some("still updatable".into());
+        s.put_maker_swap(&a).unwrap();
+        s.put_maker_swap(&with_hash("c", 3, [5; 32])).unwrap();
+    }
+
+    #[test]
+    fn database_with_only_the_old_tables_opens_and_an_old_writer_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.db");
+        old_db(&path, &[]);
+        let s = Store::open(&path).unwrap();
+        s.put_maker_swap(&with_hash("a", 1, [3; 32])).unwrap();
+        drop(s);
+        // What the previous binary does against the migrated file: open (old SCHEMA is
+        // IF NOT EXISTS, never mentions the index) and upsert by id.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let r = with_hash("a", 1, [3; 32]);
+        conn.execute(
+            "INSERT INTO maker_swaps (id, created_at, state, json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET state = excluded.state, json = excluded.json",
+            params![
+                r.id,
+                1i64,
+                r.state.as_str(),
+                serde_json::to_string(&r).unwrap()
+            ],
+        )
+        .unwrap();
     }
 }

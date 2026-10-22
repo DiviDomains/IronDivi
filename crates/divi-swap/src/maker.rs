@@ -23,6 +23,7 @@
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{AcceptRequest, LegView, LockNotice, Offer, Quote, SwapView};
@@ -36,6 +37,15 @@ use crate::types::{Amount, Chain, Outpoint};
 
 /// Default wall-clock time the maker waits for the taker's lock after `accept`.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
+
+/// Bound, in seconds, on each wait `accept` (and `notify_lock`) makes around the gate: acquiring
+/// it, and (for `accept`) the taker-chain median-time-past read held under it.
+///
+/// A healthy MTP read is 2 calls (BTC/LTC) or 13 (DIVI) and takes seconds. Per-request timeouts
+/// alone allow ~27 min on DIVI (13 calls x 4 attempts x 30 s) and ~3 min on BTC/LTC, with the
+/// gate held. 20 s per wait keeps `accept` under 40 s in the worst case, inside the default 60 s
+/// quote expiry, and fails with a retryable error the taker can answer with a new quote.
+pub const GATE_BOUND_SECS: u64 = 20;
 
 /// Upper bound on transitions one `step` call performs (a swap has far fewer).
 const MAX_TRANSITIONS_PER_STEP: usize = 32;
@@ -79,6 +89,7 @@ pub struct Maker {
     lock_wait_secs: u64,
     halt_after: Mutex<Option<SwapState>>,
     gate: tokio::sync::Mutex<()>,
+    gate_bound: Duration,
     engines: Vec<Arc<dyn OfferEngine>>,
 }
 
@@ -140,8 +151,27 @@ impl Maker {
             lock_wait_secs: DEFAULT_LOCK_WAIT_SECS,
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
+            gate_bound: Duration::from_secs(GATE_BOUND_SECS),
             engines: Vec::new(),
         })
+    }
+
+    /// Replace the bound on each gate wait and gate-held chain read ([`GATE_BOUND_SECS`]).
+    pub fn with_gate_bound(mut self, bound: Duration) -> Self {
+        self.gate_bound = bound;
+        self
+    }
+
+    /// Take the gate, or fail with a retryable error after `gate_bound` (nothing was written).
+    async fn gate_bounded(&self, what: &str) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::time::timeout(self.gate_bound, self.gate.lock())
+            .await
+            .map_err(|_| {
+                SwapError::Transient(format!(
+                    "{what}: engine busy (waited {:?} for a swap step); retry",
+                    self.gate_bound
+                ))
+            })
     }
 
     /// Replace the wall clock (unix seconds). Quote expiry and the lock wait use it.
@@ -253,8 +283,12 @@ impl Maker {
     /// Holds `gate` from the used-quote and hash checks through the writes, across the one
     /// `median_time_past` read: two accepts of one quote, or of one hash on two quotes, cannot
     /// both pass the checks.
+    ///
+    /// Both the wait for `gate` and the read are bounded by `gate_bound`; on timeout the
+    /// accept fails with [`SwapError::Transient`] (HTTP 503, retryable) before any write, so the
+    /// quote stays unused and no swap row exists.
     pub async fn accept(&self, req: AcceptRequest) -> Result<SwapView> {
-        let _g = self.gate.lock().await;
+        let _g = self.gate_bounded("accept").await?;
         let mut qr = self
             .store
             .get_quote(&req.quote_id)?
@@ -278,7 +312,14 @@ impl Maker {
             return Err(SwapError::InvalidParams("hash already in use".into()));
         }
         let (tc, mc) = (qr.quote.taker_chain(), qr.quote.maker_chain());
-        let tmtp = self.chain(tc)?.median_time_past().await?;
+        let tmtp = tokio::time::timeout(self.gate_bound, self.chain(tc)?.median_time_past())
+            .await
+            .map_err(|_| {
+                SwapError::Transient(format!(
+                    "accept: {tc} median time past not read within {:?}; retry",
+                    self.gate_bound
+                ))
+            })??;
         let locktime = tmtp
             .checked_add(qr.quote.taker_timeout_secs)
             .ok_or_else(|| SwapError::InvalidParams("locktime overflow".into()))?;
@@ -326,7 +367,7 @@ impl Maker {
     /// The taker says it funded the taker-leg HTLC at `lock.outpoint`.
     pub async fn notify_lock(&self, swap_id: &str, lock: LockNotice) -> Result<SwapView> {
         {
-            let _g = self.gate.lock().await;
+            let _g = self.gate_bounded("notify_lock").await?;
             let mut rec = self.load(swap_id)?;
             match rec.taker_leg_outpoint {
                 Some(op) if op == lock.outpoint => {}
@@ -347,8 +388,13 @@ impl Maker {
                 }
             }
         }
-        // Verification errors are recorded on the swap; the scheduler retries them.
-        let _ = self.step(swap_id).await;
+        // Verification errors are recorded on the swap; the scheduler retries them. If a
+        // step already holds the gate, the lock is persisted and the scheduler picks it up:
+        // do not make the caller wait out another swap's chain calls.
+        if let Ok(g) = self.gate_bounded("notify_lock").await {
+            drop(g);
+            let _ = self.step(swap_id).await;
+        }
         self.view(swap_id)?
             .ok_or_else(|| SwapError::Other("swap vanished".into()))
     }

@@ -293,6 +293,7 @@ New observations from this review (each also a `left:` line in `status/engine.md
   (`routes.rs:340-345`). Our assessment, to be confirmed (Q1): the taker holds the preimage and coins
   reserve only at `MakerLocked`, so this reads as a duplicate-record and accounting defect rather than
   a theft path. No test: `could not verify` any test of quote reuse.
+  2026-10-22 (lane/accept-gate-bounds): the gate's chain read is now bounded and `maker_swaps` has a unique index on the hash; see status/engine.md 2026-10-22 accept-gate-bounds.
 - **F2 — no maker re-broadcast after the maker lock confirms.** See §4 (Reorg).
 - **F3 — no `OP_SIZE` preimage-length check in the script** (`htlc.rs:116-128`). Exploitable with the V0 script: the taker (any client, not ours) picks a non-32-byte preimage; every script leg claims with it but our maker code is 32-byte only, so the maker cannot claim the taker leg. Partly fixed on lane/preimage-size, see status/engine.md 2026-10-22: `ScriptVersion::V1` (`OP_SIZE 32 OP_EQUALVERIFY`) exists and is proven; it is not yet used for new swaps (needs `maker.rs`/`store.rs`, left). Q3 answered.
 - **F4 — rate limiting.** Default config puts every client behind nginx in one bucket; the shipped nginx

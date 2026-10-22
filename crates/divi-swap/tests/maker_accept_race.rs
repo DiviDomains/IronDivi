@@ -17,15 +17,17 @@ use divi_swap::{
     Result, SignedTx, SpendInfo, Store, SwapConfig, Taker, Txid,
 };
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const T0: u32 = 1_800_000_000;
 const BTC_SATS: u64 = 1_000_000;
 
-/// A mock backend whose `median_time_past` really suspends, so an `accept` that checks, awaits
-/// and then writes without a gate lets a second `accept` run in the middle.
-struct SlowMtp(MockBackend);
+/// A mock backend whose `median_time_past` really suspends (for the shared number of
+/// milliseconds), so an `accept` that checks, awaits and then writes without a gate lets a second
+/// `accept` run in the middle, and a stalled node can be simulated.
+struct SlowMtp(MockBackend, Arc<AtomicU64>);
 
 #[async_trait]
 impl ChainBackend for SlowMtp {
@@ -42,7 +44,7 @@ impl ChainBackend for SlowMtp {
         self.0.tip_hash().await
     }
     async fn median_time_past(&self) -> Result<u32> {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(self.1.load(Ordering::SeqCst))).await;
         self.0.median_time_past().await
     }
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -83,6 +85,7 @@ struct W {
     maker: Maker,
     taker: Taker,
     store: Store,
+    mtp_ms: Arc<AtomicU64>,
     _dir: tempfile::TempDir,
 }
 
@@ -93,6 +96,7 @@ fn world() -> W {
     let mbtc = btc.backend(2, Amount(0));
     let tdivi = divi.backend(3, Amount(0));
     let tbtc = btc.backend(4, Amount(10_000_000));
+    let mtp_ms = Arc::new(AtomicU64::new(50));
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("swap.db")).unwrap();
     let offer = Offer {
@@ -105,18 +109,20 @@ fn world() -> W {
     };
     let maker = Maker::new(
         SwapConfig::profile(Profile::Testnet),
-        Arc::new(SlowMtp(mdivi)),
-        Arc::new(SlowMtp(mbtc)),
+        Arc::new(SlowMtp(mdivi, mtp_ms.clone())),
+        Arc::new(SlowMtp(mbtc, mtp_ms.clone())),
         store.clone(),
         vec![offer],
     )
     .unwrap()
+    .with_gate_bound(Duration::from_millis(500))
     .with_clock(Arc::new(|| T0 as u64));
     let taker = Taker::new(Arc::new(tdivi), Arc::new(tbtc), store.clone());
     W {
         maker,
         taker,
         store,
+        mtp_ms,
         _dir: dir,
     }
 }
@@ -234,4 +240,50 @@ async fn distinct_quotes_and_hashes_accepted_concurrently_both_succeed() {
     a.unwrap();
     b.unwrap();
     assert_eq!(w.store.list_maker_swaps().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn stalled_mtp_read_fails_accept_within_the_bound_without_a_write() {
+    let w = world();
+    let req = request(&w).await;
+    w.mtp_ms.store(3_000, Ordering::SeqCst); // the node stalls, far past the 500 ms bound
+    let t = Instant::now();
+    let r = w.maker.accept(req.clone()).await;
+    let took = t.elapsed();
+    assert!(
+        matches!(r, Err(divi_swap::SwapError::Transient(_))),
+        "{r:?} after {took:?}"
+    );
+    assert!(took < Duration::from_millis(1_500), "took {took:?}");
+    assert!(
+        w.store.list_maker_swaps().unwrap().is_empty(),
+        "no swap row"
+    );
+    assert!(
+        !w.store.get_quote(&req.quote_id).unwrap().unwrap().used,
+        "quote stays unused"
+    );
+
+    // The gate was released and the quote is intact: a healthy node accepts the same request.
+    w.mtp_ms.store(50, Ordering::SeqCst);
+    w.maker.accept(req).await.unwrap();
+    assert_eq!(w.store.list_maker_swaps().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn accept_queued_behind_a_stalled_accept_fails_within_its_own_bound() {
+    let w = world();
+    let (r1, r2) = (request(&w).await, request(&w).await);
+    w.mtp_ms.store(3_000, Ordering::SeqCst);
+    let t = Instant::now();
+    let (a, b) = tokio::join!(w.maker.accept(r1), w.maker.accept(r2));
+    // The first holds the gate for its 500 ms read bound; the second then takes the gate and
+    // stalls on its own read. Neither waits out the 3 s stall, neither writes.
+    assert!(a.is_err() && b.is_err(), "{a:?} {b:?}");
+    assert!(
+        t.elapsed() < Duration::from_millis(2_500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(w.store.list_maker_swaps().unwrap().is_empty());
 }
