@@ -5254,7 +5254,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir16_staking_only_unlock_refuses_sends_and_exports() {
+    fn staking_only_unlock_refuses_sends_and_exports() {
         let (_dir, rpc, db, sent) = encrypted_rpc();
         assert_eq!(status(&rpc), "locked", "wallet should start locked");
 
@@ -5293,7 +5293,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir20_hdmasterkeyid_shown_while_locked() {
+    fn hdmasterkeyid_shown_while_locked() {
         let (_dir, rpc, _db, _sent) = encrypted_rpc();
         assert_eq!(status(&rpc), "locked");
         let locked = rpc.get_wallet_info(&Params::None).unwrap()["hdmasterkeyid"].clone();
@@ -5304,7 +5304,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir17_short_unlock_falls_back_to_staking_only() {
+    fn short_unlock_falls_back_to_staking_only() {
         let (_dir, rpc, db, _sent) = encrypted_rpc();
         unlock(&rpc, 0, true).unwrap();
         unlock(&rpc, 1, false).unwrap();
@@ -5333,7 +5333,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir15_dust_send_is_refused_before_anything_is_submitted() {
+    fn dust_send_is_refused_before_anything_is_submitted() {
         let (rpc, _, sent) = funded_rpc();
         let to = address(8, Network::Testnet);
         // The testnet send that was accepted and never relayed, and Divi Core's refusal
@@ -5370,7 +5370,7 @@ mod send_unlock_regression {
     /// A send that needs many inputs must still pay the relay minimum
     /// (10000 sat/kB) for its real size, or no node relays it
     #[test]
-    fn ir50_many_input_send_pays_relay_fee() {
+    fn many_input_send_pays_relay_fee() {
         let (rpc, db) = rpc_on(Network::Testnet);
         for i in 0..12u8 {
             let addr = db.new_receiving_address().unwrap();
@@ -5413,7 +5413,7 @@ mod send_unlock_regression {
 
     /// Mempool refusals reach the RPC as Divi Core's sendrawtransaction errors
     #[test]
-    fn ir51_submit_errors_use_divi_core_codes() {
+    fn submit_errors_use_divi_core_codes() {
         let cases = [
             (
                 TxSubmitError::Rejected {
@@ -5457,7 +5457,7 @@ mod send_unlock_regression {
 
     /// Passphrase RPC errors use Divi Core's codes and texts (rpcwallet.cpp)
     #[test]
-    fn ir52_passphrase_errors_match_divi_core() {
+    fn passphrase_errors_match_divi_core() {
         let (rpc, _) = rpc_on(Network::Testnet);
         let unencrypted = |call: &str| {
             format!(
@@ -5507,7 +5507,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir15_change_below_dust_goes_to_fee() {
+    fn change_below_dust_goes_to_fee() {
         let (rpc, _, sent) = funded_rpc();
         let to = address(8, Network::Testnet);
         // 10 DIVI in, fee estimate 3000 sat for one input: leave 3000 sat of change,
@@ -5527,7 +5527,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir14_validateaddress_rejects_other_network() {
+    fn validateaddress_rejects_other_network() {
         let (rpc, _) = rpc_on(Network::Testnet);
         let mainnet = address(7, Network::Mainnet);
         let testnet = address(7, Network::Testnet);
@@ -5551,7 +5551,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir14_sendtoaddress_rejects_mainnet_address_on_testnet() {
+    fn sendtoaddress_rejects_mainnet_address_on_testnet() {
         let (rpc, _) = rpc_on(Network::Testnet);
         let mainnet = address(7, Network::Mainnet);
         assert_eq!(
@@ -5561,7 +5561,7 @@ mod send_unlock_regression {
     }
 
     #[test]
-    fn ir14_every_address_rpc_rejects_other_network() {
+    fn every_address_rpc_rejects_other_network() {
         let (rpc, _) = rpc_on(Network::Testnet);
         let m = address(9, Network::Mainnet);
         let mut outputs = serde_json::Map::new();

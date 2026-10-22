@@ -61,7 +61,7 @@ fn encrypted_rpc(path: &Path) -> (WalletRpc, Arc<WalletDb>) {
 }
 
 #[test]
-fn ir21_getnewaddress_while_locked_keeps_label_and_key_across_restart() {
+fn getnewaddress_while_locked_keeps_label_and_key_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("w");
     let (addr, change) = {
@@ -106,7 +106,7 @@ fn ir21_getnewaddress_while_locked_keeps_label_and_key_across_restart() {
 }
 
 #[test]
-fn ir21_locked_keypool_runs_out_with_minus_12() {
+fn locked_keypool_runs_out_with_minus_12() {
     let dir = tempfile::tempdir().unwrap();
     let (rpc, _db) = encrypted_rpc(&dir.path().join("w"));
     let keypoolsize = |rpc: &WalletRpc| {
@@ -244,7 +244,7 @@ fn wif(key: &SecretKey) -> Value {
 }
 
 #[test]
-fn ir29_importprivkey_rescan_true_finds_past_coins() {
+fn importprivkey_rescan_true_finds_past_coins() {
     let net = Net::new();
     let (key, addr) = funded_foreign_key(&net);
 
@@ -271,7 +271,7 @@ fn ir29_importprivkey_rescan_true_finds_past_coins() {
 }
 
 #[test]
-fn ir29_importprivkey_rescan_false_waits_for_rescanblockchain() {
+fn importprivkey_rescan_false_waits_for_rescanblockchain() {
     let net = Net::new();
     let (key, addr) = funded_foreign_key(&net);
 
@@ -286,7 +286,7 @@ fn ir29_importprivkey_rescan_false_waits_for_rescanblockchain() {
 }
 
 #[test]
-fn m11g_importaddress_rescan_true_shows_past_coins_watch_only() {
+fn importaddress_rescan_true_shows_past_coins_watch_only() {
     let net = Net::new();
     let (_key, addr) = funded_foreign_key(&net);
 
@@ -308,7 +308,7 @@ fn m11g_importaddress_rescan_true_shows_past_coins_watch_only() {
 }
 
 #[test]
-fn m11g_importaddress_rescan_false_waits_for_rescanblockchain() {
+fn importaddress_rescan_false_waits_for_rescanblockchain() {
     let net = Net::new();
     let (_key, addr) = funded_foreign_key(&net);
 
