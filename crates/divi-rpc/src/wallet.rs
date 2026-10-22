@@ -773,7 +773,7 @@ impl WalletRpc {
             if !wallet.is_encrypted() {
                 return Err(RpcError::new(
                     codes::WALLET_WRONG_ENC_STATE,
-                    "Error: running with an unencrypted wallet, but this call needs an encrypted one.",
+                    "Error: running with an unencrypted wallet, but walletpassphrase was called.",
                 )
                 .into());
             }
@@ -790,9 +790,11 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         if !wallet.is_encrypted() {
-            return Err(
-                RpcError::new(codes::WALLET_WRONG_ENC_STATE, "Wallet is not encrypted").into(),
-            );
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrase was called.",
+            )
+            .into());
         }
 
         if staking_only && wallet.is_unlocked_for_staking_only() {
@@ -805,8 +807,13 @@ impl WalletRpc {
 
         wallet
             .unlock_for(passphrase, timeout as u32, staking_only)
-            .map_err(|_| {
-                RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
+            .map_err(|e| match e {
+                divi_wallet::WalletError::WrongPassphrase
+                | divi_wallet::WalletError::InvalidPassphrase => RpcError::new(
+                    codes::WALLET_PASSPHRASE_INCORRECT,
+                    "Error: The wallet passphrase entered was incorrect.",
+                ),
+                other => RpcError::new(codes::WALLET_ERROR, other.to_string()),
             })?;
 
         Ok(serde_json::Value::Null)
@@ -817,9 +824,11 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         if !wallet.is_encrypted() {
-            return Err(
-                RpcError::new(codes::WALLET_WRONG_ENC_STATE, "Wallet is not encrypted").into(),
-            );
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletlock was called.",
+            )
+            .into());
         }
 
         wallet.lock();
@@ -3109,7 +3118,7 @@ impl WalletRpc {
             if !wallet.is_encrypted() {
                 return Err(RpcError::new(
                     codes::WALLET_WRONG_ENC_STATE,
-                    "Error: running with an unencrypted wallet, but this call needs an encrypted one.",
+                    "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
                 )
                 .into());
             }
@@ -3122,15 +3131,22 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("New passphrase required"))?;
 
         if old_passphrase.is_empty() || new_passphrase.is_empty() {
-            return Err(RpcError::invalid_params("Passphrases cannot be empty").into());
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "walletpassphrasechange <oldpassphrase> <newpassphrase>\n\
+                 Changes the wallet passphrase from <oldpassphrase> to <newpassphrase>.",
+            )
+            .into());
         }
 
         let wallet = self.get_wallet()?;
 
         if !wallet.is_encrypted() {
-            return Err(
-                RpcError::new(codes::WALLET_WRONG_ENC_STATE, "Wallet is not encrypted").into(),
-            );
+            return Err(RpcError::new(
+                codes::WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrasechange was called.",
+            )
+            .into());
         }
 
         // Change the passphrase
@@ -3162,7 +3178,11 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("encryptwallet \"passphrase\""))?;
         if passphrase.is_empty() {
-            return Err(RpcError::invalid_params("passphrase can not be empty").into());
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "encryptwallet <passphrase>\nEncrypts the wallet with <passphrase>.",
+            )
+            .into());
         }
 
         let wallet = self.get_wallet()?;
@@ -5249,6 +5269,57 @@ mod send_unlock_regression {
                 (want_code, want_message.to_string())
             );
         }
+    }
+
+    /// Passphrase RPC errors use Divi Core's codes and texts (rpcwallet.cpp)
+    #[test]
+    fn ir52_passphrase_errors_match_divi_core() {
+        let (rpc, _) = rpc_on(Network::Testnet);
+        let unencrypted = |call: &str| {
+            format!(
+                "Error: running with an unencrypted wallet, but {} was called.",
+                call
+            )
+        };
+        assert_eq!(
+            err(rpc.wallet_passphrase(&p(vec![json!("x"), json!(60)]))),
+            (
+                codes::WALLET_WRONG_ENC_STATE,
+                unencrypted("walletpassphrase")
+            )
+        );
+        assert_eq!(
+            err(rpc.wallet_lock(&Params::None)),
+            (codes::WALLET_WRONG_ENC_STATE, unencrypted("walletlock"))
+        );
+        assert_eq!(
+            err(rpc.wallet_passphrase_change(&p(vec![json!("a"), json!("b")]))),
+            (
+                codes::WALLET_WRONG_ENC_STATE,
+                unencrypted("walletpassphrasechange")
+            )
+        );
+        assert_eq!(
+            err(rpc.encrypt_wallet(&p(vec![json!("")]))),
+            (
+                codes::MISC_ERROR,
+                "encryptwallet <passphrase>\nEncrypts the wallet with <passphrase>.".to_string()
+            )
+        );
+
+        let (_dir, rpc, _db, _sent) = encrypted_rpc();
+        let incorrect = (
+            codes::WALLET_PASSPHRASE_INCORRECT,
+            "Error: The wallet passphrase entered was incorrect.".to_string(),
+        );
+        assert_eq!(
+            err(rpc.wallet_passphrase(&p(vec![json!("not it"), json!(60)]))),
+            incorrect
+        );
+        assert_eq!(
+            err(rpc.wallet_passphrase_change(&p(vec![json!("not it"), json!("new")]))),
+            incorrect
+        );
     }
 
     #[test]
