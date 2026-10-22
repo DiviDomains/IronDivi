@@ -1243,7 +1243,36 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
+        // With privkeys, Divi Core signs only with those keys (a temporary keystore)
+        // and does not need the wallet unlocked
+        let given_keys = match params.get(2).filter(|v| !v.is_null()) {
+            Some(keys) => {
+                let keys = keys
+                    .as_array()
+                    .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "privkeys must be an array"))?;
+                let store = divi_wallet::KeyStore::new(self.address_network());
+                for key in keys {
+                    let invalid =
+                        || RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid private key");
+                    let wif = key
+                        .as_str()
+                        .and_then(|k| divi_wallet::decode_wif(k).ok())
+                        .ok_or_else(invalid)?;
+                    let secret =
+                        divi_crypto::keys::SecretKey::from_bytes(&wif.key_bytes).map_err(|_| {
+                            RpcError::new(
+                                codes::INVALID_ADDRESS_OR_KEY,
+                                "Private key outside allowed range",
+                            )
+                        })?;
+                    store.import_key(secret, None);
+                }
+                Some(store)
+            }
+            None => None,
+        };
+
+        if given_keys.is_none() && wallet.is_locked() {
             return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
         }
 
@@ -1327,13 +1356,14 @@ impl WalletRpc {
 
         // Sign what we can and merge with the signatures already present
         let mempool = self.mempool.read().clone();
+        // Given keys use only the redeem scripts given with them, as in Divi Core
         let redeem_script = |h: &Hash160| {
             redeem_scripts
                 .get(h)
                 .cloned()
-                .or_else(|| wallet.get_script(h))
+                .or_else(|| given_keys.is_none().then(|| wallet.get_script(h)).flatten())
         };
-        let signer = TransactionSigner::new(wallet.keystore());
+        let signer = TransactionSigner::new(given_keys.as_ref().unwrap_or(wallet.keystore()));
         let mut complete = true;
         for i in 0..tx.vin.len() {
             let outpoint = tx.vin[i].prevout;
