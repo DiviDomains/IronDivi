@@ -612,3 +612,61 @@ async fn scan_cursor_persists_with_wallet() {
     // A fresh process sees the saved cursor.
     assert_eq!(open().scanned_height(), Some(102));
 }
+
+/// Fixture: a 64-hex block hash in explorer (display) order, as DIVI `getbestblockhash` answers.
+const DIVI_GENESIS_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
+#[tokio::test]
+async fn tip_hash_reads_getbestblockhash_in_display_order() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getbestblockhash", json!(DIVI_GENESIS_HASH.to_uppercase()));
+    assert_eq!(b.tip_hash().await.unwrap(), DIVI_GENESIS_HASH);
+}
+
+#[tokio::test]
+async fn tip_hash_non_string_or_malformed_is_transient() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getbestblockhash", json!(null));
+    assert!(matches!(b.tip_hash().await, Err(SwapError::Transient(_))));
+    node.result("getbestblockhash", json!("deadbeef"));
+    assert!(matches!(b.tip_hash().await, Err(SwapError::Transient(_))));
+}
+
+#[tokio::test]
+async fn tip_hash_failing_endpoint_errors() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.plain("getbestblockhash", 503);
+    assert!(b.tip_hash().await.is_err());
+}
+
+/// Read-only smoke against the live DIVI APIs: prints `SMOKE <chain> <net> <height_before>
+/// <tip_hash> <height_after>` for comparison with an independent explorer. Broadcasts nothing.
+#[tokio::test]
+#[ignore = "hits live DIVI APIs (read-only GETs)"]
+async fn tip_hash_live_smoke() {
+    for net in ["testnet", "mainnet"] {
+        let b = {
+            let (rpc, network) = if net == "mainnet" {
+                (MAINNET_RPC, Network::Mainnet)
+            } else {
+                (TESTNET_RPC, Network::Testnet)
+            };
+            DiviBackend::new(
+                rpc,
+                SecretKey::new_random(),
+                network,
+                FeePolicy::default(),
+                None,
+            )
+            .unwrap()
+        };
+        let before = b.tip_height().await.unwrap();
+        let hash = b.tip_hash().await.unwrap();
+        let after = b.tip_height().await.unwrap();
+        assert_eq!(hash.len(), 64, "{hash}");
+        println!("SMOKE DIVI {net} {before} {hash} {after}");
+    }
+}

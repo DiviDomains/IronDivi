@@ -288,6 +288,17 @@ impl ChainBackend for UsdcBackend {
             .map_err(|e| SwapError::Transient(format!("get_block_number: {e}")))
     }
 
+    async fn tip_hash(&self) -> Result<String> {
+        let block = self
+            .client
+            .provider()
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| SwapError::Transient(format!("get_block_by_number: {e}")))?
+            .ok_or_else(|| SwapError::Transient("no latest block".into()))?;
+        Ok(hex::encode(block.header.hash))
+    }
+
     /// The latest block's timestamp: the same quantity `Erc20Htlc`'s own
     /// `block.timestamp >= timelock` check compares against (see the design doc).
     async fn median_time_past(&self) -> Result<u32> {

@@ -812,6 +812,9 @@ impl ChainBackend for Spy {
     async fn tip_height(&self) -> Result<u64> {
         self.inner.tip_height().await
     }
+    async fn tip_hash(&self) -> Result<String> {
+        self.inner.tip_hash().await
+    }
     async fn median_time_past(&self) -> Result<u32> {
         self.inner.median_time_past().await
     }

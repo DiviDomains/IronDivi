@@ -342,6 +342,14 @@ impl ChainBackend for DiviBackend {
             })
     }
 
+    async fn tip_hash(&self) -> Result<String> {
+        let v = self.rpc.call_ok("getbestblockhash", json!([])).await?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| SwapError::Transient("getbestblockhash: not a string".into()))?;
+        divi_swap::backend::normalize_block_hash(s)
+    }
+
     async fn median_time_past(&self) -> Result<u32> {
         // The node reports `mediantime: null`, so take the median of the last 11 block times.
         let tip = self.tip_height().await?;

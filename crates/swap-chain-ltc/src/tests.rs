@@ -886,3 +886,67 @@ async fn build_send_rejects_a_destination_on_the_other_network() {
     let err = main.build_send(&test_addr, 20_000).await.unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");
 }
+
+/// Bitcoin genesis, as explorers show it: leading zeros, lowercase. Esplora may answer with
+/// uppercase or a trailing newline; `tip_hash` normalises both.
+const GENESIS_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
+#[tokio::test]
+async fn tip_hash_reads_tip_hash_endpoint_in_display_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{}\n", GENESIS_HASH.to_uppercase())),
+        )
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    assert_eq!(b.tip_hash().await.unwrap(), GENESIS_HASH);
+}
+
+#[tokio::test]
+async fn tip_hash_rejects_malformed_body_as_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("tiphash"))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    let err = b.tip_hash().await.unwrap_err();
+    assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn tip_hash_failing_endpoint_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/blocks/tip/hash"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    let b = backend(vec![server.uri()], MAKER_KEY);
+    assert!(b.tip_hash().await.is_err());
+}
+
+/// Read-only smoke against the live LTC APIs: prints `SMOKE <chain> <net> <height_before>
+/// <tip_hash> <height_after>` for comparison with an independent explorer. Broadcasts nothing.
+#[tokio::test]
+#[ignore = "hits live LTC APIs (read-only GETs)"]
+async fn tip_hash_live_smoke() {
+    for net in ["testnet", "mainnet"] {
+        let b = LtcBackend::for_network(
+            net,
+            SecretKey::from_slice(&TAKER_KEY).unwrap(),
+            FeePolicy::Fixed(1),
+        )
+        .unwrap();
+        let before = b.tip_height().await.unwrap();
+        let hash = b.tip_hash().await.unwrap();
+        let after = b.tip_height().await.unwrap();
+        assert_eq!(hash.len(), 64, "{hash}");
+        println!("SMOKE LTC {net} {before} {hash} {after}");
+    }
+}

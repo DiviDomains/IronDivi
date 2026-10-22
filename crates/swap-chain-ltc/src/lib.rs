@@ -122,6 +122,11 @@ impl std::fmt::Debug for LtcBackend {
 }
 
 impl LtcBackend {
+    /// The raw `/blocks/tip/hash` body, shared by `tip_hash` and `median_time_past`.
+    async fn tip_hash_raw(&self) -> Result<String> {
+        Ok(self.esplora.get("/blocks/tip/hash").await?)
+    }
+
     /// Testnet backend on explicit `endpoints`: Esplora base URLs, primary first. `key` is
     /// resolved by the caller. Other networks: [`LtcBackend::new_on`].
     pub fn new(
@@ -424,8 +429,12 @@ impl ChainBackend for LtcBackend {
             .map_err(|_| SwapError::Transient(format!("unparseable tip height {body:?}")))
     }
 
+    async fn tip_hash(&self) -> Result<String> {
+        divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)
+    }
+
     async fn median_time_past(&self) -> Result<u32> {
-        let hash = self.esplora.get("/blocks/tip/hash").await?;
+        let hash = self.tip_hash_raw().await?;
         let block = self.get_json(&format!("/block/{}", hash.trim())).await?;
         block["mediantime"]
             .as_u64()

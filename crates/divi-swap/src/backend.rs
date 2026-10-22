@@ -20,6 +20,19 @@ use crate::error::Result;
 use crate::htlc::HtlcParams;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
 
+/// Normalise a block hash a backend reported to 64 lowercase hex characters, or a
+/// `Transient` error (an empty or malformed hash is a node glitch, not a chain state).
+pub fn normalize_block_hash(raw: &str) -> Result<String> {
+    let h = raw.trim().to_ascii_lowercase();
+    if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(h)
+    } else {
+        Err(crate::error::SwapError::Transient(format!(
+            "malformed tip block hash {raw:?}"
+        )))
+    }
+}
+
 /// One chain, one engine key. A backend owns exactly one secp256k1 key (resolved from
 /// 1Password at startup): it funds HTLCs from that key's coins, and claims / refunds to it.
 // clippy >= 1.99 flags the `#[must_use]` that `async_trait` adds to the boxed futures.
@@ -35,6 +48,11 @@ pub trait ChainBackend: Send + Sync {
 
     /// Current best block height.
     async fn tip_height(&self) -> Result<u64>;
+
+    /// Hash of the current best block: 64 lowercase hex characters in display byte order
+    /// (what block explorers show; no `0x` prefix, on EVM too), so a height can be
+    /// cross-checked against an independent explorer. Read-only; no swap path calls it.
+    async fn tip_hash(&self) -> Result<String>;
 
     /// Median time past of the tip (what CLTV unix-time locktimes are compared against).
     async fn median_time_past(&self) -> Result<u32>;

@@ -128,6 +128,12 @@ impl MockChain {
         self.state.lock().mtp
     }
 
+    /// Deterministic fake hash of the tip block: the chain index and height, zero-padded
+    /// to 64 hex characters (distinct per height and per chain).
+    pub fn tip_hash(&self) -> String {
+        format!("{:02x}{:062x}", self.chain as u8, self.height())
+    }
+
     /// Current height.
     pub fn height(&self) -> u64 {
         self.state.lock().height
@@ -228,6 +234,11 @@ impl ChainBackend for MockBackend {
     async fn tip_height(&self) -> Result<u64> {
         self.check_online()?;
         Ok(self.chain.height())
+    }
+
+    async fn tip_hash(&self) -> Result<String> {
+        self.check_online()?;
+        Ok(self.chain.tip_hash())
     }
 
     async fn median_time_past(&self) -> Result<u32> {
@@ -419,6 +430,21 @@ mod tests {
             refund_pubkey: refund,
             locktime,
         }
+    }
+
+    #[tokio::test]
+    async fn tip_hash_tracks_height_and_goes_offline() {
+        let chain = MockChain::new(Chain::Divi, 1_800_000_000, 60);
+        let b = chain.backend(1, Amount(0));
+        let h0 = b.tip_hash().await.unwrap();
+        assert_eq!(h0.len(), 64);
+        assert!(h0
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        chain.mine(1);
+        assert_ne!(b.tip_hash().await.unwrap(), h0);
+        chain.set_offline(true);
+        assert!(b.tip_hash().await.is_err());
     }
 
     #[tokio::test]

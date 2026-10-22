@@ -353,6 +353,11 @@ impl ChainBackend for ZecBackend {
             .height)
     }
 
+    async fn tip_hash(&self) -> Result<String> {
+        let tip = self.client.latest_block().await.map_err(SwapError::from)?;
+        display_block_hash(&tip.hash)
+    }
+
     async fn median_time_past(&self) -> Result<u32> {
         let tip = self.tip_height().await?;
         let start = tip.saturating_sub(10);
@@ -574,6 +579,20 @@ impl ChainBackend for ZecBackend {
     }
 }
 
+/// `BlockID.hash` from lightwalletd is the 32-byte hash in internal (wire) order; explorers
+/// show it byte-reversed. Returns the explorer form: 64 lowercase hex characters.
+fn display_block_hash(wire: &[u8]) -> Result<String> {
+    if wire.len() != 32 {
+        return Err(SwapError::Transient(format!(
+            "GetLatestBlock hash is {} bytes, expected 32",
+            wire.len()
+        )));
+    }
+    let mut rev = wire.to_vec();
+    rev.reverse();
+    Ok(hex::encode(rev))
+}
+
 #[cfg(test)]
 mod tests {
     use divi_swap::htlc::new_preimage;
@@ -679,6 +698,23 @@ mod tests {
             "transaction rejected: any transaction with the same effects will be rejected \
              from the mempool until a chain reset: transaction was committed to the best chain"
         ));
+    }
+
+    /// Zcash mainnet genesis: lightwalletd's wire bytes are the reverse of the explorer hash.
+    #[test]
+    fn display_block_hash_reverses_wire_bytes() {
+        let explorer = "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08";
+        let mut wire = hex::decode(explorer).unwrap();
+        wire.reverse();
+        assert_eq!(display_block_hash(&wire).unwrap(), explorer);
+    }
+
+    #[test]
+    fn display_block_hash_rejects_wrong_length() {
+        for bad in [&[][..], &[0u8; 31][..], &[0u8; 33][..]] {
+            let err = display_block_hash(bad).unwrap_err();
+            assert!(matches!(err, SwapError::Transient(_)), "{err:?}");
+        }
     }
 
     #[test]
@@ -801,6 +837,22 @@ mod tests {
             n: 0,
         };
         assert_eq!(spend_in_block(&block, &other.txid, other.n), None);
+    }
+
+    /// Read-only smoke: prints `SMOKE ZEC <net> <height_before> <tip_hash> <height_after>`
+    /// for comparison with an independent explorer. Broadcasts nothing.
+    #[tokio::test]
+    #[ignore = "hits live lightwalletd (read-only)"]
+    async fn tip_hash_live_smoke() {
+        for net in ["testnet", "mainnet"] {
+            let sk = SecretKey::from_slice(&[0x42; 32]).unwrap();
+            let b = ZecBackend::for_network(net, sk, FeePolicy::default()).unwrap();
+            let before = b.tip_height().await.unwrap();
+            let hash = b.tip_hash().await.unwrap();
+            let after = b.tip_height().await.unwrap();
+            assert_eq!(hash.len(), 64, "{hash}");
+            println!("SMOKE ZEC {net} {before} {hash} {after}");
+        }
     }
 
     /// Read-only, against the live testnet API.
