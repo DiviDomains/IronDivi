@@ -995,7 +995,8 @@ impl BlockchainRpc {
     /// Get address deltas
     pub fn get_address_deltas(&self, params: &Params) -> Result<Value, Error> {
         // Parse parameters to validate structure
-        let _addresses = self.parse_address_index_params(params, "getaddressdeltas")?;
+        let addresses = self.parse_address_index_params(params, "getaddressdeltas")?;
+        self.check_index_addresses(&addresses)?;
 
         // Return address index not enabled error
         Err(self.address_index_not_enabled())
@@ -1004,7 +1005,8 @@ impl BlockchainRpc {
     /// Get address transaction IDs
     pub fn get_address_txids(&self, params: &Params) -> Result<Value, Error> {
         // Parse parameters to validate structure
-        let _addresses = self.parse_address_index_params(params, "getaddresstxids")?;
+        let addresses = self.parse_address_index_params(params, "getaddresstxids")?;
+        self.check_index_addresses(&addresses)?;
 
         // Return address index not enabled error
         Err(self.address_index_not_enabled())
@@ -1058,6 +1060,17 @@ impl BlockchainRpc {
              The address index allows querying transaction history and balances for any address.",
         )
         .into()
+    }
+
+    /// Divi Core getAddressesFromParams: every address must decode for this
+    /// node's network, else -5 "Invalid address"
+    fn check_index_addresses(&self, addresses: &[String]) -> Result<(), Error> {
+        use divi_wallet::address::Address;
+        for a in addresses {
+            Address::from_base58_for_network(a, self.address_network())
+                .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        }
+        Ok(())
     }
 
     fn parse_address_index_params(

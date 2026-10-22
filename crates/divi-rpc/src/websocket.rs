@@ -26,6 +26,7 @@ use axum::{
 };
 use divi_primitives::hash::Hash256;
 use divi_primitives::script::Script;
+use divi_wallet::address::Network;
 use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -137,11 +138,22 @@ pub struct NotificationHub {
     block_tx: broadcast::Sender<Notification>,
     /// Address to script mapping for reverse lookup
     address_to_script: RwLock<HashMap<String, Vec<u8>>>,
+    /// Network subscriptions must belong to; None accepts any (no chain known)
+    network: Option<Network>,
 }
 
 impl NotificationHub {
     /// Create a new notification hub
     pub fn new() -> Arc<Self> {
+        Self::with_network(None)
+    }
+
+    /// Create a hub that refuses subscriptions to another network's addresses
+    pub fn for_network(network: Network) -> Arc<Self> {
+        Self::with_network(Some(network))
+    }
+
+    fn with_network(network: Option<Network>) -> Arc<Self> {
         let (tx, _) = broadcast::channel(10000);
         let (block_tx, _) = broadcast::channel(1000);
 
@@ -149,6 +161,7 @@ impl NotificationHub {
             tx,
             block_tx,
             address_to_script: RwLock::new(HashMap::new()),
+            network,
         })
     }
 
@@ -221,14 +234,13 @@ impl NotificationHub {
 
     /// Parse address to script
     fn parse_address(&self, addr_str: &str) -> Option<Vec<u8>> {
-        use divi_primitives::script::Script;
-        use divi_wallet::address::{Address, AddressType};
+        use divi_wallet::address::Address;
 
-        let address = Address::from_base58(addr_str).ok()?;
-        let script = match address.addr_type {
-            AddressType::P2PKH => Script::new_p2pkh(address.hash.as_bytes()),
-            AddressType::P2SH => Script::new_p2sh(address.hash.as_bytes()),
+        let address = match self.network {
+            Some(network) => Address::from_base58_for_network(addr_str, network).ok()?,
+            None => Address::from_base58(addr_str).ok()?,
         };
+        let script = address.script_pubkey();
 
         // Cache the mapping
         self.address_to_script
@@ -248,6 +260,7 @@ impl Default for NotificationHub {
             tx: hub.tx.clone(),
             block_tx: hub.block_tx.clone(),
             address_to_script: RwLock::new(HashMap::new()),
+            network: None,
         }
     }
 }
@@ -450,6 +463,21 @@ mod tests {
             }
             _ => panic!("Expected Ping message"),
         }
+    }
+
+    #[test]
+    fn hub_for_a_network_refuses_other_network_addresses() {
+        use divi_primitives::hash::Hash160;
+        use divi_wallet::address::Address;
+        let hash = Hash160::from_bytes([3; 20]);
+        let mainnet = Address::from_pubkey_hash(hash, Network::Mainnet).to_base58();
+        let testnet = Address::from_pubkey_hash(hash, Network::Testnet).to_base58();
+        let hub = NotificationHub::for_network(Network::Testnet);
+        assert!(hub.parse_address(&mainnet).is_none());
+        assert!(hub.parse_address(&testnet).is_some());
+        let hub = NotificationHub::for_network(Network::Mainnet);
+        assert!(hub.parse_address(&testnet).is_none());
+        assert!(hub.parse_address(&mainnet).is_some());
     }
 
     #[test]
