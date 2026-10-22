@@ -498,6 +498,9 @@ impl WalletRpc {
                 let confs = utxo.confirmations(height);
                 confs >= min_conf && confs <= max_conf
             })
+            // Vault outputs are not listed, as in Core (AvailableCoins with
+            // ALL_SPENDABLE_COINS); getcoinavailability reports them
+            .filter(|utxo| StakingVaultScript::from_script(&utxo.script_pubkey).is_none())
             .filter(|utxo| {
                 addresses
                     .as_ref()
@@ -5021,5 +5024,53 @@ mod accounting_tests {
             .map(|u| u.value.as_sat())
             .sum();
         assert_eq!(selectable, BALANCE);
+    }
+
+    #[test]
+    fn list_unspent_leaves_out_vault_outputs() {
+        let f = fixture();
+        // A vault managed by our `second` key, funded with 50 DIVI in block 6
+        let manager = Address::from_base58(&f.second).unwrap();
+        let mut owner = [0u8; 20];
+        owner.copy_from_slice(&[0xcc; 20]);
+        let vault = StakingVaultScript::new(owner, *manager.hash.as_bytes()).to_script();
+        f.wallet.store_vault(divi_wallet::wallet_db::VaultMetadata {
+            owner_address: String::new(),
+            manager_address: f.second.clone(),
+            vault_script: vault.as_bytes().to_vec(),
+            funding_txid: [0u8; 32],
+        });
+        let coin = f
+            .wallet
+            .get_utxos()
+            .into_iter()
+            .find(|u| u.address == f.miner)
+            .unwrap();
+        let fund = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin.outpoint(), Script::default(), 0xffffffff)],
+            vout: vec![
+                TxOut::new(Amount::from_sat(50 * COIN), vault.clone()),
+                TxOut::new(
+                    Amount::from_sat(1200 * COIN - 1_000_000),
+                    script_of(&f.miner),
+                ),
+            ],
+            lock_time: 0,
+        };
+        mine(&f.chain, stranger(), &[fund]);
+        f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
+        assert!(f
+            .wallet
+            .get_utxos()
+            .iter()
+            .any(|u| u.script_pubkey == vault));
+
+        let listed = f.rpc.list_unspent(&Params::Array(vec![])).unwrap();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 4);
+        assert!(listed
+            .iter()
+            .all(|u| u["scriptPubKey"] != json!(hex::encode(vault.as_bytes()))));
     }
 }
