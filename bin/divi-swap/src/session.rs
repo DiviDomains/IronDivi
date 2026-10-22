@@ -25,13 +25,31 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub maker_url: String,
     pub maker_swap_id: String,
     /// The xmr maker's per-swap token (`X-Swap-Token`); empty for hashlock sessions.
     #[serde(default)]
     pub swap_token: String,
+}
+
+// Hand-written so a stray `{:?}` never prints the bearer token.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("maker_url", &self.maker_url)
+            .field("maker_swap_id", &self.maker_swap_id)
+            .field(
+                "swap_token",
+                &if self.swap_token.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
 }
 
 pub struct Sessions {

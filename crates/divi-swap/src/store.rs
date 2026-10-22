@@ -42,7 +42,7 @@ pub struct QuoteRecord {
 /// The maker's persisted view of one swap. Legs are role-based: the *taker leg* is on
 /// `quote.taker_chain()`, the *maker leg* on `quote.maker_chain()`. Pre-direction records
 /// (taker leg = BTC, maker leg = DIVI) load through the serde aliases.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MakerRecord {
     /// Swap id.
     pub id: String,
@@ -91,7 +91,7 @@ pub struct MakerRecord {
 }
 
 /// The taker's persisted view of one swap (role-based legs, see [`MakerRecord`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakerRecord {
     /// Local swap id.
     pub id: String,
@@ -133,6 +133,93 @@ pub struct TakerRecord {
     pub claim_declined: Option<String>,
     /// Last error.
     pub last_error: Option<String>,
+}
+
+/// What a secret prints as in `Debug` output.
+const REDACTED: &str = "<redacted>";
+
+// `Debug` is written by hand so a stray `{:?}` never prints the preimage. Every field is
+// listed; adding a field to the struct without listing it here fails to compile.
+impl std::fmt::Debug for MakerRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let MakerRecord {
+            id,
+            created_at,
+            state,
+            quote,
+            hash,
+            taker_maker_leg_pubkey,
+            taker_leg_htlc,
+            taker_leg_outpoint,
+            taker_leg_locked,
+            maker_leg_htlc,
+            maker_leg_funding,
+            maker_leg_scan_from,
+            maker_mtp_at_lock,
+            maker_leg_refund,
+            preimage,
+            taker_leg_claim,
+            last_error,
+        } = self;
+        f.debug_struct("MakerRecord")
+            .field("id", id)
+            .field("created_at", created_at)
+            .field("state", state)
+            .field("quote", quote)
+            .field("hash", hash)
+            .field("taker_maker_leg_pubkey", taker_maker_leg_pubkey)
+            .field("taker_leg_htlc", taker_leg_htlc)
+            .field("taker_leg_outpoint", taker_leg_outpoint)
+            .field("taker_leg_locked", taker_leg_locked)
+            .field("maker_leg_htlc", maker_leg_htlc)
+            .field("maker_leg_funding", maker_leg_funding)
+            .field("maker_leg_scan_from", maker_leg_scan_from)
+            .field("maker_mtp_at_lock", maker_mtp_at_lock)
+            .field("maker_leg_refund", maker_leg_refund)
+            .field("preimage", &preimage.as_ref().map(|_| REDACTED))
+            .field("taker_leg_claim", taker_leg_claim)
+            .field("last_error", last_error)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for TakerRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let TakerRecord {
+            id,
+            state,
+            quote,
+            preimage: _,
+            hash,
+            maker_swap_id,
+            taker_leg_htlc,
+            taker_leg_funding,
+            maker_leg_htlc,
+            maker_leg_outpoint,
+            maker_leg_amount,
+            maker_leg_claim,
+            taker_leg_refund,
+            claim_declined,
+            last_error,
+        } = self;
+        f.debug_struct("TakerRecord")
+            .field("id", id)
+            .field("state", state)
+            .field("quote", quote)
+            .field("preimage", &REDACTED)
+            .field("hash", hash)
+            .field("maker_swap_id", maker_swap_id)
+            .field("taker_leg_htlc", taker_leg_htlc)
+            .field("taker_leg_funding", taker_leg_funding)
+            .field("maker_leg_htlc", maker_leg_htlc)
+            .field("maker_leg_outpoint", maker_leg_outpoint)
+            .field("maker_leg_amount", maker_leg_amount)
+            .field("maker_leg_claim", maker_leg_claim)
+            .field("taker_leg_refund", taker_leg_refund)
+            .field("claim_declined", claim_declined)
+            .field("last_error", last_error)
+            .finish()
+    }
 }
 
 fn storage<E: std::fmt::Display>(e: E) -> SwapError {
@@ -200,16 +287,22 @@ fn ensure_unique_hash(conn: &Connection) -> Result<()> {
 impl Store {
     /// Open (creating if needed) the database at `path`, migrating the schema.
     ///
-    /// The file is created with mode 0600 before SQLite touches it.
+    /// A new file is created with mode 0600 before SQLite touches it. An existing database
+    /// and its `-wal`/`-shm` that are looser than 0600 (an older build, a copied file) are
+    /// tightened to 0600 with a warning; one that cannot be tightened is an error, because
+    /// the file holds the preimage and per-swap keys. [`Store::open_read_only`] never chmods.
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             create_private(path)?;
         }
+        tighten_existing(path)?;
         let conn = Connection::open(path).map_err(storage)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(storage)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(storage)?;
+        // SQLite has now created (or reopened) the sidecars.
+        tighten_existing(path)?;
         Self::init(conn)
     }
 
@@ -422,6 +515,44 @@ fn create_private(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn create_private(path: &Path) -> Result<()> {
     std::fs::File::create(path).map(|_| ()).map_err(storage)
+}
+
+/// Tighten `path` and its `-wal`/`-shm` to 0600 when they exist and are looser. A file the
+/// process cannot chmod (not the owner) is an error rather than a silent pass: the caller is
+/// about to put secrets into it.
+#[cfg(unix)]
+fn tighten_existing(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let p = std::path::PathBuf::from(name);
+        let mode = match std::fs::metadata(&p) {
+            Ok(m) => m.permissions().mode() & 0o777,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(storage(format!("{}: {e}", p.display()))),
+        };
+        if mode & 0o077 == 0 {
+            continue;
+        }
+        tracing::warn!(
+            path = %p.display(), old_mode = format!("{mode:04o}"),
+            "swap database file was readable beyond its owner; tightening to 0600"
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            storage(format!(
+                "{} has mode {mode:04o} and cannot be tightened to 0600 ({e}); it holds swap \
+                 secrets, so the store will not open it",
+                p.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten_existing(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 mod hex33 {

@@ -56,6 +56,7 @@ pub mod live;
 pub mod maker;
 pub mod mock;
 pub mod nums;
+mod redact;
 pub mod taker;
 pub mod wire;
 

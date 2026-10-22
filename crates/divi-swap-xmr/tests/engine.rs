@@ -281,6 +281,72 @@ async fn happy_path_maker_gets_xmr_taker_gets_divi() {
     );
 }
 
+/// Every string / number-array under the secret keys of a serialized record, in each form a
+/// careless `{:?}` could print them (as-is, hex, decimal list).
+fn secret_forms(rec: &serde_json::Value) -> Vec<String> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(x) if x.len() >= 8 => out.push(x.clone()),
+            serde_json::Value::Array(a) => {
+                let bytes: Option<Vec<u8>> = a
+                    .iter()
+                    .map(|n| n.as_u64().and_then(|n| u8::try_from(n).ok()))
+                    .collect();
+                if let Some(b) = bytes.filter(|b| b.len() >= 8) {
+                    out.push(hex::encode(&b));
+                    out.push(
+                        b.iter()
+                            .map(|x| x.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                } else {
+                    a.iter().for_each(|x| walk(x, out));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for k in ["swap_token", "divi_key", "s_m", "s_t", "view_secret"] {
+        if let Some(v) = rec.get(k) {
+            walk(v, &mut out);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn xmr_record_debug_output_carries_no_secret() {
+    let w = W::new();
+    let (mid, tid) = w.open().await;
+    for _ in 0..30 {
+        w.round(&mid, &tid, true, true).await;
+        if w.maker_state(&mid) == XmrMakerState::Done
+            && w.taker_rec(&tid).state == XmrTakerState::Done
+        {
+            break;
+        }
+    }
+    let maker = w.maker.record(&mid).unwrap().unwrap();
+    let taker = w.taker_rec(&tid);
+    let mj = serde_json::to_value(&maker).unwrap();
+    let tj = serde_json::to_value(&taker).unwrap();
+    for (name, json, dbg) in [
+        ("maker", &mj, format!("{maker:?}\n{maker:#?}")),
+        ("taker", &tj, format!("{taker:?}\n{taker:#?}")),
+    ] {
+        let forms = secret_forms(json);
+        assert!(forms.len() >= 2, "{name}: fixture has too few secrets");
+        for f in forms {
+            assert!(!dbg.contains(&f), "{name} Debug leaked a secret");
+        }
+        assert!(dbg.contains("<redacted>"), "{name} Debug marks redaction");
+    }
+    // The non-secret fields stay visible.
+    assert!(format!("{maker:?}").contains(&mid));
+}
+
 #[tokio::test]
 async fn taker_walks_away_after_locking_xmr_both_refund() {
     let w = W::new();

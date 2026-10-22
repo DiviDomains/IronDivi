@@ -91,7 +91,7 @@ pub struct JRoundRequest {
 }
 
 /// The maker's answer to `POST /xmr/swaps` and to each `POST /xmr/swaps/:id/j`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JRoundReply {
     /// The maker's swap id.
     pub swap_id: String,
@@ -106,6 +106,26 @@ pub struct JRoundReply {
     pub setup: Option<SetupReply>,
     /// Whether the maker holds his `σ_J` share's output (his signing is finished).
     pub signed: bool,
+}
+
+// Hand-written so a stray `{:?}` never prints the bearer token.
+impl std::fmt::Debug for JRoundReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let JRoundReply {
+            swap_id,
+            swap_token: _,
+            msgs,
+            setup,
+            signed,
+        } = self;
+        f.debug_struct("JRoundReply")
+            .field("swap_id", swap_id)
+            .field("swap_token", &"<redacted>")
+            .field("msgs", msgs)
+            .field("setup", setup)
+            .field("signed", signed)
+            .finish()
+    }
 }
 
 /// Step 2, maker → taker (the reply to `POST /xmr/swaps`).
