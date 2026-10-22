@@ -97,6 +97,10 @@ pub struct XmrTakerRecord {
     /// `s_t`: Monero spend-key share and `Tx_redeem` adaptor secret.
     #[serde(with = "wire::ed_scalar")]
     pub s_t: ScalarQ,
+    /// The taker's own DIVI MTP read in `prepare`, before the request: the floor for the
+    /// maker's `t_cancel` clock. `None` on a record that predates it.
+    #[serde(default)]
+    pub prepare_mtp: Option<u32>,
     /// Where the DIVI is paid.
     #[serde(with = "wire::bytes")]
     pub payout_script: Vec<u8>,
@@ -322,12 +326,18 @@ impl XmrTaker {
             (SecretKey::new_random(), s_t, proof, x, share, sid)
         };
         let payout = self.divi.payout_script();
+        // Her own clock, before the maker commits to one (`xmr-design.md`, "Maker MTP bound").
+        let prepare_mtp = match &self.floor {
+            Some(_) => Some(self.divi.median_time_past().await?),
+            None => None,
+        };
         let rec = XmrTakerRecord {
             id: uuid::Uuid::new_v4().to_string(),
             state: XmrTakerState::Prepared,
             quote: quote.clone(),
             divi_key,
             s_t,
+            prepare_mtp,
             payout_script: payout.as_bytes().to_vec(),
             j_sid,
             setup: None,
@@ -525,6 +535,7 @@ impl XmrTaker {
         if let Some(f) = &self.floor {
             f.check_setup_timelocks(
                 mtp,
+                r.prepare_mtp,
                 reply.maker_mtp,
                 reply.t_cancel,
                 reply.t_punish,

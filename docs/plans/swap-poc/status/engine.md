@@ -97,3 +97,10 @@
 - left: ZEC testnet and DIVI testnet tip hashes could not be checked against an independent public explorer (none found); the EVM anvil test has not run on hp1 (no anvil installed); no caller yet (a `divi-swap tip` command is another lane's).
 - needs: nothing
 - decisions: required trait method rather than a default, since every backend can answer; EVM hash returned unprefixed so all chains share one format; ZEC reversed in the ZEC crate because lightwalletd serves internal order
+
+## 2026-10-22 — xmr-prepare-mtp-floor (builder AP)
+- done: AO's option (a) implemented. `XmrTakerRecord::prepare_mtp: Option<u32>` (`serde(default)`) is read in `prepare` (only when the taker holds a floor); `check_setup_timelocks` takes it and floors `t_cancel >= prepare_mtp - maker_mtp_trail_secs + cancel_after_secs` on top of the existing floor, whether or not the maker states `maker_mtp`. New `XmrConfig::maker_mtp_trail_secs`, default = `sigs_wait_secs` (1800 s on testnet and mainnet). Truth table in AO's section matched the base (`taker.rs` prepare/verify_setup, `lib.rs` floor); no drift.
+- proof: five new `divi-swap-xmr` lib tests, each with `L` set explicitly except the default one: `a_maker_stating_an_old_mtp_is_refused_against_the_prepare_mtp`, `a_maker_omitting_its_mtp_is_refused_against_the_prepare_mtp`, `an_honest_maker_trailing_by_less_than_the_tolerance_is_accepted_and_beyond_refused`, `a_record_without_a_prepare_mtp_keeps_todays_floor`, `the_default_tolerance_is_sigs_wait_secs_on_every_profile_and_changes_nothing`; lib tests 44 -> 49, every other suite unchanged (engine 8/8, all green), 0 failed; fmt and clippy (-D warnings) clean for `divi-swap-xmr`, `divi-swapd`, `divi-swap-cli`.
+- left: the value of `L`; the shipped default keeps today's behaviour exactly.
+- needs: Bert: pick `L` (0 / 360 s recommended / 1800 s); then set `maker_mtp_trail_secs` in the two profile constructors.
+- decisions: no wire change; no confirmation count, timeout, margin or `sigs_wait_secs` changed; a taker without a floor does not read the extra MTP.
