@@ -164,11 +164,14 @@ pub struct WalletTx {
 
 /// A wallet transaction waiting in the mempool.
 ///
-/// Kept in memory only, beside the confirmed state rather than inside it: the
-/// confirmed UTXO set, spent set and history are what get persisted and what
-/// the block scan updates, so a mempool transaction never touches them. When
-/// the transaction confirms, the block scan records it as usual and the entry
-/// is dropped; if it is evicted or conflicted, dropping the entry is enough.
+/// Kept beside the confirmed state rather than inside it: the confirmed UTXO
+/// set, spent set and history are what the block scan updates, so a mempool
+/// transaction never touches them. The raw transaction is stored on disk as
+/// soon as the wallet sees it and the overlay is rebuilt from it on open, so
+/// an unconfirmed send survives a restart or crash before the next block.
+/// When the transaction confirms, the block scan records it as usual and the
+/// entry is dropped; if it is evicted or conflicted, dropping the entry (here
+/// and on disk) is enough.
 /// Where a coin in the wallet's effective UTXO view came from
 #[derive(Debug, Clone, Copy)]
 enum CoinSource {
@@ -201,6 +204,8 @@ struct MempoolWalletTx {
     trusted: bool,
     /// History entry shown by listtransactions/gettransaction (block_height None)
     record: WalletTx,
+    /// The transaction itself, to store and to resubmit after a restart
+    tx: divi_primitives::transaction::Transaction,
 }
 
 /// Wallet database
@@ -241,7 +246,7 @@ pub struct WalletDb {
     dirty: RwLock<DirtyFlags>,
     /// Spent UTXOs with spending height - for reorg restoration (in-memory only)
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
-    /// Wallet transactions in the mempool (in-memory only, never persisted)
+    /// Wallet transactions in the mempool (stored on disk as raw transactions)
     mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
 }
 
@@ -336,9 +341,68 @@ impl WalletDb {
                 vaults_map.insert(key, metadata);
             }
         }
+        // Needs keys, UTXOs, spent set, history and vaults loaded first
+        wallet.restore_unconfirmed_txs(&db)?;
         debug!("Restored {} vaults", wallet.vaults.read().len());
 
         Ok(wallet)
+    }
+
+    /// Rebuild the mempool overlay from the unconfirmed transactions on disk.
+    /// A stored transaction that has since confirmed, or whose coin was spent
+    /// by a confirmed transaction, is dropped from disk instead, together with
+    /// the stored transactions that spend its outputs.
+    fn restore_unconfirmed_txs(&self, db: &WalletDatabase) -> Result<(), WalletError> {
+        let mut stored = Vec::new();
+        for (timestamp, raw) in db.load_unconfirmed_txs()? {
+            match divi_primitives::deserialize::<divi_primitives::transaction::Transaction>(&raw) {
+                Ok(tx) => stored.push((timestamp, tx)),
+                Err(e) => tracing::warn!("Skipping unreadable unconfirmed wallet tx: {}", e),
+            }
+        }
+        let mut restored = 0;
+        let mut dropped = HashSet::new();
+        for (timestamp, tx) in parents_first(stored) {
+            let txid = tx.txid();
+            let orphaned = tx.vin.iter().any(|i| dropped.contains(&i.prevout.txid));
+            let confirmed = matches!(
+                self.transactions.read().get(&txid),
+                Some(t) if t.block_height.is_some()
+            );
+            let conflicted = {
+                let spent = self.spent.read();
+                tx.vin.iter().any(|i| {
+                    !i.prevout.is_null()
+                        && spent.contains(&OutPoint::new(i.prevout.txid, i.prevout.vout))
+                })
+            };
+            if orphaned || confirmed || conflicted || !self.track_mempool_tx(&tx, Some(timestamp)) {
+                debug!("Dropping stored unconfirmed wallet tx {}", txid);
+                db.remove_unconfirmed_tx(&txid)?;
+                if !confirmed {
+                    // Its outputs never existed, so whatever spends them is void too
+                    dropped.insert(txid);
+                }
+            } else {
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            info!("Restored {} unconfirmed wallet transaction(s)", restored);
+        }
+        Ok(())
+    }
+
+    /// Unconfirmed wallet transactions, parents before children, to resubmit
+    /// to the mempool after a restart
+    pub fn unconfirmed_transactions(&self) -> Vec<divi_primitives::transaction::Transaction> {
+        let txs = self
+            .mempool_txs
+            .read()
+            .values()
+            .map(|e| (e.record.timestamp, e.tx.clone()))
+            .collect();
+        parents_first(txs).into_iter().map(|(_, tx)| tx).collect()
     }
 
     /// Migrate the wallet's chain_mode for future key derivations.
@@ -1773,9 +1837,21 @@ impl WalletDb {
 
     /// Track a transaction that has entered the mempool.
     ///
-    /// Returns true if it concerns this wallet. Nothing persisted is changed:
-    /// the block scan records the transaction once it confirms.
+    /// Returns true if it concerns this wallet. The raw transaction is stored
+    /// (synced) before this returns, so a send is on disk before the RPC that
+    /// made it answers; the confirmed state is left to the block scan, which
+    /// records the transaction once it confirms.
     pub fn add_mempool_tx(&self, tx: &divi_primitives::transaction::Transaction) -> bool {
+        self.track_mempool_tx(tx, None)
+    }
+
+    /// Add a transaction to the mempool overlay. `restored_time` is set when it
+    /// comes from disk: it keeps its first-seen time and is not stored again.
+    fn track_mempool_tx(
+        &self,
+        tx: &divi_primitives::transaction::Transaction,
+        restored_time: Option<u64>,
+    ) -> bool {
         if tx.is_coinbase() || tx.is_coinstake() {
             return false;
         }
@@ -1855,10 +1931,12 @@ impl WalletDb {
             txid,
             block_hash: None,
             block_height: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp: restored_time.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            }),
             amount: net_amount,
             fee,
             category: category.to_string(),
@@ -1873,6 +1951,7 @@ impl WalletDb {
             net_amount.abs(),
             if trusted { "trusted" } else { "untrusted" }
         );
+        let timestamp = record.timestamp;
         overlay.insert(
             txid,
             MempoolWalletTx {
@@ -1881,9 +1960,32 @@ impl WalletDb {
                 spends,
                 outputs,
                 record,
+                tx: tx.clone(),
             },
         );
+        drop(overlay);
+
+        if restored_time.is_none() {
+            if let Some(db) = &self.db {
+                if let Err(e) =
+                    db.store_unconfirmed_tx(&txid, timestamp, &divi_primitives::serialize(tx))
+                {
+                    tracing::error!("Failed to store unconfirmed wallet tx {}: {}", txid, e);
+                }
+            }
+        }
         true
+    }
+
+    /// Delete stored unconfirmed transactions that left the overlay
+    fn forget_stored_unconfirmed(&self, txids: &[Hash256]) {
+        if let Some(db) = &self.db {
+            for txid in txids {
+                if let Err(e) = db.remove_unconfirmed_tx(txid) {
+                    tracing::warn!("Failed to forget unconfirmed wallet tx {}: {}", txid, e);
+                }
+            }
+        }
     }
 
     /// Stop tracking a transaction that has left the mempool.
@@ -1891,7 +1993,11 @@ impl WalletDb {
     /// The wallet mirrors the mempool, so only this entry is dropped; any
     /// child still in the mempool gets its own removal notice.
     pub fn remove_mempool_tx(&self, txid: &Hash256) -> bool {
-        self.mempool_txs.write().remove(txid).is_some()
+        let removed = self.mempool_txs.write().remove(txid).is_some();
+        if removed {
+            self.forget_stored_unconfirmed(&[*txid]);
+        }
+        removed
     }
 
     /// Number of wallet transactions currently tracked in the mempool
@@ -1908,7 +2014,10 @@ impl WalletDb {
         if overlay.is_empty() {
             return;
         }
-        overlay.remove(&txid);
+        let mut forgotten = Vec::new();
+        if overlay.remove(&txid).is_some() {
+            forgotten.push(txid);
+        }
 
         let confirmed_inputs: HashSet<OutPoint> = tx
             .vin
@@ -1923,6 +2032,7 @@ impl WalletDb {
             .collect();
         while let Some(id) = doomed.pop() {
             if overlay.remove(&id).is_some() {
+                forgotten.push(id);
                 info!("Dropped mempool wallet tx {} (conflicts with {})", id, txid);
                 doomed.extend(
                     overlay
@@ -1932,6 +2042,8 @@ impl WalletDb {
                 );
             }
         }
+        drop(overlay);
+        self.forget_stored_unconfirmed(&forgotten);
     }
 
     /// Update confirmation counts for all transactions
@@ -2257,6 +2369,26 @@ fn decrypt_master_key(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, WalletErr
         .map_err(|_| WalletError::WrongPassphrase)?;
 
     Ok(decrypted.to_vec())
+}
+
+/// Order transactions oldest first, moving each child after the parents it
+/// spends from within the list
+fn parents_first(
+    mut txs: Vec<(u64, divi_primitives::transaction::Transaction)>,
+) -> Vec<(u64, divi_primitives::transaction::Transaction)> {
+    txs.sort_by_key(|(timestamp, _)| *timestamp);
+    let mut pending: HashSet<Hash256> = txs.iter().map(|(_, tx)| tx.txid()).collect();
+    let mut ordered = Vec::with_capacity(txs.len());
+    while !txs.is_empty() {
+        let ready = txs
+            .iter()
+            .position(|(_, tx)| tx.vin.iter().all(|i| !pending.contains(&i.prevout.txid)))
+            .unwrap_or(0);
+        let (timestamp, tx) = txs.remove(ready);
+        pending.remove(&tx.txid());
+        ordered.push((timestamp, tx));
+    }
+    ordered
 }
 
 #[cfg(test)]
@@ -3052,7 +3184,7 @@ mod tests {
         }
 
         #[test]
-        fn overlay_is_not_persisted() {
+        fn overlay_is_restored_on_open() {
             use tempfile::tempdir;
 
             let dir = tempdir().unwrap();
@@ -3070,10 +3202,30 @@ mod tests {
                 wallet.save_incremental().unwrap();
                 wallet.save().unwrap();
             }
+            // Stored apart from the confirmed state, and back in the overlay on open
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
-            assert_eq!(wallet.mempool_tx_count(), 0);
-            assert!(wallet.get_utxos().is_empty());
-            assert!(wallet.get_transaction(&tx.txid()).is_none());
+            assert_eq!(wallet.mempool_tx_count(), 1);
+            assert_eq!(wallet.get_utxos().len(), 1);
+            assert!(wallet.utxos.read().is_empty());
+            let rec = wallet.get_transaction(&tx.txid()).unwrap();
+            assert!(rec.block_height.is_none());
+            assert!(wallet.transactions.read().is_empty());
+        }
+
+        #[test]
+        fn unconfirmed_transactions_come_back_parents_first() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            let child = spend(&[(tx.txid(), 1)], vec![(69 * COIN, stranger())]);
+            assert!(wallet.add_mempool_tx(&tx));
+            assert!(wallet.add_mempool_tx(&child));
+            // Same first-seen second, child listed first: order must follow the spend
+            for entry in wallet.mempool_txs.write().values_mut() {
+                entry.record.timestamp = 5;
+            }
+            let swapped = parents_first(vec![(5, child.clone()), (5, tx.clone())]);
+            assert_eq!(swapped[0].1.txid(), tx.txid());
+            assert_eq!(wallet.unconfirmed_transactions(), vec![tx, child]);
         }
     }
 }

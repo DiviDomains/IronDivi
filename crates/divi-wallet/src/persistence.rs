@@ -709,6 +709,16 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(e.to_string()))
     }
 
+    /// Write a batch atomically and fsync the WAL before returning, so the batch
+    /// survives a crash or power loss right after the call
+    pub fn write_batch_sync(&self, batch: WriteBatch) -> Result<(), WalletError> {
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(batch, &opts)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     /// Get a column family handle by name
     pub fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(name).unwrap()
@@ -819,6 +829,68 @@ impl WalletDatabase {
             }
         }
 
+        Ok(results)
+    }
+
+    // ========== Unconfirmed wallet transactions ==========
+    //
+    // Kept in the default column family, which nothing else uses, so a wallet
+    // written by this version still opens with an older one (RocksDB refuses
+    // to open a database with an unknown column family).
+
+    /// Key prefix of unconfirmed wallet transactions
+    const UNCONFIRMED_TX_PREFIX: &'static [u8] = b"unconfirmed_tx_";
+
+    fn unconfirmed_tx_key(txid: &Hash256) -> Vec<u8> {
+        let mut key = Self::UNCONFIRMED_TX_PREFIX.to_vec();
+        key.extend_from_slice(txid.as_bytes());
+        key
+    }
+
+    /// Store an unconfirmed wallet transaction (raw bytes) and the time the
+    /// wallet first saw it. Synced: callers rely on it surviving a crash
+    /// right after they return.
+    pub fn store_unconfirmed_tx(
+        &self,
+        txid: &Hash256,
+        timestamp: u64,
+        raw_tx: &[u8],
+    ) -> Result<(), WalletError> {
+        let mut value = Vec::with_capacity(8 + raw_tx.len());
+        value.extend_from_slice(&timestamp.to_le_bytes());
+        value.extend_from_slice(raw_tx);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_DEFAULT), Self::unconfirmed_tx_key(txid), &value);
+        self.write_batch_sync(batch)
+    }
+
+    /// Forget an unconfirmed wallet transaction (confirmed, evicted or conflicted)
+    pub fn remove_unconfirmed_tx(&self, txid: &Hash256) -> Result<(), WalletError> {
+        self.db
+            .delete_cf(self.cf(CF_DEFAULT), Self::unconfirmed_tx_key(txid))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load every stored unconfirmed wallet transaction as (timestamp, raw tx)
+    pub fn load_unconfirmed_txs(&self) -> Result<Vec<(u64, Vec<u8>)>, WalletError> {
+        let iter = self.db.iterator_cf(
+            self.cf(CF_DEFAULT),
+            rocksdb::IteratorMode::From(Self::UNCONFIRMED_TX_PREFIX, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if !key.starts_with(Self::UNCONFIRMED_TX_PREFIX) {
+                break;
+            }
+            if value.len() < 8 {
+                debug!("Skipping corrupt unconfirmed tx entry");
+                continue;
+            }
+            let mut ts = [0u8; 8];
+            ts.copy_from_slice(&value[..8]);
+            results.push((u64::from_le_bytes(ts), value[8..].to_vec()));
+        }
         Ok(results)
     }
 }
