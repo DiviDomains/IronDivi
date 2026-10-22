@@ -327,7 +327,7 @@ pub(crate) fn spend(prevout: OutPoint, value: u64, to: Script, lock_time: u32) -
 }
 
 /// A fresh per-swap token: 32 random bytes from the same RNG the setup keys come from, hex.
-fn new_swap_token() -> String {
+pub fn new_swap_token() -> String {
     let mut b = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut b);
     hex::encode(b)
@@ -335,7 +335,7 @@ fn new_swap_token() -> String {
 
 /// `given == expected` without an early exit on the first differing byte; an empty
 /// `expected` (a record from before tokens) matches nothing.
-fn token_matches(expected: &str, given: &str) -> bool {
+pub fn token_matches(expected: &str, given: &str) -> bool {
     let (e, g) = (expected.as_bytes(), given.as_bytes());
     if e.is_empty() || e.len() != g.len() {
         return false;

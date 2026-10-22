@@ -22,6 +22,10 @@
 #     the installed `divi-swapd` read-only against the maker's database. If that fails (binary
 #     missing, too old to know --xmr-watch, database unreadable) it says so instead of seeing no swaps.
 # Secrets: /etc/swap-watch.env (root 0600): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID. Never logged.
+#   The hashlock listing (GET /swaps) is operator-only: the job reads the maker's
+#   `operator_token_file` (OPERATOR_TOKEN_FILE, default /etc/divi-swapd/operator.token; root
+#   0600 or readable by the job's user) and sends it to curl on stdin, never on the command line.
+#   A missing/unreadable file or a refused listing is reported as a problem, not as "no swaps".
 # State: /var/lib/swap-watch (when each swap entered its state; the last alert).
 #
 #   swap-watch.sh          one check
@@ -30,6 +34,7 @@
 
 set -u
 API="${API:-http://127.0.0.1:18480}"
+OPERATOR_TOKEN_FILE="${OPERATOR_TOKEN_FILE:-/etc/divi-swapd/operator.token}"
 MONEROD_URL="${MONEROD_URL-http://127.0.0.1:38089}"
 UNITS="${UNITS:-divi-swapd monerod-stagenet}"
 SCAN_MAX="${SCAN_MAX:-3600}"
@@ -115,9 +120,30 @@ else
   problems+=("XMR swap state unreadable: $(head -n 1 <<<"${xmr_out:-no output}" | cut -c1-140)")
 fi
 
+# The hashlock listing needs the operator token (header on curl's stdin, never argv). Prints
+# the JSON array; returns non-zero, with the reason on stderr, when it cannot be had.
+htlc_listing() {
+  local tok body
+  [ -r "$OPERATOR_TOKEN_FILE" ] || { echo "operator token file $OPERATOR_TOKEN_FILE unreadable" >&2; return 1; }
+  tok=$(tr -d '\r\n' <"$OPERATOR_TOKEN_FILE")
+  [ -n "$tok" ] || { echo "operator token file $OPERATOR_TOKEN_FILE is empty" >&2; return 1; }
+  body=$(printf 'header = "X-Operator-Token: %s"\n' "$tok" |
+    curl -sS -m 10 --config - -w '\n%{http_code}' "$API/swaps" 2>/dev/null) || { echo "maker unreachable" >&2; return 1; }
+  tok=""
+  [ "${body##*$'\n'}" = 200 ] || { echo "listing refused (HTTP ${body##*$'\n'}): is operator_token_file set in divi-swapd.toml and the same token?" >&2; return 1; }
+  printf '%s' "${body%$'\n'*}"
+}
+htlc_json=""
+htlc_err=$(mktemp)
+if ! htlc_json=$(htlc_listing 2>"$htlc_err"); then
+  htlc_json=""
+  problems+=("hashlock swap listing unavailable: $(head -n 1 "$htlc_err" | cut -c1-140)")
+fi
+rm -f "$htlc_err"
+
 # One line per swap: kind id state last_error. Hashlock states are PascalCase, XMR snake_case.
 swaps=$( {
-  curl -sS -m 10 "$API/swaps" 2>/dev/null | jq -r '.[]? | ["htlc", .id, .state, (.last_error // "")] | @tsv'
+  [ -n "$htlc_json" ] && jq -r '.[]? | ["htlc", .id, .state, (.last_error // "")] | @tsv' <<<"$htlc_json"
   [ -n "$xmr_rows" ] && awk -F'\t' -v OFS='\t' '{ print "xmr", $1, $2, $4 }' <<<"$xmr_rows"
 } )
 seen_file="$STATE_DIR/seen.tsv"   # kind id state since last_error

@@ -23,12 +23,21 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 mkdir -p "$tmp/bin"
 
-# curl: /healthz ok, /swaps empty, /xmr/swaps answers like the daemon today (405, empty body).
+# curl: /healthz ok, /xmr/swaps answers like the daemon today (405, empty body), and the
+# operator-only /swaps listing: with --config (the header arrives on stdin) it is empty only
+# when the header carries $OPTOK, else 404; argv is logged so a test can prove no token is in it.
 cat >"$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
+echo "$*" >>"$CURL_ARGV_LOG"
 case "$*" in
   */healthz*) echo '{"ok":true}' ;;
-  */swaps*) case "$*" in */xmr/swaps*) ;; *) echo '[]' ;; esac ;;
+  */swaps*) case "$*" in
+    */xmr/swaps*) ;;
+    *--config*)
+      hdr=$(cat)
+      if grep -qF "X-Operator-Token: $OPTOK" <<<"$hdr"; then printf '[]\n200'; else printf '\n404'; fi ;;
+    *) echo '[]' ;;
+  esac ;;
 esac
 STUB
 # divi-swapd: prints $FAKE_OUT (printf %b), exits $FAKE_RC; logs argv.
@@ -45,6 +54,9 @@ STUB
 chmod +x "$tmp/bin/"*
 export PATH="$tmp/bin:$PATH"
 export FAKE_LOG="$tmp/swapd.log"
+export CURL_ARGV_LOG="$tmp/curl-argv.log"
+export OPTOK=op-token-for-test-0123456789
+printf '%s\n' "$OPTOK" >"$tmp/op.token"
 
 ID=abcdef0123456789abcdef0123456789
 now=$(date +%s)
@@ -55,6 +67,7 @@ run() {
   [ -n "${SEEN-}" ] && printf '%b' "$SEEN" >"$tmp/state/seen.tsv"
   : >"$FAKE_LOG"
   OUT=$(UNITS="" MONEROD_URL="" API="http://stub" STATE_DIR="$tmp/state" ENV_FILE="$tmp/none" \
+    OPERATOR_TOKEN_FILE="${OPTOK_FILE-$tmp/op.token}" \
     SWAPD_BIN="${SWAPD_BIN_T:-$tmp/bin/divi-swapd}" SWAPD_USER="" SWAPD_CONFIG="$tmp/cfg.toml" \
     "$1" dry-run 2>&1)
   RC=$?
@@ -133,6 +146,23 @@ if has "0 problem(s)"; then pass "a first-time last_error stays quiet"; else fai
 case_stuck; export FAKE_RC FAKE_OUT; run "$TARGET"
 if [ "$(cat "$tmp/state/seen.tsv")" = "$(printf '%b' "$SEEN")" ]; then pass "dry-run leaves the seen state untouched"
 else fail "dry-run changed seen.tsv"; fi
+
+# 7. the hashlock listing is operator-only: token on stdin, never argv; a refusal is a problem
+FAKE_RC=0 FAKE_OUT='xmr_configured yes\nin_flight 0\n'; export FAKE_RC FAKE_OUT; SEEN=""
+: >"$CURL_ARGV_LOG"; run "$TARGET"
+if has "0 problem(s)" && ! grep -qF "$OPTOK" "$CURL_ARGV_LOG"; then
+  pass "the listing is read with the operator token on stdin, not on the command line"
+else fail "listing ok: out=$OUT argv=$(cat "$CURL_ARGV_LOG")"; fi
+OPTOK_FILE="$tmp/no-such-token" run "$TARGET"
+if has "problem: hashlock swap listing unavailable: operator token file"; then
+  pass "a missing operator token file is a problem, not 'no swaps'"
+else fail "missing token file: out=$OUT"; fi
+printf 'wrong\n' >"$tmp/wrong.token"
+OPTOK_FILE="$tmp/wrong.token" run "$TARGET"
+if has "problem: hashlock swap listing unavailable: listing refused (HTTP 404)"; then
+  pass "a refused listing (wrong token or operator_token_file unset) is a problem"
+else fail "refused listing: out=$OUT"; fi
+if ! grep -qF wrong <<<"$OUT"; then pass "the token is not echoed in the alert"; else fail "token echoed: $OUT"; fi
 
 # ---- the base script must NOT see these (the bug this test exists for) ---------------------------
 if [ -z "${SWAP_WATCH:-}" ]; then

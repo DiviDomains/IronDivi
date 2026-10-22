@@ -25,13 +25,29 @@ use std::time::Duration;
 use divi_swap::api::Offer;
 use divi_swap::mock::{MockBackend, MockChain};
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Profile, Store, SwapConfig, Taker};
-use divi_swapd::{router, spawn_scheduler, AppState, ScanStatus};
+use divi_swapd::{router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus};
 use tokio::task::JoinHandle;
 
 pub const OFFER_ID: &str = "o1";
 pub const REV_OFFER_ID: &str = "o1-rev";
 pub const BTC_SATS: u64 = 100_000;
 pub const T0: u32 = 1_700_000_000;
+
+/// The operator credential the test daemons are configured with (`GET /swaps`).
+pub const OPERATOR_TOKEN: &str = "test-operator-token";
+
+/// `GET url` carrying the operator credential, parsed as JSON.
+pub async fn operator_json(url: &str) -> serde_json::Value {
+    reqwest::Client::new()
+        .get(url)
+        .header("x-operator-token", OPERATOR_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
 
 pub struct World {
     pub divi: MockChain,
@@ -138,7 +154,9 @@ pub async fn serve(world: &World, maker: Arc<Maker>, tick: Option<Duration>) -> 
         btc: Arc::new(world.maker_btc.clone()),
         scan: ScanStatus::done(),
     };
-    let app = router(state, "/swap");
+    let auth = HashlockAuth::new(Store::in_memory().unwrap())
+        .with_operator_token(Some(OPERATOR_TOKEN.into()));
+    let app = router_with_auth(state, None, "/swap", false, auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {

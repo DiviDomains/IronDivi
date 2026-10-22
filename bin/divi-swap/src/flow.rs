@@ -200,7 +200,7 @@ pub async fn begin(
         Session {
             maker_url: client.base().to_string(),
             maker_swap_id: view.id.clone(),
-            swap_token: String::new(),
+            swap_token: client.swap_token(&view.id).unwrap_or_default(),
         },
     )?;
     taker.accepted(&local, &view).await?;
@@ -216,6 +216,9 @@ pub async fn lock(
 ) -> Result<()> {
     let session = sessions.get(local)?;
     let notice = taker.lock(local).await?;
+    let client = client
+        .clone()
+        .with_swap_token(&session.maker_swap_id, &session.swap_token);
     client.lock(&session.maker_swap_id, &notice).await?;
     Ok(())
 }
@@ -228,6 +231,9 @@ pub async fn step(
     local: &str,
 ) -> Result<TakerState> {
     let session = sessions.get(local)?;
+    let client = client
+        .clone()
+        .with_swap_token(&session.maker_swap_id, &session.swap_token);
     let view = match client.swap(&session.maker_swap_id).await {
         Ok(v) => Some(v),
         Err(e) => {

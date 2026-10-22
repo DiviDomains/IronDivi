@@ -1007,6 +1007,7 @@ async fn main() -> Result<()> {
         Cmd::Status { swap } => {
             let s = sessions.get(swap)?;
             let view = MakerClient::new(&s.maker_url)
+                .with_swap_token(&s.maker_swap_id, &s.swap_token)
                 .swap(&s.maker_swap_id)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
@@ -1095,6 +1096,7 @@ async fn main() -> Result<()> {
                 .get_taker_swap(swap)?
                 .with_context(|| format!("no taker record {swap}"))?;
             let view = MakerClient::new(&s.maker_url)
+                .with_swap_token(&s.maker_swap_id, &s.swap_token)
                 .swap(&s.maker_swap_id)
                 .await?;
             for l in divi_swap_cli::txids::lines(&rec, &view) {

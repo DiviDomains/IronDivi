@@ -30,8 +30,12 @@ use divi_swap_xmr::mock::{
     MockDiviChain, MockDiviWallet, MockMoneroChain, MockMoneroWallet, MOCK_DIVI_FEE, MOCK_XMR_FEE,
 };
 use divi_swap_xmr::{XmrConfig, XmrMaker, XmrMakerState, XmrTaker, XmrTakerState};
-use divi_swapd::{mock_xmr_offers, router_with_proxy, spawn_scheduler, AppState, ScanStatus};
+use divi_swapd::{
+    mock_xmr_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus,
+};
 use tokio::task::JoinHandle;
+
+const OPERATOR_TOKEN: &str = "test-operator-token";
 
 const T0: u32 = 1_700_000_000;
 const XMR_UNITS: u64 = 1_000_000; // 0.01 XMR
@@ -144,7 +148,9 @@ async fn serve_with(w: &World, db: &std::path::Path, trust_proxy_headers: bool) 
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
-    let app = router_with_proxy(state, Some(xmr.clone()), "/swap", trust_proxy_headers);
+    let auth = HashlockAuth::new(Store::in_memory().unwrap())
+        .with_operator_token(Some(OPERATOR_TOKEN.into()));
+    let app = router_with_auth(state, Some(xmr.clone()), "/swap", trust_proxy_headers, auth);
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -318,12 +324,16 @@ async fn xmr_and_hashlock_routes_do_not_cross() {
     });
     let r = reqwest::Client::new()
         .post(format!("{}/swaps", d.base))
+        .header("x-swap-token-support", "1")
         .json(&body)
         .send()
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 400);
-    let all: serde_json::Value = reqwest::get(format!("{}/swaps", d.base))
+    let all: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/swaps", d.base))
+        .header("x-operator-token", OPERATOR_TOKEN)
+        .send()
         .await
         .unwrap()
         .json()

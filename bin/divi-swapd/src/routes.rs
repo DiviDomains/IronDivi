@@ -27,13 +27,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Extension;
 use axum::{Json, Router};
-use divi_swap::api::{AcceptRequest, LockNotice, Offer, Quote, SwapView};
-use divi_swap::{Chain, ChainBackend, Maker, SwapError};
+use divi_swap::api::{
+    AcceptReply, AcceptRequest, LockNotice, Offer, Quote, SwapView, OPERATOR_TOKEN_HEADER,
+    SWAP_TOKEN_HEADER as HASHLOCK_TOKEN_HEADER, SWAP_TOKEN_SUPPORT_HEADER,
+};
+use divi_swap::{Chain, ChainBackend, Maker, Store, SwapError};
 use divi_swap_xmr::api::{
     JRoundReply, JRoundRequest, SetupRequest, SigsRequest, XmrLockNotice, XmrSwapView,
     SWAP_TOKEN_HEADER,
 };
+use divi_swap_xmr::maker::{new_swap_token, token_matches};
 use divi_swap_xmr::XmrMaker;
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
@@ -167,6 +172,101 @@ async fn swap_token_gate(
     }
 }
 
+/// `docs` kind holding a hashlock swap's token, keyed by the maker's swap id. A swap with no
+/// such document predates tokens (or was accepted with tokenless swaps allowed): a legacy swap.
+const TOKEN_KIND: &str = "hashlock_swap_token";
+
+#[derive(Serialize, Deserialize)]
+struct TokenDoc {
+    token: String,
+}
+
+/// What the hashlock routes check: the per-swap tokens (kept beside the swaps in the maker's
+/// database, through the docs table) and the operator token for the full listing.
+#[derive(Clone)]
+pub struct HashlockAuth {
+    store: Store,
+    operator_token: Option<Arc<String>>,
+    allow_tokenless: bool,
+}
+
+impl HashlockAuth {
+    /// Tokens are kept in `store`: pass the maker's own (a clone shares the connection).
+    pub fn new(store: Store) -> Self {
+        HashlockAuth {
+            store,
+            operator_token: None,
+            allow_tokenless: false,
+        }
+    }
+
+    /// The credential for `GET /swaps` (the listing); `None` or empty leaves the listing a 404.
+    pub fn with_operator_token(mut self, token: Option<String>) -> Self {
+        self.operator_token = token.filter(|t| !t.is_empty()).map(Arc::new);
+        self
+    }
+
+    /// Let a taker that does not send `X-Swap-Token-Support` open a swap with no token (it is
+    /// then a legacy swap: readable and lockable by anyone who knows its id).
+    pub fn allow_tokenless(mut self, allow: bool) -> Self {
+        self.allow_tokenless = allow;
+        self
+    }
+}
+
+/// The reply every refused hashlock swap call gets, whether the id is unknown or the token is
+/// missing, wrong or another swap's.
+fn no_swap(id: &str) -> Response {
+    ApiError(StatusCode::NOT_FOUND, format!("no swap {id}")).into_response()
+}
+
+#[derive(Clone)]
+struct SwapGate {
+    auth: HashlockAuth,
+    maker: Arc<Maker>,
+}
+
+/// Gate for `GET /swaps/:id` and `POST /swaps/:id/lock`, run before the body is parsed. A swap
+/// with a token needs it in `X-Swap-Token`; a legacy swap (no token document) is open, as it
+/// was; an unknown id is refused. All refusals are the one 404 of [`no_swap`].
+async fn hashlock_token_gate(
+    State(g): State<SwapGate>,
+    Path(params): Path<HashMap<String, String>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let id = params.get("id").map(String::as_str).unwrap_or("");
+    let given = req
+        .headers()
+        .get(HASHLOCK_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ok = match g.auth.store.get_doc::<TokenDoc>(TOKEN_KIND, id) {
+        Ok(Some(d)) => token_matches(&d.token, given),
+        Ok(None) => matches!(g.maker.view(id), Ok(Some(_))),
+        Err(_) => false,
+    };
+    if ok {
+        next.run(req).await
+    } else {
+        no_swap(id)
+    }
+}
+
+/// Gate for `GET /swaps`: the operator token, or a bare 404 (the answer for a route that does
+/// not exist). With no operator token configured the listing is always a 404.
+async fn operator_gate(State(a): State<HashlockAuth>, req: Request, next: Next) -> Response {
+    let given = req
+        .headers()
+        .get(OPERATOR_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match &a.operator_token {
+        Some(t) if token_matches(t, given) => next.run(req).await,
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub maker: Arc<Maker>,
@@ -216,6 +316,32 @@ pub fn router_with_proxy(
     prefix: &str,
     trust_proxy_headers: bool,
 ) -> Router {
+    // Swap tokens in memory only, no operator token: for in-process tests. The daemon calls
+    // `router_with_auth` with the maker's own store.
+    let auth = HashlockAuth::new(Store::in_memory().expect("in-memory store"));
+    router_with_auth(state, xmr, prefix, trust_proxy_headers, auth)
+}
+
+/// [`router_with_proxy`] with the hashlock routes' credentials: every `/swaps/:id` call needs
+/// the swap's `X-Swap-Token` (the same 404 as an unknown id otherwise; a swap with no token on
+/// record is legacy and stays open), and `GET /swaps` needs the operator token (else 404).
+pub fn router_with_auth(
+    state: AppState,
+    xmr: Option<Arc<XmrMaker>>,
+    prefix: &str,
+    trust_proxy_headers: bool,
+    auth: HashlockAuth,
+) -> Router {
+    let gate = || {
+        middleware::from_fn_with_state(
+            SwapGate {
+                auth: auth.clone(),
+                maker: state.maker.clone(),
+            },
+            hashlock_token_gate,
+        )
+    };
+    let operator = middleware::from_fn_with_state(auth.clone(), operator_gate);
     let rate = RateState {
         limiter: Arc::new(RateLimiter::new(RATE_LIMIT_PER_WINDOW, RATE_WINDOW)),
         trust_proxy_headers,
@@ -238,12 +364,21 @@ pub fn router_with_proxy(
         .route("/offers/:id/quote", get(quote).route_layer(limited()))
         .route(
             "/swaps",
-            post(accept)
-                .route_layer(writes.clone())
-                .merge(get(list_swaps).route_layer(reads.clone())),
+            post(accept).route_layer(writes.clone()).merge(
+                get(list_swaps)
+                    .route_layer(operator)
+                    .route_layer(reads.clone()),
+            ),
         )
-        .route("/swaps/:id", get(get_swap).route_layer(reads))
-        .route("/swaps/:id/lock", post(lock).route_layer(writes))
+        .route(
+            "/swaps/:id",
+            get(get_swap).route_layer(gate()).route_layer(reads),
+        )
+        .route(
+            "/swaps/:id/lock",
+            post(lock).route_layer(gate()).route_layer(writes),
+        )
+        .layer(Extension(auth.clone()))
         .with_state(state);
     if let Some(x) = xmr {
         api = api.merge(
@@ -368,10 +503,48 @@ async fn quote(
 
 async fn accept(
     State(s): State<AppState>,
+    Extension(auth): Extension<HashlockAuth>,
+    headers: HeaderMap,
     Json(req): Json<AcceptRequest>,
-) -> Result<(StatusCode, Json<SwapView>), ApiError> {
+) -> Result<(StatusCode, Json<AcceptReply>), ApiError> {
     s.require_wallet()?;
-    Ok((StatusCode::CREATED, Json(s.maker.accept(req).await?)))
+    let tokens = headers
+        .get(SWAP_TOKEN_SUPPORT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
+    // Before the quote is spent: a taker that would never learn the token must not open a swap
+    // it could not read.
+    if !tokens && !auth.allow_tokenless {
+        return Err(ApiError(
+            StatusCode::UPGRADE_REQUIRED,
+            format!(
+                "this maker gives each swap a token; upgrade the taker to one that sends \
+                 {SWAP_TOKEN_SUPPORT_HEADER}: 1 and returns the token in {HASHLOCK_TOKEN_HEADER}"
+            ),
+        ));
+    }
+    let view = s.maker.accept(req).await?;
+    let swap_token = if tokens {
+        let token = new_swap_token();
+        auth.store
+            .put_doc(
+                TOKEN_KIND,
+                &view.id,
+                &TokenDoc {
+                    token: token.clone(),
+                },
+            )
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not store the swap token".into(),
+                )
+            })?;
+        Some(token)
+    } else {
+        None
+    };
+    Ok((StatusCode::CREATED, Json(AcceptReply { view, swap_token })))
 }
 
 async fn list_swaps(State(s): State<AppState>) -> Result<Json<Vec<SwapView>>, ApiError> {

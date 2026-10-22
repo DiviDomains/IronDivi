@@ -26,8 +26,8 @@ pub use config::{
     DaemonConfig, LtcSection, UsdcSection, XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
 pub use routes::{
-    router, router_with_proxy, router_with_xmr, AppState, RateLimiter, RATE_LIMIT_PER_WINDOW,
-    RATE_WINDOW, READ_LIMIT_PER_WINDOW, WRITE_LIMIT_PER_WINDOW,
+    router, router_with_auth, router_with_proxy, router_with_xmr, AppState, HashlockAuth,
+    RateLimiter, RATE_LIMIT_PER_WINDOW, RATE_WINDOW, READ_LIMIT_PER_WINDOW, WRITE_LIMIT_PER_WINDOW,
 };
 pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
 pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};

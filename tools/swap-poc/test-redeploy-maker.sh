@@ -51,7 +51,9 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port = int(sys.argv[1])
-routes = {"/swaps": (int(sys.argv[2]), sys.argv[3].encode())}
+routes = {"/swaps": (int(sys.argv[2]), sys.argv[3].encode()), "/ready": (200, b"ok")}
+import os
+OPTOK = os.environ["OPTOK"]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -59,6 +61,11 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/swaps" and self.headers.get("X-Operator-Token") != OPTOK:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         status, body = routes.get(self.path, (405 if self.path.startswith("/xmr/") else 404, b"nope"))
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -71,7 +78,7 @@ HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 PY
   server_pid=$!
   for _ in $(seq 1 50); do
-    curl -fsS -m 2 "http://127.0.0.1:$port/swaps" >/dev/null 2>&1 && return 0
+    curl -fsS -m 2 "http://127.0.0.1:$port/ready" >/dev/null 2>&1 && return 0
     sleep 0.1
   done
   echo "test-redeploy-maker: mock server on $port never came up" >&2
@@ -84,7 +91,26 @@ stop_mock() {
   server_pid=""
 }
 
+# GET /swaps is operator-only (the mock 404s without X-Operator-Token): the gate is given the
+# token through OPERATOR_TOKEN_FILE, and refuses (never "no swaps") when it has none or a wrong one.
+export OPTOK=op-token-for-test-0123456789
+printf '%s\n' "$OPTOK" >"$tmp/op.token"
+export OPERATOR_TOKEN_FILE="$tmp/op.token"
+
 PORT=18599
+
+# 0. no / wrong operator token -> refuse with a reason that names the fix
+start_mock '[]' "$PORT" || exit 1
+out="$(OPERATOR_TOKEN_FILE="" "$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"; rc=$?
+if ((rc != 0)) && grep -q "no operator token" <<<"$out"; then pass "no operator token: gate refuses and says why"
+else fail "no operator token: rc=$rc out=$out"; fi
+printf "zz-bad-9f3a\n" >"$tmp/wrong.token"
+out="$("$TARGET" --check-only --operator-token-file "$tmp/wrong.token" --maker-url "http://127.0.0.1:$PORT" 2>&1)"; rc=$?
+if ((rc != 0)) && grep -q "REFUSE" <<<"$out" && ! grep -q zz-bad-9f3a <<<"$out"; then pass "wrong operator token: gate refuses, token not echoed"
+else fail "wrong operator token: rc=$rc out=$out"; fi
+out="$("$TARGET" --check-only --maker-url "http://127.0.0.1:$PORT" 2>&1)"; rc=$?
+if ((rc == 0)); then pass "right operator token (env): gate reads the listing"; else fail "right token: rc=$rc out=$out"; fi
+stop_mock
 
 # 1. every swap terminal -> gate passes (--check-only exits 0, prints no in-flight ids)
 start_mock '[{"id":"a","state":"Done"},{"id":"b","state":"Aborted"}]' "$PORT" || exit 1

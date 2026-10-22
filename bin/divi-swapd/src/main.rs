@@ -27,9 +27,9 @@ use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
-    mock_counter_offers, mock_xmr_offers, router_with_proxy, run_scan, spawn_gated_scheduler,
-    AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, XmrSection,
-    ZecSection, MOCK_ONLY_CHAINS,
+    mock_counter_offers, mock_xmr_offers, router_with_auth, run_scan, spawn_gated_scheduler,
+    AppState, BackendKind, BtcSection, DaemonConfig, HashlockAuth, LtcSection, ScanStatus,
+    XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
 use swap_chain_divi::{DiviBackend, FeePolicy as DiviFeePolicy};
@@ -617,6 +617,9 @@ async fn main() -> Result<()> {
             }
         }
     };
+    let hashlock_auth = HashlockAuth::new(store.clone())
+        .with_operator_token(cfg.operator_token()?)
+        .allow_tokenless(cfg.allow_tokenless_swaps);
     let counters = std::iter::once(btc.clone()).chain(others).collect();
     let mut maker =
         Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?;
@@ -630,7 +633,7 @@ async fn main() -> Result<()> {
         scan.clone(),
     );
 
-    let app = router_with_proxy(
+    let app = router_with_auth(
         AppState {
             maker,
             divi,
@@ -640,11 +643,17 @@ async fn main() -> Result<()> {
         xmr,
         &cfg.prefix(),
         cfg.trust_proxy_headers,
+        hashlock_auth,
     );
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("binding {}", cfg.listen))?;
-    tracing::info!(listen = %cfg.listen, backend = ?kind, "divi-swapd up");
+    tracing::info!(
+        listen = %cfg.listen, backend = ?kind,
+        swap_listing = cfg.operator_token_file.is_some(),
+        tokenless_swaps = cfg.allow_tokenless_swaps,
+        "divi-swapd up"
+    );
     if let Some(job) = scan_job {
         tokio::spawn(async move {
             run_scan(&*job.divi, job.from, &scan, SCAN_CHUNK, SCAN_RETRY).await;

@@ -31,6 +31,17 @@ async fn get_json(url: &str) -> (u16, Value) {
     (r.status().as_u16(), r.json().await.unwrap())
 }
 
+/// GET with the per-swap token the taker's session holds (`X-Swap-Token`).
+async fn get_json_token(url: &str, token: &str) -> (u16, Value) {
+    let r = reqwest::Client::new()
+        .get(url)
+        .header("x-swap-token", token)
+        .send()
+        .await
+        .unwrap();
+    (r.status().as_u16(), r.json().await.unwrap())
+}
+
 #[tokio::test]
 async fn healthz_ok() {
     let w = World::new();
@@ -130,14 +141,15 @@ async fn post_swaps_accepts_quote() {
     let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
         .await
         .unwrap();
-    let id = sessions.get(&local).unwrap().maker_swap_id;
-    let (code, v) = get_json(&format!("{}/swaps/{id}", d.base)).await;
+    let session = sessions.get(&local).unwrap();
+    let id = session.maker_swap_id;
+    let (code, v) = get_json_token(&format!("{}/swaps/{id}", d.base), &session.swap_token).await;
     assert_eq!(code, 200);
     assert_eq!(v["state"], "Accepted");
     assert_eq!(v["maker_leg"], Value::Null, "maker has locked nothing yet");
     assert_eq!(w.maker_divi.funding_calls(), 0);
 
-    let (_, all) = get_json(&format!("{}/swaps", d.base)).await;
+    let all = operator_json(&format!("{}/swaps", d.base)).await;
     assert_eq!(all.as_array().unwrap().len(), 1);
     let (code, _) = get_json(&format!("{}/swaps/does-not-exist", d.base)).await;
     assert_eq!(code, 404);
@@ -168,9 +180,13 @@ async fn get_swap_never_leaks_keys() {
     let local = flow::begin(&taker, &client, &sessions, OFFER_ID, BTC_SATS)
         .await
         .unwrap();
-    let id = sessions.get(&local).unwrap().maker_swap_id;
+    let session = sessions.get(&local).unwrap();
+    let id = session.maker_swap_id;
 
-    let raw = reqwest::get(format!("{}/swaps/{id}", d.base))
+    let raw = reqwest::Client::new()
+        .get(format!("{}/swaps/{id}", d.base))
+        .header("x-swap-token", &session.swap_token)
+        .send()
         .await
         .unwrap()
         .text()
@@ -194,13 +210,8 @@ async fn get_swap_never_leaks_keys() {
         );
     }
     // The list endpoint exposes the same view type, nothing more.
-    let list = reqwest::get(format!("{}/swaps", d.base))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    serde_json::from_str::<Vec<SwapView>>(&list).unwrap();
+    let list = operator_json(&format!("{}/swaps", d.base)).await;
+    serde_json::from_value::<Vec<SwapView>>(list).unwrap();
     d.stop();
 }
 

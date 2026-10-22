@@ -26,7 +26,9 @@ use divi_swap::{
     Amount, Chain, ChainBackend, Maker, Profile, Store, SwapConfig, SwapState, Taker, TakerState,
 };
 use divi_swap_cli::{flow, run_swap, MakerClient, RunOpts, Sessions};
-use divi_swapd::{mock_counter_offers, router, spawn_scheduler, AppState, ScanStatus};
+use divi_swapd::{
+    mock_counter_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus,
+};
 use tokio::task::JoinHandle;
 
 const T0: u32 = 1_700_000_000;
@@ -34,6 +36,7 @@ const LTC_SATS: u64 = 1_000_000;
 /// Upper bound for polling loops: wall clock, not an iteration count, so a busy build
 /// host (hp2 runs many lanes at once) slows them down instead of failing them.
 const LOADED_HOST_WAIT: Duration = Duration::from_secs(180);
+const OPERATOR_TOKEN: &str = "test-operator-token";
 const TICK: Duration = Duration::from_millis(15);
 /// A BTC offer beside the LTC ones, for the old-client checks.
 const BTC_OFFER: &str = "divi-btc-testnet";
@@ -162,7 +165,10 @@ async fn serve(w: &World, db: &std::path::Path) -> Daemon {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        axum::serve(listener, router(state, "/swap")).await.unwrap();
+        let auth = HashlockAuth::new(Store::in_memory().unwrap())
+            .with_operator_token(Some(OPERATOR_TOKEN.into()));
+        let app = router_with_auth(state, None, "/swap", false, auth);
+        axum::serve(listener, app).await.unwrap();
     });
     Daemon {
         base,
@@ -349,6 +355,8 @@ async fn raw_take(
     }
     let r = reqwest::Client::new()
         .post(format!("{base}/swaps"))
+        // Models the counter-chain era of client, not the token era: it keeps the token.
+        .header("x-swap-token-support", "1")
         .json(&body)
         .send()
         .await
@@ -357,7 +365,10 @@ async fn raw_take(
 }
 
 async fn swap_count(base: &str) -> usize {
-    let all: serde_json::Value = reqwest::get(format!("{base}/swaps"))
+    let all: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/swaps"))
+        .header("x-operator-token", OPERATOR_TOKEN)
+        .send()
         .await
         .unwrap()
         .json()

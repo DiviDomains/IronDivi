@@ -285,6 +285,43 @@ pub struct LegView {
     pub spend_txid: Option<Txid>,
 }
 
+/// Header carrying a hashlock swap's token ([`AcceptReply::swap_token`]) on `GET /swaps/:id`
+/// and `POST /swaps/:id/lock`. The same name the XMR routes use.
+pub const SWAP_TOKEN_HEADER: &str = "x-swap-token";
+/// Header a taker sends on `POST /swaps` to say it keeps the swap token and sends it back. A
+/// maker that issues tokens refuses an accept without it (a taker that cannot send the token
+/// could never read its own swap) unless the operator allowed tokenless swaps.
+pub const SWAP_TOKEN_SUPPORT_HEADER: &str = "x-swap-token-support";
+/// Header carrying the operator token on `GET /swaps` (the full listing).
+pub const OPERATOR_TOKEN_HEADER: &str = "x-operator-token";
+
+/// `POST /swaps` reply: the new swap's [`SwapView`] plus its per-swap token. The token is the
+/// credential for every later call on that swap and is only ever returned here, once, to the
+/// taker that accepted. A maker from before tokens omits it; a taker from before tokens
+/// ignores it (the `SwapView` fields sit at the top level, as before).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptReply {
+    /// The swap, as `GET /swaps/:id` would show it.
+    #[serde(flatten)]
+    pub view: SwapView,
+    /// The swap token (hex); absent from a maker that does not issue tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_token: Option<String>,
+}
+
+impl std::fmt::Debug for AcceptReply {
+    // Never prints the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptReply")
+            .field("view", &self.view)
+            .field(
+                "swap_token",
+                &self.swap_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// `GET /swaps/:id` — what either party may see. Never contains a key; contains the
 /// preimage only after the taker has revealed it on chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -482,6 +482,16 @@ pub struct DaemonConfig {
     /// pick its own rate bucket.
     #[serde(default)]
     pub trust_proxy_headers: bool,
+    /// File holding the operator token (one line) that `GET /swaps`, the full swap listing,
+    /// requires in `X-Operator-Token`. Unset: the listing answers 404 to everyone. Keep the
+    /// file out of git, mode 0600; the daemon reads it once at start.
+    #[serde(default)]
+    pub operator_token_file: Option<PathBuf>,
+    /// Let a taker that cannot send swap tokens (built before them) open a swap anyway. That
+    /// swap has no token, so anyone who learns its id can read it and call `lock` on it.
+    /// Off by default: such a taker is refused at accept with a message to upgrade.
+    #[serde(default)]
+    pub allow_tokenless_swaps: bool,
     /// Optional path prefix. Empty by default: nginx strips `/swap/` before proxying.
     #[serde(default)]
     pub path_prefix: String,
@@ -518,6 +528,22 @@ pub struct DaemonConfig {
 }
 
 impl DaemonConfig {
+    /// The operator token from [`DaemonConfig::operator_token_file`], trimmed; `None` when no
+    /// file is configured. A configured file that is unreadable or empty is an error (the
+    /// listing would silently stay closed).
+    pub fn operator_token(&self) -> Result<Option<String>> {
+        let Some(p) = &self.operator_token_file else {
+            return Ok(None);
+        };
+        let t = std::fs::read_to_string(p)
+            .with_context(|| format!("reading operator_token_file {}", p.display()))?;
+        let t = t.trim();
+        if t.is_empty() {
+            bail!("operator_token_file {} is empty", p.display());
+        }
+        Ok(Some(t.to_string()))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;

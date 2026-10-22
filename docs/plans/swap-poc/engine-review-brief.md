@@ -190,13 +190,15 @@ Routes (`bin/divi-swapd/src/routes.rs:200-240`):
 |---|---|---|
 | `GET /healthz`, `GET /offers` | none | none |
 | `GET /offers/:id/quote` | none | per-IP, 20 per 60 s (`routes.rs:46-55`, `:122`) |
-| `POST /swaps` (accept), `POST /swaps/:id/lock` | **none** | per-IP, 20 per 60 s, one shared write bucket (`WRITE_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
-| `GET /swaps` (**lists every swap**), `GET /swaps/:id` | **none** | per-IP, 300 per 60 s, one shared read bucket (`READ_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
+| `POST /swaps` (accept) | none (a quote id is the capability); a taker must send `X-Swap-Token-Support: 1` or gets 426 (unless `allow_tokenless_swaps`); the reply carries the new `swap_token`; fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22 | per-IP, 20 per 60 s, one shared write bucket (`WRITE_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
+| `POST /swaps/:id/lock` | swap token in `X-Swap-Token`; a missing, wrong or another swap's token returns the same 404 as an unknown id (`hashlock_token_gate`); a swap made before this change has no token and stays open by id; fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22 | per-IP, 20 per 60 s, one shared write bucket (`WRITE_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
+| `GET /swaps` (lists every swap) | operator-only: `X-Operator-Token` against `operator_token_file`; unset file or wrong token is a 404 for everyone (`operator_gate`); fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22 | per-IP, 300 per 60 s, one shared read bucket (`READ_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
+| `GET /swaps/:id` | swap token in `X-Swap-Token`, same 404 rule as lock; legacy swaps open by id; fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22 | per-IP, 300 per 60 s, one shared read bucket (`READ_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
 | `POST /xmr/swaps` (setup, XMR only) | none | per-IP |
 | `/xmr/swaps/:id` and `/j`, `/sigs`, `/xmr-lock` (XMR only) | swap token in `X-Swap-Token` (`swap_token_gate`, `routes.rs:138`); a missing, wrong or unknown token returns the same 404 as an unknown id | per-IP on setup only |
 
-The "C3 token" covers the XMR routes **only**. The hashlock engine routes above have no
-authentication: anyone who can reach the port can list swaps, read a `SwapView` by id, and call
+The "C3 token" covered the XMR routes only; the hashlock routes now use the same scheme (fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22). Before the fix the hashlock engine routes had no
+authentication: anyone who could reach the port could list swaps, read a `SwapView` by id, and call
 `accept` and `lock`. A `SwapView` (`api.rs:286-306`) holds the quote, both HTLC descriptions (hash,
 public keys, locktimes), state, `last_error`, and the preimage after the taker has revealed it. It
 holds no key. Impact of unauthenticated reads and of `lock`: Q4.
@@ -299,7 +301,7 @@ New observations from this review (each also a `left:` line in `status/engine.md
 - **F4 — rate limiting.** Default config puts every client behind nginx in one bucket; the shipped nginx
   snippet was wrong for `trust_proxy_headers = true` (§3.9). Only `quote` was limited; `accept`, `lock`,
   `GET /swaps` and `GET /swaps/:id` now are too, and the limit keys on the address nginx sets (fixed on lane/route-rate-limits, see status/engine.md 2026-10-22).
-- **F5 — hashlock engine routes are unauthenticated**, including a full swap listing (§3.9).
+- **F5 — hashlock engine routes are unauthenticated**, including a full swap listing (§3.9). Result: fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22. Remaining: swaps created before the fix have no token and stay readable and lockable by id (a uuid v4); an old taker gets 426 unless `allow_tokenless_swaps`.
 - **F6 — confirmation fallback.** A chain absent from `cfg.chains` takes the *mainnet* built-in count
   (more conservative than testnet; confirm it can never be less conservative). Result: pinned on lane/conf-fallback-reorg-design, see status/engine.md 2026-10-22.
 - **F7 — plaintext preimage and keys-adjacent data in SQLite**, protected by file mode only. **Verdict (2026-10-22): acceptable as designed, with two gaps fixed and one left.** A stolen pre-reveal preimage alone loses no funds (the taker-leg claim also needs the maker's key, the maker-leg claim the taker's); it is dangerous only in the hands of the maker, or of someone who also holds the maker's key. The DB, WAL and SHM are created 0600 (`store.rs:204-216,410-420`, pinned by `store_file_mode_0600`). Gap fixed: the CLI sidecar `<db>.sessions.json` holds the xmr maker's bearer token and was written with the default umask; it is now 0600 (`bin/divi-swap/src/session.rs`, `bin/divi-swap/tests/session_mode.rs`). Gap fixed (lane/store-at-rest): `Store::open` (read-write) now tightens an existing DB and its `-wal`/`-shm` to 0600 with a `tracing::warn!` naming the path and old mode, and refuses to open a file it cannot tighten; `open_read_only` never chmods. `MakerRecord`, `TakerRecord`, `XmrMakerRecord`, `XmrTakerRecord`, `JRoundReply` and the CLI `Session` have hand-written `Debug` that prints `<redacted>` for secret fields. Left: nothing zeroizes the preimage after the claim. See Q9.
@@ -360,6 +362,7 @@ no funds, no keys.
 4. **Unauthenticated routes:** `GET /swaps` and `GET /swaps/:id` expose swap ids, HTLC keys and states,
    and `POST /swaps/:id/lock` accepts a notice from anyone. What can an observer or griefer do with
    that? Is a token on the hashlock routes warranted before mainnet?
+   **Answer (2026-10-22):** yes, and it is now in place (fixed on lane/hashlock-route-auth, see status/engine.md 2026-10-22). An observer who could list swaps learned every id, both parties' HTLC public keys, locktimes, state, `last_error` and, after the taker claimed, the preimage; with an id they could read any swap and call `lock` on it, which makes the maker's `notify_lock` run a chain check (no funds move, no key is exposed, but it spends the maker's backend calls and the write rate bucket and lets a griefer race the real taker's notice). The listing is the worst part (it hands out every capability id at once), so it is operator-only, and each swap has its own token as the XMR swaps do.
 5. **Opt-in floors:** a taker built without `with_profile_floor` takes the maker's terms as offered.
    Is any shipped entry point (CLI, daemon) able to construct one on mainnet?
 

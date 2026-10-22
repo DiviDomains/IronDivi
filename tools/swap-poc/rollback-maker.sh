@@ -16,6 +16,8 @@
 #     [--to prev|TIMESTAMP]        snapshot to restore (default: prev, the set the last
 #                                   redeploy replaced; TIMESTAMP as listed by --list)
 #     [--maker-url URL]            default http://127.0.0.1:18482 (tunnel to dnsdivi's API)
+#     [--operator-token-file PATH] local file holding the maker's operator token (env
+#                                   OPERATOR_TOKEN_FILE); the in-flight gate needs it for GET /swaps
 #     [--host ALIAS]               ssh host alias (default: dnsdivi)
 #     [--remote-port PORT]         maker's bind port on dnsdivi, for the health check (default: 18480)
 #     [--remote-bin PATH]          installed binary (default: /usr/local/bin/divi-swapd)
@@ -40,6 +42,7 @@ usage() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAKER_URL="http://127.0.0.1:18482"
+OPERATOR_TOKEN_FILE="${OPERATOR_TOKEN_FILE:-}"
 FORCE_INFLIGHT=0
 TO=prev
 LIST=0
@@ -62,6 +65,7 @@ while (($#)); do
     --force-inflight) FORCE_INFLIGHT=1; shift ;;
     --to) TO="${2:?}"; shift 2 ;;
     --maker-url) MAKER_URL="${2:?}"; shift 2 ;;
+    --operator-token-file) OPERATOR_TOKEN_FILE="${2:?}"; shift 2 ;;
     --host) HOST="${2:?}"; shift 2 ;;
     --remote-port) REMOTE_PORT="${2:?}"; shift 2 ;;
     --remote-bin) REMOTE_BIN="${2:?}"; shift 2 ;;
@@ -114,6 +118,7 @@ fi
 # --- the in-flight gate (same as a redeploy's) ------------------------------------------
 gate=("$HERE/redeploy-maker.sh" --check-only --maker-url "$MAKER_URL" --host "$HOST" --remote-port "$REMOTE_PORT"
   --remote-bin "$REMOTE_BIN" --remote-toml "$REMOTE_TOML" --service-user "$SERVICE_USER")
+[[ -n "$OPERATOR_TOKEN_FILE" ]] && gate+=(--operator-token-file "$OPERATOR_TOKEN_FILE")
 ((FORCE_INFLIGHT)) && gate+=(--force-inflight)
 ((DRY)) && gate+=(--dry-run)
 "${gate[@]}" | grep -v '^DRY RUN:' || {

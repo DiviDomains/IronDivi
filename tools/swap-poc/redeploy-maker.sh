@@ -21,6 +21,10 @@
 #     [--maker-url URL]            default http://127.0.0.1:18482 (tunnel to dnsdivi's API;
 #                                   open it yourself, e.g. ssh -N -L 18482:127.0.0.1:18480 dnsdivi);
 #                                   only the /swaps half of the gate needs it
+#     [--operator-token-file PATH] the maker's operator_token_file contents, a local file (env
+#                                   OPERATOR_TOKEN_FILE): GET /swaps is operator-only, so the
+#                                   gate cannot read the hashlock swaps without it and refuses
+#                                   (it is sent to curl on stdin, never on the command line)
 #     [--binary PATH]              use this prebuilt divi-swapd instead of building one
 #     [--built-binary-path PATH]   where a remote-cargo build is expected to land
 #                                   (default: <repo>/target/release/divi-swapd)
@@ -62,11 +66,12 @@
 set -euo pipefail
 
 usage() {
-  sed -n '20,43p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '20,47p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
 MAKER_URL="http://127.0.0.1:18482"
+OPERATOR_TOKEN_FILE="${OPERATOR_TOKEN_FILE:-}"
 FORCE_INFLIGHT=0
 BINARY_PATH=""
 BUILT_BINARY_PATH=""
@@ -92,6 +97,7 @@ while (($#)); do
     --check-only) CHECK_ONLY=1; shift ;;
     --force-inflight) FORCE_INFLIGHT=1; shift ;;
     --maker-url) MAKER_URL="${2:?}"; shift 2 ;;
+    --operator-token-file) OPERATOR_TOKEN_FILE="${2:?}"; shift 2 ;;
     --binary) BINARY_PATH="${2:?}"; shift 2 ;;
     --built-binary-path) BUILT_BINARY_PATH="${2:?}"; shift 2 ;;
     --remote-cargo) REMOTE_CARGO="${2:?}"; shift 2 ;;
@@ -183,17 +189,28 @@ check_inflight() {
   step "checking for in-flight swaps on the running maker ($MAKER_URL/swaps; XMR store via ssh $HOST)"
   [[ -n "$GATE_BIN" ]] || GATE_BIN="$REMOTE_BIN"
   if ((DRY)); then
-    echo "  [dry-run] curl -fsS -m 20 $MAKER_URL/swaps"
+    echo "  [dry-run] curl -fsS -m 20 --config - $MAKER_URL/swaps   (X-Operator-Token from ${OPERATOR_TOKEN_FILE:-<no --operator-token-file>} on stdin)"
     echo "  [dry-run] ssh $HOST sudo -n -u $SERVICE_USER $GATE_BIN --config $REMOTE_TOML --xmr-inflight"
     echo "  [dry-run] refuse if any /swaps state is not Done/Aborted, or any XMR swap is not"
     echo "            done/aborted/punished, unless --force-inflight"
     return 0
   fi
   local swaps_json xmr_out xmr_parsed ids xmr_ids n listed="" xmr_cfg xmr_n rc
-  if ! swaps_json="$(curl -fsS -m 20 "$MAKER_URL/swaps" 2>&1)"; then
-    unreadable "$MAKER_URL/swaps" "$swaps_json"
+  # GET /swaps is operator-only: a missing credential must refuse, never read as "no swaps".
+  local op_tok=""
+  if [[ -n "$OPERATOR_TOKEN_FILE" && -r "$OPERATOR_TOKEN_FILE" ]]; then
+    op_tok="$(tr -d '\r\n' <"$OPERATOR_TOKEN_FILE")"
+  fi
+  if [[ -z "$op_tok" ]]; then
+    unreadable "$MAKER_URL/swaps" "no operator token: pass --operator-token-file (the maker's operator_token_file contents)"
     return
   fi
+  if ! swaps_json="$(printf 'header = "X-Operator-Token: %s"\n' "$op_tok" |
+    curl -fsS -m 20 --config - "$MAKER_URL/swaps" 2>&1)"; then
+    unreadable "$MAKER_URL/swaps" "$swaps_json; a 404 means the token is wrong or operator_token_file is unset"
+    return
+  fi
+  op_tok=""
   if ! ids="$(in_flight_ids <<<"$swaps_json" 2>&1)"; then
     unreadable "$MAKER_URL/swaps" "not a swap list: $ids"
     return

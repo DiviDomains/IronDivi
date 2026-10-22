@@ -77,6 +77,22 @@ bucket either way. Turn it on only behind a proxy you control and with the daemo
 only through it: if clients can reach the daemon directly, each can choose its own bucket and
 the limit is void. It is off by default and the example config ships it commented out.
 
+## Hashlock route credentials
+
+* `POST /swaps` (accept) answers a taker that sent `X-Swap-Token-Support: 1` with the usual swap view plus
+  `swap_token`. `GET /swaps/:id` and `POST /swaps/:id/lock` then need that value in `X-Swap-Token`; a missing,
+  wrong or another swap's token is the same 404 as an unknown id. The CLI stores the token in its sidecar
+  `<db>.sessions.json` and sends it itself.
+* An old taker (no support header) gets 426 "upgrade the taker" and no quote is spent, unless the maker sets
+  `allow_tokenless_swaps = true`. A swap made before this version has no token and stays open by id.
+* `GET /swaps` (the listing) is for the operator: set `operator_token_file` in `divi-swapd.toml` (root:divi-swapd
+  0640, one random line, made on the maker host) and send it as `X-Operator-Token`. Unset, the listing is a 404.
+  Give `swap-watch` the same file (`OPERATOR_TOKEN_FILE`, default `/etc/divi-swapd/operator.token`) and
+  `redeploy-maker.sh` / `rollback-maker.sh` `--operator-token-file PATH` (or env `OPERATOR_TOKEN_FILE`);
+  `wave4-smoke.sh` takes the same flag. They pass it to curl on stdin, never on the command line.
+* nginx: the default config forwards these headers; if a deployment filters headers, allow `X-Swap-Token`,
+  `X-Swap-Token-Support` and `X-Operator-Token`.
+
 ## Rollback
 
 `deploy.sh rollback` restores `/usr/local/bin/divi-swapd.prev` and restarts. The DB is not
