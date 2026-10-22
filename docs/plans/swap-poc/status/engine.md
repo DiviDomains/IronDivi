@@ -77,3 +77,10 @@
 - left: DIVI testnet and ZEC testnet tips still have no independent source (every explorer tried was down, 404, or gone): could not verify. XMR testnet (not stagenet) was not smoked. No block hash printed (no `tip_hash` until AL lands).
 - needs: nothing
 - decisions: XMR bypasses `ChainBackend` (a separate `TipSource`), so `backend.rs` and every `swap-chain-*` crate are untouched; no swap path, confirmation count, lag, timeout or margin changed; the existing "N of M chain tips could not be read" message counts only real chain lines, not the skip note.
+
+## 2026-10-22 — xmr-maker-mtp-bound (builder AO)
+- done: design only, no code. `xmr-design.md` § "Maker MTP bound (2026-10-22)": truth table of the setup order with file:line on `54ef132` (the taker reads no DIVI time before sending the request; the maker reads its MTP after `J`; the taker's only MTP read is `taker.rs:515`), options (a) taker's pre-request MTP, (b) counter-signed time, (c) others, recommendation (a).
+- proof: reading of `taker.rs`, `maker.rs`, `api.rs`, `lib.rs` on the base; attack arithmetic: today a lying or field-omitting maker shortens `t_cancel` by `sigs_wait_secs` = 1800 s; under (a) by `(mtp_verify − p) + L` (about 450-500 s with L = 360 s). No test run, nothing built.
+- left: the tolerance `L` (how far an honest maker's node may trail the taker's) is a new value with no existing parameter that states it; code is not written. A maker omitting `maker_mtp` is covered by (a) only once it is implemented.
+- needs: Bert: pick `L` (0 / 360 s recommended / 1800 s).
+- decisions: no confirmation count, timeout, margin or `sigs_wait_secs` changed; (b) rejected because a signature does not make a clock true; (c3) rejected as a compat break (a) avoids.

@@ -603,3 +603,41 @@ inherited risk (same one every ECDSA-adaptor-based swap in production today carr
 this lane can close. The next lane to pick this up should start at build-plan step 2 (the DIVI-side
 presigned multisig skeleton) since it needs no Monero or adaptor-signature machinery yet and gives
 the earliest on-chain confidence signal.
+
+## Maker MTP bound (2026-10-22)
+
+Base `54ef132`. Question: AB made the taker floor `t_cancel` exactly against the maker's *stated* `maker_mtp`; how does she bound a maker that lies about it, using a time she checks herself?
+
+### Truth table (file:line on `54ef132`)
+
+| Step | Who | What | Where |
+|---|---|---|---|
+| 1 | taker | `prepare`: keys, DLEQ, first `J` message. Reads **no** DIVI time; `SetupRequest` has no time field | `taker.rs:308-385`, `api.rs:57` |
+| 2 | maker | `setup` accepts the request, runs the `J` rounds | `maker.rs:613` |
+| 3 | maker | `persist_setup` reads its MTP **after** `J` exists and sets `t_cancel = mtp + cancel_after_secs` | `maker.rs:846-847`, `deadlines` `maker.rs:337-352` |
+| 4 | maker | puts that MTP in `SetupReply::maker_mtp` (optional) | `maker.rs:938`, `api.rs:150-154` |
+| 5 | taker | `verify_setup` reads her MTP **now** (first and only read before signing) and calls the floor | `taker.rs:515`, `taker.rs:524-534` |
+| 6 | taker | floor: `Some(m)`: refuse `m > mtp` or `mtp − m > sigs_wait_secs`, require `t_cancel ≥ m + cancel_after`; `None`: require `t_cancel ≥ mtp + cancel_after − sigs_wait_secs` | `lib.rs:266-330` |
+
+`maker_mtp` is checked only against the taker's step-5 reading and the staleness bound `sigs_wait_secs` (1800 s, `lib.rs:175,197`). The taker's first chance to read her own MTP before the maker commits to a time is step 1.
+
+### Attack today
+A malicious maker sets `t_cancel` from a clock it chooses. Either it states `m = mtp − 1800` (the oldest the check accepts) with `t_cancel = m + C`, or it omits the field and sets `t_cancel = mtp − 1800 + C` (the tolerant floor). Both pass. Honest `t_cancel` would be `≈ mtp + C`, so the shortening is **`sigs_wait_secs` = 1800 s** (`t_cancel − mtp = C − 1800`), minus nothing. The taker's redeem window and the later punish window are cut by that much; the `redeem_margin` (`taker.rs:787-808`) is spent from the shortened end.
+
+### Options
+
+**(a) Taker reads her MTP before the request (`p`, in `prepare`), stores it on her record, and floors `t_cancel` against it.** Honest maker's MTP at step 3 is never behind the true MTP at step 1, so `t_cancel ≥ p − L + C` for any honest maker whose node trails hers by at most `L`. Floor becomes `max(m_stated or mtp − sigs_wait_secs, p − L) + C`: it applies **whether or not the maker states `maker_mtp`**, so omitting the field gains nothing.
+- Attack bound left: `(mtp_verify − p) + L`, capped by today's 1800 s. `mtp_verify − p` is the taker's own observed prepare→setup gap (J rounds, ~20-90 s + network). With L = 360: ≈ 450-500 s, vs 1800 now.
+- False refusal: an honest maker whose node trails the taker's by more than `L` is refused (retryable; nothing is locked at this point). `L = 0` refuses any one-block disagreement.
+- Wire change: none. One new taker-record field `prepare_mtp: Option<u32>` (`serde(default)`); a record without it keeps today's floor.
+- Compat: old maker (no `maker_mtp`) is covered by the same floor; new maker with an old taker unchanged; AB's optional field untouched.
+
+**(b) Counter-signed time.** The maker signs `maker_mtp` (or the taker sends `p` and the maker countersigns it). Gives non-repudiation, **not a bound**: the signature proves what the maker said, not that its clock is right, and a lying maker signs its lie. Wire change, new message order, no attack bound left over (a). Rejected.
+
+**(c) Others.** (c1) Taker's wall clock instead of her MTP: DIVI MTP lags wall time by up to `divi_mtp_lag_secs` (1800 s, `lib.rs:127`), so the bound is no better than today. (c2) Maker-side refusal when its MTP is behind a taker-sent `p`: protects only honest makers, binds nothing against a liar. (c3) Require `maker_mtp` by profile (refuse `None`): removes the omit-the-field path but is a compat break; (a) closes the same path without it.
+
+### Recommendation
+(a). It is the only option that bounds a liar by something the taker measured, needs no wire change and no extra message, and covers the omitted-field path.
+
+### Open item: the tolerance `L` (new value, Bert's decision)
+`L` is how far an honest maker's DIVI node may trail the taker's. No existing parameter states it: `sigs_wait_secs` (1800 s) is a setup-duration bound and gives no gain; `divi_mtp_lag_secs` is MTP-vs-wall lag, not node-vs-node. Options: **L = 0** (strict; refuses any honest one-block disagreement); **L = 360 s = `reaction_secs` (300, `lib.rs:158`) + `divi_block_secs` (60)**: a node learns of a tip within one reaction plus one block (recommended; it is a judgment, not a derivation, hence no code); **L = 1800** (no improvement). Per the lane rules no code until L is chosen. When it is, the change is: record `prepare_mtp` in `prepare`, pass it to `check_setup_timelocks`, tests for (1) lying maker (states old `m` or omits it) refused, (2) honest maker trailing by < L accepted and > L refused, (3) record without `prepare_mtp` and `maker_mtp = None` keep today's behaviour.
