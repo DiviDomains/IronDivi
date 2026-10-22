@@ -643,3 +643,56 @@ A malicious maker sets `t_cancel` from a clock it chooses. Either it states `m =
 `L` is how far an honest maker's DIVI node may trail the taker's. No existing parameter states it: `sigs_wait_secs` (1800 s) is a setup-duration bound and gives no gain; `divi_mtp_lag_secs` is MTP-vs-wall lag, not node-vs-node. Options: **L = 0** (strict; refuses any honest one-block disagreement); **L = 360 s = `reaction_secs` (300, `lib.rs:158`) + `divi_block_secs` (60)**: a node learns of a tip within one reaction plus one block (recommended; it is a judgment, not a derivation, hence no code); **L = 1800** (no improvement). Per the lane rules no code until L is chosen. When it is, the change is: record `prepare_mtp` in `prepare`, pass it to `check_setup_timelocks`, tests for (1) lying maker (states old `m` or omits it) refused, (2) honest maker trailing by < L accepted and > L refused, (3) record without `prepare_mtp` and `maker_mtp = None` keep today's behaviour.
 
 2026-10-22: implemented behind `XmrConfig::maker_mtp_trail_secs` (default = `sigs_wait_secs`, no behaviour change) in 5e03cb3. `L` stays Bert's open decision: setting the field to 0 / 360 / 1800 is the whole change.
+
+### L from mainnet data (2026-10-22)
+
+Derived by builder BW from DIVI mainnet block times and the Divi Core source. **Nothing is changed**: `maker_mtp_trail_secs` stays 1800 (`crates/divi-swap-xmr/src/lib.rs:196`, `mainnet()`); the value below awaits Bert's yes. Raw data and scripts: `~/swap-lanes/builders/BW/data/` on hp1 (`analyze.py`, `analysis.out`), not in git.
+
+**How DIVI computes MTP.** Median of the **11** newest block timestamps *including the block itself* (`nMedianTimeSpan = 11`, walk `pindex = this` back through `pprev`, sort, take index 5): Divi Core `src/chain.h:251-264` (`GetMedianTimePast`, repo `9e2f76c`, 2023-07-06). A new block must be strictly later than its parent's MTP (`ChainExtensionService.cpp:314`). This repo: `swap-chain-divi/src/lib.rs:682-702` (`median_time_past_on`) takes `time` of the tip block and its 10 predecessors via `getblock`, sorts, takes `times[len/2]` (same rule). The node's RPC never reports it: `mediantime` is not emitted anywhere in Divi Core `rpcblockchain.cpp` (grep: no match), so there is no RPC value to cross-check against.
+
+**Data.** Primary node: Divi Core 3.0.0 container `divi_divi_1.1.ifx4oj…` on hp1 (tip 4 270 557, `getblockheader` per block, 4 walkers). Window: heights **3 744 858 – 4 270 557** (525 700 blocks; 2025-10-28 15:58 – 2026-10-22 21:50 UTC), MTP(h) defined for 3 744 868 – 4 270 557, **n = 525 690** (≈ 364 days). Mean block gap 59.0 s. Method: MTP(h) = median of `time` over h−10..h, computed by script. Cross-check: for 20 random heights (seed 7) the MTP recomputed from the *second* node (`divi_divi.1.ieiy2i…`, spot check only) equals the primary's: 20 / 20 identical.
+
+| measure (s) | n | min | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|---|
+| a. `time(h) − MTP(h)` | 525 690 | 0 | 274 | 490 | 720 | 922 | 1395 |
+| b. `MTP(h) − MTP(h−1)` | 525 689 | 0 | 34 | 146 | 315 | 491 | 1161 |
+| b. k = 2 | 525 688 | 0 | 94 | 245 | 439 | 626 | 1225 |
+| b. k = 3 | 525 687 | 1 | 154 | 330 | 538 | 735 | 1251 |
+| b. k = 4 | 525 686 | not run | not run | not run | 633 | 831 | 1332 |
+| b. k = 5 | 525 685 | 7 | 273 | 488 | 718 | 919 | 1395 |
+| b. k = 10 | 525 680 | 64 | 573 | 845 | 1107 | 1329 | 1911 |
+| c. gap `time(h) − time(h−1)` | 525 699 | −213 | 40 | 153 | 322 | 499 | 1161 |
+
+(k = 4 was computed only for p99, p99.9, max and the refusal shares; the other columns were not run.)
+
+- **Bert's hint holds at the median**: `time − MTP` p50 = 274 s ≈ 5 blocks of 59 s (5–6 blocks, 300–360 s), but the tail is 2.7× longer: p99.9 = 922 s, max 1395 s.
+- **(c) stalls.** Gaps > 300 s: 7 017; > 600 s: 158; > 1800 s: none. Longest: 1161 s at 4 077 319 (2026-06-12 16:23 UTC), 1050 s at 4 061 493, 1007 s at 4 259 019. **Timestamps are not monotonic**: 89 373 gaps (17 %) are negative (min −213 s), 93 471 are ≤ 0.
+- **(d) MTP never goes backwards**: 0 heights in 525 690 (the consensus rule `ChainExtensionService.cpp:314` forbids it).
+
+**How many blocks behind can an honest maker be (k).**
+1. *Propagation.* In `ifx4oj`'s `debug.log` (2026-10-18 14:07 – 2026-10-22, **n = 6 331** `UpdateTip` lines) the node logged each tip `log time − block time`: p50 13 s, p90 28 s, p99 44 s, p99.9 190 s, max 277 s. That is an upper bound on propagation (block time is set by the staker, can be early). Against a mean gap of 59.0 s: p99 is under one block, p99.9 (190 s) is 3.2 blocks, the max (277 s) 4.7 blocks.
+2. *What the engine does.* With a `fallback`, MTP is read from both sources and must agree within `MTP_TOLERANCE_SECS` = 600 s (`swap-chain-divi/src/second_source.rs:28`, `agree_mtp` :131, returns the lower) and tips within `TIP_TOLERANCE_BLOCKS` = 2 (`:35`). A single-node setup has no such check. A node behind by up to ~10 blocks therefore passes the second-source check.
+3. *Stale-tip refusal.* There is none in the swap path: grep for tip age / stale in `divi-swap`, `divi-swap-xmr`, `swap-chain-divi` finds nothing (the only tip-age check is the staker's 24 h `max_tip_age_secs`, `divi-node/src/staker.rs`, unrelated). A maker on a stalled node keeps acting.
+4. **k = 4**: the p99.9 propagation lag (190 s) is 3.2 blocks, rounded up. k = 5 (the max seen, 277 s ≈ 4.7) is the trade-off value. A maker further behind than that is not "honest and in sync"; it is the case the bound exists to refuse.
+
+**Margin from timelock slack** (`XmrConfig::mainnet` `lib.rs:196`, minimums under `ChainTiming::live()` `lib.rs:145`; I recomputed them by hand from `min_*_secs`, `lib.rs:374-421`, and they match the doc comment on `mainnet()`):
+
+| field | configured | derived minimum | slack |
+|---|---|---|---|
+| `cancel_after_secs` | 43 200 | 20 400 | **22 800** |
+| `punish_after_secs` | 43 200 | 7 200 | 36 000 (exact difference, not touched by a liar) |
+| `late_after_secs` | 43 200 | 7 200 | 36 000 (same) |
+| `redeem_margin_secs` | 7 200 | 3 900 | **3 300** |
+
+A lying maker shortens `t_cancel` by `X = (mtp_verify − prepare_mtp) + L`. Binding slack: schedule (`cancel_after`) 22 800 s; conservative (the shortening eats the redeem margin) **3 300 s**. The prepare→setup gap `g` is **not measured here** (needs a live run; the design estimates 20–90 s, and `sigs_wait_secs` = 1800 caps it, `mainnet()`, `lib.rs:196`). With the chosen L = 900: g = 90 → X = 990 s; g at the 1800 cap → X = 2 700 s; both inside 3 300 s with ≥ 600 s to spare and far inside 22 800 s.
+
+**Result.** `L` = p99.9 of (b) at k=4 (831 s) + 60 s margin (one block) = 891 → **900 s (15 min)**. At k+1 = 5: 919 + 60 = 979 → **1 020 s (17 min)**.
+
+| L | protects (attack bound left = g + L) | cost: honest maker k blocks behind refused (share of 525 689 heights) |
+|---|---|---|
+| 360 (hint, `reaction + block`) | g + 360 | k=1 0.54 %, k=2 2.6 %, k=3 7.3 %, k=4 15.9 % |
+| **900 (k=4)** | **g + 900** (≈ 990 s at g = 90 s; today 1800 s) | k=1 0.001 %, k=2 0.004 %, k=3 0.014 %, **k=4 0.042 %**, k=5 0.13 % |
+| 1020 (k=5) | g + 1020 | k=4 0.012 %, k=5 0.031 %, k=6 0.082 % |
+| 1800 (today) | 1800 + g (capped at 1800 by `sigs_wait`) | 0 |
+
+The cost is conditional on the maker being k blocks behind, which per the propagation figures happens well under 1 % of the time at k ≥ 2, so the joint refusal rate is far below the table. A refusal is retryable and locks nothing (design "Option (a)"). The 360 s hint would refuse an honest maker one block behind 0.54 % of the time and two blocks behind 2.6 %: too tight for this chain's timestamps. **The value awaits Bert's yes; no code changed.**

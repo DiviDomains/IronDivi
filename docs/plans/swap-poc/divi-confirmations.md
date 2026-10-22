@@ -77,3 +77,82 @@ timeouts leave ample room for the wait (the wait is <1% of the maker timeout). *
 (= coinbase maturity, ~20 min, BTC wall-clock parity); cost is an extra ~10 min per lock. **Open evidence gap:** the
 public endpoint cannot give `getchaintips`, so the observed worst reorg is unknown; before raising or lowering the count,
 run `getchaintips` against a node we control (or ask the endpoint operator to allow it). Decision belongs to Bert.
+
+## Derived from the spec and mainnet data (2026-10-22, builder BW)
+
+Closes the evidence gap named above. **Nothing is changed**: DIVI mainnet `divi_confirmations` stays 10 (`crates/divi-swap/src/config.rs:113`). Data and scripts: `~/swap-lanes/builders/BW/data/` on hp1 (not in git).
+
+### 1. What the spec says (Divi Core 3.0.0 source, clone at `9e2f76c`, 2023-07-06)
+
+| rule | value | Divi Core cite | IronDivi |
+|---|---|---|---|
+| Max reorg depth | **a fork is rejected when `ActiveChain().Height() - nHeight >= nMaxReorgDepth`**; mainnet 100, `-maxreorg` overrides | `ChainExtensionService.cpp:309-311`; default `chainparams.cpp:180` (also :289, :396) | **not implemented**: `divi-network/src/sync.rs:810-812` says "There is no max-reorg-depth rule in this codebase" |
+| Same depth used elsewhere | block serving, minter | `main.cpp:235-239`, `CoinMinter.cpp:67` | – |
+| Checkpoints | mainnet holds heights 0 and 100 only (last timestamp 2018-09-27); static, no code adds more | `chainparams.cpp:107-110`; enforced `ChainExtensionService.cpp:321-346` | `storage/src/chain.rs:2077-2087` `get_checkpoint_hash` returns `None` |
+| Block time vs MTP | `time-too-old` if not later than parent MTP | `ChainExtensionService.cpp:314` | – |
+| Coinbase and coinstake maturity | 20 blocks | `chainparams.cpp:184`; `UtxoCheckingAndUpdating.cpp:75` | `COINBASE_MATURITY` = 20, `divi-primitives/src/lib.rs:82` |
+| Min stake age | 1 h | `chainparams.cpp:195`; `ProofOfStakeGenerator.cpp:84` | **could not verify** that production code enforces it (only a test uses 3600, `pos_generator.rs:162`) |
+| Stake target | value × timeWeight / COIN / 400 | `ProofOfStakeCalculator.cpp:19-24` | – |
+| Stake modifier | interval 60 s, ratio 3 | `StakeModifierIntervalHelpers.h`; `ChainExtensionService.cpp:135-178`; `PoSStakeModifierService.cpp` | – |
+| Block value / payee | `bad-cb-amount`, `bad-cb-payee` | `BlockConnectionService.cpp:85-96`; `BlockIncentivesPopulator.cpp:43,70,156-186` | – |
+
+Consequence: the only reorg limit is 100 blocks, and only on Divi Core nodes. **There is no finality gadget** and no rule that makes a shallower reorg impossible. Anything below 100 is a probability question, not a guarantee. LAST_POW_BLOCK is 100 (`chainparams.cpp:189`); block time 60 s.
+
+### 2. Observed reorgs (the number the earlier section lacked)
+
+`getchaintips` on two Divi Core 3.0.0 containers on hp1 (ours, read-only RPC): `ifx4oj` (primary) 13 694 tips; `ieiy2i` (second opinion) 16 618 tips. The oldest tip is at height 2 487 937 (2023-06-21): the index covers about three years, not just the log window.
+
+| `ifx4oj` status | branchlen 1 | branchlen 2 | longer |
+|---|---|---|---|
+| valid-fork (fully validated side chain) | 3 402 | 95 | none |
+| invalid | 96 | 2 | none |
+| valid-headers (headers only, never connected) | 10 047 | 50 | 1 at branchlen 62 |
+
+- **Deepest validated reorg candidate: 2 blocks.** The one 62-long tip (height 2 580 255, 2023-08-23 13:30 UTC) is `valid-headers`: headers only, never validated, so it is not a reorg.
+- `ieiy2i` has one extra branchlen-3 `valid-headers` tip (height 4 045 040, about 2026-05-21), also headers only.
+- `debug.log` windows (ifx4oj 2026-10-18 14:07, ieiy2i 2026-10-17 13:45, both to 2026-10-22 ~21:53): `grep -ci "reorganiz|disconnect"` = 0 on both.
+- Caveat: a side chain shows up only if the block was relayed to these nodes, so depth 2 is a lower bound on what happened network-wide.
+
+### 3. Attacker model (what `z` blocks protect against)
+
+Rosenfeld 2012, "Analysis of hashrate-based double spending", arXiv:1402.2009 §3.1: the attacker finds each block with probability q (honest p = 1 − q), the blocks he has when the payment gets z confirmations are k ~ NegBin(z, p); from a deficit d = z − k he ever gets strictly ahead with probability (q/p)^(d+1). Nakamoto 2008 §11 (Poisson) is the whitepaper variant; my script reproduces its figures (q = 0.1: z = 5 → 9.137e-4, z = 6 → 2.428e-4). Script `race.py`, output `race.out`.
+
+Caveat: q here is the attacker's share of the **staking** coins (what wins a PoS race), not of total supply, and the model is an approximation for a stake-weighted race; read it as the shape of the risk, not an exact figure.
+
+P(a payment with z confirmations is reversed):
+
+| z | q = 0.10 | q = 0.25 | q = 0.33 | q = 0.40 |
+|---|---|---|---|---|
+| 1 | 3.1e-2 | 0.208 | 0.380 | 0.587 |
+| 3 | 3.0e-3 | 0.094 | 0.251 | 0.483 |
+| 6 | 1.10e-4 | 3.24e-2 | 0.147 | 0.381 |
+| 10 | 1.5e-6 | 8.56e-3 | 0.0776 | 0.291 |
+| 15 | 7.6e-9 | 1.74e-3 | 0.0367 | 0.214 |
+
+Smallest z for a target risk:
+
+| target | q = 0.10 | q = 0.25 | q = 0.33 | q = 0.40 |
+|---|---|---|---|---|
+| < 1 % | 2 | 10 | 25 | 77 |
+| < 0.1 % | 4 | **17** | 42 | 128 |
+| < 0.01 % | 7 | 25 | 59 | 181 |
+| < 1e-6 | 11 | 40 | 95 | 289 |
+
+Largest attacker share q that a given z still holds against:
+
+| z | < 0.1 % | < 0.01 % |
+|---|---|---|
+| 6 | 14.1 % | 9.9 % |
+| 10 | 19.6 % | 15.3 % |
+| 15 | 23.9 % | 19.9 % |
+| 17 | 25.1 % | 21.2 % |
+| 20 | 26.7 % | 23.0 % |
+
+### 4. Result
+
+- **Derived number: 17 confirmations** (target: reversal < 0.1 %, attacker with 25 % of staking coins). It is a function of the assumed q and target; the table above is the real output, pick another row for another assumption.
+- **Does 6 hold?** Against *natural* forks, yes with a wide margin: the deepest observed is 2, Core rejects ≥ 100. Against a *deliberate* attacker, only up to about 14 % staking share at 0.1 % (about 10 % at 0.01 %); at q = 25 % it is 3.2 %. **6 does not hold at q = 0.25.**
+- **The current 10** holds to about 19.6 % at 0.1 %, and at q = 0.25 is 0.86 %.
+- Cost of a higher count: each confirmation is about 60 s per lock (17 ≈ 17 min against 10 min today), see the cost line in the sections above.
+- The 100-block max-reorg rule is not a finality guarantee for any z < 100 and does not exist in IronDivi nodes.
+- **Not decided here.** The code value stays 10. The decision (keep 10, or move toward 17) belongs to Bert.
