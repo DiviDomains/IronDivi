@@ -245,8 +245,8 @@ pub struct WalletDb {
     scripts: RwLock<HashMap<Hash160, Script>>,
     /// Vault metadata storage
     vaults: RwLock<HashMap<Vec<u8>, VaultMetadata>>,
-    /// Unlock expiration time (None if locked or not encrypted)
-    unlock_until: RwLock<Option<Instant>>,
+    /// How the wallet is unlocked: timer and staking-only flag
+    unlock: RwLock<UnlockState>,
     /// Decrypted master key (in memory only when unlocked)
     decrypted_master_key: RwLock<Option<Zeroizing<Vec<u8>>>>,
     /// Tracks which data categories have been modified since last save
@@ -255,6 +255,18 @@ pub struct WalletDb {
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
     /// Wallet transactions in the mempool (in-memory only, never persisted)
     mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
+}
+
+/// Unlock state of an encrypted wallet (Divi Core `walletStakingOnly` plus the
+/// `walletpassphrase` timer of rpcserver.cpp `UnlockWalletBriefly`)
+#[derive(Debug, Clone, Copy, Default)]
+struct UnlockState {
+    /// When the current unlock ends; None means until `walletlock`
+    until: Option<Instant>,
+    /// Keys are in memory for staking only: sends and key exports are refused
+    staking_only: bool,
+    /// When `until` passes, go back to staking-only instead of locking
+    revert_to_staking: bool,
 }
 
 impl WalletDb {
@@ -275,7 +287,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -300,7 +312,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -330,7 +342,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults,
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -419,7 +431,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -460,6 +472,9 @@ impl WalletDb {
                 "Restored HD wallet from mnemonic (chain_mode={:?})",
                 chain_mode
             );
+        } else if let Some(ids) = db.load_hd_public_ids()? {
+            // Encrypted wallet: the seed stays locked, its public ids do not
+            self.keystore.set_hd_public_ids(ids);
         }
 
         // Load HD indices
@@ -1431,13 +1446,28 @@ impl WalletDb {
         }
         // Clear decrypted master key from memory
         *self.decrypted_master_key.write() = None;
-        *self.unlock_until.write() = None;
+        *self.unlock.write() = UnlockState::default();
         drop(locked);
         info!("Wallet locked");
     }
 
     /// Unlock the wallet with passphrase for specified timeout
     pub fn unlock(&self, passphrase: &str, timeout_secs: u32) -> Result<(), WalletError> {
+        self.unlock_for(passphrase, timeout_secs, false)
+    }
+
+    /// Unlock the wallet, fully or for staking only (`walletpassphrase` with
+    /// stakingOnly). A timeout of 0 lasts until `walletlock`.
+    ///
+    /// As in Divi Core, a timed unlock given while the wallet is unlocked for
+    /// staking only goes back to staking-only when it ends, rather than locking
+    /// the wallet, so a short unlock to send does not stop staking.
+    pub fn unlock_for(
+        &self,
+        passphrase: &str,
+        timeout_secs: u32,
+        staking_only: bool,
+    ) -> Result<(), WalletError> {
         if !*self.encrypted.read() {
             // Not encrypted, nothing to unlock
             *self.locked.write() = false;
@@ -1486,6 +1516,12 @@ impl WalletDb {
 
         if let Some(hd) = hd_wallet {
             self.keystore.set_hd_wallet(hd);
+            // Wallets encrypted before the ids were stored get them on first unlock
+            if db.load_hd_public_ids()?.is_none() {
+                if let Some(ids) = self.keystore.hd_public_ids() {
+                    db.store_hd_public_ids(&ids)?;
+                }
+            }
         }
         for (hash, secret) in secrets {
             self.keystore.restore_secret(&hash, secret);
@@ -1512,10 +1548,23 @@ impl WalletDb {
         } else {
             None // Unlimited
         };
-        *self.unlock_until.write() = expiration;
+        let was_staking_only = self.is_unlocked_for_staking_only();
+        *self.unlock.write() = UnlockState {
+            until: expiration,
+            staking_only,
+            revert_to_staking: was_staking_only && expiration.is_some(),
+        };
 
         *self.locked.write() = false;
-        info!("Wallet unlocked for {} seconds", timeout_secs);
+        info!(
+            "Wallet unlocked{} for {} seconds",
+            if staking_only {
+                " for staking only"
+            } else {
+                ""
+            },
+            timeout_secs
+        );
         Ok(())
     }
 
@@ -1527,25 +1576,55 @@ impl WalletDb {
         }
 
         // Check if unlock has expired
-        let unlock_until = *self.unlock_until.read();
-        if let Some(unlock_until) = unlock_until {
-            if Instant::now() >= unlock_until {
-                // Auto-lock on timeout
-                self.lock();
-                return true;
+        if self.is_auto_lock_expired() {
+            let reverted = {
+                let mut state = self.unlock.write();
+                let expired = state.until.is_some_and(|t| Instant::now() >= t);
+                if !expired {
+                    None // another caller already handled it
+                } else if state.revert_to_staking {
+                    *state = UnlockState {
+                        staking_only: true,
+                        ..UnlockState::default()
+                    };
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            };
+            match reverted {
+                Some(true) => info!("Wallet unlock timed out; unlocked for staking only again"),
+                Some(false) => {
+                    // Auto-lock on timeout
+                    self.lock();
+                    return true;
+                }
+                None => {}
             }
         }
 
-        false
+        *self.locked.read()
     }
 
     /// Check if the auto-lock timeout has expired
     pub fn is_auto_lock_expired(&self) -> bool {
-        if let Some(unlock_until) = *self.unlock_until.read() {
+        if let Some(unlock_until) = self.unlock.read().until {
             Instant::now() >= unlock_until
         } else {
             false
         }
+    }
+
+    /// Unlocked for staking only (`walletpassphrase … true`): the staker can sign,
+    /// sends and key exports are refused
+    pub fn is_unlocked_for_staking_only(&self) -> bool {
+        !self.is_locked() && self.unlock.read().staking_only
+    }
+
+    /// Unlocked for everything (Divi Core `IsFullyUnlocked`); always true for an
+    /// unencrypted wallet
+    pub fn is_fully_unlocked(&self) -> bool {
+        !self.is_locked() && !self.unlock.read().staking_only
     }
 
     /// Check if wallet is encrypted
@@ -1554,10 +1633,12 @@ impl WalletDb {
     }
 
     /// Encryption state as reported by `getwalletinfo`:
-    /// "unencrypted", "locked" or "unlocked".
+    /// "unencrypted", "unlocked-for-staking", "locked" or "unlocked".
     pub fn encryption_status(&self) -> &'static str {
         if !self.is_encrypted() {
             "unencrypted"
+        } else if self.is_unlocked_for_staking_only() {
+            "unlocked-for-staking"
         } else if self.is_locked() {
             "locked"
         } else {
@@ -1571,7 +1652,7 @@ impl WalletDb {
         if !self.is_encrypted() || self.is_locked() {
             return 0;
         }
-        match *self.unlock_until.read() {
+        match self.unlock.read().until {
             Some(t) => {
                 let remaining = t.saturating_duration_since(Instant::now()).as_secs();
                 std::time::SystemTime::now()
@@ -1647,6 +1728,14 @@ impl WalletDb {
             receiving.to_le_bytes(),
         );
         batch.put_cf(db.cf_metadata(), b"change_index", change.to_le_bytes());
+        // The seed is about to be locked away; keep its public ids readable
+        if let Some(ids) = self.keystore.hd_public_ids() {
+            batch.put_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_HD_PUBLIC_IDS,
+                crate::persistence::encode_hd_public_ids(&ids),
+            );
+        }
         batch.put_cf(db.cf_metadata(), b"encryption_salt", &salt);
         batch.put_cf(db.cf_metadata(), b"encrypted_master_key", &sealed_master);
         batch.put_cf(db.cf_metadata(), b"encrypted", [1u8]);

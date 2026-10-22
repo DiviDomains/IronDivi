@@ -327,9 +327,9 @@ impl TransactionBuilder {
         self
     }
 
-    /// Add a P2PKH output to an address
+    /// Add an output paying an address (P2PKH or P2SH)
     pub fn add_output_to_address(self, value: Amount, address: &Address) -> Self {
-        let script = Script::new_p2pkh(address.hash.as_bytes());
+        let script = address.script_pubkey();
         self.add_output(value, script)
     }
 

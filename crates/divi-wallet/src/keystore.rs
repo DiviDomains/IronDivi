@@ -106,6 +106,33 @@ pub struct KeyStore {
     keypool_target: RwLock<u32>,
     /// Timestamp of oldest key in keypool
     keypool_oldest: RwLock<u64>,
+    /// Public ids of the HD chain; kept when the seed is stripped on lock
+    hd_public_ids: RwLock<Option<HdPublicIds>>,
+}
+
+/// Public identifiers of an HD wallet. They identify the seed without revealing
+/// it, so `getwalletinfo` and `validateaddress` can show them while locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdPublicIds {
+    /// hash160 of the master public key (`hdmasterkeyid`)
+    pub master_key_id: [u8; 20],
+    /// sha256 of the master public key (`hdchainid`)
+    pub chain_id: [u8; 32],
+}
+
+impl HdPublicIds {
+    /// Derive the ids from an HD wallet
+    pub fn of(wallet: &HdWallet) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+
+        let master_key_id = wallet.master_key_id().ok()?;
+        let master_pubkey = wallet.get_master_pubkey().ok()?;
+        let chain_id: [u8; 32] = Sha256::digest(master_pubkey.to_bytes()).into();
+        Some(HdPublicIds {
+            master_key_id,
+            chain_id,
+        })
+    }
 }
 
 /// Default keypool target size (matches C++ Divi DEFAULT_KEYPOOL_SIZE)
@@ -126,6 +153,7 @@ impl KeyStore {
             change_index: RwLock::new(0),
             keypool_target: RwLock::new(DEFAULT_KEYPOOL_SIZE),
             keypool_oldest: RwLock::new(now),
+            hd_public_ids: RwLock::new(None),
         }
     }
 
@@ -137,6 +165,7 @@ impl KeyStore {
             .as_secs();
         KeyStore {
             keys: RwLock::new(HashMap::new()),
+            hd_public_ids: RwLock::new(HdPublicIds::of(&wallet)),
             hd_wallet: RwLock::new(Some(wallet)),
             network,
             receiving_index: RwLock::new(0),
@@ -284,6 +313,17 @@ impl KeyStore {
             .read()
             .as_ref()
             .and_then(|w| w.master_key_id().ok())
+            .or_else(|| self.hd_public_ids().map(|ids| ids.master_key_id))
+    }
+
+    /// Public ids of the HD chain, also while the seed is locked away
+    pub fn hd_public_ids(&self) -> Option<HdPublicIds> {
+        *self.hd_public_ids.read()
+    }
+
+    /// Restore the public ids of a locked HD wallet (from persistence)
+    pub fn set_hd_public_ids(&self, ids: HdPublicIds) {
+        *self.hd_public_ids.write() = Some(ids);
     }
 
     /// Get HD wallet indices (receiving, change)
@@ -356,6 +396,7 @@ impl KeyStore {
 
     /// Set the HD wallet (for restoration from persistence)
     pub fn set_hd_wallet(&self, wallet: HdWallet) {
+        *self.hd_public_ids.write() = HdPublicIds::of(&wallet);
         *self.hd_wallet.write() = Some(wallet);
     }
 
@@ -378,7 +419,9 @@ impl KeyStore {
         use sha2::{Digest, Sha256};
 
         let wallet = self.hd_wallet.read();
-        let wallet = wallet.as_ref()?;
+        let Some(wallet) = wallet.as_ref() else {
+            return self.hd_public_ids().map(|ids| hex::encode(ids.chain_id));
+        };
 
         let master_pubkey = wallet.get_master_pubkey().ok()?;
         let pubkey_bytes = master_pubkey.to_bytes();

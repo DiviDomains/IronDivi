@@ -147,6 +147,10 @@ struct Args {
     #[arg(long)]
     stakeonstaletip: bool,
 
+    /// Stake split threshold in DIVI, reported by getstakingstatus (C++ -stakesplitthreshold, default 20000)
+    #[arg(long)]
+    stakesplitthreshold: Option<f64>,
+
     /// Enable spent index for gettxout RPC
     #[arg(long)]
     spentindex: bool,
@@ -411,6 +415,18 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     );
                 }
             }
+            "stakesplitthreshold" => {
+                let divi = value
+                    .as_float()
+                    .or_else(|| value.as_integer().map(|i| i as f64))
+                    .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
+                match divi {
+                    Some(d) if d >= 0.0 => {
+                        config.staking.split_threshold = (d * 100_000_000.0).round() as i64
+                    }
+                    _ => warn!("Invalid stakesplitthreshold value in config file, expected DIVI"),
+                }
+            }
             // Index settings
             "txindex" => {
                 if let Some(b) = value.as_bool() {
@@ -649,6 +665,9 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     }
     if args.stakeonstaletip {
         config.staking.stake_on_stale_tip = true;
+    }
+    if let Some(divi) = args.stakesplitthreshold {
+        config.staking.split_threshold = (divi * 100_000_000.0).round() as i64;
     }
     config.index.txindex = args.txindex;
     config.index.spentindex = args.spentindex;
@@ -1384,6 +1403,10 @@ async fn run_daemon(
     if let Some(wallet) = wallet {
         // Setup staker callbacks if enabled
         let staker_ref = staker.clone();
+        let wallet_for_staking_status = Arc::clone(&wallet);
+        let chain_for_staking_status = Arc::clone(&chain);
+        let peers_for_staking_status = Arc::clone(&peer_manager);
+        let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
@@ -1448,31 +1471,21 @@ async fn run_daemon(
                     if let Some(ref staker_arc) = staker_ref {
                         let staker_for_status = Arc::clone(staker_arc);
                         let staker_for_control = Arc::clone(staker_arc);
+                        let wallet_for_status = Arc::clone(&wallet_for_staking_status);
+                        let chain_for_status = Arc::clone(&chain_for_staking_status);
+                        let peers_for_status = Arc::clone(&peers_for_staking_status);
 
                         // Register status callback
                         rpc_server.staking().set_status_callback(Arc::new(move || {
-                            let status = staker_for_status.get_status();
-                            divi_rpc::StakingInfo {
-                                enabled: status.enabled,
-                                staking: status.staking,
-                                errors: None,
-                                current_block_size: 0,
-                                current_block_tx: 0,
-                                pooled_tx: 0,
-                                difficulty: 0.000244140625,
-                                search_interval: 500,
-                                weight: status.stake_weight,
-                                netstakeweight: status.stake_weight,
-                                expected_time: status.expected_time,
-                                staking_balance: status.stake_weight as f64 / 100_000_000.0,
-                                wallet_unlocked: true,
-                                have_connections: true,
-                                valid_time: true,
-                                mintable_coins: status.staking,
-                                enough_coins: status.stake_weight > 0,
-                                mnsync: true,
-                                blocks: status.blocks,
-                            }
+                            let tip_time = chain_for_status.tip().map(|t| t.time).unwrap_or(0);
+                            staking_info(
+                                &staker_for_status.get_status(),
+                                wallet_for_status.is_locked(),
+                                peers_for_status.peer_count(),
+                                tip_time,
+                                blockchain_synced(&chain_for_status),
+                                split_threshold_divi,
+                            )
                         }));
 
                         // Register control callback
@@ -1550,6 +1563,58 @@ async fn run_daemon(
 
     info!("Node stopped");
     Ok(())
+}
+
+/// getstakingstatus/getmintinginfo data. Each field has the meaning Divi Core's
+/// getstakingstatus gives it (rpcmisc.cpp).
+fn staking_info(
+    status: &divi_node::StakingStatus,
+    wallet_locked: bool,
+    peer_count: usize,
+    tip_time: u32,
+    synced: bool,
+    split_threshold_divi: f64,
+) -> divi_rpc::StakingInfo {
+    divi_rpc::StakingInfo {
+        enabled: status.enabled,
+        staking: status.staking,
+        errors: None,
+        current_block_size: 0,
+        current_block_tx: 0,
+        pooled_tx: 0,
+        difficulty: 0.000244140625,
+        search_interval: 500,
+        weight: status.stake_weight,
+        netstakeweight: status.stake_weight,
+        expected_time: status.expected_time,
+        staking_balance: status.stake_weight as f64 / 100_000_000.0,
+        // !IsLocked(): also true when unlocked for staking only
+        wallet_unlocked: !wallet_locked,
+        have_connections: peer_count > 0,
+        // Tip time after the PoS start, 2016-08-18 (1471482000)
+        valid_time: tip_time > 1_471_482_000,
+        mintable_coins: status.mintable_coins,
+        enough_coins: status.stake_weight > 0,
+        // IronDivi keeps no masternode list sync of its own; Divi Core's
+        // starts once the chain is synced
+        mnsync: synced,
+        blocks: status.blocks,
+        stake_split_threshold: split_threshold_divi,
+    }
+}
+
+/// Divi Core `IsBlockchainSynced`, which its masternode sync waits for: not in
+/// initial block download and the tip is at most ten minutes old. IronDivi has no
+/// masternode list sync of its own, so getstakingstatus `mnsync` reports this.
+fn blockchain_synced(chain: &divi_storage::Chain) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    !chain.is_ibd()
+        && chain
+            .tip()
+            .is_some_and(|t| now.saturating_sub(t.time as u64) <= 600)
 }
 
 fn storage_params(config: &NodeConfig) -> divi_storage::ChainParams {
@@ -2213,5 +2278,40 @@ mod expire_tests {
         // Invalid value on any surface is an error, not a warning.
         assert!(cfg(None, &["--expire=30"]).is_err());
         assert!(cfg_env(None, Some("bogus"), &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod staking_status_tests {
+    use super::*;
+
+    /// getstakingstatus used to hardcode walletunlocked, haveconnections,
+    /// validtime, mnsync, mintablecoins and the split threshold
+    #[test]
+    fn staking_info_reports_real_state() {
+        let status = divi_node::StakingStatus {
+            enabled: true,
+            staking: true,
+            mintable_coins: false,
+            utxo_count: 1,
+            stake_weight: 12_000 * 100_000_000,
+            expected_time: None,
+            last_stake_time: 0,
+            blocks: 100,
+        };
+        let info = staking_info(&status, true, 0, 0, false, 5000.0);
+        assert!(!info.wallet_unlocked, "locked wallet reported unlocked");
+        assert!(!info.have_connections, "no peers reported as connections");
+        assert!(!info.valid_time);
+        assert!(
+            !info.mintable_coins,
+            "mintablecoins copied the staking flag"
+        );
+        assert!(!info.mnsync);
+        assert_eq!(info.stake_split_threshold, 5000.0);
+        assert!(info.enough_coins);
+
+        let info = staking_info(&status, false, 3, 1_761_000_000, true, 20000.0);
+        assert!(info.wallet_unlocked && info.have_connections && info.valid_time && info.mnsync);
     }
 }

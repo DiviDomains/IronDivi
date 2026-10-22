@@ -168,7 +168,9 @@ struct Args {
     #[arg(long)]
     stdinrpcpass: bool,
 
-    /// Read wallet passphrase from stdin
+    /// Read the wallet passphrase from stdin (one line; for walletpassphrasechange
+    /// the old then the new passphrase on two lines) for walletpassphrase,
+    /// walletpassphrasechange and encryptwallet. Not echoed when stdin is a terminal.
     #[arg(long)]
     stdinwalletpassphrase: bool,
 
@@ -483,6 +485,17 @@ fn handle_stdin(args: &mut Args) -> Result<(), CliError> {
         args.rpcpassword = Some(pass.trim().to_string());
     }
 
+    // Then the wallet passphrase(s), inserted as the method's first argument(s)
+    if args.stdinwalletpassphrase {
+        let method = args.args.first().map(String::as_str).unwrap_or("");
+        let stdin = io::stdin();
+        let terminal = io::IsTerminal::is_terminal(&stdin);
+        let passphrases = read_wallet_passphrases(method, &mut stdin.lock(), terminal)?;
+        for (i, passphrase) in passphrases.into_iter().enumerate() {
+            args.args.insert(1 + i, passphrase);
+        }
+    }
+
     // Then read remaining lines for command args
     if args.stdin {
         let mut extra_input = String::new();
@@ -498,6 +511,75 @@ fn handle_stdin(args: &mut Args) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Wallet passphrases `method` takes as its first arguments
+fn wallet_passphrase_count(method: &str) -> Option<usize> {
+    match method {
+        "walletpassphrase" | "encryptwallet" => Some(1),
+        "walletpassphrasechange" => Some(2),
+        _ => None,
+    }
+}
+
+/// Parameters sent as strings whatever they look like, so a passphrase such as
+/// "1234" or "true" is not turned into a number or a boolean
+fn is_string_param(method: &str, index: usize) -> bool {
+    wallet_passphrase_count(method).is_some_and(|n| index < n)
+}
+
+/// `--stdinwalletpassphrase` (bitcoin-cli `-stdinwalletpassphrase`): read one
+/// passphrase per line, prompting on stderr with echo off when `terminal`.
+fn read_wallet_passphrases(
+    method: &str,
+    input: &mut impl BufRead,
+    terminal: bool,
+) -> Result<Vec<String>, CliError> {
+    let count = wallet_passphrase_count(method).ok_or_else(|| {
+        CliError::InvalidParams(
+            "--stdinwalletpassphrase is only applicable for walletpassphrase, \
+             walletpassphrasechange and encryptwallet"
+                .to_string(),
+        )
+    })?;
+    let prompts = if count == 2 {
+        ["Old wallet passphrase> ", "New wallet passphrase> "].as_slice()
+    } else {
+        ["Wallet passphrase> "].as_slice()
+    };
+    let mut passphrases = Vec::with_capacity(count);
+    for prompt in prompts {
+        if terminal {
+            eprint!("{}", prompt);
+            set_terminal_echo(false);
+        }
+        let mut line = String::new();
+        let read = input.read_line(&mut line);
+        if terminal {
+            set_terminal_echo(true);
+            eprintln!();
+        }
+        let n = read.map_err(|e| CliError::General(e.to_string()))?;
+        if n == 0 {
+            return Err(CliError::General(
+                "--stdinwalletpassphrase specified but failed to read from standard input"
+                    .to_string(),
+            ));
+        }
+        // Only the line ending is removed: spaces belong to the passphrase
+        let len = line.trim_end_matches(['\n', '\r']).len();
+        line.truncate(len);
+        passphrases.push(line);
+    }
+    Ok(passphrases)
+}
+
+/// Turn terminal echo on stdin on or off (Unix `stty`)
+fn set_terminal_echo(on: bool) {
+    let _ = std::process::Command::new("stty")
+        .arg(if on { "echo" } else { "-echo" })
+        .stdin(std::process::Stdio::inherit())
+        .status();
 }
 
 /// Handle -getinfo special command (aggregates multiple RPC calls)
@@ -812,7 +894,11 @@ fn run() -> Result<(), CliError> {
         Value::Array(
             method_args
                 .iter()
-                .map(|arg| {
+                .enumerate()
+                .map(|(index, arg)| {
+                    if is_string_param(method, index) {
+                        return json!(arg);
+                    }
                     // Try to parse as JSON first (for objects/arrays)
                     serde_json::from_str(arg).unwrap_or_else(|_| {
                         // If not valid JSON, try as number
@@ -1005,5 +1091,46 @@ mod endpoint_tests {
         assert_eq!(unquote("alice"), "alice");
         assert_eq!(unquote("\""), "\"");
         assert_eq!(unquote("51491"), "51491");
+    }
+}
+
+#[cfg(test)]
+mod stdin_passphrase_tests {
+    use super::*;
+
+    #[test]
+    fn reads_one_passphrase_line_keeping_spaces() {
+        let mut input = io::Cursor::new(b"  my pass phrase \r\nnext\n".to_vec());
+        let got = read_wallet_passphrases("walletpassphrase", &mut input, false).unwrap();
+        assert_eq!(got, vec!["  my pass phrase ".to_string()]);
+        let mut input = io::Cursor::new(b"pw\n".to_vec());
+        assert_eq!(
+            read_wallet_passphrases("encryptwallet", &mut input, false).unwrap(),
+            vec!["pw".to_string()]
+        );
+    }
+
+    #[test]
+    fn walletpassphrasechange_reads_old_then_new() {
+        let mut input = io::Cursor::new(b"old one\nnew one\n".to_vec());
+        let got = read_wallet_passphrases("walletpassphrasechange", &mut input, false).unwrap();
+        assert_eq!(got, vec!["old one".to_string(), "new one".to_string()]);
+    }
+
+    #[test]
+    fn refuses_other_methods_and_empty_input() {
+        let mut input = io::Cursor::new(b"pw\n".to_vec());
+        assert!(read_wallet_passphrases("getbalance", &mut input, false).is_err());
+        let mut input = io::Cursor::new(Vec::new());
+        assert!(read_wallet_passphrases("walletpassphrase", &mut input, false).is_err());
+    }
+
+    #[test]
+    fn passphrase_params_stay_strings() {
+        assert!(is_string_param("walletpassphrase", 0));
+        assert!(!is_string_param("walletpassphrase", 1));
+        assert!(is_string_param("walletpassphrasechange", 1));
+        assert!(is_string_param("encryptwallet", 0));
+        assert!(!is_string_param("getblock", 0));
     }
 }

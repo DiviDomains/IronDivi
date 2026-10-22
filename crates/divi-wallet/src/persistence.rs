@@ -15,7 +15,7 @@
 
 use crate::address::Network;
 use crate::error::WalletError;
-use crate::keystore::KeyEntry;
+use crate::keystore::{HdPublicIds, KeyEntry};
 use crate::wallet_db::{WalletTx, WalletUtxo};
 
 use divi_crypto::keys::SecretKey;
@@ -55,9 +55,18 @@ const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
 const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
 const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
 
 /// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
 pub(crate) const ENCRYPTED_SECRET_SUFFIX: u8 = 0x01;
+
+/// master key id (20 bytes) followed by chain id (32 bytes)
+pub(crate) fn encode_hd_public_ids(ids: &HdPublicIds) -> Vec<u8> {
+    let mut data = Vec::with_capacity(52);
+    data.extend_from_slice(&ids.master_key_id);
+    data.extend_from_slice(&ids.chain_id);
+    data
+}
 
 /// Salt and encrypted master key pair
 type EncryptionMetadata = (Vec<u8>, Vec<u8>);
@@ -237,6 +246,39 @@ impl WalletDatabase {
                 };
                 Ok(Some(mode))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Store the HD chain's public ids, which an encrypted wallet cannot derive
+    /// while locked
+    pub fn store_hd_public_ids(&self, ids: &HdPublicIds) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_HD_PUBLIC_IDS, encode_hd_public_ids(ids))
+            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the HD chain's public ids
+    pub fn load_hd_public_ids(&self) -> Result<Option<HdPublicIds>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        match self
+            .db
+            .get_cf(cf, KEY_HD_PUBLIC_IDS)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(data) if data.len() == 52 => {
+                let mut master_key_id = [0u8; 20];
+                let mut chain_id = [0u8; 32];
+                master_key_id.copy_from_slice(&data[..20]);
+                chain_id.copy_from_slice(&data[20..]);
+                Ok(Some(HdPublicIds {
+                    master_key_id,
+                    chain_id,
+                }))
+            }
+            Some(_) => Err(WalletError::Storage("Invalid HD public ids".into())),
             None => Ok(None),
         }
     }

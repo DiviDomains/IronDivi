@@ -43,6 +43,15 @@ impl LiteWalletRpc {
         }
     }
 
+    /// Create with a chain reference, so addresses are checked against its network
+    pub fn for_chain(chain: Arc<Chain>) -> Self {
+        LiteWalletRpc {
+            chain: Some(chain),
+            address_index: None,
+            mempool: None,
+        }
+    }
+
     /// Create with chain and address index
     pub fn with_index(chain: Arc<Chain>, address_index: Arc<AddressIndex>) -> Self {
         LiteWalletRpc {
@@ -72,12 +81,30 @@ impl LiteWalletRpc {
         self.chain.as_ref().map(|c| c.height()).unwrap_or(0)
     }
 
+    /// Decode an address; once the chain is known, an address of another network is invalid
+    fn decode_address(&self, addr_str: &str) -> Option<divi_wallet::address::Address> {
+        use divi_wallet::address::{Address, Network};
+
+        match self.chain.as_ref().map(|c| c.network_type()) {
+            Some(network_type) => {
+                let network = match network_type {
+                    NetworkType::Mainnet => Network::Mainnet,
+                    NetworkType::Testnet => Network::Testnet,
+                    NetworkType::Regtest => Network::Regtest,
+                };
+                Address::from_base58_for_network(addr_str, network).ok()
+            }
+            None => Address::from_base58(addr_str).ok(),
+        }
+    }
+
     /// Parse an address string to a script
     fn parse_address(&self, addr_str: &str) -> Result<Script, Error> {
-        use divi_wallet::address::{Address, AddressType};
+        use divi_wallet::address::AddressType;
 
-        let address = Address::from_base58(addr_str)
-            .map_err(|_| RpcError::invalid_params(format!("Invalid address: {}", addr_str)))?;
+        let address = self
+            .decode_address(addr_str)
+            .ok_or_else(|| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
 
         // Convert address to script_pubkey
         match address.addr_type {
@@ -307,8 +334,6 @@ impl LiteWalletRpc {
     /// Validate multiple addresses
     /// validateaddresses ["address1", "address2", ...]
     pub fn validate_addresses(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        use divi_wallet::address::Address;
-
         // Get first parameter and check if it's an array
         let addresses = params
             .get(0)
@@ -319,7 +344,7 @@ impl LiteWalletRpc {
             .iter()
             .filter_map(|v| v.as_str())
             .map(|addr_str| {
-                let valid = Address::from_base58(addr_str).is_ok();
+                let valid = self.decode_address(addr_str).is_some();
                 serde_json::json!({
                     "address": addr_str,
                     "valid": valid,

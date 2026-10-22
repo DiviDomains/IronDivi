@@ -146,6 +146,8 @@ pub enum StakeResult {
     },
     /// No stakeable UTXOs available
     NoStakeableUtxos,
+    /// The wallet is locked, so no coinstake can be signed
+    WalletLocked,
     /// Failed to find valid proof
     NoProofFound,
     /// Rate limited - too soon to try again
@@ -189,6 +191,9 @@ pub struct Staker {
     config: RwLock<StakingConfig>,
     /// Whether staking is currently running
     running: AtomicBool,
+    /// A warning that staking is blocked by a locked wallet has been logged
+    /// (cleared when the wallet is unlocked again)
+    wallet_locked_warned: AtomicBool,
     /// Event broadcaster
     event_tx: broadcast::Sender<StakerEvent>,
     /// Last successful stake time
@@ -223,6 +228,7 @@ impl Staker {
             peer_manager,
             config: RwLock::new(config),
             running: AtomicBool::new(false),
+            wallet_locked_warned: AtomicBool::new(false),
             event_tx,
             last_stake_time: RwLock::new(0),
             stake_weight: RwLock::new(0),
@@ -273,12 +279,53 @@ impl Staker {
         StakingStatus {
             enabled: self.running.load(Ordering::SeqCst),
             staking: self.running.load(Ordering::SeqCst) && !stakeable.is_empty(),
+            mintable_coins: self.has_mintable_coins(),
             utxo_count: stakeable.len(),
             stake_weight,
             expected_time: self.calculate_expected_time(stake_weight),
             last_stake_time: *self.last_stake_time.read(),
             blocks: current_height,
         }
+    }
+
+    /// Confirmations a coinbase or coinstake output needs before it can stake
+    fn coinbase_maturity(&self) -> u32 {
+        match self.chain.network_type() {
+            divi_storage::NetworkType::Mainnet => 20u32,
+            divi_storage::NetworkType::Testnet => 1u32,
+            divi_storage::NetworkType::Regtest => 1u32,
+        }
+    }
+
+    /// Divi Core `HasAgedCoins`: the wallet holds a coin the staker could use
+    /// now, i.e. mature, at least the minimum stake amount, and older than the
+    /// minimum coin age (vault coins count, as in Divi Core's stakable coins)
+    pub fn has_mintable_coins(&self) -> bool {
+        let height = self.chain.height();
+        let now = current_timestamp() as u32;
+        let maturity = self.coinbase_maturity();
+        let (min_amount, min_age) = {
+            let c = self.config.read();
+            (c.min_stake_amount, c.min_coin_age)
+        };
+        let aged = |utxo: &divi_wallet::WalletUtxo| {
+            utxo.value.as_sat() >= min_amount
+                && utxo.is_mature(height, maturity)
+                && utxo
+                    .height
+                    .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
+                    .is_some_and(|idx| now.saturating_sub(idx.time) >= min_age)
+        };
+        let regular = self.wallet.get_spendable_utxos(height, 1);
+        regular
+            .iter()
+            .filter(|u| !u.address.starts_with("vault:"))
+            .any(aged)
+            || self
+                .wallet
+                .get_stakeable_vault_utxos(height, 1)
+                .iter()
+                .any(|(u, _)| aged(u))
     }
 
     /// Calculate expected time to stake a block
@@ -534,6 +581,11 @@ impl Staker {
                 StakeResult::NoProofFound => {
                     trace!("No valid proof found this round");
                 }
+                StakeResult::WalletLocked => {
+                    // Already reported once by note_wallet_locked
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    continue;
+                }
                 StakeResult::RateLimited => {
                     // Step 4: Sleep longer when rate-limited (22s wait needed, not 500ms)
                     static RATE_LIMITED_COUNT: std::sync::atomic::AtomicU32 =
@@ -616,8 +668,37 @@ impl Staker {
     }
 
     /// Try to stake a block
+    /// Log once, at warn level, that staking is on but the wallet is locked, and
+    /// once more at info level when it is unlocked again. Returns true when the
+    /// warning was logged by this call.
+    fn note_wallet_locked(&self, locked: bool) -> bool {
+        if locked {
+            let first = !self.wallet_locked_warned.swap(true, Ordering::SeqCst);
+            if first {
+                warn!(
+                    "Staking is enabled but the wallet is locked, so no block can be staked; \
+                     unlock it with walletpassphrase \"<passphrase>\" 0 true"
+                );
+            }
+            first
+        } else {
+            if self.wallet_locked_warned.swap(false, Ordering::SeqCst) {
+                info!("Wallet unlocked; staking can sign blocks again");
+            }
+            false
+        }
+    }
+
     fn try_stake(&self) -> StakeResult {
         let current_time = current_timestamp() as u32;
+
+        // A locked wallet cannot sign a coinstake; say so once instead of
+        // failing every candidate at debug level
+        let locked = self.wallet.is_locked();
+        self.note_wallet_locked(locked);
+        if locked {
+            return StakeResult::WalletLocked;
+        }
 
         // Get the current tip FIRST - this ensures all state is consistent
         let tip = match self.chain.tip() {
@@ -706,11 +787,7 @@ impl Staker {
         // Filter stakeable UTXOs:
         // 1. Must meet minimum amount
         // 2. Must be mature
-        let coinbase_maturity = match self.chain.network_type() {
-            divi_storage::NetworkType::Mainnet => 20u32,
-            divi_storage::NetworkType::Testnet => 1u32,
-            divi_storage::NetworkType::Regtest => 1u32,
-        };
+        let coinbase_maturity = self.coinbase_maturity();
         let stakeable: Vec<_> = utxos
             .into_iter()
             .filter(|u| {
@@ -1522,6 +1599,8 @@ pub struct StakingStatus {
     pub enabled: bool,
     /// Whether actively staking (enabled and has UTXOs)
     pub staking: bool,
+    /// Divi Core `mintablecoins`: a coin is mature and old enough to stake now
+    pub mintable_coins: bool,
     /// Number of stakeable UTXOs
     pub utxo_count: usize,
     /// Total stake weight (sum of UTXO values)
@@ -1836,6 +1915,48 @@ mod tests {
 
         // Staker starts in stopped state
         assert!(!staker.is_running());
+    }
+
+    #[test]
+    fn locked_wallet_is_reported_once_and_skips_staking() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        wallet.encrypt_wallet("pw").unwrap();
+        let staker = Staker::new(
+            wallet.clone(),
+            chain,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig::default(),
+        );
+
+        assert!(matches!(staker.try_stake(), StakeResult::WalletLocked));
+        assert!(staker.wallet_locked_warned.load(Ordering::SeqCst));
+        // Later ticks stay quiet
+        assert!(!staker.note_wallet_locked(true));
+        assert!(matches!(staker.try_stake(), StakeResult::WalletLocked));
+
+        // Unlocking clears it; locking again warns again
+        wallet.unlock("pw", 0).unwrap();
+        assert!(!staker.note_wallet_locked(false));
+        assert!(!staker.wallet_locked_warned.load(Ordering::SeqCst));
+        assert!(staker.note_wallet_locked(true));
     }
 
     #[test]

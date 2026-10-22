@@ -23,9 +23,10 @@ use divi_primitives::constants::MAX_MONEY;
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::serialize::{deserialize, serialize};
-use divi_primitives::transaction::{OutPoint, Transaction};
+use divi_primitives::transaction::{OutPoint, Transaction, TxOut, DEFAULT_MIN_RELAY_FEE_PER_KB};
 use divi_script::opcodes::Opcode;
 use divi_script::StakingVaultScript;
+use divi_storage::chain::NetworkType;
 use divi_storage::Chain;
 use divi_wallet::{
     wallet_db::VaultMetadata, Address, Network, TransactionBuilder, TransactionSigner, WalletDb,
@@ -41,6 +42,40 @@ use tracing::{debug, info};
 /// unless `allow_zero`; round to the nearest satoshi rather than truncating.
 /// Core's MaxMoneyOut is per-network; only the mainnet MAX_MONEY exists here,
 /// which is at most 0.03% below the test/regtest limit.
+/// Divi Core `EnsureNoOutputsAreDust`: a send whose output would be dust is
+/// refused with -4 before anything is built, signed or committed.
+fn ensure_not_dust(value: Amount, script: &Script) -> Result<(), Error> {
+    if TxOut::new(value, script.clone()).is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
+        return Err(RpcError::new(
+            codes::WALLET_ERROR,
+            "Transaction output(s) amount too small",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Smallest change output worth creating. Less than this would be dust, which
+/// no node relays, so it goes to the fee instead, as in Divi Core. Change always
+/// pays a P2PKH address.
+fn min_change_value() -> Amount {
+    TxOut::new(Amount::ZERO, Script::new_p2pkh(&[0; 20]))
+        .min_non_dust_value(DEFAULT_MIN_RELAY_FEE_PER_KB)
+}
+
+/// Divi Core `EnsureWalletIsUnlocked`: sends, signing and key exports need a full
+/// unlock, so a wallet unlocked for staking only is refused like a locked one.
+fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
+    if !wallet.is_fully_unlocked() {
+        return Err(RpcError::new(
+            codes::WALLET_UNLOCK_NEEDED,
+            "Error: Please enter the wallet passphrase with walletpassphrase first.",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
     let invalid = || RpcError::new(codes::TYPE_ERROR, "Invalid amount");
     let divi = value.as_f64().ok_or_else(invalid)?;
@@ -189,6 +224,27 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded").into())
     }
 
+    /// Network this node runs on: the chain's, else the loaded wallet's
+    fn network(&self) -> Network {
+        if let Some(ref chain) = self.chain {
+            return match chain.network_type() {
+                NetworkType::Mainnet => Network::Mainnet,
+                NetworkType::Testnet => Network::Testnet,
+                NetworkType::Regtest => Network::Regtest,
+            };
+        }
+        self.wallet
+            .read()
+            .as_ref()
+            .map(|w| w.network())
+            .unwrap_or(Network::Mainnet)
+    }
+
+    /// Decode an address given to an RPC; an address of another network is invalid
+    fn decode_address(&self, s: &str) -> Result<Address, divi_wallet::WalletError> {
+        Address::from_base58_for_network(s, self.network())
+    }
+
     /// Get current height
     fn current_height(&self) -> u32 {
         // Try to get height from chain first (most accurate)
@@ -248,7 +304,7 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
 
-        match Address::from_base58(addr_str) {
+        match self.decode_address(addr_str) {
             Ok(addr) => {
                 let wallet_guard = self.wallet.read();
                 let is_mine = wallet_guard
@@ -298,7 +354,8 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
 
-        let addr = Address::from_base58(addr_str)
+        let addr = self
+            .decode_address(addr_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
 
         let wallet = self.get_wallet()?;
@@ -670,6 +727,8 @@ impl WalletRpc {
         let timeout = params
             .get_u64(1)
             .ok_or_else(|| RpcError::invalid_params("Timeout required"))?;
+        // Divi Core's third argument: unlock for staking only
+        let staking_only = params.get_bool(2).unwrap_or(false);
 
         let wallet = self.get_wallet()?;
 
@@ -679,9 +738,19 @@ impl WalletRpc {
             );
         }
 
-        wallet.unlock(passphrase, timeout as u32).map_err(|_| {
-            RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
-        })?;
+        if staking_only && wallet.is_unlocked_for_staking_only() {
+            return Err(RpcError::new(
+                codes::WALLET_ALREADY_UNLOCKED,
+                "Error: Wallet is already unlocked for staking.",
+            )
+            .into());
+        }
+
+        wallet
+            .unlock_for(passphrase, timeout as u32, staking_only)
+            .map_err(|_| {
+                RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
+            })?;
 
         Ok(serde_json::Value::Null)
     }
@@ -707,14 +776,13 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
 
-        let addr = Address::from_base58(addr_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        let addr = self
+            .decode_address(addr_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let key_entry = wallet.keystore().get_key_by_address(&addr).ok_or_else(|| {
             RpcError::new(
@@ -756,9 +824,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Decode the WIF private key
         let wif_key = divi_wallet::decode_wif(wif).map_err(|e| {
@@ -933,16 +999,17 @@ impl WalletRpc {
             .get(1)
             .ok_or_else(|| RpcError::invalid_params("Amount required"))?;
 
-        let dest_addr = Address::from_base58(addr_str)
+        let dest_addr = self
+            .decode_address(addr_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let send_amount = amount_from_value(amount_value, false)?;
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
+
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
         let height = self.current_height();
 
@@ -960,7 +1027,7 @@ impl WalletRpc {
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
 
         for utxo in utxos {
             selected.push(utxo.clone());
@@ -1100,10 +1167,10 @@ impl WalletRpc {
         for (addr_str, amount_value) in outputs {
             let amount = amount_from_value(amount_value, true)?;
 
-            let addr = Address::from_base58(addr_str).map_err(|_| {
+            let addr = self.decode_address(addr_str).map_err(|_| {
                 RpcError::new(
                     codes::INVALID_ADDRESS_OR_KEY,
-                    format!("Invalid address: {}", addr_str),
+                    format!("Invalid DIVI address: {}", addr_str),
                 )
             })?;
 
@@ -1125,9 +1192,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Decode transaction
         let tx_bytes = hex::decode(hex_str)
@@ -1218,9 +1283,11 @@ impl WalletRpc {
         })?;
         let mut tx: Transaction = deserialize(&tx_bytes)
             .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
-        let address = Address::from_base58(params.get_str(1).unwrap_or("")).map_err(|_| {
-            RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
-        })?;
+        let address = self
+            .decode_address(params.get_str(1).unwrap_or(""))
+            .map_err(|_| {
+                RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
+            })?;
         let wallet = self.get_wallet()?;
         let entry = wallet
             .keystore()
@@ -1716,7 +1783,8 @@ impl WalletRpc {
     /// OP_IF <owner_hash> OP_ELSE OP_REQUIRE_COINSTAKE <manager_hash> OP_ENDIF ...
     /// ```
     fn address_to_hash160(&self, address_str: &str) -> Result<[u8; 20], Error> {
-        let address = Address::from_base58(address_str)
+        let address = self
+            .decode_address(address_str)
             .map_err(|e| RpcError::invalid_params(format!("Invalid Divi address: {}", e)))?;
 
         let mut hash = [0u8; 20];
@@ -2037,9 +2105,7 @@ impl WalletRpc {
     pub fn fund_vault(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let vault_encoding = params.get_str(0).ok_or_else(|| {
             RpcError::invalid_params("Missing required parameter: [owner_address:]manager_address")
@@ -2065,6 +2131,7 @@ impl WalletRpc {
         let manager_hash = self.address_to_hash160(&manager_addr)?;
 
         let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+        ensure_not_dust(send_amount, &vault_script)?;
 
         let height = self.current_height();
 
@@ -2082,7 +2149,7 @@ impl WalletRpc {
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
 
         for utxo in utxos {
             selected.push(utxo.clone());
@@ -2283,7 +2350,7 @@ impl WalletRpc {
         }
 
         let total_input = total_of(&selected);
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
         let (fee, received, change) = match mode {
             VaultFeeMode::SweepFunds => {
                 let fee = fee_for(selected.len(), 1);
@@ -2404,13 +2471,13 @@ impl WalletRpc {
             .into());
         }
 
-        let dest_addr = Address::from_base58(destination)
+        let dest_addr = self
+            .decode_address(destination)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
         let mode = Self::parse_vault_fee_mode(params.get_str(3), false)?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let height = self.current_height();
         let candidates: Vec<_> = wallet
@@ -2441,9 +2508,7 @@ impl WalletRpc {
     pub fn reclaim_vault_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let destination = params
             .get_str(0)
@@ -2456,8 +2521,10 @@ impl WalletRpc {
             false,
         )?;
 
-        let dest_addr = Address::from_base58(destination)
-            .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
+        let dest_addr = self
+            .decode_address(destination)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
         let mode = Self::parse_vault_fee_mode(params.get_str(2), true)?;
 
@@ -2499,15 +2566,14 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: passphrase"))?;
 
         // Parse address
-        let addr = Address::from_base58(addr_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        let addr = self
+            .decode_address(addr_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         // Get wallet and check if locked
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Get the private key for this address
         let key_entry = wallet.keystore().get_key_by_address(&addr).ok_or_else(|| {
@@ -2546,9 +2612,7 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: password"))?;
 
         let wallet = self.get_wallet()?;
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
         let network = wallet.network();
 
         let secret = divi_crypto::keys::SecretKey::new_random();
@@ -2807,9 +2871,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let height = self.current_height();
 
@@ -2819,10 +2881,10 @@ impl WalletRpc {
 
         for (addr_str, amount_value) in amounts {
             let amount = amount_from_value(amount_value, false)?;
-            let addr = Address::from_base58(addr_str).map_err(|_| {
+            let addr = self.decode_address(addr_str).map_err(|_| {
                 RpcError::new(
                     codes::INVALID_ADDRESS_OR_KEY,
-                    format!("Invalid address: {}", addr_str),
+                    format!("Invalid DIVI address: {}", addr_str),
                 )
             })?;
 
@@ -2905,6 +2967,10 @@ impl WalletRpc {
             }
         }
 
+        for (addr, amount) in &adjusted_outputs {
+            ensure_not_dust(*amount, &addr.script_pubkey())?;
+        }
+
         // Get change address
         let change_addr = wallet.new_change_address().map_err(|e| {
             RpcError::new(
@@ -2926,7 +2992,7 @@ impl WalletRpc {
         }
 
         // Add change output if significant
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
         let change_amount = total_input - adjusted_total_send - fee;
         if change_amount >= min_output {
             builder = builder.add_output_to_address(change_amount, &change_addr);
@@ -3057,8 +3123,9 @@ impl WalletRpc {
 
         let min_conf = params.get_u64(1).unwrap_or(1) as u32;
 
-        let addr = Address::from_base58(addr_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        let addr = self
+            .decode_address(addr_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
 
@@ -3094,14 +3161,14 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         // Try to parse as address first
-        let addr = if let Ok(address) = Address::from_base58(addr_or_script) {
+        let addr = if let Ok(address) = self.decode_address(addr_or_script) {
             address
         } else {
             // Try as hex script
             let script_bytes = hex::decode(addr_or_script).map_err(|_| {
                 RpcError::new(
                     codes::INVALID_ADDRESS_OR_KEY,
-                    "Invalid Divi address or script",
+                    "Invalid DIVI address or script",
                 )
             })?;
 
@@ -3201,7 +3268,7 @@ impl WalletRpc {
             })?;
 
             // Try to parse as address first
-            if let Ok(addr) = Address::from_base58(key_str) {
+            if let Ok(addr) = self.decode_address(key_str) {
                 // Get pubkey from wallet
                 if let Some(key_entry) = wallet.get_key_by_address(&addr) {
                     pubkeys.push(key_entry.public.to_bytes().to_vec());
@@ -3310,9 +3377,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Actually refill the keypool
         let generated = wallet
@@ -3356,14 +3421,15 @@ impl WalletRpc {
         let _comment = params.get_str(4);
         let _comment_to = params.get_str(5);
 
-        let dest_addr = Address::from_base58(addr_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        let dest_addr = self
+            .decode_address(addr_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
+
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
         let height = self.current_height();
 
@@ -3402,7 +3468,7 @@ impl WalletRpc {
         // Simple coin selection
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let min_output = Amount::from_sat(546);
+        let min_output = min_change_value();
 
         for utxo in utxos {
             selected.push(utxo.clone());
@@ -3568,7 +3634,7 @@ impl WalletRpc {
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
 
-        if wallet.is_locked() {
+        if !wallet.is_fully_unlocked() {
             return Err(RpcError::new(
                 codes::WALLET_UNLOCK_NEEDED,
                 "Error: Please enter the wallet passphrase with walletpassphrase first.",
@@ -3708,13 +3774,12 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Parse address
-        let address = Address::from_base58(address_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        let address = self
+            .decode_address(address_str)
+            .map_err(|_| RpcError::new(codes::TYPE_ERROR, "Invalid address"))?;
 
         // Get private key for this address
         let key_entry = wallet
@@ -3762,7 +3827,8 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Message required"))?;
 
         // Parse address
-        let address = Address::from_base58(address_str)
+        let address = self
+            .decode_address(address_str)
             .map_err(|_| RpcError::new(codes::TYPE_ERROR, "Invalid address"))?;
 
         // Decode base64 signature
@@ -3835,7 +3901,8 @@ impl WalletRpc {
                 divi_crypto::keys::PublicKey::from_hex(key_str)
                     .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid hex public key"))?
             } else {
-                let address = Address::from_base58(key_str)
+                let address = self
+                    .decode_address(key_str)
                     .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid address"))?;
 
                 let wallet_guard = self.wallet.read();
@@ -3898,8 +3965,9 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
 
-        let address = Address::from_base58(address_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+        let address = self
+            .decode_address(address_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
         let account = wallet.get_account(&address);
@@ -3914,8 +3982,9 @@ impl WalletRpc {
         // C++: the account is optional (defaults to "") and the address is checked first
         let account = params.get_str(1).unwrap_or("");
 
-        let address = Address::from_base58(address_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid Divi address"))?;
+        let address = self
+            .decode_address(address_str)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
 
@@ -4811,5 +4880,345 @@ mod tests {
             .dump_privkey(&p(vec![json!(change[0].to_string())]))
             .unwrap();
         assert!(!wif.as_str().unwrap().is_empty());
+    }
+}
+
+/// Regressions for send checks and wallet unlock state (IR-14 and later).
+/// Only public RPC entry points are used, so the same tests run on older trees.
+#[cfg(test)]
+mod send_unlock_regression {
+    use super::*;
+    use divi_primitives::ChainMode;
+    use divi_wallet::HdWallet;
+
+    fn rpc_on(network: Network) -> (WalletRpc, Arc<WalletDb>) {
+        let db = Arc::new(WalletDb::with_hd_wallet(
+            network,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        ));
+        (WalletRpc::with_wallet(db.clone()), db)
+    }
+
+    fn p(values: Vec<serde_json::Value>) -> Params {
+        Params::Array(values)
+    }
+
+    fn err(result: Result<serde_json::Value, Error>) -> (i32, String) {
+        match result {
+            Err(Error::Rpc(r)) => (r.code, r.message),
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    fn address(hash: u8, network: Network) -> String {
+        Address::from_pubkey_hash(Hash160::from_bytes([hash; 20]), network).to_base58()
+    }
+
+    type Sent = Arc<parking_lot::Mutex<Vec<Transaction>>>;
+
+    /// Testnet wallet holding one confirmed 10 DIVI coin; submitted txs are captured
+    fn funded_rpc() -> (WalletRpc, Arc<WalletDb>, Sent) {
+        let (rpc, db) = rpc_on(Network::Testnet);
+        let sent = fund(&rpc, &db);
+        (rpc, db, sent)
+    }
+
+    fn fund(rpc: &WalletRpc, db: &WalletDb) -> Sent {
+        let addr = db.new_receiving_address().unwrap();
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([3; 32]),
+            vout: 0,
+            value: Amount::from_divi(10),
+            script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+            height: Some(100),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: addr.to_string(),
+        });
+        rpc.set_height(200);
+        let sent: Sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = sent.clone();
+        rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            capture.lock().push(tx);
+            Ok(txid)
+        }));
+        sent
+    }
+
+    const PASS: &str = "throwaway test passphrase";
+
+    /// Encrypted (so locked) persistent testnet wallet with one coin
+    fn encrypted_rpc() -> (tempfile::TempDir, WalletRpc, Arc<WalletDb>, Sent) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            WalletDb::create_persistent(
+                &dir.path().join("w"),
+                Network::Testnet,
+                HdWallet::new(ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let rpc = WalletRpc::with_wallet(db.clone());
+        let sent = fund(&rpc, &db);
+        rpc.encrypt_wallet(&p(vec![json!(PASS)])).unwrap();
+        (dir, rpc, db, sent)
+    }
+
+    fn status(rpc: &WalletRpc) -> String {
+        rpc.get_wallet_info(&Params::None).unwrap()["encryption_status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn unlock(
+        rpc: &WalletRpc,
+        timeout: u64,
+        staking_only: bool,
+    ) -> Result<serde_json::Value, Error> {
+        rpc.wallet_passphrase(&p(vec![json!(PASS), json!(timeout), json!(staking_only)]))
+    }
+
+    #[test]
+    fn ir16_staking_only_unlock_refuses_sends_and_exports() {
+        let (_dir, rpc, db, sent) = encrypted_rpc();
+        let own = rpc.get_new_address(&Params::None);
+        assert!(own.is_err(), "wallet should start locked");
+        assert_eq!(status(&rpc), "locked");
+
+        unlock(&rpc, 0, true).unwrap();
+        assert_eq!(status(&rpc), "unlocked-for-staking");
+        assert!(!db.is_locked(), "staking needs the keys in memory");
+
+        let to = address(8, Network::Testnet);
+        let own = rpc.get_new_address(&Params::None).unwrap();
+        let need_unlock = codes::WALLET_UNLOCK_NEEDED;
+        assert_eq!(
+            err(rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))).0,
+            need_unlock
+        );
+        assert_eq!(
+            err(rpc.send_from(&p(vec![json!(""), json!(to), json!(1.0)]))).0,
+            need_unlock
+        );
+        assert_eq!(err(rpc.dump_privkey(&p(vec![own.clone()]))).0, need_unlock);
+        assert_eq!(err(rpc.dump_hd_info(&Params::None)).0, need_unlock);
+        assert_eq!(
+            err(rpc.sign_message(&p(vec![own, json!("hello")]))).0,
+            need_unlock
+        );
+        assert!(sent.lock().is_empty());
+
+        // Divi Core: a second staking-only unlock is -17
+        assert_eq!(err(unlock(&rpc, 0, true)).0, codes::WALLET_ALREADY_UNLOCKED);
+
+        // A full unlock allows the send
+        unlock(&rpc, 0, false).unwrap();
+        assert_eq!(status(&rpc), "unlocked");
+        rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))
+            .unwrap();
+        assert_eq!(sent.lock().len(), 1);
+    }
+
+    #[test]
+    fn ir20_hdmasterkeyid_shown_while_locked() {
+        let (_dir, rpc, _db, _sent) = encrypted_rpc();
+        assert_eq!(status(&rpc), "locked");
+        let locked = rpc.get_wallet_info(&Params::None).unwrap()["hdmasterkeyid"].clone();
+        unlock(&rpc, 0, false).unwrap();
+        let unlocked = rpc.get_wallet_info(&Params::None).unwrap()["hdmasterkeyid"].clone();
+        assert_ne!(unlocked, json!(""));
+        assert_eq!(locked, unlocked);
+    }
+
+    #[test]
+    fn ir17_short_unlock_falls_back_to_staking_only() {
+        let (_dir, rpc, db, _sent) = encrypted_rpc();
+        unlock(&rpc, 0, true).unwrap();
+        unlock(&rpc, 1, false).unwrap();
+        assert_eq!(status(&rpc), "unlocked");
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        assert_eq!(status(&rpc), "unlocked-for-staking");
+        assert!(
+            !db.is_locked(),
+            "staking stopped when the short unlock ended"
+        );
+
+        // Without a staking unlock before it, a timed unlock ends locked
+        rpc.wallet_lock(&Params::None).unwrap();
+        assert_eq!(status(&rpc), "locked");
+        unlock(&rpc, 1, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        assert_eq!(status(&rpc), "locked");
+        assert!(db.is_locked());
+    }
+
+    fn dust_error() -> (i32, String) {
+        (
+            codes::WALLET_ERROR,
+            "Transaction output(s) amount too small".into(),
+        )
+    }
+
+    #[test]
+    fn ir15_dust_send_is_refused_before_anything_is_submitted() {
+        let (rpc, _, sent) = funded_rpc();
+        let to = address(8, Network::Testnet);
+        // The testnet send that was accepted and never relayed, and Divi Core's refusal
+        for amount in [0.000001, 0.00001] {
+            assert_eq!(
+                err(rpc.send_to_address(&p(vec![json!(to), json!(amount)]))),
+                dust_error(),
+                "sendtoaddress {}",
+                amount
+            );
+            assert_eq!(
+                err(rpc.send_from(&p(vec![json!(""), json!(to), json!(amount)]))),
+                dust_error(),
+                "sendfrom {}",
+                amount
+            );
+            let mut outputs = serde_json::Map::new();
+            outputs.insert(to.clone(), json!(amount));
+            assert_eq!(
+                err(rpc.send_many(&p(vec![json!(""), serde_json::Value::Object(outputs)]))),
+                dust_error(),
+                "sendmany {}",
+                amount
+            );
+        }
+        assert!(sent.lock().is_empty(), "a dust send reached the mempool");
+
+        // Divi Core accepts 0.0000546 (5460 sat, the P2PKH dust limit)
+        rpc.send_to_address(&p(vec![json!(to), json!(0.0000546)]))
+            .unwrap();
+        assert_eq!(sent.lock().len(), 1);
+    }
+
+    #[test]
+    fn ir15_change_below_dust_goes_to_fee() {
+        let (rpc, _, sent) = funded_rpc();
+        let to = address(8, Network::Testnet);
+        // 10 DIVI in, fee estimate 3000 sat for one input: leave 3000 sat of change,
+        // above the old 546 limit and below the real 5460 one.
+        let amount = (1_000_000_000i64 - 6000) as f64 / 100_000_000.0;
+        rpc.send_to_address(&p(vec![json!(to), json!(amount)]))
+            .unwrap();
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1);
+        for out in &sent[0].vout {
+            assert!(
+                out.value.as_sat() >= 5460,
+                "dust output of {} sat",
+                out.value.as_sat()
+            );
+        }
+    }
+
+    #[test]
+    fn ir14_validateaddress_rejects_other_network() {
+        let (rpc, _) = rpc_on(Network::Testnet);
+        let mainnet = address(7, Network::Mainnet);
+        let testnet = address(7, Network::Testnet);
+        let r = rpc.validate_address(&p(vec![json!(mainnet)])).unwrap();
+        assert_eq!(r["isvalid"], false, "mainnet-form address on testnet");
+        let r = rpc.validate_address(&p(vec![json!(testnet)])).unwrap();
+        assert_eq!(r["isvalid"], true);
+
+        let (rpc, _) = rpc_on(Network::Mainnet);
+        let r = rpc.validate_address(&p(vec![json!(testnet)])).unwrap();
+        assert_eq!(r["isvalid"], false, "testnet-form address on mainnet");
+        let r = rpc.validate_address(&p(vec![json!(mainnet)])).unwrap();
+        assert_eq!(r["isvalid"], true);
+
+        // Regtest uses the testnet prefixes
+        let (rpc, _) = rpc_on(Network::Regtest);
+        let r = rpc.validate_address(&p(vec![json!(testnet)])).unwrap();
+        assert_eq!(r["isvalid"], true);
+        let r = rpc.validate_address(&p(vec![json!(mainnet)])).unwrap();
+        assert_eq!(r["isvalid"], false);
+    }
+
+    #[test]
+    fn ir14_sendtoaddress_rejects_mainnet_address_on_testnet() {
+        let (rpc, _) = rpc_on(Network::Testnet);
+        let mainnet = address(7, Network::Mainnet);
+        assert_eq!(
+            err(rpc.send_to_address(&p(vec![json!(mainnet), json!(1.0)]))),
+            (codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address".into())
+        );
+    }
+
+    #[test]
+    fn ir14_every_address_rpc_rejects_other_network() {
+        let (rpc, _) = rpc_on(Network::Testnet);
+        let m = address(9, Network::Mainnet);
+        let mut outputs = serde_json::Map::new();
+        outputs.insert(m.clone(), json!(1.0));
+        let outputs = serde_json::Value::Object(outputs);
+        let invalid = codes::INVALID_ADDRESS_OR_KEY;
+        let cases: Vec<(&str, Result<serde_json::Value, Error>, i32)> = vec![
+            (
+                "sendfrom",
+                rpc.send_from(&p(vec![json!(""), json!(m), json!(1.0)])),
+                invalid,
+            ),
+            (
+                "sendmany",
+                rpc.send_many(&p(vec![json!(""), outputs.clone()])),
+                invalid,
+            ),
+            (
+                "createrawtransaction",
+                rpc.create_raw_transaction(&p(vec![json!([]), outputs])),
+                invalid,
+            ),
+            (
+                "getreceivedbyaddress",
+                rpc.get_received_by_address(&p(vec![json!(m)])),
+                invalid,
+            ),
+            ("dumpprivkey", rpc.dump_privkey(&p(vec![json!(m)])), invalid),
+            (
+                "getaddressinfo",
+                rpc.get_address_info(&p(vec![json!(m)])),
+                invalid,
+            ),
+            ("getaccount", rpc.get_account(&p(vec![json!(m)])), invalid),
+            (
+                "setaccount",
+                rpc.set_account(&p(vec![json!(m), json!("acct")])),
+                invalid,
+            ),
+            (
+                "importaddress",
+                rpc.import_address(&p(vec![json!(m), json!(""), json!(false)])),
+                invalid,
+            ),
+            (
+                "bip38encrypt",
+                rpc.bip38_encrypt(&p(vec![json!(m), json!("pw")])),
+                invalid,
+            ),
+            (
+                "signmessage",
+                rpc.sign_message(&p(vec![json!(m), json!("hello")])),
+                codes::TYPE_ERROR,
+            ),
+            (
+                "verifymessage",
+                rpc.verify_message(&p(vec![json!(m), json!("c2ln"), json!("hello")])),
+                codes::TYPE_ERROR,
+            ),
+        ];
+        for (name, result, code) in cases {
+            assert_eq!(
+                err(result).0,
+                code,
+                "{} accepted a mainnet-form address",
+                name
+            );
+        }
     }
 }
