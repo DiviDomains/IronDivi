@@ -50,9 +50,9 @@ case_new() {
 poll() { printf '%b' "$1" >"$FAKE_DIR/$(printf %02d "$NEXT")"; NEXT=$((NEXT + 1)); }
 polls() { grep -c -e '--xmr-inflight' "$FAKE_SSH_LOG" || true; }
 kills() { grep -c 'kill' "$FAKE_SSH_LOG" || true; }
-# run <name> [timeout-secs]: runs the script quietly; sets RC.
+# run <name> [timeout-secs]: runs the script quietly; sets RC. The default is a hang guard only (runs that should finish exit at once; 3s flaked on a loaded Mac, load avg 70).
 run() {
-  POLL_SECS=0.05 FAIL_LIMIT=3 timeout "${2:-3}" "$TARGET" "$tmp/out-$1" >"$tmp/stdout" 2>"$tmp/stderr"
+  POLL_SECS=0.05 FAIL_LIMIT=3 timeout "${2:-30}" "$TARGET" "$tmp/out-$1" >"$tmp/stdout" 2>"$tmp/stderr"
   RC=$?
 }
 

@@ -17,7 +17,7 @@ for c in bash env git grep sed awk tr head tail cat dirname basename mktemp rm m
          wc cut true false uname date ls chmod cp mv sleep find diff jq xargs readlink; do
   p="$(command -v "$c" 2>/dev/null)" && [[ -x "$p" ]] && ln -sf "$p" "$BIN/$c"
 done
-HOME_T="$T/home"; mkdir -p "$HOME_T"   # lib.sh prepends $HOME/.local/bin etc.: keep them empty
+HOME_T="$T/home"; mkdir -p "$HOME_T"   # empty $HOME; SWAP_POC_KEEP_PATH=1 (below) keeps lib.sh from prepending toolchain dirs
 
 mkstub() { # mkstub <name> — stub whose behaviour comes from $STUB_<NAME>: ok | err | (absent => not created)
   local n="$1" up; up="$(tr a-z- A-Z_ <<<"$n")"
@@ -98,7 +98,7 @@ OUT=""; RC=0
 run_script() { # run_script <script> [VAR=val ...]
   local s="$1"; shift
   : > "$T/calls.log"
-  OUT="$(cd "$R" && env -i HOME="$HOME_T" PATH="$STUBS_ON:$BIN" CALL_LOG="$T/calls.log" R="$R" "$@" \
+  OUT="$(cd "$R" && env -i HOME="$HOME_T" PATH="$STUBS_ON:$BIN" SWAP_POC_KEEP_PATH=1 CALL_LOG="$T/calls.log" R="$R" "$@" \
          bash "tools/swap-poc/$s" 2>&1)"; RC=$?
 }
 expect() { # expect <name> <want_rc> <want_regex|-> <forbid_regex|->
@@ -112,9 +112,9 @@ calls() { grep -c "^$1" "$T/calls.log" 2>/dev/null || true; }
 with_tools() { # with_tools "<stub names>" — a PATH dir holding only those stubs
   rm -rf "$T/on"; mkdir -p "$T/on"; for n in $1; do ln -s "$STUBS/$n" "$T/on/$n"; done; STUBS_ON="$T/on"
 }
-absent_ok() { # lib.sh re-prepends fixed dirs; make sure the "absent" tool is really absent before trusting the case
-  local t="$1"; if env -i HOME="$HOME_T" PATH="$STUBS_ON:$BIN" bash -c "source <(sed -n '/^export PATH=/p' '$SRC/lib.sh'); command -v $t" >/dev/null 2>&1; then
-    echo "note: $t is on lib.sh's fixed PATH dirs here; absent-tool case for $t not meaningful on this host"; return 1; fi
+absent_ok() { # SWAP_POC_KEEP_PATH=1 stops lib.sh re-prepending the toolchain; still confirm the "absent" tool is absent on STUBS_ON:BIN
+  local t="$1"; if env -i HOME="$HOME_T" PATH="$STUBS_ON:$BIN" SWAP_POC_KEEP_PATH=1 bash -c "command -v $t" >/dev/null 2>&1; then
+    echo "note: $t is on the harness PATH here; absent-tool case for $t not meaningful on this host"; return 1; fi
 }
 
 # btc ---------------------------------------------------------------------------------------------------
@@ -138,7 +138,7 @@ with_tools "curl shellcheck"
 run_script check-e2e-local.sh; expect "e2e-local: no opt-in -> network rows SKIP, exit 0" 0 'SKIP \(network row' 'FAIL'
 [[ "$(calls curl)" == 0 ]] && ok "e2e-local: no opt-in -> curl never invoked" || bad "e2e-local: curl invoked"
 
-# shellcheck: e2e-local, rev-tools, deploy ---------------------------------------------------------------
+# the shellcheck rows: e2e-local, rev-tools, deploy ---------------------------------------------------------------
 with_tools ""
 if absent_ok shellcheck; then
   run_script check-e2e-local.sh;  expect "e2e-local: shellcheck absent -> SKIP (shellcheck not installed), exit 0" 0 'SKIP \(shellcheck not installed\): e2e.sh shellcheck' 'FAIL'

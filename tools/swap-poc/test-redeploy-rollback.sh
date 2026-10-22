@@ -18,10 +18,13 @@ T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stub" "$T/host"
 export FAKE_BIN="$T/host/divi-swapd" FAKE_LOG="$T/systemctl.log"
+export FAKE_CLOCK="$T/clock"
+FAKE_TOML="$T/host/divi-swapd.toml" FAKE_UNIT="$T/host/divi-swapd.service" FAKE_BACKUP="$T/host/backups"
 
 cat >"$T/stub/ssh" <<'EOF'
 #!/usr/bin/env bash
 shift                                    # host alias
+case "$*" in *--xmr-inflight*) printf "xmr_configured no\nin_flight 0\n"; exit 0 ;; esac   # redeploy-maker.sh in-flight gate: empty XMR store
 if [ "${1:-}" = sudo ]; then shift; exec "$@"; fi   # `sudo bash -s` with the script on stdin
 exec bash -c "$*"
 EOF
@@ -43,6 +46,18 @@ case "$url" in
   *) exit 6 ;;
 esac
 EOF
+cat >"$T/stub/install" <<'EOF'
+#!/usr/bin/env bash
+# the script installs as root:root; the fake host is an ordinary user's temp dir, so drop -o/-g
+args=(); while [ $# -gt 0 ]; do case "$1" in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac; done
+exec /usr/bin/install "${args[@]}"
+EOF
+cat >"$T/stub/date" <<'EOF'
+#!/usr/bin/env bash
+# the snapshot dir is named by a one-second timestamp; two deploys in the same second would collide
+n=$(($(cat "$FAKE_CLOCK" 2>/dev/null || echo 0) + 1)); echo "$n" >"$FAKE_CLOCK"
+printf '20260101T0000%02dZ\n' "$n"
+EOF
 cat >"$T/stub/sha256sum" <<'EOF'
 #!/usr/bin/env bash
 exec shasum -a 256 "$@"
@@ -53,6 +68,7 @@ deploy() { # deploy <new-binary-contents>; prints output, returns the script's e
   printf '%s\n' "$1" >"$T/new"
   : >"$FAKE_LOG"
   PATH="$T/stub:$PATH" "$SCRIPT" --binary "$T/new" --remote-bin "$FAKE_BIN" \
+    --remote-toml "$FAKE_TOML" --remote-unit "$FAKE_UNIT" --backup-dir "$FAKE_BACKUP" \
     --maker-url http://fake --health-timeout 1 --health-interval 1 >"$T/out" 2>&1
   local rc=$?
   sed 's/^/      | /' "$T/out"
@@ -60,7 +76,7 @@ deploy() { # deploy <new-binary-contents>; prints output, returns the script's e
 }
 
 # 1. healthy new binary: installs, keeps the old one as .prev, exits 0
-printf 'GOOD v1\n' >"$FAKE_BIN"
+printf 'GOOD v1\n' >"$FAKE_BIN"; printf 'toml\n' >"$FAKE_TOML"; printf 'unit\n' >"$FAKE_UNIT"
 echo "-- case 1: healthy new binary (v1 -> v2)"
 if deploy "GOOD v2"; then pass "healthy deploy exits 0"; else fail "healthy deploy exited non-zero"; fi
 grep -q "GOOD v2" "$FAKE_BIN" && pass "v2 installed" || fail "v2 not installed"
@@ -75,11 +91,13 @@ grep -q "healthy again" "$T/out" && pass "post-rollback health check passed" || 
 [ "$(grep -c 'restart divi-swapd' "$FAKE_LOG")" = 2 ] && pass "service restarted twice (deploy + rollback)" \
   || fail "expected 2 restarts, got: $(cat "$FAKE_LOG")"
 
-# 3. first deploy (no existing binary, so no .prev) of an unhealthy binary: says so, exits 1
-echo "-- case 3: first-ever deploy of a bad binary (nothing to roll back to)"
+# 3. first deploy (no installed binary, so no rollback set can be snapshotted): refuses before
+#    installing anything, says so, exits 1
+echo "-- case 3: first-ever deploy of a bad binary (nothing to snapshot, nothing installed)"
 rm -f "$FAKE_BIN" "$FAKE_BIN.prev"
 if deploy "BAD v1"; then fail "first bad deploy exited 0"; else pass "first bad deploy exits non-zero"; fi
-grep -q "no .prev to roll back to" "$T/out" && pass "missing .prev reported" || fail "missing .prev not reported"
+grep -q "nothing complete to snapshot" "$T/out" && pass "missing rollback set reported" || fail "missing rollback set not reported"
+[ ! -e "$FAKE_BIN" ] && pass "BAD v1 was not installed" || fail "BAD v1 installed with no rollback set"
 
 if ((FAILS)); then echo "FAIL: test-redeploy-rollback ($FAILS)"; exit 1; fi
 echo "PASS: test-redeploy-rollback"

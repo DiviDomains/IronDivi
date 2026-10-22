@@ -2,7 +2,9 @@
 # Shared helpers for tools/swap-poc/check-*.sh. Each check exits 0 only when its lane's
 # acceptance criteria (docs/plans/atomic-swap-poc.md §5) pass, and prints every failure.
 set -uo pipefail
-export PATH="$HOME/.local/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"  # hooks and panes start without the rust toolchain on PATH
+# Hooks and panes start without the rust toolchain on PATH, so put it there. Test harnesses that
+# stub tools on PATH set SWAP_POC_KEEP_PATH=1: the caller already built the PATH and nothing may precede its stubs.
+[[ "${SWAP_POC_KEEP_PATH:-}" == 1 ]] || export PATH="$HOME/.local/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 2
 FAILS=0
