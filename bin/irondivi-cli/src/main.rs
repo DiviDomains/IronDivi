@@ -453,36 +453,43 @@ fn read_config(path: &Path, network: &str) -> Config {
     config
 }
 
-/// Cookie files to try, first match wins: irondivid writes `.cookie` in its
-/// own data directory (`--datadir`, or its default per network); Divi
-/// Core-style nodes keep it in a network subdirectory of the Core directory.
-fn cookie_paths(
+/// The cookie irondivid writes in its own data directory (`--datadir`, or
+/// its default per mode and network).
+fn irondivi_cookie_path(
     home: &Path,
     datadir: Option<&Path>,
     privatedivi: bool,
     network: &str,
-) -> Vec<PathBuf> {
-    let core_subdir = |base: &Path| match network {
+) -> PathBuf {
+    match datadir {
+        Some(dir) => dir.join(".cookie"),
+        None => irondivi_data_dir(home, privatedivi, network).join(".cookie"),
+    }
+}
+
+/// The cookie of a Divi Core-style node: a network subdirectory of
+/// `--datadir`, or of the Core directory.
+fn core_cookie_path(
+    home: &Path,
+    datadir: Option<&Path>,
+    privatedivi: bool,
+    network: &str,
+) -> PathBuf {
+    let base = datadir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| chain_home(home, privatedivi));
+    match network {
         "testnet" => base.join("testnet3").join(".cookie"),
         "regtest" => base.join("regtest").join(".cookie"),
         _ => base.join(".cookie"),
-    };
-    match datadir {
-        Some(dir) => vec![dir.join(".cookie"), core_subdir(dir)],
-        None => vec![
-            irondivi_data_dir(home, privatedivi, network).join(".cookie"),
-            core_subdir(&chain_home(home, privatedivi)),
-        ],
     }
 }
 
 /// Read cookie file for authentication
-fn read_cookie(paths: &[PathBuf]) -> Option<(String, String)> {
-    paths.iter().find_map(|path| {
-        let contents = std::fs::read_to_string(path).ok()?;
-        let (user, pass) = contents.trim().split_once(':')?;
-        Some((user.to_string(), pass.to_string()))
-    })
+fn read_cookie(path: &Path) -> Option<(String, String)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let (user, pass) = contents.trim().split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
 }
 
 /// Handle stdin input (CRITICAL: Read password FIRST when both flags used)
@@ -710,19 +717,34 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
         .or(config.rpcport)
         .unwrap_or_else(|| default_rpc_port(testnet, regtest, privatedivi));
 
-    // Determine credentials (CLI > config > cookie file)
+    // Determine credentials: CLI > irondivi.conf (or --conf) > irondivid's
+    // cookie > the Divi Core fallback conf > a Core-layout cookie. irondivid's
+    // own cookie beats ~/.divi/divi.conf credentials, which belong to divid.
+    let datadir = args.datadir.as_deref();
+    let conf_is_core_fallback =
+        args.conf.is_none() && conf_path == default_conf_path(home, privatedivi);
+    let conf_creds = match (config.rpcuser, config.rpcpassword) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
     let (rpc_user, rpc_password) = match (&args.rpcuser, &args.rpcpassword) {
         (Some(u), Some(p)) => (Some(u.clone()), Some(p.clone())),
-        _ => match (config.rpcuser, config.rpcpassword) {
-            (Some(u), Some(p)) => (Some(u), Some(p)),
-            _ => {
-                let paths = cookie_paths(home, args.datadir.as_deref(), privatedivi, network);
-                match read_cookie(&paths) {
-                    Some((u, p)) => (Some(u), Some(p)),
-                    None => (args.rpcuser.clone(), args.rpcpassword.clone()),
+        _ => {
+            let found = match conf_creds {
+                Some(creds) if !conf_is_core_fallback => Some(creds),
+                core_creds => {
+                    read_cookie(&irondivi_cookie_path(home, datadir, privatedivi, network))
+                        .or(core_creds)
+                        .or_else(|| {
+                            read_cookie(&core_cookie_path(home, datadir, privatedivi, network))
+                        })
                 }
+            };
+            match found {
+                Some((u, p)) => (Some(u), Some(p)),
+                None => (args.rpcuser.clone(), args.rpcpassword.clone()),
             }
-        },
+        }
     };
 
     Endpoint {
@@ -1021,6 +1043,45 @@ mod endpoint_tests {
         ]);
         let ep = resolve_endpoint(&args, home.path());
         assert_eq!(ep.rpc_password.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn irondivid_cookie_beats_divi_core_conf_credentials() {
+        // A host that also runs divid has ~/.divi/divi.conf with rpcuser and
+        // rpcpassword; they must not shadow irondivid's own cookie.
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".divi")).unwrap();
+        fs::write(
+            home.path().join(".divi/divi.conf"),
+            "rpcuser=core\nrpcpassword=corepw\n",
+        )
+        .unwrap();
+        let datadir = home.path().join("node");
+        fs::create_dir_all(&datadir).unwrap();
+        let args = Args::parse_from([
+            "irondivi-cli",
+            "--regtest",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        // No cookie: the Core conf is still the fallback
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("core"));
+
+        fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
+        assert_eq!(ep.rpc_password.as_deref(), Some("feedbeef"));
+
+        // Credentials in the node's own irondivi.conf still win
+        fs::write(
+            datadir.join("irondivi.conf"),
+            "rpcuser = \"u\"\nrpcpassword = \"p\"\n",
+        )
+        .unwrap();
+        let ep = resolve_endpoint(&args, home.path());
+        assert_eq!(ep.rpc_user.as_deref(), Some("u"));
     }
 
     #[test]
