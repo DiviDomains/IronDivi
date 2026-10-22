@@ -364,7 +364,9 @@ fn manager_listunspent_vault_not_spendable() {
 // ---------------------------------------------------------------- IR-11
 
 /// The owner wallet alone (no manager key, vault never registered there) sees
-/// its vault output and reclaims from it.
+/// its vault and reclaims from it. As in Divi Core, listunspent leaves vault
+/// outputs out (ALL_SPENDABLE_COINS excludes owned and managed vaults); the
+/// owner sees the vault in getcoinavailability.
 #[test]
 fn owner_only_wallet_sees_and_reclaims_vault() {
     let s = setup();
@@ -372,17 +374,18 @@ fn owner_only_wallet_sees_and_reclaims_vault() {
     assert!(s.owner.get_all_vaults().is_empty());
     let rpc = s.net.rpc(&s.owner);
 
+    let ca = rpc.get_coin_availability(&Params::None).unwrap();
+    assert_eq!(divi(&ca["Vaulted"]), VAULT_DIVI as f64, "{}", ca);
     let vault_hex = hex::encode(s.vault.as_bytes());
     let lu = rpc.list_unspent(&Params::None).unwrap();
-    let row = lu
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|u| u["scriptPubKey"] == json!(vault_hex))
-        .unwrap_or_else(|| panic!("owner does not see its vault: {}", lu))
-        .clone();
-    assert_eq!(divi(&row["amount"]), VAULT_DIVI as f64);
-    assert_eq!(row["spendable"], json!(true));
+    assert!(
+        !lu.as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["scriptPubKey"] == json!(vault_hex)),
+        "vault output in listunspent: {}",
+        lu
+    );
 
     let dest = s.owner.new_receiving_address().unwrap();
     rpc.reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
