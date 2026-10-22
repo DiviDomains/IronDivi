@@ -46,6 +46,18 @@ use std::path::PathBuf;
 /// Public RPC proxy for Divi testnet.
 pub const TESTNET_RPC: &str = "https://services.divi.domains/api/testnet/rpc/";
 
+/// Public RPC proxy for Divi mainnet. Note the path has no `/mainnet/` segment
+/// (`/api/mainnet/rpc/` is a 404); `getblockchaininfo` answers `chain = "main"`.
+pub const MAINNET_RPC: &str = "https://services.divi.domains/api/rpc/";
+
+/// The default public RPC proxy for `network` (regtest has none; it uses the testnet one).
+pub fn default_rpc(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => MAINNET_RPC,
+        Network::Testnet | Network::Regtest => TESTNET_RPC,
+    }
+}
+
 /// Outputs below this are not worth creating; the remainder goes to fees instead.
 const DUST: u64 = 10_000;
 /// Size of a DER signature + sighash byte used while estimating fees.

@@ -31,7 +31,6 @@ use divi_swapd::{
     AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, XmrSection,
     ZecSection, MOCK_ONLY_CHAINS,
 };
-use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
 use swap_chain_divi::{DiviBackend, FeePolicy as DiviFeePolicy};
 use swap_chain_ltc::LtcBackend;
@@ -428,14 +427,15 @@ async fn live_backends(
     }
     let btc = live_btc(btc_cfg)?;
     let key = resolve_divi_key(&divi_cfg.key, "divi")?;
+    let divi_network = divi_cfg.network()?;
     let divi = DiviBackend::new(
-        &divi_cfg.rpc_url,
+        &divi_cfg.rpc_url()?,
         key,
-        DiviNetwork::Testnet,
+        divi_network,
         DiviFeePolicy::default(),
         divi_cfg.wallet_path.clone(),
     )?;
-    tracing::info!(address = %divi.address(), "divi backend ready");
+    tracing::info!(address = %divi.address(), network = ?divi_network, "divi backend ready");
     let divi = Arc::new(divi);
     let job = divi_cfg.scan_from_height.map(|from| ScanJob {
         divi: divi.clone(),

@@ -11,3 +11,11 @@
 - decisions: MTP = median of last 11 block times (proxy returns mediantime null); wallet is local JSON + block scan since proxy has no address/spent index; seeded from 03f9… only, outputs of 6ff5… excluded
 - note: stop-hook fmt/clippy/test FAILs were PATH only (cargo lives in /opt/homebrew/opt/rustup/bin)
 - last_sha: d3bd5e9
+
+## 2026-10-22 round: divi-mainnet-wiring (builder X, base 9565e95)
+
+- done: the DIVI leg's network is selectable. `[divi].network` (testnet default | mainnet) + `[divi].allow_mainnet` in divi-swapd, `--divi-network` in divi-swap, `swap_chain_divi::{MAINNET_RPC, default_rpc}`; `check_profile_networks` now covers DIVI in both binaries so the profile must agree
+- smoke: read-only on hp3 with a throwaway zero-balance key (deleted): CLI `balance` gives `D…` address and 0; daemon up on mainnet, `/swap/healthz` divi.tip 4269956; three config refusals; recorded in mainnet-readiness.md §DIVI
+- endpoint: `https://services.divi.domains/api/rpc/` answers `chain = "main"` (verified); `/api/mainnet/rpc/` is a 404
+- tests: 274 -> 286 passed, 0 failed (4 packages); fmt and clippy `--all-targets -D warnings` clean
+- left: first funded mainnet swap; review of the DIVI mainnet confirmation count (not touched here)

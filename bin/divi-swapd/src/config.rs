@@ -31,21 +31,51 @@ use serde::Deserialize;
 pub enum BackendKind {
     /// Every chain simulated in-process.
     Mock,
-    /// Real DIVI testnet RPC + BTC Esplora.
+    /// Real DIVI RPC (testnet unless `[divi].network = "mainnet"`) + BTC Esplora.
     Live,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiviSection {
-    /// DIVI JSON-RPC proxy URL.
-    #[serde(default = "default_divi_rpc")]
-    pub rpc_url: String,
+    /// `testnet` (default) or `mainnet`, mirroring `[zec].network`.
+    #[serde(default = "default_divi_network")]
+    pub network: String,
+    /// Must be `true` for `network = "mainnet"`, which moves real money. Off by default,
+    /// mirroring `[zec].allow_mainnet`.
+    #[serde(default)]
+    pub allow_mainnet: bool,
+    /// DIVI JSON-RPC proxy URL. When absent, [`DiviSection::rpc_url`] falls back to
+    /// `swap_chain_divi::default_rpc(network)`.
+    pub rpc_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's DIVI key.
     pub key: String,
     /// Known-UTXO file (public data only).
     pub wallet_path: Option<PathBuf>,
     /// First block height to scan for wallet UTXOs.
     pub scan_from_height: Option<u64>,
+}
+
+fn default_divi_network() -> String {
+    "testnet".into()
+}
+
+impl DiviSection {
+    /// The configured DIVI network (`testnet` or `mainnet`).
+    pub fn network(&self) -> Result<divi_wallet::address::Network> {
+        match self.network.as_str() {
+            "testnet" => Ok(divi_wallet::address::Network::Testnet),
+            "mainnet" => Ok(divi_wallet::address::Network::Mainnet),
+            other => bail!("[divi].network must be testnet or mainnet, got {other:?}"),
+        }
+    }
+
+    /// `rpc_url`, or `network`'s default public endpoint if unset.
+    pub fn rpc_url(&self) -> Result<String> {
+        Ok(match &self.rpc_url {
+            Some(u) => u.clone(),
+            None => swap_chain_divi::default_rpc(self.network()?).to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -677,7 +707,8 @@ impl DaemonConfig {
                 );
             }
         }
-        // One rule for every section (xmr and usdc have no gate of their own above).
+        // One rule for every section (xmr and usdc have no gate of their own above). DIVI
+        // is checked after the counter coins, so their errors are reported first.
         let mut coins: Vec<divi_swap::config::ConfiguredNetwork<'_>> = Vec::new();
         if let Some(b) = &self.btc {
             coins.push((Chain::Btc, &b.network, Some(b.allow_mainnet)));
@@ -696,6 +727,23 @@ impl DaemonConfig {
         }
         divi_swap::config::check_profile_networks(self.profile, &coins)
             .map_err(anyhow::Error::msg)?;
+        if let Some(d) = &self.divi {
+            d.network()?;
+            if d.network == "mainnet" && !d.allow_mainnet {
+                bail!(
+                    "[divi].network = \"mainnet\": divi mainnet moves real money: no mainnet \
+                     without the explicit allow_mainnet opt-in (mainnet-readiness.md §DIVI)"
+                );
+            }
+            if (d.network == "mainnet") != (self.profile == Profile::Mainnet) {
+                bail!(
+                    "[divi].network = {:?} disagrees with profile = {:?}: the swap timing \
+                     profile and the divi backend must run on the same network",
+                    d.network,
+                    self.profile
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -735,11 +783,94 @@ key = "credential:btc"
 
     /// `GOOD` with its `[btc]` section on mainnet (allowed), for tests that set
     /// `profile = "mainnet"`: every live section must agree with the profile.
-    fn good_mainnet_btc() -> String {
+    fn good_mainnet_btc_only() -> String {
         GOOD.replace(
             "[btc]\nkey",
             "[btc]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
         )
+    }
+
+    /// As [`good_mainnet_btc_only`], with `[divi]` on mainnet (allowed) too.
+    fn good_mainnet_btc() -> String {
+        good_mainnet_btc_only().replace(
+            "[divi]\nkey",
+            "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        )
+    }
+
+    #[test]
+    fn divi_section_defaults_to_testnet_and_its_rpc() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.network, "testnet");
+        assert!(!d.allow_mainnet);
+        assert_eq!(d.rpc_url().unwrap(), swap_chain_divi::TESTNET_RPC);
+        assert_eq!(d.rpc_url().unwrap(), default_divi_rpc());
+    }
+
+    #[test]
+    fn divi_mainnet_with_allow_and_matching_profile_is_ok_with_the_mainnet_default_rpc() {
+        let text = format!("profile = \"mainnet\"\n{}", good_mainnet_btc());
+        let d = DaemonConfig::parse(&text).unwrap().divi.unwrap();
+        assert!(d.allow_mainnet);
+        assert_eq!(d.network().unwrap(), divi_wallet::address::Network::Mainnet);
+        assert_eq!(d.rpc_url().unwrap(), swap_chain_divi::MAINNET_RPC);
+        // An explicit rpc_url wins over the network default.
+        let text = text.replace("[divi]\n", "[divi]\nrpc_url = \"http://localhost:9\"\n");
+        let d = DaemonConfig::parse(&text).unwrap().divi.unwrap();
+        assert_eq!(d.rpc_url().unwrap(), "http://localhost:9");
+    }
+
+    #[test]
+    fn divi_mainnet_without_allow_mainnet_is_rejected() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}",
+            good_mainnet_btc().replace(
+                "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
+                "[divi]\nnetwork = \"mainnet\"\n"
+            )
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network = \"mainnet\": divi mainnet moves real money")
+                && e.contains("no mainnet without the explicit allow_mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_bad_network_is_rejected() {
+        let text = GOOD.replace("[divi]\nkey", "[divi]\nnetwork = \"regtest\"\nkey");
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_mainnet_under_a_testnet_profile_is_rejected_even_with_allow() {
+        // btc on signet so the btc check passes first; the default profile is testnet.
+        let text = GOOD.replace(
+            "[divi]\nkey",
+            "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network = \"mainnet\" disagrees with profile = Testnet")
+                && e.contains("must run on the same network"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_testnet_under_a_mainnet_profile_is_rejected() {
+        // The dangerous direction before this lane: real BTC, DIVI silently on testnet.
+        let text = format!("profile = \"mainnet\"\n{}", good_mainnet_btc_only());
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("[divi].network = \"testnet\" disagrees with profile = Mainnet"),
+            "{e}"
+        );
     }
 
     #[test]

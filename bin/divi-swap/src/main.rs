@@ -67,6 +67,11 @@ struct Cli {
     /// DIVI height to start scanning for the taker's coins when the wallet has no cursor yet.
     #[arg(long, global = true)]
     divi_scan_from: Option<u64>,
+    /// DIVI network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`). Picks the
+    /// DIVI RPC endpoint and address version; with `--profile` it must agree (not used by the
+    /// xmr arm, whose DIVI side follows `--xmr-network`).
+    #[arg(long, global = true, default_value = "testnet")]
+    divi_network: String,
     /// BTC network: `signet` (default), `testnet` (testnet3) or `mainnet` (only with
     /// `--allow-mainnet`).
     #[arg(
@@ -87,7 +92,8 @@ struct Cli {
     /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(long, global = true, default_value = "testnet")]
     zec_network: String,
-    /// Allow `--zec-network`, `--btc-network`, `--ltc-network` or `--usdc-network` mainnet
+    /// Allow `--divi-network`, `--zec-network`, `--btc-network`, `--ltc-network` or
+    /// `--usdc-network` mainnet
     /// (`mainnet`, or `ethereum`/`base` for usdc), which moves real money. Off by default,
     /// mirroring `--xmr-allow-mainnet` (one shared flag for the zec/btc/ltc/usdc arms; xmr
     /// keeps its own).
@@ -449,9 +455,23 @@ fn guard_profile(cli: &Cli) -> Result<()> {
             cli.xmr_network.as_str(),
             Some(cli.xmr_allow_mainnet),
         ),
-        Chain::Divi => return Ok(()),
+        Chain::Divi => (
+            Chain::Divi,
+            cli.divi_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
     };
-    divi_swap::config::check_profile_networks(cli.profile, &[coin]).map_err(anyhow::Error::msg)
+    let mut coins = vec![coin];
+    // DIVI last, so a counter coin's disagreement is reported first. The xmr arm's DIVI side
+    // follows `--xmr-network` (`live::divi_network`), not `--divi-network`.
+    if !matches!(cli.counter_chain, Chain::Xmr | Chain::Divi) {
+        coins.push((
+            Chain::Divi,
+            cli.divi_network.as_str(),
+            Some(cli.allow_mainnet),
+        ));
+    }
+    divi_swap::config::check_profile_networks(cli.profile, &coins).map_err(anyhow::Error::msg)
 }
 
 fn live_backends(cli: &Cli) -> Result<Backends> {
@@ -482,7 +502,18 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
             );
         }
     }
+    guard_network(
+        "--divi-network",
+        &cli.divi_network,
+        &["testnet"],
+        cli.allow_mainnet,
+    )?;
     guard_profile(cli)?;
+    let divi_network = if cli.divi_network == "mainnet" {
+        divi_wallet::address::Network::Mainnet
+    } else {
+        divi_wallet::address::Network::Testnet
+    };
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
         .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
@@ -493,9 +524,9 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         .map(divi_swap_cli::wallet::prepare_wallet_path)
         .transpose()?;
     let divi = Arc::new(DiviBackend::new(
-        "https://services.divi.domains/api/testnet/rpc/",
+        swap_chain_divi::default_rpc(divi_network),
         dkey,
-        divi_wallet::address::Network::Testnet,
+        divi_network,
         swap_chain_divi::FeePolicy::default(),
         wallet,
     )?);
@@ -917,6 +948,86 @@ mod tests {
     fn zec_network_defaults_to_testnet() {
         assert_eq!(cli(&[]).zec_network, "testnet");
         assert!(!cli(&[]).allow_mainnet);
+    }
+
+    #[test]
+    fn divi_network_defaults_to_testnet() {
+        assert_eq!(cli(&[]).divi_network, "testnet");
+    }
+
+    #[test]
+    fn divi_mainnet_without_allow_mainnet_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&["--divi-network", "mainnet"])) {
+            Ok(_) => panic!("built a live divi backend without --allow-mainnet"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("--divi-network mainnet moves real money") && e.contains("--allow-mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_bad_network_is_rejected_before_any_network_call() {
+        let e = match live_backends(&cli(&["--divi-network", "regtest"])) {
+            Ok(_) => panic!("built a live divi backend on regtest"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("--divi-network must be testnet or mainnet"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_network_must_agree_with_the_profile_in_both_directions() {
+        // Mainnet profile + mainnet btc, DIVI left on testnet.
+        let e = match live_backends(&cli(&[
+            "--profile",
+            "mainnet",
+            "--btc-network",
+            "mainnet",
+            "--allow-mainnet",
+        ])) {
+            Ok(_) => panic!("built a live backend: mainnet profile, divi testnet"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("profile = \"mainnet\" but [divi].network = \"testnet\"")
+                && e.contains("mainnet profile with a test network is refused"),
+            "{e}"
+        );
+        // Testnet profile (default), DIVI on mainnet with the opt-in.
+        let e = match live_backends(&cli(&["--divi-network", "mainnet", "--allow-mainnet"])) {
+            Ok(_) => panic!("built a live backend: testnet profile, divi mainnet"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("profile = \"testnet\" but [divi].network = \"mainnet\"")
+                && e.contains("real funds under testnet timeouts are refused"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn divi_mainnet_passes_every_guard_when_all_agree() {
+        let c = cli(&[
+            "--profile",
+            "mainnet",
+            "--btc-network",
+            "mainnet",
+            "--divi-network",
+            "mainnet",
+            "--allow-mainnet",
+        ]);
+        guard_network(
+            "--divi-network",
+            &c.divi_network,
+            &["testnet"],
+            c.allow_mainnet,
+        )
+        .unwrap();
+        guard_profile(&c).unwrap();
     }
 
     #[test]

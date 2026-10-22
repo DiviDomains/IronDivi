@@ -18,6 +18,14 @@ use wiremock::{matchers::method, Mock, MockServer, Request, Respond, ResponseTem
 
 const LOCKTIME: u32 = 1_900_000_000;
 
+#[test]
+fn default_rpc_follows_the_network() {
+    assert_eq!(default_rpc(Network::Mainnet), MAINNET_RPC);
+    assert_eq!(default_rpc(Network::Testnet), TESTNET_RPC);
+    assert_ne!(MAINNET_RPC, TESTNET_RPC);
+    assert!(!MAINNET_RPC.contains("testnet"));
+}
+
 type NodeError = (u16, i64, String);
 
 /// Replies to JSON-RPC calls by method name; unknown methods get a -32601 error.

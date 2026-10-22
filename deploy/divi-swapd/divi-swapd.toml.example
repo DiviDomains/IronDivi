@@ -7,6 +7,9 @@ db_path = "/var/lib/divi-swapd/swaps.db"
 tick_secs = 10               # scheduler interval for Maker::tick
 
 [divi]
+network = "testnet"        # or "mainnet"; "mainnet" needs allow_mainnet = true and profile = "mainnet"
+# allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
+# rpc_url is optional: unset, it defaults per network (testnet .../api/testnet/rpc/, mainnet .../api/rpc/)
 rpc_url = "https://services.divi.domains/api/testnet/rpc/"
 key = "credential:maker-divi"   # systemd LoadCredential, see divi-swapd.service
 wallet_path = "/var/lib/divi-swapd/divi-wallet.json"  # known UTXOs (public data only)
