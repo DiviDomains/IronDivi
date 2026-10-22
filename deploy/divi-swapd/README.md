@@ -30,6 +30,7 @@ and a matching top-level `profile = "mainnet"`, so a mainnet cutover is never a 
 edit.
 `[btc]` and `[ltc]` follow the same rule: `network = "mainnet"` needs `allow_mainnet = true` and `profile = "mainnet"`,
 and with `esplora_url` unset the mainnet endpoints come from the crate defaults.
+`profile` (default `testnet`) must agree with every configured coin section (`[btc]`, `[ltc]`, `[zec]`, `[xmr]`, `[usdc]`): a mainnet profile with a test network, a mainnet network without `allow_mainnet`, or a testnet profile with a mainnet network is refused at config load.
 
 ## Secrets
 

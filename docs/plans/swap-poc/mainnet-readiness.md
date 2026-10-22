@@ -33,7 +33,7 @@ mainnet is a separate project, tracked as these work items (one per coin, plus s
 - [x] **ZEC:** add mainnet address prefixes and a lightwalletd endpoint, and pick the v5/v6 tx format by activation height — done in `71ed663` on `lane/zec-mainnet-readiness`: `address.rs:30-36`, `lib.rs:61-77`, `tx.rs:59-80`. The format switch is the **NU6.3** activation height (not NU7): see ZEC §Facts.
 - [ ] **USDC/EVM:** add Ethereum/Base mainnet `network.rs` variants with the canonical USDC addresses, and an audited HTLC deployment.
 - [ ] **XMR:** mainnet backends, and remove the runtime refusal only after the above (`xmr_live.rs:174-191`). Sequenced plan with gates: `xmr-mainnet-plan.md`.
-- [ ] **Shared:** a mainnet timeout/confirmation profile in `divi-swap/src/config.rs`, an external security review, and staged low-value mainnet trials.
+- [x] **Shared:** a mainnet timeout/confirmation profile — done: `Profile::{Mainnet,Testnet}`, `ChainParams::builtin` and `SwapConfig::profile` (`divi-swap/src/config.rs:17-56,97-120`), and `check_profile_networks` (`:226`), which `divi-swapd` (config load, `bin/divi-swapd/src/config.rs:677`) and `divi-swap` (`--profile`, before any network call, `bin/divi-swap/src/main.rs:440`) both call so the profile must agree with every configured coin's `network` and `allow_mainnet` (xmr and usdc included). Still open: an external security review, and staged low-value mainnet trials.
 
 ## BTC
 

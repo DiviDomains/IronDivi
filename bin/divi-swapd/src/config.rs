@@ -657,6 +657,25 @@ impl DaemonConfig {
                 );
             }
         }
+        // One rule for every section (xmr and usdc have no gate of their own above).
+        let mut coins: Vec<divi_swap::config::ConfiguredNetwork<'_>> = Vec::new();
+        if let Some(b) = &self.btc {
+            coins.push((Chain::Btc, &b.network, Some(b.allow_mainnet)));
+        }
+        if let Some(l) = &self.ltc {
+            coins.push((Chain::Ltc, &l.network, Some(l.allow_mainnet)));
+        }
+        if let Some(z) = &self.zec {
+            coins.push((Chain::Zec, &z.network, Some(z.allow_mainnet)));
+        }
+        if let Some(x) = &self.xmr {
+            coins.push((Chain::Xmr, &x.network, Some(x.allow_mainnet)));
+        }
+        if let Some(u) = &self.usdc {
+            coins.push((Chain::Usdc, &u.network, None));
+        }
+        divi_swap::config::check_profile_networks(self.profile, &coins)
+            .map_err(anyhow::Error::msg)?;
         Ok(())
     }
 }
@@ -1278,6 +1297,66 @@ divi_fund_txids = ["ab"]
     fn rejects_raw_key_values() {
         let bad = GOOD.replace("op://v/i/f", "deadbeefdeadbeef");
         assert!(DaemonConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn xmr_testnet_profile_with_mainnet_network_is_rejected() {
+        // The dangerous direction: real XMR under testnet timeouts, even with the opt-in.
+        let section = XMR_SECTION.replace(
+            "[xmr]\n",
+            "[xmr]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
+        );
+        let e = DaemonConfig::parse(&format!("{GOOD}{XMR}{section}")).unwrap_err();
+        let e = e.to_string();
+        assert!(
+            e.contains("profile = \"testnet\" but [xmr].network = \"mainnet\"")
+                && e.contains("real funds under testnet timeouts are refused"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn xmr_mainnet_profile_with_stagenet_or_without_allow_is_rejected() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}{XMR}{XMR_SECTION}",
+            good_mainnet_btc()
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("profile = \"mainnet\" but [xmr].network = \"stagenet\"")
+                && e.contains("mainnet profile with a test network is refused"),
+            "{e}"
+        );
+        let section = XMR_SECTION.replace("[xmr]\n", "[xmr]\nnetwork = \"mainnet\"\n");
+        let text = format!(
+            "profile = \"mainnet\"\n{}{XMR}{section}",
+            good_mainnet_btc()
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(e.contains("[xmr].allow_mainnet is not set"), "{e}");
+        // All agree: accepted.
+        let section = XMR_SECTION.replace(
+            "[xmr]\n",
+            "[xmr]\nnetwork = \"mainnet\"\nallow_mainnet = true\n",
+        );
+        let text = format!(
+            "profile = \"mainnet\"\n{}{XMR}{section}",
+            good_mainnet_btc()
+        );
+        DaemonConfig::parse(&text).unwrap();
+    }
+
+    #[test]
+    fn usdc_test_network_under_mainnet_profile_is_rejected() {
+        let text = format!(
+            "profile = \"mainnet\"\n{}\n[usdc]\nhtlc = \"0x00\"\nkey = \"credential:usdc\"\n",
+            good_mainnet_btc()
+        );
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(
+            e.contains("profile = \"mainnet\" but [usdc].network = \"sepolia\""),
+            "{e}"
+        );
     }
 
     #[test]

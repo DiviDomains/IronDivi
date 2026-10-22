@@ -92,6 +92,12 @@ struct Cli {
     /// zec/btc/ltc arms; xmr keeps its own).
     #[arg(long, global = true)]
     allow_mainnet: bool,
+    /// Swap timing profile the networks must agree with: `testnet` (default) or `mainnet`.
+    /// The taker takes its terms from the maker, so this only gates the network flags: a
+    /// `mainnet` profile with a test network, or a `testnet` profile with a mainnet one, is
+    /// refused before any network call.
+    #[arg(long, global = true, default_value = "testnet", value_parser = parse_profile)]
+    profile: divi_swap::Profile,
     /// Secret reference for the taker's USDC (EVM) key. Needed when `--counter-chain usdc`.
     #[arg(long, global = true)]
     usdc_key: Option<String>,
@@ -141,6 +147,14 @@ struct Cli {
     xmr_lookback_blocks: u64,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+fn parse_profile(s: &str) -> Result<divi_swap::Profile, String> {
+    match s {
+        "testnet" => Ok(divi_swap::Profile::Testnet),
+        "mainnet" => Ok(divi_swap::Profile::Mainnet),
+        other => Err(format!("profile must be testnet or mainnet, got {other:?}")),
+    }
 }
 
 fn parse_counter_chain(s: &str) -> Result<Chain, String> {
@@ -397,6 +411,35 @@ fn guard_network(flag: &str, network: &str, test_networks: &[&str], allow: bool)
     Ok(())
 }
 
+/// The engine profile must agree with the network of the counter chain in use.
+fn guard_profile(cli: &Cli) -> Result<()> {
+    let coin = match cli.counter_chain {
+        Chain::Btc => (
+            Chain::Btc,
+            cli.btc_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+        Chain::Ltc => (
+            Chain::Ltc,
+            cli.ltc_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+        Chain::Zec => (
+            Chain::Zec,
+            cli.zec_network.as_str(),
+            Some(cli.allow_mainnet),
+        ),
+        Chain::Usdc => (Chain::Usdc, cli.usdc_network.as_str(), None),
+        Chain::Xmr => (
+            Chain::Xmr,
+            cli.xmr_network.as_str(),
+            Some(cli.xmr_allow_mainnet),
+        ),
+        Chain::Divi => return Ok(()),
+    };
+    divi_swap::config::check_profile_networks(cli.profile, &[coin]).map_err(anyhow::Error::msg)
+}
+
 fn live_backends(cli: &Cli) -> Result<Backends> {
     match cli.counter_chain {
         Chain::Btc => guard_network(
@@ -425,6 +468,7 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
             );
         }
     }
+    guard_profile(cli)?;
     let dhex = secret_hex(&cli.divi_key, "--divi-key", "divi")?;
     let dkey = divi_crypto::keys::SecretKey::from_hex(dhex.trim())
         .map_err(|_| anyhow::anyhow!("divi key is not a valid 32-byte hex key"))?;
@@ -683,6 +727,7 @@ async fn live_xmr_taker(cli: &Cli) -> Result<divi_swap_xmr::XmrTaker> {
     let network = live::parse_network(&cli.xmr_network)?;
     let profile = live::profile_for(network, cli.xmr_allow_mainnet)
         .map_err(|e| anyhow::anyhow!("--xmr-network {}: {e}", cli.xmr_network))?;
+    guard_profile(cli)?;
     let divi_rpc_url = match (&cli.xmr_divi_rpc_url, network) {
         (Some(u), _) => u.clone(),
         (None, live::Network::Mainnet) => {
@@ -914,6 +959,88 @@ mod tests {
     }
 
     #[test]
+    fn profile_defaults_to_testnet() {
+        assert_eq!(cli(&[]).profile, divi_swap::Profile::Testnet);
+    }
+
+    #[test]
+    fn mainnet_profile_with_a_test_network_is_rejected_before_any_network_call() {
+        for (chain, extra) in [("btc", &[][..]), ("ltc", &[]), ("zec", &[]), ("usdc", &[])] {
+            let mut argv = vec!["--counter-chain", chain, "--profile", "mainnet"];
+            argv.extend_from_slice(extra);
+            let e = match live_backends(&cli(&argv)) {
+                Ok(_) => panic!("built a live {chain} backend: mainnet profile, test network"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&format!("profile = \"mainnet\" but [{chain}].network"))
+                    && e.contains("mainnet profile with a test network is refused"),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn testnet_profile_with_a_mainnet_network_is_rejected_before_any_network_call() {
+        for (chain, flag) in [
+            ("btc", "--btc-network"),
+            ("ltc", "--ltc-network"),
+            ("zec", "--zec-network"),
+        ] {
+            let e = match live_backends(&cli(&[
+                "--counter-chain",
+                chain,
+                flag,
+                "mainnet",
+                "--allow-mainnet",
+            ])) {
+                Ok(_) => panic!("built a live {chain} backend: testnet profile, mainnet"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                e.contains(&format!(
+                    "profile = \"testnet\" but [{chain}].network = \"mainnet\""
+                )) && e.contains("real funds under testnet timeouts are refused"),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn xmr_profile_must_agree_with_xmr_network_before_any_network_call() {
+        let mainnet_testnet = cli(&[
+            "--counter-chain",
+            "xmr",
+            "--xmr-network",
+            "mainnet",
+            "--xmr-allow-mainnet",
+            "--xmr-divi-rpc-url",
+            "http://127.0.0.1:1",
+            "--xmr-sweep-address",
+            "x",
+        ]);
+        let e = live_xmr_taker(&mainnet_testnet)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("profile = \"testnet\" but [xmr].network = \"mainnet\""),
+            "{e}"
+        );
+        let stagenet_mainnet = cli(&["--counter-chain", "xmr", "--profile", "mainnet"]);
+        let e = live_xmr_taker(&stagenet_mainnet)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("profile = \"mainnet\" but [xmr].network = \"stagenet\""),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn mainnet_guard_passes_with_allow_mainnet() {
         guard_network("--btc-network", "mainnet", &["signet", "testnet"], true).unwrap();
         guard_network("--ltc-network", "mainnet", &["testnet"], true).unwrap();
@@ -939,6 +1066,8 @@ mod tests {
             "--xmr-network",
             "mainnet",
             "--xmr-allow-mainnet",
+            "--profile",
+            "mainnet",
         ])
         .await;
         assert!(e.contains("--xmr-divi-rpc-url"), "{e}");

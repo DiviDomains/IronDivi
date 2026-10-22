@@ -198,6 +198,62 @@ impl SwapConfig {
     }
 }
 
+/// Whether `network` is `chain`'s mainnet. Every coin spells it `"mainnet"`; USDC's EVM
+/// networks (`swap_chain_evm::UsdcNetwork`, which this crate cannot depend on) are only
+/// `sepolia` and `base-sepolia` today, so its mainnet names are matched here by variant
+/// name (`ethereum`, `base`) until the usdc lane adds them.
+fn is_mainnet_network(chain: Chain, network: &str) -> bool {
+    network == "mainnet" || (chain == Chain::Usdc && matches!(network, "ethereum" | "base"))
+}
+
+/// One configured coin: its chain, its `network` string, and its `allow_mainnet` flag
+/// (`None` where the section has no such flag, e.g. USDC).
+pub type ConfiguredNetwork<'a> = (Chain, &'a str, Option<bool>);
+
+/// Refuse a swap profile that disagrees with the networks of the coins in use. Shared by
+/// `divi-swapd` (at config load) and `divi-swap` (before any network call).
+///
+/// * `Profile::Mainnet`: every coin must be on its mainnet and, where it has the flag,
+///   `allow_mainnet = true`.
+/// * `Profile::Testnet`: no coin may be on a mainnet (real funds under testnet timeouts).
+///
+/// ```
+/// use divi_swap::config::check_profile_networks;
+/// use divi_swap::{Chain, Profile};
+/// assert!(check_profile_networks(Profile::Testnet, &[(Chain::Btc, "signet", Some(false))]).is_ok());
+/// assert!(check_profile_networks(Profile::Mainnet, &[(Chain::Btc, "signet", Some(false))]).is_err());
+/// ```
+pub fn check_profile_networks(
+    profile: Profile,
+    coins: &[ConfiguredNetwork<'_>],
+) -> std::result::Result<(), String> {
+    for &(chain, network, allow_mainnet) in coins {
+        let mainnet = is_mainnet_network(chain, network);
+        match profile {
+            Profile::Mainnet if !mainnet => {
+                return Err(format!(
+                    "profile = \"mainnet\" but [{chain}].network = \"{network}\" — a mainnet \
+                     profile with a test network is refused"
+                ));
+            }
+            Profile::Mainnet if allow_mainnet == Some(false) => {
+                return Err(format!(
+                    "profile = \"mainnet\" but [{chain}].allow_mainnet is not set — mainnet \
+                     moves real money and needs the explicit opt-in"
+                ));
+            }
+            Profile::Testnet if mainnet => {
+                return Err(format!(
+                    "profile = \"testnet\" but [{chain}].network = \"{network}\" — real funds \
+                     under testnet timeouts are refused; set profile = \"mainnet\""
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +347,73 @@ quote_expiry_secs = 60
         // And the new shape round-trips.
         let text = toml::to_string(&t).unwrap();
         assert_eq!(toml::from_str::<SwapConfig>(&text).unwrap(), t);
+    }
+
+    const ALL_TEST: [ConfiguredNetwork<'static>; 5] = [
+        (Chain::Btc, "signet", Some(false)),
+        (Chain::Ltc, "testnet", Some(false)),
+        (Chain::Zec, "testnet", Some(false)),
+        (Chain::Xmr, "stagenet", Some(false)),
+        (Chain::Usdc, "sepolia", None),
+    ];
+    const ALL_MAIN: [ConfiguredNetwork<'static>; 5] = [
+        (Chain::Btc, "mainnet", Some(true)),
+        (Chain::Ltc, "mainnet", Some(true)),
+        (Chain::Zec, "mainnet", Some(true)),
+        (Chain::Xmr, "mainnet", Some(true)),
+        (Chain::Usdc, "ethereum", None),
+    ];
+
+    #[test]
+    fn profile_network_all_agree_is_ok() {
+        assert!(check_profile_networks(Profile::Testnet, &ALL_TEST).is_ok());
+        assert!(check_profile_networks(Profile::Mainnet, &ALL_MAIN).is_ok());
+        assert!(check_profile_networks(Profile::Mainnet, &[]).is_ok());
+        assert!(check_profile_networks(Profile::Testnet, &[]).is_ok());
+    }
+
+    #[test]
+    fn mainnet_profile_refuses_a_test_network_for_every_coin() {
+        for (i, coin) in ALL_TEST.iter().enumerate() {
+            let mut set = ALL_MAIN;
+            set[i] = (coin.0, coin.1, ALL_MAIN[i].2);
+            let e = check_profile_networks(Profile::Mainnet, &set).unwrap_err();
+            assert!(
+                e.contains(&format!("[{}].network = \"{}\"", coin.0, coin.1))
+                    && e.contains("mainnet profile with a test network is refused"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn testnet_profile_refuses_a_mainnet_network_for_every_coin() {
+        for (i, coin) in ALL_MAIN.iter().enumerate() {
+            let mut set = ALL_TEST;
+            set[i] = (coin.0, coin.1, ALL_TEST[i].2);
+            let e = check_profile_networks(Profile::Testnet, &set).unwrap_err();
+            assert!(
+                e.contains(&format!("[{}].network = \"{}\"", coin.0, coin.1))
+                    && e.contains("real funds under testnet timeouts are refused")
+                    && e.contains("set profile = \"mainnet\""),
+                "{e}"
+            );
+        }
+        let e =
+            check_profile_networks(Profile::Testnet, &[(Chain::Usdc, "base", None)]).unwrap_err();
+        assert!(e.contains("[usdc].network = \"base\""), "{e}");
+    }
+
+    #[test]
+    fn mainnet_profile_without_allow_mainnet_is_refused() {
+        for i in 0..4 {
+            let mut set = ALL_MAIN;
+            set[i].2 = Some(false);
+            let e = check_profile_networks(Profile::Mainnet, &set).unwrap_err();
+            assert!(
+                e.contains(&format!("[{}].allow_mainnet is not set", set[i].0)),
+                "{e}"
+            );
+        }
     }
 }
