@@ -266,12 +266,53 @@ impl Staker {
         StakingStatus {
             enabled: self.running.load(Ordering::SeqCst),
             staking: self.running.load(Ordering::SeqCst) && !stakeable.is_empty(),
+            mintable_coins: self.has_mintable_coins(),
             utxo_count: stakeable.len(),
             stake_weight,
             expected_time: self.calculate_expected_time(stake_weight),
             last_stake_time: *self.last_stake_time.read(),
             blocks: current_height,
         }
+    }
+
+    /// Confirmations a coinbase or coinstake output needs before it can stake
+    fn coinbase_maturity(&self) -> u32 {
+        match self.chain.network_type() {
+            divi_storage::NetworkType::Mainnet => 20u32,
+            divi_storage::NetworkType::Testnet => 1u32,
+            divi_storage::NetworkType::Regtest => 1u32,
+        }
+    }
+
+    /// Divi Core `HasAgedCoins`: the wallet holds a coin the staker could use
+    /// now, i.e. mature, at least the minimum stake amount, and older than the
+    /// minimum coin age (vault coins count, as in Divi Core's stakable coins)
+    pub fn has_mintable_coins(&self) -> bool {
+        let height = self.chain.height();
+        let now = current_timestamp() as u32;
+        let maturity = self.coinbase_maturity();
+        let (min_amount, min_age) = {
+            let c = self.config.read();
+            (c.min_stake_amount, c.min_coin_age)
+        };
+        let aged = |utxo: &divi_wallet::WalletUtxo| {
+            utxo.value.as_sat() >= min_amount
+                && utxo.is_mature(height, maturity)
+                && utxo
+                    .height
+                    .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
+                    .is_some_and(|idx| now.saturating_sub(idx.time) >= min_age)
+        };
+        let regular = self.wallet.get_spendable_utxos(height, 1);
+        regular
+            .iter()
+            .filter(|u| !u.address.starts_with("vault:"))
+            .any(aged)
+            || self
+                .wallet
+                .get_stakeable_vault_utxos(height, 1)
+                .iter()
+                .any(|(u, _)| aged(u))
     }
 
     /// Calculate expected time to stake a block
@@ -699,11 +740,7 @@ impl Staker {
         // Filter stakeable UTXOs:
         // 1. Must meet minimum amount
         // 2. Must be mature
-        let coinbase_maturity = match self.chain.network_type() {
-            divi_storage::NetworkType::Mainnet => 20u32,
-            divi_storage::NetworkType::Testnet => 1u32,
-            divi_storage::NetworkType::Regtest => 1u32,
-        };
+        let coinbase_maturity = self.coinbase_maturity();
         let stakeable: Vec<_> = utxos
             .into_iter()
             .filter(|u| {
@@ -1515,6 +1552,8 @@ pub struct StakingStatus {
     pub enabled: bool,
     /// Whether actively staking (enabled and has UTXOs)
     pub staking: bool,
+    /// Divi Core `mintablecoins`: a coin is mature and old enough to stake now
+    pub mintable_coins: bool,
     /// Number of stakeable UTXOs
     pub utxo_count: usize,
     /// Total stake weight (sum of UTXO values)

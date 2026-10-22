@@ -44,6 +44,8 @@ pub struct StakingInfo {
     pub mnsync: bool,
     /// Current chain height
     pub blocks: u32,
+    /// Stake split threshold in DIVI (`-stakesplitthreshold`)
+    pub stake_split_threshold: f64,
 }
 
 /// Callback for getting staking status
@@ -104,7 +106,7 @@ impl StakingRpc {
             "mnsync": info.mnsync,
             "staking status": info.staking && info.enabled,
             "staking status text": staking_status_text,
-            "stake split threshold": 20000.0,
+            "stake split threshold": info.stake_split_threshold,
         }))
     }
 
@@ -228,6 +230,7 @@ mod tests {
             enough_coins: true,
             mnsync: true,
             blocks: 12345,
+            stake_split_threshold: 20000.0,
         }));
 
         let result = rpc.get_staking_status(&Params::None).unwrap();
