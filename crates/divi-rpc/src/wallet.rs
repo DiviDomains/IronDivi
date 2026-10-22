@@ -235,7 +235,8 @@ impl WalletRpc {
         *self.mempool.write() = Some(mempool);
     }
 
-    /// Address-encoding network of the chain this node runs on
+    /// Address-encoding network of the chain this node runs on (the wallet's when
+    /// there is no chain); every address or key the RPC prints uses it
     fn address_network(&self) -> Network {
         use divi_storage::chain::NetworkType;
         match self.chain.as_ref().map(|c| c.network_type()) {
@@ -2455,13 +2456,7 @@ impl WalletRpc {
                 )
             })?;
 
-        // Determine network from wallet, defaulting to mainnet
-        let wallet_guard = self.wallet.read();
-        let network = wallet_guard
-            .as_ref()
-            .map(|w| w.network())
-            .unwrap_or(Network::Mainnet);
-        drop(wallet_guard);
+        let network = self.address_network();
 
         // Encode as WIF
         use divi_wallet::address::encode_wif;
@@ -2517,13 +2512,7 @@ impl WalletRpc {
         let (script_type, solutions) = divi_script::extract_script_type(&script_bytes);
         let type_name = divi_script::get_script_type_name(script_type);
 
-        // Get network from wallet if available, otherwise default to Mainnet
-        let network = self
-            .wallet
-            .read()
-            .as_ref()
-            .map(|w| w.network())
-            .unwrap_or(Network::Mainnet);
+        let network = self.address_network();
 
         // Extract addresses based on script type
         let mut addresses: Vec<String> = Vec::new();
@@ -3722,13 +3711,7 @@ impl WalletRpc {
 
         let script_hash = divi_crypto::hash160(&redeem_script);
 
-        let network = self
-            .wallet
-            .read()
-            .as_ref()
-            .map(|w| w.network())
-            .unwrap_or(Network::Mainnet);
-
+        let network = self.address_network();
         let address = Address::p2sh(script_hash, network);
         let address_str = address.to_base58();
 
