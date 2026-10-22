@@ -126,6 +126,11 @@ fn unix_now() -> u32 {
         .unwrap_or(0)
 }
 
+/// Checks a transaction against the chain before it may enter the mempool
+/// (inputs, amounts, scripts); see [`Mempool::set_validator`]
+pub type MempoolValidator =
+    Arc<dyn Fn(&Mempool, &Transaction) -> Result<(), NodeError> + Send + Sync>;
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -154,6 +159,8 @@ pub struct Mempool {
 
     /// Chain tip height, for the finality of height-locked transactions
     tip_height: RwLock<Option<TipHeightProvider>>,
+    /// Input and script checks every transaction must pass to be added
+    validator: RwLock<Option<MempoolValidator>>,
 }
 
 impl Mempool {
@@ -169,6 +176,7 @@ impl Mempool {
             on_added: RwLock::new(None),
             on_removed: RwLock::new(None),
             tip_height: RwLock::new(None),
+            validator: RwLock::new(None),
         }
     }
 
@@ -189,6 +197,14 @@ impl Mempool {
     /// Register a listener for transactions entering the mempool
     pub fn set_added_listener(&self, listener: MempoolListener) {
         *self.on_added.write() = Some(listener);
+    }
+
+    /// Install the checks every added transaction must pass. The node sets
+    /// this once at start (Divi Core's AcceptToMemoryPool input and script
+    /// checks), so every path into the mempool is covered: RPC sends, relay,
+    /// wallet resubmission and transactions re-added after a reorg.
+    pub fn set_validator(&self, validator: MempoolValidator) {
+        *self.validator.write() = Some(validator);
     }
 
     /// Register a listener for transactions leaving the mempool
@@ -276,6 +292,13 @@ impl Mempool {
                     existing
                 )));
             }
+        }
+
+        // Inputs and scripts, last as in Divi Core (called without holding any
+        // mempool lock: the validator looks up parent transactions here)
+        let validator = self.validator.read().clone();
+        if let Some(validator) = validator {
+            validator(self, &entry.tx)?;
         }
 
         // Add to mempool

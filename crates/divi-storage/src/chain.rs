@@ -28,7 +28,7 @@ use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::{OutPoint, Transaction};
 use divi_primitives::ChainMode;
-use divi_script::verify_input;
+use divi_script::{verify_input_with_flags, ScriptFlags};
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
@@ -44,6 +44,69 @@ pub struct AcceptBlockResult {
     /// These should be re-added to the mempool so they can be re-mined.
     /// Only populated when a reorg occurred.
     pub orphaned_transactions: Vec<Transaction>,
+}
+
+/// Counts of block inputs whose scripts were verified, by the type of the
+/// output they spend (P2SH split by redeem script)
+#[derive(Default)]
+struct ScriptStats {
+    inputs: std::sync::atomic::AtomicU64,
+    coinstake: std::sync::atomic::AtomicU64,
+    p2pkh: std::sync::atomic::AtomicU64,
+    p2pk: std::sync::atomic::AtomicU64,
+    p2sh_multisig: std::sync::atomic::AtomicU64,
+    p2sh_other: std::sync::atomic::AtomicU64,
+    multisig: std::sync::atomic::AtomicU64,
+    vault: std::sync::atomic::AtomicU64,
+    other: std::sync::atomic::AtomicU64,
+}
+
+impl ScriptStats {
+    fn record(&self, script_pubkey: &[u8], script_sig: &[u8], coinstake: bool) {
+        use divi_script::ScriptType;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inputs.fetch_add(1, Relaxed);
+        if coinstake {
+            self.coinstake.fetch_add(1, Relaxed);
+        }
+        let counter = match divi_script::extract_script_type(script_pubkey).0 {
+            ScriptType::PubKeyHash => &self.p2pkh,
+            ScriptType::PubKey => &self.p2pk,
+            ScriptType::Multisig => &self.multisig,
+            ScriptType::Vault => &self.vault,
+            ScriptType::ScriptHash => {
+                // The redeem script is the scriptSig's last push
+                let mut pc = 0;
+                let mut last: &[u8] = &[];
+                while let Some((_, data)) = divi_script::get_op(script_sig, &mut pc) {
+                    last = data;
+                }
+                if divi_script::extract_script_type(last).0 == ScriptType::Multisig {
+                    &self.p2sh_multisig
+                } else {
+                    &self.p2sh_other
+                }
+            }
+            _ => &self.other,
+        };
+        counter.fetch_add(1, Relaxed);
+    }
+
+    fn summary(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "{} inputs (p2pkh {}, p2pk {}, p2sh-multisig {}, p2sh-other {}, multisig {}, vault {}, other {}; coinstake inputs {})",
+            self.inputs.load(Relaxed),
+            self.p2pkh.load(Relaxed),
+            self.p2pk.load(Relaxed),
+            self.p2sh_multisig.load(Relaxed),
+            self.p2sh_other.load(Relaxed),
+            self.multisig.load(Relaxed),
+            self.vault.load(Relaxed),
+            self.other.load(Relaxed),
+            self.coinstake.load(Relaxed)
+        )
+    }
 }
 
 /// Network type for chain configuration
@@ -187,6 +250,8 @@ pub struct Chain {
     /// When true, script verification is skipped for performance since
     /// the blockchain data is assumed valid during catch-up.
     ibd_mode: RwLock<bool>,
+    /// What block script verification has checked, logged periodically
+    script_stats: ScriptStats,
 }
 
 /// Metadata marker: the one-time height index repair has run on this datadir.
@@ -217,6 +282,7 @@ impl Chain {
             params,
             chain_lock: Mutex::new(()),
             ibd_mode: RwLock::new(true),
+            script_stats: ScriptStats::default(),
         };
 
         // Load tip from database
@@ -2937,6 +3003,23 @@ impl Chain {
             .map(|tx| self.compute_txid(tx))
             .collect();
 
+        // Script flags for this block: Core's mandatory flags, plus CLTV and
+        // LIMIT_TRANSFER once their forks are active by the block's median
+        // time past (BlockTransactionChecker::Check)
+        let block_flags = {
+            use crate::fork_activation::{ActivationState, Fork};
+            let mtp = self.get_median_time_past(index)? as i64;
+            let activation = ActivationState::new_with_mtp(index, mtp);
+            let mut flags = ScriptFlags::mandatory();
+            if activation.is_active(Fork::CheckLockTimeVerify) {
+                flags.set(ScriptFlags::CHECKLOCKTIMEVERIFY);
+            }
+            if activation.is_active(Fork::LimitTransferVerify) {
+                flags.set(ScriptFlags::LIMIT_TRANSFER);
+            }
+            flags
+        };
+
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             let txid = txids[tx_idx];
 
@@ -2959,7 +3042,7 @@ impl Chain {
 
             // Remove spent UTXOs (except for coinbase which has no real inputs)
             if !is_coinbase {
-                for input in &tx.vin {
+                for (input_index, input) in tx.vin.iter().enumerate() {
                     // Coinstake first input is empty marker, skip it
                     if is_coinstake && input.prevout.is_null() {
                         continue;
@@ -2998,47 +3081,57 @@ impl Chain {
                         block_undo.push(input.prevout, utxo.clone());
                     }
 
-                    // Validate the input script against the previous output's scriptPubKey.
-                    //
-                    // NOTE: This validation is NON-FATAL (warn-only) for now. IronDivi is
-                    // already synced past thousands of blocks; we emit warnings so we can
-                    // observe any mismatches without breaking sync. Once we confirm parity
-                    // with C++ we can promote this to a hard error.
-                    //
-                    // Skip validation for coinstake inputs. The interpreter now enforces
-                    // OP_REQUIRE_COINSTAKE (Core's CoinstakeCheckOp), but checking coinstake
-                    // inputs and making failures fatal wait on log evidence and a vault-stake
-                    // canary. See docs/plans/coinstake-script-enforcement.md.
-                    //
-                    // Also skip script verification entirely during IBD (Initial Block
-                    // Download) since the blockchain data is assumed valid during catch-up.
-                    if !is_coinstake && !*self.ibd_mode.read() {
-                        if let Some(ref utxo) = prev_utxo {
-                            // Determine the index of this input within the transaction.
-                            // We iterate tx.vin alongside the outer loop so find by pointer.
-                            let input_index = tx
-                                .vin
-                                .iter()
-                                .position(|i| std::ptr::eq(i as *const _, input as *const _))
-                                .unwrap_or(0);
-
-                            match verify_input(tx, input_index, &utxo.script_pubkey, utxo.value) {
-                                Ok(()) => {
-                                    trace!(
-                                        "  │  ├─ script ok: {}:{} in tx {}",
-                                        input.prevout.txid,
-                                        input.prevout.vout,
-                                        txid
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "SCRIPT VALIDATION FAILED (non-fatal): tx {} \
-                                        input {}:{} at height {} — {:?}",
-                                        txid, input.prevout.txid, input.prevout.vout, height, e
-                                    );
-                                }
-                            }
+                    // Divi Core's CheckInputs: every input of every non-coinbase
+                    // transaction, coinstakes included, is script-verified under the
+                    // block's flags, during initial sync too. A failure rejects the
+                    // block (BlockTransactionChecker::Check, ConnectBlock).
+                    if let Some(ref utxo) = prev_utxo {
+                        verify_input_with_flags(
+                            tx,
+                            input_index,
+                            &utxo.script_pubkey,
+                            utxo.value,
+                            block_flags,
+                        )
+                        .map_err(|e| {
+                            warn!(
+                                "Script verification failed: tx {} input {} ({}:{}) at height {}: {}",
+                                txid,
+                                input_index,
+                                input.prevout.txid,
+                                input.prevout.vout,
+                                height,
+                                e.core_message()
+                            );
+                            StorageError::InvalidBlock(format!(
+                                "mandatory-script-verify-flag-failed ({}) in tx {} input {}",
+                                e.core_message(),
+                                txid,
+                                input_index
+                            ))
+                        })?;
+                        self.script_stats.record(
+                            utxo.script_pubkey.as_bytes(),
+                            input.script_sig.as_bytes(),
+                            is_coinstake,
+                        );
+                        // CheckProofOfStake also verifies the stake kernel (input 0)
+                        // under POS_SCRIPT_VERIFY_FLAGS
+                        if is_coinstake && input_index == 0 {
+                            verify_input_with_flags(
+                                tx,
+                                0,
+                                &utxo.script_pubkey,
+                                utxo.value,
+                                ScriptFlags::pos(),
+                            )
+                            .map_err(|e| {
+                                StorageError::InvalidBlock(format!(
+                                    "VerifySignature failed on coinstake {} ({})",
+                                    txid,
+                                    e.core_message()
+                                ))
+                            })?;
                         }
                     }
 
@@ -3150,6 +3243,14 @@ impl Chain {
         index.status.insert(BlockStatus::VALID_CHAIN);
         index.status.insert(BlockStatus::VALID_SCRIPTS);
         index.status.insert(BlockStatus::ON_MAIN_CHAIN);
+
+        if height.is_multiple_of(10_000) {
+            info!(
+                "Script verification through height {}: {} verified",
+                height,
+                self.script_stats.summary()
+            );
+        }
 
         debug!(
             "✅ BLOCK VALIDATED: {} at height {} | {} txs, {} UTXOs created",
