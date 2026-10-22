@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIVI Atomic Swap Maker (testnet)</title>
+<link rel="stylesheet" href="landing.css">
+<script src="landing.js" defer></script>
+</head>
+<body>
+<h1>DIVI Atomic Swap Maker &mdash; testnet</h1>
+<p class="banner">Practice network only. These are test coins with no value. Nothing here touches real money.</p>
+
+<h2>What this is (testnet)</h2>
+<p>This is a swap maker for DIVI. It trades DIVI test coins directly against other test coins (Bitcoin, Litecoin, Zcash and Monero test networks) with no exchange in the middle. Each swap is an atomic swap: either both sides complete or both sides get their coins back.</p>
+
+<h2>Status (testnet)</h2>
+<div id="status" data-state="loading">Checking&hellip;</div>
+<noscript><p>This page needs JavaScript to show live status and offers.</p></noscript>
+
+<h2>Current offers (testnet)</h2>
+<div id="offers">Loading&hellip;</div>
+<p>Amounts are in whole coins. A smallest and largest swap are given on the counter coin's side.</p>
+
+<h2>How to swap (testnet)</h2>
+<ol>
+<li>Get test coins from the faucet: <a href="https://services.divi.domains/testnet/faucet" rel="noopener noreferrer">https://services.divi.domains/testnet/faucet</a></li>
+<li>Get the <code>divi-swap</code> taker app. <strong>The taker app is not published yet</strong>, so there is no download link on this page.</li>
+<li>Pick an offer id from the table above and run, on the test networks (the default profile):</li>
+</ol>
+<pre>divi-swap --maker https://divi.cx/swap quote --offer OFFER_ID --btc-sats AMOUNT
+divi-swap --maker https://divi.cx/swap run   --offer OFFER_ID --btc-sats AMOUNT</pre>
+<p><code>AMOUNT</code> is the counter-coin amount in satoshis (1 coin = 100,000,000). <code>quote</code> only prints a price. <code>run</code> does the whole swap. Add <code>--counter-chain ltc</code> or <code>zec</code> for offers on those coins. Other steps, if you want them one at a time: <code>accept</code>, <code>lock</code>, <code>status</code>, <code>claim</code>, <code>refund</code>.</p>
+
+<h2>About this page (testnet)</h2>
+<p>This page is read-only. It has no forms, no wallet, no keys, no cookies and no analytics. It only reads <code>healthz</code> and <code>offers</code> from this maker.</p>
+</body>
+</html>

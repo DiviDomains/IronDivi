@@ -114,3 +114,14 @@ Install order on the maker host: (1) install the new `divi-swapd` binary (`tools
 (2) copy `swap-watch.sh` to `/usr/local/bin/swap-watch.sh`; (3) check with
 `sudo /usr/local/bin/swap-watch.sh dry-run`. Installing the script first only gives the `unreadable`
 alert, never a silent miss. Test: `tools/swap-poc/test-swap-watch.sh` (stubs, no network).
+
+## Landing page at /swap/ (testnet, read-only)
+
+A static page (`www/index.html`, `landing.js`, `landing.css`) served by nginx; no daemon change. It reads `healthz` and `offers` from the same origin.
+Install adds ONLY the marked block in `landing.fragment` to the live snippet `/etc/nginx/snippets/divi-swapd.conf`; the existing `location /swap/ { ... }` proxy block stays byte-identical. Do not fold the repo `nginx-swap.conf` X-Forwarded-For change into this install.
+
+    deploy/divi-swapd/landing-install.sh install            # dry run: prints the steps
+    deploy/divi-swapd/landing-install.sh install --apply    # backup, copy page, append block, nginx -t, reload
+    deploy/divi-swapd/landing-install.sh rollback --apply   # restore backup, nginx -t, reload
+
+Tests: `deploy/divi-swapd/test/run.sh` (node --test, then a docker nginx proof against a mock daemon).

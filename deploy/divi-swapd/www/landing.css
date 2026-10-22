@@ -1,0 +1,14 @@
+:root { color-scheme: light dark; }
+body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; padding: 1rem; max-width: 52rem; }
+h1 { font-size: 1.6rem; margin: .5rem 0; }
+h2 { font-size: 1.2rem; margin-top: 2rem; }
+.banner { border: 2px solid currentColor; padding: .5rem .75rem; border-radius: .4rem; }
+#status { border-left: .4rem solid gray; padding: .5rem .75rem; }
+#status[data-state="ready"] { border-color: seagreen; }
+#status[data-state="catching_up"] { border-color: darkorange; }
+#status[data-state="degraded"], #status[data-state="unreachable"] { border-color: crimson; }
+#offers { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid gray; overflow-wrap: anywhere; }
+pre { overflow-x: auto; padding: .6rem; border: 1px solid gray; border-radius: .3rem; }
+code { overflow-wrap: anywhere; }
