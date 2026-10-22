@@ -696,3 +696,11 @@ run above) is the orchestrator's step, from the Mac, same as every prior live le
     `~/swap-lanes/builders/P/STATUS.md` on hp1 and in the lane commit message).
 - left: still a single mainnet data source (`litecoinspace.org`); no live mainnet run of any kind was made.
 - needs: nothing. Mainnet funds remain the only money gate; nothing here turns `allow_mainnet` on.
+
+## Round: LTC mainnet read-only smoke (builder W, 2026-10-22)
+
+- done: ran `divi-swap` and `divi-swapd` against LTC mainnet with a throwaway zero-balance key (generated on hp3, mode 600, outside git, deleted). CLI `balance` with `--ltc-network mainnet --allow-mainnet` printed `ltc_address=ltc1q…`, `ltc_balance_sats=0` in 0.19 s via `https://litecoinspace.org/api`; without `--allow-mainnet` it refuses before any network call. Daemon (`profile = "mainnet"`, `[btc]` and `[ltc]` mainnet, defaults for URLs) logged "ltc backend ready" network `mainnet`, `/healthz` `counters.ltc.tip` 3199562. Corrected the stale §LTC "Public backends", "Address network" and findings rows in `mainnet-readiness.md`; added the two smoke rows. Confirmation, MTP and reorg rows untouched.
+- proof: tip `https://litecoinspace.org/api/blocks/tip/height` → `3199562` (HTTP 200, 2026-10-22T11:09Z), same value from the daemon `/healthz` and the direct curl; verdict `verified`. Gate first lines (verbatim) are in the readiness row: `allow_mainnet = false`, `profile = "testnet"` + mainnet coin, `profile = "mainnet"` + testnet coin. fmt clean, clippy `-D warnings` on the four packages clean, tests 178 passed / 0 failed / 1 ignored (docs-only change, so before = after).
+- left: `litecoinspace.org` is still the only LTC endpoint (`crates/swap-chain-ltc/src/lib.rs:69`); the CLI has no `tip` subcommand (tip checked by curl); a live `[ltc]` section needs `[divi]` + `[btc]` and an enabled ltc offer (`bin/divi-swapd/src/main.rs:382-384`); the DIVI backend is built on `DiviNetwork::Testnet` whatever the profile (`bin/divi-swapd/src/main.rs:430-436`, `bin/divi-swap/src/main.rs:487-494`).
+- needs: nothing.
+- decisions: no code change, no confirmation/MTP/timeout/margin change.

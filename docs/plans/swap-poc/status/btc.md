@@ -47,3 +47,11 @@
     `~/swap-lanes/builders/P/STATUS.md` on hp1 and in the lane commit message).
 - left: mainnet confirmations are still 2 (`crates/divi-swap/src/config.rs:44`, flagged `risky` above); no live mainnet run of any kind was made.
 - needs: nothing. Mainnet funds remain the only money gate; nothing here turns `allow_mainnet` on.
+
+## Round: BTC mainnet read-only smoke (builder W, 2026-10-22)
+
+- done: ran `divi-swap` and `divi-swapd` against BTC mainnet with a throwaway zero-balance key (generated on hp3, mode 600, outside git, deleted). CLI `balance` with `--btc-network mainnet --allow-mainnet` printed `btc_address=bc1q…`, `btc_balance_sats=0` in 0.11 s via `https://mempool.space/api`; without `--allow-mainnet` it refuses before any network call. Daemon (`profile = "mainnet"`, `[btc] network = "mainnet" allow_mainnet = true`, default endpoints) logged "btc backend ready" network `mainnet`, `/healthz` `btc.tip` 972609. Corrected the stale §BTC "Public backends", "Address network" and findings rows in `mainnet-readiness.md`; added the two smoke rows. Confirmations stay 2 with the "risky: thin" rows exactly as they were (parked decision).
+- proof: tip 972609 from both `https://mempool.space/api/blocks/tip/height` and `https://blockstream.info/api/blocks/tip/height` (HTTP 200, 2026-10-22T11:09Z, same tip hash `00000000000000000001a4b1e376cb4869d2bc5a86b9ec9fbf844c7f2bd8dcd7`); verdict `verified`. The secondary endpoint also reports the throwaway address with 0 funded txo. Gate first lines (verbatim) are in the readiness row. fmt clean, clippy `-D warnings` on the four packages clean, tests 178 passed / 0 failed / 1 ignored (docs-only change, so before = after).
+- left: the CLI has no `tip` subcommand (tip checked by curl); the DIVI backend is built on `DiviNetwork::Testnet` whatever the profile, so a mainnet-profile daemon still talks to the DIVI testnet RPC (`bin/divi-swapd/src/main.rs:430-436`, `bin/divi-swap/src/main.rs:487-494`).
+- needs: nothing.
+- decisions: no code change, no confirmation/MTP/timeout/margin change.
