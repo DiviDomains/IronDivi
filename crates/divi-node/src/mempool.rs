@@ -211,6 +211,14 @@ impl Mempool {
             ));
         }
 
+        // Divi Core IsStandard: a transaction with a dust output is not relayed by
+        // any node, so it is not accepted here either. Locally created sends must
+        // not reach the wallet through the mempool when the network will refuse them.
+        let relay_fee_per_kb = self.config.min_relay_fee * 1000;
+        if tx.vout.iter().any(|out| out.is_dust_at(relay_fee_per_kb)) {
+            return Err(NodeError::TransactionValidation("dust".into()));
+        }
+
         // Check for conflicts (double spends)
         for input in &tx.vin {
             let outpoint = (input.prevout.txid, input.prevout.vout);
@@ -558,6 +566,22 @@ mod tests {
             )],
             lock_time: 0,
         }
+    }
+
+    #[test]
+    fn test_mempool_refuses_dust_output() {
+        // Default relay fee (10 sat/byte): Divi Core's dust limit is 5460 sat for P2PKH
+        let mempool = Mempool::new(MempoolConfig::default());
+        let mut tx = create_test_tx([9u8; 32], 1);
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(5459),
+            Script::new_p2pkh(&[1u8; 20]),
+        ));
+        assert!(mempool.add(tx.clone(), Amount::from_sat(100_000)).is_err());
+        assert_eq!(mempool.size(), 0);
+
+        tx.vout[1].value = Amount::from_sat(5460);
+        assert!(mempool.add(tx, Amount::from_sat(100_000)).is_ok());
     }
 
     #[test]

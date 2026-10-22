@@ -23,7 +23,7 @@ use divi_primitives::constants::MAX_MONEY;
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::serialize::{deserialize, serialize};
-use divi_primitives::transaction::{OutPoint, Transaction};
+use divi_primitives::transaction::{OutPoint, Transaction, TxOut, DEFAULT_MIN_RELAY_FEE_PER_KB};
 use divi_script::opcodes::Opcode;
 use divi_script::StakingVaultScript;
 use divi_storage::chain::NetworkType;
@@ -42,6 +42,27 @@ use tracing::{debug, info};
 /// unless `allow_zero`; round to the nearest satoshi rather than truncating.
 /// Core's MaxMoneyOut is per-network; only the mainnet MAX_MONEY exists here,
 /// which is at most 0.03% below the test/regtest limit.
+/// Divi Core `EnsureNoOutputsAreDust`: a send whose output would be dust is
+/// refused with -4 before anything is built, signed or committed.
+fn ensure_not_dust(value: Amount, script: &Script) -> Result<(), Error> {
+    if TxOut::new(value, script.clone()).is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
+        return Err(RpcError::new(
+            codes::WALLET_ERROR,
+            "Transaction output(s) amount too small",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Smallest change output worth creating. Less than this would be dust, which
+/// no node relays, so it goes to the fee instead, as in Divi Core. Change always
+/// pays a P2PKH address.
+fn min_change_value() -> Amount {
+    TxOut::new(Amount::ZERO, Script::new_p2pkh(&[0; 20]))
+        .min_non_dust_value(DEFAULT_MIN_RELAY_FEE_PER_KB)
+}
+
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
     let invalid = || RpcError::new(codes::TYPE_ERROR, "Invalid amount");
     let divi = value.as_f64().ok_or_else(invalid)?;
@@ -936,6 +957,8 @@ impl WalletRpc {
             return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
         }
 
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
+
         let height = self.current_height();
 
         // Get spendable UTXOs (1 confirmation minimum)
@@ -952,7 +975,7 @@ impl WalletRpc {
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
 
         for utxo in utxos {
             selected.push(utxo.clone());
@@ -2024,6 +2047,7 @@ impl WalletRpc {
         let manager_hash = self.address_to_hash160(&manager_addr)?;
 
         let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+        ensure_not_dust(send_amount, &vault_script)?;
 
         let height = self.current_height();
 
@@ -2041,7 +2065,7 @@ impl WalletRpc {
         // Simple coin selection: select UTXOs until we have enough
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
 
         for utxo in utxos {
             selected.push(utxo.clone());
@@ -2212,6 +2236,7 @@ impl WalletRpc {
         let dest_addr = self
             .decode_address(destination)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
         let chain = self
             .chain
@@ -2311,7 +2336,7 @@ impl WalletRpc {
         }
         builder = builder.add_output_to_address(send_amount, &dest_addr);
 
-        let min_output = Amount::from_sat(546);
+        let min_output = min_change_value();
         if change_amount >= min_output {
             builder = builder.add_output_to_address(change_amount, &change_addr);
         }
@@ -2751,6 +2776,10 @@ impl WalletRpc {
             }
         }
 
+        for (addr, amount) in &adjusted_outputs {
+            ensure_not_dust(*amount, &addr.script_pubkey())?;
+        }
+
         // Get change address
         let change_addr = wallet.new_change_address().map_err(|e| {
             RpcError::new(
@@ -2772,7 +2801,7 @@ impl WalletRpc {
         }
 
         // Add change output if significant
-        let min_output = Amount::from_sat(546); // Dust limit
+        let min_output = min_change_value();
         let change_amount = total_input - adjusted_total_send - fee;
         if change_amount >= min_output {
             builder = builder.add_output_to_address(change_amount, &change_addr);
@@ -3213,6 +3242,8 @@ impl WalletRpc {
             return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
         }
 
+        ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
+
         let height = self.current_height();
 
         // Get addresses for the specified account
@@ -3250,7 +3281,7 @@ impl WalletRpc {
         // Simple coin selection
         let mut selected = Vec::new();
         let mut total_input = Amount::ZERO;
-        let min_output = Amount::from_sat(546);
+        let min_output = min_change_value();
 
         for utxo in utxos {
             selected.push(utxo.clone());
@@ -4593,6 +4624,95 @@ mod send_unlock_regression {
 
     fn address(hash: u8, network: Network) -> String {
         Address::from_pubkey_hash(Hash160::from_bytes([hash; 20]), network).to_base58()
+    }
+
+    type Sent = Arc<parking_lot::Mutex<Vec<Transaction>>>;
+
+    /// Testnet wallet holding one confirmed 10 DIVI coin; submitted txs are captured
+    fn funded_rpc() -> (WalletRpc, Arc<WalletDb>, Sent) {
+        let (rpc, db) = rpc_on(Network::Testnet);
+        let addr = db.new_receiving_address().unwrap();
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([3; 32]),
+            vout: 0,
+            value: Amount::from_divi(10),
+            script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+            height: Some(100),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: addr.to_string(),
+        });
+        rpc.set_height(200);
+        let sent: Sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = sent.clone();
+        rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            capture.lock().push(tx);
+            Ok(txid)
+        }));
+        (rpc, db, sent)
+    }
+
+    fn dust_error() -> (i32, String) {
+        (
+            codes::WALLET_ERROR,
+            "Transaction output(s) amount too small".into(),
+        )
+    }
+
+    #[test]
+    fn ir15_dust_send_is_refused_before_anything_is_submitted() {
+        let (rpc, _, sent) = funded_rpc();
+        let to = address(8, Network::Testnet);
+        // The testnet send that was accepted and never relayed, and Divi Core's refusal
+        for amount in [0.000001, 0.00001] {
+            assert_eq!(
+                err(rpc.send_to_address(&p(vec![json!(to), json!(amount)]))),
+                dust_error(),
+                "sendtoaddress {}",
+                amount
+            );
+            assert_eq!(
+                err(rpc.send_from(&p(vec![json!(""), json!(to), json!(amount)]))),
+                dust_error(),
+                "sendfrom {}",
+                amount
+            );
+            let mut outputs = serde_json::Map::new();
+            outputs.insert(to.clone(), json!(amount));
+            assert_eq!(
+                err(rpc.send_many(&p(vec![json!(""), serde_json::Value::Object(outputs)]))),
+                dust_error(),
+                "sendmany {}",
+                amount
+            );
+        }
+        assert!(sent.lock().is_empty(), "a dust send reached the mempool");
+
+        // Divi Core accepts 0.0000546 (5460 sat, the P2PKH dust limit)
+        rpc.send_to_address(&p(vec![json!(to), json!(0.0000546)]))
+            .unwrap();
+        assert_eq!(sent.lock().len(), 1);
+    }
+
+    #[test]
+    fn ir15_change_below_dust_goes_to_fee() {
+        let (rpc, _, sent) = funded_rpc();
+        let to = address(8, Network::Testnet);
+        // 10 DIVI in, fee estimate 3000 sat for one input: leave 3000 sat of change,
+        // above the old 546 limit and below the real 5460 one.
+        let amount = (1_000_000_000i64 - 6000) as f64 / 100_000_000.0;
+        rpc.send_to_address(&p(vec![json!(to), json!(amount)]))
+            .unwrap();
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1);
+        for out in &sent[0].vout {
+            assert!(
+                out.value.as_sat() >= 5460,
+                "dust output of {} sat",
+                out.value.as_sat()
+            );
+        }
     }
 
     #[test]

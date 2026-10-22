@@ -196,7 +196,32 @@ impl TxOut {
     pub fn is_dust(&self, dust_threshold: Amount) -> bool {
         self.value < dust_threshold && !self.is_op_return()
     }
+
+    /// Smallest value this output may carry without being dust at
+    /// `relay_fee_per_kb` (satoshis per 1000 bytes).
+    ///
+    /// Divi Core `FeeAndPriorityCalculator::MinimumValueForNonDust`: an output is
+    /// dust when spending it would cost more than a third of its value, with a
+    /// 148-byte input to spend it. At the default relay fee that is 5460 satoshis
+    /// for P2PKH and 5400 for P2SH.
+    pub fn min_non_dust_value(&self, relay_fee_per_kb: i64) -> Amount {
+        let size = self.encoded_size() as i64 + 148;
+        let mut fee = relay_fee_per_kb * size / 1000;
+        if fee == 0 && relay_fee_per_kb > 0 {
+            fee = relay_fee_per_kb;
+        }
+        Amount::from_sat(3 * fee)
+    }
+
+    /// Divi Core `IsDust` at `relay_fee_per_kb`. OP_RETURN outputs are exempt.
+    pub fn is_dust_at(&self, relay_fee_per_kb: i64) -> bool {
+        self.is_dust(self.min_non_dust_value(relay_fee_per_kb))
+    }
 }
+
+/// Divi Core's default minimum relay fee (`DEFAULT_TX_RELAY_FEE_PER_KILOBYTE`), in
+/// satoshis per 1000 bytes. The dust limit is derived from it.
+pub const DEFAULT_MIN_RELAY_FEE_PER_KB: i64 = 10_000;
 
 impl fmt::Debug for TxOut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -360,6 +385,23 @@ impl Decodable for Transaction {
 mod tests {
     use super::*;
     use crate::serialize::{deserialize, serialize};
+
+    #[test]
+    fn test_dust_limit_matches_divi_core() {
+        let p2pkh = TxOut::new(Amount::from_sat(5460), Script::new_p2pkh(&[1u8; 20]));
+        let p2sh = TxOut::new(Amount::from_sat(5400), Script::new_p2sh(&[1u8; 20]));
+        let fee = DEFAULT_MIN_RELAY_FEE_PER_KB;
+        assert_eq!(p2pkh.min_non_dust_value(fee), Amount::from_sat(5460));
+        assert_eq!(p2sh.min_non_dust_value(fee), Amount::from_sat(5400));
+        assert!(!p2pkh.is_dust_at(fee));
+        assert!(!p2sh.is_dust_at(fee));
+        let below = TxOut::new(Amount::from_sat(5459), Script::new_p2pkh(&[1u8; 20]));
+        assert!(below.is_dust_at(fee));
+        // Divi Core testnet: 0.00001 is refused, 0.0000546 accepted
+        let refused = TxOut::new(Amount::from_sat(1000), Script::new_p2pkh(&[1u8; 20]));
+        assert!(refused.is_dust_at(fee));
+        assert!(!TxOut::new(Amount::ZERO, Script::new_op_return(b"meta")).is_dust_at(fee));
+    }
 
     #[test]
     fn test_outpoint_null() {
