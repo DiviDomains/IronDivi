@@ -982,13 +982,14 @@ pub(crate) fn serialize_key_entry(entry: &KeyEntry) -> Vec<u8> {
 
     // Flags: bit 0 = watch_only
     // bit 1 = secret stripped (held encrypted elsewhere; only the public key is stored)
+    // bit 2 = uncompressed key (older builds ignore it and treat the key as compressed)
     let flags = if entry.is_watch_only {
         0x01
     } else if entry.secret.is_none() {
         0x02
     } else {
         0x00
-    };
+    } | if entry.compressed { 0x00 } else { 0x04 };
     data.push(flags);
 
     // Key data
@@ -1034,6 +1035,7 @@ fn deserialize_key_entry(data: &[u8]) -> Result<KeyEntry, WalletError> {
     let mut pos = 0;
 
     // Check for version byte (v2 starts with version 2)
+    let mut compressed = true;
     let (is_watch_only, secret, public) = if data[0] == 2 {
         // New format with version and flags
         pos = 1; // Skip version
@@ -1041,6 +1043,7 @@ fn deserialize_key_entry(data: &[u8]) -> Result<KeyEntry, WalletError> {
         pos += 1;
         let is_watch_only = (flags & 0x01) != 0;
         let secret_stripped = (flags & 0x02) != 0;
+        compressed = (flags & 0x04) == 0;
 
         if is_watch_only || secret_stripped {
             // Watch-only: read public key (33 bytes)
@@ -1125,6 +1128,7 @@ fn deserialize_key_entry(data: &[u8]) -> Result<KeyEntry, WalletError> {
         label,
         hd_path: path,
         is_watch_only,
+        compressed,
     })
 }
 

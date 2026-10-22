@@ -2087,7 +2087,19 @@ impl WalletDb {
         secret: divi_crypto::keys::SecretKey,
         label: Option<String>,
     ) -> Address {
-        let address = self.keystore.import_key(secret, label);
+        self.import_key_with_compression(secret, true, label)
+    }
+
+    /// Import a private key in its compressed or uncompressed form (the WIF's flag)
+    pub fn import_key_with_compression(
+        &self,
+        secret: divi_crypto::keys::SecretKey,
+        compressed: bool,
+        label: Option<String>,
+    ) -> Address {
+        let address = self
+            .keystore
+            .import_key_with_compression(secret, compressed, label);
         self.dirty.write().keys = true;
         if let Err(e) = self.persist_keys(&[address.hash]) {
             // Still held in memory; save() and lock() retry the write

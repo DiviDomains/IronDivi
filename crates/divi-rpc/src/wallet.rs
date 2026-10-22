@@ -601,9 +601,9 @@ impl WalletRpc {
                 if is_mine {
                     if let Some(wallet) = wallet_guard.as_ref() {
                         if let Some(key_entry) = wallet.get_key_by_address(&addr) {
-                            let pubkey_hex = hex::encode(key_entry.public.to_bytes());
+                            let pubkey_hex = hex::encode(key_entry.pubkey_bytes());
                             result["pubkey"] = serde_json::json!(pubkey_hex);
-                            result["iscompressed"] = serde_json::json!(true);
+                            result["iscompressed"] = serde_json::json!(key_entry.compressed);
 
                             if let Some(ref hd_path) = key_entry.hd_path {
                                 result["hdkeypath"] = serde_json::json!(hd_path);
@@ -1143,7 +1143,7 @@ impl WalletRpc {
         let key_bytes = secret.as_bytes();
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(key_bytes);
-        let wif = encode_wif(&key_array, true, network);
+        let wif = encode_wif(&key_array, key_entry.compressed, network);
 
         Ok(serde_json::json!(wif))
     }
@@ -1179,11 +1179,13 @@ impl WalletRpc {
         })?;
 
         // As Divi Core: the label is set even for a key already held, and a key
-        // already held is not imported or rescanned again
-        let address = Address::p2pkh(&secret.public_key(), wallet.network());
+        // already held is not imported or rescanned again. The key is compressed
+        // or not as the WIF says (Divi Core's CBitcoinSecret), which decides its address.
+        let address = divi_wallet::KeyEntry::imported(secret.clone(), wif_key.compressed)
+            .address(wallet.network());
         let held = wallet.is_mine(&address) && !wallet.is_watch_only(&address);
         if !held {
-            wallet.import_key(secret, label.clone());
+            wallet.import_key_with_compression(secret, wif_key.compressed, label.clone());
             info!("Imported private key for address: {}", address);
         }
         wallet
@@ -1551,7 +1553,7 @@ impl WalletRpc {
                                 "Private key outside allowed range",
                             )
                         })?;
-                    store.import_key(secret, None);
+                    store.import_key_with_compression(secret, wif.compressed, None);
                 }
                 Some(store)
             }
@@ -1771,7 +1773,7 @@ impl WalletRpc {
             return Err(unable().into());
         }
         let mut dummy = vec![];
-        let pk = entry.public.to_bytes();
+        let pk = entry.pubkey_bytes();
         dummy.push(pk.len() as u8);
         dummy.extend_from_slice(&pk);
         dummy.push(0xac); // OP_CHECKSIG
@@ -2905,13 +2907,15 @@ impl WalletRpc {
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(key_bytes);
 
-        // Encrypt using BIP38 (always use compressed for modern wallets)
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, true).map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("BIP38 encryption failed: {}", e),
-            )
-        })?;
+        // Encrypt using BIP38 in the key's own form (as PIVX's bip38encrypt, which this
+        // RPC follows; Divi Core's own BIP38 RPCs keep the flag the same way)
+        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, key_entry.compressed)
+            .map_err(|e| {
+                RpcError::new(
+                    codes::WALLET_ERROR,
+                    format!("BIP38 encryption failed: {}", e),
+                )
+            })?;
 
         Ok(json!(encrypted))
     }
@@ -3571,7 +3575,7 @@ impl WalletRpc {
             if let Ok(addr) = self.decode_address(key_str) {
                 // Get pubkey from wallet
                 if let Some(key_entry) = wallet.get_key_by_address(&addr) {
-                    pubkeys.push(key_entry.public.to_bytes().to_vec());
+                    pubkeys.push(key_entry.pubkey_bytes());
                 } else {
                     return Err(RpcError::new(
                         codes::INVALID_ADDRESS_OR_KEY,
@@ -4089,8 +4093,12 @@ impl WalletRpc {
         let signature = divi_crypto::sign_hash_recoverable(secret, &hash)
             .map_err(|e| RpcError::new(codes::MISC_ERROR, format!("Signing failed: {}", e)))?;
 
-        // Return base64-encoded signature (65 bytes: recovery_id + r + s)
-        let sig_bytes = signature.to_compact_with_recovery();
+        // 65 bytes: header (27 + recid, +4 for a compressed key) + r + s
+        let sig_bytes = if key_entry.compressed {
+            signature.to_compact_with_recovery()
+        } else {
+            signature.to_compact_with_recovery_uncompressed()
+        };
         let sig_b64 = STANDARD.encode(sig_bytes);
 
         debug!("Signed message with address {}", address_str);
@@ -4135,8 +4143,15 @@ impl WalletRpc {
             return Ok(serde_json::Value::Bool(false));
         };
 
-        // Derive address from recovered public key
-        let recovered_address = Address::p2pkh(&recovered_pubkey, address.network);
+        // Derive the address from the recovered key in the form the header names
+        // (CPubKey::RecoverCompact: 27..30 uncompressed, 31..34 compressed)
+        let recovered_bytes = if (27..=30).contains(&sig_bytes[0]) {
+            recovered_pubkey.serialize_uncompressed().to_vec()
+        } else {
+            recovered_pubkey.to_bytes()
+        };
+        let recovered_address =
+            Address::from_pubkey_hash(divi_crypto::hash160(&recovered_bytes), address.network);
 
         // Check if recovered address matches the claimed address
         let valid = recovered_address == address;
@@ -4181,8 +4196,11 @@ impl WalletRpc {
                 RpcError::invalid_params("Each key must be a string (hex pubkey or address)")
             })?;
 
+            // Serialized as given: an uncompressed key stays 65 bytes, as in Core
             let pubkey = if key_str.len() == 66 || key_str.len() == 130 {
                 divi_crypto::keys::PublicKey::from_hex(key_str)
+                    .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid hex public key"))?;
+                hex::decode(key_str)
                     .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid hex public key"))?
             } else {
                 let address = self
@@ -4194,7 +4212,7 @@ impl WalletRpc {
                     wallet
                         .keystore()
                         .get_key_by_address(&address)
-                        .map(|entry| entry.public.clone())
+                        .map(|entry| entry.pubkey_bytes())
                         .ok_or_else(|| {
                             RpcError::new(
                                 codes::MISC_ERROR,
@@ -4217,10 +4235,9 @@ impl WalletRpc {
 
         redeem_script.push(0x50 + nrequired as u8);
 
-        for pubkey in &pubkeys {
-            let pubkey_bytes = pubkey.to_bytes();
+        for pubkey_bytes in &pubkeys {
             redeem_script.push(pubkey_bytes.len() as u8);
-            redeem_script.extend_from_slice(&pubkey_bytes);
+            redeem_script.extend_from_slice(pubkey_bytes);
         }
 
         redeem_script.push(0x50 + pubkeys.len() as u8);
