@@ -251,6 +251,8 @@ impl Connection {
         }
 
         // Store their version info
+        self.info.time_offset =
+            their_version.timestamp - crate::peer::unix_now_us() as i64 / 1_000_000;
         self.info.services = their_version.services;
         self.info.start_height = their_version.start_height as u32;
         self.info.version = Some(their_version);
@@ -381,9 +383,10 @@ impl Connection {
         let codec = DiviCodec::new(magic);
         let mut framed = FramedRead::new(reader, codec);
 
-        // Proactive keepalive timer to prevent C++ node's inactivity timeout (~60s)
+        // Proactive keepalive timer to prevent C++ node's inactivity timeout (~60s).
+        // Its first tick fires at once, so the round trip is measured right after the
+        // handshake (as C++ queues a ping for every new peer) instead of 30 s later.
         let mut ping_timer = tokio::time::interval(PING_INTERVAL);
-        ping_timer.tick().await; // Consume the immediate first tick
 
         loop {
             info.publish(&stats);
@@ -419,13 +422,8 @@ impl Connection {
                 result = timeout(READ_TIMEOUT, framed.next()) => {
                     match result {
                         Ok(Some(Ok(msg))) => {
-                            // Calculate approximate bytes received for this message
-                            // Note: This is an approximation based on the command.
-                            // For accurate tracking, we'd need to track bytes in the codec itself.
-                            // For now, we use the message size as a proxy (header + payload).
-
-                            let msg_bytes = msg.to_bytes(magic).map(|b| b.len()).unwrap_or(0);
-                            let bytes_received = msg_bytes as u64;
+                            // Exact bytes the codec took off the wire for this message
+                            let bytes_received = framed.decoder_mut().take_bytes_consumed();
 
                             // Update stats
                             info.bytes_recv += bytes_received;
@@ -502,7 +500,9 @@ impl Connection {
                 if let Some(sent_nonce) = info.ping_nonce {
                     if sent_nonce == *nonce {
                         if let Some(ping_time) = info.ping_time {
-                            info.ping_latency_ms = Some(ping_time.elapsed().as_millis() as u64);
+                            // Microseconds: a LAN or localhost round trip is well under 1 ms
+                            info.ping_latency_us =
+                                Some((ping_time.elapsed().as_micros() as u64).max(1));
                         }
                         info.ping_nonce = None;
                         info.ping_time = None;

@@ -519,11 +519,20 @@ fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
     println!("Difficulty: {}", blockchain["difficulty"]);
     println!();
     println!("Network: {}", network["subversion"].as_str().unwrap_or(""));
+    let (conn_in, conn_out) = match (
+        network["connections_in"].as_u64(),
+        network["connections_out"].as_u64(),
+    ) {
+        (Some(i), Some(o)) => (i, o),
+        // Older servers do not report the split: count it from the peer list
+        _ => {
+            let peers = client.call("getpeerinfo", Value::Array(vec![]))?;
+            connection_split(&peers)
+        }
+    };
     println!(
         "Connections: {} (in: {}, out: {})",
-        network["connections"],
-        network["connections_in"].as_u64().unwrap_or(0),
-        network["connections_out"].as_u64().unwrap_or(0)
+        network["connections"], conn_in, conn_out
     );
 
     if let Some(w) = wallet {
@@ -533,6 +542,16 @@ fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// (inbound, outbound) connection counts from a `getpeerinfo` result
+fn connection_split(peers: &Value) -> (u64, u64) {
+    let peers = peers.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let inbound = peers
+        .iter()
+        .filter(|p| p["inbound"].as_bool().unwrap_or(false))
+        .count() as u64;
+    (inbound, peers.len() as u64 - inbound)
 }
 
 /// Handle -netinfo special command (shows peer connection summary)

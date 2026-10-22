@@ -80,39 +80,6 @@ pub struct AddedNode {
     pub connecting: bool,
 }
 
-/// Statistics for a connected peer (for RPC getpeerinfo)
-#[derive(Debug, Clone)]
-pub struct PeerStatistics {
-    /// Peer ID
-    pub id: PeerId,
-    /// Remote address
-    pub addr: SocketAddr,
-    /// Whether this is an inbound connection
-    pub inbound: bool,
-    /// Connection establishment time (seconds since epoch)
-    pub conntime: u64,
-    /// Last message sent time (seconds since epoch)
-    pub lastsend: u64,
-    /// Last message received time (seconds since epoch)
-    pub lastrecv: u64,
-    /// Bytes sent to this peer
-    pub bytessent: u64,
-    /// Bytes received from this peer
-    pub bytesrecv: u64,
-    /// Last ping round-trip time in seconds (None if no pong received yet)
-    pub pingtime: Option<f64>,
-    /// Ping wait time in seconds (time since ping sent, waiting for pong)
-    pub pingwait: Option<f64>,
-    /// Services offered by the peer
-    pub services: u64,
-    /// Protocol version
-    pub version: u32,
-    /// User agent string
-    pub subver: String,
-    /// Starting height of the peer
-    pub startingheight: i32,
-}
-
 /// Manages connections to multiple peers
 pub struct PeerManager {
     /// Configuration
@@ -764,41 +731,6 @@ impl PeerManager {
         self.peers.write().clear();
     }
 
-    /// Get the best height among all connected peers
-    pub fn best_peer_height(&self) -> u32 {
-        // Note: We don't track heights per peer after handshake currently
-        // This would need to be updated when we receive inv messages
-        0
-    }
-
-    /// Get detailed statistics for all connected peers (for RPC getpeerinfo)
-    pub fn get_peer_statistics(&self) -> Vec<PeerStatistics> {
-        self.peers
-            .read()
-            .values()
-            .map(|handle| {
-                // Note: We only have access to basic handle info here
-                // Full statistics would require storing PeerInfo in PeerManager
-                PeerStatistics {
-                    id: handle.id,
-                    addr: handle.addr,
-                    inbound: handle.inbound,
-                    conntime: 0, // Would need to track connection time
-                    lastsend: 0,
-                    lastrecv: 0,
-                    bytessent: 0, // Updated below via accessor
-                    bytesrecv: 0, // Updated below via accessor
-                    pingtime: None,
-                    pingwait: None,
-                    services: 0,
-                    version: 0,
-                    subver: String::new(),
-                    startingheight: 0,
-                }
-            })
-            .collect()
-    }
-
     /// Get network traffic totals across all peers
     ///
     /// Returns (total_bytes_sent, total_bytes_received)
@@ -1286,13 +1218,6 @@ mod tests {
         let (sent, recv) = pm.get_net_totals();
         assert_eq!(sent, 0);
         assert_eq!(recv, 0);
-    }
-
-    #[test]
-    fn test_peer_statistics_empty() {
-        let pm = PeerManager::new(PeerManagerConfig::default());
-        let stats = pm.get_peer_statistics();
-        assert!(stats.is_empty());
     }
 
     #[test]
