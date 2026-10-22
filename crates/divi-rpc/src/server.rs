@@ -1664,7 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_without_credentials_is_never_open() {
-        // IR-44: no rpcuser/rpcpassword must not mean an unauthenticated RPC
+        // no rpcuser/rpcpassword must not mean an unauthenticated RPC
         for (user, pass) in [(None, None), (Some("alice"), None), (Some(""), Some(""))] {
             let (server, _dir) = create_test_server();
             let config = RpcConfig {

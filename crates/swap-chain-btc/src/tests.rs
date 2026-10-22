@@ -41,7 +41,7 @@ fn backend(urls: Vec<String>, key: [u8; 32]) -> BtcBackend {
 
 #[test]
 fn regtest_network_is_supported() {
-    // IR-46: regtest maps to bcrt1 addresses and a local Esplora
+    // regtest maps to bcrt1 addresses and a local Esplora
     let key = SecretKey::from_slice(&MAKER_KEY).unwrap();
     let b = BtcBackend::for_network("regtest", key, FeePolicy::Fixed(1)).unwrap();
     assert!(

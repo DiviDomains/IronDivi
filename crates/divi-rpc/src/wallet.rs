@@ -4342,7 +4342,7 @@ mod tests {
 
     #[test]
     fn sendrawtransaction_non_final_is_rejected_with_26() {
-        // IR-41: Divi Core answers -26 "64: non-final"; other submit failures stay -25
+        // Divi Core answers -26 "64: non-final"; other submit failures stay -25
         use divi_primitives::transaction::{TxIn, TxOut};
         let rpc = create_test_wallet_rpc();
         rpc.set_tx_submit(Arc::new(
@@ -5080,7 +5080,7 @@ mod tests {
     }
 }
 
-/// Regressions for send checks and wallet unlock state (IR-14 and later).
+/// Regressions for send checks and wallet unlock state.
 /// Only public RPC entry points are used, so the same tests run on older trees.
 #[cfg(test)]
 mod send_unlock_regression {

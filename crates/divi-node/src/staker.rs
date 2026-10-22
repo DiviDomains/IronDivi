@@ -2067,7 +2067,7 @@ mod tests {
 
     #[test]
     fn test_stake_split_above_threshold() {
-        // IR-43: Divi Core splits value + reward above -stakesplitthreshold
+        // Divi Core splits value + reward above -stakesplitthreshold
         // into credit / 2 and the remainder, both to the kernel's script.
         let kernel = coin(1, 0, 30_000, 7);
         let credit = Amount::from_sat(30_000 * 100_000_000 + 456_00000001);

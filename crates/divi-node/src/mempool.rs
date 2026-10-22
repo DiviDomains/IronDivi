@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_non_final_time_locked_tx_rejected() {
-        // IR-41: a tx time-locked far in the future with a non-final input
+        // a tx time-locked far in the future with a non-final input
         // must not enter the mempool (Divi Core: -26 "64: non-final").
         let mempool = Mempool::new(test_config());
         let tx = locked_tx([7u8; 32], 4_000_000_000, 0);

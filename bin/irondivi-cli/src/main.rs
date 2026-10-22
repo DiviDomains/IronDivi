@@ -1254,7 +1254,7 @@ mod endpoint_tests {
 
     #[test]
     fn cookie_in_irondivid_datadir_is_used() {
-        // IR-44: irondivid writes <datadir>/.cookie; the CLI must find it with
+        // irondivid writes <datadir>/.cookie; the CLI must find it with
         // the same --datadir and no credentials.
         let home = tempfile::tempdir().unwrap();
         let datadir = home.path().join("node");

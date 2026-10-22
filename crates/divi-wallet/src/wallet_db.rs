@@ -4475,7 +4475,7 @@ mod tests {
             });
         }
 
-        /// IR-07: a manager's registered vault output is never part of the
+        /// a manager's registered vault output is never part of the
         /// plain spendable set, so ordinary coin selection cannot pick it.
         #[test]
         fn manager_vault_output_is_not_spendable() {
@@ -4504,7 +4504,7 @@ mod tests {
                 .all(|u| !divi_script::is_staking_vault_script(&u.script_pubkey)));
         }
 
-        /// IR-07: removevault on the manager drops the vault outputs, and the
+        /// removevault on the manager drops the vault outputs, and the
         /// drop survives a restart. A wallet written by 0.2.6 (vault removed,
         /// outputs left behind) is cleaned when it is opened.
         #[test]
@@ -4540,7 +4540,7 @@ mod tests {
             assert_eq!(wallet.get_balance(), Amount::ZERO);
         }
 
-        /// IR-07: a wallet left by 0.2.6 removevault (metadata gone, the vault
+        /// a wallet left by 0.2.6 removevault (metadata gone, the vault
         /// output still stored) drops that output when it is opened.
         #[test]
         fn open_drops_vault_outputs_left_by_old_removevault() {
@@ -4577,7 +4577,7 @@ mod tests {
             assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
         }
 
-        /// IR-11: the owner key alone makes a vault output ours (registered
+        /// the owner key alone makes a vault output ours (registered
         /// or not), outside the plain spendable set and not stakeable.
         #[test]
         fn owner_key_alone_tracks_vault_as_owned() {

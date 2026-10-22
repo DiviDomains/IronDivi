@@ -264,7 +264,7 @@ fn error_message(e: divi_rpc::Error) -> String {
     }
 }
 
-// ---------------------------------------------------------------- IR-07
+// ----------------------------------------------------------------
 
 /// A manager with a registered vault can still spend its own plain coins:
 /// coin selection must never pick the vault output it can only stake.
@@ -361,7 +361,7 @@ fn manager_listunspent_vault_not_spendable() {
     }
 }
 
-// ---------------------------------------------------------------- IR-11
+// ----------------------------------------------------------------
 
 /// The owner wallet alone (no manager key, vault never registered there) sees
 /// its vault and reclaims from it. As in Divi Core, listunspent leaves vault
@@ -419,7 +419,7 @@ fn manager_cannot_reclaim_vault() {
     assert!(s.net.submitted.lock().is_empty());
 }
 
-// ---------------------------------------------------------------- IR-10
+// ----------------------------------------------------------------
 
 /// getwalletinfo and getcoinavailability as Divi Core: the owner's vaulted
 /// balance is the vault; the manager's managed vault is stakable only, in no
@@ -515,7 +515,7 @@ fn vaulted_balance_owner_and_manager_views() {
     );
 }
 
-// ---------------------------------------------------------------- IR-08
+// ----------------------------------------------------------------
 
 /// addvault on a funding output that is already spent is refused and adds no
 /// balance (seen on testnet: re-add after the owner reclaimed the vault).
@@ -589,7 +589,7 @@ fn addvault_refuses_funding_output_spent_in_mempool() {
     assert!(s.manager.get_all_vaults().is_empty());
 }
 
-// ---------------------------------------------------------------- IR-09
+// ----------------------------------------------------------------
 
 /// The owner also holds the manager key and registers the vault (a
 /// self-vault, as on testnet), so reclaim works even where the owner key
@@ -731,7 +731,7 @@ fn reclaim_unknown_fee_mode_is_refused() {
     assert!(s.net.submitted.lock().is_empty());
 }
 
-// ---------------------------------------------------------------- IR-12
+// ----------------------------------------------------------------
 
 /// debitvaultbyname pays from the named vault only, with the owner key alone,
 /// and the rest stays in that vault (Divi Core sets the change to the vault).
@@ -825,7 +825,7 @@ fn debitvaultbyname_needs_owner_key() {
     assert!(s.net.submitted.lock().is_empty());
 }
 
-// ---------------------------------------------------------------- IR-13
+// ----------------------------------------------------------------
 
 /// removevault takes the encoding alone, as Divi Core; the two-argument form
 /// still works.

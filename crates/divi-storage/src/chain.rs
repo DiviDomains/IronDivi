@@ -4171,7 +4171,7 @@ mod tests {
 
     #[test]
     fn test_block_with_non_final_tx_rejected() {
-        // IR-41 (consensus side): Divi Core rejects a block holding a tx that is
+        // Consensus side: Divi Core rejects a block holding a tx that is
         // not final at the block's height ("bad-txns-nonfinal").
         let (chain, _dir) = create_test_chain();
         let (genesis_hash, genesis_time) = get_genesis_info(&chain);
