@@ -1873,9 +1873,9 @@ impl WalletRpc {
                 RpcError::new(codes::INVALID_PARAMETER, "Could not parse vault encoding!").into(),
             );
         }
-        let tx_hash = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: tx_hash"))?;
+        // Divi Core takes the encoding only; an optional funding txid is
+        // still accepted (and echoed back) for older IronDivi callers
+        let tx_hash = params.get_str(1);
 
         let (owner_addr, manager_addr) = self.parse_vault_encoding(vault_addresses)?;
         let owner_hash = if let Some(ref addr) = owner_addr {
@@ -1909,11 +1909,15 @@ impl WalletRpc {
             return Err(RpcError::new(codes::WALLET_ERROR, "Failed to remove vault").into());
         }
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
+            "removal_status": true,
             "result": "success",
             "message": format!("Vault {} removed successfully", vault_addresses),
-            "tx_hash": tx_hash
-        }))
+        });
+        if let Some(tx_hash) = tx_hash {
+            result["tx_hash"] = json!(tx_hash);
+        }
+        Ok(result)
     }
 
     /// Get coin availability - Show available vault funds

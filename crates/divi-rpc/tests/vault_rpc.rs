@@ -821,3 +821,27 @@ fn debitvaultbyname_needs_owner_key() {
     }
     assert!(s.net.submitted.lock().is_empty());
 }
+
+// ---------------------------------------------------------------- IR-13
+
+/// removevault takes the encoding alone, as Divi Core; the two-argument form
+/// still works.
+#[test]
+fn removevault_one_and_two_arguments() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let res = rpc
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap_or_else(|e| panic!("one-argument removevault failed: {}", error_message(e)));
+    assert_eq!(res["removal_status"], json!(true), "{}", res);
+    assert!(s.manager.get_all_vaults().is_empty());
+
+    rpc.add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .unwrap();
+    let res = rpc
+        .remove_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .unwrap();
+    assert_eq!(res["removal_status"], json!(true), "{}", res);
+    assert_eq!(res["tx_hash"], json!(s.fund_txid.to_string()));
+    assert!(s.manager.get_all_vaults().is_empty());
+}
