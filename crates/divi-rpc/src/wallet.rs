@@ -316,27 +316,36 @@ impl WalletRpc {
         match self.decode_address(addr_str) {
             Ok(addr) => {
                 let wallet_guard = self.wallet.read();
-                let is_mine = wallet_guard
+                let known = wallet_guard
                     .as_ref()
                     .map(|w| w.is_mine(&addr))
                     .unwrap_or(false);
+                let is_watch_only = wallet_guard
+                    .as_ref()
+                    .map(|w| w.is_watch_only(&addr))
+                    .unwrap_or(false);
+                // Divi Core: ismine means spendable; a watched address is
+                // iswatchonly only
+                let is_mine = known && !is_watch_only;
 
                 let mut result = serde_json::json!({
                     "isvalid": true,
                     "address": addr_str,
                     "scriptPubKey": format!("76a914{}88ac", hex::encode(addr.hash.as_bytes())),
                     "ismine": is_mine,
-                    "iswatchonly": false,
+                    "iswatchonly": is_watch_only,
                     "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
                 });
 
+                if let (true, Some(wallet)) = (known, wallet_guard.as_ref()) {
+                    result["account"] = serde_json::json!(wallet.get_account(&addr));
+                }
                 if is_mine {
                     if let Some(wallet) = wallet_guard.as_ref() {
                         if let Some(key_entry) = wallet.get_key_by_address(&addr) {
                             let pubkey_hex = hex::encode(key_entry.public.to_bytes());
                             result["pubkey"] = serde_json::json!(pubkey_hex);
                             result["iscompressed"] = serde_json::json!(true);
-                            result["account"] = serde_json::json!("");
 
                             if let Some(ref hd_path) = key_entry.hd_path {
                                 result["hdkeypath"] = serde_json::json!(hd_path);
@@ -368,8 +377,14 @@ impl WalletRpc {
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
 
         let wallet = self.get_wallet()?;
-        let is_mine = wallet.is_mine(&addr);
+        let known = wallet.is_mine(&addr);
         let is_watch_only = wallet.is_watch_only(&addr);
+        let is_mine = known && !is_watch_only;
+        let labels: Vec<String> = if known {
+            vec![wallet.get_account(&addr)]
+        } else {
+            Vec::new()
+        };
 
         // Get HD key path if available
         let hd_key_path = wallet
@@ -383,7 +398,7 @@ impl WalletRpc {
             "iswatchonly": is_watch_only,
             "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
             "ischange": wallet.is_change_address(&addr),
-            "labels": [],
+            "labels": labels,
         });
 
         // Add hdkeypath field if present
@@ -3266,18 +3281,19 @@ impl WalletRpc {
             })?;
 
         info!("Imported watch-only address: {}", addr);
-
-        // Rescan blockchain if requested
-        if rescan {
-            info!("Note: Blockchain rescan for watch-only address not yet fully implemented");
-            // TODO: Trigger blockchain rescan to find historical transactions
-            // For now, only new transactions will be tracked
-        }
+        wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+        })?;
 
         // Save wallet
         wallet.save().map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
         })?;
+
+        // Past coins to the address show only after a scan, as in Divi Core
+        if rescan {
+            self.rescan_after_import(&wallet)?;
+        }
 
         Ok(serde_json::Value::Null)
     }

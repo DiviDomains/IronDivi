@@ -284,3 +284,45 @@ fn ir29_importprivkey_rescan_false_waits_for_rescanblockchain() {
     net.rpc.rescan_blockchain(&Params::None).unwrap();
     assert_eq!(net.coins_at(&addr), 25 * COIN);
 }
+
+#[test]
+fn m11g_importaddress_rescan_true_shows_past_coins_watch_only() {
+    let net = Net::new();
+    let (_key, addr) = funded_foreign_key(&net);
+
+    net.rpc
+        .import_address(&p(vec![json!(addr.to_string()), json!(""), json!(true)]))
+        .unwrap();
+    assert_eq!(
+        net.coins_at(&addr),
+        25 * COIN,
+        "rescan did not find the coin"
+    );
+    let info = net
+        .rpc
+        .validate_address(&p(vec![json!(addr.to_string())]))
+        .unwrap();
+    // Divi Core: ismine is the spendable flag, a watched address is not
+    assert_eq!(info["ismine"], false);
+    assert_eq!(info["iswatchonly"], true);
+}
+
+#[test]
+fn m11g_importaddress_rescan_false_waits_for_rescanblockchain() {
+    let net = Net::new();
+    let (_key, addr) = funded_foreign_key(&net);
+
+    net.rpc
+        .import_address(&p(vec![json!(addr.to_string()), json!("w"), json!(false)]))
+        .unwrap();
+    assert_eq!(net.coins_at(&addr), 0, "rescan=false must not scan");
+    assert_eq!(
+        net.rpc
+            .get_account(&p(vec![json!(addr.to_string())]))
+            .unwrap(),
+        "w"
+    );
+
+    net.rpc.rescan_blockchain(&Params::None).unwrap();
+    assert_eq!(net.coins_at(&addr), 25 * COIN);
+}
