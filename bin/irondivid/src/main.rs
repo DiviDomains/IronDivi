@@ -1247,6 +1247,7 @@ async fn run_daemon(
         // Use regtest-friendly staking config
         let mut staking_config = StakingConfig {
             allow_stale_tip: config.staking.stake_on_stale_tip,
+            stake_split_threshold: config.staking.split_threshold,
             ..StakingConfig::default()
         };
         if staking_config.allow_stale_tip {
@@ -1476,6 +1477,17 @@ async fn run_daemon(
                             }
                             Ok(())
                         }));
+
+                        // set/getstakesplitthreshold
+                        let staker_for_split = Arc::clone(staker_arc);
+                        rpc_server
+                            .staking()
+                            .set_split_threshold_control(Arc::new(move |new| {
+                                if let Some(threshold) = new {
+                                    staker_for_split.set_stake_split_threshold(threshold);
+                                }
+                                staker_for_split.stake_split_threshold()
+                            }));
 
                         info!("Staking RPC callbacks registered");
                     }

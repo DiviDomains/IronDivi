@@ -52,9 +52,16 @@ pub type StakingStatusCallback = Arc<dyn Fn() -> StakingInfo + Send + Sync>;
 /// Callback for enabling/disabling staking
 pub type SetStakingCallback = Arc<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
 
+/// Callback for the stake split threshold in satoshis: sets it when given a
+/// value, and returns the current one
+pub type SplitThresholdCallback = Arc<dyn Fn(Option<i64>) -> i64 + Send + Sync>;
+
+const COIN: i64 = 100_000_000;
+
 pub struct StakingRpc {
     status_callback: RwLock<Option<StakingStatusCallback>>,
     set_staking_callback: RwLock<Option<SetStakingCallback>>,
+    split_threshold_callback: RwLock<Option<SplitThresholdCallback>>,
     reserve_balance: RwLock<f64>,
 }
 
@@ -63,6 +70,7 @@ impl StakingRpc {
         StakingRpc {
             status_callback: RwLock::new(None),
             set_staking_callback: RwLock::new(None),
+            split_threshold_callback: RwLock::new(None),
             reserve_balance: RwLock::new(0.0),
         }
     }
@@ -75,6 +83,50 @@ impl StakingRpc {
     /// Set the staking control callback
     pub fn set_staking_control(&self, callback: SetStakingCallback) {
         *self.set_staking_callback.write() = Some(callback);
+    }
+
+    /// Set the stake split threshold callback
+    pub fn set_split_threshold_control(&self, callback: SplitThresholdCallback) {
+        *self.split_threshold_callback.write() = Some(callback);
+    }
+
+    fn split_threshold(&self, new_sats: Option<i64>) -> Result<i64, Error> {
+        let callback = self.split_threshold_callback.read();
+        let callback = callback
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Staking control not available"))?;
+        Ok(callback(new_sats))
+    }
+
+    /// getstakesplitthreshold - the stake split threshold in whole DIVI
+    /// (startup value from -stakesplitthreshold)
+    pub fn get_stake_split_threshold(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+        Ok(serde_json::json!(self.split_threshold(None)? / COIN))
+    }
+
+    /// setstakesplitthreshold <DIVI> - change the stake split threshold for
+    /// the running node: a stake whose value plus reward exceeds it is paid
+    /// back as two outputs; smaller coins of the same address are combined up
+    /// to half of it (Divi Core -stakesplitthreshold, whole DIVI)
+    pub fn set_stake_split_threshold(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let divi = params
+            .get(0)
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .ok_or_else(|| {
+                RpcError::invalid_params(
+                    "setstakesplitthreshold value\n\nvalue: threshold in whole DIVI (integer >= 0)",
+                )
+            })?;
+        let sats = divi
+            .checked_mul(COIN)
+            .filter(|_| divi >= 0)
+            .ok_or_else(|| RpcError::new(codes::INVALID_PARAMETER, "Threshold out of range"))?;
+        let threshold = self.split_threshold(Some(sats))? / COIN;
+        info!("Stake split threshold set to {} DIVI", threshold);
+        Ok(serde_json::json!({ "threshold": threshold }))
     }
 
     /// getstakingstatus - Get staking status (C++ Divi format)
@@ -202,6 +254,33 @@ mod tests {
         // Without callback, should return error
         let result = rpc.get_staking_status(&Params::None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stake_split_threshold_rpc() {
+        let rpc = StakingRpc::new();
+        let value = Arc::new(parking_lot::Mutex::new(20_000 * COIN));
+        let v = Arc::clone(&value);
+        rpc.set_split_threshold_control(Arc::new(move |new| {
+            let mut cur = v.lock();
+            if let Some(n) = new {
+                *cur = n;
+            }
+            *cur
+        }));
+        assert_eq!(
+            rpc.get_stake_split_threshold(&Params::None).unwrap(),
+            serde_json::json!(20_000)
+        );
+        let set = rpc
+            .set_stake_split_threshold(&Params::Array(vec![serde_json::json!(5000)]))
+            .unwrap();
+        assert_eq!(set, serde_json::json!({"threshold": 5000}));
+        assert_eq!(*value.lock(), 5000 * COIN);
+        assert!(rpc
+            .set_stake_split_threshold(&Params::Array(vec![serde_json::json!(-1)]))
+            .is_err());
+        assert!(rpc.set_stake_split_threshold(&Params::None).is_err());
     }
 
     #[test]

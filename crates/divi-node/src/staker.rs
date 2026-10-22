@@ -98,6 +98,96 @@ pub struct StakingConfig {
     /// Explicit operator override (`-stakeonstaletip`): stake even when the tip
     /// is older than `max_tip_age_secs`, e.g. to restart a stalled network.
     pub allow_stale_tip: bool,
+    /// Split the stake output in two when value + reward exceeds this, in
+    /// satoshis (Divi Core `-stakesplitthreshold`, default 20,000 DIVI)
+    pub stake_split_threshold: i64,
+    /// Add small coins of the kernel's address as extra coinstake inputs
+    /// (Divi Core `-autocombine`, default on)
+    pub autocombine: bool,
+}
+
+/// Divi Core default `-stakesplitthreshold`: 20,000 DIVI.
+pub const DEFAULT_STAKE_SPLIT_THRESHOLD: i64 = 20_000 * 100_000_000;
+
+/// Divi Core `MAX_KERNEL_COMBINED_INPUTS` (Settings.cpp): consensus limit on
+/// coinstake inputs.
+pub const MAX_COMBINED_STAKE_INPUTS: usize = 20;
+
+/// Inputs and stake outputs of a coinstake, before payee outputs are added.
+#[derive(Debug, Clone)]
+pub struct StakeOutputPlan {
+    /// Extra inputs after the kernel (combined coins)
+    pub extra_inputs: Vec<divi_wallet::WalletUtxo>,
+    /// Values of the stake outputs paying back to the kernel's script
+    pub stake_outputs: Vec<Amount>,
+}
+
+/// Divi Core `PoSTransactionCreator::SplitOrCombineUTXOS`.
+///
+/// `credit` is the kernel value plus the stake reward. Above the split
+/// threshold it is paid as two outputs (`credit / 2` and the rest). Otherwise,
+/// with `autocombine`, coins of the kernel's script from other transactions
+/// are added smallest first while the credit stays at or below half the
+/// threshold and the coinstake has at most 20 inputs. `pool` must already hold
+/// only coins Divi Core would stake with (`CWallet::SelectStakeCoins`).
+pub fn plan_stake_outputs(
+    kernel: &divi_wallet::WalletUtxo,
+    credit: Amount,
+    split_threshold: i64,
+    autocombine: bool,
+    pool: &[divi_wallet::WalletUtxo],
+) -> StakeOutputPlan {
+    let credit = credit.as_sat();
+    if credit > split_threshold {
+        let first = credit / 2;
+        return StakeOutputPlan {
+            extra_inputs: Vec::new(),
+            stake_outputs: vec![Amount::from_sat(first), Amount::from_sat(credit - first)],
+        };
+    }
+    if !autocombine {
+        return StakeOutputPlan {
+            extra_inputs: Vec::new(),
+            stake_outputs: vec![Amount::from_sat(credit)],
+        };
+    }
+
+    let combine_threshold = split_threshold / 2;
+    let mut candidates: Vec<&divi_wallet::WalletUtxo> = pool
+        .iter()
+        .filter(|c| {
+            c.script_pubkey == kernel.script_pubkey
+                && c.txid != kernel.txid
+                && c.value.as_sat() + credit <= combine_threshold
+        })
+        .collect();
+    candidates.sort_by_key(|c| c.value.as_sat());
+
+    let mut total = credit;
+    let mut extra_inputs = Vec::new();
+    for c in candidates {
+        if 1 + extra_inputs.len() >= MAX_COMBINED_STAKE_INPUTS
+            || total > combine_threshold
+            || total + c.value.as_sat() > combine_threshold
+        {
+            break;
+        }
+        total += c.value.as_sat();
+        extra_inputs.push(c.clone());
+    }
+    StakeOutputPlan {
+        extra_inputs,
+        stake_outputs: vec![Amount::from_sat(total)],
+    }
+}
+
+/// Divi Core `COINBASE_MATURITY` per network (chainparams.cpp: regtest 20).
+fn cpp_coinbase_maturity(network: divi_storage::NetworkType) -> u32 {
+    match network {
+        divi_storage::NetworkType::Mainnet => 20,
+        divi_storage::NetworkType::Testnet => 1,
+        divi_storage::NetworkType::Regtest => 20,
+    }
 }
 
 /// Default maximum tip age for staking: 24 hours (C++ `nMaxTipAge`).
@@ -131,6 +221,8 @@ impl Default for StakingConfig {
             loop_interval_ms: 500, // Try every 500ms
             max_tip_age_secs: DEFAULT_MAX_TIP_AGE_SECS,
             allow_stale_tip: false,
+            stake_split_threshold: DEFAULT_STAKE_SPLIT_THRESHOLD,
+            autocombine: true,
         }
     }
 }
@@ -238,6 +330,16 @@ impl Staker {
     /// mempool cleanup, and fee estimation happen when we self-accept our own blocks.
     pub fn set_block_connected_callback(&self, callback: BlockConnectedCallback) {
         *self.block_connected_callback.write() = Some(callback);
+    }
+
+    /// Current stake split threshold in satoshis
+    pub fn stake_split_threshold(&self) -> i64 {
+        self.config.read().stake_split_threshold
+    }
+
+    /// Change the stake split threshold (satoshis) for the next stakes
+    pub fn set_stake_split_threshold(&self, threshold: i64) {
+        self.config.write().stake_split_threshold = threshold;
     }
 
     /// Subscribe to staker events
@@ -927,7 +1029,7 @@ impl Staker {
                 );
 
                 // Create the block
-                match self.create_stake_block(&tip, candidate, timestamp, n_bits) {
+                match self.create_stake_block(&tip, candidate, timestamp, n_bits, &stakeable) {
                     Ok(block) => {
                         let block_hash = compute_block_hash(&block.header);
                         let height = current_height + 1;
@@ -1048,6 +1150,7 @@ impl Staker {
         candidate: &StakeCandidate,
         timestamp: u32,
         n_bits: u32,
+        stakeable: &[divi_wallet::WalletUtxo],
     ) -> Result<Block, String> {
         let stake_utxo = candidate.utxo();
         // Get stake reward
@@ -1151,12 +1254,21 @@ impl Staker {
 
         // Create coinstake transaction (with lottery and/or treasury payments if applicable)
         let coinstake = match candidate {
-            StakeCandidate::Regular(_) => self.create_coinstake_tx(
-                stake_utxo,
-                stake_reward,
-                lottery_payments,
-                treasury_payments,
-            )?,
+            StakeCandidate::Regular(_) => {
+                let (split_threshold, autocombine) = {
+                    let c = self.config.read();
+                    (c.stake_split_threshold, c.autocombine)
+                };
+                let pool = self.combinable_coins(stakeable, tip.height, timestamp);
+                let plan = plan_stake_outputs(
+                    stake_utxo,
+                    stake_utxo.value + stake_reward,
+                    split_threshold,
+                    autocombine,
+                    &pool,
+                );
+                self.create_coinstake_tx(stake_utxo, &plan, lottery_payments, treasury_payments)?
+            }
             StakeCandidate::Vault(_, vault_script) => self.create_vault_coinstake_tx(
                 stake_utxo,
                 vault_script,
@@ -1391,11 +1503,46 @@ impl Staker {
         Ok(tx)
     }
 
+    /// Coins that may be combined into a coinstake: the stakeable set Divi
+    /// Core's `CWallet::SelectStakeCoins` would build (depth >= 10, or coinbase
+    /// maturity for coinbase/coinstake outputs, and the minimum coin age).
+    fn combinable_coins(
+        &self,
+        stakeable: &[divi_wallet::WalletUtxo],
+        tip_height: u32,
+        now: u32,
+    ) -> Vec<divi_wallet::WalletUtxo> {
+        let maturity = cpp_coinbase_maturity(self.chain.network_type());
+        let min_coin_age = self.config.read().min_coin_age;
+        stakeable
+            .iter()
+            .filter(|u| {
+                let Some(h) = u.height else {
+                    return false;
+                };
+                let depth = (tip_height + 1).saturating_sub(h);
+                let min_depth = if u.is_coinbase || u.is_coinstake {
+                    maturity
+                } else {
+                    10
+                };
+                if depth < min_depth {
+                    return false;
+                }
+                match self.chain.get_block_index_by_height(h) {
+                    Ok(Some(idx)) => now.saturating_sub(idx.time) >= min_coin_age,
+                    _ => false,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Create the coinstake transaction
     fn create_coinstake_tx(
         &self,
         stake_utxo: &divi_wallet::WalletUtxo,
-        reward: Amount,
+        plan: &StakeOutputPlan,
         lottery_payments: Option<Vec<(Script, Amount)>>,
         treasury_payments: Option<Vec<(Script, Amount)>>,
     ) -> Result<Transaction, String> {
@@ -1404,28 +1551,36 @@ impl Staker {
             return Err("Wallet is locked".to_string());
         }
 
-        // Coinstake input: the staked UTXO
-        let input = TxIn {
-            prevout: OutPoint::new(stake_utxo.txid, stake_utxo.vout),
-            script_sig: Script::default(), // Will be signed below
-            sequence: 0xffffffff,
-        };
+        // Coinstake inputs: the kernel first, then any combined coins
+        let spent: Vec<&divi_wallet::WalletUtxo> = std::iter::once(stake_utxo)
+            .chain(plan.extra_inputs.iter())
+            .collect();
+        let inputs: Vec<TxIn> = spent
+            .iter()
+            .map(|u| TxIn {
+                prevout: OutPoint::new(u.txid, u.vout),
+                script_sig: Script::default(), // Will be signed below
+                sequence: 0xffffffff,
+            })
+            .collect();
 
         // Coinstake outputs:
         // 1. Empty marker output (value 0, empty script)
-        // 2. Stake return + reward (same address as input)
+        // 2. Stake return + reward (same address as the kernel), one or two
+        //    outputs (Divi Core stake split)
         // 3. ... (optional lottery payments for lottery blocks)
         let marker_output = TxOut {
             value: Amount::ZERO,
             script_pubkey: Script::default(),
         };
 
-        let stake_output = TxOut {
-            value: stake_utxo.value + reward,
-            script_pubkey: stake_utxo.script_pubkey.clone(),
-        };
-
-        let mut outputs = vec![marker_output, stake_output];
+        let mut outputs = vec![marker_output];
+        for value in &plan.stake_outputs {
+            outputs.push(TxOut {
+                value: *value,
+                script_pubkey: stake_utxo.script_pubkey.clone(),
+            });
+        }
 
         // Add lottery payment outputs if this is a lottery block
         if let Some(payments) = lottery_payments {
@@ -1452,20 +1607,28 @@ impl Staker {
         let mut tx = Transaction {
             version: 1,
             lock_time: 0,
-            vin: vec![input],
+            vin: inputs,
             vout: outputs,
         };
 
-        // Sign the coinstake input
+        // Sign every coinstake input
         let signer = TransactionSigner::new(self.wallet.keystore());
-        let prev_scripts = vec![stake_utxo.script_pubkey.clone()];
+        let prev_scripts: Vec<Script> = spent.iter().map(|u| u.script_pubkey.clone()).collect();
 
         let signed = signer
             .sign_all_inputs(&mut tx, &prev_scripts)
             .map_err(|e| format!("Failed to sign coinstake: {}", e))?;
 
-        if signed != 1 {
+        if signed != spent.len() {
             return Err("Failed to sign coinstake input".to_string());
+        }
+
+        if spent.len() > 1 || plan.stake_outputs.len() > 1 {
+            info!(
+                "Coinstake combines {} input(s) into {} stake output(s)",
+                spent.len(),
+                plan.stake_outputs.len()
+            );
         }
 
         Ok(tx)
@@ -1797,6 +1960,96 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.min_stake_amount, 100_000_000_000);
+    }
+
+    fn coin(tx: u8, vout: u32, divi: i64, owner: u8) -> divi_wallet::WalletUtxo {
+        divi_wallet::WalletUtxo::new(
+            Hash256::from_bytes([tx; 32]),
+            vout,
+            Amount::from_divi(divi),
+            Script::new_p2pkh(&[owner; 20]),
+            String::new(),
+        )
+    }
+
+    fn sats(values: &[Amount]) -> Vec<i64> {
+        values.iter().map(|a| a.as_sat()).collect()
+    }
+
+    #[test]
+    fn test_stake_split_above_threshold() {
+        // IR-43: Divi Core splits value + reward above -stakesplitthreshold
+        // into credit / 2 and the remainder, both to the kernel's script.
+        let kernel = coin(1, 0, 30_000, 7);
+        let credit = Amount::from_sat(30_000 * 100_000_000 + 456_00000001);
+        let plan = plan_stake_outputs(&kernel, credit, DEFAULT_STAKE_SPLIT_THRESHOLD, true, &[]);
+        assert!(plan.extra_inputs.is_empty());
+        let half = credit.as_sat() / 2;
+        assert_eq!(
+            sats(&plan.stake_outputs),
+            vec![half, credit.as_sat() - half]
+        );
+
+        // Exactly at the threshold: no split (Divi Core uses nCredit > stakeSplit)
+        let at = Amount::from_sat(DEFAULT_STAKE_SPLIT_THRESHOLD);
+        let plan = plan_stake_outputs(&kernel, at, DEFAULT_STAKE_SPLIT_THRESHOLD, true, &[]);
+        assert_eq!(sats(&plan.stake_outputs), vec![at.as_sat()]);
+    }
+
+    #[test]
+    fn test_stake_combine_small_coins_of_same_script() {
+        let threshold = 10_000 * 100_000_000; // combine up to 5,000 DIVI
+        let kernel = coin(1, 0, 1_000, 7);
+        let credit = Amount::from_divi(1_000 + 456);
+        let pool = vec![
+            kernel.clone(),
+            coin(1, 1, 10, 7),    // same tx as the kernel: never combined
+            coin(2, 0, 3_000, 7), // passes alone, too large after the smaller ones
+            coin(3, 0, 300, 7),
+            coin(4, 0, 100, 9), // other script
+            coin(5, 0, 500, 7),
+            coin(6, 0, 4_000, 7), // credit + value > threshold / 2: skipped up front
+        ];
+        let plan = plan_stake_outputs(&kernel, credit, threshold, true, &pool);
+        let combined: Vec<u8> = plan
+            .extra_inputs
+            .iter()
+            .map(|c| c.txid.as_bytes()[0])
+            .collect();
+        // Ascending: 300 (tx 3), 500 (tx 5), then 3,000 would pass 5,000: stop
+        assert_eq!(combined, vec![3, 5]);
+        assert_eq!(
+            sats(&plan.stake_outputs),
+            vec![Amount::from_divi(1_000 + 456 + 300 + 500).as_sat()]
+        );
+
+        // -autocombine=0
+        let plan = plan_stake_outputs(&kernel, credit, threshold, false, &pool);
+        assert!(plan.extra_inputs.is_empty());
+        assert_eq!(sats(&plan.stake_outputs), vec![credit.as_sat()]);
+    }
+
+    #[test]
+    fn test_stake_combine_stops_at_twenty_inputs() {
+        let kernel = coin(1, 0, 100, 7);
+        let pool: Vec<_> = (2..40).map(|t| coin(t, 0, 1, 7)).collect();
+        let plan = plan_stake_outputs(
+            &kernel,
+            Amount::from_divi(100),
+            DEFAULT_STAKE_SPLIT_THRESHOLD,
+            true,
+            &pool,
+        );
+        assert_eq!(1 + plan.extra_inputs.len(), MAX_COMBINED_STAKE_INPUTS);
+    }
+
+    #[test]
+    fn test_default_split_threshold_matches_divi_core() {
+        assert_eq!(
+            StakingConfig::default().stake_split_threshold,
+            20_000 * 100_000_000
+        );
+        assert!(StakingConfig::default().autocombine);
     }
 
     #[test]
