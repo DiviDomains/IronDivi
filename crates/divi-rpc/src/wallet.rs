@@ -825,8 +825,7 @@ impl WalletRpc {
         // Optional label parameter
         let label = params.get_str(1).map(|s| s.to_string());
 
-        // Optional rescan parameter (default true, but we don't implement rescan yet)
-        let _rescan = params.get_bool(2).unwrap_or(true);
+        let rescan = params.get_bool(2).unwrap_or(true);
 
         let wallet = self.get_wallet()?;
 
@@ -848,62 +847,44 @@ impl WalletRpc {
             )
         })?;
 
-        // Import the key
-        let address = wallet.import_key(secret, label);
-
-        info!("Imported private key for address: {}", address);
+        // As Divi Core: the label is set even for a key already held, and a key
+        // already held is not imported or rescanned again
+        let address = Address::p2pkh(&secret.public_key(), wallet.network());
+        let held = wallet.is_mine(&address) && !wallet.is_watch_only(&address);
+        if !held {
+            wallet.import_key(secret, label.clone());
+            info!("Imported private key for address: {}", address);
+        }
+        wallet
+            .set_label(&address, label.as_deref().unwrap_or(""))
+            .map_err(|e| {
+                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+            })?;
+        if held {
+            return Ok(serde_json::Value::Null);
+        }
 
         wallet.save().map_err(|e| {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
         })?;
 
-        // Note: rescan not implemented - caller should manually rescan if needed
+        // A WIF carries no birth time, so the scan starts at genesis
+        if rescan {
+            self.rescan_after_import(&wallet)?;
+        }
         Ok(serde_json::Value::Null)
     }
 
-    /// rescanblockchain - Rescan the blockchain for wallet transactions
-    ///
-    /// Arguments:
-    /// 1. start_height (numeric, optional, default=0) - block height where rescan should begin
-    /// 2. stop_height (numeric, optional, default=chain tip) - block height where rescan should end
-    ///
-    /// Returns:
-    /// {
-    ///   "start_height": n,
-    ///   "stop_height": n
-    /// }
-    pub fn rescan_blockchain(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let wallet = self.get_wallet()?;
-
-        let chain = self
-            .chain
-            .as_ref()
-            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available for rescan"))?;
-
-        // Get start height (default to 0)
-        let start_height = params.get_i64(0).unwrap_or(0).max(0) as u32;
-
-        // Get stop height (default to chain tip)
-        let current_height = chain.height();
-        let stop_height = params
-            .get_i64(1)
-            .map(|h| (h as u32).min(current_height))
-            .unwrap_or(current_height);
-
-        // Validate range
-        if start_height > stop_height {
-            return Err(RpcError::invalid_params(format!(
-                "Invalid range: start_height ({}) > stop_height ({})",
-                start_height, stop_height
-            ))
-            .into());
-        }
-
-        info!(
-            "Rescanning blockchain from height {} to {}",
-            start_height, stop_height
-        );
-
+    /// Rescan blocks `start_height..=stop_height` into the wallet and save it.
+    /// Returns the number of blocks scanned. Shared by `rescanblockchain` and the
+    /// import RPCs.
+    fn rescan_range(
+        &self,
+        wallet: &WalletDb,
+        chain: &Arc<Chain>,
+        start_height: u32,
+        stop_height: u32,
+    ) -> Result<u32, Error> {
         // Do not wipe the wallet if the first block cannot be had at all
         let fetcher = self.block_fetcher.read().clone();
         if let Some(first) = chain.get_block_index_by_height(start_height)? {
@@ -981,6 +962,66 @@ impl WalletRpc {
                 format!("Failed to save wallet after rescan: {}", e),
             )
         })?;
+        Ok(scanned)
+    }
+
+    /// Rescan the whole chain after an import, as Divi Core's
+    /// `ScanForWalletTransactions(chainActive.Genesis())`. Without a chain (a
+    /// wallet-only handler) there is nothing to scan.
+    fn rescan_after_import(&self, wallet: &WalletDb) -> Result<(), Error> {
+        let Some(chain) = self.chain.as_ref() else {
+            return Ok(());
+        };
+        let tip = chain.height();
+        info!("Rescanning blocks 0 to {} after import", tip);
+        self.rescan_range(wallet, chain, 0, tip)?;
+        Ok(())
+    }
+
+    /// rescanblockchain - Rescan the blockchain for wallet transactions
+    ///
+    /// Arguments:
+    /// 1. start_height (numeric, optional, default=0) - block height where rescan should begin
+    /// 2. stop_height (numeric, optional, default=chain tip) - block height where rescan should end
+    ///
+    /// Returns:
+    /// {
+    ///   "start_height": n,
+    ///   "stop_height": n
+    /// }
+    pub fn rescan_blockchain(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let wallet = self.get_wallet()?;
+
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available for rescan"))?;
+
+        // Get start height (default to 0)
+        let start_height = params.get_i64(0).unwrap_or(0).max(0) as u32;
+
+        // Get stop height (default to chain tip)
+        let current_height = chain.height();
+        let stop_height = params
+            .get_i64(1)
+            .map(|h| (h as u32).min(current_height))
+            .unwrap_or(current_height);
+
+        // Validate range
+        if start_height > stop_height {
+            return Err(RpcError::invalid_params(format!(
+                "Invalid range: start_height ({}) > stop_height ({})",
+                start_height, stop_height
+            ))
+            .into());
+        }
+
+        info!(
+            "Rescanning blockchain from height {} to {}",
+            start_height, stop_height
+        );
+
+        let scanned = self.rescan_range(&wallet, chain, start_height, stop_height)?;
 
         let actual_stop = if scanned > 0 {
             start_height + scanned - 1
