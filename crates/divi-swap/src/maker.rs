@@ -306,6 +306,7 @@ impl Maker {
             maker_leg_htlc: None,
             maker_leg_funding: None,
             maker_leg_scan_from: 0,
+            maker_mtp_at_lock: None,
             maker_leg_refund: None,
             preimage: None,
             taker_leg_claim: None,
@@ -578,6 +579,7 @@ impl Maker {
         r.maker_leg_htlc = Some(htlc);
         r.maker_leg_funding = Some(funding);
         r.maker_leg_scan_from = scan_from;
+        r.maker_mtp_at_lock = Some(mtp);
         self.enter(r, SwapState::MakerLocked)
     }
 
@@ -767,5 +769,6 @@ fn view_of(r: &MakerRecord) -> SwapView {
         },
         preimage: r.preimage.map(hex::encode),
         last_error: r.last_error.clone(),
+        maker_mtp_at_lock: r.maker_mtp_at_lock,
     }
 }

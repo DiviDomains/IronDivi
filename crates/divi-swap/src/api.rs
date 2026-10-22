@@ -305,6 +305,11 @@ pub struct SwapView {
     pub preimage: Option<String>,
     /// Last error the scheduler hit on this swap, for operators.
     pub last_error: Option<String>,
+    /// The maker-chain median time past the maker read when it built its lock (the locktime
+    /// is this plus `quote.maker_timeout_secs`). Optional on the wire: an older maker omits
+    /// it and the taker falls back to the tolerant floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_mtp_at_lock: Option<u32>,
 }
 
 mod hex32 {

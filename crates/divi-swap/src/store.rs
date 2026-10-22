@@ -75,6 +75,9 @@ pub struct MakerRecord {
     /// Maker-leg chain height from which to scan for the taker's claim.
     #[serde(alias = "divi_scan_from")]
     pub maker_leg_scan_from: u64,
+    /// Maker-chain MTP read when the maker-leg locktime was set; sent to the taker.
+    #[serde(default)]
+    pub maker_mtp_at_lock: Option<u32>,
     /// The signed maker-leg refund tx, once built.
     #[serde(alias = "divi_refund")]
     pub maker_leg_refund: Option<SignedTx>,
@@ -430,6 +433,7 @@ mod tests {
             maker_leg_htlc: None,
             maker_leg_funding: None,
             maker_leg_scan_from: 0,
+            maker_mtp_at_lock: None,
             maker_leg_refund: None,
             preimage: None,
             taker_leg_claim: None,

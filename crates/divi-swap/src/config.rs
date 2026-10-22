@@ -418,6 +418,70 @@ pub fn check_maker_leg_locktime(
     Ok(())
 }
 
+/// Exact maker-leg floor when the maker states the MTP it locked at (`SwapView::maker_mtp_at_lock`).
+///
+/// An honest maker sets `locktime = mtp_at_lock + maker_timeout_secs`, so the exact check is
+/// `maker_leg_locktime >= stated_mtp + maker_timeout_secs`. The stated MTP is the maker's
+/// word, so it is first bounded by what the taker can see itself (no new numbers, the same
+/// tolerance and profile MTP lag as [`check_maker_leg_locktime`]):
+///
+/// * from below: the maker locks after the taker's accept, so
+///   `stated_mtp >= taker_leg_locktime - taker_timeout_secs - accept_tolerance_secs - lag`;
+///   a smaller one would let a short lock pass the exact check by understating the MTP;
+/// * from above: MTP never runs ahead of the chain, so `stated_mtp <= observed_maker_mtp + lag`
+///   where `observed_maker_mtp` is the taker's own read of the maker chain just now.
+///
+/// Additive to [`check_maker_leg_locktime`]: a maker that also understates its MTP down to the
+/// lower bound is still bounded only by that tolerant floor.
+#[allow(clippy::too_many_arguments)]
+pub fn check_maker_leg_locktime_exact(
+    profile: Profile,
+    chains: (Chain, Chain),
+    terms: &OfferedTerms,
+    taker_leg_locktime: u32,
+    maker_leg_locktime: u32,
+    stated_mtp: u32,
+    observed_maker_mtp: u32,
+    accept_tolerance_secs: u32,
+) -> std::result::Result<(), String> {
+    let floor = SwapConfig::profile(profile);
+    let (taker_chain, maker_chain) = chains;
+    let lag = floor
+        .chain_params(taker_chain)
+        .mtp_lag_secs
+        .max(floor.chain_params(maker_chain).mtp_lag_secs) as i64;
+    let lowest = taker_leg_locktime as i64
+        - terms.taker_timeout_secs as i64
+        - accept_tolerance_secs as i64
+        - lag;
+    if (stated_mtp as i64) < lowest {
+        return Err(format!(
+            "maker's stated MTP-at-lock {stated_mtp} is implausibly low, below {lowest} \
+             (taker-leg locktime {taker_leg_locktime} - taker_timeout_secs {} - \
+             {accept_tolerance_secs}s accept tolerance - {lag}s MTP lag) of this taker's \
+             --profile {profile}; not claiming",
+            terms.taker_timeout_secs
+        ));
+    }
+    let highest = observed_maker_mtp as i64 + lag;
+    if (stated_mtp as i64) > highest {
+        return Err(format!(
+            "maker's stated MTP-at-lock {stated_mtp} is implausibly high, above {highest} \
+             (the maker chain's MTP {observed_maker_mtp} + {lag}s MTP lag) of this taker's \
+             --profile {profile}; not claiming"
+        ));
+    }
+    let exact = stated_mtp as i64 + terms.maker_timeout_secs as i64;
+    if (maker_leg_locktime as i64) < exact {
+        return Err(format!(
+            "maker-leg locktime is {maker_leg_locktime}, below the exact {exact} floor (maker's \
+             stated MTP-at-lock {stated_mtp} + maker_timeout_secs {}) of the quote; not claiming",
+            terms.maker_timeout_secs
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +866,111 @@ quote_expiry_secs = 60
                 assert!(e.contains(&(floor - 1).to_string()), "{e}");
                 assert!(e.contains(&floor.to_string()), "{e}");
                 assert!(e.contains(&format!("--profile {p}")), "{e}");
+            }
+        }
+    }
+
+    fn exact_case(p: Profile, c: Chain) -> (OfferedTerms, u32, u32, u32, u32) {
+        let f = SwapConfig::profile(p);
+        let t = OfferedTerms {
+            taker_timeout_secs: f.taker_timeout_secs,
+            maker_timeout_secs: f.maker_timeout_secs,
+            counter_confirmations: f.confirmations(c),
+            divi_confirmations: f.confirmations(Chain::Divi),
+        };
+        let lag = f
+            .chain_params(c)
+            .mtp_lag_secs
+            .max(f.chain_params(Chain::Divi).mtp_lag_secs);
+        // taker leg locked at maker-chain time `now`, maker reads its MTP a little later
+        let now = 2_000_000_000u32;
+        (t, now + t.taker_timeout_secs, now, now + 100, lag)
+    }
+
+    #[test]
+    fn maker_leg_locktime_exact_floor_at_below_above_per_profile_and_direction() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            for c in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+                // both directions: (taker chain, maker chain)
+                for pair in [(c, Chain::Divi), (Chain::Divi, c)] {
+                    let (t, tl, _, stated, _) = exact_case(p, c);
+                    let exact = stated + t.maker_timeout_secs;
+                    let chk = |ml| {
+                        check_maker_leg_locktime_exact(p, pair, &t, tl, ml, stated, stated, 1800)
+                    };
+                    chk(exact).unwrap();
+                    chk(exact + 1).unwrap();
+                    chk(exact + 10_000).unwrap();
+                    let e = chk(exact - 1).unwrap_err();
+                    assert!(e.contains("exact"), "{e}");
+                    assert!(e.contains(&(exact - 1).to_string()), "{e}");
+                    assert!(e.contains(&exact.to_string()), "{e}");
+                    // inside AA's tolerance, still refused when the MTP is stated
+                    assert!(chk(exact - 600).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maker_leg_locktime_exact_refuses_an_implausible_stated_mtp() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            for c in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+                for pair in [(c, Chain::Divi), (Chain::Divi, c)] {
+                    let (t, tl, _, stated, lag) = exact_case(p, c);
+                    let lowest = tl - t.taker_timeout_secs - 1800 - lag;
+                    // lower edge accepted, one below refused as implausibly low
+                    check_maker_leg_locktime_exact(
+                        p,
+                        pair,
+                        &t,
+                        tl,
+                        lowest + t.maker_timeout_secs,
+                        lowest,
+                        stated,
+                        1800,
+                    )
+                    .unwrap();
+                    let e = check_maker_leg_locktime_exact(
+                        p,
+                        pair,
+                        &t,
+                        tl,
+                        u32::MAX,
+                        lowest - 1,
+                        stated,
+                        1800,
+                    )
+                    .unwrap_err();
+                    assert!(e.contains("implausibly low"), "{e}");
+                    assert!(e.contains(&(lowest - 1).to_string()), "{e}");
+                    // upper edge accepted, one above refused as implausibly high
+                    let highest = stated + lag;
+                    check_maker_leg_locktime_exact(
+                        p,
+                        pair,
+                        &t,
+                        tl,
+                        highest + t.maker_timeout_secs,
+                        highest,
+                        stated,
+                        1800,
+                    )
+                    .unwrap();
+                    let e = check_maker_leg_locktime_exact(
+                        p,
+                        pair,
+                        &t,
+                        tl,
+                        u32::MAX,
+                        highest + 1,
+                        stated,
+                        1800,
+                    )
+                    .unwrap_err();
+                    assert!(e.contains("implausibly high"), "{e}");
+                    assert!(e.contains(&(highest + 1).to_string()), "{e}");
+                }
             }
         }
     }
