@@ -531,9 +531,7 @@ fn combine_multisig(
         push_data(&mut out, sig);
         have += 1;
     }
-    for _ in have..required {
-        out.push(0x00);
-    }
+    out.resize(out.len() + (required - have), 0x00);
     Script::from_bytes(out)
 }
 
