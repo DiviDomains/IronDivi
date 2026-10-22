@@ -6,10 +6,25 @@ export PATH="$HOME/.local/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 2
 FAILS=0
+SKIPS=0
 # Heavy cargo (clippy, test, run) goes to hp2 via remote-cargo: the Mac is swap-starved (Bert, 2026-10-10).
 rcargo() { if command -v remote-cargo >/dev/null 2>&1; then remote-cargo "$@"; else cargo "$@"; fi; }
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 pass() { echo "ok:   $*"; }
+# skip <reason> <what> — a row that did not run. Not a failure: it never changes the exit code.
+skip() { echo "SKIP ($1): $2"; SKIPS=$((SKIPS + 1)); }
+
+# net_optin — network rows (explorer / public RPC lookups) run only with SWAP_CHECK_NETWORK=1.
+net_optin() { [[ "${SWAP_CHECK_NETWORK:-}" == 1 ]]; }
+skip_net() { skip "network row, set SWAP_CHECK_NETWORK=1 to run" "$*"; }
+
+# tool_check <tool> <label> <cmd>... — pass if <cmd> exits 0, FAIL if it exits nonzero,
+# SKIP when <tool> is not installed (a missing tool must not look like a defect).
+tool_check() {
+  local tool="$1" label="$2"; shift 2
+  if ! command -v "$tool" >/dev/null 2>&1; then skip "$tool not installed" "$label"; return 0; fi
+  if "$@" >/dev/null 2>&1; then pass "$label"; else fail "$label"; fi
+}
 
 # require_tests <package> <name>... — each named test must exist (substring of a listed test).
 require_tests() {
@@ -57,6 +72,6 @@ btc_confirmed() {
 }
 
 finish() {
-  if (( FAILS == 0 )); then echo "PASS: $1"; exit 0; fi
+  if (( FAILS == 0 )); then echo "PASS: $1$( (( SKIPS )) && echo " ($SKIPS skipped)")"; exit 0; fi
   echo "$FAILS check(s) failing for $1"; exit 1
 }

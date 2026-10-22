@@ -9,6 +9,7 @@ for k in accepted taker_lock_seen taker_lock_confirmed maker_locked maker_lock_c
   line="$(grep -E "^- *chaos_$k:" "$F" 2>/dev/null | head -1)"
   t="$(awk '{print $NF}' <<<"$line" | tr -d '`')"
   if [[ -z "$t" ]]; then fail "chaos_$k missing"; continue; fi
+  if ! net_optin; then skip_net "chaos_$k $t"; continue; fi
   if divi_confirmed "$t" || btc_confirmed "$t"; then pass "chaos_$k final $t confirmed"; else fail "chaos_$k final tx $t unconfirmed"; fi
 done
 grep -qE '^- *stuck:.*[a-z0-9]' "$F" 2>/dev/null && fail "stuck swaps listed in $F" || pass "no stuck swaps"

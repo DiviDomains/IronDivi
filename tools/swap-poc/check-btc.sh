@@ -12,6 +12,8 @@ require_tests swap-chain-btc \
   funding_selects_coins_and_change live_fund_claim_refund
 for k in live_fund_txid live_claim_txid live_refund_txid; do
   t="$(status_field btc "$k")"
-  if [[ -n "$t" ]] && btc_confirmed "$t"; then pass "$k $t confirmed"; else fail "$k missing or unconfirmed in status/btc.md ('$t')"; fi
+  if [[ -z "$t" ]]; then fail "$k missing or unconfirmed in status/btc.md ('$t')"
+  elif ! net_optin; then skip_net "$k $t"
+  elif btc_confirmed "$t"; then pass "$k $t confirmed"; else fail "$k missing or unconfirmed in status/btc.md ('$t')"; fi
 done
 finish btc

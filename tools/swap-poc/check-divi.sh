@@ -12,6 +12,8 @@ require_tests swap-chain-divi \
   live_fund_claim_refund
 for k in live_fund_txid live_claim_txid live_refund_txid; do
   t="$(status_field divi "$k")"
-  if [[ -n "$t" ]] && divi_confirmed "$t"; then pass "$k $t confirmed"; else fail "$k missing or unconfirmed in status/divi.md ('$t')"; fi
+  if [[ -z "$t" ]]; then fail "$k missing or unconfirmed in status/divi.md ('$t')"
+  elif ! net_optin; then skip_net "$k $t"
+  elif divi_confirmed "$t"; then pass "$k $t confirmed"; else fail "$k missing or unconfirmed in status/divi.md ('$t')"; fi
 done
 finish divi

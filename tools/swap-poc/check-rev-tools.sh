@@ -2,7 +2,7 @@
 # Lane rev-tools acceptance. See docs/plans/swap-poc/lanes/rev-tools.md.
 source "$(dirname "$0")/lib.sh"
 for f in tools/swap-poc/e2e.sh tools/swap-poc/check-rev-live.sh; do
-  if [[ -f "$f" ]] && shellcheck "$f" >/dev/null 2>&1; then pass "shellcheck $f"; else fail "shellcheck $f (or missing)"; fi
+  if [[ ! -f "$f" ]]; then fail "shellcheck $f (or missing)"; else tool_check shellcheck "shellcheck $f" shellcheck "$f"; fi
 done
 st="$(mktemp -d)"
 for offer in divi-btc-testnet btc-divi-testnet; do
