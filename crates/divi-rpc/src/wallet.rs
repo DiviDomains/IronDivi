@@ -134,7 +134,31 @@ fn bare_txid(tx: &Transaction) -> Hash256 {
 }
 
 /// Callback for submitting transactions to the mempool and network
-pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
+pub type TxSubmitCallback =
+    Arc<dyn Fn(Transaction) -> Result<Hash256, TxSubmitError> + Send + Sync>;
+
+/// Why the node refused a transaction handed to the submit callback
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxSubmitError {
+    /// Refused by the mempool with Divi Core's reject code and reason;
+    /// RPC -26 "<code>: <reason>"
+    Rejected { code: u8, reason: String },
+    /// An input is neither in the chain nor the mempool; RPC -26
+    /// "Unknown inputs being spent"
+    UnknownInputs,
+    /// Any other failure; RPC -25 with the message
+    Failed(String),
+}
+
+impl From<String> for TxSubmitError {
+    fn from(message: String) -> Self {
+        TxSubmitError::Failed(message)
+    }
+}
+
+/// Divi Core DEFAULT_TRANSACTION_MAXFEE: sendrawtransaction refuses a higher fee
+/// unless allowhighfees is given
+const MAX_TX_FEE: Amount = Amount::from_sat(100 * 100_000_000);
 
 /// Who pays the fee when spending from a vault (Divi Core's TransactionFeeMode)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +310,16 @@ impl WalletRpc {
             RpcError::new(codes::MISC_ERROR, "Transaction submission not configured")
         })?;
 
-        callback(tx).map_err(|e| RpcError::new(codes::VERIFY_ERROR, e).into())
+        // Divi Core sendrawtransaction (rpcrawtransaction.cpp) codes and texts
+        callback(tx).map_err(|e| match e {
+            TxSubmitError::Rejected { code, reason } => {
+                RpcError::new(codes::VERIFY_REJECTED, format!("{}: {}", code, reason)).into()
+            }
+            TxSubmitError::UnknownInputs => {
+                RpcError::new(codes::VERIFY_REJECTED, "Unknown inputs being spent").into()
+            }
+            TxSubmitError::Failed(message) => RpcError::new(codes::VERIFY_ERROR, message).into(),
+        })
     }
 
     /// getnewaddress - Generate a new receiving address
@@ -1360,6 +1393,39 @@ impl WalletRpc {
         })?;
 
         let txid = tx.txid();
+        let allow_high_fees = params.get_bool(1).unwrap_or(false);
+
+        if let Some(ref chain) = self.chain {
+            // Divi Core: an output of the txid in the UTXO set means it is
+            // already confirmed
+            let in_chain = (0..tx.vout.len() as u32)
+                .any(|n| matches!(chain.get_utxo(&OutPoint::new(txid, n)), Ok(Some(_))));
+            if in_chain {
+                return Err(RpcError::new(
+                    codes::VERIFY_ALREADY_IN_CHAIN,
+                    "transaction already in block chain",
+                )
+                .into());
+            }
+            // Fee cap. Inputs still in the mempool are not visible here; such a
+            // transaction is checked by the mempool only.
+            let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
+                .get_utxo(&i.prevout)
+            {
+                Ok(Some(u)) => Some(sum + u.value),
+                _ => None,
+            });
+            if let Some(inputs) = inputs {
+                let outputs = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
+                if !allow_high_fees && inputs - outputs > MAX_TX_FEE {
+                    return Err(RpcError::new(
+                        codes::VERIFY_REJECTED,
+                        "Fees being paid are in excess of maximum fee, but fee override is not provided",
+                    )
+                    .into());
+                }
+            }
+        }
 
         // Submit to mempool and broadcast
         self.submit_transaction(tx)?;
@@ -5139,6 +5205,50 @@ mod send_unlock_regression {
             tx.size(),
             min
         );
+    }
+
+    /// Mempool refusals reach the RPC as Divi Core's sendrawtransaction errors
+    #[test]
+    fn ir51_submit_errors_use_divi_core_codes() {
+        let cases = [
+            (
+                TxSubmitError::Rejected {
+                    code: 64,
+                    reason: "dust".into(),
+                },
+                (codes::VERIFY_REJECTED, "64: dust"),
+            ),
+            (
+                TxSubmitError::Rejected {
+                    code: 66,
+                    reason: "insufficient fee".into(),
+                },
+                (codes::VERIFY_REJECTED, "66: insufficient fee"),
+            ),
+            (
+                TxSubmitError::UnknownInputs,
+                (codes::VERIFY_REJECTED, "Unknown inputs being spent"),
+            ),
+            (
+                TxSubmitError::Failed("boom".into()),
+                (codes::VERIFY_ERROR, "boom"),
+            ),
+        ];
+        for (error, (want_code, want_message)) in cases {
+            let (rpc, _) = rpc_on(Network::Testnet);
+            rpc.set_tx_submit(Arc::new(move |_tx: Transaction| Err(error.clone())));
+            let tx = Transaction {
+                version: 1,
+                vin: vec![],
+                vout: vec![],
+                lock_time: 0,
+            };
+            let hex = hex::encode(serialize(&tx));
+            assert_eq!(
+                err(rpc.send_raw_transaction(&p(vec![json!(hex)]))),
+                (want_code, want_message.to_string())
+            );
+        }
     }
 
     #[test]

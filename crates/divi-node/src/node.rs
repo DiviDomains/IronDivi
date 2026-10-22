@@ -1006,16 +1006,10 @@ impl Node {
                         if (input.prevout.vout as usize) < mempool_entry.tx.vout.len() {
                             total_input += mempool_entry.tx.vout[input.prevout.vout as usize].value;
                         } else {
-                            return Err(NodeError::TransactionValidation(format!(
-                                "Input {}:{} output index out of bounds",
-                                input.prevout.txid, input.prevout.vout
-                            )));
+                            return Err(NodeError::MissingInputs);
                         }
                     } else {
-                        return Err(NodeError::TransactionValidation(format!(
-                            "Input {}:{} not found in UTXO set",
-                            input.prevout.txid, input.prevout.vout
-                        )));
+                        return Err(NodeError::MissingInputs);
                     }
                 }
                 Err(e) => {
@@ -1097,16 +1091,10 @@ impl Node {
                         if (input.prevout.vout as usize) < mempool_entry.tx.vout.len() {
                             total_input += mempool_entry.tx.vout[input.prevout.vout as usize].value;
                         } else {
-                            return Err(NodeError::TransactionValidation(format!(
-                                "Input {}:{} output index out of bounds",
-                                input.prevout.txid, input.prevout.vout
-                            )));
+                            return Err(NodeError::MissingInputs);
                         }
                     } else {
-                        return Err(NodeError::TransactionValidation(format!(
-                            "Input {}:{} not found in UTXO set",
-                            input.prevout.txid, input.prevout.vout
-                        )));
+                        return Err(NodeError::MissingInputs);
                     }
                 }
                 Err(e) => {
@@ -1642,10 +1630,6 @@ mod tests {
         };
 
         let result = node.validate_transaction(&tx);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in UTXO set"));
+        assert!(matches!(result, Err(NodeError::MissingInputs)));
     }
 }

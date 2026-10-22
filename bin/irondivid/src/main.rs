@@ -1456,8 +1456,8 @@ async fn run_daemon(
                             &chain_for_submit,
                             &mempool_for_submit,
                         )
-                        .map_err(|e| format!("Mempool rejected: {}", e))?;
-                        mempool_for_submit.add(tx, fee).map_err(|e| format!("Mempool rejected: {}", e))?;
+                        .map_err(submit_error)?;
+                        mempool_for_submit.add(tx, fee).map_err(submit_error)?;
 
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();
@@ -1566,6 +1566,17 @@ async fn run_daemon(
 
     info!("Node stopped");
     Ok(())
+}
+
+/// How a mempool refusal of a locally submitted transaction reaches the RPC
+fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
+    use divi_node::NodeError;
+    use divi_rpc::TxSubmitError;
+    match e {
+        NodeError::TxRejected { code, reason } => TxSubmitError::Rejected { code, reason },
+        NodeError::MissingInputs => TxSubmitError::UnknownInputs,
+        other => TxSubmitError::Failed(other.to_string()),
+    }
 }
 
 /// getstakingstatus/getmintinginfo data. Each field has the meaning Divi Core's

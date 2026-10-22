@@ -73,5 +73,5 @@ pub use server::{
     start_server_with_wallet_peer_and_staker, LogConfigInfo, RpcConfig, RpcServer,
 };
 pub use staking::{StakingInfo, StakingRpc};
-pub use wallet::WalletRpc;
+pub use wallet::{TxSubmitError, WalletRpc};
 pub use websocket::{ws_handler, Notification, NotificationHub, WsState};
