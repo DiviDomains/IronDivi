@@ -253,6 +253,10 @@ impl Node {
         // Create chain Arc for sharing
         let chain = Arc::new(chain);
 
+        // Height locks are checked against the chain tip on every path into the mempool
+        let chain_for_mempool = Arc::clone(&chain);
+        mempool.set_tip_height_provider(Arc::new(move || chain_for_mempool.height()));
+
         // Create block sync manager
         let block_sync = BlockSync::new(Arc::clone(&chain), Arc::clone(&peer_manager));
 

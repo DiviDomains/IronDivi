@@ -67,7 +67,7 @@ struct Cli {
     /// DIVI height to start scanning for the taker's coins when the wallet has no cursor yet.
     #[arg(long, global = true)]
     divi_scan_from: Option<u64>,
-    /// BTC test network: `signet` or `testnet` (testnet3).
+    /// BTC test network: `signet`, `testnet` (testnet3) or `regtest` (local Esplora).
     #[arg(
         long,
         global = true,

@@ -265,7 +265,9 @@ fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
     let key = resolve_key(&cfg.key, "btc")?;
     let mut endpoints = vec![cfg.esplora_url.clone()];
     endpoints.extend(cfg.fallback_esplora_url.clone());
-    let backend = BtcBackend::new(endpoints, key, FeePolicy::default(), RetryPolicy::default())?;
+    let network = swap_chain_btc::btc_network(&cfg.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let backend = BtcBackend::new(endpoints, key, FeePolicy::default(), RetryPolicy::default())?
+        .with_network(network);
     tracing::info!(address = %backend.address(), network = %cfg.network, "btc backend ready");
     Ok(Arc::new(backend))
 }

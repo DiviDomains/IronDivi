@@ -1419,6 +1419,8 @@ async fn run_daemon(
                                 }
                             }
                         }
+                        // The tip may now be lower: drop what can no longer be mined
+                        mempool_for_orphans.remove_non_final();
                     },
                 ));
             }
@@ -1512,6 +1514,7 @@ async fn run_daemon(
         // Use regtest-friendly staking config
         let mut staking_config = StakingConfig {
             allow_stale_tip: config.staking.stake_on_stale_tip,
+            stake_split_threshold: config.staking.split_threshold,
             ..StakingConfig::default()
         };
         if staking_config.allow_stale_tip {
@@ -1598,11 +1601,28 @@ async fn run_daemon(
         None
     };
 
-    // Start RPC server
+    // Start RPC server. RPC always requires authentication: without a complete
+    // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie
+    // (mode 0600) for local clients; `_rpc_cookie` removes it when we return.
+    let (rpc_user, rpc_password, _rpc_cookie) = divi_rpc::resolve_rpc_auth(
+        config.rpc.username.as_deref(),
+        config.rpc.password.as_deref(),
+        &config.data_dir,
+    )
+    .with_context(|| format!("Failed to write RPC cookie in {:?}", config.data_dir))?;
+    match &_rpc_cookie {
+        Some(cookie) => {
+            if config.rpc.username.is_some() || config.rpc.password.is_some() {
+                warn!("Only one of rpcuser/rpcpassword is set; using cookie authentication");
+            }
+            info!("RPC cookie authentication: {:?}", cookie.path());
+        }
+        None => info!("RPC authentication: rpcuser/rpcpassword"),
+    }
     let rpc_config = RpcConfig {
         bind_address: config.rpc.socket_addr(),
-        username: config.rpc.username.clone(),
-        password: config.rpc.password.clone(),
+        username: Some(rpc_user),
+        password: Some(rpc_password),
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -1726,6 +1746,17 @@ async fn run_daemon(
                             Ok(())
                         }));
 
+                        // set/getstakesplitthreshold
+                        let staker_for_split = Arc::clone(staker_arc);
+                        rpc_server
+                            .staking()
+                            .set_split_threshold_control(Arc::new(move |new| {
+                                if let Some(threshold) = new {
+                                    staker_for_split.set_stake_split_threshold(threshold);
+                                }
+                                staker_for_split.stake_split_threshold()
+                            }));
+
                         info!("Staking RPC callbacks registered");
                     }
                 }
@@ -1805,6 +1836,10 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
     match e {
         NodeError::TxRejected { code, reason } => TxSubmitError::Rejected { code, reason },
         NodeError::MissingInputs => TxSubmitError::UnknownInputs,
+        NodeError::NonFinal => TxSubmitError::Rejected {
+            code: divi_node::error::reject::NONSTANDARD,
+            reason: "non-final".to_string(),
+        },
         other => TxSubmitError::Failed(other.to_string()),
     }
 }

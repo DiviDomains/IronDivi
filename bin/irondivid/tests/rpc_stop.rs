@@ -29,7 +29,7 @@ fn rpc(port: u16, method: &str) -> Option<String> {
         .ok()?;
     let body = format!(r#"{{"jsonrpc":"1.0","id":1,"method":"{method}","params":[]}}"#);
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -62,6 +62,8 @@ fn rpc_stop_exits_the_daemon() {
         .args(["--rpcport", &rpc_port.to_string()])
         .args(["--port", &p2p_port.to_string()])
         .args(["--bind", "127.0.0.1", "--staking=false"])
+        // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
+        .args(["--rpcuser", "test", "--rpcpassword", "test"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

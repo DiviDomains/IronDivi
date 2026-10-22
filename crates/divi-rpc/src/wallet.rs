@@ -4341,6 +4341,45 @@ mod tests {
     }
 
     #[test]
+    fn sendrawtransaction_non_final_is_rejected_with_26() {
+        // IR-41: Divi Core answers -26 "64: non-final"; other submit failures stay -25
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let rpc = create_test_wallet_rpc();
+        rpc.set_tx_submit(Arc::new(
+            |_tx: Transaction| -> Result<Hash256, TxSubmitError> {
+                Err(TxSubmitError::Rejected {
+                    code: 64,
+                    reason: "non-final".to_string(),
+                })
+            },
+        ));
+        let tx = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([7; 32]), 0),
+                Script::new(),
+                0,
+            )],
+            vout: vec![TxOut::new(
+                divi_primitives::amount::Amount::from_sat(1000),
+                Script::new(),
+            )],
+            lock_time: 4_000_000_000,
+        };
+        let hex = hex::encode(divi_primitives::serialize::serialize(&tx));
+        let err = rpc
+            .send_raw_transaction(&Params::Array(vec![serde_json::json!(hex)]))
+            .unwrap_err();
+        match err {
+            Error::Rpc(r) => {
+                assert_eq!(r.code, codes::VERIFY_REJECTED);
+                assert_eq!(r.message, "64: non-final");
+            }
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn error_code_order_matches_cpp() {
         let rpc = create_test_wallet_rpc();
         let p = |v: &[&str]| Params::Array(v.iter().map(|s| serde_json::json!(s)).collect());

@@ -43,15 +43,30 @@ pub const MEMPOOL_TESTNET: &str = "https://mempool.space/testnet/api";
 /// Testnet3 secondary Esplora endpoint.
 pub const BLOCKSTREAM_TESTNET: &str = "https://blockstream.info/testnet/api";
 
-/// Default Esplora endpoints (primary first) for a test network name: `signet` or `testnet`
-/// (testnet3). Both use `tb1` addresses, so only the endpoints differ.
-pub fn esplora_endpoints(network: &str) -> Result<Vec<String>> {
+/// Regtest has no public Esplora: a local one (electrs' regtest HTTP default port).
+pub const LOCAL_REGTEST_ESPLORA: &str = "http://127.0.0.1:3002";
+
+/// Bitcoin network for a test network name: `signet`, `testnet` (testnet3) or `regtest`.
+/// Mainnet is not accepted.
+pub fn btc_network(network: &str) -> Result<Network> {
     match network {
-        "signet" => Ok(vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()]),
-        "testnet" => Ok(vec![MEMPOOL_TESTNET.into(), BLOCKSTREAM_TESTNET.into()]),
+        "signet" => Ok(Network::Signet),
+        "testnet" => Ok(Network::Testnet),
+        "regtest" => Ok(Network::Regtest),
         other => Err(SwapError::InvalidParams(format!(
-            "btc network {other:?} unsupported: signet or testnet"
+            "btc network {other:?} unsupported: signet, testnet or regtest"
         ))),
+    }
+}
+
+/// Default Esplora endpoints (primary first) for a test network name: `signet`, `testnet`
+/// (testnet3) or `regtest` (a local Esplora). Signet and testnet both use `tb1` addresses;
+/// regtest uses `bcrt1`.
+pub fn esplora_endpoints(network: &str) -> Result<Vec<String>> {
+    match btc_network(network)? {
+        Network::Signet => Ok(vec![MEMPOOL_SIGNET.into(), BLOCKSTREAM_SIGNET.into()]),
+        Network::Testnet => Ok(vec![MEMPOOL_TESTNET.into(), BLOCKSTREAM_TESTNET.into()]),
+        _ => Ok(vec![LOCAL_REGTEST_ESPLORA.into()]),
     }
 }
 
@@ -120,17 +135,25 @@ impl BtcBackend {
         Self::for_network("signet", key, fees)
     }
 
-    /// Default endpoints for `signet` or `testnet` (see [`esplora_endpoints`]).
+    /// Default endpoints for `signet`, `testnet` or `regtest` (see [`esplora_endpoints`]).
     pub fn for_network(network: &str, key: SecretKey, fees: FeePolicy) -> Result<Self> {
-        Self::new(
+        Ok(Self::new(
             esplora_endpoints(network)?,
             key,
             fees,
             RetryPolicy::default(),
-        )
+        )?
+        .with_network(btc_network(network)?))
     }
 
-    /// The key's P2WPKH `tb1` address (same string on signet and testnet3; where funding coins live and spends land).
+    /// Use the address encoding of `network` (`new` defaults to signet's `tb1`).
+    pub fn with_network(mut self, network: Network) -> Self {
+        self.address = Address::p2wpkh(&self.pubkey, network);
+        self
+    }
+
+    /// The key's P2WPKH address: `tb1` on signet and testnet3 (same string), `bcrt1` on
+    /// regtest; where funding coins live and spends land.
     pub fn address(&self) -> &Address {
         &self.address
     }

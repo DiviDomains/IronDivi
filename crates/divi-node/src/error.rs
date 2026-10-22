@@ -76,6 +76,10 @@ pub enum NodeError {
     /// A transaction spends a coin that is neither in the chain nor the mempool
     #[error("missing inputs")]
     MissingInputs,
+
+    /// Transaction cannot be mined in the next block (Divi Core reject code 64)
+    #[error("64: non-final")]
+    NonFinal,
 }
 
 /// Divi Core reject codes (defaultValues.h)

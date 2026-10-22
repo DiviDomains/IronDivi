@@ -64,7 +64,7 @@ fn try_rpc(port: u16, method: &str, params: &Value) -> Option<Value> {
         .ok()?;
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -100,6 +100,8 @@ impl Daemon {
             .args(["--rpcport", &rpc_port.to_string()])
             .args(["--port", &free_port().to_string()])
             .args(["--bind", "127.0.0.1", "--staking=false"])
+            // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
+            .args(["--rpcuser", "test", "--rpcpassword", "test"])
             .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
             .env("WALLET_LOOKAHEAD", "5")
             .stdout(Stdio::null())
