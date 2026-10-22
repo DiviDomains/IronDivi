@@ -348,8 +348,12 @@ pub struct P2pConfig {
     #[serde(default)]
     pub listen: Option<bool>,
 
-    /// Ban time for misbehaving peers (seconds)
+    /// Ban time for misbehaving peers (seconds; Divi Core -bantime)
     pub ban_time: u64,
+
+    /// Misbehaviour score at which a peer is banned (Divi Core -banscore)
+    #[serde(default = "default_ban_score")]
+    pub ban_score: u32,
 
     /// User agent string
     pub user_agent: String,
@@ -392,6 +396,10 @@ impl P2pConfig {
     }
 }
 
+fn default_ban_score() -> u32 {
+    100
+}
+
 impl Default for P2pConfig {
     fn default() -> Self {
         P2pConfig {
@@ -403,6 +411,7 @@ impl Default for P2pConfig {
             connect: Vec::new(),
             listen: None,
             ban_time: 86400, // 24 hours
+            ban_score: default_ban_score(),
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
         }

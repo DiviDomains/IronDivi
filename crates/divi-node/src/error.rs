@@ -82,9 +82,57 @@ pub enum NodeError {
     NonFinal,
 }
 
+impl NodeError {
+    /// A transaction a peer relayed was refused with this error: the
+    /// misbehaviour score Divi Core gives that peer (the score its
+    /// AcceptToMemoryPool records for ProcessMessage's `Misbehaving`).
+    /// Every REJECT_INVALID refusal is 100 there (coinbase or coinstake as a
+    /// loose transaction, bad input or output values, a mandatory script
+    /// failure); policy refusals (dust, fee, non-final, non-mandatory
+    /// script), conflicts and missing inputs (an orphan) are 0.
+    pub fn misbehaviour_score(&self) -> u32 {
+        match self {
+            NodeError::TxRejected { code, .. } if *code == reject::INVALID => 100,
+            _ => 0,
+        }
+    }
+}
+
 /// Divi Core reject codes (defaultValues.h)
 pub mod reject {
     pub const INVALID: u8 = 0x10;
     pub const NONSTANDARD: u8 = 0x40;
     pub const INSUFFICIENT_FEE: u8 = 0x42;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_scores_follow_divi_core() {
+        let rejected = |code, reason: &str| NodeError::TxRejected {
+            code,
+            reason: reason.into(),
+        };
+        assert_eq!(
+            rejected(reject::INVALID, "coinstake").misbehaviour_score(),
+            100
+        );
+        assert_eq!(
+            rejected(reject::INVALID, "mandatory-script-verify-flag-failed (x)")
+                .misbehaviour_score(),
+            100
+        );
+        assert_eq!(
+            rejected(reject::NONSTANDARD, "dust").misbehaviour_score(),
+            0
+        );
+        assert_eq!(
+            rejected(reject::INSUFFICIENT_FEE, "insufficient fee").misbehaviour_score(),
+            0
+        );
+        assert_eq!(NodeError::MissingInputs.misbehaviour_score(), 0);
+        assert_eq!(NodeError::NonFinal.misbehaviour_score(), 0);
+    }
 }

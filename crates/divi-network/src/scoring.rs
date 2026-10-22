@@ -233,8 +233,22 @@ pub struct PeerScoring {
     bans: RwLock<HashMap<IpAddr, BanEntry>>,
     /// Rate limiting: messages per IP per second
     rate_limits: RwLock<HashMap<IpAddr, RateLimit>>,
-    /// Ban threshold score
-    _ban_threshold: i32,
+    /// Misbehaviour score at which a peer is banned (Divi Core -banscore)
+    ban_threshold: RwLock<i32>,
+    /// How long a misbehaving peer stays banned (Divi Core -bantime)
+    ban_duration: RwLock<Duration>,
+}
+
+/// What recording misbehaviour did to the peer
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MisbehaviourOutcome {
+    /// Score recorded, still under the threshold (or nothing recorded)
+    Scored,
+    /// Threshold crossed: the IP is banned and the peer must be disconnected
+    Banned,
+    /// Threshold crossed by a local peer: disconnected but not banned, as
+    /// Divi Core does ("not banning local peer")
+    DisconnectOnly,
 }
 
 /// Rate limiting state for an IP
@@ -259,7 +273,8 @@ impl PeerScoring {
             stats: RwLock::new(HashMap::new()),
             bans: RwLock::new(HashMap::new()),
             rate_limits: RwLock::new(HashMap::new()),
-            _ban_threshold: 100,
+            ban_threshold: RwLock::new(100),
+            ban_duration: RwLock::new(DEFAULT_BAN_DURATION),
         }
     }
 
@@ -286,24 +301,70 @@ impl PeerScoring {
         self.stats.read().values().cloned().collect()
     }
 
-    /// Record misbehavior for a peer
-    pub fn record_misbehavior(&self, peer_id: PeerId, reason: Misbehavior) -> bool {
-        let mut stats = self.stats.write();
-        if let Some(peer_stats) = stats.get_mut(&peer_id) {
-            peer_stats.record_misbehavior(reason);
+    /// Set the ban threshold and duration (Divi Core -banscore, -bantime)
+    pub fn set_ban_policy(&self, threshold: i32, duration: Duration) {
+        *self.ban_threshold.write() = threshold;
+        *self.ban_duration.write() = duration;
+    }
 
-            if peer_stats.should_ban() {
-                let ip = peer_stats.ip;
-                drop(stats);
-                self.ban_ip(
-                    ip,
-                    DEFAULT_BAN_DURATION,
-                    format!("Misbehavior: {:?}", reason),
-                );
-                return true;
-            }
+    /// The ban threshold and duration in force
+    pub fn ban_policy(&self) -> (i32, Duration) {
+        (*self.ban_threshold.read(), *self.ban_duration.read())
+    }
+
+    /// Record misbehavior for a peer; true if it must be disconnected
+    pub fn record_misbehavior(&self, peer_id: PeerId, reason: Misbehavior) -> bool {
+        self.record_misbehavior_score(peer_id, reason.penalty(), &format!("{:?}", reason))
+            != MisbehaviourOutcome::Scored
+    }
+
+    /// Divi Core's `Misbehaving(node, howmuch, cause)`: add `score` to the
+    /// peer's misbehaviour; when the total first reaches the ban threshold
+    /// the peer is disconnected and its IP banned for the ban time, except
+    /// a local (loopback or unspecified) address, which Core only
+    /// disconnects. A score of 0 records nothing.
+    pub fn record_misbehavior_score(
+        &self,
+        peer_id: PeerId,
+        score: i32,
+        cause: &str,
+    ) -> MisbehaviourOutcome {
+        if score <= 0 {
+            return MisbehaviourOutcome::Scored;
         }
-        false
+        let threshold = *self.ban_threshold.read();
+        let (ip, crossed) = {
+            let mut stats = self.stats.write();
+            let Some(peer_stats) = stats.get_mut(&peer_id) else {
+                return MisbehaviourOutcome::Scored;
+            };
+            let before = peer_stats.misbehavior_score;
+            peer_stats.misbehavior_score = before.saturating_add(score);
+            let after = peer_stats.misbehavior_score;
+            let crossed = before < threshold && after >= threshold;
+            if crossed {
+                warn!(
+                    "Misbehaving: peer {} ({}) ({} -> {}) BAN THRESHOLD EXCEEDED | {}",
+                    peer_id, peer_stats.ip, before, after, cause
+                );
+            } else {
+                info!(
+                    "Misbehaving: peer {} ({}) ({} -> {}) | {}",
+                    peer_id, peer_stats.ip, before, after, cause
+                );
+            }
+            (peer_stats.ip, crossed)
+        };
+        if !crossed {
+            return MisbehaviourOutcome::Scored;
+        }
+        if ip.is_loopback() || ip.is_unspecified() {
+            warn!("Not banning local peer {} ({})", peer_id, ip);
+            return MisbehaviourOutcome::DisconnectOnly;
+        }
+        let duration = *self.ban_duration.read();
+        self.ban_ip(ip, duration, format!("Misbehaving: {}", cause));
+        MisbehaviourOutcome::Banned
     }
 
     /// Record successful block receipt
@@ -602,5 +663,60 @@ mod tests {
         // Serious misbehavior results in low score
         stats.record_misbehavior(Misbehavior::InvalidBlockHeader);
         assert!(stats.reliability_score() < 50);
+    }
+
+    #[test]
+    fn misbehaviour_score_bans_once_at_the_threshold() {
+        let scoring = PeerScoring::new();
+        let ip: IpAddr = "192.0.2.20".parse().unwrap();
+        scoring.register_peer(1, ip);
+
+        assert_eq!(
+            scoring.record_misbehavior_score(1, 0, "nothing"),
+            MisbehaviourOutcome::Scored
+        );
+        assert_eq!(
+            scoring.record_misbehavior_score(1, 10, "ten"),
+            MisbehaviourOutcome::Scored
+        );
+        assert!(!scoring.is_banned(&ip));
+        assert_eq!(
+            scoring.record_misbehavior_score(1, 90, "ninety"),
+            MisbehaviourOutcome::Banned
+        );
+        assert!(scoring.is_banned(&ip));
+        // Past the threshold, further scores do not ban again
+        assert_eq!(
+            scoring.record_misbehavior_score(1, 100, "more"),
+            MisbehaviourOutcome::Scored
+        );
+        assert_eq!(scoring.get_stats(1).unwrap().misbehavior_score, 200);
+    }
+
+    #[test]
+    fn local_peer_is_disconnected_not_banned() {
+        let scoring = PeerScoring::new();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        scoring.register_peer(2, ip);
+        assert_eq!(
+            scoring.record_misbehavior_score(2, 100, "bad"),
+            MisbehaviourOutcome::DisconnectOnly
+        );
+        assert!(!scoring.is_banned(&ip));
+    }
+
+    #[test]
+    fn ban_policy_sets_threshold_and_duration() {
+        let scoring = PeerScoring::new();
+        assert_eq!(scoring.ban_policy(), (100, DEFAULT_BAN_DURATION));
+        scoring.set_ban_policy(50, Duration::from_secs(5));
+        let ip: IpAddr = "192.0.2.21".parse().unwrap();
+        scoring.register_peer(3, ip);
+        assert_eq!(
+            scoring.record_misbehavior_score(3, 50, "half"),
+            MisbehaviourOutcome::Banned
+        );
+        let ban = scoring.list_bans().pop().unwrap();
+        assert!(ban.reason.contains("half"));
     }
 }

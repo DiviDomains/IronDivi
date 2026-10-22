@@ -94,6 +94,6 @@ pub use peer_manager::{
     PeerManagerConfig,
 };
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
-pub use scoring::{BanEntry, Misbehavior, PeerScoring, PeerStats};
+pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};
 pub use spork::{SporkManager, SporkSyncProgress, SporkSyncState};
 pub use sync::{BlockConnectedCallback, BlockSync, ReorgCallback, SyncProgress, SyncState};

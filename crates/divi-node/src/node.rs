@@ -249,6 +249,11 @@ impl Node {
             proxy,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
+        // Divi Core -banscore / -bantime
+        peer_manager.scoring().set_ban_policy(
+            config.p2p.ban_score.min(i32::MAX as u32) as i32,
+            std::time::Duration::from_secs(config.p2p.ban_time),
+        );
 
         // Create chain Arc for sharing
         let chain = Arc::new(chain);
@@ -788,33 +793,17 @@ impl Node {
         let mempool_for_relay = Arc::clone(&self.mempool);
         let chain_for_relay = Arc::clone(&self.chain);
         let event_tx_for_relay = self.event_tx.clone();
+        let peers_for_relay = Arc::clone(&self.peer_manager);
         let mut tx_events = tx_relay_for_mempool.subscribe();
         tokio::spawn(async move {
             while let Ok(event) = tx_events.recv().await {
-                // Calculate fee from actual UTXO values
-                let fee = match Self::calculate_transaction_fee(
-                    &event.tx,
+                match accept_relayed_transaction(
                     &chain_for_relay,
                     &mempool_for_relay,
+                    &peers_for_relay,
+                    &event,
                 ) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::debug!(
-                            "Failed to calculate fee for relayed tx {}: {}",
-                            event.txid,
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                match mempool_for_relay.add(event.tx.clone(), fee) {
                     Ok(txid) => {
-                        tracing::debug!(
-                            "Added relayed tx {} to mempool with fee {}",
-                            txid,
-                            fee.as_sat()
-                        );
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                     }
                     Err(e) => {
@@ -1050,20 +1039,20 @@ impl Node {
         for output in &tx.vout {
             // Check for negative values (should be caught by Amount, but be safe)
             if output.value.as_sat() < 0 {
-                return Err(NodeError::TransactionValidation(
-                    "Negative output value".into(),
-                ));
+                return Err(NodeError::TxRejected {
+                    code: crate::error::reject::INVALID,
+                    reason: "bad-txns-vout-negative".into(),
+                });
             }
             total_output += output.value;
         }
 
         // Input must be >= output (difference is the fee)
         if total_input.as_sat() < total_output.as_sat() {
-            return Err(NodeError::TransactionValidation(format!(
-                "Inputs ({}) less than outputs ({})",
-                total_input.as_sat(),
-                total_output.as_sat()
-            )));
+            return Err(NodeError::TxRejected {
+                code: crate::error::reject::INVALID,
+                reason: "bad-txns-in-belowout".into(),
+            });
         }
 
         // Calculate and return fee
@@ -1134,20 +1123,20 @@ impl Node {
         let mut total_output = Amount::from_sat(0);
         for output in &tx.vout {
             if output.value.as_sat() < 0 {
-                return Err(NodeError::TransactionValidation(
-                    "Negative output value".into(),
-                ));
+                return Err(NodeError::TxRejected {
+                    code: crate::error::reject::INVALID,
+                    reason: "bad-txns-vout-negative".into(),
+                });
             }
             total_output += output.value;
         }
 
         // Input must be >= output (difference is the fee)
         if total_input.as_sat() < total_output.as_sat() {
-            return Err(NodeError::TransactionValidation(format!(
-                "Inputs ({}) less than outputs ({})",
-                total_input.as_sat(),
-                total_output.as_sat()
-            )));
+            return Err(NodeError::TxRejected {
+                code: crate::error::reject::INVALID,
+                reason: "bad-txns-in-belowout".into(),
+            });
         }
 
         Ok(Amount::from_sat(
@@ -1333,6 +1322,31 @@ pub struct MempoolInfo {
     pub max_size: usize,
     /// Total fees
     pub total_fee: f64,
+}
+
+/// A transaction relayed by a peer: work out its fee and offer it to the
+/// mempool. As Divi Core's ProcessMessage, a refusal costs the peer the
+/// refusal's misbehaviour score (100 for an invalid transaction, 0 for policy
+/// refusals and missing inputs); enough of it bans the peer.
+pub fn accept_relayed_transaction(
+    chain: &Arc<Chain>,
+    mempool: &Arc<Mempool>,
+    peers: &PeerManager,
+    event: &divi_network::TxRelayEvent,
+) -> Result<Hash256, NodeError> {
+    let result = Node::calculate_transaction_fee(&event.tx, chain, mempool)
+        .and_then(|fee| mempool.add(event.tx.clone(), fee));
+    match &result {
+        Ok(txid) => tracing::debug!("Added relayed tx {} to mempool", txid),
+        Err(e) => {
+            peers.report_misbehavior_score(
+                event.from_peer,
+                e.misbehaviour_score(),
+                &format!("tx {} rejected by the mempool: {}", event.txid, e),
+            );
+        }
+    }
+    result
 }
 
 /// Divi Core's AcceptToMemoryPool input checks against the chain: every input

@@ -410,8 +410,13 @@ impl Connection {
                     break;
                 }
 
-                // Handle outgoing messages
-                Some(msg) = outbound_rx.recv() => {
+                // Handle outgoing messages. The channel closes when the peer
+                // manager drops this peer (disconnect, ban): end the connection.
+                msg = outbound_rx.recv() => {
+                    let Some(msg) = msg else {
+                        info!("Disconnecting from {} (dropped by the peer manager)", info.addr);
+                        break;
+                    };
                     // A queued ping (the `ping` RPC) gets a fresh nonce and is timed like the
                     // keep-alive, so its pong updates pingtime (C++ fPingQueued)
                     let msg = match msg {
