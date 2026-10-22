@@ -25,8 +25,8 @@ use divi_primitives::script::Script;
 use divi_primitives::transaction::OutPoint;
 use divi_primitives::ChainMode;
 
-use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -141,6 +141,20 @@ impl DirtyFlags {
     }
 }
 
+/// UTXO, spent and transaction rows to delete from disk on the next save
+#[derive(Default)]
+struct PendingDeletes {
+    utxos: HashSet<OutPoint>,
+    spent: HashSet<OutPoint>,
+    transactions: HashSet<Hash256>,
+}
+
+impl PendingDeletes {
+    fn is_empty(&self) -> bool {
+        self.utxos.is_empty() && self.spent.is_empty() && self.transactions.is_empty()
+    }
+}
+
 /// Wallet transaction record
 #[derive(Debug, Clone)]
 pub struct WalletTx {
@@ -243,7 +257,21 @@ pub struct WalletDb {
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
     /// Wallet transactions in the mempool (in-memory only, never persisted)
     mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
+    /// Serializes block scanning: live block notifications, the startup
+    /// catch-up, reorg rollback and rescans must not interleave, or a spend
+    /// can be scanned before the coin it spends and be lost
+    scan_lock: Mutex<()>,
+    /// Rows removed from memory that must also be deleted from disk on the
+    /// next save (a save only writes what is in memory)
+    pending_deletes: RwLock<PendingDeletes>,
+    /// Hashes of the most recently scanned blocks by height (in memory), so a
+    /// sync notices a chain switch it was not told about (invalidateblock,
+    /// a missed reorg notification) and rolls back to the fork first
+    scanned_hashes: RwLock<BTreeMap<u32, Hash256>>,
 }
+
+/// How many recently scanned block hashes the wallet remembers
+const SCANNED_HASHES_KEPT: usize = 10_000;
 
 impl WalletDb {
     /// Create a new in-memory wallet
@@ -268,6 +296,9 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            scan_lock: Mutex::new(()),
+            pending_deletes: RwLock::new(PendingDeletes::default()),
+            scanned_hashes: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -293,6 +324,9 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            scan_lock: Mutex::new(()),
+            pending_deletes: RwLock::new(PendingDeletes::default()),
+            scanned_hashes: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -323,6 +357,9 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            scan_lock: Mutex::new(()),
+            pending_deletes: RwLock::new(PendingDeletes::default()),
+            scanned_hashes: RwLock::new(BTreeMap::new()),
         };
 
         // Load wallet data from database
@@ -409,6 +446,9 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            scan_lock: Mutex::new(()),
+            pending_deletes: RwLock::new(PendingDeletes::default()),
+            scanned_hashes: RwLock::new(BTreeMap::new()),
         };
 
         Ok(wallet_db)
@@ -653,6 +693,16 @@ impl WalletDb {
         }
         db.write_batch(key_batch)?;
 
+        // Delete rows dropped from memory (reorg, rescan) before writing the
+        // current state, so they do not come back on the next load
+        let pending = self.pending_deletes_snapshot();
+        if !pending.is_empty() {
+            let mut batch = db.create_batch();
+            Self::put_pending_deletes(&mut batch, db, &pending);
+            db.write_batch(batch)?;
+            self.clear_pending_deletes(&pending);
+        }
+
         // Save UTXOs and remove spent ones from the UTXO table.
         // First, delete any spent outpoints from the UTXO column family so they
         // don't reappear when the wallet is loaded next time.
@@ -706,6 +756,40 @@ impl WalletDb {
         Ok(())
     }
 
+    fn pending_deletes_snapshot(&self) -> PendingDeletes {
+        let p = self.pending_deletes.read();
+        PendingDeletes {
+            utxos: p.utxos.clone(),
+            spent: p.spent.clone(),
+            transactions: p.transactions.clone(),
+        }
+    }
+
+    /// Forget deletes that have been written (new ones may have arrived since)
+    fn clear_pending_deletes(&self, written: &PendingDeletes) {
+        let mut p = self.pending_deletes.write();
+        p.utxos.retain(|o| !written.utxos.contains(o));
+        p.spent.retain(|o| !written.spent.contains(o));
+        p.transactions.retain(|t| !written.transactions.contains(t));
+    }
+
+    fn put_pending_deletes(
+        batch: &mut rocksdb::WriteBatch,
+        db: &WalletDatabase,
+        pending: &PendingDeletes,
+    ) {
+        use crate::persistence::outpoint_key;
+        for outpoint in &pending.utxos {
+            batch.delete_cf(db.cf_utxos(), outpoint_key(outpoint));
+        }
+        for outpoint in &pending.spent {
+            batch.delete_cf(db.cf_spent(), outpoint_key(outpoint));
+        }
+        for txid in &pending.transactions {
+            batch.delete_cf(db.cf_transactions(), txid.as_bytes());
+        }
+    }
+
     /// Save only the last scan height to database (lightweight, no flush)
     pub fn save_scan_height(&self) -> Result<(), WalletError> {
         if let Some(db) = &self.db {
@@ -725,12 +809,16 @@ impl WalletDb {
         };
 
         let flags = self.dirty.read().clone();
-        if !flags.any_dirty() {
+        let pending = self.pending_deletes_snapshot();
+        if !flags.any_dirty() && pending.is_empty() {
             // Nothing changed — just persist scan height
             return self.save_scan_height();
         }
 
         let mut batch = db.create_batch();
+
+        // Deletes go first so that rows written below win over them
+        Self::put_pending_deletes(&mut batch, db, &pending);
 
         // Always update scan height
         batch.put_cf(
@@ -821,6 +909,7 @@ impl WalletDb {
 
         // Clear dirty flags
         self.dirty.write().clear();
+        self.clear_pending_deletes(&pending);
 
         debug!("Wallet incremental save complete");
         Ok(())
@@ -1260,9 +1349,28 @@ impl WalletDb {
     /// Used before rescanning to ensure clean state
     pub fn clear_transactions_and_utxos(&self) {
         info!("Clearing wallet transactions, UTXOs, and spent tracking");
-        self.transactions.write().clear();
-        self.utxos.write().clear();
-        self.spent.write().clear();
+        {
+            let mut pending = self.pending_deletes.write();
+            pending
+                .transactions
+                .extend(self.transactions.write().drain().map(|(txid, _)| txid));
+            pending
+                .utxos
+                .extend(self.utxos.write().drain().map(|(outpoint, _)| outpoint));
+            // A spent coin may still have a row in the UTXO table
+            for outpoint in self.spent.write().drain() {
+                pending.utxos.insert(outpoint);
+                pending.spent.insert(outpoint);
+            }
+        }
+        self.scanned_hashes.write().clear();
+        for (outpoint, _) in self.spent_utxo_data.write().drain() {
+            if let Some(ref db) = self.db {
+                if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
+                    debug!("Failed to remove spent_utxo_data from disk: {}", e);
+                }
+            }
+        }
         let mut dirty = self.dirty.write();
         dirty.transactions = true;
         dirty.utxos = true;
@@ -1662,7 +1770,11 @@ impl WalletDb {
                 utxo.is_coinbase = is_coinbase;
                 utxo.is_coinstake = is_coinstake;
 
-                self.add_utxo(utxo);
+                // Scanning a block again (rescan, catch-up overlap) must not
+                // bring back a coin already seen spent
+                if !self.spent.read().contains(&utxo.outpoint()) {
+                    self.add_utxo(utxo);
+                }
                 self.mark_address_used(&address);
 
                 trace!("Received {} to {} in tx {}", output.value, address, txid);
@@ -1685,6 +1797,17 @@ impl WalletDb {
                     outpoint.txid,
                     outpoint.vout
                 );
+            } else if let Some(value) = height.and_then(|h| {
+                // This block was scanned before and already spent the coin:
+                // count it again so the history entry comes out the same
+                self.spent_utxo_data
+                    .read()
+                    .get(&outpoint)
+                    .filter(|(_, spent_height)| *spent_height == h)
+                    .map(|(u, _)| u.value)
+            }) {
+                is_relevant = true;
+                sent += value;
             }
         }
 
@@ -1945,76 +2068,220 @@ impl WalletDb {
         }
     }
 
-    /// Handle a reorg - remove UTXOs and transactions above given height,
-    /// and restore UTXOs that were spent in orphaned blocks
+    /// Handle a reorg: undo everything recorded from blocks above the fork
+    /// point. The next [`sync_to_tip`](Self::sync_to_tip) scans the new
+    /// branch from there.
     pub fn handle_reorg(&self, fork_height: u32) {
         info!("Handling reorg at fork height {}", fork_height);
+        let _scan = self.scan_lock.lock();
+        self.rollback_heights(fork_height.saturating_add(1), u32::MAX);
+        let mut last = self.last_scan_height.write();
+        if *last > fork_height {
+            *last = fork_height;
+        }
+    }
 
-        // Remove UTXOs confirmed after fork
-        {
+    /// Undo what blocks at heights `start..=stop` recorded: their outputs and
+    /// history entries go, and coins they spent come back unless those coins
+    /// were themselves created in the range.
+    fn rollback_heights(&self, start: u32, stop: u32) {
+        let in_range = |h: u32| h >= start && h <= stop;
+        let mut pending = self.pending_deletes.write();
+
+        let removed_utxos = {
             let mut utxos = self.utxos.write();
-            let before = utxos.len();
-            utxos.retain(|_, utxo| utxo.height.map(|h| h <= fork_height).unwrap_or(true));
-            let removed = before - utxos.len();
-            if removed > 0 {
-                info!(
-                    "Removed {} UTXOs above fork height {}",
-                    removed, fork_height
-                );
+            let gone: Vec<OutPoint> = utxos
+                .iter()
+                .filter(|(_, u)| u.height.is_some_and(in_range))
+                .map(|(op, _)| *op)
+                .collect();
+            for op in &gone {
+                utxos.remove(op);
+                pending.utxos.insert(*op);
             }
-        }
+            gone.len()
+        };
 
-        // Remove transactions confirmed after fork
-        {
+        let removed_txs = {
             let mut txs = self.transactions.write();
-            let before = txs.len();
-            txs.retain(|_, tx| tx.block_height.map(|h| h <= fork_height).unwrap_or(true));
-            let removed = before - txs.len();
-            if removed > 0 {
-                info!(
-                    "Removed {} transactions above fork height {}",
-                    removed, fork_height
-                );
+            let gone: Vec<Hash256> = txs
+                .iter()
+                .filter(|(_, tx)| tx.block_height.is_some_and(in_range))
+                .map(|(txid, _)| *txid)
+                .collect();
+            for txid in &gone {
+                txs.remove(txid);
+                pending.transactions.insert(*txid);
             }
-        }
+            gone.len()
+        };
 
-        // Restore UTXOs that were spent by transactions in orphaned blocks
+        self.scanned_hashes
+            .write()
+            .retain(|height, _| !in_range(*height));
+
+        let mut restored = 0usize;
         {
             let mut spent_data = self.spent_utxo_data.write();
             let mut spent_set = self.spent.write();
             let mut utxos = self.utxos.write();
 
-            let to_restore: Vec<_> = spent_data
+            let undone: Vec<(OutPoint, WalletUtxo)> = spent_data
                 .iter()
-                .filter(|(_, (_, spent_height))| *spent_height > fork_height)
+                .filter(|(_, (_, spent_height))| in_range(*spent_height))
                 .map(|(op, (utxo, _))| (*op, utxo.clone()))
                 .collect();
 
-            for (outpoint, utxo) in &to_restore {
-                info!(
-                    "Restoring UTXO {}:{} ({}) spent at orphaned height",
-                    outpoint.txid, outpoint.vout, utxo.value
-                );
-                utxos.insert(*outpoint, utxo.clone());
-                spent_set.remove(outpoint);
-                spent_data.remove(outpoint);
-                // Remove from persisted CF so it doesn't resurrect after next restart
+            for (outpoint, utxo) in undone {
+                spent_data.remove(&outpoint);
+                spent_set.remove(&outpoint);
+                pending.spent.insert(outpoint);
                 if let Some(ref db) = self.db {
-                    if let Err(e) = db.remove_spent_utxo_data(outpoint) {
+                    if let Err(e) = db.remove_spent_utxo_data(&outpoint) {
                         debug!("Failed to remove spent_utxo_data from disk: {}", e);
                     }
                 }
-            }
-
-            if !to_restore.is_empty() {
-                info!("Restored {} UTXOs from orphaned blocks", to_restore.len());
+                if utxo.height.is_some_and(in_range) {
+                    // Created and spent in the range: the coin goes with its block
+                    pending.utxos.insert(outpoint);
+                    continue;
+                }
+                info!(
+                    "Restoring UTXO {}:{} ({}) spent at rolled-back height",
+                    outpoint.txid, outpoint.vout, utxo.value
+                );
+                pending.utxos.remove(&outpoint);
+                utxos.insert(outpoint, utxo);
+                restored += 1;
             }
         }
+
+        info!(
+            "Rolled back heights {}..={}: removed {} UTXOs and {} transactions, restored {} spent UTXOs",
+            start, stop, removed_utxos, removed_txs, restored
+        );
 
         let mut dirty = self.dirty.write();
         dirty.utxos = true;
         dirty.transactions = true;
         dirty.spent = true;
+    }
+
+    /// Scan the active chain's blocks above the last scanned height, in
+    /// height order, up to `tip_height`, and advance the scan height.
+    ///
+    /// `hash_at` and `get_block` return the active chain's block hash and
+    /// block at a height. Every path that feeds blocks to the wallet goes
+    /// through here (or through [`rescan`](Self::rescan)) under one lock, so a
+    /// block is never skipped (e.g. the middle blocks of a reorg) and a spend
+    /// is never scanned before the coin it spends. If the blocks last scanned
+    /// are no longer in the active chain, what they recorded is rolled back
+    /// first. Returns the heights whose block could not be read; they are
+    /// skipped.
+    pub fn sync_to_tip<H, F>(&self, tip_height: u32, hash_at: H, mut get_block: F) -> Vec<u32>
+    where
+        H: Fn(u32) -> Option<Hash256>,
+        F: FnMut(u32) -> Option<(Hash256, divi_primitives::block::Block)>,
+    {
+        let _scan = self.scan_lock.lock();
+
+        let last = self.last_scan_height();
+        if let Some(fork) = self.find_fork(last, &hash_at) {
+            info!(
+                "Wallet scanned blocks above {} that left the active chain; rolling back",
+                fork
+            );
+            self.rollback_heights(fork + 1, u32::MAX);
+            self.set_last_scan_height(fork);
+        }
+
+        let mut missing = Vec::new();
+        let from = self.last_scan_height().saturating_add(1);
+        for height in from..=tip_height {
+            match get_block(height) {
+                Some((hash, block)) => self.scan_active_block(hash, height, &block),
+                None => missing.push(height),
+            }
+            self.set_last_scan_height(height);
+        }
+        missing
+    }
+
+    /// Highest height below `last` whose scanned block is still active, if
+    /// the block scanned at `last` is not. Heights without a remembered hash
+    /// are taken as still active.
+    fn find_fork<H: Fn(u32) -> Option<Hash256>>(&self, last: u32, hash_at: &H) -> Option<u32> {
+        let hashes = self.scanned_hashes.read();
+        let mut height = last;
+        while height > 0 {
+            match hashes.get(&height) {
+                Some(scanned) if hash_at(height) != Some(*scanned) => height -= 1,
+                _ => break,
+            }
+        }
+        (height < last).then_some(height)
+    }
+
+    /// Scan a block of the active chain and remember its hash
+    fn scan_active_block(&self, hash: Hash256, height: u32, block: &divi_primitives::block::Block) {
+        self.scan_block(hash, height, block.header.time, &block.transactions);
+        let mut hashes = self.scanned_hashes.write();
+        hashes.insert(height, hash);
+        while hashes.len() > SCANNED_HASHES_KEPT {
+            hashes.pop_first();
+        }
+    }
+
+    /// Rescan heights `start..=stop` of the active chain (`rescanblockchain`).
+    ///
+    /// A full rescan (from 0 to the tip) rebuilds the wallet from nothing. A
+    /// partial one rolls back only what the range recorded and scans it again,
+    /// so coins and history outside the range are kept. Returns the number of
+    /// blocks scanned and the first height that could not be read, if any
+    /// (the scan stops there and the wallet re-scans from it later).
+    pub fn rescan<F>(
+        &self,
+        start: u32,
+        stop: u32,
+        tip_height: u32,
+        mut get_block: F,
+    ) -> (u32, Option<u32>)
+    where
+        F: FnMut(u32) -> Option<(Hash256, divi_primitives::block::Block)>,
+    {
+        let _scan = self.scan_lock.lock();
+        let full = start == 0 && stop >= tip_height;
+        if full {
+            self.clear_transactions_and_utxos();
+        } else {
+            self.rollback_heights(start, stop);
+        }
+
+        let mut scanned = 0u32;
+        let mut unreadable = None;
+        for height in start..=stop {
+            match get_block(height) {
+                Some((hash, block)) => {
+                    self.scan_active_block(hash, height, &block);
+                    scanned += 1;
+                }
+                None => {
+                    unreadable = Some(height);
+                    break;
+                }
+            }
+        }
+
+        let last = self.last_scan_height();
+        match unreadable {
+            // Blocks from here on were rolled back but not scanned again
+            Some(h) => self.set_last_scan_height(last.min(h.saturating_sub(1))),
+            None if full || (start <= last.saturating_add(1) && stop > last) => {
+                self.set_last_scan_height(stop)
+            }
+            None => {}
+        }
+        (scanned, unreadable)
     }
 
     pub fn set_account(&self, address: &Address, account: &str) {
@@ -3074,6 +3341,328 @@ mod tests {
             assert_eq!(wallet.mempool_tx_count(), 0);
             assert!(wallet.get_utxos().is_empty());
             assert!(wallet.get_transaction(&tx.txid()).is_none());
+        }
+    }
+
+    /// Confirmed-state accounting: blocks scanned twice, reorgs, restarts
+    mod chain_accounting {
+        use super::*;
+        use divi_primitives::block::Block;
+        use divi_primitives::transaction::{OutPoint as TxOutPoint, Transaction, TxIn, TxOut};
+
+        const COIN: i64 = 100_000_000;
+        const CHANGE: i64 = 70 * COIN - 1_000_000;
+
+        fn tx(prevouts: &[(Hash256, u32)], outputs: Vec<(i64, Script)>) -> Transaction {
+            Transaction {
+                version: 1,
+                vin: prevouts
+                    .iter()
+                    .map(|(txid, vout)| TxIn {
+                        prevout: TxOutPoint {
+                            txid: *txid,
+                            vout: *vout,
+                        },
+                        script_sig: Script::default(),
+                        sequence: 0xffffffff,
+                    })
+                    .collect(),
+                vout: outputs
+                    .into_iter()
+                    .map(|(v, script_pubkey)| TxOut {
+                        value: Amount::from_sat(v),
+                        script_pubkey,
+                    })
+                    .collect(),
+                lock_time: 0,
+            }
+        }
+
+        fn stranger() -> Script {
+            Script::new_p2pkh(&[0xaa; 20])
+        }
+
+        fn mine(addr: &Address) -> Script {
+            Script::new_p2pkh(addr.hash.as_bytes())
+        }
+
+        fn block_hash(height: u32, branch: u8) -> Hash256 {
+            let mut b = [branch; 32];
+            b[..4].copy_from_slice(&height.to_le_bytes());
+            Hash256::from_bytes(b)
+        }
+
+        fn scan(wallet: &WalletDb, height: u32, txs: &[Transaction]) {
+            wallet.scan_block(block_hash(height, 0), height, 1_000 + height, txs);
+        }
+
+        /// `fund` pays the wallet 100 DIVI; `send` spends it: 30 to a
+        /// stranger, 69.99 change back to the wallet, 0.01 fee.
+        fn fixture(wallet: &WalletDb) -> (Transaction, Transaction) {
+            let addr = wallet.new_receiving_address().unwrap();
+            let change = wallet.new_change_address().unwrap();
+            let fund = tx(
+                &[(Hash256::from_bytes([9u8; 32]), 0)],
+                vec![(100 * COIN, mine(&addr))],
+            );
+            let send = tx(
+                &[(fund.txid(), 0)],
+                vec![(30 * COIN, stranger()), (CHANGE, mine(&change))],
+            );
+            (fund, send)
+        }
+
+        fn outpoints(wallet: &WalletDb) -> HashSet<OutPoint> {
+            wallet.get_utxos().iter().map(|u| u.outpoint()).collect()
+        }
+
+        #[test]
+        fn rescanned_block_does_not_bring_back_spent_coin() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            // A catch-up or rescan reads block 1 again
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+
+            assert!(!wallet.has_utxo(&OutPoint::new(fund.txid(), 0)));
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+        }
+
+        #[test]
+        fn rescanned_block_keeps_history_amount() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            let first = wallet.get_transaction(&send.txid()).unwrap();
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            let again = wallet.get_transaction(&send.txid()).unwrap();
+
+            assert_eq!(first.amount, -(30 * COIN + 1_000_000));
+            assert_eq!(again.amount, first.amount);
+            assert_eq!(again.fee, first.fee);
+            assert_eq!(again.category, "send");
+        }
+
+        #[test]
+        fn reorg_does_not_restore_coin_created_above_fork() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let spend_change = tx(&[(send.txid(), 1)], vec![(CHANGE - 1_000_000, stranger())]);
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            scan(&wallet, 3, std::slice::from_ref(&spend_change));
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+
+            wallet.handle_reorg(1);
+
+            // Blocks 2 and 3 are gone: the funding coin is back, and the change
+            // created (and spent) above the fork does not exist
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(fund.txid(), 0)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+            assert!(wallet.get_transaction(&send.txid()).is_none());
+        }
+
+        #[test]
+        fn reorged_tx_mined_again_restores_its_outputs() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let spend_change = tx(&[(send.txid(), 1)], vec![(CHANGE - 1_000_000, stranger())]);
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            scan(&wallet, 3, std::slice::from_ref(&spend_change));
+            wallet.handle_reorg(1);
+            // The new branch mines `send` again but not `spend_change`
+            wallet.scan_block(block_hash(2, 1), 2, 1_002, std::slice::from_ref(&send));
+
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(send.txid(), 1)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+        }
+
+        #[test]
+        fn reorg_rollback_survives_restart() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("reorg.dat");
+            let (fund, send);
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                (fund, send) = fixture(&wallet);
+                wallet.save().unwrap();
+                scan(&wallet, 1, std::slice::from_ref(&fund));
+                wallet.save_incremental().unwrap();
+                scan(&wallet, 2, std::slice::from_ref(&send));
+                wallet.save_incremental().unwrap();
+
+                wallet.handle_reorg(1);
+                wallet.save_incremental().unwrap();
+                assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+            }
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(fund.txid(), 0)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+            assert!(wallet.get_transaction(&send.txid()).is_none());
+        }
+
+        /// An active chain for `sync_to_tip`: blocks at heights 1.., hashed
+        /// per branch so two branches differ
+        struct TestChain(Vec<Block>, u8);
+
+        impl TestChain {
+            fn new(branch: u8, blocks: &[&[Transaction]]) -> Self {
+                TestChain(
+                    blocks
+                        .iter()
+                        .map(|txs| Block {
+                            transactions: txs.to_vec(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    branch,
+                )
+            }
+
+            fn hash_at(&self, h: u32) -> Option<Hash256> {
+                (h >= 1 && h as usize <= self.0.len()).then(|| block_hash(h, self.1))
+            }
+
+            fn block_at(&self, h: u32) -> Option<(Hash256, Block)> {
+                Some((self.hash_at(h)?, self.0[h as usize - 1].clone()))
+            }
+
+            fn sync(&self, wallet: &WalletDb) -> Vec<u32> {
+                wallet.sync_to_tip(
+                    self.0.len() as u32,
+                    |h| self.hash_at(h),
+                    |h| self.block_at(h),
+                )
+            }
+        }
+
+        #[test]
+        fn sync_scans_every_block_of_a_reorg() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let branch_a = TestChain::new(0, &[std::slice::from_ref(&fund), &[]]);
+            assert!(branch_a.sync(&wallet).is_empty());
+            assert_eq!(wallet.last_scan_height(), 2);
+
+            // Branch B replaces block 2 and adds 3. The spend sits in the middle
+            // block, which is not the block that triggered the reorg.
+            let branch_b = TestChain::new(
+                1,
+                &[
+                    std::slice::from_ref(&fund),
+                    std::slice::from_ref(&send),
+                    &[],
+                ],
+            );
+            wallet.handle_reorg(1);
+            assert_eq!(wallet.last_scan_height(), 1);
+            branch_b.sync(&wallet);
+
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(send.txid(), 1)])
+            );
+            assert_eq!(wallet.last_scan_height(), 3);
+        }
+
+        #[test]
+        fn sync_rolls_back_chain_switch_it_was_not_told_about() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let branch_a = TestChain::new(
+                0,
+                &[std::slice::from_ref(&fund), std::slice::from_ref(&send)],
+            );
+            branch_a.sync(&wallet);
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+
+            // invalidateblock on block 2, then two new blocks without the send;
+            // no reorg notification reaches the wallet
+            let branch_b = TestChain::new(1, &[std::slice::from_ref(&fund), &[], &[]]);
+            let switched = |h: u32| {
+                if h == 1 {
+                    Some(block_hash(1, 0))
+                } else {
+                    branch_b.hash_at(h)
+                }
+            };
+            wallet.sync_to_tip(3, switched, |h| branch_b.block_at(h));
+
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(fund.txid(), 0)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
+            assert!(wallet.get_transaction(&send.txid()).is_none());
+            assert_eq!(wallet.last_scan_height(), 3);
+        }
+
+        #[test]
+        fn sync_scans_in_order_from_last_height() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let chain = TestChain::new(
+                0,
+                &[
+                    &[],
+                    std::slice::from_ref(&fund),
+                    std::slice::from_ref(&send),
+                ],
+            );
+            // A notification for block 3 arrives while the wallet is at 0: the
+            // funding block 2 is scanned first, so the spend in 3 is not lost
+            let mut order = Vec::new();
+            wallet.sync_to_tip(
+                3,
+                |h| chain.hash_at(h),
+                |h| {
+                    order.push(h);
+                    chain.block_at(h)
+                },
+            );
+            assert_eq!(order, vec![1, 2, 3]);
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+
+            // Already at the tip: nothing is scanned again
+            let mut again = 0;
+            wallet.sync_to_tip(
+                3,
+                |h| chain.hash_at(h),
+                |_| {
+                    again += 1;
+                    None
+                },
+            );
+            assert_eq!(again, 0);
+        }
+
+        #[test]
+        fn sync_skips_unreadable_block() {
+            let wallet = create_test_wallet();
+            let (fund, _) = fixture(&wallet);
+            let chain = TestChain::new(0, &[std::slice::from_ref(&fund), &[], &[]]);
+            let missing = wallet.sync_to_tip(
+                3,
+                |h| chain.hash_at(h),
+                |h| (h != 2).then(|| chain.block_at(h)).flatten(),
+            );
+            assert_eq!(missing, vec![2]);
+            assert_eq!(wallet.last_scan_height(), 3);
         }
     }
 }

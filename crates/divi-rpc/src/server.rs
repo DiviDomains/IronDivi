@@ -371,7 +371,10 @@ impl RpcServer {
             "getinfo" => self.get_info(params),
             "getchaintips" => self.blockchain.get_chain_tips(params),
             "invalidateblock" | "reconsiderblock" | "reverseblocktransactions" => {
-                self.blockchain.invalidate_block_family(method, params)
+                let result = self.blockchain.invalidate_block_family(method, params);
+                // The active chain may have changed without a block notification
+                self.wallet.sync_with_chain();
+                result
             }
             "getdifficulty" => self.blockchain.get_difficulty(params),
             "gettxoutsetinfo" => self.blockchain.get_txout_set_info(params),

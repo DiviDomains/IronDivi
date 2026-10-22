@@ -445,6 +445,9 @@ impl Staker {
                                     "Reorg detected during self-accept of staked block {} (fork height {})",
                                     block_hash, fork_height
                                 );
+                                // Undo what the wallet recorded from the disconnected
+                                // blocks; the callback below rescans the new branch
+                                self.wallet.handle_reorg(fork_height);
                             }
                             info!(
                                 "Self-accepted staked block {} at height {}",

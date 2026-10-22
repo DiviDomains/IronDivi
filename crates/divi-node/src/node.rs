@@ -1042,7 +1042,7 @@ impl Node {
 
     /// Calculate transaction fee from UTXO lookups
     /// This is a static helper that can be called from spawned tasks
-    fn calculate_transaction_fee(
+    pub fn calculate_transaction_fee(
         tx: &Transaction,
         chain: &Arc<Chain>,
         mempool: &Arc<Mempool>,

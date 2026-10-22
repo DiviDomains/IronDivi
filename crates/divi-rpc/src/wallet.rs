@@ -34,7 +34,7 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Parse a DIVI amount parameter the way Core's AmountFromValue does
 /// (JsonTxHelpers.cpp): reject negatives, values above MaxMoneyOut, and zero
@@ -88,7 +88,41 @@ pub struct WalletRpc {
     locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
 }
 
+/// Scan the active chain into the wallet, in order, from its last scanned
+/// height up to the tip (rolling back first if the chain switched under it).
+/// Returns the heights whose block could not be read (pruned); they are
+/// skipped.
+pub fn sync_wallet_with_chain(wallet: &WalletDb, chain: &Chain) -> Vec<u32> {
+    wallet.sync_to_tip(
+        chain.height(),
+        |height| {
+            chain
+                .get_block_index_by_height(height)
+                .ok()
+                .flatten()
+                .map(|index| index.hash)
+        },
+        |height| {
+            let index = chain.get_block_index_by_height(height).ok().flatten()?;
+            let block = chain.get_block(&index.hash).ok().flatten()?;
+            Some((index.hash, block))
+        },
+    )
+}
+
 impl WalletRpc {
+    /// Bring the wallet up to the active chain after the chain moved without
+    /// a block notification (invalidateblock, reconsiderblock)
+    pub fn sync_with_chain(&self) {
+        let (Some(chain), Ok(wallet)) = (self.chain.as_ref(), self.get_wallet()) else {
+            return;
+        };
+        sync_wallet_with_chain(&wallet, chain);
+        if let Err(e) = wallet.save_incremental() {
+            warn!("Failed to save wallet after chain sync: {}", e);
+        }
+    }
+
     pub fn new() -> Self {
         WalletRpc {
             wallet: Arc::new(RwLock::new(None)),
