@@ -6873,6 +6873,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "wiremock",
  "zeroize",
 ]
 

@@ -1965,3 +1965,59 @@ both!(
     rev_gone_lock_past_locktime_stays_refundable,
     gone_lock_past_locktime_stays_refundable_body
 );
+
+/// q4 follow-up: once the refund of a lock is refused and the node does not know the lock,
+/// the engine asks the backend to release the lock's wallet booking (the phantom change coin
+/// and the tombstoned inputs). Not before: a dropped lock inside its locktime is only re-sent.
+async fn gone_lock_is_released_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().forget(&lock);
+    h.ml_chain().reject_next_broadcast();
+    h.maker.tick().await.unwrap();
+    assert!(h.maker_rec().maker_lock_dropped);
+    assert!(
+        h.m_ml().released_locks().is_empty(),
+        "released while merely dropped"
+    );
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    for _ in 0..3 {
+        let _ = h.maker.tick().await;
+        ml.mine(1);
+    }
+    assert_eq!(h.maker_state(), SwapState::MakerRefundable);
+    let released = h.m_ml().released_locks();
+    assert!(!released.is_empty(), "phantom lock never released");
+    assert!(released.iter().all(|t| *t == lock));
+}
+both!(
+    gone_lock_is_released,
+    rev_gone_lock_is_released,
+    gone_lock_is_released_body
+);
+
+/// The counterpart: a lock the node merely cannot look up (no txindex) is still in the chain,
+/// so the refund goes through and nothing is released.
+async fn unseen_lock_is_not_released_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().blind(&lock);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    for _ in 0..4 {
+        let _ = h.maker.tick().await;
+        ml.mine(1);
+    }
+    assert!(
+        h.m_ml().released_locks().is_empty(),
+        "released a lock that is in the chain"
+    );
+}
+both!(
+    unseen_lock_is_not_released,
+    rev_unseen_lock_is_not_released,
+    unseen_lock_is_not_released_body
+);

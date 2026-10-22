@@ -211,6 +211,7 @@ impl MockChain {
             chain: self.clone(),
             pubkey,
             funding_calls: Arc::new(AtomicU64::new(0)),
+            released: Arc::default(),
             nonce: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -223,12 +224,18 @@ pub struct MockBackend {
     pubkey: [u8; 33],
     funding_calls: Arc<AtomicU64>,
     nonce: Arc<AtomicU64>,
+    released: Arc<Mutex<Vec<Txid>>>,
 }
 
 impl MockBackend {
     /// How many times `build_funding` (coin selection) has been called.
     pub fn funding_calls(&self) -> u64 {
         self.funding_calls.load(Ordering::SeqCst)
+    }
+
+    /// Locks the engine asked this backend to release as lost (`release_dead_lock`), in order.
+    pub fn released_locks(&self) -> Vec<Txid> {
+        self.released.lock().clone()
     }
 
     /// The underlying chain.
@@ -419,6 +426,11 @@ impl ChainBackend for MockBackend {
         }
         s.txs.insert(tx.txid, (parsed, None));
         Ok(tx.txid)
+    }
+
+    async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
+        self.released.lock().push(lock.txid);
+        Ok(true)
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {

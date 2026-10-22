@@ -213,6 +213,31 @@ impl Wallet {
     }
 }
 
+impl Wallet {
+    /// Undo [`record_broadcast`](Self::record_broadcast) for a transaction that can never
+    /// confirm: drop every coin created by `txid` (its phantom change) and give the
+    /// tombstoned `inputs` back as spendable coins. Returns whether anything changed, so a
+    /// repeat call is a no-op. An input that is not tombstoned (never recorded, or already
+    /// released and perhaps reserved again) is left alone.
+    pub fn release_dead_tx(&mut self, txid: Txid, inputs: &[Utxo]) -> Result<bool, SwapError> {
+        let before = self.utxos.len() + self.reserved.len();
+        self.utxos.retain(|u| u.outpoint.txid != txid);
+        self.reserved.retain(|r| r.utxo.outpoint.txid != txid);
+        let mut changed = self.utxos.len() + self.reserved.len() != before;
+        for u in inputs {
+            if let Some(i) = self.spent.iter().position(|s| *s == u.outpoint) {
+                self.spent.remove(i);
+                self.add(*u);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist()?;
+        }
+        Ok(changed)
+    }
+}
+
 #[cfg(test)]
 mod orphan_tests {
     use super::*;

@@ -545,6 +545,38 @@ impl ChainBackend for DiviBackend {
         Ok(tx.txid)
     }
 
+    async fn release_dead_lock(&self, lock: &SignedTx) -> Result<bool> {
+        let parsed: Transaction = divi_primitives::serialize::deserialize(&lock.raw)
+            .map_err(|e| SwapError::InvalidParams(format!("undecodable transaction: {e}")))?;
+        // Proof the lock is not in the chain: every input is still an unspent output paying
+        // our key. `gettxout` needs no index; a node that refuses it is an error here, so
+        // there is no release without the proof.
+        let mut coins = Vec::new();
+        for i in &parsed.vin {
+            let op = Outpoint {
+                txid: from_hash(&i.prevout.txid),
+                vout: i.prevout.vout,
+            };
+            let mut views = vec![txout_on(&self.rpc, &op, &self.spk).await?];
+            if let Some(fb) = &self.fallback {
+                views.push(txout_on(fb, &op, &self.spk).await?);
+            }
+            match views.as_slice() {
+                [Some(value)] => coins.push(Utxo {
+                    outpoint: op,
+                    value: *value,
+                }),
+                [Some(a), Some(b)] if a == b => coins.push(Utxo {
+                    outpoint: op,
+                    value: *a,
+                }),
+                // Spent (by the lock or a rival), unknown, not ours, or the endpoints disagree.
+                _ => return Ok(false),
+            }
+        }
+        self.wallet.lock().release_dead_tx(lock.txid, &coins)
+    }
+
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
         let Some(fb) = &self.fallback else {
             return confirmations_on(&self.rpc, txid).await;
@@ -608,6 +640,24 @@ async fn get_tx_opt_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<Value>> {
         Err(RpcError::Node { code: -5, .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Value in satoshis of `op` if it is unspent (`gettxout`, mempool included) and pays
+/// `spk`; `None` if it is spent, unknown or pays something else.
+async fn txout_on(rpc: &RpcClient, op: &Outpoint, spk: &Script) -> Result<Option<u64>> {
+    let v = rpc
+        .call_ok("gettxout", json!([op.txid.to_rpc_hex(), op.vout, true]))
+        .await?;
+    if v.is_null()
+        || v["scriptPubKey"]["hex"].as_str() != Some(hex::encode(spk.as_bytes()).as_str())
+    {
+        return Ok(None);
+    }
+    let sat = v["valueSat"]
+        .as_u64()
+        .or_else(|| v["value"].as_f64().map(|x| (x * 1e8).round() as u64))
+        .ok_or_else(|| SwapError::Transient("gettxout: output without value".into()))?;
+    Ok(Some(sat))
 }
 
 async fn tip_hash_on(rpc: &RpcClient) -> Result<String> {

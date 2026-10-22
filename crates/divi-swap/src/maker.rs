@@ -33,7 +33,7 @@ use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, ScriptVersion};
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
-use crate::types::{Amount, Chain, Outpoint};
+use crate::types::{Amount, Chain, Outpoint, SignedTx};
 
 /// Default wall-clock time the maker waits for the taker's lock after `accept`.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 1800;
@@ -763,6 +763,10 @@ impl Maker {
                 // Refused for good: re-sign on the next step rather than resend dead bytes.
                 r.maker_leg_refund = None;
                 self.store.put_maker_swap(r)?;
+                // The refund spends the lock, so the chain refusing it while it does not know
+                // the lock at all means the lock is gone: hand its wallet bookkeeping back.
+                // Never on a mere "not seen" refund error; the backend still wants its own proof.
+                self.release_dead_lock(r, &funding.tx).await;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -776,6 +780,23 @@ impl Maker {
             return self.enter(r, SwapState::MakerRefunded);
         }
         Ok(Flow::Idle)
+    }
+
+    /// Best effort: a lock the node does not know after a refund rejection is released from
+    /// the maker's wallet bookkeeping (no-op on chains without it). Any failure is logged and
+    /// leaves everything held.
+    async fn release_dead_lock(&self, r: &MakerRecord, lock: &SignedTx) {
+        let Ok(mk) = self.mk(r) else { return };
+        if !matches!(mk.confirmations(&lock.txid).await, Ok(None)) {
+            return;
+        }
+        match mk.release_dead_lock(lock).await {
+            Ok(true) => {
+                tracing::warn!(txid = %lock.txid, "released the wallet booking of a lost maker lock")
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(txid = %lock.txid, "lost maker lock not released: {e}"),
+        }
     }
 
     async fn on_taker_claimed(&self, r: &mut MakerRecord) -> Result<Flow> {

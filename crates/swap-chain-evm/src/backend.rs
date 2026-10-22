@@ -669,6 +669,103 @@ mod tests {
         assert!(!is_already_known("execution reverted: wrong preimage"));
     }
 
+    /// A JSON-RPC node that has mined 5 transactions from the account (`latest` = 5) and
+    /// holds `pending_txs` more in its mempool (`pending` = 5 + that). Records every block tag
+    /// `eth_getTransactionCount` was asked about.
+    #[derive(Clone, Default)]
+    struct NonceNode {
+        pending_txs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        tags: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl wiremock::Respond for NonceNode {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use serde_json::{json, Value};
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let result: Value = match body["method"].as_str().unwrap_or("") {
+                "eth_getTransactionCount" => {
+                    let tag = body["params"][1].as_str().unwrap_or("").to_string();
+                    let pending = self.pending_txs.load(std::sync::atomic::Ordering::SeqCst);
+                    let n = if tag == "latest" { 5 } else { 5 + pending };
+                    self.tags.lock().unwrap().push(tag);
+                    json!(format!("0x{n:x}"))
+                }
+                "eth_chainId" => json!("0x7a69"),
+                "eth_estimateGas" => json!("0x30d40"),
+                "eth_feeHistory" => {
+                    let n = usize::from_str_radix(
+                        body["params"][0]
+                            .as_str()
+                            .unwrap_or("0x1")
+                            .trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap_or(1);
+                    json!({
+                        "oldestBlock": "0x1",
+                        "baseFeePerGas": vec!["0x3b9aca00"; n + 1],
+                        "gasUsedRatio": vec![0.5; n],
+                        "reward": vec![vec!["0x3b9aca00"]; n],
+                    })
+                }
+                "eth_maxPriorityFeePerGas" => json!("0x3b9aca00"),
+                other => {
+                    return wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": body["id"],
+                        "error": {"code": -32601, "message": format!("unmocked {other}")},
+                    }))
+                }
+            };
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+        }
+    }
+
+    fn signed_nonce(tx: &SignedTx) -> u64 {
+        use alloy::consensus::{Transaction as _, TxEnvelope};
+        use alloy::eips::Decodable2718;
+        TxEnvelope::decode_2718(&mut tx.raw.as_slice())
+            .unwrap()
+            .nonce()
+    }
+
+    /// The nonce source is the node's `pending` count, not `latest`: while one of our
+    /// transactions sits unmined in the mempool, the next one is signed with the next nonce
+    /// instead of replacing it ("replacement transaction underpriced"). Fails if the call is
+    /// changed to `latest` (the second signature then reuses nonce 5).
+    #[tokio::test]
+    async fn two_pending_txs_get_distinct_nonces() {
+        let server = wiremock::MockServer::start().await;
+        let node = NonceNode::default();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(node.clone())
+            .mount(&server)
+            .await;
+        let key = PrivateKeySigner::random();
+        let backend = UsdcBackend::new(
+            &server.uri(),
+            key,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap();
+        let call = IErc20Htlc::refundCall {
+            id: B256::repeat_byte(7),
+        };
+        let first = backend.sign_htlc_call(&call).await.unwrap();
+        // The first tx is now in the node's mempool, unmined.
+        node.pending_txs
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let second = backend.sign_htlc_call(&call).await.unwrap();
+        assert_eq!(signed_nonce(&first), 5);
+        assert_eq!(signed_nonce(&second), 6, "second tx reused a pending nonce");
+        assert!(
+            node.tags.lock().unwrap().iter().all(|t| t == "pending"),
+            "{:?}",
+            node.tags.lock().unwrap()
+        );
+    }
+
     #[test]
     fn nonce_conflict_recognizes_both_wordings() {
         assert!(is_nonce_conflict("nonce too low: next nonce 5, tx nonce 3"));

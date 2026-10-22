@@ -98,4 +98,18 @@ pub trait ChainBackend: Send + Sync {
     /// tip and then the mempool where the backend can. Must not rely on address or spent
     /// indexes (plan §2: missing on the DIVI testnet proxy).
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>>;
+
+    /// `lock` (a funding transaction this backend built and broadcast) can never confirm:
+    /// give back what the wallet booked for it. Returns `true` if anything was released.
+    ///
+    /// Only the DIVI backend overrides this: its wallet tombstones the inputs and books the
+    /// change as a coin the moment `broadcast` succeeds, so a lock that is gone for good
+    /// leaves a phantom change coin and inputs that stay locked. Chains whose wallet
+    /// re-reads live coins have nothing to release (the default). The caller must have
+    /// shown that the chain does not know `lock`; the backend must still fail closed
+    /// (`Ok(false)` or an error, no release) unless it can prove the lock's inputs are
+    /// unspent.
+    async fn release_dead_lock(&self, _lock: &SignedTx) -> Result<bool> {
+        Ok(false)
+    }
 }

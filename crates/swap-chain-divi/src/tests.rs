@@ -671,3 +671,127 @@ async fn tip_hash_live_smoke() {
         println!("SMOKE DIVI {net} {before} {hash} {after}");
     }
 }
+
+// ---- release_dead_lock: a lock gone for good leaves no phantom change coin ----
+
+const COIN_SAT: u64 = 500 * 100_000_000;
+
+fn txout_json(b: &DiviBackend, sat: u64) -> Value {
+    json!({
+        "bestblock": "00", "confirmations": 3, "value": sat as f64 / 1e8, "valueSat": sat,
+        "scriptPubKey": {"hex": hex::encode(b.spk.as_bytes())},
+    })
+}
+
+/// A backend that has funded and broadcast a lock from one 500-DIVI coin.
+async fn broadcast_lock(b: &DiviBackend, node: &Node) -> Funding {
+    let (_, hash) = new_preimage();
+    let h = htlc_for(b, hash);
+    b.wallet
+        .lock()
+        .record_broadcast(&[], &[coin(1, COIN_SAT)])
+        .unwrap();
+    let f = b.build_funding(&h, AMOUNT).await.unwrap();
+    node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
+    b.broadcast(&f.tx).await.unwrap();
+    f
+}
+
+#[tokio::test]
+async fn dead_lock_gives_back_inputs_and_drops_phantom_change() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    let f = broadcast_lock(&b, &node).await;
+    let change = parse(&f.tx).vout[1].value.as_sat() as u64;
+    // The wallet now counts the lock's change and has tombstoned the input.
+    assert_eq!(b.balance(), change);
+    assert_eq!(
+        b.wallet.lock().available(),
+        vec![Utxo {
+            outpoint: Outpoint {
+                txid: f.tx.txid,
+                vout: 1
+            },
+            value: change,
+        }]
+    );
+    // The input is unspent in the chain: the lock never made it.
+    node.result("gettxout", txout_json(&b, COIN_SAT));
+    assert!(b.release_dead_lock(&f.tx).await.unwrap());
+    assert_eq!(
+        b.balance(),
+        COIN_SAT,
+        "phantom change gone, input spendable"
+    );
+    assert_eq!(b.wallet.lock().available(), vec![coin(1, COIN_SAT)]);
+    // Idempotent.
+    assert!(!b.release_dead_lock(&f.tx).await.unwrap());
+    assert_eq!(b.balance(), COIN_SAT);
+    // The released input is selectable again.
+    let (_, hash) = new_preimage();
+    let again = b.build_funding(&htlc_for(&b, hash), AMOUNT).await.unwrap();
+    assert_eq!(parse(&again.tx).vin[0].prevout.txid, to_hash(&txid_n(1)));
+}
+
+#[tokio::test]
+async fn dead_lock_is_not_released_without_proof() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    let f = broadcast_lock(&b, &node).await;
+    let change = parse(&f.tx).vout[1].value.as_sat() as u64;
+    // Input spent (the lock, or a rival, is in the chain): `gettxout` says null.
+    node.result("gettxout", Value::Null);
+    assert!(!b.release_dead_lock(&f.tx).await.unwrap());
+    // Input not ours: not released.
+    node.result(
+        "gettxout",
+        json!({"value": 1.0, "valueSat": 100_000_000, "scriptPubKey": {"hex": "aa"}}),
+    );
+    assert!(!b.release_dead_lock(&f.tx).await.unwrap());
+    // The node refuses `gettxout`: fails closed with an error.
+    node.results.lock().remove("gettxout");
+    node.error("gettxout", 500, -32601, "Method not found");
+    assert!(b.release_dead_lock(&f.tx).await.is_err());
+    // Transport failure: Transient, nothing released.
+    node.errors.lock().clear();
+    node.plain("gettxout", 503);
+    assert!(matches!(
+        b.release_dead_lock(&f.tx).await,
+        Err(SwapError::Transient(_))
+    ));
+    assert_eq!(b.balance(), change, "change still booked");
+    assert_eq!(b.wallet.lock().reserved_count(), 0);
+}
+
+#[tokio::test]
+async fn released_state_survives_a_restart() {
+    let (server, node) = mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.json");
+    let key = SecretKey::new_random();
+    let mk = |k: SecretKey| {
+        DiviBackend::with_retry(
+            &server.uri(),
+            k,
+            Network::Testnet,
+            FeePolicy::default(),
+            Some(path.clone()),
+            RetryPolicy {
+                attempts: 2,
+                base_delay: Duration::from_millis(1),
+            },
+        )
+        .unwrap()
+    };
+    let b = mk(key.clone());
+    let f = broadcast_lock(&b, &node).await;
+    node.result("gettxout", txout_json(&b, COIN_SAT));
+    assert!(b.release_dead_lock(&f.tx).await.unwrap());
+    drop(b);
+    let b2 = mk(key);
+    assert_eq!(b2.balance(), COIN_SAT);
+    assert!(
+        !b2.release_dead_lock(&f.tx).await.unwrap(),
+        "nothing left to release"
+    );
+}
