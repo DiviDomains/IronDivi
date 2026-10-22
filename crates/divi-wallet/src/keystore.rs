@@ -306,6 +306,47 @@ impl KeyStore {
         *self.hd_wallet.write() = None;
     }
 
+    /// Drop only the HD seed from memory, keeping per-key secrets.
+    pub fn clear_hd_wallet(&self) {
+        *self.hd_wallet.write() = None;
+    }
+
+    /// Re-derive the private key of every HD key that has none, from its stored
+    /// path, and return the hashes restored. Older builds could store an HD key
+    /// without its encrypted secret; this gets those back on unlock. A derived key
+    /// is only taken if its public key matches the stored one.
+    pub fn restore_missing_hd_secrets(&self) -> Vec<Hash160> {
+        let wallet = self.hd_wallet.read();
+        let wallet = match wallet.as_ref() {
+            Some(w) => w,
+            None => return Vec::new(),
+        };
+        let mut restored = Vec::new();
+        for (hash, entry) in self.keys.write().iter_mut() {
+            if entry.secret.is_some() || entry.is_watch_only {
+                continue;
+            }
+            let Some(path) = entry.hd_path.as_deref() else {
+                continue;
+            };
+            let mut parts = path.rsplit('/');
+            let index = parts.next().and_then(|s| s.parse::<u32>().ok());
+            let derived = match (parts.next(), index) {
+                (Some("0"), Some(i)) => wallet.derive_receiving(0, i),
+                (Some("1"), Some(i)) => wallet.derive_change(0, i),
+                _ => continue,
+            };
+            let Ok(secret) = derived.and_then(|k| k.secret_key()) else {
+                continue;
+            };
+            if secret.public_key().to_bytes() == entry.public.to_bytes() {
+                entry.secret = Some(secret);
+                restored.push(*hash);
+            }
+        }
+        restored
+    }
+
     /// Restore a private key stripped by `strip_secrets` (wallet unlock).
     pub fn restore_secret(&self, hash: &Hash160, secret: SecretKey) {
         if let Some(entry) = self.keys.write().get_mut(hash) {
