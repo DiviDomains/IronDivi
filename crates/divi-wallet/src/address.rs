@@ -19,6 +19,7 @@ use crate::error::WalletError;
 use divi_crypto::hash160;
 use divi_crypto::keys::PublicKey;
 use divi_primitives::hash::Hash160;
+use divi_primitives::script::Script;
 use sha2::{Digest, Sha256};
 
 /// Divi mainnet P2PKH version byte
@@ -184,6 +185,14 @@ impl Address {
                 address.version_byte(),
                 network
             )))
+        }
+    }
+
+    /// The output script that pays this address
+    pub fn script_pubkey(&self) -> Script {
+        match self.addr_type {
+            AddressType::P2PKH => Script::new_p2pkh(self.hash.as_bytes()),
+            AddressType::P2SH => Script::new_p2sh(self.hash.as_bytes()),
         }
     }
 
