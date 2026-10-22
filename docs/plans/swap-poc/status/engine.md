@@ -119,3 +119,14 @@
 - left: a live run against real nodes (to compare the hashes with an explorer) is an operator step; no `tip` run was made against any public endpoint here.
 - needs: nothing
 - decisions: a hash failure is a failure exit even though the height printed, so a script cannot miss it; XMR prints `-` rather than failing when monerod omits `top_block_hash`
+
+## 2026-10-22 — engine-review-brief (builder AT)
+- done: `engine-review-brief.md`, a security-review brief for the shared HTLC engine (`crates/divi-swap`, `bin/divi-swapd`, `bin/divi-swap`, `swap-chain-{btc,ltc,zec,evm,divi}`), written against 88c85b2 with a re-anchor note: scope, protocol per direction, ten invariant groups each with enforcing file:line and proving test, threat model, linked open decisions, build/test commands, ten reviewer questions. Linked from the `outside audit` line in `mainnet-readiness.md`. Docs only; no code, count, timeout or margin changed.
+- proof: `cargo test --no-fail-fast` on hp3 for the eight in-scope packages: 472 passed, 0 failed, 8 ignored (live tests, not run); `cargo fmt --all --check` clean. Per-package counts are in the brief section 6. Every cited file:line was opened on 88c85b2; items that could not be checked are marked `could not verify` in the brief.
+- left: F1 `Maker::accept` (`maker.rs:252`) takes no `gate` and has an await between the used-quote/hash checks and the writes; no unique hash index, no test of quote reuse.
+- left: F2 no maker re-broadcast of its funding tx if reorged out after `MakerLockConfirmed` (`maker.rs:608-617`); no test.
+- left: F4/F5 the hashlock routes (`GET /swaps`, `/swaps/:id`, `POST /swaps`, `/swaps/:id/lock`) have no auth, and only `quote` is rate-limited; the C3 token covers only `/xmr/swaps/:id/*`. The shipped `nginx-swap.conf` uses `$proxy_add_x_forwarded_for`, which a client can spoof if `trust_proxy_headers` is on; if it is off, all clients share one bucket.
+- left: F3 no `OP_SIZE` preimage-length check; F6 a chain missing from `cfg.chains` takes the mainnet built-in; F7 the preimage sits in plaintext SQLite (mode 0600). There is no test that no secret reaches argv or logs, and none that the preimage never leaves the taker before claim.
+- left: single-source backends (LTC one Esplora URL; BTC MTP and confirmations from one explorer), and the deepest DIVI reorg could not be verified.
+- needs: Bert: DIVI confirmations 10 vs 20 (`divi-confirmations.md`) and the XMR `L` value, both already open; nothing new.
+- decisions: findings are reported, not fixed (docs-only lane); F1 is framed as a duplicate-record defect, not theft, pending the reviewer.
