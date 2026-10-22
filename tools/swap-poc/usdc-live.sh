@@ -60,7 +60,7 @@ set -euo pipefail
 usage() {
   echo "usage: $0 [--network sepolia|base-sepolia] [--scenario happy|case-c|all]" \
     "[--direction forward|reverse|both] [--htlc 0x...] [--rpc-url URL] [--usdc-sats N]" \
-    "[--skip-fund] [--dry-run] [--maker-url URL]" >&2
+    "[--skip-fund] [--dry-run] [--check-secrets] [--maker-url URL]" >&2
   exit 2
 }
 die() { echo "usdc-live: $*" >&2; exit 1; }
@@ -73,6 +73,7 @@ rpc_url=""
 usdc_sats=100000000 # 1 USDC-equivalent in engine sats (1e8/coin); must be a multiple of 100
 skip_fund=""
 dry_run=0
+check_secrets=0
 maker_url=""
 while (($#)); do
   case "$1" in
@@ -84,6 +85,7 @@ while (($#)); do
     --usdc-sats) usdc_sats="${2:-}"; shift 2 || usage ;;
     --skip-fund) skip_fund=1; shift ;;
     --dry-run) dry_run=1; shift ;;
+    --check-secrets) check_secrets=1; shift ;;
     --maker-url) maker_url="${2:-}"; shift 2 || usage; [[ -n "$maker_url" ]] || usage ;;
     *) usage ;;
   esac
@@ -106,6 +108,25 @@ cd "$ROOT"
 
 vault="op://global_secret_store"
 ref() { echo "$vault/IronDivi Swap POC - $1/password"; }
+
+# resolve_secret KEY: one `secret get` per KEY per process (never per use, never in a loop);
+# the value is cached in the shell variable _secret_<KEY> (dashes -> underscores) and is never
+# echoed, logged, put in argv or written to disk. Fails closed, naming the item and never the
+# value: exit 2 = op unavailable, 3 = not found, 4 = denied. No `set -x` anywhere near this.
+resolve_secret() {
+  local k="$1" v rc=0 var="_secret_${1//-/_}"
+  [[ -z "${!var:-}" ]] || return 0
+  v="$(secret get --name "irondivi-swap-poc-$k-password" --op-ref "$(ref "$k")" 2>/dev/null </dev/null)" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) die "cannot read the $k key: 1Password unavailable (secret get exit 2; is secret-broker running? secret-broker status)" ;;
+    3) die "cannot read the $k key: item 'IronDivi Swap POC - $k' not found (secret get exit 3)" ;;
+    4) die "cannot read the $k key: access denied (secret get exit 4)" ;;
+    *) die "cannot read the $k key: secret get failed (exit $rc)" ;;
+  esac
+  [[ -n "$v" ]] || die "secret get returned an empty $k key"
+  printf -v "$var" '%s' "$v"
+}
 
 # Mirrors swap_chain_evm::UsdcNetwork (crates/swap-chain-evm/src/network.rs) — keep in sync.
 case "$network" in
@@ -164,6 +185,14 @@ fi
 
 echo "usdc-live: scenarios=${scenarios[*]} directions=${directions[*]} network=$network dry_run=$dry_run maker_url=${maker_url:-<local>}"
 
+if ((check_secrets)); then
+  # Resolve exactly the keys a live run needs, once each, then stop: no build, no chain call.
+  echo "usdc-live: --check-secrets: resolving keys only — no build, no daemon, no chain call"
+  needed=(taker-btc maker-btc maker-divi taker-divi); [[ -z "$maker_url" ]] || needed=(taker-btc taker-divi)
+  for k in "${needed[@]}"; do resolve_secret "$k"; echo "usdc-live: $k resolved"; done
+  exit 0
+fi
+
 if ((dry_run)); then
   echo "usdc-live: --dry-run: checking funding only — no keys, no daemon, no broadcast"
   echo "usdc-live: building swap-chain-evm's sepolia_ops example"
@@ -193,11 +222,7 @@ fi
 
 if [[ -n "$maker_url" ]]; then
   echo "usdc-live: preflight — can 1Password resolve the taker keys this run needs?"
-  for k in taker-btc taker-divi; do
-    if ! secret get --name "irondivi-swap-poc-$k-password" --op-ref "$(ref "$k")" >/dev/null 2>&1; then
-      die "cannot read the $k key (1Password locked, or secret-broker not running). Rerun once it is up."
-    fi
-  done
+  for k in taker-btc taker-divi; do resolve_secret "$k"; done
   bin_dir="${E2E_BIN_DIR:-}"
   if [[ -z "$bin_dir" ]]; then
     bin_dir="$ROOT/target/release"
@@ -208,18 +233,12 @@ if [[ -n "$maker_url" ]]; then
   echo "usdc-live: remote maker $maker_url; taker binary $bin_dir/divi-swap (not rebuilt)"
 else
   echo "usdc-live: preflight — can 1Password resolve the keys this run needs?"
-  for k in taker-btc maker-btc maker-divi taker-divi; do
-    if ! secret get --name "irondivi-swap-poc-$k-password" --op-ref "$(ref "$k")" >/dev/null 2>&1; then
-      die "cannot read the $k key (1Password locked, or secret-broker not running). Rerun once it is up."
-    fi
-  done
+  for k in taker-btc maker-btc maker-divi taker-divi; do resolve_secret "$k"; done
   # The one key this script itself hands to a child process (sepolia_ops deploy/send-*, and
   # the live_*_lock_claim test): resolved once, via the proxy (same --name as the preflight,
   # so it is served from the cache the preflight just warmed), held in a shell variable and
   # passed only through the child's environment.
-  taker_evm_key_hex="$(secret get --name irondivi-swap-poc-taker-btc-password --op-ref "$(ref taker-btc)")" \
-    || die "cannot resolve the taker-btc key through secret get (secret-broker status)"
-  [[ -n "$taker_evm_key_hex" ]] || die "secret get returned an empty taker-btc key"
+  taker_evm_key_hex="$_secret_taker_btc" # already resolved (once) by the preflight above
 
   echo "usdc-live: building divi-swapd, divi-swap and swap-chain-evm's sepolia_ops example"
   cargo build -q -p divi-swapd -p divi-swap-cli
@@ -271,7 +290,7 @@ else
   echo "usdc-live: $lock_claim_test (self-contained UsdcBackend sanity check)"
   SWAP_EVM_TEST_KEY_HEX="$taker_evm_key_hex" env "$lock_claim_rpc_var=$rpc_url" \
     cargo test -p swap-chain-evm --features live -- --ignored "$lock_claim_test" --nocapture
-  unset taker_evm_key_hex
+  unset taker_evm_key_hex _secret_taker_btc _secret_maker_btc _secret_maker_divi _secret_taker_divi
 
   bin_dir="$ROOT/target/debug"
   swapd="$bin_dir/divi-swapd"

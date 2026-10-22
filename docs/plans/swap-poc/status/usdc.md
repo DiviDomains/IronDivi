@@ -114,8 +114,8 @@
     `divi-usdc-sepolia` swap (maker sells DIVI, taker pays USDC) through `divi-swapd` +
     `divi-swap`, mirroring `e2e.sh`'s structure (state dir outside the repo, `op://` refs
     passed through to the Rust binaries that resolve them, `secret get` preflight). Keys
-    resolved here only for `sepolia_ops` calls (raw hex via `op read`, unset immediately
-    after); `divi-swapd`/`divi-swap` get `op://` reference strings and resolve their own.
+    resolved here only for `sepolia_ops` calls (raw hex via `secret get`, resolved once per process by
+    `resolve_secret`, passed only in the child's environment, unset immediately after); `divi-swapd`/`divi-swap` get `op://` reference strings and resolve their own.
     **Untested beyond `sepolia_ops` itself** — it needs 1Password and the real network,
     neither available on hp2; written carefully against `e2e.sh`'s established pattern.
   - Gas measured for real (anvil, same contract bytecode that will go to Sepolia):
