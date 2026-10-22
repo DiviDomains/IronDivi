@@ -639,12 +639,14 @@ A malicious maker sets `t_cancel` from a clock it chooses. Either it states `m =
 ### Recommendation
 (a). It is the only option that bounds a liar by something the taker measured, needs no wire change and no extra message, and covers the omitted-field path.
 
-### Open item: the tolerance `L` (new value, Bert's decision)
+### Open item: the tolerance `L` (new value, Bert's decision) — DECIDED 2026-10-23: 900 s on mainnet, testnet 1800 (see "L from mainnet data")
 `L` is how far an honest maker's DIVI node may trail the taker's. No existing parameter states it: `sigs_wait_secs` (1800 s) is a setup-duration bound and gives no gain; `divi_mtp_lag_secs` is MTP-vs-wall lag, not node-vs-node. Options: **L = 0** (strict; refuses any honest one-block disagreement); **L = 360 s = `reaction_secs` (300, `lib.rs:158`) + `divi_block_secs` (60)**: a node learns of a tip within one reaction plus one block (recommended; it is a judgment, not a derivation, hence no code); **L = 1800** (no improvement). Per the lane rules no code until L is chosen. When it is, the change is: record `prepare_mtp` in `prepare`, pass it to `check_setup_timelocks`, tests for (1) lying maker (states old `m` or omits it) refused, (2) honest maker trailing by < L accepted and > L refused, (3) record without `prepare_mtp` and `maker_mtp = None` keep today's behaviour.
 
 2026-10-22: implemented behind `XmrConfig::maker_mtp_trail_secs` (default = `sigs_wait_secs`, no behaviour change) in 5e03cb3. `L` stays Bert's open decision: setting the field to 0 / 360 / 1800 is the whole change.
 
 ### L from mainnet data (2026-10-22)
+
+Bert chose 900 s (2026-10-23, card 0e00f75c option a); implemented on mainnet, testnet stays 1800 (testnet block timing was never measured).
 
 Derived by builder BW from DIVI mainnet block times and the Divi Core source. **Nothing is changed**: `maker_mtp_trail_secs` stays 1800 (`crates/divi-swap-xmr/src/lib.rs:196`, `mainnet()`); the value below awaits Bert's yes. Raw data and scripts: `~/swap-lanes/builders/BW/data/` on hp1 (`analyze.py`, `analysis.out`), not in git.
 

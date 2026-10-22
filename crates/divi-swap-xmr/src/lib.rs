@@ -109,9 +109,11 @@ pub struct XmrConfig {
     /// How far behind the taker's own DIVI MTP (read in `prepare`, before the request) the
     /// maker's `t_cancel` clock may be: the setup floor on `t_cancel` is that MTP minus this,
     /// plus `cancel_after_secs` (`docs/plans/swap-poc/xmr-design.md`, "Maker MTP bound"). It
-    /// bounds a maker that lies about, or omits, `maker_mtp`. Every profile sets it to
-    /// `sigs_wait_secs`, which makes the floor never stricter than the one without it. The
-    /// right value (0, 360 or 1800) is an open decision of Bert's.
+    /// bounds a maker that lies about, or omits, `maker_mtp`. Mainnet sets 900 s, derived from
+    /// DIVI mainnet data (p99.9 of `MTP(h) − MTP(h−4)` = 831 s, plus 60 s; Bert chose it
+    /// 2026-10-23, `xmr-design.md` "L from mainnet data"). Testnet block timing was never
+    /// measured, so it keeps `sigs_wait_secs`, which makes the floor never stricter than the
+    /// one without it.
     pub maker_mtp_trail_secs: u64,
     /// Quote validity.
     pub quote_expiry_secs: u32,
@@ -204,7 +206,7 @@ impl XmrConfig {
             xmr_confirmations: swap_chain_xmr::live_rpc::SPENDABLE_AGE as u32,
             divi_fee_sats: 1_000_000,
             sigs_wait_secs: 1800,
-            maker_mtp_trail_secs: 1800,
+            maker_mtp_trail_secs: 900,
             quote_expiry_secs: 60,
         }
     }
@@ -718,10 +720,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_tolerance_is_sigs_wait_secs_on_every_profile_and_changes_nothing() {
-        for p in PROFILES {
+    fn the_testnet_tolerance_is_sigs_wait_secs_and_changes_nothing() {
+        // Testnet block timing was never measured, so it keeps `sigs_wait_secs`.
+        for p in [divi_swap::Profile::Testnet] {
             let f = XmrConfig::for_profile(p);
             assert_eq!(f.maker_mtp_trail_secs, f.sigs_wait_secs, "{p:?}");
+            assert_eq!(f.maker_mtp_trail_secs, 1800, "{p:?}");
             // With the default, a prepare MTP at or behind the verification MTP never
             // tightens the floor: same verdict at every t_cancel around it.
             let (prep, mtp) = (1_800_000_000u32, 1_800_000_060u32);
@@ -738,6 +742,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Mainnet L, measured on DIVI mainnet (`xmr-design.md`, "L from mainnet data").
+    const MAINNET_L: u32 = 900;
+
+    fn mainnet_case(p: u32, mtp: u32, m: Option<u32>, t_cancel_from: u32) -> Result<(), String> {
+        let f = XmrConfig::mainnet();
+        let c = t_cancel_from + f.cancel_after_secs;
+        let pu = c + f.punish_after_secs;
+        f.check_setup_timelocks(mtp, Some(p), m, c, pu, pu + f.late_after_secs)
+    }
+
+    #[test]
+    fn the_mainnet_trail_is_900_secs_from_mainnet_data() {
+        assert_eq!(XmrConfig::mainnet().maker_mtp_trail_secs, MAINNET_L as u64);
+    }
+
+    #[test]
+    fn on_mainnet_a_maker_trailing_by_900_secs_is_accepted_and_by_901_refused() {
+        // Boundary in the code: `t_cancel ≥ prepare_mtp − L + cancel_after`, so a maker
+        // whose stated MTP is exactly L behind the prepare MTP passes, one second more fails.
+        let (p, mtp) = (1_800_000_000u32, 1_800_000_060u32);
+        mainnet_case(p, mtp, Some(p - MAINNET_L), p - MAINNET_L).unwrap();
+        let m = p - MAINNET_L - 1;
+        let e = mainnet_case(p, mtp, Some(m), m).unwrap_err();
+        assert!(e.contains("own DIVI MTP before the request"), "{e}");
+        assert!(e.contains("900s trail"), "{e}");
+    }
+
+    #[test]
+    fn on_mainnet_a_maker_omitting_its_mtp_gets_the_prepare_floor_with_l_900() {
+        let (p, mtp) = (1_800_000_000u32, 1_800_000_060u32);
+        // floor = prepare_mtp − 900 + cancel_after_secs
+        mainnet_case(p, mtp, None, p - MAINNET_L).unwrap();
+        assert!(mainnet_case(p, mtp, None, p - MAINNET_L - 1).is_err());
+    }
+
+    #[test]
+    fn mainnet_with_l_900_still_validates_under_the_live_chain_timing() {
+        XmrConfig::mainnet()
+            .validate_for(&ChainTiming::live())
+            .unwrap();
     }
 
     #[test]
@@ -787,7 +833,7 @@ mod tests {
                 xmr_confirmations: 10,
                 divi_fee_sats: 1_000_000,
                 sigs_wait_secs: 1800,
-                maker_mtp_trail_secs: 1800,
+                maker_mtp_trail_secs: 900,
                 quote_expiry_secs: 60,
             }
         );
