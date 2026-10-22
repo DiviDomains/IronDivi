@@ -134,3 +134,22 @@
 ### 2026-10-22 engine-review-brief follow-up (orchestrator, from AT's unpushed amend 5ab6767)
 - done: engine-review-brief.md counts the 5 doc-tests in divi-swap (173 -> 178 passed) and names the three in-scope files changed since 88c85b2 that were not re-verified (live_rpc.rs is out of scope).
 - proof: docs only; diff 8eb0f46..5ab6767 applied unchanged.
+
+## 2026-10-22 — tip-live-crosscheck (builder AV)
+- done: `tools/swap-poc/tip-crosscheck.sh` runs `divi-swap tip --chain all` (add `MAINNET=1` for mainnet, `XMR_MONEROD_URL`/`XMR_NETWORK` for XMR) and compares each printed hash, by height, with an independent public source (curl + jq only, read-only, no keys). Rows are MATCH / MISMATCH / SKIP (no independent source, sources named) / ERROR; exit 1 on any MISMATCH or ERROR. A block missing at the explorer, or a differing hash, is re-asked once after `RACE_WAIT` (15 s) before it counts. `tools/swap-poc/test-tip-crosscheck.sh` is the hermetic self-test (stubbed `divi-swap` and curl). Runbook line added to `mainnet-readiness.md` (BTC tip row); the `ltc.md` pre-flight row no longer tells the operator to use a raw 1Password identity check (now `secret-broker status` or one `secret get` on a known ref). No code change.
+- proof: live run on hp1, 2026-10-22 14:48Z, base d433f25, `tip` read-only (mainnet via `--profile mainnet --allow-mainnet` on that one invocation; no config or default changed). Self-test: 8/8 ok (MATCH, MISMATCH, SKIP no-source, 1-block race, second-source fallback, XMR height-1, tip error).
+  | chain | network | height | code hash (prefix) | independent source | result |
+  |---|---|---|---|---|---|
+  | btc | mainnet | 972623 | 00000000000000000001ebbd… | blockstream.info/api, blockchain.info (code uses mempool.space first) | MATCH |
+  | btc | signet | 327495 | 000000050ed5d857… | blockstream.info/signet/api (code uses mempool.space first) | MATCH |
+  | ltc | mainnet | 3199639 | eb1d963b9b2be3851f37… | api.blockcypher.com | MATCH |
+  | zec | mainnet | 3526789 | 00000000004d79763a24… | mainnet.zcashexplorer.app (full 64 hex) and api.blockchair.com (script run) | MATCH |
+  | divi | mainnet | 4270142 | b5156bd0359e83b6… | chainz.cryptoid.info | MATCH |
+  | xmr | stagenet | 2235225 (count; top block 2235224) | 5640662f6aa39d13… | stagenet.xmrchain.net (page) vs code's monerod stagenet.xmr-tw.org | MATCH |
+  | divi | testnet | 361083 | 28d2043503030c1e… | none: only services.divi.domains (the code's own endpoint) answers; explorer.diviproject.org 301s, no testnet explorer resolves | NO-SOURCE |
+  | ltc | testnet | 4929736 | 0e964fe65f7ceda6… | litecoinspace.org/testnet is the code's own; chain.so v2 retired, sochain LTCTEST 404, blockcypher has no LTC testnet | NO-SOURCE |
+  | zec | testnet | 4529311 | 000024d79b19… | testnet.zcashexplorer.app (stale: newest block 4488804, 404 at the tip), blockexplorer.one (Cloudflare "Not Found"), explorer.testnet.z.cash (no DNS), blockchair has no testnet | NO-SOURCE |
+  Findings: XMR `tip` prints monerod's block COUNT, so the top block is at `height-1` (the script compares that block); all six comparable rows agree, no MISMATCH; blockchair rate-limits per IP (HTTP 430) after a handful of calls, so it is only a fallback.
+- left: DIVI testnet, LTC testnet and ZEC testnet tip hashes still have no independent public source (re-check a testnet explorer for each later; ZEC testnet could be compared with a second lightwalletd, which is gRPC and not curl+jq); the XMR run used the one public stagenet monerod that answers (`stagenet.xmr-tw.org:38081`), its second-monerod check (`XMR_CROSS_URL`) was not exercised live because no other stagenet node answered; XMR testnet (not stagenet) was not smoked, no testnet monerod/explorer was reachable (`node.monerodevs.org:38089` resets, `node.sethforprivacy.com:38089` has no such height).
+- needs: nothing
+- decisions: no code, confirmation count, timeout, network guard or mainnet opt-in changed; mainnet rows come from the existing per-invocation `--allow-mainnet --profile mainnet` flags on `tip`, which is read-only; sources limited to public no-key endpoints.

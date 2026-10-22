@@ -536,8 +536,9 @@ every flag/subcommand name was confirmed against `divi-swap --help`/`run --help`
       bind port, confirmed in `deploy/divi-swapd/README.md` and `wave4-deploy.md`).
 - [ ] Maker currently healthy on the *old* binary before touching anything:
       `curl -fsS http://127.0.0.1:18482/healthz | jq '{ok, version}'` → `ok: true`.
-- [ ] 1Password / secret-broker unlocked on the Mac (`op whoami`, or
-      `secret-broker status` if that's the path this runner uses) — the taker/maker keys
+- [ ] 1Password / secret-broker unlocked on the Mac (prove it with `secret-broker status`, or one
+      `secret get --name <n> --op-ref op://…` on a known ref; never a raw CLI identity check, it
+      is unreliable) — the taker/maker keys
       below are resolved from `op://…` refs passed as flag *values*, not environment
       variables, so there is no key-bearing env var to set for the swap CLI itself. The
       taker's LTC address needs funds already (`balance` in step 5 confirms this; if it
