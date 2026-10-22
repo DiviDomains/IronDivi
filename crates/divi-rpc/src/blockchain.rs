@@ -114,6 +114,11 @@ pub trait MempoolProvider: Send + Sync {
 
     fn prioritise_transaction(&self, txid: &Hash256, priority_delta: f64, fee_delta: i64) -> bool;
 
+    /// Whether a pool transaction spends this outpoint
+    fn is_spent(&self, _outpoint: &divi_primitives::transaction::OutPoint) -> bool {
+        false
+    }
+
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()

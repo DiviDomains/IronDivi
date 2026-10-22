@@ -77,6 +77,17 @@ fn bare_txid(tx: &Transaction) -> Hash256 {
 /// Callback for submitting transactions to the mempool and network
 pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
 
+/// Who pays the fee when spending from a vault (Divi Core's TransactionFeeMode)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultFeeMode {
+    /// Fee comes out of the remainder; the destination gets the full amount
+    SenderPays,
+    /// Fee comes out of the amount sent
+    ReceiverPays,
+    /// Everything available goes to the destination, minus the fee
+    SweepFunds,
+}
+
 /// Wallet RPC handler
 pub struct WalletRpc {
     wallet: Arc<RwLock<Option<Arc<WalletDb>>>>,
@@ -86,6 +97,8 @@ pub struct WalletRpc {
     /// Fetches pruned blocks from full-history peers during rescan
     block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
     locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
+    /// Node mempool, to see coins spent by unconfirmed transactions
+    mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
 }
 
 impl WalletRpc {
@@ -97,6 +110,7 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
@@ -112,6 +126,7 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
@@ -124,6 +139,7 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
@@ -136,12 +152,18 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
     /// Set the wallet
     pub fn set_wallet(&self, wallet: Arc<WalletDb>) {
         *self.wallet.write() = Some(wallet);
+    }
+
+    /// Set the node mempool
+    pub fn set_mempool(&self, mempool: Arc<dyn crate::blockchain::MempoolProvider>) {
+        *self.mempool.write() = Some(mempool);
     }
 
     /// Update the current chain height
@@ -361,6 +383,14 @@ impl WalletRpc {
         let unconfirmed = wallet.get_unconfirmed_balance();
         let immature = wallet.get_immature_balance(height, 100);
 
+        // Core: spendable_balance excludes every vault, vaulted_balance is the
+        // coins in vaults we own (a managed vault is in neither)
+        let spendable = wallet
+            .get_spendable_utxos(height, 1)
+            .iter()
+            .fold(Amount::ZERO, |a, u| a + u.value);
+        let vaulted = wallet.get_vaulted_balance();
+
         let divi_balance = balance.as_sat() as f64 / 100_000_000.0;
         let divi_unconfirmed = unconfirmed.as_sat() as f64 / 100_000_000.0;
         let divi_immature = immature.as_sat() as f64 / 100_000_000.0;
@@ -370,8 +400,8 @@ impl WalletRpc {
             "active_wallet": "wallet.dat",
             "walletversion": 120200,
             "balance": divi_balance,
-            "spendable_balance": divi_balance,
-            "vaulted_balance": 0.0,
+            "spendable_balance": spendable.as_divi_f64(),
+            "vaulted_balance": vaulted.as_divi_f64(),
             "encryption_status": wallet.encryption_status(),
             "unconfirmed_balance": divi_unconfirmed,
             "immature_balance": divi_immature,
@@ -415,9 +445,12 @@ impl WalletRpc {
                     false
                 };
 
-                // UTXO is spendable if mature AND not watch-only
-                let spendable =
-                    utxo.is_mature(height, wallet.coinbase_maturity()) && !is_watch_only;
+                // UTXO is spendable if mature AND not watch-only, and a vault
+                // output only through its owner key (a manager can only stake it)
+                let spendable = utxo.is_mature(height, wallet.coinbase_maturity())
+                    && !is_watch_only
+                    && (!divi_script::is_staking_vault_script(&utxo.script_pubkey)
+                        || wallet.can_spend_script(&utxo.script_pubkey));
 
                 serde_json::json!({
                     "txid": utxo.txid.to_string(),
@@ -1741,16 +1774,39 @@ impl WalletRpc {
 
         // Verify transaction has output paying to vault script
         let vault_script_bytes = vault_script.as_bytes();
-        let has_vault_output = tx
+        let vault_outpoints: Vec<OutPoint> = tx
             .vout
             .iter()
-            .any(|out| out.script_pubkey.as_bytes() == vault_script_bytes);
+            .enumerate()
+            .filter(|(_, out)| out.script_pubkey.as_bytes() == vault_script_bytes)
+            .map(|(vout, _)| OutPoint::new(funding_txid, vout as u32))
+            .collect();
 
-        if !has_vault_output {
+        if vault_outpoints.is_empty() {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
                 format!(
                     "Transaction {} does not pay to the specified vault script",
+                    funding_tx
+                ),
+            )
+            .into());
+        }
+
+        // Only coins still in the UTXO set and not spent by a mempool
+        // transaction can be staked; a spent funding output is refused
+        let mempool = self.mempool.read().clone();
+        let unspent_in_chain = |op: &OutPoint| chain.get_utxo(op).ok().flatten().is_some();
+        let spent_in_mempool = |op: &OutPoint| mempool.as_ref().is_some_and(|m| m.is_spent(op));
+        let live = vault_outpoints
+            .iter()
+            .filter(|op| unspent_in_chain(op) && !spent_in_mempool(op))
+            .count();
+        if live == 0 {
+            return Err(RpcError::new(
+                codes::WALLET_ERROR,
+                format!(
+                    "AddingVaultScript: the vault output of transaction {} is already spent",
                     funding_tx
                 ),
             )
@@ -1783,6 +1839,11 @@ impl WalletRpc {
             }
 
             wallet.scan_transaction(&fund_tx, Some(location.block_hash), height, None);
+            // The scan records every vault output of the transaction; drop
+            // those already spent on chain so no phantom balance appears
+            for op in vault_outpoints.iter().filter(|op| !unspent_in_chain(op)) {
+                wallet.spend_utxo(op);
+            }
             tracing::info!(
                 "Scanned funding tx {} at height {:?} for vault UTXOs",
                 funding_tx,
@@ -1812,9 +1873,9 @@ impl WalletRpc {
                 RpcError::new(codes::INVALID_PARAMETER, "Could not parse vault encoding!").into(),
             );
         }
-        let tx_hash = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: tx_hash"))?;
+        // Divi Core takes the encoding only; an optional funding txid is
+        // still accepted (and echoed back) for older IronDivi callers
+        let tx_hash = params.get_str(1);
 
         let (owner_addr, manager_addr) = self.parse_vault_encoding(vault_addresses)?;
         let owner_hash = if let Some(ref addr) = owner_addr {
@@ -1848,11 +1909,15 @@ impl WalletRpc {
             return Err(RpcError::new(codes::WALLET_ERROR, "Failed to remove vault").into());
         }
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
+            "removal_status": true,
             "result": "success",
             "message": format!("Vault {} removed successfully", vault_addresses),
-            "tx_hash": tx_hash
-        }))
+        });
+        if let Some(tx_hash) = tx_hash {
+            result["tx_hash"] = json!(tx_hash);
+        }
+        Ok(result)
     }
 
     /// Get coin availability - Show available vault funds
@@ -1871,12 +1936,9 @@ impl WalletRpc {
         let vaults = wallet.get_all_vaults();
         let total_vaults = vaults.len();
 
-        // Get vault UTXOs (mature, confirmed vault outputs)
-        let vault_utxos = wallet.get_vault_utxos(height, 1);
-
-        // Group by vault script and calculate totals
+        // Balance of each registered vault, from every vault output we hold
         let mut vault_balances = std::collections::HashMap::new();
-        for utxo in vault_utxos {
+        for utxo in wallet.get_vault_utxos(height, 1) {
             let script_key = utxo.script_pubkey.as_bytes().to_vec();
             *vault_balances.entry(script_key).or_insert(Amount::ZERO) += utxo.value;
         }
@@ -1896,19 +1958,19 @@ impl WalletRpc {
             }));
         }
 
-        // C++ shape: Vaulted / Stakable / Spendable. Stakable is approximated by the
-        // confirmed, mature, non-vault coins (the node has no coin-age filter here).
-        let vault_utxos = wallet.get_vault_utxos(height, 1);
-        let vault_scripts: std::collections::HashSet<Vec<u8>> = wallet
-            .get_all_vaults()
-            .into_iter()
-            .map(|v| v.vault_script)
-            .collect();
-        let plain: Vec<_> = wallet
-            .get_spendable_utxos(height, 1)
-            .into_iter()
-            .filter(|u| !vault_scripts.contains(u.script_pubkey.as_bytes()))
-            .collect();
+        // C++ shape (AvailableUtxoCalculator): Vaulted = vaults we own,
+        // Stakable = plain coins plus vaults we manage, Spendable = plain coins.
+        // The node has no coin-age filter here.
+        let owned_vaults = wallet.get_owned_vault_utxos(height, 1);
+        let plain = wallet.get_spendable_utxos(height, 1);
+        let mut stakable = plain.clone();
+        stakable.extend(
+            wallet
+                .get_stakeable_vault_utxos(height, 1)
+                .into_iter()
+                .map(|(u, _)| u),
+        );
+        let network = wallet.network();
         let sum = |us: &[divi_wallet::wallet_db::WalletUtxo]| -> f64 {
             us.iter()
                 .fold(Amount::ZERO, |a, u| a + u.value)
@@ -1930,14 +1992,17 @@ impl WalletRpc {
             let mut all_vaults = Vec::new();
             let mut vault_total = Amount::ZERO;
             for (script, (value, txids)) in by_script {
-                if let Some(v) = wallet
-                    .get_all_vaults()
-                    .into_iter()
-                    .find(|v| v.vault_script == script)
-                {
+                if let Some(v) = StakingVaultScript::from_script(&Script::from_bytes(script)) {
+                    let addr = |h: [u8; 20]| {
+                        Address::from_pubkey_hash(
+                            divi_primitives::hash::Hash160::from_bytes(h),
+                            network,
+                        )
+                        .to_string()
+                    };
                     vault_total += value;
                     all_vaults.push(json!({
-                        "vault": format!("{}:{}", v.owner_address, v.manager_address),
+                        "vault": format!("{}:{}", addr(v.owner_pubkey_hash), addr(v.vault_pubkey_hash)),
                         "value": value.as_divi_f64(),
                         "txids": txids,
                     }));
@@ -1947,11 +2012,15 @@ impl WalletRpc {
             json!({"AllVaults": all_vaults, "NonVaults": (total - vault_total).as_divi_f64()})
         };
         let (vaulted, stakable, spendable) = if verbose {
-            (describe(&vault_utxos), describe(&plain), describe(&plain))
+            (
+                describe(&owned_vaults),
+                describe(&stakable),
+                describe(&plain),
+            )
         } else {
             (
-                json!(sum(&vault_utxos)),
-                json!(sum(&plain)),
+                json!(sum(&owned_vaults)),
+                json!(sum(&stakable)),
                 json!(sum(&plain)),
             )
         };
@@ -2122,174 +2191,144 @@ impl WalletRpc {
         Ok(serde_json::json!(txid.to_string()))
     }
 
-    /// Debit vault by name - Withdraws funds from vault using vault manager key (coinstake only)
-    pub fn debit_vault_by_name(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let vault_encoding = params.get_str(0).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: vault-encoding")
-        })?;
-        let destination = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: diviaddress"))?;
-        let amount = params
-            .get(2)
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?;
-        let _fee_mode = params.get_str(3);
-
-        let (owner_addr, manager_addr) = self.parse_vault_encoding(vault_encoding)?;
-        let _ = Address::from_base58(destination)
-            .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
-
-        let owner_hash = if let Some(ref addr) = owner_addr {
-            self.address_to_hash160(addr)?
-        } else {
-            return Err(RpcError::invalid_params(
-                "Owner address is required. Use format: owner_address:manager_address",
+    /// Fee mode argument of reclaimvaultfunds / debitvaultbyname (Divi Core:
+    /// none = sender pays, "receiver_pays", "sweep_funds"; reclaim also takes
+    /// "metadata", whose comments are not kept here)
+    fn parse_vault_fee_mode(
+        mode: Option<&str>,
+        allow_metadata: bool,
+    ) -> Result<VaultFeeMode, Error> {
+        match mode {
+            None | Some("") => Ok(VaultFeeMode::SenderPays),
+            Some("receiver_pays") => Ok(VaultFeeMode::ReceiverPays),
+            Some("sweep_funds") => Ok(VaultFeeMode::SweepFunds),
+            Some("metadata") if allow_metadata => Ok(VaultFeeMode::SenderPays),
+            Some(_) => Err(RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Unknown option for reclaiming vault funds",
             )
-            .into());
-        };
-        let manager_hash = self.address_to_hash160(&manager_addr)?;
-
-        let _vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
-
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            format!(
-                "debitvaultbyname not yet implemented. This command requires coinstake creation, which is outside the current scope. The vault manager can ONLY spend vault funds via coinstake transactions (OP_REQUIRE_COINSTAKE enforces this). This command would create a coinstake spending {} DIVI from vault {} to {}. Full implementation requires: (1) Coinstake transaction building, (2) Kernel hash computation, (3) Proof-of-stake validation",
-                amount, vault_encoding, destination
-            )
-        ).into())
+            .into()),
+        }
     }
 
-    /// Reclaim vault funds - Withdraw from vault using owner key (can spend anytime)
-    pub fn reclaim_vault_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let wallet = self.get_wallet()?;
+    /// Pay `amount` to `dest` out of vault outputs we own, signing with the
+    /// owner key. What is left goes back to a vault script, so it keeps
+    /// staking: `change_script` if given (debitvaultbyname), otherwise the
+    /// vault the coins came from. Returns (txid, amount received, fee).
+    fn spend_owned_vault_utxos(
+        &self,
+        wallet: &WalletDb,
+        candidates: Vec<divi_wallet::wallet_db::WalletUtxo>,
+        dest: &Address,
+        amount: Amount,
+        mode: VaultFeeMode,
+        change_script: Option<Script>,
+    ) -> Result<(Hash256, Amount, Amount), Error> {
+        let fee_for = |inputs: usize, outputs: usize| {
+            Amount::from_sat(1000 + 1000 * inputs as i64 + 500 * outputs as i64)
+        };
+        let total_of = |us: &[divi_wallet::wallet_db::WalletUtxo]| {
+            us.iter().fold(Amount::ZERO, |a, u| a + u.value)
+        };
+        let available = total_of(&candidates);
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
-
-        let destination = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: diviaddress"))?;
-
-        let send_amount = amount_from_value(
-            params
-                .get(1)
-                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
-            false,
-        )?;
-
-        let dest_addr = Address::from_base58(destination)
-            .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
-
-        let chain = self
-            .chain
-            .as_ref()
-            .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available"))?;
-        let height = chain.height();
-
-        let vault_utxos = wallet.get_vault_utxos(height, 1);
-
-        if vault_utxos.is_empty() {
-            return Err(
-                RpcError::new(codes::WALLET_ERROR, "No vault funds available to reclaim").into(),
-            );
-        }
-
-        // Filter vault UTXOs to only those where we have the owner's private key
-        let keystore = wallet.keystore();
-        let owned_vault_utxos: Vec<_> = vault_utxos
-            .into_iter()
-            .filter(|utxo| {
-                if let Some(vault) =
-                    divi_script::StakingVaultScript::from_script(&utxo.script_pubkey)
-                {
-                    let owner_hash =
-                        divi_primitives::hash::Hash160::from_bytes(vault.owner_pubkey_hash);
-                    if let Some(entry) = keystore.get_key(&owner_hash) {
-                        !entry.is_watch_only && entry.secret.is_some()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        if owned_vault_utxos.is_empty() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                "No vault funds available to reclaim (no owner keys found for any vaults)",
-            )
-            .into());
-        }
-
+        // Coins to spend: everything for a sweep; otherwise, when no change
+        // script is fixed, the smallest single vault that covers the payment
+        // (so the remainder has one vault to go back to), else largest first
         let mut selected = Vec::new();
-        let mut total_input = Amount::ZERO;
-
-        for utxo in owned_vault_utxos {
-            selected.push(utxo.clone());
-            total_input += utxo.value;
-
-            let base_fee = Amount::from_sat(1000);
-            let per_input_fee = Amount::from_sat(1000);
-            let per_output_fee = Amount::from_sat(500);
-            let fee = base_fee
-                + Amount::from_sat(
-                    per_input_fee.as_sat() * selected.len() as i64 + per_output_fee.as_sat() * 2,
-                );
-
-            if total_input >= send_amount + fee {
-                break;
+        if mode == VaultFeeMode::SweepFunds {
+            selected = candidates;
+        } else {
+            let need = |n: usize| match mode {
+                VaultFeeMode::ReceiverPays => amount,
+                _ => amount + fee_for(n, 2),
+            };
+            let mut pool = candidates;
+            if change_script.is_none() {
+                let mut by_script: std::collections::BTreeMap<Vec<u8>, Vec<_>> = Default::default();
+                for u in &pool {
+                    by_script
+                        .entry(u.script_pubkey.as_bytes().to_vec())
+                        .or_default()
+                        .push(u.clone());
+                }
+                if let Some(group) = by_script
+                    .into_values()
+                    .filter(|g| total_of(g) >= need(g.len()))
+                    .min_by_key(|g| total_of(g))
+                {
+                    pool = group;
+                }
+            }
+            pool.sort_by_key(|u| std::cmp::Reverse(u.value));
+            let mut total = Amount::ZERO;
+            for u in pool {
+                total += u.value;
+                selected.push(u);
+                if total >= need(selected.len()) {
+                    break;
+                }
+            }
+            if total < need(selected.len()) {
+                return Err(RpcError::new(
+                    codes::WALLET_INSUFFICIENT_FUNDS,
+                    format!(
+                        "Insufficient vault funds. Have {}, need {}",
+                        available.as_divi_f64(),
+                        need(selected.len()).as_divi_f64()
+                    ),
+                )
+                .into());
             }
         }
 
-        let base_fee = Amount::from_sat(1000);
-        let per_input_fee = Amount::from_sat(1000);
-        let per_output_fee = Amount::from_sat(500);
-        let final_fee = base_fee
-            + Amount::from_sat(
-                per_input_fee.as_sat() * selected.len() as i64 + per_output_fee.as_sat() * 2,
-            );
-
-        if total_input < send_amount + final_fee {
+        let total_input = total_of(&selected);
+        let min_output = Amount::from_sat(546); // Dust limit
+        let (fee, received, change) = match mode {
+            VaultFeeMode::SweepFunds => {
+                let fee = fee_for(selected.len(), 1);
+                (fee, total_input - fee, Amount::ZERO)
+            }
+            VaultFeeMode::ReceiverPays => {
+                let fee = fee_for(selected.len(), 2);
+                (fee, amount - fee, total_input - amount)
+            }
+            VaultFeeMode::SenderPays => {
+                let fee = fee_for(selected.len(), 2);
+                (fee, amount, total_input - amount - fee)
+            }
+        };
+        if received < min_output {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
                 format!(
-                    "Insufficient vault funds. Have {}, need {}",
-                    total_input.as_divi_f64(),
-                    (send_amount + final_fee).as_divi_f64()
+                    "Amount {} is too small to pay the fee of {}",
+                    amount.as_divi_f64(),
+                    fee.as_divi_f64()
                 ),
             )
             .into());
         }
 
-        let change_amount = total_input - send_amount - final_fee;
-
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
         let mut builder = TransactionBuilder::new();
         for utxo in &selected {
             builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
         }
-        builder = builder.add_output_to_address(send_amount, &dest_addr);
-
-        let min_output = Amount::from_sat(546);
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
+        builder = builder.add_output_to_address(received, dest);
+        if change >= min_output {
+            let change_script = change_script.unwrap_or_else(|| {
+                selected
+                    .iter()
+                    .max_by_key(|u| u.value)
+                    .map(|u| u.script_pubkey.clone())
+                    .expect("at least one input")
+            });
+            builder = builder.add_output(change, change_script);
         }
 
         let (mut tx, prev_scripts) = builder.build();
 
-        // NOTE: Vault scripts use OP_IF with owner key in the true branch (push 1).
-        // TransactionSigner must have the owner's private key to sign successfully.
+        // Vault scripts use OP_IF with the owner key in the true branch (push 1)
         let signer = TransactionSigner::new(wallet.keystore());
         let signed_count = signer
             .sign_all_inputs(&mut tx, &prev_scripts)
@@ -2314,11 +2353,139 @@ impl WalletRpc {
 
         let txid = tx.txid();
         self.submit_transaction(tx)?;
+        // A dropped (dust) change is part of the fee
+        let fee = total_input
+            - received
+            - if change >= min_output {
+                change
+            } else {
+                Amount::ZERO
+            };
+        Ok((txid, received, fee))
+    }
+
+    /// Debit vault by name - pay out of one vault with the owner key; the rest
+    /// stays in that vault (Divi Core sets the change script to the vault)
+    pub fn debit_vault_by_name(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let vault_encoding = params.get_str(0).ok_or_else(|| {
+            RpcError::invalid_params("Missing required parameter: vault-encoding")
+        })?;
+        let destination = params
+            .get_str(1)
+            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: diviaddress"))?;
+        let send_amount = amount_from_value(
+            params
+                .get(2)
+                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
+            false,
+        )?;
+
+        let invalid_encoding = || -> Error {
+            RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid Vault Encoding").into()
+        };
+        let (owner_addr, manager_addr) = self
+            .parse_vault_encoding(vault_encoding)
+            .map_err(|_| invalid_encoding())?;
+        let owner_addr = owner_addr.ok_or_else(invalid_encoding)?;
+        let owner_hash = self
+            .address_to_hash160(&owner_addr)
+            .map_err(|_| invalid_encoding())?;
+        let manager_hash = self
+            .address_to_hash160(&manager_addr)
+            .map_err(|_| invalid_encoding())?;
+        let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+
+        let wallet = self.get_wallet()?;
+        if wallet.vault_role(&vault_script) != Some(divi_wallet::wallet_db::VaultRole::Owned) {
+            return Err(RpcError::new(
+                codes::INVALID_ADDRESS_OR_KEY,
+                format!("Vault owner key is unknown: address={}", owner_addr),
+            )
+            .into());
+        }
+
+        let dest_addr = Address::from_base58(destination)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        let mode = Self::parse_vault_fee_mode(params.get_str(3), false)?;
+
+        if wallet.is_locked() {
+            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
+        }
+
+        let height = self.current_height();
+        let candidates: Vec<_> = wallet
+            .get_owned_vault_utxos(height, 1)
+            .into_iter()
+            .filter(|u| u.script_pubkey == vault_script)
+            .collect();
+        if candidates.is_empty() {
+            return Err(RpcError::new(
+                codes::WALLET_INSUFFICIENT_FUNDS,
+                format!("No funds available in vault {}", vault_encoding),
+            )
+            .into());
+        }
+
+        let (txid, _, _) = self.spend_owned_vault_utxos(
+            &wallet,
+            candidates,
+            &dest_addr,
+            send_amount,
+            mode,
+            Some(vault_script),
+        )?;
+        Ok(json!(txid.to_string()))
+    }
+
+    /// Reclaim vault funds - Withdraw from vault using owner key (can spend anytime)
+    pub fn reclaim_vault_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        let wallet = self.get_wallet()?;
+
+        if wallet.is_locked() {
+            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
+        }
+
+        let destination = params
+            .get_str(0)
+            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: diviaddress"))?;
+
+        let send_amount = amount_from_value(
+            params
+                .get(1)
+                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
+            false,
+        )?;
+
+        let dest_addr = Address::from_base58(destination)
+            .map_err(|e| RpcError::invalid_params(format!("Invalid destination address: {}", e)))?;
+
+        let mode = Self::parse_vault_fee_mode(params.get_str(2), true)?;
+
+        let height = self.current_height();
+
+        // Vault outputs whose owner key we hold, registered or not (Divi Core's
+        // OWNED_VAULT_COINS); a manager key alone gives nothing to reclaim
+        let owned_vault_utxos = wallet.get_owned_vault_utxos(height, 1);
+
+        if owned_vault_utxos.is_empty() {
+            return Err(
+                RpcError::new(codes::WALLET_ERROR, "No vault funds available to reclaim").into(),
+            );
+        }
+
+        let (txid, received, fee) = self.spend_owned_vault_utxos(
+            &wallet,
+            owned_vault_utxos,
+            &dest_addr,
+            send_amount,
+            mode,
+            None,
+        )?;
 
         Ok(json!({
             "txid": txid.to_string(),
-            "amount": send_amount.as_divi_f64(),
-            "fee": final_fee.as_divi_f64()
+            "amount": received.as_divi_f64(),
+            "fee": fee.as_divi_f64()
         }))
     }
 

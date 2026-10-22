@@ -254,8 +254,15 @@ impl Staker {
     pub fn get_status(&self) -> StakingStatus {
         let current_height = self.chain.height();
 
-        // Get stakeable UTXOs
-        let utxos = self.wallet.get_spendable_utxos(current_height, 1);
+        // Get stakeable UTXOs: plain coins and registered vaults we manage
+        // (vaults are not part of the spendable set)
+        let mut utxos = self.wallet.get_spendable_utxos(current_height, 1);
+        utxos.extend(
+            self.wallet
+                .get_stakeable_vault_utxos(current_height, 1)
+                .into_iter()
+                .map(|(u, _)| u),
+        );
         let stakeable: Vec<_> = utxos
             .into_iter()
             .filter(|u| u.value.as_sat() >= self.config.read().min_stake_amount)
