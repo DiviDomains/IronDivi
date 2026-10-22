@@ -16,7 +16,7 @@ mod second_source;
 mod wallet;
 
 pub use rpc::{classify_broadcast_error, BroadcastClass, RetryPolicy, RpcClient, RpcError};
-pub use second_source::{CONFIRMATION_TOLERANCE, MTP_TOLERANCE_SECS};
+pub use second_source::{CONFIRMATION_TOLERANCE, MTP_TOLERANCE_SECS, TIP_TOLERANCE_BLOCKS};
 pub use wallet::{Utxo, Wallet};
 
 use std::time::Duration;
@@ -172,7 +172,7 @@ impl DiviBackend {
     }
 
     /// Add a second, independent endpoint. Every swap-relevant read (confirmations, HTLC
-    /// output, find-spend, MTP) is then made on both and any disagreement is
+    /// output, find-spend, MTP, tip height and hash, and the wallet scan reads) is then made on both and any disagreement is
     /// `SwapError::Transient`; a broadcast goes to both. An empty `url` leaves the backend
     /// single-source.
     pub fn with_fallback_rpc(mut self, url: &str) -> Self {
@@ -206,10 +206,7 @@ impl DiviBackend {
     /// Learn the coins a known transaction (e.g. the faucet send) pays to this key.
     /// Returns how many new coins were added.
     pub async fn add_funding_tx(&self, txid: &Txid) -> Result<usize> {
-        let tx = self
-            .rpc
-            .call_ok("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
-            .await?;
+        let tx = self.get_tx(&txid.to_rpc_hex()).await?;
         self.wallet.lock().apply_tx(&tx, &self.spk.to_hex())
     }
 
@@ -241,12 +238,31 @@ impl DiviBackend {
         Ok(to_height + 1)
     }
 
+    /// The transactions of block `height`. With a fallback both endpoints must list the same
+    /// ones: a primary that hides a block's transactions would hide a coin or a spend from the
+    /// wallet for good, because the scan cursor moves past the block.
     async fn block_txids(&self, height: u64) -> Result<Vec<String>> {
-        block_txids_on(&self.rpc, height).await
+        let Some(fb) = &self.fallback else {
+            return block_txids_on(&self.rpc, height).await;
+        };
+        let (a, b) = tokio::join!(
+            block_txids_on(&self.rpc, height),
+            block_txids_on(fb, height)
+        );
+        let (a, b) = second_source::pair("block_txids", a, b)?;
+        second_source::agree_block_txids(a, b)
     }
 
+    /// A transaction as the wallet will learn it. With a fallback both endpoints must give the
+    /// same txid, spent outpoints and outputs; the wallet derives coins and spends from them,
+    /// and coin selection (which UTXO is spent, for how much) follows from the coins.
     async fn get_tx(&self, txid: &str) -> Result<Value> {
-        get_tx_on(&self.rpc, txid).await
+        let Some(fb) = &self.fallback else {
+            return get_tx_on(&self.rpc, txid).await;
+        };
+        let (a, b) = tokio::join!(get_tx_on(&self.rpc, txid), get_tx_on(fb, txid));
+        let (a, b) = second_source::pair("wallet_tx", a, b)?;
+        second_source::agree_wallet_tx(a, b)
     }
 
     /// Like `get_tx` but `None` for "No such mempool or blockchain transaction" (-5).
@@ -343,15 +359,21 @@ impl ChainBackend for DiviBackend {
     }
 
     async fn tip_height(&self) -> Result<u64> {
-        tip_height_on(&self.rpc).await
+        let Some(fb) = &self.fallback else {
+            return tip_height_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(tip_height_on(&self.rpc), tip_height_on(fb));
+        let (a, b) = second_source::pair("tip_height", a, b)?;
+        second_source::agree_tip_height(a, b)
     }
 
     async fn tip_hash(&self) -> Result<String> {
-        let v = self.rpc.call_ok("getbestblockhash", json!([])).await?;
-        let s = v
-            .as_str()
-            .ok_or_else(|| SwapError::Transient("getbestblockhash: not a string".into()))?;
-        divi_swap::backend::normalize_block_hash(s)
+        let Some(fb) = &self.fallback else {
+            return tip_hash_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(tip_hash_on(&self.rpc), tip_hash_on(fb));
+        let (a, b) = second_source::pair("tip_hash", a, b)?;
+        second_source::agree_tip_hash(a, b)
     }
 
     async fn median_time_past(&self) -> Result<u32> {
@@ -586,6 +608,14 @@ async fn get_tx_opt_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<Value>> {
         Err(RpcError::Node { code: -5, .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+async fn tip_hash_on(rpc: &RpcClient) -> Result<String> {
+    let v = rpc.call_ok("getbestblockhash", json!([])).await?;
+    let s = v
+        .as_str()
+        .ok_or_else(|| SwapError::Transient("getbestblockhash: not a string".into()))?;
+    divi_swap::backend::normalize_block_hash(s)
 }
 
 async fn tip_height_on(rpc: &RpcClient) -> Result<u64> {

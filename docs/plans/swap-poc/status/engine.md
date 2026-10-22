@@ -260,3 +260,10 @@
 - left: BTC/LTC/ZEC relay-policy limits (policy.h) not in the vendored sources, unverified. An old binary reading an in-flight V1 record would rebuild V0. A new taker accepts an old maker's V0 leg (interop; its own preimage is honest). The in-flight V0 maker-leg inheritance is covered by code only, no test.
 - needs: nothing
 - decisions: version rides in `HtlcParams` so the maker-built taker leg crosses the wire to the taker; V0 omits the field so existing JSON is byte-identical; no confirmation count, timeout, margin, route, rate limit or opt-in was touched.
+
+## 2026-10-22 — divi-second-source-tip (builder BJ)
+- done: the DIVI `fallback_rpc_url` rule now also covers `tip_height`, `tip_hash`, `block_txids` and `get_tx` (so `scan_range`, `scan_blocks`, `add_funding_tx`) in `crates/swap-chain-divi/src/lib.rs` and `second_source.rs`: tip height within `TIP_TOLERANCE_BLOCKS` (2) with the lower used, everything else exact, any disagreement or one endpoint down is `Transient`. The taker has `--divi-fallback-rpc-url` (`bin/divi-swap/src/main.rs`, wired through `with_fallback_rpc` at both `DiviBackend::new` sites). Unset is the old single-source path.
+- proof: 15 new tests in `crates/swap-chain-divi/tests/second_source_tip.rs` (wiremock, no network) plus 3 taker unit tests. Against the base source 13 of the 15 fail (a lying primary is trusted), after the change all 15 pass. Counts for `-p swap-chain-divi -p divi-swap -p divi-swap-cli -p divi-swapd`: 396 passed before, 414 after, 0 failed.
+- left: `build_funding` stays local (no RPC; only the wallet and key can answer). Making a second endpoint mandatory on mainnet is still an operator decision. Two colluding endpoints are not covered.
+- needs: nothing
+- decisions: tolerance 2 blocks because a 1 to 2 block lag between endpoints is ordinary and the lower height is always the safe one for the maker scan start; wallet transaction fields compared exactly since a coin the wallet then spends must be real.

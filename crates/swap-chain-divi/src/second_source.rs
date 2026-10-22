@@ -14,6 +14,7 @@
 //! liar can lower a number but never raise one.
 
 use divi_swap::{LockedOutput, SpendInfo, SwapError};
+use serde_json::Value;
 
 type Result<T> = std::result::Result<T, SwapError>;
 
@@ -25,6 +26,13 @@ pub const CONFIRMATION_TOLERANCE: u32 = 1;
 /// Ten minutes is ten DIVI blocks: far wider than tip lag, far narrower than a lie that moves
 /// a timelock decision. The lower value is used.
 pub const MTP_TOLERANCE_SECS: u32 = 600;
+
+/// Tip heights that differ by more than this many blocks are a disagreement. Two endpoints
+/// behind different proxies are routinely one block apart (a block lands between the two
+/// reads), and two blocks apart is still lag. The lower height is used, so a lag or a lie can
+/// only move the answer down: the one decision that reads the tip (where the maker starts
+/// looking for the taker's claim) is safe at a lower height, never at a higher one.
+pub const TIP_TOLERANCE_BLOCKS: u64 = 2;
 
 fn disagree(op: &str, detail: String) -> SwapError {
     tracing::warn!(
@@ -125,4 +133,74 @@ pub(crate) fn agree_mtp(a: u32, b: u32) -> Result<u32> {
         return Err(disagree("median_time_past", format!("{a} vs {b}")));
     }
     Ok(a.min(b))
+}
+
+pub(crate) fn agree_tip_height(a: u64, b: u64) -> Result<u64> {
+    if a.abs_diff(b) > TIP_TOLERANCE_BLOCKS {
+        return Err(disagree("tip_height", format!("{a} vs {b}")));
+    }
+    Ok(a.min(b))
+}
+
+/// Two endpoints on different tips name different hashes without either lying, so a difference
+/// is reported as a disagreement and retried; a tip that is stable for a moment agrees.
+pub(crate) fn agree_tip_hash(a: String, b: String) -> Result<String> {
+    if a != b {
+        return Err(disagree("tip_hash", format!("{a} vs {b}")));
+    }
+    Ok(a)
+}
+
+/// The transactions in one block, as two endpoints list them: identical or a disagreement.
+pub(crate) fn agree_block_txids(a: Vec<String>, b: Vec<String>) -> Result<Vec<String>> {
+    if a != b {
+        return Err(disagree(
+            "block_txids",
+            format!("{} vs {} transactions", a.len(), b.len()),
+        ));
+    }
+    Ok(a)
+}
+
+/// What the wallet learns from a transaction: its id, the outpoints it spends and its outputs
+/// (index, script, value). Fields the wallet never reads (confirmations, size) may differ.
+type WalletView = (
+    Option<String>,
+    Vec<(String, u64)>,
+    Vec<(u64, String, Option<u64>)>,
+);
+
+fn wallet_view(tx: &Value) -> WalletView {
+    let txid = tx["txid"].as_str().map(String::from);
+    let vin = tx["vin"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| Some((i["txid"].as_str()?.to_string(), i["vout"].as_u64()?)))
+        .collect();
+    let vout = tx["vout"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|o| {
+            let value = o["valueSat"]
+                .as_u64()
+                .or_else(|| o["value"].as_f64().map(|v| (v * 1e8).round() as u64));
+            (
+                o["n"].as_u64().unwrap_or(0),
+                o["scriptPubKey"]["hex"].as_str().unwrap_or("").to_string(),
+                value,
+            )
+        })
+        .collect();
+    (txid, vin, vout)
+}
+
+/// A transaction the wallet will learn coins and spends from: the two views must be identical.
+pub(crate) fn agree_wallet_tx(a: Value, b: Value) -> Result<Value> {
+    if wallet_view(&a) != wallet_view(&b) {
+        let id = a["txid"].as_str().unwrap_or("?").to_string();
+        return Err(disagree("wallet_tx", format!("transaction {id} differs")));
+    }
+    Ok(a)
 }

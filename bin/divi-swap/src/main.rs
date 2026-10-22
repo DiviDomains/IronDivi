@@ -67,6 +67,12 @@ struct Cli {
     /// DIVI height to start scanning for the taker's coins when the wallet has no cursor yet.
     #[arg(long, global = true)]
     divi_scan_from: Option<u64>,
+    /// A second, independent DIVI JSON-RPC endpoint. When set, the taker's DIVI reads
+    /// (confirmations, HTLC output, find-spend, median time, tip, wallet scan) are made on both
+    /// endpoints and a disagreement is retried, never acted on. Must differ from the default
+    /// endpoint; unset = single endpoint. Not used by the xmr arm.
+    #[arg(long, global = true)]
+    divi_fallback_rpc_url: Option<String>,
     /// DIVI network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`). Picks the
     /// DIVI RPC endpoint and address version; with `--profile` it must agree (not used by the
     /// xmr arm, whose DIVI side follows `--xmr-network`).
@@ -492,6 +498,27 @@ fn guard_profile(cli: &Cli) -> Result<()> {
     divi_swap::config::check_profile_networks(cli.profile, &coins).map_err(anyhow::Error::msg)
 }
 
+/// Apply `--divi-fallback-rpc-url` to a DIVI backend. Unset or blank leaves it untouched; the
+/// same URL as the default endpoint is refused (one node asked twice is not a second source).
+fn with_divi_fallback(
+    cli: &Cli,
+    network: divi_wallet::address::Network,
+    backend: DiviBackend,
+) -> Result<DiviBackend> {
+    let Some(url) = cli
+        .divi_fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(backend);
+    };
+    if url.trim_end_matches('/') == swap_chain_divi::default_rpc(network).trim_end_matches('/') {
+        bail!("--divi-fallback-rpc-url must differ from the default DIVI endpoint");
+    }
+    Ok(backend.with_fallback_rpc(url))
+}
+
 fn live_backends(cli: &Cli) -> Result<Backends> {
     match cli.counter_chain {
         Chain::Btc => guard_network(
@@ -546,12 +573,16 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         .as_deref()
         .map(divi_swap_cli::wallet::prepare_wallet_path)
         .transpose()?;
-    let divi = Arc::new(DiviBackend::new(
-        swap_chain_divi::default_rpc(divi_network),
-        dkey,
+    let divi = Arc::new(with_divi_fallback(
+        cli,
         divi_network,
-        swap_chain_divi::FeePolicy::default(),
-        wallet,
+        DiviBackend::new(
+            swap_chain_divi::default_rpc(divi_network),
+            dkey,
+            divi_network,
+            swap_chain_divi::FeePolicy::default(),
+            wallet,
+        )?,
     )?);
 
     if cli.counter_chain == Chain::Usdc {
@@ -722,12 +753,16 @@ fn tip_backend(cli: &Cli, chain: Chain) -> Result<Arc<dyn ChainBackend>> {
             };
             let dkey = divi_crypto::keys::SecretKey::from_hex(&hex::encode(key.secret_bytes()))
                 .map_err(|_| anyhow::anyhow!("divi throwaway key"))?;
-            Arc::new(DiviBackend::new(
-                swap_chain_divi::default_rpc(network),
-                dkey,
+            Arc::new(with_divi_fallback(
+                cli,
                 network,
-                swap_chain_divi::FeePolicy::default(),
-                None,
+                DiviBackend::new(
+                    swap_chain_divi::default_rpc(network),
+                    dkey,
+                    network,
+                    swap_chain_divi::FeePolicy::default(),
+                    None,
+                )?,
             )?)
         }
         other => bail!("no tip backend for {other}"),
@@ -1506,6 +1541,53 @@ mod tests {
         assert!(lines[1].starts_with("xmr stagenet error: "), "{lines:?}");
         assert!(lines[1].contains("127.0.0.1:1"), "{lines:?}");
         assert!(lines[2].starts_with("zec mock "), "{lines:?}");
+    }
+
+    fn throwaway_divi() -> DiviBackend {
+        let key = divi_crypto::keys::SecretKey::from_hex(&"11".repeat(32)).unwrap();
+        DiviBackend::new(
+            "http://127.0.0.1:1",
+            key,
+            divi_wallet::address::Network::Testnet,
+            swap_chain_divi::FeePolicy::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn divi_fallback_flag_parses_and_builds_a_backend_with_a_fallback() {
+        let net = divi_wallet::address::Network::Testnet;
+        let c = cli(&["--divi-fallback-rpc-url", "http://127.0.0.1:2"]);
+        assert_eq!(
+            c.divi_fallback_rpc_url.as_deref(),
+            Some("http://127.0.0.1:2")
+        );
+        let b = with_divi_fallback(&c, net, throwaway_divi()).unwrap();
+        assert!(b.has_fallback());
+    }
+
+    #[test]
+    fn divi_fallback_unset_or_blank_leaves_the_backend_single_source() {
+        let net = divi_wallet::address::Network::Testnet;
+        let unset = cli(&[]);
+        assert_eq!(unset.divi_fallback_rpc_url, None);
+        assert!(!with_divi_fallback(&unset, net, throwaway_divi())
+            .unwrap()
+            .has_fallback());
+        let blank = cli(&["--divi-fallback-rpc-url", "  "]);
+        assert!(!with_divi_fallback(&blank, net, throwaway_divi())
+            .unwrap()
+            .has_fallback());
+    }
+
+    #[test]
+    fn divi_fallback_equal_to_the_default_endpoint_is_refused() {
+        let net = divi_wallet::address::Network::Testnet;
+        let same = swap_chain_divi::default_rpc(net).to_string();
+        let c = cli(&["--divi-fallback-rpc-url", &same]);
+        let err = with_divi_fallback(&c, net, throwaway_divi()).err().unwrap();
+        assert!(err.to_string().contains("must differ"), "{err}");
     }
 
     fn cli(extra: &[&str]) -> Cli {
