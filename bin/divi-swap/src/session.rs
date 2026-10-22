@@ -15,8 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Which maker swap a local taker swap id belongs to. The engine `Store` keeps the taker's
-//! own state; this sidecar (no secrets) only remembers where the maker lives so separate
-//! CLI invocations (`accept`, then `lock`, then `status`) can find it.
+//! own state; this sidecar only remembers where the maker lives so separate CLI invocations
+//! (`accept`, then `lock`, then `status`) can find it. It holds the xmr maker's per-swap bearer
+//! token, so it is written mode 0600 like the database beside it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,7 +60,7 @@ impl Sessions {
         let mut all = self.load()?;
         all.insert(local_id.to_string(), s);
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&all)?)?;
+        write_private(&tmp, &serde_json::to_vec_pretty(&all)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -69,6 +70,27 @@ impl Sessions {
             .remove(local_id)
             .ok_or_else(|| anyhow!("unknown local swap id {local_id}"))
     }
+}
+
+/// Write `bytes` to `path` with mode 0600, whatever the umask or a stale file already there.
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` applies only when the file is created; tighten a leftover before any byte lands.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]
