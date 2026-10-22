@@ -113,6 +113,10 @@ struct Args {
     #[arg(long = "connect")]
     connect: Vec<String>,
 
+    /// How many of the newest blocks to check at start (default 100; 0 = all blocks)
+    #[arg(long, value_name = "N")]
+    checkblocks: Option<u32>,
+
     /// Make outbound P2P connections through this SOCKS5 proxy (ip:port, port 9050 if
     /// omitted). DNS seeds are then not resolved locally.
     #[arg(long, value_name = "IP:PORT")]
@@ -311,6 +315,18 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     config.p2p.listen_addr = s.to_string();
                 } else {
                     warn!("Invalid bind value in config file, expected string");
+                }
+            }
+            "checkblocks" => {
+                if let Some(i) = value
+                    .as_integer()
+                    .filter(|i| (0..=u32::MAX as i64).contains(i))
+                {
+                    config.check_blocks = i as u32;
+                } else {
+                    warn!(
+                        "Invalid checkblocks value in config file, expected a non-negative integer"
+                    );
                 }
             }
             "proxy" => {
@@ -616,6 +632,9 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     }
     if let Some(bind) = &args.bind {
         config.p2p.listen_addr = bind.clone();
+    }
+    if let Some(n) = args.checkblocks {
+        config.check_blocks = n;
     }
     if let Some(proxy) = &args.proxy {
         config.p2p.proxy = Some(proxy.clone());
@@ -1884,6 +1903,20 @@ mod connect_tests {
         // The command line wins over the file
         let both = build_config(&argv(&["--proxy=127.0.0.1:9050"])).unwrap();
         assert_eq!(both.p2p.proxy.as_deref(), Some("127.0.0.1:9050"));
+    }
+
+    #[test]
+    fn checkblocks_default_cli_and_config_file() {
+        assert_eq!(cfg(&[]).check_blocks, 100);
+        assert_eq!(cfg(&["--checkblocks=0"]).check_blocks, 0);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("irondivi.conf"), "checkblocks = 500\n").unwrap();
+        let args = Args::parse_from([
+            "irondivid".to_string(),
+            "--regtest".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ]);
+        assert_eq!(build_config(&args).unwrap().check_blocks, 500);
     }
 
     #[test]

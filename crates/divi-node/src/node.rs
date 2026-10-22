@@ -143,8 +143,28 @@ impl Node {
         });
 
         // Initialize chain state
-        let mut chain = Chain::new(db.clone(), chain_params.clone())
-            .map_err(|e| NodeError::Init(format!("Failed to initialize chain state: {}", e)))?;
+        let damaged = |e: divi_storage::StorageError| {
+            NodeError::Init(format!(
+                "Chain database {} cannot be used: {}. Stopping instead of building on it. \
+                 To recover, stop irondivid, move that directory aside and start again to \
+                 resync (or use --import-snapshot).",
+                config.chainstate_path().display(),
+                e
+            ))
+        };
+        let mut chain = Chain::new(db.clone(), chain_params.clone()).map_err(damaged)?;
+
+        // C++ checks the newest blocks at every start (-checkblocks); a damaged
+        // database otherwise goes unnoticed until the bad record is read.
+        let started = std::time::Instant::now();
+        let checked = chain
+            .verify_recent_blocks(config.check_blocks)
+            .map_err(damaged)?;
+        tracing::info!(
+            "Verified the last {} blocks in {} ms",
+            checked,
+            started.elapsed().as_millis()
+        );
 
         if config.index.txindex {
             let txindex_path = config.data_dir.join("txindex");
@@ -1313,6 +1333,84 @@ mod tests {
         let mut config = NodeConfig::testnet(ChainMode::Divi);
         config.data_dir = temp_dir.keep();
         config
+    }
+
+    /// Write `n` regtest blocks to the node's chain database and flush the block bodies
+    /// to their own table file; returns the path of that file.
+    fn regtest_chain_on_disk(config: &NodeConfig, n: u32) -> std::path::PathBuf {
+        use divi_primitives::amount::Amount;
+        use divi_primitives::block::Block;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{Transaction, TxIn, TxOut};
+        let db = Arc::new(ChainDatabase::open(config.chainstate_path()).unwrap());
+        let chain = Chain::new(
+            db.clone(),
+            ChainParams::for_network(StorageNetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap();
+        let mut parent = chain.tip().unwrap();
+        for i in 0..n {
+            let mut block = Block::default();
+            block.header.version = 1;
+            block.header.prev_block = parent.hash;
+            block.header.time = parent.time + 60;
+            block.header.bits = 0x207fffff;
+            block.transactions.push(Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+                vout: vec![TxOut::new(
+                    Amount::from_sat(1250_00000000),
+                    Script::new_p2pkh(&[i as u8 + 1; 20]),
+                )],
+                lock_time: 0,
+            });
+            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            chain.accept_block(block).unwrap();
+            parent = chain.tip().unwrap();
+        }
+        assert_eq!(chain.height(), n);
+        let raw = db.inner_db();
+        for cf in ["blocks", "block_index", "metadata", "undo", "utxo"] {
+            raw.flush_cf(&raw.cf_handle(cf).unwrap()).unwrap();
+        }
+        let file = raw
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.column_family_name == "blocks")
+            .expect("block bodies flushed to a table file");
+        config
+            .chainstate_path()
+            .join(file.name.trim_start_matches('/'))
+    }
+
+    /// A damaged block table must stop the node at start with a clear error, as C++
+    /// -checkblocks does. It used to start and run on (testnet: 8 KB overwritten in a
+    /// chainstate file, no error). --checkblocks=0 checks every block, as in C++.
+    #[test]
+    fn test_damaged_block_data_is_caught_at_start() {
+        let dir = tempdir().unwrap();
+        let mut config = NodeConfig::regtest(ChainMode::Divi);
+        config.data_dir = dir.path().to_path_buf();
+        let table = regtest_chain_on_disk(&config, 10);
+        drop(Node::new(config.clone()).expect("healthy database starts"));
+
+        // Overwrite bytes inside the first data block (the bodies of all 10 blocks)
+        let mut bytes = std::fs::read(&table).unwrap();
+        for b in &mut bytes[16..48] {
+            *b ^= 0x5a;
+        }
+        std::fs::write(&table, bytes).unwrap();
+
+        let err = match Node::new(config.clone()) {
+            Ok(_) => panic!("node started on a damaged chain database"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("damaged at height"), "{err}");
+        assert!(err.contains("move that directory aside"), "{err}");
+
+        config.check_blocks = 0;
+        assert!(Node::new(config).is_err());
     }
 
     #[test]

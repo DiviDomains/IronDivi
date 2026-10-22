@@ -54,6 +54,17 @@ pub struct NodeConfig {
 
     /// Block-expiry pruning (`-1` = never, `0` = minimum, else a retention window).
     pub expire: divi_storage::prune::Expire,
+
+    /// How many of the newest blocks to check at start (`-checkblocks`, 0 = all, as in C++)
+    #[serde(default = "default_check_blocks")]
+    pub check_blocks: u32,
+}
+
+/// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
+pub const DEFAULT_CHECK_BLOCKS: u32 = 100;
+
+fn default_check_blocks() -> u32 {
+    DEFAULT_CHECK_BLOCKS
 }
 
 impl Default for NodeConfig {
@@ -70,6 +81,7 @@ impl Default for NodeConfig {
             log: LogConfig::default(),
             utxo_cache_size: 10_000_000,
             expire: divi_storage::prune::Expire::Never,
+            check_blocks: DEFAULT_CHECK_BLOCKS,
         }
     }
 }

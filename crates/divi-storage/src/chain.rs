@@ -635,12 +635,115 @@ impl Chain {
     /// Load the chain tip from the database
     fn load_tip(&mut self) -> Result<(), StorageError> {
         if let Some(hash) = self.db.get_best_block()? {
-            if let Some(index) = self.db.get_block_index(&hash)? {
-                *self.best_known_block.write() = Some(index.clone());
-                *self.tip.write() = Some(index);
+            match self.db.get_block_index(&hash)? {
+                Some(index) => {
+                    *self.best_known_block.write() = Some(index.clone());
+                    *self.tip.write() = Some(index);
+                }
+                // A recorded tip without its index entry is damage, not an empty chain:
+                // falling through to init_genesis would quietly restart from block 0.
+                None => {
+                    return Err(StorageError::ChainState(format!(
+                        "database is damaged: best block {} has no block index entry",
+                        hash
+                    )))
+                }
             }
         }
         Ok(())
+    }
+
+    /// Check the last `depth` blocks of the active chain, as C++ `-checkblocks` does at
+    /// start (CVerifyDB::VerifyDB): each height maps to an index entry that links to the
+    /// one below, and each stored block body reads back (RocksDB checks its CRC on read),
+    /// hashes to its index entry and matches its merkle root; stored undo data must decode.
+    /// Bodies may be absent only where pruning or a snapshot import removed them.
+    /// `depth` 0 checks the whole chain (C++ treats `-checkblocks=0` the same way).
+    ///
+    /// Returns the number of heights checked.
+    pub fn verify_recent_blocks(&self, depth: u32) -> Result<u32, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(0);
+        };
+        let bodies_optional_to = self
+            .db
+            .prune_height()
+            .max(self.db.snapshot_base().map(|(h, _)| h).unwrap_or(0));
+        let lowest = match depth {
+            0 => 0,
+            n => tip.height.saturating_sub(n - 1),
+        };
+        let damaged = |height: u32, what: String| {
+            StorageError::ChainState(format!("database is damaged at height {height}: {what}"))
+        };
+        let mut above: Option<BlockIndex> = None;
+        let mut checked = 0;
+        for height in (lowest..=tip.height).rev() {
+            let hash = if height == tip.height {
+                tip.hash
+            } else {
+                self.db
+                    .get_height_mapping(height)
+                    .map_err(|e| damaged(height, format!("height index unreadable ({e})")))?
+                    .ok_or_else(|| damaged(height, "no block in the height index".into()))?
+            };
+            let index = self
+                .db
+                .get_block_index(&hash)
+                .map_err(|e| damaged(height, format!("block index unreadable ({e})")))?
+                .ok_or_else(|| damaged(height, format!("no index entry for block {hash}")))?;
+            if index.height != height {
+                return Err(damaged(
+                    height,
+                    format!("index entry of {hash} says height {}", index.height),
+                ));
+            }
+            if let Some(child) = &above {
+                if child.prev_hash != hash {
+                    return Err(damaged(
+                        height,
+                        format!(
+                            "block {} names parent {}, height index has {hash}",
+                            child.hash, child.prev_hash
+                        ),
+                    ));
+                }
+            }
+            let block = self
+                .db
+                .get_block(&hash)
+                .map_err(|e| damaged(height, format!("block {hash} unreadable ({e})")))?;
+            match block {
+                Some(block) => {
+                    let computed = self.compute_block_hash(&block);
+                    if computed != hash {
+                        return Err(damaged(
+                            height,
+                            format!("stored block {hash} hashes to {computed}"),
+                        ));
+                    }
+                    if compute_merkle_root(&block.transactions) != block.header.merkle_root {
+                        return Err(damaged(
+                            height,
+                            format!("block {hash} transactions do not match its merkle root"),
+                        ));
+                    }
+                }
+                None if height <= bodies_optional_to => {}
+                None => return Err(damaged(height, format!("block {hash} data is missing"))),
+            }
+            let undo = self
+                .db
+                .get_undo_data(&hash)
+                .map_err(|e| damaged(height, format!("undo data of {hash} unreadable ({e})")))?;
+            if let Some(bytes) = undo.filter(|b| !b.is_empty()) {
+                BlockUndo::from_bytes(&bytes)
+                    .map_err(|e| damaged(height, format!("undo data of {hash} is bad ({e})")))?;
+            }
+            above = Some(index);
+            checked += 1;
+        }
+        Ok(checked)
     }
 
     /// Get the current chain tip
@@ -5528,6 +5631,67 @@ mod tests {
             hash_a1
         );
         assert!(chain.db.get_block_index(&hash_b1).unwrap().is_some());
+    }
+
+    /// A recorded tip whose index entry is gone used to send Chain::new into
+    /// init_genesis, quietly restarting the chain from block 0.
+    #[test]
+    fn test_missing_tip_index_is_an_error_not_a_new_chain() {
+        let dir = tempdir().unwrap();
+        let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+        let tip_hash = {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let chain = Chain::new(db, params.clone()).unwrap();
+            let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+            let b1 = create_child_block_with_pubkey(genesis_hash, genesis_time, [0x0a; 20]);
+            chain.accept_block(b1).unwrap().hash
+        };
+        {
+            let db = ChainDatabase::open(dir.path()).unwrap();
+            let raw = db.inner_db();
+            let key = crate::block_index::block_index_key(&tip_hash);
+            raw.delete_cf(&raw.cf_handle("block_index").unwrap(), key)
+                .unwrap();
+        }
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let err = Chain::new(db.clone(), params).err().expect("must refuse");
+        assert!(err.to_string().contains("damaged"), "{err}");
+        assert_eq!(
+            db.get_best_block().unwrap(),
+            Some(tip_hash),
+            "tip left alone"
+        );
+    }
+
+    /// verify_recent_blocks walks the newest blocks and reports a body that does not
+    /// match its index entry.
+    #[test]
+    fn test_verify_recent_blocks() {
+        let (chain, _dir) = create_test_chain();
+        let (mut hash, mut time) = get_genesis_info(&chain);
+        let mut blocks = Vec::new();
+        for i in 0..5u8 {
+            let b = create_child_block_with_pubkey(hash, time, [i + 1; 20]);
+            time = b.header.time;
+            hash = chain.accept_block(b.clone()).unwrap().hash;
+            blocks.push((hash, b));
+        }
+        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 6, "0 = whole chain");
+        assert_eq!(chain.verify_recent_blocks(3).unwrap(), 3);
+        assert_eq!(
+            chain.verify_recent_blocks(100).unwrap(),
+            6,
+            "tip down to genesis"
+        );
+        // Store block 2's body under block 4's hash: wrong data for that key
+        chain.db.store_block(&blocks[3].0, &blocks[1].1).unwrap();
+        let err = chain.verify_recent_blocks(100).unwrap_err().to_string();
+        assert!(err.contains("damaged at height 4"), "{err}");
+        assert_eq!(
+            chain.verify_recent_blocks(1).unwrap(),
+            1,
+            "height 4 not in range"
+        );
     }
 
     /// getchaintips must report side branches, not just the active tip.
