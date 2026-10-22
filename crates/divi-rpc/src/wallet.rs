@@ -415,9 +415,12 @@ impl WalletRpc {
                     false
                 };
 
-                // UTXO is spendable if mature AND not watch-only
-                let spendable =
-                    utxo.is_mature(height, wallet.coinbase_maturity()) && !is_watch_only;
+                // UTXO is spendable if mature AND not watch-only, and a vault
+                // output only through its owner key (a manager can only stake it)
+                let spendable = utxo.is_mature(height, wallet.coinbase_maturity())
+                    && !is_watch_only
+                    && (!divi_script::is_staking_vault_script(&utxo.script_pubkey)
+                        || wallet.can_spend_script(&utxo.script_pubkey));
 
                 serde_json::json!({
                     "txid": utxo.txid.to_string(),

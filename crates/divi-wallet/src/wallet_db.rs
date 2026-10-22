@@ -338,6 +338,9 @@ impl WalletDb {
         }
         debug!("Restored {} vaults", wallet.vaults.read().len());
 
+        // Wallets written before removevault dropped its outputs still hold them
+        wallet.prune_unowned_vault_utxos();
+
         Ok(wallet)
     }
 
@@ -1096,6 +1099,10 @@ impl WalletDb {
 
     /// Get spendable UTXOs (mature and confirmed)
     ///
+    /// Vault outputs are never included (Core's ALL_SPENDABLE_COINS): a
+    /// manager can only stake them, and an owner spends them on purpose with
+    /// reclaimvaultfunds or debitvaultbyname.
+    ///
     /// Coins already spent by a mempool transaction are excluded. With
     /// `min_confirmations == 0`, our own unconfirmed change is included, but
     /// not unconfirmed coins from others (Core only spends trusted coins).
@@ -1108,6 +1115,7 @@ impl WalletDb {
             .into_iter()
             .filter(|(_, source)| source.is_trusted())
             .map(|(utxo, _)| utxo)
+            .filter(|utxo| !divi_script::is_staking_vault_script(&utxo.script_pubkey))
             .filter(|utxo| {
                 let confs = utxo.confirmations(current_height);
                 let mature = utxo.is_mature(current_height, self.coinbase_maturity());
@@ -2092,9 +2100,13 @@ impl WalletDb {
         self.vaults.read().get(vault_script).cloned()
     }
 
-    /// Remove vault metadata
+    /// Remove vault metadata. Outputs of the vault that the wallet no longer
+    /// owns once it is unregistered (the manager side) leave the wallet.
     pub fn remove_vault(&self, vault_script: &[u8]) -> bool {
         let removed = self.vaults.write().remove(vault_script).is_some();
+        if removed {
+            self.prune_unowned_vault_utxos();
+        }
 
         if removed {
             if let Some(ref db) = self.db {
@@ -2108,6 +2120,89 @@ impl WalletDb {
     /// Get all vaults
     pub fn get_all_vaults(&self) -> Vec<VaultMetadata> {
         self.vaults.read().values().cloned().collect()
+    }
+
+    /// Drop vault outputs that are no longer the wallet's (is_mine_script is
+    /// false for them, e.g. after removevault on the manager). They are not
+    /// spent, so they are deleted rather than moved to the spent set; a later
+    /// addvault brings them back.
+    fn prune_unowned_vault_utxos(&self) -> usize {
+        // Ownership checks take keystore/vault locks, so do them before
+        // locking the UTXO set or the overlay
+        let is_vault = |u: &&WalletUtxo| divi_script::is_staking_vault_script(&u.script_pubkey);
+        let mut scripts: Vec<Script> = self
+            .utxos
+            .read()
+            .values()
+            .filter(is_vault)
+            .map(|u| u.script_pubkey.clone())
+            .collect();
+        scripts.extend(
+            self.mempool_txs
+                .read()
+                .values()
+                .flat_map(|e| e.outputs.iter())
+                .filter(is_vault)
+                .map(|u| u.script_pubkey.clone()),
+        );
+        scripts.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        scripts.dedup();
+        let unowned: HashSet<Vec<u8>> = scripts
+            .into_iter()
+            .filter(|script| !self.is_mine_script(script))
+            .map(|script| script.as_bytes().to_vec())
+            .collect();
+        if unowned.is_empty() {
+            return 0;
+        }
+
+        let doomed: Vec<OutPoint> = {
+            let mut utxos = self.utxos.write();
+            let doomed: Vec<OutPoint> = utxos
+                .values()
+                .filter(|u| unowned.contains(u.script_pubkey.as_bytes()))
+                .map(|u| u.outpoint())
+                .collect();
+            for outpoint in &doomed {
+                utxos.remove(outpoint);
+            }
+            doomed
+        };
+        if let Some(ref db) = self.db {
+            for outpoint in &doomed {
+                if let Err(e) = db.remove_utxo(outpoint) {
+                    debug!("Failed to delete vault UTXO {:?}: {}", outpoint, e);
+                }
+            }
+        }
+        for entry in self.mempool_txs.write().values_mut() {
+            entry
+                .outputs
+                .retain(|u| !unowned.contains(u.script_pubkey.as_bytes()));
+        }
+        if !doomed.is_empty() {
+            info!(
+                "Dropped {} vault UTXOs the wallet no longer owns",
+                doomed.len()
+            );
+        }
+        doomed.len()
+    }
+
+    /// Whether the wallet can sign for an output it holds: P2PKH with a
+    /// private key, or a vault through its owner key. A manager key alone
+    /// cannot spend a vault output (OP_REQUIRE_COINSTAKE).
+    pub fn can_spend_script(&self, script: &Script) -> bool {
+        let hash = if let Some(hash_bytes) = script.extract_p2pkh_hash() {
+            Hash160::from_bytes(hash_bytes)
+        } else if let Some(vault) = divi_script::StakingVaultScript::from_script(script) {
+            Hash160::from_bytes(vault.owner_pubkey_hash)
+        } else {
+            return false;
+        };
+        self.keystore
+            .get_key(&hash)
+            .is_some_and(|entry| !entry.is_watch_only)
     }
 
     /// Find vault UTXOs (UTXOs that pay to any tracked vault script)
@@ -3074,6 +3169,157 @@ mod tests {
             assert_eq!(wallet.mempool_tx_count(), 0);
             assert!(wallet.get_utxos().is_empty());
             assert!(wallet.get_transaction(&tx.txid()).is_none());
+        }
+    }
+
+    mod vaults {
+        use super::*;
+        use divi_primitives::transaction::{OutPoint as TxOutPoint, Transaction, TxIn, TxOut};
+
+        const COIN: i64 = 100_000_000;
+
+        /// A non-coinbase transaction paying `outputs`, spending a coin of nobody
+        fn pay(outputs: Vec<(i64, Script)>) -> Transaction {
+            Transaction {
+                version: 1,
+                vin: vec![TxIn {
+                    prevout: TxOutPoint {
+                        txid: Hash256::from_bytes([0xee; 32]),
+                        vout: 0,
+                    },
+                    script_sig: Script::default(),
+                    sequence: 0xffffffff,
+                }],
+                vout: outputs
+                    .into_iter()
+                    .map(|(v, script_pubkey)| TxOut {
+                        value: Amount::from_sat(v),
+                        script_pubkey,
+                    })
+                    .collect(),
+                lock_time: 0,
+            }
+        }
+
+        fn hash20(addr: &Address) -> [u8; 20] {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(addr.hash.as_bytes());
+            h
+        }
+
+        fn register(wallet: &WalletDb, owner: [u8; 20], manager: &Address, script: &Script) {
+            wallet.store_vault(VaultMetadata {
+                owner_address: Address::from_pubkey_hash(
+                    Hash160::from_bytes(owner),
+                    wallet.network(),
+                )
+                .to_string(),
+                manager_address: manager.to_string(),
+                vault_script: script.as_bytes().to_vec(),
+                funding_txid: [0u8; 32],
+            });
+        }
+
+        /// IR-07: a manager's registered vault output is never part of the
+        /// plain spendable set, so ordinary coin selection cannot pick it.
+        #[test]
+        fn manager_vault_output_is_not_spendable() {
+            let wallet = create_test_wallet();
+            let manager = wallet.new_receiving_address().unwrap();
+            let plain = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new([0x11; 20], hash20(&manager)).to_script();
+            register(&wallet, [0x11; 20], &manager, &vault);
+            let tx = pay(vec![
+                (500 * COIN, vault.clone()),
+                (50 * COIN, Script::new_p2pkh(plain.hash.as_bytes())),
+            ]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([1; 32])), Some(10), None);
+            assert_eq!(wallet.get_utxos().len(), 2, "manager tracks its vault");
+
+            let spendable = wallet.get_spendable_utxos(20, 1);
+            assert_eq!(spendable.len(), 1);
+            assert_eq!(spendable[0].value.as_sat(), 50 * COIN);
+            let selection = wallet
+                .select_coins(Amount::from_sat(COIN), 10, 2, 20, 1)
+                .unwrap();
+            assert!(selection
+                .utxos
+                .iter()
+                .all(|u| !divi_script::is_staking_vault_script(&u.script_pubkey)));
+        }
+
+        /// IR-07: removevault on the manager drops the vault outputs, and the
+        /// drop survives a restart. A wallet written by 0.2.6 (vault removed,
+        /// outputs left behind) is cleaned when it is opened.
+        #[test]
+        fn removevault_drops_manager_vault_outputs_persistently() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("manager.dat");
+            let vault;
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                let manager = wallet.new_receiving_address().unwrap();
+                vault =
+                    divi_script::StakingVaultScript::new([0x22; 20], hash20(&manager)).to_script();
+                register(&wallet, [0x22; 20], &manager, &vault);
+                let tx = pay(vec![(500 * COIN, vault.clone())]);
+                wallet.scan_transaction(&tx, Some(Hash256::from_bytes([2; 32])), Some(10), None);
+                wallet.save().unwrap();
+                assert_eq!(wallet.get_utxos().len(), 1);
+
+                assert!(wallet.remove_vault(vault.as_bytes()));
+                assert!(wallet.get_utxos().is_empty(), "removed vault still held");
+                assert_eq!(wallet.get_balance(), Amount::ZERO);
+                wallet.save_incremental().unwrap();
+            }
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            assert!(wallet.get_vault(vault.as_bytes()).is_none());
+            assert!(
+                wallet.get_utxos().is_empty(),
+                "removed vault output came back after restart"
+            );
+            assert_eq!(wallet.get_balance(), Amount::ZERO);
+        }
+
+        /// IR-07: a wallet left by 0.2.6 removevault (metadata gone, the vault
+        /// output still stored) drops that output when it is opened.
+        #[test]
+        fn open_drops_vault_outputs_left_by_old_removevault() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("old-manager.dat");
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                let manager = wallet.new_receiving_address().unwrap();
+                let vault =
+                    divi_script::StakingVaultScript::new([0x33; 20], hash20(&manager)).to_script();
+                register(&wallet, [0x33; 20], &manager, &vault);
+                let tx = pay(vec![(500 * COIN, vault.clone())]);
+                wallet.scan_transaction(&tx, Some(Hash256::from_bytes([3; 32])), Some(10), None);
+                wallet.save().unwrap();
+                // What 0.2.6 removevault did: forget the metadata only
+                wallet.vaults.write().remove(vault.as_bytes());
+                wallet
+                    .db
+                    .as_ref()
+                    .unwrap()
+                    .remove_vault(vault.as_bytes())
+                    .unwrap();
+                assert_eq!(wallet.get_utxos().len(), 1);
+            }
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            assert!(wallet.get_utxos().is_empty());
+            assert_eq!(wallet.get_balance(), Amount::ZERO);
+            drop(wallet);
+            // and the deletion reached the disk
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
         }
     }
 }
