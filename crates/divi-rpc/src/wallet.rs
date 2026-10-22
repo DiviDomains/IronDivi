@@ -1521,6 +1521,8 @@ impl WalletRpc {
 
     /// signrawtransaction - Sign a raw transaction with wallet keys
     pub fn sign_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_script::SigHashType;
+
         let hex_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Transaction hex required"))?;
@@ -1638,6 +1640,25 @@ impl WalletRpc {
             }
         }
 
+        // sighashtype, as Divi Core's mapSigHashValues
+        let (sighash_type, anyone_can_pay) = match params.get(3).filter(|v| !v.is_null()) {
+            None => (SigHashType::All, false),
+            Some(v) => match v.as_str() {
+                Some("ALL") => (SigHashType::All, false),
+                Some("ALL|ANYONECANPAY") => (SigHashType::All, true),
+                Some("NONE") => (SigHashType::None, false),
+                Some("NONE|ANYONECANPAY") => (SigHashType::None, true),
+                Some("SINGLE") => (SigHashType::Single, false),
+                Some("SINGLE|ANYONECANPAY") => (SigHashType::Single, true),
+                _ => {
+                    return Err(
+                        RpcError::new(codes::INVALID_PARAMETER, "Invalid sighash param").into(),
+                    )
+                }
+            },
+        };
+        let hash_single = sighash_type == SigHashType::Single;
+
         // Sign what we can and merge with the signatures already present
         let mempool = self.mempool.read().clone();
         // Given keys use only the redeem scripts given with them, as in Divi Core
@@ -1647,7 +1668,10 @@ impl WalletRpc {
                 .cloned()
                 .or_else(|| given_keys.is_none().then(|| wallet.get_script(h)).flatten())
         };
-        let signer = TransactionSigner::new(given_keys.as_ref().unwrap_or(wallet.keystore()));
+        let signer = TransactionSigner::new(given_keys.as_ref().unwrap_or(wallet.keystore()))
+            .with_hash_type(sighash_type, anyone_can_pay);
+        let no_keys = divi_wallet::KeyStore::new(self.address_network());
+        let merge_only = TransactionSigner::new(&no_keys);
         let mut complete = true;
         for i in 0..tx.vin.len() {
             let outpoint = tx.vin[i].prevout;
@@ -1670,6 +1694,13 @@ impl WalletRpc {
             let Some(script_pubkey) = script_pubkey else {
                 complete = false;
                 continue;
+            };
+            // Only sign SIGHASH_SINGLE if there's a corresponding output (Divi Core);
+            // the signatures already in the input are still merged and checked
+            let signer = if hash_single && i >= tx.vout.len() {
+                &merge_only
+            } else {
+                &signer
             };
             let verified = signer
                 .sign_and_merge_input(&mut tx, i, &script_pubkey, &redeem_script)

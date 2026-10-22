@@ -143,14 +143,34 @@ pub fn sign_input(
     secret_key: &SecretKey,
     sighash_type: SigHashType,
 ) -> Result<Vec<u8>, WalletError> {
-    let hash = sighash(tx, input_index, script_pubkey, sighash_type, false)?;
+    sign_input_with_flags(
+        tx,
+        input_index,
+        script_pubkey,
+        secret_key,
+        sighash_type,
+        false,
+    )
+}
+
+/// Sign a single transaction input, optionally with SIGHASH_ANYONECANPAY
+pub fn sign_input_with_flags(
+    tx: &Transaction,
+    input_index: usize,
+    script_pubkey: &Script,
+    secret_key: &SecretKey,
+    sighash_type: SigHashType,
+    anyone_can_pay: bool,
+) -> Result<Vec<u8>, WalletError> {
+    let hash = sighash(tx, input_index, script_pubkey, sighash_type, anyone_can_pay)?;
 
     let signature = sign_hash(secret_key, hash.as_bytes())
         .map_err(|e| WalletError::TransactionError(e.to_string()))?;
 
     // Append sighash type byte to DER signature
     let mut sig_bytes = signature.to_der();
-    sig_bytes.push(sighash_type as u8);
+    let acp = if anyone_can_pay { 0x80 } else { 0 };
+    sig_bytes.push(sighash_type as u8 | acp);
 
     Ok(sig_bytes)
 }
@@ -195,12 +215,23 @@ pub fn create_vault_owner_script_sig(signature: &[u8], pubkey: &PublicKey) -> Sc
 /// Transaction signer that uses keystore for signing
 pub struct TransactionSigner<'a> {
     keystore: &'a KeyStore,
+    /// Hash type and ANYONECANPAY flag used by sign_and_merge_input
+    hash_type: (SigHashType, bool),
 }
 
 impl<'a> TransactionSigner<'a> {
     /// Create a new transaction signer
     pub fn new(keystore: &'a KeyStore) -> Self {
-        TransactionSigner { keystore }
+        TransactionSigner {
+            keystore,
+            hash_type: (SigHashType::All, false),
+        }
+    }
+
+    /// Sign with this hash type (signrawtransaction's sighashtype) instead of ALL
+    pub fn with_hash_type(mut self, sighash_type: SigHashType, anyone_can_pay: bool) -> Self {
+        self.hash_type = (sighash_type, anyone_can_pay);
+        self
     }
 
     /// Sign a transaction input using a specific address's key
@@ -367,7 +398,9 @@ impl<'a> TransactionSigner<'a> {
         let Some(secret) = entry.secret.as_ref().filter(|_| !entry.is_watch_only) else {
             return Ok(None);
         };
-        let sig = sign_input(tx, index, script_code, secret, SigHashType::All)?;
+        let (sighash_type, anyone_can_pay) = self.hash_type;
+        let sig =
+            sign_input_with_flags(tx, index, script_code, secret, sighash_type, anyone_can_pay)?;
         Ok(Some((sig, entry.public)))
     }
 
