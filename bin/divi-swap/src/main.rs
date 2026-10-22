@@ -261,6 +261,13 @@ enum Cmd {
     },
     /// Print the taker's DIVI and BTC addresses and balances (live backend; no keys).
     Balance,
+    /// Print each chain's tip height as the swap code sees it, one `chain network height`
+    /// line per chain (read-only; the same network flags and mainnet guards as `balance`).
+    Tip {
+        /// `divi`, `btc`, `ltc`, `zec` or `all`.
+        #[arg(long, default_value = "all")]
+        chain: String,
+    },
     /// Print `key=value` txids for a swap: the taker's own plus the maker's view.
     Txids {
         /// Local swap id.
@@ -591,6 +598,180 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
     })
 }
 
+/// Per-chain tip read deadline: a hung endpoint becomes a named error for that chain
+/// instead of stalling the whole report.
+const TIP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The chains `tip --chain <name>` reports, in print order.
+fn tip_chains(name: &str) -> Result<Vec<Chain>> {
+    match name.to_ascii_lowercase().as_str() {
+        "all" => Ok(vec![Chain::Divi, Chain::Btc, Chain::Ltc, Chain::Zec]),
+        "divi" => Ok(vec![Chain::Divi]),
+        "btc" => Ok(vec![Chain::Btc]),
+        "ltc" => Ok(vec![Chain::Ltc]),
+        "zec" => Ok(vec![Chain::Zec]),
+        other => bail!("--chain must be divi, btc, ltc, zec or all, got {other:?}"),
+    }
+}
+
+/// The network flag value `chain` runs on (`mock` for the mock backend).
+fn tip_network(cli: &Cli, chain: Chain) -> &str {
+    if matches!(cli.backend, BackendArg::Mock) {
+        return "mock";
+    }
+    match chain {
+        Chain::Btc => &cli.btc_network,
+        Chain::Ltc => &cli.ltc_network,
+        Chain::Zec => &cli.zec_network,
+        _ => &cli.divi_network,
+    }
+}
+
+/// The `balance` network guards for every selected chain, plus the profile agreement, all
+/// before any network call. A mainnet chain needs `--allow-mainnet` and `--profile mainnet`.
+fn tip_guards(cli: &Cli, chains: &[Chain]) -> Result<()> {
+    for &chain in chains {
+        match chain {
+            Chain::Btc => guard_network(
+                "--btc-network",
+                &cli.btc_network,
+                &["signet", "testnet"],
+                cli.allow_mainnet,
+            )?,
+            Chain::Ltc => guard_network(
+                "--ltc-network",
+                &cli.ltc_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?,
+            Chain::Zec => guard_network(
+                "--zec-network",
+                &cli.zec_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?,
+            _ => guard_network(
+                "--divi-network",
+                &cli.divi_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?,
+        }
+        divi_swap::config::check_profile_networks(
+            cli.profile,
+            &[(chain, tip_network(cli, chain), Some(cli.allow_mainnet))],
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// A live backend for `chain`. Reading a tip needs no key, but every backend constructor
+/// takes one: a fresh in-memory key that is never saved, never funded and dropped on return.
+fn tip_backend(cli: &Cli, chain: Chain) -> Result<Arc<dyn ChainBackend>> {
+    let key = bitcoin::secp256k1::SecretKey::new(&mut rand::thread_rng());
+    Ok(match chain {
+        Chain::Btc => Arc::new(BtcBackend::for_network(
+            &cli.btc_network,
+            key,
+            swap_chain_btc::FeePolicy::default(),
+        )?),
+        Chain::Ltc => Arc::new(LtcBackend::for_network(
+            &cli.ltc_network,
+            key,
+            swap_chain_ltc::FeePolicy::default(),
+        )?),
+        Chain::Zec => Arc::new(ZecBackend::for_network(
+            &cli.zec_network,
+            key,
+            swap_chain_zec::FeePolicy::default(),
+        )?),
+        Chain::Divi => {
+            let network = if cli.divi_network == "mainnet" {
+                divi_wallet::address::Network::Mainnet
+            } else {
+                divi_wallet::address::Network::Testnet
+            };
+            let dkey = divi_crypto::keys::SecretKey::from_hex(&hex::encode(key.secret_bytes()))
+                .map_err(|_| anyhow::anyhow!("divi throwaway key"))?;
+            Arc::new(DiviBackend::new(
+                swap_chain_divi::default_rpc(network),
+                dkey,
+                network,
+                swap_chain_divi::FeePolicy::default(),
+                None,
+            )?)
+        }
+        other => bail!("no tip backend for {other}"),
+    })
+}
+
+/// A chain, its network label and its backend (or why it could not be built).
+type TipEntry = (Chain, String, Result<Arc<dyn ChainBackend>>);
+
+/// One backend per selected chain (a mock chain per chain under `--backend mock`). A chain
+/// whose backend cannot be built keeps its error so it is reported by name.
+fn tip_backends(cli: &Cli, chains: &[Chain]) -> Vec<TipEntry> {
+    chains
+        .iter()
+        .map(|&chain| {
+            let backend = match cli.backend {
+                BackendArg::Mock => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(1_700_000_000);
+                    let backend: Arc<dyn ChainBackend> =
+                        Arc::new(MockChain::new(chain, now, 60).backend(3, Amount(0)));
+                    Ok(backend)
+                }
+                BackendArg::Live => tip_backend(cli, chain),
+            };
+            (chain, tip_network(cli, chain).to_string(), backend)
+        })
+        .collect()
+}
+
+/// Read every chain's tip: `(lines, failures)`. A chain that cannot be reached prints
+/// `chain network error: …` and counts as a failure; the others still print.
+async fn tip_report(entries: Vec<TipEntry>) -> (Vec<String>, usize) {
+    let mut lines = Vec::new();
+    let mut failures = 0;
+    for (chain, network, backend) in entries {
+        let height = match backend {
+            Err(e) => Err(format!("{e:#}")),
+            Ok(b) => match tokio::time::timeout(TIP_TIMEOUT, b.tip_height()).await {
+                Ok(Ok(h)) => Ok(h),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!("no answer within {}s", TIP_TIMEOUT.as_secs())),
+            },
+        };
+        match height {
+            Ok(h) => lines.push(format!("{chain} {network} {h}")),
+            Err(e) => {
+                failures += 1;
+                lines.push(format!("{chain} {network} error: {e}"));
+            }
+        }
+    }
+    (lines, failures)
+}
+
+async fn tip_main(cli: &Cli, chain: &str) -> Result<()> {
+    let chains = tip_chains(chain)?;
+    if matches!(cli.backend, BackendArg::Live) {
+        tip_guards(cli, &chains)?;
+    }
+    let (lines, failures) = tip_report(tip_backends(cli, &chains)).await;
+    for line in &lines {
+        println!("{line}");
+    }
+    if failures > 0 {
+        bail!("{failures} of {} chain tips could not be read", lines.len());
+    }
+    Ok(())
+}
+
 /// Bring the DIVI wallet up to the chain tip when the taker will spend DIVI from it.
 async fn sync_divi(cli: &Cli, b: &Backends) -> Result<()> {
     if let (Some((divi, _)), Some(_)) = (&b.live, &cli.divi_wallet) {
@@ -657,6 +838,9 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    if let Cmd::Tip { chain } = &cli.cmd {
+        return tip_main(&cli, chain).await;
+    }
     let sessions = Sessions::beside(&cli.db);
     if cli.counter_chain == Chain::Xmr {
         return xmr_main(&cli, &sessions).await;
@@ -743,6 +927,7 @@ async fn main() -> Result<()> {
             .await?;
             println!("{local} {state:?}");
         }
+        Cmd::Tip { .. } => unreachable!("handled before the match"),
         Cmd::Balance if is_usdc_live(&cli) => {
             guard_profile(&cli)?;
             let usdc = live_usdc_backend(&cli)?;
@@ -950,6 +1135,7 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
             .await?;
             println!("{local} {outcome}");
         }
+        Cmd::Tip { .. } => unreachable!("handled before the xmr arm"),
         Cmd::Lock { .. } | Cmd::Balance | Cmd::Txids { .. } => {
             bail!("not available for xmr: `accept` sends the signatures, `claim` steps the swap (it locks XMR and redeems)");
         }
@@ -960,6 +1146,81 @@ async fn xmr_main(cli: &Cli, sessions: &Sessions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tip_cli(extra: &[&str]) -> Cli {
+        let mut argv = vec!["divi-swap"];
+        argv.extend_from_slice(extra);
+        argv.push("tip");
+        Cli::parse_from(argv)
+    }
+
+    #[tokio::test]
+    async fn tip_prints_one_line_per_chain_on_the_mock_backend() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        let chains = tip_chains("all").unwrap();
+        let (lines, failures) = tip_report(tip_backends(&cli, &chains)).await;
+        assert_eq!(failures, 0);
+        assert_eq!(lines.len(), 4);
+        for (line, chain) in lines.iter().zip(["divi", "btc", "ltc", "zec"]) {
+            let f: Vec<&str> = line.split(' ').collect();
+            assert_eq!(f.len(), 3, "{line}");
+            assert_eq!((f[0], f[1]), (chain, "mock"));
+            f[2].parse::<u64>().unwrap();
+        }
+    }
+
+    #[test]
+    fn tip_chain_selector_names_what_it_accepts() {
+        assert_eq!(tip_chains("zec").unwrap(), vec![Chain::Zec]);
+        let e = tip_chains("xmr").unwrap_err().to_string();
+        assert!(e.contains("divi, btc, ltc, zec or all"), "{e}");
+    }
+
+    #[test]
+    fn tip_refuses_a_mainnet_network_without_allow_mainnet() {
+        for (chain, flag) in [
+            ("btc", "--btc-network"),
+            ("ltc", "--ltc-network"),
+            ("zec", "--zec-network"),
+            ("divi", "--divi-network"),
+        ] {
+            let cli = tip_cli(&[flag, "mainnet", "--profile", "mainnet"]);
+            let e = tip_guards(&cli, &tip_chains(chain).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("no mainnet without the explicit --allow-mainnet"),
+                "{chain}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn tip_guards_accept_mainnet_with_both_opt_ins_and_refuse_a_profile_mismatch() {
+        let ok = tip_cli(&[
+            "--btc-network",
+            "mainnet",
+            "--allow-mainnet",
+            "--profile",
+            "mainnet",
+        ]);
+        tip_guards(&ok, &[Chain::Btc]).unwrap();
+        let bad = tip_cli(&["--btc-network", "mainnet", "--allow-mainnet"]);
+        let e = tip_guards(&bad, &[Chain::Btc]).unwrap_err().to_string();
+        assert!(e.contains("profile"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn tip_names_the_unreachable_chain_and_still_prints_the_rest() {
+        let cli = tip_cli(&["--backend", "mock"]);
+        let mut entries = tip_backends(&cli, &[Chain::Divi, Chain::Ltc, Chain::Zec]);
+        entries[1].2 = Err(anyhow::anyhow!("esplora unreachable"));
+        let (lines, failures) = tip_report(entries).await;
+        assert_eq!(failures, 1);
+        assert!(lines[0].starts_with("divi mock "), "{lines:?}");
+        assert_eq!(lines[1], "ltc mock error: esplora unreachable");
+        assert!(lines[2].starts_with("zec mock "), "{lines:?}");
+    }
 
     fn cli(extra: &[&str]) -> Cli {
         let mut argv = vec!["divi-swap"];

@@ -55,3 +55,11 @@
 - left: the CLI has no `tip` subcommand (tip checked by curl); the DIVI backend is built on `DiviNetwork::Testnet` whatever the profile, so a mainnet-profile daemon still talks to the DIVI testnet RPC (`bin/divi-swapd/src/main.rs:430-436`, `bin/divi-swap/src/main.rs:487-494`).
 - needs: nothing.
 - decisions: no code change, no confirmation/MTP/timeout/margin change.
+
+## Round: DIVI network claim corrected (builder AH, 2026-10-22)
+
+- done: the previous round's `left:` that the DIVI backend is built on `DiviNetwork::Testnet` whatever the profile is stale. `bin/divi-swapd/src/main.rs:433-440` builds it from `divi_cfg.network()?` and the config's `rpc_url()`, and `bin/divi-swap/src/main.rs` picks `divi_wallet::address::Network::Mainnet` when `--divi-network mainnet` (default testnet) and `swap_chain_divi::default_rpc(divi_network)`; both are behind `allow_mainnet`/`--allow-mainnet` and must agree with the profile (commit 97bc181). Also: the CLI now has `divi-swap tip` (see engine.md), so the BTC tip no longer needs a curl.
+- proof: the two source locations above; live `divi-swap tip --chain divi` printed `divi testnet 360958` by default and `divi mainnet 4270016` with `--divi-network mainnet --allow-mainnet --profile mainnet` (cryptoid `getblockcount` 4270015 at 12:48:51Z).
+- left: nothing.
+- needs: nothing.
+- decisions: history above is left as written; this round supersedes its `left:` line.
