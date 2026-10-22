@@ -88,6 +88,14 @@ pub struct WalletRpc {
     locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
 }
 
+/// A history entry's amount as Core shows it: the net change to the wallet
+/// without the fee, which is reported separately (`fee`). A 1 DIVI send with a
+/// 0.00003 fee is amount -1, fee -0.00003.
+fn amount_without_fee(tx: &divi_wallet::WalletTx) -> f64 {
+    let fee = tx.fee.map_or(0, |f| f.as_sat());
+    (tx.amount + fee) as f64 / 100_000_000.0
+}
+
 /// Scan the active chain into the wallet, in order, from its last scanned
 /// height up to the tip (rolling back first if the chain switched under it).
 /// Returns the heights whose block could not be read (pruned); they are
@@ -547,7 +555,7 @@ impl WalletRpc {
             _ => 0,
         };
 
-        let divi_amount = tx.amount as f64 / 100_000_000.0;
+        let divi_amount = amount_without_fee(&tx);
         // Fee is shown as negative for sent transactions (C++ Divi convention)
         let divi_fee = tx.fee.map(|f| -(f.as_sat() as f64 / 100_000_000.0));
 
@@ -561,9 +569,16 @@ impl WalletRpc {
             "txid": tx.txid.to_string(),
             "time": tx.timestamp,
             "timereceived": tx.timestamp,
-            "details": [{
-                "category": tx.category,
-                "amount": divi_amount,
+            "details": [match divi_fee {
+                Some(fee) => serde_json::json!({
+                    "category": tx.category,
+                    "amount": divi_amount,
+                    "fee": fee,
+                }),
+                None => serde_json::json!({
+                    "category": tx.category,
+                    "amount": divi_amount,
+                }),
             }],
         }))
     }
@@ -597,7 +612,7 @@ impl WalletRpc {
                     Some(h) if height >= h => height - h + 1,
                     _ => 0,
                 };
-                let divi_amount = tx.amount as f64 / 100_000_000.0;
+                let divi_amount = amount_without_fee(tx);
 
                 let mut entry = serde_json::json!({
                     "category": tx.category,
@@ -670,7 +685,7 @@ impl WalletRpc {
                     Some(h) if current_height >= h => current_height - h + 1,
                     _ => 0,
                 };
-                let divi_amount = tx.amount as f64 / 100_000_000.0;
+                let divi_amount = amount_without_fee(tx);
 
                 let mut entry = serde_json::json!({
                     "category": tx.category,
@@ -4876,5 +4891,57 @@ mod accounting_tests {
         assert_eq!(code(json!(["notanaddress"])), codes::INVALID_ADDRESS_OR_KEY);
         assert_eq!(code(json!([f.second, f.second])), codes::INVALID_PARAMETER);
         assert_eq!(code(json!(f.second)), codes::TYPE_ERROR);
+    }
+
+    #[test]
+    fn history_amount_excludes_fee() {
+        let f = fixture();
+        let txid = f.spend.txid().to_string();
+        // Block 5's send: 1000 to a stranger, 0.01 fee, change to our address
+        let tx = f
+            .rpc
+            .get_transaction(&Params::Array(vec![json!(txid)]))
+            .unwrap();
+        assert_eq!(tx["amount"], json!(-1000.0));
+        assert_eq!(tx["fee"], json!(-0.01));
+        assert_eq!(tx["details"][0]["amount"], json!(-1000.0));
+        assert_eq!(tx["details"][0]["fee"], json!(-0.01));
+
+        let listed = f
+            .rpc
+            .list_transactions(&Params::Array(vec![json!("*"), json!(100)]))
+            .unwrap();
+        let entry = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["txid"] == json!(txid))
+            .expect("send listed");
+        assert_eq!(entry["amount"], json!(-1000.0));
+        assert_eq!(entry["fee"], json!(-0.01));
+
+        let since = f.rpc.list_since_block(&Params::Array(vec![])).unwrap();
+        let entry = since["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["txid"] == json!(txid))
+            .expect("send in listsinceblock");
+        assert_eq!(entry["amount"], json!(-1000.0));
+        assert_eq!(entry["fee"], json!(-0.01));
+
+        // A receive has no fee and its amount is unchanged
+        let coinbase = f
+            .wallet
+            .get_transactions(None)
+            .into_iter()
+            .find(|t| t.category == "coinbase")
+            .unwrap();
+        let tx = f
+            .rpc
+            .get_transaction(&Params::Array(vec![json!(coinbase.txid.to_string())]))
+            .unwrap();
+        assert_eq!(tx["amount"], json!(1250.0));
+        assert_eq!(tx["fee"], serde_json::Value::Null);
     }
 }
