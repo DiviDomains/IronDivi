@@ -306,7 +306,7 @@ LGPL.
   keys); secret scan; license files; README with a testnet example.
 - [ ] 10.4 Security review of the library (key handling, refund timing, untrusted maker data).
 - [ ] 10.5 **CARD (Bert yes/no): license choice.**
-- [ ] 10.6 **CARD (Bert yes/no): make the library repo public.** A new repo only; IronDivi stays private.
+- [ ] 10.6 **CARD (Bert yes/no): make the library repo public.** A new repo only. The swap code lives in the private swap repo (`bshuler/IronDivi`) and stays there until this card; the public `DiviDomains/IronDivi` node repo is not changed by it.
 - [ ] 10.7 **CARD (Bert yes/no): publish the packages** (crates.io, npm, Maven/Swift package), testnet default.
 
 ## 11. Swap built into every IronDivi wallet (Bert 2026-10-22 21:30: "publish this integrated into all the wallets, IronDivi Web, Browser, Telegram")
