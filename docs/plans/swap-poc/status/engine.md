@@ -226,3 +226,9 @@
 - left: the Q5 pin is a source scan, so a taker built through a helper that hides `Taker::new(` from the scan would not be caught; none exists today. Test count: divi-swap integration test files 9 -> 11, tests +2.
 - needs: nothing
 - decisions: no code fix, because neither question is exploitable; no confirmation count, timeout, margin or guard touched.
+## 2026-10-22 — single-source-q6 (builder BG)
+- done: Q6 answered in place in `engine-review-brief.md`. `single-source-design.md` has the per-chain truth table (source, config key, file:line, cross-check), the attack table (inflated confirmations, hidden spend, shifted MTP, censored broadcast) and the ranking: DIVI, LTC, ZEC, USDC/EVM, BTC, XMR. `single-source-design.FACTS.md` lists the third-party claims with verdict `could not verify` (no network in this lane).
+- proof: design-only commit; no Rust changed, so no test counts moved. Every file:line in the doc was read on base `fb25f36`.
+- left: nothing implemented. Cheapest change across chains is a "disagree is Transient" quorum read on `htlc_output`, `confirmations`, `find_spend`, `median_time_past` when a second endpoint is configured (DIVI first: `[divi].fallback_rpc_url`, `swap-chain-divi/src/rpc.rs`). LTC: make `[ltc].crosscheck` mandatory on mainnet (`bin/divi-swapd/src/config.rs:704`), which changes a mainnet config rule and so needs a decision.
+- needs: a decision on whether a mainnet config may start with `[ltc].crosscheck = "off"` and with no second DIVI endpoint.
+- decisions: design only, because every mitigation touches shared client or config files or a mainnet start rule; no confirmation count, timeout, margin, route or opt-in was touched.
