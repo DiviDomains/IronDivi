@@ -11,7 +11,9 @@
 # Hard refusals (exit 1, nothing pushed): the `private` remote's push URL is not the bshuler repo
 # or mentions DiviDomains (the public mirror is never a push target of this script; `origin` may
 # stay public for fetching), the working tree is dirty, the pick conflicts, or `git verify-commit`
-# fails on the new commit (the commit is then dropped so nothing unsigned is left on the branch).
+# fails on the new commit (the commit is then dropped so nothing unsigned is left on the branch), or
+# the pick drops or unticks a docs checklist row (tools/swap-poc/checklist-guard.py; override with
+# LAND_ALLOW_CHECKLIST_DROP="<why>", recorded as a Checklist-Drop-Allowed: line).
 set -euo pipefail
 
 coin="${1:-}"
@@ -102,9 +104,26 @@ if git diff --cached --quiet; then
   echo "nothing to land: $coin@${tip:0:7} adds no change to $branch"; exit 0
 fi
 
+# --- checklist guard -----------------------------------------------------------------------------
+# A landing may tick or rewrite a `- [ ]`/`- [x]` row under docs/, never silently drop or untick one
+# (97bc181 dropped a finished mainnet-readiness row on 2026-10-22). An intended removal is landed with
+# LAND_ALLOW_CHECKLIST_DROP="<why>", which is recorded in the commit message.
+trailer=()
+if ! guard_out="$(python3 "$root/tools/swap-poc/checklist-guard.py" "$before" 2>&1)"; then
+  if [[ -n "${LAND_ALLOW_CHECKLIST_DROP:-}" ]]; then
+    echo "land-private: checklist rows removed, allowed: $LAND_ALLOW_CHECKLIST_DROP" >&2
+    echo "$guard_out" >&2
+    trailer=(-m "Checklist-Drop-Allowed: $LAND_ALLOW_CHECKLIST_DROP")
+  else
+    git reset -q --hard "$before"
+    echo "$guard_out" >&2
+    die "$coin@${tip:0:7} drops or unticks checklist rows (above); tree reset to ${before:0:7}. Restore them in the lane, or set LAND_ALLOW_CHECKLIST_DROP=\"<why>\" if intended"
+  fi
+fi
+
 # --- commit, sign, verify ------------------------------------------------------------------------
 git -c user.name="$author_name" -c user.email="$author_email" commit -q \
-  -m "$subject" -m "Landed-From: $tip"
+  -m "$subject" -m "Landed-From: $tip" ${trailer[@]+"${trailer[@]}"}
 new="$(git rev-parse HEAD)"
 if ! git verify-commit "$new" >/dev/null 2>&1; then
   git reset -q --hard "$before"
