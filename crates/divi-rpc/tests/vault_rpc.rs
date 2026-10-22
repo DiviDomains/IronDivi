@@ -415,3 +415,99 @@ fn manager_cannot_reclaim_vault() {
     assert!(error_message(e).contains("No vault funds available to reclaim"));
     assert!(s.net.submitted.lock().is_empty());
 }
+
+// ---------------------------------------------------------------- IR-10
+
+/// getwalletinfo and getcoinavailability as Divi Core: the owner's vaulted
+/// balance is the vault; the manager's managed vault is stakable only, in no
+/// balance.
+#[test]
+fn vaulted_balance_owner_and_manager_views() {
+    let s = setup();
+    let owner_change = (1250 - VAULT_DIVI - MANAGER_PLAIN_DIVI) as f64 - 0.0001;
+
+    let owner = s.net.rpc(&s.owner).get_wallet_info(&Params::None).unwrap();
+    assert_eq!(
+        divi(&owner["vaulted_balance"]),
+        VAULT_DIVI as f64,
+        "{}",
+        owner
+    );
+    assert_eq!(
+        divi(&owner["balance"]),
+        VAULT_DIVI as f64 + owner_change,
+        "{}",
+        owner
+    );
+    assert_eq!(divi(&owner["spendable_balance"]), owner_change, "{}", owner);
+
+    let manager = s
+        .net
+        .rpc(&s.manager)
+        .get_wallet_info(&Params::None)
+        .unwrap();
+    assert_eq!(divi(&manager["vaulted_balance"]), 0.0, "{}", manager);
+    assert_eq!(
+        divi(&manager["balance"]),
+        MANAGER_PLAIN_DIVI as f64,
+        "{}",
+        manager
+    );
+    assert_eq!(
+        divi(&manager["spendable_balance"]),
+        MANAGER_PLAIN_DIVI as f64,
+        "{}",
+        manager
+    );
+    assert_eq!(
+        divi(&s.net.rpc(&s.manager).get_balance(&Params::None).unwrap()),
+        MANAGER_PLAIN_DIVI as f64
+    );
+
+    let ca = s
+        .net
+        .rpc(&s.owner)
+        .get_coin_availability(&Params::None)
+        .unwrap();
+    assert_eq!(divi(&ca["Vaulted"]), VAULT_DIVI as f64, "{}", ca);
+    assert_eq!(divi(&ca["Stakable"]), owner_change, "{}", ca);
+    assert_eq!(divi(&ca["Spendable"]), owner_change, "{}", ca);
+
+    let ca = s
+        .net
+        .rpc(&s.manager)
+        .get_coin_availability(&Params::None)
+        .unwrap();
+    assert_eq!(divi(&ca["Vaulted"]), 0.0, "{}", ca);
+    assert_eq!(
+        divi(&ca["Stakable"]),
+        (VAULT_DIVI + MANAGER_PLAIN_DIVI) as f64,
+        "{}",
+        ca
+    );
+    assert_eq!(divi(&ca["Spendable"]), MANAGER_PLAIN_DIVI as f64, "{}", ca);
+
+    // Verbose form names the vault by its encoding on both sides
+    let ca = s
+        .net
+        .rpc(&s.owner)
+        .get_coin_availability(&p(vec![json!(true)]))
+        .unwrap();
+    assert_eq!(
+        ca["Vaulted"]["AllVaults"][0]["vault"],
+        json!(s.encoding),
+        "{}",
+        ca
+    );
+    let ca = s
+        .net
+        .rpc(&s.manager)
+        .get_coin_availability(&p(vec![json!(true)]))
+        .unwrap();
+    assert_eq!(
+        ca["Stakable"]["AllVaults"][0]["vault"],
+        json!(s.encoding),
+        "{}",
+        ca
+    );
+}

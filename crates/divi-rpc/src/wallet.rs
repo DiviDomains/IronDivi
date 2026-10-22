@@ -361,6 +361,14 @@ impl WalletRpc {
         let unconfirmed = wallet.get_unconfirmed_balance();
         let immature = wallet.get_immature_balance(height, 100);
 
+        // Core: spendable_balance excludes every vault, vaulted_balance is the
+        // coins in vaults we own (a managed vault is in neither)
+        let spendable = wallet
+            .get_spendable_utxos(height, 1)
+            .iter()
+            .fold(Amount::ZERO, |a, u| a + u.value);
+        let vaulted = wallet.get_vaulted_balance();
+
         let divi_balance = balance.as_sat() as f64 / 100_000_000.0;
         let divi_unconfirmed = unconfirmed.as_sat() as f64 / 100_000_000.0;
         let divi_immature = immature.as_sat() as f64 / 100_000_000.0;
@@ -370,8 +378,8 @@ impl WalletRpc {
             "active_wallet": "wallet.dat",
             "walletversion": 120200,
             "balance": divi_balance,
-            "spendable_balance": divi_balance,
-            "vaulted_balance": 0.0,
+            "spendable_balance": spendable.as_divi_f64(),
+            "vaulted_balance": vaulted.as_divi_f64(),
             "encryption_status": wallet.encryption_status(),
             "unconfirmed_balance": divi_unconfirmed,
             "immature_balance": divi_immature,
@@ -1874,12 +1882,9 @@ impl WalletRpc {
         let vaults = wallet.get_all_vaults();
         let total_vaults = vaults.len();
 
-        // Get vault UTXOs (mature, confirmed vault outputs)
-        let vault_utxos = wallet.get_vault_utxos(height, 1);
-
-        // Group by vault script and calculate totals
+        // Balance of each registered vault, from every vault output we hold
         let mut vault_balances = std::collections::HashMap::new();
-        for utxo in vault_utxos {
+        for utxo in wallet.get_vault_utxos(height, 1) {
             let script_key = utxo.script_pubkey.as_bytes().to_vec();
             *vault_balances.entry(script_key).or_insert(Amount::ZERO) += utxo.value;
         }
@@ -1899,19 +1904,19 @@ impl WalletRpc {
             }));
         }
 
-        // C++ shape: Vaulted / Stakable / Spendable. Stakable is approximated by the
-        // confirmed, mature, non-vault coins (the node has no coin-age filter here).
-        let vault_utxos = wallet.get_vault_utxos(height, 1);
-        let vault_scripts: std::collections::HashSet<Vec<u8>> = wallet
-            .get_all_vaults()
-            .into_iter()
-            .map(|v| v.vault_script)
-            .collect();
-        let plain: Vec<_> = wallet
-            .get_spendable_utxos(height, 1)
-            .into_iter()
-            .filter(|u| !vault_scripts.contains(u.script_pubkey.as_bytes()))
-            .collect();
+        // C++ shape (AvailableUtxoCalculator): Vaulted = vaults we own,
+        // Stakable = plain coins plus vaults we manage, Spendable = plain coins.
+        // The node has no coin-age filter here.
+        let owned_vaults = wallet.get_owned_vault_utxos(height, 1);
+        let plain = wallet.get_spendable_utxos(height, 1);
+        let mut stakable = plain.clone();
+        stakable.extend(
+            wallet
+                .get_stakeable_vault_utxos(height, 1)
+                .into_iter()
+                .map(|(u, _)| u),
+        );
+        let network = wallet.network();
         let sum = |us: &[divi_wallet::wallet_db::WalletUtxo]| -> f64 {
             us.iter()
                 .fold(Amount::ZERO, |a, u| a + u.value)
@@ -1933,14 +1938,17 @@ impl WalletRpc {
             let mut all_vaults = Vec::new();
             let mut vault_total = Amount::ZERO;
             for (script, (value, txids)) in by_script {
-                if let Some(v) = wallet
-                    .get_all_vaults()
-                    .into_iter()
-                    .find(|v| v.vault_script == script)
-                {
+                if let Some(v) = StakingVaultScript::from_script(&Script::from_bytes(script)) {
+                    let addr = |h: [u8; 20]| {
+                        Address::from_pubkey_hash(
+                            divi_primitives::hash::Hash160::from_bytes(h),
+                            network,
+                        )
+                        .to_string()
+                    };
                     vault_total += value;
                     all_vaults.push(json!({
-                        "vault": format!("{}:{}", v.owner_address, v.manager_address),
+                        "vault": format!("{}:{}", addr(v.owner_pubkey_hash), addr(v.vault_pubkey_hash)),
                         "value": value.as_divi_f64(),
                         "txids": txids,
                     }));
@@ -1950,11 +1958,15 @@ impl WalletRpc {
             json!({"AllVaults": all_vaults, "NonVaults": (total - vault_total).as_divi_f64()})
         };
         let (vaulted, stakable, spendable) = if verbose {
-            (describe(&vault_utxos), describe(&plain), describe(&plain))
+            (
+                describe(&owned_vaults),
+                describe(&stakable),
+                describe(&plain),
+            )
         } else {
             (
-                json!(sum(&vault_utxos)),
-                json!(sum(&plain)),
+                json!(sum(&owned_vaults)),
+                json!(sum(&stakable)),
                 json!(sum(&plain)),
             )
         };

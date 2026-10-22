@@ -1235,10 +1235,20 @@ impl WalletDb {
         select::select_minimum(&available_utxos, target, fee_rate, num_outputs)
     }
 
+    /// Our coins for balance purposes: everything except vaults we only
+    /// manage (Core's balances count ISMINE_SPENDABLE and ISMINE_OWNED_VAULT,
+    /// never ISMINE_MANAGED_VAULT)
+    fn balance_utxos(&self) -> Vec<(WalletUtxo, CoinSource)> {
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(u, _)| self.vault_role(&u.script_pubkey) != Some(VaultRole::Managed))
+            .collect()
+    }
+
     /// Get total balance: Core's GetBalance, i.e. trusted coins only
     /// (confirmed, plus our own unconfirmed change)
     pub fn get_balance(&self) -> Amount {
-        self.effective_utxos()
+        self.balance_utxos()
             .into_iter()
             .filter(|(_, source)| source.is_trusted())
             .map(|(u, _)| u.value)
@@ -1251,7 +1261,7 @@ impl WalletDb {
     /// transaction no longer count, our own unconfirmed change counts at any
     /// minconf, and unconfirmed coins from others count only at minconf 0.
     pub fn get_confirmed_balance(&self, current_height: u32, min_confirmations: u32) -> Amount {
-        self.effective_utxos()
+        self.balance_utxos()
             .into_iter()
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.confirmations(current_height) >= min_confirmations,
@@ -1264,7 +1274,7 @@ impl WalletDb {
     /// Get unconfirmed balance: Core's GetUnconfirmedBalance, i.e. unconfirmed
     /// coins that are not trusted (incoming from others)
     pub fn get_unconfirmed_balance(&self) -> Amount {
-        self.effective_utxos()
+        self.balance_utxos()
             .into_iter()
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.height.is_none(),
@@ -1276,12 +1286,18 @@ impl WalletDb {
 
     /// Get immature balance (coinbase/coinstake not yet mature)
     pub fn get_immature_balance(&self, current_height: u32, maturity: u32) -> Amount {
-        self.utxos
+        let immature: Vec<WalletUtxo> = self
+            .utxos
             .read()
             .values()
             .filter(|utxo| {
                 (utxo.is_coinbase || utxo.is_coinstake) && !utxo.is_mature(current_height, maturity)
             })
+            .cloned()
+            .collect();
+        immature
+            .iter()
+            .filter(|u| self.vault_role(&u.script_pubkey) != Some(VaultRole::Managed))
             .map(|u| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
@@ -2248,6 +2264,16 @@ impl WalletDb {
             })
             .cloned()
             .collect()
+    }
+
+    /// Core's GetVaultedBalance: trusted coins in vaults we own. A vault we
+    /// only manage is not vaulted for us (Core counts it as stakable).
+    pub fn get_vaulted_balance(&self) -> Amount {
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(_, source)| source.is_trusted())
+            .filter(|(u, _)| self.vault_role(&u.script_pubkey) == Some(VaultRole::Owned))
+            .fold(Amount::ZERO, |a, (u, _)| a + u.value)
     }
 
     /// Vault outputs we own (owner key held), confirmed and mature, not spent
