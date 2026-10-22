@@ -47,6 +47,12 @@ pub struct DiviSection {
     /// DIVI JSON-RPC proxy URL. When absent, [`DiviSection::rpc_url`] falls back to
     /// `swap_chain_divi::default_rpc(network)`.
     pub rpc_url: Option<String>,
+    /// Optional second, independent DIVI JSON-RPC endpoint (ideally the operator's own node).
+    /// When set, every swap-relevant read is made on both endpoints and a disagreement is
+    /// `Transient` (retried later), never a decision; a broadcast goes to both. Unset (the
+    /// default) keeps the single-source behavior.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's DIVI key.
     pub key: String,
     /// Known-UTXO file (public data only).
@@ -75,6 +81,21 @@ impl DiviSection {
             Some(u) => u.clone(),
             None => swap_chain_divi::default_rpc(self.network()?).to_string(),
         })
+    }
+
+    /// `fallback_rpc_url` when set and non-blank; an identical URL to `rpc_url` is refused
+    /// because it would make the "second" source a copy of the first.
+    pub fn fallback_rpc_url(&self) -> Result<Option<String>> {
+        let Some(f) = self.fallback_rpc_url.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if f.is_empty() {
+            return Ok(None);
+        }
+        if f == self.rpc_url()?.trim() {
+            bail!("[divi].fallback_rpc_url must differ from [divi].rpc_url");
+        }
+        Ok(Some(f.to_string()))
     }
 }
 
@@ -816,6 +837,24 @@ key = "credential:btc"
             "[divi]\nkey",
             "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
         )
+    }
+
+    #[test]
+    fn divi_fallback_rpc_url_is_off_by_default_and_must_differ_from_the_primary() {
+        let d = DaemonConfig::parse(GOOD).unwrap().divi.unwrap();
+        assert_eq!(d.fallback_rpc_url().unwrap(), None);
+        let with = |extra: &str| {
+            DaemonConfig::parse(&GOOD.replace("[divi]\n", &format!("[divi]\n{extra}\n")))
+                .unwrap()
+                .divi
+                .unwrap()
+        };
+        let d = with("rpc_url = \"http://a:1\"\nfallback_rpc_url = \" http://b:2 \"");
+        assert_eq!(d.fallback_rpc_url().unwrap().as_deref(), Some("http://b:2"));
+        let d = with("fallback_rpc_url = \"  \"");
+        assert_eq!(d.fallback_rpc_url().unwrap(), None);
+        let d = with("rpc_url = \"http://a:1\"\nfallback_rpc_url = \"http://a:1\"");
+        assert!(d.fallback_rpc_url().is_err());
     }
 
     #[test]

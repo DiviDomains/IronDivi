@@ -12,9 +12,11 @@
 //! proof (`examples/*_cltv_proof.rs`) shows the transaction shapes that the chain accepts.
 
 mod rpc;
+mod second_source;
 mod wallet;
 
 pub use rpc::{classify_broadcast_error, BroadcastClass, RetryPolicy, RpcClient, RpcError};
+pub use second_source::{CONFIRMATION_TOLERANCE, MTP_TOLERANCE_SECS};
 pub use wallet::{Utxo, Wallet};
 
 use std::time::Duration;
@@ -92,6 +94,10 @@ impl FeePolicy {
 /// `ChainBackend` for DIVI over the JSON-RPC proxy, holding one engine key.
 pub struct DiviBackend {
     rpc: RpcClient,
+    /// Optional second endpoint (`[divi].fallback_rpc_url`). When set, every swap-relevant
+    /// read is made on both and a disagreement is `Transient`; see [`second_source`].
+    fallback: Option<RpcClient>,
+    retry: RetryPolicy,
     key: SecretKey,
     pubkey: [u8; 33],
     spk: Script,
@@ -154,6 +160,8 @@ impl DiviBackend {
         let pk = key.public_key();
         Ok(DiviBackend {
             rpc: RpcClient::new(rpc_url, retry),
+            fallback: None,
+            retry,
             pubkey: pk.serialize_compressed(),
             spk: Script::new_p2pkh(pk.pubkey_hash().as_bytes()),
             key,
@@ -161,6 +169,23 @@ impl DiviBackend {
             fee,
             wallet: Mutex::new(Wallet::open(wallet_path)?),
         })
+    }
+
+    /// Add a second, independent endpoint. Every swap-relevant read (confirmations, HTLC
+    /// output, find-spend, MTP) is then made on both and any disagreement is
+    /// `SwapError::Transient`; a broadcast goes to both. An empty `url` leaves the backend
+    /// single-source.
+    pub fn with_fallback_rpc(mut self, url: &str) -> Self {
+        let url = url.trim();
+        if !url.is_empty() {
+            self.fallback = Some(RpcClient::new(url, self.retry));
+        }
+        self
+    }
+
+    /// Whether a second endpoint is configured.
+    pub fn has_fallback(&self) -> bool {
+        self.fallback.is_some()
     }
 
     /// The key's P2PKH address.
@@ -217,35 +242,17 @@ impl DiviBackend {
     }
 
     async fn block_txids(&self, height: u64) -> Result<Vec<String>> {
-        let hash = self.rpc.call_ok("getblockhash", json!([height])).await?;
-        let block = self.rpc.call_ok("getblock", json!([hash, true])).await?;
-        Ok(block["tx"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default())
+        block_txids_on(&self.rpc, height).await
     }
 
     async fn get_tx(&self, txid: &str) -> Result<Value> {
-        self.rpc
-            .call_ok("getrawtransaction", json!([txid, 1]))
-            .await
+        get_tx_on(&self.rpc, txid).await
     }
 
     /// Like `get_tx` but `None` for "No such mempool or blockchain transaction" (-5).
+    #[cfg(test)]
     async fn get_tx_opt(&self, txid: &Txid) -> Result<Option<Value>> {
-        match self
-            .rpc
-            .call("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
-            .await
-        {
-            Ok(v) => Ok(Some(v)),
-            Err(RpcError::Node { code: -5, .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        get_tx_opt_on(&self.rpc, txid).await
     }
 
     fn sign_input(&self, tx: &Transaction, idx: usize, script_code: &Script) -> Result<Vec<u8>> {
@@ -336,15 +343,7 @@ impl ChainBackend for DiviBackend {
     }
 
     async fn tip_height(&self) -> Result<u64> {
-        self.rpc
-            .call_ok("getblockcount", json!([]))
-            .await?
-            .as_u64()
-            .ok_or_else(|| {
-                // A proxy returning a null/non-numeric block count is a glitch, not a real
-                // "the chain has no height" condition.
-                SwapError::Transient("getblockcount: not a number".into())
-            })
+        tip_height_on(&self.rpc).await
     }
 
     async fn tip_hash(&self) -> Result<String> {
@@ -356,24 +355,12 @@ impl ChainBackend for DiviBackend {
     }
 
     async fn median_time_past(&self) -> Result<u32> {
-        // The node reports `mediantime: null`, so take the median of the last 11 block times.
-        let tip = self.tip_height().await?;
-        let mut hash = self.rpc.call_ok("getblockhash", json!([tip])).await?;
-        let mut times = Vec::with_capacity(11);
-        for _ in 0..11 {
-            let block = self.rpc.call_ok("getblock", json!([hash, true])).await?;
-            times.push(block["time"].as_u64().ok_or_else(|| {
-                // A real block always has a time; its absence means a proxy-fronted
-                // node behind the one that reported this hash hasn't indexed it yet.
-                SwapError::Transient("block without time (still indexing?)".into())
-            })?);
-            match block.get("previousblockhash").filter(|p| p.is_string()) {
-                Some(prev) => hash = prev.clone(),
-                None => break,
-            }
-        }
-        times.sort_unstable();
-        Ok(times[times.len() / 2] as u32)
+        let Some(fb) = &self.fallback else {
+            return median_time_past_on(&self.rpc).await;
+        };
+        let (a, b) = tokio::join!(median_time_past_on(&self.rpc), median_time_past_on(fb));
+        let (a, b) = second_source::pair("median_time_past", a, b)?;
+        second_source::agree_mtp(a, b)
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -488,37 +475,28 @@ impl ChainBackend for DiviBackend {
     async fn broadcast(&self, tx: &SignedTx) -> Result<Txid> {
         let parsed: Transaction = divi_primitives::serialize::deserialize(&tx.raw)
             .map_err(|e| SwapError::InvalidParams(format!("undecodable transaction: {e}")))?;
-        let result = self
-            .rpc
-            .call("sendrawtransaction", json!([hex::encode(&tx.raw)]))
-            .await;
-        match result {
-            Ok(_) => {}
-            Err(RpcError::Node { message, .. }) => match classify_broadcast_error(&message) {
-                BroadcastClass::AlreadyKnown => {}
-                BroadcastClass::Premature => return Err(SwapError::Premature(message)),
-                BroadcastClass::Rejected => {
-                    // A rejection of a tx the chain already has (e.g. its inputs are now
-                    // spent by itself) is still success. A single `None` here is not
-                    // proof of absence, though: a proxy fronting more than one node can
-                    // reject against one backend while another already has the tx (the
-                    // same lagging-backend race as the esplora "Block not found" bug) —
-                    // so double-check a couple of times, with a short delay, before
-                    // concluding the rejection is real.
-                    let mut known = self.get_tx_opt(&tx.txid).await?.is_some();
-                    for _ in 0..2 {
-                        if known {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        known = self.get_tx_opt(&tx.txid).await?.is_some();
+        let raw_hex = hex::encode(&tx.raw);
+        match &self.fallback {
+            None => send_raw_on(&self.rpc, &raw_hex, &tx.txid).await?,
+            Some(fb) => {
+                // Broadcast goes to both endpoints: a transaction either one accepts is on
+                // the network, so one endpoint dropping or hiding it cannot stall a claim
+                // or a refund.
+                let (p, f) = tokio::join!(
+                    send_raw_on(&self.rpc, &raw_hex, &tx.txid),
+                    send_raw_on(fb, &raw_hex, &tx.txid)
+                );
+                match (p, f) {
+                    (Ok(()), Ok(())) => {}
+                    (Ok(()), Err(e)) => {
+                        tracing::warn!(txid = %tx.txid, "fallback endpoint did not take the broadcast: {e}");
                     }
-                    if !known {
-                        return Err(SwapError::Rejected(message));
+                    (Err(e), Ok(())) => {
+                        tracing::warn!(txid = %tx.txid, "primary endpoint did not take the broadcast: {e}");
                     }
+                    (Err(e), Err(_)) => return Err(e),
                 }
-            },
-            Err(e) => return Err(e.into()),
+            }
         }
         let own: Vec<Utxo> = parsed
             .vout
@@ -546,62 +524,200 @@ impl ChainBackend for DiviBackend {
     }
 
     async fn confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        Ok(self
-            .get_tx_opt(txid)
-            .await?
-            .map(|v| v["confirmations"].as_u64().unwrap_or(0) as u32))
+        let Some(fb) = &self.fallback else {
+            return confirmations_on(&self.rpc, txid).await;
+        };
+        let (a, b) = tokio::join!(
+            confirmations_on(&self.rpc, txid),
+            confirmations_on(fb, txid)
+        );
+        let (a, b) = second_source::pair("confirmations", a, b)?;
+        second_source::agree_confirmations(a, b)
     }
 
     async fn htlc_output(&self, htlc: &HtlcParams, at: &Outpoint) -> Result<Option<LockedOutput>> {
-        let Some(tx) = self.get_tx_opt(&at.txid).await? else {
-            return Ok(None);
+        let Some(fb) = &self.fallback else {
+            return htlc_output_on(&self.rpc, htlc, at).await;
         };
-        let Some(out) = tx["vout"]
-            .as_array()
-            .and_then(|a| a.iter().find(|o| o["n"].as_u64() == Some(at.vout as u64)))
-        else {
-            return Ok(None);
-        };
-        if out["scriptPubKey"]["hex"].as_str() != Some(htlc_script_pubkey(htlc).to_hex().as_str()) {
-            return Ok(None);
-        }
-        let sat = out["valueSat"]
-            .as_u64()
-            .or_else(|| out["value"].as_f64().map(|v| (v * 1e8).round() as u64))
-            .ok_or_else(|| SwapError::Other("output without value".into()))?;
-        Ok(Some(LockedOutput {
-            amount: Amount(sat),
-            confirmations: tx["confirmations"].as_u64().unwrap_or(0) as u32,
-        }))
+        let (a, b) = tokio::join!(
+            htlc_output_on(&self.rpc, htlc, at),
+            htlc_output_on(fb, htlc, at)
+        );
+        let (a, b) = second_source::pair("htlc_output", a, b)?;
+        second_source::agree_htlc_output(a, b)
     }
 
     async fn find_spend(&self, outpoint: &Outpoint, from_height: u64) -> Result<Option<SpendInfo>> {
-        let want_txid = outpoint.txid.to_rpc_hex();
-        let tip = self.tip_height().await?;
-        for h in from_height..=tip {
-            for txid in self.block_txids(h).await? {
-                let tx = self.get_tx(&txid).await?;
-                if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, Some(h))? {
-                    return Ok(Some(s));
-                }
-            }
+        let Some(fb) = &self.fallback else {
+            return find_spend_on(&self.rpc, outpoint, from_height).await;
+        };
+        let (a, b) = tokio::join!(
+            find_spend_on(&self.rpc, outpoint, from_height),
+            find_spend_on(fb, outpoint, from_height)
+        );
+        let (a, b) = second_source::pair("find_spend", a, b)?;
+        second_source::agree_spend(a, b)
+    }
+}
+
+async fn block_txids_on(rpc: &RpcClient, height: u64) -> Result<Vec<String>> {
+    let hash = rpc.call_ok("getblockhash", json!([height])).await?;
+    let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+    Ok(block["tx"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+async fn get_tx_on(rpc: &RpcClient, txid: &str) -> Result<Value> {
+    rpc.call_ok("getrawtransaction", json!([txid, 1])).await
+}
+
+async fn get_tx_opt_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<Value>> {
+    match rpc
+        .call("getrawtransaction", json!([txid.to_rpc_hex(), 1]))
+        .await
+    {
+        Ok(v) => Ok(Some(v)),
+        Err(RpcError::Node { code: -5, .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn tip_height_on(rpc: &RpcClient) -> Result<u64> {
+    rpc.call_ok("getblockcount", json!([]))
+        .await?
+        .as_u64()
+        .ok_or_else(|| {
+            // A proxy returning a null/non-numeric block count is a glitch, not a real
+            // "the chain has no height" condition.
+            SwapError::Transient("getblockcount: not a number".into())
+        })
+}
+
+async fn median_time_past_on(rpc: &RpcClient) -> Result<u32> {
+    // The node reports `mediantime: null`, so take the median of the last 11 block times.
+    let tip = tip_height_on(rpc).await?;
+    let mut hash = rpc.call_ok("getblockhash", json!([tip])).await?;
+    let mut times = Vec::with_capacity(11);
+    for _ in 0..11 {
+        let block = rpc.call_ok("getblock", json!([hash, true])).await?;
+        times.push(block["time"].as_u64().ok_or_else(|| {
+            // A real block always has a time; its absence means a proxy-fronted
+            // node behind the one that reported this hash hasn't indexed it yet.
+            SwapError::Transient("block without time (still indexing?)".into())
+        })?);
+        match block.get("previousblockhash").filter(|p| p.is_string()) {
+            Some(prev) => hash = prev.clone(),
+            None => break,
         }
-        let pool = self.rpc.call_ok("getrawmempool", json!([])).await?;
-        for txid in pool
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            let tx = match self.get_tx_opt(&txid.parse()?).await? {
-                Some(tx) => tx,
-                None => continue, // left the mempool meanwhile; a block scan will see it
-            };
-            if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, None)? {
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2] as u32)
+}
+
+async fn confirmations_on(rpc: &RpcClient, txid: &Txid) -> Result<Option<u32>> {
+    Ok(get_tx_opt_on(rpc, txid)
+        .await?
+        .map(|v| v["confirmations"].as_u64().unwrap_or(0) as u32))
+}
+
+async fn htlc_output_on(
+    rpc: &RpcClient,
+    htlc: &HtlcParams,
+    at: &Outpoint,
+) -> Result<Option<LockedOutput>> {
+    let Some(tx) = get_tx_opt_on(rpc, &at.txid).await? else {
+        return Ok(None);
+    };
+    let Some(out) = tx["vout"]
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["n"].as_u64() == Some(at.vout as u64)))
+    else {
+        return Ok(None);
+    };
+    if out["scriptPubKey"]["hex"].as_str() != Some(htlc_script_pubkey(htlc).to_hex().as_str()) {
+        return Ok(None);
+    }
+    let sat = out["valueSat"]
+        .as_u64()
+        .or_else(|| out["value"].as_f64().map(|v| (v * 1e8).round() as u64))
+        .ok_or_else(|| SwapError::Other("output without value".into()))?;
+    Ok(Some(LockedOutput {
+        amount: Amount(sat),
+        confirmations: tx["confirmations"].as_u64().unwrap_or(0) as u32,
+    }))
+}
+
+async fn find_spend_on(
+    rpc: &RpcClient,
+    outpoint: &Outpoint,
+    from_height: u64,
+) -> Result<Option<SpendInfo>> {
+    let want_txid = outpoint.txid.to_rpc_hex();
+    let tip = tip_height_on(rpc).await?;
+    for h in from_height..=tip {
+        for txid in block_txids_on(rpc, h).await? {
+            let tx = get_tx_on(rpc, &txid).await?;
+            if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, Some(h))? {
                 return Ok(Some(s));
             }
         }
-        Ok(None)
+    }
+    let pool = rpc.call_ok("getrawmempool", json!([])).await?;
+    for txid in pool
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let tx = match get_tx_opt_on(rpc, &txid.parse()?).await? {
+            Some(tx) => tx,
+            None => continue, // left the mempool meanwhile; a block scan will see it
+        };
+        if let Some(s) = spend_in(&tx, &want_txid, outpoint.vout, None)? {
+            return Ok(Some(s));
+        }
+    }
+    Ok(None)
+}
+
+/// One endpoint's `sendrawtransaction`, with the "already known" / premature / recheck
+/// classification the single-source backend always had.
+async fn send_raw_on(rpc: &RpcClient, raw_hex: &str, txid: &Txid) -> Result<()> {
+    match rpc.call("sendrawtransaction", json!([raw_hex])).await {
+        Ok(_) => Ok(()),
+        Err(RpcError::Node { message, .. }) => match classify_broadcast_error(&message) {
+            BroadcastClass::AlreadyKnown => Ok(()),
+            BroadcastClass::Premature => Err(SwapError::Premature(message)),
+            BroadcastClass::Rejected => {
+                // A rejection of a tx the chain already has (e.g. its inputs are now
+                // spent by itself) is still success. A single `None` here is not
+                // proof of absence, though: a proxy fronting more than one node can
+                // reject against one backend while another already has the tx (the
+                // same lagging-backend race as the esplora "Block not found" bug) —
+                // so double-check a couple of times, with a short delay, before
+                // concluding the rejection is real.
+                let mut known = get_tx_opt_on(rpc, txid).await?.is_some();
+                for _ in 0..2 {
+                    if known {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    known = get_tx_opt_on(rpc, txid).await?.is_some();
+                }
+                if known {
+                    Ok(())
+                } else {
+                    Err(SwapError::Rejected(message))
+                }
+            }
+        },
+        Err(e) => Err(e.into()),
     }
 }
 

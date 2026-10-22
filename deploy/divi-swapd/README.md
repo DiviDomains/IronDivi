@@ -30,6 +30,7 @@ and a matching top-level `profile = "mainnet"`, so a mainnet cutover is never a 
 edit.
 `[btc]` and `[ltc]` follow the same rule: `network = "mainnet"` needs `allow_mainnet = true` and `profile = "mainnet"`,
 and with `esplora_url` unset the mainnet endpoints come from the crate defaults.
+`[divi].rpc_url` is the DIVI JSON-RPC proxy (unset: the network's public default). The optional `[divi].fallback_rpc_url` (unset by default) adds a second, independent DIVI endpoint, ideally your own node: confirmations, the HTLC output, find-spend and the median time are then read on both, any disagreement is `Transient` (the engine retries later; nothing is decided on a split view), and a broadcast goes to both. It must differ from `rpc_url`. Making it mandatory on mainnet is an operator decision, not enforced.
 `profile` (default `testnet`) must agree with every configured coin section (`[btc]`, `[ltc]`, `[zec]`, `[xmr]`, `[usdc]`): a mainnet profile with a test network, a mainnet network without `allow_mainnet`, or a testnet profile with a mainnet network is refused at config load. The taker CLI `divi-swap --profile mainnet` likewise refuses any maker quote whose confirmation depths or timeouts are weaker than the mainnet profile's, before it signs or funds anything.
 
 `[usdc].network` defaults to `sepolia`; the mainnets `ethereum` and `base` likewise need

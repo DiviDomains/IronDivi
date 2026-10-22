@@ -11,6 +11,10 @@ network = "testnet"        # or "mainnet"; "mainnet" needs allow_mainnet = true 
 # allow_mainnet = false     # default; mainnet moves real money — off until a reviewed mainnet cutover
 # rpc_url is optional: unset, it defaults per network (testnet .../api/testnet/rpc/, mainnet .../api/rpc/)
 rpc_url = "https://services.divi.domains/api/testnet/rpc/"
+# fallback_rpc_url is optional and off by default (a second DIVI RPC, ideally your own node). When set, every swap read
+# (confirmations, HTLC output, find-spend, MTP) is made on both endpoints; any disagreement is Transient (retried), never
+# a decision, and a broadcast goes to both. Must differ from rpc_url. Unset = single source, as before.
+# fallback_rpc_url = "http://127.0.0.1:51473"
 key = "credential:maker-divi"   # systemd LoadCredential, see divi-swapd.service
 wallet_path = "/var/lib/divi-swapd/divi-wallet.json"  # known UTXOs (public data only)
 scan_from_height = 339800

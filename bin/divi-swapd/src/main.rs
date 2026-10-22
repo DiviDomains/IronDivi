@@ -450,13 +450,19 @@ async fn live_backends(
     let btc = live_btc(btc_cfg)?;
     let key = resolve_divi_key(&divi_cfg.key, "divi")?;
     let divi_network = divi_cfg.network()?;
-    let divi = DiviBackend::new(
+    let mut divi = DiviBackend::new(
         &divi_cfg.rpc_url()?,
         key,
         divi_network,
         DiviFeePolicy::default(),
         divi_cfg.wallet_path.clone(),
     )?;
+    if let Some(fallback) = divi_cfg.fallback_rpc_url()? {
+        divi = divi.with_fallback_rpc(&fallback);
+        tracing::info!(
+            "divi second source enabled: swap reads on two endpoints, disagreement is transient"
+        );
+    }
     tracing::info!(address = %divi.address(), network = ?divi_network, "divi backend ready");
     let divi = Arc::new(divi);
     let job = divi_cfg.scan_from_height.map(|from| ScanJob {

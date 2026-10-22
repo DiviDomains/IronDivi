@@ -29,11 +29,13 @@ All paths are under the repo root. "Mainnet default" is what a config that sets 
 
 ### DIVI
 - Source: one JSON-RPC proxy. Mainnet default `https://services.divi.domains/api/rpc/`
-  (`crates/swap-chain-divi/src/lib.rs:51`; testnet `:47`). Key `[divi].rpc_url` (`bin/divi-swapd/src/config.rs:49`). **No fallback key exists.**
+  (`crates/swap-chain-divi/src/lib.rs:51`; testnet `:47`). Key `[divi].rpc_url` (`bin/divi-swapd/src/config.rs:49`). **Implemented, opt-in (lane/divi-second-source): `[divi].fallback_rpc_url` (`bin/divi-swapd/src/config.rs:55`, wired at `bin/divi-swapd/src/main.rs:453-461`). Unset by default on every network, and unset is the same single-source code path as before.**
 - confirmations: `getrawtransaction` `confirmations` field, `lib.rs:548`; `htlc_output` `lib.rs:555`.
 - spend detection: `find_spend` `lib.rs:578` walks every block with `getblock` and then `getrawmempool` through the same proxy (no address/spent index).
 - MTP: `lib.rs:358`, median of 11 block times fetched through the same proxy (the node's own `mediantime` is null).
 - broadcast: `sendrawtransaction`, `lib.rs:488`.
+- With `fallback_rpc_url` set (`DiviBackend::with_fallback_rpc`), `median_time_past`, `confirmations`, `htlc_output` and `find_spend` (`lib.rs:362,534,546,558`) read both endpoints and compare in `crates/swap-chain-divi/src/second_source.rs`. Disagreement, or exactly one endpoint unable to answer, is `SwapError::Transient`. Confirmations may differ by `CONFIRMATION_TOLERANCE` (1, tip lag) and MTP by `MTP_TOLERANCE_SECS` (600); within tolerance the lower value is used, so an inflation can only be clipped. A tx, output or spend only one endpoint knows, differing amounts, and a spend with a different txid, input or scriptSig (the preimage) are `Transient`. `broadcast` goes to both and succeeds if either accepts. `tip_height`, `tip_hash` and the wallet scan stay on the primary only.
+- Not covered: two colluding endpoints, and a mainnet start rule that requires the key. Making it mandatory is an operator decision.
 - Second source / cross-check: none in the daemon. `tools/swap-poc/tip-crosscheck.sh` compares tip hashes by hand; nothing in the engine reads it. Mainnet default: **none**.
 
 ### BTC
@@ -96,7 +98,7 @@ proceeds; no timeout, margin or confirmation count changes.
 
 | Rank | Chain | Cheapest mitigation | Cost | Code sites |
 |---|---|---|---|---|
-| 1 | DIVI | Add `[divi].fallback_rpc_url` and a `DiviRpcQuorum`: `find_spend`, `htlc_output` and `confirmations` ask both URLs and treat *disagreement* as `SwapError::Transient` (retry) — the engine already retries `Transient`. Operators can point the second URL at their own node. | ~1 day; one config key; mock RPC tests. | `crates/swap-chain-divi/src/rpc.rs` (new client wrapper), `lib.rs:338-598`, `bin/divi-swapd/src/config.rs:39-80` |
+| 1 | DIVI | **Done, opt-in (lane/divi-second-source):** add `[divi].fallback_rpc_url` and a `DiviRpcQuorum` (implemented as `second_source.rs` plus a second `RpcClient` in `DiviBackend`): `find_spend`, `htlc_output` and `confirmations` ask both URLs and treat *disagreement* as `SwapError::Transient` (retry) — the engine already retries `Transient`. Operators can point the second URL at their own node. | ~1 day; one config key; mock RPC tests. | `crates/swap-chain-divi/src/rpc.rs` (new client wrapper), `lib.rs:338-598`, `bin/divi-swapd/src/config.rs:39-80` |
 | 2 | LTC | Make `[ltc].crosscheck` mandatory when `network = "mainnet"` (refuse to start with `off`), and call `crosscheck()` again before a claim. Then add a second Esplora to the default list once one exists. | config + 10 lines; the module already exists. | `bin/divi-swapd/src/config.rs:704`, `crates/swap-chain-ltc/src/lib.rs:185` |
 | 3 | ZEC | Compare the lightwalletd tip hash with a second *operator* via the same `CrossCheckSource` idea; make `SWAP_ZEC_LIGHTWALLETD_EXTRA` a required value on mainnet. | small; reuse `crosscheck.rs` shape. | `crates/swap-chain-zec/src/lib.rs:52,62`, `bin/divi-swapd/src/config.rs:277` |
 | 4 | USDC/EVM | `[usdc].fallback_rpc_url` with the same disagree-is-transient rule on `htlc_output`, `find_spend`, `median_time_past`. | ~1 day; alloy provider wrapper. | `crates/swap-chain-evm/src/client.rs:79-98`, `backend.rs:283-600` |
