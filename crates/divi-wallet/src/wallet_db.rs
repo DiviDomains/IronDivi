@@ -233,8 +233,8 @@ pub struct WalletDb {
     scripts: RwLock<HashMap<Hash160, Script>>,
     /// Vault metadata storage
     vaults: RwLock<HashMap<Vec<u8>, VaultMetadata>>,
-    /// Unlock expiration time (None if locked or not encrypted)
-    unlock_until: RwLock<Option<Instant>>,
+    /// How the wallet is unlocked: timer and staking-only flag
+    unlock: RwLock<UnlockState>,
     /// Decrypted master key (in memory only when unlocked)
     decrypted_master_key: RwLock<Option<Zeroizing<Vec<u8>>>>,
     /// Tracks which data categories have been modified since last save
@@ -243,6 +243,16 @@ pub struct WalletDb {
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
     /// Wallet transactions in the mempool (in-memory only, never persisted)
     mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
+}
+
+/// Unlock state of an encrypted wallet (Divi Core `walletStakingOnly` plus the
+/// `walletpassphrase` timer of rpcserver.cpp `UnlockWalletBriefly`)
+#[derive(Debug, Clone, Copy, Default)]
+struct UnlockState {
+    /// When the current unlock ends; None means until `walletlock`
+    until: Option<Instant>,
+    /// Keys are in memory for staking only: sends and key exports are refused
+    staking_only: bool,
 }
 
 impl WalletDb {
@@ -263,7 +273,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -288,7 +298,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -318,7 +328,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults,
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -404,7 +414,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
-            unlock_until: RwLock::new(None),
+            unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
@@ -1314,7 +1324,7 @@ impl WalletDb {
         *self.locked.write() = true;
         // Clear decrypted master key from memory
         *self.decrypted_master_key.write() = None;
-        *self.unlock_until.write() = None;
+        *self.unlock.write() = UnlockState::default();
         // An encrypted wallet also drops every private key and the HD seed; they
         // are restored from their encrypted copies on unlock. An unencrypted
         // wallet has no other copy, so it only gets the flag.
@@ -1326,6 +1336,17 @@ impl WalletDb {
 
     /// Unlock the wallet with passphrase for specified timeout
     pub fn unlock(&self, passphrase: &str, timeout_secs: u32) -> Result<(), WalletError> {
+        self.unlock_for(passphrase, timeout_secs, false)
+    }
+
+    /// Unlock the wallet, fully or for staking only (`walletpassphrase` with
+    /// stakingOnly). A timeout of 0 lasts until `walletlock`.
+    pub fn unlock_for(
+        &self,
+        passphrase: &str,
+        timeout_secs: u32,
+        staking_only: bool,
+    ) -> Result<(), WalletError> {
         if !*self.encrypted.read() {
             // Not encrypted, nothing to unlock
             *self.locked.write() = false;
@@ -1388,10 +1409,21 @@ impl WalletDb {
         } else {
             None // Unlimited
         };
-        *self.unlock_until.write() = expiration;
+        *self.unlock.write() = UnlockState {
+            until: expiration,
+            staking_only,
+        };
 
         *self.locked.write() = false;
-        info!("Wallet unlocked for {} seconds", timeout_secs);
+        info!(
+            "Wallet unlocked{} for {} seconds",
+            if staking_only {
+                " for staking only"
+            } else {
+                ""
+            },
+            timeout_secs
+        );
         Ok(())
     }
 
@@ -1403,25 +1435,34 @@ impl WalletDb {
         }
 
         // Check if unlock has expired
-        let unlock_until = *self.unlock_until.read();
-        if let Some(unlock_until) = unlock_until {
-            if Instant::now() >= unlock_until {
-                // Auto-lock on timeout
-                self.lock();
-                return true;
-            }
+        if self.is_auto_lock_expired() {
+            // Auto-lock on timeout
+            self.lock();
+            return true;
         }
 
-        false
+        *self.locked.read()
     }
 
     /// Check if the auto-lock timeout has expired
     pub fn is_auto_lock_expired(&self) -> bool {
-        if let Some(unlock_until) = *self.unlock_until.read() {
+        if let Some(unlock_until) = self.unlock.read().until {
             Instant::now() >= unlock_until
         } else {
             false
         }
+    }
+
+    /// Unlocked for staking only (`walletpassphrase … true`): the staker can sign,
+    /// sends and key exports are refused
+    pub fn is_unlocked_for_staking_only(&self) -> bool {
+        !self.is_locked() && self.unlock.read().staking_only
+    }
+
+    /// Unlocked for everything (Divi Core `IsFullyUnlocked`); always true for an
+    /// unencrypted wallet
+    pub fn is_fully_unlocked(&self) -> bool {
+        !self.is_locked() && !self.unlock.read().staking_only
     }
 
     /// Check if wallet is encrypted
@@ -1430,10 +1471,12 @@ impl WalletDb {
     }
 
     /// Encryption state as reported by `getwalletinfo`:
-    /// "unencrypted", "locked" or "unlocked".
+    /// "unencrypted", "unlocked-for-staking", "locked" or "unlocked".
     pub fn encryption_status(&self) -> &'static str {
         if !self.is_encrypted() {
             "unencrypted"
+        } else if self.is_unlocked_for_staking_only() {
+            "unlocked-for-staking"
         } else if self.is_locked() {
             "locked"
         } else {
@@ -1447,7 +1490,7 @@ impl WalletDb {
         if !self.is_encrypted() || self.is_locked() {
             return 0;
         }
-        match *self.unlock_until.read() {
+        match self.unlock.read().until {
             Some(t) => {
                 let remaining = t.saturating_duration_since(Instant::now()).as_secs();
                 std::time::SystemTime::now()

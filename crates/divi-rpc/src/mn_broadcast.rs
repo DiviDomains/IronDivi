@@ -256,7 +256,7 @@ pub fn setup_masternode(
         .wallet
         .as_ref()
         .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet disabled!"))?;
-    if wallet.is_locked() {
+    if !wallet.is_fully_unlocked() {
         return Err(RpcError::new(
             codes::WALLET_UNLOCK_NEEDED,
             "Error: Please enter the wallet passphrase with walletpassphrase first.",

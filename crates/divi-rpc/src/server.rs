@@ -613,7 +613,7 @@ impl RpcServer {
                 "gettransaction" => "gettransaction \"txid\"\n\nGet detailed information about an in-wallet transaction.",
                 "listtransactions" => "listtransactions ( count skip )\n\nReturns up to 'count' most recent transactions.",
                 "listsinceblock" => "listsinceblock ( \"blockhash\" target_confirmations )\n\nGet all transactions in blocks since block [blockhash], or all transactions if omitted.",
-                "walletpassphrase" => "walletpassphrase \"passphrase\" timeout\n\nUnlocks the wallet for 'timeout' seconds.",
+                "walletpassphrase" => "walletpassphrase \"passphrase\" timeout ( stakingOnly )\n\nUnlocks the wallet for 'timeout' seconds (0: until walletlock).\nWith stakingOnly true the keys are only used for staking: sends, signing and key exports are refused.",
                 "encryptwallet" => "encryptwallet \"passphrase\"\n\nEncrypts the wallet with 'passphrase'. This is for first time encryption; after that, use walletpassphrasechange. The wallet is left locked, and a private-key or seed operation then needs walletpassphrase first.\n\nArguments:\n1. \"passphrase\"  (string, required) The passphrase to encrypt the wallet with.",
                 "walletlock" => "walletlock\n\nLocks the wallet.",
                 "dumpprivkey" => "dumpprivkey \"address\"\n\nReveals the private key corresponding to 'address'.",

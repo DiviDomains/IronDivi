@@ -63,6 +63,19 @@ fn min_change_value() -> Amount {
         .min_non_dust_value(DEFAULT_MIN_RELAY_FEE_PER_KB)
 }
 
+/// Divi Core `EnsureWalletIsUnlocked`: sends, signing and key exports need a full
+/// unlock, so a wallet unlocked for staking only is refused like a locked one.
+fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
+    if !wallet.is_fully_unlocked() {
+        return Err(RpcError::new(
+            codes::WALLET_UNLOCK_NEEDED,
+            "Error: Please enter the wallet passphrase with walletpassphrase first.",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amount, Error> {
     let invalid = || RpcError::new(codes::TYPE_ERROR, "Invalid amount");
     let divi = value.as_f64().ok_or_else(invalid)?;
@@ -681,6 +694,8 @@ impl WalletRpc {
         let timeout = params
             .get_u64(1)
             .ok_or_else(|| RpcError::invalid_params("Timeout required"))?;
+        // Divi Core's third argument: unlock for staking only
+        let staking_only = params.get_bool(2).unwrap_or(false);
 
         let wallet = self.get_wallet()?;
 
@@ -690,9 +705,19 @@ impl WalletRpc {
             );
         }
 
-        wallet.unlock(passphrase, timeout as u32).map_err(|_| {
-            RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
-        })?;
+        if staking_only && wallet.is_unlocked_for_staking_only() {
+            return Err(RpcError::new(
+                codes::WALLET_ALREADY_UNLOCKED,
+                "Error: Wallet is already unlocked for staking.",
+            )
+            .into());
+        }
+
+        wallet
+            .unlock_for(passphrase, timeout as u32, staking_only)
+            .map_err(|_| {
+                RpcError::new(codes::WALLET_PASSPHRASE_INCORRECT, "Incorrect passphrase")
+            })?;
 
         Ok(serde_json::Value::Null)
     }
@@ -724,9 +749,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let key_entry = wallet.keystore().get_key_by_address(&addr).ok_or_else(|| {
             RpcError::new(
@@ -768,9 +791,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Decode the WIF private key
         let wif_key = divi_wallet::decode_wif(wif).map_err(|e| {
@@ -953,9 +974,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
@@ -1140,9 +1159,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Decode transaction
         let tx_bytes = hex::decode(hex_str)
@@ -2019,9 +2036,7 @@ impl WalletRpc {
     pub fn fund_vault(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let vault_encoding = params.get_str(0).ok_or_else(|| {
             RpcError::invalid_params("Missing required parameter: [owner_address:]manager_address")
@@ -2218,9 +2233,7 @@ impl WalletRpc {
     pub fn reclaim_vault_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let destination = params
             .get_str(0)
@@ -2394,9 +2407,7 @@ impl WalletRpc {
         // Get wallet and check if locked
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Get the private key for this address
         let key_entry = wallet.keystore().get_key_by_address(&addr).ok_or_else(|| {
@@ -2435,9 +2446,7 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: password"))?;
 
         let wallet = self.get_wallet()?;
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
         let network = wallet.network();
 
         let secret = divi_crypto::keys::SecretKey::new_random();
@@ -2678,9 +2687,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         let height = self.current_height();
 
@@ -3186,9 +3193,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Actually refill the keypool
         let generated = wallet
@@ -3238,9 +3243,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
@@ -3447,7 +3450,7 @@ impl WalletRpc {
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
 
-        if wallet.is_locked() {
+        if !wallet.is_fully_unlocked() {
             return Err(RpcError::new(
                 codes::WALLET_UNLOCK_NEEDED,
                 "Error: Please enter the wallet passphrase with walletpassphrase first.",
@@ -3587,9 +3590,7 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
-        if wallet.is_locked() {
-            return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
-        }
+        ensure_fully_unlocked(&wallet)?;
 
         // Parse address
         let address = self
@@ -4631,6 +4632,11 @@ mod send_unlock_regression {
     /// Testnet wallet holding one confirmed 10 DIVI coin; submitted txs are captured
     fn funded_rpc() -> (WalletRpc, Arc<WalletDb>, Sent) {
         let (rpc, db) = rpc_on(Network::Testnet);
+        let sent = fund(&rpc, &db);
+        (rpc, db, sent)
+    }
+
+    fn fund(rpc: &WalletRpc, db: &WalletDb) -> Sent {
         let addr = db.new_receiving_address().unwrap();
         db.add_utxo(divi_wallet::WalletUtxo {
             txid: Hash256::from_bytes([3; 32]),
@@ -4650,7 +4656,82 @@ mod send_unlock_regression {
             capture.lock().push(tx);
             Ok(txid)
         }));
-        (rpc, db, sent)
+        sent
+    }
+
+    const PASS: &str = "throwaway test passphrase";
+
+    /// Encrypted (so locked) persistent testnet wallet with one coin
+    fn encrypted_rpc() -> (tempfile::TempDir, WalletRpc, Arc<WalletDb>, Sent) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            WalletDb::create_persistent(
+                &dir.path().join("w"),
+                Network::Testnet,
+                HdWallet::new(ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let rpc = WalletRpc::with_wallet(db.clone());
+        let sent = fund(&rpc, &db);
+        rpc.encrypt_wallet(&p(vec![json!(PASS)])).unwrap();
+        (dir, rpc, db, sent)
+    }
+
+    fn status(rpc: &WalletRpc) -> String {
+        rpc.get_wallet_info(&Params::None).unwrap()["encryption_status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn unlock(
+        rpc: &WalletRpc,
+        timeout: u64,
+        staking_only: bool,
+    ) -> Result<serde_json::Value, Error> {
+        rpc.wallet_passphrase(&p(vec![json!(PASS), json!(timeout), json!(staking_only)]))
+    }
+
+    #[test]
+    fn ir16_staking_only_unlock_refuses_sends_and_exports() {
+        let (_dir, rpc, db, sent) = encrypted_rpc();
+        let own = rpc.get_new_address(&Params::None);
+        assert!(own.is_err(), "wallet should start locked");
+        assert_eq!(status(&rpc), "locked");
+
+        unlock(&rpc, 0, true).unwrap();
+        assert_eq!(status(&rpc), "unlocked-for-staking");
+        assert!(!db.is_locked(), "staking needs the keys in memory");
+
+        let to = address(8, Network::Testnet);
+        let own = rpc.get_new_address(&Params::None).unwrap();
+        let need_unlock = codes::WALLET_UNLOCK_NEEDED;
+        assert_eq!(
+            err(rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))).0,
+            need_unlock
+        );
+        assert_eq!(
+            err(rpc.send_from(&p(vec![json!(""), json!(to), json!(1.0)]))).0,
+            need_unlock
+        );
+        assert_eq!(err(rpc.dump_privkey(&p(vec![own.clone()]))).0, need_unlock);
+        assert_eq!(err(rpc.dump_hd_info(&Params::None)).0, need_unlock);
+        assert_eq!(
+            err(rpc.sign_message(&p(vec![own, json!("hello")]))).0,
+            need_unlock
+        );
+        assert!(sent.lock().is_empty());
+
+        // Divi Core: a second staking-only unlock is -17
+        assert_eq!(err(unlock(&rpc, 0, true)).0, codes::WALLET_ALREADY_UNLOCKED);
+
+        // A full unlock allows the send
+        unlock(&rpc, 0, false).unwrap();
+        assert_eq!(status(&rpc), "unlocked");
+        rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))
+            .unwrap();
+        assert_eq!(sent.lock().len(), 1);
     }
 
     fn dust_error() -> (i32, String) {
