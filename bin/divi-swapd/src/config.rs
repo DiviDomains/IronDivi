@@ -129,9 +129,20 @@ pub struct LtcSection {
     pub fallback_esplora_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's LTC key.
     pub key: String,
+    /// Opt-in tip-hash cross-check of the primary Esplora against an independent source:
+    /// `"blockbook"`, `"blockcypher"` or `"off"` (default). Mainnet only; refused at config
+    /// load on testnet. Run once at startup, before any LTC action.
+    #[serde(default = "default_ltc_crosscheck")]
+    pub crosscheck: String,
 }
 
 impl LtcSection {
+    /// Parsed `crosscheck`; `None` is `off`.
+    pub fn crosscheck_source(&self) -> Result<Option<swap_chain_ltc::CrossCheckSource>> {
+        swap_chain_ltc::CrossCheckSource::parse_opt(&self.crosscheck)
+            .map_err(|e| anyhow::anyhow!("[ltc].crosscheck: {e}"))
+    }
+
     /// Esplora endpoints, primary first: `esplora_url` (then `fallback_esplora_url`) when
     /// set, else `network`'s defaults (`swap_chain_ltc::esplora_endpoints`).
     pub fn endpoints(&self) -> Result<Vec<String>> {
@@ -296,6 +307,9 @@ pub fn default_divi_rpc() -> String {
 }
 fn default_network() -> String {
     "signet".into()
+}
+fn default_ltc_crosscheck() -> String {
+    "off".into()
 }
 fn default_ltc_network() -> String {
     "testnet".into()
@@ -684,6 +698,9 @@ impl DaemonConfig {
         }
         if let Some(l) = &self.ltc {
             self.validate_mainnet_gate("ltc", &l.network, l.allow_mainnet, &["testnet"])?;
+            if l.crosscheck_source()?.is_some() && l.network != "mainnet" {
+                bail!("[ltc].crosscheck is mainnet-only: no testnet source is verified");
+            }
         }
         if let Some(z) = &self.zec {
             match z.network.as_str() {
@@ -1180,6 +1197,43 @@ divi_fund_txids = ["ab"]
             l.endpoints().unwrap(),
             vec!["https://litecoinspace.org/api"]
         );
+    }
+
+    #[test]
+    fn ltc_crosscheck_defaults_off_and_is_mainnet_only() {
+        let c = DaemonConfig::parse(&format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\n")).unwrap();
+        assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), None);
+        // Testnet refuses any source at config load (no testnet source is verified).
+        for src in ["blockbook", "blockcypher"] {
+            let text = format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck = \"{src}\"\n");
+            let e = DaemonConfig::parse(&text).unwrap_err();
+            assert!(
+                e.to_string().contains("[ltc].crosscheck is mainnet-only"),
+                "{e}"
+            );
+        }
+        // `off` is fine on testnet; an unknown value is refused anywhere.
+        let ok = format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck = \"off\"\n");
+        DaemonConfig::parse(&ok).unwrap();
+        let bad = format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\ncrosscheck = \"esplora\"\n");
+        let e = DaemonConfig::parse(&bad).unwrap_err();
+        assert!(e.to_string().contains("[ltc].crosscheck"), "{e}");
+    }
+
+    #[test]
+    fn ltc_crosscheck_is_accepted_on_mainnet() {
+        for (src, want) in [
+            ("blockbook", swap_chain_ltc::CrossCheckSource::Blockbook),
+            ("blockcypher", swap_chain_ltc::CrossCheckSource::BlockCypher),
+        ] {
+            let text = format!(
+                "profile = \"mainnet\"\n{}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+                 key = \"credential:btc\"\ncrosscheck = \"{src}\"\n",
+                good_mainnet_btc()
+            );
+            let c = DaemonConfig::parse(&text).unwrap();
+            assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), Some(want));
+        }
     }
 
     #[test]

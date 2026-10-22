@@ -28,6 +28,10 @@ network = "testnet"        # "mainnet" needs allow_mainnet = true and profile = 
 esplora_url = "https://litecoinspace.org/testnet/api"
 # No independent secondary mirror of this API shape is known (swap-chain-ltc lane status,
 # decisions, 2026-10-11); fallback_esplora_url is left unset.
+# crosscheck = "off"        # "blockbook" | "blockcypher" | "off" (default). MAINNET ONLY: refused on
+#                           # testnet at config load. Once at startup, compares the block hash 6 below
+#                           # the tip from esplora_url with an independent explorer: a mismatch refuses
+#                           # to start, an unreachable source only logs a warning.
 # Testnets reuse the BTC swap key on every secp256k1 chain (docs/plans/swap-poc/funding.md,
 # decision 64ae2a0): no maker-ltc 1Password item or credential file exists or is needed —
 # this is the same maker-btc credential already loaded above.

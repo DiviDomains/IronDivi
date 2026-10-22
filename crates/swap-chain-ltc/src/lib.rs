@@ -16,11 +16,16 @@
 
 mod address;
 mod client;
+mod crosscheck;
 mod send;
 mod tx;
 
 pub use address::{decode_segwit_v0, encode_segwit_v0, LTC_HRP, TLTC_HRP};
 pub use client::{ClientError, EsploraClient, RetryPolicy};
+pub use crosscheck::{
+    enforce as enforce_tip_crosscheck, tip_crosscheck, CrossCheckOutcome, CrossCheckSource,
+    BLOCKBOOK_MAINNET, BLOCKCYPHER_MAINNET, CROSSCHECK_DEPTH,
+};
 pub use send::build_send_tx;
 pub use tx::{
     build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin, Spend,
@@ -33,6 +38,7 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
+use crosscheck::enforce;
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx, SpendInfo,
     SwapError, Txid,
@@ -166,6 +172,18 @@ impl LtcBackend {
     /// The key's P2WPKH address string (`ltc1…` on mainnet, `tltc1…` on testnet) (where funding coins live and spends land).
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// Opt-in mainnet tip-hash cross-check of this backend's Esplora against an independent
+    /// source (see [`enforce_tip_crosscheck`]): `Disagree` is an error, `Unavailable` warns.
+    /// `None` (`off`) makes no request.
+    pub async fn crosscheck(&self, source: Option<CrossCheckSource>) -> Result<()> {
+        if source.is_some() && self.hrp != LTC_HRP {
+            return Err(SwapError::InvalidParams(
+                "ltc crosscheck is mainnet-only: no testnet source is verified".into(),
+            ));
+        }
+        enforce(&self.esplora, source, None, RetryPolicy::default()).await
     }
 
     async fn sat_per_vb(&self) -> u64 {

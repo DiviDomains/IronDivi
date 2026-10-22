@@ -89,6 +89,16 @@ struct Cli {
         default_value = "testnet"
     )]
     ltc_network: String,
+    /// Opt-in LTC mainnet tip-hash cross-check against an independent source: `blockbook`,
+    /// `blockcypher` or `off` (default). Mainnet only; run before any LTC action. A
+    /// disagreement refuses; an unreachable source only warns.
+    #[arg(
+        long,
+        global = true,
+        env = "SWAP_LTC_CROSSCHECK",
+        default_value = "off"
+    )]
+    ltc_crosscheck: String,
     /// Zcash network: `testnet` (default) or `mainnet` (only with `--allow-mainnet`).
     #[arg(long, global = true, default_value = "testnet")]
     zec_network: String,
@@ -482,12 +492,17 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
             &["signet", "testnet"],
             cli.allow_mainnet,
         )?,
-        Chain::Ltc => guard_network(
-            "--ltc-network",
-            &cli.ltc_network,
-            &["testnet"],
-            cli.allow_mainnet,
-        )?,
+        Chain::Ltc => {
+            guard_network(
+                "--ltc-network",
+                &cli.ltc_network,
+                &["testnet"],
+                cli.allow_mainnet,
+            )?;
+            if ltc_crosscheck_source(cli)?.is_some() && cli.ltc_network != "mainnet" {
+                bail!("--ltc-crosscheck is mainnet-only: no testnet source is verified");
+            }
+        }
         _ => {}
     }
     if cli.counter_chain == Chain::Zec {
@@ -610,8 +625,24 @@ async fn chain_balance(endpoints: &[String], address: &str) -> Result<i64> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no esplora endpoint")))
 }
 
+/// `--ltc-crosscheck` parsed; `None` is `off`.
+fn ltc_crosscheck_source(cli: &Cli) -> Result<Option<swap_chain_ltc::CrossCheckSource>> {
+    swap_chain_ltc::CrossCheckSource::parse_opt(&cli.ltc_crosscheck)
+        .map_err(|e| anyhow::anyhow!("--ltc-crosscheck: {e}"))
+}
+
+/// Before any LTC action: the opt-in tip-hash cross-check. A disagreement is an error; an
+/// unavailable source warns and continues; `off` and non-LTC runs make no request.
+async fn ltc_preflight(cli: &Cli, b: &Backends) -> Result<()> {
+    if let Some((_, CounterLive::Ltc(ltc))) = &b.live {
+        ltc.crosscheck(ltc_crosscheck_source(cli)?).await?;
+    }
+    Ok(())
+}
+
 async fn taker(cli: &Cli) -> Result<Taker> {
     let b = backends(cli)?;
+    ltc_preflight(cli, &b).await?;
     sync_divi(cli, &b).await?;
     Ok(Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile))
 }
@@ -689,6 +720,7 @@ async fn main() -> Result<()> {
                 (None, false) => ClaimPolicy::Asap,
             };
             let b = backends(&cli)?;
+            ltc_preflight(&cli, &b).await?;
             sync_divi(&cli, &b).await?;
             let gate = ClaimGate {
                 policy,
@@ -1060,6 +1092,27 @@ mod tests {
                 .contains("--zec-network must be testnet or mainnet"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn ltc_crosscheck_defaults_off_and_testnet_refuses_it_before_any_network_call() {
+        assert_eq!(cli(&[]).ltc_crosscheck, "off");
+        for src in ["blockbook", "blockcypher"] {
+            let e = match live_backends(&cli(&["--counter-chain", "ltc", "--ltc-crosscheck", src]))
+            {
+                Ok(_) => panic!("built a live testnet ltc backend with --ltc-crosscheck {src}"),
+                Err(e) => e,
+            };
+            assert!(
+                e.to_string().contains("--ltc-crosscheck is mainnet-only"),
+                "{e}"
+            );
+        }
+        let e = match live_backends(&cli(&["--counter-chain", "ltc", "--ltc-crosscheck", "x"])) {
+            Ok(_) => panic!("accepted an unknown --ltc-crosscheck"),
+            Err(e) => e,
+        };
+        assert!(e.to_string().contains("--ltc-crosscheck"), "{e}");
     }
 
     #[test]

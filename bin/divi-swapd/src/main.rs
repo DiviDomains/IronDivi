@@ -282,7 +282,7 @@ fn live_btc(cfg: &BtcSection) -> Result<Arc<dyn ChainBackend>> {
     Ok(Arc::new(backend))
 }
 
-fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
+async fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
     // Network name and the mainnet opt-in are validated at config load; the network also
     // picks the address HRP (`ltc` vs `tltc`).
     let endpoints = cfg.endpoints()?;
@@ -295,6 +295,9 @@ fn live_ltc(cfg: &LtcSection) -> Result<Arc<dyn ChainBackend>> {
         swap_chain_ltc::RetryPolicy::default(),
     )?;
     tracing::info!(address = %backend.address(), network = %cfg.network, "ltc backend ready");
+    // Opt-in (`[ltc].crosscheck`): a primary that disagrees with the independent source
+    // refuses to start; an unreachable source only warns.
+    backend.crosscheck(cfg.crosscheck_source()?).await?;
     Ok(Arc::new(backend))
 }
 
@@ -386,7 +389,7 @@ async fn live_backends(
     let mut underfunded_offers: Vec<String> = Vec::new();
     for c in cfg.counter_backends_to_start(in_flight)? {
         others.push(match c {
-            Chain::Ltc => live_ltc(cfg.ltc.as_ref().expect("checked by config"))?,
+            Chain::Ltc => live_ltc(cfg.ltc.as_ref().expect("checked by config")).await?,
             Chain::Usdc => {
                 let (backend, underfunded) =
                     live_usdc(cfg.usdc.as_ref().expect("checked by config"), &cfg.offers).await?;
