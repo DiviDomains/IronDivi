@@ -44,6 +44,17 @@ use tower_http::trace::TraceLayer;
 /// Behind a reverse proxy every client shares the proxy's address unless `trust_proxy_headers`
 /// is set (see [`client_ip`]).
 pub const RATE_LIMIT_PER_WINDOW: u32 = 20;
+/// Requests one IP may make per [`RATE_WINDOW`] to the swap-state-changing routes
+/// (`POST /swaps` accept, `POST /swaps/:id/lock`). A taker makes one of each per swap (a
+/// retry or two on a transient error); 20 leaves room for several swaps a minute from one
+/// NAT address. A separate limiter from the quote/setup one so a swap's negotiation calls
+/// do not eat into each other.
+pub const WRITE_LIMIT_PER_WINDOW: u32 = 20;
+/// Requests one IP may make per [`RATE_WINDOW`] to `GET /swaps` and `GET /swaps/:id`. A live
+/// taker polls `GET /swaps/:id` once per `--poll-secs` (default 10 s = 6 a minute; 1 s = 60).
+/// 300 is 5x the 1 s case, and a separate limiter keeps status polling from exhausting the
+/// accept/lock budget.
+pub const READ_LIMIT_PER_WINDOW: u32 = 300;
 /// Length of the fixed window [`RATE_LIMIT_PER_WINDOW`] counts in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Most distinct IPs the limiter tracks; at this many, expired windows are swept first and,
@@ -95,8 +106,10 @@ struct RateState {
 
 /// The address a request is rate limited under. The peer address comes from the connection
 /// (`ConnectInfo`); a router served without it (in-process tests) shares one
-/// unspecified-address bucket. With `trust_proxy_headers` the first address in
-/// `X-Forwarded-For` (else `X-Real-IP`) wins when it parses, else the peer address. Without
+/// unspecified-address bucket. With `trust_proxy_headers` the LAST address in
+/// `X-Forwarded-For` (else `X-Real-IP`) wins when it parses, else the peer address: the last
+/// entry is the one the nearest proxy wrote (nginx's `$proxy_add_x_forwarded_for` appends
+/// `$remote_addr`), while earlier entries are whatever the client sent. Without
 /// it the headers are never read: any client can send them, so honouring them by default
 /// would let it pick its own bucket and defeat the limit.
 fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy_headers: bool) -> IpAddr {
@@ -107,7 +120,7 @@ fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy_headers: boo
     let header_ip = |name: &str, first_of_list: bool| -> Option<IpAddr> {
         let v = headers.get(name)?.to_str().ok()?;
         let v = if first_of_list {
-            v.split(',').next()?
+            v.rsplit(',').next()?
         } else {
             v
         };
@@ -208,13 +221,29 @@ pub fn router_with_proxy(
         trust_proxy_headers,
     };
     let limited = || middleware::from_fn_with_state(rate.clone(), rate_limit);
+    let bucket = |max: u32| {
+        middleware::from_fn_with_state(
+            RateState {
+                limiter: Arc::new(RateLimiter::new(max, RATE_WINDOW)),
+                trust_proxy_headers,
+            },
+            rate_limit,
+        )
+    };
+    let writes = bucket(WRITE_LIMIT_PER_WINDOW);
+    let reads = bucket(READ_LIMIT_PER_WINDOW);
     let mut api = Router::new()
         .route("/healthz", get(healthz))
         .route("/offers", get(offers))
         .route("/offers/:id/quote", get(quote).route_layer(limited()))
-        .route("/swaps", post(accept).get(list_swaps))
-        .route("/swaps/:id", get(get_swap))
-        .route("/swaps/:id/lock", post(lock))
+        .route(
+            "/swaps",
+            post(accept)
+                .route_layer(writes.clone())
+                .merge(get(list_swaps).route_layer(reads.clone())),
+        )
+        .route("/swaps/:id", get(get_swap).route_layer(reads))
+        .route("/swaps/:id/lock", post(lock).route_layer(writes))
         .with_state(state);
     if let Some(x) = xmr {
         api = api.merge(
@@ -456,11 +485,11 @@ mod tests {
     fn trusted_proxy_headers_pick_the_client_and_garbage_falls_back() {
         let peer: IpAddr = "10.0.0.9".parse().unwrap();
         let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
-        let xff = headers(&[("x-forwarded-for", "203.0.113.7, 10.1.1.1")]);
+        let xff = headers(&[("x-forwarded-for", "10.1.1.1, 203.0.113.7")]);
         assert_eq!(
             client_ip(&xff, Some(peer), true),
             ip("203.0.113.7"),
-            "first hop"
+            "last entry: the one the proxy wrote"
         );
         let v6 = headers(&[("x-forwarded-for", " 2001:db8::1 ")]);
         assert_eq!(client_ip(&v6, Some(peer), true), ip("2001:db8::1"));
@@ -473,7 +502,7 @@ mod tests {
         assert_eq!(
             client_ip(&both, Some(peer), true),
             ip("203.0.113.7"),
-            "XFF first"
+            "XFF before X-Real-IP"
         );
         let bad_xff = headers(&[
             ("x-forwarded-for", "nonsense"),

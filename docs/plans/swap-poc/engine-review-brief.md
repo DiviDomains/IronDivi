@@ -190,7 +190,8 @@ Routes (`bin/divi-swapd/src/routes.rs:200-240`):
 |---|---|---|
 | `GET /healthz`, `GET /offers` | none | none |
 | `GET /offers/:id/quote` | none | per-IP, 20 per 60 s (`routes.rs:46-55`, `:122`) |
-| `POST /swaps` (accept), `GET /swaps` (**lists every swap**), `GET /swaps/:id`, `POST /swaps/:id/lock` | **none** | **none** |
+| `POST /swaps` (accept), `POST /swaps/:id/lock` | **none** | per-IP, 20 per 60 s, one shared write bucket (`WRITE_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
+| `GET /swaps` (**lists every swap**), `GET /swaps/:id` | **none** | per-IP, 300 per 60 s, one shared read bucket (`READ_LIMIT_PER_WINDOW`); fixed on lane/route-rate-limits, see status/engine.md 2026-10-22 |
 | `POST /xmr/swaps` (setup, XMR only) | none | per-IP |
 | `/xmr/swaps/:id` and `/j`, `/sigs`, `/xmr-lock` (XMR only) | swap token in `X-Swap-Token` (`swap_token_gate`, `routes.rs:138`); a missing, wrong or unknown token returns the same 404 as an unknown id | per-IP on setup only |
 
@@ -202,7 +203,7 @@ holds no key. Impact of unauthenticated reads and of `lock`: Q4.
 
 Rate limiter (`routes.rs:55-100`): fixed window per IP, at most 10,000 tracked IPs; when full and the
 IP is new it **refuses** (fails closed). Key is the socket peer unless `trust_proxy_headers = true`
-(`routes.rs:102-120`).
+(`routes.rs:102-120`); with it, the **last** `X-Forwarded-For` entry (the one the proxy wrote), fixed on lane/route-rate-limits, see status/engine.md 2026-10-22.
 
 | Invariant | Code | Test |
 |---|---|---|
@@ -215,7 +216,7 @@ Deployment (`DECISIONS.md` #10): the maker is public at `https://divi.cx/swap/` 
 `X-Forwarded-For $proxy_add_x_forwarded_for`. With `trust_proxy_headers` **off** (the default; only a
 commented example exists in `divi-swapd.toml.example:5`) every client shares the proxy's address and
 one 20-per-minute bucket (see F4). With it **on**, `$proxy_add_x_forwarded_for` *appends* to a
-client-supplied `X-Forwarded-For`, and the limiter reads the **first** entry, which a client controls.
+client-supplied `X-Forwarded-For`, and the limiter used to read the **first** entry, which a client controls (fixed on lane/route-rate-limits, see status/engine.md 2026-10-22: the snippet now sets `X-Forwarded-For $remote_addr` and the limiter reads the last entry).
 `deploy/divi-swapd/README.md:67-70` already says to use `$remote_addr` instead. Whether the live
 deployment sets `trust_proxy_headers`: `could not verify` (no access to the host).
 
@@ -296,8 +297,8 @@ New observations from this review (each also a `left:` line in `status/engine.md
 - **F3 — no `OP_SIZE` preimage-length check in the script** (`htlc.rs:116-128`). The taker chooses the
   preimage, so a maker cannot pick a long one; Q3.
 - **F4 — rate limiting.** Default config puts every client behind nginx in one bucket; the shipped nginx
-  snippet is wrong for `trust_proxy_headers = true` (§3.9). Only `quote` is limited; `accept`, `lock`,
-  `GET /swaps` and `GET /swaps/:id` are not.
+  snippet was wrong for `trust_proxy_headers = true` (§3.9). Only `quote` was limited; `accept`, `lock`,
+  `GET /swaps` and `GET /swaps/:id` now are too, and the limit keys on the address nginx sets (fixed on lane/route-rate-limits, see status/engine.md 2026-10-22).
 - **F5 — hashlock engine routes are unauthenticated**, including a full swap listing (§3.9).
 - **F6 — confirmation fallback.** A chain absent from `cfg.chains` takes the *mainnet* built-in count
   (more conservative than testnet; confirm it can never be less conservative). Result: pinned on lane/conf-fallback-reorg-design, see status/engine.md 2026-10-22.

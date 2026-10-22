@@ -455,9 +455,10 @@ pub struct DaemonConfig {
     pub db_path: PathBuf,
     #[serde(default = "default_profile")]
     pub profile: Profile,
-    /// Key the per-IP rate limit on `X-Forwarded-For` (else `X-Real-IP`) instead of the socket
-    /// peer. Off by default: set it only behind a reverse proxy you control that overwrites
-    /// those headers, since otherwise any client could pick its own rate bucket.
+    /// Key the per-IP rate limit on the last `X-Forwarded-For` entry (else `X-Real-IP`) instead
+    /// of the socket peer. Off by default: set it only behind a reverse proxy you control that
+    /// sets those headers (the shipped nginx snippet does), since otherwise any client could
+    /// pick its own rate bucket.
     #[serde(default)]
     pub trust_proxy_headers: bool,
     /// Optional path prefix. Empty by default: nginx strips `/swap/` before proxying.

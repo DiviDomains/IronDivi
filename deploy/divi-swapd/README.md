@@ -62,15 +62,19 @@ With an `[xmr]` section the daemon asks the configured `monerod` for its `nettyp
 
 ### Rate limit behind a reverse proxy
 
-The quote and XMR setup routes are limited to 20 requests a minute per client address. By
-default that address is the socket peer, so behind nginx every client shares the proxy's bucket.
-Set `trust_proxy_headers = true` in `divi-swapd.toml` and the limiter keys on the first address in
-`X-Forwarded-For` (else `X-Real-IP`; an unparseable value falls back to the socket peer). Turn it
-on only behind a proxy you control that overwrites those headers (`proxy_set_header
-X-Forwarded-For $remote_addr;`, not `$proxy_add_x_forwarded_for`) and with the daemon reachable
-only through it: if clients can reach the daemon directly, or the proxy passes their own header
-through, each can choose its own bucket and the limit is void. It is off by default and the example
-config ships it commented out.
+The quote and XMR setup routes are limited to 20 requests a minute per client address; accept
+and lock (`POST /swaps`, `POST /swaps/:id/lock`) to 20 a minute in their own bucket; and
+`GET /swaps` and `GET /swaps/:id` to 300 a minute in a third, so a taker's status polling cannot
+use up its accept/lock budget. `/healthz` and `GET /offers` are unlimited. By default the
+address is the socket peer, so behind nginx every client shares the proxy's bucket.
+Set `trust_proxy_headers = true` in `divi-swapd.toml` and the limiter keys on the LAST address in
+`X-Forwarded-For` (else `X-Real-IP`; an unparseable value falls back to the socket peer). The
+shipped `nginx-swap.conf` sets `X-Forwarded-For $remote_addr` (an overwrite, so the header is a
+single address nginx chose), and the daemon takes the last entry, which is also what nginx's
+`$proxy_add_x_forwarded_for` would have appended: a client-supplied header cannot pick the
+bucket either way. Turn it on only behind a proxy you control and with the daemon reachable
+only through it: if clients can reach the daemon directly, each can choose its own bucket and
+the limit is void. It is off by default and the example config ships it commented out.
 
 ## Rollback
 
