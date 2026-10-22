@@ -155,6 +155,49 @@ pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Valu
     })
 }
 
+/// Base64 decoding as Divi Core's DecodeBase64 does it: decoding stops at the first
+/// character outside the alphabet, and only a dangling partial group (without the
+/// matching '=' padding) makes the input invalid.
+fn decode_base64_like_core(s: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let (mut out, mut mode, mut left, mut i) = (Vec::new(), 0, 0u8, 0);
+    while let Some(dec) = bytes.get(i).copied().and_then(value) {
+        i += 1;
+        match mode {
+            0 => left = dec,
+            1 => {
+                out.push((left << 2) | (dec >> 4));
+                left = dec & 15;
+            }
+            2 => {
+                out.push((left << 4) | (dec >> 2));
+                left = dec & 3;
+            }
+            _ => out.push((left << 6) | dec),
+        }
+        mode = (mode + 1) % 4;
+    }
+    let rest = &bytes[i..];
+    let ends_group = |n: usize| rest.get(n).copied().and_then(value).is_none();
+    let valid = match mode {
+        0 => true,
+        1 => false,
+        2 => left == 0 && rest.starts_with(b"==") && ends_group(2),
+        _ => left == 0 && rest.starts_with(b"=") && ends_group(1),
+    };
+    valid.then_some(out)
+}
+
 /// Callback for submitting transactions to the mempool and network
 pub type TxSubmitCallback = Arc<dyn Fn(Transaction) -> Result<Hash256, String> + Send + Sync>;
 
@@ -3454,28 +3497,20 @@ impl WalletRpc {
             return Err(RpcError::new(codes::WALLET_UNLOCK_NEEDED, "Wallet is locked").into());
         }
 
-        // Parse address
+        // Parse address (error codes as Divi Core's signmessage)
         let address = Address::from_base58(address_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+            .map_err(|_| RpcError::new(codes::TYPE_ERROR, "Invalid address"))?;
+        if address.addr_type != divi_wallet::AddressType::P2PKH {
+            return Err(RpcError::new(codes::TYPE_ERROR, "Address does not refer to key").into());
+        }
 
-        // Get private key for this address
+        // Get private key for this address; watch-only keys have none
+        let no_key = || RpcError::new(codes::WALLET_ERROR, "Private key not available");
         let key_entry = wallet
             .keystore()
             .get_key_by_address(&address)
-            .ok_or_else(|| {
-                RpcError::new(
-                    codes::INVALID_ADDRESS_OR_KEY,
-                    "Private key for address not found in wallet",
-                )
-            })?;
-
-        // Sign the message with recoverable signature - ensure not watch-only
-        let secret = key_entry.secret.as_ref().ok_or_else(|| {
-            RpcError::new(
-                codes::INVALID_ADDRESS_OR_KEY,
-                "Address is watch-only, cannot sign messages",
-            )
-        })?;
+            .ok_or_else(no_key)?;
+        let secret = key_entry.secret.as_ref().ok_or_else(no_key)?;
 
         // Hash with the DarkNet magic prefix to match C++ Divi's CHashWriter protocol
         let hash = message_magic_hash(message.as_bytes());
@@ -3503,29 +3538,29 @@ impl WalletRpc {
             .get_str(2)
             .ok_or_else(|| RpcError::invalid_params("Message required"))?;
 
-        // Parse address
+        // Parse address (error codes as Divi Core's verifymessage)
         let address = Address::from_base58(address_str)
             .map_err(|_| RpcError::new(codes::TYPE_ERROR, "Invalid address"))?;
+        if address.addr_type != divi_wallet::AddressType::P2PKH {
+            return Err(RpcError::new(codes::TYPE_ERROR, "Address does not refer to key").into());
+        }
 
         // Decode base64 signature
-        let sig_bytes = STANDARD.decode(signature_b64).map_err(|_| {
-            RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid base64 signature")
+        let sig_bytes = decode_base64_like_core(signature_b64).ok_or_else(|| {
+            RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Malformed base64 encoding")
         })?;
 
-        // Parse recoverable signature
-        let signature = divi_crypto::RecoverableSig::from_compact_with_recovery(&sig_bytes)
-            .map_err(|_| {
-                RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid signature format")
-            })?;
+        // A signature that does not parse or recover is "not verified", not an error
+        let Ok(signature) = divi_crypto::RecoverableSig::from_compact_with_recovery(&sig_bytes)
+        else {
+            return Ok(serde_json::Value::Bool(false));
+        };
 
         // Recover the public key from the signature using the DarkNet magic-prefixed hash
         let hash = message_magic_hash(message.as_bytes());
-        let recovered_pubkey = signature.recover_from_hash(&hash).map_err(|_| {
-            RpcError::new(
-                codes::INVALID_ADDRESS_OR_KEY,
-                "Failed to recover public key",
-            )
-        })?;
+        let Ok(recovered_pubkey) = signature.recover_from_hash(&hash) else {
+            return Ok(serde_json::Value::Bool(false));
+        };
 
         // Derive address from recovered public key
         let recovered_address = Address::p2pkh(&recovered_pubkey, address.network);
