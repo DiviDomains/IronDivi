@@ -233,6 +233,13 @@ pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Valu
 /// character outside the alphabet, and only a dangling partial group (without the
 /// matching '=' padding) makes the input invalid.
 fn decode_base64_like_core(s: &str) -> Option<Vec<u8>> {
+    let (out, valid) = decode_base64_core(s);
+    valid.then_some(out)
+}
+
+/// Divi Core's DecodeBase64: the bytes decoded up to the first character that
+/// is not base64, and whether the input was valid (`pfInvalid`)
+fn decode_base64_core(s: &str) -> (Vec<u8>, bool) {
     fn value(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -269,7 +276,25 @@ fn decode_base64_like_core(s: &str) -> Option<Vec<u8>> {
         2 => left == 0 && rest.starts_with(b"==") && ends_group(2),
         _ => left == 0 && rest.starts_with(b"=") && ends_group(1),
     };
-    valid.then_some(out)
+    (out, valid)
+}
+
+/// Divi Core's ParseHex: skip whitespace before each byte, stop at the first
+/// pair that is not two hex digits
+fn parse_hex_like_core(s: &str) -> Vec<u8> {
+    let digit = |c: Option<&u8>| (*c? as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    loop {
+        while bytes.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        let (Some(hi), Some(lo)) = (digit(bytes.get(i)), digit(bytes.get(i + 1))) else {
+            return out;
+        };
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
 }
 
 /// Callback for submitting transactions to the mempool and network
@@ -4061,12 +4086,30 @@ pub fn message_magic_hash(message: &[u8]) -> [u8; 32] {
 impl WalletRpc {
     /// signmessage - Sign a message with the private key of an address
     pub fn sign_message(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if params.len() < 2 || params.len() > 4 {
+            return Err(RpcError::invalid_params(
+                "signmessage \"diviaddress\" \"message\" ( \"input_format\" \"output_format\" )",
+            )
+            .into());
+        }
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
-        let message = params
+        let text = params
             .get_str(1)
             .ok_or_else(|| RpcError::invalid_params("Message required"))?;
+        let format = |i: usize| {
+            params
+                .get_str(i)
+                .ok_or_else(|| RpcError::invalid_params("Format must be a string"))
+        };
+        // Divi Core: "hex" or "b64" decode the message first; anything else is text
+        let message = match (params.len() > 2).then(|| format(2)).transpose()? {
+            Some("hex") => parse_hex_like_core(text),
+            Some("b64") => decode_base64_core(text).0,
+            _ => text.as_bytes().to_vec(),
+        };
+        let hex_output = params.len() == 4 && format(3)? == "hex";
 
         let wallet = self.get_wallet()?;
 
@@ -4089,7 +4132,7 @@ impl WalletRpc {
         let secret = key_entry.secret.as_ref().ok_or_else(no_key)?;
 
         // Hash with the DarkNet magic prefix to match C++ Divi's CHashWriter protocol
-        let hash = message_magic_hash(message.as_bytes());
+        let hash = message_magic_hash(&message);
         let signature = divi_crypto::sign_hash_recoverable(secret, &hash)
             .map_err(|e| RpcError::new(codes::MISC_ERROR, format!("Signing failed: {}", e)))?;
 
@@ -4099,6 +4142,9 @@ impl WalletRpc {
         } else {
             signature.to_compact_with_recovery_uncompressed()
         };
+        if hex_output {
+            return Ok(serde_json::Value::String(hex::encode(sig_bytes)));
+        }
         let sig_b64 = STANDARD.encode(sig_bytes);
 
         debug!("Signed message with address {}", address_str);
@@ -4108,6 +4154,12 @@ impl WalletRpc {
 
     /// verifymessage - Verify a signed message
     pub fn verify_message(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if params.len() != 3 {
+            return Err(RpcError::invalid_params(
+                "verifymessage \"diviaddress\" \"signature\" \"message\"",
+            )
+            .into());
+        }
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
