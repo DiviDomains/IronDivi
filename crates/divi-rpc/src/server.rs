@@ -176,6 +176,7 @@ impl RpcServer {
 
     pub fn set_mempool(&self, mempool: Arc<dyn crate::blockchain::MempoolProvider>) {
         self.blockchain.set_mempool(mempool.clone());
+        self.wallet.set_mempool(mempool.clone());
         self.lite_wallet.write().set_mempool(mempool);
     }
 

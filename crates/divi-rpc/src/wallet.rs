@@ -86,6 +86,8 @@ pub struct WalletRpc {
     /// Fetches pruned blocks from full-history peers during rescan
     block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
     locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
+    /// Node mempool, to see coins spent by unconfirmed transactions
+    mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
 }
 
 impl WalletRpc {
@@ -97,6 +99,7 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
@@ -112,6 +115,7 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: None,
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
@@ -124,6 +128,7 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
@@ -136,12 +141,18 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             chain: Some(chain),
             locked_utxos: Arc::new(RwLock::new(HashSet::new())),
+            mempool: RwLock::new(None),
         }
     }
 
     /// Set the wallet
     pub fn set_wallet(&self, wallet: Arc<WalletDb>) {
         *self.wallet.write() = Some(wallet);
+    }
+
+    /// Set the node mempool
+    pub fn set_mempool(&self, mempool: Arc<dyn crate::blockchain::MempoolProvider>) {
+        *self.mempool.write() = Some(mempool);
     }
 
     /// Update the current chain height
@@ -1752,16 +1763,39 @@ impl WalletRpc {
 
         // Verify transaction has output paying to vault script
         let vault_script_bytes = vault_script.as_bytes();
-        let has_vault_output = tx
+        let vault_outpoints: Vec<OutPoint> = tx
             .vout
             .iter()
-            .any(|out| out.script_pubkey.as_bytes() == vault_script_bytes);
+            .enumerate()
+            .filter(|(_, out)| out.script_pubkey.as_bytes() == vault_script_bytes)
+            .map(|(vout, _)| OutPoint::new(funding_txid, vout as u32))
+            .collect();
 
-        if !has_vault_output {
+        if vault_outpoints.is_empty() {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
                 format!(
                     "Transaction {} does not pay to the specified vault script",
+                    funding_tx
+                ),
+            )
+            .into());
+        }
+
+        // Only coins still in the UTXO set and not spent by a mempool
+        // transaction can be staked; a spent funding output is refused
+        let mempool = self.mempool.read().clone();
+        let unspent_in_chain = |op: &OutPoint| chain.get_utxo(op).ok().flatten().is_some();
+        let spent_in_mempool = |op: &OutPoint| mempool.as_ref().is_some_and(|m| m.is_spent(op));
+        let live = vault_outpoints
+            .iter()
+            .filter(|op| unspent_in_chain(op) && !spent_in_mempool(op))
+            .count();
+        if live == 0 {
+            return Err(RpcError::new(
+                codes::WALLET_ERROR,
+                format!(
+                    "AddingVaultScript: the vault output of transaction {} is already spent",
                     funding_tx
                 ),
             )
@@ -1794,6 +1828,11 @@ impl WalletRpc {
             }
 
             wallet.scan_transaction(&fund_tx, Some(location.block_hash), height, None);
+            // The scan records every vault output of the transaction; drop
+            // those already spent on chain so no phantom balance appears
+            for op in vault_outpoints.iter().filter(|op| !unspent_in_chain(op)) {
+                wallet.spend_utxo(op);
+            }
             tracing::info!(
                 "Scanned funding tx {} at height {:?} for vault UTXOs",
                 funding_tx,

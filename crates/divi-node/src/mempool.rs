@@ -462,6 +462,10 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
         self.prioritise_transaction(txid, priority_delta, fee_delta)
     }
 
+    fn is_spent(&self, outpoint: &divi_primitives::transaction::OutPoint) -> bool {
+        self.is_spent(&outpoint.txid, outpoint.vout)
+    }
+
     fn get_tx_infos(&self) -> Vec<divi_rpc::blockchain::MempoolTxInfo> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

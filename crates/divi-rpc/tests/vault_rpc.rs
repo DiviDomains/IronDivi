@@ -511,3 +511,77 @@ fn vaulted_balance_owner_and_manager_views() {
         ca
     );
 }
+
+// ---------------------------------------------------------------- IR-08
+
+/// addvault on a funding output that is already spent is refused and adds no
+/// balance (seen on testnet: re-add after the owner reclaimed the vault).
+#[test]
+fn addvault_refuses_spent_funding_output() {
+    let mut s = setup();
+    // The owner spends the whole vault output (signed by hand, owner branch)
+    let dest = s.owner.new_receiving_address().unwrap();
+    let (mut tx, prev) = TransactionBuilder::new()
+        .add_input(OutPoint::new(s.fund_txid, 0), s.vault.clone())
+        .add_output_to_address(Amount::from_sat(VAULT_DIVI * COIN - 10_000), &dest)
+        .build();
+    let signed = TransactionSigner::new(s.owner.keystore())
+        .sign_all_inputs(&mut tx, &prev)
+        .unwrap();
+    assert_eq!(signed, 1);
+    s.net.mine(vec![tx], &s.owner_addr);
+    assert!(s
+        .net
+        .chain
+        .get_utxo(&OutPoint::new(s.fund_txid, 0))
+        .unwrap()
+        .is_none());
+
+    // A manager wallet that never saw the vault, holding the manager key
+    let fresh = s.net.wallet();
+    let manager_key = s
+        .manager
+        .keystore()
+        .get_key(&s.manager_addr.hash)
+        .unwrap()
+        .secret
+        .unwrap();
+    fresh.import_key(manager_key, None);
+    let rpc = s.net.rpc(&fresh);
+    let e = rpc
+        .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .unwrap_err();
+    assert!(error_message(e).contains("already spent"));
+    assert!(fresh.get_all_vaults().is_empty());
+    let ca = rpc.get_coin_availability(&Params::None).unwrap();
+    assert_eq!(divi(&ca["Stakable"]), 0.0, "{}", ca);
+    assert_eq!(divi(&ca["Vaulted"]), 0.0, "{}", ca);
+}
+
+/// A funding output already spent by a transaction in the mempool is refused.
+#[test]
+fn addvault_refuses_funding_output_spent_in_mempool() {
+    struct SpendsEverything;
+    impl divi_rpc::blockchain::MempoolProvider for SpendsEverything {
+        fn get_txids(&self) -> Vec<Hash256> {
+            Vec::new()
+        }
+        fn prioritise_transaction(&self, _: &Hash256, _: f64, _: i64) -> bool {
+            false
+        }
+        fn is_spent(&self, _: &OutPoint) -> bool {
+            true
+        }
+    }
+    let s = setup();
+    let fresh_rpc = s.net.rpc(&s.manager);
+    fresh_rpc
+        .remove_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .unwrap();
+    fresh_rpc.set_mempool(Arc::new(SpendsEverything));
+    let e = fresh_rpc
+        .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .unwrap_err();
+    assert!(error_message(e).contains("already spent"));
+    assert!(s.manager.get_all_vaults().is_empty());
+}
