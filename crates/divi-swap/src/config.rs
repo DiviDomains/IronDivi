@@ -374,6 +374,50 @@ pub fn check_terms_against_profile(
     Ok(())
 }
 
+/// Refuse a maker-leg HTLC whose real on-chain locktime is below the floor the quote implies.
+///
+/// What the taker knows when it first sees the maker's lock: its own leg's locktime
+/// (`taker_leg_locktime`, already checked against `quote.taker_timeout_secs` in
+/// `Taker::accepted`) and the quote's two timeouts. An honest maker locks at
+/// `maker_chain_mtp_at_lock + maker_timeout_secs`, and it locks after the taker's accept, so
+/// its locktime is at least `taker_leg_locktime - (taker_timeout_secs - maker_timeout_secs)`
+/// less the slack between the two chains' clocks. The floor is therefore
+///
+/// `maker_leg_locktime >= taker_leg_locktime - (taker_timeout_secs - maker_timeout_secs)
+///                        - accept_tolerance_secs - max(MTP lag of the two chains)`
+///
+/// where `accept_tolerance_secs` is the drift `Taker::accepted` already allows on the taker
+/// leg and the lag is the profile's own per-chain value. Because `terms` passed the profile
+/// check in `Taker::prepare`, this also floors the maker timeout at the profile's. No new
+/// numbers: every term is an existing quote, profile or taker constant.
+pub fn check_maker_leg_locktime(
+    profile: Profile,
+    chains: (Chain, Chain),
+    terms: &OfferedTerms,
+    taker_leg_locktime: u32,
+    maker_leg_locktime: u32,
+    accept_tolerance_secs: u32,
+) -> std::result::Result<(), String> {
+    let floor = SwapConfig::profile(profile);
+    let (taker_chain, maker_chain) = chains;
+    let lag = floor
+        .chain_params(taker_chain)
+        .mtp_lag_secs
+        .max(floor.chain_params(maker_chain).mtp_lag_secs);
+    let gap = terms.taker_timeout_secs as i64 - terms.maker_timeout_secs as i64;
+    let min = taker_leg_locktime as i64 - gap - accept_tolerance_secs as i64 - lag as i64;
+    if (maker_leg_locktime as i64) < min {
+        return Err(format!(
+            "maker-leg locktime is {maker_leg_locktime}, below the {min} floor (taker-leg \
+             locktime {taker_leg_locktime} - quoted gap {gap}s [taker_timeout_secs {} - \
+             maker_timeout_secs {}] - {accept_tolerance_secs}s accept tolerance - {lag}s MTP \
+             lag) of this taker's --profile {profile}; not claiming",
+            terms.taker_timeout_secs, terms.maker_timeout_secs
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +771,38 @@ quote_expiry_secs = 60
                 divi_confirmations: 4,
             }
         );
+    }
+
+    #[test]
+    fn maker_leg_locktime_floor_per_profile() {
+        for p in [Profile::Testnet, Profile::Mainnet] {
+            for c in [Chain::Btc, Chain::Ltc, Chain::Zec] {
+                let pair = (c, Chain::Divi);
+                let f = SwapConfig::profile(p);
+                let t = OfferedTerms {
+                    taker_timeout_secs: f.taker_timeout_secs,
+                    maker_timeout_secs: f.maker_timeout_secs,
+                    counter_confirmations: f.confirmations(c),
+                    divi_confirmations: f.confirmations(Chain::Divi),
+                };
+                let lag = f
+                    .chain_params(c)
+                    .mtp_lag_secs
+                    .max(f.chain_params(Chain::Divi).mtp_lag_secs);
+                let tol = 1800;
+                let tl = 2_000_000_000u32;
+                let floor = tl - (t.taker_timeout_secs - t.maker_timeout_secs) - tol - lag;
+                // at the floor, and stronger: accepted
+                check_maker_leg_locktime(p, pair, &t, tl, floor, tol).unwrap();
+                check_maker_leg_locktime(p, pair, &t, tl, floor + 1, tol).unwrap();
+                check_maker_leg_locktime(p, pair, &t, tl, tl, tol).unwrap();
+                // one below: refused, naming the term and both values
+                let e = check_maker_leg_locktime(p, pair, &t, tl, floor - 1, tol).unwrap_err();
+                assert!(e.contains("maker-leg locktime"), "{e}");
+                assert!(e.contains(&(floor - 1).to_string()), "{e}");
+                assert!(e.contains(&floor.to_string()), "{e}");
+                assert!(e.contains(&format!("--profile {p}")), "{e}");
+            }
+        }
     }
 }

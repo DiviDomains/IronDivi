@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::api::{AcceptRequest, LockNotice, Quote, SwapView};
 use crate::backend::ChainBackend;
-use crate::config::{check_terms_against_profile, OfferedTerms, Profile};
+use crate::config::{check_maker_leg_locktime, check_terms_against_profile, OfferedTerms, Profile};
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
@@ -414,6 +414,22 @@ impl Taker {
             r.claim_declined = Some(reason);
             self.store.put_taker_swap(r)?;
             return Ok(Flow::Idle);
+        }
+        if let Some(p) = self.profile_floor {
+            // Same decided-once outcome for a maker that quoted strong terms but locked short.
+            if let Err(reason) = check_maker_leg_locktime(
+                p,
+                (r.quote.taker_chain(), r.quote.maker_chain()),
+                &OfferedTerms::from(&r.quote),
+                self.taker_leg_htlc(r)?.locktime,
+                htlc.locktime,
+                LOCKTIME_TOLERANCE_SECS,
+            ) {
+                tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
+                r.claim_declined = Some(format!("{reason}; waiting for the taker-leg refund"));
+                self.store.put_taker_swap(r)?;
+                return Ok(Flow::Idle);
+            }
         }
         r.maker_leg_htlc = Some(htlc);
         r.maker_leg_outpoint = Some(op);
