@@ -19,6 +19,8 @@ trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stub" "$T/host"
 export FAKE_BIN="$T/host/divi-swapd" FAKE_LOG="$T/systemctl.log"
 export FAKE_CLOCK="$T/clock"
+# the in-flight gate reads /swaps with the operator token (the curl stub ignores its value)
+printf "op-token-for-test\n" >"$T/op.token"; export OPERATOR_TOKEN_FILE="$T/op.token"
 FAKE_TOML="$T/host/divi-swapd.toml" FAKE_UNIT="$T/host/divi-swapd.service" FAKE_BACKUP="$T/host/backups"
 
 cat >"$T/stub/ssh" <<'EOF'
