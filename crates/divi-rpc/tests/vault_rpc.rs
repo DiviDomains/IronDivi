@@ -585,3 +585,145 @@ fn addvault_refuses_funding_output_spent_in_mempool() {
     assert!(error_message(e).contains("already spent"));
     assert!(s.manager.get_all_vaults().is_empty());
 }
+
+// ---------------------------------------------------------------- IR-09
+
+/// The owner also holds the manager key and registers the vault (a
+/// self-vault, as on testnet), so reclaim works even where the owner key
+/// alone was not enough.
+fn make_self_vault(s: &Setup) -> WalletRpc {
+    let manager_key = s
+        .manager
+        .keystore()
+        .get_key(&s.manager_addr.hash)
+        .unwrap()
+        .secret
+        .unwrap();
+    s.owner.import_key(manager_key, None);
+    let rpc = s.net.rpc(&s.owner);
+    rpc.add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .unwrap();
+    rpc
+}
+
+fn submitted_tx(s: &Setup) -> Transaction {
+    let txs = s.net.submitted.lock();
+    assert_eq!(txs.len(), 1);
+    txs[0].clone()
+}
+
+fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
+    tx.vout
+        .iter()
+        .filter(|o| &o.script_pubkey == script)
+        .map(|o| o.value.as_sat())
+        .collect()
+}
+
+/// Default mode: the destination gets the full amount, the fee comes out of
+/// the remainder, and the remainder goes back to the same vault script so it
+/// keeps staking (seen on the manager after the block).
+#[test]
+fn reclaim_partial_keeps_remainder_in_vault() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    let res = rpc
+        .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
+        .unwrap();
+    let tx = submitted_tx(&s);
+    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    assert!(fee > 0);
+    assert_eq!(
+        output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
+        vec![40 * COIN]
+    );
+    assert_eq!(
+        output_to(&tx, &s.vault),
+        vec![(VAULT_DIVI - 40) * COIN - fee],
+        "the rest of the vault left the vault"
+    );
+
+    s.net.mine_submitted(&s.owner_addr);
+    let h = s.net.chain.height();
+    let managed: i64 = s
+        .manager
+        .get_stakeable_vault_utxos(h, 1)
+        .iter()
+        .map(|(u, _)| u.value.as_sat())
+        .sum();
+    assert_eq!(managed, (VAULT_DIVI - 40) * COIN - fee);
+}
+
+/// receiver_pays: the fee comes out of the amount, the vault keeps the rest
+/// untouched.
+#[test]
+fn reclaim_receiver_pays_takes_fee_from_amount() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    let res = rpc
+        .reclaim_vault_funds(&p(vec![
+            json!(dest.to_string()),
+            json!(5.0),
+            json!("receiver_pays"),
+        ]))
+        .unwrap();
+    let tx = submitted_tx(&s);
+    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    assert!(fee > 0);
+    assert_eq!(
+        output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
+        vec![5 * COIN - fee],
+        "receiver_pays ignored"
+    );
+    assert_eq!(output_to(&tx, &s.vault), vec![(VAULT_DIVI - 5) * COIN]);
+    s.net.mine_submitted(&s.owner_addr);
+}
+
+/// sweep_funds: everything goes to the destination minus the fee, the amount
+/// argument is not used (Divi Core behaviour).
+#[test]
+fn reclaim_sweep_funds_sends_everything() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    let res = rpc
+        .reclaim_vault_funds(&p(vec![
+            json!(dest.to_string()),
+            json!(1.0),
+            json!("sweep_funds"),
+        ]))
+        .unwrap();
+    let tx = submitted_tx(&s);
+    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    assert_eq!(tx.vout.len(), 1, "sweep left change");
+    assert_eq!(
+        output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
+        vec![VAULT_DIVI * COIN - fee]
+    );
+    s.net.mine_submitted(&s.owner_addr);
+}
+
+/// An unknown fee mode is an error, as in Divi Core (-8).
+#[test]
+fn reclaim_unknown_fee_mode_is_refused() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    let e = rpc
+        .reclaim_vault_funds(&p(vec![
+            json!(dest.to_string()),
+            json!(1.0),
+            json!("fastest"),
+        ]))
+        .unwrap_err();
+    match e {
+        divi_rpc::Error::Rpc(r) => {
+            assert_eq!(r.code, -8);
+            assert_eq!(r.message, "Unknown option for reclaiming vault funds");
+        }
+        other => panic!("{:?}", other),
+    }
+    assert!(s.net.submitted.lock().is_empty());
+}
