@@ -2367,7 +2367,6 @@ impl WalletRpc {
         }
 
         let total_input = total_of(&selected);
-        let min_output = min_change_value();
         let (fee, received, change) = match mode {
             VaultFeeMode::SweepFunds => {
                 let fee = fee_for(selected.len(), 1);
@@ -2382,7 +2381,8 @@ impl WalletRpc {
                 (fee, amount, total_input - amount - fee)
             }
         };
-        if received < min_output {
+        // The payment is checked against the destination's own dust limit
+        if TxOut::new(received, dest.script_pubkey()).is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
                 format!(
@@ -2393,21 +2393,24 @@ impl WalletRpc {
             )
             .into());
         }
+        let change_script = change_script.unwrap_or_else(|| {
+            selected
+                .iter()
+                .max_by_key(|u| u.value)
+                .map(|u| u.script_pubkey.clone())
+                .expect("at least one input")
+        });
 
         let mut builder = TransactionBuilder::new();
         for utxo in &selected {
             builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
         }
         builder = builder.add_output_to_address(received, dest);
-        if change >= min_output {
-            let change_script = change_script.unwrap_or_else(|| {
-                selected
-                    .iter()
-                    .max_by_key(|u| u.value)
-                    .map(|u| u.script_pubkey.clone())
-                    .expect("at least one input")
-            });
-            builder = builder.add_output(change, change_script);
+        // Change returns to a vault script, whose dust limit is above the P2PKH
+        // one; dust change goes to the fee, as for ordinary sends
+        let change_out = TxOut::new(change, change_script);
+        if !change_out.is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
+            builder = builder.add_output(change_out.value, change_out.script_pubkey);
         }
 
         let (mut tx, prev_scripts) = builder.build();
@@ -2436,15 +2439,10 @@ impl WalletRpc {
         }
 
         let txid = tx.txid();
-        self.submit_transaction(tx)?;
         // A dropped (dust) change is part of the fee
-        let fee = total_input
-            - received
-            - if change >= min_output {
-                change
-            } else {
-                Amount::ZERO
-            };
+        let paid_out = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
+        let fee = total_input - paid_out;
+        self.submit_transaction(tx)?;
         Ok((txid, received, fee))
     }
 
