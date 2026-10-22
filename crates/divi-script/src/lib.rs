@@ -42,9 +42,12 @@ pub mod standard;
 pub mod vault;
 
 pub use asm::{to_asm, Script as AsmScript, ScriptItem, ScriptIterator};
-pub use checker::{verify_input, TransactionSignatureChecker};
+pub use checker::{verify_input, verify_input_with_flags, TransactionSignatureChecker};
 pub use error::{ScriptError, ScriptFlags, SigHashType};
-pub use interpreter::{verify_script, NullChecker, ScriptInterpreter, SignatureChecker};
+pub use interpreter::{
+    get_op, is_push_only, verify_script, verify_script_with_amount, NullChecker, ScriptInterpreter,
+    SignatureChecker,
+};
 pub use opcodes::Opcode;
 pub use stack::{ScriptNum, Stack};
 pub use standard::{

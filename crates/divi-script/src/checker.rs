@@ -15,25 +15,25 @@
 //! ECDSA signatures against actual transaction data, enabling full script
 //! validation during block acceptance.
 
-use crate::error::SigHashType;
-use crate::interpreter::SignatureChecker;
+use crate::interpreter::{get_op, SignatureChecker};
 use divi_primitives::amount::Amount;
 use divi_primitives::script::Script;
 use divi_primitives::serialize::serialize;
-use divi_primitives::transaction::{Transaction, TxOut};
+use divi_primitives::transaction::Transaction;
 use sha2::{Digest, Sha256};
 
 /// Transaction signature checker that verifies signatures against actual transaction data
 ///
 /// This implements the SignatureChecker trait, enabling the script interpreter
 /// to verify ECDSA signatures during script execution (OP_CHECKSIG, etc).
+/// It follows Divi Core's `TransactionSignatureChecker`
+/// (script/SignatureCheckers.cpp).
 pub struct TransactionSignatureChecker<'a> {
     /// The transaction being validated
     tx: &'a Transaction,
     /// Index of the input being validated
     input_index: usize,
-    /// Value of the UTXO being spent (for segwit-style sighash, not used in legacy)
-    #[allow(dead_code)]
+    /// Value of the UTXO being spent (OP_LIMIT_TRANSFER)
     amount: Amount,
 }
 
@@ -43,7 +43,7 @@ impl<'a> TransactionSignatureChecker<'a> {
     /// # Arguments
     /// * `tx` - The transaction containing the input being validated
     /// * `input_index` - Index of the input whose script is being executed
-    /// * `amount` - Value of the UTXO being spent (for future segwit support)
+    /// * `amount` - Value of the UTXO being spent
     pub fn new(tx: &'a Transaction, input_index: usize, amount: Amount) -> Self {
         TransactionSignatureChecker {
             tx,
@@ -52,98 +52,114 @@ impl<'a> TransactionSignatureChecker<'a> {
         }
     }
 
-    /// Compute the sighash for legacy (pre-segwit) transactions
-    ///
-    /// This matches Bitcoin/Divi's SignatureHash() function behavior.
-    fn compute_sighash(
-        &self,
-        script_code: &Script,
-        sighash_type: SigHashType,
-        anyone_can_pay: bool,
-    ) -> Result<[u8; 32], &'static str> {
-        if self.input_index >= self.tx.vin.len() {
-            return Err("Input index out of bounds");
-        }
+    /// Value of the output being spent
+    pub fn amount(&self) -> Amount {
+        self.amount
+    }
 
-        // Build modified transaction for signing
-        let mut tx_copy = self.tx.clone();
+    /// Divi Core's `SignatureHash` for this input. `hash_type` is the raw
+    /// last byte of the signature: NONE/SINGLE come from its low 5 bits and
+    /// ANYONECANPAY from bit 7, and the byte itself is hashed as a 4-byte
+    /// integer, whatever its other bits.
+    pub fn signature_hash(&self, script_code: &Script, hash_type: i32) -> [u8; 32] {
+        signature_hash(script_code, self.tx, self.input_index, hash_type)
+    }
+}
 
-        // Clear all input scripts
-        for input in tx_copy.vin.iter_mut() {
-            input.script_sig = Script::new();
-        }
+/// Divi Core's `SignatureHash` (script/SignatureCheckers.cpp). Out-of-range
+/// inputs, and SIGHASH_SINGLE without a matching output, hash to the value 1,
+/// as in Core.
+pub fn signature_hash(
+    script_code: &Script,
+    tx: &Transaction,
+    input_index: usize,
+    hash_type: i32,
+) -> [u8; 32] {
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    if input_index >= tx.vin.len() {
+        return one;
+    }
+    let anyone_can_pay = hash_type & 0x80 != 0;
+    let hash_single = hash_type & 0x1f == 3;
+    let hash_none = hash_type & 0x1f == 2;
+    if hash_single && input_index >= tx.vout.len() {
+        return one;
+    }
 
-        // Set the script code for the input being signed
-        // (this is the scriptPubKey of the output being spent)
-        tx_copy.vin[self.input_index].script_sig = script_code.clone();
-
-        // Handle different sighash types
-        match sighash_type {
-            SigHashType::All => {
-                // SIGHASH_ALL: Sign all inputs and outputs (default)
-                // No modification needed
-            }
-            SigHashType::None => {
-                // SIGHASH_NONE: Sign all inputs, no outputs
-                tx_copy.vout.clear();
-                // Set all other input sequences to 0
-                for (i, input) in tx_copy.vin.iter_mut().enumerate() {
-                    if i != self.input_index {
-                        input.sequence = 0;
-                    }
-                }
-            }
-            SigHashType::Single => {
-                // SIGHASH_SINGLE: Sign all inputs, only output at same index
-                if self.input_index >= tx_copy.vout.len() {
-                    // If no matching output, return 1 (special case from Bitcoin)
-                    let mut result = [0u8; 32];
-                    result[0] = 1;
-                    return Ok(result);
-                }
-                // Keep only the output at input_index
-                let output = tx_copy.vout[self.input_index].clone();
-                tx_copy.vout.clear();
-                // Fill outputs before input_index with empty outputs
-                for _ in 0..self.input_index {
-                    tx_copy
-                        .vout
-                        .push(TxOut::new(Amount::from_sat(-1), Script::new()));
-                }
-                tx_copy.vout.push(output);
-                // Set all other input sequences to 0
-                for (i, input) in tx_copy.vin.iter_mut().enumerate() {
-                    if i != self.input_index {
-                        input.sequence = 0;
-                    }
-                }
-            }
-            SigHashType::AnyoneCanPay => {
-                // This shouldn't happen as ANYONECANPAY is a modifier, not a base type
-            }
-        }
-
-        // Handle ANYONECANPAY modifier
-        if anyone_can_pay {
-            // Only keep the input being signed
-            let input = tx_copy.vin[self.input_index].clone();
-            tx_copy.vin.clear();
-            tx_copy.vin.push(input);
-        }
-
-        // Serialize and compute hash
-        let mut data = serialize(&tx_copy);
-
-        // Append sighash type as 4-byte LE
-        let hash_type_value = if anyone_can_pay {
-            (sighash_type as u32) | 0x80
+    let mut data = Vec::with_capacity(256);
+    data.extend_from_slice(&tx.version.to_le_bytes());
+    let inputs: Vec<usize> = if anyone_can_pay {
+        vec![input_index]
+    } else {
+        (0..tx.vin.len()).collect()
+    };
+    compact_size(&mut data, inputs.len() as u64);
+    for n in inputs {
+        let input = &tx.vin[n];
+        data.extend_from_slice(&serialize(&input.prevout));
+        if n == input_index {
+            serialize_script_code(&mut data, script_code.as_bytes());
         } else {
-            sighash_type as u32
+            // Blank out other inputs' signatures
+            compact_size(&mut data, 0);
+        }
+        let sequence = if n != input_index && (hash_single || hash_none) {
+            0
+        } else {
+            input.sequence
         };
-        data.extend_from_slice(&hash_type_value.to_le_bytes());
+        data.extend_from_slice(&sequence.to_le_bytes());
+    }
+    let outputs = if hash_none {
+        0
+    } else if hash_single {
+        input_index + 1
+    } else {
+        tx.vout.len()
+    };
+    compact_size(&mut data, outputs as u64);
+    for n in 0..outputs {
+        if hash_single && n != input_index {
+            // CTxOut(): value -1, empty script
+            data.extend_from_slice(&(-1i64).to_le_bytes());
+            compact_size(&mut data, 0);
+        } else {
+            data.extend_from_slice(&serialize(&tx.vout[n]));
+        }
+    }
+    data.extend_from_slice(&tx.lock_time.to_le_bytes());
+    data.extend_from_slice(&hash_type.to_le_bytes());
+    double_sha256(&data)
+}
 
-        // Double SHA256
-        Ok(double_sha256(&data))
+fn compact_size(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&serialize(&divi_primitives::CompactSize(n)));
+}
+
+/// Core's `SerializeScriptCode`: the script without its OP_CODESEPARATORs,
+/// prefixed by the size Core computes (which counts the full script when a
+/// truncated push stops the copy, exactly as Core does)
+fn serialize_script_code(out: &mut Vec<u8>, code: &[u8]) {
+    const OP_CODESEPARATOR: u8 = 0xab;
+    let mut separators = 0usize;
+    let mut pc = 0usize;
+    while let Some((opcode, _)) = get_op(code, &mut pc) {
+        if opcode == OP_CODESEPARATOR {
+            separators += 1;
+        }
+    }
+    compact_size(out, (code.len() - separators) as u64);
+    let mut pc = 0usize;
+    let mut begin = 0usize;
+    while let Some((opcode, _)) = get_op(code, &mut pc) {
+        if opcode == OP_CODESEPARATOR {
+            out.extend_from_slice(&code[begin..pc - 1]);
+            begin = pc;
+        }
+    }
+    if begin != code.len() {
+        out.extend_from_slice(&code[begin..pc]);
     }
 }
 
@@ -156,48 +172,61 @@ fn double_sha256(data: &[u8]) -> [u8; 32] {
     result
 }
 
+/// Divi Core's `CPubKey::Verify` for `sighash`: the key's length must match
+/// its header byte, the signature is parsed with the lax DER parser and
+/// normalized to low S before verifying (high-S signatures are valid).
+pub fn verify_ecdsa_lax(pubkey: &[u8], der_sig: &[u8], sighash: &[u8; 32]) -> bool {
+    use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+    let expected_len = match pubkey.first() {
+        Some(2) | Some(3) => 33,
+        Some(4) | Some(6) | Some(7) => 65,
+        _ => return false,
+    };
+    if pubkey.len() != expected_len || der_sig.is_empty() {
+        return false;
+    }
+    let Ok(key) = PublicKey::from_slice(pubkey) else {
+        return false;
+    };
+    let Ok(mut sig) = Signature::from_der_lax(der_sig) else {
+        return false;
+    };
+    sig.normalize_s();
+    thread_local! {
+        static SECP: Secp256k1<secp256k1::VerifyOnly> = Secp256k1::verification_only();
+    }
+    let msg = Message::from_digest(*sighash);
+    SECP.with(|secp| secp.verify_ecdsa(&msg, &sig, &key).is_ok())
+}
+
 impl SignatureChecker for TransactionSignatureChecker<'_> {
     /// Reference: Divi/divi/src/script/SignatureCheckers.cpp CheckCoinstake
     fn check_coinstake(&self) -> bool {
         self.tx.is_coinstake()
     }
 
+    /// Reference: Divi/divi/src/script/SignatureCheckers.cpp CheckSig
     fn check_sig(&self, sig: &[u8], pubkey: &[u8], script_code: &Script) -> bool {
-        // Empty signature always fails
-        if sig.is_empty() {
+        // The hash type is one byte tacked on to the end of the signature
+        let Some((&hash_type, der_sig)) = sig.split_last() else {
             return false;
+        };
+        let sighash = self.signature_hash(script_code, hash_type as i32);
+        verify_ecdsa_lax(pubkey, der_sig, &sighash)
+    }
+
+    /// Reference: Divi/divi/src/script/SignatureCheckers.cpp CheckTransferLimit
+    fn check_transfer_limit(&self, minimum_change: i64, change_script: &[u8]) -> bool {
+        if minimum_change < 1 {
+            return true;
         }
-
-        // Parse sighash type from last byte of signature
-        let sighash_byte = sig[sig.len() - 1];
-        let (sighash_type, anyone_can_pay) = match SigHashType::from_u8(sighash_byte) {
-            Some((st, acp)) => (st, acp),
-            None => return false, // Invalid sighash type
-        };
-
-        // The actual DER signature is everything except the last byte
-        let der_sig = &sig[..sig.len() - 1];
-
-        // Compute the sighash
-        let sighash = match self.compute_sighash(script_code, sighash_type, anyone_can_pay) {
-            Ok(h) => h,
-            Err(_) => return false,
-        };
-
-        // Parse the public key
-        let pk = match divi_crypto::PublicKey::from_bytes(pubkey) {
-            Ok(pk) => pk,
-            Err(_) => return false,
-        };
-
-        // Parse the DER signature
-        let signature = match divi_crypto::Signature::from_der(der_sig) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        // Verify the signature
-        divi_crypto::verify_hash(&pk, &signature, &sighash)
+        match self.tx.vout.get(self.input_index) {
+            Some(out) => {
+                out.script_pubkey.as_bytes() == change_script
+                    && minimum_change <= out.value.as_sat()
+            }
+            None => false,
+        }
     }
 
     fn check_lock_time(&self, lock_time: i64) -> bool {
@@ -287,38 +316,60 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
 /// * `input_index` - Index of the input to verify
 /// * `script_pubkey` - The scriptPubKey of the output being spent
 /// * `amount` - Value of the output being spent
+/// * `flags` - Script verification flags, e.g. [`ScriptFlags::mandatory`]
+///   for blocks or [`ScriptFlags::policy`] for the mempool
 ///
 /// # Returns
 /// * `Ok(())` if the scripts verify successfully
 /// * `Err(ScriptError)` if verification fails
+///
+/// [`ScriptFlags::mandatory`]: crate::error::ScriptFlags::mandatory
+/// [`ScriptFlags::policy`]: crate::error::ScriptFlags::policy
+pub fn verify_input_with_flags(
+    tx: &Transaction,
+    input_index: usize,
+    script_pubkey: &Script,
+    amount: Amount,
+    flags: crate::error::ScriptFlags,
+) -> Result<(), crate::error::ScriptError> {
+    if input_index >= tx.vin.len() {
+        return Err(crate::error::ScriptError::InvalidStackOperation);
+    }
+    let checker = TransactionSignatureChecker::new(tx, input_index, amount);
+    crate::interpreter::verify_script_with_amount(
+        &tx.vin[input_index].script_sig,
+        script_pubkey,
+        amount.as_sat(),
+        flags,
+        &checker,
+    )
+}
+
+/// Verify one input of `tx` against the output it spends, under
+/// [`ScriptFlags::standard`](crate::error::ScriptFlags::standard)
 pub fn verify_input(
     tx: &Transaction,
     input_index: usize,
     script_pubkey: &Script,
     amount: Amount,
 ) -> Result<(), crate::error::ScriptError> {
-    use crate::error::ScriptFlags;
-    use crate::interpreter::verify_script;
-
-    if input_index >= tx.vin.len() {
-        return Err(crate::error::ScriptError::InvalidStackOperation);
-    }
-
-    let script_sig = &tx.vin[input_index].script_sig;
-    let checker = TransactionSignatureChecker::new(tx, input_index, amount);
-
-    // Use standard verification flags
-    let flags = ScriptFlags::standard();
-
-    verify_script(script_sig, script_pubkey, flags, &checker)
+    verify_input_with_flags(
+        tx,
+        input_index,
+        script_pubkey,
+        amount,
+        crate::error::ScriptFlags::standard(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SigHashType;
     use divi_crypto::keys::KeyPair;
     use divi_primitives::constants::SEQUENCE_FINAL;
     use divi_primitives::hash::Hash256;
+    use divi_primitives::transaction::TxOut;
     use divi_primitives::transaction::{OutPoint, TxIn};
 
     fn create_test_keypair() -> KeyPair {
@@ -401,9 +452,7 @@ mod tests {
         let checker = TransactionSignatureChecker::new(&tx, 0, Amount::from_divi(50));
 
         // Compute the sighash
-        let sighash = checker
-            .compute_sighash(&script_code, SigHashType::All, false)
-            .unwrap();
+        let sighash = checker.signature_hash(&script_code, 1);
 
         // Sign the hash
         let signature = divi_crypto::sign_hash(kp.secret_key(), &sighash).unwrap();
@@ -510,9 +559,7 @@ mod tests {
     /// `<sig> <pubkey> <branch>` (branch true = owner path, false = vault path).
     fn sign_vault_input(tx: &mut Transaction, script_pubkey: &Script, kp: &KeyPair, owner: bool) {
         let checker = TransactionSignatureChecker::new(tx, 0, Amount::from_divi(15000));
-        let sighash = checker
-            .compute_sighash(script_pubkey, SigHashType::All, false)
-            .unwrap();
+        let sighash = checker.signature_hash(script_pubkey, 1);
         let mut sig = divi_crypto::sign_hash(kp.secret_key(), &sighash)
             .unwrap()
             .to_der();

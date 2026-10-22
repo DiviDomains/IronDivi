@@ -61,6 +61,10 @@ pub mod staker;
 pub use config::{NetworkConfig, NetworkType, NodeConfig, P2pConfig, RpcConfig};
 pub use error::NodeError;
 pub use fee_estimator::{FeeEstimator, FeeEstimatorStats};
+pub use mempool::MempoolValidator;
 pub use mempool::{Mempool, MempoolEntry, MempoolStats};
-pub use node::{BlockchainInfo, MempoolInfo, NetworkInfo, Node, NodeEvent, NodeStatus};
+pub use node::{
+    check_mempool_transaction, BlockchainInfo, MempoolInfo, NetworkInfo, Node, NodeEvent,
+    NodeStatus,
+};
 pub use staker::{StakeResult, Staker, StakerEvent, StakingConfig, StakingStatus};

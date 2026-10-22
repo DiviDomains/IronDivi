@@ -132,6 +132,52 @@ pub enum ScriptError {
 }
 
 /// Script verification flags
+impl ScriptError {
+    /// Divi Core's text for this error (`ScriptErrorString`,
+    /// script/script_error.cpp), as used in reject reasons such as
+    /// "mandatory-script-verify-flag-failed (...)"
+    pub fn core_message(&self) -> &'static str {
+        use ScriptError::*;
+        match self {
+            EvalFalse => {
+                "Script evaluated without error but finished with a false/empty top stack element"
+            }
+            // OP_RETURN is Divi's OP_META
+            OpReturn => "OP_META was encountered",
+            ScriptSize => "Script is too big",
+            PushSize | ElementSize => "Push value size limit exceeded",
+            OpCount => "Operation limit exceeded",
+            StackSize => "Stack size limit exceeded",
+            InvalidStackOperation => "Operation not valid with the current stack size",
+            InvalidAltstackOperation => "Operation not valid with the current altstack size",
+            SigCount => "Signature count negative or greater than pubkey count",
+            PubkeyCount => "Pubkey count negative or limit exceeded",
+            PubkeyType => "Public key is neither compressed or uncompressed",
+            SigDer => "Non-canonical DER signature",
+            SigPushOnly => "Only non-push operators allowed in signatures",
+            SigHashType => "Signature hash type missing or not understood",
+            SigHighS => "Non-canonical signature: S value is unnecessarily high",
+            SigNullDummy => "Dummy CHECKMULTISIG argument must be zero",
+            // Core's CoinstakeCheckOp fails with SCRIPT_ERR_VERIFY
+            Verify | RequireCoinstake => "Script failed an OP_VERIFY operation",
+            EqualVerify => "Script failed an OP_EQUALVERIFY operation",
+            CheckSigVerify => "Script failed an OP_CHECKSIGVERIFY operation",
+            CheckMultiSigVerify => "Script failed an OP_CHECKMULTISIGVERIFY operation",
+            NumEqualVerify => "Script failed an OP_NUMEQUALVERIFY operation",
+            BadOpcode => "Opcode missing or not understood",
+            DisabledOpcode => "Attempted to use a disabled opcode",
+            UnbalancedConditional => "Invalid OP_IF construction",
+            MinimalData => "Data push larger than necessary",
+            DiscourageUpgradableNops => "NOPx reserved for soft-fork upgrades",
+            CheckLockTimeVerify | NegativeLocktime | UnsatisfiedLocktime => {
+                "Invalid transaction lock time (BIP65)"
+            }
+            LimitTransfer => "Invalid transfer limit",
+            CheckSequenceVerify | Unknown | ScriptNumOverflow | InvalidSignature => "unknown error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScriptFlags {
     bits: u32,
@@ -177,6 +223,34 @@ impl ScriptFlags {
                 | Self::NULLDUMMY
                 | Self::REQUIRE_COINSTAKE
                 | Self::CHECKLOCKTIMEVERIFY,
+        }
+    }
+
+    /// Divi Core's `MANDATORY_SCRIPT_VERIFY_FLAGS`: what every block input
+    /// must pass (script/standard.h). Blocks add CHECKLOCKTIMEVERIFY and
+    /// LIMIT_TRANSFER once those forks are active.
+    pub fn mandatory() -> Self {
+        ScriptFlags {
+            bits: Self::P2SH | Self::DERSIG | Self::REQUIRE_COINSTAKE,
+        }
+    }
+
+    /// Divi Core's `POS_SCRIPT_VERIFY_FLAGS`: the coinstake kernel input's
+    /// check in CheckProofOfStake
+    pub fn pos() -> Self {
+        ScriptFlags {
+            bits: Self::mandatory().bits | Self::STRICTENC | Self::MINIMALDATA | Self::NULLDUMMY,
+        }
+    }
+
+    /// Divi Core's `STANDARD_SCRIPT_VERIFY_FLAGS`: mempool policy. Unlike
+    /// [`standard`](Self::standard) it has no LOW_S, as in Core.
+    pub fn policy() -> Self {
+        ScriptFlags {
+            bits: Self::pos().bits
+                | Self::CHECKLOCKTIMEVERIFY
+                | Self::LIMIT_TRANSFER
+                | Self::DISCOURAGE_UPGRADABLE_NOPS,
         }
     }
 

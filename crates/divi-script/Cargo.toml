@@ -10,6 +10,10 @@ divi-crypto = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+secp256k1 = { workspace = true }
+# OP_SHA1; already in the build at this version (axum, tungstenite)
+sha1 = "0.10"
 
 [dev-dependencies]
 proptest = { workspace = true }
+serde_json = { workspace = true }

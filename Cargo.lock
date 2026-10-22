@@ -2762,6 +2762,7 @@ dependencies = [
  "divi-crypto",
  "divi-masternode",
  "divi-primitives",
+ "divi-script",
  "divi-storage",
  "futures",
  "hex",
@@ -2853,6 +2854,9 @@ dependencies = [
  "divi-primitives",
  "hex",
  "proptest",
+ "secp256k1 0.29.1",
+ "serde_json",
+ "sha1",
  "sha2",
  "thiserror 1.0.69",
 ]

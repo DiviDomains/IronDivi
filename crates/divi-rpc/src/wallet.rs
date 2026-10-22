@@ -5769,6 +5769,20 @@ mod accounting_tests {
         Script::new_p2pkh(a.hash.as_bytes())
     }
 
+    /// Sign every input of `tx` with the wallet's keys: blocks must now
+    /// carry valid scripts. The coins spent are P2PKH outputs in the chain.
+    fn sign_with_wallet(wallet: &WalletDb, chain: &Chain, tx: &mut Transaction) {
+        let scripts: Vec<Script> = tx
+            .vin
+            .iter()
+            .map(|i| chain.get_utxo(&i.prevout).unwrap().unwrap().script_pubkey)
+            .collect();
+        let signed = divi_wallet::signer::TransactionSigner::new(wallet.keystore())
+            .sign_all_inputs(tx, &scripts)
+            .unwrap();
+        assert_eq!(signed, tx.vin.len());
+    }
+
     /// Mine a block on the tip: a coinbase paying `payee`, then `txs`
     fn mine(chain: &Chain, payee: Script, txs: &[Transaction]) -> Block {
         let tip = chain.tip().unwrap();
@@ -5831,6 +5845,8 @@ mod accounting_tests {
             ],
             lock_time: 0,
         };
+        let mut spend = spend;
+        sign_with_wallet(&wallet, &chain, &mut spend);
         mine(&chain, stranger(), std::slice::from_ref(&spend));
         assert_eq!(chain.height(), 5);
 
@@ -5958,6 +5974,8 @@ mod accounting_tests {
             )],
             lock_time: 0,
         };
+        let mut tx = tx;
+        sign_with_wallet(&f.wallet, &f.chain, &mut tx);
         mine(&f.chain, stranger(), &[tx]);
         f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
         assert!(!f.wallet.get_utxos().iter().any(|u| u.address == f.second));
@@ -6231,6 +6249,8 @@ mod accounting_tests {
             ],
             lock_time: 0,
         };
+        let mut fund = fund;
+        sign_with_wallet(&f.wallet, &f.chain, &mut fund);
         mine(&f.chain, stranger(), &[fund]);
         f.rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
         assert!(f

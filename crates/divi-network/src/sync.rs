@@ -2791,7 +2791,7 @@ mod tests {
                     TxOut::new(value + rewards.stake + rewards.masternode, pay.clone()),
                 ];
                 vout.extend(regtest_superblock_outputs(h, &parent.lottery_winners));
-                let coinstake = Transaction {
+                let mut coinstake = Transaction {
                     version: 1,
                     vin: vec![TxIn {
                         prevout,
@@ -2801,6 +2801,17 @@ mod tests {
                     vout,
                     lock_time: 0,
                 };
+                // Blocks are script-verified: sign the stake input
+                let sighash = divi_script::TransactionSignatureChecker::new(&coinstake, 0, value)
+                    .signature_hash(&pay, 1);
+                let mut sig = divi_crypto::sign_hash(&key, &sighash).unwrap().to_der();
+                sig.push(1);
+                let pubkey = key.public_key().to_bytes();
+                let mut script_sig = vec![sig.len() as u8];
+                script_sig.extend_from_slice(&sig);
+                script_sig.push(pubkey.len() as u8);
+                script_sig.extend_from_slice(&pubkey);
+                coinstake.vin[0].script_sig = Script::from_bytes(script_sig);
                 stake = Some((OutPoint::new(coinstake.txid(), 1), coinstake.vout[1].value));
                 let marker = Transaction {
                     version: 2,

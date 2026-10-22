@@ -257,6 +257,15 @@ impl Node {
         let chain_for_mempool = Arc::clone(&chain);
         mempool.set_tip_height_provider(Arc::new(move || chain_for_mempool.height()));
 
+        // Every transaction entering the mempool is checked against the chain:
+        // inputs, then scripts, as Divi Core's AcceptToMemoryPool does
+        {
+            let chain_for_scripts = Arc::clone(&chain);
+            mempool.set_validator(Arc::new(move |pool: &Mempool, tx: &Transaction| {
+                check_mempool_transaction(&chain_for_scripts, pool, tx)
+            }));
+        }
+
         // Create block sync manager
         let block_sync = BlockSync::new(Arc::clone(&chain), Arc::clone(&peer_manager));
 
@@ -1324,6 +1333,69 @@ pub struct MempoolInfo {
     pub max_size: usize,
     /// Total fees
     pub total_fee: f64,
+}
+
+/// Divi Core's AcceptToMemoryPool input checks against the chain: every input
+/// unspent in the chain or an output of a mempool transaction, then every
+/// input script under the standard flags (and, to pick the reject reason, the
+/// mandatory ones). Script failures are refused with Core's code and text.
+/// (Mempool::add itself refuses coinbase and coinstake transactions.)
+pub fn check_mempool_transaction(
+    chain: &Chain,
+    mempool: &Mempool,
+    tx: &Transaction,
+) -> Result<(), NodeError> {
+    use crate::error::reject;
+    use divi_primitives::amount::Amount;
+    use divi_primitives::script::Script;
+    use divi_script::{verify_input_with_flags, ScriptFlags};
+
+    let mut spent: Vec<(Script, Amount)> = Vec::with_capacity(tx.vin.len());
+    for input in &tx.vin {
+        let prev = match chain.get_utxo(&input.prevout) {
+            Ok(Some(utxo)) => Some((utxo.script_pubkey, utxo.value)),
+            Ok(None) => mempool.get(&input.prevout.txid).and_then(|parent| {
+                parent
+                    .tx
+                    .vout
+                    .get(input.prevout.vout as usize)
+                    .map(|out| (out.script_pubkey.clone(), out.value))
+            }),
+            Err(e) => {
+                return Err(NodeError::TransactionValidation(format!(
+                    "Failed to lookup UTXO {}:{}: {}",
+                    input.prevout.txid, input.prevout.vout, e
+                )))
+            }
+        };
+        spent.push(prev.ok_or(NodeError::MissingInputs)?);
+    }
+
+    for (i, (script_pubkey, value)) in spent.iter().enumerate() {
+        if let Err(e) = verify_input_with_flags(tx, i, script_pubkey, *value, ScriptFlags::policy())
+        {
+            // As Core's CheckInputs: if the mandatory flags alone pass, only
+            // policy failed
+            let (code, reason) = match verify_input_with_flags(
+                tx,
+                i,
+                script_pubkey,
+                *value,
+                ScriptFlags::mandatory(),
+            ) {
+                Ok(()) => (
+                    reject::NONSTANDARD,
+                    format!("non-mandatory-script-verify-flag ({})", e.core_message()),
+                ),
+                Err(e) => (
+                    reject::INVALID,
+                    format!("mandatory-script-verify-flag-failed ({})", e.core_message()),
+                ),
+            };
+            return Err(NodeError::TxRejected { code, reason });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
