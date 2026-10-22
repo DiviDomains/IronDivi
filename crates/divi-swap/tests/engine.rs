@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use divi_swap::api::{AcceptRequest, Direction, LockNotice, Offer, Quote};
+use divi_swap::htlc::ScriptVersion;
 use divi_swap::mock::{MockBackend, MockChain};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
@@ -1484,3 +1485,116 @@ proptest! {
         prop_body(REV, refund, maker_side, mi, ti, &outages);
     }
 }
+
+// ---- F3: new swaps lock with the size-checked V1 script; records written before it stay V0 ----
+
+/// A swap accepted now is V1 on both legs, on both sides' records.
+async fn new_swap_is_v1_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.run(Scn::Happy, None, &[]).await;
+    assert_atomic(&h, Scn::Happy);
+    let m = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(m.taker_leg_htlc.script_version, ScriptVersion::V1);
+    assert_eq!(m.maker_leg_htlc.unwrap().script_version, ScriptVersion::V1);
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(t.taker_leg_htlc.unwrap().script_version, ScriptVersion::V1);
+    assert_eq!(t.maker_leg_htlc.unwrap().script_version, ScriptVersion::V1);
+    // The V1 script is on the wire the taker reads.
+    let v = h.maker.view(&h.maker_id).unwrap().unwrap();
+    assert_eq!(v.taker_leg.htlc.script_version, ScriptVersion::V1);
+    assert_eq!(v.maker_leg.unwrap().htlc.script_version, ScriptVersion::V1);
+}
+both!(new_swap_is_v1, rev_new_swap_is_v1, new_swap_is_v1_body);
+
+/// A taker that locks the V0 script (an old client building its own leg) for a new swap is
+/// refused with no write, and the maker never funds its leg.
+async fn maker_refuses_v0_taker_leg_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    let before = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(before.taker_leg_htlc.script_version, ScriptVersion::V1);
+    let v0 = HtlcParams {
+        script_version: ScriptVersion::V0,
+        ..before.taker_leg_htlc
+    };
+    let f = h
+        .t_tl()
+        .build_funding(&v0, before.quote.taker_leg_amount())
+        .await
+        .unwrap();
+    h.t_tl().broadcast(&f.tx).await.unwrap();
+    h.mine_all(1);
+    let err = h
+        .maker
+        .notify_lock(
+            &h.maker_id,
+            LockNotice {
+                outpoint: f.outpoint,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("V0"), "{err}");
+    let after = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "refusal must not write"
+    );
+    for _ in 0..5 {
+        h.maker.tick().await.unwrap();
+        h.mine_all(1);
+    }
+    assert_eq!(h.m_ml().funding_calls(), 0);
+}
+both!(
+    maker_refuses_v0_taker_leg,
+    rev_maker_refuses_v0_taker_leg,
+    maker_refuses_v0_taker_leg_body
+);
+
+/// Today's JSON (no `script_version`) is V0, and its script is rebuilt byte for byte from the
+/// raw fixture fields, independently of `redeem_script`.
+#[test]
+fn old_records_are_v0_and_rebuild_byte_for_byte() {
+    let raw: serde_json::Value = serde_json::from_str(MAKER_HAPPY).unwrap();
+    let rec: MakerRecord = serde_json::from_str(MAKER_HAPPY).unwrap();
+    for (key, got) in [
+        ("btc_htlc", rec.taker_leg_htlc),
+        ("divi_htlc", rec.maker_leg_htlc.unwrap()),
+    ] {
+        let j = &raw[key];
+        assert!(
+            j.get("script_version").is_none(),
+            "{key}: fixture is not pre-F3"
+        );
+        assert_eq!(got.script_version, ScriptVersion::V0);
+        // OP_IF OP_SHA256 <h> OP_EQUALVERIFY <claim> OP_ELSE <lt> CLTV OP_DROP <refund> OP_ENDIF CHECKSIG
+        let lt = divi_swap::htlc::script_num(got.locktime as i64);
+        let want = format!(
+            "63a820{}8821{}67{:02x}{}b17521{}68ac",
+            j["hash"].as_str().unwrap(),
+            j["claim_pubkey"].as_str().unwrap(),
+            lt.len(),
+            hex::encode(&lt),
+            j["refund_pubkey"].as_str().unwrap()
+        );
+        assert_eq!(hex::encode(got.redeem_script()), want, "{key}");
+        assert_eq!(got.redeem_script(), got.redeem_script_v(ScriptVersion::V0));
+        // And it re-serializes to exactly today's JSON.
+        assert_eq!(&serde_json::to_value(got).unwrap(), j, "{key}");
+    }
+}
+
+ltc_rev!(ltc_rev_new_swap_is_v1, new_swap_is_v1_body);
+ltc_fwd!(ltc_fwd_new_swap_is_v1, new_swap_is_v1_body);
+zec_fwd!(zec_fwd_new_swap_is_v1, new_swap_is_v1_body);
+zec_rev!(zec_rev_new_swap_is_v1, new_swap_is_v1_body);
+ltc_rev!(
+    ltc_rev_maker_refuses_v0_taker_leg,
+    maker_refuses_v0_taker_leg_body
+);
+zec_fwd!(
+    zec_fwd_maker_refuses_v0_taker_leg,
+    maker_refuses_v0_taker_leg_body
+);

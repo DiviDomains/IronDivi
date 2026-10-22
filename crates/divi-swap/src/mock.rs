@@ -429,6 +429,7 @@ mod tests {
             claim_pubkey: claim,
             refund_pubkey: refund,
             locktime,
+            script_version: Default::default(),
         }
     }
 

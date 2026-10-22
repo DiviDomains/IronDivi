@@ -472,6 +472,7 @@ mod tests {
                 claim_pubkey: [2; 33],
                 refund_pubkey: [3; 33],
                 locktime: 1_800_000_000,
+                script_version: Default::default(),
             },
             taker_leg_outpoint: None,
             taker_leg_locked: None,

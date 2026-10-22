@@ -61,6 +61,13 @@ pub enum ScriptVersion {
     V1,
 }
 
+impl ScriptVersion {
+    /// True for `V0`; a V0 HTLC serializes without the field, byte-identical to a pre-F3 record.
+    pub fn is_v0(&self) -> bool {
+        *self == ScriptVersion::V0
+    }
+}
+
 /// Locktimes below this are block heights; the HTLC only accepts unix timestamps.
 pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 
@@ -82,6 +89,10 @@ pub struct HtlcParams {
     pub refund_pubkey: [u8; 33],
     /// Unix timestamp, compared against median time past (must be `>= LOCKTIME_THRESHOLD`).
     pub locktime: u32,
+    /// Which redeem script this HTLC uses. Records and wire messages written before F3 carry
+    /// no version and read as `V0`, so their script, address, claim and refund are unchanged.
+    #[serde(default, skip_serializing_if = "ScriptVersion::is_v0")]
+    pub script_version: ScriptVersion,
 }
 
 impl HtlcParams {
@@ -115,6 +126,7 @@ impl HtlcParams {
     ///     claim_pubkey: [0x02; 33],
     ///     refund_pubkey: [0x03; 33],
     ///     locktime: 1_800_000_000, // 0x6b49d200
+    ///     script_version: Default::default(),
     /// };
     /// let s = hex::encode(p.redeem_script());
     /// assert_eq!(
@@ -130,11 +142,11 @@ impl HtlcParams {
     /// assert_eq!(p.redeem_script().len(), 114);
     /// ```
     pub fn redeem_script(&self) -> Vec<u8> {
-        self.redeem_script_v(ScriptVersion::V0)
+        self.redeem_script_v(self.script_version)
     }
 
-    /// The redeem / witness script of the given version. `V0` is exactly [`Self::redeem_script`];
-    /// `V1` adds `OP_SIZE <32> OP_EQUALVERIFY` (4 bytes) so only a 32-byte preimage claims.
+    /// The redeem / witness script of an explicit version, whatever `self.script_version` says.
+    /// `V0` is the pre-F3 script; `V1` adds `OP_SIZE <32> OP_EQUALVERIFY` (4 bytes) so only a 32-byte preimage claims.
     pub fn redeem_script_v(&self, version: ScriptVersion) -> Vec<u8> {
         let mut s = Vec::with_capacity(118);
         s.push(OP_IF);
@@ -162,7 +174,7 @@ impl HtlcParams {
 
     /// SHA256 of the redeem script (the P2WSH program).
     pub fn script_sha256(&self) -> [u8; 32] {
-        Sha256::digest(self.redeem_script()).into()
+        self.script_sha256_v(self.script_version)
     }
 }
 
@@ -291,6 +303,7 @@ mod tests {
             claim_pubkey: [2; 33],
             refund_pubkey: [3; 33],
             locktime: 1_800_000_000,
+            script_version: Default::default(),
         };
         assert!(p.validate().is_ok());
         p.locktime = 340_000;
@@ -313,6 +326,7 @@ mod tests {
             claim_pubkey: [2; 33],
             refund_pubkey: [3; 33],
             locktime: 1_800_000_000,
+            script_version: Default::default(),
         };
         let j = serde_json::to_string(&p).unwrap();
         assert_eq!(serde_json::from_str::<HtlcParams>(&j).unwrap(), p);
@@ -325,6 +339,7 @@ mod tests {
             claim_pubkey: [2; 33],
             refund_pubkey: [3; 33],
             locktime: 1_800_000_000,
+            script_version: Default::default(),
         };
         let v0 = p.redeem_script();
         assert_eq!(v0.len(), 114);

@@ -83,12 +83,14 @@ async fn live_fund_claim_refund() {
         claim_pubkey: pk,
         refund_pubkey: pk,
         locktime: now() + 86_400,
+        script_version: Default::default(),
     };
     let bp = HtlcParams {
         hash: hash_b,
         claim_pubkey: pk,
         refund_pubkey: pk,
         locktime: now() + 600,
+        script_version: Default::default(),
     };
 
     // Fund both.

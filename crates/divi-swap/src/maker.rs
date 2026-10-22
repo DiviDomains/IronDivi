@@ -30,7 +30,7 @@ use crate::api::{AcceptRequest, LegView, LockNotice, Offer, Quote, SwapView};
 use crate::backend::ChainBackend;
 use crate::config::SwapConfig;
 use crate::error::{Result, SwapError};
-use crate::htlc::HtlcParams;
+use crate::htlc::{HtlcParams, ScriptVersion};
 use crate::state::SwapState;
 use crate::store::{MakerRecord, QuoteRecord, Store};
 use crate::types::{Amount, Chain, Outpoint};
@@ -328,6 +328,7 @@ impl Maker {
             claim_pubkey: qr.quote.maker_pubkey(tc),
             refund_pubkey: req.taker_pubkey(tc),
             locktime,
+            script_version: ScriptVersion::V1,
         };
         taker_leg_htlc.validate()?;
         // The maker leg is built later, on its own chain's clock; check the keys now.
@@ -336,6 +337,7 @@ impl Maker {
             claim_pubkey: req.taker_pubkey(mc),
             refund_pubkey: qr.quote.maker_pubkey(mc),
             locktime,
+            script_version: ScriptVersion::V1,
         }
         .validate()?;
 
@@ -377,6 +379,7 @@ impl Maker {
                     ))
                 }
                 None if rec.state == SwapState::Accepted => {
+                    self.refuse_downgraded_lock(&rec, &lock.outpoint).await?;
                     rec.taker_leg_outpoint = Some(lock.outpoint);
                     self.store.put_maker_swap(&rec)?;
                 }
@@ -397,6 +400,28 @@ impl Maker {
         }
         self.view(swap_id)?
             .ok_or_else(|| SwapError::Other("swap vanished".into()))
+    }
+
+    /// F3: a new swap's taker leg is the V1 script. A taker (an old client, or a hostile one)
+    /// that locked the V0 script for the same parameters is refused here, before anything is
+    /// written: the V0 leg accepts a non-32-byte preimage that we could never claim with.
+    /// A chain read that fails or times out is not a refusal; the step re-checks the real script.
+    async fn refuse_downgraded_lock(&self, rec: &MakerRecord, op: &Outpoint) -> Result<()> {
+        if rec.taker_leg_htlc.script_version == ScriptVersion::V0 {
+            return Ok(());
+        }
+        let v0 = HtlcParams {
+            script_version: ScriptVersion::V0,
+            ..rec.taker_leg_htlc
+        };
+        let probe = async { self.tk(rec)?.htlc_output(&v0, op).await };
+        if let Ok(Ok(Some(_))) = tokio::time::timeout(self.gate_bound, probe).await {
+            return Err(SwapError::InvalidParams(
+                "taker lock uses the V0 HTLC script; this swap requires the size-checked V1 script"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Current view of one swap.
@@ -623,6 +648,8 @@ impl Maker {
             locktime: mtp
                 .checked_add(r.quote.maker_timeout_secs)
                 .ok_or_else(|| SwapError::InvalidParams("locktime overflow".into()))?,
+            // Same script as the taker leg: V1 for a swap accepted now, V0 for one in flight.
+            script_version: r.taker_leg_htlc.script_version,
         };
         htlc.validate()?;
         let scan_from = mb.tip_height().await?;

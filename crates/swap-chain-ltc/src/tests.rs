@@ -58,6 +58,7 @@ fn htlc(hash: [u8; 32]) -> HtlcParams {
         claim_pubkey: pk(&TAKER_KEY),
         refund_pubkey: pk(&MAKER_KEY),
         locktime: LOCKTIME,
+        script_version: Default::default(),
     }
 }
 
@@ -789,6 +790,7 @@ mod live {
             claim_pubkey: b.pubkey(),
             refund_pubkey: b.pubkey(),
             locktime,
+            script_version: Default::default(),
         };
         let (pre_claim, hash_claim) = new_preimage();
         let (_, hash_refund) = new_preimage();
@@ -967,4 +969,23 @@ fn v1_script_pubkey_wraps_the_size_checked_script() {
     );
     assert_eq!(v1, want);
     assert_eq!(h.redeem_script_v(ScriptVersion::V1).len(), 118);
+}
+
+#[test]
+fn script_pubkey_follows_the_params_version() {
+    use divi_swap::htlc::ScriptVersion;
+    let v0 = htlc([7; 32]);
+    let v1 = HtlcParams {
+        script_version: ScriptVersion::V1,
+        ..v0
+    };
+    assert_eq!(
+        tx::htlc_script_pubkey(&v0),
+        tx::htlc_script_pubkey_v(&v0, ScriptVersion::V0)
+    );
+    assert_eq!(
+        tx::htlc_script_pubkey(&v1),
+        tx::htlc_script_pubkey_v(&v1, ScriptVersion::V1)
+    );
+    assert_ne!(tx::htlc_script_pubkey(&v0), tx::htlc_script_pubkey(&v1));
 }

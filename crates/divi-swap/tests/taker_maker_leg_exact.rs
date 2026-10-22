@@ -127,6 +127,7 @@ async fn hand_locked_view(
         claim_pubkey: tb.pubkey(),
         refund_pubkey: mb.pubkey(),
         locktime,
+        script_version: Default::default(),
     };
     let funding = mb
         .build_funding(&htlc, rec.quote.maker_leg_amount())

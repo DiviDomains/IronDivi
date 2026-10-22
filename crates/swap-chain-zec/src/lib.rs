@@ -780,6 +780,7 @@ mod tests {
             claim_pubkey: pk,
             refund_pubkey: pk,
             locktime: 1_900_000_000,
+            script_version: Default::default(),
         };
         let fund_outpoint = OutPoint {
             txid: [7; 32],
@@ -984,6 +985,7 @@ mod tests {
                 claim_pubkey: b.pubkey(),
                 refund_pubkey: b.pubkey(),
                 locktime,
+                script_version: Default::default(),
             };
             let (pre_claim, hash_claim) = new_preimage();
             let (_, hash_refund) = new_preimage();

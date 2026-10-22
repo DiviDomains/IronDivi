@@ -133,6 +133,7 @@ async fn main() {
                 claim_pubkey: mypk,
                 refund_pubkey: mypk,
                 locktime: mtp().await + 86_400,
+                script_version: Default::default(),
             };
             let b = HtlcParams {
                 hash: hash_b,
@@ -143,6 +144,7 @@ async fn main() {
                     .unwrap()
                     .as_secs() as u32)
                     + REFUND_DELAY_SECS,
+                script_version: Default::default(),
             };
             let (ra, rb) = (a.redeem_script(), b.redeem_script());
             for (n, r) in [("A", &ra), ("B", &rb)] {

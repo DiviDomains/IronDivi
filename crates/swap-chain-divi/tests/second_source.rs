@@ -139,6 +139,7 @@ fn htlc(b: &DiviBackend) -> HtlcParams {
         claim_pubkey: b.pubkey(),
         refund_pubkey: b.pubkey(),
         locktime: 1_900_000_000,
+        script_version: Default::default(),
     }
 }
 

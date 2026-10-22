@@ -1600,6 +1600,7 @@ mod tests {
             claim_pubkey: pubkey_of(&TAKER_KEY),
             refund_pubkey: pubkey_of(&MAKER_KEY),
             locktime: LOCKTIME,
+            script_version: Default::default(),
         }
     }
 
@@ -1976,6 +1977,33 @@ mod tests {
             DUST_ZATOSHI >= ZIP317_MARGINAL_FEE,
             "DUST_ZATOSHI must be at least one ZIP 317 marginal fee, or a dust-sized \
              output can cost more to spend than it is worth"
+        );
+    }
+}
+
+#[cfg(test)]
+mod script_version_tests {
+    use super::*;
+    use divi_swap::htlc::ScriptVersion;
+
+    #[test]
+    fn v1_params_give_the_size_checked_p2sh_script() {
+        let v0 = HtlcParams {
+            hash: [9; 32],
+            claim_pubkey: [2; 33],
+            refund_pubkey: [3; 33],
+            locktime: 1_900_000_000,
+            script_version: ScriptVersion::V0,
+        };
+        let v1 = HtlcParams {
+            script_version: ScriptVersion::V1,
+            ..v0
+        };
+        assert_eq!(v0.redeem_script().len(), 114);
+        assert_eq!(v1.redeem_script().len(), 118);
+        assert_ne!(
+            htlc_script_pubkey(&v0.redeem_script()),
+            htlc_script_pubkey(&v1.redeem_script())
         );
     }
 }

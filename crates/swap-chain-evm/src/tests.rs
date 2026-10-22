@@ -281,6 +281,7 @@ async fn locked_and_refundable(
         claim_pubkey: pk,
         refund_pubkey: pk,
         locktime,
+        script_version: Default::default(),
     };
     let amount = Amount::from_sat(100); // 1 USDC base unit (100 engine sats / 100 per unit)
 

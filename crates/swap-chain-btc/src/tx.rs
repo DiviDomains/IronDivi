@@ -43,7 +43,7 @@ pub struct Coin {
 
 /// The P2WSH script pubkey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> ScriptBuf {
-    htlc_script_pubkey_v(htlc, ScriptVersion::V0)
+    htlc_script_pubkey_v(htlc, htlc.script_version)
 }
 
 /// The P2WSH script pubkey of an HTLC redeem script of the given version.

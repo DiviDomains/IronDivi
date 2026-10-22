@@ -36,6 +36,7 @@ fn params(preimage: &[u8]) -> HtlcParams {
         claim_pubkey: [2; 33],
         refund_pubkey: [3; 33],
         locktime: 1_900_000_000,
+        script_version: Default::default(),
     }
 }
 
@@ -93,4 +94,30 @@ fn v1_refund_branch_still_works() {
         &AcceptAll,
     )
     .expect("refund");
+}
+
+/// The params exactly as the maker now builds them (`script_version: V1`), through the
+/// version-free entry points the backend calls: 31/32/33 bytes.
+#[test]
+fn maker_built_v1_params_claim_only_32_bytes() {
+    for (n, ok) in [(31usize, false), (32, true), (33, false)] {
+        let pre = vec![7u8; n];
+        let h = HtlcParams {
+            script_version: ScriptVersion::V1,
+            ..params(&pre)
+        };
+        assert_eq!(h.redeem_script().len(), 118);
+        let mut sig = Vec::new();
+        push_data(&mut sig, &[0x30; 9]);
+        push_data(&mut sig, &pre);
+        sig.push(OP_1);
+        push_data(&mut sig, &h.redeem_script());
+        let r = verify_script(
+            &Script::from_bytes(sig),
+            &swap_chain_divi::htlc_script_pubkey(&h),
+            ScriptFlags::standard(),
+            &AcceptAll,
+        );
+        assert_eq!(r.is_ok(), ok, "{n} bytes");
+    }
 }

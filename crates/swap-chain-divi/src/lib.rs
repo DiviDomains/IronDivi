@@ -120,7 +120,7 @@ fn script_err(what: &str, e: impl std::fmt::Debug) -> SwapError {
 
 /// P2SH scriptPubKey of an HTLC.
 pub fn htlc_script_pubkey(htlc: &HtlcParams) -> Script {
-    htlc_script_pubkey_v(htlc, divi_swap::htlc::ScriptVersion::V0)
+    htlc_script_pubkey_v(htlc, htlc.script_version)
 }
 
 /// P2SH scriptPubKey of an HTLC redeem script of the given version.

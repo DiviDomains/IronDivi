@@ -141,6 +141,7 @@ async fn a_maker_that_quotes_strong_but_locks_short_is_declined_and_refunded() {
         claim_pubkey: w.tdivi.pubkey(),
         refund_pubkey: w.mdivi.pubkey(),
         locktime: w.divi.mtp() + 3600,
+        script_version: Default::default(),
     };
     assert!(short.locktime - w.divi.mtp() < quote_maker_timeout);
     let funding = w
@@ -217,6 +218,7 @@ async fn without_a_profile_floor_a_short_maker_lock_is_unchanged() {
         claim_pubkey: w.tdivi.pubkey(),
         refund_pubkey: w.mdivi.pubkey(),
         locktime: w.divi.mtp() + 3600,
+        script_version: Default::default(),
     };
     let funding = w
         .mdivi
