@@ -171,7 +171,8 @@ jobs:
   release:
     name: Create Release
     needs: build
-    if: always()
+    # Never publish a release with no binaries (e.g. when the audit gate skips every build).
+    if: always() && needs.build.result != 'skipped' && needs.build.result != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
