@@ -471,8 +471,12 @@ impl NetworkRpc {
         Ok(serde_json::json!(result))
     }
 
-    /// ping - Send ping to all peers
+    /// ping - Queue a ping to every peer; the results show in getpeerinfo
+    /// pingtime/pingwait (C++ `ping`)
     pub fn ping(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+        if let Some(pm) = &self.peer_manager {
+            pm.ping_all();
+        }
         Ok(serde_json::Value::Null)
     }
 
@@ -596,6 +600,82 @@ mod tests {
         let inbound = &server_rpc.get_peer_info(&Params::None).unwrap()[0];
         assert_eq!(inbound["inbound"], true);
         assert!(inbound["bytesrecv"].as_u64().unwrap() > 0);
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
+    /// The `ping` RPC returned null without sending anything. It must queue a timed ping
+    /// to every peer: the peer answers, and both sides count the traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ping_rpc_pings_every_peer() {
+        use std::time::Duration;
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let server = PeerManager::new(divi_network::PeerManagerConfig {
+            listen_addr: Some(listen),
+            ..quiet_config()
+        });
+        tokio::spawn(Arc::clone(&server).start());
+        let client = PeerManager::new(quiet_config());
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected);
+        let client_rpc = NetworkRpc::with_peer_manager(Arc::clone(&client));
+        let server_rpc = NetworkRpc::with_peer_manager(Arc::clone(&server));
+        let peer = |rpc: &NetworkRpc| rpc.get_peer_info(&Params::None).unwrap()[0].clone();
+        let n = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap_or(0);
+
+        // Let the handshake pings finish in both directions, then the link is quiet
+        // (next keep-alive is 30 s away)
+        let mut settled = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (c, s) = (peer(&client_rpc), peer(&server_rpc));
+            if c["pingtime"].as_f64().unwrap_or(0.0) > 0.0
+                && s["pingtime"].as_f64().unwrap_or(0.0) > 0.0
+                && c.get("pingwait").is_none()
+                && s.get("pingwait").is_none()
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "handshake pings did not complete");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (c0, s0) = (peer(&client_rpc), peer(&server_rpc));
+
+        assert_eq!(
+            client_rpc.ping(&Params::None).unwrap(),
+            serde_json::Value::Null
+        );
+        // ping and pong are 32 bytes each on the wire (24-byte header + 8-byte nonce)
+        let mut c1 = c0.clone();
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c1 = peer(&client_rpc);
+            if n(&c1, "bytesrecv") >= n(&c0, "bytesrecv") + 32 {
+                break;
+            }
+        }
+        assert_eq!(
+            n(&c1, "bytessent"),
+            n(&c0, "bytessent") + 32,
+            "ping not sent: {c1}"
+        );
+        assert_eq!(
+            n(&c1, "bytesrecv"),
+            n(&c0, "bytesrecv") + 32,
+            "no pong: {c1}"
+        );
+        let s1 = peer(&server_rpc);
+        assert_eq!(n(&s1, "bytesrecv"), n(&s0, "bytesrecv") + 32);
+        assert!(c1["pingtime"].as_f64().unwrap() > 0.0);
+        assert!(c1.get("pingwait").is_none(), "pong was matched: {c1}");
         client.disconnect_all();
         server.disconnect_all();
     }

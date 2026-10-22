@@ -412,6 +412,17 @@ impl Connection {
 
                 // Handle outgoing messages
                 Some(msg) = outbound_rx.recv() => {
+                    // A queued ping (the `ping` RPC) gets a fresh nonce and is timed like the
+                    // keep-alive, so its pong updates pingtime (C++ fPingQueued)
+                    let msg = match msg {
+                        NetworkMessage::Ping(_) => {
+                            let nonce = rand::random();
+                            info.ping_nonce = Some(nonce);
+                            info.ping_time = Some(std::time::Instant::now());
+                            NetworkMessage::Ping(nonce)
+                        }
+                        other => other,
+                    };
                     if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await {
                         error!("Failed to send message to {}: {}", info.addr, e);
                         break;
