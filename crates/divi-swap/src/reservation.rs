@@ -43,6 +43,17 @@ fn storage<E: std::fmt::Display>(e: E) -> SwapError {
     SwapError::Storage(e.to_string())
 }
 
+/// One reserved input, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationRow {
+    /// Chain the input belongs to.
+    pub chain: Chain,
+    /// The reserved wallet input.
+    pub input: Outpoint,
+    /// The transaction that spends it (the one that was, or is to be, broadcast).
+    pub reserved_by: Txid,
+}
+
 /// Persisted set of reserved inputs, keyed by the transaction that spends them. Cheap to clone.
 #[derive(Clone)]
 pub struct InputReservations {
@@ -78,6 +89,29 @@ impl InputReservations {
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(storage)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Open an existing database for an operator write, refusing while any other connection
+    /// (the daemon) has it open. The connection takes SQLite's EXCLUSIVE locking mode before
+    /// its first access, and in WAL mode that needs the shared-memory lock no other open
+    /// connection leaves free; the lock is then held until this handle is dropped, so the
+    /// daemon cannot start writing mid-release either. Never creates the file or the table.
+    pub fn open_exclusive(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(storage)?;
+        let busy = |e: rusqlite::Error| {
+            SwapError::Storage(format!(
+                "swap database is in use (is divi-swapd running? stop it first): {e}"
+            ))
+        };
+        conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .map_err(storage)?;
+        // The first read/write is what actually takes the lock.
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .map_err(busy)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -144,6 +178,52 @@ impl InputReservations {
                 params![chain.to_string(), txid.to_rpc_hex()],
             )
             .map_err(storage)
+    }
+
+    /// Every reservation on every chain, ordered by chain, reserving txid, then input. A
+    /// database that predates the table lists as empty.
+    pub fn list_all(&self) -> Result<Vec<ReservationRow>> {
+        let conn = self.conn.lock();
+        let have: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'input_reservation'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage)?
+            > 0;
+        if !have {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT chain, in_txid, in_vout, reserved_by FROM input_reservation \
+                 ORDER BY chain, reserved_by, in_txid, in_vout",
+            )
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u32>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (chain, txid, vout, by) = row.map_err(storage)?;
+            out.push(ReservationRow {
+                chain: chain.parse()?,
+                input: Outpoint {
+                    txid: Txid::from_rpc_hex(&txid)?,
+                    vout,
+                },
+                reserved_by: Txid::from_rpc_hex(&by)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Every input currently reserved on `chain`.

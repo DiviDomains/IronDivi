@@ -65,6 +65,39 @@ struct Args {
     /// `refunded` included). Without this flag the output is byte-identical to before.
     #[arg(long, requires = "xmr_inflight", conflicts_with = "xmr_lock_txids")]
     xmr_watch: bool,
+    /// Print every reserved wallet input (BTC, LTC, ZEC maker locks), read straight from the
+    /// swap database, and exit. Read-only: nothing is created or written, no node, key or
+    /// network is touched, and it is safe next to a running daemon. Output (stdout only):
+    /// `reservations N`, then one tab-separated
+    /// `<chain>\t<input txid>:<vout>\t<reserving txid>\t<swap id|unknown>\t<swap state|unknown>`
+    /// per input. Exit 0 iff the database was readable. Run it as the service user.
+    #[arg(long, conflicts_with_all = ["xmr_inflight", "release_reservation"])]
+    reservations: bool,
+    /// Release the reservations of ONE lock transaction (hex txid, as `--reservations` prints
+    /// it) on the chain given by `--chain`, so those coins are selectable again. WRITES the
+    /// swap database. BEFORE using it you MUST check, with a node of that chain, that the
+    /// txid is in no mempool and in no block: releasing the inputs of a lock that can still
+    /// confirm lets the next swap double-spend it. Refused unless the swap that broadcast the
+    /// txid is terminal (`done`, `aborted`) or no swap row names it, and refused while
+    /// `divi-swapd` (or anything else) has the database open: stop the daemon first. Without
+    /// `--yes` it only prints what it would release and exits 2.
+    #[arg(
+        long,
+        value_name = "TXID",
+        requires = "chain",
+        conflicts_with = "xmr_inflight"
+    )]
+    release_reservation: Option<String>,
+    /// With `--release-reservation`: the chain the reservation is on (btc, ltc, zec).
+    #[arg(long, requires = "release_reservation", value_parser = parse_chain)]
+    chain: Option<Chain>,
+    /// With `--release-reservation`: actually release.
+    #[arg(long, requires = "release_reservation")]
+    yes: bool,
+}
+
+fn parse_chain(s: &str) -> Result<Chain, String> {
+    s.parse::<Chain>().map_err(|e| e.to_string())
 }
 
 fn parse_backend(s: &str) -> Result<BackendKind, String> {
@@ -514,6 +547,130 @@ fn xmr_inflight_report(cfg: &DaemonConfig, lock_txids: bool) -> Result<String> {
     Ok(out)
 }
 
+/// The swap in `store` that broadcast `txid` on `chain`: `(id, state, terminal)`. Maker swaps
+/// are matched on their maker-leg funding tx; a taker swap naming it counts as non-terminal
+/// (this tool does not know a taker swap to be finished).
+fn swap_for_txid(
+    store: &Store,
+    chain: Chain,
+    txid: &divi_swap::Txid,
+) -> Result<Option<(String, String, bool)>> {
+    for s in store.list_maker_swaps()? {
+        if s.quote.counter_chain == chain
+            && s.maker_leg_funding.as_ref().map(|f| f.tx.txid) == Some(*txid)
+        {
+            let state = serde_json::to_value(s.state)?;
+            return Ok(Some((
+                s.id,
+                state.as_str().unwrap_or("?").to_string(),
+                s.state.is_terminal(),
+            )));
+        }
+    }
+    for s in store.list_taker_swaps()? {
+        if s.quote.counter_chain == chain
+            && s.taker_leg_funding.as_ref().map(|f| f.tx.txid) == Some(*txid)
+        {
+            let state = serde_json::to_value(s.state)?;
+            return Ok(Some((
+                s.id,
+                state.as_str().unwrap_or("?").to_string(),
+                false,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// `--reservations`: every reserved input, as the lines documented on `Args`. Read-only.
+fn reservations_report(cfg: &DaemonConfig) -> Result<String> {
+    let store = Store::open_read_only(&cfg.db_path)
+        .with_context(|| format!("opening swap database {}", cfg.db_path.display()))?;
+    let rows = InputReservations::open_read_only(&cfg.db_path)
+        .context("opening input reservations")?
+        .list_all()?;
+    let mut out = format!("reservations {}\n", rows.len());
+    for r in rows {
+        let (id, state) = match swap_for_txid(&store, r.chain, &r.reserved_by)? {
+            Some((id, state, _)) => (id, state),
+            None => ("unknown".to_string(), "unknown".to_string()),
+        };
+        out.push_str(&format!(
+            "{}\t{}:{}\t{}\t{}\t{}\n",
+            r.chain,
+            r.input.txid.to_rpc_hex(),
+            r.input.vout,
+            r.reserved_by.to_rpc_hex(),
+            tsv_escape(&id),
+            state
+        ));
+    }
+    Ok(out)
+}
+
+/// Result of `--release-reservation`: what to print, and whether anything was released.
+struct ReleaseOutcome {
+    text: String,
+    released: bool,
+}
+
+/// `--release-reservation <txid> --chain <c> [--yes]`. Refuses (an error) when the swap that
+/// broadcast `txid` is not terminal, when nothing is reserved for it, or (with `yes`) when
+/// another connection has the database open. Without `yes` it writes nothing. The swap state
+/// is read before the exclusive lock is taken (the lock cannot coexist with a reader); with
+/// the lock held no daemon can run, and a terminal swap never leaves its state.
+fn release_reservation(
+    cfg: &DaemonConfig,
+    chain: Chain,
+    txid_hex: &str,
+    yes: bool,
+) -> Result<ReleaseOutcome> {
+    let txid = divi_swap::Txid::from_rpc_hex(txid_hex)
+        .map_err(|e| anyhow::anyhow!("not a txid ({txid_hex:?}): {e}"))?;
+    let (held, swap) = {
+        let store = Store::open_read_only(&cfg.db_path)
+            .with_context(|| format!("opening swap database {}", cfg.db_path.display()))?;
+        let rows = InputReservations::open_read_only(&cfg.db_path)
+            .context("opening input reservations")?
+            .list_all()?;
+        let held = rows
+            .iter()
+            .filter(|r| r.chain == chain && r.reserved_by == txid)
+            .count();
+        (held, swap_for_txid(&store, chain, &txid)?)
+    };
+    if held == 0 {
+        bail!("no {chain} input is reserved by {txid}: nothing to release");
+    }
+    let who = match &swap {
+        Some((id, state, terminal)) => {
+            if !*terminal {
+                bail!(
+                    "refusing: swap {id} that broadcast {txid} is {state}, not terminal; its lock \
+                     may still confirm or be rebroadcast"
+                );
+            }
+            format!("swap {id} ({state}, terminal)")
+        }
+        None => "no swap row names it (orphan)".to_string(),
+    };
+    if !yes {
+        return Ok(ReleaseOutcome {
+            text: format!(
+                "would release {held} {chain} input(s) reserved by {txid}: {who}\n\
+                 first check that {txid} is in no mempool and no block; re-run with --yes to release\n"
+            ),
+            released: false,
+        });
+    }
+    let res = InputReservations::open_exclusive(&cfg.db_path).context("taking the database")?;
+    let n = res.release_tx(chain, &txid)?;
+    Ok(ReleaseOutcome {
+        text: format!("released {n} {chain} input(s) reserved by {txid}: {who}\n"),
+        released: true,
+    })
+}
+
 /// Escape a field of an `--xmr-watch` line so it cannot add a column or a line.
 fn tsv_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -571,6 +728,20 @@ async fn main() -> Result<()> {
                 xmr_inflight_report(&cfg, args.xmr_lock_txids)?
             }
         );
+        return Ok(());
+    }
+    if args.reservations {
+        let cfg = DaemonConfig::load(&args.config)?;
+        print!("{}", reservations_report(&cfg)?);
+        return Ok(());
+    }
+    if let (Some(txid), Some(chain)) = (&args.release_reservation, args.chain) {
+        let cfg = DaemonConfig::load(&args.config)?;
+        let out = release_reservation(&cfg, chain, txid, args.yes)?;
+        print!("{}", out.text);
+        if !out.released {
+            std::process::exit(2);
+        }
         return Ok(());
     }
     tracing_subscriber::fmt()
@@ -997,5 +1168,274 @@ mod tests {
         let ro = Store::open_read_only(&db).unwrap();
         assert!(ro.put_doc("k", "i", &1u8).is_err(), "read-only handle");
         assert_eq!(divi_swap_xmr::XmrMaker::in_flight(&ro).unwrap().len(), 1);
+    }
+
+    // ---- --reservations / --release-reservation ----
+
+    fn op(n: u8, vout: u32) -> divi_swap::Outpoint {
+        divi_swap::Outpoint {
+            txid: divi_swap::Txid([n; 32]),
+            vout,
+        }
+    }
+
+    /// A maker swap in `state` whose maker-leg lock on BTC is the tx `lock`.
+    fn lock_swap(id: &str, state: divi_swap::SwapState, lock: u8) -> divi_swap::store::MakerRecord {
+        let htlc = divi_swap::HtlcParams {
+            hash: [1; 32],
+            claim_pubkey: [2; 33],
+            refund_pubkey: [3; 33],
+            locktime: 1_800_000_000,
+            script_version: Default::default(),
+        };
+        divi_swap::store::MakerRecord {
+            id: id.into(),
+            created_at: 10,
+            state,
+            quote: divi_swap::api::Quote {
+                id: format!("q-{id}"),
+                offer_id: "o".into(),
+                direction: Direction::TakerPaysDivi,
+                counter_chain: Chain::Btc,
+                btc_amount: Amount(1),
+                divi_amount: Amount(2),
+                expires_at: 3,
+                maker_btc_pubkey: [2; 33],
+                maker_divi_pubkey: [3; 33],
+                taker_timeout_secs: 4,
+                maker_timeout_secs: 5,
+                btc_confirmations: 1,
+                divi_confirmations: 1,
+            },
+            hash: [lock; 32],
+            taker_maker_leg_pubkey: [2; 33],
+            taker_leg_htlc: htlc,
+            taker_leg_outpoint: None,
+            taker_leg_locked: None,
+            maker_leg_htlc: Some(htlc),
+            maker_leg_funding: Some(divi_swap::Funding {
+                tx: divi_swap::SignedTx {
+                    txid: divi_swap::Txid([lock; 32]),
+                    raw: vec![],
+                },
+                outpoint: op(lock, 0),
+                amount: Amount(1),
+            }),
+            maker_leg_scan_from: 0,
+            maker_mtp_at_lock: None,
+            maker_leg_refund: None,
+            preimage: None,
+            taker_leg_claim: None,
+            last_error: None,
+            maker_lock_dropped: false,
+        }
+    }
+
+    /// A database with: swap `done` (lock 0x11, input 1:0 and 2:1), swap `live` (lock 0x22,
+    /// input 3:0), and an orphan lock 0x33 (input 4:0) that no swap row names. All BTC.
+    fn reserved_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = dir.join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .put_maker_swap(&lock_swap("done", divi_swap::SwapState::Done, 0x11))
+            .unwrap();
+        store
+            .put_maker_swap(&lock_swap("live", divi_swap::SwapState::MakerLocked, 0x22))
+            .unwrap();
+        let res = InputReservations::open(&db).unwrap();
+        let t = |n: u8| divi_swap::Txid([n; 32]);
+        res.reserve(Chain::Btc, &t(0x11), &[op(1, 0), op(2, 1)])
+            .unwrap();
+        res.reserve(Chain::Btc, &t(0x22), &[op(3, 0)]).unwrap();
+        res.reserve(Chain::Btc, &t(0x33), &[op(4, 0)]).unwrap();
+        db
+    }
+
+    fn hex_of(n: u8) -> String {
+        divi_swap::Txid([n; 32]).to_rpc_hex()
+    }
+
+    #[test]
+    fn reservations_list_is_empty_on_a_store_with_and_without_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        Store::open(&db).unwrap();
+        let cfg = inflight_cfg(&db, false);
+        assert_eq!(reservations_report(&cfg).unwrap(), "reservations 0\n");
+        InputReservations::open(&db).unwrap();
+        assert_eq!(reservations_report(&cfg).unwrap(), "reservations 0\n");
+        assert!(reservations_report(&inflight_cfg(&dir.path().join("nope.db"), false)).is_err());
+    }
+
+    #[test]
+    fn reservations_list_names_the_swap_and_state_or_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        let out = reservations_report(&inflight_cfg(&db, false)).unwrap();
+        let line = |input: u8, vout: u32, by: u8, id: &str, state: &str| {
+            format!(
+                "btc\t{}:{vout}\t{}\t{id}\t{state}\n",
+                hex_of(input),
+                hex_of(by)
+            )
+        };
+        let mut want = String::from("reservations 4\n");
+        for l in [
+            line(1, 0, 0x11, "done", "Done"),
+            line(2, 1, 0x11, "done", "Done"),
+            line(3, 0, 0x22, "live", "MakerLocked"),
+            line(4, 0, 0x33, "unknown", "unknown"),
+        ] {
+            want.push_str(&l);
+        }
+        // Rows come back ordered by reserving txid (internal-byte hex), then input.
+        let mut got: Vec<&str> = out.lines().collect();
+        let mut exp: Vec<&str> = want.lines().collect();
+        got[1..].sort_unstable();
+        exp[1..].sort_unstable();
+        assert_eq!(got, exp, "{out}");
+    }
+
+    #[test]
+    fn reservations_list_leaves_the_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        // Close the writers so the WAL is checkpointed into the main file first.
+        let before = std::fs::read(&db).unwrap();
+        let cfg = inflight_cfg(&db, false);
+        reservations_report(&cfg).unwrap();
+        reservations_report(&cfg).unwrap();
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn release_is_refused_for_a_non_terminal_swap_even_with_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        for yes in [false, true] {
+            let err =
+                release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x22), yes)
+                    .err()
+                    .expect("must refuse");
+            assert!(err.to_string().contains("not terminal"), "{err}");
+        }
+        assert_eq!(
+            InputReservations::open(&db)
+                .unwrap()
+                .reserved(Chain::Btc)
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn release_without_yes_prints_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        let out = release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x11), false)
+            .unwrap();
+        assert!(!out.released);
+        assert!(
+            out.text.starts_with("would release 2 btc input(s)"),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            InputReservations::open(&db)
+                .unwrap()
+                .reserved(Chain::Btc)
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn release_is_accepted_for_a_terminal_swap_and_the_inputs_are_selectable_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        let out = release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x11), true)
+            .unwrap();
+        assert!(out.released);
+        assert!(
+            out.text.starts_with("released 2 btc input(s)"),
+            "{}",
+            out.text
+        );
+        let res = InputReservations::open(&db).unwrap();
+        let held = res.reserved(Chain::Btc).unwrap();
+        assert!(!held.contains(&op(1, 0)) && !held.contains(&op(2, 1)));
+        assert_eq!(held.len(), 2, "the other locks keep theirs");
+        // Another transaction can now take the released input.
+        res.reserve(Chain::Btc, &divi_swap::Txid([0x44; 32]), &[op(1, 0)])
+            .unwrap();
+    }
+
+    #[test]
+    fn release_is_accepted_for_an_orphan_txid_and_scoped_to_one_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        // Same txid reserved on LTC too: a BTC release must leave it.
+        InputReservations::open(&db)
+            .unwrap()
+            .reserve(Chain::Ltc, &divi_swap::Txid([0x33; 32]), &[op(9, 0)])
+            .unwrap();
+        let out = release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x33), true)
+            .unwrap();
+        assert!(out.text.contains("no swap row names it"), "{}", out.text);
+        let res = InputReservations::open(&db).unwrap();
+        assert_eq!(res.reserved(Chain::Ltc).unwrap().len(), 1);
+        assert_eq!(res.reserved(Chain::Btc).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn release_refuses_an_unreserved_or_malformed_txid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        let cfg = inflight_cfg(&db, false);
+        assert!(release_reservation(&cfg, Chain::Btc, &hex_of(0x99), true).is_err());
+        assert!(release_reservation(&cfg, Chain::Ltc, &hex_of(0x11), true).is_err());
+        assert!(release_reservation(&cfg, Chain::Btc, "zz", true).is_err());
+    }
+
+    #[test]
+    fn release_refuses_while_another_connection_holds_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = reserved_db(dir.path());
+        // What the daemon holds for its lifetime.
+        let _daemon = (
+            Store::open(&db).unwrap(),
+            InputReservations::open(&db).unwrap(),
+        );
+        let err = release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x11), true)
+            .err()
+            .expect("must refuse");
+        assert!(format!("{err:#}").contains("in use"), "{err:#}");
+        assert_eq!(_daemon.1.reserved(Chain::Btc).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn release_flags_need_each_other() {
+        assert!(Args::try_parse_from(["divi-swapd", "--config", "c", "--yes"]).is_err());
+        assert!(Args::try_parse_from([
+            "divi-swapd",
+            "--config",
+            "c",
+            "--release-reservation",
+            "ab"
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "divi-swapd",
+            "--config",
+            "c",
+            "--release-reservation",
+            "ab",
+            "--chain",
+            "btc"
+        ])
+        .is_ok());
+        assert!(Args::try_parse_from(["divi-swapd", "--config", "c", "--reservations"]).is_ok());
     }
 }

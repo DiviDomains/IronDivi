@@ -77,6 +77,28 @@ bucket either way. Turn it on only behind a proxy you control and with the daemo
 only through it: if clients can reach the daemon directly, each can choose its own bucket and
 the limit is void. It is off by default and the example config ships it commented out.
 
+## Lock-input reservations (BTC, LTC, ZEC)
+
+A BTC, LTC or ZEC maker lock reserves its wallet inputs in the swap database (table `input_reservation`)
+from broadcast until the lock confirms; a lock that never confirms keeps them reserved, so those coins
+stay out of coin selection. Two operator commands, same style as `--xmr-inflight` (documented under
+swap-watch below and in `docs/plans/swap-poc/xmr-runbook.md`), run as the service user (the database is 0600):
+
+```
+divi-swapd --config /etc/divi-swapd/divi-swapd.toml --reservations
+divi-swapd --config /etc/divi-swapd/divi-swapd.toml --release-reservation <txid> --chain btc [--yes]
+```
+
+- `--reservations` is read-only (same open as `--xmr-inflight`: no write, no migration, safe next to the
+  running daemon; no node, key or network). It prints `reservations N`, then per input a tab-separated
+  `<chain> <input txid>:<vout> <reserving txid> <swap id|unknown> <swap state|unknown>`.
+- `--release-reservation` writes. First check, with a node of that chain, that `<txid>` is in no mempool and
+  no block: releasing the inputs of a lock that can still confirm lets the next swap double-spend them.
+  It refuses unless the swap that broadcast the txid is terminal (`Done`, `Aborted`) or no swap row names
+  it, refuses while any other process has the database open (stop `divi-swapd` first; it takes SQLite's
+  exclusive lock and waits about 5 seconds), and without `--yes` only prints what it would release and
+  exits 2. It never calls a node.
+
 ## Hashlock route credentials
 
 * `POST /swaps` (accept) answers a taker that sent `X-Swap-Token-Support: 1` with the usual swap view plus

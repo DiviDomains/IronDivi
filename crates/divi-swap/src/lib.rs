@@ -34,7 +34,7 @@ pub use config::{ChainParams, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
 pub use maker::{Maker, OfferEngine};
-pub use reservation::InputReservations;
+pub use reservation::{InputReservations, ReservationRow};
 pub use state::SwapState;
 pub use store::Store;
 pub use taker::{Taker, TakerState};
