@@ -264,6 +264,7 @@ For each adversary: what they can do, what stops them, what the reviewer should 
   taker side re-broadcasts in `on_locked` (`taker.rs:366-459`). No test covers a reorg of the maker
   lock after confirmation: `could not verify` the scheduler does not recover this elsewhere.
 - Locktimes use MTP, which can lag the tip; the required gap includes `2 × max MTP lag`.
+- The proposed maker re-broadcast after a reorg is written up in `maker-rebroadcast-design.md` (design only, no code).
 
 **Hung endpoint / outage.**
 - Errors are `SwapError::Transient` and the step is retried; no state is advanced on an error. A long
@@ -299,7 +300,7 @@ New observations from this review (each also a `left:` line in `status/engine.md
   `GET /swaps` and `GET /swaps/:id` are not.
 - **F5 — hashlock engine routes are unauthenticated**, including a full swap listing (§3.9).
 - **F6 — confirmation fallback.** A chain absent from `cfg.chains` takes the *mainnet* built-in count
-  (more conservative than testnet; confirm it can never be less conservative).
+  (more conservative than testnet; confirm it can never be less conservative). Result: pinned on lane/conf-fallback-reorg-design, see status/engine.md 2026-10-22.
 - **F7 — plaintext preimage and keys-adjacent data in SQLite**, protected by file mode only.
 
 ## 6. Build and test

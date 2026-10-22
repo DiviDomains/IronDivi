@@ -1,0 +1,82 @@
+# Maker lock re-broadcast after a reorg (F2) — design
+
+Status: design only, no code. Base `ff4401a` (`private/signed/main`). Review brief: `engine-review-brief.md` §4 Reorg, question 7.
+Paths are relative to the repo root; line numbers are on the base.
+
+## 1. The gap
+
+The maker builds its lock (the "maker leg": the HTLC that pays the taker if the preimage is shown, and refunds the maker after `maker_locktime`) in `on_taker_lock_confirmed` (`crates/divi-swap/src/maker.rs:553-584`), persists the signed funding tx in `maker_leg_funding`, and enters `MakerLocked`.
+
+| State | Code | What it does with the maker lock tx |
+|---|---|---|
+| `MakerLocked` | `maker.rs:586-606` | Broadcasts `maker_leg_funding.tx` **on every step** (idempotent, `backend.rs:86-88`), reads `confirmations`. At `>= maker_leg_confs` (or already spent) goes to `MakerLockConfirmed`; at locktime goes to `MakerRefundable`. |
+| `MakerLockConfirmed` | `maker.rs:608-617` | **Never broadcasts again and never reads `confirmations` of the lock.** Looks only for a revealed preimage (`find_spend`) and for `maker_leg_timed_out` (MTP >= locktime). |
+| `MakerRefundable` | `maker.rs:619-658` | Builds, persists and broadcasts the refund tx spending the lock output. A revealed preimage still wins until the refund is on chain. |
+| `TakerClaimed` / `MakerClaimed` | `maker.rs:660-707` | Claims the **taker** leg with the preimage; the maker lock is no longer touched. |
+
+So after `MakerLockConfirmed` a reorg that drops the maker lock tx leaves the maker with a persisted signed tx it will not send again.
+
+Consequences by who is hurt:
+
+* **Taker.** Before it claims, the taker re-reads the maker lock from the chain every step (`taker.rs:366-404`): an absent output (`htlc_output` → `None`) or too few confirmations is `Flow::Idle`, i.e. it waits and retries (`:396-398,:402-404`). So a reorg *before* the taker claims only delays it, and a re-broadcast brings it back. Two limits: (a) the taker declines the claim **for good** (`claim_declined`, `:406-419`) if, when the lock reappears, the maker locktime is within `TAKER_SAFETY_MARGIN_SECS` of the maker chain's MTP; a late re-broadcast can therefore be useless; (b) once the taker has entered its own `MakerLockConfirmed` it builds and broadcasts the claim; a claim against a lock that was just orphaned is not valid until the lock returns (claim handling `taker.rs:460-520`, not re-read for this note).
+* **Maker.** Its funds are not locked while the tx is out of the chain (the inputs are spendable again), so nothing is lost by the maker either, **unless** the maker's wallet spends the same inputs in the meantime (see §5 q3). The swap then fails at `maker_leg_timed_out`: `on_maker_lock_confirmed` moves to `MakerRefundable` (`:611-613`), `build_refund` spends an output that never reappears, and `broadcast` returns `Rejected`/inputs-missing, which `on_maker_refundable` turns into an `Err` with the refund bytes cleared (`:636-645`) on every step until an operator looks. The terminal state is never reached; this is the second half of F2 and the design must cover it.
+* **Taker claim race.** If the lock is dropped and later re-mined (by anyone), a taker claim built before the reorg is still valid (same outpoint, same txid, because re-broadcast is of the **same** signed tx).
+
+## 2. What each backend can observe
+
+`ChainBackend::confirmations` is documented as `Some(0)` in mempool, `None` unknown (`backend.rs:90-91`).
+
+| Chain | `confirmations` after the lock block is orphaned | Evidence | Mempool / re-add |
+|---|---|---|---|
+| BTC (Esplora) | `Some(0)` if the node put the tx back in its mempool; `None` if Esplora no longer knows it | `swap-chain-btc/src/lib.rs:473-485`: `/tx/{id}/status` 404 → `None`, `confirmed != true` → `Some(0)` | Node normally re-adds disconnected-block txs to its mempool. Esplora behind a load balancer can briefly disagree (`maker.rs:509-511` comment). |
+| LTC (Esplora) | same as BTC | `swap-chain-ltc/src/lib.rs:527-539` | same |
+| ZEC (lightwalletd) | `Some(0)` for height 0 **or** `u64::MAX` (mined on a fork, `swap-chain-zec/src/lib.rs:489-505`); `None` if unknown. The fork case is a positive signal that the tx was orphaned. | same lines | zcashd re-adds to mempool; lightwalletd may lag. |
+| DIVI (RPC) | `getrawtransaction <id> 1` → `confirmations` field, `unwrap_or(0)`; a code -5 is `None` (`swap-chain-divi/src/lib.rs:234-244,543-548`). For a tx back in the mempool the field is absent, so `Some(0)`. | same | Needs `txindex` or mempool membership for the tx to be found at all: after a reorg a tx that is neither in the mempool nor indexed is `None` (`could not verify` on the public proxy; no `getchaintips`, brief §4). |
+| USDC (EVM) | Receipt present → `tip - block + 1`; **no receipt but tx known** → `Some(0)`; neither → `None` (`swap-chain-evm/src/backend.rs:472-494`). After a reorg the receipt of the orphaned block disappears and the tx returns to the txpool (`Some(0)`) or is dropped (`None`). | same | `broadcast` of the same raw tx is idempotent: "already known" → Ok; a nonce conflict is Ok only if the receipt exists, else `Rejected` (`backend.rs:437-470`). |
+| XMR | Not a hashlock chain: the engine in `divi-swap-xmr` locks via adaptor signatures and never goes through `maker.rs` (`types.rs:33-35`). The maker-side lock there is the DIVI `Tx_lock`, with its own state machine (`crates/divi-swap-xmr/src/maker.rs`). **Out of scope here**; open question q6. | — | — |
+
+`confirmations` going back to 0 is therefore the normal reorg signal on every UTXO chain; `None` is the ambiguous one (reorged and not re-added, or the index lags).
+
+## 3. Proposed watcher
+
+**Where.** One new arm in `on_maker_lock_confirmed` (and the same check in `on_taker_claimed` is not needed: once the preimage is known the maker only needs the taker leg). No new state; no new table.
+
+**When.** Every `step`, i.e. each scheduler tick (`tick_secs`, `bin/divi-swapd/src/main.rs:557`, default every few seconds). One extra `confirmations` call per tick per `MakerLockConfirmed` swap. Same cost class as the existing `find_spend`.
+
+**Condition.** Let `c = mk.confirmations(lock_txid)`.
+
+1. If a preimage is revealed (`revealed_preimage`) → unchanged, go to `TakerClaimed`. Check this **first**: a lock with `c = None` because it was spent by the taker's claim must not trigger a re-broadcast.
+2. `c >= maker_leg_confs` → nothing.
+3. `c = Some(n)` with `n < maker_leg_confs` (including `Some(0)`) → **re-broadcast** `maker_leg_funding.tx` (idempotent). Do not change state: the lock is still "ours", we simply keep pushing it until it is deep again. The state stays `MakerLockConfirmed` so the taker's own check (confirmation depth on its side) decides when it claims.
+4. `c = None` → re-broadcast too, but only after the spend check in (1) returned nothing. A broadcast that returns `Rejected` (inputs spent) is an **operator alert**, not a silent loop: record `last_error` once ("maker lock dropped by a reorg and its inputs were spent") and stop retrying that tx (see §5 q3).
+
+**Same signed tx, not re-signed.** The maker re-broadcasts the persisted bytes (`maker_leg_funding`). Re-signing would produce a different txid (ECDSA nonce) and orphan the outpoint the taker is already watching (`LegView.outpoint`, `maker.rs:view_of`); the taker's claim and `htlc_output` are keyed by that outpoint. The EVM tx is likewise re-sent as the same raw tx (same nonce, same hash). A re-sign is only an option after a `Rejected`, and then the taker's view would have to be updated: not proposed.
+
+**Interaction with the taker's claim.** The re-broadcast does not change the HTLC (hash, pubkeys, locktime fixed at `:567-574`). A taker claim already in the mempool spends the same outpoint and remains valid when the lock returns. The watcher never rebroadcasts after a preimage is seen, so it cannot interfere with the claim.
+
+**Interaction with the refund deadline.** The re-broadcast is bounded by the same condition as today: `maker_leg_timed_out` (MTP >= locktime) wins and moves to `MakerRefundable`. In `MakerRefundable` the maker must not re-broadcast the lock (a late lock after the refund is built would race the refund for the same inputs). Open point for q2: near the locktime, a lock that re-confirms after `locktime - maker_margin` is useless to the taker (the taker declines the claim for good, `taker.rs:406-419`); the watcher should stop re-broadcasting when `locktime - mtp < claim_margin_secs` and go to `MakerRefundable` early instead. This uses only config the maker already has (`SwapConfig::claim_margin_secs`).
+
+**Persistence.** None needed for correctness: the signed tx and the lock outpoint are already persisted write-ahead (`enter` persists on every transition, `maker.rs:408-417`). Optionally record `last_error = "maker lock dropped by a reorg, re-broadcasting"` (and clear it when `c >= maker_leg_confs`) so the operator sees the event; `last_error` is already on `MakerRecord`/`SwapView`.
+
+## 4. Test plan (mock backends only)
+
+The mock has no reorg primitive today (`crates/divi-swap/src/mock.rs:80-143`: `mine`, `advance_time`, `set_offline`, `reject_next_broadcast`). Add test-only `MockChain::unconfirm(txid)` (puts a mined tx back to the mempool) and `MockChain::forget(txid)` (drops it). Tests in `crates/divi-swap/tests/engine.rs`, per counter chain as the existing `on_counter!` macro does (`engine.rs:1307-1312`):
+
+1. Lock confirmed → `unconfirm` → one tick re-broadcasts, `funding_calls` increases by one, state stays `MakerLockConfirmed`; `mine` → depth restored → no further broadcast.
+2. Lock confirmed → `forget` (`None`) → re-broadcast; `mine` → confirmed.
+3. Lock confirmed → `forget` → `reject_next_broadcast` (inputs spent) → `last_error` set, state unchanged, no infinite error (one record, not one per tick).
+4. Taker claim already in mempool when the lock is orphaned and re-mined: preimage discovered, state `TakerClaimed`, no re-broadcast after.
+5. Reorg near the locktime (`advance_time` past `locktime - claim_margin`) → watcher stops, `MakerRefundable`, refund confirms.
+6. Locktime passes with the lock orphaned and never returning (`forget`, rejected) → `MakerRefundable` and an error that does not loop (the second half of §1).
+7. Idempotence on every backend: `broadcast` of the same tx twice (already covered per backend: `swap-chain-btc/src/tests.rs:148`, `swap-chain-ltc/src/tests.rs:161,186`, `swap-chain-evm/src/tests.rs:327,371`; ZEC and DIVI: `could not verify` a test exists, DIVI has `swap-chain-divi/src/tests.rs:552`).
+8. Crash after the re-broadcast and before the next tick: no state to lose; verify with `halt_after`.
+
+## 5. Open questions
+
+1. Should the watcher also run in `MakerLocked` past `maker_leg_confs`, i.e. is `MakerLockConfirmed` ever re-entered backwards? Proposed: no, keep the state forward-only (`can_transition_to`, `maker.rs:408-419`).
+2. Early-refund threshold near the locktime (§3): `claim_margin_secs` or a dedicated margin? No margin is changed by this design.
+3. What if the maker wallet spent the lock inputs after the reorg? The coin-selection reservation of the lock inputs is not visible from `maker.rs` (`could not verify`). If the wallet can reuse them, the re-broadcast returns `Rejected` and the lock is gone for good; the swap can only fail. Needs a wallet-side answer (DIVI wallet UTXO lock; BTC/LTC/ZEC wallets are the maker's own keys).
+4. `None` after a reorg on the DIVI public proxy without `txindex`: is re-broadcast the only way to find out? (brief §4: no `getchaintips`.)
+5. Depth to re-broadcast: any drop below `maker_leg_confs`, or only to `0`? Proposed: any drop (cheap, idempotent); the cost is one RPC per tick.
+6. XMR engine: the maker-side DIVI lock in `divi-swap-xmr` is a different state machine; does the same gap exist there? Not analysed here (`could not verify`).
+7. Does the taker need a signal when the maker re-broadcasts (to wait rather than `claim_declined` is permanent, `taker.rs:406-419`)? A `claim_declined` that is final while the lock may return is a second reorg-related gap on the taker side.
