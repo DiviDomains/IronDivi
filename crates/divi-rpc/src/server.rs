@@ -28,7 +28,7 @@ use divi_wallet::WalletDb;
 
 use axum::{
     extract::{Path, Request as HttpRequest, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::post,
@@ -37,7 +37,6 @@ use axum::{
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 
 /// RPC server configuration
@@ -1023,11 +1022,6 @@ pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Ro
 }
 
 fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::POST])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
-
     let router = Router::new()
         .route("/", post(handle_rpc))
         .route("/wallet/:wallet_name", post(handle_wallet_rpc))
@@ -1059,8 +1053,8 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
         }
     }));
 
-    // CORS stays outermost so preflight requests are answered without credentials.
-    router.layer(cors)
+    // No cross-origin headers on RPC replies, as Divi Core sends none
+    router
 }
 
 /// The credentials to enforce: both must be set. `None` means no request can
@@ -1682,6 +1676,59 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
+    }
+
+    /// Serve `router` on a loopback port, send `request` as is and return the
+    /// whole HTTP response.
+    async fn raw_response(router: Router, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(request.replace("{addr}", &addr.to_string()).as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn rpc_replies_carry_no_cross_origin_headers() {
+        let (server, _dir) = create_test_server();
+        let config = RpcConfig {
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..RpcConfig::default()
+        };
+        let router = create_router_with_auth(server, &config);
+        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+        let preflight = "OPTIONS / HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://example.com\r\n\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: authorization,content-type\r\n\
+             Connection: close\r\n\r\n"
+            .to_string();
+        let post = format!(
+            "POST / HTTP/1.1\r\nHost: {{addr}}\r\nOrigin: https://example.com\r\n\
+             Content-Type: application/json\r\nAuthorization: {}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            basic("alice", "s3cret"),
+            body.len()
+        );
+        for request in [preflight, post] {
+            let response = raw_response(router.clone(), request).await;
+            assert!(
+                !response.to_ascii_lowercase().contains("access-control-"),
+                "unexpected cross-origin header in {response:?}"
+            );
+        }
+        // The authorized POST itself still works
+        assert_eq!(
+            status_of(router, Some(basic("alice", "s3cret"))).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

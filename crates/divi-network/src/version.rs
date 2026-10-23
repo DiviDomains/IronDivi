@@ -210,7 +210,7 @@ mod tests {
             addr_recv: NetAddr::from_ipv4([127, 0, 0, 1], 52474, NODE_NETWORK),
             addr_from: NetAddr::from_ipv4([0, 0, 0, 0], 0, NODE_NETWORK),
             nonce: 0xdeadbeef_cafebabe,
-            user_agent: "/IronDivi:0.1.0/".to_string(),
+            user_agent: USER_AGENT.to_string(),
             start_height: 500_000,
             relay: true,
         };
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(deserialized.services, NODE_NETWORK);
         assert_eq!(deserialized.start_height, 500_000);
         assert!(deserialized.relay);
-        assert_eq!(deserialized.user_agent, "/IronDivi:0.1.0/");
+        assert_eq!(deserialized.user_agent, USER_AGENT);
 
         // The magic bytes for PrivateDivi testnet are 0x70 0xd1 0x76 0x12
         assert_eq!(PRIVATEDIVI_TESTNET_MAGIC, [0x70, 0xd1, 0x76, 0x12]);
