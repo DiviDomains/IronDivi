@@ -2445,7 +2445,7 @@ impl Chain {
         }
 
         // A transaction list repeated at the end of a level gives the same merkle
-        // root (CVE-2012-2459); Core refuses it as a duplicate (BlockCheckingHelpers.cpp:39-44)
+        // root; Core refuses it as a duplicate (BlockCheckingHelpers.cpp:39-44)
         let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
         if merkle_tree_mutated(&txids) {
             return Err(StorageError::InvalidBlock(
