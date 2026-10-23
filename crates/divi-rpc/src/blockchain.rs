@@ -983,14 +983,6 @@ impl BlockchainRpc {
         .into())
     }
 
-    pub fn set_generate(&self, _params: &Params) -> Result<Value, Error> {
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "setgenerate is not yet implemented - requires full mining subsystem",
-        )
-        .into())
-    }
-
     pub fn decode_script(&self, params: &Params) -> Result<Value, Error> {
         use divi_crypto::hash160;
         use divi_primitives::hash::Hash160;

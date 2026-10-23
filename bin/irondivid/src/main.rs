@@ -1662,6 +1662,16 @@ async fn run_daemon(
                                 staker_for_split.stake_split_threshold()
                             }));
 
+                        // setgenerate (regtest): mine blocks to the wallet now
+                        let staker_for_generate = Arc::clone(staker_arc);
+                        rpc_server
+                            .staking()
+                            .set_generate_control(Arc::new(move |n| {
+                                staker_for_generate
+                                    .generate_blocks(n)
+                                    .map(|hashes| hashes.iter().map(|h| h.to_string()).collect())
+                            }));
+
                         info!("Staking RPC callbacks registered");
                     }
                 }
