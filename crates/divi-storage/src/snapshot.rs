@@ -58,6 +58,16 @@ pub struct KnownState {
 
 /// Snapshot bases this release accepts.
 pub const KNOWN_STATES: &[KnownState] = &[
+    // Divi mainnet at 4,271,533, from a node synced from genesis on 2026-10-23; the block hash
+    // matches Divi Core 3.0.0's getblockhash 4271533, and Core's gettxoutsetinfo hash_serialized
+    // (bc93a4f9...f26b) recomputed from this node's UTXO set equals Core's at that height.
+    KnownState {
+        chain_mode: ChainMode::Divi,
+        network: NetworkType::Mainnet,
+        height: 4_271_533,
+        block_hash: "d96e72872e0517c38250f4fcf0a18124c591676f54ab608f6ce22ad3b7dfe860",
+        state_hash: "94530069ad50bd93db3e04bbdab5d3db937cf37b2dc3dc972408ec393731fcbf",
+    },
     // Divi testnet at 361,452, from a node synced from genesis on 2026-10-22; the block hash
     // matches Divi Core 3.0.0's getblockhash 361452.
     KnownState {
