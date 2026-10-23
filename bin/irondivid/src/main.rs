@@ -1620,24 +1620,12 @@ async fn run_daemon(
         let staker_chain = node.chain().clone();
         let staker_peer_manager = node.peer_manager().clone();
 
-        // Use regtest-friendly staking config
-        let mut staking_config = StakingConfig {
-            allow_stale_tip: config.staking.stake_on_stale_tip,
-            stake_split_threshold: config.staking.split_threshold,
-            ..StakingConfig::default()
-        };
-        if staking_config.allow_stale_tip {
+        let staking_config = staking_config(&config, node.chain().params());
+        if staking_config.allow_stale_tip && config.network.network_type != NetworkType::Regtest {
             warn!(
                 "-stakeonstaletip set: staking is allowed on a tip older than {}s",
                 staking_config.max_tip_age_secs
             );
-        }
-        if config.network.network_type == NetworkType::Regtest {
-            // Reduce minimum requirements for regtest
-            staking_config.min_stake_amount = 1_000_000_000; // 10 DIVI (instead of 10,000)
-            staking_config.min_coin_age = 60; // 1 minute (instead of 1 hour)
-                                              // Regtest chains start from an old genesis; never apply the stale-tip guard.
-            staking_config.allow_stale_tip = true;
         }
 
         let staker = Arc::new(Staker::new(
@@ -1926,6 +1914,21 @@ async fn run_daemon(
 
     info!("Node stopped");
     Ok(())
+}
+
+/// The staker's settings. The minimum coin age is the network's (Divi Core
+/// nMinCoinAgeForStaking, chainparams.cpp:195, :498: one hour, none on
+/// regtest), the age block validation requires; there is no minimum coin
+/// value, as in Core.
+fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> StakingConfig {
+    StakingConfig {
+        // Regtest chains start from an old genesis; never apply the stale-tip guard.
+        allow_stale_tip: config.staking.stake_on_stale_tip
+            || config.network.network_type == NetworkType::Regtest,
+        stake_split_threshold: config.staking.split_threshold,
+        min_coin_age: chain.min_stake_age,
+        ..StakingConfig::default()
+    }
 }
 
 /// How a mempool refusal of a locally submitted transaction reaches the RPC
@@ -3110,5 +3113,39 @@ mod mempool_block_tests {
         );
         assert!(!mempool.contains(&pending.txid()));
         assert_eq!(fees, Amount::from_sat(COIN));
+    }
+}
+
+#[cfg(test)]
+mod staking_config_tests {
+    use super::*;
+
+    /// The staker uses the network's minimum coin age and no minimum coin
+    /// value, as Divi Core's staker does
+    #[test]
+    fn staking_config_follows_the_network() {
+        for (network, config, age) in [
+            (
+                divi_storage::NetworkType::Regtest,
+                NodeConfig::regtest(divi_primitives::ChainMode::Divi),
+                0,
+            ),
+            (
+                divi_storage::NetworkType::Testnet,
+                NodeConfig::testnet(divi_primitives::ChainMode::Divi),
+                3600,
+            ),
+            (
+                divi_storage::NetworkType::Mainnet,
+                NodeConfig::mainnet(divi_primitives::ChainMode::Divi),
+                3600,
+            ),
+        ] {
+            let params =
+                divi_storage::ChainParams::for_network(network, divi_primitives::ChainMode::Divi);
+            let staking = staking_config(&config, &params);
+            assert_eq!(staking.min_coin_age, age, "{network:?}");
+            assert_eq!(staking.min_stake_amount, 0, "{network:?}");
+        }
     }
 }
