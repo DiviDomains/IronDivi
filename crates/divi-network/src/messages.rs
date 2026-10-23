@@ -307,7 +307,10 @@ impl NetworkMessage {
             "pong" => NetworkMessage::Pong(r.u64()?),
 
             "reject" => NetworkMessage::Reject(RejectMessage::deserialize(payload)?),
-            "alert" => NetworkMessage::Alert(payload.to_vec()),
+            "alert" => {
+                crate::alert::Alert::parse(payload)?;
+                NetworkMessage::Alert(payload.to_vec())
+            }
             "filterload" => NetworkMessage::FilterLoad(payload.to_vec()),
             "filteradd" => NetworkMessage::FilterAdd(payload.to_vec()),
 

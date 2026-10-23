@@ -20,6 +20,7 @@ use crate::mempool::Mempool;
 use divi_consensus::bits_to_difficulty;
 use divi_crypto::compute_block_hash;
 use divi_masternode::MasternodeManager;
+use divi_network::constants::MAX_INV_SIZE;
 use divi_network::{
     BlockSync, MasternodeHandler, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
     SporkManager, SyncState, TxRelay,
@@ -29,9 +30,51 @@ use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::Transaction;
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType as StorageNetworkType};
 use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+/// Most block hashes in one answer to `getblocks` (Divi Core main.cpp)
+pub const GETBLOCKS_LIMIT: usize = 500;
+
+/// Divi Core's answer to `getblocks`: the main-chain blocks after the first
+/// locator hash we have on it (genesis if none), up to `limit` or the stop
+/// hash. When the limit is reached, the last hash is returned too: when the
+/// peer asks for that block, our tip is announced so it asks for the next batch.
+pub fn getblocks_reply(
+    chain: &Chain,
+    msg: &divi_network::GetBlocksMessage,
+    limit: usize,
+) -> (Vec<divi_network::InvItem>, Option<Hash256>) {
+    let start_height = msg.locator_hashes.iter().find_map(|hash| {
+        chain
+            .get_block_index(hash)
+            .ok()
+            .flatten()
+            .filter(|idx| idx.is_on_main_chain())
+            .map(|idx| idx.height)
+    });
+    let mut items = Vec::new();
+    let mut height = start_height.unwrap_or(0) + 1;
+    while height <= chain.height() {
+        let Ok(Some(idx)) = chain.get_block_index_by_height(height) else {
+            break;
+        };
+        items.push(divi_network::InvItem::new(
+            divi_network::InvType::Block,
+            idx.hash,
+        ));
+        if items.len() >= limit {
+            return (items, Some(idx.hash));
+        }
+        if idx.hash == msg.stop_hash {
+            break;
+        }
+        height += 1;
+    }
+    (items, None)
+}
 
 /// Node status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,7 +461,12 @@ impl Node {
         let masternode_handler = Arc::clone(&self.masternode_handler);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
+        let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
         tokio::spawn(async move {
+            // Per peer: the last hash of a full getblocks answer (Divi Core
+            // hashContinue) and the alerts already accepted from it
+            let mut hash_continue: HashMap<u64, Hash256> = HashMap::new();
+            let mut alerts_known: HashMap<u64, HashSet<[u8; 32]>> = HashMap::new();
             while let Ok(event) = peer_events.recv().await {
                 match event {
                     PeerEvent::Connected {
@@ -437,6 +485,8 @@ impl Node {
                         block_sync.remove_peer(peer_id);
                         tx_relay.remove_peer(peer_id);
                         spork_manager.remove_peer(peer_id);
+                        hash_continue.remove(&peer_id);
+                        alerts_known.remove(&peer_id);
                     }
                     PeerEvent::Message { peer_id, message } => {
                         // Log all message types at INFO for debugging sync issues
@@ -483,6 +533,14 @@ impl Node {
                                 }
                             }
                             NetworkMessage::Inv(items) => {
+                                if items.len() > MAX_INV_SIZE {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        20,
+                                        "Asked for too large an inventory of data items",
+                                    );
+                                    continue;
+                                }
                                 // Split into block and tx inv items
                                 let block_items: Vec<_> = items
                                     .iter()
@@ -515,6 +573,14 @@ impl Node {
                                 tx_relay.handle_tx(peer_id, tx).await;
                             }
                             NetworkMessage::GetData(items) => {
+                                if items.len() > MAX_INV_SIZE {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        20,
+                                        "Getdata request too large",
+                                    );
+                                    continue;
+                                }
                                 // Split block and tx getdata items
                                 let block_items: Vec<_> = items
                                     .iter()
@@ -547,6 +613,23 @@ impl Node {
                                                     item.hash,
                                                     peer_id
                                                 );
+                                                // The last block of a full getblocks
+                                                // answer: announce our tip so the peer
+                                                // asks for the next batch
+                                                if hash_continue.get(&peer_id) == Some(&item.hash) {
+                                                    hash_continue.remove(&peer_id);
+                                                    if let Some(tip) = chain.tip() {
+                                                        let inv = NetworkMessage::Inv(vec![
+                                                            divi_network::InvItem::new(
+                                                                divi_network::InvType::Block,
+                                                                tip.hash,
+                                                            ),
+                                                        ]);
+                                                        let _ = peer_manager
+                                                            .send_block_to_peer(peer_id, inv)
+                                                            .await;
+                                                    }
+                                                }
                                             }
                                         }
                                         Ok(None) => {
@@ -591,34 +674,10 @@ impl Node {
                             }
                             // Handle getblocks: respond with inv for blocks after locator
                             NetworkMessage::GetBlocks(msg) => {
-                                // Find the first locator hash we have on our main chain
-                                let mut start_height = None;
-                                for locator_hash in &msg.locator_hashes {
-                                    if let Ok(Some(idx)) = chain.get_block_index(locator_hash) {
-                                        if idx.is_on_main_chain() {
-                                            start_height = Some(idx.height);
-                                            break;
-                                        }
-                                    }
-                                }
-                                // If no locator found, start from genesis
-                                let start = start_height.unwrap_or(0) + 1;
-                                let tip_height = chain.height();
-                                // Send up to 500 block inv items (standard Bitcoin protocol limit)
-                                let end = std::cmp::min(start + 500, tip_height + 1);
-                                let mut inv_items = Vec::new();
-                                for h in start..end {
-                                    if let Ok(Some(idx)) = chain.get_block_index_by_height(h) {
-                                        inv_items.push(divi_network::InvItem::new(
-                                            divi_network::InvType::Block,
-                                            idx.hash,
-                                        ));
-                                        if idx.hash == msg.stop_hash {
-                                            break;
-                                        }
-                                    } else {
-                                        break;
-                                    }
+                                let (inv_items, continue_at) =
+                                    getblocks_reply(&chain, &msg, GETBLOCKS_LIMIT);
+                                if let Some(hash) = continue_at {
+                                    hash_continue.insert(peer_id, hash);
                                 }
                                 if !inv_items.is_empty() {
                                     let count = inv_items.len();
@@ -720,6 +779,50 @@ impl Node {
                                     payload.len(),
                                     &payload[..std::cmp::min(64, payload.len())]
                                 );
+                            }
+                            NetworkMessage::Addr(addrs) => {
+                                // IronDivi keeps no address book; only Divi Core's limit applies
+                                if addrs.len() > 1000 {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        20,
+                                        "Requested too many addresses",
+                                    );
+                                }
+                            }
+                            // IronDivi does not offer NODE_BLOOM, and Divi Core without
+                            // bloom filters bans a peer that sends these
+                            NetworkMessage::FilterLoad(_)
+                            | NetworkMessage::FilterAdd(_)
+                            | NetworkMessage::FilterClear => {
+                                peer_manager.report_misbehavior_score(
+                                    peer_id,
+                                    100,
+                                    "Sent bloom filter msg but they are disabled",
+                                );
+                            }
+                            NetworkMessage::Alert(payload) => {
+                                let (Some(key), Ok(alert)) =
+                                    (&alert_key, divi_network::alert::Alert::parse(&payload))
+                                else {
+                                    continue;
+                                };
+                                let known = alerts_known.entry(peer_id).or_default();
+                                if known.contains(&alert.hash()) {
+                                    continue;
+                                }
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_secs() as i64);
+                                if alert.is_acceptable(key, now) {
+                                    known.insert(alert.hash());
+                                } else {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        divi_network::alert::BAD_ALERT_SCORE,
+                                        "Unable to process alert message",
+                                    );
+                                }
                             }
                             NetworkMessage::Reject(reject) => {
                                 let hash_hex = if reject.data.len() >= 32 {

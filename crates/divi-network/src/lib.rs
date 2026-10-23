@@ -55,6 +55,7 @@
 //! assert!(bytes.len() > 24); // Header + payload
 //! ```
 
+pub mod alert;
 pub mod constants;
 pub mod error;
 pub mod message;
