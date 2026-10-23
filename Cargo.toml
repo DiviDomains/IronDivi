@@ -79,7 +79,7 @@ rocksdb = "0.22"
 # Web API
 axum = "0.7"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["trace"] }
 hyper = "1.1"
 
 # Utilities
