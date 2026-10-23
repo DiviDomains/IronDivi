@@ -1582,13 +1582,14 @@ async fn run_daemon(
                     "Wallet scanned to height {} but the chain is at {}; rescanning above it as the chain syncs",
                     last_scan, chain_height
                 );
-            }
-            if last_scan != chain_height {
+            } else if last_scan < chain_height {
                 info!(
                     "Wallet catch-up scan: blocks {} to {}",
-                    last_scan.min(chain_height) + 1,
+                    last_scan + 1,
                     chain_height
                 );
+            }
+            if last_scan != chain_height {
                 sync_wallet_to_tip(wallet_arc, node.chain());
                 if let Err(e) = wallet_arc.save() {
                     error!("Failed to save wallet after catch-up scan: {}", e);
