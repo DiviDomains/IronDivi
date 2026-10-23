@@ -632,11 +632,12 @@ fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
         .collect()
 }
 
-/// Default mode: the destination gets the full amount, the fee comes out of
-/// the remainder, and the remainder goes back to the same vault script so it
-/// keeps staking (seen on the manager after the block).
+/// Default mode: the destination gets the full amount and the fee comes out
+/// of the remainder, which goes to a new key of the owner: Divi Core's
+/// reclaimvaultfunds has no change script, so its change takes a key from the
+/// keypool (rpcwallet.cpp:1158-1186, wallet.cpp:1905-1910)
 #[test]
-fn reclaim_partial_keeps_remainder_in_vault() {
+fn reclaim_partial_sends_remainder_to_a_new_owner_key() {
     let s = setup();
     let rpc = make_self_vault(&s);
     let dest = s.owner.new_receiving_address().unwrap();
@@ -650,25 +651,21 @@ fn reclaim_partial_keeps_remainder_in_vault() {
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
         vec![40 * COIN]
     );
-    assert_eq!(
-        output_to(&tx, &s.vault),
-        vec![(VAULT_DIVI - 40) * COIN - fee],
-        "the rest of the vault left the vault"
-    );
-
-    s.net.mine_submitted(&s.owner_addr);
-    let h = s.net.chain.height();
-    let managed: i64 = s
-        .manager
-        .get_stakeable_vault_utxos(h, 1)
+    assert!(output_to(&tx, &s.vault).is_empty());
+    let change: Vec<&TxOut> = tx
+        .vout
         .iter()
-        .map(|(u, _)| u.value.as_sat())
-        .sum();
-    assert_eq!(managed, (VAULT_DIVI - 40) * COIN - fee);
+        .filter(|o| o.script_pubkey != Script::new_p2pkh(dest.hash.as_bytes()))
+        .collect();
+    assert_eq!(change.len(), 1);
+    assert_eq!(change[0].value.as_sat(), (VAULT_DIVI - 40) * COIN - fee);
+    assert!(change[0].script_pubkey.is_p2pkh());
+    assert!(s.owner.is_mine_script(&change[0].script_pubkey));
+    s.net.mine_submitted(&s.owner_addr);
 }
 
-/// receiver_pays: the fee comes out of the amount, the vault keeps the rest
-/// untouched.
+/// receiver_pays: the fee comes out of the amount; the rest goes to a new
+/// owner key, as for any reclaim
 #[test]
 fn reclaim_receiver_pays_takes_fee_from_amount() {
     let s = setup();
@@ -689,7 +686,16 @@ fn reclaim_receiver_pays_takes_fee_from_amount() {
         vec![5 * COIN - fee],
         "receiver_pays ignored"
     );
-    assert_eq!(output_to(&tx, &s.vault), vec![(VAULT_DIVI - 5) * COIN]);
+    assert!(output_to(&tx, &s.vault).is_empty());
+    let change: i64 = tx
+        .vout
+        .iter()
+        .filter(|o| {
+            o.script_pubkey.is_p2pkh() && o.script_pubkey != Script::new_p2pkh(dest.hash.as_bytes())
+        })
+        .map(|o| o.value.as_sat())
+        .sum();
+    assert_eq!(change, (VAULT_DIVI - 5) * COIN);
     s.net.mine_submitted(&s.owner_addr);
 }
 

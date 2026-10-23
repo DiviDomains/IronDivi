@@ -44,6 +44,7 @@ pub mod error;
 pub mod hd;
 pub mod keystore;
 pub mod persistence;
+pub mod send;
 pub mod signer;
 pub mod wallet_db;
 
