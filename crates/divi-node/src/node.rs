@@ -26,7 +26,7 @@ use divi_network::{
 };
 use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
-use divi_primitives::transaction::Transaction;
+use divi_primitives::transaction::{OutPoint, Transaction};
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType as StorageNetworkType};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
@@ -1348,67 +1348,60 @@ pub fn accept_relayed_transaction(
     result
 }
 
-/// Return the transactions of a reorganisation's disconnected blocks to the
-/// mempool so they can be mined on the new chain.
+/// Whether a chain coin can be spent by a transaction in the next block: it
+/// is unspent and, if a coinbase or coinstake output, mature at that height
+/// (Divi Core CheckInputs, UtxoCheckingAndUpdating.cpp:61-78, which the
+/// mempool runs with the tip as the spending block's parent).
+fn spendable_in_next_block(chain: &Chain, outpoint: &OutPoint) -> Result<bool, NodeError> {
+    let next_height = chain.height() + 1;
+    let maturity = coinbase_maturity(chain.network_type());
+    Ok(chain
+        .get_utxo(outpoint)?
+        .is_some_and(|utxo| utxo.is_mature_with(next_height, maturity)))
+}
+
+/// Bring the mempool in line with the active chain after a reorganisation.
+///
+/// Divi Core does this block by block. disconnectTip offers every transaction
+/// of a disconnected block to AcceptToMemoryPool, then drops the mempool
+/// transactions spending a coinbase or coinstake output that is gone or no
+/// longer mature (removeCoinbaseSpends); connectTip removes the transactions
+/// each connected block confirms and those conflicting with it
+/// (ChainTipManager.cpp:139-141, :175-183). Here the chain has already moved:
+/// `disconnected` (parents before children, as `Chain::accept_block` returns
+/// them) is offered first, each with its fee worked out from the chain and the
+/// mempool, then every transaction the new chain made unspendable goes, with
+/// its descendants.
 pub fn update_mempool_after_reorg(
     chain: &Arc<Chain>,
     mempool: &Arc<Mempool>,
     disconnected: Vec<Transaction>,
 ) {
-    use divi_primitives::amount::Amount;
-    tracing::info!(
-        "Reorg: re-adding {} orphaned transaction(s) to mempool",
-        disconnected.len()
-    );
+    let offered = disconnected.len();
+    let mut returned = 0;
     for tx in disconnected {
         let txid = tx.txid();
-        // Calculate fee by summing inputs minus outputs using the UTXO set
-        let fee = {
-            let mut input_total = Amount::from_sat(0);
-            let mut ok = true;
-            for input in &tx.vin {
-                match chain.get_utxo(&input.prevout) {
-                    Ok(Some(utxo)) => {
-                        input_total += utxo.value;
-                    }
-                    _ => {
-                        // UTXO not found — tx may depend on another orphaned tx
-                        // that is also being re-added; skip fee check and use 0.
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                let output_total: Amount = tx
-                    .vout
-                    .iter()
-                    .map(|o| o.value)
-                    .fold(Amount::from_sat(0), |a, b| a + b);
-                if input_total >= output_total {
-                    input_total - output_total
-                } else {
-                    Amount::from_sat(0)
-                }
-            } else {
-                Amount::from_sat(0)
-            }
-        };
-        match mempool.add(tx, fee) {
-            Ok(_) => {
-                tracing::debug!(
-                    "Re-added orphaned tx {} to mempool (fee: {} sat)",
-                    txid,
-                    fee.as_sat()
-                );
-            }
-            Err(e) => {
-                tracing::debug!("Could not re-add orphaned tx {} to mempool: {}", txid, e);
-            }
+        match Node::calculate_transaction_fee(&tx, chain, mempool)
+            .and_then(|fee| mempool.add(tx, fee))
+        {
+            Ok(_) => returned += 1,
+            Err(e) => tracing::debug!(
+                "Transaction {} of a disconnected block not returned to the mempool: {}",
+                txid,
+                e
+            ),
         }
     }
+    let dropped = mempool
+        .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
     // The tip may now be lower: drop what can no longer be mined
     mempool.remove_non_final();
+    tracing::info!(
+        "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
+        returned,
+        offered,
+        dropped
+    );
 }
 
 /// Divi Core `COINBASE_MATURITY` per network (chainparams.cpp:184 main, :293
