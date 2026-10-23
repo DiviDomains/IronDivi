@@ -2897,7 +2897,10 @@ impl Chain {
                 )
             })?;
 
-        let expected_stake_reward = Self::stake_reward(&self.block_rewards(parent.height + 1));
+        let expected_stake_reward = coinstake_stake_reward(
+            &self.block_rewards(parent.height + 1),
+            self.masternodes_deprecated(parent)?,
+        );
         crate::pos_validation::validate_coinstake_vault_rules(
             coinstake,
             expected_stake_reward,
@@ -3734,11 +3737,21 @@ impl Chain {
         rewards
     }
 
-    /// Core's `nStakeReward`: after DeprecateMasternodes (always active on
-    /// PrivateDivi) the masternode reward is folded into the stake. Shared by
-    /// the mint check and the vault rule so the two cannot disagree.
-    ///
-    /// C++ reference: BlockConnectionService.cpp lines 322-326
+    /// Whether DeprecateMasternodes is active for the block after `parent`: Divi
+    /// Core checks the parent's median time past against 2023-08-23
+    /// (BlockConnectionService.cpp:322, ForkActivation.cpp:19-31, :48-60). Always
+    /// active on PrivateDivi.
+    fn masternodes_deprecated(&self, parent: &BlockIndex) -> Result<bool, StorageError> {
+        if self.params.chain_mode == ChainMode::PrivateDivi {
+            return Ok(true);
+        }
+        let mtp = self.get_median_time_past(parent)? as i64;
+        Ok(masternodes_deprecated_after(parent, mtp))
+    }
+
+    /// The limit on what the coinbase and coinstake may create: stake plus
+    /// masternode reward, whether or not the masternode reward is still paid
+    /// separately (BlockIncentivesPopulator.cpp:202-220 sums both).
     fn stake_reward(rewards: &divi_consensus::block_subsidy::BlockRewards) -> Amount {
         rewards.stake + rewards.masternode
     }
@@ -4421,6 +4434,28 @@ impl divi_masternode::UtxoProvider for ChainDatabase {
     }
 }
 
+/// DeprecateMasternodes for the block after `parent`, from the parent's median
+/// time past (ForkActivation.cpp:31, :35-36, :56)
+fn masternodes_deprecated_after(parent: &BlockIndex, parent_mtp: i64) -> bool {
+    use crate::fork_activation::{ActivationState, Fork};
+    ActivationState::new_with_mtp(parent, parent_mtp).is_active(Fork::DeprecateMasternodes)
+}
+
+/// Divi Core's `nStakeReward` as ConnectBlock hands it to the vault coinstake rule
+/// (BlockConnectionService.cpp:321-326, BlockTransactionChecker.cpp:57-108): the
+/// stake share, plus the masternode share only once DeprecateMasternodes is active.
+/// Before that the masternode share is paid to another output.
+fn coinstake_stake_reward(
+    rewards: &divi_consensus::block_subsidy::BlockRewards,
+    masternodes_deprecated: bool,
+) -> Amount {
+    if masternodes_deprecated {
+        rewards.stake + rewards.masternode
+    } else {
+        rewards.stake
+    }
+}
+
 /// Divi Core `MoneyRange` against the network's `MaxMoneyOut`
 fn money_range(value: Amount, max_money: Amount) -> bool {
     value >= Amount::ZERO && value <= max_money
@@ -4611,6 +4646,118 @@ mod tests {
     }
 
     /// Create a test chain with regtest network (genesis already initialized)
+    /// Real mainnet vault coinstakes, all accepted by Divi Core (read from a Core
+    /// 3.0.0 node): height, parent's median time past, vault input, vault outputs,
+    /// other outputs, all in satoshis. DeprecateMasternodes starts at 2,580,189,
+    /// the first block whose parent's MTP reaches 1692792000. 2,580,186 and
+    /// 2,580,187 have block times past that but parents' MTPs below it, so they are
+    /// still before the fork and pay the masternode share to another output.
+    #[allow(clippy::type_complexity)]
+    const MAINNET_VAULT_STAKES: &[(u32, i64, i64, &[i64], &[i64])] = &[
+        (
+            1_191_825,
+            1_610_308_802,
+            6_200_000_000_000,
+            &[3_120_900_000_000, 3_120_900_000_000],
+            &[49_500_000_000],
+        ),
+        (
+            2_400_002,
+            1_682_102_505,
+            1_569_559_351_563,
+            &[1_603_759_351_563],
+            &[40_500_000_000],
+        ),
+        (
+            2_400_005,
+            1_682_102_826,
+            740_515_029_326,
+            &[774_715_029_326],
+            &[40_500_000_000],
+        ),
+        (
+            2_580_186,
+            1_692_791_906,
+            1_969_562_500_000,
+            &[1_001_881_250_000, 1_001_881_250_000],
+            &[40_500_000_000],
+        ),
+        (
+            2_580_187,
+            1_692_791_913,
+            1_305_117_500_000,
+            &[1_339_317_500_000],
+            &[40_500_000_000],
+        ),
+        (
+            2_580_194,
+            1_692_792_561,
+            1_715_190_625_000,
+            &[1_789_890_625_000],
+            &[],
+        ),
+    ];
+
+    #[test]
+    fn test_vault_coinstakes_of_real_mainnet_blocks() {
+        let vault = divi_script::StakingVaultScript::new([0x36; 20], [0xa7; 20]).to_script();
+        let prev = OutPoint::new(Hash256::from_bytes([0x44; 32]), 1);
+        for &(height, parent_mtp, value_in, vault_outs, others) in MAINNET_VAULT_STAKES {
+            let parent = BlockIndex::from_header(
+                &divi_primitives::block::BlockHeader::default(),
+                height - 1,
+                None,
+            );
+            let deprecated = masternodes_deprecated_after(&parent, parent_mtp);
+            assert_eq!(deprecated, height >= 2_580_189, "fork state at {height}");
+
+            let mut vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+            vout.extend(
+                vault_outs
+                    .iter()
+                    .map(|&v| TxOut::new(Amount::from_sat(v), vault.clone())),
+            );
+            vout.extend(
+                others
+                    .iter()
+                    .map(|&v| TxOut::new(Amount::from_sat(v), Script::new_p2pkh(&[0xcd; 20]))),
+            );
+            let coinstake = Transaction {
+                version: 1,
+                vin: vec![TxIn::new(prev, Script::new(), 0xffff_ffff)],
+                vout,
+                lock_time: 0,
+            };
+            let input = TxOut::new(Amount::from_sat(value_in), vault.clone());
+            let get = |op: &OutPoint| (*op == prev).then(|| input.clone());
+            let check = |reward| {
+                crate::pos_validation::validate_coinstake_vault_rules(&coinstake, reward, &get)
+            };
+            let rewards = divi_consensus::block_subsidy::get_block_subsidy(height, 525_600);
+            assert!(
+                check(coinstake_stake_reward(&rewards, deprecated)).is_ok(),
+                "Core accepted block {height}"
+            );
+            if !deprecated {
+                // What IronDivi required before: the masternode share counted as the vault's
+                assert!(
+                    check(coinstake_stake_reward(&rewards, true)).is_err(),
+                    "block {height} pays the masternode share elsewhere"
+                );
+            }
+        }
+        // 1,191,825 in DIVI, as the refusal reported it
+        let rewards = divi_consensus::block_subsidy::get_block_subsidy(1_191_825, 525_600);
+        assert_eq!(
+            coinstake_stake_reward(&rewards, false),
+            Amount::from_divi(418)
+        );
+        assert_eq!(
+            coinstake_stake_reward(&rewards, true),
+            Amount::from_divi(913)
+        );
+    }
+
     fn create_test_chain() -> (Chain, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
