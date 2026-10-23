@@ -425,7 +425,8 @@ impl WalletRpc {
         let mut by_addr: HashMap<String, (i64, u32)> = HashMap::new();
         for output in wallet.received_outputs() {
             let confs = output.confirmations(height);
-            if output.is_coinbase || confs < min_conf {
+            // A bare multisig output has no address to tally under
+            if output.is_coinbase || confs < min_conf || output.address.is_empty() {
                 continue;
             }
             let entry = by_addr.entry(output.address).or_insert((0, u32::MAX));
@@ -730,14 +731,13 @@ impl WalletRpc {
     pub fn get_balance(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        // Divi Core (rpcwallet.cpp getbalance): with no params it returns
-        // GetBalance(), the trusted balance (confirmed coins plus our own
-        // unconfirmed change). With params it is `getbalance "*" minconf`, where
-        // our own 0-conf change counts at any minconf and others' 0-conf
-        // payments count only at minconf 0. IronDivi also accepts a bare
-        // numeric minconf as the first param.
+        // Divi Core (rpcwallet.cpp:1577-1578): with no params or account "*"
+        // it returns GetBalance(), whatever minconf: confirmed, mature coins.
+        // For another account, our own 0-conf change counts at any minconf and
+        // others' 0-conf payments count only at minconf 0. IronDivi also
+        // accepts a bare numeric minconf as the first param.
         let height = self.current_height();
-        let balance = if params.is_empty() {
+        let balance = if params.is_empty() || params.get_str(0) == Some("*") {
             wallet.get_balance()
         } else {
             let min_conf = if params.get_str(0).is_some() {
@@ -784,10 +784,7 @@ impl WalletRpc {
 
         // Core: spendable_balance excludes every vault, vaulted_balance is the
         // coins in vaults we own (a managed vault is in neither)
-        let spendable = wallet
-            .get_spendable_utxos(height, 1)
-            .iter()
-            .fold(Amount::ZERO, |a, u| a + u.value);
+        let spendable = wallet.get_spendable_balance(height);
         let vaulted = wallet.get_vaulted_balance();
 
         let divi_balance = balance.as_sat() as f64 / 100_000_000.0;
@@ -855,7 +852,12 @@ impl WalletRpc {
         };
 
         let height = self.current_height();
-        let utxos = wallet.get_utxos();
+        // What Core's AvailableCoins gives a send (rpcrawtransaction.cpp:310,
+        // AvailableUtxoCalculator.cpp:3-30, 60-90): spendable coins only (no
+        // vault or watched output), mature, not spent by a wallet transaction,
+        // unconfirmed ones only when every input was ours, and not locked by
+        // lockunspent
+        let utxos = wallet.get_spendable_utxos(height, 0);
 
         let result: Vec<_> = utxos
             .iter()
@@ -863,15 +865,7 @@ impl WalletRpc {
                 let confs = utxo.confirmations(height);
                 confs >= min_conf && confs <= max_conf
             })
-            // Vault outputs are not listed, as in Core (AvailableCoins with
-            // ALL_SPENDABLE_COINS); getcoinavailability reports them
-            .filter(|utxo| StakingVaultScript::from_script(&utxo.script_pubkey).is_none())
-            // Nor are coins locked by lockunspent or immature coinbase and
-            // coinstake outputs: Core lists what AvailableCoins gives a send
-            // (rpcrawtransaction.cpp:286, AvailableUtxoCalculator.cpp:91,
-            // FilteredTransactionsCalculator.h:74-76)
             .filter(|utxo| !wallet.is_coin_locked(&utxo.outpoint()))
-            .filter(|utxo| utxo.is_mature(height, wallet.coinbase_maturity()))
             .filter(|utxo| {
                 addresses
                     .as_ref()
@@ -881,31 +875,22 @@ impl WalletRpc {
                 let divi = utxo.value.as_sat() as f64 / 100_000_000.0;
                 let is_change = wallet.is_change_address_str(&utxo.address);
 
-                // Check if this address is watch-only
-                let is_watch_only = if let Ok(addr) = Address::from_base58(&utxo.address) {
-                    wallet.is_watch_only(&addr)
-                } else {
-                    false
-                };
-
-                // UTXO is spendable if mature AND not watch-only, and a vault
-                // output only through its owner key (a manager can only stake it)
-                let spendable = utxo.is_mature(height, wallet.coinbase_maturity())
-                    && !is_watch_only
-                    && (!divi_script::is_staking_vault_script(&utxo.script_pubkey)
-                        || wallet.can_spend_script(&utxo.script_pubkey));
-
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "txid": utxo.txid.to_string(),
                     "vout": utxo.vout,
                     "address": utxo.address,
                     "scriptPubKey": hex::encode(utxo.script_pubkey.as_bytes()),
                     "amount": divi,
                     "confirmations": utxo.confirmations(height),
-                    "spendable": spendable,
+                    "spendable": true,
                     "solvable": true,
                     "ischange": is_change,
-                })
+                });
+                // A bare multisig output has no address (Core's ExtractDestination)
+                if utxo.address.is_empty() {
+                    entry.as_object_mut().map(|o| o.remove("address"));
+                }
+                entry
             })
             .collect();
 
@@ -1500,15 +1485,22 @@ impl WalletRpc {
         }
         let (mut tx, prev_scripts) = builder.build();
 
+        // Every coin type the wallet spends (P2PKH, P2PK, multisig, P2SH with
+        // a stored redeem script), as Core's SignSignature (wallet.cpp:1609-1624)
         let signer = TransactionSigner::new(wallet.keystore());
-        let signed_count = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to sign transaction: {}", e),
-                )
-            })?;
+        let redeem_script = |hash: &Hash160| wallet.get_script(hash);
+        let mut signed_count = 0;
+        for (i, script) in prev_scripts.iter().enumerate() {
+            let verified = signer
+                .sign_and_merge_input(&mut tx, i, script, &redeem_script)
+                .map_err(|e| {
+                    RpcError::new(
+                        codes::WALLET_ERROR,
+                        format!("Failed to sign transaction: {}", e),
+                    )
+                })?;
+            signed_count += usize::from(verified);
+        }
         if signed_count != plan.inputs.len() {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
@@ -3211,11 +3203,18 @@ impl WalletRpc {
             return Ok(serde_json::json!(0.0));
         }
 
-        // Everything received at the address, including coins since spent
-        let total = self
-            .received_by_address(&wallet, min_conf)
-            .get(addr_str)
-            .map_or(0, |(amount, _)| *amount);
+        // Everything received at the address, including coins since spent:
+        // outputs paying exactly its script, so a P2PK output to its key is not
+        // counted (rpcwallet.cpp:1468-1480). Coinbase outputs are left out.
+        let height = self.current_height();
+        let script = addr.script_pubkey();
+        let total: i64 = wallet
+            .received_outputs()
+            .iter()
+            .filter(|o| !o.is_coinbase && o.script_pubkey == script)
+            .filter(|o| o.confirmations(height) >= min_conf)
+            .map(|o| o.value.as_sat())
+            .sum();
 
         let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
@@ -3265,12 +3264,20 @@ impl WalletRpc {
             }
         };
 
-        if wallet.is_mine(&addr) {
+        if wallet.is_mine(&addr) && !wallet.is_watch_only(&addr) {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
                 "The wallet already contains the private key for this address",
             )
             .into());
+        }
+        // As Core: an address already watched only gets its label
+        // (rpcdump.cpp:150-156)
+        if wallet.is_watch_only(&addr) {
+            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+            })?;
+            return Ok(serde_json::Value::Null);
         }
 
         // Import as watch-only address
@@ -5841,7 +5848,7 @@ mod accounting_tests {
     }
 
     #[test]
-    fn send_does_not_spend_own_unconfirmed_change_that_getbalance_counts() {
+    fn send_does_not_spend_own_unconfirmed_change() {
         let f = fixture();
         // Our own tx spends every confirmed coin: 100 DIVI change comes back
         // unconfirmed (trusted, as all inputs are ours)
@@ -5860,8 +5867,16 @@ mod accounting_tests {
             lock_time: 0,
         };
         assert!(f.wallet.add_mempool_tx(&own));
+        // Core's getbalance counts confirmed coins only; the change is
+        // unconfirmed balance until it confirms (wallet.cpp:1395-1412)
         assert_eq!(
             f.rpc.get_balance(&Params::Array(vec![])).unwrap(),
+            json!(0.0)
+        );
+        assert_eq!(
+            f.rpc
+                .get_unconfirmed_balance(&Params::Array(vec![]))
+                .unwrap(),
             json!(100.0)
         );
 
@@ -5873,7 +5888,7 @@ mod accounting_tests {
             Ok(txid)
         }));
         // Divi Core spends only confirmed coins unless -spendzeroconfchange
-        // (off by default), though getbalance counts our own change
+        // (off by default)
         assert!(f
             .rpc
             .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))

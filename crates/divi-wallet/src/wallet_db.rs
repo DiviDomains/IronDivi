@@ -121,6 +121,21 @@ pub enum VaultRole {
     Managed,
 }
 
+/// How the wallet owns an output script (Divi Core's isminetype)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// Not the wallet's
+    No,
+    /// Watched only: never recorded as a coin
+    WatchOnly,
+    /// The wallet can sign for it
+    Spendable,
+    /// A vault whose owner key the wallet holds
+    OwnedVault,
+    /// A registered vault whose manager key the wallet holds
+    ManagedVault,
+}
+
 /// Tracks which categories of wallet data have been modified since last save
 #[derive(Default, Clone)]
 struct DirtyFlags {
@@ -1162,14 +1177,15 @@ impl WalletDb {
         self.keystore.get_addresses()
     }
 
-    /// Check if an address belongs to this wallet
+    /// Whether the wallet knows an address at all, spendable or watched
+    /// (Divi Core's IsMine of its script is not ISMINE_NO)
     pub fn is_mine(&self, address: &Address) -> bool {
-        self.keystore.have_key(&address.hash)
+        self.ownership(&address.script_pubkey()) != Ownership::No
     }
 
-    /// Check if an address is watch-only
+    /// Whether an address is watched only (Divi Core's ISMINE_WATCH_ONLY)
     pub fn is_watch_only(&self, address: &Address) -> bool {
-        self.keystore.is_watch_only(&address.hash)
+        self.ownership(&address.script_pubkey()) == Ownership::WatchOnly
     }
 
     /// Import a watch-only public key
@@ -1248,17 +1264,85 @@ impl WalletDb {
             .unwrap_or_default()
     }
 
-    /// Check if a script belongs to this wallet
+    /// Whether the wallet records an output paying `script`: Divi Core keeps a
+    /// transaction only when it pays or spends a spendable or vault output
+    /// (wallet.cpp:1300-1305), so watched scripts never bring coins in.
     pub fn is_mine_script(&self, script: &Script) -> bool {
-        // Try P2PKH first (most common)
-        if let Some(hash_bytes) = script.extract_p2pkh_hash() {
-            let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
-            if self.keystore.have_key(&hash) {
-                return true;
-            }
-        }
+        matches!(
+            self.ownership(script),
+            Ownership::Spendable | Ownership::OwnedVault | Ownership::ManagedVault
+        )
+    }
 
-        self.vault_role(script).is_some()
+    /// How the wallet owns `script`, as Divi Core's IsMine
+    /// (wallet_ismine.cpp:37-113): P2PKH and P2PK of a wallet key, a bare
+    /// multisig of wallet keys only, and P2SH by what its stored redeem script
+    /// is are spendable; a vault is owned through its owner key or managed
+    /// through its manager key once registered. Watched P2PKH and P2SH
+    /// addresses, and redeem scripts stored without every key, are watch-only.
+    pub fn ownership(&self, script: &Script) -> Ownership {
+        use divi_script::standard::{extract_script_type, ScriptType};
+
+        if self.is_watched_script(script) {
+            return Ownership::WatchOnly;
+        }
+        let (kind, solutions) = extract_script_type(script.as_bytes());
+        let has_signing_key = |hash: Hash160| {
+            self.keystore
+                .get_key(&hash)
+                .is_some_and(|entry| !entry.is_watch_only)
+        };
+        match kind {
+            ScriptType::PubKey => {
+                if has_signing_key(divi_crypto::hash160(&solutions[0])) {
+                    return Ownership::Spendable;
+                }
+            }
+            ScriptType::PubKeyHash => {
+                if has_signing_key(hash160_from(&solutions[0])) {
+                    return Ownership::Spendable;
+                }
+            }
+            ScriptType::ScriptHash => {
+                if let Some(redeem) = self.get_script(&hash160_from(&solutions[0])) {
+                    return match self.ownership(&redeem) {
+                        // addmultisigaddress watches a redeem script it
+                        // cannot spend (rpcwallet.cpp:1770-1771)
+                        Ownership::No => Ownership::WatchOnly,
+                        mine => mine,
+                    };
+                }
+            }
+            ScriptType::Vault => match self.vault_role(script) {
+                Some(VaultRole::Owned) => return Ownership::OwnedVault,
+                Some(VaultRole::Managed) => return Ownership::ManagedVault,
+                None => {}
+            },
+            ScriptType::Multisig => {
+                let keys = &solutions[1..solutions.len() - 1];
+                if keys
+                    .iter()
+                    .all(|key| has_signing_key(divi_crypto::hash160(key)))
+                {
+                    return Ownership::Spendable;
+                }
+            }
+            _ => {}
+        }
+        Ownership::No
+    }
+
+    /// A P2PKH or P2SH script imported with importaddress (Divi Core's
+    /// HaveWatchOnly; IronDivi keeps the watched hash as a key entry)
+    fn is_watched_script(&self, script: &Script) -> bool {
+        let hash = match script.extract_p2pkh_hash() {
+            Some(hash) => hash,
+            None => match script.extract_p2sh_hash() {
+                Some(hash) => hash,
+                None => return false,
+            },
+        };
+        self.keystore.is_watch_only(&Hash160::from_bytes(hash))
     }
 
     /// Our role for a vault script, as Divi Core's IsMine: the owner key makes
@@ -1446,20 +1530,10 @@ impl WalletDb {
             .into_iter()
             .filter(|(_, source)| source.is_trusted())
             .map(|(utxo, _)| utxo)
-            .filter(|utxo| !divi_script::is_staking_vault_script(&utxo.script_pubkey))
+            .filter(|utxo| self.ownership(&utxo.script_pubkey) == Ownership::Spendable)
             .filter(|utxo| {
-                let confs = utxo.confirmations(current_height);
-                let mature = utxo.is_mature(current_height, self.coinbase_maturity());
-
-                // Check if this is a watch-only address
-                let is_watch_only = if let Ok(addr) = Address::from_base58(&utxo.address) {
-                    self.is_watch_only(&addr)
-                } else {
-                    false
-                };
-
-                // Only include UTXOs that are confirmed, mature, and not watch-only
-                confs >= min_confirmations && mature && !is_watch_only
+                utxo.confirmations(current_height) >= min_confirmations
+                    && utxo.is_mature(current_height, self.coinbase_maturity())
             })
             .collect()
     }
@@ -1557,26 +1631,6 @@ impl WalletDb {
         select::select_minimum(&available_utxos, target, fee_rate, num_outputs)
     }
 
-    /// Our coins for balance purposes: everything except vaults we only
-    /// manage (Core's balances count ISMINE_SPENDABLE and ISMINE_OWNED_VAULT,
-    /// never ISMINE_MANAGED_VAULT)
-    fn balance_utxos(&self) -> Vec<(WalletUtxo, CoinSource)> {
-        self.effective_utxos()
-            .into_iter()
-            .filter(|(u, _)| self.vault_role(&u.script_pubkey) != Some(VaultRole::Managed))
-            .collect()
-    }
-
-    /// Whether a coin can be spent at all once selected: mature and not
-    /// watch-only. Balances count only such coins, like Core's
-    /// GetAvailableCredit (immature rewards are getimmaturebalance's).
-    fn is_spendable_coin(&self, utxo: &WalletUtxo, current_height: u32) -> bool {
-        let watch_only = Address::from_base58(&utxo.address)
-            .map(|addr| self.is_watch_only(&addr))
-            .unwrap_or(false);
-        utxo.is_mature(current_height, self.coinbase_maturity()) && !watch_only
-    }
-
     /// Coins a send may use, as Divi Core's `AvailableCoins` gives them to a
     /// send: confirmed (at least `min_confirmations`, never fewer than one),
     /// mature, unspent and not locked by `lockunspent`. Our own unconfirmed
@@ -1594,26 +1648,47 @@ impl WalletDb {
             .collect()
     }
 
-    /// Get total balance: Core's GetBalance, i.e. trusted coins only
-    /// (confirmed, plus our own unconfirmed change), mature and not watch-only
-    pub fn get_balance(&self) -> Amount {
-        let height = self.last_scan_height();
-        self.balance_utxos()
+    /// Unspent coins of the given ownership, confirmed or not, with where
+    /// they come from. Coins spent by a wallet transaction in the mempool are
+    /// left out, as Divi Core's IsSpent counts those spends.
+    fn owned_coins(&self, wanted: &[Ownership]) -> Vec<(WalletUtxo, CoinSource)> {
+        self.effective_utxos()
             .into_iter()
-            .filter(|(u, source)| source.is_trusted() && self.is_spendable_coin(u, height))
-            .map(|(u, _)| u.value)
-            .fold(Amount::ZERO, |a, b| a + b)
+            .filter(|(u, _)| wanted.contains(&self.ownership(&u.script_pubkey)))
+            .collect()
     }
 
-    /// Get confirmed balance
-    ///
-    /// Matches Core's getbalance "*" minconf: coins spent by a mempool
+    /// Confirmed, mature coins of the given ownership (Divi Core's
+    /// CONFIRMED_AND_MATURE filter)
+    fn confirmed_mature(&self, wanted: &[Ownership], current_height: u32) -> Amount {
+        self.owned_coins(wanted)
+            .into_iter()
+            .filter(|(u, source)| {
+                matches!(source, CoinSource::Block)
+                    && u.height.is_some()
+                    && u.is_mature(current_height, self.coinbase_maturity())
+            })
+            .fold(Amount::ZERO, |a, (u, _)| a + u.value)
+    }
+
+    /// Core's GetBalance (getbalance, getbalance "*"): confirmed, mature
+    /// spendable coins and coins in vaults we own. Unconfirmed coins, our own
+    /// change included, are getunconfirmedbalance's (wallet.cpp:1395-1402,
+    /// FilteredTransactionsCalculator.h:62-78).
+    pub fn get_balance(&self) -> Amount {
+        self.confirmed_mature(
+            &[Ownership::Spendable, Ownership::OwnedVault],
+            self.last_scan_height(),
+        )
+    }
+
+    /// Balance of `getbalance <account> minconf`: coins spent by a mempool
     /// transaction no longer count, our own unconfirmed change counts at any
     /// minconf, and unconfirmed coins from others count only at minconf 0.
     pub fn get_confirmed_balance(&self, current_height: u32, min_confirmations: u32) -> Amount {
-        self.balance_utxos()
+        self.owned_coins(&[Ownership::Spendable, Ownership::OwnedVault])
             .into_iter()
-            .filter(|(utxo, _)| self.is_spendable_coin(utxo, current_height))
+            .filter(|(utxo, _)| utxo.is_mature(current_height, self.coinbase_maturity()))
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.confirmations(current_height) >= min_confirmations,
                 CoinSource::Mempool { trusted } => *trusted || min_confirmations == 0,
@@ -1622,35 +1697,44 @@ impl WalletDb {
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
-    /// Get unconfirmed balance: Core's GetUnconfirmedBalance, i.e. unconfirmed
-    /// coins that are not trusted (incoming from others)
+    /// Core's GetUnconfirmedBalance: unconfirmed spendable coins, our own
+    /// change as well as payments from others (wallet.cpp:1404-1412)
     pub fn get_unconfirmed_balance(&self) -> Amount {
-        self.balance_utxos()
+        self.owned_coins(&[Ownership::Spendable])
             .into_iter()
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.height.is_none(),
-                CoinSource::Mempool { trusted } => !*trusted,
+                CoinSource::Mempool { .. } => true,
             })
             .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
-    /// Get immature balance (coinbase/coinstake not yet mature)
+    /// Core's GetImmatureBalance: confirmed, immature spendable coins. A reward
+    /// paid to a vault we own is in no balance until it matures
+    /// (wallet.cpp:1414-1422).
     pub fn get_immature_balance(&self, current_height: u32, maturity: u32) -> Amount {
-        let immature: Vec<WalletUtxo> = self
-            .utxos
-            .read()
-            .values()
-            .filter(|utxo| {
-                (utxo.is_coinbase || utxo.is_coinstake) && !utxo.is_mature(current_height, maturity)
+        self.owned_coins(&[Ownership::Spendable])
+            .into_iter()
+            .filter(|(utxo, source)| {
+                matches!(source, CoinSource::Block)
+                    && utxo.height.is_some()
+                    && !utxo.is_mature(current_height, maturity)
             })
-            .cloned()
-            .collect();
-        immature
-            .iter()
-            .filter(|u| self.vault_role(&u.script_pubkey) != Some(VaultRole::Managed))
-            .map(|u| u.value)
+            .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
+    }
+
+    /// Core's GetSpendableBalance (getwalletinfo spendable_balance):
+    /// confirmed, mature spendable coins plus unconfirmed spendable outputs of
+    /// transactions that spend only our spendable coins (WalletBalanceCalculator.cpp:73-81)
+    pub fn get_spendable_balance(&self, current_height: u32) -> Amount {
+        let unconfirmed = self
+            .owned_coins(&[Ownership::Spendable])
+            .into_iter()
+            .filter(|(_, source)| matches!(source, CoinSource::Mempool { trusted: true }))
+            .fold(Amount::ZERO, |a, (u, _)| a + u.value);
+        self.confirmed_mature(&[Ownership::Spendable], current_height) + unconfirmed
     }
 
     /// Clear all wallet transactions, UTXOs, and spent tracking
@@ -2245,7 +2329,9 @@ impl WalletDb {
                 if !self.spent.read().contains(&utxo.outpoint()) {
                     self.add_utxo(utxo);
                 }
-                self.mark_address_used(&address);
+                if !address.is_empty() {
+                    self.mark_address_used(&address);
+                }
 
                 trace!("Received {} to {} in tx {}", output.value, address, txid);
             }
@@ -2347,11 +2433,21 @@ impl WalletDb {
         }
     }
 
-    /// Label for an output we own: its P2PKH address, or "vault:<manager>"
+    /// Label for an output we own: its address as Divi Core's
+    /// ExtractDestination gives it (a P2PK output shows its key's P2PKH
+    /// address, a bare multisig none), or "vault:<manager>"
     fn output_address(&self, script_pubkey: &Script) -> String {
         if let Some(hash_bytes) = script_pubkey.extract_p2pkh_hash() {
             let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
             Address::from_pubkey_hash(hash, self.network).to_string()
+        } else if let Some(hash_bytes) = script_pubkey.extract_p2sh_hash() {
+            Address::p2sh(Hash160::from_bytes(hash_bytes), self.network).to_string()
+        } else if divi_script::standard::is_p2pk(script_pubkey.as_bytes()) {
+            let pubkey_len = script_pubkey.as_bytes()[0] as usize;
+            let hash = divi_crypto::hash160(&script_pubkey.as_bytes()[1..1 + pubkey_len]);
+            Address::from_pubkey_hash(hash, self.network).to_string()
+        } else if divi_script::standard::is_multisig(script_pubkey.as_bytes()).is_some() {
+            String::new()
         } else if let Some(vault) = divi_script::StakingVaultScript::from_script(script_pubkey) {
             // For vault UTXOs, use vault: prefix with manager address
             let manager_hash = Hash160::from_bytes(vault.vault_pubkey_hash);
@@ -2416,6 +2512,7 @@ impl WalletDb {
         let mut inputs = Vec::new();
         let mut spends = Vec::new();
         let mut sent = Amount::ZERO;
+        let mut spends_vault = false;
         {
             let utxos = self.utxos.read();
             for input in &tx.vin {
@@ -2424,17 +2521,15 @@ impl WalletDb {
                 }
                 let outpoint = OutPoint::new(input.prevout.txid, input.prevout.vout);
                 inputs.push(outpoint);
-                let value = utxos.get(&outpoint).map(|u| u.value).or_else(|| {
-                    overlay.get(&outpoint.txid).and_then(|e| {
-                        e.outputs
-                            .iter()
-                            .find(|u| u.vout == outpoint.vout)
-                            .map(|u| u.value)
-                    })
+                let coin = utxos.get(&outpoint).cloned().or_else(|| {
+                    overlay
+                        .get(&outpoint.txid)
+                        .and_then(|e| e.outputs.iter().find(|u| u.vout == outpoint.vout).cloned())
                 });
-                if let Some(v) = value {
+                if let Some(coin) = coin {
                     spends.push(outpoint);
-                    sent += v;
+                    sent += coin.value;
+                    spends_vault |= divi_script::is_staking_vault_script(&coin.script_pubkey);
                 }
             }
         }
@@ -2472,7 +2567,10 @@ impl WalletDb {
             confirmations: 0,
         };
 
-        let trusted = spends.len() == inputs.len();
+        // Core trusts an unconfirmed transaction whose every input is a
+        // spendable coin of ours (AvailableUtxoCalculator.cpp:33-43); a vault
+        // coin is not spendable in that sense
+        let trusted = spends.len() == inputs.len() && !spends_vault;
         info!(
             "Mempool wallet tx {} {} {} sats ({})",
             category,
@@ -3094,14 +3192,10 @@ impl WalletDb {
             .collect()
     }
 
-    /// Core's GetVaultedBalance: trusted coins in vaults we own. A vault we
-    /// only manage is not vaulted for us (Core counts it as stakable).
+    /// Core's GetVaultedBalance: confirmed, mature coins in vaults we own. A
+    /// vault we only manage is not vaulted for us (Core counts it as stakable).
     pub fn get_vaulted_balance(&self) -> Amount {
-        self.effective_utxos()
-            .into_iter()
-            .filter(|(_, source)| source.is_trusted())
-            .filter(|(u, _)| self.vault_role(&u.script_pubkey) == Some(VaultRole::Owned))
-            .fold(Amount::ZERO, |a, (u, _)| a + u.value)
+        self.confirmed_mature(&[Ownership::OwnedVault], self.last_scan_height())
     }
 
     /// Vault outputs we own (owner key held), confirmed and mature, not spent
@@ -3179,6 +3273,13 @@ impl WalletDb {
 const PBKDF2_ITERATIONS: u32 = 25000;
 
 /// Derive encryption key from passphrase using PBKDF2-HMAC-SHA512
+/// A 20-byte hash taken from a script solution
+fn hash160_from(bytes: &[u8]) -> Hash160 {
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&bytes[..20]);
+    Hash160::from_bytes(hash)
+}
+
 fn derive_key_from_passphrase(passphrase: &str, salt: &[u8]) -> Vec<u8> {
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha512;
@@ -3306,13 +3407,14 @@ mod tests {
         let wallet = create_test_wallet();
         let addr = wallet.new_receiving_address().unwrap();
 
-        let utxo = WalletUtxo::new(
+        let mut utxo = WalletUtxo::new(
             Hash256::from_bytes([1u8; 32]),
             0,
             Amount::from_sat(100_000_000),
             Script::new_p2pkh(addr.hash.as_bytes()),
             addr.to_string(),
         );
+        utxo.height = Some(1);
 
         wallet.add_utxo(utxo.clone());
 
@@ -3325,7 +3427,7 @@ mod tests {
         let wallet = create_test_wallet();
         let addr = wallet.new_receiving_address().unwrap();
 
-        let utxo = WalletUtxo::new(
+        let mut utxo = WalletUtxo::new(
             Hash256::from_bytes([1u8; 32]),
             0,
             Amount::from_sat(100_000_000),
@@ -3333,6 +3435,7 @@ mod tests {
             addr.to_string(),
         );
         let outpoint = utxo.outpoint();
+        utxo.height = Some(1);
 
         wallet.add_utxo(utxo);
         assert_eq!(wallet.get_balance(), Amount::from_sat(100_000_000));
@@ -3998,13 +4101,21 @@ mod tests {
             assert_eq!(spendable[0].txid, tx.txid());
             assert!(wallet.get_spendable_utxos(100, 1).is_empty());
 
-            // Core: change is trusted, so it is in getbalance, not getunconfirmedbalance.
-            assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
+            // Core: getbalance counts confirmed coins only; the change is in
+            // getunconfirmedbalance and spendable_balance until it confirms.
+            assert_eq!(wallet.get_balance().as_sat(), 0);
             assert_eq!(
                 wallet.get_confirmed_balance(100, 1).as_sat(),
                 70 * COIN - 1_000_000
             );
-            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), 0);
+            assert_eq!(
+                wallet.get_unconfirmed_balance().as_sat(),
+                70 * COIN - 1_000_000
+            );
+            assert_eq!(
+                wallet.get_spendable_balance(100).as_sat(),
+                70 * COIN - 1_000_000
+            );
 
             let rec = wallet.get_transaction(&tx.txid()).unwrap();
             assert_eq!(rec.category, "send");
@@ -4350,7 +4461,7 @@ mod tests {
                     .collect()
             };
             // Our unconfirmed change is not spent (Divi Core without
-            // -spendzeroconfchange), though getbalance counts it
+            // -spendzeroconfchange), nor counted by getbalance
             let expected: HashSet<OutPoint> = [
                 OutPoint::new(small.txid(), 0),
                 OutPoint::new(other.txid(), 0),
@@ -4358,7 +4469,8 @@ mod tests {
             .into();
             assert_eq!(coins(&wallet, 1), expected);
             assert_eq!(coins(&wallet, 0), expected);
-            assert_eq!(wallet.get_balance().as_sat(), 3 * COIN + CHANGE);
+            assert_eq!(wallet.get_balance().as_sat(), 3 * COIN);
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), CHANGE);
             // A locked coin is not spent
             wallet.set_coin_locked(OutPoint::new(other.txid(), 0), true);
             assert_eq!(coins(&wallet, 1), [OutPoint::new(small.txid(), 0)].into());
@@ -4377,7 +4489,10 @@ mod tests {
                 vec![(5 * COIN, Script::new_p2pkh(watched.hash.as_bytes()))],
             );
             scan(&wallet, 1, std::slice::from_ref(&pay));
-            assert_eq!(wallet.get_utxos().len(), 1);
+            // Divi Core records no coin paid only to a watched script
+            // (wallet.cpp:1292-1311)
+            assert!(wallet.get_utxos().is_empty());
+            assert!(wallet.get_transactions(None).is_empty());
             assert_eq!(wallet.get_balance().as_sat(), 0);
             assert_eq!(wallet.get_confirmed_balance(1, 1).as_sat(), 0);
             assert!(wallet.get_send_candidates(1, 1).is_empty());
@@ -4974,6 +5089,32 @@ mod tests {
             // and removevault does not drop the owner's coins
             assert!(wallet.remove_vault(vault.as_bytes()));
             assert_eq!(wallet.get_owned_vault_utxos(20, 1).len(), 1);
+        }
+
+        /// A stake reward paid to a vault we own is in no balance until it
+        /// matures: Divi Core's getimmaturebalance counts spendable coins
+        /// only, getbalance mature ones (wallet.cpp:1395-1422)
+        #[test]
+        fn owned_vault_reward_is_not_immature_balance() {
+            let wallet = create_test_wallet();
+            let owner = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new(hash20(&owner), [0x44; 20]).to_script();
+            let mut coinstake = pay(vec![(0, Script::default()), (300 * COIN, vault)]);
+            coinstake.vout[0].value = Amount::ZERO;
+            assert!(coinstake.is_coinstake());
+            wallet.scan_transaction(
+                &coinstake,
+                Some(Hash256::from_bytes([4; 32])),
+                Some(10),
+                None,
+            );
+            wallet.set_last_scan_height(15);
+
+            assert_eq!(wallet.get_immature_balance(15, 20), Amount::ZERO);
+            assert_eq!(wallet.get_balance(), Amount::ZERO);
+            wallet.set_last_scan_height(30);
+            assert_eq!(wallet.get_balance(), Amount::from_sat(300 * COIN));
         }
 
         /// The manager key counts only for a registered vault.
