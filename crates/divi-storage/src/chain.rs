@@ -2577,7 +2577,7 @@ impl Chain {
     }
 
     /// Divi Core `MaxMoneyOut` (chainparams.cpp:186 main, :402 test; regtest inherits test)
-    fn max_money(&self) -> Amount {
+    pub fn max_money(&self) -> Amount {
         match self.params.network_type {
             NetworkType::Mainnet => Amount::from_divi(2_534_320_700),
             NetworkType::Testnet | NetworkType::Regtest => Amount::from_divi(2_535_000_000),
@@ -4338,6 +4338,11 @@ impl Chain {
         self.db.get_utxo(outpoint)
     }
 
+    /// Whether any spendable output of `txid` is unspent (Core's `HaveCoins`)
+    pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
+        self.db.has_spendable_output_of(txid)
+    }
+
     /// Check if a UTXO exists
     pub fn has_utxo(&self, outpoint: &OutPoint) -> Result<bool, StorageError> {
         self.db.has_utxo(outpoint)
@@ -4651,54 +4656,74 @@ fn check_block_transactions(block: &Block, max_money: Amount) -> Result<(), Stor
 
     let mut inputs = std::collections::HashSet::new();
     for tx in &block.transactions {
-        if tx.vin.is_empty() {
-            return Err(StorageError::invalid_block_scored(
-                10,
-                "bad-txns-vin-empty".into(),
-            ));
-        }
-        if tx.vout.is_empty() {
-            return Err(StorageError::invalid_block_scored(
-                10,
-                "bad-txns-vout-empty".into(),
-            ));
-        }
-        if tx.encoded_size() > MAX_TX_SIZE {
-            return invalid("bad-txns-oversize: size limits failed".into());
-        }
-        let mut value_out = Amount::ZERO;
-        for out in &tx.vout {
-            if out.is_empty() && !tx.is_coinbase() && !tx.is_coinstake() {
-                return invalid("txout empty for user transaction".into());
-            }
-            if !money_range(out.value, max_money) {
-                return invalid("bad-txns-vout-negative-or-toolarge".into());
-            }
-            value_out += out.value;
-            if !money_range(value_out, max_money) {
-                return invalid("bad-txns-txouttotal-toolarge".into());
-            }
-        }
-        for input in &tx.vin {
-            if !inputs.insert(input.prevout) {
-                return invalid(format!(
-                    "bad-txns-inputs-duplicate: {}:{}",
-                    input.prevout.txid, input.prevout.vout
-                ));
-            }
-        }
-        if tx.is_coinbase() {
-            let len = tx.vin[0].script_sig.len();
-            if !(2..=150).contains(&len) {
-                return invalid(format!("bad-cb-length: coinbase script size={}", len));
-            }
-        }
+        check_transaction_with(tx, max_money, &mut inputs)?;
     }
     let sig_ops: u32 = block.transactions.iter().map(legacy_sig_op_count).sum();
     if sig_ops > MAX_BLOCK_SIGOPS_LEGACY {
         return invalid("bad-blk-sigops: out-of-bounds SigOpCount".into());
     }
     Ok(())
+}
+
+/// Divi Core `CheckTransaction` (BlockCheckingHelpers.cpp:99-147): the checks
+/// that need no context. `inputs` collects the outpoints spent so far; a block
+/// shares one set across its transactions, as Core's CheckBlock does.
+fn check_transaction_with(
+    tx: &Transaction,
+    max_money: Amount,
+    inputs: &mut std::collections::HashSet<OutPoint>,
+) -> Result<(), StorageError> {
+    use divi_primitives::serialize::Encodable;
+    let invalid = |reason: String| Err(StorageError::InvalidBlock(reason));
+    if tx.vin.is_empty() {
+        return Err(StorageError::invalid_block_scored(
+            10,
+            "bad-txns-vin-empty".into(),
+        ));
+    }
+    if tx.vout.is_empty() {
+        return Err(StorageError::invalid_block_scored(
+            10,
+            "bad-txns-vout-empty".into(),
+        ));
+    }
+    if tx.encoded_size() > MAX_TX_SIZE {
+        return invalid("bad-txns-oversize: size limits failed".into());
+    }
+    let mut value_out = Amount::ZERO;
+    for out in &tx.vout {
+        if out.is_empty() && !tx.is_coinbase() && !tx.is_coinstake() {
+            return invalid("txout empty for user transaction".into());
+        }
+        if !money_range(out.value, max_money) {
+            return invalid("bad-txns-vout-negative-or-toolarge".into());
+        }
+        value_out += out.value;
+        if !money_range(value_out, max_money) {
+            return invalid("bad-txns-txouttotal-toolarge".into());
+        }
+    }
+    for input in &tx.vin {
+        if !inputs.insert(input.prevout) {
+            return invalid(format!(
+                "bad-txns-inputs-duplicate: {}:{}",
+                input.prevout.txid, input.prevout.vout
+            ));
+        }
+    }
+    if tx.is_coinbase() {
+        let len = tx.vin[0].script_sig.len();
+        if !(2..=150).contains(&len) {
+            return invalid(format!("bad-cb-length: coinbase script size={}", len));
+        }
+    }
+    Ok(())
+}
+
+/// Divi Core `CheckTransaction` for a single transaction (the mempool's first
+/// check); the error carries Core's reason
+pub fn check_transaction(tx: &Transaction, max_money: Amount) -> Result<(), StorageError> {
+    check_transaction_with(tx, max_money, &mut std::collections::HashSet::new())
 }
 
 /// Divi Core `ContextualCheckBlock` finality rule: a block may only contain

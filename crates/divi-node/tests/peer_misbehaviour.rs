@@ -69,7 +69,10 @@ impl TestNode {
     /// A mature 1250 DIVI coin paying `kp`
     fn fund(&self, kp: &KeyPair) -> OutPoint {
         let coin = self.mine(p2pkh(kp));
-        self.mine(Script::new_p2pkh(&[0xee; 20]));
+        // Regtest coinbase maturity is 20 blocks
+        for _ in 0..20 {
+            self.mine(Script::new_p2pkh(&[0xee; 20]));
+        }
         coin
     }
 
@@ -136,15 +139,22 @@ fn sign(tx: &mut Transaction, kp: &KeyPair) {
     tx.vin[0].script_sig = Script::from_bytes(ss);
 }
 
+/// Signed with the wrong key: the mandatory script check fails (DoS 100)
+fn wrongly_signed(coin: OutPoint, value: i64, to: Script) -> Transaction {
+    let mut tx = spend(coin, value, to);
+    sign(&mut tx, &KeyPair::new_random());
+    tx
+}
+
 #[test]
-fn peer_relaying_an_unsigned_spend_is_banned() {
+fn peer_relaying_a_wrongly_signed_spend_is_banned() {
     let t = TestNode::new();
     let owner = KeyPair::new_random();
     let coin = t.fund(&owner);
     let (peer, ip) = t.peer(1, "192.0.2.10");
 
     let err = t
-        .relay(peer, spend(coin, 1249 * COIN, p2pkh(&owner)))
+        .relay(peer, wrongly_signed(coin, 1249 * COIN, p2pkh(&owner)))
         .unwrap_err();
     assert!(
         err.starts_with("16: mandatory-script-verify-flag-failed"),
@@ -153,6 +163,24 @@ fn peer_relaying_an_unsigned_spend_is_banned() {
     );
     assert_eq!(t.score(peer), 100);
     assert!(t.banned(&ip));
+}
+
+/// An unsigned spend leaves the scriptSig without the two items a P2PKH
+/// spend needs, so Divi Core's AreInputsStandard refuses it before any
+/// script runs, with no misbehaviour score (MempoolConsensus.cpp:189, :363-364)
+#[test]
+fn peer_relaying_an_unsigned_spend_is_not_scored() {
+    let t = TestNode::new();
+    let owner = KeyPair::new_random();
+    let coin = t.fund(&owner);
+    let (peer, ip) = t.peer(6, "192.0.2.14");
+
+    let err = t
+        .relay(peer, spend(coin, 1249 * COIN, p2pkh(&owner)))
+        .unwrap_err();
+    assert_eq!(err, "64: bad-txns-nonstandard-inputs");
+    assert_eq!(t.score(peer), 0);
+    assert!(!t.banned(&ip));
 }
 
 #[test]
@@ -205,7 +233,7 @@ fn local_peer_is_scored_but_not_banned() {
     let coin = t.fund(&owner);
     let (peer, ip) = t.peer(4, "127.0.0.1");
     assert!(t
-        .relay(peer, spend(coin, 1249 * COIN, p2pkh(&owner)))
+        .relay(peer, wrongly_signed(coin, 1249 * COIN, p2pkh(&owner)))
         .is_err());
     assert_eq!(t.score(peer), 100);
     assert!(!t.banned(&ip));
@@ -223,9 +251,13 @@ fn ban_score_setting_raises_the_threshold() {
     let b = t.fund(&owner);
     let (peer, ip) = t.peer(5, "192.0.2.13");
 
-    assert!(t.relay(peer, spend(a, 1249 * COIN, p2pkh(&owner))).is_err());
+    assert!(t
+        .relay(peer, wrongly_signed(a, 1249 * COIN, p2pkh(&owner)))
+        .is_err());
     assert!(!t.banned(&ip));
-    assert!(t.relay(peer, spend(b, 1249 * COIN, p2pkh(&owner))).is_err());
+    assert!(t
+        .relay(peer, wrongly_signed(b, 1249 * COIN, p2pkh(&owner)))
+        .is_err());
     assert_eq!(t.score(peer), 200);
     assert!(t.banned(&ip));
     let ban = t.node.peer_manager().scoring().list_bans();
