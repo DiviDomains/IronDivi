@@ -40,7 +40,6 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// IronDivi Daemon - Rust implementation of Divi node
@@ -951,20 +950,15 @@ fn compute_data_dir(args: &Args) -> PathBuf {
     })
 }
 
-/// Check if log file exceeds max size and rotate if needed
-fn maybe_rotate_logs(log_dir: &std::path::Path, max_size: u64, max_files: u32) {
-    let log_path = log_dir.join("debug.log");
-
-    // Check current size
-    if let Ok(metadata) = std::fs::metadata(&log_path) {
-        if metadata.len() >= max_size {
-            rotate_logs(log_dir, max_files);
-        }
-    }
-}
-
-/// Rotate log files: debug.log -> debug.log.1, .1 -> .2, etc.
+/// Rotate log files: debug.log -> debug.log.1, .1 -> .2, etc., keeping
+/// `max_files` files in all (debug.log included)
 fn rotate_logs(log_dir: &std::path::Path, max_files: u32) {
+    let current = log_dir.join("debug.log");
+    if max_files <= 1 {
+        let _ = std::fs::remove_file(&current);
+        return;
+    }
+
     // Delete oldest if it would exceed max_files
     let oldest = log_dir.join(format!("debug.log.{}", max_files - 1));
     let _ = std::fs::remove_file(&oldest);
@@ -977,19 +971,117 @@ fn rotate_logs(log_dir: &std::path::Path, max_files: u32) {
     }
 
     // Rotate current log
-    let current = log_dir.join("debug.log");
     let rotated = log_dir.join("debug.log.1");
     let _ = std::fs::rename(&current, &rotated);
 }
 
-/// Spawn background task to periodically check and rotate logs
-fn spawn_log_rotation_task(data_dir: PathBuf, max_size: u64, max_files: u32) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60)); // Check every minute
-            maybe_rotate_logs(&data_dir, max_size, max_files);
+/// The debug.log writer. Before a write would take the file past
+/// `max_size`, the file is closed and rotated, and a new debug.log is
+/// opened, so the node never keeps writing to a rotated file. A file only
+/// goes over `max_size` if a single record is larger than that. When
+/// stdout and stderr go to debug.log (daemon mode), they follow the new
+/// file too.
+struct RotatingLog {
+    dir: PathBuf,
+    max_size: u64,
+    max_files: u32,
+    redirect_std: bool,
+    file: Option<std::fs::File>,
+    size: u64,
+}
+
+impl RotatingLog {
+    fn open(
+        dir: &std::path::Path,
+        max_size: u64,
+        max_files: u32,
+        redirect_std: bool,
+    ) -> std::io::Result<Self> {
+        let mut log = RotatingLog {
+            dir: dir.to_path_buf(),
+            max_size,
+            max_files,
+            redirect_std,
+            file: None,
+            size: 0,
+        };
+        log.reopen()?;
+        // The log may already be too big from an earlier run
+        if log.size >= max_size {
+            log.rotate()?;
         }
-    });
+        Ok(log)
+    }
+
+    fn reopen(&mut self) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("debug.log"))?;
+        self.size = file.metadata()?.len();
+        #[cfg(unix)]
+        if self.redirect_std {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
+                libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+            }
+        }
+        self.file = Some(file);
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.file = None;
+        rotate_logs(&self.dir, self.max_files);
+        self.reopen()
+    }
+}
+
+impl std::io::Write for RotatingLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
+            self.rotate()?;
+        }
+        if self.file.is_none() {
+            // A failed rotation left no file open; try again
+            self.reopen()?;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(std::io::Error::other("debug.log is not open"));
+        };
+        let n = file.write(buf)?;
+        self.size += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Whether stderr is the file at `path` (stdout and stderr were sent to
+/// debug.log in daemon mode)
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn stderr_is_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut st) } != 0 {
+        return false;
+    }
+    st.st_dev as u64 == meta.dev() && st.st_ino as u64 == meta.ino()
+}
+
+#[cfg(not(unix))]
+fn stderr_is_file(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// Initialize logging
@@ -1003,7 +1095,10 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         }
     });
 
-    if log_config.print_to_console {
+    // In daemon mode the console is debug.log itself, so it rotates like it
+    let std_is_log = stderr_is_file(&data_dir.join("debug.log"));
+
+    if log_config.print_to_console && !std_is_log {
         // Log to console only
         tracing_subscriber::registry()
             .with(fmt::layer())
@@ -1025,11 +1120,27 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             return;
         }
 
-        // Check for rotation before starting (in case log is already too big)
-        maybe_rotate_logs(data_dir, log_config.max_file_size, log_config.max_files);
-
-        // Create file appender - no rotation, just debug.log like C++ divid
-        let file_appender = RollingFileAppender::new(Rotation::NEVER, data_dir, "debug.log");
+        // debug.log, rotated by size like C++ divid
+        let file_appender = match RotatingLog::open(
+            data_dir,
+            log_config.max_file_size,
+            log_config.max_files,
+            std_is_log,
+        ) {
+            Ok(log) => log,
+            Err(e) => {
+                eprintln!(
+                    "Warning: Could not open {:?}: {}",
+                    data_dir.join("debug.log"),
+                    e
+                );
+                tracing_subscriber::registry()
+                    .with(fmt::layer())
+                    .with(filter)
+                    .init();
+                return;
+            }
+        };
 
         // Create a non-blocking writer to avoid blocking the async runtime
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -1047,13 +1158,6 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             )
             .with(filter)
             .init();
-
-        // Start background rotation task
-        spawn_log_rotation_task(
-            data_dir.clone(),
-            log_config.max_file_size,
-            log_config.max_files,
-        );
 
         eprintln!("Logging to {:?}", data_dir.join("debug.log"));
         eprintln!(
@@ -1486,14 +1590,23 @@ async fn run_daemon(
             // Catch-up scan: process blocks between last_scan_height and current chain tip.
             // Block notifications may already be arriving; they share the wallet's scan
             // lock and its scan height, so neither side skips or reorders a block.
+            // A chain lower than the scan height (rebuilt or reindexed) rolls the
+            // wallet back to the tip; the sync that follows scans those blocks again.
             let last_scan = wallet_arc.last_scan_height();
             let chain_height = node.chain().height();
-            if last_scan < chain_height {
+            if last_scan > chain_height {
+                info!(
+                    "Wallet scanned to height {} but the chain is at {}; rescanning above it as the chain syncs",
+                    last_scan, chain_height
+                );
+            } else if last_scan < chain_height {
                 info!(
                     "Wallet catch-up scan: blocks {} to {}",
                     last_scan + 1,
                     chain_height
                 );
+            }
+            if last_scan != chain_height {
                 sync_wallet_to_tip(wallet_arc, node.chain());
                 if let Err(e) = wallet_arc.save() {
                     error!("Failed to save wallet after catch-up scan: {}", e);
@@ -1508,7 +1621,7 @@ async fn run_daemon(
             // Removes phantom UTXOs left from orphaned staked blocks whose
             // spent_utxo_data was lost before it was persisted to disk.
             let chain_for_reconcile = node.chain().clone();
-            let removed = wallet_arc.reconcile_utxos(|outpoint| {
+            let removed = wallet_arc.reconcile_utxos(chain_for_reconcile.height(), |outpoint| {
                 chain_for_reconcile
                     .get_utxo(outpoint)
                     .ok()
@@ -2841,5 +2954,95 @@ mod staking_status_tests {
 
         let info = staking_info(&status, false, 3, 1_761_000_000, true, 20000.0);
         assert!(info.wallet_unlocked && info.have_connections && info.valid_time && info.mnsync);
+    }
+}
+
+#[cfg(test)]
+mod log_rotation_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Names and sizes of the log files in `dir`
+    fn log_files(dir: &std::path::Path) -> Vec<(String, u64)> {
+        let mut files: Vec<(String, u64)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("debug.log"))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata().unwrap().len(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Write `lines` records of 50 bytes, checking the files after each
+    fn write_and_check(max_size: u64, max_files: u32, lines: usize) -> Vec<(String, u64)> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false).unwrap();
+        for i in 0..lines {
+            let line = format!("{:049}\n", i);
+            log.write_all(line.as_bytes()).unwrap();
+            log.flush().unwrap();
+            let files = log_files(dir.path());
+            assert!(
+                files.iter().any(|(n, _)| n == "debug.log"),
+                "debug.log missing after line {i}: {files:?}"
+            );
+            assert!(
+                files.iter().all(|(_, len)| *len <= max_size),
+                "file over {max_size} bytes after line {i}: {files:?}"
+            );
+            assert!(
+                files.len() <= max_files as usize,
+                "more than {max_files} files after line {i}: {files:?}"
+            );
+        }
+        // The newest record is in debug.log
+        let last = std::fs::read_to_string(dir.path().join("debug.log")).unwrap();
+        assert!(last.ends_with(&format!("{:049}\n", lines - 1)));
+        log_files(dir.path())
+    }
+
+    #[test]
+    fn log_rotation_writes_new_debug_log_within_limits() {
+        // 1000 bytes per file, 20 records each: rotates 9 times
+        let files = write_and_check(1000, 5, 200);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "debug.log",
+                "debug.log.1",
+                "debug.log.2",
+                "debug.log.3",
+                "debug.log.4"
+            ]
+        );
+        assert!(files.iter().all(|(_, len)| *len == 1000));
+    }
+
+    #[test]
+    fn log_rotation_with_one_file_keeps_only_debug_log() {
+        let files = write_and_check(1000, 1, 50);
+        assert_eq!(files, [("debug.log".to_string(), 500)]);
+    }
+
+    #[test]
+    fn log_rotation_rotates_oversized_log_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("debug.log"), vec![b'x'; 2000]).unwrap();
+        let mut log = RotatingLog::open(dir.path(), 1000, 3, false).unwrap();
+        log.write_all(b"new\n").unwrap();
+        assert_eq!(
+            log_files(dir.path()),
+            [
+                ("debug.log".to_string(), 4),
+                ("debug.log.1".to_string(), 2000)
+            ]
+        );
     }
 }
