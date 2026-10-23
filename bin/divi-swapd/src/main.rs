@@ -78,7 +78,7 @@ struct Args {
     /// swap database. BEFORE using it you MUST check, with a node of that chain, that the
     /// txid is in no mempool and in no block: releasing the inputs of a lock that can still
     /// confirm lets the next swap double-spend it. Refused unless the swap that broadcast the
-    /// txid is terminal (`done`, `aborted`) or no swap row names it, and refused while
+    /// txid is terminal (a maker swap `done`/`aborted`, a taker swap `done`) or no swap row names it, and refused while
     /// `divi-swapd` (or anything else) has the database open: stop the daemon first. Without
     /// `--yes` it only prints what it would release and exits 2.
     #[arg(
@@ -548,8 +548,8 @@ fn xmr_inflight_report(cfg: &DaemonConfig, lock_txids: bool) -> Result<String> {
 }
 
 /// The swap in `store` that broadcast `txid` on `chain`: `(id, state, terminal)`. Maker swaps
-/// are matched on their maker-leg funding tx; a taker swap naming it counts as non-terminal
-/// (this tool does not know a taker swap to be finished).
+/// are matched on their maker-leg funding tx, taker swaps on their taker-leg funding tx;
+/// `terminal` is the swap state's own `is_terminal`.
 fn swap_for_txid(
     store: &Store,
     chain: Chain,
@@ -575,7 +575,7 @@ fn swap_for_txid(
             return Ok(Some((
                 s.id,
                 state.as_str().unwrap_or("?").to_string(),
-                false,
+                s.state.is_terminal(),
             )));
         }
     }
@@ -1327,6 +1327,103 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    /// A taker swap in `state` whose taker-leg funding on BTC is the tx `lock`.
+    fn taker_lock_swap(
+        id: &str,
+        state: divi_swap::TakerState,
+        lock: u8,
+    ) -> divi_swap::store::TakerRecord {
+        let m = lock_swap(id, divi_swap::SwapState::Done, lock);
+        divi_swap::store::TakerRecord {
+            id: id.into(),
+            state,
+            quote: m.quote,
+            preimage: [9; 32],
+            hash: m.hash,
+            maker_swap_id: None,
+            taker_leg_htlc: Some(m.taker_leg_htlc),
+            taker_leg_funding: m.maker_leg_funding,
+            maker_leg_htlc: None,
+            maker_leg_outpoint: None,
+            maker_leg_amount: None,
+            maker_leg_claim: None,
+            taker_leg_refund: None,
+            claim_declined: None,
+            last_error: None,
+        }
+    }
+
+    /// A database with a finished taker swap (lock 0x51, input 5:0) and a refunded-but-not-done
+    /// one (lock 0x52, input 6:0). All BTC.
+    fn taker_reserved_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = dir.join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        store
+            .put_taker_swap(&taker_lock_swap("tdone", divi_swap::TakerState::Done, 0x51))
+            .unwrap();
+        store
+            .put_taker_swap(&taker_lock_swap(
+                "trefunded",
+                divi_swap::TakerState::Refunded,
+                0x52,
+            ))
+            .unwrap();
+        let res = InputReservations::open(&db).unwrap();
+        let t = |n: u8| divi_swap::Txid([n; 32]);
+        res.reserve(Chain::Btc, &t(0x51), &[op(5, 0)]).unwrap();
+        res.reserve(Chain::Btc, &t(0x52), &[op(6, 0)]).unwrap();
+        db
+    }
+
+    #[test]
+    fn release_is_refused_for_a_non_terminal_taker_swap_even_with_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = taker_reserved_db(dir.path());
+        for yes in [false, true] {
+            let err =
+                release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x52), yes)
+                    .err()
+                    .expect("must refuse");
+            assert!(err.to_string().contains("not terminal"), "{err}");
+        }
+        assert_eq!(
+            InputReservations::open(&db)
+                .unwrap()
+                .reserved(Chain::Btc)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn release_is_accepted_for_a_terminal_taker_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = taker_reserved_db(dir.path());
+        let out = release_reservation(&inflight_cfg(&db, false), Chain::Btc, &hex_of(0x51), true)
+            .unwrap();
+        assert!(out.released);
+        assert!(
+            out.text.contains("swap tdone (done, terminal)"),
+            "{}",
+            out.text
+        );
+        let held = InputReservations::open(&db)
+            .unwrap()
+            .reserved(Chain::Btc)
+            .unwrap();
+        assert!(!held.contains(&op(5, 0)) && held.contains(&op(6, 0)));
+    }
+
+    #[test]
+    fn reservations_list_shows_the_real_taker_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = taker_reserved_db(dir.path());
+        let out = reservations_report(&inflight_cfg(&db, false)).unwrap();
+        assert!(out.contains("\ttdone\tdone\n"), "{out}");
+        assert!(out.contains("\ttrefunded\trefunded\n"), "{out}");
     }
 
     #[test]

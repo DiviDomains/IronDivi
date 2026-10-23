@@ -57,6 +57,38 @@ pub enum TakerState {
     Done,
 }
 
+impl TakerState {
+    /// Whether the swap can never move again and never needs another broadcast, so a
+    /// reservation held for its taker-leg funding tx may be released by an operator.
+    ///
+    /// Only the state that no transition leaves qualifies; every variant is decided here:
+    /// - `Prepared`: not terminal. `accepted` moves it to `Accepted`.
+    /// - `Accepted`: not terminal. `lock` funds the taker leg (`Locked`).
+    /// - `Locked`: not terminal. The funding tx may still be rebroadcast; it moves to
+    ///   `MakerLockConfirmed` or `Refunded`.
+    /// - `MakerLockConfirmed`: not terminal. Moves to `Claimed` or `Refunded`.
+    /// - `Claimed`: not terminal. The maker-leg claim is still being broadcast until it
+    ///   confirms (`Done`).
+    /// - `Refunded`: not terminal. The refund is only built and broadcast from here, and
+    ///   still owed until it confirms (`Done`); the taker leg stays funded and spendable
+    ///   by the refund.
+    /// - `Done`: terminal. Reached from `Claimed` or `Refunded` once the claim or refund
+    ///   confirmed; `step` and `refund` return at once and nothing else leaves it.
+    ///
+    /// The `match` is exhaustive on purpose: a new variant must be decided here.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            TakerState::Done => true,
+            TakerState::Prepared
+            | TakerState::Accepted
+            | TakerState::Locked
+            | TakerState::MakerLockConfirmed
+            | TakerState::Claimed
+            | TakerState::Refunded => false,
+        }
+    }
+}
+
 /// Taker engine. `divi` holds the taker's DIVI key, each counter backend the taker's key on
 /// that chain.
 pub struct Taker {
@@ -565,4 +597,41 @@ enum Flow {
     Idle,
     Moved,
     Halted,
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::TakerState;
+
+    /// Every variant with its verdict. The match makes a new variant a compile error here
+    /// as well as in `is_terminal`, so it cannot be added without a decision.
+    fn verdict(s: TakerState) -> bool {
+        match s {
+            TakerState::Prepared
+            | TakerState::Accepted
+            | TakerState::Locked
+            | TakerState::MakerLockConfirmed
+            | TakerState::Claimed
+            | TakerState::Refunded => false,
+            TakerState::Done => true,
+        }
+    }
+
+    #[test]
+    fn is_terminal_matches_the_table_for_every_variant() {
+        let all = [
+            TakerState::Prepared,
+            TakerState::Accepted,
+            TakerState::Locked,
+            TakerState::MakerLockConfirmed,
+            TakerState::Claimed,
+            TakerState::Refunded,
+            TakerState::Done,
+        ];
+        for s in all {
+            assert_eq!(s.is_terminal(), verdict(s), "{s:?}");
+        }
+        // Refunded still owes its refund broadcast, so only Done is terminal.
+        assert_eq!(all.iter().filter(|s| s.is_terminal()).count(), 1);
+    }
 }

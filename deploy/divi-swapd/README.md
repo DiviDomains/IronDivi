@@ -94,10 +94,15 @@ divi-swapd --config /etc/divi-swapd/divi-swapd.toml --release-reservation <txid>
   `<chain> <input txid>:<vout> <reserving txid> <swap id|unknown> <swap state|unknown>`.
 - `--release-reservation` writes. First check, with a node of that chain, that `<txid>` is in no mempool and
   no block: releasing the inputs of a lock that can still confirm lets the next swap double-spend them.
-  It refuses unless the swap that broadcast the txid is terminal (`Done`, `Aborted`) or no swap row names
-  it, refuses while any other process has the database open (stop `divi-swapd` first; it takes SQLite's
+  It refuses unless the swap that broadcast the txid is terminal (a maker swap `Done` or `Aborted`, a taker
+  swap `Done`) or no swap row names it, refuses while any other process has the database open (stop `divi-swapd` first; it takes SQLite's
   exclusive lock and waits about 5 seconds), and without `--yes` only prints what it would release and
   exits 2. It never calls a node.
+- Taker rows: a taker swap is matched on its taker-leg funding txid, and `--reservations` prints its real
+  state. Only a taker swap in `Done` can be released. A taker in `Refunded` is not terminal (its refund is
+  still to be broadcast and confirmed) and is refused, as are `Prepared`, `Accepted`, `Locked`,
+  `MakerLockConfirmed` and `Claimed`. The `divi-swap` CLI taker does not reserve inputs today; this matters
+  for a taker whose backends were given the swap database's reservations.
 
 ## Hashlock route credentials
 
