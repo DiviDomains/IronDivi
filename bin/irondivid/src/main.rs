@@ -1469,12 +1469,20 @@ async fn run_daemon(
             // Catch-up scan: process blocks between last_scan_height and current chain tip.
             // Block notifications may already be arriving; they share the wallet's scan
             // lock and its scan height, so neither side skips or reorders a block.
+            // A chain lower than the scan height (rebuilt or reindexed) rolls the
+            // wallet back to the tip; the sync that follows scans those blocks again.
             let last_scan = wallet_arc.last_scan_height();
             let chain_height = node.chain().height();
-            if last_scan < chain_height {
+            if last_scan > chain_height {
+                info!(
+                    "Wallet scanned to height {} but the chain is at {}; rescanning above it as the chain syncs",
+                    last_scan, chain_height
+                );
+            }
+            if last_scan != chain_height {
                 info!(
                     "Wallet catch-up scan: blocks {} to {}",
-                    last_scan + 1,
+                    last_scan.min(chain_height) + 1,
                     chain_height
                 );
                 sync_wallet_to_tip(wallet_arc, node.chain());
@@ -1491,7 +1499,7 @@ async fn run_daemon(
             // Removes phantom UTXOs left from orphaned staked blocks whose
             // spent_utxo_data was lost before it was persisted to disk.
             let chain_for_reconcile = node.chain().clone();
-            let removed = wallet_arc.reconcile_utxos(|outpoint| {
+            let removed = wallet_arc.reconcile_utxos(chain_for_reconcile.height(), |outpoint| {
                 chain_for_reconcile
                     .get_utxo(outpoint)
                     .ok()
