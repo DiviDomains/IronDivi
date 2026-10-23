@@ -53,6 +53,28 @@ pub fn err_text<T>(r: Result<T, StorageError>) -> String {
     }
 }
 
+/// `CScript() << height`, the start of every coinbase script (BIP34)
+pub fn bip34_height(height: u32) -> Vec<u8> {
+    match height {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + height as u8],
+        _ => {
+            let mut num = Vec::new();
+            let mut v = height;
+            while v > 0 {
+                num.push((v & 0xff) as u8);
+                v >>= 8;
+            }
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                num.push(0);
+            }
+            let mut out = vec![num.len() as u8];
+            out.extend_from_slice(&num);
+            out
+        }
+    }
+}
+
 /// Grind the nonce until the header hash meets its bits
 pub fn mine(block: &mut Block) {
     let target = Hash256::from_compact(block.header.bits);
@@ -110,8 +132,9 @@ impl TestChain {
     pub fn coinbase(&self, height: u32, outputs: Vec<TxOut>) -> Transaction {
         let tag = self.tag.get() + 1;
         self.tag.set(tag);
-        let mut sig = vec![8u8];
-        sig.extend_from_slice(&height.to_le_bytes());
+        // BIP34: the script starts with the height, then a unique tag
+        let mut sig = bip34_height(height);
+        sig.push(4);
         sig.extend_from_slice(&tag.to_le_bytes());
         Transaction {
             version: 1,

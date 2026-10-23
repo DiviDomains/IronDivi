@@ -623,13 +623,15 @@ mod tests {
         use divi_primitives::transaction::{Transaction, TxIn, TxOut};
         use divi_primitives::{amount::Amount, script::Script};
         let mut block = divi_primitives::Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = parent.hash;
         block.header.time = parent.time + 60;
         block.header.bits = 0x207fffff;
+        let mut sig = crate::chain::bip34_height_script(parent.height + 1);
+        sig.extend_from_slice(&[0x01, n]);
         block.transactions.push(Transaction {
             version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05, n]))],
+            vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
             vout: vec![TxOut::new(
                 Amount::from_sat(1250_00000000),
                 Script::new_p2pkh(&[n; 20]),

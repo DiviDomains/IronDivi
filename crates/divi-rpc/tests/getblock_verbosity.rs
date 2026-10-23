@@ -31,13 +31,19 @@ fn call(server: &RpcServer, method: &str, params: Vec<serde_json::Value>) -> Res
 fn mine_one(chain: &Chain) -> (Block, String) {
     let tip = chain.tip().unwrap();
     let mut block = Block::default();
-    block.header.version = 1;
+    block.header.version = 4;
     block.header.prev_block = tip.hash;
     block.header.time = tip.time + 60;
     block.header.bits = 0x207fffff;
     block.transactions.push(Transaction {
         version: 1,
-        vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05, 1, 0, 0, 0]))],
+        vin: vec![TxIn::coinbase(Script::from_bytes(
+            [
+                divi_storage::bip34_height_script(tip.height + 1),
+                vec![0x04, 1, 0, 0, 0],
+            ]
+            .concat(),
+        ))],
         vout: vec![TxOut::new(
             Amount::from_sat(1250_00000000),
             Script::new_p2pkh(&[4u8; 20]),

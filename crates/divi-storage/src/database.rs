@@ -512,6 +512,30 @@ impl ChainDatabase {
         }
     }
 
+    /// Whether `txid` still has an unspent output that can be spent (Divi Core
+    /// `CCoins::IsPruned` is false: OP_META outputs never count). RocksDB holds
+    /// every UTXO write, so a prefix scan sees them all.
+    pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut prefix = Vec::with_capacity(33);
+        prefix.push(b'u');
+        prefix.extend_from_slice(txid.as_bytes());
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if !Utxo::from_bytes(&value)?.script_pubkey.is_op_return() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Get a UTXO directly from database (bypassing cache)
     fn get_utxo_direct(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).unwrap();

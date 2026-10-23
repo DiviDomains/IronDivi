@@ -5787,7 +5787,8 @@ mod accounting_tests {
     fn mine(chain: &Chain, payee: Script, txs: &[Transaction]) -> Block {
         let tip = chain.tip().unwrap();
         let height = tip.height + 1;
-        let mut sig = vec![4u8];
+        // BIP34: the coinbase starts with the height
+        let mut sig = divi_storage::bip34_height_script(height);
         sig.extend_from_slice(&height.to_le_bytes());
         let coinbase = Transaction {
             version: 1,
@@ -5796,7 +5797,7 @@ mod accounting_tests {
             lock_time: 0,
         };
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;

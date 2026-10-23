@@ -67,11 +67,12 @@ impl Net {
         let tip = self.chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;
-        let mut cb_sig = vec![0x04];
+        // BIP34: the coinbase starts with the height
+        let mut cb_sig = divi_storage::bip34_height_script(height);
         cb_sig.extend_from_slice(&height.to_le_bytes());
         let coinbase = Transaction {
             version: 1,
