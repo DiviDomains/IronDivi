@@ -1983,11 +1983,11 @@ impl WalletRpc {
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Chain not available"))?;
 
-        let in_mempool = self
-            .mempool
-            .read()
-            .as_ref()
-            .and_then(|m| m.get_transaction(&txid));
+        let in_mempool = self.mempool.read().as_ref().and_then(|m| {
+            // By txid or bare txid, as Divi Core's GetTransaction
+            m.get_transaction(&txid)
+                .or_else(|| m.get_transaction_by_bare_txid(&txid))
+        });
         let (tx, location) = match in_mempool {
             Some(tx) => (tx, None),
             None => {
@@ -2020,17 +2020,26 @@ impl WalletRpc {
                 })?
                 .ok_or_else(|| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Block not found"))?;
 
-            let tip_height = chain.height();
-            let confirmations = if block_index.height <= tip_height {
-                tip_height - block_index.height + 1
-            } else {
-                0
-            };
             result["blockhash"] = json!(location.block_hash.to_string());
-            result["confirmations"] = json!(confirmations);
-            result["time"] = json!(block_index.time);
-            result["blocktime"] = json!(block_index.time);
-            result["height"] = json!(block_index.height);
+            // The transaction index keeps the entries of disconnected blocks;
+            // Divi Core shows such a transaction at height -1 with no
+            // confirmations (rpcrawtransaction.cpp:223-232)
+            let on_active_chain = chain
+                .get_block_index_by_height(block_index.height)
+                .map_err(|e| {
+                    RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
+                })?
+                .is_some_and(|active| active.hash == location.block_hash);
+            if on_active_chain {
+                let confirmations = chain.height() - block_index.height + 1;
+                result["confirmations"] = json!(confirmations);
+                result["time"] = json!(block_index.time);
+                result["blocktime"] = json!(block_index.time);
+                result["height"] = json!(block_index.height);
+            } else {
+                result["height"] = json!(-1);
+                result["confirmations"] = json!(0);
+            }
         }
         Ok(result)
     }
