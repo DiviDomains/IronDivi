@@ -147,7 +147,7 @@ pub trait MempoolProvider: Send + Sync {
 
     /// Estimate fee for confirmation within target blocks
     fn estimate_fee(&self, _conf_target: u32) -> f64 {
-        0.00001 // Default minimum fee
+        0.0001 // Divi Core's default relay floor, 10000 sat/kB
     }
 
     /// Estimate smart fee with block count used
@@ -315,6 +315,15 @@ impl BlockchainRpc {
     /// Set the mempool provider
     pub fn set_mempool(&self, mempool: Arc<dyn MempoolProvider>) {
         *self.mempool.write() = Some(mempool);
+    }
+
+    /// The minimum relay fee in DIVI/kB that getinfo and getnetworkinfo
+    /// report (Divi Core's getMinimumRelayFeeRate, -minrelaytxfee)
+    pub fn relay_fee(&self) -> f64 {
+        match self.mempool.read().as_ref() {
+            Some(mempool) => mempool.get_stats().min_fee,
+            None => 0.0001,
+        }
     }
 
     pub fn set_block_fetcher(&self, fetcher: Arc<dyn BlockFetcher>) {
@@ -640,7 +649,7 @@ impl BlockchainRpc {
             "keypoololdest": 0,
             "keypoolsize": 0,
             "paytxfee": 0.0,
-            "relayfee": 0.00001,
+            "relayfee": self.relay_fee(),
             "staking status": "Staking Not Active",
             "errors": ""
         }))

@@ -450,7 +450,7 @@ impl RpcServer {
             "keypoolsize": keypoolsize,
             "balance": balance,
             "paytxfee": 0.0,
-            "relayfee": 0.0001,
+            "relayfee": self.blockchain.relay_fee(),
             "staking status": staking_status_text,
             "errors": ""
         }))
@@ -527,7 +527,14 @@ impl RpcServer {
             "setgenerate" => self.blockchain.set_generate(params),
 
             // Network methods
-            "getnetworkinfo" => self.network.read().get_network_info(params),
+            "getnetworkinfo" => self
+                .network
+                .read()
+                .get_network_info(params)
+                .map(|mut info| {
+                    info["relayfee"] = serde_json::json!(self.blockchain.relay_fee());
+                    info
+                }),
             "getpeerinfo" => self.network.read().get_peer_info(params),
             "getconnectioncount" => self.network.read().get_connection_count(params),
             "ping" => self.network.read().ping(params),
