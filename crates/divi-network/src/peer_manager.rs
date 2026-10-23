@@ -140,6 +140,11 @@ impl PeerManager {
         })
     }
 
+    /// The network magic of this peer manager's network
+    pub fn magic(&self) -> crate::constants::Magic {
+        self.config.magic
+    }
+
     /// Get a reference to peer scoring
     pub fn scoring(&self) -> &PeerScoring {
         &self.scoring
