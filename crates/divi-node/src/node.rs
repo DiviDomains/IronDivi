@@ -267,9 +267,11 @@ impl Node {
         // inputs, then scripts, as Divi Core's AcceptToMemoryPool does
         {
             let chain_for_scripts = Arc::clone(&chain);
-            mempool.set_validator(Arc::new(move |pool: &Mempool, tx: &Transaction| {
-                check_mempool_transaction(&chain_for_scripts, pool, tx)
-            }));
+            mempool.set_validator(Arc::new(
+                move |pool: &Mempool, tx: &Transaction, limit_free: bool| {
+                    check_mempool_transaction(&chain_for_scripts, pool, tx, limit_free)
+                },
+            ));
         }
 
         // Create block sync manager
@@ -1038,20 +1040,20 @@ impl Node {
         for output in &tx.vout {
             // Check for negative values (should be caught by Amount, but be safe)
             if output.value.as_sat() < 0 {
-                return Err(NodeError::TxRejected {
-                    code: crate::error::reject::INVALID,
-                    reason: "bad-txns-vout-negative".into(),
-                });
+                return Err(NodeError::rejected(
+                    crate::error::reject::INVALID,
+                    "bad-txns-vout-negative",
+                ));
             }
             total_output += output.value;
         }
 
         // Input must be >= output (difference is the fee)
         if total_input.as_sat() < total_output.as_sat() {
-            return Err(NodeError::TxRejected {
-                code: crate::error::reject::INVALID,
-                reason: "bad-txns-in-belowout".into(),
-            });
+            return Err(NodeError::rejected(
+                crate::error::reject::INVALID,
+                "bad-txns-in-belowout",
+            ));
         }
 
         // Calculate and return fee
@@ -1122,20 +1124,20 @@ impl Node {
         let mut total_output = Amount::from_sat(0);
         for output in &tx.vout {
             if output.value.as_sat() < 0 {
-                return Err(NodeError::TxRejected {
-                    code: crate::error::reject::INVALID,
-                    reason: "bad-txns-vout-negative".into(),
-                });
+                return Err(NodeError::rejected(
+                    crate::error::reject::INVALID,
+                    "bad-txns-vout-negative",
+                ));
             }
             total_output += output.value;
         }
 
         // Input must be >= output (difference is the fee)
         if total_input.as_sat() < total_output.as_sat() {
-            return Err(NodeError::TxRejected {
-                code: crate::error::reject::INVALID,
-                reason: "bad-txns-in-belowout".into(),
-            });
+            return Err(NodeError::rejected(
+                crate::error::reject::INVALID,
+                "bad-txns-in-belowout",
+            ));
         }
 
         Ok(Amount::from_sat(
@@ -1323,18 +1325,18 @@ pub struct MempoolInfo {
     pub total_fee: f64,
 }
 
-/// A transaction relayed by a peer: work out its fee and offer it to the
-/// mempool. As Divi Core's ProcessMessage, a refusal costs the peer the
-/// refusal's misbehaviour score (100 for an invalid transaction, 0 for policy
-/// refusals and missing inputs); enough of it bans the peer.
+/// A transaction relayed by a peer: offer it to the mempool (which works out
+/// its fee). As Divi Core's ProcessMessage, a refusal costs the peer the
+/// refusal's misbehaviour score (Core's DoS value: 100 for most invalid
+/// transactions, 0 for policy refusals, immature spends and missing inputs);
+/// enough of it bans the peer.
 pub fn accept_relayed_transaction(
-    chain: &Arc<Chain>,
+    _chain: &Arc<Chain>,
     mempool: &Arc<Mempool>,
     peers: &PeerManager,
     event: &divi_network::TxRelayEvent,
 ) -> Result<Hash256, NodeError> {
-    let result = Node::calculate_transaction_fee(&event.tx, chain, mempool)
-        .and_then(|fee| mempool.add(event.tx.clone(), fee));
+    let result = mempool.add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
     match &result {
         Ok(txid) => tracing::debug!("Added relayed tx {} to mempool", txid),
         Err(e) => {
@@ -1348,67 +1350,287 @@ pub fn accept_relayed_transaction(
     result
 }
 
-/// Divi Core's AcceptToMemoryPool input checks against the chain: every input
-/// unspent in the chain or an output of a mempool transaction, then every
+/// Divi Core `MAX_STANDARD_TX_SIZE` (defaultValues.h:54)
+const MAX_STANDARD_TX_SIZE: usize = 100_000;
+
+/// Divi Core `MAX_TX_SIGOPS_CURRENT` (defaultValues.h:61): 40,000 / 5
+const MAX_TX_SIGOPS: u32 = 8_000;
+
+/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121) with
+/// its defaults (`-permitbaremultisig` on, `-datacarriersize` 603): the reason
+/// a transaction is not relayed, if it is not. Applies on every network, as
+/// `-acceptnonstandard` is off by default.
+pub fn check_standard_tx(
+    tx: &Transaction,
+    tip_height: u32,
+    now: u32,
+    relay_fee_per_kb: i64,
+) -> Result<(), NodeError> {
+    use crate::error::reject;
+    use divi_script::policy::{standard_output_type, MAX_OP_META_RELAY};
+    use divi_script::ScriptType;
+
+    let nonstandard = |reason: &str| Err(NodeError::rejected(reject::NONSTANDARD, reason));
+    // CTransaction::CURRENT_VERSION is 1
+    if tx.version != 1 {
+        return nonstandard("version");
+    }
+    if !crate::mempool::is_final_for_next_block(tx, tip_height, now) {
+        return Err(NodeError::NonFinal);
+    }
+    if tx.size() >= MAX_STANDARD_TX_SIZE {
+        return nonstandard("tx-size");
+    }
+    for input in &tx.vin {
+        if input.script_sig.len() > 1650 {
+            return nonstandard("scriptsig-size");
+        }
+        if !divi_script::is_push_only(input.script_sig.as_bytes()) {
+            return nonstandard("scriptsig-not-pushonly");
+        }
+    }
+    let mut data_outputs = 0;
+    for out in &tx.vout {
+        match standard_output_type(out.script_pubkey.as_bytes(), MAX_OP_META_RELAY) {
+            None => return nonstandard("scriptpubkey"),
+            Some(ScriptType::NullData) => data_outputs += 1,
+            Some(_) => {
+                if out.value < out.min_non_dust_value(relay_fee_per_kb) {
+                    return nonstandard("dust");
+                }
+            }
+        }
+    }
+    // Only one OP_META output
+    if data_outputs > 1 {
+        return nonstandard("multi-op-meta");
+    }
+    Ok(())
+}
+
+/// Divi Core's `MempoolConsensus::AcceptToMemoryPool` (MempoolConsensus.cpp:268-422)
+/// against the chain, in Core's order: CheckTransaction, no coinbase or
+/// coinstake, IsStandardTx, no conflict, inputs known and unspent, standard
+/// inputs, at most 8,000 sigops, the relay fee or enough priority, then
+/// CheckInputs (maturity, input values, value in at least value out) and every
 /// input script under the standard flags (and, to pick the reject reason, the
-/// mandatory ones). Script failures are refused with Core's code and text.
-/// (Mempool::add itself refuses coinbase and coinstake transactions.)
+/// mandatory ones). Returns the fee. Each refusal carries Core's reject code,
+/// reason and misbehaviour score. `limit_free` is Core's `fLimitFree` (true for
+/// relayed transactions).
 pub fn check_mempool_transaction(
     chain: &Chain,
     mempool: &Mempool,
     tx: &Transaction,
-) -> Result<(), NodeError> {
+    limit_free: bool,
+) -> Result<divi_primitives::amount::Amount, NodeError> {
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
     use divi_script::{verify_input_with_flags, ScriptFlags};
 
-    let mut spent: Vec<(Script, Amount)> = Vec::with_capacity(tx.vin.len());
-    for input in &tx.vin {
-        let prev = match chain.get_utxo(&input.prevout) {
-            Ok(Some(utxo)) => Some((utxo.script_pubkey, utxo.value)),
-            Ok(None) => mempool.get(&input.prevout.txid).and_then(|parent| {
-                parent
-                    .tx
-                    .vout
-                    .get(input.prevout.vout as usize)
-                    .map(|out| (out.script_pubkey.clone(), out.value))
-            }),
-            Err(e) => {
-                return Err(NodeError::TransactionValidation(format!(
-                    "Failed to lookup UTXO {}:{}: {}",
-                    input.prevout.txid, input.prevout.vout, e
-                )))
-            }
-        };
-        spent.push(prev.ok_or(NodeError::MissingInputs)?);
+    let lookup_failed = |e: divi_storage::StorageError| {
+        NodeError::TransactionValidation(format!("Failed to look up the chain: {}", e))
+    };
+
+    let max_money = chain.max_money();
+    if divi_storage::check_transaction(tx, max_money).is_err() {
+        return Err(NodeError::rejected(reject::INVALID, "bad-tx"));
+    }
+    if tx.is_coinbase() {
+        return Err(NodeError::rejected(reject::INVALID, "coinbase"));
+    }
+    if tx.is_coinstake() {
+        return Err(NodeError::rejected(reject::INVALID, "coinstake"));
+    }
+    let tip_height = chain.height();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+    mempool.check_conflicts(tx)?;
+
+    // The transaction's own outputs must not exist yet
+    let txid = tx.txid();
+    if chain
+        .has_spendable_output_of(&txid)
+        .map_err(lookup_failed)?
+    {
+        return Err(NodeError::TransactionValidation(
+            "transaction outputs already exist".into(),
+        ));
     }
 
-    for (i, (script_pubkey, value)) in spent.iter().enumerate() {
-        if let Err(e) = verify_input_with_flags(tx, i, script_pubkey, *value, ScriptFlags::policy())
+    // Each input: (script, value, height and coinbase/coinstake if confirmed)
+    struct Spent {
+        script: Script,
+        value: Amount,
+        confirmed: Option<(u32, bool)>,
+    }
+    let mut spent: Vec<Spent> = Vec::with_capacity(tx.vin.len());
+    let mut any_unknown = false;
+    let mut any_spent = false;
+    for input in &tx.vin {
+        if let Some(utxo) = chain.get_utxo(&input.prevout).map_err(lookup_failed)? {
+            spent.push(Spent {
+                script: utxo.script_pubkey,
+                value: utxo.value,
+                confirmed: Some((utxo.height, utxo.is_coinbase || utxo.is_coinstake)),
+            });
+            continue;
+        }
+        match mempool.get(&input.prevout.txid) {
+            Some(parent) => match parent.tx.vout.get(input.prevout.vout as usize) {
+                Some(out) => spent.push(Spent {
+                    script: out.script_pubkey.clone(),
+                    value: out.value,
+                    confirmed: None,
+                }),
+                None => any_spent = true,
+            },
+            None => {
+                // Core's HaveCoins: the transaction still has unspent outputs,
+                // so this one is spent; otherwise it is unknown (an orphan)
+                if chain
+                    .has_spendable_output_of(&input.prevout.txid)
+                    .map_err(lookup_failed)?
+                {
+                    any_spent = true;
+                } else {
+                    any_unknown = true;
+                }
+            }
+        }
+    }
+    if any_unknown {
+        return Err(NodeError::MissingInputs);
+    }
+    if any_spent {
+        return Err(NodeError::rejected_scored(
+            reject::DUPLICATE,
+            "bad-txns-inputs-spent",
+            0,
+        ));
+    }
+
+    // AreInputsStandard: refused without a reject reason in Core
+    for (input, prev) in tx.vin.iter().zip(&spent) {
+        if !divi_script::policy::is_input_standard(
+            prev.script.as_bytes(),
+            input.script_sig.as_bytes(),
+        ) {
+            return Err(NodeError::rejected(
+                reject::NONSTANDARD,
+                "bad-txns-nonstandard-inputs",
+            ));
+        }
+    }
+
+    // GetLegacySigOpCount + GetP2SHSigOpCount
+    let mut sig_ops: u32 = tx
+        .vin
+        .iter()
+        .map(|i| divi_script::sig_op_count(i.script_sig.as_bytes(), false))
+        .chain(
+            tx.vout
+                .iter()
+                .map(|o| divi_script::sig_op_count(o.script_pubkey.as_bytes(), false)),
+        )
+        .sum();
+    for (input, prev) in tx.vin.iter().zip(&spent) {
+        if divi_script::is_p2sh(prev.script.as_bytes()) {
+            sig_ops +=
+                divi_script::p2sh_sig_op_count(prev.script.as_bytes(), input.script_sig.as_bytes());
+        }
+    }
+    if sig_ops > MAX_TX_SIGOPS {
+        return Err(NodeError::rejected(
+            reject::NONSTANDARD,
+            "bad-txns-too-many-sigops",
+        ));
+    }
+
+    // Fee (may be negative here; CheckInputs refuses that below) and priority:
+    // Core's ComputeInputCoinAge at the tip, then ComputeInputCoinAgePerByte at
+    // the next height, which adds the value in once more
+    let value_in: i64 = spent.iter().map(|p| p.value.as_sat()).sum();
+    let value_out: i64 = tx.vout.iter().map(|o| o.value.as_sat()).sum();
+    let fee = value_in.wrapping_sub(value_out);
+    let coin_age: f64 = spent
+        .iter()
+        .filter_map(|p| p.confirmed.map(|(height, _)| (height, p.value)))
+        .filter(|(height, _)| *height < tip_height)
+        .map(|(height, value)| value.as_sat() as f64 * (tip_height - height) as f64)
+        .sum();
+    let size = tx.size();
+    let mod_size = crate::mempool::modified_size(tx, size);
+    let priority = if mod_size > 0 {
+        coin_age / mod_size as f64 + value_in as f64 / mod_size as f64
+    } else {
+        0.0
+    };
+    mempool.check_fees_paid(&txid, size, fee, priority, limit_free)?;
+
+    // CheckInputs (UtxoCheckingAndUpdating.cpp:66-103)
+    let spend_height = tip_height + 1;
+    let maturity = chain.params().coinbase_maturity;
+    let mut total_in = Amount::ZERO;
+    for prev in &spent {
+        if let Some((height, true)) = prev.confirmed {
+            if spend_height.saturating_sub(height) < maturity {
+                return Err(NodeError::rejected_scored(
+                    reject::INVALID,
+                    "bad-txns-premature-spend-of-coinbase",
+                    0,
+                ));
+            }
+        }
+        total_in += prev.value;
+        if !money_range(prev.value, max_money) || !money_range(total_in, max_money) {
+            return Err(NodeError::rejected(
+                reject::INVALID,
+                "bad-txns-inputvalues-outofrange",
+            ));
+        }
+    }
+    if value_in < value_out {
+        return Err(NodeError::rejected(reject::INVALID, "bad-txns-in-belowout"));
+    }
+
+    for (i, prev) in spent.iter().enumerate() {
+        if let Err(e) =
+            verify_input_with_flags(tx, i, &prev.script, prev.value, ScriptFlags::policy())
         {
             // As Core's CheckInputs: if the mandatory flags alone pass, only
             // policy failed
-            let (code, reason) = match verify_input_with_flags(
-                tx,
-                i,
-                script_pubkey,
-                *value,
-                ScriptFlags::mandatory(),
-            ) {
-                Ok(()) => (
-                    reject::NONSTANDARD,
-                    format!("non-mandatory-script-verify-flag ({})", e.core_message()),
-                ),
-                Err(e) => (
-                    reject::INVALID,
-                    format!("mandatory-script-verify-flag-failed ({})", e.core_message()),
-                ),
-            };
-            return Err(NodeError::TxRejected { code, reason });
+            return Err(
+                match verify_input_with_flags(
+                    tx,
+                    i,
+                    &prev.script,
+                    prev.value,
+                    ScriptFlags::mandatory(),
+                ) {
+                    Ok(()) => NodeError::rejected(
+                        reject::NONSTANDARD,
+                        format!("non-mandatory-script-verify-flag ({})", e.core_message()),
+                    ),
+                    Err(e) => NodeError::rejected(
+                        reject::INVALID,
+                        format!("mandatory-script-verify-flag-failed ({})", e.core_message()),
+                    ),
+                },
+            );
         }
     }
-    Ok(())
+    Ok(Amount::from_sat(fee))
+}
+
+fn money_range(
+    value: divi_primitives::amount::Amount,
+    max_money: divi_primitives::amount::Amount,
+) -> bool {
+    value >= divi_primitives::amount::Amount::ZERO && value <= max_money
 }
 
 #[cfg(test)]
