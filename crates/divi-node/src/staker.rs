@@ -181,13 +181,49 @@ pub fn plan_stake_outputs(
     }
 }
 
-/// Divi Core `COINBASE_MATURITY` per network (chainparams.cpp: regtest 20).
-fn cpp_coinbase_maturity(network: divi_storage::NetworkType) -> u32 {
-    match network {
-        divi_storage::NetworkType::Mainnet => 20,
-        divi_storage::NetworkType::Testnet => 1,
-        divi_storage::NetworkType::Regtest => 20,
+/// Divi Core's lowest split threshold for a vault kernel: 20,000 DIVI
+/// (PoSTransactionCreator.cpp:360-363)
+pub const VAULT_MIN_STAKE_SPLIT_THRESHOLD: i64 = 20_000 * 100_000_000;
+
+/// The split threshold Divi Core uses for a kernel: the configured
+/// `-stakesplitthreshold`, but at least 20,000 DIVI for a vault kernel
+pub fn split_threshold_for(configured: i64, vault_kernel: bool) -> i64 {
+    if vault_kernel {
+        configured.max(VAULT_MIN_STAKE_SPLIT_THRESHOLD)
+    } else {
+        configured
     }
+}
+
+/// Whether a wallet coin is in Divi Core's stake set, the coins it picks a
+/// kernel from and combines into a coinstake: not locked by `lockunspent`
+/// (AvailableUtxoCalculator.cpp:91), confirmed at least 10 blocks deep, or
+/// the coinbase maturity deep for a coinstake output, and at least the
+/// network's minimum coin age old, by the time of its block
+/// (CWallet::SelectStakeCoins, wallet.cpp:1440-1461). `block_time` is the
+/// time of the block that confirmed it.
+pub fn is_stake_set_coin(
+    coin: &divi_wallet::WalletUtxo,
+    block_time: Option<u32>,
+    tip_height: u32,
+    now: u32,
+    coinbase_maturity: u32,
+    min_coin_age: u32,
+    locked: bool,
+) -> bool {
+    let (Some(height), Some(block_time)) = (coin.height, block_time) else {
+        return false;
+    };
+    if locked || coin.value.as_sat() <= 0 {
+        return false;
+    }
+    let depth = (tip_height + 1).saturating_sub(height);
+    let min_depth = if coin.is_coinstake {
+        coinbase_maturity
+    } else {
+        10
+    };
+    depth >= min_depth && now.saturating_sub(block_time) >= min_coin_age
 }
 
 /// Default maximum tip age for staking: 24 hours (C++ `nMaxTipAge`).
@@ -581,6 +617,15 @@ impl Staker {
                 info!("Staking loop iteration {}", iteration);
             }
 
+            // Divi Core stakes only with a peer to announce the block to
+            // (CoinMinter::canMintCoins, CoinMinter.cpp:73-75); without one a
+            // block can only extend a private fork
+            if !self.has_peers() {
+                trace!("No peers - not staking");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
+            }
+
             // Try to stake
             match self.try_stake() {
                 StakeResult::Success {
@@ -722,6 +767,11 @@ impl Staker {
         }
 
         info!("Staking loop stopped");
+    }
+
+    /// Whether a peer is connected to receive a staked block
+    fn has_peers(&self) -> bool {
+        self.peer_manager.peer_count() > 0
     }
 
     /// Check if we should limit staking speed at current height
@@ -916,10 +966,6 @@ impl Staker {
             })
             .collect();
 
-        if stakeable.is_empty() {
-            return StakeResult::NoStakeableUtxos;
-        }
-
         // Apply reserve balance: only stake if we have more than the reserve
         // Sort by value descending to prioritize larger UTXOs
         let mut sorted_stakeable = stakeable;
@@ -940,7 +986,8 @@ impl Staker {
             })
             .collect();
 
-        if stakeable.is_empty() {
+        // No plain coin left is no reason to stop: vault coins are staked too
+        if stakeable.is_empty() && reserve > 0 {
             static RESERVE_LIMIT_COUNT: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
             let count = RESERVE_LIMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -955,14 +1002,32 @@ impl Staker {
                     reserve as f64 / 100_000_000.0
                 );
             }
-            return StakeResult::NoStakeableUtxos;
         }
 
+        // Divi Core stakes and combines only coins of its stake set
+        // (CWallet::SelectStakeCoins): depth, coin age, not locked
+        let stakeable = self.stake_set(&stakeable, current_height, current_time);
+
         // Also get vault UTXOs for staking (bypass reserve balance - not our money)
-        let vault_utxos = self.wallet.get_stakeable_vault_utxos(current_height, 1);
+        let vault_utxos: Vec<_> = self
+            .wallet
+            .get_stakeable_vault_utxos(current_height, 1)
+            .into_iter()
+            .filter(|(utxo, _)| self.is_in_stake_set(utxo, current_height, current_time))
+            .collect();
         if !vault_utxos.is_empty() {
             info!("Found {} vault UTXOs for staking", vault_utxos.len());
         }
+        if stakeable.is_empty() && vault_utxos.is_empty() {
+            return StakeResult::NoStakeableUtxos;
+        }
+        // Coins the coinstake may combine with its kernel: the whole stake
+        // set; plan_stake_outputs keeps those paying the kernel's script
+        let combine_pool: Vec<divi_wallet::WalletUtxo> = stakeable
+            .iter()
+            .cloned()
+            .chain(vault_utxos.iter().map(|(utxo, _)| utxo.clone()))
+            .collect();
 
         // Build combined candidate list
         let mut candidates: Vec<StakeCandidate> =
@@ -1123,7 +1188,7 @@ impl Staker {
                 );
 
                 // Create the block
-                match self.create_stake_block(&tip, candidate, timestamp, n_bits, &stakeable) {
+                match self.create_stake_block(&tip, candidate, timestamp, n_bits, &combine_pool) {
                     Ok(block) => {
                         let block_hash = compute_block_hash(&block.header);
                         let height = current_height + 1;
@@ -1244,7 +1309,7 @@ impl Staker {
         candidate: &StakeCandidate,
         timestamp: u32,
         n_bits: u32,
-        stakeable: &[divi_wallet::WalletUtxo],
+        combine_pool: &[divi_wallet::WalletUtxo],
     ) -> Result<Block, String> {
         let stake_utxo = candidate.utxo();
         // Get stake reward
@@ -1346,27 +1411,33 @@ impl Staker {
             None
         };
 
+        // Split or combine as Divi Core does for every kernel, vault kernels
+        // included (PoSTransactionCreator.cpp:358-365)
+        let (configured_threshold, autocombine) = {
+            let c = self.config.read();
+            (c.stake_split_threshold, c.autocombine)
+        };
+        let split_threshold = split_threshold_for(
+            configured_threshold,
+            matches!(candidate, StakeCandidate::Vault(..)),
+        );
+        let plan = plan_stake_outputs(
+            stake_utxo,
+            stake_utxo.value + stake_reward,
+            split_threshold,
+            autocombine,
+            combine_pool,
+        );
+
         // Create coinstake transaction (with lottery and/or treasury payments if applicable)
         let coinstake = match candidate {
             StakeCandidate::Regular(_) => {
-                let (split_threshold, autocombine) = {
-                    let c = self.config.read();
-                    (c.stake_split_threshold, c.autocombine)
-                };
-                let pool = self.combinable_coins(stakeable, tip.height, timestamp);
-                let plan = plan_stake_outputs(
-                    stake_utxo,
-                    stake_utxo.value + stake_reward,
-                    split_threshold,
-                    autocombine,
-                    &pool,
-                );
                 self.create_coinstake_tx(stake_utxo, &plan, lottery_payments, treasury_payments)?
             }
             StakeCandidate::Vault(_, vault_script) => self.create_vault_coinstake_tx(
                 stake_utxo,
                 vault_script,
-                stake_reward,
+                &plan,
                 lottery_payments,
                 treasury_payments,
             )?,
@@ -1529,13 +1600,14 @@ impl Staker {
 
     /// Create a vault coinstake transaction
     ///
-    /// Uses CoinstakeBuilder for vault-path spending. The coinstake output pays back
-    /// to the same vault script (preserving owner control).
+    /// Uses CoinstakeBuilder for vault-path spending. The kernel and any
+    /// combined coins of the same vault are the inputs; the stake outputs pay
+    /// back to the same vault script (preserving owner control).
     fn create_vault_coinstake_tx(
         &self,
         stake_utxo: &divi_wallet::WalletUtxo,
         vault_script: &divi_script::StakingVaultScript,
-        reward: Amount,
+        plan: &StakeOutputPlan,
         lottery_payments: Option<Vec<(Script, Amount)>>,
         treasury_payments: Option<Vec<(Script, Amount)>>,
     ) -> Result<Transaction, String> {
@@ -1545,9 +1617,14 @@ impl Staker {
 
         let mut builder = divi_wallet::CoinstakeBuilder::new();
         builder.add_vault_input(stake_utxo);
+        for coin in &plan.extra_inputs {
+            builder.add_vault_input(coin);
+        }
 
-        // Output: stake return + reward, paying to the SAME vault script
-        builder.add_output_raw(stake_utxo.value + reward, stake_utxo.script_pubkey.clone());
+        // Stake outputs: stake return + reward, paying to the SAME vault script
+        for value in &plan.stake_outputs {
+            builder.add_output_raw(*value, stake_utxo.script_pubkey.clone());
+        }
 
         let (mut tx, prev_scripts) = builder
             .build()
@@ -1589,48 +1666,47 @@ impl Staker {
             .map_err(|e| format!("Failed to sign vault coinstake: {}", e))?;
 
         info!(
-            "Created vault coinstake: {} inputs, {} outputs, value {}",
+            "Created vault coinstake: {} inputs, {} outputs",
             tx.vin.len(),
-            tx.vout.len(),
-            stake_utxo.value + reward
+            tx.vout.len()
         );
 
         Ok(tx)
     }
 
-    /// Coins that may be combined into a coinstake: the stakeable set Divi
-    /// Core's `CWallet::SelectStakeCoins` would build (depth >= 10, or coinbase
-    /// maturity for coinbase/coinstake outputs, and the minimum coin age).
-    fn combinable_coins(
+    /// The coins of `coins` in Divi Core's stake set, the set it picks
+    /// kernels from and combines into a coinstake
+    fn stake_set(
         &self,
-        stakeable: &[divi_wallet::WalletUtxo],
+        coins: &[divi_wallet::WalletUtxo],
         tip_height: u32,
         now: u32,
     ) -> Vec<divi_wallet::WalletUtxo> {
-        let maturity = cpp_coinbase_maturity(self.chain.network_type());
-        let min_coin_age = self.config.read().min_coin_age;
-        stakeable
+        coins
             .iter()
-            .filter(|u| {
-                let Some(h) = u.height else {
-                    return false;
-                };
-                let depth = (tip_height + 1).saturating_sub(h);
-                let min_depth = if u.is_coinbase || u.is_coinstake {
-                    maturity
-                } else {
-                    10
-                };
-                if depth < min_depth {
-                    return false;
-                }
-                match self.chain.get_block_index_by_height(h) {
-                    Ok(Some(idx)) => now.saturating_sub(idx.time) >= min_coin_age,
-                    _ => false,
-                }
-            })
+            .filter(|u| self.is_in_stake_set(u, tip_height, now))
             .cloned()
             .collect()
+    }
+
+    /// Whether `coin` is in Divi Core's stake set (see `is_stake_set_coin`)
+    fn is_in_stake_set(&self, coin: &divi_wallet::WalletUtxo, tip_height: u32, now: u32) -> bool {
+        let block_time = coin.height.and_then(|h| {
+            self.chain
+                .get_block_index_by_height(h)
+                .ok()
+                .flatten()
+                .map(|idx| idx.time)
+        });
+        is_stake_set_coin(
+            coin,
+            block_time,
+            tip_height,
+            now,
+            self.chain.params().coinbase_maturity,
+            self.config.read().min_coin_age,
+            self.wallet.is_coin_locked(&coin.outpoint()),
+        )
     }
 
     /// Create the coinstake transaction
@@ -1842,12 +1918,15 @@ fn current_timestamp() -> u64 {
 
 /// Create a minimal coinbase marker transaction for PoS blocks
 fn create_coinbase_marker(height: u32) -> Transaction {
-    // PoS blocks have an empty coinbase with just the height in scriptSig
-    // Encode height using CScriptNum format (BIP34): little-endian with sign extension
-    let script_sig = Script::from_bytes(encode_bip34_height(height));
+    // Divi Core CreateEmptyCoinbaseTransaction (BlockFactory.cpp:38-52): the
+    // height (BIP34, CScriptNum) then the extra nonce 1, one empty output,
+    // transaction version 1
+    let mut script_sig = encode_bip34_height(height);
+    script_sig.extend_from_slice(&[0x01, 0x01]);
+    let script_sig = Script::from_bytes(script_sig);
 
     Transaction {
-        version: 2,
+        version: 1,
         lock_time: 0,
         vin: vec![TxIn {
             prevout: OutPoint::null(),
@@ -2416,6 +2495,252 @@ mod tests {
         assert!(marker.is_coinbase());
         assert_eq!(marker.vout.len(), 1);
         assert_eq!(marker.vout[0].value, Amount::ZERO);
+    }
+
+    /// A staked block's coinbase is Divi Core's CreateEmptyCoinbaseTransaction
+    /// (BlockFactory.cpp:38-52): version 1, the height then the extra nonce 1
+    /// (`CScript() << nHeight << CScriptNum(1)`), one empty output
+    #[test]
+    fn coinbase_of_a_staked_block_is_core_s() {
+        let marker = create_coinbase_marker(150);
+        assert_eq!(marker.version, 1);
+        // 150 needs a sign byte: push 2 bytes 96 00, then push 1 byte 01
+        assert_eq!(
+            marker.vin[0].script_sig.as_bytes(),
+            &[0x02, 0x96, 0x00, 0x01, 0x01]
+        );
+        let marker = create_coinbase_marker(4_271_533);
+        assert_eq!(
+            marker.vin[0].script_sig.as_bytes(),
+            &[0x03, 0xad, 0x2d, 0x41, 0x01, 0x01]
+        );
+        assert_eq!(marker.vout.len(), 1);
+        assert!(marker.vout[0].is_empty());
+    }
+
+    /// Divi Core's stake set (CWallet::SelectStakeCoins): at least 10 blocks
+    /// deep, the coinbase maturity for a coinstake output, the minimum coin
+    /// age, and not locked
+    #[test]
+    fn stake_set_is_core_s_select_stake_coins() {
+        let at = |height: u32, coinstake: bool| {
+            let mut c = coin(1, 0, 100, 7);
+            c.height = Some(height);
+            c.is_coinstake = coinstake;
+            c
+        };
+        let ok = |c: &divi_wallet::WalletUtxo, tip: u32, age: u32, locked: bool| {
+            is_stake_set_coin(c, Some(1_000), tip, 1_000 + age, 20, 3600, locked)
+        };
+        // A plain coin: 10 deep (tip 109 for a coin at 100), not 9
+        assert!(ok(&at(100, false), 109, 3600, false));
+        assert!(!ok(&at(100, false), 108, 3600, false));
+        // A coinstake output: the coinbase maturity, 20 here
+        assert!(!ok(&at(100, true), 118, 3600, false));
+        assert!(ok(&at(100, true), 119, 3600, false));
+        // Minimum coin age
+        assert!(!ok(&at(100, false), 200, 3599, false));
+        // Locked by lockunspent
+        assert!(!ok(&at(100, false), 200, 3600, true));
+        // Unconfirmed, or its block unknown
+        assert!(!ok(&coin(1, 0, 100, 7), 200, 3600, false));
+        assert!(!is_stake_set_coin(
+            &at(100, false),
+            None,
+            200,
+            99_999,
+            20,
+            0,
+            false
+        ));
+        // Regtest: no minimum age
+        assert!(is_stake_set_coin(
+            &at(100, false),
+            Some(1_000),
+            109,
+            1_000,
+            20,
+            0,
+            false
+        ));
+    }
+
+    /// A vault kernel is split above max(-stakesplitthreshold, 20,000 DIVI)
+    /// and combines coins of its own vault below half of that, as Divi Core
+    /// does for every kernel (PoSTransactionCreator.cpp:358-365, :281-308)
+    #[test]
+    fn vault_kernel_splits_and_combines_as_core() {
+        let vault = divi_script::StakingVaultScript::new([0x11; 20], [0x22; 20]).to_script();
+        let vault_coin = |tx: u8, divi: i64| {
+            let mut c = coin(tx, 0, divi, 7);
+            c.script_pubkey = vault.clone();
+            c
+        };
+        // Threshold: at least 20,000 DIVI for a vault kernel
+        assert_eq!(
+            split_threshold_for(1_000 * 100_000_000, true),
+            20_000 * 100_000_000
+        );
+        assert_eq!(
+            split_threshold_for(30_000 * 100_000_000, true),
+            30_000 * 100_000_000
+        );
+        assert_eq!(
+            split_threshold_for(1_000 * 100_000_000, false),
+            1_000 * 100_000_000
+        );
+
+        // 30,000 DIVI vault coin + 456 reward: two outputs
+        let big = vault_coin(1, 30_000);
+        let plan = plan_stake_outputs(
+            &big,
+            big.value + Amount::from_divi(456),
+            split_threshold_for(DEFAULT_STAKE_SPLIT_THRESHOLD, true),
+            true,
+            &[],
+        );
+        assert_eq!(
+            sats(&plan.stake_outputs),
+            vec![15_228 * 100_000_000, 15_228 * 100_000_000]
+        );
+
+        // A small vault coin combines the vault's other small coins, not a
+        // plain coin of the same wallet
+        let small = vault_coin(2, 1_000);
+        let pool = vec![vault_coin(3, 500), vault_coin(4, 700), coin(5, 0, 100, 7)];
+        let plan = plan_stake_outputs(
+            &small,
+            small.value + Amount::from_divi(456),
+            split_threshold_for(DEFAULT_STAKE_SPLIT_THRESHOLD, true),
+            true,
+            &pool,
+        );
+        assert_eq!(plan.extra_inputs.len(), 2);
+        assert!(plan.extra_inputs.iter().all(|c| c.script_pubkey == vault));
+        assert_eq!(sats(&plan.stake_outputs), vec![2_656 * 100_000_000]);
+    }
+
+    /// A wallet whose only stakable coins are vault coins it manages still
+    /// stakes, as Divi Core does (its stake set is plain and managed vault
+    /// coins alike, CWallet::SelectStakeCoins): the coinstake spends the vault
+    /// coin and pays back to the vault.
+    #[test]
+    fn vault_manager_without_plain_coins_stakes() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::wallet_db::VaultMetadata;
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        chain.set_ibd_mode(false);
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let manager = wallet.new_receiving_address().unwrap();
+        let vault =
+            divi_script::StakingVaultScript::new([0x11; 20], *manager.hash.as_bytes()).to_script();
+        wallet.store_vault(VaultMetadata {
+            owner_address: String::new(),
+            manager_address: manager.to_string(),
+            vault_script: vault.as_bytes().to_vec(),
+            funding_txid: [0u8; 32],
+        });
+
+        // Block 1 pays its coinbase to the vault; 24 more make it mature
+        for height in 1..=25u32 {
+            let tip = chain.tip().unwrap();
+            let payee = if height == 1 {
+                vault.clone()
+            } else {
+                Script::new_p2pkh(&[0xee; 20])
+            };
+            let mut sig = divi_storage::bip34_height_script(height);
+            sig.push(0);
+            let mut block = Block::default();
+            block.header.version = 4;
+            block.header.prev_block = tip.hash;
+            block.header.time = tip.time + 60;
+            block.header.bits = 0x207fffff;
+            block.transactions = vec![Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+                vout: vec![TxOut::new(Amount::from_divi(1250), payee)],
+                lock_time: 0,
+            }];
+            block.header.merkle_root = compute_merkle_root(&block.transactions);
+            let target = Hash256::from_compact(block.header.bits);
+            while compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            let hash = chain.accept_block(block.clone()).unwrap().hash;
+            wallet.scan_block(hash, height, block.header.time, &block.transactions);
+            wallet.set_last_scan_height(height);
+        }
+        assert_eq!(wallet.get_stakeable_vault_utxos(25, 1).len(), 1);
+        assert!(wallet.get_spendable_utxos(25, 1).is_empty());
+
+        let staker = Staker::new(
+            wallet,
+            chain,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig {
+                allow_stale_tip: true,
+                min_coin_age: 0,
+                ..StakingConfig::default()
+            },
+        );
+        match staker.try_stake() {
+            StakeResult::Success { block, .. } => {
+                let coinstake = &block.transactions[1];
+                assert!(coinstake.is_coinstake());
+                assert_eq!(coinstake.vout[1].script_pubkey, vault);
+                assert_eq!(coinstake.vin.len(), 1);
+            }
+            _ => panic!("expected a vault stake"),
+        }
+    }
+
+    /// Divi Core stakes only with a peer to announce the block to
+    /// (CoinMinter::canMintCoins, CoinMinter.cpp:73-75)
+    #[test]
+    fn staker_without_peers_does_not_stake() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let staker = Staker::new(
+            wallet,
+            chain,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig::default(),
+        );
+        assert!(!staker.has_peers());
     }
 
     #[test]

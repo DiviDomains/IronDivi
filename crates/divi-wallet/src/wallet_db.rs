@@ -264,6 +264,9 @@ pub struct WalletDb {
     scripts: RwLock<HashMap<Hash160, Script>>,
     /// Vault metadata storage
     vaults: RwLock<HashMap<Vec<u8>, VaultMetadata>>,
+    /// Coins `lockunspent` set aside. In memory only, as Divi Core's
+    /// `setLockedCoins`; neither staked nor spent while locked.
+    locked_coins: RwLock<HashSet<OutPoint>>,
     /// How the wallet is unlocked: timer and staking-only flag
     unlock: RwLock<UnlockState>,
     /// Decrypted master key (in memory only when unlocked)
@@ -320,6 +323,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -348,6 +352,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -381,6 +386,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults,
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -532,6 +538,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -1390,6 +1397,26 @@ impl WalletDb {
             }
         }
         out
+    }
+
+    /// Lock (`lock` true) or unlock a coin, as `lockunspent` does
+    pub fn set_coin_locked(&self, outpoint: OutPoint, lock: bool) {
+        let mut locked = self.locked_coins.write();
+        if lock {
+            locked.insert(outpoint);
+        } else {
+            locked.remove(&outpoint);
+        }
+    }
+
+    /// Whether `lockunspent` locked this coin
+    pub fn is_coin_locked(&self, outpoint: &OutPoint) -> bool {
+        self.locked_coins.read().contains(outpoint)
+    }
+
+    /// Every coin `lockunspent` locked
+    pub fn locked_coins(&self) -> Vec<OutPoint> {
+        self.locked_coins.read().iter().copied().collect()
     }
 
     /// Outpoints spent by wallet transactions in the mempool
@@ -3105,8 +3132,9 @@ impl WalletDb {
 
     /// Get vault UTXOs suitable for staking, with their parsed vault script
     ///
-    /// Returns (utxo, vault_script_parsed) pairs where the vault is registered
-    /// and we have the manager key (an owner-only wallet cannot stake it).
+    /// Returns (utxo, vault_script_parsed) pairs where the vault is registered,
+    /// we have the manager key and not the owner key: a vault we own is not
+    /// staked, as in Divi Core.
     pub fn get_stakeable_vault_utxos(
         &self,
         current_height: u32,
@@ -3143,11 +3171,10 @@ impl WalletDb {
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .filter(|(_, vault)| {
-                self.keystore
-                    .get_key(&Hash160::from_bytes(vault.vault_pubkey_hash))
-                    .is_some_and(|entry| !entry.is_watch_only)
-            })
+            // Divi Core stakes managed vault coins only: a vault whose owner
+            // key is in the wallet is owned, even when the manager key is too
+            // (AvailableUtxoCalculator.cpp:28-31)
+            .filter(|(utxo, _)| self.vault_role(&utxo.script_pubkey) == Some(VaultRole::Managed))
             .collect()
     }
 }
@@ -4868,6 +4895,50 @@ mod tests {
             // and the deletion reached the disk
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
             assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
+        }
+
+        /// A registered vault whose owner and manager keys are both in the
+        /// wallet is owned, and Divi Core does not stake owned vault coins
+        /// (AvailableUtxoCalculator.cpp:28-31): only a vault managed for
+        /// someone else is staked.
+        #[test]
+        fn vault_with_owner_and_manager_keys_is_not_staked() {
+            let wallet = create_test_wallet();
+            let owner = wallet.new_receiving_address().unwrap();
+            let manager = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new(hash20(&owner), hash20(&manager)).to_script();
+            register(&wallet, hash20(&owner), &manager, &vault);
+            let tx = pay(vec![(300 * COIN, vault.clone())]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([6; 32])), Some(10), None);
+
+            assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Owned));
+            assert!(wallet.get_stakeable_vault_utxos(20, 1).is_empty());
+
+            // The same vault managed for someone else is staked
+            let other = wallet.new_receiving_address().unwrap();
+            let managed =
+                divi_script::StakingVaultScript::new([0x55; 20], hash20(&other)).to_script();
+            register(&wallet, [0x55; 20], &other, &managed);
+            let tx = pay(vec![(300 * COIN, managed.clone())]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([7; 32])), Some(10), None);
+            let stakeable = wallet.get_stakeable_vault_utxos(20, 1);
+            assert_eq!(stakeable.len(), 1);
+            assert_eq!(stakeable[0].0.script_pubkey, managed);
+        }
+
+        /// `lockunspent` locks a coin for the whole wallet, in memory
+        #[test]
+        fn locked_coin_is_recorded_until_unlocked() {
+            let wallet = create_test_wallet();
+            let coin = TxOutPoint::new(Hash256::from_bytes([8; 32]), 1);
+            assert!(!wallet.is_coin_locked(&coin));
+            wallet.set_coin_locked(coin, true);
+            assert!(wallet.is_coin_locked(&coin));
+            assert_eq!(wallet.locked_coins(), vec![coin]);
+            wallet.set_coin_locked(coin, false);
+            assert!(!wallet.is_coin_locked(&coin));
+            assert!(wallet.locked_coins().is_empty());
         }
 
         /// the owner key alone makes a vault output ours (registered
