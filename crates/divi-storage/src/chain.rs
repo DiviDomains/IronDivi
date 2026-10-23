@@ -4369,9 +4369,13 @@ impl Chain {
         self.db.has_utxo_cache()
     }
 
-    /// Try to activate a stored block (potentially triggering a chain reorganization)
-    /// Returns true if a reorg was triggered, false if block was already on main chain
-    pub fn try_activate_block(&self, hash: &Hash256) -> Result<bool, StorageError> {
+    /// Try to activate a stored block (potentially triggering a chain reorganization).
+    /// When it does, returns the fork height and the transactions of the
+    /// disconnected blocks to return to the mempool, as `accept_block` reports them.
+    pub fn try_activate_block(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
         // Acquire exclusive lock for chain state modifications
         debug!("try_activate_block: Waiting for chain lock...");
         let _chain_guard = self.chain_lock.lock();
@@ -4382,20 +4386,20 @@ impl Chain {
             Some(idx) => idx,
             None => {
                 debug!("try_activate_block: Block {} not found in index", hash);
-                return Ok(false); // Block not found
+                return Ok(None); // Block not found
             }
         };
 
         // Already on main chain, nothing to do
         if existing_index.status.contains(BlockStatus::ON_MAIN_CHAIN) {
             debug!("try_activate_block: Block {} already on main chain", hash);
-            return Ok(false);
+            return Ok(None);
         }
 
         // Never activate a block that is, or descends from, an invalid block.
         if self.has_failed_ancestor(&existing_index)? {
             debug!("try_activate_block: Block {} is on an invalid chain", hash);
-            return Ok(false);
+            return Ok(None);
         }
 
         // Check if this block has more work than our tip
@@ -4405,7 +4409,7 @@ impl Chain {
                 "try_activate_block: No tip yet, cannot activate block {}",
                 hash
             );
-            return Ok(false); // No tip yet
+            return Ok(None); // No tip yet
         };
 
         debug!(
@@ -4418,7 +4422,7 @@ impl Chain {
                 "try_activate_block: Block {} should NOT update tip (insufficient work or doesn't extend)",
                 hash
             );
-            return Ok(false); // Not enough work to trigger reorg
+            return Ok(None); // Not enough work to trigger reorg
         }
 
         // Get the block data
@@ -4440,9 +4444,13 @@ impl Chain {
 
         let mut index = existing_index;
         match self.reorganize_chain(&block, &mut index, current_tip) {
-            Ok((_fork_height, _orphans)) => {
+            Ok(reorg) => {
                 info!("try_activate_block: Successfully activated block {}", hash);
-                Ok(true)
+                self.update_best_known_block(&index);
+                if self.db.has_utxo_cache() {
+                    self.db.flush_utxo_cache()?;
+                }
+                Ok(Some(reorg))
             }
             Err(e) => {
                 warn!(
@@ -5489,7 +5497,7 @@ mod tests {
         assert_eq!(chain.tip().unwrap().hash, hash_a2);
 
         // Neither the explicit activation path nor activate_best_chain picks it again.
-        assert!(!chain.try_activate_block(&hash_b3).unwrap());
+        assert!(chain.try_activate_block(&hash_b3).unwrap().is_none());
         assert!(chain.activate_best_chain().unwrap().is_none());
         assert_eq!(chain.tip().unwrap().hash, hash_a2);
 

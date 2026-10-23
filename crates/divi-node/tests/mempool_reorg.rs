@@ -206,3 +206,25 @@ fn reorg_drops_what_the_new_chain_confirms_conflicts_with_or_lacks() {
     );
     assert_eq!(t.node.mempool().size(), 1);
 }
+
+/// A block stored on a side chain confirms nothing: the mempool keeps the
+/// transactions it carries (Divi Core changes the mempool only in connectTip
+/// and disconnectTip).
+#[test]
+fn side_chain_block_leaves_the_mempool_alone() {
+    let t = TestNode::new();
+    let coin = t.mature_coins(1)[0];
+    let pending = spend(coin, 1250 * COIN);
+    t.add(&pending);
+
+    // A sibling of the tip: same work, so it stays on a side chain
+    let tip = t.node.chain().tip().unwrap();
+    let side = t.block_on(tip.prev_hash, 1, std::slice::from_ref(&pending));
+    t.node.accept_block(side).unwrap();
+    assert_eq!(t.tip(), tip.hash, "the side block does not become the tip");
+
+    assert!(
+        t.in_mempool(&pending),
+        "a side-chain block confirms nothing"
+    );
+}

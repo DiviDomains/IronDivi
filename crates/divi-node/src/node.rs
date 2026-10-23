@@ -910,16 +910,14 @@ impl Node {
         let hash = compute_block_hash(&block.header);
 
         // Validate and add to chain
-        let _result = self
+        let result = self
             .chain
             .accept_block(block.clone())
             .map_err(|e| NodeError::BlockValidation(e.to_string()))?;
 
-        // Remove confirmed transactions from mempool and mark as seen in relay
+        // A block on the active chain confirms its transactions and makes double
+        // spends of its inputs unminable; one stored on a side chain does neither
         let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-        self.mempool.remove_for_block(&txids);
-        // Double spends of the block's inputs can never confirm, if the block
-        // is on the active chain
         let active = self
             .chain
             .get_block_index_by_height(self.chain.height())
@@ -927,7 +925,16 @@ impl Node {
             .flatten()
             .is_some_and(|tip| tip.hash == hash);
         if active {
+            self.mempool.remove_for_block(&txids);
             self.mempool.remove_conflicts(&block.transactions);
+        }
+        if let Some(fork_height) = result.reorg_fork_height {
+            tracing::info!(
+                "Block {} reorganised the chain at height {}",
+                hash,
+                fork_height
+            );
+            update_mempool_after_reorg(&self.chain, &self.mempool, result.orphaned_transactions);
         }
         for txid in &txids {
             self.tx_relay.mark_seen(*txid);
