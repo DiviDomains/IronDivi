@@ -297,21 +297,39 @@ fn vault_stake_block(
     vault_spk: &Script,
     signer: &KeyPair,
 ) -> Block {
+    // Paying the vault the stake and masternode shares satisfies the rule both
+    // before and after DeprecateMasternodes
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(t.chain.height() + 1, 100);
+    let back = Amount::from_sat(value) + reward.stake + reward.masternode;
+    vault_stake_block_paying(t, coin, value, vault_spk, signer, vec![back], vec![])
+}
+
+/// A vault stake block whose coinstake pays `vault_outs` back to the vault, then `others`
+fn vault_stake_block_paying(
+    t: &TestChain,
+    coin: OutPoint,
+    value: i64,
+    vault_spk: &Script,
+    signer: &KeyPair,
+    vault_outs: Vec<Amount>,
+    others: Vec<TxOut>,
+) -> Block {
     let height = t.chain.height() + 1;
     let mut coinbase = t.coinbase(height, Script::new());
     coinbase.vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+    let mut vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+    vout.extend(
+        vault_outs
+            .into_iter()
+            .map(|v| TxOut::new(v, vault_spk.clone())),
+    );
+    vout.extend(others);
     let mut stake = Transaction {
         version: 1,
         vin: vec![TxIn::new(coin, Script::new(), 0xffffffff)],
-        vout: vec![
-            TxOut::new(Amount::ZERO, Script::new()),
-            TxOut::new(Amount::from_sat(value), vault_spk.clone()),
-        ],
+        vout,
         lock_time: 0,
     };
-    // The vault output must carry the stake reward too (CheckCoinstakeForVaults)
-    let reward = divi_consensus::block_subsidy::get_block_subsidy(height, 100);
-    stake.vout[1].value = Amount::from_sat(value) + reward.stake + reward.masternode;
     let sig = sign(&stake, 0, vault_spk, value, signer);
     stake.vin[0].script_sig = vault_script_sig(&sig, signer, false);
     let mut block = t.block(vec![coinbase, stake]);
@@ -319,6 +337,70 @@ fn vault_stake_block(
     let rsig = divi_crypto::sign_hash_recoverable(signer.secret_key(), hash.as_bytes()).unwrap();
     block.block_sig = rsig.to_compact_with_recovery().to_vec();
     block
+}
+
+/// Before DeprecateMasternodes (median time past 2023-08-23; these regtest blocks
+/// carry 2018 times) the vault gets its input plus the stake share only, and the
+/// masternode share goes to another payee. Mainnet block 1,191,825 has this shape:
+/// in 62000 (vault), out 31209 + 31209 (vault, split), 495 to a pubkey hash.
+#[test]
+fn vault_stake_paying_the_masternode_elsewhere_is_accepted() {
+    let t = TestChain::new();
+    let owner = KeyPair::new_random();
+    let manager = KeyPair::new_random();
+    let vault_spk = vault(&owner, &manager);
+    let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
+    let height = t.chain.height();
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(height + 1, 100);
+    assert!(reward.masternode > Amount::ZERO);
+    // Split in two halves would need 10,000 DIVI each; this vault holds 1250, so
+    // the stake share goes into the one vault output
+    let back = Amount::from_sat(value) + reward.stake;
+    let masternode = TxOut::new(reward.masternode, p2pkh(&KeyPair::new_random()));
+    let block = vault_stake_block_paying(
+        &t,
+        coin,
+        value,
+        &vault_spk,
+        &manager,
+        vec![back],
+        vec![masternode],
+    );
+    t.chain
+        .accept_block(block)
+        .expect("vault keeps the stake share, the masternode share is paid elsewhere");
+    assert_eq!(t.chain.height(), height + 1);
+}
+
+/// A vault coinstake that pays itself less than its input plus the stake share is refused
+#[test]
+fn vault_stake_paying_itself_too_little_is_refused() {
+    let t = TestChain::new();
+    let owner = KeyPair::new_random();
+    let manager = KeyPair::new_random();
+    let vault_spk = vault(&owner, &manager);
+    let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
+    let height = t.chain.height();
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(height + 1, 100);
+    let back = Amount::from_sat(value) + reward.stake - Amount::from_sat(1);
+    let elsewhere = TxOut::new(
+        reward.masternode + Amount::from_sat(1),
+        p2pkh(&KeyPair::new_random()),
+    );
+    let block = vault_stake_block_paying(
+        &t,
+        coin,
+        value,
+        &vault_spk,
+        &manager,
+        vec![back],
+        vec![elsewhere],
+    );
+    let err = t.chain.accept_block(block).unwrap_err().to_string();
+    assert!(err.contains("Vault output value"), "{err}");
+    assert_eq!(t.chain.height(), height);
 }
 
 #[test]

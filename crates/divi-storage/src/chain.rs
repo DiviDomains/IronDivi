@@ -2897,7 +2897,10 @@ impl Chain {
                 )
             })?;
 
-        let expected_stake_reward = Self::stake_reward(&self.block_rewards(parent.height + 1));
+        let expected_stake_reward = coinstake_stake_reward(
+            &self.block_rewards(parent.height + 1),
+            self.masternodes_deprecated(parent)?,
+        );
         crate::pos_validation::validate_coinstake_vault_rules(
             coinstake,
             expected_stake_reward,
@@ -3734,11 +3737,22 @@ impl Chain {
         rewards
     }
 
-    /// Core's `nStakeReward`: after DeprecateMasternodes (always active on
-    /// PrivateDivi) the masternode reward is folded into the stake. Shared by
-    /// the mint check and the vault rule so the two cannot disagree.
-    ///
-    /// C++ reference: BlockConnectionService.cpp lines 322-326
+    /// Whether DeprecateMasternodes is active for the block after `parent`: Divi
+    /// Core checks the parent's median time past against 2023-08-23
+    /// (BlockConnectionService.cpp:322, ForkActivation.cpp:19-31, :48-60). Always
+    /// active on PrivateDivi.
+    fn masternodes_deprecated(&self, parent: &BlockIndex) -> Result<bool, StorageError> {
+        if self.params.chain_mode == ChainMode::PrivateDivi {
+            return Ok(true);
+        }
+        use crate::fork_activation::{ActivationState, Fork};
+        let mtp = self.get_median_time_past(parent)? as i64;
+        Ok(ActivationState::new_with_mtp(parent, mtp).is_active(Fork::DeprecateMasternodes))
+    }
+
+    /// The limit on what the coinbase and coinstake may create: stake plus
+    /// masternode reward, whether or not the masternode reward is still paid
+    /// separately (BlockIncentivesPopulator.cpp:202-220 sums both).
     fn stake_reward(rewards: &divi_consensus::block_subsidy::BlockRewards) -> Amount {
         rewards.stake + rewards.masternode
     }
@@ -4421,6 +4435,21 @@ impl divi_masternode::UtxoProvider for ChainDatabase {
     }
 }
 
+/// Divi Core's `nStakeReward` as ConnectBlock hands it to the vault coinstake rule
+/// (BlockConnectionService.cpp:321-326, BlockTransactionChecker.cpp:57-108): the
+/// stake share, plus the masternode share only once DeprecateMasternodes is active.
+/// Before that the masternode share is paid to another output.
+fn coinstake_stake_reward(
+    rewards: &divi_consensus::block_subsidy::BlockRewards,
+    masternodes_deprecated: bool,
+) -> Amount {
+    if masternodes_deprecated {
+        rewards.stake + rewards.masternode
+    } else {
+        rewards.stake
+    }
+}
+
 /// Divi Core `MoneyRange` against the network's `MaxMoneyOut`
 fn money_range(value: Amount, max_money: Amount) -> bool {
     value >= Amount::ZERO && value <= max_money
@@ -4611,6 +4640,50 @@ mod tests {
     }
 
     /// Create a test chain with regtest network (genesis already initialized)
+    /// Mainnet block 1,191,825 (44dfdb8e...f513, accepted by Divi Core): a vault
+    /// coinstake from before DeprecateMasternodes. Its vault output covers the
+    /// input plus the stake share (418); the masternode share (495) goes elsewhere.
+    #[test]
+    fn test_vault_coinstake_of_mainnet_block_1191825() {
+        let rewards = divi_consensus::block_subsidy::get_block_subsidy(1_191_825, 525_600);
+        assert_eq!(rewards.stake, Amount::from_divi(418));
+        assert_eq!(rewards.masternode, Amount::from_divi(495));
+        assert_eq!(
+            coinstake_stake_reward(&rewards, false),
+            Amount::from_divi(418)
+        );
+        assert_eq!(
+            coinstake_stake_reward(&rewards, true),
+            Amount::from_divi(913)
+        );
+
+        let vault = divi_script::StakingVaultScript::new([0x36; 20], [0xa7; 20]).to_script();
+        let prev = OutPoint::new(Hash256::from_bytes([0x44; 32]), 1);
+        let coinstake = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(prev, Script::new(), 0xffff_ffff)],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(Amount::from_divi(31_209), vault.clone()),
+                TxOut::new(Amount::from_divi(31_209), vault.clone()),
+                TxOut::new(Amount::from_divi(495), Script::new_p2pkh(&[0xcd; 20])),
+            ],
+            lock_time: 0,
+        };
+        let input = TxOut::new(Amount::from_divi(62_000), vault);
+        let get = |op: &OutPoint| (*op == prev).then(|| input.clone());
+        let check = |reward| {
+            crate::pos_validation::validate_coinstake_vault_rules(&coinstake, reward, &get)
+        };
+        assert!(check(coinstake_stake_reward(&rewards, false)).is_ok());
+        // What IronDivi asked for before: the masternode share counted as the vault's
+        let err = check(coinstake_stake_reward(&rewards, true)).unwrap_err();
+        assert!(
+            err.contains("(62418 DIVI) < input value plus stake reward (62913 DIVI)"),
+            "{err}"
+        );
+    }
+
     fn create_test_chain() -> (Chain, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
