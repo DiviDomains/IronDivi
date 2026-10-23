@@ -357,3 +357,40 @@ fn reclaim_change_goes_to_a_new_key() {
     assert!(change[0].script_pubkey.is_p2pkh(), "change is not P2PKH");
     assert!(net.wallet.is_mine_script(&change[0].script_pubkey));
 }
+
+/// listunspent leaves out locked coins and immature coinbase outputs, as
+/// Divi Core's (which lists what AvailableCoins gives a send)
+#[test]
+fn listunspent_leaves_out_locked_and_immature_coins() {
+    let net = Net::new();
+    net.fund(&[50 * COIN, 30 * COIN]);
+    // A fresh coinbase to the wallet: immature
+    let reward_addr = net.wallet.new_receiving_address().unwrap();
+    net.mine(vec![], &reward_addr);
+    let rpc = net.rpc();
+    let listed = |rpc: &WalletRpc| -> Vec<i64> {
+        let mut v: Vec<i64> = rpc
+            .list_unspent(&p(vec![]))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| (u["amount"].as_f64().unwrap() * COIN as f64).round() as i64)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(listed(&rpc), vec![30 * COIN, 50 * COIN]);
+    let fifty = net
+        .wallet
+        .get_spendable_utxos(net.chain.height(), 1)
+        .into_iter()
+        .find(|u| u.value.as_sat() == 50 * COIN)
+        .unwrap();
+    rpc.lock_unspent(&p(vec![
+        json!(false),
+        json!([{"txid": fifty.txid.to_string(), "vout": fifty.vout}]),
+    ]))
+    .unwrap();
+    assert_eq!(listed(&rpc), vec![30 * COIN]);
+}

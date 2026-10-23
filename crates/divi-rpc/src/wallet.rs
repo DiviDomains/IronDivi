@@ -866,6 +866,12 @@ impl WalletRpc {
             // Vault outputs are not listed, as in Core (AvailableCoins with
             // ALL_SPENDABLE_COINS); getcoinavailability reports them
             .filter(|utxo| StakingVaultScript::from_script(&utxo.script_pubkey).is_none())
+            // Nor are coins locked by lockunspent or immature coinbase and
+            // coinstake outputs: Core lists what AvailableCoins gives a send
+            // (rpcrawtransaction.cpp:286, AvailableUtxoCalculator.cpp:91,
+            // FilteredTransactionsCalculator.h:74-76)
+            .filter(|utxo| !wallet.is_coin_locked(&utxo.outpoint()))
+            .filter(|utxo| utxo.is_mature(height, wallet.coinbase_maturity()))
             .filter(|utxo| {
                 addresses
                     .as_ref()
