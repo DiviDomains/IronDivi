@@ -1577,28 +1577,21 @@ impl WalletDb {
         utxo.is_mature(current_height, self.coinbase_maturity()) && !watch_only
     }
 
-    /// Coins a send may use, in the order it should try them: coins with at
-    /// least `min_confirmations` (largest first), then, when `min_confirmations`
-    /// is 0 or 1, our own unconfirmed change (largest first). This is Core's
-    /// CreateTransaction with spendzeroconfchange: confirmed coins first, then
-    /// trusted 0-conf coins, which getbalance already counts.
+    /// Coins a send may use, as Divi Core's `AvailableCoins` gives them to a
+    /// send: confirmed (at least `min_confirmations`, never fewer than one),
+    /// mature, unspent and not locked by `lockunspent`. Our own unconfirmed
+    /// change is not spent: Core spends it only with `-spendzeroconfchange`,
+    /// which is off by default (wallet.cpp:1843, AvailableUtxoCollector.cpp:33-43).
+    /// The send's coin selection orders them.
     pub fn get_send_candidates(
         &self,
         current_height: u32,
         min_confirmations: u32,
     ) -> Vec<WalletUtxo> {
-        let mut confirmed = self.get_spendable_utxos(current_height, min_confirmations.max(1));
-        confirmed.sort_by_key(|u| std::cmp::Reverse(u.value));
-        if min_confirmations <= 1 {
-            let mut change: Vec<_> = self
-                .get_spendable_utxos(current_height, 0)
-                .into_iter()
-                .filter(|u| u.confirmations(current_height) == 0)
-                .collect();
-            change.sort_by_key(|u| std::cmp::Reverse(u.value));
-            confirmed.extend(change);
-        }
-        confirmed
+        self.get_spendable_utxos(current_height, min_confirmations.max(1))
+            .into_iter()
+            .filter(|utxo| !self.is_coin_locked(&utxo.outpoint()))
+            .collect()
     }
 
     /// Get total balance: Core's GetBalance, i.e. trusted coins only
@@ -4335,31 +4328,42 @@ mod tests {
         }
 
         #[test]
-        fn send_candidates_take_confirmed_coins_before_own_change() {
+        fn send_candidates_are_confirmed_unlocked_coins() {
             let wallet = create_test_wallet();
             let (fund, send) = fixture(&wallet);
             let small = tx(
                 &[(Hash256::from_bytes([7u8; 32]), 0)],
                 vec![(COIN, mine(&wallet.new_receiving_address().unwrap()))],
             );
-            scan(&wallet, 1, &[fund, small.clone()]);
+            let other = tx(
+                &[(Hash256::from_bytes([8u8; 32]), 0)],
+                vec![(2 * COIN, mine(&wallet.new_receiving_address().unwrap()))],
+            );
+            scan(&wallet, 1, &[fund, small.clone(), other.clone()]);
             assert!(wallet.add_mempool_tx(&send));
 
-            let order: Vec<OutPoint> = wallet
-                .get_send_candidates(1, 1)
-                .iter()
-                .map(|u| u.outpoint())
-                .collect();
-            assert_eq!(
-                order,
-                vec![
-                    OutPoint::new(small.txid(), 0),
-                    OutPoint::new(send.txid(), 1)
-                ]
-            );
-            // An explicit higher minconf does not fall back to 0-conf change
+            let coins = |wallet: &WalletDb, minconf| -> HashSet<OutPoint> {
+                wallet
+                    .get_send_candidates(1, minconf)
+                    .iter()
+                    .map(|u| u.outpoint())
+                    .collect()
+            };
+            // Our unconfirmed change is not spent (Divi Core without
+            // -spendzeroconfchange), though getbalance counts it
+            let expected: HashSet<OutPoint> = [
+                OutPoint::new(small.txid(), 0),
+                OutPoint::new(other.txid(), 0),
+            ]
+            .into();
+            assert_eq!(coins(&wallet, 1), expected);
+            assert_eq!(coins(&wallet, 0), expected);
+            assert_eq!(wallet.get_balance().as_sat(), 3 * COIN + CHANGE);
+            // A locked coin is not spent
+            wallet.set_coin_locked(OutPoint::new(other.txid(), 0), true);
+            assert_eq!(coins(&wallet, 1), [OutPoint::new(small.txid(), 0)].into());
+            // An explicit higher minconf
             assert!(wallet.get_send_candidates(1, 2).is_empty());
-            assert_eq!(wallet.get_balance().as_sat(), COIN + CHANGE);
         }
 
         #[test]

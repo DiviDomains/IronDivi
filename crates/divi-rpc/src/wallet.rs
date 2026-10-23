@@ -28,6 +28,10 @@ use divi_script::opcodes::Opcode;
 use divi_script::StakingVaultScript;
 use divi_storage::chain::NetworkType;
 use divi_storage::Chain;
+use divi_wallet::send::{
+    check_signed, max_script_sig_bytes, plan_send, ChangeKind, FeeMode, FeePolicy, SendCoin,
+    SendError, SendPlan,
+};
 use divi_wallet::{
     wallet_db::VaultMetadata, Address, Network, TransactionBuilder, TransactionSigner, WalletDb,
 };
@@ -55,36 +59,82 @@ fn ensure_not_dust(value: Amount, script: &Script) -> Result<(), Error> {
     Ok(())
 }
 
-/// Upper bound on the serialized size of a wallet transaction with `inputs`
-/// P2PKH or vault inputs (scriptSig at most 73 + 34 + 2 bytes) paying `outputs`
-fn max_tx_size(inputs: usize, outputs: &[Script]) -> usize {
-    let outputs: usize = outputs.iter().map(|s| 9 + s.len()).sum();
-    // version, lock time and the two counts (varints up to 3 bytes)
-    14 + 150 * inputs + outputs
+/// Where a send's change goes
+enum ChangeTo {
+    /// A new change key, taken only when there is change (Divi Core's
+    /// CReserveKey, returned to the keypool otherwise)
+    NewKey,
+    /// A given script (debitvaultbyname: back to the vault)
+    Script(Script),
 }
 
-/// Fee a wallet send pays: the flat schedule IronDivi always used (1000 sat plus
-/// 1000 per input and 500 per output), raised to the relay minimum (Divi Core
-/// minRelayTxFee, 10000 sat/kB) of the largest size the transaction can have, so
-/// a send with many inputs is never below what the mempool and peers accept.
-fn wallet_fee(inputs: usize, outputs: &[Script]) -> Amount {
-    let flat = 1000 + 1000 * inputs as i64 + 500 * outputs.len() as i64;
-    let relay = DEFAULT_MIN_RELAY_FEE_PER_KB * max_tx_size(inputs, outputs) as i64 / 1000;
-    Amount::from_sat(flat.max(relay))
+impl ChangeTo {
+    /// A script of the change output's shape, for its dust limit
+    fn template(&self) -> Script {
+        match self {
+            ChangeTo::NewKey => Script::new_p2pkh(&[0; 20]),
+            ChangeTo::Script(script) => script.clone(),
+        }
+    }
 }
 
-/// Script shape of a change output (P2PKH), for fee estimates before the change
-/// address is taken
-fn change_script_template() -> Script {
-    Script::new_p2pkh(&[0; 20])
+/// RPC error for a send that cannot be built. Insufficient funds keep the code
+/// this RPC always returned; the rest are wallet errors with Divi Core's text.
+fn send_error(e: SendError) -> Error {
+    let code = match e {
+        SendError::InsufficientFunds | SendError::CannotPayFee => codes::WALLET_INSUFFICIENT_FUNDS,
+        _ => codes::WALLET_ERROR,
+    };
+    RpcError::new(code, e.to_string()).into()
 }
 
-/// Smallest change output worth creating. Less than this would be dust, which
-/// no node relays, so it goes to the fee instead, as in Divi Core. Change always
-/// pays a P2PKH address.
-fn min_change_value() -> Amount {
-    TxOut::new(Amount::ZERO, Script::new_p2pkh(&[0; 20]))
-        .min_non_dust_value(DEFAULT_MIN_RELAY_FEE_PER_KB)
+/// IronDivi's `subtractfeefromamount` for sendmany (Divi Core has none): the
+/// fee is split evenly over the listed outputs, the first taking the
+/// remainder, and the sender keeps that much more as change; if that change
+/// would be dust it goes to the fee, as all dust change does
+fn subtract_fee_from_outputs(plan: &mut SendPlan, outputs: &[usize]) -> Result<(), Error> {
+    let fee = plan.fee.as_sat();
+    let n = outputs.len() as i64;
+    for (k, &i) in outputs.iter().enumerate() {
+        let share = fee / n + if k == 0 { fee % n } else { 0 };
+        let out = &mut plan.outputs[i];
+        let reduced = TxOut::new(
+            Amount::from_sat(out.value.as_sat() - share),
+            out.script_pubkey.clone(),
+        );
+        if reduced.value.as_sat() <= 0 || reduced.is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
+            return Err(
+                RpcError::invalid_params("Amount is too small to subtract the fee from").into(),
+            );
+        }
+        *out = reduced;
+    }
+    let change = plan.change.map_or(0, |c| c.as_sat()) + fee;
+    if TxOut::new(Amount::from_sat(change), Script::new_p2pkh(&[0; 20]))
+        .is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB)
+    {
+        plan.change = None;
+        plan.fee = Amount::from_sat(fee + fee);
+    } else {
+        plan.change = Some(Amount::from_sat(change));
+    }
+    Ok(())
+}
+
+/// The fee mode argument of sendtoaddress, reclaimvaultfunds and
+/// debitvaultbyname (Divi Core rpcwallet.cpp:1336-1356, :1118-1132, :1162-1184)
+fn parse_fee_mode(mode: Option<&str>, allow_metadata: bool) -> Result<FeeMode, Error> {
+    match mode {
+        None | Some("") => Ok(FeeMode::SenderPays),
+        Some("metadata") if allow_metadata => Ok(FeeMode::SenderPays),
+        Some(other) => FeeMode::parse(other).ok_or_else(|| {
+            RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Unknown option for reclaiming vault funds",
+            )
+            .into()
+        }),
+    }
 }
 
 /// Divi Core `EnsureWalletIsUnlocked`: sends, signing and key exports need a full
@@ -323,17 +373,6 @@ impl From<String> for TxSubmitError {
 /// Divi Core DEFAULT_TRANSACTION_MAXFEE: sendrawtransaction refuses a higher fee
 /// unless allowhighfees is given
 const MAX_TX_FEE: Amount = Amount::from_sat(100 * 100_000_000);
-
-/// Who pays the fee when spending from a vault (Divi Core's TransactionFeeMode)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VaultFeeMode {
-    /// Fee comes out of the remainder; the destination gets the full amount
-    SenderPays,
-    /// Fee comes out of the amount sent
-    ReceiverPays,
-    /// Everything available goes to the destination, minus the fee
-    SweepFunds,
-}
 
 /// Wallet RPC handler
 pub struct WalletRpc {
@@ -827,6 +866,12 @@ impl WalletRpc {
             // Vault outputs are not listed, as in Core (AvailableCoins with
             // ALL_SPENDABLE_COINS); getcoinavailability reports them
             .filter(|utxo| StakingVaultScript::from_script(&utxo.script_pubkey).is_none())
+            // Nor are coins locked by lockunspent or immature coinbase and
+            // coinstake outputs: Core lists what AvailableCoins gives a send
+            // (rpcrawtransaction.cpp:286, AvailableUtxoCalculator.cpp:91,
+            // FilteredTransactionsCalculator.h:74-76)
+            .filter(|utxo| !wallet.is_coin_locked(&utxo.outpoint()))
+            .filter(|utxo| utxo.is_mature(height, wallet.coinbase_maturity()))
             .filter(|utxo| {
                 addresses
                     .as_ref()
@@ -1355,6 +1400,130 @@ impl WalletRpc {
         }))
     }
 
+    /// The coins a send may spend, as Divi Core hands them to its coin
+    /// selection: not locked by `lockunspent` (AvailableUtxoCalculator.cpp:91),
+    /// each with Core's estimate of its input: the largest scriptSig it can
+    /// need plus 40 bytes. A coin Core cannot size is left out.
+    fn send_coins(
+        wallet: &WalletDb,
+        coins: Vec<divi_wallet::WalletUtxo>,
+        height: u32,
+    ) -> Vec<SendCoin> {
+        let pubkey_len = |hash: &[u8; 20]| {
+            wallet
+                .keystore()
+                .get_key(&Hash160::from_bytes(*hash))
+                .map(|entry| entry.public.to_bytes().len())
+        };
+        let redeem = |hash: &[u8; 20]| wallet.get_script(&Hash160::from_bytes(*hash));
+        coins
+            .into_iter()
+            .filter(|utxo| !wallet.is_coin_locked(&utxo.outpoint()))
+            .filter_map(|utxo| {
+                let script_sig = max_script_sig_bytes(&utxo.script_pubkey, &pubkey_len, &redeem)?;
+                Some(SendCoin {
+                    depth: utxo.confirmations(height),
+                    input_bytes: script_sig + 40,
+                    utxo,
+                })
+            })
+            .collect()
+    }
+
+    /// The coins of `account`, as Divi Core's AccountCoinSelector filters them
+    /// for a named account (rpcwallet.cpp:445-459); all coins for ""
+    fn account_coins(
+        wallet: &WalletDb,
+        account: &str,
+        coins: Vec<divi_wallet::WalletUtxo>,
+    ) -> Vec<divi_wallet::WalletUtxo> {
+        if account.is_empty() {
+            return coins;
+        }
+        coins
+            .into_iter()
+            .filter(|utxo| {
+                Address::from_base58(&utxo.address)
+                    .is_ok_and(|address| wallet.get_account(&address) == account)
+            })
+            .collect()
+    }
+
+    /// Plan a send as Divi Core's CreateTransaction does
+    fn plan(
+        payees: &[TxOut],
+        coins: &[SendCoin],
+        mode: FeeMode,
+        kind: ChangeKind,
+        change_to: &ChangeTo,
+    ) -> Result<SendPlan, Error> {
+        plan_send(
+            payees,
+            coins,
+            mode,
+            kind,
+            &change_to.template(),
+            FeePolicy::default(),
+        )
+        .map_err(send_error)
+    }
+
+    /// Sign a planned send, check it as Divi Core does once signed, and
+    /// submit it. The change key is taken only when there is change.
+    fn sign_and_submit(
+        &self,
+        wallet: &WalletDb,
+        plan: &SendPlan,
+        change_to: ChangeTo,
+    ) -> Result<Hash256, Error> {
+        let mut builder = TransactionBuilder::new();
+        for utxo in &plan.inputs {
+            builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
+        }
+        for out in &plan.outputs {
+            builder = builder.add_output(out.value, out.script_pubkey.clone());
+        }
+        if let Some(change) = plan.change {
+            let script = match change_to {
+                ChangeTo::NewKey => wallet
+                    .new_change_address()
+                    .map_err(|e| {
+                        RpcError::new(
+                            codes::WALLET_ERROR,
+                            format!("Failed to generate change address: {}", e),
+                        )
+                    })?
+                    .script_pubkey(),
+                ChangeTo::Script(script) => script,
+            };
+            builder = builder.add_output(change, script);
+        }
+        let (mut tx, prev_scripts) = builder.build();
+
+        let signer = TransactionSigner::new(wallet.keystore());
+        let signed_count = signer
+            .sign_all_inputs(&mut tx, &prev_scripts)
+            .map_err(|e| {
+                RpcError::new(
+                    codes::WALLET_ERROR,
+                    format!("Failed to sign transaction: {}", e),
+                )
+            })?;
+        if signed_count != plan.inputs.len() {
+            return Err(RpcError::new(
+                codes::WALLET_ERROR,
+                format!(
+                    "Only signed {} of {} inputs",
+                    signed_count,
+                    plan.inputs.len()
+                ),
+            )
+            .into());
+        }
+        check_signed(&tx, plan.fee, FeePolicy::default()).map_err(send_error)?;
+        self.submit_transaction(tx)
+    }
+
     /// sendtoaddress - Send amount to a given address
     pub fn send_to_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let addr_str = params
@@ -1372,6 +1541,9 @@ impl WalletRpc {
 
         let send_amount = amount_from_value(amount_value, false)?;
 
+        // Divi Core: receiver_pays, sweep_funds or metadata (comments)
+        let mode = parse_fee_mode(params.get_str(2), true)?;
+
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
@@ -1379,99 +1551,10 @@ impl WalletRpc {
         ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
         let height = self.current_height();
-
-        // Confirmed coins first (largest first), then our own unconfirmed
-        // change, which getbalance counts (Core's spendzeroconfchange)
-        let utxos = wallet.get_send_candidates(height, 1);
-
-        // Fee: see wallet_fee; the outputs include a change output
-        let fee_outputs: Vec<Script> = vec![dest_addr.script_pubkey(), change_script_template()];
-
-        // Simple coin selection: select UTXOs until we have enough
-        let mut selected = Vec::new();
-        let mut total_input = Amount::ZERO;
-        let min_output = min_change_value();
-
-        for utxo in utxos {
-            selected.push(utxo.clone());
-            total_input += utxo.value;
-
-            // Calculate required amount (send + fee estimate)
-            let est_fee = wallet_fee(selected.len(), &fee_outputs);
-            let required = send_amount + est_fee;
-
-            if total_input >= required {
-                break;
-            }
-        }
-
-        // Check if we have enough funds
-        let fee = wallet_fee(selected.len(), &fee_outputs);
-        let required = send_amount + fee;
-
-        if total_input < required {
-            return Err(RpcError::new(
-                codes::WALLET_INSUFFICIENT_FUNDS,
-                format!(
-                    "Insufficient funds. Have {} DIVI, need {} DIVI",
-                    total_input.as_sat() as f64 / 100_000_000.0,
-                    required.as_sat() as f64 / 100_000_000.0
-                ),
-            )
-            .into());
-        }
-
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
-        // Build the transaction
-        let mut builder = TransactionBuilder::new();
-
-        // Add inputs
-        for utxo in &selected {
-            builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
-        }
-
-        // Add destination output
-        builder = builder.add_output_to_address(send_amount, &dest_addr);
-
-        // Add change output if significant
-        let change_amount = total_input - send_amount - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
-
-        let (mut tx, prev_scripts) = builder.build();
-
-        // Sign the transaction
-        let signer = TransactionSigner::new(wallet.keystore());
-        let signed_count = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to sign transaction: {}", e),
-                )
-            })?;
-
-        if signed_count != selected.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Only signed {} of {} inputs", signed_count, selected.len()),
-            )
-            .into());
-        }
-
-        // Calculate txid
-        let txid = tx.txid();
-
-        // Submit to mempool and broadcast
-        self.submit_transaction(tx)?;
+        let coins = Self::send_coins(&wallet, wallet.get_send_candidates(height, 1), height);
+        let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
+        let plan = Self::plan(&payees, &coins, mode, ChangeKind::P2pkh, &ChangeTo::NewKey)?;
+        let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
         info!(
             "Sent {} DIVI to {} (txid: {})",
@@ -2469,101 +2552,18 @@ impl WalletRpc {
 
         let height = self.current_height();
 
-        // Get spendable UTXOs (1 confirmation minimum)
-        let mut utxos = wallet.get_spendable_utxos(height, 1);
-
-        // Sort by value descending for simple coin selection
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
-
-        // Fee: see wallet_fee; the outputs include a change output
-        let fee_outputs: Vec<Script> = vec![vault_script.clone(), change_script_template()];
-
-        // Simple coin selection: select UTXOs until we have enough
-        let mut selected = Vec::new();
-        let mut total_input = Amount::ZERO;
-        let min_output = min_change_value();
-
-        for utxo in utxos {
-            selected.push(utxo.clone());
-            total_input += utxo.value;
-
-            // Calculate required amount (send + fee estimate)
-            let est_fee = wallet_fee(selected.len(), &fee_outputs);
-            let required = send_amount + est_fee;
-
-            if total_input >= required {
-                break;
-            }
-        }
-
-        // Check if we have enough funds
-        let fee = wallet_fee(selected.len(), &fee_outputs);
-        let required = send_amount + fee;
-
-        if total_input < required {
-            return Err(RpcError::new(
-                codes::WALLET_INSUFFICIENT_FUNDS,
-                format!(
-                    "Insufficient funds. Have {} DIVI, need {} DIVI",
-                    total_input.as_sat() as f64 / 100_000_000.0,
-                    required.as_sat() as f64 / 100_000_000.0
-                ),
-            )
-            .into());
-        }
-
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
-        // Build the transaction
-        let mut builder = TransactionBuilder::new();
-
-        // Add inputs
-        for utxo in &selected {
-            builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
-        }
-
-        // Add vault output
+        // An ordinary send to the vault script (Divi Core fundvault: not from vaults)
+        let coins = Self::send_coins(&wallet, wallet.get_send_candidates(height, 1), height);
+        let payees = [TxOut::new(send_amount, vault_script.clone())];
+        let plan = Self::plan(
+            &payees,
+            &coins,
+            FeeMode::SenderPays,
+            ChangeKind::P2pkh,
+            &ChangeTo::NewKey,
+        )?;
         let vault_script_bytes = vault_script.as_bytes().to_vec();
-        builder = builder.add_output(send_amount, vault_script);
-
-        // Add change output if significant
-        let change_amount = total_input - send_amount - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
-
-        let (mut tx, prev_scripts) = builder.build();
-
-        // Sign the transaction
-        let signer = TransactionSigner::new(wallet.keystore());
-        let signed_count = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to sign transaction: {}", e),
-                )
-            })?;
-
-        if signed_count != selected.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Only signed {} of {} inputs", signed_count, selected.len()),
-            )
-            .into());
-        }
-
-        // Calculate txid
-        let txid = tx.txid();
-
-        // Submit to mempool and broadcast
-        self.submit_transaction(tx)?;
+        let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
         // Register the vault in the wallet so it can be tracked for staking/reclaiming
         let metadata = VaultMetadata {
@@ -2582,186 +2582,6 @@ impl WalletRpc {
         );
 
         Ok(serde_json::json!(txid.to_string()))
-    }
-
-    /// Fee mode argument of reclaimvaultfunds / debitvaultbyname (Divi Core:
-    /// none = sender pays, "receiver_pays", "sweep_funds"; reclaim also takes
-    /// "metadata", whose comments are not kept here)
-    fn parse_vault_fee_mode(
-        mode: Option<&str>,
-        allow_metadata: bool,
-    ) -> Result<VaultFeeMode, Error> {
-        match mode {
-            None | Some("") => Ok(VaultFeeMode::SenderPays),
-            Some("receiver_pays") => Ok(VaultFeeMode::ReceiverPays),
-            Some("sweep_funds") => Ok(VaultFeeMode::SweepFunds),
-            Some("metadata") if allow_metadata => Ok(VaultFeeMode::SenderPays),
-            Some(_) => Err(RpcError::new(
-                codes::INVALID_PARAMETER,
-                "Unknown option for reclaiming vault funds",
-            )
-            .into()),
-        }
-    }
-
-    /// Pay `amount` to `dest` out of vault outputs we own, signing with the
-    /// owner key. What is left goes back to a vault script, so it keeps
-    /// staking: `change_script` if given (debitvaultbyname), otherwise the
-    /// vault the coins came from. Returns (txid, amount received, fee).
-    fn spend_owned_vault_utxos(
-        &self,
-        wallet: &WalletDb,
-        candidates: Vec<divi_wallet::wallet_db::WalletUtxo>,
-        dest: &Address,
-        amount: Amount,
-        mode: VaultFeeMode,
-        change_script: Option<Script>,
-    ) -> Result<(Hash256, Amount, Amount), Error> {
-        // Change goes back to a vault script; every vault script has the same size
-        let vault_template = change_script
-            .clone()
-            .or_else(|| candidates.first().map(|u| u.script_pubkey.clone()))
-            .unwrap_or_default();
-        let fee_for = |inputs: usize, outputs: usize| {
-            let mut scripts = vec![dest.script_pubkey()];
-            if outputs > 1 {
-                scripts.push(vault_template.clone());
-            }
-            wallet_fee(inputs, &scripts)
-        };
-        let total_of = |us: &[divi_wallet::wallet_db::WalletUtxo]| {
-            us.iter().fold(Amount::ZERO, |a, u| a + u.value)
-        };
-        let available = total_of(&candidates);
-
-        // Coins to spend: everything for a sweep; otherwise, when no change
-        // script is fixed, the smallest single vault that covers the payment
-        // (so the remainder has one vault to go back to), else largest first
-        let mut selected = Vec::new();
-        if mode == VaultFeeMode::SweepFunds {
-            selected = candidates;
-        } else {
-            let need = |n: usize| match mode {
-                VaultFeeMode::ReceiverPays => amount,
-                _ => amount + fee_for(n, 2),
-            };
-            let mut pool = candidates;
-            if change_script.is_none() {
-                let mut by_script: std::collections::BTreeMap<Vec<u8>, Vec<_>> = Default::default();
-                for u in &pool {
-                    by_script
-                        .entry(u.script_pubkey.as_bytes().to_vec())
-                        .or_default()
-                        .push(u.clone());
-                }
-                if let Some(group) = by_script
-                    .into_values()
-                    .filter(|g| total_of(g) >= need(g.len()))
-                    .min_by_key(|g| total_of(g))
-                {
-                    pool = group;
-                }
-            }
-            pool.sort_by_key(|u| std::cmp::Reverse(u.value));
-            let mut total = Amount::ZERO;
-            for u in pool {
-                total += u.value;
-                selected.push(u);
-                if total >= need(selected.len()) {
-                    break;
-                }
-            }
-            if total < need(selected.len()) {
-                return Err(RpcError::new(
-                    codes::WALLET_INSUFFICIENT_FUNDS,
-                    format!(
-                        "Insufficient vault funds. Have {}, need {}",
-                        available.as_divi_f64(),
-                        need(selected.len()).as_divi_f64()
-                    ),
-                )
-                .into());
-            }
-        }
-
-        let total_input = total_of(&selected);
-        let (fee, received, change) = match mode {
-            VaultFeeMode::SweepFunds => {
-                let fee = fee_for(selected.len(), 1);
-                (fee, total_input - fee, Amount::ZERO)
-            }
-            VaultFeeMode::ReceiverPays => {
-                let fee = fee_for(selected.len(), 2);
-                (fee, amount - fee, total_input - amount)
-            }
-            VaultFeeMode::SenderPays => {
-                let fee = fee_for(selected.len(), 2);
-                (fee, amount, total_input - amount - fee)
-            }
-        };
-        // The payment is checked against the destination's own dust limit
-        if TxOut::new(received, dest.script_pubkey()).is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!(
-                    "Amount {} is too small to pay the fee of {}",
-                    amount.as_divi_f64(),
-                    fee.as_divi_f64()
-                ),
-            )
-            .into());
-        }
-        let change_script = change_script.unwrap_or_else(|| {
-            selected
-                .iter()
-                .max_by_key(|u| u.value)
-                .map(|u| u.script_pubkey.clone())
-                .expect("at least one input")
-        });
-
-        let mut builder = TransactionBuilder::new();
-        for utxo in &selected {
-            builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
-        }
-        builder = builder.add_output_to_address(received, dest);
-        // Change returns to a vault script, whose dust limit is above the P2PKH
-        // one; dust change goes to the fee, as for ordinary sends
-        let change_out = TxOut::new(change, change_script);
-        if !change_out.is_dust_at(DEFAULT_MIN_RELAY_FEE_PER_KB) {
-            builder = builder.add_output(change_out.value, change_out.script_pubkey);
-        }
-
-        let (mut tx, prev_scripts) = builder.build();
-
-        // Vault scripts use OP_IF with the owner key in the true branch (push 1)
-        let signer = TransactionSigner::new(wallet.keystore());
-        let signed_count = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to sign transaction: {}", e),
-                )
-            })?;
-
-        if signed_count != selected.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!(
-                    "Only signed {}/{} inputs. Wallet may not have owner keys for all vaults.",
-                    signed_count,
-                    selected.len()
-                ),
-            )
-            .into());
-        }
-
-        let txid = tx.txid();
-        // A dropped (dust) change is part of the fee
-        let paid_out = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
-        let fee = total_input - paid_out;
-        self.submit_transaction(tx)?;
-        Ok((txid, received, fee))
     }
 
     /// Debit vault by name - pay out of one vault with the owner key; the rest
@@ -2808,7 +2628,7 @@ impl WalletRpc {
             .decode_address(destination)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
         ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
-        let mode = Self::parse_vault_fee_mode(params.get_str(3), false)?;
+        let mode = parse_fee_mode(params.get_str(3), false)?;
 
         ensure_fully_unlocked(&wallet)?;
 
@@ -2826,14 +2646,12 @@ impl WalletRpc {
             .into());
         }
 
-        let (txid, _, _) = self.spend_owned_vault_utxos(
-            &wallet,
-            candidates,
-            &dest_addr,
-            send_amount,
-            mode,
-            Some(vault_script),
-        )?;
+        // Divi Core VaultCoinSelector for this vault; change back to the vault
+        let coins = Self::send_coins(&wallet, candidates, height);
+        let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
+        let change_to = ChangeTo::Script(vault_script);
+        let plan = Self::plan(&payees, &coins, mode, ChangeKind::Vault, &change_to)?;
+        let txid = self.sign_and_submit(&wallet, &plan, change_to)?;
         Ok(json!(txid.to_string()))
     }
 
@@ -2859,7 +2677,7 @@ impl WalletRpc {
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
         ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
-        let mode = Self::parse_vault_fee_mode(params.get_str(2), true)?;
+        let mode = parse_fee_mode(params.get_str(2), true)?;
 
         let height = self.current_height();
 
@@ -2873,14 +2691,14 @@ impl WalletRpc {
             );
         }
 
-        let (txid, received, fee) = self.spend_owned_vault_utxos(
-            &wallet,
-            owned_vault_utxos,
-            &dest_addr,
-            send_amount,
-            mode,
-            None,
-        )?;
+        // Divi Core VaultCoinSelector over every owned vault; with no change
+        // script given, the change goes to a new key (rpcwallet.cpp:1158-1186,
+        // wallet.cpp:1905-1910)
+        let coins = Self::send_coins(&wallet, owned_vault_utxos, height);
+        let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
+        let plan = Self::plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
+        let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        let (received, fee) = (plan.outputs[0].value, plan.fee);
 
         Ok(json!({
             "txid": txid.to_string(),
@@ -3164,8 +2982,8 @@ impl WalletRpc {
 
     /// sendmany - Send to multiple addresses in one transaction
     pub fn send_many(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        // Get account (ignored for now, legacy feature)
-        let _account = params
+        // Divi Core spends only the named account's coins ("" for all)
+        let account = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Account required"))?;
 
@@ -3175,11 +2993,8 @@ impl WalletRpc {
             .and_then(|v| v.as_object())
             .ok_or_else(|| RpcError::invalid_params("Amounts object required"))?;
 
-        // Optional minconf (default 1)
+        // Optional minconf (default 1); in Divi Core the third argument is a comment
         let min_conf = params.get_u64(2).unwrap_or(1) as u32;
-
-        // Optional comment (ignored)
-        let _comment = params.get_str(3);
 
         // Optional subtractfeefromamount array - addresses to subtract fee from
         let subtract_fee_from: Vec<String> = params
@@ -3198,149 +3013,75 @@ impl WalletRpc {
 
         let height = self.current_height();
 
-        // Parse and validate all outputs first
-        let mut outputs: Vec<(Address, Amount)> = Vec::new();
-        let mut total_send = Amount::ZERO;
-
+        // Divi Core parseMultiSendJson (rpcwallet.cpp:1652-1692): an amount, or
+        // {"amount": a, "repetitions": n} for n outputs of a
+        let mut payees: Vec<TxOut> = Vec::new();
+        let mut subtract_outputs: Vec<usize> = Vec::new();
         for (addr_str, amount_value) in amounts {
-            let amount = amount_from_value(amount_value, false)?;
             let addr = self.decode_address(addr_str).map_err(|_| {
                 RpcError::new(
                     codes::INVALID_ADDRESS_OR_KEY,
                     format!("Invalid DIVI address: {}", addr_str),
                 )
             })?;
-
-            outputs.push((addr, amount));
-            total_send += amount;
+            let (amount, repetitions) = match amount_value.as_object() {
+                Some(details) => {
+                    let amount = details.get("amount").ok_or_else(|| {
+                        RpcError::new(
+                            codes::INVALID_PARAMETER,
+                            format!("Unable to parse amount for: {}", addr_str),
+                        )
+                    })?;
+                    let repetitions = details
+                        .get("repetitions")
+                        .and_then(|r| r.as_i64())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                codes::INVALID_PARAMETER,
+                                format!("Unable to parse repetitions for: {}", addr_str),
+                            )
+                        })?;
+                    (
+                        amount_from_value(amount, false)?,
+                        repetitions.max(1) as usize,
+                    )
+                }
+                None => (amount_from_value(amount_value, false)?, 1),
+            };
+            for _ in 0..repetitions {
+                if subtract_fee_from.contains(addr_str) {
+                    subtract_outputs.push(payees.len());
+                }
+                payees.push(TxOut::new(amount, addr.script_pubkey()));
+            }
         }
 
-        if outputs.is_empty() {
+        if payees.is_empty() {
             return Err(RpcError::invalid_params("No recipients specified").into());
         }
-
-        // Coins with min_conf first, then (at the default minconf) our own
-        // unconfirmed change, as in Core
-        let utxos = wallet.get_send_candidates(height, min_conf);
-
-        // Simple coin selection
-        // Fee: see wallet_fee; the outputs include a change output
-        let fee_outputs: Vec<Script> = outputs
-            .iter()
-            .map(|(a, _)| a.script_pubkey())
-            .chain(std::iter::once(change_script_template()))
-            .collect();
-
-        let mut selected = Vec::new();
-        let mut total_input = Amount::ZERO;
-
-        for utxo in utxos {
-            selected.push(utxo.clone());
-            total_input += utxo.value;
-
-            let est_fee = wallet_fee(selected.len(), &fee_outputs);
-            let required = total_send + est_fee;
-
-            if total_input >= required {
-                break;
-            }
+        for out in &payees {
+            ensure_not_dust(out.value, &out.script_pubkey)?;
         }
 
-        // Check if we have enough funds
-        let fee = wallet_fee(selected.len(), &fee_outputs);
-        let required = total_send + fee;
-
-        if total_input < required {
-            return Err(RpcError::new(
-                codes::WALLET_INSUFFICIENT_FUNDS,
-                format!(
-                    "Insufficient funds. Have {} DIVI, need {} DIVI",
-                    total_input.as_sat() as f64 / 100_000_000.0,
-                    required.as_sat() as f64 / 100_000_000.0
-                ),
-            )
-            .into());
+        let candidates = Self::account_coins(
+            &wallet,
+            account,
+            wallet.get_send_candidates(height, min_conf),
+        );
+        let coins = Self::send_coins(&wallet, candidates, height);
+        let mut plan = Self::plan(
+            &payees,
+            &coins,
+            FeeMode::SenderPays,
+            ChangeKind::P2pkh,
+            &ChangeTo::NewKey,
+        )?;
+        if !subtract_outputs.is_empty() {
+            subtract_fee_from_outputs(&mut plan, &subtract_outputs)?;
         }
+        let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
-        let mut adjusted_outputs = outputs.clone();
-        let mut adjusted_total_send = total_send;
-
-        if !subtract_fee_from.is_empty() {
-            let fee_per_output = Amount::from_sat(fee.as_sat() / subtract_fee_from.len() as i64);
-
-            for (addr, amount) in adjusted_outputs.iter_mut() {
-                let addr_str = addr.to_base58();
-                if subtract_fee_from.contains(&addr_str) {
-                    if *amount <= fee_per_output {
-                        return Err(RpcError::invalid_params(format!(
-                            "Amount for {} is too small to subtract fee from",
-                            addr_str
-                        ))
-                        .into());
-                    }
-                    *amount -= fee_per_output;
-                    adjusted_total_send -= fee_per_output;
-                }
-            }
-        }
-
-        for (addr, amount) in &adjusted_outputs {
-            ensure_not_dust(*amount, &addr.script_pubkey())?;
-        }
-
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
-        // Build transaction
-        let mut builder = TransactionBuilder::new();
-
-        // Add inputs
-        for utxo in &selected {
-            builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
-        }
-
-        for (addr, amount) in adjusted_outputs {
-            builder = builder.add_output_to_address(amount, &addr);
-        }
-
-        // Add change output if significant
-        let min_output = min_change_value();
-        let change_amount = total_input - adjusted_total_send - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
-
-        let (mut tx, prev_scripts) = builder.build();
-
-        // Sign the transaction
-        let signer = TransactionSigner::new(wallet.keystore());
-        let signed_count = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to sign transaction: {}", e),
-                )
-            })?;
-
-        if signed_count != selected.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Only signed {} of {} inputs", signed_count, selected.len()),
-            )
-            .into());
-        }
-
-        // Calculate txid and submit
-        let txid = tx.txid();
-        self.submit_transaction(tx)?;
-
-        info!("Sent to {} addresses (txid: {})", amounts.len(), txid);
+        info!("Sent {} outputs (txid: {})", plan.outputs.len(), txid);
 
         Ok(serde_json::json!(txid.to_string()))
     }
@@ -3757,10 +3498,7 @@ impl WalletRpc {
 
         let height = self.current_height();
 
-        // Get addresses for the specified account
-        let account_addresses = wallet.get_addresses_by_account(account);
-
-        if account_addresses.is_empty() && !account.is_empty() {
+        if !account.is_empty() && wallet.get_addresses_by_account(account).is_empty() {
             return Err(RpcError::new(
                 codes::WALLET_INVALID_ACCOUNT_NAME,
                 format!("Account '{}' has no addresses", account),
@@ -3768,108 +3506,22 @@ impl WalletRpc {
             .into());
         }
 
-        // Get UTXOs only from account addresses
-        let all_utxos = wallet.get_send_candidates(height, min_conf);
-        let mut utxos: Vec<_> = if account.is_empty() {
-            // Empty account means default account - use all addresses
-            all_utxos
-        } else {
-            // Filter to only account addresses
-            let account_addr_set: std::collections::HashSet<_> = account_addresses.iter().collect();
-            all_utxos
-                .into_iter()
-                .filter(|utxo| account_addr_set.contains(&utxo.address))
-                .collect()
-        };
-
-        utxos.sort_by_key(|u| std::cmp::Reverse(u.value));
-
-        // Fee: see wallet_fee; the outputs include a change output
-        let fee_outputs: Vec<Script> = vec![dest_addr.script_pubkey(), change_script_template()];
-
-        // Simple coin selection
-        let mut selected = Vec::new();
-        let mut total_input = Amount::ZERO;
-        let min_output = min_change_value();
-
-        for utxo in utxos {
-            selected.push(utxo.clone());
-            total_input += utxo.value;
-
-            let est_fee = wallet_fee(selected.len(), &fee_outputs);
-            let required = send_amount + est_fee;
-
-            if total_input >= required {
-                break;
-            }
-        }
-
-        // Check if we have enough funds from this account
-        let fee = wallet_fee(selected.len(), &fee_outputs);
-        let required = send_amount + fee;
-
-        if total_input < required {
-            return Err(RpcError::new(
-                codes::WALLET_INSUFFICIENT_FUNDS,
-                format!(
-                    "Account '{}' has insufficient funds. Have {} DIVI, need {} DIVI",
-                    account,
-                    total_input.as_sat() as f64 / 100_000_000.0,
-                    required.as_sat() as f64 / 100_000_000.0
-                ),
-            )
-            .into());
-        }
-
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
-        // Build transaction
-        let mut builder = TransactionBuilder::new();
-
-        // Add inputs
-        for utxo in &selected {
-            builder = builder.add_input(utxo.outpoint(), utxo.script_pubkey.clone());
-        }
-
-        // Add destination output
-        builder = builder.add_output_to_address(send_amount, &dest_addr);
-
-        // Add change output if significant
-        let change_amount = total_input - send_amount - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
-
-        let (mut tx, prev_scripts) = builder.build();
-
-        // Sign the transaction
-        let signer = TransactionSigner::new(wallet.keystore());
-        let signed_count = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to sign transaction: {}", e),
-                )
-            })?;
-
-        if signed_count != selected.len() {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Only signed {} of {} inputs", signed_count, selected.len()),
-            )
-            .into());
-        }
-
-        // Calculate txid and submit
-        let txid = tx.txid();
-        self.submit_transaction(tx)?;
+        // Only the account's coins, as Divi Core's AccountCoinSelector
+        let candidates = Self::account_coins(
+            &wallet,
+            account,
+            wallet.get_send_candidates(height, min_conf),
+        );
+        let coins = Self::send_coins(&wallet, candidates, height);
+        let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
+        let plan = Self::plan(
+            &payees,
+            &coins,
+            FeeMode::SenderPays,
+            ChangeKind::P2pkh,
+            &ChangeTo::NewKey,
+        )?;
+        let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
         info!(
             "Sent {} DIVI from account '{}' to {} (txid: {})",
@@ -5629,9 +5281,11 @@ mod send_unlock_regression {
     fn change_below_dust_goes_to_fee() {
         let (rpc, _, sent) = funded_rpc();
         let to = address(8, Network::Testnet);
-        // 10 DIVI in, fee estimate 3000 sat for one input: leave 3000 sat of change,
-        // above the old 546 limit and below the real 5460 one.
-        let amount = (1_000_000_000i64 - 6000) as f64 / 100_000_000.0;
+        // 10 DIVI in. Divi Core's selection needs the payment, 5,460 sat of
+        // room for change and the 440 + 1,480 sat input estimate: this amount
+        // just fits, and the 5,120 sat left (below the 5,460 dust limit once
+        // the 340 sat change estimate is paid) goes to the fee.
+        let amount = (1_000_000_000i64 - 7_380) as f64 / 100_000_000.0;
         rpc.send_to_address(&p(vec![json!(to), json!(amount)]))
             .unwrap();
         let sent = sent.lock();
@@ -6178,7 +5832,7 @@ mod accounting_tests {
     }
 
     #[test]
-    fn send_can_use_own_unconfirmed_change_that_getbalance_counts() {
+    fn send_does_not_spend_own_unconfirmed_change_that_getbalance_counts() {
         let f = fixture();
         // Our own tx spends every confirmed coin: 100 DIVI change comes back
         // unconfirmed (trusted, as all inputs are ours)
@@ -6209,12 +5863,13 @@ mod accounting_tests {
             *sink.lock() = Some(tx);
             Ok(txid)
         }));
-        f.rpc
+        // Divi Core spends only confirmed coins unless -spendzeroconfchange
+        // (off by default), though getbalance counts our own change
+        assert!(f
+            .rpc
             .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
-            .expect("getbalance says 100, so a 10 DIVI send must find the coins");
-        let tx = submitted.lock().clone().unwrap();
-        assert_eq!(tx.vin.len(), 1);
-        assert_eq!(tx.vin[0].prevout.txid, own.txid());
+            .is_err());
+        assert!(submitted.lock().is_none());
     }
 
     #[test]
