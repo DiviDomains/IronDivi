@@ -344,13 +344,6 @@ impl Node {
         // Create masternode P2P handler
         let masternode_handler = Arc::new(MasternodeHandler::new(Arc::clone(&masternode_manager)));
 
-        // Set up relay callback for masternode handler
-        let pm_for_relay = Arc::clone(&peer_manager);
-        masternode_handler.set_relay_callback(move |msg, exclude_peer| {
-            // Broadcast to all peers except the one who sent it
-            pm_for_relay.broadcast_except(msg, exclude_peer);
-        });
-
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
         // Do NOT set it here — main.rs sets a single unified callback.
@@ -714,32 +707,10 @@ impl Node {
                                 tracing::debug!("Received govsync request from peer {}", peer_id);
                             }
                             // Masternode P2P messages
-                            NetworkMessage::RequestMasternodeList(payload) => {
-                                let handler = Arc::clone(&masternode_handler);
-                                let pm = Arc::clone(&peer_manager);
-                                tokio::spawn(async move {
-                                    match handler.handle_list_request(peer_id, &payload) {
-                                        Ok(responses) => {
-                                            // Send responses back to the requesting peer
-                                            for response in responses {
-                                                if let Err(e) =
-                                                    pm.send_to_peer(peer_id, response).await
-                                                {
-                                                    tracing::warn!(
-                                                        "Failed to send masternode response to peer {}: {}",
-                                                        peer_id, e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to handle masternode list request from peer {}: {}",
-                                                peer_id, e
-                                            );
-                                        }
-                                    }
-                                });
+                            // Not answered: IronDivi cannot vouch for masternode
+                            // entries as Divi Core does (see MasternodeHandler)
+                            NetworkMessage::RequestMasternodeList(_) => {
+                                tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
                             NetworkMessage::MasternodeBroadcast(payload) => {
                                 if let Err(e) =
