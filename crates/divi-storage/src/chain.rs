@@ -18,7 +18,7 @@ use crate::block_index::{BlockIndex, BlockStatus};
 use crate::database::{BatchedUtxoWriter, ChainDatabase};
 use crate::difficulty::{get_next_work_required, DifficultyParams};
 use crate::error::StorageError;
-use crate::spent_index::SpentIndex;
+use crate::search_index::{self, SearchIndex};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::BlockUndo;
 use crate::utxo::Utxo;
@@ -30,6 +30,7 @@ use divi_primitives::transaction::{OutPoint, Transaction};
 use divi_primitives::ChainMode;
 use divi_script::{verify_input_with_flags, ScriptFlags};
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -308,8 +309,8 @@ pub struct Chain {
     db: Arc<ChainDatabase>,
     /// Transaction index for O(1) transaction lookups
     tx_index: Option<Arc<TxIndex>>,
-    /// Spent index for tracking spent outputs
-    spent_index: Option<Arc<SpentIndex>>,
+    /// Divi Core's address and spent indexes (`-addressindex`, `-spentindex`)
+    search_index: Option<Arc<SearchIndex>>,
     /// Current chain tip
     tip: RwLock<Option<BlockIndex>>,
     /// Best known block index (block with the highest chain work we've seen).
@@ -351,7 +352,7 @@ impl Chain {
         let mut chain = Chain {
             db,
             tx_index: None,
-            spent_index: None,
+            search_index: None,
             tip: RwLock::new(None),
             best_known_block: RwLock::new(None),
             params,
@@ -387,9 +388,49 @@ impl Chain {
         self.tx_index = Some(tx_index);
     }
 
-    /// Enable spent index for tracking spent outputs
-    pub fn enable_spent_index(&mut self, spent_index: Arc<SpentIndex>) {
-        self.spent_index = Some(spent_index);
+    /// Keep Divi Core's address and spent indexes as blocks are connected
+    /// and disconnected
+    pub fn enable_search_index(&mut self, search_index: Arc<SearchIndex>) {
+        self.search_index = Some(search_index);
+    }
+
+    /// The address and spent indexes, when enabled
+    pub fn search_index(&self) -> Option<&Arc<SearchIndex>> {
+        self.search_index.as_ref()
+    }
+
+    /// Write a connected block (UTXOs, undo data, tip) and then its address
+    /// and spent index entries, as Divi Core's ConnectBlock does once the
+    /// block's transactions have been checked
+    fn commit_connected_block(
+        &self,
+        block: &Block,
+        utxo_batch: &BatchedUtxoWriter,
+        undo_bytes: &[u8],
+        index: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        self.db
+            .atomic_connect_block(utxo_batch, undo_bytes, &index.hash, index)?;
+        if let Some(ref search) = self.search_index {
+            let mut prevouts = HashMap::new();
+            if !undo_bytes.is_empty() {
+                for entry in BlockUndo::from_bytes(undo_bytes)?.entries {
+                    prevouts.insert(
+                        entry.outpoint,
+                        (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
+                    );
+                }
+            }
+            let updates = search_index::collect_connect(
+                block,
+                index.height,
+                &prevouts,
+                search.address_enabled(),
+                search.spent_enabled(),
+            );
+            search.apply_connect(&updates)?;
+        }
+        Ok(())
     }
 
     /// Set IBD (Initial Block Download) mode.
@@ -1516,8 +1557,7 @@ impl Chain {
                     let accepted_height = index.height;
 
                     // Atomic write: UTXOs + undo data + tip update in single WriteBatch
-                    self.db
-                        .atomic_connect_block(&utxo_batch, &undo_bytes, &index.hash, &index)?;
+                    self.commit_connected_block(&block, &utxo_batch, &undo_bytes, &index)?;
                     *self.tip.write() = Some(index.clone());
 
                     // Keep best_known_block in sync with the new tip
@@ -1591,8 +1631,7 @@ impl Chain {
                 let accepted_height = index.height;
 
                 // Atomic write: UTXOs + undo data + tip update in single WriteBatch
-                self.db
-                    .atomic_connect_block(&utxo_batch, &undo_bytes, &index.hash, &index)?;
+                self.commit_connected_block(&block, &utxo_batch, &undo_bytes, &index)?;
                 *self.tip.write() = Some(index.clone());
 
                 // Keep best_known_block in sync with the new tip
@@ -1873,12 +1912,7 @@ impl Chain {
                 .check_block_proof_of_stake(block, parent)
                 .and_then(|()| self.connect_block(block, &mut index_mut))
                 .and_then(|(utxo_batch, undo_bytes)| {
-                    self.db.atomic_connect_block(
-                        &utxo_batch,
-                        &undo_bytes,
-                        &index_mut.hash,
-                        &index_mut,
-                    )
+                    self.commit_connected_block(block, &utxo_batch, &undo_bytes, &index_mut)
                 });
             if let Err(e) = connected {
                 warn!("Failed to connect block {}: {}", index.hash, e);
@@ -1998,8 +2032,7 @@ impl Chain {
                     .get_block_index(&index.hash)?
                     .ok_or_else(|| StorageError::BlockNotFound(index.hash.to_string()))?;
                 let (utxo_batch, undo_bytes) = self.connect_block(block, &mut stored)?;
-                self.db
-                    .atomic_connect_block(&utxo_batch, &undo_bytes, &stored.hash, &stored)?;
+                self.commit_connected_block(block, &utxo_batch, &undo_bytes, &stored)?;
             }
             // disconnect_block does not move the DB tip; when no old block was
             // reconnected it would still name a rolled-back block.
@@ -2250,6 +2283,24 @@ impl Chain {
             }
         }
 
+        // Divi Core DisconnectBlock: reverse the block's address and spent
+        // index entries from the outputs its inputs spent
+        if let Some(ref search) = self.search_index {
+            let prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
+                .adds
+                .iter()
+                .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
+                .collect();
+            let updates = search_index::collect_disconnect(
+                block,
+                index.height,
+                &prevouts,
+                search.address_enabled(),
+                search.spent_enabled(),
+            );
+            search.apply_disconnect(&updates)?;
+        }
+
         // Flush all UTXO changes in a single atomic write
         if !utxo_batch.is_empty() {
             trace!(
@@ -2271,14 +2322,9 @@ impl Chain {
         // (the previous block at this height is on a different fork)
         self.db.remove_height_mapping(index.height)?;
 
-        if let Some(ref tx_index) = self.tx_index {
-            let txids: Vec<Hash256> = block
-                .transactions
-                .iter()
-                .map(|tx| self.compute_txid(tx))
-                .collect();
-            tx_index.delete_locations_batch(&txids)?;
-        }
+        // The transaction index keeps the block's entries: Divi Core's
+        // DisconnectBlock leaves them, so getrawtransaction still finds a
+        // transaction of a disconnected block.
 
         info!(
             "Disconnected block {} at height {}",
@@ -3654,10 +3700,14 @@ impl Chain {
 
         if let Some(ref tx_index) = self.tx_index {
             let mut locations = Vec::with_capacity(block.transactions.len());
-            for (tx_idx, txid) in txids.iter().enumerate() {
-                locations.push((*txid, TxLocation::new(index.hash, tx_idx as u32)));
+            for (tx_idx, (txid, tx)) in txids.iter().zip(&block.transactions).enumerate() {
+                locations.push((
+                    *txid,
+                    crate::txindex::bare_txid(tx),
+                    TxLocation::new(index.hash, tx_idx as u32),
+                ));
             }
-            tx_index.put_locations_batch(&locations)?;
+            tx_index.put_tx_locations(&locations)?;
         }
 
         debug!("  ├─ Lottery winners update");

@@ -127,6 +127,18 @@ pub trait MempoolProvider: Send + Sync {
         None
     }
 
+    /// The pool transaction whose bare txid is `bare` (Divi Core
+    /// `CTxMemPool::lookupBareTxid`)
+    fn get_transaction_by_bare_txid(
+        &self,
+        bare: &Hash256,
+    ) -> Option<divi_primitives::transaction::Transaction> {
+        self.get_txids()
+            .iter()
+            .filter_map(|txid| self.get_transaction(txid))
+            .find(|tx| divi_storage::bare_txid(tx) == *bare)
+    }
+
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()
@@ -1023,57 +1035,253 @@ impl BlockchainRpc {
 
     // Address Index Commands
 
-    /// Get address deltas
+    /// getaddressdeltas: an address's receives and spends from the address
+    /// index (Divi Core rpcmisc.cpp getaddressdeltas)
     pub fn get_address_deltas(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters to validate structure
-        let addresses = self.parse_address_index_params(params, "getaddressdeltas")?;
-        self.check_index_addresses(&addresses)?;
-
-        // Return address index not enabled error
-        Err(self.address_index_not_enabled())
+        let (start, end, include_chain_info) = match params.get(0).and_then(|p| p.as_object()) {
+            Some(obj) => {
+                let chain_info = obj
+                    .get("chainInfo")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match (
+                    obj.get("start").and_then(|v| v.as_i64()),
+                    obj.get("end").and_then(|v| v.as_i64()),
+                ) {
+                    (Some(start), Some(end)) => {
+                        if start <= 0 || end <= 0 {
+                            return Err(RpcError::new(
+                                codes::INVALID_ADDRESS_OR_KEY,
+                                "Start and end is expected to be greater than zero",
+                            )
+                            .into());
+                        }
+                        if end < start {
+                            return Err(RpcError::new(
+                                codes::INVALID_ADDRESS_OR_KEY,
+                                "End value is expected to be greater than start",
+                            )
+                            .into());
+                        }
+                        (start, end, chain_info)
+                    }
+                    _ => (0, 0, chain_info),
+                }
+            }
+            None => (0, 0, false),
+        };
+        let keys = self.index_keys(params, "getaddressdeltas")?;
+        let index = self.address_index()?;
+        let mut deltas = Vec::new();
+        for (address_type, hash) in &keys {
+            for (key, satoshis) in
+                index.read_deltas(*address_type, hash, start as u32, end as u32)?
+            {
+                deltas.push(json!({
+                    "satoshis": satoshis,
+                    "txid": key.txid.to_string(),
+                    "index": key.index,
+                    "blockindex": key.tx_index,
+                    "height": key.height,
+                    "address": self.index_address(key.address_type, &key.hash),
+                }));
+            }
+        }
+        if include_chain_info && start > 0 && end > 0 {
+            let height = i64::from(self.chain.height());
+            if start > height || end > height {
+                return Err(RpcError::new(
+                    codes::INVALID_ADDRESS_OR_KEY,
+                    "Start or end is outside chain range",
+                )
+                .into());
+            }
+            let hash_at = |h: i64| -> Result<String, Error> {
+                Ok(self
+                    .chain
+                    .get_block_index_by_height(h as u32)?
+                    .map(|i| i.hash.to_string())
+                    .unwrap_or_default())
+            };
+            return Ok(json!({
+                "deltas": deltas,
+                "start": {"hash": hash_at(start)?, "height": start},
+                "end": {"hash": hash_at(end)?, "height": end},
+            }));
+        }
+        Ok(json!(deltas))
     }
 
-    /// Get address transaction IDs
+    /// getaddresstxids: the txids touching the addresses, one per (height,
+    /// txid); for several addresses ordered by height then txid (Divi Core
+    /// rpcmisc.cpp getaddresstxids)
     pub fn get_address_txids(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters to validate structure
-        let addresses = self.parse_address_index_params(params, "getaddresstxids")?;
-        self.check_index_addresses(&addresses)?;
-
-        // Return address index not enabled error
-        Err(self.address_index_not_enabled())
+        let keys = self.index_keys(params, "getaddresstxids")?;
+        let (start, end) = params
+            .get(0)
+            .and_then(|p| p.as_object())
+            .and_then(|obj| Some((obj.get("start")?.as_i64()?, obj.get("end")?.as_i64()?)))
+            .filter(|(start, end)| *start > 0 && *end > 0)
+            .unwrap_or((0, 0));
+        let index = self.address_index()?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut result = Vec::new();
+        for (address_type, hash) in &keys {
+            for (key, _) in index.read_deltas(*address_type, hash, start as u32, end as u32)? {
+                let txid = key.txid.to_string();
+                if seen.insert((key.height, txid.clone())) && keys.len() == 1 {
+                    result.push(txid);
+                }
+            }
+        }
+        if keys.len() > 1 {
+            result = seen.into_iter().map(|(_, txid)| txid).collect();
+        }
+        Ok(json!(result))
     }
 
-    /// Get spent info for a transaction output
+    /// getaddressbalance: the sum of the addresses' deltas, and of the
+    /// receives alone (Divi Core rpcmisc.cpp getaddressbalance)
+    pub fn get_address_balance(&self, params: &Params) -> Result<Value, Error> {
+        let keys = self.index_keys(params, "getaddressbalance")?;
+        let index = self.address_index()?;
+        let (mut balance, mut received) = (0i64, 0i64);
+        for (address_type, hash) in &keys {
+            for (_, satoshis) in index.read_deltas(*address_type, hash, 0, 0)? {
+                if satoshis > 0 {
+                    received += satoshis;
+                }
+                balance += satoshis;
+            }
+        }
+        Ok(json!({"balance": balance, "received": received}))
+    }
+
+    /// getaddressutxos: the addresses' unspent outputs by height (Divi Core
+    /// rpcmisc.cpp getaddressutxos)
+    pub fn get_address_utxos(&self, params: &Params) -> Result<Value, Error> {
+        let include_chain_info = params
+            .get(0)
+            .and_then(|p| p.as_object())
+            .and_then(|obj| obj.get("chainInfo"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let keys = self.index_keys(params, "getaddressutxos")?;
+        let index = self.address_index()?;
+        let mut unspent = Vec::new();
+        for (address_type, hash) in &keys {
+            unspent.extend(index.read_unspent(*address_type, hash)?);
+        }
+        unspent.sort_by_key(|(_, value)| value.height);
+        let utxos: Vec<Value> = unspent
+            .iter()
+            .map(|(key, value)| {
+                json!({
+                    "address": self.index_address(key.address_type, &key.hash),
+                    "txid": key.txid.to_string(),
+                    "outputIndex": key.index,
+                    "script": hex::encode(value.script.as_bytes()),
+                    "satoshis": value.satoshis,
+                    "height": value.height,
+                })
+            })
+            .collect();
+        if include_chain_info {
+            let tip = self.chain.tip();
+            return Ok(json!({
+                "utxos": utxos,
+                "hash": tip.as_ref().map(|t| t.hash.to_string()).unwrap_or_default(),
+                "height": self.chain.height(),
+            }));
+        }
+        Ok(json!(utxos))
+    }
+
+    /// getspentinfo: the input that spent an output, from the spent index
+    /// (Divi Core rpcmisc.cpp getspentinfo)
     pub fn get_spent_info(&self, params: &Params) -> Result<Value, Error> {
         // Parse parameters - expect object with txid and index
         let param = params
             .get(0)
             .ok_or_else(|| RpcError::invalid_params("Missing parameter"))?;
 
-        if let Some(obj) = param.as_object() {
-            // Validate txid field
-            let txid_str = obj
-                .get("txid")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'txid' field"))?;
-
-            // Validate it's a valid hash
-            let _txid = parse_hash(txid_str)?;
-
-            // Validate index field
-            let _index = obj
-                .get("index")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'index' field"))?;
-        } else {
+        let Some(obj) = param.as_object() else {
             return Err(RpcError::invalid_params(
                 "Parameter must be an object with 'txid' and 'index' fields",
             )
             .into());
-        }
+        };
+        let txid_str = obj
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'txid' field"))?;
+        let txid = parse_hash(txid_str)?;
+        let index = obj
+            .get("index")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'index' field"))?;
 
-        // Return address index not enabled error
-        Err(self.address_index_not_enabled())
+        let search = match self.chain.search_index() {
+            Some(search) if search.spent_enabled() => search,
+            _ => return Err(self.address_index_not_enabled()),
+        };
+        match search.read_spent(&divi_storage::SpentIndexKey::new(txid, index as u32))? {
+            Some(value) => Ok(json!({
+                "txid": value.spending_txid.to_string(),
+                "index": value.input_index,
+                "height": value.block_height,
+            })),
+            None => {
+                Err(RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Unable to get spent info").into())
+            }
+        }
+    }
+
+    /// The address index, or the error for a node without it
+    fn address_index(&self) -> Result<&Arc<divi_storage::SearchIndex>, Error> {
+        match self.chain.search_index() {
+            Some(search) if search.address_enabled() => Ok(search),
+            _ => Err(self.address_index_not_enabled()),
+        }
+    }
+
+    /// Divi Core getAddressesFromParams/GetIndexKey: the address type and hash
+    /// each address is indexed under. With the second parameter (only vaults)
+    /// true, a key-hash address names the vaults it owns (type 3) and a
+    /// script-hash address is refused.
+    fn index_keys(&self, params: &Params, method: &str) -> Result<Vec<(u8, [u8; 20])>, Error> {
+        use divi_wallet::address::{Address, AddressType};
+        let addresses = self.parse_address_index_params(params, method)?;
+        self.check_index_addresses(&addresses)?;
+        let only_vaults =
+            params.len() == 2 && params.get(1).and_then(|v| v.as_bool()) == Some(true);
+        addresses
+            .iter()
+            .map(|a| {
+                let address = Address::from_base58_for_network(a, self.address_network())
+                    .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
+                let hash = *address.hash.as_bytes();
+                match (address.addr_type, only_vaults) {
+                    (AddressType::P2SH, true) => {
+                        Err(RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address").into())
+                    }
+                    (_, true) => Ok((3, hash)),
+                    (AddressType::P2PKH, false) => Ok((1, hash)),
+                    (AddressType::P2SH, false) => Ok((2, hash)),
+                }
+            })
+            .collect()
+    }
+
+    /// Divi Core getAddressFromIndex: the address of an index entry
+    fn index_address(&self, address_type: u8, hash: &[u8; 20]) -> String {
+        use divi_wallet::address::Address;
+        let hash = Hash160::from_bytes(*hash);
+        if address_type == 2 {
+            Address::p2sh(hash, self.address_network()).to_base58()
+        } else {
+            Address::from_pubkey_hash(hash, self.address_network()).to_base58()
+        }
     }
 
     // Helper methods for address index

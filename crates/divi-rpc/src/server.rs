@@ -402,6 +402,8 @@ impl RpcServer {
             "getaddressdeltas" => self.blockchain.get_address_deltas(params),
             "getaddresstxids" => self.blockchain.get_address_txids(params),
             "getspentinfo" => self.blockchain.get_spent_info(params),
+            "getaddressbalance" => self.blockchain.get_address_balance(params),
+            "getaddressutxos" => self.blockchain.get_address_utxos(params),
 
             // Mining/generation methods
             "generateblock" => self.blockchain.generate_block(params),
@@ -501,8 +503,6 @@ impl RpcServer {
             "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
             // Lite wallet methods (external address queries)
-            "getaddressbalance" => self.lite_wallet.read().get_address_balance(params),
-            "getaddressutxos" => self.lite_wallet.read().get_address_utxos(params),
             "getaddresshistory" => self.lite_wallet.read().get_address_history(params),
             "gettxindex" => self.lite_wallet.read().get_tx_index(params),
             "estimatefee" => self.lite_wallet.read().estimate_fee(params),
