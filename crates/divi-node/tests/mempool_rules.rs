@@ -269,18 +269,18 @@ fn nonstandard_transactions_are_refused() {
     );
 
     // Exactly 100,000 bytes: within CheckTransaction's limit but not standard.
-    // An OP_META output takes up the slack; the signature length varies, so
-    // adjust and sign again until the size is exact.
-    let mut pad = 300usize;
-    let exact = loop {
+    // An OP_META output takes up the slack. The signature length varies with
+    // the content, so try pad lengths around the estimate until one fits.
+    let build = |pad: usize| {
         let mut outputs: Vec<TxOut> = (0..2925).map(|_| pay(COIN / 10, &owner)).collect();
         outputs.push(meta(pad));
-        let signed = sign_all(tx(&[coin], outputs), &owner, COINBASE);
-        match signed.size() {
-            100_000 => break signed,
-            n => pad = (pad as i64 + 100_000 - n as i64) as usize,
-        }
+        sign_all(tx(&[coin], outputs), &owner, COINBASE)
     };
+    let estimate = 300 + 100_000 - build(300).size();
+    let exact = (estimate - 8..=estimate + 8)
+        .map(build)
+        .find(|t| t.size() == 100_000)
+        .expect("a pad length giving exactly 100,000 bytes");
     assert_eq!(t.relay(peer, exact).unwrap_err(), "64: tx-size");
 
     assert_eq!(t.score(peer), 0);
