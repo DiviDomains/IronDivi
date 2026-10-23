@@ -232,7 +232,7 @@ mod nettype_tests {
 /// mirror. Found via the mainnet-readiness review: this
 /// crate's DIVI-side confirmation check was hardcoded to `>= 1`, 10x thinner than the
 /// engine uses for every other coin's DIVI leg on mainnet.
-pub const DIVI_CONFIRMATIONS_MAINNET: u64 = 10;
+pub const DIVI_CONFIRMATIONS_MAINNET: u64 = 17;
 
 /// Whether a DIVI transaction has at least `min_confirmations`
 /// (`getrawtransaction` against the testnet RPC proxy).

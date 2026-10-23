@@ -58,8 +58,9 @@ impl ChainParams {
             // 9 to keep the same ~225s finality depth this chain always intended — the
             // figure was set assuming 75s blocks before the real NU7 rate was measured).
             Chain::Zec => (if mainnet { 10 } else { 9 }, 1800),
-            // 1-minute blocks.
-            Chain::Divi => (if mainnet { 10 } else { 3 }, 1800),
+            // 1-minute blocks; mainnet 17 = lock-reversal risk below 0.1 % against 25 % of stake
+            // (docs/plans/swap-poc/divi-confirmations.md, Bert chose 17 on 2026-10-23).
+            Chain::Divi => (if mainnet { 17 } else { 3 }, 1800),
             // ~12-second blocks; 12 confirmations is the common safe-finality heuristic for
             // Ethereum mainnet. No MTP smoothing on EVM (the contract itself compares against
             // the latest block's timestamp), so the lag only needs to cover block-time jitter.
@@ -110,7 +111,7 @@ impl SwapConfig {
                 taker_timeout_secs: 24 * 3600,
                 maker_timeout_secs: 12 * 3600,
                 btc_confirmations: 2,
-                divi_confirmations: 10,
+                divi_confirmations: 17,
                 btc_mtp_lag_secs: 3600,
                 claim_margin_secs: 3600,
                 quote_expiry_secs: 60,
@@ -512,7 +513,7 @@ mod tests {
         let m = SwapConfig::profile(Profile::Mainnet);
         assert_eq!(
             (m.confirmations(Chain::Btc), m.confirmations(Chain::Divi)),
-            (2, 10)
+            (2, 17)
         );
         assert_eq!(c.confirmations(Chain::Ltc), 2);
         assert_eq!(m.confirmations(Chain::Zec), 10);
@@ -806,6 +807,34 @@ quote_expiry_secs = 60
     fn a_mainnet_floor_is_the_unchanged_btc_two_confirmations() {
         let t = terms_of(Profile::Mainnet, Chain::Btc);
         assert_eq!(t.counter_confirmations, 2);
+        check_terms_against_profile(Profile::Mainnet, (Chain::Btc, Chain::Divi), &t).unwrap();
+    }
+
+    #[test]
+    fn mainnet_divi_confirmations_are_17_and_testnet_stays_3() {
+        assert_eq!(SwapConfig::profile(Profile::Mainnet).divi_confirmations, 17);
+        assert_eq!(
+            ChainParams::builtin(Chain::Divi, Profile::Mainnet).confirmations,
+            17
+        );
+        assert_eq!(SwapConfig::profile(Profile::Testnet).divi_confirmations, 3);
+        assert_eq!(
+            ChainParams::builtin(Chain::Divi, Profile::Testnet).confirmations,
+            3
+        );
+    }
+
+    #[test]
+    fn a_mainnet_taker_refuses_16_divi_confirmations_and_accepts_17() {
+        let mut t = terms_of(Profile::Mainnet, Chain::Btc);
+        t.divi_confirmations = 16;
+        let e = check_terms_against_profile(Profile::Mainnet, (Chain::Btc, Chain::Divi), &t)
+            .unwrap_err();
+        assert!(
+            e.contains("divi_confirmations (divi lock) is 16, below the 17 floor"),
+            "{e}"
+        );
+        t.divi_confirmations = 17;
         check_terms_against_profile(Profile::Mainnet, (Chain::Btc, Chain::Divi), &t).unwrap();
     }
 

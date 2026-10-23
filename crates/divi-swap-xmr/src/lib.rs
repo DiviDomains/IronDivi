@@ -192,8 +192,8 @@ impl XmrConfig {
     /// (`xmr-mainnet-plan.md` phase D). DIVI depth is the shared engine's mainnet DIVI
     /// depth, XMR depth Monero's spendable age; timelocks mirror the shared mainnet profile
     /// (`t_cancel` = its 12 h maker timeout, `t_punish` = its 24 h taker timeout) with a 2 h
-    /// redeem margin. Derived minimums under [`ChainTiming::live`]: cancel 20 400 s, punish
-    /// and late 7 200 s, margin 3 900 s. The presigned transactions cannot be fee-bumped, so their fee
+    /// redeem margin. Derived minimums under [`ChainTiming::live`]: cancel 21 660 s, punish
+    /// and late 7 200 s, margin 5 160 s. The presigned transactions cannot be fee-bumped, so their fee
     /// is the DIVI wallet's 0.01 DIVI/kB rate on a full kB, about 3× a 2-of-2 spend's size.
     pub fn mainnet() -> Self {
         XmrConfig {
@@ -829,7 +829,7 @@ mod tests {
                 punish_after_secs: 43_200,
                 late_after_secs: 43_200,
                 redeem_margin_secs: 7_200,
-                divi_confirmations: 10,
+                divi_confirmations: 17,
                 xmr_confirmations: 10,
                 divi_fee_sats: 1_000_000,
                 sigs_wait_secs: 1800,
@@ -858,7 +858,7 @@ mod tests {
                 m.min_late_after_secs(&t),
                 m.min_redeem_margin_secs(&t)
             ),
-            (20_400, 7_200, 7_200, 3_900)
+            (21_660, 7_200, 7_200, 5_160)
         );
     }
 
@@ -908,18 +908,18 @@ mod tests {
         assert!(e.contains("cancel_after_secs"), "{e}");
 
         let mut c = base.clone();
-        c.redeem_margin_secs = 3900; // below the maker's own refund need of 4 380 s
+        c.redeem_margin_secs = 5160; // below the maker's own refund need of 5 640 s
         c.punish_after_secs = c.min_punish_after_secs(&t) as u32;
-        assert_eq!(c.punish_after_secs, 4380);
+        assert_eq!(c.punish_after_secs, 5640);
         c.validate().unwrap();
         c.punish_after_secs -= 1;
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("punish_after_secs"), "{e}");
 
         let mut c = base.clone();
-        c.redeem_margin_secs = 3900;
+        c.redeem_margin_secs = 5160;
         c.late_after_secs = c.min_late_after_secs(&t) as u32;
-        assert_eq!(c.late_after_secs, 4380);
+        assert_eq!(c.late_after_secs, 5640);
         c.validate().unwrap();
         c.late_after_secs -= 1;
         let e = c.validate().unwrap_err().to_string();

@@ -142,7 +142,7 @@ calls it (`maker.rs:461`).
 | `cancel_after_secs` | 21 600 (6 h) | 43 200 (12 h) |
 | `punish_after_secs` | 10 800 (3 h) | 43 200 (12 h) |
 | `redeem_margin_secs` | 3 600 | 7 200 |
-| `divi_confirmations` | 3 | 10 (`crates/divi-swap/src/config.rs:113`) |
+| `divi_confirmations` | 3 | 17 (`crates/divi-swap/src/config.rs:114`; was 10 until 2026-10-23) |
 | `xmr_confirmations` | 10 | 10 (`live_rpc.rs:242` `SPENDABLE_AGE`) |
 | `divi_fee_sats` per presigned tx | 100 000 | 1 000 000 |
 | `sigs_wait_secs` / `quote_expiry_secs` | 1 800 / 60 | 1 800 / 60 |

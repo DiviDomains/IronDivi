@@ -4,7 +4,7 @@
 
 Every line is already named elsewhere in the docs or status files; nothing here is new. Tag, then item, then where it is recorded.
 
-- `Bert decision` — the DIVI mainnet confirmation count: the profile uses 10 (`crates/divi-swap/src/config.rs:113`); the review recommends keeping 10 for the first funded swap, with 20 as the option for more margin, and Bert has not decided. Pointers: `divi-confirmations.md` §5, `status/divi.md` (left, 2026-10-22).
+- `Bert decision` — the DIVI mainnet confirmation count: **DECIDED 2026-10-23 (card 330b2472 option a): Bert chose 17; the mainnet profile now uses 17 (`crates/divi-swap/src/config.rs:114`), testnet stays 3** (it was 10; the review had recommended keeping 10 for the first funded swap, with 20 as the option for more margin). Pointers: `divi-confirmations.md` §5, `status/divi.md` (left, 2026-10-22).
 - `Bert decision` — BTC mainnet confirmations stay at 2 (`crates/divi-swap/src/config.rs:54`); raising them is parked. Pointer: the BTC item below ("Still open: raise mainnet confirmations above 2") and §BTC.
 - `Bert decision` — the XMR mainnet swap itself, and written acceptance of any unfixed finding if one is raised (the Gate C list is empty today). Pointer: `xmr-mainnet-plan.md` §Phase C and the 2026-10-21 decision-log entry.
 - `outside audit` — the USDC `Erc20Htlc` deployment: the internal pre-audit is done, an outside audit is not. Pointer: `usdc-htlc-preaudit.md`, the USDC/EVM item below.

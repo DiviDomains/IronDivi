@@ -156,3 +156,5 @@ Largest attacker share q that a given z still holds against:
 - Cost of a higher count: each confirmation is about 60 s per lock (17 ≈ 17 min against 10 min today), see the cost line in the sections above.
 - The 100-block max-reorg rule is not a finality guarantee for any z < 100 and does not exist in IronDivi nodes.
 - **Not decided here.** The code value stays 10. The decision (keep 10, or move toward 17) belongs to Bert.
+
+- **Decided 2026-10-23:** Bert chose 17 (2026-10-23, card 330b2472 option a); mainnet implemented, testnet stays 3.

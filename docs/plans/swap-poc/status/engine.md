@@ -382,3 +382,10 @@
 - left: the prepare-to-setup gap g is still an estimate, not measured live; mainnet remains refused at runtime; nothing deployed.
 - needs: nothing
 - decisions: only `crates/divi-swap-xmr/` and docs touched; `sigs_wait_secs`, timelocks, confirmations and the testnet profile unchanged.
+
+## 2026-10-23 round: divi-confirmations-17 (builder CA, `lane/divi-confirmations-17`)
+- done: DIVI mainnet confirmations 10 -> 17 (Bert chose 17, card 330b2472 option a): `SwapConfig::profile(Mainnet).divi_confirmations` and the `ChainParams::builtin(Divi, Mainnet)` copy in `crates/divi-swap/src/config.rs`; the XMR engine reads the profile value (`divi-swap-xmr/src/lib.rs:193`), so its mainnet depth follows; `swap-chain-xmr` `DIVI_CONFIRMATIONS_MAINNET` mirror 10 -> 17 (its drift test requires it). Testnet stays 3, BTC stays 2, no timelock changed.
+- proof: new tests `mainnet_divi_confirmations_are_17_and_testnet_stays_3`, `a_mainnet_taker_refuses_16_divi_confirmations_and_accepts_17`; fail-before and counts in `~/swap-lanes/builders/CA/STATUS.md`; `XmrConfig::mainnet().validate_for(&ChainTiming::live())` still passes with 17.
+- left: nothing in `deploy/` was edited (see STATUS `left:`); the `docs/plans/swap-poc/status/xmr.md` history still says 10 as of its date.
+- needs: nothing
+- decisions: no timelock moved; a lock now takes about 17 min on DIVI (was 10).
