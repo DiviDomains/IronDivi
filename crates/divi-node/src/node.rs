@@ -1348,6 +1348,69 @@ pub fn accept_relayed_transaction(
     result
 }
 
+/// Return the transactions of a reorganisation's disconnected blocks to the
+/// mempool so they can be mined on the new chain.
+pub fn update_mempool_after_reorg(
+    chain: &Arc<Chain>,
+    mempool: &Arc<Mempool>,
+    disconnected: Vec<Transaction>,
+) {
+    use divi_primitives::amount::Amount;
+    tracing::info!(
+        "Reorg: re-adding {} orphaned transaction(s) to mempool",
+        disconnected.len()
+    );
+    for tx in disconnected {
+        let txid = tx.txid();
+        // Calculate fee by summing inputs minus outputs using the UTXO set
+        let fee = {
+            let mut input_total = Amount::from_sat(0);
+            let mut ok = true;
+            for input in &tx.vin {
+                match chain.get_utxo(&input.prevout) {
+                    Ok(Some(utxo)) => {
+                        input_total += utxo.value;
+                    }
+                    _ => {
+                        // UTXO not found — tx may depend on another orphaned tx
+                        // that is also being re-added; skip fee check and use 0.
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let output_total: Amount = tx
+                    .vout
+                    .iter()
+                    .map(|o| o.value)
+                    .fold(Amount::from_sat(0), |a, b| a + b);
+                if input_total >= output_total {
+                    input_total - output_total
+                } else {
+                    Amount::from_sat(0)
+                }
+            } else {
+                Amount::from_sat(0)
+            }
+        };
+        match mempool.add(tx, fee) {
+            Ok(_) => {
+                tracing::debug!(
+                    "Re-added orphaned tx {} to mempool (fee: {} sat)",
+                    txid,
+                    fee.as_sat()
+                );
+            }
+            Err(e) => {
+                tracing::debug!("Could not re-add orphaned tx {} to mempool: {}", txid, e);
+            }
+        }
+    }
+    // The tip may now be lower: drop what can no longer be mined
+    mempool.remove_non_final();
+}
+
 /// Divi Core's AcceptToMemoryPool input checks against the chain: every input
 /// unspent in the chain or an output of a mempool transaction, then every
 /// input script under the standard flags (and, to pick the reject reason, the

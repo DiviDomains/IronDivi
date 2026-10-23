@@ -1386,19 +1386,14 @@ async fn run_daemon(
         let tx_relay_for_callback = node.tx_relay().clone();
         let chain_for_callback = node.chain().clone();
         block_sync.set_block_connected_callback(Arc::new(move |block, height| {
-            let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
-            for tx in block.transactions.iter().skip(1) {
-                if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
-                    total_fees += mempool_entry.fee;
-                }
-            }
-            let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-            mempool_for_callback.remove_for_block(&txids);
-            evict_block_conflicts(&mempool_for_callback, &chain_for_callback, block);
-            for txid in &txids {
-                tx_relay_for_callback.mark_seen(*txid);
-            }
-            fee_estimator_for_callback.add_block(height, block, total_fees);
+            mempool_block_connected(
+                &mempool_for_callback,
+                &chain_for_callback,
+                |txid| tx_relay_for_callback.mark_seen(txid),
+                &fee_estimator_for_callback,
+                block,
+                height,
+            );
         }));
 
         None
@@ -1435,19 +1430,14 @@ async fn run_daemon(
                 sync_wallet_to_tip(&wallet_for_scan, &chain_for_scan);
 
                 // 2. Calculate fees from mempool entries and clean mempool
-                let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
-                for tx in block.transactions.iter().skip(1) {
-                    if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
-                        total_fees += mempool_entry.fee;
-                    }
-                }
-                let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-                mempool_for_callback.remove_for_block(&txids);
-                evict_block_conflicts(&mempool_for_callback, &chain_for_scan, block);
-                for txid in &txids {
-                    tx_relay_for_callback.mark_seen(*txid);
-                }
-                fee_estimator_for_callback.add_block(height, block, total_fees);
+                let total_fees = mempool_block_connected(
+                    &mempool_for_callback,
+                    &chain_for_scan,
+                    |txid| tx_relay_for_callback.mark_seen(txid),
+                    &fee_estimator_for_callback,
+                    block,
+                    height,
+                );
 
                 // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
                 if let Err(e) = wallet_for_scan.save_incremental() {
@@ -1526,62 +1516,11 @@ async fn run_daemon(
                 let chain_for_orphans = node.chain().clone();
                 block_sync.set_orphaned_tx_callback(Arc::new(
                     move |orphaned_txs: Vec<Transaction>| {
-                        info!(
-                            "Reorg: re-adding {} orphaned transaction(s) to mempool",
-                            orphaned_txs.len()
+                        divi_node::update_mempool_after_reorg(
+                            &chain_for_orphans,
+                            &mempool_for_orphans,
+                            orphaned_txs,
                         );
-                        for tx in orphaned_txs {
-                            let txid = tx.txid();
-                            // Calculate fee by summing inputs minus outputs using the UTXO set
-                            let fee = {
-                                let mut input_total = Amount::from_sat(0);
-                                let mut ok = true;
-                                for input in &tx.vin {
-                                    match chain_for_orphans.get_utxo(&input.prevout) {
-                                        Ok(Some(utxo)) => {
-                                            input_total += utxo.value;
-                                        }
-                                        _ => {
-                                            // UTXO not found — tx may depend on another orphaned tx
-                                            // that is also being re-added; skip fee check and use 0.
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if ok {
-                                    let output_total: Amount = tx
-                                        .vout
-                                        .iter()
-                                        .map(|o| o.value)
-                                        .fold(Amount::from_sat(0), |a, b| a + b);
-                                    if input_total >= output_total {
-                                        input_total - output_total
-                                    } else {
-                                        Amount::from_sat(0)
-                                    }
-                                } else {
-                                    Amount::from_sat(0)
-                                }
-                            };
-                            match mempool_for_orphans.add(tx, fee) {
-                                Ok(_) => {
-                                    debug!(
-                                        "Re-added orphaned tx {} to mempool (fee: {} sat)",
-                                        txid,
-                                        fee.as_sat()
-                                    );
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "Could not re-add orphaned tx {} to mempool: {}",
-                                        txid, e
-                                    );
-                                }
-                            }
-                        }
-                        // The tip may now be lower: drop what can no longer be mined
-                        mempool_for_orphans.remove_non_final();
                     },
                 ));
             }
@@ -1725,20 +1664,15 @@ async fn run_daemon(
                 // (see the block-connected callback for why)
                 sync_wallet_to_tip(&wallet_for_staker, &chain_for_staker_scan);
 
-                // 2. Calculate fees from mempool entries and clean mempool
-                let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
-                for tx in block.transactions.iter().skip(1) {
-                    if let Some(mempool_entry) = mempool_for_staker.get(&tx.txid()) {
-                        total_fees += mempool_entry.fee;
-                    }
-                }
-                let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-                mempool_for_staker.remove_for_block(&txids);
-                evict_block_conflicts(&mempool_for_staker, &chain_for_staker_scan, block);
-                for txid in &txids {
-                    tx_relay_for_staker.mark_seen(*txid);
-                }
-                fee_estimator_for_staker.add_block(height, block, total_fees);
+                // 2. Clean the mempool and feed the fee estimator
+                mempool_block_connected(
+                    &mempool_for_staker,
+                    &chain_for_staker_scan,
+                    |txid| tx_relay_for_staker.mark_seen(txid),
+                    &fee_estimator_for_staker,
+                    block,
+                    height,
+                );
 
                 // 3. Persist wallet changes
                 if let Err(e) = wallet_for_staker.save_incremental() {
@@ -2067,23 +2001,46 @@ fn blockchain_synced(chain: &divi_storage::Chain) -> bool {
             .is_some_and(|t| now.saturating_sub(t.time as u64) <= 600)
 }
 
-/// Drop mempool txs that double-spend an input of `block`, if the block is on
-/// the active chain (the callbacks are also handed side-chain blocks).
-fn evict_block_conflicts(
-    mempool: &divi_node::Mempool,
-    chain: &divi_storage::Chain,
-    block: &divi_primitives::block::Block,
-) {
+/// Whether `block` is on the active chain (the sync layer also hands over
+/// blocks it stored on a side chain)
+fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::Block) -> bool {
     let hash = compute_block_hash(&block.header);
-    let active = chain
+    chain
         .get_block_index(&hash)
         .ok()
         .flatten()
         .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
-        .is_some_and(|index| index.hash == hash);
-    if active {
+        .is_some_and(|index| index.hash == hash)
+}
+
+/// The mempool side of a block handed over by the sync layer or the staker:
+/// drop the transactions it confirms and, if it is on the active chain, those
+/// that conflict with it, then feed the fee estimator. Returns the fees of the
+/// block's transactions that were in the mempool.
+fn mempool_block_connected(
+    mempool: &divi_node::Mempool,
+    chain: &divi_storage::Chain,
+    mark_seen: impl Fn(divi_primitives::hash::Hash256),
+    fee_estimator: &divi_node::FeeEstimator,
+    block: &divi_primitives::block::Block,
+    height: u32,
+) -> divi_primitives::amount::Amount {
+    let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
+    for tx in block.transactions.iter().skip(1) {
+        if let Some(mempool_entry) = mempool.get(&tx.txid()) {
+            total_fees += mempool_entry.fee;
+        }
+    }
+    let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
+    mempool.remove_for_block(&txids);
+    if block_is_active(chain, block) {
         mempool.remove_conflicts(&block.transactions);
     }
+    for txid in &txids {
+        mark_seen(*txid);
+    }
+    fee_estimator.add_block(height, block, total_fees);
+    total_fees
 }
 
 /// Scan the active chain into the wallet, in order, from its last scanned
