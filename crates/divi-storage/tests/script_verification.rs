@@ -91,7 +91,8 @@ impl TestChain {
     }
 
     fn coinbase(&self, height: u32, payee: Script) -> Transaction {
-        let mut sig = vec![4u8];
+        // BIP34: the coinbase starts with the height
+        let mut sig = divi_storage::bip34_height_script(height);
         sig.extend_from_slice(&height.to_le_bytes());
         Transaction {
             version: 1,
@@ -104,7 +105,7 @@ impl TestChain {
     fn block(&self, txs: Vec<Transaction>) -> Block {
         let tip = self.chain.tip().unwrap();
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;

@@ -36,8 +36,15 @@ fn new_chain(net: NetworkType) -> (Chain, TempDir) {
     (chain, dir)
 }
 
-/// A PoW-era (height <= 100) block: one coinbase, optional extra transactions.
-fn block_on(parent: Hash256, time: u32, bits: u32, tag: u8, extra: Vec<Transaction>) -> Block {
+/// A PoW-era (height <= 100) block at `height`: one coinbase, optional extra transactions.
+fn block_on(
+    height: u32,
+    parent: Hash256,
+    time: u32,
+    bits: u32,
+    tag: u8,
+    extra: Vec<Transaction>,
+) -> Block {
     let mut block = Block::default();
     block.header.version = 4;
     block.header.prev_block = parent;
@@ -45,11 +52,14 @@ fn block_on(parent: Hash256, time: u32, bits: u32, tag: u8, extra: Vec<Transacti
     block.header.bits = bits;
     let coinbase = Transaction {
         version: 1,
-        vin: vec![TxIn::coinbase(Script::from_bytes(vec![
-            0x05,
-            tag,
-            (time & 0xff) as u8,
-        ]))],
+        // BIP34 height, then a tag
+        vin: vec![TxIn::coinbase(Script::from_bytes(
+            [
+                common::bip34_height(height),
+                vec![2, tag, (time & 0xff) as u8],
+            ]
+            .concat(),
+        ))],
         vout: vec![TxOut::new(
             Amount::from_sat(1250_00000000),
             Script::new_p2pkh(&[tag; 20]),
@@ -89,15 +99,15 @@ fn block_not_later_than_parent_mtp_is_rejected_on_the_tip() {
     let (mut parent, mut t) = tip_info(&chain);
     for i in 0..11u32 {
         t += 60;
-        let b = block_on(parent, t, EASY_BITS, 1 + i as u8, vec![]);
+        let b = block_on(i + 1, parent, t, EASY_BITS, 1 + i as u8, vec![]);
         chain.accept_block(b).unwrap();
         parent = chain.tip().unwrap().hash;
     }
     let mtp = chain.get_median_time_past(&chain.tip().unwrap()).unwrap();
-    let bad = block_on(parent, mtp, EASY_BITS, 0x77, vec![]);
+    let bad = block_on(12, parent, mtp, EASY_BITS, 0x77, vec![]);
     let msg = err_text(chain.accept_block(bad));
     assert!(msg.contains("not greater than median time past"), "{msg}");
-    let ok = block_on(parent, mtp + 1, EASY_BITS, 0x78, vec![]);
+    let ok = block_on(12, parent, mtp + 1, EASY_BITS, 0x78, vec![]);
     assert!(chain.accept_block(ok).is_ok());
 }
 
@@ -111,18 +121,18 @@ fn block_not_later_than_parent_mtp_is_rejected_on_a_side_chain() {
     for i in 0..3u32 {
         t += 60;
         chain
-            .accept_block(block_on(parent, t, EASY_BITS, 1 + i as u8, vec![]))
+            .accept_block(block_on(i + 1, parent, t, EASY_BITS, 1 + i as u8, vec![]))
             .unwrap();
         parent = chain.tip().unwrap().hash;
     }
     // Fork off genesis: first fork block is fine, the second is not later than its parent's MTP.
-    let f1 = block_on(genesis, gt + 30, EASY_BITS, 0x40, vec![]);
+    let f1 = block_on(1, genesis, gt + 30, EASY_BITS, 0x40, vec![]);
     let f1h = divi_crypto::compute_block_hash(&f1.header);
     chain.accept_block(f1).unwrap();
     let mtp = chain
         .get_median_time_past(&chain.get_block_index(&f1h).unwrap().unwrap())
         .unwrap();
-    let bad = block_on(f1h, mtp, EASY_BITS, 0x41, vec![]);
+    let bad = block_on(2, f1h, mtp, EASY_BITS, 0x41, vec![]);
     let msg = err_text(chain.accept_block(bad));
     assert!(msg.contains("not greater than median time past"), "{msg}");
 }
@@ -150,7 +160,7 @@ fn fork_deeper_than_max_reorg_depth_is_rejected() {
     let mut p = genesis;
     let mut refused = None;
     for i in 1..=102u32 {
-        let b = block_on(p, gt + 59 * i, EASY_BITS, (i % 200) as u8 + 101, vec![]);
+        let b = block_on(i, p, gt + 59 * i, EASY_BITS, (i % 200) as u8 + 101, vec![]);
         p = divi_crypto::compute_block_hash(&b.header);
         if let Err(e) = chain.accept_block(b) {
             refused = Some((i, e.to_string()));
@@ -173,7 +183,7 @@ fn fork_deeper_than_max_reorg_depth_is_rejected() {
 fn block_spending_an_immature_coinbase_is_rejected() {
     let (chain, _d) = new_chain(NetworkType::Regtest);
     let (genesis, gt) = tip_info(&chain);
-    let b1 = block_on(genesis, gt + 60, EASY_BITS, 1, vec![]);
+    let b1 = block_on(1, genesis, gt + 60, EASY_BITS, 1, vec![]);
     let cb_txid = b1.transactions[0].txid();
     let h1 = divi_crypto::compute_block_hash(&b1.header);
     chain.accept_block(b1).unwrap();
@@ -190,7 +200,7 @@ fn block_spending_an_immature_coinbase_is_rejected() {
         )],
         lock_time: 0,
     };
-    let b2 = block_on(h1, gt + 120, EASY_BITS, 2, vec![spend]);
+    let b2 = block_on(2, h1, gt + 120, EASY_BITS, 2, vec![spend]);
     let msg = err_text(chain.accept_block(b2));
     assert!(
         msg.contains("bad-txns-premature-spend-of-coinbase"),

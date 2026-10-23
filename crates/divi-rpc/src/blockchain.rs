@@ -1279,11 +1279,13 @@ mod tests {
         let mut out = Vec::new();
         for h in 1..=len {
             t += 60;
-            let mut tag = vec![0x05];
+            // BIP34 height, then height and seed
+            let mut tag = divi_storage::bip34_height_script(h);
+            tag.push(0x05);
             tag.extend_from_slice(&h.to_le_bytes());
             tag.push(seed);
             let mut block = Block::default();
-            block.header.version = 1;
+            block.header.version = 4;
             block.header.prev_block = prev;
             block.header.time = t;
             block.header.bits = 0x207fffff;

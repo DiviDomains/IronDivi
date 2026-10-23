@@ -40,7 +40,8 @@ impl TestNode {
     fn mine(&self, payee: Script) -> OutPoint {
         let chain = self.node.chain();
         let tip = chain.tip().unwrap();
-        let mut tag = vec![4u8];
+        // BIP34: the coinbase starts with the height
+        let mut tag = divi_storage::bip34_height_script(tip.height + 1);
         tag.extend_from_slice(&(tip.height + 1).to_le_bytes());
         let coinbase = Transaction {
             version: 1,
@@ -50,7 +51,7 @@ impl TestNode {
         };
         let outpoint = OutPoint::new(coinbase.txid(), 0);
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;

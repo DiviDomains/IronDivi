@@ -1440,13 +1440,19 @@ mod tests {
         let mut parent = chain.tip().unwrap();
         for i in 0..n {
             let mut block = Block::default();
-            block.header.version = 1;
+            block.header.version = 4;
             block.header.prev_block = parent.hash;
             block.header.time = parent.time + 60;
             block.header.bits = 0x207fffff;
             block.transactions.push(Transaction {
                 version: 1,
-                vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05, i as u8]))],
+                vin: vec![TxIn::coinbase(Script::from_bytes(
+                    [
+                        divi_storage::bip34_height_script(i + 1),
+                        vec![0x01, i as u8],
+                    ]
+                    .concat(),
+                ))],
                 vout: vec![TxOut::new(
                     Amount::from_sat(1250_00000000),
                     Script::new_p2pkh(&[i as u8 + 1; 20]),

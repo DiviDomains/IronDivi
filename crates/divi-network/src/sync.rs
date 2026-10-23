@@ -2831,8 +2831,10 @@ mod tests {
 
         for h in 1..=len {
             t += 60;
-            // Height + seed keep every coinbase txid unique across both chains.
-            let mut tag = vec![0x05];
+            // BIP34 height, then height + seed to keep every coinbase txid unique
+            // across both chains.
+            let mut tag = divi_storage::bip34_height_script(h);
+            tag.push(0x05);
             tag.extend_from_slice(&h.to_le_bytes());
             tag.push(seed);
 
@@ -2842,7 +2844,7 @@ mod tests {
             block.header.bits = 0x207fffff; // regtest never retargets
 
             if h <= 100 {
-                block.header.version = 1;
+                block.header.version = 4;
                 let coinbase = Transaction {
                     version: 1,
                     vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
@@ -3379,10 +3381,10 @@ mod tests {
         use divi_primitives::script::Script;
         use divi_primitives::transaction::{TxIn, TxOut};
         let tip = chain.tip().unwrap();
-        let mut tag = vec![4u8];
+        let mut tag = divi_storage::bip34_height_script(tip.height + 1);
         tag.extend_from_slice(&(tip.height + 1).to_le_bytes());
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;

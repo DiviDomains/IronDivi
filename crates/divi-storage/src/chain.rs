@@ -170,6 +170,24 @@ impl Default for ChainParams {
 /// regtest inherits testnet's)
 pub const LAST_POW_BLOCK: u32 = 100;
 
+/// Divi Core MaxFutureBlockDrift: a PoS block's time may be at most this many
+/// seconds ahead (Settings.cpp:215-218)
+const MAX_FUTURE_BLOCK_DRIFT_POS: u64 = 180;
+
+/// Divi Core MAX_BLOCK_SIZE_CURRENT (defaultValues.h:43)
+const MAX_BLOCK_SIZE: usize = 2_000_000;
+
+/// Divi Core MAX_STANDARD_TX_SIZE, which CheckTransaction applies to block
+/// transactions too (defaultValues.h:54, BlockCheckingHelpers.cpp:106-109)
+const MAX_TX_SIZE: usize = 100_000;
+
+/// Divi Core MAX_BLOCK_SIGOPS_LEGACY, the CheckBlock limit (defaultValues.h:57)
+const MAX_BLOCK_SIGOPS_LEGACY: u32 = 1_000_000 / 50;
+
+/// Divi Core MAX_BLOCK_SIGOPS_CURRENT, the ConnectBlock limit counting P2SH inputs
+/// (defaultValues.h:56)
+const MAX_BLOCK_SIGOPS: u32 = MAX_BLOCK_SIZE as u32 / 50;
+
 /// Divi mainnet checkpoint at height 100 (Divi Core chainparams.cpp:107-110). Height 0 is the
 /// genesis block, which `Chain::new` hard-codes.
 const DIVI_MAINNET_CHECKPOINT_100: &str =
@@ -1335,6 +1353,7 @@ impl Chain {
         if let Some(ref parent) = parent_index {
             self.check_block_work(&block, &hash, parent)?;
             self.check_reorg_depth(parent.height + 1)?;
+            Self::check_block_version_and_height(&block, parent.height + 1)?;
         }
 
         // 6. Check contextual validity (skip for genesis)
@@ -2397,15 +2416,22 @@ impl Chain {
             ));
         }
 
-        // Check timestamp not too far in the future (2 hours)
+        // Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): at most 180 s in the
+        // future for a PoS block (MaxFutureBlockDrift, Settings.cpp:215-218), 2 hours
+        // for a PoW block
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| StorageError::ChainState(format!("System time error: {}", e)))?
-            .as_secs() as u32;
-        if block.header.time > now + 2 * 60 * 60 {
+            .as_secs();
+        let max_drift = if block.is_proof_of_stake() {
+            MAX_FUTURE_BLOCK_DRIFT_POS
+        } else {
+            2 * 60 * 60
+        };
+        if u64::from(block.header.time) > now + max_drift {
             return Err(StorageError::invalid_block_scored(
                 0,
-                "timestamp too far in future".into(),
+                "time-too-new: block timestamp too far in the future".into(),
             ));
         }
 
@@ -2418,6 +2444,38 @@ impl Chain {
             )));
         }
 
+        // A transaction list repeated at the end of a level gives the same merkle
+        // root (CVE-2012-2459); Core refuses it as a duplicate (BlockCheckingHelpers.cpp:39-44)
+        let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        if merkle_tree_mutated(&txids) {
+            return Err(StorageError::InvalidBlock(
+                "bad-txns-duplicate: duplicate transaction".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Divi Core ContextualCheckBlockHeader's version rule and ContextualCheckBlock's
+    /// BIP34 rule (ChainExtensionService.cpp:350-353, :375-382), for every block
+    /// after the genesis block
+    fn check_block_version_and_height(block: &Block, height: u32) -> Result<(), StorageError> {
+        if block.header.version < 3 {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "bad-version: rejected nVersion={} block",
+                    block.header.version
+                ),
+            ));
+        }
+        let expect = bip34_height_script(height);
+        let script_sig = block.transactions[0].vin[0].script_sig.as_bytes();
+        if !script_sig.starts_with(&expect) {
+            return Err(StorageError::InvalidBlock(
+                "bad-cb-height: block height mismatch in coinbase".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -3234,6 +3292,20 @@ impl Chain {
             }
         }
 
+        // Divi Core BIP30 (BlockConnectionService.cpp:56-62): a transaction may not
+        // reuse the id of one that still has unspent outputs
+        if height > 0 {
+            for tx in &block.transactions {
+                let txid = tx.txid();
+                if self.db.has_spendable_output_of(&txid)? {
+                    return Err(StorageError::InvalidBlock(format!(
+                        "bad-txns-BIP30: tried to overwrite transaction ({})",
+                        txid
+                    )));
+                }
+            }
+        }
+
         // IMPORTANT: Validate treasury payments BEFORE modifying any state
         // This prevents UTXO corruption if validation fails
         debug!(
@@ -3251,6 +3323,8 @@ impl Chain {
         let mut mint = Amount::ZERO;
         let mut fees = Amount::ZERO;
         let max_money = self.max_money();
+        // Divi Core TotalSigOpsAreBelowMaximum (TransactionInputChecker.cpp:85-100)
+        let mut sig_ops = 0u32;
 
         // Use batched UTXO writer for better performance
         // Pre-calculate capacity: estimate ~2 inputs and ~3 outputs per tx
@@ -3311,6 +3385,30 @@ impl Chain {
             total_inputs += tx.vin.len();
             total_outputs += tx.vout.len();
             let mut value_in = Amount::ZERO;
+
+            sig_ops += legacy_sig_op_count(tx);
+            if !is_coinbase {
+                // Pay-to-script-hash inputs add their redeem script's sigops, for the
+                // whole transaction before any of its scripts is run
+                for input in &tx.vin {
+                    let prev_script =
+                        match utxo_batch.adds.iter().find(|(op, _)| op == &input.prevout) {
+                            Some((_, u)) => Some(u.script_pubkey.clone()),
+                            None => self.db.get_utxo(&input.prevout)?.map(|u| u.script_pubkey),
+                        };
+                    if let Some(spk) = prev_script.filter(|spk| spk.is_p2sh()) {
+                        sig_ops += divi_script::p2sh_sig_op_count(
+                            spk.as_bytes(),
+                            input.script_sig.as_bytes(),
+                        );
+                    }
+                }
+            }
+            if sig_ops > MAX_BLOCK_SIGOPS {
+                return Err(StorageError::InvalidBlock(
+                    "bad-blk-sigops: too many sigops".into(),
+                ));
+            }
 
             // Remove spent UTXOs (except for coinbase which has no real inputs)
             if !is_coinbase {
@@ -4456,6 +4554,67 @@ fn coinstake_stake_reward(
     }
 }
 
+/// `CScript() << height` (Divi Core script.h:210-225): OP_1..OP_16 for 1-16,
+/// otherwise the minimal CScriptNum encoding pushed as data
+pub fn bip34_height_script(height: u32) -> Vec<u8> {
+    match height {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + height as u8],
+        _ => {
+            let mut num = Vec::new();
+            let mut v = height;
+            while v > 0 {
+                num.push((v & 0xff) as u8);
+                v >>= 8;
+            }
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                num.push(0x00);
+            }
+            let mut out = vec![num.len() as u8];
+            out.extend_from_slice(&num);
+            out
+        }
+    }
+}
+
+/// Divi Core CBlock::BuildMerkleTree's `fMutated` (primitives/block.cpp:59-79): two
+/// identical hashes at the end of a level
+fn merkle_tree_mutated(txids: &[Hash256]) -> bool {
+    let mut level = txids.to_vec();
+    let mut mutated = false;
+    while level.len() > 1 {
+        let n = level.len();
+        let mut next = Vec::with_capacity(n.div_ceil(2));
+        for i in (0..n).step_by(2) {
+            let i2 = (i + 1).min(n - 1);
+            if i2 == i + 1 && i2 + 1 == n && level[i] == level[i2] {
+                mutated = true;
+            }
+            let mut pair = Vec::with_capacity(64);
+            pair.extend_from_slice(level[i].as_bytes());
+            pair.extend_from_slice(level[i2].as_bytes());
+            next.push(hash256(&pair));
+        }
+        level = next;
+    }
+    mutated
+}
+
+/// Divi Core `GetLegacySigOpCount` (TransactionOpCounting.cpp:6-16)
+fn legacy_sig_op_count(tx: &Transaction) -> u32 {
+    let ins: u32 = tx
+        .vin
+        .iter()
+        .map(|i| divi_script::sig_op_count(i.script_sig.as_bytes(), false))
+        .sum();
+    let outs: u32 = tx
+        .vout
+        .iter()
+        .map(|o| divi_script::sig_op_count(o.script_pubkey.as_bytes(), false))
+        .sum();
+    ins + outs
+}
+
 /// Divi Core `MoneyRange` against the network's `MaxMoneyOut`
 fn money_range(value: Amount, max_money: Amount) -> bool {
     value >= Amount::ZERO && value <= max_money
@@ -4467,8 +4626,12 @@ fn money_range(value: Amount, max_money: Amount) -> bool {
 /// without inputs or outputs; output values in range; no coin spent twice.
 fn check_block_transactions(block: &Block, max_money: Amount) -> Result<(), StorageError> {
     let invalid = |reason: String| Err(StorageError::InvalidBlock(reason));
-    if block.transactions.is_empty() {
-        return invalid("bad-blk-length: block has no transactions".into());
+    use divi_primitives::serialize::Encodable;
+    if block.transactions.is_empty()
+        || block.transactions.len() > MAX_BLOCK_SIZE
+        || block.encoded_size() > MAX_BLOCK_SIZE
+    {
+        return invalid("bad-blk-length: size limits failed".into());
     }
     if !block.transactions[0].is_coinbase() {
         return invalid("bad-cb-missing: first tx is not coinbase".into());
@@ -4500,6 +4663,9 @@ fn check_block_transactions(block: &Block, max_money: Amount) -> Result<(), Stor
                 "bad-txns-vout-empty".into(),
             ));
         }
+        if tx.encoded_size() > MAX_TX_SIZE {
+            return invalid("bad-txns-oversize: size limits failed".into());
+        }
         let mut value_out = Amount::ZERO;
         for out in &tx.vout {
             if out.is_empty() && !tx.is_coinbase() && !tx.is_coinstake() {
@@ -4527,6 +4693,10 @@ fn check_block_transactions(block: &Block, max_money: Amount) -> Result<(), Stor
                 return invalid(format!("bad-cb-length: coinbase script size={}", len));
             }
         }
+    }
+    let sig_ops: u32 = block.transactions.iter().map(legacy_sig_op_count).sum();
+    if sig_ops > MAX_BLOCK_SIGOPS_LEGACY {
+        return invalid("bad-blk-sigops: out-of-bounds SigOpCount".into());
     }
     Ok(())
 }
@@ -4769,13 +4939,39 @@ mod tests {
         (chain, dir)
     }
 
-    /// Compute the merkle root and grind a nonce that meets the block's bits
+    thread_local! {
+        /// Heights of the blocks `seal` produced in this test (a test runs on one thread)
+        static SEALED_HEIGHTS: std::cell::RefCell<std::collections::HashMap<Hash256, u32>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// Make a test block valid as Core requires: version 4, a coinbase that starts
+    /// with the block height (one more than its sealed parent's, 1 on genesis),
+    /// the merkle root, and a nonce that meets the block's bits
     fn seal(block: &mut Block) {
+        let height = SEALED_HEIGHTS.with(|m| {
+            m.borrow()
+                .get(&block.header.prev_block)
+                .map_or(1, |h| h + 1)
+        });
+        if block.header.version < 3 {
+            block.header.version = 4;
+        }
+        if let Some(cb) = block.transactions.first_mut().filter(|tx| tx.is_coinbase()) {
+            let prefix = bip34_height_script(height);
+            if !cb.vin[0].script_sig.as_bytes().starts_with(&prefix) {
+                let mut sig = prefix;
+                sig.extend_from_slice(cb.vin[0].script_sig.as_bytes());
+                cb.vin[0].script_sig = Script::from_bytes(sig);
+            }
+        }
         block.header.merkle_root = compute_merkle_root(&block.transactions);
         let target = Hash256::from_compact(block.header.bits);
         while compute_block_hash(&block.header) > target {
             block.header.nonce += 1;
         }
+        let hash = compute_block_hash(&block.header);
+        SEALED_HEIGHTS.with(|m| m.borrow_mut().insert(hash, height));
     }
 
     /// Get the existing genesis block info from the chain
@@ -5630,6 +5826,8 @@ mod tests {
 
         block.transactions.push(coinstake.clone());
         seal(&mut block);
+        // seal puts the height in front of the coinbase script
+        let coinstake = block.transactions[0].clone();
 
         // Accept the block
         let block_hash = chain
@@ -5863,6 +6061,8 @@ mod tests {
 
         block.transactions.push(tx1.clone());
         seal(&mut block);
+        // seal puts the height in front of the coinbase script
+        let tx1 = block.transactions[0].clone();
         let first = chain.accept_block(block).unwrap().hash;
 
         let mut block = Block::default();
@@ -5872,6 +6072,7 @@ mod tests {
         block.header.bits = 0x207fffff;
         block.transactions.push(tx2.clone());
         seal(&mut block);
+        let tx2 = block.transactions[0].clone();
         chain.accept_block(block).unwrap();
 
         let tx1_hash = chain.compute_txid(&tx1);
