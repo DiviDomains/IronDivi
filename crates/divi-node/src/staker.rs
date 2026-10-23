@@ -276,8 +276,6 @@ pub enum StakeResult {
     NoStakeableUtxos,
     /// The wallet is locked, so no coinstake can be signed
     WalletLocked,
-    /// No peer to send a block to (Divi Core stakes only with peers)
-    NoPeers,
     /// Failed to find valid proof
     NoProofFound,
     /// Rate limited - too soon to try again
@@ -619,6 +617,15 @@ impl Staker {
                 info!("Staking loop iteration {}", iteration);
             }
 
+            // Divi Core stakes only with a peer to announce the block to
+            // (CoinMinter::canMintCoins, CoinMinter.cpp:73-75); without one a
+            // block can only extend a private fork
+            if !self.has_peers() {
+                trace!("No peers - not staking");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
+            }
+
             // Try to stake
             match self.try_stake() {
                 StakeResult::Success {
@@ -736,11 +743,6 @@ impl Staker {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                StakeResult::NoPeers => {
-                    trace!("No peers - not staking");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    continue;
-                }
                 StakeResult::RateLimited => {
                     // Step 4: Sleep longer when rate-limited (22s wait needed, not 500ms)
                     static RATE_LIMITED_COUNT: std::sync::atomic::AtomicU32 =
@@ -765,6 +767,11 @@ impl Staker {
         }
 
         info!("Staking loop stopped");
+    }
+
+    /// Whether a peer is connected to receive a staked block
+    fn has_peers(&self) -> bool {
+        self.peer_manager.peer_count() > 0
     }
 
     /// Check if we should limit staking speed at current height
@@ -864,14 +871,6 @@ impl Staker {
         let current_height = tip.height;
         let next_height = current_height + 1;
 
-        // Divi Core stakes only with a peer to announce the block to
-        // (CoinMinter::canMintCoins, CoinMinter.cpp:73-75); without one a
-        // block can only extend a private fork
-        if self.peer_manager.peer_count() == 0 {
-            debug!("Skipping stake: no peers");
-            return StakeResult::NoPeers;
-        }
-
         // Don't stake while actively syncing (IBD mode).
         if self.chain.is_ibd() {
             debug!("Skipping stake: still in IBD mode");
@@ -967,10 +966,6 @@ impl Staker {
             })
             .collect();
 
-        if stakeable.is_empty() {
-            return StakeResult::NoStakeableUtxos;
-        }
-
         // Apply reserve balance: only stake if we have more than the reserve
         // Sort by value descending to prioritize larger UTXOs
         let mut sorted_stakeable = stakeable;
@@ -991,7 +986,8 @@ impl Staker {
             })
             .collect();
 
-        if stakeable.is_empty() {
+        // No plain coin left is no reason to stop: vault coins are staked too
+        if stakeable.is_empty() && reserve > 0 {
             static RESERVE_LIMIT_COUNT: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
             let count = RESERVE_LIMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1006,7 +1002,6 @@ impl Staker {
                     reserve as f64 / 100_000_000.0
                 );
             }
-            return StakeResult::NoStakeableUtxos;
         }
 
         // Divi Core stakes and combines only coins of its stake set
@@ -2625,6 +2620,97 @@ mod tests {
         assert_eq!(sats(&plan.stake_outputs), vec![2_656 * 100_000_000]);
     }
 
+    /// A wallet whose only stakable coins are vault coins it manages still
+    /// stakes, as Divi Core does (its stake set is plain and managed vault
+    /// coins alike, CWallet::SelectStakeCoins): the coinstake spends the vault
+    /// coin and pays back to the vault.
+    #[test]
+    fn vault_manager_without_plain_coins_stakes() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::wallet_db::VaultMetadata;
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        chain.set_ibd_mode(false);
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let manager = wallet.new_receiving_address().unwrap();
+        let vault =
+            divi_script::StakingVaultScript::new([0x11; 20], *manager.hash.as_bytes()).to_script();
+        wallet.store_vault(VaultMetadata {
+            owner_address: String::new(),
+            manager_address: manager.to_string(),
+            vault_script: vault.as_bytes().to_vec(),
+            funding_txid: [0u8; 32],
+        });
+
+        // Block 1 pays its coinbase to the vault; 24 more make it mature
+        for height in 1..=25u32 {
+            let tip = chain.tip().unwrap();
+            let payee = if height == 1 {
+                vault.clone()
+            } else {
+                Script::new_p2pkh(&[0xee; 20])
+            };
+            let mut sig = divi_storage::bip34_height_script(height);
+            sig.push(0);
+            let mut block = Block::default();
+            block.header.version = 4;
+            block.header.prev_block = tip.hash;
+            block.header.time = tip.time + 60;
+            block.header.bits = 0x207fffff;
+            block.transactions = vec![Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+                vout: vec![TxOut::new(Amount::from_divi(1250), payee)],
+                lock_time: 0,
+            }];
+            block.header.merkle_root = compute_merkle_root(&block.transactions);
+            let target = Hash256::from_compact(block.header.bits);
+            while compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            let hash = chain.accept_block(block.clone()).unwrap().hash;
+            wallet.scan_block(hash, height, block.header.time, &block.transactions);
+            wallet.set_last_scan_height(height);
+        }
+        assert_eq!(wallet.get_stakeable_vault_utxos(25, 1).len(), 1);
+        assert!(wallet.get_spendable_utxos(25, 1).is_empty());
+
+        let staker = Staker::new(
+            wallet,
+            chain,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig {
+                allow_stale_tip: true,
+                min_coin_age: 0,
+                ..StakingConfig::default()
+            },
+        );
+        match staker.try_stake() {
+            StakeResult::Success { block, .. } => {
+                let coinstake = &block.transactions[1];
+                assert!(coinstake.is_coinstake());
+                assert_eq!(coinstake.vout[1].script_pubkey, vault);
+                assert_eq!(coinstake.vin.len(), 1);
+            }
+            _ => panic!("expected a vault stake"),
+        }
+    }
+
     /// Divi Core stakes only with a peer to announce the block to
     /// (CoinMinter::canMintCoins, CoinMinter.cpp:73-75)
     #[test]
@@ -2654,7 +2740,7 @@ mod tests {
             PeerManager::new(PeerManagerConfig::default()),
             StakingConfig::default(),
         );
-        assert!(matches!(staker.try_stake(), StakeResult::NoPeers));
+        assert!(!staker.has_peers());
     }
 
     #[test]
