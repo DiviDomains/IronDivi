@@ -102,8 +102,10 @@ pub const DEFAULT_RPC_PORT_PRIVATEDIVI_TESTNET: u16 = 52473;
 /// Default RPC port for PrivateDivi regtest
 pub const DEFAULT_RPC_PORT_PRIVATEDIVI_REGTEST: u16 = 52475;
 
-/// User agent string
-pub const USER_AGENT: &str = "/IronDivi:0.1.0/";
+/// User agent sent in the version message, built from the crate version so
+/// it always names the running release (also used as getnetworkinfo's
+/// "subversion")
+pub const USER_AGENT: &str = concat!("/IronDivi:", env!("CARGO_PKG_VERSION"), "/");
 
 /// Service flags
 pub mod services {
@@ -145,5 +147,18 @@ mod advertised_services_tests {
     #[test]
     fn full_node_sets_network_bit_only() {
         assert_eq!(advertised_services(false), services::NODE_NETWORK);
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::USER_AGENT;
+
+    #[test]
+    fn user_agent_names_the_crate_version() {
+        assert_eq!(
+            USER_AGENT,
+            format!("/IronDivi:{}/", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

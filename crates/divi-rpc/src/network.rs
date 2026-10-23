@@ -60,7 +60,7 @@ impl NetworkRpc {
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
-            "subversion": format!("/IronDivi:{}/", env!("CARGO_PKG_VERSION")),
+            "subversion": divi_network::USER_AGENT,
             "protocolversion": 70920,
             "localservices": format!("{:016x}", local_services),
             "timeoffset": self.time_offset(),
