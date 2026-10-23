@@ -10,6 +10,7 @@ divi-primitives = { workspace = true }
 divi-crypto = { workspace = true }
 divi-storage = { workspace = true }
 divi-masternode = { workspace = true }
+divi-script = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -20,11 +21,10 @@ rand = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 divi-consensus = { workspace = true }
-divi-script = { workspace = true }
-hex = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = "0.4"
 tracing-subscriber = { workspace = true }

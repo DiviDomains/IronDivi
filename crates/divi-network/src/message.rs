@@ -82,6 +82,20 @@ impl MessageHeader {
         &self.magic == expected
     }
 
+    /// Divi Core `CMessageHeader::IsValid` command check: printable ASCII,
+    /// then only zero bytes after the first zero
+    pub fn command_is_valid(&self) -> bool {
+        let end = self
+            .command
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(COMMAND_SIZE);
+        self.command[..end]
+            .iter()
+            .all(|&b| (b' '..=0x7e).contains(&b))
+            && self.command[end..].iter().all(|&b| b == 0)
+    }
+
     /// Validate the checksum against payload
     pub fn validate_checksum(&self, payload: &[u8]) -> bool {
         let hash = double_sha256(payload);
@@ -132,6 +146,9 @@ impl MessageHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum InvType {
+    /// A type Divi Core does not define: it reads any type and ignores
+    /// the ones it does not know, so such items are kept but never acted on
+    Unknown = 0,
     /// Transaction
     Tx = 1,
     /// Block
@@ -213,20 +230,12 @@ impl InvItem {
 
     /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        if data.len() < 36 {
-            return Err(NetworkError::Deserialization("inv item too short".into()));
-        }
+        Self::read(&mut crate::wire::Reader::new(data))
+    }
 
-        let mut cursor = std::io::Cursor::new(&data[0..4]);
-        let type_val = cursor.read_u32::<LittleEndian>()?;
-        let inv_type = InvType::from_u32(type_val).ok_or_else(|| {
-            NetworkError::Deserialization(format!("unknown inv type: {}", type_val))
-        })?;
-
-        let mut hash_bytes = [0u8; 32];
-        hash_bytes.copy_from_slice(&data[4..36]);
-        let hash = divi_primitives::hash::Hash256::from_bytes(hash_bytes);
-
+    pub(crate) fn read(r: &mut crate::wire::Reader) -> Result<Self, NetworkError> {
+        let inv_type = InvType::from_u32(r.u32()?).unwrap_or(InvType::Unknown);
+        let hash = r.hash()?;
         Ok(InvItem { inv_type, hash })
     }
 }
@@ -274,19 +283,14 @@ impl NetAddr {
 
     /// Deserialize from bytes (without time)
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        if data.len() < 26 {
-            return Err(NetworkError::Deserialization("net addr too short".into()));
-        }
+        Self::read(&mut crate::wire::Reader::new(data))
+    }
 
-        let mut cursor = std::io::Cursor::new(&data[0..8]);
-        let services = cursor.read_u64::<LittleEndian>()?;
-
+    pub(crate) fn read(r: &mut crate::wire::Reader) -> Result<Self, NetworkError> {
+        let services = r.u64()?;
         let mut ip = [0u8; 16];
-        ip.copy_from_slice(&data[8..24]);
-
-        let mut cursor = std::io::Cursor::new(&data[24..26]);
-        let port = cursor.read_u16::<byteorder::BigEndian>()?;
-
+        ip.copy_from_slice(r.take(16)?);
+        let port = r.u16_be()?;
         Ok(NetAddr { services, ip, port })
     }
 }

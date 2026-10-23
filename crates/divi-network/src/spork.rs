@@ -49,9 +49,58 @@ pub struct SporkSyncProgress {
 }
 
 /// Spork synchronization manager
+/// Divi Core `strSporkKey` (chainparams.cpp); regtest uses the testnet key
+const MAINNET_SPORK_KEY: &str =
+    "02c1ed5eadcf6793fa22840febfbd667fabbabc48ddd75c2d228662d65e292eb00";
+const TESTNET_SPORK_KEY: &str =
+    "034ffa41e5cffdd009f3b34a3e1482ec82b514bb218b7648948b5858cc5c035adb";
+
+/// Points Divi Core adds for a spork with a bad signature (spork.cpp)
+pub const BAD_SPORK_SCORE: u32 = 100;
+
+/// The spork key of a Divi network, by its magic (None for other chains)
+pub fn spork_key(magic: &crate::constants::Magic) -> Option<Vec<u8>> {
+    use crate::constants::{MAINNET_MAGIC, REGTEST_MAGIC, TESTNET_MAGIC};
+    let key = if magic == &MAINNET_MAGIC {
+        MAINNET_SPORK_KEY
+    } else if magic == &TESTNET_MAGIC || magic == &REGTEST_MAGIC {
+        TESTNET_SPORK_KEY
+    } else {
+        return None;
+    };
+    hex::decode(key).ok()
+}
+
+/// Divi Core `IsMultiValueSpork`: sporks 13 to 16 keep a list of values
+fn is_multi_value(spork_id: i32) -> bool {
+    use crate::messages::spork_ids::*;
+    matches!(
+        spork_id,
+        SPORK_13_BLOCK_PAYMENTS
+            | SPORK_14_TX_FEE
+            | SPORK_15_BLOCK_VALUE
+            | SPORK_16_LOTTERY_TICKET_MIN_VALUE
+    )
+}
+
+impl SporkMessage {
+    /// Divi Core `CSporkMessage::CheckSignature`: a compact signature over
+    /// id + value + time (as decimal text, with the signed-message magic)
+    /// that recovers to the compressed spork key
+    pub fn signature_is_valid(&self, key: &[u8]) -> bool {
+        let message = format!("{}{}{}", self.spork_id, self.value, self.time_signed);
+        self.signature.len() == 65
+            && (31..=34).contains(&self.signature[0])
+            && divi_masternode::cpp_wire::verify_message(key, &self.signature, message.as_bytes())
+    }
+}
+
 pub struct SporkManager {
     /// Peer manager for sending messages
     peer_manager: Arc<PeerManager>,
+
+    /// Key that signs sporks on this network (None: not checked)
+    spork_key: Option<Vec<u8>>,
 
     /// Sync state per peer
     peer_states: RwLock<HashMap<PeerId, SporkSyncState>>,
@@ -71,6 +120,7 @@ impl SporkManager {
     pub fn new(peer_manager: Arc<PeerManager>) -> Arc<Self> {
         let (progress_tx, _) = broadcast::channel(16);
         Arc::new(SporkManager {
+            spork_key: spork_key(&peer_manager.magic()),
             peer_manager,
             peer_states: RwLock::new(HashMap::new()),
             sporks: RwLock::new(HashMap::new()),
@@ -151,6 +201,31 @@ impl SporkManager {
             peer_id
         );
 
+        // Divi Core ProcessSpork: a spork no newer than the active one is
+        // only counted (unless it is a multi-value spork); otherwise its
+        // signature must check out, or the peer gets Misbehaving(100)
+        if let Some(key) = &self.spork_key {
+            let newer = self
+                .active_sporks
+                .read()
+                .get(&spork.spork_id)
+                .is_none_or(|active| spork.time_signed > active.time_signed);
+            if !newer && !is_multi_value(spork.spork_id) {
+                self.count_received(peer_id);
+                self.emit_progress();
+                return;
+            }
+            if !spork.signature_is_valid(key) {
+                tracing::warn!("Spork {} from peer {}: invalid signature", hash, peer_id);
+                self.peer_manager.report_misbehavior_score(
+                    peer_id,
+                    BAD_SPORK_SCORE,
+                    "Invalid spork signature",
+                );
+                return;
+            }
+        }
+
         // Store the spork
         {
             let mut sporks = self.sporks.write();
@@ -169,7 +244,13 @@ impl SporkManager {
             }
         }
 
-        // Update peer state
+        self.count_received(peer_id);
+
+        self.emit_progress();
+    }
+
+    /// Count a spork received from a peer towards its sync
+    fn count_received(&self, peer_id: PeerId) {
         {
             let mut states = self.peer_states.write();
             if let Some(SporkSyncState::Syncing { expected, received }) =
@@ -194,8 +275,6 @@ impl SporkManager {
                 }
             }
         }
-
-        self.emit_progress();
     }
 
     /// Handle getsporks request (respond with our sporks)
@@ -265,5 +344,45 @@ mod tests {
     fn test_spork_sync_state() {
         assert_eq!(SporkSyncState::Pending, SporkSyncState::Pending);
         assert_ne!(SporkSyncState::Pending, SporkSyncState::Synced);
+    }
+
+    fn signed(kp: &divi_crypto::KeyPair, id: i32, value: &str, time: i64) -> SporkMessage {
+        let message = format!("{}{}{}", id, value, time);
+        let signature =
+            divi_masternode::cpp_wire::sign_message(kp.secret_key(), message.as_bytes()).unwrap();
+        SporkMessage {
+            spork_id: id,
+            value: value.into(),
+            time_signed: time,
+            signature,
+        }
+    }
+
+    #[test]
+    fn spork_signature_is_checked_against_the_key() {
+        let kp = divi_crypto::KeyPair::new_random();
+        let key = kp.public_key().to_bytes();
+        let spork = signed(&kp, 10007, "1", 1_700_000_000);
+        assert!(spork.signature_is_valid(&key));
+
+        let mut changed = spork.clone();
+        changed.value = "0".into();
+        assert!(!changed.signature_is_valid(&key));
+
+        let other = divi_crypto::KeyPair::new_random();
+        assert!(!spork.signature_is_valid(&other.public_key().to_bytes()));
+
+        // Divi Core compares key ids: the recovery byte must say compressed
+        let mut uncompressed = spork.clone();
+        uncompressed.signature[0] -= 4;
+        assert!(!uncompressed.signature_is_valid(&key));
+    }
+
+    #[test]
+    fn spork_keys_by_network() {
+        use crate::constants::*;
+        assert_eq!(spork_key(&MAINNET_MAGIC).unwrap()[0], 0x02);
+        assert_eq!(spork_key(&REGTEST_MAGIC), spork_key(&TESTNET_MAGIC));
+        assert!(spork_key(&PRIVATEDIVI_MAINNET_MAGIC).is_none());
     }
 }

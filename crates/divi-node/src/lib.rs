@@ -64,7 +64,8 @@ pub use fee_estimator::{FeeEstimator, FeeEstimatorStats};
 pub use mempool::MempoolValidator;
 pub use mempool::{Mempool, MempoolEntry, MempoolStats};
 pub use node::{
-    accept_relayed_transaction, check_mempool_transaction, update_mempool_after_reorg,
-    BlockchainInfo, MempoolInfo, NetworkInfo, Node, NodeEvent, NodeStatus,
+    accept_relayed_transaction, check_mempool_transaction, getblocks_reply,
+    update_mempool_after_reorg, BlockchainInfo, MempoolInfo, NetworkInfo, Node, NodeEvent,
+    NodeStatus, GETBLOCKS_LIMIT,
 };
 pub use staker::{StakeResult, Staker, StakerEvent, StakingConfig, StakingStatus};

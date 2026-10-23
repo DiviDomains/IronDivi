@@ -100,6 +100,8 @@ pub struct PeerManager {
     shutdown_tx: broadcast::Sender<()>,
     /// Peer scoring and ban management
     scoring: PeerScoring,
+    /// Nonces of our version messages on open connections (self-connection check)
+    local_nonces: crate::connection::LocalNonces,
     /// Manually added nodes (via addnode RPC)
     added_nodes: RwLock<HashSet<SocketAddr>>,
     /// Addresses currently being connected to (connection attempt in progress)
@@ -129,12 +131,18 @@ impl PeerManager {
             event_tx,
             shutdown_tx,
             scoring: PeerScoring::new(),
+            local_nonces: Default::default(),
             added_nodes: RwLock::new(HashSet::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// The network magic of this peer manager's network
+    pub fn magic(&self) -> crate::constants::Magic {
+        self.config.magic
     }
 
     /// Get a reference to peer scoring
@@ -172,6 +180,19 @@ impl PeerManager {
             _ => self.disconnect(peer_id),
         }
         outcome
+    }
+
+    /// Divi Core bans a peer whose protocol version is too old
+    /// (`PeerBanningService::Ban` after `DisconnectOldProtocol`), local or not
+    fn ban_obsolete(&self, ip: std::net::IpAddr, error: &NetworkError) {
+        if let NetworkError::VersionMismatch { peer, required } = error {
+            let (_, duration) = self.scoring.ban_policy();
+            self.ban_ip(
+                ip,
+                duration,
+                format!("obsolete version {} (need {})", peer, required),
+            );
+        }
     }
 
     /// Check if an IP is banned
@@ -560,6 +581,7 @@ impl PeerManager {
             self.shutdown_tx.subscribe(),
             self.bytes_sent_counter(),
             self.bytes_recv_counter(),
+            Arc::clone(&self.local_nonces),
         )
         .await;
 
@@ -582,6 +604,7 @@ impl PeerManager {
         tokio::spawn(async move {
             if let Err(e) = conn.run().await {
                 debug!("Connection to {} ended: {}", addr, e);
+                self_clone.ban_obsolete(addr.ip(), &e);
             }
             // Remove peer on disconnect
             self_clone.peers.write().remove(&peer_id);
@@ -617,6 +640,7 @@ impl PeerManager {
             self.shutdown_tx.subscribe(),
             self.bytes_sent_counter(),
             self.bytes_recv_counter(),
+            Arc::clone(&self.local_nonces),
         )
         .await?;
 
@@ -634,6 +658,7 @@ impl PeerManager {
         tokio::spawn(async move {
             if let Err(e) = conn.run().await {
                 debug!("Inbound connection ended: {}", e);
+                self_clone.ban_obsolete(addr.ip(), &e);
             }
             // Remove peer on disconnect
             self_clone.peers.write().remove(&peer_id);

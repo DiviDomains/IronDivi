@@ -64,63 +64,42 @@ impl DiviCodec {
     }
 }
 
+/// One message taken off the wire
+#[derive(Debug)]
+pub enum Decoded {
+    /// A message that parsed
+    Message(NetworkMessage),
+    /// A message whose payload did not parse (Divi Core answers with a
+    /// `reject` "error parsing message" and keeps the connection)
+    Malformed {
+        /// The message's command
+        command: String,
+        /// Why it did not parse
+        error: String,
+    },
+}
+
 impl Decoder for DiviCodec {
-    type Item = NetworkMessage;
+    type Item = Decoded;
     type Error = NetworkError;
 
+    /// Divi Core's framing (`ProcessReceivedMessages`, `CNetMessage::readHeader`):
+    /// a wrong magic or an oversized payload ends the connection, a bad
+    /// checksum skips the message, and a payload that does not parse is
+    /// reported as malformed
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         loop {
             match &self.state {
                 DecodeState::Header => {
-                    // Need at least HEADER_SIZE bytes
                     if src.len() < HEADER_SIZE {
-                        // Reserve space for header if needed
                         src.reserve(HEADER_SIZE - src.len());
                         return Ok(None);
                     }
 
-                    // Parse the header (don't consume yet - we need to validate magic first)
                     let header = MessageHeader::deserialize(&src[..HEADER_SIZE])?;
-
-                    // Validate magic bytes
                     if !header.validate_magic(&self.magic) {
-                        // Invalid magic - try to resync by scanning for valid magic
-                        warn!(
-                            "Invalid magic bytes: got {:02x?}, expected {:02x?}. Scanning for resync...",
-                            header.magic, self.magic
-                        );
-
-                        // Look for magic bytes in the buffer
-                        let magic_bytes: &[u8] = &self.magic;
-                        if let Some(pos) = src.windows(4).position(|w| w == magic_bytes) {
-                            if pos > 0 {
-                                debug!(
-                                    "Found magic at offset {}, discarding {} garbage bytes",
-                                    pos, pos
-                                );
-                                // Discard bytes before magic
-                                src.advance(pos);
-                                self.bytes_consumed += pos as u64;
-                                // Continue to try parsing header again
-                                continue;
-                            }
-                        } else {
-                            // No magic found in buffer - discard all but last 3 bytes
-                            // (magic could be split across buffer boundary)
-                            if src.len() > 3 {
-                                let discard = src.len() - 3;
-                                debug!(
-                                    "No magic found, discarding {} bytes, keeping last 3",
-                                    discard
-                                );
-                                src.advance(discard);
-                                self.bytes_consumed += discard as u64;
-                            }
-                            return Ok(None);
-                        }
+                        return Err(NetworkError::InvalidMagic);
                     }
-
-                    // Validate payload size
                     if header.payload_size > MAX_MESSAGE_SIZE {
                         return Err(NetworkError::MessageTooLarge {
                             size: header.payload_size,
@@ -134,68 +113,46 @@ impl Decoder for DiviCodec {
                         header.payload_size
                     );
 
-                    // Consume header bytes
                     src.advance(HEADER_SIZE);
                     self.bytes_consumed += HEADER_SIZE as u64;
-
-                    // Transition to payload state
                     self.state = DecodeState::Payload { header };
                 }
 
                 DecodeState::Payload { header } => {
                     let payload_size = header.payload_size as usize;
-
-                    // Need complete payload
                     if src.len() < payload_size {
-                        // Reserve space for remaining payload
                         src.reserve(payload_size - src.len());
                         return Ok(None);
                     }
 
-                    // Extract payload
-                    let payload = &src[..payload_size];
-
-                    // Validate checksum
-                    if !header.validate_checksum(payload) {
-                        // Reset state and return error
-                        self.state = DecodeState::Header;
-                        return Err(NetworkError::InvalidChecksum);
-                    }
-
-                    // Deserialize message
-                    let command = header.command_string();
-
-                    // Log block messages at trace level
-                    if command == "block" {
-                        tracing::trace!(
-                            "Codec: Decoding block message ({} bytes payload)",
-                            payload_size
-                        );
-                    }
-
-                    let message = match NetworkMessage::deserialize(&command, payload) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            if command == "block" {
-                                tracing::error!(
-                                    "Codec: Failed to deserialize block message: {}",
-                                    e
-                                );
-                            }
-                            return Err(e);
-                        }
-                    };
-
-                    trace!("Decoded message: {} ({} bytes)", command, payload_size);
-
-                    // Consume payload bytes
-                    src.advance(payload_size);
+                    let payload = src.split_to(payload_size);
                     self.bytes_consumed += payload_size as u64;
-
-                    // Reset state for next message
+                    let header = header.clone();
                     self.state = DecodeState::Header;
 
-                    return Ok(Some(message));
+                    let command = header.command_string();
+                    if !header.command_is_valid() {
+                        warn!("{}: errors in the message header, message skipped", command);
+                        continue;
+                    }
+                    if !header.validate_checksum(&payload) {
+                        warn!("{}: checksum error, message skipped", command);
+                        continue;
+                    }
+
+                    trace!("Decoded message: {} ({} bytes)", command, payload_size);
+                    return Ok(Some(
+                        match NetworkMessage::deserialize(&command, &payload) {
+                            Ok(message) => Decoded::Message(message),
+                            Err(e) => {
+                                debug!("{}: payload does not parse: {}", command, e);
+                                Decoded::Malformed {
+                                    command,
+                                    error: e.to_string(),
+                                }
+                            }
+                        },
+                    ));
                 }
             }
         }
@@ -217,20 +174,25 @@ mod tests {
     use super::*;
     use crate::constants::MAINNET_MAGIC;
 
+    fn message(item: Option<Decoded>) -> NetworkMessage {
+        match item {
+            Some(Decoded::Message(m)) => m,
+            other => panic!("expected a message, got {:?}", other),
+        }
+    }
+
     /// getpeerinfo bytesrecv comes from this count, so it must be the exact wire size
-    /// (it used to be re-serialised from the decoded message, an estimate).
     #[test]
     fn test_codec_counts_exact_bytes_consumed() {
         let mut codec = DiviCodec::new(MAINNET_MAGIC);
         let mut buf = BytesMut::new();
         let ping = NetworkMessage::Ping(7).to_bytes(MAINNET_MAGIC).unwrap();
         let verack = NetworkMessage::Verack.to_bytes(MAINNET_MAGIC).unwrap();
-        buf.extend_from_slice(&[0xde, 0xad]); // garbage before the magic is skipped
         buf.extend_from_slice(&ping);
         buf.extend_from_slice(&verack);
-        assert!(codec.decode(&mut buf).unwrap().is_some());
-        assert_eq!(codec.take_bytes_consumed(), 2 + ping.len() as u64);
-        assert!(codec.decode(&mut buf).unwrap().is_some());
+        message(codec.decode(&mut buf).unwrap());
+        assert_eq!(codec.take_bytes_consumed(), ping.len() as u64);
+        message(codec.decode(&mut buf).unwrap());
         assert_eq!(codec.take_bytes_consumed(), verack.len() as u64);
         assert_eq!(codec.take_bytes_consumed(), 0);
     }
@@ -239,91 +201,105 @@ mod tests {
     fn test_codec_decode_ping() {
         let mut codec = DiviCodec::new(MAINNET_MAGIC);
         let mut buf = BytesMut::new();
+        let bytes = NetworkMessage::Ping(12345).to_bytes(MAINNET_MAGIC).unwrap();
 
-        // Create a ping message
-        let ping = NetworkMessage::Ping(12345);
-        let bytes = ping.to_bytes(MAINNET_MAGIC).unwrap();
-
-        // Feed partial bytes - should return None
+        // Partial bytes: nothing yet, bytes kept
         buf.extend_from_slice(&bytes[..10]);
         assert!(codec.decode(&mut buf).unwrap().is_none());
-        assert_eq!(buf.len(), 10); // Bytes preserved
+        assert_eq!(buf.len(), 10);
 
-        // Feed rest of message
         buf.extend_from_slice(&bytes[10..]);
-        let result = codec.decode(&mut buf).unwrap();
-        assert!(result.is_some());
-
-        if let Some(NetworkMessage::Ping(nonce)) = result {
-            assert_eq!(nonce, 12345);
-        } else {
-            panic!("Expected Ping message");
-        }
-
-        assert_eq!(buf.len(), 0); // All bytes consumed
+        assert!(matches!(
+            message(codec.decode(&mut buf).unwrap()),
+            NetworkMessage::Ping(12345)
+        ));
+        assert_eq!(buf.len(), 0);
     }
 
     #[test]
     fn test_codec_decode_multiple_messages() {
         let mut codec = DiviCodec::new(MAINNET_MAGIC);
         let mut buf = BytesMut::new();
-
-        // Create two messages
-        let ping1 = NetworkMessage::Ping(111);
-        let ping2 = NetworkMessage::Ping(222);
-
-        buf.extend_from_slice(&ping1.to_bytes(MAINNET_MAGIC).unwrap());
-        buf.extend_from_slice(&ping2.to_bytes(MAINNET_MAGIC).unwrap());
-
-        // Decode first
-        let msg1 = codec.decode(&mut buf).unwrap().unwrap();
-        if let NetworkMessage::Ping(n) = msg1 {
-            assert_eq!(n, 111);
-        } else {
-            panic!("Expected Ping");
-        }
-
-        // Decode second
-        let msg2 = codec.decode(&mut buf).unwrap().unwrap();
-        if let NetworkMessage::Ping(n) = msg2 {
-            assert_eq!(n, 222);
-        } else {
-            panic!("Expected Ping");
-        }
-
+        buf.extend_from_slice(&NetworkMessage::Ping(111).to_bytes(MAINNET_MAGIC).unwrap());
+        buf.extend_from_slice(&NetworkMessage::Ping(222).to_bytes(MAINNET_MAGIC).unwrap());
+        assert!(matches!(
+            message(codec.decode(&mut buf).unwrap()),
+            NetworkMessage::Ping(111)
+        ));
+        assert!(matches!(
+            message(codec.decode(&mut buf).unwrap()),
+            NetworkMessage::Ping(222)
+        ));
         assert_eq!(buf.len(), 0);
     }
 
+    /// Divi Core stops reading from a peer whose stream has a wrong magic
     #[test]
-    fn test_codec_resync_on_garbage() {
+    fn wrong_magic_is_an_error() {
         let mut codec = DiviCodec::new(MAINNET_MAGIC);
         let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+        buf.extend_from_slice(&NetworkMessage::Ping(999).to_bytes(MAINNET_MAGIC).unwrap());
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(NetworkError::InvalidMagic)
+        ));
+    }
 
-        // Add some garbage followed by a valid message
-        buf.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]); // 4 garbage bytes
-        let ping = NetworkMessage::Ping(999);
-        buf.extend_from_slice(&ping.to_bytes(MAINNET_MAGIC).unwrap());
+    /// A bad checksum skips that message only
+    #[test]
+    fn bad_checksum_skips_the_message() {
+        let mut codec = DiviCodec::new(MAINNET_MAGIC);
+        let mut buf = BytesMut::new();
+        let mut bad = NetworkMessage::Ping(1).to_bytes(MAINNET_MAGIC).unwrap();
+        bad[20] ^= 0xff;
+        buf.extend_from_slice(&bad);
+        buf.extend_from_slice(&NetworkMessage::Ping(2).to_bytes(MAINNET_MAGIC).unwrap());
+        assert!(matches!(
+            message(codec.decode(&mut buf).unwrap()),
+            NetworkMessage::Ping(2)
+        ));
+    }
 
-        // Should skip garbage and find the message
-        let result = codec.decode(&mut buf).unwrap();
-        assert!(result.is_some());
+    /// A payload over 2 MiB ends the connection
+    #[test]
+    fn oversized_payload_is_an_error() {
+        let mut codec = DiviCodec::new(MAINNET_MAGIC);
+        let mut buf = BytesMut::new();
+        let mut header = NetworkMessage::Ping(1).to_bytes(MAINNET_MAGIC).unwrap();
+        header.truncate(HEADER_SIZE);
+        header[16..20].copy_from_slice(&(MAX_MESSAGE_SIZE + 1).to_le_bytes());
+        buf.extend_from_slice(&header);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(NetworkError::MessageTooLarge { .. })
+        ));
+    }
 
-        if let Some(NetworkMessage::Ping(nonce)) = result {
-            assert_eq!(nonce, 999);
-        } else {
-            panic!("Expected Ping message");
-        }
+    /// A payload that does not parse is reported, and the next message still decodes
+    #[test]
+    fn malformed_payload_is_reported() {
+        let mut codec = DiviCodec::new(MAINNET_MAGIC);
+        let mut buf = BytesMut::new();
+        let short_ping = crate::message::MessageHeader::new(MAINNET_MAGIC, "ping", &[1, 2]);
+        buf.extend_from_slice(&short_ping.serialize());
+        buf.extend_from_slice(&[1, 2]);
+        buf.extend_from_slice(&NetworkMessage::Ping(3).to_bytes(MAINNET_MAGIC).unwrap());
+        assert!(matches!(
+            codec.decode(&mut buf).unwrap(),
+            Some(Decoded::Malformed { ref command, .. }) if command == "ping"
+        ));
+        assert!(matches!(
+            message(codec.decode(&mut buf).unwrap()),
+            NetworkMessage::Ping(3)
+        ));
     }
 
     #[test]
     fn test_codec_encode() {
         let mut codec = DiviCodec::new(MAINNET_MAGIC);
         let mut buf = BytesMut::new();
-
-        let ping = NetworkMessage::Ping(42);
-        codec.encode(ping, &mut buf).unwrap();
-
-        // Should produce same bytes as to_bytes
+        codec.encode(NetworkMessage::Ping(42), &mut buf).unwrap();
         let expected = NetworkMessage::Ping(42).to_bytes(MAINNET_MAGIC).unwrap();
         assert_eq!(&buf[..], &expected[..]);
     }
