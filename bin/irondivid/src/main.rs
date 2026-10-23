@@ -1945,6 +1945,10 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
             code: divi_node::error::reject::NONSTANDARD,
             reason: "non-final".to_string(),
         },
+        NodeError::PrematureSpend => TxSubmitError::Rejected {
+            code: divi_node::error::reject::INVALID,
+            reason: "bad-txns-premature-spend-of-coinbase".to_string(),
+        },
         other => TxSubmitError::Failed(other.to_string()),
     }
 }

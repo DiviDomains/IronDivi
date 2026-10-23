@@ -66,10 +66,13 @@ impl TestNode {
         outpoint
     }
 
-    /// A mature 1250 DIVI coin paying `kp`
+    /// A 1250 DIVI coin paying `kp`, mature for the next block (regtest
+    /// coinbase maturity 20, Divi Core chainparams.cpp:479)
     fn fund(&self, kp: &KeyPair) -> OutPoint {
         let coin = self.mine(p2pkh(kp));
-        self.mine(Script::new_p2pkh(&[0xee; 20]));
+        for _ in 0..19 {
+            self.mine(Script::new_p2pkh(&[0xee; 20]));
+        }
         coin
     }
 

@@ -1411,10 +1411,21 @@ pub fn update_mempool_after_reorg(
     mempool.remove_non_final();
 }
 
+/// Divi Core `COINBASE_MATURITY` per network (chainparams.cpp:184 main, :293
+/// test, :479 regtest)
+pub fn coinbase_maturity(network: StorageNetworkType) -> u32 {
+    match network {
+        StorageNetworkType::Mainnet => 20,
+        StorageNetworkType::Testnet => 1,
+        StorageNetworkType::Regtest => 20,
+    }
+}
+
 /// Divi Core's AcceptToMemoryPool input checks against the chain: every input
-/// unspent in the chain or an output of a mempool transaction, then every
-/// input script under the standard flags (and, to pick the reject reason, the
-/// mandatory ones). Script failures are refused with Core's code and text.
+/// unspent in the chain (and mature, if a coinbase or coinstake output) or an
+/// output of a mempool transaction, then every input script under the
+/// standard flags (and, to pick the reject reason, the mandatory ones). Script
+/// failures are refused with Core's code and text.
 /// (Mempool::add itself refuses coinbase and coinstake transactions.)
 pub fn check_mempool_transaction(
     chain: &Chain,
@@ -1426,10 +1437,19 @@ pub fn check_mempool_transaction(
     use divi_primitives::script::Script;
     use divi_script::{verify_input_with_flags, ScriptFlags};
 
+    // Core checks maturity at the height of the block that would spend the
+    // coin: the tip's child (UtxoCheckingAndUpdating.cpp:61-78)
+    let next_height = chain.height() + 1;
+    let maturity = coinbase_maturity(chain.network_type());
     let mut spent: Vec<(Script, Amount)> = Vec::with_capacity(tx.vin.len());
     for input in &tx.vin {
         let prev = match chain.get_utxo(&input.prevout) {
-            Ok(Some(utxo)) => Some((utxo.script_pubkey, utxo.value)),
+            Ok(Some(utxo)) => {
+                if !utxo.is_mature_with(next_height, maturity) {
+                    return Err(NodeError::PrematureSpend);
+                }
+                Some((utxo.script_pubkey, utxo.value))
+            }
             Ok(None) => mempool.get(&input.prevout.txid).and_then(|parent| {
                 parent
                     .tx

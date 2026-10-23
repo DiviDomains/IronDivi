@@ -1375,10 +1375,14 @@ impl Staker {
         let mempool_txs = self.mempool.get_block_txs(
             self.config.read().max_block_size - 1000, // Leave room for coinbase/coinstake
         );
-        // A stale mempool tx (an input already spent on chain) would make our own
-        // block fail self-accept and waste the stake, so keep only spendable ones.
-        let mempool_txs =
-            retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
+        // A stale mempool tx (an input already spent on chain, or a coinbase or
+        // coinstake output not mature at this height) would make our own block
+        // fail self-accept and waste the stake, so keep only spendable ones.
+        let maturity = crate::node::coinbase_maturity(self.chain.network_type());
+        let mempool_txs = retain_spendable_txs(mempool_txs, |op| match self.chain.get_utxo(op) {
+            Ok(utxo) => utxo.is_some_and(|utxo| utxo.is_mature_with(height, maturity)),
+            Err(_) => true,
+        });
         // Every tx must be final at this block's height and time, or the block
         // is invalid (Divi Core ContextualCheckBlock "bad-txns-nonfinal").
         transactions.extend(

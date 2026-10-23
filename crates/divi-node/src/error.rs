@@ -80,6 +80,12 @@ pub enum NodeError {
     /// Transaction cannot be mined in the next block (Divi Core reject code 64)
     #[error("64: non-final")]
     NonFinal,
+
+    /// A transaction spends a coinbase or coinstake output that is not mature
+    /// in the next block. Divi Core refuses it as invalid but with no
+    /// misbehaviour score (CheckInputs `state.Invalid`, UtxoCheckingAndUpdating.cpp:76-78).
+    #[error("16: bad-txns-premature-spend-of-coinbase")]
+    PrematureSpend,
 }
 
 impl NodeError {
