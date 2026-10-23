@@ -58,6 +58,11 @@ pub struct NodeConfig {
     /// How many of the newest blocks to check at start (`-checkblocks`, 0 = all, as in C++)
     #[serde(default = "default_check_blocks")]
     pub check_blocks: u32,
+
+    /// Refuse a block this many blocks or more below the tip (C++ `-maxreorg`;
+    /// unset = the network's depth, 100 on Divi)
+    #[serde(default)]
+    pub max_reorg: Option<u32>,
 }
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
@@ -82,6 +87,7 @@ impl Default for NodeConfig {
             utxo_cache_size: 10_000_000,
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
+            max_reorg: None,
         }
     }
 }

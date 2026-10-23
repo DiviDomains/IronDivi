@@ -124,8 +124,9 @@ impl Node {
             crate::config::NetworkType::Testnet => StorageNetworkType::Testnet,
             crate::config::NetworkType::Regtest => StorageNetworkType::Regtest,
         };
-        let chain_params =
+        let mut chain_params =
             ChainParams::for_network(storage_network_type, config.network.chain_mode);
+        chain_params.max_reorg_arg = config.max_reorg;
 
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.data_dir)
@@ -526,7 +527,7 @@ impl Node {
 
                                 // Handle block getdata: serve blocks from our chain
                                 for item in block_items {
-                                    match chain.get_block(&item.hash) {
+                                    match chain.get_block_for_peer(&item.hash) {
                                         Ok(Some(block)) => {
                                             let msg = NetworkMessage::Block(block);
                                             if let Err(e) =
@@ -992,15 +993,13 @@ impl Node {
             // First check if the input is in the UTXO set
             match self.chain.get_utxo(&input.prevout) {
                 Ok(Some(utxo)) => {
-                    // Check coinbase maturity (network-specific: mainnet=20, testnet/regtest=1)
+                    // Check coinbase maturity (the chain's nMaturity: mainnet 20,
+                    // testnet 1, regtest 20)
                     if utxo.is_coinbase || utxo.is_coinstake {
-                        let current_height = self.chain.height();
-                        let confirmations = current_height.saturating_sub(utxo.height);
-                        let coinbase_maturity = match self.chain.network_type() {
-                            StorageNetworkType::Mainnet => 20,
-                            StorageNetworkType::Testnet => 1,
-                            StorageNetworkType::Regtest => 1,
-                        };
+                        // Spent in the next block, as Core's CheckInputs counts it
+                        let spend_height = self.chain.height() + 1;
+                        let confirmations = spend_height.saturating_sub(utxo.height);
+                        let coinbase_maturity = self.chain.params().coinbase_maturity;
                         if confirmations < coinbase_maturity {
                             return Err(NodeError::TransactionValidation(format!(
                                 "Input {}:{} is immature ({} confirmations, need {})",
@@ -1447,7 +1446,7 @@ mod tests {
             block.header.bits = 0x207fffff;
             block.transactions.push(Transaction {
                 version: 1,
-                vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+                vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05, i as u8]))],
                 vout: vec![TxOut::new(
                     Amount::from_sat(1250_00000000),
                     Script::new_p2pkh(&[i as u8 + 1; 20]),
@@ -1455,6 +1454,11 @@ mod tests {
                 lock_time: 0,
             });
             block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            // Proof of work for the block's bits
+            let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+            while divi_crypto::compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
             chain.accept_block(block).unwrap();
             parent = chain.tip().unwrap();
         }

@@ -118,6 +118,11 @@ impl Net {
         }
         block.transactions.extend(txs);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         let time = block.header.time;
         let txs = block.transactions.clone();
         let hash = self.chain.accept_block(block).unwrap().hash;
@@ -218,7 +223,10 @@ fn setup() -> Setup {
         .unwrap()
         .transactions[0]
         .clone();
-    net.mine(vec![], &miner);
+    // Regtest coinbases mature after 20 blocks
+    for _ in 0..20 {
+        net.mine(vec![], &miner);
+    }
 
     let vault = vault_script(&owner_addr, &manager_addr);
     let fund = fund_vault_tx(

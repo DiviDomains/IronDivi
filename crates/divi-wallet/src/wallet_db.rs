@@ -1097,12 +1097,13 @@ impl WalletDb {
         self.network
     }
 
-    /// Get coinbase maturity for this network (mainnet=20, testnet/regtest=1)
+    /// Get coinbase maturity for this network (Divi Core nMaturity: mainnet 20,
+    /// testnet 1, regtest 20; chainparams.cpp:184, :400, :479)
     pub fn coinbase_maturity(&self) -> u32 {
         match self.network {
             Network::Mainnet => 20,
             Network::Testnet => 1,
-            Network::Regtest => 1,
+            Network::Regtest => 20,
         }
     }
 

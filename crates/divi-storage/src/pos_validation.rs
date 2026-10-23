@@ -29,10 +29,6 @@ use std::io::Write;
 /// Reference: ProofOfStakeCalculator.cpp:8
 const MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING: u64 = 60 * 60 * 24 * 7 - 60 * 60;
 
-/// Minimum coin age required for staking (60 seconds)
-/// Reference: ProofOfStakeGenerator.cpp and Settings
-const MINIMUM_COIN_AGE_FOR_STAKING: u64 = 60;
-
 /// Hash drift allowance for proof-of-stake (45 seconds)
 /// Reference: I_ProofOfStakeGenerator.h:30
 pub const HASH_DRIFT: u32 = 45;
@@ -214,10 +210,13 @@ pub fn compute_and_verify_proof_of_stake(
 
 /// Check if proof-of-stake time requirements are met
 ///
+/// `min_coin_age` is the network's `nMinCoinAgeForStaking` (chainparams.cpp:195, :498).
+///
 /// Reference: ProofOfStakeGenerator.cpp:75-90
 pub fn check_pos_time_requirements(
     coinstake_start_time: u32,
     hashproof_timestamp: u32,
+    min_coin_age: u32,
 ) -> Result<(), String> {
     // Transaction timestamp violation
     // Reference: ProofOfStakeGenerator.cpp:79-82
@@ -230,10 +229,10 @@ pub fn check_pos_time_requirements(
 
     // Minimum age requirement
     // Reference: ProofOfStakeGenerator.cpp:84-88
-    if coinstake_start_time + MINIMUM_COIN_AGE_FOR_STAKING as u32 > hashproof_timestamp {
+    if u64::from(coinstake_start_time) + u64::from(min_coin_age) > u64::from(hashproof_timestamp) {
         return Err(format!(
             "min age violation: coinstake_start_time ({}) + min_age ({}) > hashproof_timestamp ({})",
-            coinstake_start_time, MINIMUM_COIN_AGE_FOR_STAKING, hashproof_timestamp
+            coinstake_start_time, min_coin_age, hashproof_timestamp
         ));
     }
 
@@ -429,20 +428,21 @@ mod tests {
     #[test]
     fn test_pos_time_requirements_valid() {
         let coinstake_start = 1000000;
-        let hashproof = coinstake_start + 60; // Exactly minimum age
+        let hashproof = coinstake_start + 3600; // Exactly the mainnet minimum age
 
-        assert!(check_pos_time_requirements(coinstake_start, hashproof).is_ok());
+        assert!(check_pos_time_requirements(coinstake_start, hashproof, 3600).is_ok());
 
-        let hashproof2 = coinstake_start + 3600; // 1 hour later
-        assert!(check_pos_time_requirements(coinstake_start, hashproof2).is_ok());
+        // Regtest has no minimum age
+        assert!(check_pos_time_requirements(coinstake_start, coinstake_start, 0).is_ok());
     }
 
     #[test]
     fn test_pos_time_requirements_too_young() {
         let coinstake_start = 1000000;
-        let hashproof = coinstake_start + 59; // 1 second too young
+        let hashproof = coinstake_start + 3599; // 1 second too young
 
-        assert!(check_pos_time_requirements(coinstake_start, hashproof).is_err());
+        let result = check_pos_time_requirements(coinstake_start, hashproof, 3600);
+        assert!(result.unwrap_err().contains("min age violation"));
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
         let coinstake_start = 1000000;
         let hashproof = 999999; // Before coinstake start
 
-        let result = check_pos_time_requirements(coinstake_start, hashproof);
+        let result = check_pos_time_requirements(coinstake_start, hashproof, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("nTime violation"));
     }

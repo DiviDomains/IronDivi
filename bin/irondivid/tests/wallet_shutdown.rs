@@ -185,6 +185,11 @@ fn mine_offline(datadir: &Path, to: &divi_wallet::Address, n: u32) {
             lock_time: 0,
         });
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         chain.accept_block(block).unwrap();
     }
 }
@@ -229,9 +234,11 @@ fn send_then_end(how: End) {
     daemon.rpc("stop", json!([]));
     assert!(daemon.wait());
     mine_offline(datadir, &first_address(WALLET_MNEMONIC), 3);
+    // Regtest coinbases mature after 20 blocks: 22 more blocks to someone else
+    mine_offline(datadir, &first_address(OTHER_MNEMONIC), 22);
 
     let daemon = Daemon::start(datadir);
-    assert_eq!(daemon.rpc("getblockcount", json!([])), json!(3));
+    assert_eq!(daemon.rpc("getblockcount", json!([])), json!(25));
     let before = unspent(&daemon);
     assert_eq!(before.len(), 3, "funding coins: {before:?}");
 

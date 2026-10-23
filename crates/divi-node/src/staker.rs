@@ -395,7 +395,7 @@ impl Staker {
         match self.chain.network_type() {
             divi_storage::NetworkType::Mainnet => 20u32,
             divi_storage::NetworkType::Testnet => 1u32,
-            divi_storage::NetworkType::Regtest => 1u32,
+            divi_storage::NetworkType::Regtest => 20u32,
         }
     }
 

@@ -134,11 +134,7 @@ impl LiteWalletRpc {
         let coinbase_maturity = self
             .chain
             .as_ref()
-            .map(|c| match c.network_type() {
-                NetworkType::Mainnet => 20u32,
-                NetworkType::Testnet => 1,
-                NetworkType::Regtest => 1,
-            })
+            .map(|c| c.params().coinbase_maturity)
             .unwrap_or(20);
         let balance = index
             .get_balance(&script, min_conf, height, coinbase_maturity)

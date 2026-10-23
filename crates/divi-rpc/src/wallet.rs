@@ -5803,6 +5803,11 @@ mod accounting_tests {
         block.transactions.push(coinbase);
         block.transactions.extend_from_slice(txs);
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         chain.accept_block(block.clone()).unwrap();
         block
     }
@@ -5832,6 +5837,11 @@ mod accounting_tests {
         for _ in 2..=4 {
             mine(&chain, script_of(&miner), &[]);
         }
+        // Regtest coinbases mature after 20 blocks: blocks 5-23 pay a stranger, so
+        // at the spend (block 24) the coinbases of blocks 1-4 are mature
+        for _ in 5..=23 {
+            mine(&chain, stranger(), &[]);
+        }
         let spend = Transaction {
             version: 1,
             vin: vec![TxIn::new(
@@ -5848,7 +5858,7 @@ mod accounting_tests {
         let mut spend = spend;
         sign_with_wallet(&wallet, &chain, &mut spend);
         mine(&chain, stranger(), std::slice::from_ref(&spend));
-        assert_eq!(chain.height(), 5);
+        assert_eq!(chain.height(), FIXTURE_HEIGHT);
 
         let rpc = WalletRpc::with_wallet_and_chain(wallet.clone(), chain.clone());
         rpc.rescan_blockchain(&Params::Array(vec![])).unwrap();
@@ -5863,6 +5873,9 @@ mod accounting_tests {
         }
     }
 
+    /// Height of the fixture's spend block, its tip
+    const FIXTURE_HEIGHT: u32 = 24;
+
     /// Balance after the fixture's blocks: three 1250 coinbases plus 249.99
     const BALANCE: i64 = 3 * 1250 * COIN + 250 * COIN - 1_000_000;
 
@@ -5870,15 +5883,15 @@ mod accounting_tests {
     fn partial_rescan_keeps_coins_below_start() {
         let f = fixture();
         assert_eq!(f.wallet.get_balance().as_sat(), BALANCE);
-        assert_eq!(f.chain.height(), 5);
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT);
 
-        for start in [3, 5, 1] {
+        for start in [3, FIXTURE_HEIGHT, 1] {
             let r = f
                 .rpc
                 .rescan_blockchain(&Params::Array(vec![json!(start)]))
                 .unwrap();
             assert_eq!(r["start_height"], json!(start));
-            assert_eq!(r["stop_height"], json!(5));
+            assert_eq!(r["stop_height"], json!(FIXTURE_HEIGHT));
             assert_eq!(
                 f.wallet.get_balance().as_sat(),
                 BALANCE,
@@ -5886,9 +5899,9 @@ mod accounting_tests {
                 start
             );
         }
-        // The send recorded in block 5 is still a single send
+        // The send recorded in the spend block is still a single send
         let sent = f.wallet.get_transaction(&f.spend.txid()).unwrap();
-        assert_eq!(sent.block_height, Some(5));
+        assert_eq!(sent.block_height, Some(FIXTURE_HEIGHT));
         assert_eq!(sent.category, "send");
     }
 

@@ -133,6 +133,19 @@ pub struct ChainParams {
     pub network_type: NetworkType,
     /// Chain mode (Divi or PrivateDivi)
     pub chain_mode: ChainMode,
+    /// The network's max reorganization depth (Core `nMaxReorganizationDepth`).
+    /// `None` = no limit.
+    pub max_reorg_depth: Option<u32>,
+    /// `-maxreorg`: replaces `max_reorg_depth` when refusing a block that arrives
+    /// (block serving keeps the network's value, as Core does)
+    pub max_reorg_arg: Option<u32>,
+    /// Block hashes the chain must have at these heights
+    pub checkpoints: Vec<(u32, Hash256)>,
+    /// Seconds a coin must exist before it can stake (Core `nMinCoinAgeForStaking`)
+    pub min_stake_age: u32,
+    /// Check each block's difficulty bits, its proof of work and that PoW blocks
+    /// end and PoS blocks start after the last PoW block
+    pub check_block_work: bool,
 }
 
 impl Default for ChainParams {
@@ -144,9 +157,23 @@ impl Default for ChainParams {
             target_block_time: 60,
             network_type: NetworkType::Mainnet,
             chain_mode: ChainMode::Divi,
+            max_reorg_depth: None,
+            max_reorg_arg: None,
+            checkpoints: Vec::new(),
+            min_stake_age: 0,
+            check_block_work: false,
         }
     }
 }
+
+/// Last proof-of-work block on every Divi network (Divi Core chainparams.cpp:189, :405;
+/// regtest inherits testnet's)
+pub const LAST_POW_BLOCK: u32 = 100;
+
+/// Divi mainnet checkpoint at height 100 (Divi Core chainparams.cpp:107-110). Height 0 is the
+/// genesis block, which `Chain::new` hard-codes.
+const DIVI_MAINNET_CHECKPOINT_100: &str =
+    "000000275b2b4a8af2c93ebdfd36ef8dd8c8ec710072bcc388ecbf5d0c8d3f9d";
 
 impl ChainParams {
     /// Create chain parameters for the specified network
@@ -177,10 +204,35 @@ impl ChainParams {
             }
         };
 
+        // Divi Core nMaturity: chainparams.cpp:184 (main), :400 (test), :479 (regtest)
         let coinbase_maturity = match network_type {
             NetworkType::Mainnet => 20,
             NetworkType::Testnet => 1,
-            NetworkType::Regtest => 1,
+            NetworkType::Regtest => 20,
+        };
+
+        // The rules below follow Divi Core's chainparams. PrivateDivi keeps its
+        // earlier behaviour until they are checked against PrivateDivi Core.
+        let divi = chain_mode == ChainMode::Divi;
+
+        // nMaxReorganizationDepth: chainparams.cpp:180 (main), :396 (test; regtest inherits)
+        let max_reorg_depth = divi.then_some(100);
+
+        // Testnet's and regtest's maps hold only height 0, which is never checked
+        // (ChainExtensionService.cpp:297-298), so only mainnet has a live checkpoint.
+        let checkpoints = if divi && network_type == NetworkType::Mainnet {
+            vec![(
+                100,
+                Hash256::from_hex(DIVI_MAINNET_CHECKPOINT_100).expect("checkpoint hash"),
+            )]
+        } else {
+            Vec::new()
+        };
+
+        // nMinCoinAgeForStaking: chainparams.cpp:195 (main; testnet inherits), :498 (regtest)
+        let min_stake_age = match (divi, network_type) {
+            (true, NetworkType::Mainnet | NetworkType::Testnet) => 60 * 60,
+            _ => 0,
         };
 
         ChainParams {
@@ -190,6 +242,11 @@ impl ChainParams {
             target_block_time: 60,
             network_type,
             chain_mode,
+            max_reorg_depth,
+            max_reorg_arg: None,
+            checkpoints,
+            min_stake_age,
+            check_block_work: divi,
         }
     }
 }
@@ -951,12 +1008,24 @@ impl Chain {
     /// network-appropriate difficulty parameters. Used by the staker to
     /// compute the correct nBits for a new block.
     pub fn get_next_bits(&self, prev_block: &BlockIndex) -> Result<u32, StorageError> {
-        let diff_params = match self.params.network_type {
-            NetworkType::Mainnet => DifficultyParams::default(),
-            NetworkType::Testnet => DifficultyParams::testnet(),
-            NetworkType::Regtest => DifficultyParams::regtest(),
-        };
-        get_next_work_required(&self.db, prev_block, &diff_params)
+        get_next_work_required(&self.db, prev_block, &self.difficulty_params())
+    }
+
+    fn difficulty_params(&self) -> DifficultyParams {
+        match (self.params.chain_mode, self.params.network_type) {
+            (ChainMode::Divi, NetworkType::Mainnet) => DifficultyParams::default(),
+            (ChainMode::Divi, NetworkType::Testnet) => DifficultyParams::testnet(),
+            (ChainMode::Divi, NetworkType::Regtest) => DifficultyParams::regtest(),
+            (ChainMode::PrivateDivi, NetworkType::Mainnet) => {
+                DifficultyParams::privatedivi(56700, true)
+            }
+            (ChainMode::PrivateDivi, NetworkType::Testnet) => {
+                DifficultyParams::privatedivi(100, true)
+            }
+            (ChainMode::PrivateDivi, NetworkType::Regtest) => {
+                DifficultyParams::privatedivi(100, false)
+            }
+        }
     }
 
     pub fn get_utxo_stats(&self) -> Result<crate::database::UtxoStats, StorageError> {
@@ -969,6 +1038,35 @@ impl Chain {
     }
 
     /// Get a block index by hash
+    /// A stored block that may be sent to a peer that asks for it
+    ///
+    /// Divi Core main.cpp:223-239: any block on the active chain; a block off it only
+    /// if it was fully validated and lies less than the network's max reorganization
+    /// depth below the tip, so a peer cannot probe which stale blocks we hold.
+    pub fn get_block_for_peer(&self, hash: &Hash256) -> Result<Option<Block>, StorageError> {
+        let Some(index) = self.db.get_block_index(hash)? else {
+            return Ok(None);
+        };
+        if !index.is_on_main_chain() {
+            let best_header_height = self
+                .best_known_block
+                .read()
+                .as_ref()
+                .map(|b| b.height)
+                .unwrap_or(0);
+            let within_depth = self.params.max_reorg_depth.is_none_or(|depth| {
+                i64::from(self.height()) - i64::from(index.height) < i64::from(depth)
+            });
+            if !(index.status.contains(BlockStatus::VALID_SCRIPTS)
+                && best_header_height > 0
+                && within_depth)
+            {
+                return Ok(None);
+            }
+        }
+        self.db.get_block(hash)
+    }
+
     pub fn get_block_index(&self, hash: &Hash256) -> Result<Option<BlockIndex>, StorageError> {
         self.db.get_block_index(hash)
     }
@@ -1201,6 +1299,7 @@ impl Chain {
         // 3. Basic header validation
         debug!("  ├─ Header validation");
         self.check_block_header(&block)?;
+        check_block_transactions(&block, self.max_money())?;
         debug!("  ├─ Header validation: ✅ PASS");
 
         // 4. Check if this is the genesis block (prev_block is all zeros)
@@ -1228,6 +1327,14 @@ impl Chain {
                     parent.hash, parent.height, hash
                 )));
             }
+        }
+
+        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), then
+        // ContextualCheckBlockHeader's depth limit (ChainExtensionService.cpp:308-311).
+        // Both run for every block, whether it extends the tip or not.
+        if let Some(ref parent) = parent_index {
+            self.check_block_work(&block, &hash, parent)?;
+            self.check_reorg_depth(parent.height + 1)?;
         }
 
         // 6. Check contextual validity (skip for genesis)
@@ -1276,8 +1383,8 @@ impl Chain {
                     hash, height, expected_hash
                 );
                 return Err(StorageError::InvalidBlock(format!(
-                    "Block {} at height {} fails checkpoint: expected {}",
-                    hash, height, expected_hash
+                    "checkpoint mismatch: rejected by checkpoint lock-in at {} (block {}, expected {})",
+                    height, hash, expected_hash
                 )));
             }
             warn!(
@@ -1730,16 +1837,24 @@ impl Chain {
                 index.height
             );
             let mut index_mut = index.clone();
-            let connected =
-                self.connect_block(block, &mut index_mut)
-                    .and_then(|(utxo_batch, undo_bytes)| {
-                        self.db.atomic_connect_block(
-                            &utxo_batch,
-                            &undo_bytes,
-                            &index_mut.hash,
-                            &index_mut,
-                        )
-                    });
+            // A side-chain block was stored without its proof of stake being
+            // checked (that needs the UTXO set at its parent, which is now in place)
+            let parent = if i == 0 {
+                &common_ancestor
+            } else {
+                &blocks_to_connect[i - 1].1
+            };
+            let connected = self
+                .check_block_proof_of_stake(block, parent)
+                .and_then(|()| self.connect_block(block, &mut index_mut))
+                .and_then(|(utxo_batch, undo_bytes)| {
+                    self.db.atomic_connect_block(
+                        &utxo_batch,
+                        &undo_bytes,
+                        &index_mut.hash,
+                        &index_mut,
+                    )
+                });
             if let Err(e) = connected {
                 warn!("Failed to connect block {}: {}", index.hash, e);
                 // Divi Core ChainTipManager::connectTip -> InvalidBlockFound:
@@ -2258,17 +2373,18 @@ impl Chain {
     }
 
     /// Get the expected block hash at a checkpoint height, if any.
-    /// Checkpoints prevent following minority forks during IBD.
+    ///
+    /// Divi Core ContextualCheckBlockHeader (ChainExtensionService.cpp:320-328). Its
+    /// second clause, "forked chain older than last checkpoint" (:330-347), keeps the
+    /// lowest checkpoint found (the genesis block) and so never refuses anything.
+    /// PrivateDivi has none: its relaunch map holds only the genesis (PrivateDivi
+    /// Core 21de13166, chainparams.cpp:107-109).
     fn get_checkpoint_hash(&self, height: u32) -> Option<Hash256> {
-        // Checkpoints are only for known fork points discovered during testing.
-        // None are pinned today.
-        //
-        // PrivateDivi mainnet used to pin height 47791 of the pre-relaunch
-        // chain. The 2026-04-20 relaunch replaced that chain, and Core's
-        // relaunch checkpoint map holds only the genesis (PrivateDivi Core
-        // 21de13166, chainparams.cpp:107-109), so there is none here.
-        let _ = height;
-        None
+        self.params
+            .checkpoints
+            .iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, hash)| *hash)
     }
 
     /// Check basic block header validity
@@ -2322,18 +2438,92 @@ impl Chain {
             ));
         }
 
-        // Validate proof-of-stake if this is a PoS block
-        // Skip during IBD — the chain is trusted by accumulated work, and PoS validation
-        // depends on stake modifiers which can diverge at fork points during IBD.
-        // Once synced to tip, PoS validation is enabled for all new blocks.
-        if block.is_proof_of_stake() && !*self.ibd_mode.read() {
+        self.check_block_proof_of_stake(block, parent)
+    }
+
+    /// The proof of stake (kernel, stake modifier, target, coin age) and the block
+    /// signature. Divi Core checks the proof for every block it accepts, during
+    /// initial sync too (AcceptBlock -> CheckWork, BlockProofVerifier.cpp:149-155).
+    /// Here it needs the UTXO set at `parent`, so it runs when the block is
+    /// connected: on arrival for a block on the tip, during a reorg otherwise.
+    fn check_block_proof_of_stake(
+        &self,
+        block: &Block,
+        parent: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        if block.is_proof_of_stake() {
             self.validate_proof_of_stake(block, parent)?;
         }
+        self.verify_block_signature(block)
+    }
 
-        // Verify block signature
-        self.verify_block_signature(block)?;
-
+    /// Check the block's difficulty bits and, for a PoW block, its proof of work
+    ///
+    /// Divi Core CheckWork (BlockProofVerifier.cpp:136-155) and CheckProofOfWork
+    /// (:27-43). A failure there carries no misbehaviour score.
+    fn check_block_work(
+        &self,
+        block: &Block,
+        hash: &Hash256,
+        parent: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        if !self.params.check_block_work {
+            return Ok(());
+        }
+        let required = self.get_next_bits(parent)?;
+        if block.header.bits != required {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "bad-diffbits: block bits 0x{:08x}, required 0x{:08x}",
+                    block.header.bits, required
+                ),
+            ));
+        }
+        if block.is_proof_of_work() {
+            let target = Hash256::from_compact(block.header.bits);
+            if target.is_zero() || target > self.difficulty_params().pow_limit {
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    "CheckProofOfWork() : nBits below minimum work".into(),
+                ));
+            }
+            if *hash > target {
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    "CheckProofOfWork() : hash doesn't match nBits".into(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Refuse a block more than the max reorganization depth below the active tip
+    ///
+    /// Divi Core ContextualCheckBlockHeader (ChainExtensionService.cpp:308-311).
+    fn check_reorg_depth(&self, height: u32) -> Result<(), StorageError> {
+        let Some(depth) = self.params.max_reorg_arg.or(self.params.max_reorg_depth) else {
+            return Ok(());
+        };
+        let tip_height = self.tip.read().as_ref().map(|t| t.height).unwrap_or(0);
+        if i64::from(tip_height) - i64::from(height) >= i64::from(depth) {
+            return Err(StorageError::invalid_block_scored(
+                1,
+                format!(
+                    "forked chain older than max reorganization depth (height {})",
+                    height
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Divi Core `MaxMoneyOut` (chainparams.cpp:186 main, :402 test; regtest inherits test)
+    fn max_money(&self) -> Amount {
+        match self.params.network_type {
+            NetworkType::Mainnet => Amount::from_divi(2_534_320_700),
+            NetworkType::Testnet | NetworkType::Regtest => Amount::from_divi(2_535_000_000),
+        }
     }
 
     /// Verify the block signature
@@ -2753,6 +2943,17 @@ impl Chain {
             block_hash_of_chain_tip: parent.hash,
         };
 
+        // Coin age before the stake modifier, as Divi Core's
+        // CreateProofOfStakeCalculator (ProofOfStakeGenerator.cpp:92-98)
+        crate::pos_validation::check_pos_time_requirements(
+            kernel_block_index.time,
+            block.header.time,
+            self.params.min_stake_age,
+        )
+        .map_err(|e| {
+            StorageError::invalid_block_scored(0, format!("PoS verification failed: {}", e))
+        })?;
+
         // Get stake modifier for this block using proper lookup algorithm
         // Reference: Divi/divi/src/PoSStakeModifierService.cpp
         let stake_modifier = self.get_stake_modifier_for_validation(parent, &kernel_block_index)?;
@@ -3010,6 +3211,26 @@ impl Chain {
         // this block's height and time ("bad-txns-nonfinal").
         check_block_txs_final(block, height)?;
 
+        // Divi Core ConnectBlock checks the block again in case an earlier
+        // version stored a bad one (BlockConnectionService.cpp:300-302)
+        check_block_transactions(block, self.max_money())?;
+
+        // Divi Core CheckEnforcedPoSBlocksAndBIP30 (BlockConnectionService.cpp:46-54)
+        if self.params.check_block_work && height > 0 {
+            if height <= LAST_POW_BLOCK && block.is_proof_of_stake() {
+                return Err(StorageError::InvalidBlock(format!(
+                    "PoS-early: PoS period not active (height {})",
+                    height
+                )));
+            }
+            if height > LAST_POW_BLOCK && block.is_proof_of_work() {
+                return Err(StorageError::InvalidBlock(format!(
+                    "PoW-ended: PoW period ended (height {})",
+                    height
+                )));
+            }
+        }
+
         // IMPORTANT: Validate treasury payments BEFORE modifying any state
         // This prevents UTXO corruption if validation fails
         debug!(
@@ -3019,13 +3240,14 @@ impl Chain {
         self.validate_treasury_payments(block, index)?;
         debug!("  ├─ Treasury validation: ✅ PASS");
 
-        debug!("  ├─ Block value + lottery validation check");
-        self.validate_block_value(block, index)?;
-        debug!("  ├─ Block value validation: ✅ PASS");
-
         debug!("  ├─ Processing {} transactions", block.transactions.len());
         let mut total_inputs = 0;
         let mut total_outputs = 0;
+        // Divi Core nMint (coinbase and coinstake supply change) and the fees of
+        // all other transactions (TransactionInputChecker.cpp:79-81)
+        let mut mint = Amount::ZERO;
+        let mut fees = Amount::ZERO;
+        let max_money = self.max_money();
 
         // Use batched UTXO writer for better performance
         // Pre-calculate capacity: estimate ~2 inputs and ~3 outputs per tx
@@ -3085,6 +3307,7 @@ impl Chain {
 
             total_inputs += tx.vin.len();
             total_outputs += tx.vout.len();
+            let mut value_in = Amount::ZERO;
 
             // Remove spent UTXOs (except for coinbase which has no real inputs)
             if !is_coinbase {
@@ -3092,6 +3315,15 @@ impl Chain {
                     // Coinstake first input is empty marker, skip it
                     if is_coinstake && input.prevout.is_null() {
                         continue;
+                    }
+
+                    // A coin spent earlier in this block is gone (Divi Core CheckBlock,
+                    // BlockCheckingHelpers.cpp:131-136)
+                    if spent_in_block.contains(&input.prevout) {
+                        return Err(StorageError::InvalidBlock(format!(
+                            "bad-txns-inputs-duplicate: {}:{} in tx {}",
+                            input.prevout.txid, input.prevout.vout, txid
+                        )));
                     }
 
                     // Check if UTXO was created earlier in this same block
@@ -3124,6 +3356,26 @@ impl Chain {
                     };
 
                     if let Some(ref utxo) = prev_utxo {
+                        // Divi Core CheckInputs (UtxoCheckingAndUpdating.cpp:72-84): coinbase
+                        // and coinstake outputs mature after nMaturity blocks; input values
+                        // must be in range
+                        if utxo.is_coinbase || utxo.is_coinstake {
+                            let depth = i64::from(height) - i64::from(utxo.height);
+                            if depth < i64::from(self.params.coinbase_maturity) {
+                                return Err(StorageError::InvalidBlock(format!(
+                                    "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
+                                    depth, utxo.is_coinstake, txid
+                                )));
+                            }
+                        }
+                        value_in += utxo.value;
+                        if !money_range(utxo.value, max_money) || !money_range(value_in, max_money)
+                        {
+                            return Err(StorageError::InvalidBlock(format!(
+                                "bad-txns-inputvalues-outofrange in tx {}",
+                                txid
+                            )));
+                        }
                         block_undo.push(input.prevout, utxo.clone());
                     }
 
@@ -3190,6 +3442,21 @@ impl Chain {
                 }
             }
 
+            // Divi Core CheckInputs (UtxoCheckingAndUpdating.cpp:86-99): an ordinary
+            // transaction may not spend more than its inputs; the difference is its fee
+            let value_out = tx.vout.iter().fold(Amount::ZERO, |acc, o| acc + o.value);
+            if is_coinbase || is_coinstake {
+                mint = mint + value_out - value_in;
+            } else {
+                if value_in < value_out {
+                    return Err(StorageError::InvalidBlock(format!(
+                        "bad-txns-in-belowout: tx {} value in ({}) < value out ({})",
+                        txid, value_in, value_out
+                    )));
+                }
+                fees += value_in - value_out;
+            }
+
             // Add new UTXOs
             let mut utxos_created = 0;
             for (vout, output) in tx.vout.iter().enumerate() {
@@ -3230,6 +3497,10 @@ impl Chain {
                 debug!("  tx {}: created {} UTXOs", txid, utxos_created);
             }
         }
+
+        debug!("  ├─ Block value + lottery validation check");
+        self.validate_block_value(block, index, mint, fees)?;
+        debug!("  ├─ Block value validation: ✅ PASS");
 
         // Money supply: previous supply plus everything created minus everything consumed
         // (coinbase/coinstake rewards raise it, fees burned by plain transactions lower it)
@@ -3447,12 +3718,20 @@ impl Chain {
 
     /// Per-block rewards at `height`
     fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
-        divi_consensus::block_subsidy::get_block_subsidy_for_chain(
+        let mut rewards = divi_consensus::block_subsidy::get_block_subsidy_for_chain(
             self.params.chain_mode,
             self.network_type() == NetworkType::Mainnet,
             height,
             self.halving_interval(),
-        )
+        );
+        // Divi regtest's premine is 1250 coins (Divi Core chainparams.cpp:470)
+        if height == 1
+            && self.params.chain_mode == ChainMode::Divi
+            && self.network_type() == NetworkType::Regtest
+        {
+            rewards.stake = Amount::from_divi(1_250);
+        }
+        rewards
     }
 
     /// Core's `nStakeReward`: after DeprecateMasternodes (always active on
@@ -3466,13 +3745,36 @@ impl Chain {
 
     /// Validate block value (total mint) doesn't exceed expected rewards.
     /// Matches C++ BlockIncentivesPopulator::IsBlockValueValid and HasValidPayees.
-    fn validate_block_value(&self, block: &Block, index: &BlockIndex) -> Result<(), StorageError> {
+    ///
+    /// `mint` is Core's `nMint`: what the coinbase and the coinstake create beyond
+    /// their inputs. `fees` is what the other transactions leave unspent; PoW blocks
+    /// may claim it, PoS blocks burn it (BlockConnectionService.cpp:67-96).
+    fn validate_block_value(
+        &self,
+        block: &Block,
+        index: &BlockIndex,
+        mint: Amount,
+        fees: Amount,
+    ) -> Result<(), StorageError> {
         use divi_consensus::{block_subsidy, lottery, treasury};
 
         let height = index.height;
 
-        // Skip PoW blocks and genesis
-        if height <= 100 {
+        if height == 0 {
+            return Ok(());
+        }
+        if height <= LAST_POW_BLOCK {
+            // PrivateDivi keeps its earlier behaviour (no PoW-era check)
+            if !self.params.check_block_work {
+                return Ok(());
+            }
+            let limit = Self::stake_reward(&self.block_rewards(height)) + fees;
+            if mint > limit {
+                return Err(StorageError::InvalidBlock(format!(
+                    "bad-cb-amount: reward pays too much (actual={} vs limit={})",
+                    mint, limit
+                )));
+            }
             return Ok(());
         }
 
@@ -3549,35 +3851,10 @@ impl Chain {
             base_expected
         };
 
-        // Compute actual mint from coinstake (tx[1])
-        let coinstake = block
-            .transactions
-            .get(1)
-            .ok_or_else(|| StorageError::InvalidBlock("PoS block missing coinstake".to_string()))?;
-
-        // Sum coinstake input values from UTXO set
-        let mut input_sum = Amount::ZERO;
-        for input in &coinstake.vin {
-            if input.prevout.is_null() {
-                continue; // Skip coinstake marker input
-            }
-            if let Some(utxo) = self.db.get_utxo(&input.prevout)? {
-                input_sum += utxo.value;
-            }
-            // If UTXO not found, it may have been created earlier in this block (edge case)
-            // The UTXO existence check in connect_block handles this
-        }
-
-        let output_sum = coinstake
-            .vout
-            .iter()
-            .fold(Amount::ZERO, |acc, o| acc + o.value);
-        let actual_mint = output_sum - input_sum;
-
-        if actual_mint > expected_mint {
+        if mint > expected_mint {
             return Err(StorageError::InvalidBlock(format!(
-                "Block {} mints too much: actual {} > expected {}",
-                height, actual_mint, expected_mint
+                "bad-cb-amount: reward pays too much (actual={} vs limit={}) at height {}",
+                mint, expected_mint, height
             )));
         }
 
@@ -4144,6 +4421,81 @@ impl divi_masternode::UtxoProvider for ChainDatabase {
     }
 }
 
+/// Divi Core `MoneyRange` against the network's `MaxMoneyOut`
+fn money_range(value: Amount, max_money: Amount) -> bool {
+    value >= Amount::ZERO && value <= max_money
+}
+
+/// The context-free transaction checks of Divi Core CheckBlock and
+/// CheckTransaction (BlockCheckingHelpers.cpp:24-147): one coinbase, first; a PoS
+/// block's coinbase pays nothing and its coinstake comes second; no transaction
+/// without inputs or outputs; output values in range; no coin spent twice.
+fn check_block_transactions(block: &Block, max_money: Amount) -> Result<(), StorageError> {
+    let invalid = |reason: String| Err(StorageError::InvalidBlock(reason));
+    if block.transactions.is_empty() {
+        return invalid("bad-blk-length: block has no transactions".into());
+    }
+    if !block.transactions[0].is_coinbase() {
+        return invalid("bad-cb-missing: first tx is not coinbase".into());
+    }
+    if block.transactions[1..].iter().any(|tx| tx.is_coinbase()) {
+        return invalid("bad-cb-multiple: more than one coinbase".into());
+    }
+    if block.is_proof_of_stake() {
+        let coinbase = &block.transactions[0];
+        if coinbase.vout.len() != 1 || !coinbase.vout[0].is_empty() {
+            return invalid("coinbase output not empty for proof-of-stake block".into());
+        }
+        if block.transactions[2..].iter().any(|tx| tx.is_coinstake()) {
+            return invalid("more than one coinstake".into());
+        }
+    }
+
+    let mut inputs = std::collections::HashSet::new();
+    for tx in &block.transactions {
+        if tx.vin.is_empty() {
+            return Err(StorageError::invalid_block_scored(
+                10,
+                "bad-txns-vin-empty".into(),
+            ));
+        }
+        if tx.vout.is_empty() {
+            return Err(StorageError::invalid_block_scored(
+                10,
+                "bad-txns-vout-empty".into(),
+            ));
+        }
+        let mut value_out = Amount::ZERO;
+        for out in &tx.vout {
+            if out.is_empty() && !tx.is_coinbase() && !tx.is_coinstake() {
+                return invalid("txout empty for user transaction".into());
+            }
+            if !money_range(out.value, max_money) {
+                return invalid("bad-txns-vout-negative-or-toolarge".into());
+            }
+            value_out += out.value;
+            if !money_range(value_out, max_money) {
+                return invalid("bad-txns-txouttotal-toolarge".into());
+            }
+        }
+        for input in &tx.vin {
+            if !inputs.insert(input.prevout) {
+                return invalid(format!(
+                    "bad-txns-inputs-duplicate: {}:{}",
+                    input.prevout.txid, input.prevout.vout
+                ));
+            }
+        }
+        if tx.is_coinbase() {
+            let len = tx.vin[0].script_sig.len();
+            if !(2..=150).contains(&len) {
+                return invalid(format!("bad-cb-length: coinbase script size={}", len));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Divi Core `ContextualCheckBlock` finality rule: a block may only contain
 /// transactions that are final at its own height and timestamp.
 fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError> {
@@ -4270,6 +4622,15 @@ mod tests {
         (chain, dir)
     }
 
+    /// Compute the merkle root and grind a nonce that meets the block's bits
+    fn seal(block: &mut Block) {
+        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+    }
+
     /// Get the existing genesis block info from the chain
     fn get_genesis_info(chain: &Chain) -> (Hash256, u32) {
         let tip = chain.tip().expect("Chain should have genesis block");
@@ -4286,7 +4647,7 @@ mod tests {
         // Add coinbase transaction
         let coinbase = Transaction {
             version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x05]))],
             vout: vec![TxOut::new(
                 Amount::from_sat(1250_00000000),
                 Script::new_p2pkh(&[1u8; 20]),
@@ -4296,7 +4657,7 @@ mod tests {
         block.transactions.push(coinbase);
 
         // Compute merkle root
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
         block
     }
 
@@ -4341,7 +4702,7 @@ mod tests {
         let mut block1 = create_child_block(genesis_hash, genesis_time);
         block1.transactions[0].lock_time = 1; // height 1 is not below 1
         block1.transactions[0].vin[0].sequence = 0;
-        block1.header.merkle_root = compute_merkle_root(&block1.transactions);
+        seal(&mut block1);
 
         let result = chain.accept_block(block1);
         assert!(result.is_err(), "block with a non-final tx was accepted");
@@ -4357,7 +4718,7 @@ mod tests {
         // A time lock below the block's own timestamp is final
         block1.transactions[0].lock_time = genesis_time;
         block1.transactions[0].vin[0].sequence = 0;
-        block1.header.merkle_root = compute_merkle_root(&block1.transactions);
+        seal(&mut block1);
 
         chain.accept_block(block1).unwrap();
         assert_eq!(chain.height(), 1);
@@ -4447,7 +4808,7 @@ mod tests {
 
         let coinbase = Transaction {
             version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x05]))],
             vout: vec![TxOut::new(
                 Amount::from_sat(1250_00000000),
                 Script::new_p2pkh(&pubkey_hash),
@@ -4455,7 +4816,7 @@ mod tests {
             lock_time: 0,
         };
         block.transactions.push(coinbase);
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
         block
     }
 
@@ -4662,7 +5023,7 @@ mod tests {
             )],
             lock_time: 0,
         });
-        block_b2.header.merkle_root = compute_merkle_root(&block_b2.transactions);
+        seal(&mut block_b2);
         let hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
 
         // B3 gives the side chain more work and triggers the reorg, which fails at B2.
@@ -4900,7 +5261,7 @@ mod tests {
             lock_time: 0,
         };
         spending_block.transactions.push(spending_tx);
-        spending_block.header.merkle_root = compute_merkle_root(&spending_block.transactions);
+        seal(&mut spending_block);
 
         // This should fail because coinbase needs 100 confirmations
         // (maturity rule)
@@ -4972,7 +5333,7 @@ mod tests {
         empty_block.header.prev_block = genesis_hash;
         empty_block.header.time = genesis_time + 60;
         empty_block.header.bits = 0x207fffff;
-        empty_block.header.merkle_root = compute_merkle_root(&empty_block.transactions);
+        seal(&mut empty_block);
 
         let _result = chain.accept_block(empty_block);
         // Note: The current implementation may accept empty blocks (depending on validation)
@@ -4995,7 +5356,7 @@ mod tests {
         // Note: Divi allows timestamps > MTP, so this might be valid
         let mut old_block = create_child_block(genesis_hash, genesis_time);
         old_block.header.time = genesis_time.saturating_sub(1000); // Before genesis
-        old_block.header.merkle_root = compute_merkle_root(&old_block.transactions);
+        seal(&mut old_block);
 
         // Depending on implementation, may or may not be rejected
         let _result = chain.accept_block(old_block);
@@ -5016,7 +5377,7 @@ mod tests {
             .unwrap()
             .as_secs() as u32;
         future_block.header.time = future_time + 3 * 60 * 60; // 3 hours in future
-        future_block.header.merkle_root = compute_merkle_root(&future_block.transactions);
+        seal(&mut future_block);
 
         let result = chain.accept_block(future_block);
         assert!(
@@ -5105,34 +5466,23 @@ mod tests {
         block.header.time = genesis_time + 60;
         block.header.bits = 0x207fffff;
 
-        // Create coinbase (required)
-        let coinbase = Transaction {
-            version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
-            vout: vec![TxOut::new(Amount::ZERO, Script::new())], // Empty coinbase
-            lock_time: 0,
-        };
-
-        // Create coinstake transaction with empty first output
+        // A coinbase with an empty first output, like a coinstake's marker output.
+        // (Only a coinbase or a coinstake may carry an empty output, and a
+        // coinstake needs a real stake; the stored layout is the same.)
         let coinstake = Transaction {
             version: 1,
-            vin: vec![TxIn {
-                prevout: OutPoint::null(), // Coinstake marker
-                script_sig: Script::new(),
-                sequence: 0xffffffff,
-            }],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
             vout: vec![
-                // Output 0: Empty marker (coinstake marker output)
+                // Output 0: Empty marker
                 TxOut::new(Amount::ZERO, Script::new()),
-                // Output 1: Actual stake reward
-                TxOut::new(Amount::from_divi(9150), Script::new_p2pkh(&[0xaa; 20])),
+                // Output 1: Actual reward
+                TxOut::new(Amount::from_divi(1000), Script::new_p2pkh(&[0xaa; 20])),
             ],
             lock_time: 0,
         };
 
-        block.transactions.push(coinbase);
         block.transactions.push(coinstake.clone());
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
 
         // Accept the block
         let block_hash = chain
@@ -5179,7 +5529,7 @@ mod tests {
             .expect("Output 1 should exist in UTXO set");
         assert_eq!(
             utxo_1.value,
-            Amount::from_divi(9150),
+            Amount::from_divi(1000),
             "Output 1 should have correct value"
         );
 
@@ -5208,7 +5558,7 @@ mod tests {
                 sequence: 0xffffffff,
             }],
             vout: vec![TxOut::new(
-                Amount::from_divi(9100),
+                Amount::from_divi(900),
                 Script::new_p2pkh(&[0xbb; 20]),
             )],
             lock_time: 0,
@@ -5216,7 +5566,7 @@ mod tests {
 
         spending_block.transactions.push(coinbase2);
         spending_block.transactions.push(spending_tx);
-        spending_block.header.merkle_root = compute_merkle_root(&spending_block.transactions);
+        seal(&mut spending_block);
 
         // This should succeed because output 1 exists at index 1
         let result = chain.accept_block(spending_block);
@@ -5262,7 +5612,7 @@ mod tests {
     //
     //         let coinbase = Transaction {
     //             version: 1,
-    //             vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01]))],
+    //             vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
     //             vout: vec![TxOut::new(Amount::ZERO, Script::new())],
     //             lock_time: 0,
     //         };
@@ -5339,22 +5689,12 @@ mod tests {
         block.header.time = genesis_time + 60;
         block.header.bits = 0x207fffff;
 
-        // Coinbase
-        let coinbase = Transaction {
-            version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01]))],
-            vout: vec![TxOut::new(Amount::ZERO, Script::new())],
-            lock_time: 0,
-        };
-
-        // Transaction 1: empty output at index 0, real output at index 1
+        // Two coinbase-like transactions are not allowed in one block, so each
+        // layout goes in its own block's coinbase.
+        // tx1: empty output at index 0, real output at index 1
         let tx1 = Transaction {
             version: 1,
-            vin: vec![TxIn {
-                prevout: OutPoint::null(),
-                script_sig: Script::new(),
-                sequence: 0xffffffff,
-            }],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
             vout: vec![
                 TxOut::new(Amount::ZERO, Script::new()), // Index 0: empty
                 TxOut::new(Amount::from_divi(100), Script::new_p2pkh(&[0xaa; 20])), // Index 1
@@ -5362,14 +5702,10 @@ mod tests {
             lock_time: 0,
         };
 
-        // Transaction 2: empty outputs at 0 and 1, real output at index 2
+        // tx2: empty outputs at 0 and 1, real output at index 2
         let tx2 = Transaction {
             version: 1,
-            vin: vec![TxIn {
-                prevout: OutPoint::null(),
-                script_sig: Script::new(),
-                sequence: 0xffffffff,
-            }],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x02]))],
             vout: vec![
                 TxOut::new(Amount::ZERO, Script::new()), // Index 0: empty
                 TxOut::new(Amount::ZERO, Script::new()), // Index 1: empty
@@ -5378,11 +5714,17 @@ mod tests {
             lock_time: 0,
         };
 
-        block.transactions.push(coinbase);
         block.transactions.push(tx1.clone());
-        block.transactions.push(tx2.clone());
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
+        let first = chain.accept_block(block).unwrap().hash;
 
+        let mut block = Block::default();
+        block.header.version = 1;
+        block.header.prev_block = first;
+        block.header.time = genesis_time + 120;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(tx2.clone());
+        seal(&mut block);
         chain.accept_block(block).unwrap();
 
         let tx1_hash = chain.compute_txid(&tx1);
@@ -5803,7 +6145,7 @@ mod tests {
         };
 
         block.transactions.push(coinbase);
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
         block
     }
 
