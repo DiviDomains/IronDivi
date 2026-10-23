@@ -1724,8 +1724,9 @@ impl Chain {
     /// Reorganize the chain to use a new best chain.
     /// Returns `(fork_height, orphaned_txs)` where `orphaned_txs` is the list of
     /// non-coinbase, non-coinstake transactions from disconnected blocks that are
-    /// not present in any of the newly-connected blocks.  Callers should re-insert
-    /// these into the mempool so they can be re-mined.
+    /// not present in any of the newly-connected blocks, parents before children:
+    /// the block nearest the fork first, each block's transactions in block order.
+    /// Callers should re-insert these into the mempool so they can be re-mined.
     fn reorganize_chain(
         &self,
         new_block: &Block,
@@ -1781,8 +1782,13 @@ impl Chain {
 
         // Collect candidate orphaned transactions from disconnected blocks.
         // Skip coinbase (index 0 in every block) and coinstake (index 1 in PoS blocks).
+        // blocks_to_disconnect runs from the old tip down; walk it from the fork
+        // up so a transaction comes after the ones it spends. Divi Core offers each
+        // block's transactions to the mempool as it disconnects it, while the
+        // blocks below are still connected (ChainTipManager.cpp:175-182), so a
+        // child is never refused there for a parent that is not back yet.
         let mut orphaned_txs: Vec<Transaction> = Vec::new();
-        for (block, _index) in &blocks_to_disconnect {
+        for (block, _index) in blocks_to_disconnect.iter().rev() {
             for tx in &block.transactions {
                 if tx.is_coinbase() || tx.is_coinstake() {
                     continue;
@@ -5320,6 +5326,68 @@ mod tests {
             chain.has_utxo(&outpoint_b1).unwrap(),
             "UTXO from B1 should exist after reorg"
         );
+    }
+
+    /// The transactions of disconnected blocks come back parents first, so the
+    /// mempool can take a child after its parent. Divi Core offers each block's
+    /// transactions to the mempool while the blocks below it are still connected
+    /// (ChainTipManager.cpp:175-182), so both come back there.
+    #[test]
+    fn reorg_returns_disconnected_transactions_parents_first() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let anyone = Script::from_bytes(vec![0x51]);
+        let spend = |coin: OutPoint, value: i64| Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin, Script::new(), 0xffff_ffff)],
+            vout: vec![TxOut::new(Amount::from_sat(value), anyone.clone())],
+            lock_time: 0,
+        };
+
+        // 21 blocks, so the first one's coinbase is mature (regtest maturity 20)
+        let mut parent = (genesis_hash, genesis_time);
+        let mut coin = None;
+        for _ in 0..21 {
+            let mut block = create_child_block(parent.0, parent.1);
+            block.transactions[0].vout[0].script_pubkey = anyone.clone();
+            seal(&mut block);
+            let hash = chain.accept_block(block.clone()).unwrap().hash;
+            coin.get_or_insert(OutPoint::new(block.transactions[0].txid(), 0));
+            parent = (hash, block.header.time);
+        }
+        let fork = parent;
+
+        // A22 confirms T1, A23 confirms T2 spending T1
+        let t1 = spend(coin.unwrap(), 1249_00000000);
+        let t2 = spend(OutPoint::new(t1.txid(), 0), 1248_00000000);
+        let mut a22 = create_child_block(fork.0, fork.1);
+        a22.transactions.push(t1.clone());
+        seal(&mut a22);
+        let a22_hash = chain.accept_block(a22.clone()).unwrap().hash;
+        let mut a23 = create_child_block(a22_hash, a22.header.time);
+        a23.transactions.push(t2.clone());
+        seal(&mut a23);
+        chain.accept_block(a23).unwrap();
+        assert_eq!(chain.height(), 23);
+
+        // A branch from height 21 with more work disconnects both
+        let mut parent = (fork.0, fork.1 + 1);
+        let mut result = None;
+        for _ in 0..3 {
+            let block = create_child_block_with_pubkey(parent.0, parent.1, [0x2b; 20]);
+            let accepted = chain.accept_block(block.clone()).unwrap();
+            parent = (accepted.hash, block.header.time);
+            result = Some(accepted);
+        }
+        let result = result.unwrap();
+        assert_eq!(chain.height(), 24);
+        assert_eq!(result.reorg_fork_height, Some(21));
+        let returned: Vec<Hash256> = result
+            .orphaned_transactions
+            .iter()
+            .map(|tx| tx.txid())
+            .collect();
+        assert_eq!(returned, vec![t1.txid(), t2.txid()]);
     }
 
     /// A side-chain block that fails to connect during a reorg must be marked
