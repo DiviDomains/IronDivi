@@ -37,6 +37,7 @@ pub mod checker;
 pub mod error;
 pub mod interpreter;
 pub mod opcodes;
+pub mod policy;
 pub mod stack;
 pub mod standard;
 pub mod vault;

@@ -1320,10 +1320,9 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
             mempool.contains(&input.prevout.txid)
                 || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
         });
-        // Same generous fee as a local RPC send (see set_tx_submit below)
-        let fee = Amount::from_sat((tx.size() as i64) * 10_000);
+        // The mempool works out the fee itself (Node's validator)
         let result = if inputs_available {
-            mempool.add(tx, fee).map_err(|e| e.to_string())
+            mempool.add(tx, Amount::ZERO).map_err(|e| e.to_string())
         } else {
             Err("inputs no longer available".to_string())
         };
@@ -1792,20 +1791,14 @@ async fn run_daemon(
                     // Wire up transaction submission (mempool + relay)
                     let mempool_for_submit = mempool_for_tx.clone();
                     let tx_relay_for_submit = tx_relay_for_tx.clone();
-                    let chain_for_submit = Arc::clone(&chain_for_staking_status);
                     rpc_server.wallet().set_tx_submit(Arc::new(move |tx: Transaction| {
                         let txid = tx.txid();
 
-                        // The real fee (inputs - outputs), so the mempool's relay
-                        // fee check sees what peers will see
-                        let fee = Node::calculate_transaction_fee(
-                            &tx,
-                            &chain_for_submit,
-                            &mempool_for_submit,
-                        )
-                        .map_err(submit_error)?;
-                        // The mempool checks inputs and scripts (Node's validator)
-                        mempool_for_submit.add(tx, fee).map_err(submit_error)?;
+                        // The mempool runs every check and works out the fee
+                        // (Node's validator)
+                        mempool_for_submit
+                            .add(tx, Amount::ZERO)
+                            .map_err(submit_error)?;
 
                         // Announce to peers (async, fire-and-forget)
                         let relay = tx_relay_for_submit.clone();
@@ -1940,15 +1933,11 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
     use divi_node::NodeError;
     use divi_rpc::TxSubmitError;
     match e {
-        NodeError::TxRejected { code, reason } => TxSubmitError::Rejected { code, reason },
+        NodeError::TxRejected { code, reason, .. } => TxSubmitError::Rejected { code, reason },
         NodeError::MissingInputs => TxSubmitError::UnknownInputs,
         NodeError::NonFinal => TxSubmitError::Rejected {
             code: divi_node::error::reject::NONSTANDARD,
             reason: "non-final".to_string(),
-        },
-        NodeError::PrematureSpend => TxSubmitError::Rejected {
-            code: divi_node::error::reject::INVALID,
-            reason: "bad-txns-premature-spend-of-coinbase".to_string(),
         },
         other => TxSubmitError::Failed(other.to_string()),
     }
@@ -3082,7 +3071,10 @@ mod mempool_block_tests {
             )],
             lock_time: 0,
         };
-        node.mempool()
+        // A mempool without the chain checks: this is about which blocks clean
+        // it, not about what it admits
+        let mempool = divi_node::Mempool::new(divi_node::config::MempoolConfig::default());
+        mempool
             .add(pending.clone(), Amount::from_sat(COIN))
             .unwrap();
 
@@ -3096,27 +3088,27 @@ mod mempool_block_tests {
         chain.accept_block(side.clone()).unwrap();
         assert_ne!(chain.tip().unwrap().hash, compute_block_hash(&side.header));
         let fees = mempool_block_connected(
-            node.mempool(),
+            &mempool,
             chain,
             |_| {},
             node.fee_estimator(),
             &side,
             chain.height(),
         );
-        assert!(node.mempool().contains(&pending.txid()));
+        assert!(mempool.contains(&pending.txid()));
         assert_eq!(fees, Amount::from_sat(0));
 
         let active = block_on(chain, parent, 0, std::slice::from_ref(&pending));
         chain.accept_block(active.clone()).unwrap();
         let fees = mempool_block_connected(
-            node.mempool(),
+            &mempool,
             chain,
             |_| {},
             node.fee_estimator(),
             &active,
             chain.height(),
         );
-        assert!(!node.mempool().contains(&pending.txid()));
+        assert!(!mempool.contains(&pending.txid()));
         assert_eq!(fees, Amount::from_sat(COIN));
     }
 }

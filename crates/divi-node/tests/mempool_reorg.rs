@@ -7,6 +7,7 @@
 //! and children alike, and nothing the new chain confirmed, conflicts with or
 //! no longer has.
 
+use divi_crypto::KeyPair;
 use divi_node::config::NodeConfig;
 use divi_node::{update_mempool_after_reorg, Node};
 use divi_primitives::amount::Amount;
@@ -15,6 +16,7 @@ use divi_primitives::hash::Hash256;
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use divi_primitives::ChainMode;
+use divi_script::TransactionSignatureChecker;
 
 const COIN: i64 = 100_000_000;
 const FEE: i64 = 10_000_000;
@@ -22,22 +24,37 @@ const FEE: i64 = 10_000_000;
 /// Regtest coinbase and coinstake maturity (Divi Core chainparams.cpp:479)
 const MATURITY: u32 = 20;
 
-fn anyone() -> Script {
-    Script::from_bytes(vec![0x51])
+fn p2pkh(kp: &KeyPair) -> Script {
+    Script::new_p2pkh(divi_crypto::hash160(&kp.public_key().to_bytes()).as_bytes())
 }
 
-fn spend(coin: OutPoint, value: i64) -> Transaction {
-    Transaction {
+/// Spend `coin`, worth `value` and paying `kp`, back to `kp`, less `fee`
+fn spend_with_fee(kp: &KeyPair, coin: OutPoint, value: i64, fee: i64) -> Transaction {
+    let mut tx = Transaction {
         version: 1,
         vin: vec![TxIn::new(coin, Script::new(), 0xffffffff)],
-        vout: vec![TxOut::new(Amount::from_sat(value - FEE), anyone())],
+        vout: vec![TxOut::new(Amount::from_sat(value - fee), p2pkh(kp))],
         lock_time: 0,
-    }
+    };
+    let checker = TransactionSignatureChecker::new(&tx, 0, Amount::from_sat(value));
+    let sighash = checker.signature_hash(&p2pkh(kp), 1);
+    let mut sig = divi_crypto::sign_hash(kp.secret_key(), &sighash)
+        .unwrap()
+        .to_der();
+    sig.push(1);
+    let pubkey = kp.public_key().to_bytes();
+    let mut ss = vec![sig.len() as u8];
+    ss.extend_from_slice(&sig);
+    ss.push(pubkey.len() as u8);
+    ss.extend_from_slice(&pubkey);
+    tx.vin[0].script_sig = Script::from_bytes(ss);
+    tx
 }
 
 struct TestNode {
     _dir: tempfile::TempDir,
     node: Node,
+    key: KeyPair,
 }
 
 impl TestNode {
@@ -46,10 +63,14 @@ impl TestNode {
         let mut config = NodeConfig::regtest(ChainMode::Divi);
         config.data_dir = dir.path().to_path_buf();
         let node = Node::new(config).unwrap();
-        TestNode { _dir: dir, node }
+        TestNode {
+            _dir: dir,
+            node,
+            key: KeyPair::new_random(),
+        }
     }
 
-    /// A block on `parent` paying its coinbase to anyone (`tag` makes
+    /// A block on `parent` paying its coinbase to the node's key (`tag` makes
     /// blocks of different branches differ) and confirming `txs`
     fn block_on(&self, parent: Hash256, tag: u8, txs: &[Transaction]) -> Block {
         let parent = self.node.chain().get_block_index(&parent).unwrap().unwrap();
@@ -59,7 +80,7 @@ impl TestNode {
         let coinbase = Transaction {
             version: 1,
             vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
-            vout: vec![TxOut::new(Amount::from_sat(1250 * COIN), anyone())],
+            vout: vec![TxOut::new(Amount::from_sat(1250 * COIN), p2pkh(&self.key))],
             lock_time: 0,
         };
         let mut block = Block::default();
@@ -75,6 +96,11 @@ impl TestNode {
             block.header.nonce += 1;
         }
         block
+    }
+
+    /// Spend `coin`, worth `value`, paying the node's key, less the fee
+    fn spend(&self, coin: OutPoint, value: i64) -> Transaction {
+        spend_with_fee(&self.key, coin, value, FEE)
     }
 
     fn tip(&self) -> Hash256 {
@@ -142,8 +168,8 @@ fn disconnected_send_and_its_child_both_return_to_the_mempool() {
     let coin = t.mature_coins(1)[0];
     let fork = t.tip();
 
-    let send = spend(coin, 1250 * COIN);
-    let child = spend(OutPoint::new(send.txid(), 0), 1250 * COIN - FEE);
+    let send = t.spend(coin, 1250 * COIN);
+    let child = t.spend(OutPoint::new(send.txid(), 0), 1250 * COIN - FEE);
     t.mine(std::slice::from_ref(&send));
     t.mine(std::slice::from_ref(&child));
 
@@ -175,12 +201,11 @@ fn reorg_drops_what_the_new_chain_confirms_conflicts_with_or_lacks() {
     // A coinbase only the old branch has, mature at its tip
     let old_branch_coin = t.mature_coins(1)[0];
 
-    let confirmed = spend(coins[0], 1250 * COIN);
-    let child_of_confirmed = spend(OutPoint::new(confirmed.txid(), 0), 1250 * COIN - FEE);
-    let pending = spend(coins[1], 1250 * COIN);
-    let mut double_spend = spend(coins[1], 1250 * COIN);
-    double_spend.vout[0].value = Amount::from_sat(1250 * COIN - 2 * FEE);
-    let spends_old_coin = spend(old_branch_coin, 1250 * COIN);
+    let confirmed = t.spend(coins[0], 1250 * COIN);
+    let child_of_confirmed = t.spend(OutPoint::new(confirmed.txid(), 0), 1250 * COIN - FEE);
+    let pending = t.spend(coins[1], 1250 * COIN);
+    let double_spend = spend_with_fee(&t.key, coins[1], 1250 * COIN, 2 * FEE);
+    let spends_old_coin = t.spend(old_branch_coin, 1250 * COIN);
     for tx in [&confirmed, &child_of_confirmed, &pending, &spends_old_coin] {
         t.add(tx);
     }
@@ -214,7 +239,7 @@ fn reorg_drops_what_the_new_chain_confirms_conflicts_with_or_lacks() {
 fn side_chain_block_leaves_the_mempool_alone() {
     let t = TestNode::new();
     let coin = t.mature_coins(1)[0];
-    let pending = spend(coin, 1250 * COIN);
+    let pending = t.spend(coin, 1250 * COIN);
     t.add(&pending);
 
     // A sibling of the tip: same work, so it stays on a side chain

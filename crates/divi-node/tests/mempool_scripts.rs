@@ -91,11 +91,11 @@ impl TestNode {
         outpoint
     }
 
-    /// A 1250 DIVI coin paying `script`, mature for the next block (regtest
-    /// coinbase maturity 20, Divi Core chainparams.cpp:479)
+    /// A mature 1250 DIVI coin paying `script`
     fn fund(&self, script: Script) -> (OutPoint, i64) {
         let coin = self.mine(script);
-        for _ in 0..19 {
+        // Regtest coinbase maturity is 20 blocks
+        for _ in 0..20 {
             self.mine(Script::new_p2pkh(&[0xee; 20]));
         }
         (coin, 1250 * COIN)
@@ -110,6 +110,8 @@ impl TestNode {
     }
 }
 
+/// Divi Core's AreInputsStandard refuses an unsigned spend before any script
+/// runs: a P2PKH spend needs two scriptSig items
 #[test]
 fn unsigned_spend_is_refused_as_core_refuses_it() {
     let t = TestNode::new();
@@ -118,10 +120,7 @@ fn unsigned_spend_is_refused_as_core_refuses_it() {
     let err = t
         .submit(spend(coin, value, p2pkh(&KeyPair::new_random())))
         .unwrap_err();
-    assert_eq!(
-        err,
-        "16: mandatory-script-verify-flag-failed (Operation not valid with the current stack size)"
-    );
+    assert_eq!(err, "64: bad-txns-nonstandard-inputs");
     assert_eq!(t.node.mempool().size(), 0);
 }
 

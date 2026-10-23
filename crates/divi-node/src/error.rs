@@ -69,9 +69,10 @@ pub enum NodeError {
     TransactionValidation(String),
 
     /// The mempool refused a transaction, with Divi Core's reject code and
-    /// reason (e.g. 64 "dust", 66 "insufficient fee")
+    /// reason (e.g. 64 "dust", 66 "insufficient fee") and the misbehaviour
+    /// score Core's AcceptToMemoryPool records for it (`dos`)
     #[error("{code}: {reason}")]
-    TxRejected { code: u8, reason: String },
+    TxRejected { code: u8, reason: String, dos: u32 },
 
     /// A transaction spends a coin that is neither in the chain nor the mempool
     #[error("missing inputs")]
@@ -80,26 +81,38 @@ pub enum NodeError {
     /// Transaction cannot be mined in the next block (Divi Core reject code 64)
     #[error("64: non-final")]
     NonFinal,
-
-    /// A transaction spends a coinbase or coinstake output that is not mature
-    /// in the next block. Divi Core refuses it as invalid but with no
-    /// misbehaviour score (CheckInputs `state.Invalid`, UtxoCheckingAndUpdating.cpp:76-78).
-    #[error("16: bad-txns-premature-spend-of-coinbase")]
-    PrematureSpend,
 }
 
 impl NodeError {
     /// A transaction a peer relayed was refused with this error: the
     /// misbehaviour score Divi Core gives that peer (the score its
     /// AcceptToMemoryPool records for ProcessMessage's `Misbehaving`).
-    /// Every REJECT_INVALID refusal is 100 there (coinbase or coinstake as a
-    /// loose transaction, bad input or output values, a mandatory script
-    /// failure); policy refusals (dust, fee, non-final, non-mandatory
-    /// script), conflicts and missing inputs (an orphan) are 0.
+    /// Most REJECT_INVALID refusals are 100 there (a CheckTransaction failure,
+    /// coinbase or coinstake as a loose transaction, bad input values, value
+    /// in below value out, a mandatory script failure), but an immature
+    /// coinbase or coinstake spend is 0. Policy refusals (standardness, fee,
+    /// non-final, non-mandatory script), conflicts, spent and missing inputs
+    /// (an orphan) are 0.
     pub fn misbehaviour_score(&self) -> u32 {
         match self {
-            NodeError::TxRejected { code, .. } if *code == reject::INVALID => 100,
+            NodeError::TxRejected { dos, .. } => *dos,
             _ => 0,
+        }
+    }
+
+    /// A refusal with Core's reject code and reason; REJECT_INVALID scores 100,
+    /// everything else 0
+    pub fn rejected(code: u8, reason: impl Into<String>) -> Self {
+        let dos = if code == reject::INVALID { 100 } else { 0 };
+        NodeError::rejected_scored(code, reason, dos)
+    }
+
+    /// A refusal with an explicit misbehaviour score
+    pub fn rejected_scored(code: u8, reason: impl Into<String>, dos: u32) -> Self {
+        NodeError::TxRejected {
+            code,
+            reason: reason.into(),
+            dos,
         }
     }
 }
@@ -107,6 +120,7 @@ impl NodeError {
 /// Divi Core reject codes (defaultValues.h)
 pub mod reject {
     pub const INVALID: u8 = 0x10;
+    pub const DUPLICATE: u8 = 0x12;
     pub const NONSTANDARD: u8 = 0x40;
     pub const INSUFFICIENT_FEE: u8 = 0x42;
 }
@@ -117,10 +131,7 @@ mod tests {
 
     #[test]
     fn relay_scores_follow_divi_core() {
-        let rejected = |code, reason: &str| NodeError::TxRejected {
-            code,
-            reason: reason.into(),
-        };
+        let rejected = |code, reason: &str| NodeError::rejected(code, reason);
         assert_eq!(
             rejected(reject::INVALID, "coinstake").misbehaviour_score(),
             100
