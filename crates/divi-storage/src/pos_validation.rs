@@ -33,9 +33,11 @@ const MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING: u64 = 60 * 60 * 24 * 7 - 60 * 60;
 /// Reference: I_ProofOfStakeGenerator.h:30
 pub const HASH_DRIFT: u32 = 45;
 
-/// Maximum number of inputs that can be combined in a coinstake transaction
-/// Reference: BlockProofVerifier.cpp:54
-const MAX_COMBINABLE_INPUTS: usize = 30;
+/// Maximum number of inputs in a coinstake transaction, kernel included.
+/// A fixed 20 in Divi Core (`MAX_KERNEL_COMBINED_INPUTS`, Settings.cpp:210-214),
+/// checked for every proof-of-stake block (BlockProofVerifier.cpp:54-61) and
+/// used by its staker when combining coins (PoSTransactionCreator.cpp:178, :199).
+pub const MAX_COMBINABLE_INPUTS: usize = 20;
 
 /// Staking data required for proof-of-stake validation
 /// Reference: StakingData.h
@@ -492,6 +494,43 @@ mod tests {
 
         let result = validate_coinstake_transaction(&tx);
         assert!(result.is_err());
+    }
+
+    /// A coinstake with `n` inputs and valid marker and stake outputs
+    fn coinstake_with_inputs(n: usize) -> Transaction {
+        use divi_primitives::{Script, TxIn, TxOut};
+        Transaction {
+            version: 1,
+            vin: (0..n)
+                .map(|i| TxIn {
+                    prevout: OutPoint {
+                        txid: Hash256::from_slice(&[i as u8 + 1; 32]),
+                        vout: 0,
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xFFFFFFFF,
+                })
+                .collect(),
+            vout: vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: Script::new(),
+                },
+                TxOut {
+                    value: Amount::from_divi(100),
+                    script_pubkey: Script::new_p2pkh(&[7; 20]),
+                },
+            ],
+            lock_time: 0,
+        }
+    }
+
+    /// Divi Core refuses a coinstake with more than 20 inputs
+    #[test]
+    fn coinstake_input_limit_is_twenty() {
+        assert!(validate_coinstake_transaction(&coinstake_with_inputs(20)).is_ok());
+        let err = validate_coinstake_transaction(&coinstake_with_inputs(21)).unwrap_err();
+        assert!(err.contains("too many inputs: 21 > 20"), "{err}");
     }
 
     #[test]

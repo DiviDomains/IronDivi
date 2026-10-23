@@ -110,8 +110,8 @@ pub struct StakingConfig {
 pub const DEFAULT_STAKE_SPLIT_THRESHOLD: i64 = 20_000 * 100_000_000;
 
 /// Divi Core `MAX_KERNEL_COMBINED_INPUTS` (Settings.cpp): consensus limit on
-/// coinstake inputs.
-pub const MAX_COMBINED_STAKE_INPUTS: usize = 20;
+/// coinstake inputs, the same figure block validation checks.
+pub const MAX_COMBINED_STAKE_INPUTS: usize = divi_storage::pos_validation::MAX_COMBINABLE_INPUTS;
 
 /// Inputs and stake outputs of a coinstake, before payee outputs are added.
 #[derive(Debug, Clone)]
