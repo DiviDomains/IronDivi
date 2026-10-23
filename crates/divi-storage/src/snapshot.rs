@@ -637,6 +637,10 @@ mod tests {
             lock_time: 0,
         });
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         block
     }
 

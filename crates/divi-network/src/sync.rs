@@ -815,9 +815,9 @@ impl BlockSync {
     /// out-works our tip and `accept_block` reorgs onto it. A peer that does
     /// not know the hint skips it and matches on the main-chain entries.
     ///
-    /// There is no max-reorg-depth rule in this codebase (nor in C++ Divi's
-    /// getblocks sync); the only fork-choice limit is the hard-coded
-    /// checkpoint table in `Chain::get_checkpoint_hash`.
+    /// `Chain::accept_block` refuses a block 100 or more blocks below the tip
+    /// (Divi Core's max reorganization depth, `-maxreorg`) and one that misses a
+    /// checkpoint, so a fork that diverges deeper than that stops growing here.
     fn build_block_locator(&self) -> Vec<Hash256> {
         let mut locator = Vec::new();
         if let Some((side_hash, side_height)) = self.valid_side_chain_tip() {
@@ -2779,39 +2779,54 @@ mod tests {
 
     /// Build `len` consensus-valid regtest blocks on top of genesis.
     ///
-    /// Heights 1..=100 are PoW; above that each block is PoS, built the way
-    /// `divi-node`'s staker builds one (coinbase marker, coinstake re-staking
-    /// the previous stake output, lottery and treasury payees, recoverable
-    /// block signature). The chain is built in its own scratch `Chain`, where
-    /// it is the main chain, so lottery winners come from the real chain code.
-    /// Stake-kernel checks are skipped in IBD mode, which a fresh `Chain` is in.
+    /// Heights 1..=100 are PoW (1250 DIVI coinbases, with a real proof of work
+    /// for regtest's bits); above that each block is PoS, built the way
+    /// `divi-node`'s staker builds one (coinbase marker, coinstake, lottery and
+    /// treasury payees, recoverable block signature). Each coinstake stakes the
+    /// largest coin at least 20 blocks deep (regtest's maturity). The chain is
+    /// built in its own scratch `Chain`, where it is the main chain, so lottery
+    /// winners come from the real chain code.
     fn build_regtest_chain(len: u32, seed: u8, time_offset: u32) -> Vec<Block> {
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
         let chain = Chain::new(db, regtest_params()).unwrap();
-        extend_regtest_chain(&chain, len, seed, time_offset, 1250_00000000)
+        extend_regtest_chain(&chain, len, seed, time_offset, false)
     }
 
     /// Extend `chain` from genesis to height `len` (see `build_regtest_chain`).
-    /// `pow_value_sat` is the value of each PoW coinbase; the stake re-staked
-    /// from height 101 on starts from the height-100 coinbase.
+    /// With `big_stake`, height 40 joins the coinbases of heights 1-10 into one
+    /// coin of about 12,500 DIVI, above the lottery's ticket minimum.
     fn extend_regtest_chain(
         chain: &Chain,
         len: u32,
         seed: u8,
         time_offset: u32,
-        pow_value_sat: i64,
+        big_stake: bool,
     ) -> Vec<Block> {
         use divi_consensus::block_subsidy;
         use divi_primitives::amount::Amount;
         use divi_primitives::script::Script;
         use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
 
+        const MATURITY: u32 = 20;
         let key = divi_crypto::SecretKey::from_bytes(&[seed; 32]).unwrap();
         let pay = Script::new_p2pkh(key.public_key().pubkey_hash().as_bytes());
+        let sign_input = |tx: &mut Transaction, i: usize, value: Amount| {
+            let sighash =
+                divi_script::TransactionSignatureChecker::new(tx, i, value).signature_hash(&pay, 1);
+            let mut sig = divi_crypto::sign_hash(&key, &sighash).unwrap().to_der();
+            sig.push(1);
+            let pubkey = key.public_key().to_bytes();
+            let mut script_sig = vec![sig.len() as u8];
+            script_sig.extend_from_slice(&sig);
+            script_sig.push(pubkey.len() as u8);
+            script_sig.extend_from_slice(&pubkey);
+            tx.vin[i].script_sig = Script::from_bytes(script_sig);
+        };
         let genesis = chain.tip().unwrap();
         let (mut prev, mut t) = (genesis.hash, genesis.time + time_offset);
-        let mut stake: Option<(OutPoint, Amount)> = None;
+        // Spendable coins of `pay`: (outpoint, value, height)
+        let mut coins: Vec<(OutPoint, Amount, u32)> = Vec::new();
         let mut blocks = Vec::with_capacity(len as usize);
 
         for h in 1..=len {
@@ -2831,17 +2846,44 @@ mod tests {
                 let coinbase = Transaction {
                     version: 1,
                     vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
-                    vout: vec![TxOut::new(Amount::from_sat(pow_value_sat), pay.clone())],
+                    vout: vec![TxOut::new(Amount::from_sat(1250_00000000), pay.clone())],
                     lock_time: 0,
                 };
-                if h == 100 {
-                    stake = Some((OutPoint::new(coinbase.txid(), 0), coinbase.vout[0].value));
-                }
+                coins.push((OutPoint::new(coinbase.txid(), 0), coinbase.vout[0].value, h));
                 block.transactions.push(coinbase);
+                if big_stake && h == 40 {
+                    let joined: Vec<_> = coins.drain(..10).collect();
+                    let total = joined.iter().fold(Amount::ZERO, |acc, (_, v, _)| acc + *v);
+                    let mut join = Transaction {
+                        version: 1,
+                        vin: joined
+                            .iter()
+                            .map(|(op, _, _)| TxIn::new(*op, Script::default(), 0xffffffff))
+                            .collect(),
+                        vout: vec![TxOut::new(
+                            total - Amount::from_sat(1_00000000),
+                            pay.clone(),
+                        )],
+                        lock_time: 0,
+                    };
+                    for (i, (_, v, _)) in joined.iter().enumerate() {
+                        sign_input(&mut join, i, *v);
+                    }
+                    coins.push((OutPoint::new(join.txid(), 0), join.vout[0].value, h));
+                    block.transactions.push(join);
+                }
             } else {
                 block.header.version = 4;
                 let parent = chain.get_block_index(&prev).unwrap().unwrap();
-                let (prevout, value) = stake.take().unwrap();
+                // The largest mature coin (the earliest of equal ones)
+                let pick = coins
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, ch))| h - ch >= MATURITY)
+                    .max_by(|(ia, (_, va, _)), (ib, (_, vb, _))| va.cmp(vb).then(ib.cmp(ia)))
+                    .map(|(i, _)| i)
+                    .expect("a mature coin to stake");
+                let (prevout, value, _) = coins.remove(pick);
                 let rewards = block_subsidy::get_block_subsidy(h, 100);
                 let mut vout = vec![
                     TxOut::new(Amount::ZERO, Script::default()),
@@ -2859,17 +2901,12 @@ mod tests {
                     lock_time: 0,
                 };
                 // Blocks are script-verified: sign the stake input
-                let sighash = divi_script::TransactionSignatureChecker::new(&coinstake, 0, value)
-                    .signature_hash(&pay, 1);
-                let mut sig = divi_crypto::sign_hash(&key, &sighash).unwrap().to_der();
-                sig.push(1);
-                let pubkey = key.public_key().to_bytes();
-                let mut script_sig = vec![sig.len() as u8];
-                script_sig.extend_from_slice(&sig);
-                script_sig.push(pubkey.len() as u8);
-                script_sig.extend_from_slice(&pubkey);
-                coinstake.vin[0].script_sig = Script::from_bytes(script_sig);
-                stake = Some((OutPoint::new(coinstake.txid(), 1), coinstake.vout[1].value));
+                sign_input(&mut coinstake, 0, value);
+                coins.push((
+                    OutPoint::new(coinstake.txid(), 1),
+                    coinstake.vout[1].value,
+                    h,
+                ));
                 let marker = Transaction {
                     version: 2,
                     vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
@@ -2887,6 +2924,11 @@ mod tests {
                     .unwrap()
                     .to_compact_with_recovery()
                     .to_vec();
+            } else {
+                let target = Hash256::from_compact(block.header.bits);
+                while compute_block_hash(&block.header) > target {
+                    block.header.nonce += 1;
+                }
             }
             prev = chain
                 .accept_block(block.clone())
@@ -2958,8 +3000,8 @@ mod tests {
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
         let chain = Chain::new(db, regtest_params()).unwrap();
 
-        // 20,000 DIVI PoW coinbases: every coinstake from 101 on is a ticket.
-        let blocks = extend_regtest_chain(&chain, 150, 0x7C, 0, 2_000_000_000_000);
+        // One stake above the ticket minimum, staked every 20 blocks (101, 121, 141).
+        let blocks = extend_regtest_chain(&chain, 150, 0x7C, 0, true);
 
         assert!(treasury::is_treasury_block_with_lottery(
             150,
@@ -3009,7 +3051,11 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
-        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        // This test is about fetching a long fork across inv batches; lift the
+        // 100-block reorganization limit, which would refuse a fork this deep
+        let mut params = regtest_params();
+        params.max_reorg_depth = None;
+        let chain = Arc::new(Chain::new(db, params).unwrap());
         let pm = PeerManager::new(Default::default());
         let sync = BlockSync::new(chain.clone(), pm.clone());
 
@@ -3350,6 +3396,10 @@ mod tests {
             lock_time: 0,
         });
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         block
     }
 

@@ -56,6 +56,11 @@ impl TestNode {
         block.header.bits = 0x207fffff;
         block.transactions = vec![coinbase];
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         chain.accept_block(block).unwrap();
         outpoint
     }

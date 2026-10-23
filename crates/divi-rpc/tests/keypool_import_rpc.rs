@@ -203,6 +203,11 @@ impl Net {
             lock_time: 0,
         });
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         let time = block.header.time;
         let txs = block.transactions.clone();
         let hash = self.chain.accept_block(block).unwrap().hash;

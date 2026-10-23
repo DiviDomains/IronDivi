@@ -203,7 +203,7 @@ fn build_block(prev_hash: Hash256, prev_time: u32, tag: u8) -> Block {
 
     let coinbase = Transaction {
         version: 1,
-        vin: vec![TxIn::coinbase(Script::from_bytes(vec![tag]))],
+        vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, tag]))],
         vout: vec![TxOut::new(
             Amount::from_sat(1250_00000000),
             Script::new_p2pkh(&[tag; 20]),
@@ -212,6 +212,10 @@ fn build_block(prev_hash: Hash256, prev_time: u32, tag: u8) -> Block {
     };
     block.transactions.push(coinbase);
     block.header.merkle_root = compute_merkle_root(&block.transactions);
+    let target = Hash256::from_compact(block.header.bits);
+    while divi_crypto::compute_block_hash(&block.header) > target {
+        block.header.nonce += 1;
+    }
     block
 }
 

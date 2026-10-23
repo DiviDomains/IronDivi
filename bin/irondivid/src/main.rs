@@ -118,6 +118,10 @@ struct Args {
     #[arg(long, value_name = "N")]
     checkblocks: Option<u32>,
 
+    /// Refuse a block N or more blocks below the tip (default 100, as Divi Core's -maxreorg)
+    #[arg(long, value_name = "N")]
+    maxreorg: Option<u32>,
+
     /// Make outbound P2P connections through this SOCKS5 proxy (ip:port, port 9050 if
     /// omitted). DNS seeds are then not resolved locally.
     #[arg(long, value_name = "IP:PORT")]
@@ -346,8 +350,8 @@ fn conf_kind(key: &str) -> Option<ConfKind> {
     use ConfKind::*;
     Some(match key {
         "rpcuser" | "rpcpassword" | "rpcbind" | "bind" | "proxy" | "mode" | "expire" => Str,
-        "rpcport" | "port" | "checkblocks" | "maxlogsize" | "maxlogfiles" | "utxocachesize"
-        | "banscore" | "bantime" => Int,
+        "rpcport" | "port" | "checkblocks" | "maxreorg" | "maxlogsize" | "maxlogfiles"
+        | "utxocachesize" | "banscore" | "bantime" => Int,
         "listen" | "testnet" | "regtest" | "daemon" | "printtoconsole" | "staking"
         | "stakeonstaletip" | "txindex" | "spentindex" | "addressindex" | "disablewallet" => Bool,
         "addnode" | "fullnode" | "connect" => List,
@@ -529,6 +533,16 @@ fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
                     warn!(
                         "Invalid checkblocks value in config file, expected a non-negative integer"
                     );
+                }
+            }
+            "maxreorg" => {
+                if let Some(i) = value
+                    .as_integer()
+                    .filter(|i| (0..=u32::MAX as i64).contains(i))
+                {
+                    config.max_reorg = Some(i as u32);
+                } else {
+                    warn!("Invalid maxreorg value in config file, expected a non-negative integer");
                 }
             }
             "proxy" => {
@@ -862,6 +876,9 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     }
     if let Some(n) = args.checkblocks {
         config.check_blocks = n;
+    }
+    if let Some(n) = args.maxreorg {
+        config.max_reorg = Some(n);
     }
     if let Some(proxy) = &args.proxy {
         config.p2p.proxy = Some(proxy.clone());

@@ -110,6 +110,10 @@ impl TestChain {
         block.header.bits = 0x207fffff;
         block.transactions = txs;
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         block
     }
 
@@ -123,15 +127,24 @@ impl TestChain {
         self.chain.accept_block(block).is_ok() && self.chain.height() == height
     }
 
-    /// Fund `script` with a 1250 DIVI coinbase and let it mature
+    /// Fund `script` with a 1250 DIVI coinbase and let it mature (20 blocks on regtest)
     fn fund(&self, script: Script) -> (OutPoint, i64) {
         let height = self.chain.height() + 1;
         let cb = self.coinbase(height, script);
         let outpoint = OutPoint::new(cb.txid(), 0);
         let block = self.block(vec![cb]);
         self.chain.accept_block(block).unwrap();
-        assert!(self.mine(p2pkh(&self.miner), vec![]));
+        for _ in 0..20 {
+            assert!(self.mine(p2pkh(&self.miner), vec![]));
+        }
         (outpoint, 1250 * COIN)
+    }
+
+    /// Mine PoW blocks up to the last PoW block, so the next block may be PoS
+    fn mine_to_last_pow_block(&self) {
+        while self.chain.height() < 100 {
+            assert!(self.mine(p2pkh(&self.miner), vec![]));
+        }
     }
 }
 
@@ -296,6 +309,9 @@ fn vault_stake_block(
         ],
         lock_time: 0,
     };
+    // The vault output must carry the stake reward too (CheckCoinstakeForVaults)
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(height, 100);
+    stake.vout[1].value = Amount::from_sat(value) + reward.stake + reward.masternode;
     let sig = sign(&stake, 0, vault_spk, value, signer);
     stake.vin[0].script_sig = vault_script_sig(&sig, signer, false);
     let mut block = t.block(vec![coinbase, stake]);
@@ -312,6 +328,7 @@ fn vault_manager_stake_is_accepted() {
     let manager = KeyPair::new_random();
     let vault_spk = vault(&owner, &manager);
     let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
     let height = t.chain.height();
 
     let block = vault_stake_block(&t, coin, value, &vault_spk, &manager);
@@ -328,6 +345,7 @@ fn vault_stake_signed_by_wrong_key_is_refused() {
     let manager = KeyPair::new_random();
     let vault_spk = vault(&owner, &manager);
     let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
     let height = t.chain.height();
 
     // The coinstake input is signed by a key that is not the manager's; the

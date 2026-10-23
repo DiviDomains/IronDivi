@@ -85,6 +85,11 @@ impl Net {
         block.transactions.push(coinbase.clone());
         block.transactions.extend(txs);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         self.chain.accept_block(block).unwrap();
         assert_eq!(self.chain.height(), height);
         coinbase
@@ -122,6 +127,10 @@ fn confirmed_transaction_is_already_in_block_chain() {
     let net = Net::new();
     let me = net.wallet.new_receiving_address().unwrap();
     let cb = net.mine(vec![], &me);
+    // Regtest coinbases mature after 20 blocks
+    for _ in 0..20 {
+        net.mine(vec![], &me);
+    }
     let tx = spend(&net, &cb, 1249 * COIN);
     net.mine(vec![tx.clone()], &me);
     assert_eq!(
