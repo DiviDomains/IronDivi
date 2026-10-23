@@ -352,6 +352,7 @@ impl WalletDb {
 
     /// Create wallet with HD wallet
     pub fn with_hd_wallet(network: Network, wallet: HdWallet) -> Self {
+        let wallet = with_core_coin_type(wallet, network);
         WalletDb {
             keystore: KeyStore::with_hd_wallet(network, wallet),
             network,
@@ -506,7 +507,16 @@ impl WalletDb {
         }
 
         if let Some(mnemonic) = db.load_mnemonic()? {
-            let hd_wallet = HdWallet::from_mnemonic(&mnemonic, None, new_mode)?;
+            let passphrase = db.load_mnemonic_passphrase()?;
+            let mut hd_wallet =
+                HdWallet::from_mnemonic(&mnemonic, passphrase.as_deref(), new_mode)?;
+            // A Divi wallet keeps a testnet coin type it was made with
+            if let (ChainMode::Divi, Some(coin_type)) = (new_mode, db.load_hd_coin_type()?) {
+                if coin_type != crate::hd::PRIVATEDIVI_COIN_TYPE {
+                    hd_wallet = hd_wallet.with_coin_type(coin_type);
+                }
+            }
+            db.store_hd_coin_type(hd_wallet.coin_type())?;
             self.keystore.set_hd_wallet(hd_wallet);
             db.store_chain_mode(new_mode)?;
             info!("Migrated wallet chain_mode to {:?}", new_mode);
@@ -524,19 +534,19 @@ impl WalletDb {
         let db = WalletDatabase::open(path)?;
         let db = Arc::new(db);
 
-        // Store mnemonic, network, and chain mode
+        // Store mnemonic, network, chain mode and coin type
+        let wallet = with_core_coin_type(wallet, network);
         if let Some(mnemonic) = wallet.mnemonic() {
             db.store_mnemonic(mnemonic)?;
         }
+        if let Some(passphrase) = wallet.mnemonic_passphrase() {
+            db.store_mnemonic_passphrase(passphrase)?;
+        }
         db.store_network(network)?;
 
-        // Store chain mode for correct HD derivation on future loads
-        let chain_mode = if wallet.coin_type() == 801 {
-            ChainMode::PrivateDivi
-        } else {
-            ChainMode::Divi
-        };
-        db.store_chain_mode(chain_mode)?;
+        // Store chain mode and coin type for the same HD derivation on future loads
+        db.store_chain_mode(wallet.chain_mode())?;
+        db.store_hd_coin_type(wallet.coin_type())?;
 
         let wallet_db = WalletDb {
             keystore: KeyStore::with_hd_wallet(network, wallet),
@@ -589,15 +599,14 @@ impl WalletDb {
 
         // Load mnemonic and restore HD wallet
         if let Some(mnemonic) = db.load_mnemonic()? {
-            // Use stored chain_mode, defaulting to Divi for backward compat
-            // (all existing wallets used Divi's coin type due to the old hardcode)
-            let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
-            let hd_wallet = HdWallet::from_mnemonic(&mnemonic, None, chain_mode)?;
-            self.keystore.set_hd_wallet(hd_wallet);
+            let passphrase = db.load_mnemonic_passphrase()?;
+            let hd_wallet = stored_hd_wallet(db, &mnemonic, passphrase.as_deref())?;
             debug!(
-                "Restored HD wallet from mnemonic (chain_mode={:?})",
-                chain_mode
+                "Restored HD wallet from mnemonic (chain_mode={:?}, coin type {})",
+                hd_wallet.chain_mode(),
+                hd_wallet.coin_type()
             );
+            self.keystore.set_hd_wallet(hd_wallet);
         } else if let Some(ids) = db.load_hd_public_ids()? {
             // Encrypted wallet: the seed stays locked, its public ids do not
             self.keystore.set_hd_public_ids(ids);
@@ -1151,13 +1160,14 @@ impl WalletDb {
         let addr = if *locked {
             self.keystore.take_from_keypool(is_change)?
         } else {
-            let addr = if is_change {
+            // Divi Core tops the keypool up, then takes its oldest key
+            // (wallet.cpp:2122-2156), so the pool is one short afterwards
+            store = self.keystore.top_up_keypool(None).unwrap_or_default();
+            if is_change {
                 self.keystore.new_change_address()?
             } else {
                 self.keystore.new_receiving_address()?
-            };
-            store = self.keystore.top_up_keypool(None).unwrap_or_default();
-            addr
+            }
         };
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // receiving/change index changed
@@ -1898,8 +1908,20 @@ impl WalletDb {
                 let mnemonic = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
                 let mnemonic = std::str::from_utf8(&mnemonic)
                     .map_err(|_| WalletError::Storage("corrupt encrypted mnemonic".into()))?;
-                let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
-                Some(HdWallet::from_mnemonic(mnemonic, None, chain_mode)?)
+                let passphrase = match db.load_encrypted_mnemonic_passphrase()? {
+                    Some(blob) => {
+                        let bytes = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
+                        Some(Zeroizing::new(String::from_utf8(bytes.to_vec()).map_err(
+                            |_| WalletError::Storage("corrupt encrypted passphrase".into()),
+                        )?))
+                    }
+                    None => None,
+                };
+                Some(stored_hd_wallet(
+                    db,
+                    mnemonic,
+                    passphrase.as_ref().map(|p| p.as_str()),
+                )?)
             }
             None => None,
         };
@@ -2139,6 +2161,18 @@ impl WalletDb {
             );
             batch.delete_cf(db.cf_metadata(), b"mnemonic");
         }
+        if let Some(passphrase) = self.keystore.mnemonic_passphrase() {
+            let passphrase = Zeroizing::new(passphrase);
+            batch.put_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_ENCRYPTED_MNEMONIC_PASSPHRASE,
+                encrypt_blob(&master_key, passphrase.as_bytes()),
+            );
+            batch.delete_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_MNEMONIC_PASSPHRASE,
+            );
+        }
         let (receiving, change) = self.keystore.get_indices();
         batch.put_cf(
             db.cf_metadata(),
@@ -2237,6 +2271,14 @@ impl WalletDb {
             return None;
         }
         self.keystore.mnemonic()
+    }
+
+    /// BIP39 passphrase of the HD seed (if one was given and unlocked)
+    pub fn mnemonic_passphrase(&self) -> Option<String> {
+        if *self.locked.read() {
+            return None;
+        }
+        self.keystore.mnemonic_passphrase()
     }
 
     /// Get key entry by address
@@ -3273,6 +3315,27 @@ impl WalletDb {
 const PBKDF2_ITERATIONS: u32 = 25000;
 
 /// Derive encryption key from passphrase using PBKDF2-HMAC-SHA512
+/// The wallet's HD seed from its mnemonic, with the stored chain mode and coin
+/// type (wallets made before the coin type was stored keep the chain mode's)
+fn stored_hd_wallet(
+    db: &WalletDatabase,
+    mnemonic: &str,
+    passphrase: Option<&str>,
+) -> Result<HdWallet, WalletError> {
+    let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
+    let hd_wallet = HdWallet::from_mnemonic(mnemonic, passphrase, chain_mode)?;
+    Ok(match db.load_hd_coin_type()? {
+        Some(coin_type) => hd_wallet.with_coin_type(coin_type),
+        None => hd_wallet,
+    })
+}
+
+/// A new wallet derives with Divi Core's coin type for its network
+fn with_core_coin_type(wallet: HdWallet, network: Network) -> HdWallet {
+    let coin_type = crate::hd::core_coin_type(wallet.chain_mode(), network == Network::Mainnet);
+    wallet.with_coin_type(coin_type)
+}
+
 /// A 20-byte hash taken from a script solution
 fn hash160_from(bytes: &[u8]) -> Hash160 {
     let mut hash = [0u8; 20];

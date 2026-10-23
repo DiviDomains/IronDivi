@@ -32,9 +32,12 @@ fn new_encrypted_wallet(path: &Path) -> WalletDb {
     wallet
 }
 
-/// Address of the HD key at `index` of the receiving or change chain
+/// Address of the HD key at `index` of the receiving or change chain (a
+/// testnet wallet derives with Divi Core's testnet coin type, 1)
 fn hd_address(change: bool, index: u32) -> Address {
-    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi)
+        .unwrap()
+        .with_coin_type(1);
     let key = if change {
         hd.derive_change(0, index).unwrap()
     } else {
@@ -123,7 +126,7 @@ fn locked_pool_runs_out_and_unlock_tops_it_up() {
     let dir = tempdir().unwrap();
     let wallet = new_encrypted_wallet(&dir.path().join("wallet"));
     let full = wallet.keypool_size();
-    assert_eq!(full, 100, "encryptwallet fills the default keypool");
+    assert_eq!(full, 2000, "encryptwallet fills the default keypool");
 
     let mut handed = 0;
     let err = loop {
@@ -154,9 +157,10 @@ fn locked_pool_runs_out_and_unlock_tops_it_up() {
 fn keypool_size_and_refill_are_real() {
     let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
     let wallet = WalletDb::with_hd_wallet(Network::Testnet, hd);
-    assert_eq!(wallet.refill_keypool(Some(20)).unwrap(), 20);
+    // 10 keys of each chain, as Divi Core's keypoolrefill 10
+    assert_eq!(wallet.refill_keypool(Some(10)).unwrap(), 20);
     // Nothing is missing: a second refill adds nothing
-    assert_eq!(wallet.refill_keypool(Some(20)).unwrap(), 0);
+    assert_eq!(wallet.refill_keypool(Some(10)).unwrap(), 0);
     assert_eq!(wallet.keypool_size(), 20);
 
     // Change keys handed out past the pool must not make receiving keys look

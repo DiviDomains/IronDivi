@@ -20,7 +20,9 @@ use divi_primitives::{
 };
 use divi_rpc::{Params, WalletRpc};
 use divi_storage::{txindex::TxIndex, Chain, ChainDatabase, ChainParams, NetworkType};
-use divi_wallet::{Address, HdWallet, Network, TransactionBuilder, TransactionSigner, WalletDb};
+use divi_wallet::{
+    Address, ExtendedPrivateKey, HdWallet, Network, TransactionBuilder, TransactionSigner, WalletDb,
+};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -396,4 +398,118 @@ fn getbalance_star_ignores_minconf() {
         amount(&rpc.get_balance(&p(vec![json!("*"), json!(6)])).unwrap()),
         5 * COIN
     );
+}
+
+/// keypoolrefill n fills n receiving and n change keys, and a new wallet's
+/// keypool holds Divi Core's default of 1000 per chain (wallet.cpp:2057-2120)
+#[test]
+fn keypool_is_sized_per_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("w"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    );
+    let rpc = WalletRpc::with_wallet(wallet.clone());
+    rpc.keypool_refill(&p(vec![json!(10)])).unwrap();
+    let info = rpc.get_wallet_info(&p(vec![])).unwrap();
+    assert_eq!(info["keypoolsize"], json!(20));
+    rpc.keypool_refill(&p(vec![])).unwrap();
+    let info = rpc.get_wallet_info(&p(vec![])).unwrap();
+    assert_eq!(info["keypoolsize"], json!(2000));
+}
+
+/// BIP39 seed of the "abandon ... about" test mnemonic (public test vector)
+const ABANDON_SEED: &str = "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1\
+                            9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
+
+fn abandon_mnemonic() -> String {
+    ["abandon"; 11].join(" ") + " about"
+}
+
+/// Address of key m/44'/coin'/0'/0/index of a seed
+fn receiving_address(seed: &[u8], coin: u32, index: u32) -> Address {
+    let key = ExtendedPrivateKey::from_seed(seed)
+        .unwrap()
+        .derive_hardened(44)
+        .unwrap()
+        .derive_hardened(coin)
+        .unwrap()
+        .derive_hardened(0)
+        .unwrap()
+        .derive_normal(0)
+        .unwrap()
+        .derive_normal(index)
+        .unwrap();
+    divi_wallet::KeyEntry::with_hd_path(key.secret_key().unwrap(), String::new())
+        .address(Network::Regtest)
+}
+
+/// A regtest or testnet wallet derives with coin type 1, as Divi Core
+/// (chainparams.cpp nExtCoinType), and keeps it when reopened
+#[test]
+fn testnet_and_regtest_wallets_use_cores_coin_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w");
+    let seed = hex::decode(ABANDON_SEED.replace(' ', "")).unwrap();
+    let first = {
+        let hd = HdWallet::from_mnemonic(&abandon_mnemonic(), None, ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(&path, Network::Regtest, hd).unwrap();
+        let addr = wallet.new_receiving_address().unwrap();
+        wallet.save().unwrap();
+        addr
+    };
+    assert_eq!(first, receiving_address(&seed, 1, 0));
+    let wallet = WalletDb::open(&path, Network::Regtest).unwrap();
+    assert_eq!(
+        wallet.new_receiving_address().unwrap(),
+        receiving_address(&seed, 1, 1)
+    );
+}
+
+/// A seed made with a BIP39 passphrase (Divi Core's -mnemonicpassphrase)
+/// keeps deriving with it after a restart and after encryption, and
+/// dumphdinfo shows it (rpcdump.cpp:221-233)
+#[test]
+fn mnemonic_passphrase_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w");
+    let mnemonic = abandon_mnemonic();
+    // BIP39 vector: "abandon ... about" with passphrase "TREZOR"
+    let seed = hex::decode(
+        "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553\
+         1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04",
+    )
+    .unwrap();
+    {
+        let hd = HdWallet::from_mnemonic(&mnemonic, Some("TREZOR"), ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(&path, Network::Regtest, hd).unwrap();
+        wallet.save().unwrap();
+    }
+    let wallet = Arc::new(WalletDb::open(&path, Network::Regtest).unwrap());
+    assert_eq!(
+        wallet.new_receiving_address().unwrap(),
+        receiving_address(&seed, 1, 0)
+    );
+    let rpc = WalletRpc::with_wallet(wallet.clone());
+    let info = rpc.dump_hd_info(&p(vec![])).unwrap();
+    assert_eq!(info["mnemonicpassphrase"], json!("TREZOR"));
+    assert_eq!(info["hdseed"], json!(hex::encode(&seed)));
+
+    wallet.encrypt_wallet("correct horse").unwrap();
+    wallet.save().unwrap();
+    drop(rpc);
+    drop(wallet);
+    let wallet = Arc::new(WalletDb::open(&path, Network::Regtest).unwrap());
+    wallet.unlock("correct horse", 0).unwrap();
+    assert_eq!(
+        wallet.new_receiving_address().unwrap(),
+        receiving_address(&seed, 1, 1)
+    );
+    let rpc = WalletRpc::with_wallet(wallet.clone());
+    let info = rpc.dump_hd_info(&p(vec![])).unwrap();
+    assert_eq!(info["mnemonicpassphrase"], json!("TREZOR"));
 }

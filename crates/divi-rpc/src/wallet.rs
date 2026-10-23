@@ -3637,13 +3637,16 @@ impl WalletRpc {
             .parse()
             .map_err(|e| RpcError::new(codes::WALLET_ERROR, format!("Invalid mnemonic: {}", e)))?;
 
-        let seed = mnemonic_obj.to_seed("");
+        // The seed is made with the mnemonic passphrase, as Core's CHDChain
+        // (rpcdump.cpp:221-233)
+        let passphrase = wallet.mnemonic_passphrase().unwrap_or_default();
+        let seed = mnemonic_obj.to_seed(passphrase.as_str());
         let hdseed_hex = hex::encode(&seed[0..64]);
 
         Ok(serde_json::json!({
             "hdseed": hdseed_hex,
             "mnemonic": mnemonic,
-            "mnemonicpassphrase": ""
+            "mnemonicpassphrase": passphrase
         }))
     }
 

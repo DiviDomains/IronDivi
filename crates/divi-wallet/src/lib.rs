@@ -52,7 +52,7 @@ pub use address::{decode_wif, encode_wif, Address, AddressType, Network, WifKey}
 pub use coin_selection::{CoinSelector, SelectionResult};
 pub use coinstake::CoinstakeBuilder;
 pub use error::WalletError;
-pub use hd::{ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
+pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DIVI_COIN_TYPE};
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore};
 pub use persistence::WalletDatabase;
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
