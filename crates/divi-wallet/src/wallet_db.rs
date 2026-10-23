@@ -1757,6 +1757,11 @@ impl WalletDb {
             return Err(WalletError::InvalidPassphrase);
         }
 
+        // Settle an earlier timed unlock that has run out before anything is
+        // restored: if is_locked first noticed it further down, it would lock
+        // the wallet and strip the keys and HD seed this unlock brings back
+        let was_staking_only = self.is_unlocked_for_staking_only();
+
         // Load encryption metadata from database
         let db = self.db.as_ref().ok_or_else(|| {
             WalletError::Storage("Cannot unlock wallet without database".to_string())
@@ -1839,7 +1844,6 @@ impl WalletDb {
         } else {
             None // Unlimited
         };
-        let was_staking_only = self.is_unlocked_for_staking_only();
         *self.unlock.write() = UnlockState {
             until: expiration,
             staking_only,
