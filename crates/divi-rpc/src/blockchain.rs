@@ -32,6 +32,7 @@ pub struct BlockchainRpc {
     money_supply_cache: RwLock<Option<(Hash256, f64)>>,
     /// Fetches blocks this node has pruned from full-history peers
     block_fetcher: RwLock<Option<Arc<dyn BlockFetcher>>>,
+    block_sync: RwLock<Option<Arc<divi_network::BlockSync>>>,
 }
 
 /// Source for block bodies this node no longer stores (to avoid a dependency on divi-node).
@@ -179,6 +180,7 @@ impl BlockchainRpc {
             mempool: RwLock::new(None),
             money_supply_cache: RwLock::new(None),
             block_fetcher: RwLock::new(None),
+            block_sync: RwLock::new(None),
         }
     }
 
@@ -317,6 +319,20 @@ impl BlockchainRpc {
 
     pub fn set_block_fetcher(&self, fetcher: Arc<dyn BlockFetcher>) {
         *self.block_fetcher.write() = Some(fetcher);
+    }
+
+    /// Let `getblockchaininfo` report the headers the sync holds
+    pub fn set_block_sync(&self, sync: Arc<divi_network::BlockSync>) {
+        *self.block_sync.write() = Some(sync);
+    }
+
+    /// Divi Core's GetBestHeaderBlockHeight: the best header's height, never
+    /// below the tip
+    fn best_header_height(&self, height: u32) -> u32 {
+        match self.block_sync.read().as_ref() {
+            Some(sync) => sync.best_header_height().max(height),
+            None => height,
+        }
     }
 
     /// Load a block body, asking a full-history peer if it is pruned locally.
@@ -573,6 +589,8 @@ impl BlockchainRpc {
             ),
         };
 
+        let headers = self.best_header_height(height);
+
         Ok(json!({
             "chain": match self.chain.network_type() {
                 NetworkType::Mainnet => "main",
@@ -580,11 +598,10 @@ impl BlockchainRpc {
                 NetworkType::Regtest => "regtest",
             },
             "blocks": height,
-            "headers": height,
+            "headers": headers,
             "bestblockhash": best_hash,
             "difficulty": difficulty,
             "mediantime": mediantime,
-            "verificationprogress": 1.0,
             "chainwork": chain_work,
             "pruned": self.chain.prune_height() > 0,
             "pruneheight": self.chain.prune_height(),

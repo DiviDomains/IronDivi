@@ -305,6 +305,11 @@ impl RpcServer {
         self.blockchain.set_block_fetcher(fetcher);
     }
 
+    /// Let `getblockchaininfo` report real headers and sync progress
+    pub fn set_block_sync(&self, sync: Arc<divi_network::BlockSync>) {
+        self.blockchain.set_block_sync(sync);
+    }
+
     /// Set the spork manager that backs the `spork` RPC
     pub fn set_spork_manager(&self, sporks: Arc<divi_network::SporkManager>) {
         self.spork.set_manager(sporks);
