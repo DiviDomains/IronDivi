@@ -216,7 +216,7 @@ impl Default for StakingConfig {
             min_stake_amount: 0, // No minimum - any UTXO can stake (matches C++ Divi)
             reserve_balance: 0,
             min_coin_age: 60 * 60, // 1 hour
-            max_block_size: 2_000_000,
+            max_block_size: DEFAULT_BLOCK_MAX_SIZE,
             max_block_weight: 4_000_000,
             loop_interval_ms: 500, // Try every 500ms
             max_tip_age_secs: DEFAULT_MAX_TIP_AGE_SECS,
@@ -1372,20 +1372,21 @@ impl Staker {
         ];
 
         // Add mempool transactions up to block limit
-        let mempool_txs = self.mempool.get_block_txs(
-            self.config.read().max_block_size - 1000, // Leave room for coinbase/coinstake
-        );
+        let max_block_size = block_max_size(self.config.read().max_block_size);
+        let mempool_txs = self.mempool.get_block_txs(max_block_size);
         // A stale mempool tx (an input already spent on chain) would make our own
         // block fail self-accept and waste the stake, so keep only spendable ones.
         let mempool_txs =
             retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
-        // Every tx must be final at this block's height and time, or the block
-        // is invalid (Divi Core ContextualCheckBlock "bad-txns-nonfinal").
-        transactions.extend(
-            mempool_txs
-                .into_iter()
-                .filter(|tx| tx.is_final(height, timestamp)),
-        );
+        // Recheck each one against this block, as Divi Core's block assembler does
+        transactions.extend(select_block_txs(
+            mempool_txs,
+            height,
+            timestamp,
+            max_block_size,
+            self.chain.params().coinbase_maturity,
+            |op| self.chain.get_utxo(op).ok().flatten(),
+        ));
 
         // Compute merkle root
         let merkle_root = compute_merkle_root(&transactions);
@@ -1883,6 +1884,120 @@ fn encode_bip34_height(height: u32) -> Vec<u8> {
     data
 }
 
+/// Divi Core `MAX_BLOCK_SIZE_CURRENT` (defaultValues.h:43)
+const MAX_BLOCK_SIZE: usize = 2_000_000;
+
+/// Divi Core `DEFAULT_BLOCK_MAX_SIZE` (defaultValues.h:47): `-blockmaxsize` default
+pub const DEFAULT_BLOCK_MAX_SIZE: usize = 750_000;
+
+/// Divi Core `MAX_BLOCK_SIGOPS_CURRENT` (defaultValues.h:56)
+const MAX_BLOCK_SIGOPS: u32 = 40_000;
+
+/// Divi Core `GetMaxBlockSize` (BlockMemoryPoolTransactionCollector.cpp:18-27):
+/// the configured size, kept between 1,000 bytes and 1,000 below the network limit
+fn block_max_size(configured: usize) -> usize {
+    configured.clamp(1000, MAX_BLOCK_SIZE - 1000)
+}
+
+/// Divi Core `PrioritizeTransactionsByBlockSpaceUsage`
+/// (BlockMemoryPoolTransactionCollector.cpp:261-342) for transactions already
+/// in order (parents first): each must be final in this block, keep the block
+/// under `max_block_size` (counting 1,000 bytes for the header and block-reward
+/// transactions) and under 40,000 sigops (counting 100), spend only outputs
+/// still available, and pass CheckInputs with the mandatory script flags
+/// (coinbase/coinstake maturity, value in at least value out, scripts). One
+/// that fails is left out, and so is everything spending it.
+fn select_block_txs(
+    txs: Vec<Transaction>,
+    height: u32,
+    time: u32,
+    max_block_size: usize,
+    maturity: u32,
+    utxo: impl Fn(&OutPoint) -> Option<divi_storage::Utxo>,
+) -> Vec<Transaction> {
+    use std::collections::HashSet;
+    let mut kept = Vec::new();
+    let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
+    let mut spent: HashSet<OutPoint> = HashSet::new();
+    let mut block_size = 1000usize;
+    let mut block_sig_ops = 100u32;
+    'next: for tx in txs {
+        if !tx.is_final(height, time) {
+            continue;
+        }
+        let size = tx.size();
+        let mut sig_ops: u32 = tx
+            .vin
+            .iter()
+            .map(|i| divi_script::sig_op_count(i.script_sig.as_bytes(), false))
+            .chain(
+                tx.vout
+                    .iter()
+                    .map(|o| divi_script::sig_op_count(o.script_pubkey.as_bytes(), false)),
+            )
+            .sum();
+        if block_size + size >= max_block_size || block_sig_ops + sig_ops >= MAX_BLOCK_SIGOPS {
+            continue;
+        }
+
+        let mut inputs: Vec<(Script, Amount)> = Vec::with_capacity(tx.vin.len());
+        let mut value_in = Amount::ZERO;
+        for input in &tx.vin {
+            if spent.contains(&input.prevout) {
+                continue 'next;
+            }
+            let (script, value) = if let Some(out) = created.get(&input.prevout) {
+                (out.script_pubkey.clone(), out.value)
+            } else if let Some(coin) = utxo(&input.prevout) {
+                if (coin.is_coinbase || coin.is_coinstake)
+                    && height.saturating_sub(coin.height) < maturity
+                {
+                    continue 'next;
+                }
+                (coin.script_pubkey, coin.value)
+            } else {
+                continue 'next;
+            };
+            if divi_script::is_p2sh(script.as_bytes()) {
+                sig_ops +=
+                    divi_script::p2sh_sig_op_count(script.as_bytes(), input.script_sig.as_bytes());
+            }
+            value_in += value;
+            inputs.push((script, value));
+        }
+        if block_sig_ops + sig_ops >= MAX_BLOCK_SIGOPS {
+            continue;
+        }
+        let value_out = tx.vout.iter().fold(Amount::ZERO, |sum, o| sum + o.value);
+        if value_in < value_out {
+            continue;
+        }
+        for (i, (script, value)) in inputs.iter().enumerate() {
+            if divi_script::verify_input_with_flags(
+                &tx,
+                i,
+                script,
+                *value,
+                divi_script::ScriptFlags::mandatory(),
+            )
+            .is_err()
+            {
+                continue 'next;
+            }
+        }
+
+        block_size += size;
+        block_sig_ops += sig_ops;
+        spent.extend(tx.vin.iter().map(|i| i.prevout));
+        let txid = tx.txid();
+        for (n, out) in tx.vout.iter().enumerate() {
+            created.insert(OutPoint::new(txid, n as u32), out.clone());
+        }
+        kept.push(tx);
+    }
+    kept
+}
+
 /// Keep only mempool transactions whose inputs are all spendable: present in the
 /// chain UTXO set (`on_chain`) or created by another kept transaction. Order is
 /// preserved; a tx that double-spends an earlier kept tx is dropped. Production
@@ -2031,7 +2146,7 @@ mod tests {
     #[test]
     fn test_staking_config_max_block_size() {
         let config = StakingConfig::default();
-        assert_eq!(config.max_block_size, 2_000_000);
+        assert_eq!(config.max_block_size, 750_000);
     }
 
     #[test]
@@ -2589,5 +2704,91 @@ mod tests {
         let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
         let kept = retain_spendable_txs(vec![parent, child], |_| false);
         assert!(kept.is_empty());
+    }
+
+    fn chain_coin(value: i64, script: &[u8], height: u32, coinstake: bool) -> divi_storage::Utxo {
+        divi_storage::Utxo::new(
+            Amount::from_sat(value),
+            Script::from_bytes(script.to_vec()),
+            height,
+            false,
+            coinstake,
+        )
+    }
+
+    /// A UTXO set of `(outpoint, coin)` pairs
+    fn utxos(
+        coins: Vec<(OutPoint, divi_storage::Utxo)>,
+    ) -> impl Fn(&OutPoint) -> Option<divi_storage::Utxo> {
+        move |p| coins.iter().find(|(o, _)| o == p).map(|(_, c)| c.clone())
+    }
+
+    const OP_TRUE: &[u8] = &[0x51];
+
+    /// A coinstake output may be spent 20 blocks on (regtest), in a block at
+    /// height 120 one from height 100; an earlier spend, and anything spending
+    /// it, is left out of the block (Core's CheckInputs in the block assembler)
+    #[test]
+    fn immature_coinstake_spend_is_left_out_of_a_stake_block() {
+        let mature = op(1, 0);
+        let young = op(2, 0);
+        let set = utxos(vec![
+            (mature, chain_coin(10, OP_TRUE, 100, true)),
+            (young, chain_coin(10, OP_TRUE, 101, true)),
+        ]);
+        let a = spend_tx(&[mature], 1);
+        let b = spend_tx(&[young], 2);
+        let child = spend_tx(&[OutPoint::new(b.txid(), 0)], 3);
+        let kept = select_block_txs(vec![a.clone(), b, child], 120, 0, 750_000, 20, set);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), a.txid());
+    }
+
+    #[test]
+    fn overspend_and_failing_script_are_left_out() {
+        let small = op(1, 0);
+        let locked = op(2, 0);
+        let fine = op(3, 0);
+        let set = utxos(vec![
+            (small, chain_coin(0, OP_TRUE, 1, false)),
+            (locked, chain_coin(10, &[0x00], 1, false)),
+            (fine, chain_coin(10, OP_TRUE, 1, false)),
+        ]);
+        let mut overspend = spend_tx(&[small], 1);
+        overspend.vout[0].value = Amount::from_sat(1);
+        let fails = spend_tx(&[locked], 2);
+        let ok = spend_tx(&[fine], 3);
+        let kept = select_block_txs(vec![overspend, fails, ok.clone()], 50, 0, 750_000, 20, set);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), ok.txid());
+    }
+
+    #[test]
+    fn block_size_and_sigops_budgets() {
+        let coins: Vec<OutPoint> = (1..=4).map(|n| op(n, 0)).collect();
+        let set = utxos(
+            coins
+                .iter()
+                .map(|o| (*o, chain_coin(10, OP_TRUE, 1, false)))
+                .collect(),
+        );
+        let a = spend_tx(&coins[0..1], 1);
+        let b = spend_tx(&coins[1..2], 2);
+        // 1,000 bytes counted for the header and reward transactions
+        let max = 1000 + a.size() + b.size();
+        let kept = select_block_txs(vec![a.clone(), b], 50, 0, max, 20, &set);
+        assert_eq!(kept.len(), 1, "a block stays under the size limit");
+
+        // 100 sigops counted for the reward transactions; 20 per CHECKMULTISIG
+        let with_sigops = |input: OutPoint, n: usize, tag: u32| {
+            let mut tx = spend_tx(&[input], tag);
+            tx.vout[0].script_pubkey = Script::from_bytes(vec![0xae; n]);
+            tx
+        };
+        let at_limit = with_sigops(coins[2], 1995, 3);
+        let under = with_sigops(coins[3], 1994, 4);
+        let kept = select_block_txs(vec![at_limit, under.clone()], 50, 0, 750_000, 20, &set);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), under.txid());
     }
 }
