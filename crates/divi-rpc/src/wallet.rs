@@ -6178,7 +6178,7 @@ mod accounting_tests {
     }
 
     #[test]
-    fn send_can_use_own_unconfirmed_change_that_getbalance_counts() {
+    fn send_does_not_spend_own_unconfirmed_change_that_getbalance_counts() {
         let f = fixture();
         // Our own tx spends every confirmed coin: 100 DIVI change comes back
         // unconfirmed (trusted, as all inputs are ours)
@@ -6209,12 +6209,13 @@ mod accounting_tests {
             *sink.lock() = Some(tx);
             Ok(txid)
         }));
-        f.rpc
+        // Divi Core spends only confirmed coins unless -spendzeroconfchange
+        // (off by default), though getbalance counts our own change
+        assert!(f
+            .rpc
             .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
-            .expect("getbalance says 100, so a 10 DIVI send must find the coins");
-        let tx = submitted.lock().clone().unwrap();
-        assert_eq!(tx.vin.len(), 1);
-        assert_eq!(tx.vin[0].prevout.txid, own.txid());
+            .is_err());
+        assert!(submitted.lock().is_none());
     }
 
     #[test]
