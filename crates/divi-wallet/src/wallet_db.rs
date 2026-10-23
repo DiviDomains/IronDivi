@@ -264,6 +264,9 @@ pub struct WalletDb {
     scripts: RwLock<HashMap<Hash160, Script>>,
     /// Vault metadata storage
     vaults: RwLock<HashMap<Vec<u8>, VaultMetadata>>,
+    /// Coins `lockunspent` set aside. In memory only, as Divi Core's
+    /// `setLockedCoins`; neither staked nor spent while locked.
+    locked_coins: RwLock<HashSet<OutPoint>>,
     /// How the wallet is unlocked: timer and staking-only flag
     unlock: RwLock<UnlockState>,
     /// Decrypted master key (in memory only when unlocked)
@@ -320,6 +323,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -348,6 +352,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -381,6 +386,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults,
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -532,6 +538,7 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
@@ -1390,6 +1397,26 @@ impl WalletDb {
             }
         }
         out
+    }
+
+    /// Lock (`lock` true) or unlock a coin, as `lockunspent` does
+    pub fn set_coin_locked(&self, outpoint: OutPoint, lock: bool) {
+        let mut locked = self.locked_coins.write();
+        if lock {
+            locked.insert(outpoint);
+        } else {
+            locked.remove(&outpoint);
+        }
+    }
+
+    /// Whether `lockunspent` locked this coin
+    pub fn is_coin_locked(&self, outpoint: &OutPoint) -> bool {
+        self.locked_coins.read().contains(outpoint)
+    }
+
+    /// Every coin `lockunspent` locked
+    pub fn locked_coins(&self) -> Vec<OutPoint> {
+        self.locked_coins.read().iter().copied().collect()
     }
 
     /// Outpoints spent by wallet transactions in the mempool
@@ -4868,6 +4895,20 @@ mod tests {
             // and the deletion reached the disk
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
             assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
+        }
+
+        /// `lockunspent` locks a coin for the whole wallet, in memory
+        #[test]
+        fn locked_coin_is_recorded_until_unlocked() {
+            let wallet = create_test_wallet();
+            let coin = TxOutPoint::new(Hash256::from_bytes([8; 32]), 1);
+            assert!(!wallet.is_coin_locked(&coin));
+            wallet.set_coin_locked(coin, true);
+            assert!(wallet.is_coin_locked(&coin));
+            assert_eq!(wallet.locked_coins(), vec![coin]);
+            wallet.set_coin_locked(coin, false);
+            assert!(!wallet.is_coin_locked(&coin));
+            assert!(wallet.locked_coins().is_empty());
         }
 
         /// the owner key alone makes a vault output ours (registered

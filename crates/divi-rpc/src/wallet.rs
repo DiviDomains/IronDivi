@@ -345,7 +345,6 @@ pub struct WalletRpc {
     block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
     /// Node mempool: unconfirmed spends, and `getrawtransaction` for pool transactions
     mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
-    locked_utxos: Arc<RwLock<HashSet<OutPoint>>>,
 }
 
 /// A history entry's amount as Core shows it: the net change to the wallet
@@ -417,7 +416,6 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
             chain: None,
-            locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -455,7 +453,6 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
             chain: None,
-            locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -468,7 +465,6 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
             chain: Some(chain),
-            locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -481,7 +477,6 @@ impl WalletRpc {
             block_fetcher: RwLock::new(None),
             mempool: RwLock::new(None),
             chain: Some(chain),
-            locked_utxos: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -3889,8 +3884,12 @@ impl WalletRpc {
 
     /// listlockunspent - Returns list of temporarily unspendable outputs
     pub fn list_lock_unspent(&self, _params: &Params) -> Result<serde_json::Value, Error> {
-        let locked = self.locked_utxos.read();
-        let result: Vec<_> = locked
+        let wallet_guard = self.wallet.read();
+        let wallet = wallet_guard
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
+        let result: Vec<_> = wallet
+            .locked_coins()
             .iter()
             .map(|outpoint| {
                 serde_json::json!({
@@ -3919,7 +3918,10 @@ impl WalletRpc {
             .and_then(|v| v.as_array())
             .ok_or_else(|| RpcError::invalid_params("outputs array required"))?;
 
-        let mut locked = self.locked_utxos.write();
+        let wallet_guard = self.wallet.read();
+        let wallet = wallet_guard
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
 
         for output in outputs_array {
             let txid_str = output
@@ -3938,11 +3940,7 @@ impl WalletRpc {
 
             let outpoint = OutPoint { txid, vout };
 
-            if unlock {
-                locked.remove(&outpoint);
-            } else {
-                locked.insert(outpoint);
-            }
+            wallet.set_coin_locked(outpoint, !unlock);
         }
 
         Ok(serde_json::Value::Bool(true))
@@ -4574,6 +4572,27 @@ mod tests {
             rpc_code(rpc.lock_unspent(&Params::None).unwrap_err()),
             codes::MISC_ERROR
         );
+    }
+
+    /// lockunspent locks the coin in the wallet itself, where the staker
+    /// sees it (Divi Core keeps locked coins out of the stake set)
+    #[test]
+    fn lockunspent_locks_the_coin_in_the_wallet() {
+        let rpc = create_test_wallet_rpc();
+        let wallet = rpc.wallet_db().unwrap();
+        let coin = OutPoint::new(Hash256::from_bytes([9; 32]), 2);
+        let entry = json!([{ "txid": coin.txid.to_string(), "vout": 2 }]);
+        rpc.lock_unspent(&Params::Array(vec![json!(false), entry.clone()]))
+            .unwrap();
+        assert!(wallet.is_coin_locked(&coin));
+        assert_eq!(
+            rpc.list_lock_unspent(&Params::None).unwrap(),
+            json!([{ "txid": coin.txid.to_string(), "vout": 2 }])
+        );
+        rpc.lock_unspent(&Params::Array(vec![json!(true), entry]))
+            .unwrap();
+        assert!(!wallet.is_coin_locked(&coin));
+        assert_eq!(rpc.list_lock_unspent(&Params::None).unwrap(), json!([]));
     }
 
     #[test]
