@@ -162,6 +162,11 @@ impl ChainDatabase {
             ColumnFamilyDescriptor::new(CF_MASTERNODES, mn_opts),
             ColumnFamilyDescriptor::new(CF_SPENT_INDEX, spent_opts),
             ColumnFamilyDescriptor::new(CF_UNDO, undo_opts),
+            ColumnFamilyDescriptor::new(crate::search_index::CF_ADDRESS_DELTA, Options::default()),
+            ColumnFamilyDescriptor::new(
+                crate::search_index::CF_ADDRESS_UNSPENT,
+                Options::default(),
+            ),
         ];
 
         tracing::info!(

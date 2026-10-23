@@ -32,6 +32,7 @@ pub mod masternode;
 pub mod pos_validation;
 pub mod prune;
 pub mod rewards;
+pub mod search_index;
 pub mod snapshot;
 pub mod spent_index;
 pub mod spork;
@@ -74,6 +75,7 @@ pub use rewards::{
     block_subsidy, get_block_rewards, get_charity_reward, get_lottery_reward, get_treasury_reward,
     is_lottery_block, is_treasury_block, BlockRewards, RewardParams,
 };
+pub use search_index::SearchIndex;
 pub use spent_index::{SpentIndex, SpentIndexKey, SpentIndexValue};
 pub use spork::{
     spork_ids, BlockPaymentSpork, BlockSubsidySpork, LotteryTicketMinSpork, SporkManager,
@@ -83,6 +85,6 @@ pub use stake_modifier::{
     compute_next_stake_modifier, get_stake_entropy_bit, get_stake_modifier_selection_interval,
     get_stake_modifier_selection_interval_section, MODIFIER_INTERVAL, MODIFIER_INTERVAL_RATIO,
 };
-pub use txindex::{TxIndex, TxLocation};
+pub use txindex::{bare_txid, TxIndex, TxLocation};
 pub use utxo::Utxo;
 pub use utxo_cache::{CacheStats, UtxoCache, DEFAULT_UTXO_CACHE_SIZE};

@@ -210,7 +210,33 @@ impl Node {
             started.elapsed().as_millis()
         );
 
-        if config.index.txindex {
+        // Divi Core keeps the index flags with the chain database: a changed
+        // -txindex refuses to start, and -addressindex/-spentindex take effect
+        // only on a new chain database (init.cpp:1103-1106, txdb.cpp:498-523)
+        let requested = divi_storage::search_index::IndexFlags {
+            txindex: config.index.txindex,
+            addressindex: config.index.addressindex,
+            spentindex: config.index.spentindex,
+        };
+        let flags =
+            divi_storage::search_index::IndexFlags::load_or_init(&db, chain.height(), requested)
+                .map_err(damaged)?;
+        if flags.txindex != requested.txindex {
+            return Err(NodeError::Init(
+                "You need to rebuild the database using -reindex to change -txindex".into(),
+            ));
+        }
+        if requested.addressindex != flags.addressindex || requested.spentindex != flags.spentindex
+        {
+            tracing::warn!(
+                "Address index {} and spent index {} as kept by this chain database; \
+                 -addressindex and -spentindex apply only to a new one",
+                if flags.addressindex { "on" } else { "off" },
+                if flags.spentindex { "on" } else { "off" },
+            );
+        }
+
+        if flags.txindex {
             let txindex_path = config.data_dir.join("txindex");
             let tx_index = divi_storage::TxIndex::open(&txindex_path).map_err(|e| {
                 tracing::error!("Failed to open transaction index: {}", e);
@@ -220,10 +246,17 @@ impl Node {
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
 
-        if config.index.spentindex {
-            let spent_index = divi_storage::SpentIndex::new(db.clone());
-            chain.enable_spent_index(Arc::new(spent_index));
-            tracing::info!("Spent index enabled");
+        if flags.addressindex || flags.spentindex {
+            chain.enable_search_index(Arc::new(divi_storage::SearchIndex::new(
+                db.clone(),
+                flags.addressindex,
+                flags.spentindex,
+            )));
+            tracing::info!(
+                "Address index {}, spent index {}",
+                if flags.addressindex { "on" } else { "off" },
+                if flags.spentindex { "on" } else { "off" },
+            );
         }
 
         // Initialize mempool
