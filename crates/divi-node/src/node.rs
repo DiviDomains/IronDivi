@@ -743,12 +743,13 @@ impl Node {
                             }
                         }
                     }
+                    // Scores found by the connection itself (handshake, framing)
                     PeerEvent::Misbehavior {
                         peer_id,
                         score,
                         reason,
                     } => {
-                        tracing::warn!("Peer {} misbehaved (score {}): {}", peer_id, score, reason);
+                        peer_manager.report_misbehavior_score(peer_id, score, &reason);
                     }
                 }
             }

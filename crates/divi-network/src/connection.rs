@@ -77,6 +77,27 @@ pub struct Connection {
     total_bytes_recv: Arc<AtomicU64>,
     /// Shared live stats for RPC
     stats: Arc<LivePeerStats>,
+    /// Nonces of the version messages this node has sent (shared by its connections)
+    local_nonces: LocalNonces,
+    /// The nonce of our version message on this connection, removed when it ends
+    sent_nonce: Option<NonceGuard>,
+}
+
+/// Nonces in the version messages a node has sent on its open connections:
+/// a version arriving with one of them comes from the node itself (Divi Core
+/// `CNode::IsSelfConnection`)
+pub type LocalNonces = Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>;
+
+/// Removes a sent nonce from the node's set when the connection ends
+struct NonceGuard {
+    nonces: LocalNonces,
+    nonce: u64,
+}
+
+impl Drop for NonceGuard {
+    fn drop(&mut self) {
+        self.nonces.lock().remove(&self.nonce);
+    }
 }
 
 impl Connection {
@@ -92,6 +113,7 @@ impl Connection {
         shutdown_rx: broadcast::Receiver<()>,
         total_bytes_sent: Arc<AtomicU64>,
         total_bytes_recv: Arc<AtomicU64>,
+        local_nonces: LocalNonces,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         // Establish TCP connection with timeout; never fall back to a direct
         // connection when the proxy fails
@@ -141,6 +163,8 @@ impl Connection {
             total_bytes_sent,
             total_bytes_recv,
             stats,
+            local_nonces,
+            sent_nonce: None,
         };
 
         Ok((conn, handle))
@@ -157,6 +181,7 @@ impl Connection {
         shutdown_rx: broadcast::Receiver<()>,
         total_bytes_sent: Arc<AtomicU64>,
         total_bytes_recv: Arc<AtomicU64>,
+        local_nonces: LocalNonces,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         let addr = stream.peer_addr()?;
         info!("Accepting connection from {}", addr);
@@ -190,6 +215,8 @@ impl Connection {
             total_bytes_sent,
             total_bytes_recv,
             stats,
+            local_nonces,
+            sent_nonce: None,
         };
 
         Ok((conn, handle))
@@ -253,12 +280,26 @@ impl Connection {
             self.info.addr, their_version.start_height, their_version.user_agent
         );
 
-        // Validate version
+        // Divi Core DisconnectOldProtocol: reject, disconnect (and the peer
+        // manager bans the address)
         if their_version.version < MIN_PEER_PROTO_VERSION {
+            let _ = self
+                .send_message(reject(
+                    "version",
+                    REJECT_OBSOLETE,
+                    &format!("Version must be {} or greater", MIN_PEER_PROTO_VERSION),
+                ))
+                .await;
             return Err(NetworkError::VersionMismatch {
                 peer: their_version.version,
                 required: MIN_PEER_PROTO_VERSION,
             });
+        }
+
+        // Divi Core IsSelfConnection: our own version came back
+        if self.local_nonces.lock().contains(&their_version.nonce) {
+            info!("Connected to self at {}, disconnecting", self.info.addr);
+            return Err(NetworkError::Connection("connected to self".into()));
         }
 
         // Store their version info
@@ -286,6 +327,21 @@ impl Connection {
         Ok(())
     }
 
+    /// A fresh nonce for our version message, recorded in the node's set
+    fn new_local_nonce(&mut self) -> u64 {
+        let nonce = loop {
+            let n: u64 = rand::random();
+            if self.local_nonces.lock().insert(n) {
+                break n;
+            }
+        };
+        self.sent_nonce = Some(NonceGuard {
+            nonces: Arc::clone(&self.local_nonces),
+            nonce,
+        });
+        nonce
+    }
+
     /// Send our version message
     async fn send_version(&mut self) -> Result<(), NetworkError> {
         let version = VersionMessage {
@@ -297,7 +353,7 @@ impl Connection {
                 .as_secs() as i64,
             addr_recv: NetAddr::from_ipv4([0, 0, 0, 0], 0, 0),
             addr_from: NetAddr::from_ipv4([0, 0, 0, 0], 0, self.our_services),
-            nonce: rand::random(),
+            nonce: self.new_local_nonce(),
             user_agent: USER_AGENT.to_string(),
             start_height: self.our_height as i32,
             relay: true,
@@ -311,15 +367,25 @@ impl Connection {
         loop {
             match self.read_message_handshake().await? {
                 Some(Decoded::Message(NetworkMessage::Version(v))) => return Ok(v),
-                Some(Decoded::Message(msg)) => {
-                    debug!("Ignoring {} during handshake", msg.command());
-                }
-                Some(Decoded::Malformed { command, error }) => {
+                Some(Decoded::Malformed { command, error }) if command == "version" => {
                     self.reject_malformed(&command, &error).await?;
                 }
+                // Divi Core does not even parse a message that comes before
+                // the version: Misbehaving(1) and ignore it
+                Some(Decoded::Message(msg)) => self.before_version(msg.command()),
+                Some(Decoded::Malformed { command, .. }) => self.before_version(&command),
                 None => {}
             }
         }
+    }
+
+    fn before_version(&self, command: &str) {
+        debug!("{} from {} before its version", command, self.info.addr);
+        let _ = self.event_tx.send(PeerEvent::Misbehavior {
+            peer_id: self.peer_id,
+            score: 1,
+            reason: "Version message has not arrived before other handshake steps".into(),
+        });
     }
 
     /// Wait for verack message (during handshake - uses blocking read, ok because no select!)
@@ -327,6 +393,14 @@ impl Connection {
         loop {
             match self.read_message_handshake().await? {
                 Some(Decoded::Message(NetworkMessage::Verack)) => return Ok(()),
+                Some(Decoded::Message(NetworkMessage::Version(_))) => {
+                    self.send_message(duplicate_version_reject()).await?;
+                    let _ = self.event_tx.send(duplicate_version(self.peer_id));
+                }
+                Some(Decoded::Malformed { command, .. }) if command == "version" => {
+                    self.send_message(duplicate_version_reject()).await?;
+                    let _ = self.event_tx.send(duplicate_version(self.peer_id));
+                }
                 Some(Decoded::Message(msg)) => {
                     debug!("Ignoring {} during handshake", msg.command());
                 }
@@ -407,6 +481,9 @@ impl Connection {
             total_bytes_sent,
             total_bytes_recv,
             stats,
+            local_nonces: _,
+            // Kept until the loop ends: the nonce leaves the node's set then
+            sent_nonce: _nonce_guard,
         } = self;
 
         // Split stream for concurrent read/write
@@ -458,18 +535,35 @@ impl Connection {
 
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
-                    let nonce = rand::random();
-                    info.ping_nonce = Some(nonce);
-                    info.ping_time = Some(std::time::Instant::now());
-                    if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
-                        error!("Failed to send keepalive ping to {}: {}", info.addr, e);
+                    if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
+                        info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
                         break;
+                    }
+                    // Like Divi Core, no new keepalive ping while one is unanswered
+                    if info.ping_nonce.is_none() {
+                        let nonce = rand::random();
+                        info.ping_nonce = Some(nonce);
+                        info.ping_time = Some(std::time::Instant::now());
+                        if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
+                            error!("Failed to send keepalive ping to {}: {}", info.addr, e);
+                            break;
+                        }
                     }
                 }
 
                 // Handle incoming messages - framed.next() IS CANCELLATION SAFE!
                 result = timeout(READ_TIMEOUT, framed.next()) => {
                     match result {
+                        Ok(Some(Ok(Decoded::Malformed { command, .. }))) if command == "version" => {
+                            let bytes_received = framed.decoder_mut().take_bytes_consumed();
+                            info.bytes_recv += bytes_received;
+                            total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
+                            if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, duplicate_version_reject()).await {
+                                error!("Failed to send reject to {}: {}", info.addr, e);
+                                break;
+                            }
+                            let _ = event_tx.send(duplicate_version(peer_id));
+                        }
                         Ok(Some(Ok(Decoded::Malformed { command, error }))) => {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
@@ -509,14 +603,19 @@ impl Connection {
                             break;
                         }
                         Err(_) => {
-                            // Timeout - send ping
-                            debug!("Read timeout from {}, sending ping", info.addr);
-                            let nonce = rand::random();
-                            info.ping_nonce = Some(nonce);
-                            info.ping_time = Some(std::time::Instant::now());
-                            if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
-                                error!("Failed to send ping to {}: {}", info.addr, e);
+                            if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
+                                info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
                                 break;
+                            }
+                            if info.ping_nonce.is_none() {
+                                debug!("Read timeout from {}, sending ping", info.addr);
+                                let nonce = rand::random();
+                                info.ping_nonce = Some(nonce);
+                                info.ping_time = Some(std::time::Instant::now());
+                                if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
+                                    error!("Failed to send ping to {}: {}", info.addr, e);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -544,6 +643,18 @@ impl Connection {
         msg: NetworkMessage,
     ) -> Result<(), NetworkError> {
         match &msg {
+            // Divi Core: one version per connection
+            NetworkMessage::Version(_) => {
+                Self::write_message(
+                    writer,
+                    info,
+                    magic,
+                    total_bytes_sent,
+                    duplicate_version_reject(),
+                )
+                .await?;
+                let _ = event_tx.send(duplicate_version(peer_id));
+            }
             NetworkMessage::Ping(nonce) => {
                 // Respond with pong
                 Self::write_message(
@@ -626,17 +737,50 @@ impl Connection {
     }
 }
 
-/// Divi Core `REJECT_MALFORMED`
+/// Divi Core reject codes
 const REJECT_MALFORMED: u8 = 0x01;
+const REJECT_OBSOLETE: u8 = 0x11;
+const REJECT_DUPLICATE: u8 = 0x12;
+
+fn reject(command: &str, code: u8, reason: &str) -> NetworkMessage {
+    NetworkMessage::Reject(crate::messages::RejectMessage {
+        message: command.to_string(),
+        code,
+        reason: reason.to_string(),
+        data: Vec::new(),
+    })
+}
 
 /// The `reject` Divi Core sends for a message that does not parse
 fn malformed_reject(command: &str) -> NetworkMessage {
-    NetworkMessage::Reject(crate::messages::RejectMessage {
-        message: command.to_string(),
-        code: REJECT_MALFORMED,
-        reason: "error parsing message".to_string(),
-        data: Vec::new(),
-    })
+    reject(command, REJECT_MALFORMED, "error parsing message")
+}
+
+fn duplicate_version_reject() -> NetworkMessage {
+    reject("version", REJECT_DUPLICATE, "Duplicate version message")
+}
+
+fn duplicate_version(peer_id: PeerId) -> PeerEvent {
+    PeerEvent::Misbehavior {
+        peer_id,
+        score: 1,
+        reason: "Duplicated version message".into(),
+    }
+}
+
+/// Divi Core `CheckForInnactivity`: disconnect after this long without
+/// receiving anything, or with a ping unanswered
+const TIMEOUT_INTERVAL: Duration = Duration::from_secs(20 * 60);
+
+/// True once a peer has been silent, or has left a ping unanswered, for
+/// longer than `TIMEOUT_INTERVAL`
+fn inactivity_exceeded(
+    last_recv: std::time::Instant,
+    ping_sent: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    now.saturating_duration_since(last_recv) > TIMEOUT_INTERVAL
+        || ping_sent.is_some_and(|sent| now.saturating_duration_since(sent) > TIMEOUT_INTERVAL)
 }
 
 #[cfg(test)]
@@ -651,5 +795,18 @@ mod tests {
     #[test]
     fn test_handshake_timeout() {
         assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// Divi Core CheckForInnactivity: 20 minutes without data, or with a ping unanswered
+    #[test]
+    fn inactive_peers_time_out_after_twenty_minutes() {
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        assert!(!inactivity_exceeded(start, None, at(20 * 60)));
+        assert!(inactivity_exceeded(start, None, at(20 * 60 + 1)));
+        // Data keeps coming but the ping is never answered
+        assert!(!inactivity_exceeded(at(1199), Some(start), at(1200)));
+        assert!(inactivity_exceeded(at(1200), Some(start), at(1201)));
+        assert!(!inactivity_exceeded(at(1200), None, at(1201)));
     }
 }

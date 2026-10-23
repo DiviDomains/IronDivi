@@ -46,6 +46,13 @@ impl TestNode {
     }
 
     pub async fn start_with(edit: impl FnOnce(&mut NodeConfig)) -> Self {
+        let t = Self::build(edit);
+        t.run().await;
+        t
+    }
+
+    /// A configured regtest node, not started yet
+    pub fn build(edit: impl FnOnce(&mut NodeConfig)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port();
         let mut config = NodeConfig::regtest(ChainMode::Divi);
@@ -56,7 +63,17 @@ impl TestNode {
         config.p2p.enable_discovery = false;
         edit(&mut config);
         let node = Node::new(config).unwrap();
-        node.start().await.unwrap();
+        TestNode {
+            node,
+            port,
+            _dir: dir,
+        }
+    }
+
+    /// Start the node and wait until it listens
+    pub async fn run(&self) {
+        self.node.start().await.unwrap();
+        let port = self.port;
         // The listener comes up on a spawned task
         tokio::time::timeout(WAIT, async {
             while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
@@ -65,11 +82,6 @@ impl TestNode {
         })
         .await
         .expect("node listens");
-        TestNode {
-            node,
-            port,
-            _dir: dir,
-        }
     }
 
     /// The misbehaviour score of the (single) peer connected from `ip`
