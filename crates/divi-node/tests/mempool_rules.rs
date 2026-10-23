@@ -270,15 +270,18 @@ fn nonstandard_transactions_are_refused() {
 
     // Exactly 100,000 bytes: within CheckTransaction's limit but not standard.
     // An OP_META output takes up the slack. The signature length varies with
-    // the content, so try pad lengths around the estimate until one fits.
-    let build = |pad: usize| {
+    // the content, so a pad window can miss 100,000; changing the first
+    // amount keeps the size and gives a new signature, so retry with that.
+    let build = |nudge: i64, pad: usize| {
         let mut outputs: Vec<TxOut> = (0..2925).map(|_| pay(COIN / 10, &owner)).collect();
+        outputs[0] = pay(COIN / 10 - nudge, &owner);
         outputs.push(meta(pad));
         sign_all(tx(&[coin], outputs), &owner, COINBASE)
     };
-    let estimate = 300 + 100_000 - build(300).size();
-    let exact = (estimate - 8..=estimate + 8)
-        .map(build)
+    let estimate = 300 + 100_000 - build(0, 300).size();
+    let exact = (0..64)
+        .flat_map(|nudge| (estimate - 8..=estimate + 8).map(move |pad| (nudge, pad)))
+        .map(|(nudge, pad)| build(nudge, pad))
         .find(|t| t.size() == 100_000)
         .expect("a pad length giving exactly 100,000 bytes");
     assert_eq!(t.relay(peer, exact).unwrap_err(), "64: tx-size");
