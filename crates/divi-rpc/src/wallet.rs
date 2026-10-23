@@ -791,7 +791,7 @@ impl WalletRpc {
         let divi_unconfirmed = unconfirmed.as_sat() as f64 / 100_000_000.0;
         let divi_immature = immature.as_sat() as f64 / 100_000_000.0;
 
-        Ok(serde_json::json!({
+        let mut info = serde_json::json!({
             "walletname": "wallet.dat",
             "active_wallet": "wallet.dat",
             "walletversion": 120200,
@@ -804,10 +804,15 @@ impl WalletRpc {
             "txcount": wallet.get_transactions(None).len(),
             "keypoololdest": wallet.keypool_oldest(),
             "keypoolsize": wallet.keypool_size(),
-            "unlocked_until": wallet.unlocked_until(),
             "paytxfee": 0.0001,
             "hdmasterkeyid": wallet.hd_master_key_id()
-        }))
+        });
+        // Core sends unlocked_until only for an encrypted wallet; clients such
+        // as BasicSwap read its presence as "encrypted" and 0 as "locked"
+        if wallet.is_encrypted() {
+            info["unlocked_until"] = serde_json::json!(wallet.unlocked_until());
+        }
+        Ok(info)
     }
 
     /// listunspent - List unspent transaction outputs
