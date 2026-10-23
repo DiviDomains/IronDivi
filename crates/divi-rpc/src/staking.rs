@@ -139,6 +139,12 @@ impl StakingRpc {
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Staking not available"))?;
 
         let info = callback();
+        // The threshold in force now, as getstakesplitthreshold reports it
+        // (setstakesplitthreshold can change it after start-up)
+        let split_threshold = self
+            .split_threshold(None)
+            .map(|sats| sats as f64 / COIN as f64)
+            .unwrap_or(info.stake_split_threshold);
 
         let staking_status_text = if info.staking && info.enabled {
             "Staking Active"
@@ -158,7 +164,7 @@ impl StakingRpc {
             "mnsync": info.mnsync,
             "staking status": info.staking && info.enabled,
             "staking status text": staking_status_text,
-            "stake split threshold": info.stake_split_threshold,
+            "stake split threshold": split_threshold,
         }))
     }
 
@@ -283,6 +289,51 @@ mod tests {
             .set_stake_split_threshold(&Params::Array(vec![serde_json::json!(-1)]))
             .is_err());
         assert!(rpc.set_stake_split_threshold(&Params::None).is_err());
+    }
+
+    #[test]
+    fn getstakingstatus_reports_the_current_split_threshold() {
+        let rpc = StakingRpc::new();
+        rpc.set_status_callback(Arc::new(|| StakingInfo {
+            enabled: true,
+            staking: false,
+            errors: None,
+            current_block_size: 0,
+            current_block_tx: 0,
+            pooled_tx: 0,
+            difficulty: 0.0,
+            search_interval: 0,
+            weight: 0,
+            netstakeweight: 0,
+            expected_time: None,
+            staking_balance: 0.0,
+            wallet_unlocked: true,
+            have_connections: true,
+            valid_time: true,
+            mintable_coins: false,
+            enough_coins: false,
+            mnsync: true,
+            blocks: 0,
+            // the value irondivid passes from its start-up config
+            stake_split_threshold: 20000.0,
+        }));
+        let value = Arc::new(parking_lot::Mutex::new(20_000 * COIN));
+        let v = Arc::clone(&value);
+        rpc.set_split_threshold_control(Arc::new(move |new| {
+            let mut cur = v.lock();
+            if let Some(n) = new {
+                *cur = n;
+            }
+            *cur
+        }));
+        rpc.set_stake_split_threshold(&Params::Array(vec![serde_json::json!(5000)]))
+            .unwrap();
+        let status = rpc.get_staking_status(&Params::None).unwrap();
+        assert_eq!(status["stake split threshold"], 5000.0);
+        assert_eq!(
+            rpc.get_stake_split_threshold(&Params::None).unwrap(),
+            serde_json::json!(5000)
+        );
     }
 
     #[test]
