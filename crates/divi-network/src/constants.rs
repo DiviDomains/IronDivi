@@ -57,8 +57,9 @@ pub const BIP0031_VERSION: i32 = 60000;
 /// Version when getheaders was introduced
 pub const GETHEADERS_VERSION: i32 = 70077;
 
-/// Maximum message payload size (32 MB)
-pub const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
+/// Largest payload accepted from a peer; a larger one ends the connection
+/// (Divi Core `MAX_PROTOCOL_MESSAGE_LENGTH`, Node.cpp)
+pub const MAX_MESSAGE_SIZE: u32 = 2 * 1024 * 1024;
 
 /// Maximum number of headers in a single headers message
 pub const MAX_HEADERS_RESULTS: usize = 2000;

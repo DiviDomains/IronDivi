@@ -60,6 +60,7 @@ pub mod error;
 pub mod message;
 pub mod messages;
 pub mod version;
+mod wire;
 
 // P2P networking
 pub mod codec;

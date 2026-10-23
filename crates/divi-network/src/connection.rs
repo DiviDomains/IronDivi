@@ -14,8 +14,8 @@
 //! Handles reading and writing network messages over TCP.
 //! Uses tokio-util's FramedRead for cancellation-safe message reading.
 
-use crate::codec::DiviCodec;
-use crate::constants::{Magic, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
+use crate::codec::{Decoded, DiviCodec};
+use crate::constants::{Magic, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
 use crate::error::NetworkError;
 use crate::message::NetAddr;
 use crate::peer::{
@@ -309,12 +309,15 @@ impl Connection {
     /// Wait for version message (during handshake - uses blocking read, ok because no select!)
     async fn recv_version(&mut self) -> Result<VersionMessage, NetworkError> {
         loop {
-            let msg = self.read_message_handshake().await?;
-            match msg {
-                NetworkMessage::Version(v) => return Ok(v),
-                _ => {
+            match self.read_message_handshake().await? {
+                Some(Decoded::Message(NetworkMessage::Version(v))) => return Ok(v),
+                Some(Decoded::Message(msg)) => {
                     debug!("Ignoring {} during handshake", msg.command());
                 }
+                Some(Decoded::Malformed { command, error }) => {
+                    self.reject_malformed(&command, &error).await?;
+                }
+                None => {}
             }
         }
     }
@@ -322,52 +325,71 @@ impl Connection {
     /// Wait for verack message (during handshake - uses blocking read, ok because no select!)
     async fn recv_verack(&mut self) -> Result<(), NetworkError> {
         loop {
-            let msg = self.read_message_handshake().await?;
-            match msg {
-                NetworkMessage::Verack => return Ok(()),
-                _ => {
+            match self.read_message_handshake().await? {
+                Some(Decoded::Message(NetworkMessage::Verack)) => return Ok(()),
+                Some(Decoded::Message(msg)) => {
                     debug!("Ignoring {} during handshake", msg.command());
                 }
+                Some(Decoded::Malformed { command, error }) => {
+                    self.reject_malformed(&command, &error).await?;
+                }
+                None => {}
             }
         }
     }
 
-    /// Read a message during handshake (not cancellation-safe, but OK since no select!)
-    async fn read_message_handshake(&mut self) -> Result<NetworkMessage, NetworkError> {
+    /// Divi Core's answer to a message that does not parse
+    async fn reject_malformed(&mut self, command: &str, error: &str) -> Result<(), NetworkError> {
+        debug!(
+            "{} from {} does not parse: {}",
+            command, self.info.addr, error
+        );
+        self.send_message(malformed_reject(command)).await
+    }
+
+    /// Read a message during handshake (not cancellation-safe, but OK since no
+    /// select!). It reads exactly one message, so nothing is buffered past it,
+    /// and applies the codec's framing rules: `None` is a skipped message.
+    async fn read_message_handshake(&mut self) -> Result<Option<Decoded>, NetworkError> {
         use crate::message::{MessageHeader, HEADER_SIZE};
         use tokio::io::AsyncReadExt;
 
-        // Read header
         let mut header_buf = [0u8; HEADER_SIZE];
         self.stream.read_exact(&mut header_buf).await?;
         let header = MessageHeader::deserialize(&header_buf)?;
-
-        // Validate magic
         if !header.validate_magic(&self.magic) {
             return Err(NetworkError::InvalidMagic);
         }
+        if header.payload_size > MAX_MESSAGE_SIZE {
+            return Err(NetworkError::MessageTooLarge {
+                size: header.payload_size,
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
 
-        // Read payload
         let mut payload = vec![0u8; header.payload_size as usize];
-        if header.payload_size > 0 {
-            self.stream.read_exact(&mut payload).await?;
-        }
+        self.stream.read_exact(&mut payload).await?;
 
-        // Validate checksum
-        if !header.validate_checksum(&payload) {
-            return Err(NetworkError::InvalidChecksum);
-        }
-
-        // Update stats
         let bytes_received = HEADER_SIZE as u64 + header.payload_size as u64;
         self.info.bytes_recv += bytes_received;
         self.info.last_recv = std::time::Instant::now();
         self.total_bytes_recv
             .fetch_add(bytes_received, Ordering::Relaxed);
 
-        // Deserialize
+        if !header.command_is_valid() || !header.validate_checksum(&payload) {
+            debug!("Skipping a damaged message from {}", self.info.addr);
+            return Ok(None);
+        }
         let command = header.command_string();
-        NetworkMessage::deserialize(&command, &payload)
+        Ok(Some(
+            match NetworkMessage::deserialize(&command, &payload) {
+                Ok(message) => Decoded::Message(message),
+                Err(e) => Decoded::Malformed {
+                    command,
+                    error: e.to_string(),
+                },
+            },
+        ))
     }
 
     /// Main message processing loop using cancellation-safe FramedRead
@@ -448,7 +470,18 @@ impl Connection {
                 // Handle incoming messages - framed.next() IS CANCELLATION SAFE!
                 result = timeout(READ_TIMEOUT, framed.next()) => {
                     match result {
-                        Ok(Some(Ok(msg))) => {
+                        Ok(Some(Ok(Decoded::Malformed { command, error }))) => {
+                            let bytes_received = framed.decoder_mut().take_bytes_consumed();
+                            info.bytes_recv += bytes_received;
+                            info.last_recv = std::time::Instant::now();
+                            total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
+                            debug!("{} from {} does not parse: {}", command, info.addr, error);
+                            if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, malformed_reject(&command)).await {
+                                error!("Failed to send reject to {}: {}", info.addr, e);
+                                break;
+                            }
+                        }
+                        Ok(Some(Ok(Decoded::Message(msg)))) => {
                             // Exact bytes the codec took off the wire for this message
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
 
@@ -591,6 +624,19 @@ impl Connection {
         trace!("Sent {} to {}", msg.command(), self.info.addr);
         Ok(())
     }
+}
+
+/// Divi Core `REJECT_MALFORMED`
+const REJECT_MALFORMED: u8 = 0x01;
+
+/// The `reject` Divi Core sends for a message that does not parse
+fn malformed_reject(command: &str) -> NetworkMessage {
+    NetworkMessage::Reject(crate::messages::RejectMessage {
+        message: command.to_string(),
+        code: REJECT_MALFORMED,
+        reason: "error parsing message".to_string(),
+        data: Vec::new(),
+    })
 }
 
 #[cfg(test)]

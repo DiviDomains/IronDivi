@@ -22,6 +22,18 @@ use crate::serialize::{Decodable, Encodable};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
+/// Divi Core `MAX_SIZE`: `ReadCompactSize` refuses a larger size
+pub const MAX_SIZE: u64 = 0x0200_0000;
+
+/// Most memory reserved up front for a vector read from the wire; larger
+/// vectors grow as their items arrive (Divi Core reserves 5 MB at a time)
+pub const MAX_PREALLOC_BYTES: usize = 5_000_000;
+
+/// Capacity to reserve for `len` items of `T` announced by untrusted data
+pub fn prealloc_len<T>(len: usize) -> usize {
+    len.min(MAX_PREALLOC_BYTES / std::mem::size_of::<T>().max(1))
+}
+
 /// A variable-length integer encoding
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CompactSize(pub u64);
@@ -131,6 +143,12 @@ impl Decodable for CompactSize {
             v
         };
 
+        if value > MAX_SIZE {
+            return Err(Error::Deserialization(
+                "ReadCompactSize(): size too large".to_string(),
+            ));
+        }
+
         Ok(CompactSize(value))
     }
 }
@@ -184,23 +202,25 @@ mod tests {
 
     #[test]
     fn test_compact_size_roundtrip() {
-        let values = vec![
-            0u64,
-            1,
-            252,
-            253,
-            254,
-            255,
-            0xFFFF,
-            0x10000,
-            0xFFFFFFFF,
-            0x100000000,
-        ];
+        let values = vec![0u64, 1, 252, 253, 254, 255, 0xFFFF, 0x10000, MAX_SIZE];
         for v in values {
             let cs = CompactSize(v);
             let encoded = serialize(&cs);
             let decoded: CompactSize = deserialize(&encoded).unwrap();
             assert_eq!(decoded.0, v, "Roundtrip failed for {}", v);
+        }
+    }
+
+    /// Divi Core `ReadCompactSize`: "size too large" above MAX_SIZE
+    #[test]
+    fn sizes_above_max_size_are_refused() {
+        for v in [MAX_SIZE + 1, 0xFFFFFFFF, 0x100000000] {
+            let encoded = serialize(&CompactSize(v));
+            assert!(
+                deserialize::<CompactSize>(&encoded).is_err(),
+                "{} accepted",
+                v
+            );
         }
     }
 
