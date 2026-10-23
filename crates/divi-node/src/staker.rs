@@ -22,7 +22,7 @@ use divi_crypto::compute_block_hash;
 use divi_network::{BlockConnectedCallback, PeerManager};
 use divi_primitives::amount::Amount;
 use divi_primitives::block::{Block, BlockHeader};
-use divi_primitives::hash::Hash256;
+use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::script::Script;
 use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use divi_storage::Chain;
@@ -1088,6 +1088,14 @@ impl Staker {
         let mut generation_failed_count = 0u32;
         for candidate in &candidates {
             let utxo = candidate.utxo();
+            // Core's stake set holds every spendable coin, but only P2PKH, P2PK
+            // and vault coins can be the kernel (PoSTransactionCreator.cpp:142-160)
+            if matches!(candidate, StakeCandidate::Regular(_))
+                && !divi_script::standard::is_p2pkh(utxo.script_pubkey.as_bytes())
+                && !divi_script::standard::is_p2pk(utxo.script_pubkey.as_bytes())
+            {
+                continue;
+            }
             // Look up confirmation block from cache first (immutable, never changes)
             let (block_time_of_first_confirmation, block_hash_of_first_confirmation) =
                 match utxo.height {
@@ -1521,6 +1529,13 @@ impl Staker {
             .secret
             .as_ref()
             .ok_or_else(|| "Cannot stake with watch-only address".to_string())?;
+        // A P2PK kernel signs the block with a DER signature checked against
+        // the key in the script (BlockSigning.cpp:69-80)
+        if divi_script::standard::is_p2pk(stake_utxo.script_pubkey.as_bytes()) {
+            let signature = divi_crypto::sign_hash(secret, block_hash.as_bytes())
+                .map_err(|e| format!("Failed to sign block: {}", e))?;
+            return Ok(signature.to_der());
+        }
         let signature = divi_crypto::sign_hash_recoverable(secret, block_hash.as_bytes())
             .map_err(|e| format!("Failed to sign block: {}", e))?;
 
@@ -1786,9 +1801,14 @@ impl Staker {
         let signer = TransactionSigner::new(self.wallet.keystore());
         let prev_scripts: Vec<Script> = spent.iter().map(|u| u.script_pubkey.clone()).collect();
 
-        let signed = signer
-            .sign_all_inputs(&mut tx, &prev_scripts)
-            .map_err(|e| format!("Failed to sign coinstake: {}", e))?;
+        let no_redeem_script = |_: &Hash160| None;
+        let mut signed = 0;
+        for (i, script) in prev_scripts.iter().enumerate() {
+            let verified = signer
+                .sign_and_merge_input(&mut tx, i, script, &no_redeem_script)
+                .map_err(|e| format!("Failed to sign coinstake: {}", e))?;
+            signed += usize::from(verified);
+        }
 
         if signed != spent.len() {
             return Err("Failed to sign coinstake input".to_string());
@@ -2708,6 +2728,95 @@ mod tests {
                 assert_eq!(coinstake.vin.len(), 1);
             }
             _ => panic!("expected a vault stake"),
+        }
+    }
+
+    /// A P2PK coin of a wallet key stakes as in Divi Core: the coinstake pays
+    /// back to the same P2PK script and the block carries a DER signature by
+    /// that key (PoSTransactionCreator.cpp:142-160, BlockSigning.cpp:69-80),
+    /// which the chain accepts.
+    #[test]
+    fn p2pk_coin_stakes() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        chain.set_ibd_mode(false);
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let key = wallet.new_receiving_address().unwrap();
+        let mut p2pk = vec![33u8];
+        p2pk.extend_from_slice(&wallet.get_key_by_address(&key).unwrap().pubkey_bytes());
+        p2pk.push(0xac);
+        let p2pk = Script::from_bytes(p2pk);
+
+        // Block 1 pays its coinbase to the P2PK script; the proof-of-work
+        // blocks up to 100 make it mature (regtest stakes from block 101)
+        for height in 1..=100u32 {
+            let tip = chain.tip().unwrap();
+            let payee = if height == 1 {
+                p2pk.clone()
+            } else {
+                Script::new_p2pkh(&[0xee; 20])
+            };
+            let mut sig = divi_storage::bip34_height_script(height);
+            sig.push(0);
+            let mut block = Block::default();
+            block.header.version = 4;
+            block.header.prev_block = tip.hash;
+            block.header.time = tip.time + 60;
+            block.header.bits = 0x207fffff;
+            block.transactions = vec![Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+                vout: vec![TxOut::new(Amount::from_divi(1250), payee)],
+                lock_time: 0,
+            }];
+            block.header.merkle_root = compute_merkle_root(&block.transactions);
+            let target = Hash256::from_compact(block.header.bits);
+            while compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            let hash = chain.accept_block(block.clone()).unwrap().hash;
+            wallet.scan_block(hash, height, block.header.time, &block.transactions);
+            wallet.set_last_scan_height(height);
+        }
+
+        let staker = Staker::new(
+            wallet,
+            chain.clone(),
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig {
+                allow_stale_tip: true,
+                min_coin_age: 0,
+                ..StakingConfig::default()
+            },
+        );
+        match staker.try_stake() {
+            StakeResult::Success { block, .. } => {
+                let coinstake = &block.transactions[1];
+                assert!(coinstake.is_coinstake());
+                assert_eq!(coinstake.vout[1].script_pubkey, p2pk);
+                chain
+                    .accept_block(block.clone())
+                    .expect("the chain accepts the P2PK stake");
+                assert_eq!(chain.height(), 101);
+            }
+            StakeResult::Error(e) => panic!("expected a P2PK stake: {}", e),
+            _ => panic!("expected a P2PK stake"),
         }
     }
 

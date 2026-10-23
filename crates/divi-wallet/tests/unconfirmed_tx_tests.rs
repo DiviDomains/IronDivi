@@ -122,7 +122,12 @@ fn assert_send_kept(wallet: &WalletDb, fund: &Transaction, send: &Transaction) {
     );
     assert_eq!(spendable.len(), 1);
     assert_eq!(spendable[0].txid, send.txid());
-    assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
+    // The change is unconfirmed balance, not getbalance's (Divi Core)
+    assert_eq!(wallet.get_balance().as_sat(), 0);
+    assert_eq!(
+        wallet.get_unconfirmed_balance().as_sat(),
+        70 * COIN - 1_000_000
+    );
     assert_eq!(wallet.mempool_tx_count(), 1);
 }
 
@@ -177,7 +182,11 @@ fn unconfirmed_chain_of_sends_survives_restart() {
     let spendable = wallet.get_spendable_utxos(100, 0);
     assert_eq!(spendable.len(), 1);
     assert_eq!(spendable[0].txid, child.txid());
-    assert_eq!(wallet.get_balance().as_sat(), 60 * COIN - 2_000_000);
+    assert_eq!(wallet.get_balance().as_sat(), 0);
+    assert_eq!(
+        wallet.get_unconfirmed_balance().as_sat(),
+        60 * COIN - 2_000_000
+    );
 }
 
 #[test]

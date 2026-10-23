@@ -33,6 +33,9 @@ pub const DIVI_COIN_TYPE: u32 = 301;
 /// PrivateDivi coin type for BIP44 derivation
 pub const PRIVATEDIVI_COIN_TYPE: u32 = 801;
 
+/// Coin type Divi Core derives with on testnet and regtest
+pub const TEST_COIN_TYPE: u32 = 1;
+
 /// Extended private key wrapper
 #[derive(Clone)]
 pub struct ExtendedPrivateKey {
@@ -124,8 +127,12 @@ pub struct HdWallet {
     master: ExtendedPrivateKey,
     /// Mnemonic words (if available)
     mnemonic: Option<String>,
+    /// BIP39 passphrase the seed was made with (Divi Core's -mnemonicpassphrase)
+    passphrase: Option<String>,
     /// Chain mode affects BIP44 coin type
     chain_mode: ChainMode,
+    /// BIP44 coin type of the derivation path
+    coin_type: u32,
 }
 
 impl HdWallet {
@@ -156,7 +163,9 @@ impl HdWallet {
         Ok(HdWallet {
             master,
             mnemonic: Some(phrase.to_string()),
+            passphrase: passphrase.filter(|p| !p.is_empty()).map(str::to_string),
             chain_mode,
+            coin_type: legacy_coin_type(chain_mode),
         })
     }
 
@@ -166,13 +175,31 @@ impl HdWallet {
         Ok(HdWallet {
             master,
             mnemonic: None,
+            passphrase: None,
             chain_mode,
+            coin_type: legacy_coin_type(chain_mode),
         })
+    }
+
+    /// Derive with another BIP44 coin type (see `core_coin_type`)
+    pub fn with_coin_type(mut self, coin_type: u32) -> Self {
+        self.coin_type = coin_type;
+        self
     }
 
     /// Get the mnemonic phrase (if available)
     pub fn mnemonic(&self) -> Option<&str> {
         self.mnemonic.as_deref()
+    }
+
+    /// The BIP39 passphrase of the seed, if one was given
+    pub fn mnemonic_passphrase(&self) -> Option<&str> {
+        self.passphrase.as_deref()
+    }
+
+    /// The chain mode the wallet was made for
+    pub fn chain_mode(&self) -> ChainMode {
+        self.chain_mode
     }
 
     /// Get the HD master key ID (hash160 of master public key)
@@ -185,12 +212,9 @@ impl HdWallet {
         Ok(*hash.as_bytes())
     }
 
-    /// Get the BIP44 coin type for the current chain mode
+    /// The BIP44 coin type of the derivation path
     pub fn coin_type(&self) -> u32 {
-        match self.chain_mode {
-            ChainMode::Divi => DIVI_COIN_TYPE,
-            ChainMode::PrivateDivi => PRIVATEDIVI_COIN_TYPE,
-        }
+        self.coin_type
     }
 
     /// Derive BIP44 account key
@@ -236,6 +260,23 @@ impl HdWallet {
     pub fn get_master_pubkey(&self) -> Result<divi_crypto::keys::PublicKey, WalletError> {
         let secret = self.master.secret_key()?;
         Ok(secret.public_key())
+    }
+}
+
+/// Coin type of wallets made before the coin type was stored: the chain mode's
+fn legacy_coin_type(chain_mode: ChainMode) -> u32 {
+    match chain_mode {
+        ChainMode::Divi => DIVI_COIN_TYPE,
+        ChainMode::PrivateDivi => PRIVATEDIVI_COIN_TYPE,
+    }
+}
+
+/// BIP44 coin type Divi Core derives with: 301 on mainnet and 1 on testnet and
+/// regtest (chainparams.cpp nExtCoinType). PrivateDivi keeps its own.
+pub fn core_coin_type(chain_mode: ChainMode, mainnet: bool) -> u32 {
+    match chain_mode {
+        ChainMode::Divi if !mainnet => TEST_COIN_TYPE,
+        mode => legacy_coin_type(mode),
     }
 }
 

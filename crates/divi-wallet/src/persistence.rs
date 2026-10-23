@@ -55,6 +55,9 @@ const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
 const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
 const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+const KEY_HD_COIN_TYPE: &[u8] = b"hd_coin_type";
+pub(crate) const KEY_MNEMONIC_PASSPHRASE: &[u8] = b"mnemonic_passphrase";
+pub(crate) const KEY_ENCRYPTED_MNEMONIC_PASSPHRASE: &[u8] = b"encrypted_mnemonic_passphrase";
 pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
 
 /// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
@@ -145,6 +148,64 @@ impl WalletDatabase {
                 let mnemonic =
                     String::from_utf8(data).map_err(|e| WalletError::Storage(e.to_string()))?;
                 Ok(Some(mnemonic))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Store the BIP39 passphrase of an unencrypted wallet's seed
+    pub fn store_mnemonic_passphrase(&self, passphrase: &str) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_MNEMONIC_PASSPHRASE, passphrase.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load the BIP39 passphrase of an unencrypted wallet's seed
+    pub fn load_mnemonic_passphrase(&self) -> Result<Option<String>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        match self
+            .db
+            .get_cf(cf, KEY_MNEMONIC_PASSPHRASE)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(data) => String::from_utf8(data)
+                .map(Some)
+                .map_err(|e| WalletError::Storage(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// The encrypted BIP39 passphrase blob of an encrypted wallet
+    pub fn load_encrypted_mnemonic_passphrase(&self) -> Result<Option<Vec<u8>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Store the BIP44 coin type the wallet derives with
+    pub fn store_hd_coin_type(&self, coin_type: u32) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_HD_COIN_TYPE, coin_type.to_le_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// The stored BIP44 coin type; None for wallets made before it was stored
+    pub fn load_hd_coin_type(&self) -> Result<Option<u32>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        match self
+            .db
+            .get_cf(cf, KEY_HD_COIN_TYPE)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(data) => {
+                let bytes: [u8; 4] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| WalletError::Storage("Invalid coin type".into()))?;
+                Ok(Some(u32::from_le_bytes(bytes)))
             }
             None => Ok(None),
         }

@@ -291,19 +291,18 @@ fn importprivkey_rescan_false_waits_for_rescanblockchain() {
     assert_eq!(net.coins_at(&addr), 25 * COIN);
 }
 
+/// Divi Core watches the address but records only transactions that pay or
+/// spend a spendable output (wallet.cpp:1292-1311), so even after the rescan
+/// the coin paid to the watched address is not the wallet's
 #[test]
-fn importaddress_rescan_true_shows_past_coins_watch_only() {
+fn importaddress_rescan_true_watches_without_recording_coins() {
     let net = Net::new();
     let (_key, addr) = funded_foreign_key(&net);
 
     net.rpc
         .import_address(&p(vec![json!(addr.to_string()), json!(""), json!(true)]))
         .unwrap();
-    assert_eq!(
-        net.coins_at(&addr),
-        25 * COIN,
-        "rescan did not find the coin"
-    );
+    assert_eq!(net.coins_at(&addr), 0, "a watched coin was recorded");
     let info = net
         .rpc
         .validate_address(&p(vec![json!(addr.to_string())]))
@@ -314,14 +313,14 @@ fn importaddress_rescan_true_shows_past_coins_watch_only() {
 }
 
 #[test]
-fn importaddress_rescan_false_waits_for_rescanblockchain() {
+fn importaddress_rescan_false_labels_the_address() {
     let net = Net::new();
     let (_key, addr) = funded_foreign_key(&net);
 
     net.rpc
         .import_address(&p(vec![json!(addr.to_string()), json!("w"), json!(false)]))
         .unwrap();
-    assert_eq!(net.coins_at(&addr), 0, "rescan=false must not scan");
+    assert_eq!(net.coins_at(&addr), 0);
     assert_eq!(
         net.rpc
             .get_account(&p(vec![json!(addr.to_string())]))
@@ -330,5 +329,5 @@ fn importaddress_rescan_false_waits_for_rescanblockchain() {
     );
 
     net.rpc.rescan_blockchain(&Params::None).unwrap();
-    assert_eq!(net.coins_at(&addr), 25 * COIN);
+    assert_eq!(net.coins_at(&addr), 0, "a watched coin was recorded");
 }

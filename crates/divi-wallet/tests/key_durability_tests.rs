@@ -163,15 +163,16 @@ fn keypool_refill_survives_lock_and_restart() {
     let path = dir.path().join("wallet");
     let wallet = new_encrypted_wallet(&path);
     wallet.unlock("pw", 60).unwrap();
-    // walletpassphrase already topped the pool up to the default size
-    assert_eq!(wallet.refill_keypool(Some(110)).unwrap(), 10);
+    // walletpassphrase already topped the pool up to the default size, 1000
+    // keys per chain; 1005 per chain adds 5 receiving and 5 change keys
+    assert_eq!(wallet.refill_keypool(Some(1005)).unwrap(), 10);
     let pool: Vec<Address> = wallet.get_addresses();
-    assert_eq!(pool.len(), 110);
+    assert_eq!(pool.len(), 2010);
     wallet.lock();
     drop(wallet);
 
     let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
-    assert_eq!(wallet.keypool_size(), 110);
+    assert_eq!(wallet.keypool_size(), 2010);
     wallet.unlock("pw", 60).unwrap();
     for addr in &pool {
         assert_owned_and_signs(&wallet, addr);

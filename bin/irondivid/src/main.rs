@@ -1197,16 +1197,31 @@ fn load_or_create_wallet(
     chain_mode: ChainMode,
 ) -> Result<Arc<WalletDb>> {
     let restoring = std::env::var("WALLET_MNEMONIC").ok();
-    load_or_create_wallet_from(wallet_path, network, chain_mode, restoring)
+    // Divi Core's -mnemonicpassphrase: the BIP39 passphrase of the seed
+    let passphrase = std::env::var("WALLET_MNEMONIC_PASSPHRASE").ok();
+    load_or_restore_wallet(wallet_path, network, chain_mode, restoring, passphrase)
 }
 
-/// Load the wallet at `wallet_path`, or create it: restored from `restoring`
-/// when a mnemonic is given, otherwise from a fresh random seed.
+/// `load_or_restore_wallet` with no mnemonic passphrase
+#[cfg(test)]
 fn load_or_create_wallet_from(
     wallet_path: &PathBuf,
     network: WalletNetwork,
     chain_mode: ChainMode,
     restoring: Option<String>,
+) -> Result<Arc<WalletDb>> {
+    load_or_restore_wallet(wallet_path, network, chain_mode, restoring, None)
+}
+
+/// Load the wallet at `wallet_path`, or create it: restored from `restoring`
+/// when a mnemonic is given (with its BIP39 `passphrase`), otherwise from a
+/// fresh random seed.
+fn load_or_restore_wallet(
+    wallet_path: &PathBuf,
+    network: WalletNetwork,
+    chain_mode: ChainMode,
+    restoring: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
@@ -1251,11 +1266,14 @@ fn load_or_create_wallet_from(
             "Restoring wallet from WALLET_MNEMONIC environment variable (chain_mode={:?})",
             restore_chain_mode
         );
-        HdWallet::from_mnemonic(mnemonic, None, restore_chain_mode)
+        HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode)
             .with_context(|| "Failed to restore HD wallet from mnemonic")?
     } else {
         HdWallet::new(chain_mode).with_context(|| "Failed to generate HD wallet")?
     };
+    if passphrase.is_some() && restoring.is_none() {
+        warn!("WALLET_MNEMONIC_PASSPHRASE is used only with WALLET_MNEMONIC");
+    }
 
     // Never log the mnemonic: logs go to journald and log files, which are
     // neither encrypted nor access-controlled like the wallet. Point the
@@ -1265,32 +1283,27 @@ fn load_or_create_wallet_from(
     let wallet = WalletDb::create_persistent(wallet_path, network, hd_wallet)
         .with_context(|| "Failed to create wallet")?;
 
-    // When restoring from mnemonic, pre-generate keys so the catch-up scan can find
-    // UTXOs. They go into the keypool, as in Core, so the receiving and change
-    // indices stay at 0: issuing them instead would put the next getnewaddress at
-    // /0/{lookahead} and the next change output at /1/{lookahead}, past the gap
-    // limit of other wallets restoring the same seed.
-    if restoring.is_some() {
-        let lookahead: u32 = std::env::var("WALLET_LOOKAHEAD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(200);
-        info!(
-            "Pre-generating {} receiving and {} change addresses for wallet recovery",
-            lookahead, lookahead
-        );
-        let generated = wallet
-            .refill_keypool(Some(lookahead * 2))
-            .with_context(|| "Failed to pre-generate recovery keys")?;
-        info!("Pre-generated {} addresses", generated);
-    }
-
-    // A new wallet starts with a full keypool, as in Divi Core
-    if restoring.is_none() {
-        wallet
-            .top_up_keypool()
-            .with_context(|| "Failed to fill the keypool")?;
-    }
+    // A new or restored wallet starts with a full keypool, as in Divi Core,
+    // whose restore finds the coins of exactly these keys: the catch-up scan
+    // from genesis recognises every keypool key. WALLET_LOOKAHEAD sets how many
+    // keys of each chain a restore pre-generates (default: the keypool size).
+    // They stay in the keypool, so the receiving and change indices stay low.
+    let lookahead = restoring
+        .is_some()
+        .then(|| std::env::var("WALLET_LOOKAHEAD").ok()?.parse::<u32>().ok())
+        .flatten();
+    let generated = wallet
+        .refill_keypool(lookahead)
+        .with_context(|| "Failed to fill the keypool")?;
+    info!("Keypool filled with {} keys", generated);
+    // Divi Core's default key: the first receiving key, taken from the
+    // keypool with an empty label (wallet.cpp:342-356)
+    let default_key = wallet
+        .new_receiving_address()
+        .with_context(|| "Failed to take the default key")?;
+    wallet
+        .set_label(&default_key, "")
+        .with_context(|| "Failed to label the default key")?;
 
     // Save immediately
     wallet.save().with_context(|| "Failed to save wallet")?;
@@ -2676,7 +2689,8 @@ mod wallet_log_tests {
     #[test]
     fn test_restored_wallet_issues_from_index_zero() {
         // Core's keypool hands out its oldest key, so a restored wallet's first
-        // change output goes to /1/0 even though the lookahead derived /1/0..199.
+        // change output goes to /1/0 even though the keypool derived /1/0..999;
+        // receiving key /0/0 is the default key, so getnewaddress starts at /0/1.
         let mnemonic = "abandon abandon abandon abandon abandon abandon \
                         abandon abandon abandon abandon abandon about";
         let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2690,25 +2704,40 @@ mod wallet_log_tests {
         )
         .expect("wallet restore");
 
-        assert_eq!(wallet.keystore().get_indices(), (0, 0));
-        assert_eq!(wallet.keypool_size(), 400);
+        assert_eq!(wallet.keystore().get_indices(), (1, 0));
+        assert_eq!(wallet.keypool_size(), 1999);
 
-        let hd = divi_wallet::HdWallet::from_mnemonic(&mnemonic, None, ChainMode::Divi).unwrap();
+        // Divi Core derives m/44'/1'/0'/change/i on regtest; the seed of
+        // this BIP39 test vector
+        let seed = hex::decode(
+            "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1\
+             9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4",
+        )
+        .unwrap();
+        let account = divi_wallet::ExtendedPrivateKey::from_seed(&seed)
+            .unwrap()
+            .derive_hardened(44)
+            .unwrap()
+            .derive_hardened(1)
+            .unwrap()
+            .derive_hardened(0)
+            .unwrap();
         let addr_at = |change: bool, i: u32| {
-            let key = if change {
-                hd.derive_change(0, i).unwrap()
-            } else {
-                hd.derive_receiving(0, i).unwrap()
-            };
+            let key = account
+                .derive_normal(u32::from(change))
+                .unwrap()
+                .derive_normal(i)
+                .unwrap();
             divi_wallet::KeyEntry::with_hd_path(key.secret_key().unwrap(), String::new())
                 .address(WalletNetwork::Regtest)
         };
-        // The whole lookahead is still recognised for the catch-up scan.
-        assert!(wallet.is_mine(&addr_at(false, 199)));
-        assert!(wallet.is_mine(&addr_at(true, 199)));
+        // The whole keypool is still recognised for the catch-up scan.
+        assert!(wallet.is_mine(&addr_at(false, 999)));
+        assert!(wallet.is_mine(&addr_at(true, 999)));
+        assert!(wallet.is_mine(&addr_at(false, 0)));
 
         assert_eq!(wallet.new_change_address().unwrap(), addr_at(true, 0));
-        assert_eq!(wallet.new_receiving_address().unwrap(), addr_at(false, 0));
+        assert_eq!(wallet.new_receiving_address().unwrap(), addr_at(false, 1));
     }
 }
 
