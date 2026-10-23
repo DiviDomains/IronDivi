@@ -1385,19 +1385,14 @@ async fn run_daemon(
         let tx_relay_for_callback = node.tx_relay().clone();
         let chain_for_callback = node.chain().clone();
         block_sync.set_block_connected_callback(Arc::new(move |block, height| {
-            let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
-            for tx in block.transactions.iter().skip(1) {
-                if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
-                    total_fees += mempool_entry.fee;
-                }
-            }
-            let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-            mempool_for_callback.remove_for_block(&txids);
-            evict_block_conflicts(&mempool_for_callback, &chain_for_callback, block);
-            for txid in &txids {
-                tx_relay_for_callback.mark_seen(*txid);
-            }
-            fee_estimator_for_callback.add_block(height, block, total_fees);
+            mempool_block_connected(
+                &mempool_for_callback,
+                &chain_for_callback,
+                |txid| tx_relay_for_callback.mark_seen(txid),
+                &fee_estimator_for_callback,
+                block,
+                height,
+            );
         }));
 
         None
@@ -1434,19 +1429,14 @@ async fn run_daemon(
                 sync_wallet_to_tip(&wallet_for_scan, &chain_for_scan);
 
                 // 2. Calculate fees from mempool entries and clean mempool
-                let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
-                for tx in block.transactions.iter().skip(1) {
-                    if let Some(mempool_entry) = mempool_for_callback.get(&tx.txid()) {
-                        total_fees += mempool_entry.fee;
-                    }
-                }
-                let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-                mempool_for_callback.remove_for_block(&txids);
-                evict_block_conflicts(&mempool_for_callback, &chain_for_scan, block);
-                for txid in &txids {
-                    tx_relay_for_callback.mark_seen(*txid);
-                }
-                fee_estimator_for_callback.add_block(height, block, total_fees);
+                let total_fees = mempool_block_connected(
+                    &mempool_for_callback,
+                    &chain_for_scan,
+                    |txid| tx_relay_for_callback.mark_seen(txid),
+                    &fee_estimator_for_callback,
+                    block,
+                    height,
+                );
 
                 // 3. Persist dirty wallet changes to database (incremental, not full rewrite)
                 if let Err(e) = wallet_for_scan.save_incremental() {
@@ -1518,74 +1508,6 @@ async fn run_daemon(
             }
             info!("Wallet reorg callback registered");
 
-            // Register orphaned transaction callback: re-add txs from disconnected blocks
-            // to the mempool so they can be re-mined on the new chain.
-            {
-                let mempool_for_orphans = node.mempool().clone();
-                let chain_for_orphans = node.chain().clone();
-                block_sync.set_orphaned_tx_callback(Arc::new(
-                    move |orphaned_txs: Vec<Transaction>| {
-                        info!(
-                            "Reorg: re-adding {} orphaned transaction(s) to mempool",
-                            orphaned_txs.len()
-                        );
-                        for tx in orphaned_txs {
-                            let txid = tx.txid();
-                            // Calculate fee by summing inputs minus outputs using the UTXO set
-                            let fee = {
-                                let mut input_total = Amount::from_sat(0);
-                                let mut ok = true;
-                                for input in &tx.vin {
-                                    match chain_for_orphans.get_utxo(&input.prevout) {
-                                        Ok(Some(utxo)) => {
-                                            input_total += utxo.value;
-                                        }
-                                        _ => {
-                                            // UTXO not found — tx may depend on another orphaned tx
-                                            // that is also being re-added; skip fee check and use 0.
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if ok {
-                                    let output_total: Amount = tx
-                                        .vout
-                                        .iter()
-                                        .map(|o| o.value)
-                                        .fold(Amount::from_sat(0), |a, b| a + b);
-                                    if input_total >= output_total {
-                                        input_total - output_total
-                                    } else {
-                                        Amount::from_sat(0)
-                                    }
-                                } else {
-                                    Amount::from_sat(0)
-                                }
-                            };
-                            match mempool_for_orphans.add(tx, fee) {
-                                Ok(_) => {
-                                    debug!(
-                                        "Re-added orphaned tx {} to mempool (fee: {} sat)",
-                                        txid,
-                                        fee.as_sat()
-                                    );
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "Could not re-add orphaned tx {} to mempool: {}",
-                                        txid, e
-                                    );
-                                }
-                            }
-                        }
-                        // The tip may now be lower: drop what can no longer be mined
-                        mempool_for_orphans.remove_non_final();
-                    },
-                ));
-            }
-            info!("Orphaned transaction callback registered");
-
             // Catch-up scan: process blocks between last_scan_height and current chain tip.
             // Block notifications may already be arriving; they share the wallet's scan
             // lock and its scan height, so neither side skips or reorders a block.
@@ -1638,6 +1560,24 @@ async fn run_daemon(
 
         wallet
     };
+
+    // After every chain reorganization, return the transactions of the
+    // disconnected blocks to the mempool and drop what the new chain confirmed
+    // or made unspendable, as Divi Core's disconnectTip and connectTip do. This
+    // does not depend on the wallet.
+    {
+        let mempool_for_reorg = node.mempool().clone();
+        let chain_for_reorg = node.chain().clone();
+        node.block_sync().set_orphaned_tx_callback(Arc::new(
+            move |orphaned_txs: Vec<Transaction>| {
+                divi_node::update_mempool_after_reorg(
+                    &chain_for_reorg,
+                    &mempool_for_reorg,
+                    orphaned_txs,
+                );
+            },
+        ));
+    }
 
     // Block-expiry pruning: runs after the wallet catch-up scan above, then periodically.
     // Bodies within MIN_BLOCKS_TO_KEEP of the tip (and above the wallet's scan height)
@@ -1724,20 +1664,15 @@ async fn run_daemon(
                 // (see the block-connected callback for why)
                 sync_wallet_to_tip(&wallet_for_staker, &chain_for_staker_scan);
 
-                // 2. Calculate fees from mempool entries and clean mempool
-                let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
-                for tx in block.transactions.iter().skip(1) {
-                    if let Some(mempool_entry) = mempool_for_staker.get(&tx.txid()) {
-                        total_fees += mempool_entry.fee;
-                    }
-                }
-                let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-                mempool_for_staker.remove_for_block(&txids);
-                evict_block_conflicts(&mempool_for_staker, &chain_for_staker_scan, block);
-                for txid in &txids {
-                    tx_relay_for_staker.mark_seen(*txid);
-                }
-                fee_estimator_for_staker.add_block(height, block, total_fees);
+                // 2. Clean the mempool and feed the fee estimator
+                mempool_block_connected(
+                    &mempool_for_staker,
+                    &chain_for_staker_scan,
+                    |txid| tx_relay_for_staker.mark_seen(txid),
+                    &fee_estimator_for_staker,
+                    block,
+                    height,
+                );
 
                 // 3. Persist wallet changes
                 if let Err(e) = wallet_for_staker.save_incremental() {
@@ -2060,23 +1995,51 @@ fn blockchain_synced(chain: &divi_storage::Chain) -> bool {
             .is_some_and(|t| now.saturating_sub(t.time as u64) <= 600)
 }
 
-/// Drop mempool txs that double-spend an input of `block`, if the block is on
-/// the active chain (the callbacks are also handed side-chain blocks).
-fn evict_block_conflicts(
-    mempool: &divi_node::Mempool,
-    chain: &divi_storage::Chain,
-    block: &divi_primitives::block::Block,
-) {
+/// Whether `block` is on the active chain (the sync layer also hands over
+/// blocks it stored on a side chain)
+fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::Block) -> bool {
     let hash = compute_block_hash(&block.header);
-    let active = chain
+    chain
         .get_block_index(&hash)
         .ok()
         .flatten()
         .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
-        .is_some_and(|index| index.hash == hash);
-    if active {
-        mempool.remove_conflicts(&block.transactions);
+        .is_some_and(|index| index.hash == hash)
+}
+
+/// The mempool side of a block handed over by the sync layer or the staker.
+/// A block on the active chain removes the transactions it confirms and those
+/// that conflict with it, and goes to the fee estimator, as Divi Core's
+/// connectTip does (removeConfirmedTransactions, ChainTipManager.cpp:139-141).
+/// A block stored on a side chain confirms nothing and leaves the mempool as it
+/// is. Blocks a reorganisation connected below the new tip are covered by
+/// `update_mempool_after_reorg`. Returns the fees of the block's transactions
+/// that were in the mempool.
+fn mempool_block_connected(
+    mempool: &divi_node::Mempool,
+    chain: &divi_storage::Chain,
+    mark_seen: impl Fn(divi_primitives::hash::Hash256),
+    fee_estimator: &divi_node::FeeEstimator,
+    block: &divi_primitives::block::Block,
+    height: u32,
+) -> divi_primitives::amount::Amount {
+    let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
+    for txid in &txids {
+        mark_seen(*txid);
     }
+    let mut total_fees = divi_primitives::amount::Amount::from_sat(0);
+    if !block_is_active(chain, block) {
+        return total_fees;
+    }
+    for txid in txids.iter().skip(1) {
+        if let Some(mempool_entry) = mempool.get(txid) {
+            total_fees += mempool_entry.fee;
+        }
+    }
+    mempool.remove_for_block(&txids);
+    mempool.remove_conflicts(&block.transactions);
+    fee_estimator.add_block(height, block, total_fees);
+    total_fees
 }
 
 /// Scan the active chain into the wallet, in order, from its last scanned
@@ -3037,5 +3000,115 @@ mod log_rotation_tests {
                 ("debug.log.1".to_string(), 2000)
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod mempool_block_tests {
+    use super::*;
+    use divi_primitives::amount::Amount;
+    use divi_primitives::block::Block;
+    use divi_primitives::hash::Hash256;
+    use divi_primitives::script::Script;
+    use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
+
+    const COIN: i64 = 100_000_000;
+
+    fn block_on(
+        chain: &divi_storage::Chain,
+        parent: Hash256,
+        tag: u8,
+        txs: &[Transaction],
+    ) -> Block {
+        let parent = chain.get_block_index(&parent).unwrap().unwrap();
+        let mut sig = divi_storage::bip34_height_script(parent.height + 1);
+        sig.push(tag);
+        let mut block = Block::default();
+        block.header.version = 4;
+        block.header.prev_block = parent.hash;
+        block.header.time = parent.time + 60 + u32::from(tag);
+        block.header.bits = 0x207fffff;
+        block.transactions = vec![Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1250 * COIN),
+                Script::from_bytes(vec![0x51]),
+            )],
+            lock_time: 0,
+        }];
+        block.transactions.extend_from_slice(txs);
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    /// A block the sync layer stored on a side chain confirms nothing: the
+    /// mempool keeps its transactions and the fee estimator does not see it.
+    /// Its sibling on the active chain removes them.
+    #[test]
+    fn only_a_block_on_the_active_chain_cleans_the_mempool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::regtest(divi_primitives::ChainMode::Divi);
+        config.data_dir = dir.path().to_path_buf();
+        let node = divi_node::Node::new(config).unwrap();
+        let chain = node.chain();
+        let mut coin = None;
+        for _ in 0..21 {
+            let block = block_on(chain, chain.tip().unwrap().hash, 0, &[]);
+            coin.get_or_insert(OutPoint::new(block.transactions[0].txid(), 0));
+            chain.accept_block(block).unwrap();
+        }
+        let pending = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin.unwrap(), Script::new(), 0xffffffff)],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1249 * COIN),
+                Script::from_bytes(vec![0x51]),
+            )],
+            lock_time: 0,
+        };
+        // A mempool without the chain checks: this is about which blocks clean
+        // it, not about what it admits
+        let mempool = divi_node::Mempool::new(divi_node::config::MempoolConfig::default());
+        mempool
+            .add(pending.clone(), Amount::from_sat(COIN))
+            .unwrap();
+
+        let parent = chain.tip().unwrap().hash;
+        let side = block_on(
+            chain,
+            chain.tip().unwrap().prev_hash,
+            1,
+            std::slice::from_ref(&pending),
+        );
+        chain.accept_block(side.clone()).unwrap();
+        assert_ne!(chain.tip().unwrap().hash, compute_block_hash(&side.header));
+        let fees = mempool_block_connected(
+            &mempool,
+            chain,
+            |_| {},
+            node.fee_estimator(),
+            &side,
+            chain.height(),
+        );
+        assert!(mempool.contains(&pending.txid()));
+        assert_eq!(fees, Amount::from_sat(0));
+
+        let active = block_on(chain, parent, 0, std::slice::from_ref(&pending));
+        chain.accept_block(active.clone()).unwrap();
+        let fees = mempool_block_connected(
+            &mempool,
+            chain,
+            |_| {},
+            node.fee_estimator(),
+            &active,
+            chain.height(),
+        );
+        assert!(!mempool.contains(&pending.txid()));
+        assert_eq!(fees, Amount::from_sat(COIN));
     }
 }

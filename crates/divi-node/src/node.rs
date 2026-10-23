@@ -26,7 +26,7 @@ use divi_network::{
 };
 use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
-use divi_primitives::transaction::Transaction;
+use divi_primitives::transaction::{OutPoint, Transaction};
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType as StorageNetworkType};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
@@ -912,16 +912,14 @@ impl Node {
         let hash = compute_block_hash(&block.header);
 
         // Validate and add to chain
-        let _result = self
+        let result = self
             .chain
             .accept_block(block.clone())
             .map_err(|e| NodeError::BlockValidation(e.to_string()))?;
 
-        // Remove confirmed transactions from mempool and mark as seen in relay
+        // A block on the active chain confirms its transactions and makes double
+        // spends of its inputs unminable; one stored on a side chain does neither
         let txids: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-        self.mempool.remove_for_block(&txids);
-        // Double spends of the block's inputs can never confirm, if the block
-        // is on the active chain
         let active = self
             .chain
             .get_block_index_by_height(self.chain.height())
@@ -929,7 +927,16 @@ impl Node {
             .flatten()
             .is_some_and(|tip| tip.hash == hash);
         if active {
+            self.mempool.remove_for_block(&txids);
             self.mempool.remove_conflicts(&block.transactions);
+        }
+        if let Some(fork_height) = result.reorg_fork_height {
+            tracing::info!(
+                "Block {} reorganised the chain at height {}",
+                hash,
+                fork_height
+            );
+            update_mempool_after_reorg(&self.chain, &self.mempool, result.orphaned_transactions);
         }
         for txid in &txids {
             self.tx_relay.mark_seen(*txid);
@@ -1348,6 +1355,61 @@ pub fn accept_relayed_transaction(
         }
     }
     result
+}
+
+/// Whether a chain coin can be spent by a transaction in the next block: it
+/// is unspent and, if a coinbase or coinstake output, mature at that height
+/// (Divi Core CheckInputs, UtxoCheckingAndUpdating.cpp:61-78, which the
+/// mempool runs with the tip as the spending block's parent).
+fn spendable_in_next_block(chain: &Chain, outpoint: &OutPoint) -> Result<bool, NodeError> {
+    let next_height = chain.height() + 1;
+    let maturity = chain.params().coinbase_maturity;
+    Ok(chain
+        .get_utxo(outpoint)?
+        .is_some_and(|utxo| utxo.is_mature_with(next_height, maturity)))
+}
+
+/// Bring the mempool in line with the active chain after a reorganisation.
+///
+/// Divi Core does this block by block. disconnectTip offers every transaction
+/// of a disconnected block to AcceptToMemoryPool, then drops the mempool
+/// transactions spending a coinbase or coinstake output that is gone or no
+/// longer mature (removeCoinbaseSpends); connectTip removes the transactions
+/// each connected block confirms and those conflicting with it
+/// (ChainTipManager.cpp:139-141, :175-183). Here the chain has already moved:
+/// `disconnected` (parents before children, as `Chain::accept_block` returns
+/// them) is offered first, through `Mempool::add`, which works out the fee and
+/// applies Core's AcceptToMemoryPool with `fLimitFree` false as disconnectTip
+/// does; then every transaction the new chain made unspendable goes, with its
+/// descendants.
+pub fn update_mempool_after_reorg(
+    chain: &Arc<Chain>,
+    mempool: &Arc<Mempool>,
+    disconnected: Vec<Transaction>,
+) {
+    let offered = disconnected.len();
+    let mut returned = 0;
+    for tx in disconnected {
+        let txid = tx.txid();
+        match mempool.add(tx, divi_primitives::amount::Amount::ZERO) {
+            Ok(_) => returned += 1,
+            Err(e) => tracing::debug!(
+                "Transaction {} of a disconnected block not returned to the mempool: {}",
+                txid,
+                e
+            ),
+        }
+    }
+    let dropped = mempool
+        .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
+    // The tip may now be lower: drop what can no longer be mined
+    mempool.remove_non_final();
+    tracing::info!(
+        "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
+        returned,
+        offered,
+        dropped
+    );
 }
 
 /// Divi Core `MAX_STANDARD_TX_SIZE` (defaultValues.h:54)

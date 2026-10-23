@@ -604,6 +604,13 @@ impl Staker {
                                 // Undo what the wallet recorded from the disconnected
                                 // blocks; the callback below rescans the new branch
                                 self.wallet.handle_reorg(fork_height);
+                                // Return their transactions to the mempool, as for a
+                                // reorganisation a peer's block causes
+                                crate::node::update_mempool_after_reorg(
+                                    &self.chain,
+                                    &self.mempool,
+                                    result.orphaned_transactions,
+                                );
                             }
                             info!(
                                 "Self-accepted staked block {} at height {}",

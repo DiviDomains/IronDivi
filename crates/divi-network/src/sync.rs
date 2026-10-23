@@ -315,9 +315,10 @@ pub type BlockConnectedCallback = Arc<dyn Fn(&Block, u32) + Send + Sync>;
 /// Callback for when a chain reorganization occurs (parameter is fork height)
 pub type ReorgCallback = Arc<dyn Fn(u32) + Send + Sync>;
 
-/// Callback invoked after a reorg with the transactions that were in disconnected
-/// blocks but are not present in any of the newly-connected blocks.  The node
-/// should re-insert these into the mempool so they can be re-mined.
+/// Callback invoked after every reorg with the transactions that were in
+/// disconnected blocks but are not present in any of the newly-connected blocks
+/// (possibly none). The node should re-insert these into the mempool so they
+/// can be re-mined, and drop what the new chain made unspendable.
 pub type OrphanedTxCallback = Arc<dyn Fn(Vec<Transaction>) + Send + Sync>;
 
 /// Number of block hashes a getblocks answer carries when more follow (C++ limit).
@@ -434,22 +435,22 @@ impl BlockSync {
 
     /// Set callback for orphaned transactions after a chain reorganization.
     /// The callback receives transactions from disconnected blocks that were not
-    /// included in the new chain and should be re-added to the mempool.
+    /// included in the new chain and should be re-added to the mempool. It runs
+    /// after every reorganization, with an empty list too: the mempool must also
+    /// drop what the new chain confirmed or made unspendable.
     pub fn set_orphaned_tx_callback(&self, callback: OrphanedTxCallback) {
         *self.orphaned_tx_callback.write() = Some(callback);
     }
 
-    /// Fire reorg callbacks: notifies the reorg callback with `fork_height` and,
-    /// if there are orphaned transactions, invokes the orphaned-tx callback so
-    /// they can be re-added to the mempool.
+    /// Fire reorg callbacks: notifies the reorg callback with `fork_height`,
+    /// then the orphaned-tx callback, which returns the disconnected blocks'
+    /// transactions to the mempool and updates it for the new chain.
     fn fire_reorg_callbacks(&self, fork_height: u32, orphaned_txs: Vec<Transaction>) {
         if let Some(callback) = self.reorg_callback.read().as_ref() {
             callback(fork_height);
         }
-        if !orphaned_txs.is_empty() {
-            if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
-                callback(orphaned_txs);
-            }
+        if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
+            callback(orphaned_txs);
         }
     }
 
@@ -1722,13 +1723,14 @@ impl BlockSync {
                             // We have the full block but it's not on main chain
                             // Try to activate it (reorg if it has more work)
                             match self.chain.try_activate_block(&hash) {
-                                Ok(true) => {
+                                Ok(Some((fork_height, orphaned))) => {
                                     info!("Reorg triggered by block {} from inv", hash);
+                                    self.fire_reorg_callbacks(fork_height, orphaned);
                                     reorg_triggered = true;
                                     already_have += 1;
                                     continue;
                                 }
-                                Ok(false) => {
+                                Ok(None) => {
                                     // Stored on a side chain with less work than our
                                     // tip. We already hold it: count it as known. Re-
                                     // queueing it was the deep-fork loop: the queue

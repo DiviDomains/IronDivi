@@ -17,7 +17,7 @@ use crate::config::MempoolConfig;
 use crate::error::{reject, NodeError};
 use divi_primitives::amount::Amount;
 use divi_primitives::hash::Hash256;
-use divi_primitives::transaction::Transaction;
+use divi_primitives::transaction::{OutPoint, Transaction};
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -532,6 +532,46 @@ impl Mempool {
 
         if removed > 0 {
             tracing::info!("Removed {} non-final transaction(s) from mempool", removed);
+        }
+        removed
+    }
+
+    /// Remove every transaction with an input that is neither spendable on chain
+    /// (`on_chain`) nor an output of another transaction still in the mempool,
+    /// until none is left, so descendants follow their parents. After the chain
+    /// changed branch this drops what the new chain confirmed (its inputs are
+    /// spent there, while its children stay, their inputs now on chain), what
+    /// conflicts with the new chain, and what spends a coin the new chain does
+    /// not have or has not matured. Returns how many were removed.
+    pub fn remove_unspendable(&self, on_chain: impl Fn(&OutPoint) -> bool) -> usize {
+        let mut removed = 0;
+        loop {
+            let doomed: Vec<Hash256> = {
+                let txs = self.txs.read();
+                txs.values()
+                    .filter(|entry| {
+                        entry.tx.vin.iter().any(|input| {
+                            let from_pool = txs.get(&input.prevout.txid).is_some_and(|parent| {
+                                (input.prevout.vout as usize) < parent.tx.vout.len()
+                            });
+                            !from_pool && !on_chain(&input.prevout)
+                        })
+                    })
+                    .map(|entry| entry.txid)
+                    .collect()
+            };
+            if doomed.is_empty() {
+                break;
+            }
+            for txid in doomed {
+                if self.remove(&txid).is_some() {
+                    removed += 1;
+                    tracing::info!(
+                        "Removed tx {} from mempool: inputs no longer spendable",
+                        txid
+                    );
+                }
+            }
         }
         removed
     }
