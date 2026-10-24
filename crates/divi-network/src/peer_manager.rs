@@ -163,6 +163,8 @@ pub struct PeerManager {
     scoring: PeerScoring,
     /// Nonces of our version messages on open connections (self-connection check)
     local_nonces: crate::connection::LocalNonces,
+    /// The node's own addresses (Divi Core mapLocalHost)
+    local_addresses: RwLock<Arc<crate::local::LocalAddresses>>,
     /// Manually added nodes (via addnode RPC)
     added_nodes: RwLock<HashSet<SocketAddr>>,
     /// Addresses currently being connected to (connection attempt in progress)
@@ -193,6 +195,7 @@ impl PeerManager {
             shutdown_tx,
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
+            local_addresses: RwLock::new(Arc::new(Default::default())),
             added_nodes: RwLock::new(HashSet::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -319,6 +322,16 @@ impl PeerManager {
     /// block bodies must clear `NODE_NETWORK` and set `NODE_NETWORK_LIMITED`.
     pub fn set_services(&self, services: u64) {
         self.our_services.store(services, Ordering::Relaxed);
+    }
+
+    /// Set the node's own addresses, before any connection starts
+    pub fn set_local_addresses(&self, local: crate::local::LocalAddresses) {
+        *self.local_addresses.write() = Arc::new(local);
+    }
+
+    /// The node's own addresses
+    pub fn local_addresses(&self) -> Arc<crate::local::LocalAddresses> {
+        Arc::clone(&self.local_addresses.read())
     }
 
     /// Service bits we currently advertise
@@ -708,6 +721,7 @@ impl PeerManager {
             self.bytes_sent_counter(),
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
+            self.local_addresses(),
         )
         .await;
 
@@ -771,6 +785,7 @@ impl PeerManager {
             self.bytes_sent_counter(),
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
+            self.local_addresses(),
         )
         .await?;
 

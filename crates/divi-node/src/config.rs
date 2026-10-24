@@ -385,6 +385,19 @@ pub struct P2pConfig {
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+
+    /// Learn local addresses from the bound address and the machine's
+    /// interfaces (Divi Core -discover)
+    #[serde(default = "default_discover")]
+    pub discover: bool,
+
+    /// Addresses this node is reachable at (Divi Core -externalip)
+    #[serde(default)]
+    pub external_ips: Vec<SocketAddr>,
+
+    /// The machine's interface addresses, found at start with `discover`
+    #[serde(default)]
+    pub interface_ips: Vec<std::net::IpAddr>,
 }
 
 impl P2pConfig {
@@ -420,6 +433,10 @@ impl P2pConfig {
     }
 }
 
+fn default_discover() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -446,6 +463,9 @@ impl Default for P2pConfig {
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             connect_timeout_ms: default_connect_timeout_ms(),
+            discover: default_discover(),
+            external_ips: Vec::new(),
+            interface_ips: Vec::new(),
         }
     }
 }

@@ -502,6 +502,8 @@ impl Node {
         self.peer_manager
             .set_services(divi_network::constants::advertised_services(prunes));
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
+        self.peer_manager
+            .set_local_addresses(self.local_addresses());
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -1366,6 +1368,38 @@ impl Node {
     }
 
     /// Get network info
+    /// The node's own addresses, learned as Divi Core learns them: a routable
+    /// bound address (net.cpp:1379-1380), -externalip (net.cpp:1834-1839),
+    /// then the interfaces (net.cpp:1385-1425)
+    fn local_addresses(&self) -> divi_network::local::LocalAddresses {
+        use divi_network::local::{LocalAddresses, LOCAL_BIND, LOCAL_IF, LOCAL_MANUAL};
+        let p2p = &self.config.p2p;
+        let listen = self.config.peer_sources().listen;
+        let local = LocalAddresses::new(listen, p2p.discover, p2p.port);
+        let bound = p2p
+            .listen_addr
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>();
+        if let (true, Ok(ip)) = (listen, bound) {
+            local.add(std::net::SocketAddr::new(ip, p2p.port), LOCAL_BIND);
+        }
+        for addr in &p2p.external_ips {
+            local.add(*addr, LOCAL_MANUAL);
+        }
+        for ip in &p2p.interface_ips {
+            local.add(std::net::SocketAddr::new(*ip, p2p.port), LOCAL_IF);
+        }
+        for a in local.list() {
+            tracing::info!(
+                "Local address {} port {} score {}",
+                a.address,
+                a.port,
+                a.score
+            );
+        }
+        local
+    }
+
     pub fn get_network_info(&self) -> NetworkInfo {
         NetworkInfo {
             version: self.config.network.protocol_version,

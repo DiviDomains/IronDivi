@@ -66,6 +66,7 @@ mod wire;
 // P2P networking
 pub mod codec;
 pub mod connection;
+pub mod local;
 pub mod masternode_handler;
 pub mod peer;
 pub mod peer_manager;

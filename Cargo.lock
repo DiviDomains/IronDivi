@@ -4157,6 +4157,7 @@ dependencies = [
  "dirs",
  "divi-crypto",
  "divi-masternode",
+ "divi-network",
  "divi-node",
  "divi-primitives",
  "divi-rpc",

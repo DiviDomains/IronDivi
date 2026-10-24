@@ -92,7 +92,17 @@ impl NetworkRpc {
                 }
             ],
             "relayfee": 0.0001,
-            "localaddresses": []
+            // Divi Core gives port and score as strings (NetworkLocalAddressHelpers.cpp:45-51)
+            "localaddresses": pm
+                .map(|pm| pm.local_addresses().list())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| serde_json::json!({
+                    "address": a.address.to_string(),
+                    "port": a.port.to_string(),
+                    "score": a.score.to_string(),
+                }))
+                .collect::<Vec<_>>()
         }))
     }
 
