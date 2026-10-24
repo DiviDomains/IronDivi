@@ -127,6 +127,12 @@ fn lying_payloads() -> Vec<(&'static str, Vec<u8>)> {
     // ... the first with one input whose script is MAX_SIZE long
     out.push(("block", [&v4[..], &max, &tx_huge_script].concat()));
     out.push(("block", [&v4[..], &max, &tx_huge_out].concat()));
+    // ... the first announcing MAX_SIZE inputs, the first of them with a
+    // script MAX_SIZE long: three nested reservations
+    out.push((
+        "block",
+        [&v4[..], &max, &tx_head(&[&max[..], &[0u8; 36], &max].concat())].concat(),
+    ));
     // Many announced headers
     out.push(("headers", compact(1_000_000)));
     // Inventory that announces the most items a 2 MiB payload could hold
