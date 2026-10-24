@@ -1,0 +1,16 @@
+setupmasternode alias txhash outputIndex collateralPubKey ip_address
+
+Starts escrows funds for some purpose.
+
+Arguments:
+1. alias			    (string, required) Helpful identifier to recognize this masternode later. 
+2. txHash              (string, required) Funding transaction hash or bare txid. 
+3. outputIndex         (string, required) Output index transaction. 
+4. collateralPubkey    (string, required) collateral pubkey. 
+5. ip_address          (string, required) Local ip address of this node
+
+Result:
+"protocol_version"			(string) Protocol version used for serialization.
+"message_to_sign"			(string) Hex-encoded msg requiring collateral signature.
+"config_line"			    (string) Configuration data needed in the.
+"broadcast_data"			    (string) funding transaction id necessary for next step.

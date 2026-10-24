@@ -1,0 +1,11 @@
+reclaimvaultfunds destination amount (feeMode|metadata) ( "comment" "comment-to" )
+
+Withdraw an amount from your vaults into a separate address. The amount is a real and is rounded to the nearest 0.00000001
+
+Requires wallet passphrase to be set with walletpassphrase call.
+Arguments:
+1. "diviaddress"  (string, required) The divi address of your choosing to send to.
+2. "amount"      (numeric, required) The amount in DIVI to move. eg 0.1
+
+Result:
+"transactionid"  (string) The transaction id.

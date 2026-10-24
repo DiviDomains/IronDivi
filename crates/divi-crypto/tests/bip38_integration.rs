@@ -15,6 +15,9 @@
 
 use divi_crypto::{bip38_decrypt, bip38_encrypt, SecretKey};
 
+/// Divi mainnet's P2PKH address version
+const D: u8 = 30;
+
 #[test]
 fn test_bip38_paper_wallet_workflow() {
     // 1. Generate a new private key (as if creating a paper wallet)
@@ -27,7 +30,7 @@ fn test_bip38_paper_wallet_workflow() {
     let passphrase = "MySecurePassphrase123!";
 
     // 3. Encrypt the private key for paper wallet storage
-    let encrypted = bip38_encrypt(&key_array, passphrase, true).unwrap();
+    let encrypted = bip38_encrypt(&key_array, passphrase, true, D).unwrap();
 
     println!("Encrypted BIP38 key: {}", encrypted);
     assert!(
@@ -36,7 +39,7 @@ fn test_bip38_paper_wallet_workflow() {
     );
 
     // 4. Later, user wants to import the paper wallet
-    let (decrypted_key, compressed) = bip38_decrypt(&encrypted, passphrase).unwrap();
+    let (decrypted_key, compressed) = bip38_decrypt(&encrypted, passphrase, D).unwrap();
 
     // 5. Verify the decrypted key matches the original
     assert_eq!(key_array, decrypted_key);
@@ -52,10 +55,10 @@ fn test_bip38_different_passphrases() {
     let private_key = [0x42; 32];
 
     // Encrypt with passphrase A
-    let encrypted_a = bip38_encrypt(&private_key, "password_a", true).unwrap();
+    let encrypted_a = bip38_encrypt(&private_key, "password_a", true, D).unwrap();
 
     // Encrypt with passphrase B - should produce different ciphertext
-    let encrypted_b = bip38_encrypt(&private_key, "password_b", true).unwrap();
+    let encrypted_b = bip38_encrypt(&private_key, "password_b", true, D).unwrap();
 
     assert_ne!(
         encrypted_a, encrypted_b,
@@ -63,15 +66,15 @@ fn test_bip38_different_passphrases() {
     );
 
     // Each can be decrypted with its own passphrase
-    let (decrypted_a, _) = bip38_decrypt(&encrypted_a, "password_a").unwrap();
-    let (decrypted_b, _) = bip38_decrypt(&encrypted_b, "password_b").unwrap();
+    let (decrypted_a, _) = bip38_decrypt(&encrypted_a, "password_a", D).unwrap();
+    let (decrypted_b, _) = bip38_decrypt(&encrypted_b, "password_b", D).unwrap();
 
     assert_eq!(private_key, decrypted_a);
     assert_eq!(private_key, decrypted_b);
 
     // Cross-decryption should fail
-    assert!(bip38_decrypt(&encrypted_a, "password_b").is_err());
-    assert!(bip38_decrypt(&encrypted_b, "password_a").is_err());
+    assert!(bip38_decrypt(&encrypted_a, "password_b", D).is_err());
+    assert!(bip38_decrypt(&encrypted_b, "password_a", D).is_err());
 }
 
 #[test]
@@ -80,15 +83,15 @@ fn test_bip38_compressed_vs_uncompressed() {
     let passphrase = "test";
 
     // Encrypt in both formats
-    let encrypted_compressed = bip38_encrypt(&private_key, passphrase, true).unwrap();
-    let encrypted_uncompressed = bip38_encrypt(&private_key, passphrase, false).unwrap();
+    let encrypted_compressed = bip38_encrypt(&private_key, passphrase, true, D).unwrap();
+    let encrypted_uncompressed = bip38_encrypt(&private_key, passphrase, false, D).unwrap();
 
     // They should be different
     assert_ne!(encrypted_compressed, encrypted_uncompressed);
 
     // Decrypt and verify compression flags
-    let (key_c, compressed_c) = bip38_decrypt(&encrypted_compressed, passphrase).unwrap();
-    let (key_u, compressed_u) = bip38_decrypt(&encrypted_uncompressed, passphrase).unwrap();
+    let (key_c, compressed_c) = bip38_decrypt(&encrypted_compressed, passphrase, D).unwrap();
+    let (key_u, compressed_u) = bip38_decrypt(&encrypted_uncompressed, passphrase, D).unwrap();
 
     assert_eq!(private_key, key_c);
     assert_eq!(private_key, key_u);

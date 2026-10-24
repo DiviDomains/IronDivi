@@ -1,0 +1,38 @@
+getmasternodewinners ( blocks "filter" )
+
+Print the masternode winners for the last n blocks
+
+Arguments:
+1. blocks      (numeric, optional) Number of previous blocks to show (default: 10)
+2. filter      (string, optional) Search filter matching MN address
+
+Result (single winner):
+[
+  {
+    "nHeight": n,           (numeric) block height
+    "winner": {
+      "address": "xxxx",    (string) DIVI MN Address
+      "nVotes": n,          (numeric) Number of votes for winner
+    }
+  }
+  ,...
+]
+
+Result (multiple winners):
+[
+  {
+    "nHeight": n,           (numeric) block height
+    "winner": [
+      {
+        "address": "xxxx",  (string) DIVI MN Address
+        "nVotes": n,        (numeric) Number of votes for winner
+      }
+      ,...
+    ]
+  }
+  ,...
+]
+
+Examples:
+> divi-cli getmasternodewinners 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getmasternodewinners", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

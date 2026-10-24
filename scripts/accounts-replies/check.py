@@ -17,6 +17,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -196,11 +197,26 @@ def short(out):
     return json.dumps(v)[:60]
 
 
+# divid's help texts name sample addresses in their examples; irondivid's write
+# them "diviaddress" (no address of anyone's wallet is written in the tree). A
+# help text given as an error is compared with those written alike, as
+# scripts/help-replies compares them.
+SAMPLE_ADDRESS = re.compile(r"(?<![0-9A-Za-z])(?=[1-9A-HJ-NP-Za-km-z]*\d)(?=[1-9A-HJ-NP-Za-km-z]*[A-Za-z])"
+                            r"[1-9A-HJ-NP-Za-km-z]{26,35}(?![0-9A-Za-z])")
+
+
+def help_text_samples(out):
+    if out[0] == "err" and isinstance(out[2], str) and "\nExamples:\n" in out[2]:
+        return ("err", out[1], SAMPLE_ADDRESS.sub("diviaddress", out[2]))
+    return out
+
+
 def compare(name, core, iron, drop=MOMENT | NOTES, order=None):
     """Same outcome; for a result the same fields and values (except `drop`), list
     items in divid's order unless `order` gives a sort key"""
     if INJECT and INJECT == name and iron[0] == "ok":
         iron = ("ok", inject(iron[1]))
+    core, iron = help_text_samples(core), help_text_samples(iron)
     if core[0] == "err" or iron[0] == "err":
         same = core[0] == iron[0] and core[1:] == iron[1:]
         row(name, short(core), short(iron), same)

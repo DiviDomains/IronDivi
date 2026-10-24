@@ -1,0 +1,11 @@
+debitvaultbyname source destination amount (feeMode)
+Withdraw an amount from a specific vaults to a destination address. The amount is a real and is rounded to the nearest 0.00000001
+
+Arguments:
+1. "vault-encoding"  (string, required) The vault encoding to withdraw from.
+2. "diviaddress"  (string, required) The divi address of your choosing to send to.
+3. "amount"      (numeric, required) The amount in DIVI to move. eg 0.1
+4. "fee mode"      (string, optional) The fee + change output calculation mode
+
+Result:
+"transactionid"  (string) The transaction id.

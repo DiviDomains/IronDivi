@@ -1,0 +1,17 @@
+getstakingstatus
+Returns an object containing various staking information.
+
+Result:
+{
+  "validtime": true|false,          (boolean) if the chain tip is within staking phases
+  "haveconnections": true|false,    (boolean) if network connections are present
+  "walletunlocked": true|false,     (boolean) if the wallet is unlocked
+  "mintablecoins": true|false,      (boolean) if the wallet has mintable coins
+  "enoughcoins": true|false,        (boolean) if available coins are greater than reserve balance
+  "mnsync": true|false,             (boolean) if masternode data is synced
+  "staking status": true|false,     (boolean) if the wallet is staking or not
+}
+
+Examples:
+> divi-cli getstakingstatus 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getstakingstatus", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

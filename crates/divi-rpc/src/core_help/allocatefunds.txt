@@ -1,0 +1,11 @@
+allocatefunds purpose alias tier ( "pay wallet" ( "voting wallet" ) )
+
+Starts escrows funds for some purpose.
+
+Arguments:
+1. purpose			(string, required) Helpful identifier to recognize this allocation later.  Currently only masternode is recognized. 
+2. identifier      (string, required) Helpful Identifier to recognize the specific instance of the funding type that the funding is for. 
+3. tier			(diamond, platinum, gold, silver, copper) tier of masternode. 
+
+Result:
+"vin"			(string) funding transaction id or bare txid necessary for next step.

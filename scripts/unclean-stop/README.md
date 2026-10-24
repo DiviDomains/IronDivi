@@ -17,6 +17,8 @@ CORE_BIN=~/divi-3.0.0/bin scripts/unclean-stop/run.sh 54300
 | `WORK_ROOT` | a fresh directory is made under it and deleted at the end (`$TMPDIR`, else `/tmp`) |
 | `UNCLEAN_KILLS` | kill points per row (5) |
 | `UNCLEAN_BLOCKS` | length of the chain row 1 syncs (320) |
+| `UNCLEAN_ROWS` | the rows to run, comma separated: `sync`, `wallet`, `reindex`, `relay`, `reorg` (all) |
+| `UNCLEAN_REINDEX_DELAYS_MS` | row 4 at these delays after `Building the transaction index` instead of the seeded points, e.g. `$(seq -s, 1 30)` for one kill each millisecond while the indexes are built |
 | `KEEP=1` | keep the work directory (node logs, the datadir of a failed point) when a row fails |
 
 The script uses ports `<port-base>` to `<port-base>+9` and expects nothing at `<port-base>+49`. Nodes bind to
@@ -60,7 +62,7 @@ the line says so (`restart=refused (...); started with -reindex`).
 | `first-start-kill` | the first start on an empty datadir: irondivid 0-10 ms after it logs "Opening RocksDB" (the chain database is being made), divid 0-0.5 s after start | starts again (or says what it needs); tip a core1 block with the clean UTXO set; then synced to core1: same as core1 |
 | `encrypt-kill` | during `encryptwallet`; delay 0 .. 1.3 x the call's time | the wallet is unencrypted, or opens with the passphrase; balance and `dumpprivkey` of a known address unchanged |
 | `change-kill` | during `walletpassphrasechange`; same window | opens with the old or the new passphrase; balance and `dumpprivkey` unchanged |
-| `reindex-kill` | start with `-reindex` and the three indexes; odd points a delay after start, even points 0-15 ms after "Building the transaction index" | started without `-reindex`: tip, UTXO set, `getrawtransaction` of the known txids, `getaddressbalance` of the known addresses, `getspentinfo` of the spent outputs equal the clean irondivid's |
+| `reindex-kill` | start with `-reindex` and the three indexes; odd points a delay after start, even points 0-60 ms after "Building the transaction index" (the transaction index, then the address and spent indexes being built) | started without `-reindex`: tip, UTXO set, `getrawtransaction` of the known txids, `getaddressbalance` of the known addresses, `getspentinfo` of the spent outputs equal the clean irondivid's |
 | `spork-kill` | `spork SPORK_8_... <value>` then kill 0-300 ms later | `spork show`, `spork active`, `getnetworkinfo.relayfee` as before |
 | `relayfee-kill` | started with `minrelaytxfee=0.00003`, kill 0-300 ms after RPC answers | same |
 | `reorg-kill` | the node follows miner W; the other miner L mines a longer branch; the node is given L (`addnode onetry`) and killed: odd points 0-20 ms after "Disconnecting block", even ones 0-0.8 s after the addnode | tip is a block of W's or L's chain, UTXO set equals the record at that block (the line says old tip, partly disconnected, partly connected, new tip); then synced to L: same as L |

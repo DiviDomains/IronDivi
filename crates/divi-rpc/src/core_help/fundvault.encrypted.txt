@@ -1,0 +1,10 @@
+fundvault "[owner_address:]manager_address" amount
+
+Send an amount to a given vault manager address. The amount is a real and is rounded to the nearest 0.00000001
+
+Requires wallet passphrase to be set with walletpassphrase call.
+Arguments:
+1. "[owner_address:]manager_address" (string, required)
+   "owner_address" -> The address of the key owning the vault funds. Needs ':' separator if used. 
+   "manager_address" -> The divi address owned by the vault manager.
+2. "amount"      (numeric, required) The amount in DIVI to send. eg 0.1

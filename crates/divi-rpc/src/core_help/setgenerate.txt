@@ -1,0 +1,16 @@
+setgenerate numberofblocks
+Generation is limited to 'numberofblocks' additional blocks. This method is regtest only
+This method cannot be called during normal operation as it will be active by default.
+
+Arguments:
+1. numberofblocks     (numeric, required) Set the numberofblocks blocks that are generated immediately (in regtest).
+
+Result
+[ blockhashes ]     (array) hashes of blocks generated
+
+Examples:
+
+Set the generation on 1 block
+
+Using json rpc
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "setgenerate", "params": [1] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

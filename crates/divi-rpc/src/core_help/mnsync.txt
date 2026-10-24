@@ -1,0 +1,33 @@
+mnsync "status|reset"
+
+Returns the sync status or resets sync.
+
+Arguments:
+1. "mode"    (string, required) either 'status' or 'reset'
+
+Result ('status' mode):
+{
+  "IsBlockchainSynced": true|false,    (boolean) 'true' if blockchain is synced
+  "timestampOfLastMasternodeListUpdate": xxxx,        (numeric) Timestamp of last MN list message
+  "timestampOfLastMasternodeWinnerUpdate": xxxx,      (numeric) Timestamp of last MN winner message
+  "lastBudgetItem": xxxx,            (numeric) Timestamp of last MN budget message
+  "timestampOfLastFailedSync": xxxx,           (numeric) Timestamp of last failed sync
+  "countOfFailedSyncAttempts": n,           (numeric) Number of failed syncs (total)
+  "nominalNumberOfMasternodeBroadcastsReceived": n,        (numeric) Number of MN list messages (total)
+  "nominalNumberOfMasternodeWinnersReceived": n,      (numeric) Number of MN winner messages (total)
+  "sumBudgetItemProp": n,        (numeric) Number of MN budget messages (total)
+  "sumBudgetItemFin": n,         (numeric) Number of MN budget finalization messages (total)
+  "fulfilledMasternodeListSyncRequests": n,      (numeric) Number of MN list messages (local)
+  "fulfilledMasternodeWinnerSyncRequests": n,    (numeric) Number of MN winner messages (local)
+  "countBudgetItemProp": n,      (numeric) Number of MN budget messages (local)
+  "countBudgetItemFin": n,       (numeric) Number of MN budget finalization messages (local)
+  "currentMasternodeSyncStatus": n, (numeric) Status code of last sync phase
+  "totalSuccessivePeerSyncRequests": n, (numeric) Status code of last sync attempt
+}
+
+Result ('reset' mode):
+"status"     (string) 'success'
+
+Examples:
+> divi-cli mnsync "status"
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "mnsync", "params": ["status"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

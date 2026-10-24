@@ -59,8 +59,9 @@ fn err(server: &RpcServer, method: &str, params: Vec<Value>) -> (i32, String) {
 }
 
 /// divid's `help getaccount`, which also answers a wrong argument count
-/// (rpcwallet.cpp:624-636)
-const GETACCOUNT_HELP: &str = "getaccount \"diviaddress\"\n\nReturns the account associated with the given address.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address for account lookup.\n\nResult:\n\"accountname\"        (string) the account address\n\nExamples:\n> divi-cli getaccount \"XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaccount\", \"params\": [\"XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
+/// (rpcwallet.cpp:624-636); its example's sample address written "diviaddress",
+/// as irondivid's help texts write it
+const GETACCOUNT_HELP: &str = "getaccount \"diviaddress\"\n\nReturns the account associated with the given address.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address for account lookup.\n\nResult:\n\"accountname\"        (string) the account address\n\nExamples:\n> divi-cli getaccount \"diviaddress\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaccount\", \"params\": [\"diviaddress\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
 
 /// The account names the wallet has
 fn accounts(server: &RpcServer) -> Vec<String> {

@@ -1,0 +1,17 @@
+getmasternodestatus
+
+Print masternode status
+
+Result:
+{
+  "txhash": "xxxx",      (string) Collateral transaction hash
+  "outputidx": n,        (numeric) Collateral transaction output index number
+  "netaddr": "xxxx",     (string) Masternode network address
+  "addr": "xxxx",        (string) DIVI address for masternode payments
+  "status": "xxxx",      (string) Masternode status
+  "message": "xxxx"      (string) Masternode status message
+}
+
+Examples:
+> divi-cli getmasternodestatus 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getmasternodestatus", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

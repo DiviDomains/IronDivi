@@ -1,0 +1,12 @@
+bip38decrypt "diviaddress"
+
+Decrypts and then imports password protected private key.
+
+Arguments:
+1. "encryptedkey"   (string, required) The encrypted private key
+2. "passphrase"   (string, required) The passphrase you want the private key to be encrypted with
+
+Result:
+"key"                (string) The decrypted private key
+
+Examples:

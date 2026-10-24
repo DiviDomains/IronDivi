@@ -338,16 +338,8 @@ impl RpcServer {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        // Wallet data (balance, keypoololdest, keypoolsize)
-        let (balance, keypoololdest, keypoolsize) = match self.wallet.get_wallet_info(&Params::None)
-        {
-            Ok(info) => (
-                info["balance"].as_f64().unwrap_or(0.0),
-                info["keypoololdest"].as_u64().unwrap_or(0),
-                info["keypoolsize"].as_u64().unwrap_or(0),
-            ),
-            Err(_) => (0.0, 0, 0),
-        };
+        // Wallet data, none without a wallet
+        let wallet_info = self.wallet.get_wallet_info(&Params::None).ok();
 
         // Staking status from staking subsystem
         let staking_status_text = match self.staking.get_staking_status(&Params::None) {
@@ -358,10 +350,9 @@ impl RpcServer {
             Err(_) => "Staking Not Active".to_string(),
         };
 
-        Ok(serde_json::json!({
+        let mut info = serde_json::json!({
             "version": "3.0.0.0",
             "protocolversion": divi_network::constants::protocol_version(),
-            "walletversion": 120200,
             "blocks": height,
             "timeoffset": 0,
             "connections": connections,
@@ -369,14 +360,29 @@ impl RpcServer {
             "difficulty": difficulty,
             "testnet": matches!(network_type, NetworkType::Testnet),
             "moneysupply": self.blockchain.money_supply(),
-            "keypoololdest": keypoololdest,
-            "keypoolsize": keypoolsize,
-            "balance": balance,
-            "paytxfee": 0.0,
             "relayfee": self.blockchain.relay_fee(),
             "staking status": staking_status_text,
             "errors": ""
-        }))
+        });
+        // Divi Core has the wallet members only with a wallet
+        // (rpcmisc.cpp:139-144)
+        if let (Some(wallet), Some(map)) = (wallet_info, info.as_object_mut()) {
+            map.insert("walletversion".into(), serde_json::json!(120200));
+            map.insert(
+                "balance".into(),
+                serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0)),
+            );
+            map.insert(
+                "keypoololdest".into(),
+                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0)),
+            );
+            map.insert(
+                "keypoolsize".into(),
+                serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0)),
+            );
+            map.insert("paytxfee".into(), serde_json::json!(0.0));
+        }
+        Ok(info)
     }
 
     /// setmocktime - C++ only honours this on regtest; this node has no mock clock at all.
@@ -454,13 +460,10 @@ impl RpcServer {
         }
         // Then the call's own `if (fHelp || params.size() ...)`: a wrong
         // argument count answers -1 with the call's help text
-        if let Some((min, max)) = argument_count(method) {
-            if !matches!(params, Params::Object(_)) && !(min..=max).contains(&params.len()) {
-                let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
-                return Err(
-                    RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into(),
-                );
-            }
+        let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+        if crate::core_help::usage_refused(method, params, encrypted) {
+            let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
+            return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
         }
         rpc_type_check(method, params)?;
         // The wallet passphrase calls check the encryption state before they
@@ -528,13 +531,7 @@ impl RpcServer {
             "setban" => self.network.read().set_ban(params),
             "ban" => self.network.read().ban(params),
             "setmocktime" => self.set_mock_time(params),
-            "getinvalid" => Ok(serde_json::json!([{
-                // C++ 3.0.0 builds these from empty maps, so the report is always empty
-                "addresses_with_invalid": {},
-                "total_unspent": "0.00",
-                "total_minted": "0.00",
-                "total_valid_used": "0.00",
-            }])),
+            "getinvalid" => self.blockchain.get_invalid(params),
             "listbanned" => self.network.read().list_banned(params),
             "clearbanned" => self.network.read().clear_banned(params),
             "disconnectnode" => self.network.read().disconnect_node(params),
@@ -700,8 +697,14 @@ impl RpcServer {
         let method = params.get_str(0).filter(|m| !m.is_empty());
 
         if let Some(method) = method {
-            if let Some(text) = crate::core_help::text(method) {
-                return Ok(serde_json::Value::String(text.to_string()));
+            // A Divi Core call: its text in this wallet state, or Core's "unknown
+            // command" where divid gives none (rpcserver.cpp:256-258, :283-285)
+            if crate::core_help::is_core_call(method) {
+                let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+                let text = crate::core_help::text_for(method, encrypted)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("help: unknown command: {method}"));
+                return Ok(serde_json::Value::String(text));
             }
             // Return help for specific method
             let help = match method {
@@ -1137,10 +1140,9 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "backupwallet" => &[(0, "str")],
         // rpcmisc.cpp:65
         "ban" => &[(0, "str")],
-        // rpcdump.cpp:295
-        "bip38decrypt" => &[(0, "str"), (1, "str")],
-        // rpcdump.cpp:249
-        "bip38paperwallet" => &[(0, "str")],
+        // bip38decrypt, bip38paperwallet, dumpprivkey and importprivkey check
+        // that the wallet is unlocked before they read an argument
+        // (rpcdump.cpp:59, :184, :262, :309), so they check their own types
         // rpcmasternode.cpp:361
         "broadcaststartmasternode" => &[(0, "str"), (1, "str")],
         // rpcrawtransaction.cpp:361
@@ -1151,8 +1153,6 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "decoderawtransaction" => &[(0, "str")],
         // rpcrawtransaction.cpp:527
         "decodescript" => &[(0, "str")],
-        // rpcdump.cpp:170
-        "dumpprivkey" => &[(0, "str")],
         // rpcwallet.cpp:2692
         "encryptwallet" => &[(0, "str")],
         // rpcmining.cpp:120
@@ -1197,8 +1197,6 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "importaddress" => &[(0, "str"), (1, "str"), (2, "bool")],
         // rpcmasternode.cpp:595
         "importmnbroadcast" => &[(0, "str")],
-        // rpcdump.cpp:41
-        "importprivkey" => &[(0, "str"), (1, "str"), (2, "bool")],
         // rpcblockchain.cpp:612
         "invalidateblock" => &[(0, "str")],
         // rpcwallet.cpp:2544
@@ -1296,39 +1294,6 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
         ));
     }
     Ok(())
-}
-
-/// How many arguments Divi Core takes for a call, as its `fHelp` check counts
-/// them (rpcblockchain.cpp:36-557, rpcmining.cpp:54-253, rpcmisc.cpp:103,
-/// rpcrawtransaction.cpp:141-830)
-fn argument_count(method: &str) -> Option<(usize, usize)> {
-    Some(match method {
-        "getblockchaininfo" | "getblockcount" | "getbestblockhash" | "getdifficulty"
-        | "getchaintips" | "gettxoutsetinfo" | "getinfo" => (0, 0),
-        "getblockhash" | "decoderawtransaction" | "decodescript" => (1, 1),
-        "getblock" | "getblockheader" | "getrawtransaction" | "sendrawtransaction" => (1, 2),
-        "gettxout" => (2, 3),
-        "verifychain" => (0, 2),
-        "createrawtransaction" => (2, 2),
-        "signrawtransaction" => (1, 4),
-        // rpcmining.cpp:227, rpcblockchain.cpp:557
-        "getmininginfo" | "getmempoolinfo" => (0, 0),
-        // rpcblockchain.cpp:82
-        "getrawmempool" => (0, 1),
-        // rpcmining.cpp:253
-        "prioritisetransaction" => (3, 3),
-        // rpcmining.cpp:54
-        "setgenerate" => (1, 1),
-        // rpcmining.cpp:123
-        "generateblock" => (0, 1),
-        // rpcwallet.cpp:283, :540, :588, :626, :652, :1501, :1946, :2322
-        "getnewaddress" => (0, 1),
-        "getaccountaddress" | "getaccount" | "getaddressesbyaccount" => (1, 1),
-        "setaccount" | "getreceivedbyaccount" => (1, 2),
-        "listreceivedbyaccount" => (0, 3),
-        "listaccounts" => (0, 2),
-        _ => return None,
-    })
 }
 
 /// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
@@ -1803,7 +1768,7 @@ mod tests {
         let response = server.handle_request(request);
         assert!(response.result.is_some());
         let help = response.result.unwrap();
-        assert!(help.as_str().unwrap().contains("longest blockchain"));
+        assert_eq!(help.as_str(), crate::core_help::text("getblockcount"));
     }
 
     #[test]
@@ -1922,7 +1887,8 @@ mod tests {
         let r = call(&server, "getinfo", Params::None).result.unwrap();
         assert!(r["version"].is_string());
         assert!(r["moneysupply"].is_number());
-        assert_eq!(r["walletversion"], serde_json::json!(120200));
+        // No wallet on this server: no wallet members (rpcmisc.cpp:139-144)
+        assert!(r.get("walletversion").is_none());
     }
 
     #[test]

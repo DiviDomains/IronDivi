@@ -1,0 +1,27 @@
+getaddressdeltas <address>|<addresses> (only_vaults)
+
+Returns all changes for an address (requires addressindex to be enabled).
+
+Arguments:
+address: (string) The base58check encoded address
+"addresses": (optional JSON object) An object with fields:
+               (1) '"addresses"' (required) array of base58check encoded addresses
+               (2) '"start"' (optional field) integer block height to start at
+               (3) '"end"' (optional field) integer block height to stop at
+               (4) '"chainInfo"' (optional field) bool flag to include chain info
+"only_vaults" (boolean, optional) Only return utxos spendable by the specified addresses
+
+Result:
+[
+  {
+    "satoshis"  (number) The difference of satoshis
+    "txid"  (string) The related txid
+    "index"  (number) The related input or output index
+    "height"  (number) The block height
+    "address"  (string) The base58check encoded address
+  }
+]
+
+Examples:
+> divi-cli getaddressdeltas '{"addresses": ["diviaddress"]}'
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressdeltas", "params": [{"addresses": ["diviaddress"]}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

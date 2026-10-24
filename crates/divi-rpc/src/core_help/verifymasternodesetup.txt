@@ -1,0 +1,12 @@
+verifymasternodesetup ip_address sigtime collateralPubKey masternodePubKey
+
+Starts escrows funds for some purpose.
+
+Arguments:
+1. ip_address			 (string, required) Local ip address of this node. 
+2. sigtime              (string, required) Timestamp for signature 
+3. collateralPubKey     (string, required) Collateral pubkey 
+4. masternodePubKey     (string, required) Masternode pubkey. 
+
+Result:
+"expected_message"			    (bool) Expected masternode-broadcast message

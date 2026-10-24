@@ -1,0 +1,23 @@
+getlotteryblockwinners [block_height]
+
+Arguments:
+1. block_height         (numeric, optional) The block at which to query the list of winners
+
+Returns a json object with the list of current candidates to win the lottery since the last known block.
+
+Example:
+{
+    'Block Height': 189,
+    'Block Hash ': 'hash',
+    'Lottery Candidates': [
+        {'Address': 'diviaddress', 'Rank': 0, 'Score': 'ebca7a39'},
+        {'Address': 'diviaddress', 'Rank': 1, 'Score': 'a76c2a59'},
+        {'Address': 'diviaddress', 'Rank': 2, 'Score': '5fe24590'},
+        {'Address': 'diviaddress', 'Rank': 3, 'Score': '5cab25ce'},
+        {'Address': 'diviaddress', 'Rank': 4, 'Score': '57bfaf91'},
+        {'Address': 'diviaddress', 'Rank': 5, 'Score': '535158e8'},
+        {'Address': 'diviaddress', 'Rank': 6, 'Score': '1f05a975'},
+        {'Address': 'diviaddress', 'Rank': 7, 'Score': '090172bc'},
+        {'Address': 'diviaddress', 'Rank': 8, 'Score': '03810747'}
+    ]
+}
