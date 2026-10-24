@@ -150,6 +150,12 @@ pub trait MempoolProvider: Send + Sync {
         MempoolStats::default()
     }
 
+    /// The highest fee sendrawtransaction takes without allowhighfees
+    /// (-maxtxfee; Divi Core's DEFAULT_TRANSACTION_MAXFEE, defaultValues.h:34)
+    fn max_tx_fee(&self) -> divi_primitives::amount::Amount {
+        divi_primitives::amount::Amount::from_sat(100 * 100_000_000)
+    }
+
     /// Estimate fee for confirmation within target blocks
     fn estimate_fee(&self, _conf_target: u32) -> f64 {
         0.0001 // Divi Core's default relay floor, 10000 sat/kB

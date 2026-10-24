@@ -305,7 +305,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "masternodeprivkey",
     "maxreceivebuffer",
     "maxsendbuffer",
-    "maxtxfee",
     "mining",
     "mnconf",
     "mnconflock",
@@ -612,6 +611,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 relay % 100_000_000
             );
         }
+        config.mempool.max_tx_fee = max_fee;
     }
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
@@ -726,6 +726,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "maxtxfee",
         "sporkkey",
         "staking",
         "stakeonstaletip",
@@ -1653,6 +1654,7 @@ async fn run_daemon(
             w.set_vault_mode(config.vault);
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
+            w.set_max_tx_fee(config.mempool.max_tx_fee);
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
@@ -4135,7 +4137,14 @@ mod start_errors {
             "Invalid amount for -maxtxfee=<amount>: '0.00001' (must be at least the minrelay \
              fee of 0.00010000 DIV/kB to prevent stuck transactions)"
         );
-        assert!(start(CONF, &["-maxtxfee=0.5"]).is_ok());
+        assert_eq!(
+            start(CONF, &["-maxtxfee=0.5"]).unwrap().mempool.max_tx_fee,
+            50_000_000
+        );
+        assert_eq!(
+            start(CONF, &[]).unwrap().mempool.max_tx_fee,
+            100 * 100_000_000
+        );
         assert!(
             start(CONF, &["-maxtxfee=100"]).is_ok(),
             "very high is a warning only"

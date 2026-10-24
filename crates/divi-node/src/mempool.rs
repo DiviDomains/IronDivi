@@ -483,6 +483,12 @@ impl Mempool {
         self.config.min_relay_fee_per_kb
     }
 
+    /// The highest fee sendrawtransaction takes without allowhighfees
+    /// (Core's `CFeeRate::GetMaxTxFee`, -maxtxfee)
+    pub fn max_tx_fee(&self) -> Amount {
+        Amount::from_sat(self.config.max_tx_fee)
+    }
+
     /// Divi Core `CFeeRate::GetFee` (FeeRate.cpp:35-43) of the relay fee
     pub fn min_relay_fee_for(&self, size: usize) -> i64 {
         let per_kb = self.min_relay_fee_per_kb();
@@ -959,6 +965,10 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
             max_mempool: self.config.max_size,
             min_fee: self.relay_floor_divi_per_kb(),
         }
+    }
+
+    fn max_tx_fee(&self) -> Amount {
+        Mempool::max_tx_fee(self)
     }
 
     fn estimate_fee(&self, conf_target: u32) -> f64 {
