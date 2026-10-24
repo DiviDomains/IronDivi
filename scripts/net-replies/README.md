@@ -66,7 +66,8 @@ By design:
 - `getpeerinfo` `subver`, `getnetworkinfo` `subversion`: irondivid names itself (`/IronDivi:<version>/`); divid
   gives `DIVI Core: 3.0.0.0`.
 - `getnetworkinfo`: irondivid adds `connections_in` and `connections_out`; it shows `onion` as `limited`, since it
-  cannot address .onion peers.
+  cannot address .onion peers; its `version` is irondivid's own, where divid gives `3.0.0.0` (`rpcnet.cpp:369`;
+  `docs/divid-differences.md` R5).
 - `getmasternodecount`: irondivid adds the tier counts `copper`, `silver`, `gold`, `platinum`, `diamond`.
 - `listbanned`: divid gives `{"banned:": "[\n<ip>,\n]"}`, one text under a key with a colon (`rpcmisc.cpp:1023-1030`,
   `PeerBanningService.cpp:23-34`); irondivid gives an array of bans (`docs/rpc-parity-audit.md`).

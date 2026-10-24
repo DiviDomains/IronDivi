@@ -57,10 +57,11 @@ PEERINFO = ("services: irondivid does not serve bloom filters and does not adver
             "synced_headers/synced_blocks: irondivid gives -1, divid the peer's synced heights "
             "(rpcnet.cpp:139-140) [open]",
             only("[0].services", "[0].subver", "[0].synced_headers", "[0].synced_blocks"))
-NETINFO_FIELDS = (".connections_in", ".connections_out", ".localservices", ".networks[2].limited", ".subversion")
+NETINFO_FIELDS = (".connections_in", ".connections_out", ".localservices", ".networks[2].limited", ".subversion",
+                  ".version")
 NETINFO = ("connections_in/out: irondivid's extra fields [by design]; localservices: no NODE_BLOOM, as getpeerinfo "
            "[open]; onion limited: irondivid cannot address .onion peers [by design]; subversion: its user agent "
-           "[by design]",
+           "[by design]; version: irondivid's own (docs/divid-differences.md R5) [by design]",
            only(*NETINFO_FIELDS))
 MNCOUNT = ("irondivid adds the tier counts copper..diamond [by design]",
            only(".copper", ".silver", ".gold", ".platinum", ".diamond"))
