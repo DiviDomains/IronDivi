@@ -304,7 +304,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
-    "reindex",
     "rescan",
     "rest",
     "resync",
@@ -560,6 +559,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             *slot = s.get_bool(key, false);
         }
     }
+    config.index.reindex = s.get_bool("reindex", false);
     if let Some(n) = number_option(&s, "maxlogsize", 1..=i64::from(u32::MAX)) {
         config.log.max_file_size = n as u64 * 1_048_576;
     }
@@ -611,6 +611,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "txindex",
         "spentindex",
         "addressindex",
+        "reindex",
         "utxocachesize",
         "expire",
         "blocknotify",
@@ -2465,6 +2466,12 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     .await
     {
         error!("Daemon error: {:#}", e);
+        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
+        // writer may not get to write the line before the process exits
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
+        }
         // Print the full error chain
         let mut source: Option<&(dyn StdError + 'static)> = e.source();
         while let Some(err) = source {

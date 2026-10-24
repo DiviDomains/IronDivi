@@ -226,10 +226,59 @@ impl Node {
             addressindex: config.index.addressindex,
             spentindex: config.index.spentindex,
         };
-        let flags =
-            divi_storage::search_index::IndexFlags::load_or_init(&db, chain.height(), requested)
-                .map_err(damaged)?;
-        if flags.txindex != requested.txindex {
+        // A database with blocks but no stored flags (made before they were
+        // kept, or installed from a snapshot) has a transaction index of
+        // unknown extent. Divi Core always has the flags (written at genesis),
+        // so its "txindex on" means every block is indexed: here the flag is
+        // first stored as off, and set on only once the index is known to
+        // cover the chain.
+        let unflagged = chain.height() > 0
+            && divi_storage::search_index::IndexFlags::load(&db)
+                .map_err(damaged)?
+                .is_none();
+        let snapshot_base = chain.snapshot_base().map(|(height, _)| height);
+        let mut flags = divi_storage::search_index::IndexFlags::load_or_init(
+            &db,
+            chain.height(),
+            divi_storage::search_index::IndexFlags {
+                txindex: requested.txindex && !unflagged,
+                ..requested
+            },
+        )
+        .map_err(damaged)?;
+        let mut check_unflagged_index = false;
+        if unflagged && requested.txindex {
+            match snapshot_base {
+                Some(base) => tracing::warn!(
+                    "This chain database was installed from a snapshot and has no blocks \
+                     below height {}, so it cannot have a full transaction index: the \
+                     transaction index is off",
+                    base
+                ),
+                None => {
+                    flags.txindex = true;
+                    check_unflagged_index = true;
+                }
+            }
+        }
+        // -reindex builds the transaction index again with the -txindex now
+        // given, as Divi Core's -reindex writes the flags anew
+        // (ChainExtensionService.cpp:703-707). Here the index is built from
+        // the stored blocks; the chain state is kept.
+        let rebuild_tx_index = config.index.reindex && requested.txindex;
+        if config.index.reindex && flags.txindex != requested.txindex {
+            flags.txindex = requested.txindex;
+        }
+        // A snapshot database cannot build a full index; it runs without one
+        if snapshot_base.is_some() && !flags.txindex && requested.txindex {
+            if !unflagged {
+                tracing::warn!(
+                    "Transaction index off: this chain database was installed from a \
+                     snapshot and has no blocks below height {}",
+                    snapshot_base.unwrap_or_default()
+                );
+            }
+        } else if flags.txindex != requested.txindex {
             return Err(NodeError::Init(
                 "You need to rebuild the database using -reindex to change -txindex".into(),
             ));
@@ -244,14 +293,56 @@ impl Node {
             );
         }
 
+        let txindex_path = config.data_dir.join("txindex");
+        if config.index.reindex && txindex_path.exists() {
+            // Entries of an earlier index may name blocks no longer active
+            std::fs::remove_dir_all(&txindex_path).map_err(|e| {
+                NodeError::Init(format!(
+                    "Failed to remove the old transaction index {:?}: {}",
+                    txindex_path, e
+                ))
+            })?;
+        }
         if flags.txindex {
-            let txindex_path = config.data_dir.join("txindex");
             let tx_index = divi_storage::TxIndex::open(&txindex_path).map_err(|e| {
                 tracing::error!("Failed to open transaction index: {}", e);
                 NodeError::Init(format!("Failed to open transaction index: {}", e))
             })?;
-            chain.enable_tx_index(Arc::new(tx_index));
+            let tx_index = Arc::new(tx_index);
+            let build = rebuild_tx_index
+                || (check_unflagged_index
+                    && !chain
+                        .tx_index_covers_chain(&tx_index, 16)
+                        .map_err(damaged)?);
+            if check_unflagged_index && !rebuild_tx_index {
+                tracing::info!(
+                    "No index settings were stored with this chain database; {}",
+                    if build {
+                        "the transaction index does not cover it and is built now"
+                    } else {
+                        "the transaction index covers it"
+                    }
+                );
+            }
+            if build {
+                tracing::info!("Building the transaction index from the stored blocks");
+                let started = std::time::Instant::now();
+                let blocks = chain.rebuild_tx_index(tx_index).map_err(|e| {
+                    NodeError::Init(format!("Failed to build the transaction index: {}", e))
+                })?;
+                tracing::info!(
+                    "Transaction index built for {} blocks in {} ms",
+                    blocks,
+                    started.elapsed().as_millis()
+                );
+            } else {
+                chain.enable_tx_index(tx_index);
+            }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
+        }
+        // The flags change only once the index they name is complete
+        if config.index.reindex || check_unflagged_index {
+            flags.store(&db).map_err(damaged)?;
         }
 
         if flags.addressindex || flags.spentindex {
