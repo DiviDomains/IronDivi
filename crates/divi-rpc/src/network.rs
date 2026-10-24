@@ -263,12 +263,14 @@ impl NetworkRpc {
             )
             .into());
         }
+        let dns = params.get(0).and_then(|v| v.as_bool()).unwrap_or(false);
+        // The node as addnode takes it: without a port, the network's
         let filter_addr: Option<std::net::SocketAddr> = params.get_str(1).and_then(|s| {
-            if s.contains(':') {
-                s.parse().ok()
-            } else {
-                format!("{}:51472", s).parse().ok()
-            }
+            s.parse().ok().or_else(|| {
+                s.parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| std::net::SocketAddr::new(ip, peer_manager.default_port()))
+            })
         });
 
         if params.get_str(1).is_some() && !added_nodes.iter().any(|n| filter_addr == Some(n.addr)) {
@@ -279,21 +281,23 @@ impl NetworkRpc {
             .into());
         }
 
+        // Divi Core: without dns only the added node; with it, the node's
+        // address and whether a peer of that address is connected
+        // (rpcnet.cpp:220-284)
         let result: Vec<_> = added_nodes
             .iter()
             .filter(|n| filter_addr.is_none() || filter_addr == Some(n.addr))
             .map(|node| {
+                if !dns {
+                    return serde_json::json!({ "addednode": node.addr.to_string() });
+                }
                 serde_json::json!({
                     "addednode": node.addr.to_string(),
                     "connected": node.connected,
-                    "addresses": if node.connected {
-                        vec![serde_json::json!({
-                            "address": node.addr.to_string(),
-                            "connected": "outbound"
-                        })]
-                    } else {
-                        vec![]
-                    }
+                    "addresses": [{
+                        "address": node.addr.to_string(),
+                        "connected": if node.connected { "outbound" } else { "false" },
+                    }],
                 })
             })
             .collect();
@@ -827,6 +831,48 @@ mod tests {
                 "{bad:?}: {message}"
             );
         }
+    }
+
+    /// getaddednodeinfo as Divi Core gives it (rpcnet.cpp:188-287): without
+    /// dns only `addednode`; with dns `connected` and the node's address with
+    /// its own `connected` "false" while no peer of it is connected
+    #[test]
+    fn getaddednodeinfo_replies_as_divid() {
+        let pm = regtest_peers();
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&pm));
+        assert!(pm.add_node("192.0.2.1:51476".parse().unwrap()));
+        let info = |args: Vec<serde_json::Value>| rpc.get_added_node_info(&Params::Array(args));
+        let plain = serde_json::json!([{ "addednode": "192.0.2.1:51476" }]);
+        let with_dns = serde_json::json!([{
+            "addednode": "192.0.2.1:51476",
+            "connected": false,
+            "addresses": [{ "address": "192.0.2.1:51476", "connected": "false" }],
+        }]);
+        assert_eq!(info(vec![serde_json::json!(false)]).unwrap(), plain);
+        assert_eq!(
+            info(vec![
+                serde_json::json!(false),
+                serde_json::json!("192.0.2.1")
+            ])
+            .unwrap(),
+            plain
+        );
+        assert_eq!(info(vec![serde_json::json!(true)]).unwrap(), with_dns);
+        assert_eq!(
+            info(vec![
+                serde_json::json!(true),
+                serde_json::json!("192.0.2.1:51476")
+            ])
+            .unwrap(),
+            with_dns
+        );
+        assert_eq!(
+            rpc_err(info(vec![
+                serde_json::json!(true),
+                serde_json::json!("192.0.2.2")
+            ])),
+            (-24, "Error: Node has not been added.".to_string())
+        );
     }
 
     #[test]
