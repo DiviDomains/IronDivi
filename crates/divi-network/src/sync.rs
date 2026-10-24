@@ -451,6 +451,18 @@ impl BlockSync {
         *self.orphaned_tx_callback.write() = Some(callback);
     }
 
+    /// Hand the orphaned-tx callback the transactions of blocks disconnected
+    /// outside a reorganization of its own (invalidateblock,
+    /// reverseblocktransactions), or none after the chain moved up again
+    /// (reconsiderblock): the mempool takes them back and drops what the
+    /// active chain now confirms or makes unspendable, as Divi Core's
+    /// DisconnectTip and ConnectTip do
+    pub fn chain_moved(&self, disconnected: Vec<Transaction>) {
+        if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
+            callback(disconnected);
+        }
+    }
+
     /// Fire reorg callbacks: notifies the reorg callback with `fork_height`,
     /// then the orphaned-tx callback, which returns the disconnected blocks'
     /// transactions to the mempool and updates it for the new chain.

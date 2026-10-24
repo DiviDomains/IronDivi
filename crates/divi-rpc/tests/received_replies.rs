@@ -9,6 +9,7 @@
 //! 3.0.0 gives them; each test names the Core lines it follows.
 
 use divi_crypto::compute_merkle_root;
+use divi_network::{BlockSync, PeerManager, PeerManagerConfig};
 use divi_primitives::{
     amount::Amount,
     block::Block,
@@ -401,4 +402,53 @@ fn validateaddress_describes_a_multisig_address() {
     assert_eq!(v["sigsrequired"], json!(2), "{v}");
     let hex = v["hex"].as_str().unwrap();
     assert!(hex.starts_with("52") && hex.ends_with("52ae"), "{v}");
+}
+
+/// invalidateblock hands the disconnected block's transactions to the mempool,
+/// as Divi Core's DisconnectTip does, once the wallet has left the block, so
+/// the wallet takes them as unconfirmed; reconsiderblock lets the mempool drop
+/// what the block confirms again (ChainTipManager.cpp:139-141, :175-182)
+#[test]
+fn invalidateblock_returns_transactions_to_the_mempool() {
+    let f = funded(&[10 * COIN]);
+    let mine = new_address(&f.n, "back").to_base58();
+    let sent = send_and_mine(&f, &mine, 1.0);
+    assert_eq!(f.n.ok("getunconfirmedbalance", vec![]), json!(0.0));
+    let handed: Arc<Mutex<Vec<Vec<Transaction>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = handed.clone();
+    let wallet = f.n.wallet.clone();
+    let sync = BlockSync::new(
+        f.n.chain.clone(),
+        PeerManager::new(PeerManagerConfig::default()),
+    );
+    // As irondivid's mempool does: what it takes back reaches the wallet
+    sync.set_orphaned_tx_callback(Arc::new(move |txs: Vec<Transaction>| {
+        for tx in &txs {
+            wallet.add_mempool_tx(tx);
+        }
+        sink.lock().push(txs);
+    }));
+    f.n.server.set_block_sync(sync);
+    let tip = f.n.ok("getbestblockhash", vec![]);
+    f.n.ok("invalidateblock", vec![tip.clone()]);
+    {
+        let handed = handed.lock();
+        assert_eq!(handed.len(), 1);
+        let txids: Vec<Hash256> = handed[0].iter().map(|t| t.txid()).collect();
+        assert_eq!(txids, vec![sent.txid()]);
+    }
+    // The send's outputs, the payment and the change, are unconfirmed again
+    let value_out: i64 = sent.vout.iter().map(|o| o.value.as_sat()).sum();
+    assert_eq!(
+        f.n.ok("getunconfirmedbalance", vec![]),
+        json!(value_out as f64 / COIN as f64)
+    );
+    assert_eq!(
+        f.n.ok("getreceivedbyaddress", vec![json!(mine), json!(0)]),
+        json!(1.0)
+    );
+    f.n.ok("reconsiderblock", vec![tip]);
+    let handed = handed.lock();
+    assert_eq!(handed.len(), 2);
+    assert!(handed[1].is_empty());
 }

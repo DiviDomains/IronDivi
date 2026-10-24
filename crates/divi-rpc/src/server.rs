@@ -488,10 +488,15 @@ impl RpcServer {
             "getinfo" => self.get_info(params),
             "getchaintips" => self.blockchain.get_chain_tips(params),
             "invalidateblock" | "reconsiderblock" | "reverseblocktransactions" => {
-                let result = self.blockchain.invalidate_block_family(method, params);
-                // The active chain may have changed without a block notification
+                let result = self.blockchain.move_chain(method, params);
+                // The active chain may have changed without a block notification.
+                // The wallet leaves the disconnected blocks first, so it takes
+                // their transactions as unconfirmed when the mempool does.
                 self.wallet.sync_with_chain();
-                result
+                result.map(|disconnected| {
+                    self.blockchain.return_to_mempool(disconnected);
+                    serde_json::Value::Null
+                })
             }
             "getdifficulty" => self.blockchain.get_difficulty(params),
             "gettxoutsetinfo" => self.blockchain.get_txout_set_info(params),

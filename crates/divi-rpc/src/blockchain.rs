@@ -18,6 +18,7 @@ use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::serialize::serialize;
+use divi_primitives::transaction::Transaction;
 use divi_storage::chain::NetworkType;
 use divi_storage::Chain;
 use parking_lot::RwLock;
@@ -728,8 +729,18 @@ impl BlockchainRpc {
         ))
     }
 
-    /// invalidateblock / reconsiderblock / reverseblocktransactions
+    /// invalidateblock / reconsiderblock / reverseblocktransactions, then the
+    /// mempool brought in line with the chain (`return_to_mempool`)
     pub fn invalidate_block_family(&self, method: &str, params: &Params) -> Result<Value, Error> {
+        let disconnected = self.move_chain(method, params)?;
+        self.return_to_mempool(disconnected);
+        Ok(Value::Null)
+    }
+
+    /// The chain side of invalidateblock / reconsiderblock /
+    /// reverseblocktransactions: returns the transactions of the blocks
+    /// disconnected (none for reconsiderblock)
+    pub fn move_chain(&self, method: &str, params: &Params) -> Result<Vec<Transaction>, Error> {
         let usage = || RpcError::invalid_params(format!("{} \"hash\"", method));
         if params.len() != 1 {
             return Err(usage().into());
@@ -745,9 +756,12 @@ impl BlockchainRpc {
                 other => RpcError::database_error(other.to_string()).into(),
             }
         };
-        match method {
+        let disconnected = match method {
             "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
-            "reconsiderblock" => self.chain.reconsider_block(&hash).map_err(map_err)?,
+            "reconsiderblock" => {
+                self.chain.reconsider_block(&hash).map_err(map_err)?;
+                Vec::new()
+            }
             _ => {
                 // C++ reverseblocktransactions invalidates (reversing the block's
                 // transactions in the coin DB) then clears the invalid mark
@@ -755,10 +769,20 @@ impl BlockchainRpc {
                 // until another block comes (rpcblockchain.cpp:577-603)
                 self.chain
                     .reverse_block_transactions(&hash)
-                    .map_err(map_err)?;
+                    .map_err(map_err)?
             }
+        };
+        Ok(disconnected)
+    }
+
+    /// After the chain moved without a block notification: the transactions of
+    /// the disconnected blocks go back to the mempool, and what a reconnected
+    /// block confirms leaves it, as Divi Core's DisconnectTip and ConnectTip
+    /// do (ChainTipManager.cpp:139-141, :175-182)
+    pub fn return_to_mempool(&self, disconnected: Vec<Transaction>) {
+        if let Some(sync) = self.block_sync.read().as_ref() {
+            sync.chain_moved(disconnected);
         }
-        Ok(Value::Null)
     }
 
     /// getinvalid ( "all" ): Divi Core 3.0.0 builds its summary from empty
