@@ -82,3 +82,38 @@ fn wrong_argument_counts_answer_with_the_help() {
         e.message
     );
 }
+
+fn result(server: &RpcServer, method: &str, params: Vec<Value>) -> Value {
+    let reply = call(server, method, params);
+    assert!(reply.error.is_none(), "{method}: {:?}", reply.error);
+    reply.result.expect("result")
+}
+
+/// getmininginfo has divid's members only (rpcmining.cpp:229-236)
+#[test]
+fn getmininginfo_has_divids_members() {
+    let (server, _dir) = server();
+    let info = result(&server, "getmininginfo", vec![]);
+    let mut keys: Vec<&str> = info
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "blocks",
+            "chain",
+            "difficulty",
+            "errors",
+            "pooledtx",
+            "testnet"
+        ],
+        "{info}"
+    );
+    assert_eq!(info["chain"], "regtest");
+    assert_eq!(info["testnet"], false);
+    assert_eq!(info["pooledtx"], 0);
+}

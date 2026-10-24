@@ -1439,10 +1439,9 @@ impl BlockchainRpc {
             }
         };
 
+        // Divi Core's members (rpcmining.cpp:229-236)
         Ok(json!({
             "blocks": blocks,
-            "currentblocksize": 0,
-            "currentblocktx": 0,
             "difficulty": difficulty,
             "errors": "",
             "pooledtx": pooled_tx,
