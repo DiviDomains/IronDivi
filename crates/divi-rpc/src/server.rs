@@ -1272,9 +1272,22 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
     }
 }
 
+/// The calls whose arguments of `core_argument_types` Divi Core reads with no
+/// test for null first, so a null makes the getter throw too
+/// (rpcwallet.cpp:550, :1752, :1798-1808)
+fn getter_reads_null(method: &str) -> bool {
+    matches!(
+        method,
+        "addmultisigaddress"
+            | "getaccountaddress"
+            | "listreceivedbyaccount"
+            | "listreceivedbyaddress"
+    )
+}
+
 /// Refuse an argument of the wrong JSON type as json_spirit's getter does. A
 /// null is left to the call, as Divi Core mostly reads optional arguments only
-/// when they are not null.
+/// when they are not null, except for the calls of `getter_reads_null`.
 fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcError> {
     let Params::Array(values) = params else {
         return Ok(());
@@ -1284,7 +1297,7 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
             continue;
         };
         let got = crate::wallet::json_spirit_type(value);
-        if value.is_null() || got == *want {
+        if (value.is_null() && !getter_reads_null(method)) || got == *want {
             continue;
         }
         return Err(RpcError::new(

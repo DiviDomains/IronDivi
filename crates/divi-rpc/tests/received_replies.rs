@@ -182,6 +182,15 @@ fn funded(values: &[i64]) -> Funded {
     }
 }
 
+fn new_address(n: &Node, account: &str) -> Address {
+    Address::from_base58(
+        n.ok("getnewaddress", vec![json!(account)])
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 /// An address nobody here holds a key for
 fn watched() -> Address {
     Address::from_pubkey_hash(Hash160::from_bytes([0x24; 20]), Network::Regtest)
@@ -265,5 +274,36 @@ fn received_by_minconf_is_any_int() {
     assert_eq!(
         f.n.err("getreceivedbyaccount", vec![Value::Null]),
         (-1, "value is type null, expected str".to_string())
+    );
+}
+
+/// listreceivedbyaddress and listreceivedbyaccount refuse a null argument, and
+/// getaccountaddress a null account, as their getters do (rpcwallet.cpp:550,
+/// :1798-1808)
+#[test]
+fn null_arguments_are_refused() {
+    let n = node();
+    let null = |want: &str| (-1, format!("value is type null, expected {want}"));
+    for method in ["listreceivedbyaddress", "listreceivedbyaccount"] {
+        assert_eq!(n.err(method, vec![Value::Null]), null("int"), "{method}");
+        assert_eq!(
+            n.err(method, vec![json!(1), Value::Null]),
+            null("bool"),
+            "{method}"
+        );
+        assert_eq!(
+            n.err(method, vec![json!(1), json!(true), Value::Null]),
+            null("bool"),
+            "{method}"
+        );
+    }
+    assert_eq!(n.err("getaccountaddress", vec![Value::Null]), null("str"));
+    let key = new_address(&n, "").to_base58();
+    assert_eq!(
+        n.err(
+            "addmultisigaddress",
+            vec![json!(1), json!([key]), Value::Null]
+        ),
+        null("str")
     );
 }
