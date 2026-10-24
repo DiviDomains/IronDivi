@@ -197,10 +197,31 @@ fn wrong_argument_types_are_refused_as_json_spirit_refuses_them() {
         n.err("signmessage", vec![addr.clone(), json!(true)]),
         (-1, "value is type bool, expected str".to_string())
     );
+    // an unencrypted wallet is refused before the argument is read (-15)
     assert_eq!(
-        n.err("walletpassphrase", vec![json!(1234), json!(1)]),
-        int_not_str
+        n.err("walletpassphrase", vec![json!(1234), json!(1)]).0,
+        -15
     );
+    let dir = tempfile::tempdir().unwrap();
+    let w = Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("wallet"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    );
+    w.encrypt_wallet("pw").unwrap();
+    w.lock();
+    let locked = RpcServer::with_wallet(n.chain.clone(), w);
+    let r = locked.handle_request(Request {
+        jsonrpc: "1.0".to_string(),
+        id: RequestId::Number(1),
+        method: "walletpassphrase".to_string(),
+        params: Params::Array(vec![json!(1234), json!(1)]),
+    });
+    let e = r.error.expect("refused");
+    assert_eq!((e.code, e.message), int_not_str);
     assert_eq!(
         n.err(
             "setupmasternode",

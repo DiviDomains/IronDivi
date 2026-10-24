@@ -516,7 +516,17 @@ impl RpcServer {
             .into());
         }
         rpc_type_check(method, params)?;
-        json_spirit_getter_check(method, params)?;
+        // The wallet passphrase calls check the encryption state before they
+        // read an argument (rpcwallet.cpp:2596, :2642, :2715)
+        let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+        let state_first = match method {
+            "walletpassphrase" | "walletpassphrasechange" => encrypted == Some(false),
+            "encryptwallet" => encrypted == Some(true),
+            _ => false,
+        };
+        if !state_first {
+            json_spirit_getter_check(method, params)?;
+        }
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
