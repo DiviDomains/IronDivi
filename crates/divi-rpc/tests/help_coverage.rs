@@ -68,8 +68,13 @@ fn help_covers_every_dispatched_method() {
         }
         // (a regtest-only method off regtest is "Method disabled", -32601 too)
         if let Some(e) = call(&server, m, vec![]).error {
+            // -32601 here is never "Method not found": either a call that
+            // works on regtest only ("Method disabled: ...") or a wallet call
+            // on a node without a wallet (rpcserver.cpp:1043-1047)
             assert!(
-                e.code != -32601 || e.message.starts_with("Method disabled"),
+                e.code != -32601
+                    || e.message.starts_with("Method disabled")
+                    || e.message == "Method unavailable due to manually disabled wallet",
                 "{m} is not dispatched"
             );
         }

@@ -26,7 +26,13 @@ fn server_on(network: NetworkType) -> (RpcServer, tempfile::TempDir) {
     let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
     let chain =
         Arc::new(Chain::new(db, ChainParams::for_network(network, ChainMode::Divi)).unwrap());
-    (RpcServer::new(chain), dir)
+    // setgenerate and generateblock need a wallet: without one divid answers
+    // -32601 before their own checks run (rpcserver.cpp:368-369, :1043-1047)
+    let wallet = Arc::new(divi_wallet::WalletDb::with_hd_wallet(
+        divi_wallet::Network::Regtest,
+        divi_wallet::HdWallet::new(ChainMode::Divi).unwrap(),
+    ));
+    (RpcServer::with_wallet(chain, wallet), dir)
 }
 
 fn call(server: &RpcServer, method: &str, params: Vec<Value>) -> Response {
