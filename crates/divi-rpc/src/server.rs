@@ -223,6 +223,11 @@ impl RpcServer {
         self.lite_wallet.write().set_mempool(mempool);
     }
 
+    /// Set what invalidateblock and its family do to the mempool
+    pub fn set_reorg_hook(&self, hook: crate::blockchain::ReorgHook) {
+        self.blockchain.set_reorg_hook(hook);
+    }
+
     /// Let `getblock` fetch pruned blocks from full-history peers
     pub fn set_block_fetcher(&self, fetcher: Arc<dyn crate::blockchain::BlockFetcher>) {
         self.wallet.set_block_fetcher(fetcher.clone());
