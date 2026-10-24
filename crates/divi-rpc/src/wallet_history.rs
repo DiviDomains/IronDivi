@@ -656,6 +656,44 @@ impl<'a> History<'a> {
         tally
     }
 
+    /// The wallet's records in the order of Divi Core's wallet map, by txid
+    /// (GetWalletTransactionReferences, wallet.cpp:407-418): a uint256 compares
+    /// as the number its hex shows
+    fn records_by_txid(&self) -> Vec<WalletTx> {
+        let mut records = self.wallet.history_records();
+        records.sort_by_key(|r| r.txid.to_string());
+        records
+    }
+
+    /// The tally of getreceivedbyaddress (rpcwallet.cpp:1466-1483): the outputs
+    /// paying exactly `script` in wallet transactions that are not coinbases,
+    /// final and at least `min_depth` deep
+    pub(crate) fn received_by_script(&self, script: &Script, min_depth: i64) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        let mut total = 0;
+        for record in self.records_by_txid() {
+            let Some(loaded) = self.load(&record) else {
+                continue;
+            };
+            let tx = &loaded.tx;
+            if tx.is_coinbase() || !tx.is_final(self.height, now) {
+                continue;
+            }
+            if self.depth(&record.txid, &loaded) < min_depth {
+                continue;
+            }
+            total += tx
+                .vout
+                .iter()
+                .filter(|out| &out.script_pubkey == script)
+                .map(|out| out.value.as_sat())
+                .sum::<i64>();
+        }
+        total
+    }
+
     /// listaccounts (rpcwallet.cpp:2320-2350): for every address-book name
     /// with an address the wallet owns (or watches, with `watch`), that
     /// account's GetAccountBalance

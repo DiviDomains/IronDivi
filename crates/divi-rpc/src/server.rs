@@ -1183,10 +1183,9 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "getrawmempool" => &[(0, "bool")],
         // rpcrawtransaction.cpp:139
         "getrawtransaction" => &[(1, "int")],
-        // rpcwallet.cpp:1499
-        "getreceivedbyaccount" => &[(0, "str"), (1, "int")],
-        // rpcwallet.cpp:1432
-        "getreceivedbyaddress" => &[(0, "str"), (1, "int")],
+        // getreceivedbyaccount reads minconf before the account, and
+        // getreceivedbyaddress minconf only for an address of the wallet: both
+        // read their arguments themselves
         // rpcwallet.cpp:2452
         "gettransaction" => &[(0, "str"), (1, "bool")],
         // rpcblockchain.cpp:330

@@ -37,7 +37,7 @@ use divi_wallet::{
 };
 use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -658,25 +658,6 @@ pub fn sync_wallet_with_chain(wallet: &WalletDb, chain: &Chain) -> Vec<u32> {
 }
 
 impl WalletRpc {
-    /// Amount received per address over all outputs the wallet received at
-    /// `min_conf` or more, spent or not, with the fewest confirmations among
-    /// them. Coinbase outputs are left out, as in Core's received-by RPCs.
-    fn received_by_address(&self, wallet: &WalletDb, min_conf: u32) -> HashMap<String, (i64, u32)> {
-        let height = self.current_height();
-        let mut by_addr: HashMap<String, (i64, u32)> = HashMap::new();
-        for output in wallet.received_outputs() {
-            let confs = output.confirmations(height);
-            // A bare multisig output has no address to tally under
-            if output.is_coinbase || confs < min_conf || output.address.is_empty() {
-                continue;
-            }
-            let entry = by_addr.entry(output.address).or_insert((0, u32::MAX));
-            entry.0 += output.value.as_sat();
-            entry.1 = entry.1.min(confs);
-        }
-        by_addr
-    }
-
     /// Bring the wallet up to the active chain after the chain moved without
     /// a block notification (invalidateblock, reconsiderblock)
     pub fn sync_with_chain(&self) {
@@ -3741,14 +3722,10 @@ impl WalletRpc {
 
     /// getreceivedbyaddress - Get total amount received by an address
     pub fn get_received_by_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let addr_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Address required"))?;
-
-        let min_conf = params.get_u64(1).unwrap_or(1) as u32;
-
+        // rpcwallet.cpp:1450-1461: the address, then 0 for an address the
+        // wallet neither owns nor watches, and only then minconf
         let addr = self
-            .decode_address(addr_str)
+            .decode_address(spirit_str(params, 0)?)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
@@ -3756,19 +3733,18 @@ impl WalletRpc {
         if !wallet.is_mine(&addr) {
             return Ok(serde_json::json!(0.0));
         }
+        let min_depth = if params.len() > 1 {
+            spirit_int(params, 1)?
+        } else {
+            1
+        };
 
         // Everything received at the address, including coins since spent:
         // outputs paying exactly its script, so a P2PK output to its key is not
         // counted (rpcwallet.cpp:1468-1480). Coinbase outputs are left out.
-        let height = self.current_height();
-        let script = addr.script_pubkey();
-        let total: i64 = wallet
-            .received_outputs()
-            .iter()
-            .filter(|o| !o.is_coinbase && o.script_pubkey == script)
-            .filter(|o| o.confirmations(height) >= min_conf)
-            .map(|o| o.value.as_sat())
-            .sum();
+        let total = self
+            .history(&wallet)
+            .received_by_script(&addr.script_pubkey(), min_depth as i64);
 
         let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
@@ -4616,22 +4592,24 @@ impl WalletRpc {
     }
 
     pub fn get_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let min_conf = params.get_u64(1).unwrap_or(1) as u32;
-        // Read after minconf (rpcwallet.cpp:1517-1523)
-        let account = account_from_value(
-            params
-                .get_str(0)
-                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
-        )?;
+        // minconf is read before the account (rpcwallet.cpp:1517-1523)
+        let min_depth = if params.len() > 1 {
+            spirit_int(params, 1)?
+        } else {
+            1
+        };
+        let account = account_from_value(spirit_str(params, 0)?)?;
 
+        // The outputs to the account's addresses the wallet owns or watches
+        // (rpcwallet.cpp:1531-1545)
         let wallet = self.get_wallet()?;
-        let received = self.received_by_address(&wallet, min_conf);
+        let received = self.history(&wallet).received_tally(min_depth as i64, true);
 
         let total: i64 = wallet
             .get_addresses_by_account(account)
             .iter()
             .filter_map(|addr| received.get(addr))
-            .map(|(amount, _)| amount)
+            .map(|t| t.amount)
             .sum();
 
         let divi = total as f64 / 100_000_000.0;
