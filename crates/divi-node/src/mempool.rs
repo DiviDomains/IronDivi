@@ -1006,7 +1006,7 @@ fn rejected(code: u8, reason: &str) -> NodeError {
 }
 
 fn conflict(existing: &Hash256) -> NodeError {
-    NodeError::TransactionValidation(format!("Conflicts with transaction {}", existing))
+    NodeError::MempoolConflict(*existing)
 }
 
 #[cfg(test)]
@@ -1511,11 +1511,10 @@ mod tests {
 
         // Should be rejected
         assert!(result.is_err());
-        if let Err(NodeError::TransactionValidation(msg)) = result {
-            assert!(msg.contains("Conflicts"));
-        } else {
-            panic!("Expected TransactionValidation error");
-        }
+        assert!(
+            matches!(result, Err(NodeError::MempoolConflict(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

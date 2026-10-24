@@ -2075,6 +2075,9 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
         NodeError::TxRejected { reason, .. } if reason == "bad-txns-nonstandard-inputs" => {
             TxSubmitError::Failed(String::new())
         }
+        // A coin a mempool transaction already spends: AcceptToMemoryPool returns
+        // false without a reject state (MempoolConsensus.cpp:303-313), so -25 ""
+        NodeError::MempoolConflict(_) => TxSubmitError::Failed(String::new()),
         NodeError::TxRejected { code, reason, .. } => TxSubmitError::Rejected { code, reason },
         NodeError::MissingInputs => TxSubmitError::UnknownInputs,
         NodeError::NonFinal => TxSubmitError::Rejected {
@@ -3417,6 +3420,21 @@ mod staking_config_tests {
 #[cfg(test)]
 mod submit_error_tests {
     use super::*;
+
+    /// sendrawtransaction of a spend of a coin a mempool transaction spends:
+    /// Divi Core's AcceptToMemoryPool keeps no reject state for it
+    /// (MempoolConsensus.cpp:303-313), so the reply is -25 with an empty message
+    /// (rpcrawtransaction.cpp:883-886)
+    #[test]
+    fn mempool_conflict_answers_like_core() {
+        use divi_primitives::hash::Hash256;
+        match submit_error(divi_node::NodeError::MempoolConflict(Hash256::from_bytes(
+            [3; 32],
+        ))) {
+            divi_rpc::TxSubmitError::Failed(message) => assert_eq!(message, ""),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 
     /// A refusal Divi Core makes without a reject state reaches the RPC as
     /// -25 with an empty message; refusals with a state keep code and reason
