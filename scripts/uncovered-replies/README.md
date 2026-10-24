@@ -26,7 +26,7 @@ scripts/uncovered-replies/run.sh target/release ~/divi-3.0.0/bin 53950 /var/tmp
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end. Give an
   absolute path.
 
-A run takes about 40 seconds and is stopped after 10 minutes. However it ends, every node is stopped and its
+A run takes 15 to 50 seconds and is stopped after 10 minutes. However it ends, every node is stopped and its
 directory deleted. Needs bash and python3 (standard library only). The phrase is read from divid's `dumphdinfo`
 reply and handed to irondivid in its environment (`WALLET_MNEMONIC`). It is never printed, written to a file or put
 on a command line. RPC passwords are made for the run and written only to each node's mode-600 `divi.conf`.
