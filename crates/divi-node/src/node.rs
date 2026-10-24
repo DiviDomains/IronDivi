@@ -707,6 +707,10 @@ impl Node {
 
         // Set peer manager height
         self.peer_manager.set_height(self.chain.height());
+        // Version messages name the height at the time they are sent
+        let chain_for_height = Arc::clone(&self.chain);
+        self.peer_manager
+            .set_height_source(Arc::new(move || chain_for_height.height()));
 
         // A pruning node must not advertise NODE_NETWORK (full history). Key it off the
         // database too, so a node that pruned earlier stays honest if expire is later off.

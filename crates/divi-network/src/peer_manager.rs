@@ -32,6 +32,9 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+/// Reads the node's current chain height
+pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
+
 /// Configuration for the peer manager
 #[derive(Debug, Clone)]
 pub struct PeerManagerConfig {
@@ -178,6 +181,8 @@ pub struct PeerManager {
     /// Tracks (consecutive_failures, last_attempt_time) so that repeatedly-failing
     /// peers are skipped for exponentially longer periods (up to 30 minutes).
     static_peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
+    /// Reads the current chain height for version messages (set by the node)
+    height_source: RwLock<Option<HeightSource>>,
     /// The inbound listener, bound before the node starts (bind_listener)
     listener: parking_lot::Mutex<Option<TcpListener>>,
 }
@@ -203,6 +208,7 @@ impl PeerManager {
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
+            height_source: RwLock::new(None),
             listener: parking_lot::Mutex::new(None),
         })
     }
@@ -319,6 +325,20 @@ impl PeerManager {
     /// Update our best block height
     pub fn set_height(&self, height: u32) {
         *self.our_height.write() = height;
+    }
+
+    /// Read the height for version messages from `source` from now on, as
+    /// Divi Core reads its chain height in each PushVersion (Node.cpp:994)
+    pub fn set_height_source(&self, source: HeightSource) {
+        *self.height_source.write() = Some(source);
+    }
+
+    /// The height a new version message names
+    fn current_height(&self) -> u32 {
+        match self.height_source.read().as_ref() {
+            Some(source) => source(),
+            None => *self.our_height.read(),
+        }
     }
 
     /// Set the service bits we advertise to peers. A node that has pruned
@@ -748,7 +768,7 @@ impl PeerManager {
         // Mark address as connecting
         self.connecting_addrs.write().insert(addr);
 
-        let our_height = *self.our_height.read();
+        let our_height = self.current_height();
 
         let result = Connection::connect(
             addr,
@@ -813,7 +833,7 @@ impl PeerManager {
             )));
         }
 
-        let our_height = *self.our_height.read();
+        let our_height = self.current_height();
 
         let (conn, handle) = Connection::accept(
             stream,
