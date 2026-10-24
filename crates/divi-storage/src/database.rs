@@ -85,6 +85,8 @@ impl ChainDatabase {
         path: P,
         block_cache_size: usize,
     ) -> Result<Self, StorageError> {
+        crate::datadir::refuse_foreign_database(path.as_ref())?;
+
         // === Database-wide options ===
         let mut opts = Options::default();
         opts.create_if_missing(true);

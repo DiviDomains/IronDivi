@@ -72,6 +72,14 @@ pub enum StorageError {
     /// Invalid parameter
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
+
+    /// A database irondivid did not make (such as Divi Core's LevelDB chainstate)
+    #[error("{0}")]
+    NotIronDivi(String),
+
+    /// A chain database made for another network
+    #[error("{0}")]
+    WrongNetwork(String),
 }
 
 impl From<divi_primitives::error::Error> for StorageError {
