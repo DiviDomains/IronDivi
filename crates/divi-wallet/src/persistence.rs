@@ -55,6 +55,9 @@ const KEY_ENCRYPTION_SALT: &[u8] = b"encryption_salt";
 const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
 const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+/// The seed of a wallet made from a seed, no words (Divi Core's -hdseed)
+pub(crate) const KEY_HD_SEED: &[u8] = b"hd_seed";
+pub(crate) const KEY_ENCRYPTED_HD_SEED: &[u8] = b"encrypted_hd_seed";
 const KEY_HD_COIN_TYPE: &[u8] = b"hd_coin_type";
 pub(crate) const KEY_MNEMONIC_PASSPHRASE: &[u8] = b"mnemonic_passphrase";
 pub(crate) const KEY_ENCRYPTED_MNEMONIC_PASSPHRASE: &[u8] = b"encrypted_mnemonic_passphrase";
@@ -149,6 +152,18 @@ impl WalletDatabase {
         self.db.path()
     }
 
+    /// Write a consistent copy of the open database into `dir`, which must not
+    /// exist: a RocksDB checkpoint after the memtables are flushed, so writes
+    /// running meanwhile are either all in it or not at all
+    pub fn checkpoint_to(&self, dir: &Path) -> Result<(), WalletError> {
+        self.db
+            .flush()
+            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .and_then(|c| c.create_checkpoint(dir))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     // ========== Metadata ==========
 
     /// Store the mnemonic (should be encrypted in production)
@@ -237,6 +252,32 @@ impl WalletDatabase {
     }
 
     /// Accessors for the encrypted mnemonic blob (`[IV][AES-256-CBC ciphertext]`)
+    /// Store the seed of a wallet made from a seed
+    pub fn store_hd_seed(&self, seed: &[u8]) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_HD_SEED, seed)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load the seed of a wallet made from a seed (None for a mnemonic wallet)
+    pub fn load_hd_seed(&self) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        Ok(self
+            .db
+            .get_cf(cf, KEY_HD_SEED)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map(zeroize::Zeroizing::new))
+    }
+
+    /// Load the encrypted seed of an encrypted wallet made from a seed
+    pub fn load_encrypted_hd_seed(&self) -> Result<Option<Vec<u8>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_ENCRYPTED_HD_SEED)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     pub fn load_encrypted_mnemonic(&self) -> Result<Option<Vec<u8>>, WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db

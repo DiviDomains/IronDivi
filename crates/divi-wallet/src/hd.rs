@@ -133,6 +133,9 @@ pub struct HdWallet {
     chain_mode: ChainMode,
     /// BIP44 coin type of the derivation path
     coin_type: u32,
+    /// The seed of a wallet made from a seed rather than words (Divi Core's
+    /// -hdseed); a mnemonic wallet's seed comes from its words
+    seed: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
 impl HdWallet {
@@ -166,6 +169,7 @@ impl HdWallet {
             passphrase: passphrase.filter(|p| !p.is_empty()).map(str::to_string),
             chain_mode,
             coin_type: legacy_coin_type(chain_mode),
+            seed: None,
         })
     }
 
@@ -178,6 +182,7 @@ impl HdWallet {
             passphrase: None,
             chain_mode,
             coin_type: legacy_coin_type(chain_mode),
+            seed: Some(zeroize::Zeroizing::new(seed.to_vec())),
         })
     }
 
@@ -190,6 +195,17 @@ impl HdWallet {
     /// Get the mnemonic phrase (if available)
     pub fn mnemonic(&self) -> Option<&str> {
         self.mnemonic.as_deref()
+    }
+
+    /// The seed of a wallet made from a seed (no words)
+    pub fn seed(&self) -> Option<&[u8]> {
+        self.seed.as_ref().map(|s| s.as_slice())
+    }
+
+    /// Path of the account the wallet's keys derive from, m/44'/coin'/0'
+    /// (Divi Core hdchain.cpp:121-145; keys are .../change/index)
+    pub fn account_path(&self) -> String {
+        format!("m/44'/{}'/0'", self.coin_type)
     }
 
     /// The BIP39 passphrase of the seed, if one was given
