@@ -380,6 +380,9 @@ pub struct BlockSync {
     /// A growing side chain counts as progress: while a deep fork is fetched the
     /// main-chain height stays put for many rounds.
     stall_counter: RwLock<((u32, u32), u32)>,
+    /// Sync peers that stalled since the chain last moved: the next sync peer
+    /// is one not in here, until every peer has had its turn
+    stalled_sync_peers: RwLock<HashSet<PeerId>>,
     /// Highest fully stored block we know of that is NOT on the main chain
     /// (hash, height). A fork deeper than one getblocks batch (500 hashes) is
     /// fetched across several rounds; this lets each round resume from where
@@ -424,6 +427,7 @@ impl BlockSync {
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
             stall_counter: RwLock::new(((0, 0), 0)),
+            stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
         })
     }
@@ -722,12 +726,25 @@ impl BlockSync {
             best_height
         );
 
-        // Find a peer at the best height
-        let peer = heights
+        // A peer at the best height that has not stalled since the chain last
+        // moved, the lowest id first so the order is the same each time; when
+        // every one has stalled, start over. (The first entry of the map was
+        // the same peer at every rotation, so a first peer that serves no
+        // blocks stopped the sync for good.)
+        let mut at_best: Vec<PeerId> = heights
             .iter()
             .filter(|(_, &h)| h >= best_height)
             .map(|(&id, _)| id)
-            .next();
+            .collect();
+        at_best.sort_unstable();
+        let peer = {
+            let mut stalled = self.stalled_sync_peers.write();
+            let fresh = at_best.iter().copied().find(|id| !stalled.contains(id));
+            if fresh.is_none() && !at_best.is_empty() {
+                stalled.clear();
+            }
+            fresh.or_else(|| at_best.first().copied())
+        };
 
         if peer.is_none() && !heights.is_empty() {
             // No peer at best height - find the peer with highest height instead
@@ -1526,13 +1543,20 @@ impl BlockSync {
                     false
                 }
             } else {
+                if stall.0 != progress {
+                    // The chain moved: every peer may be tried again
+                    self.stalled_sync_peers.write().clear();
+                }
                 stall.0 = progress;
                 stall.1 = 0;
                 false
             }
         }; // RwLock guard dropped here
         if is_stalled {
-            *self.sync_peer.write() = None;
+            // The next sync peer is another one (select_sync_peer)
+            if let Some(peer) = self.sync_peer.write().take() {
+                self.stalled_sync_peers.write().insert(peer);
+            }
             self.downloaded_blocks.write().clear();
             self.orphan_blocks.write().clear();
             self.block_sources.write().clear();
@@ -1976,6 +2000,8 @@ impl BlockSync {
         let mut order: Vec<PeerId> = Vec::new();
         let mut batches: HashMap<PeerId, Vec<Hash256>> = HashMap::new();
         let mut assigned: HashSet<Hash256> = HashSet::new();
+        // Blocks whose peers are all full for now, kept in queue order
+        let mut waiting: Vec<(Hash256, PeerId)> = Vec::new();
 
         loop {
             let next = self.pending_block_requests.write().pop_front();
@@ -2000,7 +2026,25 @@ impl BlockSync {
                 continue;
             }
 
-            let candidates: Vec<PeerId> = if full.is_empty() {
+            // A block announced by a peer that is still connected, may be
+            // asked (a full peer, or any peer when none is full) and has not
+            // failed it is asked of that peer only. Divi Core answers an inv
+            // with a getdata to its sender (main.cpp:584-610) and otherwise
+            // asks a peer only for blocks it has shown it has
+            // (FindNextBlocksToDownload, main.cpp:1211-1214); a peer that has
+            // not announced the block may not have it and would hold it until
+            // the request times out. With the announcer's slots full the block
+            // waits for one of them.
+            let announcer = self.block_retry.read().get(&hash).and_then(|r| {
+                r.announced_by.filter(|a| {
+                    connected.contains(a)
+                        && (full.is_empty() || full.contains(a))
+                        && !r.failed_peers.contains(a)
+                })
+            });
+            let candidates: Vec<PeerId> = if let Some(announcer) = announcer {
+                vec![announcer]
+            } else if full.is_empty() {
                 // No full peer: only the announcer, as Divi Core's inv reply
                 let announcer = self
                     .block_retry
@@ -2023,15 +2067,22 @@ impl BlockSync {
                 .into_iter()
                 .find(|p| per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER);
             let Some(peer) = chosen else {
-                // Every eligible peer is full, or none is connected: wait
+                // Every peer this block may be asked of is full, or none is
+                // connected: it waits. Blocks behind it are still placed while
+                // some connected peer has a free slot (one announced by another
+                // peer, or one any peer may be asked for)
                 trace!(
                     "No peer with a free slot for block {}; {} queued",
                     hash,
                     self.pending_block_requests.read().len() + 1
                 );
-                self.pending_block_requests
-                    .write()
-                    .push_front((hash, assigned_peer));
+                waiting.push((hash, assigned_peer));
+                let any_free = connected.iter().any(|p| {
+                    per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                });
+                if any_free {
+                    continue;
+                }
                 break;
             };
             *per_peer.entry(peer).or_default() += 1;
@@ -2040,6 +2091,12 @@ impl BlockSync {
                 order.push(peer);
             }
             batches.entry(peer).or_default().push(hash);
+        }
+        {
+            let mut pending = self.pending_block_requests.write();
+            for entry in waiting.into_iter().rev() {
+                pending.push_front(entry);
+            }
         }
 
         for peer in order {
@@ -3106,6 +3163,51 @@ mod tests {
         assert_eq!(coinstake.vout.len(), 4, "no lottery payees at 150");
     }
 
+    /// A stalled sync is retried with another peer each time, and every peer
+    /// at the best height gets its turn before one is tried again: picking the
+    /// first peer of a hash map picked the same peer at every rotation, so a
+    /// node whose first peer serves no blocks never synced (mainnet replay at
+    /// 2,472,145)
+    #[tokio::test]
+    async fn stalled_sync_rotates_through_every_peer() {
+        use crate::peer::PeerHandle;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let pm = PeerManager::new(Default::default());
+        let sync = BlockSync::new(chain, pm.clone());
+        let peers: Vec<PeerId> = vec![3, 8, 11, 20, 42];
+        let mut receivers = Vec::new();
+        for &id in &peers {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            receivers.push(rx);
+            pm.insert_test_peer(PeerHandle {
+                id,
+                addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
+                tx,
+                inbound: false,
+                stats: Default::default(),
+            });
+            sync.update_peer_height(id, 500);
+        }
+
+        // Downloading blocks, as the replay was, with no block coming in
+        *sync.state.write() = SyncState::BlockDownload;
+
+        // Each stall (three checks without progress) moves to another peer
+        let mut chosen = Vec::new();
+        for _ in 0..peers.len() {
+            for _ in 0..3 {
+                sync.check_timeouts().await;
+            }
+            chosen.push(sync.sync_peer.read().expect("a sync peer is chosen"));
+        }
+        let mut distinct = chosen.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct, peers, "every peer gets a turn: {chosen:?}");
+    }
+
     /// While block files are imported a block from a peer is not taken, as
     /// Divi Core ignores "block" messages then (main.cpp:814); afterwards it is
     #[tokio::test]
@@ -3422,6 +3524,53 @@ mod tests {
             8,
             "the rest wait for a free slot"
         );
+    }
+
+    /// Blocks a peer announced are asked of that peer, not of another peer
+    /// that has not shown it has them: with the announcer's 16 slots full the
+    /// rest wait for its slots (Divi Core main.cpp:584-610, :1211-1214).
+    /// Spread over a peer that lacked them, they stayed in flight there until
+    /// the request timed out.
+    #[tokio::test]
+    async fn announced_blocks_are_asked_of_the_announcer_only() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes: Vec<Hash256> = (0..28u8)
+            .map(|i| Hash256::from_bytes([i + 1; 32]))
+            .collect();
+        sync.handle_inv(
+            1,
+            hashes
+                .iter()
+                .map(|h| InvItem::new(InvType::Block, *h))
+                .collect(),
+        )
+        .await;
+        let asked = block_getdatas(&mut rxs);
+        assert!(!asked.contains_key(&2), "peer 2 was asked: {asked:?}");
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), None, "{per:?}");
+        assert_eq!(sync.pending_block_requests.read().len(), 12);
+
+        // A block from the announcer frees a slot there for the next one
+        let first = *sync
+            .blocks_in_flight
+            .read()
+            .keys()
+            .next()
+            .expect("a block in flight");
+        sync.blocks_in_flight.write().remove(&first);
+        sync.request_queued_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), None, "{per:?}");
+        assert_eq!(sync.pending_block_requests.read().len(), 11);
+
+        // Once the announcer fails a block, another peer may be asked for it
+        let stuck = *sync.blocks_in_flight.read().keys().next().unwrap();
+        expire_request(&sync, &stuck);
+        sync.check_timeouts().await;
+        assert_eq!(in_flight_peer(&sync, &stuck), Some(2));
     }
 
     /// Divi Core fills each peer's free slots with the next blocks in chain
