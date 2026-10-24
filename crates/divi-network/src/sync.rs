@@ -1000,6 +1000,9 @@ impl BlockSync {
     /// chain order that are neither downloaded nor in flight, within
     /// BLOCK_DOWNLOAD_WINDOW of the first missing one.
     async fn request_blocks(&self) {
+        if self.chain.is_importing() {
+            return;
+        }
         let peer_ids = self.peer_manager.connected_peers();
         if peer_ids.is_empty() {
             debug!("No connected peers available for block download");
@@ -1112,6 +1115,14 @@ impl BlockSync {
     /// Handle received block
     pub async fn handle_block(&self, peer_id: PeerId, block: Block) {
         let hash = compute_block_hash(&block.header);
+        // Divi Core ignores blocks received while importing (main.cpp:814)
+        if self.chain.is_importing() {
+            debug!(
+                "Ignoring block {} from peer {} while importing",
+                hash, peer_id
+            );
+            return;
+        }
         debug!("Received block {} from peer {}", hash, peer_id);
 
         // Track chain height before processing to detect newly connected blocks
@@ -1656,6 +1667,11 @@ impl BlockSync {
 
     /// Handle inventory announcement
     pub async fn handle_inv(&self, peer_id: PeerId, items: Vec<InvItem>) {
+        // Divi Core asks for nothing announced while importing (main.cpp:581-587)
+        if self.chain.is_importing() {
+            trace!("Ignoring inv from peer {} while importing", peer_id);
+            return;
+        }
         // Count block items
         let block_count = items
             .iter()
@@ -1921,6 +1937,9 @@ impl BlockSync {
     /// dead-peer blocks will be retried the next time this method is called
     /// (e.g., from `check_timeouts` or when a new block arrives).
     async fn request_queued_blocks(&self) {
+        if self.chain.is_importing() {
+            return;
+        }
         let mut consecutive_failures: u32 = 0;
         const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
@@ -3091,6 +3110,33 @@ mod tests {
             treasury::get_charity_script(false)
         );
         assert_eq!(coinstake.vout.len(), 4, "no lottery payees at 150");
+    }
+
+    /// While block files are imported a block from a peer is not taken, as
+    /// Divi Core ignores "block" messages then (main.cpp:814); afterwards it is
+    #[tokio::test]
+    async fn blocks_from_peers_are_ignored_while_importing() {
+        let blocks = build_regtest_chain(1, 0xC3, 0);
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let sync = BlockSync::new(chain.clone(), PeerManager::new(Default::default()));
+
+        chain.set_importing(true);
+        sync.handle_block(7, blocks[0].clone()).await;
+        assert_eq!(
+            chain.height(),
+            0,
+            "a peer's block was taken while importing"
+        );
+
+        chain.set_importing(false);
+        sync.handle_block(7, blocks[0].clone()).await;
+        assert_eq!(
+            chain.height(),
+            1,
+            "a peer's block was not taken after the import"
+        );
     }
 
     #[tokio::test]
