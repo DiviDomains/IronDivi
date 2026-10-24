@@ -340,8 +340,18 @@ impl NetworkRpc {
 
         match command.to_lowercase().as_str() {
             "add" => {
-                // Ban time: missing or 0 means the node's -bantime (default 24 hours)
+                // Ban time: missing or 0 means the node's -bantime (default 24
+                // hours); with `absolute` it is the time the ban ends, in
+                // seconds since 1970, as the help says
+                let absolute = params.get_bool(3).unwrap_or(false);
                 let duration = match params.get_u64(2) {
+                    Some(until) if until > 0 && absolute => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        Duration::from_secs(until.saturating_sub(now))
+                    }
                     Some(secs) if secs > 0 => Duration::from_secs(secs),
                     _ => peer_manager.scoring().ban_policy().1,
                 };
@@ -812,6 +822,44 @@ mod tests {
             divi_network::local::LOCAL_MANUAL,
         ));
         assert_eq!(reachable(&pm), [true, true, false]);
+    }
+
+    /// setban with `absolute`: the ban ends at the time given, as the help
+    /// says, not that many seconds from now
+    #[test]
+    fn setban_absolute_bans_until_the_time_given() {
+        let pm = PeerManager::new(quiet_config());
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&pm));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let until = now + 3600;
+        rpc.set_ban(&Params::Array(vec![
+            serde_json::json!("192.0.2.11"),
+            serde_json::json!("add"),
+            serde_json::json!(until),
+            serde_json::json!(true),
+        ]))
+        .unwrap();
+        rpc.set_ban(&Params::Array(vec![
+            serde_json::json!("192.0.2.12"),
+            serde_json::json!("add"),
+            serde_json::json!(600),
+        ]))
+        .unwrap();
+        let banned = rpc.list_banned(&Params::None).unwrap();
+        let end = |ip: &str| {
+            banned
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["address"] == ip)
+                .and_then(|b| b["banned_until"].as_u64())
+                .unwrap()
+        };
+        assert!(end("192.0.2.11").abs_diff(until) <= 2, "{banned}");
+        assert!(end("192.0.2.12").abs_diff(now + 600) <= 2, "{banned}");
     }
 
     /// The code and message of an RPC error
