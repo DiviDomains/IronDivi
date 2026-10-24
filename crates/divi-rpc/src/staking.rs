@@ -62,6 +62,32 @@ pub type SplitThresholdCallback = Arc<dyn Fn(Option<i64>) -> i64 + Send + Sync>;
 /// returns their hashes
 pub type GenerateCallback = Arc<dyn Fn(u32) -> Result<Vec<String>, String> + Send + Sync>;
 
+/// What `generateblock` asks of the one block it makes (rpcmining.cpp:121-210)
+#[derive(Debug, Clone, Default)]
+pub struct GenerateBlockOptions {
+    /// `extratx`: appended after the pool's transactions
+    pub extra_txs: Vec<divi_primitives::transaction::Transaction>,
+    /// `coinstake`: takes the place of the block's coinstake
+    pub coinstake: Option<divi_primitives::transaction::Transaction>,
+    /// `ignoreMempool`: leave the pool's transactions out
+    pub ignore_mempool: bool,
+    /// `blockBitsShift`: shift the block's target left by this many bits
+    pub bits_shift: Option<u32>,
+}
+
+/// Why `generateblock` made no block
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateBlockFailure {
+    /// Refused with Divi Core's message, answered as -1
+    Refused(String),
+    /// No valid block, answered as -25 "failed to generate a valid block"
+    Failed(String),
+}
+
+/// Makes one block for `generateblock` and gives its hash
+pub type GenerateBlockCallback =
+    Arc<dyn Fn(GenerateBlockOptions) -> Result<String, GenerateBlockFailure> + Send + Sync>;
+
 const COIN: i64 = 100_000_000;
 
 pub struct StakingRpc {
@@ -69,6 +95,7 @@ pub struct StakingRpc {
     set_staking_callback: RwLock<Option<SetStakingCallback>>,
     split_threshold_callback: RwLock<Option<SplitThresholdCallback>>,
     generate_callback: RwLock<Option<GenerateCallback>>,
+    generate_block_callback: RwLock<Option<GenerateBlockCallback>>,
     reserve_balance: RwLock<f64>,
 }
 
@@ -79,6 +106,7 @@ impl StakingRpc {
             set_staking_callback: RwLock::new(None),
             split_threshold_callback: RwLock::new(None),
             generate_callback: RwLock::new(None),
+            generate_block_callback: RwLock::new(None),
             reserve_balance: RwLock::new(0.0),
         }
     }
@@ -101,6 +129,10 @@ impl StakingRpc {
     /// Set the block generation callback
     pub fn set_generate_control(&self, callback: GenerateCallback) {
         *self.generate_callback.write() = Some(callback);
+    }
+
+    pub fn set_generate_block_control(&self, callback: GenerateBlockCallback) {
+        *self.generate_block_callback.write() = Some(callback);
     }
 
     fn split_threshold(&self, new_sats: Option<i64>) -> Result<i64, Error> {
@@ -264,6 +296,98 @@ impl StakingRpc {
             RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block")
         })?;
         Ok(serde_json::json!(hashes))
+    }
+
+    /// generateblock as Divi Core (rpcmining.cpp:121-210): the options are
+    /// type-checked in name order, each extratx and the coinstake decoded,
+    /// then one block is made with them. The argument count and the type of
+    /// `options` are checked by the server first.
+    pub fn generate_block(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_primitives::serialize::deserialize;
+        use divi_primitives::transaction::Transaction;
+        use serde_json::Value;
+
+        let empty = serde_json::Map::new();
+        let options = match params.get(0) {
+            Some(Value::Object(o)) => o,
+            _ => &empty,
+        };
+        // RPCTypeCheck(options, map_list_of(...), true): a std::map, so in
+        // name order (rpcserver.cpp:214-229)
+        for (key, want) in [
+            ("blockBitsShift", "int"),
+            ("coinstake", "str"),
+            ("extratx", "array"),
+            ("ignoreMempool", "bool"),
+        ] {
+            if let Some(value) = options.get(key).filter(|v| !v.is_null()) {
+                let got = crate::wallet::json_spirit_type(value);
+                if got != want {
+                    return Err(RpcError::new(
+                        codes::TYPE_ERROR,
+                        format!("Expected type {want} for {key}, got {got}"),
+                    )
+                    .into());
+                }
+            }
+        }
+        // DecodeHexTx (core_io.cpp:99-113)
+        let decode = |hex_str: &str| -> Result<Transaction, Error> {
+            hex::decode(hex_str)
+                .ok()
+                .filter(|b| !b.is_empty())
+                .and_then(|b| deserialize::<Transaction>(&b).ok())
+                .ok_or_else(|| {
+                    RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed").into()
+                })
+        };
+        let mut wanted = GenerateBlockOptions::default();
+        if let Some(Value::Array(txs)) = options.get("extratx") {
+            for value in txs {
+                let Value::String(hex_str) = value else {
+                    return Err(RpcError::new(
+                        codes::MISC_ERROR,
+                        format!(
+                            "value is type {}, expected str",
+                            crate::wallet::json_spirit_type(value)
+                        ),
+                    )
+                    .into());
+                };
+                wanted.extra_txs.push(decode(hex_str)?);
+            }
+        }
+        if let Some(Value::String(hex_str)) = options.get("coinstake") {
+            let tx = decode(hex_str)?;
+            if !tx.is_coinstake() {
+                return Err(
+                    RpcError::new(codes::INVALID_PARAMETER, "TX is not a coinstake").into(),
+                );
+            }
+            wanted.coinstake = Some(tx);
+        }
+        if let Some(Value::Bool(ignore)) = options.get("ignoreMempool") {
+            wanted.ignore_mempool = *ignore;
+        }
+        if let Some(Value::Number(n)) = options.get("blockBitsShift") {
+            // get_int(), then taken as unsigned (ExtendedBlockFactory.cpp:160-163)
+            wanted.bits_shift = Some(n.as_i64().unwrap_or_default() as i32 as u32);
+        }
+
+        let callback = self.generate_block_callback.read().clone();
+        let callback = callback.ok_or_else(|| {
+            RpcError::new(codes::MISC_ERROR, "generateblock needs a wallet to mine to")
+        })?;
+        match callback(wanted) {
+            Ok(hash) => Ok(serde_json::json!(hash)),
+            Err(GenerateBlockFailure::Refused(message)) => {
+                Err(RpcError::new(codes::MISC_ERROR, message).into())
+            }
+            Err(GenerateBlockFailure::Failed(why)) => {
+                info!("generateblock failed: {}", why);
+                Err(RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block").into())
+            }
+        }
     }
 
     pub fn reserve_balance(&self, params: &Params) -> Result<serde_json::Value, Error> {

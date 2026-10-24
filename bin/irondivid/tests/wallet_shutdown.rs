@@ -16,6 +16,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::free_port;
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -29,7 +32,7 @@ use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -39,14 +42,6 @@ const WALLET_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon about";
 const OTHER_MNEMONIC: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// First receiving address of a wallet restored from `mnemonic`
 fn first_address(mnemonic: &str) -> divi_wallet::Address {

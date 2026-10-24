@@ -13,6 +13,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::{free_port, log_tail};
 use divi_primitives::block::{Block, BlockHeader};
 use divi_primitives::hash::Hash256;
 use divi_primitives::serialize::{deserialize, serialize};
@@ -20,23 +23,10 @@ use divi_primitives::transaction::Transaction;
 use divi_storage::BlockExport;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
-
-/// A free port in 54100-54149, the range these tests may use
-fn port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    for _ in 0..50 {
-        let p = 54100 + NEXT.fetch_add(1, Ordering::Relaxed) % 50;
-        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-    panic!("no free port in 54100-54149");
-}
 
 /// POST one JSON-RPC call; None while the server is not up
 fn try_rpc(port: u16, method: &str, params: &Value) -> Option<Value> {
@@ -65,7 +55,7 @@ fn irondivid(datadir: &Path, rpc_port: u16) -> Command {
         .arg("--datadir")
         .arg(datadir)
         .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &port().to_string()])
+        .args(["--port", &free_port().to_string()])
         .args(["--bind", "127.0.0.1", "--staking=false"])
         .args(["--connect", "127.0.0.1:1"])
         .args(["--rpcuser", "test", "--rpcpassword", "test"])
@@ -76,7 +66,7 @@ fn irondivid(datadir: &Path, rpc_port: u16) -> Command {
 /// `--export-chain` of heights `start..=end` from `datadir` into `out`, run
 /// to its exit (at most 120 s)
 fn export(datadir: &Path, start: u32, end: u32, out: &Path) -> Output {
-    let mut cmd = irondivid(datadir, port());
+    let mut cmd = irondivid(datadir, free_port());
     cmd.arg("--export-chain")
         .args(["--export-start", &start.to_string()])
         .args(["--export-end", &end.to_string()])
@@ -104,7 +94,7 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path) -> Daemon {
-        let rpc_port = port();
+        let rpc_port = free_port();
         let child = irondivid(datadir, rpc_port)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -115,7 +105,8 @@ impl Daemon {
         while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
             assert!(
                 daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
+                "irondivid exited before its RPC server came up; its log ends:\n{}",
+                log_tail(datadir)
             );
             assert!(Instant::now() < deadline, "RPC server did not come up");
             std::thread::sleep(Duration::from_millis(250));

@@ -380,6 +380,9 @@ pub struct BlockSync {
     /// A growing side chain counts as progress: while a deep fork is fetched the
     /// main-chain height stays put for many rounds.
     stall_counter: RwLock<((u32, u32), u32)>,
+    /// Sync peers that stalled since the chain last moved: the next sync peer
+    /// is one not in here, until every peer has had its turn
+    stalled_sync_peers: RwLock<HashSet<PeerId>>,
     /// Highest fully stored block we know of that is NOT on the main chain
     /// (hash, height). A fork deeper than one getblocks batch (500 hashes) is
     /// fetched across several rounds; this lets each round resume from where
@@ -424,6 +427,7 @@ impl BlockSync {
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
             stall_counter: RwLock::new(((0, 0), 0)),
+            stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
         })
     }
@@ -734,12 +738,25 @@ impl BlockSync {
             best_height
         );
 
-        // Find a peer at the best height
-        let peer = heights
+        // A peer at the best height that has not stalled since the chain last
+        // moved, the lowest id first so the order is the same each time; when
+        // every one has stalled, start over. (The first entry of the map was
+        // the same peer at every rotation, so a first peer that serves no
+        // blocks stopped the sync for good.)
+        let mut at_best: Vec<PeerId> = heights
             .iter()
             .filter(|(_, &h)| h >= best_height)
             .map(|(&id, _)| id)
-            .next();
+            .collect();
+        at_best.sort_unstable();
+        let peer = {
+            let mut stalled = self.stalled_sync_peers.write();
+            let fresh = at_best.iter().copied().find(|id| !stalled.contains(id));
+            if fresh.is_none() && !at_best.is_empty() {
+                stalled.clear();
+            }
+            fresh.or_else(|| at_best.first().copied())
+        };
 
         if peer.is_none() && !heights.is_empty() {
             // No peer at best height - find the peer with highest height instead
@@ -1538,13 +1555,20 @@ impl BlockSync {
                     false
                 }
             } else {
+                if stall.0 != progress {
+                    // The chain moved: every peer may be tried again
+                    self.stalled_sync_peers.write().clear();
+                }
                 stall.0 = progress;
                 stall.1 = 0;
                 false
             }
         }; // RwLock guard dropped here
         if is_stalled {
-            *self.sync_peer.write() = None;
+            // The next sync peer is another one (select_sync_peer)
+            if let Some(peer) = self.sync_peer.write().take() {
+                self.stalled_sync_peers.write().insert(peer);
+            }
             self.downloaded_blocks.write().clear();
             self.orphan_blocks.write().clear();
             self.block_sources.write().clear();
@@ -3121,6 +3145,88 @@ mod tests {
             treasury::get_charity_script(false)
         );
         assert_eq!(coinstake.vout.len(), 4, "no lottery payees at 150");
+    }
+
+    /// A stalled sync is retried with another peer each time, and every peer
+    /// at the best height gets its turn before one is tried again: picking the
+    /// first peer of a hash map picked the same peer at every rotation, so a
+    /// node whose first peer serves no blocks never synced (mainnet replay at
+    /// 2,472,145)
+    #[tokio::test]
+    async fn stalled_sync_rotates_through_every_peer() {
+        use crate::peer::PeerHandle;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let pm = PeerManager::new(Default::default());
+        let sync = BlockSync::new(chain, pm.clone());
+        let peers: Vec<PeerId> = vec![3, 8, 11, 20, 42];
+        let mut receivers = Vec::new();
+        for &id in &peers {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            receivers.push(rx);
+            // Peers that serve every block (NODE_NETWORK), the only ones a
+            // sync peer is chosen from
+            let stats: Arc<crate::peer::LivePeerStats> = Default::default();
+            stats
+                .services
+                .store(crate::constants::services::NODE_NETWORK, Ordering::Relaxed);
+            pm.insert_test_peer(PeerHandle {
+                id,
+                addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
+                tx,
+                inbound: false,
+                stats,
+            });
+            sync.update_peer_height(id, 500);
+        }
+
+        // Downloading blocks, as the replay was, with no block coming in
+        *sync.state.write() = SyncState::BlockDownload;
+
+        // Each stall (three checks without progress) moves to another peer
+        let mut chosen = Vec::new();
+        for _ in 0..peers.len() {
+            for _ in 0..3 {
+                sync.check_timeouts().await;
+            }
+            chosen.push(sync.sync_peer.read().expect("a sync peer is chosen"));
+        }
+        let mut distinct = chosen.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct, peers, "every peer gets a turn: {chosen:?}");
+    }
+
+    /// Both rules together: a stalled sync rotates over the NODE_NETWORK peers
+    /// and never to one without it, even at the best height
+    #[tokio::test]
+    async fn stalled_sync_rotates_only_over_peers_with_node_network() {
+        let (sync, _rxs, _dir) = sync_with_peers(4);
+        make_pruned(&sync, 2);
+        for id in 1..=4 {
+            sync.update_peer_height(id, 500);
+        }
+        *sync.state.write() = SyncState::BlockDownload;
+        let mut chosen = Vec::new();
+        for _ in 0..6 {
+            for _ in 0..3 {
+                sync.check_timeouts().await;
+            }
+            chosen.push(sync.sync_peer.read().expect("a sync peer is chosen"));
+        }
+        assert!(
+            !chosen.contains(&2),
+            "never the client-only peer: {chosen:?}"
+        );
+        let mut distinct = chosen.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            vec![1, 3, 4],
+            "every full peer gets a turn: {chosen:?}"
+        );
     }
 
     /// While block files are imported a block from a peer is not taken, as

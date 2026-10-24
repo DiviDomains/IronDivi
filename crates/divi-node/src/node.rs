@@ -148,6 +148,9 @@ pub struct Node {
     /// Transaction relay manager
     tx_relay: Arc<TxRelay>,
 
+    /// Relayed transactions waiting for a parent (Divi Core mapOrphanTransactions)
+    orphans: Arc<crate::orphans::OrphanPool>,
+
     /// Spork synchronization manager
     spork_manager: Arc<SporkManager>,
 
@@ -498,7 +501,7 @@ impl Node {
                     }
                 })
                 .collect(),
-            listen_addr: if peer_sources.listen {
+            listen_addr: if peer_sources.listen && config.p2p.listen_on_addr {
                 Some(config.p2p.socket_addr())
             } else {
                 None
@@ -506,6 +509,17 @@ impl Node {
             default_port: config.network.default_p2p_port(),
             proxy,
             connect_only: !config.p2p.connect.is_empty(),
+            whitelist: config
+                .p2p
+                .whitelist
+                .iter()
+                .filter_map(|n| divi_network::Subnet::parse(n))
+                .collect(),
+            white_listen: if peer_sources.listen {
+                config.p2p.white_bind.clone()
+            } else {
+                Vec::new()
+            },
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // Divi Core -banscore / -bantime
@@ -581,6 +595,7 @@ impl Node {
             peer_manager,
             block_sync,
             tx_relay,
+            orphans: Arc::new(crate::orphans::OrphanPool::new()),
             spork_manager,
             masternode_manager,
             masternode_handler,
@@ -694,7 +709,7 @@ impl Node {
         }
         // As Divi Core, do not start without the listening socket
         self.peer_manager
-            .bind_listener()
+            .bind_listeners()
             .await
             .map_err(NodeError::Init)?;
         self.spawn_import();
@@ -726,6 +741,7 @@ impl Node {
         let block_sync = Arc::clone(&self.block_sync);
         let history = Arc::clone(&self.history);
         let tx_relay = Arc::clone(&self.tx_relay);
+        let orphans = Arc::clone(&self.orphans);
         let spork_manager = Arc::clone(&self.spork_manager);
         let chain = Arc::clone(&self.chain);
         let mempool = Arc::clone(&self.mempool);
@@ -759,6 +775,8 @@ impl Node {
                         tracing::warn!("Peer {} disconnected: {}", peer_id, reason);
                         block_sync.remove_peer(peer_id);
                         tx_relay.remove_peer(peer_id);
+                        // Divi Core FinalizeNode: EraseOrphansFor (NodeState.cpp:41)
+                        orphans.erase_for_peer(peer_id);
                         spork_manager.remove_peer(peer_id);
                         hash_continue.remove(&peer_id);
                         alerts_known.remove(&peer_id);
@@ -1154,6 +1172,8 @@ impl Node {
         let chain_for_relay = Arc::clone(&self.chain);
         let event_tx_for_relay = self.event_tx.clone();
         let peers_for_relay = Arc::clone(&self.peer_manager);
+        let orphans_for_relay = Arc::clone(&self.orphans);
+        let max_orphans = self.config.mempool.max_orphan_txs;
         let mut tx_events = tx_relay_for_mempool.subscribe();
         tokio::spawn(async move {
             while let Ok(event) = tx_events.recv().await {
@@ -1165,6 +1185,23 @@ impl Node {
                 ) {
                     Ok(txid) => {
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
+                        for txid in accept_orphans(
+                            &mempool_for_relay,
+                            &peers_for_relay,
+                            &orphans_for_relay,
+                            txid,
+                        ) {
+                            let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
+                        }
+                    }
+                    Err(NodeError::MissingInputs) => {
+                        // Kept until a parent comes; at most -maxorphantx
+                        // (main.cpp:785-792)
+                        orphans_for_relay.add(event.tx.clone(), event.from_peer);
+                        let evicted = orphans_for_relay.limit(max_orphans);
+                        if evicted > 0 {
+                            tracing::debug!("mapOrphan overflow, removed {} tx", evicted);
+                        }
                     }
                     Err(e) => {
                         tracing::debug!("Rejected relayed tx {}: {}", event.txid, e);
@@ -1761,6 +1798,63 @@ pub fn accept_relayed_transaction(
         }
     }
     result
+}
+
+/// Divi Core's orphan resolution after `txid` entered the mempool
+/// (main.cpp:743-782): each orphan spending from an accepted transaction is
+/// offered to the mempool in turn. One accepted joins the work queue; one
+/// still missing inputs stays; any other refusal drops it, and a refusal
+/// with a misbehaviour score costs the peer that sent it, once. Returns the
+/// orphans accepted.
+pub fn accept_orphans(
+    mempool: &Arc<Mempool>,
+    peers: &PeerManager,
+    orphans: &crate::orphans::OrphanPool,
+    txid: Hash256,
+) -> Vec<Hash256> {
+    let mut work = vec![txid];
+    let mut accepted = Vec::new();
+    let mut erase = Vec::new();
+    let mut misbehaving = HashSet::new();
+    let mut i = 0;
+    while i < work.len() {
+        for orphan_id in orphans.spending(&work[i]) {
+            let Some((tx, from_peer)) = orphans.get(&orphan_id) else {
+                continue;
+            };
+            if misbehaving.contains(&from_peer) {
+                continue;
+            }
+            match mempool.add_relayed(tx, divi_primitives::amount::Amount::ZERO) {
+                Ok(_) => {
+                    tracing::debug!("   accepted orphan tx {}", orphan_id);
+                    work.push(orphan_id);
+                    accepted.push(orphan_id);
+                    erase.push(orphan_id);
+                }
+                Err(NodeError::MissingInputs) => {}
+                Err(e) => {
+                    let score = e.misbehaviour_score();
+                    if score > 0 {
+                        peers.report_misbehavior_score(
+                            from_peer,
+                            score,
+                            "Invalid orphan transaction required by mempool transaction",
+                        );
+                        misbehaving.insert(from_peer);
+                        tracing::debug!("   invalid orphan tx {}", orphan_id);
+                    }
+                    tracing::debug!("   removed orphan tx {}", orphan_id);
+                    erase.push(orphan_id);
+                }
+            }
+        }
+        i += 1;
+    }
+    for txid in erase {
+        orphans.erase(&txid);
+    }
+    accepted
 }
 
 /// Whether a chain coin can be spent by a transaction in the next block: it

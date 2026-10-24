@@ -346,6 +346,33 @@ pub struct Staker {
     /// Held while a block is built and accepted, so the staking loop and
     /// `setgenerate` never build on the same tip at once
     producing: parking_lot::Mutex<()>,
+    /// `generateblock`'s ignoreMempool and extratx for the block being made
+    /// (Divi Core ExtendedBlockTransactionCollector), cleared after it
+    next_block_txs: parking_lot::Mutex<Option<(bool, Vec<Transaction>)>>,
+}
+
+/// What `generateblock` changes about the one block it makes (Divi Core
+/// rpcmining.cpp:121-210, ExtendedBlockFactory.cpp)
+#[derive(Debug, Clone, Default)]
+pub struct BlockOverrides {
+    /// Appended after the pool's transactions (`extratx`)
+    pub extra_txs: Vec<Transaction>,
+    /// Takes the place of the block's coinstake (`coinstake`)
+    pub coinstake: Option<Transaction>,
+    /// Leave the pool's transactions out (`ignoreMempool`)
+    pub ignore_mempool: bool,
+    /// Shift the block's target left by this many bits, at most 32
+    /// (`blockBitsShift`)
+    pub bits_shift: Option<u32>,
+}
+
+/// Why `generateblock` made no block
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateBlockError {
+    /// Refused before a block was made, with Divi Core's message
+    Refused(String),
+    /// No valid block could be made
+    Failed(String),
 }
 
 impl Staker {
@@ -374,6 +401,7 @@ impl Staker {
             block_connected_callback: RwLock::new(None),
             cache: RwLock::new(StakerCache::new()),
             producing: parking_lot::Mutex::new(()),
+            next_block_txs: parking_lot::Mutex::new(None),
         }
     }
 
@@ -815,16 +843,18 @@ impl Staker {
     /// after it, as Divi Core does. The staking loop's pacing guards (rate
     /// limit, stale tip, minimum coin age, reserve balance) do not apply.
     pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, String> {
-        if self.wallet.is_locked() {
-            return Err("wallet is locked".to_string());
-        }
         let _producing = self.producing.lock();
         let mut hashes = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let tip = self.chain.tip().ok_or("no chain tip")?;
             let height = tip.height + 1;
+            // A work block pays a keypool key, which a locked wallet still
+            // hands out; only a stake block needs the wallet unlocked
+            // (CoinMinter.cpp:141-158)
             let block = if height <= divi_storage::chain::LAST_POW_BLOCK {
                 self.build_work_block(&tip)?
+            } else if self.wallet.is_locked() {
+                return Err("wallet is locked".to_string());
             } else {
                 self.build_generated_stake_block(&tip)?
             };
@@ -833,6 +863,106 @@ impl Staker {
             hashes.push(block_hash);
         }
         Ok(hashes)
+    }
+
+    /// Regtest `generateblock`: one block made as `setgenerate` makes it, then
+    /// changed as Divi Core's ExtendedBlockFactory changes it
+    /// (ExtendedBlockFactory.cpp:27-104): the pool's transactions left out,
+    /// extra ones appended, and on a proof-of-stake block another coinstake
+    /// or shifted bits, the block then signed again with the key of the
+    /// coinstake's second output (BlockSigning.cpp:39-84).
+    pub fn generate_block_with(
+        &self,
+        overrides: &BlockOverrides,
+    ) -> Result<Hash256, GenerateBlockError> {
+        use GenerateBlockError::{Failed, Refused};
+        if self.wallet.is_locked() {
+            return Err(Failed("wallet is locked".to_string()));
+        }
+        let _producing = self.producing.lock();
+        let tip = self
+            .chain
+            .tip()
+            .ok_or_else(|| Failed("no chain tip".to_string()))?;
+        let height = tip.height + 1;
+        let work = height <= divi_storage::chain::LAST_POW_BLOCK;
+        if work && overrides.coinstake.is_some() {
+            return Err(Refused(
+                "trying to set custom coinstake in non-PoS block".to_string(),
+            ));
+        }
+        *self.next_block_txs.lock() = Some((overrides.ignore_mempool, overrides.extra_txs.clone()));
+        let built = if work {
+            self.build_work_block(&tip)
+        } else {
+            self.build_generated_stake_block(&tip)
+        };
+        *self.next_block_txs.lock() = None;
+        let mut block = built.map_err(Failed)?;
+
+        if work {
+            // Core signs a changed proof-of-work block with a pay-to-pubkey
+            // output of its coinbase; this coinbase pays a key hash
+            if overrides.bits_shift.is_some() {
+                return Err(Failed(
+                    "no pay-to-pubkey coinbase output to sign with".into(),
+                ));
+            }
+        } else if overrides.coinstake.is_some() || overrides.bits_shift.is_some() {
+            if let Some(coinstake) = &overrides.coinstake {
+                block.transactions[1] = coinstake.clone();
+                block.header.merkle_root = compute_merkle_root(&block.transactions);
+            }
+            if let Some(shift) = overrides.bits_shift {
+                block.header.bits = shift_bits(block.header.bits, shift);
+            }
+            let hash = compute_block_hash(&block.header);
+            let script = &block.transactions[1]
+                .vout
+                .get(1)
+                .ok_or_else(|| Failed("coinstake has no second output".to_string()))?
+                .script_pubkey;
+            block.block_sig = self.sign_block_for_script(&hash, script).map_err(Failed)?;
+        }
+        let block_hash = compute_block_hash(&block.header);
+        self.accept_own_block(&block, block_hash, height)
+            .map_err(Failed)?;
+        Ok(block_hash)
+    }
+
+    /// Divi Core `SignBlock` for a proof-of-stake block (BlockSigning.cpp:39-84):
+    /// with the wallet's key for the coinstake's second output, a compact
+    /// signature for a key hash or vault, a DER one for a public key
+    fn sign_block_for_script(&self, hash: &Hash256, script: &Script) -> Result<Vec<u8>, String> {
+        let bytes = script.as_bytes();
+        let key_for = |key_hash: &Hash160| {
+            self.wallet
+                .keystore()
+                .get_key(key_hash)
+                .and_then(|k| k.secret)
+                .ok_or_else(|| "Sign failed: no key for the coinstake output".to_string())
+        };
+        let compact = |secret: &divi_crypto::SecretKey| {
+            divi_crypto::sign_hash_recoverable(secret, hash.as_bytes())
+                .map(|sig| sig.to_compact_with_recovery().to_vec())
+                .map_err(|e| format!("Sign failed: {e}"))
+        };
+        if divi_script::standard::is_p2pk(bytes) {
+            let pubkey = &bytes[1..bytes.len() - 1];
+            let secret = key_for(&divi_crypto::hash160(pubkey))?;
+            return divi_crypto::sign_hash(&secret, hash.as_bytes())
+                .map(|sig| sig.to_der())
+                .map_err(|e| format!("Sign failed: {e}"));
+        }
+        if let Some(vault) = divi_script::StakingVaultScript::from_script(script) {
+            return compact(&key_for(&Hash160::from_bytes(vault.vault_pubkey_hash))?);
+        }
+        if bytes.len() == 25 && bytes[..3] == [0x76, 0xa9, 0x14] && bytes[23..] == [0x88, 0xac] {
+            let mut key_hash = [0u8; 20];
+            key_hash.copy_from_slice(&bytes[3..23]);
+            return compact(&key_for(&Hash160::from_bytes(key_hash))?);
+        }
+        Err("Sign failed: the coinstake output is not a key hash, key or vault".to_string())
     }
 
     /// Earliest time a block on `tip` may carry: now, but past the median time
@@ -898,6 +1028,19 @@ impl Staker {
 
     /// Mempool transactions to put in a block at `height` and `timestamp`
     fn mempool_block_txs(&self, height: u32, timestamp: u32) -> Vec<Transaction> {
+        let overrides = self.next_block_txs.lock().clone();
+        let mut txs = match &overrides {
+            Some((true, _)) => Vec::new(),
+            _ => self.pool_block_txs(height, timestamp),
+        };
+        if let Some((_, extra)) = overrides {
+            txs.extend(extra);
+        }
+        txs
+    }
+
+    /// The pool's transactions for a block at `height` and `timestamp`
+    fn pool_block_txs(&self, height: u32, timestamp: u32) -> Vec<Transaction> {
         let limits = {
             let c = self.config.read();
             BlockAssembly::new(
@@ -2145,6 +2288,28 @@ fn block_max_size(configured: usize) -> usize {
     configured.clamp(1000, MAX_BLOCK_SIZE - 1000)
 }
 
+/// Divi Core's `blockBitsShift`: the target of `bits` shifted left by
+/// `shift` bits, at most 32, what goes past 256 bits dropped as in uint256
+/// (ExtendedBlockFactory.cpp:84-86)
+fn shift_bits(bits: u32, shift: u32) -> u32 {
+    let shift = shift.min(32) as usize;
+    let le = divi_consensus::target::Target::from_compact(bits);
+    let le = le.as_bytes();
+    let mut out = [0u8; 32];
+    let (bytes, rest) = (shift / 8, shift % 8);
+    for i in (0..32usize).rev() {
+        let Some(src) = i.checked_sub(bytes) else {
+            continue;
+        };
+        let mut v = (le[src] as u16) << rest;
+        if rest > 0 && src > 0 {
+            v |= (le[src - 1] as u16) >> (8 - rest);
+        }
+        out[i] = v as u8;
+    }
+    divi_consensus::target::Target::from_bytes(out).to_compact()
+}
+
 /// Divi Core `DEFAULT_BLOCK_PRIORITY_SIZE` (defaultValues.h:50): `-blockprioritysize` default
 pub const DEFAULT_BLOCK_PRIORITY_SIZE: usize = 50_000;
 
@@ -2629,6 +2794,46 @@ mod tests {
 
         // Staker starts in stopped state
         assert!(!staker.is_running());
+    }
+
+    /// setgenerate below the last PoW block mines on a locked wallet: the
+    /// coinbase pays a key from the keypool, which needs no unlock; only stake
+    /// blocks need the wallet unlocked (CoinMinter.cpp:141-158, wallet.cpp:2129-2136)
+    #[test]
+    fn setgenerate_mines_work_blocks_on_a_locked_wallet() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        wallet.encrypt_wallet("pw").unwrap();
+        wallet.lock();
+        assert!(wallet.is_locked());
+        let staker = Staker::new(
+            wallet.clone(),
+            chain.clone(),
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig::default(),
+        );
+        let hashes = staker
+            .generate_blocks(1)
+            .expect("a work block on a locked wallet");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(chain.height(), 1);
     }
 
     #[test]

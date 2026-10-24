@@ -164,7 +164,7 @@ impl NetworkRpc {
                     "startingheight": st.start_height.load(Relaxed),
                     "banscore": banscore,
                     "inflight": [],
-                    "whitelisted": false,
+                    "whitelisted": peer_manager.is_whitelisted(*id),
                     "synced_headers": -1,
                     "synced_blocks": -1
                 });

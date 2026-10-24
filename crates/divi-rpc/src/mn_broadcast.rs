@@ -17,7 +17,7 @@
 
 use crate::error::{codes, Error, RpcError};
 use divi_crypto::{hash160, SecretKey};
-use divi_masternode::cpp_wire::{CppBroadcast, CppPing, CppTxIn};
+use divi_masternode::cpp_wire::{CppBroadcast, CppPing, CppTxIn, WireError};
 use divi_primitives::Hash256;
 use divi_storage::chain::NetworkType;
 use divi_storage::Chain;
@@ -43,8 +43,9 @@ pub struct MnContext<'a> {
     pub wallet: Option<Arc<WalletDb>>,
 }
 
+/// The masternode calls' errors are RPC_INVALID_PARAMS (rpcmasternode.cpp:177, :236)
 fn invalid_param(msg: impl Into<String>) -> Error {
-    RpcError::new(codes::INVALID_PARAMETER, msg.into()).into()
+    RpcError::new(codes::INVALID_PARAMS, msg.into()).into()
 }
 
 fn now() -> i64 {
@@ -55,8 +56,31 @@ fn now() -> i64 {
 }
 
 /// `COutPoint::ToString`
+/// `COutPoint::ToString` with the whole hash (OutPoint.cpp:31)
 fn outpoint_string(hash: &Hash256, n: u32) -> String {
-    format!("COutPoint({}, {})", &hash.to_hex()[..10], n)
+    format!("COutPoint({}, {})", hash.to_hex(), n)
+}
+
+/// Divi Core's `ParseHex`: pairs of hex digits, spaces skipped, stopping at
+/// the first character that is not one (utilstrencodings.cpp)
+fn core_parse_hex(s: &str) -> Vec<u8> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match (
+            b.get(i).copied().and_then(digit),
+            b.get(i + 1).copied().and_then(digit),
+        ) {
+            (Some(hi), Some(lo)) => out.push(hi << 4 | lo),
+            _ => return out,
+        }
+        i += 2;
+    }
 }
 
 fn wallet_network(chain: &Chain) -> Network {
@@ -217,15 +241,22 @@ pub fn read_conf(path: &std::path::Path) -> Vec<ConfEntry> {
         .collect()
 }
 
+/// A broadcast from its hex as Divi Core reads it: `ParseHex`, then
+/// `CDataStream >> CMasternodeBroadcast`. Data that ends early is Core's stream
+/// exception, which its RPC server answers with code -1 and the exception's text.
 fn decode_hex_broadcast(hex_str: &str) -> Result<CppBroadcast, Error> {
-    let bytes = hex::decode(hex_str.trim())
-        .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "Broadcast must be hex"))?;
-    CppBroadcast::decode(&bytes).map_err(|e| {
-        RpcError::new(
+    let bytes = core_parse_hex(hex_str);
+    CppBroadcast::decode(&bytes).map_err(|e| match e {
+        WireError::Truncated | WireError::BadLength => RpcError::new(
+            codes::MISC_ERROR,
+            "CDataStream::read() : end of data: iostream error",
+        )
+        .into(),
+        e => RpcError::new(
             codes::DESERIALIZATION_ERROR,
             format!("Broadcast decode failed: {}", e),
         )
-        .into()
+        .into(),
     })
 }
 
@@ -482,6 +513,49 @@ pub fn list_broadcasts(store: &BroadcastStore) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A broadcast read as Divi Core reads it: ParseHex stops at the first
+    /// character that is not hex, and data that ends early is the stream's
+    /// exception, code -1 (rpcmasternode.cpp:174-176, :606-609)
+    #[test]
+    fn broadcast_hex_is_read_as_divid() {
+        let end_of_data = (
+            -1,
+            "CDataStream::read() : end of data: iostream error".to_string(),
+        );
+        let code_message = |hex: &str| match decode_hex_broadcast(hex) {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("expected an RPC error, got {:?}", other.map(|_| ())),
+        };
+        assert_eq!(code_message("zz"), end_of_data);
+        assert_eq!(code_message("00"), end_of_data);
+        let whole = hex::encode(bcast(1).encode());
+        assert_eq!(code_message(&whole[..whole.len() - 2]), end_of_data);
+        assert!(decode_hex_broadcast(&whole).is_ok());
+        assert!(decode_hex_broadcast(&format!("{whole}zz")).is_ok());
+    }
+
+    #[test]
+    fn parse_hex_stops_at_the_first_character_that_is_not_hex() {
+        assert_eq!(core_parse_hex("0a 0B zz 11"), vec![0x0a, 0x0b]);
+        assert_eq!(core_parse_hex("abc"), vec![0xab]);
+        assert!(core_parse_hex("").is_empty());
+    }
+
+    /// The masternode calls' errors are RPC_INVALID_PARAMS and name the outpoint
+    /// with its whole hash (rpcmasternode.cpp:236, OutPoint.cpp:31)
+    #[test]
+    fn masternode_errors_are_invalid_params_with_the_whole_outpoint() {
+        let hash = Hash256::from_bytes([0x11; 32]);
+        assert_eq!(
+            outpoint_string(&hash, 0),
+            format!("COutPoint({}, 0)", "11".repeat(32))
+        );
+        match invalid_param("x") {
+            Error::Rpc(e) => assert_eq!(e.code, -32602),
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn bcast(n: u32) -> CppBroadcast {
         CppBroadcast {
