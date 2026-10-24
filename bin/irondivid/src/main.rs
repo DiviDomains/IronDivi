@@ -587,8 +587,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(n) = number_option(&s, "maxreorg", 0..=i64::from(u32::MAX)) {
         config.max_reorg = Some(n as u32);
     }
-    if let Some(n) = number_option(&s, "maxorphantx", 0..=i64::MAX) {
-        config.mempool.max_orphan_txs = n as usize;
+    // -maxorphantx: atoi64, below 0 read as 0, then kept as an unsigned int
+    // (main.cpp:790): a negative value, a text or an empty one keeps no orphan
+    if let Some(text) = s.get("maxorphantx") {
+        config.mempool.max_orphan_txs = settings::atoi(text).max(0) as u32 as usize;
     }
     if let Some(text) = s.get("minrelaytxfee") {
         // ParseMoney; refused unless it is an amount above zero, and kept in
@@ -4034,6 +4036,11 @@ mod divid_option_tests {
         assert_eq!((c.p2p.max_inbound, c.p2p.max_outbound), (109, 16));
         assert!(!cfg("rpcuser=x\nserver=0\n").rpc.enabled);
         assert_eq!(cfg("rpcuser=x\nmaxorphantx=7\n").mempool.max_orphan_txs, 7);
+        // Below 0, a text or nothing keeps no orphan (main.cpp:790)
+        for none in ["-5", "abc", ""] {
+            let conf = format!("rpcuser=x\nmaxorphantx={none}\n");
+            assert_eq!(cfg(&conf).mempool.max_orphan_txs, 0, "-maxorphantx={none}");
+        }
         assert_eq!(
             cfg("rpcuser=x\nminrelaytxfee=0.0002\n")
                 .mempool

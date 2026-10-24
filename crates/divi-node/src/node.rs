@@ -621,6 +621,13 @@ impl Node {
 
         // Create transaction relay manager
         let tx_relay = TxRelay::new(Arc::clone(&peer_manager));
+        let orphans = Arc::new(crate::orphans::OrphanPool::new());
+        {
+            let (mempool, orphans) = (Arc::clone(&mempool), Arc::clone(&orphans));
+            tx_relay.set_have_check(Arc::new(move |txid| {
+                (mempool.contains(txid), orphans.contains(txid))
+            }));
+        }
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
@@ -665,7 +672,7 @@ impl Node {
             peer_manager,
             block_sync,
             tx_relay,
-            orphans: Arc::new(crate::orphans::OrphanPool::new()),
+            orphans,
             spork_manager,
             masternode_manager,
             masternode_handler,
@@ -1304,6 +1311,9 @@ impl Node {
                     Ok(txid) => {
                         tracing::debug!("Added relayed tx {} to mempool", txid);
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
+                        // Announced once accepted, then each orphan it lets in
+                        // (main.cpp:733-734, :760-762)
+                        tx_relay_for_mempool.relay_accepted(txid).await;
                         for txid in accept_orphans(
                             &mempool_for_relay,
                             &peers_for_relay,
@@ -1311,6 +1321,7 @@ impl Node {
                             txid,
                         ) {
                             let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
+                            tx_relay_for_mempool.relay_accepted(txid).await;
                         }
                     }
                     Err(NodeError::MissingInputs) => {
