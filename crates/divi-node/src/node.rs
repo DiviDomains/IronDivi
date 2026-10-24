@@ -824,6 +824,9 @@ impl Node {
 
                         // Update sync with peer's height
                         block_sync.update_peer_height(peer_id, version.start_height.max(0) as u32);
+                        block_sync
+                            .begin_syncing_with_peer(peer_id, version.services)
+                            .await;
 
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
