@@ -875,8 +875,7 @@ fn removevault_one_and_two_arguments() {
     let res = rpc
         .remove_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
         .unwrap();
-    assert_eq!(res["removal_status"], json!(true), "{}", res);
-    assert_eq!(res["tx_hash"], json!(s.fund_txid.to_string()));
+    assert_eq!(res, json!({"removal_status": true}));
     assert!(s.manager.get_all_vaults().is_empty());
 }
 
@@ -963,4 +962,40 @@ fn removevault_needs_the_vault_option() {
         .unwrap();
     assert_eq!(res, json!({"removal_status": false}));
     assert_eq!(s.manager.get_all_vaults().len(), 1);
+}
+
+/// removevault answers as divid: {removal_status} alone (rpcwallet.cpp:1226),
+/// true again for a vault no longer held (RemoveVault, wallet.cpp:707-713),
+/// and -5 "Vault Registry Failed: ..." for a bad manager or owner address,
+/// the manager checked first (rpcwallet.cpp:1215-1221)
+#[test]
+fn removevault_replies_as_divid() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let res = rpc.remove_vault(&p(vec![json!(s.encoding)])).unwrap();
+    assert_eq!(res, json!({"removal_status": true}));
+    let again = rpc
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap_or_else(|e| panic!("removevault of a vault not held: {}", error_message(e)));
+    assert_eq!(again, json!({"removal_status": true}));
+
+    for (encoding, text) in [
+        (
+            format!("{}:notanaddress", s.owner_addr),
+            "Vault Registry Failed: Invalid manager DIVI address",
+        ),
+        (
+            format!("notanaddress:{}", s.manager_addr),
+            "Vault Registry Failed: Invalid owner DIVI address",
+        ),
+        (
+            "notanaddress:notanaddress".to_string(),
+            "Vault Registry Failed: Invalid manager DIVI address",
+        ),
+    ] {
+        match rpc.remove_vault(&p(vec![json!(encoding)])).unwrap_err() {
+            divi_rpc::Error::Rpc(r) => assert_eq!((r.code, r.message.as_str()), (-5, text)),
+            other => panic!("{other:?}"),
+        }
+    }
 }

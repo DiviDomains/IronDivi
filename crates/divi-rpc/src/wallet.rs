@@ -2586,20 +2586,27 @@ impl WalletRpc {
                 RpcError::new(codes::INVALID_PARAMETER, "Could not parse vault encoding!").into(),
             );
         }
-        // Divi Core takes the encoding only; an optional funding txid is
-        // still accepted (and echoed back) for older IronDivi callers
-        let tx_hash = params.get_str(1);
+        // Divi Core takes the encoding only; an optional second argument (a
+        // funding txid) is still accepted for older IronDivi callers
 
-        let (owner_addr, manager_addr) = self.parse_vault_encoding(vault_addresses)?;
-        let owner_hash = if let Some(ref addr) = owner_addr {
-            self.address_to_hash160(addr)?
-        } else {
-            return Err(RpcError::invalid_params(
-                "Owner address is required. Use format: owner_address:manager_address",
+        // Split at the first ':' and check the manager, then the owner, as
+        // Divi Core does (rpcwallet.cpp:1207-1221)
+        let (owner_addr, manager_addr) = vault_addresses
+            .split_once(':')
+            .expect("checked to hold ':' above");
+        let invalid = |which: &str| -> Error {
+            RpcError::new(
+                codes::INVALID_ADDRESS_OR_KEY,
+                format!("Vault Registry Failed: Invalid {} DIVI address", which),
             )
-            .into());
+            .into()
         };
-        let manager_hash = self.address_to_hash160(&manager_addr)?;
+        let manager_hash = self
+            .address_to_hash160(manager_addr)
+            .map_err(|_| invalid("manager"))?;
+        let owner_hash = self
+            .address_to_hash160(owner_addr)
+            .map_err(|_| invalid("owner"))?;
 
         let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
 
@@ -2611,32 +2618,16 @@ impl WalletRpc {
             return Ok(serde_json::json!({ "removal_status": false }));
         }
 
+        // Divi Core's RemoveVault erases the script if it is there and
+        // answers true either way (wallet.cpp:707-713); the reply holds
+        // removal_status alone (rpcwallet.cpp:1226)
         let vault_script_bytes = vault_script.as_bytes().to_vec();
-        let vault_exists = wallet.get_vault(&vault_script_bytes).is_some();
-
-        if !vault_exists {
-            return Err(RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Vault {} not found in wallet", vault_addresses),
-            )
-            .into());
-        }
-
-        let removed = wallet.remove_vault(&vault_script_bytes);
-
-        if !removed {
+        if wallet.get_vault(&vault_script_bytes).is_some()
+            && !wallet.remove_vault(&vault_script_bytes)
+        {
             return Err(RpcError::new(codes::WALLET_ERROR, "Failed to remove vault").into());
         }
-
-        let mut result = serde_json::json!({
-            "removal_status": true,
-            "result": "success",
-            "message": format!("Vault {} removed successfully", vault_addresses),
-        });
-        if let Some(tx_hash) = tx_hash {
-            result["tx_hash"] = json!(tx_hash);
-        }
-        Ok(result)
+        Ok(serde_json::json!({ "removal_status": true }))
     }
 
     /// Get coin availability - Show available vault funds
