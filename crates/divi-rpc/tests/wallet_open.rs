@@ -328,6 +328,10 @@ fn setaccount_of_the_current_address_gives_the_old_account_a_new_one() {
     );
     rpc.set_account(&p(vec![json!(first.to_string()), json!("moved")]))
         .unwrap();
+    // The new address is in the address book at once, before anyone asks
+    // for it (divid's listreceivedbyaddress 0 true lists it)
+    let unnamed = rpc.get_addresses_by_account(&p(vec![json!("")])).unwrap();
+    assert_eq!(unnamed.as_array().unwrap().len(), 1, "{unnamed}");
     let current = rpc.get_account_address(&p(vec![json!("")])).unwrap();
     assert_ne!(current, json!(first.to_string()));
     let unnamed = rpc.get_addresses_by_account(&p(vec![json!("")])).unwrap();
