@@ -1632,8 +1632,16 @@ pub fn check_mempool_transaction(
     };
 
     let max_money = chain.max_money();
-    if divi_storage::check_transaction(tx, max_money).is_err() {
-        return Err(NodeError::rejected(reject::INVALID, "bad-tx"));
+    // Divi Core's AcceptToMemoryPool records its own 100 on top of what
+    // CheckTransaction recorded (CValidationState::DoS adds them up,
+    // ValidationState.cpp:41; MempoolConsensus.cpp:276-277): 110 for a
+    // transaction without inputs or outputs, 200 for the other failures
+    if let Err(e) = divi_storage::check_transaction(tx, max_money) {
+        return Err(NodeError::rejected_scored(
+            reject::INVALID,
+            "bad-tx",
+            e.misbehaviour_score() + 100,
+        ));
     }
     if tx.is_coinbase() {
         return Err(NodeError::rejected(reject::INVALID, "coinbase"));

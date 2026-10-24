@@ -10,7 +10,7 @@ Core paths are under `divi/src/` of the Divi Core source. IronDivi paths are fro
 
 | # | divid | irondivid | Why | Pinned by |
 |---|---|---|---|---|
-| S1 | Keeps an option it does not know and says nothing (Settings.cpp:130-150) | Starts as well, and logs `Unknown option -<name>; ignored` (bin/irondivid/src/main.rs:638) | A typo in `divi.conf` would otherwise go unnoticed; the node still starts as divid does | `bin/irondivid/tests/divid_differences.rs` `unknown_and_unsupported_options_start_with_a_log_line` |
+| S1 | Keeps an option it does not know and says nothing (Settings.cpp:130-150) | Starts as well, and logs `Unknown option -<name>; ignored`, naming a `-no<name>` as written (bin/irondivid/src/main.rs:638-644, bin/irondivid/src/settings.rs) | A typo in `divi.conf` would otherwise go unnoticed; the node still starts as divid does | `bin/irondivid/tests/divid_differences.rs` `unknown_and_unsupported_options_start_with_a_log_line`, `negated_unknown_option_is_named_as_written` |
 | S2 | Uses options such as `-dbcache`, `-checklevel`, `-createwalletbackups` | Accepts them, logs `Option -<name> is not supported by irondivid; ignored` (bin/irondivid/src/main.rs:266, :635) | They tune parts irondivid does not have (Berkeley DB, LevelDB cache, level-3 check) or keeps fixed at Core's default | same test |
 | S3 | `-masternode=<alias>` runs the node as that masternode of `masternode.conf` (MasternodeModule.cpp:163-190) | Refuses to start: `irondivid does not run as a masternode; remove the masternode= line to start it` (bin/irondivid/src/main.rs:626-633) | irondivid does not run a masternode; starting as a plain node would leave the owner believing the masternode runs | `bin/irondivid/tests/divid_differences.rs` `masternode_option_is_refused` |
 | S4 | Wallet seed only from `-mnemonic`, `-mnemonicpassphrase`, `-hdseed` (wallet.cpp:2286-2304) | The same options, and when an option is absent the environment variables `WALLET_MNEMONIC`, `WALLET_MNEMONIC_PASSPHRASE`, `WALLET_HDSEED` (bin/irondivid/src/main.rs:1005-1011) | Keeps a phrase off the command line and out of `divi.conf`; the options win, so divid's way works unchanged | `bin/irondivid/tests/move_from_core.rs` (starts with `WALLET_MNEMONIC`), `bin/irondivid/src/main.rs` `wallet_move_tests::hex_seed_restores_cores_first_address` |
@@ -52,5 +52,7 @@ Core paths are under `divi/src/` of the Divi Core source. IronDivi paths are fro
 
 Differences that are not choices (work not done yet, or replies that are only shorter or longer texts) are kept with
 the work that found them, not here: for example `getrawmempool` priorities reported as 0, `gettxout` `version`
-always 1, `listtransactions` order among transactions of one block, help texts for wrong argument counts, P2P relay
-refusals not scored, and the `-txindex` change message naming a `-reindex` irondivid does not have.
+always 1, `listtransactions` order among transactions of one block, help texts for wrong argument counts, the
+masternode messages (`mnb`, `mnp`, `mnw`) and a full send queue going unscored (irondivid does not check masternode
+signatures or collateral, and its send queue counts messages, not divid's bytes), and the `-txindex` change message
+naming a `-reindex` irondivid does not have.

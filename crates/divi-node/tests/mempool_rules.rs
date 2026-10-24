@@ -174,10 +174,12 @@ fn sign_all(mut tx: Transaction, kp: &KeyPair, value: i64) -> Transaction {
     tx
 }
 
-/// CheckTransaction failures are refused as "bad-tx" with DoS 100
-/// (MempoolConsensus.cpp:276-277; BlockCheckingHelpers.cpp:99-147)
+/// CheckTransaction failures are refused as "bad-tx": CheckTransaction's own
+/// DoS 100 plus AcceptToMemoryPool's 100, which CValidationState adds up
+/// (MempoolConsensus.cpp:276-277; BlockCheckingHelpers.cpp:99-147;
+/// ValidationState.cpp:41)
 #[test]
-fn context_free_failures_are_refused_and_score_100() {
+fn context_free_failures_are_refused_and_score_200() {
     let t = TestNode::new();
     let owner = KeyPair::new_random();
 
@@ -190,7 +192,7 @@ fn context_free_failures_are_refused_and_score_100() {
         COINBASE,
     );
     assert_eq!(t.relay(peer, twice).unwrap_err(), "16: bad-tx");
-    assert_eq!(t.score(peer), 100);
+    assert_eq!(t.score(peer), 200);
     assert!(t.banned(&ip));
 
     // An empty output (no value, no script) in an ordinary transaction
@@ -207,7 +209,7 @@ fn context_free_failures_are_refused_and_score_100() {
         COINBASE,
     );
     assert_eq!(t.relay(peer, empty).unwrap_err(), "16: bad-tx");
-    assert_eq!(t.score(peer), 100);
+    assert_eq!(t.score(peer), 200);
     assert!(t.banned(&ip));
     assert_eq!(t.node.mempool().size(), 0);
 }
