@@ -269,6 +269,8 @@ def utxo(node):
 
 
 def mine(node, n, every=None):
+    """Mine n blocks one by one, recording each; returns their hashes"""
+    hashes = []
     for k in range(n):
         if every:
             every(k)
@@ -284,6 +286,8 @@ def mine(node, n, every=None):
             raise Failed(f"{node.name} setgenerate: no block in 20 tries")
         u = utxo(node)
         hist[u[1]] = u
+        hashes.append(u[1])
+    return hashes
 
 
 def show_u(u):
@@ -794,27 +798,35 @@ def reorg_point(node, k, d, W, L):
             join(L, W)
             fork_h = W.rpc("getblockcount")
         a = rng.randint(4, (fork_h // 10 + 1) * 10 - fork_h - 1)
-        mine(W, a)
+        old = set(mine(W, a))
         node.start(d, INDEX_CONF + [f"connect={W.addr}"])
         tip = W.rpc("getbestblockhash")
         if not wait_for(lambda: node.rpc("getbestblockhash") == tip, 120, 0.1):
             raise Failed(f"did not follow {W.name} before the point")
         b = a + rng.randint(2, 6)
-        mine(L, b)
+        new = set(mine(L, b))
         node.rpc("addnode", L.addr, "onetry")
         if by_log and not wait_log(node, r"Disconnecting block", 30):
             raise Failed("no 'Disconnecting block' line within 30s of the longer branch")
         time.sleep(delay)
         node.kill9()
         how = restart_after_kill(node, d, INDEX_CONF)
-        side, h = check_on_chain(node, [(W.name, W), (L.name, L)])
+        # Which branch by the blocks each miner made here: W may have taken
+        # L's chain from the node before the kill
+        h, tip, u = node.rpc("getblockcount"), node.rpc("getbestblockhash"), utxo(node)
+        if (u[0], u[1]) != (h, tip):
+            raise Failed(f"gettxoutsetinfo h{u[0]} {u[1][:12]} is not the tip h{h} {tip[:12]}")
         old_tip, new_tip = fork_h + a, fork_h + b
-        if h <= fork_h:
-            where = f"at the fork h{h}"
-        elif side == W.name:
+        if tip in old:
             where = f"old tip h{h}" if h == old_tip else f"old branch partly disconnected h{h}/{old_tip}"
-        else:
+        elif tip in new:
             where = f"new tip h{h}" if h == new_tip else f"new branch partly connected h{h}/{new_tip}"
+        elif h <= fork_h and L.rpc("getblockhash", h) == tip:
+            where = f"at the fork h{h}"
+        else:
+            raise Failed(f"tip h{h} {tip[:12]} is on neither branch")
+        if u != hist.get(tip):
+            raise Failed(f"{where}: UTXO set {show_u(u)} != clean {show_u(hist[tip]) if tip in hist else '(none)'}")
         sync_to(node, d, INDEX_CONF, L, 120)
         u = utxo(node)
         if u != utxo(L) or u != hist[u[1]]:
