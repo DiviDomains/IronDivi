@@ -60,14 +60,10 @@ PEERINFO = ("services: irondivid does not serve bloom filters and does not adver
 NETINFO_FIELDS = (".connections_in", ".connections_out", ".localservices", ".networks[2].limited", ".subversion")
 NETINFO = ("connections_in/out: irondivid's extra fields [by design]; localservices: no NODE_BLOOM, as getpeerinfo "
            "[open]; onion limited: irondivid cannot address .onion peers [by design]; subversion: its user agent "
-           "[by design]; version and IPv4/IPv6 reachable: fixed on fix/net-replies (rpcnet.cpp:369, "
-           "NetworkLocalAddressHelpers.cpp:163-167) [open]",
-           only(*NETINFO_FIELDS, ".version", ".networks[0].reachable", ".networks[1].reachable"))
+           "[by design]",
+           only(*NETINFO_FIELDS))
 MNCOUNT = ("irondivid adds the tier counts copper..diamond [by design]",
            only(".copper", ".silver", ".gold", ".platinum", ".diamond"))
-MNSTATUS = ("divid: 'This is not a masternode' (RpcMasternodeFeatures.cpp:219); fixed on fix/net-replies [open]",
-            pair(("err", -1, "This is not a masternode"),
-                 ("err", -1, "This node is not configured as a masternode")))
 MNSYNC = ("currentMasternodeSyncStatus: divid gives its sync phase (0, then 1 after a restart, with no masternodes "
           "on regtest: rpcmisc.cpp:212, masternode-sync.h:42-47); irondivid has no masternode sync and gives 999, finished [open]",
           only(".currentMasternodeSyncStatus"))
@@ -75,7 +71,6 @@ BANLIST = ("divid gives {\"banned:\": \"<text list>\"}, irondivid an array (docs
            "listbanned; divid: rpcmisc.cpp:1023-1030, PeerBanningService.cpp:23-34) [by design]",
            pair(EMPTY_BANS, ("ok", [])))
 EXTRA = "{} is not a divid method (rpcserver.cpp:325-409); irondivid has it (docs/rpc-parity-audit.md) [by design]"
-FIXED = " ; fixed on fix/net-replies [open]"
 
 
 def iron_only(method, reply):
@@ -91,55 +86,25 @@ KNOWN = {
     "after restart: getnetworkinfo": NETINFO,
     "getmasternodecount": MNCOUNT,
     "after restart: getmasternodecount": MNCOUNT,
-    "getmasternodestatus (no masternode)": MNSTATUS,
-    "after restart: getmasternodestatus (no masternode)": MNSTATUS,
     "mnsync status": MNSYNC,
     "after restart: mnsync status": MNSYNC,
     "listbanned (none)": BANLIST,
     "after restart: listbanned (none)": BANLIST,
     "after restart: listbanned": BANLIST,
     "listbanned (after clearbanned)": BANLIST,
-    "addnode add again": ("divid: -23 'Error: Node already added' (rpcnet.cpp:174-179)" + FIXED,
-                          pair(("err", -23, "Error: Node already added"), ("err", -1, "Node already added"))),
-    "addnode remove again": ("divid: -24 'Error: Node has not been added.' (rpcnet.cpp:180-183)" + FIXED,
-                             pair(("err", -24, "Error: Node has not been added."),
-                                  ("err", -1, "Node has not been added"))),
-    "addnode <node> badcommand": ("divid answers with its help (rpcnet.cpp:156-170)" + FIXED,
-                                  lambda c, i: c[:2] == ("err", -1) and i == (
-                                      "err", -1, "Command must be 'add', 'remove', or 'onetry'")),
-    "addnode with no arguments": ("divid answers with its help (rpcnet.cpp:156-170)" + FIXED,
-                                  lambda c, i: c[:2] == ("err", -1) and i == ("err", -1, "Missing node address")),
-    "mnsync with a bad mode": ("divid answers with its help (rpcmisc.cpp:160-197)" + FIXED,
-                               lambda c, i: c[:2] == ("err", -1) and i == (
-                                   "err", -1, "Command must be 'status', 'reset', or 'next'")),
-    "getaddednodeinfo false": ("divid gives only addednode without dns (rpcnet.cpp:220-227)" + FIXED,
-                               only("[0].addresses", "[0].connected")),
-    "getaddednodeinfo false <node>": ("divid gives only addednode without dns (rpcnet.cpp:220-227)" + FIXED,
-                                      only("[0].addresses", "[0].connected")),
-    "getaddednodeinfo true <node>": ("divid lists the node's address, connected \"false\" (rpcnet.cpp:256-284)"
-                                     + FIXED, only("[0].addresses", "[0].addresses[0]",
-                                                   "[0].addresses[0].address", "[0].addresses[0].connected")),
-    "addnode <ip without a port> add": ("", None),
     "getaddednodeinfo false <ip without a port>": (
-        "divid keeps the node as written (rpcnet.cpp:220-227); irondivid keeps the address, with a port, and gave "
-        "mainnet's 51472 on every network (the port is fixed on fix/net-replies) [open]",
-        lambda c, i: c == ("ok", [{"addednode": "192.0.2.3"}]) and i[0] == "ok"
-        and len(i[1]) == 1 and i[1][0].get("addednode") in ("192.0.2.3:51472", "192.0.2.3:51476")),
+        "divid keeps the node as written (rpcnet.cpp:220-227); irondivid keeps the address, with the network's "
+        "port [open]",
+        pair(("ok", [{"addednode": "192.0.2.3"}]), ("ok", [{"addednode": "192.0.2.3:51476"}]))),
     "getaddednodeinfo true <ip without a port>": (
-        "the node as written, as above; its address with the network's port, 51476 on regtest "
-        "(rpcnet.cpp:248-262, fixed on fix/net-replies) [open]",
-        lambda c, i: c[0] == i[0] == "ok" and len(i[1]) == 1
-        and i[1][0].get("addednode") in ("192.0.2.3:51472", "192.0.2.3:51476")),
+        "the node as written, as above; its address, with the network's port, is the same [open]",
+        only("[0].addednode")),
     "setban 192.0.2.10 add": iron_only("setban", ("ok", None)),
     "setban 192.0.2.10 add again": iron_only("setban", ("ok", None)),
     "setban of a bad subnet": iron_only("setban", ("err", -30, "Invalid IP: not-a-subnet")),
     "setban 192.0.2.11 add <absolute time>": iron_only("setban", ("ok", None)),
     "setban remove of an address not banned": iron_only("setban", ("err", -30, "IP not in ban list")),
     "disconnectnode of an address not connected": iron_only("disconnectnode", ("err", -29, "Node not connected")),
-    "setban <absolute time>: banned_until": (
-        "irondivid's setban help gives absolute, but it was not read: the time was taken as seconds from now; "
-        "fixed on fix/net-replies [open]",
-        lambda e, g: g == "seconds from now"),
     "ban outdated (none outdated)": (
         "irondivid does not ban outdated peers (docs/rpc-parity-audit.md: ban outdated; divid: net.cpp:357-393) "
         "[by design]",
@@ -156,7 +121,6 @@ KNOWN = {
         lambda c, i: c == EMPTY_BANS and i[0] == "ok" and isinstance(i[1], list) and len(i[1]) == 1
         and i[1][0].get("address") == "127.0.0.1"),
 }
-KNOWN = {k: v for k, v in KNOWN.items() if v[1] is not None}
 
 fails = 0
 

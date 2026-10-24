@@ -89,22 +89,7 @@ Open (not closed yet):
   on regtest with no masternodes: `rpcmisc.cpp:212`, `masternode-sync.h:42-47`); irondivid has no masternode sync
   and gives 999 (finished).
 - `getaddednodeinfo` of a node given without a port: divid keeps the node as written (`192.0.2.3`); irondivid keeps
-  the address with a port.
-
-Fixed on `fix/net-replies` (listed here so this script passes on a tree without that branch; the branch takes them
-out):
-
-- `addnode` `add` again and `remove` again: divid -23 `Error: Node already added` and -24 `Error: Node has not been
-  added.` (`rpcnet.cpp:174-183`); irondivid -1 with other texts. An unknown command or no arguments: divid's help
-  (`rpcnet.cpp:156-170`). An address without a port took mainnet's 51472.
-- `getaddednodeinfo`: without dns divid gives only `addednode`; with dns the node's address with `connected`
-  `"false"` (`rpcnet.cpp:220-284`); irondivid always gave `connected` and an empty address list.
-- `getmasternodestatus`: divid `This is not a masternode` (`RpcMasternodeFeatures.cpp:219`).
-- `mnsync <bad mode>`: divid's help (`rpcmisc.cpp:160-197`).
-- `getnetworkinfo` `version`: divid `3.0.0.0` (`rpcnet.cpp:369`), as irondivid's `getinfo`; irondivid gave its crate
-  version. `reachable`: divid only once a local address of the network is known
-  (`NetworkLocalAddressHelpers.cpp:73-105`, `:163-167`); irondivid always true for IPv4 and IPv6.
-- `setban` with `absolute`: irondivid's help gives it, but the time was taken as seconds from now.
+  the address, with the network's port (`192.0.2.3:51476`).
 
 ## Proving a difference is caught
 
