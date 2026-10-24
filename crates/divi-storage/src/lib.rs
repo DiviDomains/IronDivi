@@ -23,6 +23,7 @@ pub mod address_index;
 pub mod block_index;
 pub mod chain;
 pub mod database;
+pub mod datadir;
 pub mod difficulty;
 pub mod error;
 pub mod export;

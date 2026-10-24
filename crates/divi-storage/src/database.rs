@@ -85,6 +85,8 @@ impl ChainDatabase {
         path: P,
         block_cache_size: usize,
     ) -> Result<Self, StorageError> {
+        crate::datadir::refuse_foreign_database(path.as_ref())?;
+
         // === Database-wide options ===
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -238,6 +240,13 @@ impl ChainDatabase {
         let key = hash.as_bytes();
         let value = serialize(block);
         self.db.put_cf(cf, key, value)?;
+        Ok(())
+    }
+
+    /// Remove a metadata value
+    pub fn delete_metadata(&self, key: &[u8]) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db.delete_cf(cf, key)?;
         Ok(())
     }
 

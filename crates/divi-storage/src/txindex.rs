@@ -103,6 +103,7 @@ impl TxIndex {
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        crate::datadir::refuse_foreign_database(path.as_ref())?;
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
