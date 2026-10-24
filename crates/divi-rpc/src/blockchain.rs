@@ -240,8 +240,14 @@ impl BlockchainRpc {
         let tip = self.chain.tip().ok_or_else(|| {
             RpcError::new(codes::MISC_ERROR, "Could not acquire lock on chain tip.")
         })?;
-        let height = match params.get_i64(0) {
-            Some(h) => h.clamp(0, tip.height as i64) as u32,
+        // params[0].get_int(): json_spirit takes only an integer
+        // (rpclottery.cpp:47); divid has no answer for a height below 0 (it
+        // reads a null block), irondivid gives genesis's
+        let height = match params.get(0) {
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => {
+                n.as_i64().unwrap_or(i64::MAX).clamp(0, tip.height as i64) as u32
+            }
+            Some(v) => return Err(json_spirit_type_error(Some(v), "int").into()),
             None => tip.height,
         };
         let index = self
@@ -1082,6 +1088,7 @@ impl BlockchainRpc {
     /// getaddressdeltas: an address's receives and spends from the address
     /// index (Divi Core rpcmisc.cpp getaddressdeltas)
     pub fn get_address_deltas(&self, params: &Params) -> Result<Value, Error> {
+        Self::address_call_arity(params, "getaddressdeltas")?;
         let (start, end, include_chain_info) = match params.get(0).and_then(|p| p.as_object()) {
             Some(obj) => {
                 let chain_info = obj
@@ -1114,7 +1121,7 @@ impl BlockchainRpc {
             }
             None => (0, 0, false),
         };
-        let keys = self.index_keys(params, "getaddressdeltas")?;
+        let keys = self.index_keys(params)?;
         let index = self.address_index()?;
         let mut deltas = Vec::new();
         for (address_type, hash) in &keys {
@@ -1160,7 +1167,8 @@ impl BlockchainRpc {
     /// txid); for several addresses ordered by height then txid (Divi Core
     /// rpcmisc.cpp getaddresstxids)
     pub fn get_address_txids(&self, params: &Params) -> Result<Value, Error> {
-        let keys = self.index_keys(params, "getaddresstxids")?;
+        Self::address_call_arity(params, "getaddresstxids")?;
+        let keys = self.index_keys(params)?;
         let (start, end) = params
             .get(0)
             .and_then(|p| p.as_object())
@@ -1187,7 +1195,8 @@ impl BlockchainRpc {
     /// getaddressbalance: the sum of the addresses' deltas, and of the
     /// receives alone (Divi Core rpcmisc.cpp getaddressbalance)
     pub fn get_address_balance(&self, params: &Params) -> Result<Value, Error> {
-        let keys = self.index_keys(params, "getaddressbalance")?;
+        Self::address_call_arity(params, "getaddressbalance")?;
+        let keys = self.index_keys(params)?;
         let index = self.address_index()?;
         let (mut balance, mut received) = (0i64, 0i64);
         for (address_type, hash) in &keys {
@@ -1204,13 +1213,14 @@ impl BlockchainRpc {
     /// getaddressutxos: the addresses' unspent outputs by height (Divi Core
     /// rpcmisc.cpp getaddressutxos)
     pub fn get_address_utxos(&self, params: &Params) -> Result<Value, Error> {
+        Self::address_call_arity(params, "getaddressutxos")?;
         let include_chain_info = params
             .get(0)
             .and_then(|p| p.as_object())
             .and_then(|obj| obj.get("chainInfo"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let keys = self.index_keys(params, "getaddressutxos")?;
+        let keys = self.index_keys(params)?;
         let index = self.address_index()?;
         let mut unspent = Vec::new();
         for (address_type, hash) in &keys {
@@ -1242,49 +1252,45 @@ impl BlockchainRpc {
     }
 
     /// getspentinfo: the input that spent an output, from the spent index
-    /// (Divi Core rpcmisc.cpp getspentinfo)
+    /// (Divi Core rpcmisc.cpp:878-926): one object argument, else -1 with the
+    /// help text; a string txid and an integer index, else -5 "Invalid txid or
+    /// index"; the txid read as ParseHashV reads it; an output the spent index
+    /// has no entry for, or a node without the index, -5 "Unable to get spent
+    /// info"
     pub fn get_spent_info(&self, params: &Params) -> Result<Value, Error> {
-        // Parse parameters - expect object with txid and index
-        let param = params
-            .get(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing parameter"))?;
-
-        let Some(obj) = param.as_object() else {
-            return Err(RpcError::invalid_params(
-                "Parameter must be an object with 'txid' and 'index' fields",
-            )
-            .into());
+        let obj = match (params.len(), params.get(0)) {
+            (1, Some(Value::Object(obj))) => obj,
+            _ => return Err(RpcError::invalid_params("getspentinfo {txid:,index:}").into()),
         };
-        let txid_str = obj
-            .get("txid")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'txid' field"))?;
-        let txid = parse_hash(txid_str)?;
-        let index = obj
-            .get("index")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'index' field"))?;
-
+        let (txid, index) = match (obj.get("txid"), obj.get("index")) {
+            (Some(Value::String(txid)), Some(Value::Number(n))) if n.is_i64() || n.is_u64() => {
+                (txid.as_str(), n.as_i64().unwrap_or(i64::MAX))
+            }
+            _ => {
+                return Err(
+                    RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid txid or index").into(),
+                )
+            }
+        };
+        // ParseHashV (JsonParseHelpers.cpp:5-15): ParseHashStr's reading, -8
+        let txid = core_parse_hash_str(txid, "txid")
+            .map_err(|e| RpcError::new(codes::INVALID_PARAMETER, e.message))?;
+        let not_found = || -> Error {
+            RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Unable to get spent info").into()
+        };
         // GetSpentIndex failing without the index (TransactionSearchIndexes.cpp:43-44)
         let search = match self.chain.search_index() {
             Some(search) if search.spent_enabled() => search,
-            _ => {
-                return Err(RpcError::new(
-                    codes::INVALID_ADDRESS_OR_KEY,
-                    "Unable to get spent info",
-                )
-                .into())
-            }
+            _ => return Err(not_found()),
         };
+        // The index is an int, kept as the key's unsigned 32 bits
         match search.read_spent(&divi_storage::SpentIndexKey::new(txid, index as u32))? {
             Some(value) => Ok(json!({
                 "txid": value.spending_txid.to_string(),
                 "index": value.input_index,
                 "height": value.block_height,
             })),
-            None => {
-                Err(RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Unable to get spent info").into())
-            }
+            None => Err(not_found()),
         }
     }
 
@@ -1296,32 +1302,72 @@ impl BlockchainRpc {
         }
     }
 
-    /// Divi Core getAddressesFromParams/GetIndexKey: the address type and hash
-    /// each address is indexed under. With the second parameter (only vaults)
-    /// true, a key-hash address names the vaults it owns (type 3) and a
-    /// script-hash address is refused.
-    fn index_keys(&self, params: &Params, method: &str) -> Result<Vec<(u8, [u8; 20])>, Error> {
-        use divi_wallet::address::{Address, AddressType};
-        let addresses = self.parse_address_index_params(params, method)?;
-        self.check_index_addresses(&addresses)?;
-        let only_vaults =
-            params.len() == 2 && params.get(1).and_then(|v| v.as_bool()) == Some(true);
+    /// Divi Core getAddressesFromParams (rpcmisc.cpp:563-595): the index key of
+    /// each address. `only_vaults` is read first, with json_spirit's type check;
+    /// then one address, or an object whose "addresses" must be a list of
+    /// strings; an address that does not decode for this network (or a P2SH one
+    /// with only_vaults) is -5 "Invalid address", as is any other first argument
+    fn index_keys(&self, params: &Params) -> Result<Vec<(u8, [u8; 20])>, Error> {
+        let only_vaults = match (params.len(), params.get(1)) {
+            (2, Some(Value::Bool(b))) => *b,
+            (2, v) => return Err(json_spirit_type_error(v, "bool").into()),
+            _ => false,
+        };
+        let invalid =
+            || -> Error { RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address").into() };
+        let addresses: Vec<&str> = match params.get(0) {
+            Some(Value::String(a)) => vec![a.as_str()],
+            Some(Value::Object(obj)) => match obj.get("addresses") {
+                Some(Value::Array(list)) => {
+                    let mut out = Vec::with_capacity(list.len());
+                    for v in list {
+                        match v {
+                            Value::String(a) => out.push(a.as_str()),
+                            other => return Err(json_spirit_type_error(Some(other), "str").into()),
+                        }
+                    }
+                    out
+                }
+                _ => {
+                    return Err(RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        "Addresses is expected to be an array",
+                    )
+                    .into())
+                }
+            },
+            _ => return Err(invalid()),
+        };
         addresses
             .iter()
-            .map(|a| {
-                let address = Address::from_base58_for_network(a, self.address_network())
-                    .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
-                let hash = *address.hash.as_bytes();
-                match (address.addr_type, only_vaults) {
-                    (AddressType::P2SH, true) => {
-                        Err(RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address").into())
-                    }
-                    (_, true) => Ok((3, hash)),
-                    (AddressType::P2PKH, false) => Ok((1, hash)),
-                    (AddressType::P2SH, false) => Ok((2, hash)),
-                }
-            })
+            .map(|a| self.index_key(a, only_vaults).ok_or_else(invalid))
             .collect()
+    }
+
+    /// Divi Core GetIndexKey (rpcmisc.cpp:543-561): an address's type (1 P2PKH,
+    /// 2 P2SH, 3 for a vault search) and hash, or None
+    fn index_key(&self, address: &str, only_vaults: bool) -> Option<(u8, [u8; 20])> {
+        use divi_wallet::address::{Address, AddressType};
+        let address = Address::from_base58_for_network(address, self.address_network()).ok()?;
+        let hash = *address.hash.as_bytes();
+        match (address.addr_type, only_vaults) {
+            (AddressType::P2SH, true) => None,
+            (_, true) => Some((3, hash)),
+            (AddressType::P2PKH, false) => Some((1, hash)),
+            (AddressType::P2SH, false) => Some((2, hash)),
+        }
+    }
+
+    /// Divi Core's argument count check of the address index calls: one or two
+    /// arguments, else -1 with the call's help text, before anything else
+    fn address_call_arity(params: &Params, method: &str) -> Result<(), Error> {
+        if params.is_empty() || params.len() > 2 {
+            return Err(RpcError::invalid_params(format!(
+                "{method} <address>|<addresses> (only_vaults)"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Divi Core getAddressFromIndex: the address of an index entry
@@ -1344,92 +1390,6 @@ impl BlockchainRpc {
             "No information available for address",
         )
         .into()
-    }
-
-    /// Divi Core getAddressesFromParams: every address must decode for this
-    /// node's network, else -5 "Invalid address"
-    fn check_index_addresses(&self, addresses: &[String]) -> Result<(), Error> {
-        use divi_wallet::address::Address;
-        for a in addresses {
-            Address::from_base58_for_network(a, self.address_network())
-                .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid address"))?;
-        }
-        Ok(())
-    }
-
-    fn parse_address_index_params(
-        &self,
-        params: &Params,
-        method: &str,
-    ) -> Result<Vec<String>, Error> {
-        let param = params
-            .get(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing address parameter"))?;
-
-        // Handle single address string
-        if let Some(addr) = param.as_str() {
-            return Ok(vec![addr.to_string()]);
-        }
-
-        // Handle object with addresses array
-        if let Some(obj) = param.as_object() {
-            if let Some(addresses) = obj.get("addresses") {
-                if let Some(arr) = addresses.as_array() {
-                    let addrs: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-
-                    // An empty array names no address and gets an empty
-                    // reply (Divi Core rpcmisc.cpp:580-589)
-                    if addrs.len() != arr.len() {
-                        return Err(RpcError::invalid_params(
-                            "'addresses' array is empty or invalid",
-                        )
-                        .into());
-                    }
-
-                    // Validate optional fields if present
-                    if let Some(start) = obj.get("start") {
-                        if !start.is_i64() {
-                            return Err(
-                                RpcError::invalid_params("'start' must be an integer").into()
-                            );
-                        }
-                    }
-
-                    if let Some(end) = obj.get("end") {
-                        if !end.is_i64() {
-                            return Err(RpcError::invalid_params("'end' must be an integer").into());
-                        }
-                    }
-
-                    if method == "getaddressdeltas" {
-                        if let Some(chain_info) = obj.get("chainInfo") {
-                            if !chain_info.is_boolean() {
-                                return Err(RpcError::invalid_params(
-                                    "'chainInfo' must be a boolean",
-                                )
-                                .into());
-                            }
-                        }
-                    }
-
-                    return Ok(addrs);
-                } else {
-                    return Err(RpcError::invalid_params("'addresses' must be an array").into());
-                }
-            } else {
-                return Err(
-                    RpcError::invalid_params("Object must contain 'addresses' field").into(),
-                );
-            }
-        }
-
-        Err(RpcError::invalid_params(
-            "Parameter must be a string address or object with 'addresses' field",
-        )
-        .into())
     }
 
     /// Verify blockchain database
@@ -1538,27 +1498,9 @@ fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
     Hash256::from_hex(&format!("{tail:0>64}")).map_err(|_| not_hex())
 }
 
-fn parse_hash(s: &str) -> Result<Hash256, Error> {
-    Hash256::from_hex(s)
-        .map_err(|e| RpcError::invalid_params(format!("Invalid hash: {} - {}", s, e)).into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_hash() {
-        let hash_str = "0000000000000000000000000000000000000000000000000000000000000000";
-        let hash = parse_hash(hash_str).unwrap();
-        assert_eq!(hash, Hash256::zero());
-    }
-
-    #[test]
-    fn test_parse_hash_invalid() {
-        assert!(parse_hash("not_hex").is_err());
-        assert!(parse_hash("0000").is_err()); // Too short
-    }
 
     /// `len` regtest PoW blocks on genesis (heights <= 100 are PoW on regtest).
     fn pow_chain(
@@ -1605,6 +1547,169 @@ mod tests {
             out.push(block);
         }
         out
+    }
+
+    /// A regtest chain of two blocks, with the address and spent indexes
+    /// when `indexes`
+    fn index_rpc(indexes: bool) -> (BlockchainRpc, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(divi_storage::ChainDatabase::open(dir.path()).unwrap());
+        let params = divi_storage::ChainParams::for_network(
+            NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let mut chain = Chain::new(Arc::clone(&db), params).unwrap();
+        if indexes {
+            chain.enable_search_index(Arc::new(divi_storage::SearchIndex::new(db, true, true)));
+        }
+        let chain = Arc::new(chain);
+        for blk in pow_chain(&chain, 2, 0xB7, 0) {
+            chain.accept_block(blk).unwrap();
+        }
+        (BlockchainRpc::new(chain), dir)
+    }
+
+    fn refusal(reply: Result<Value, Error>) -> (i32, String) {
+        match reply {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// The address index calls check their arguments as Divi Core does
+    /// (rpcmisc.cpp:563-595 getAddressesFromParams, and each call's count check)
+    #[test]
+    fn address_calls_check_arguments_as_divid() {
+        let (rpc, _dir) = index_rpc(true);
+        let address = divi_wallet::address::Address::from_pubkey_hash(
+            Hash160::from_bytes([7u8; 20]),
+            rpc.address_network(),
+        )
+        .to_base58();
+        type Call = fn(&BlockchainRpc, &Params) -> Result<Value, Error>;
+        let calls: [(&str, Call); 4] = [
+            ("getaddressbalance", BlockchainRpc::get_address_balance),
+            ("getaddressdeltas", BlockchainRpc::get_address_deltas),
+            ("getaddresstxids", BlockchainRpc::get_address_txids),
+            ("getaddressutxos", BlockchainRpc::get_address_utxos),
+        ];
+        for (method, call) in calls {
+            let at = |args: Vec<Value>| call(&rpc, &Params::Array(args));
+            for args in [vec![], vec![json!(address), json!(false), json!(1)]] {
+                let (code, message) = refusal(at(args));
+                assert_eq!(code, codes::MISC_ERROR, "{method}");
+                assert!(
+                    message.starts_with(&format!("{method} ")),
+                    "{method}: {message}"
+                );
+            }
+            for (args, code, message) in [
+                (
+                    vec![json!(address), json!("yes")],
+                    -1,
+                    "value is type str, expected bool",
+                ),
+                (vec![json!(7)], -5, "Invalid address"),
+                (vec![json!("notanaddress")], -5, "Invalid address"),
+                (
+                    vec![json!({"addresses": address})],
+                    -5,
+                    "Addresses is expected to be an array",
+                ),
+                (vec![json!({})], -5, "Addresses is expected to be an array"),
+                (
+                    vec![json!({"addresses": [7]})],
+                    -1,
+                    "value is type int, expected str",
+                ),
+                (
+                    vec![json!({"addresses": [address, "notanaddress"]})],
+                    -5,
+                    "Invalid address",
+                ),
+            ] {
+                assert_eq!(
+                    refusal(at(args.clone())),
+                    (code, message.to_string()),
+                    "{method} {args:?}"
+                );
+            }
+            // An empty list names no address: an empty answer
+            assert!(at(vec![json!({"addresses": []})]).is_ok(), "{method} []");
+            assert!(
+                at(vec![json!(address), json!(true)]).is_ok(),
+                "{method} only_vaults"
+            );
+        }
+    }
+
+    /// getspentinfo checks its argument and answers a missing entry, with or
+    /// without the spent index, as Divi Core does (rpcmisc.cpp:878-926)
+    #[test]
+    fn getspentinfo_checks_arguments_as_divid() {
+        let txid = "11".repeat(32);
+        for indexes in [true, false] {
+            let (rpc, _dir) = index_rpc(indexes);
+            let at = |args: Vec<Value>| rpc.get_spent_info(&Params::Array(args));
+            for args in [
+                vec![],
+                vec![json!({"txid": txid, "index": 0}), json!(1)],
+                vec![json!(txid)],
+            ] {
+                let (code, message) = refusal(at(args));
+                assert_eq!(code, -1);
+                assert!(message.starts_with("getspentinfo "), "{message}");
+            }
+            for (arg, code, message) in [
+                (
+                    json!({"txid": txid, "index": 0}),
+                    -5,
+                    "Unable to get spent info".to_string(),
+                ),
+                (
+                    json!({"txid": "abab", "index": 0}),
+                    -5,
+                    "Unable to get spent info".into(),
+                ),
+                (json!({"txid": txid}), -5, "Invalid txid or index".into()),
+                (
+                    json!({"txid": txid, "index": "0"}),
+                    -5,
+                    "Invalid txid or index".into(),
+                ),
+                (
+                    json!({"txid": 5, "index": 0}),
+                    -5,
+                    "Invalid txid or index".into(),
+                ),
+                (
+                    json!({"txid": "zz", "index": 0}),
+                    -8,
+                    "txid must be hexadecimal string (not 'zz')".into(),
+                ),
+            ] {
+                assert_eq!(
+                    refusal(at(vec![arg.clone()])),
+                    (code, message),
+                    "{indexes} {arg}"
+                );
+            }
+        }
+    }
+
+    /// getlotteryblockwinners reads its height with json_spirit's get_int
+    /// (rpclottery.cpp:47)
+    #[test]
+    fn getlotteryblockwinners_height_must_be_an_integer() {
+        let (rpc, _dir) = index_rpc(false);
+        let at = |args: Vec<Value>| rpc.get_lottery_block_winners(&Params::Array(args));
+        for (arg, message) in [
+            (json!("abc"), "value is type str, expected int"),
+            (json!(1.5), "value is type real, expected int"),
+            (json!(null), "value is type null, expected int"),
+        ] {
+            assert_eq!(refusal(at(vec![arg])), (-1, message.to_string()));
+        }
     }
 
     fn header_of(rpc: &BlockchainRpc, hash: Hash256) -> Value {
