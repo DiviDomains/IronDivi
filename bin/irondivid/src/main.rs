@@ -303,7 +303,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "rescan",
     "rest",
     "resync",
-    "rpckeepalive",
     "rpcthreads",
     "salvagewallet",
     "seednode",
@@ -468,6 +467,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.rpc.listen_addr = "[::]".to_string();
     }
     config.rpc.allowed_ips = allowed;
+    // -rpckeepalive=0: each RPC connection is closed after its reply
+    // (rpcserver.cpp:1014-1017)
+    config.rpc.keep_alive = s.get_bool("rpckeepalive", true);
 
     if let Some(p) = port("port") {
         config.p2p.port = p;
@@ -643,6 +645,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "server",
         "rpcallowip",
         "rpcbind",
+        "rpckeepalive",
         "port",
         "bind",
         "listen",
@@ -1845,6 +1848,7 @@ async fn run_daemon(
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
+        keep_alive: config.rpc.keep_alive,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -2908,6 +2912,24 @@ mod config_format_tests {
         .unwrap();
         assert_eq!(a.maxlogsize, Some(2));
         assert_eq!(a.chain_mode(), ChainMode::Divi);
+    }
+
+    /// -rpckeepalive is read, on by default (rpcserver.cpp:1014-1017)
+    #[test]
+    fn rpckeepalive_is_read() {
+        assert!(cfg("regtest=1\n", &[]).unwrap().rpc.keep_alive);
+        assert!(
+            !cfg("regtest=1\nrpckeepalive=0\n", &[])
+                .unwrap()
+                .rpc
+                .keep_alive
+        );
+        assert!(
+            !cfg("regtest=1\n", &["--rpckeepalive=0"])
+                .unwrap()
+                .rpc
+                .keep_alive
+        );
     }
 
     /// -whitelist and -whitebind as divid reads them: a bad network or a

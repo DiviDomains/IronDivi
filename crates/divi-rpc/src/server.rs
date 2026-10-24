@@ -50,6 +50,9 @@ pub struct RpcConfig {
     pub password: Option<String>,
     /// Who may connect besides the local host (Divi Core's -rpcallowip)
     pub allowed: Vec<Subnet>,
+    /// Keep a connection open after a reply when the request asks for it
+    /// (Divi Core's -rpckeepalive, default on)
+    pub keep_alive: bool,
 }
 
 impl Default for RpcConfig {
@@ -59,6 +62,7 @@ impl Default for RpcConfig {
             username: None,
             password: None,
             allowed: Vec::new(),
+            keep_alive: true,
         }
     }
 }
@@ -1517,7 +1521,19 @@ impl RpcServer {
 /// is never served open (irondivid fills in cookie credentials when none are
 /// configured, see [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
-    build_router(server, rpc_credentials(config))
+    let router = build_router(server, rpc_credentials(config));
+    if config.keep_alive {
+        return router;
+    }
+    // -rpckeepalive=0: every reply closes its connection, as Divi Core ends
+    // the connection's loop after it (rpcserver.cpp:1014-1017)
+    router.layer(middleware::map_response(
+        |mut res: axum::response::Response| async move {
+            res.headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            res
+        },
+    ))
 }
 
 fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
