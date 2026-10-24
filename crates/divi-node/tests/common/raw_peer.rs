@@ -88,16 +88,34 @@ impl TestNode {
         self.node.start().await.unwrap();
         let port = self.port;
         // The listener comes up on a spawned task
-        tokio::time::timeout(WAIT, async {
-            while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        let stream = tokio::time::timeout(WAIT, async {
+            loop {
+                if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
+                    return stream;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
         .expect("node listens");
-        // The probe above is an inbound connection until the node sees it
-        // close; wait until it has gone, so it holds no inbound slot when a
-        // test connects (a test with one inbound slot was refused)
+        // The kernel completes the probe's connect from its backlog before the
+        // node accepts it, so the node may not have counted it yet. Keep it open
+        // until the node answers its version (or drops it), so it has been
+        // accepted; then close it and wait until it has gone, so it holds no
+        // inbound slot when a test connects (a test with one inbound slot was
+        // refused)
+        let mut probe = RawPeer {
+            stream,
+            ip: IpAddr::from([127, 0, 0, 1]),
+        };
+        probe
+            .send(
+                "version",
+                &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/probe:1/"),
+            )
+            .await;
+        let _ = probe.expect("version", WAIT).await;
+        drop(probe);
         let pm = self.node.peer_manager();
         tokio::time::timeout(WAIT, async {
             while pm.inbound_count() > 0 || !pm.has_inbound_room() {
