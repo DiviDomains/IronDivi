@@ -856,8 +856,10 @@ impl WalletRpc {
         Ok(serde_json::json!(address.to_string()))
     }
 
-    /// getrawchangeaddress - Generate a new change address
-    pub fn get_raw_change_address(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    /// getrawchangeaddress - Generate a new change address; at most one
+    /// argument, which divid does not read (rpcwallet.cpp:558-578)
+    pub fn get_raw_change_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        crate::core_help::check_arguments("getrawchangeaddress", params, (0, 1), 0)?;
         let wallet = self.get_wallet()?;
 
         let address = wallet.new_change_address().map_err(new_key_error)?;
@@ -903,8 +905,12 @@ impl WalletRpc {
                         serde_json::json!(addr.addr_type == divi_wallet::AddressType::P2SH);
                 }
 
+                // Only an address of the address book has an account
+                // (rpcmisc.cpp:363); a change key has none
                 if let (true, Some(wallet)) = (known, wallet_guard.as_ref()) {
-                    result["account"] = serde_json::json!(wallet.get_account(&addr));
+                    if wallet.in_address_book(&addr) {
+                        result["account"] = serde_json::json!(wallet.get_account(&addr));
+                    }
                 }
                 if is_mine {
                     if let Some(wallet) = wallet_guard.as_ref() {
@@ -2143,26 +2149,32 @@ impl WalletRpc {
         &self,
         params: &Params,
     ) -> Result<serde_json::Value, Error> {
-        use divi_script::SigHashType;
-        if params.len() != 3 {
+        // Divi Core reads params[0..2] with no count check
+        // (rpcrawtransaction.cpp:566-572): more are ignored; fewer read past
+        // the list there, and are refused here
+        if params.len() < 3 {
             return Err(RpcError::new(
                 codes::MISC_ERROR,
                 "signtransactionwithaddresskey \"hexstring\" \"address\" inputindex",
             )
             .into());
         }
-        let hex_str = params.get_str(0).ok_or_else(|| {
-            RpcError::new(codes::INVALID_PARAMETER, "Invalid parameter, expected hex")
-        })?;
+        // ParseHexV (JsonParseHelpers.cpp:20-26): a non-empty even-length hex
+        // string; another type is read as ""
+        let hex_str = params.get_str(0).unwrap_or("");
+        let not_hex = || {
+            RpcError::new(
+                codes::INVALID_PARAMETER,
+                format!("Transaction hex data must be hexadecimal string (not '{hex_str}')"),
+            )
+        };
+        if hex_str.is_empty() {
+            return Err(not_hex().into());
+        }
+        let tx_bytes = hex::decode(hex_str).map_err(|_| not_hex())?;
         let input_index = params
             .get_i64(2)
             .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type int for inputindex"))?;
-        let tx_bytes = hex::decode(hex_str).map_err(|_| {
-            RpcError::new(
-                codes::INVALID_PARAMETER,
-                "Transaction hex data must be hexadecimal",
-            )
-        })?;
         let mut tx: Transaction = deserialize(&tx_bytes)
             .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
         let address = self
@@ -2192,14 +2204,19 @@ impl WalletRpc {
         dummy.extend_from_slice(&pk);
         dummy.push(0xac); // OP_CHECKSIG
         let script_code = Script::from_bytes(dummy);
-        let sig = divi_wallet::signer::sign_input(
+        // Core's SignatureHash, which for SIGHASH_SINGLE on an input without
+        // an output of its index hashes the value 1 (SignatureCheckers.cpp)
+        const SIGHASH_SINGLE: i32 = 3;
+        let hash = divi_script::checker::signature_hash(
+            &script_code,
             &tx,
             input_index as usize,
-            &script_code,
-            secret,
-            SigHashType::Single,
-        )
-        .map_err(|_| unable())?;
+            SIGHASH_SINGLE,
+        );
+        let mut sig = divi_crypto::sign_hash(secret, &hash)
+            .map_err(|_| unable())?
+            .to_der();
+        sig.push(SIGHASH_SINGLE as u8);
         let mut script_sig = vec![sig.len() as u8];
         script_sig.extend_from_slice(&sig);
         tx.vin[input_index as usize].script_sig = Script::from_bytes(script_sig);
@@ -3257,6 +3274,8 @@ impl WalletRpc {
     /// staker and the pruner at start, so replacing it here would leave them writing to
     /// the old one. The error says how to switch wallets today.
     pub fn load_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // One string argument, else divid's help text (rpcwallet.cpp:526-532)
+        crate::core_help::check_arguments("loadwallet", params, (1, 1), 1)?;
         let filename = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: filename"))?;
@@ -4040,14 +4059,18 @@ impl WalletRpc {
         Ok(serde_json::json!(txid.to_string()))
     }
 
-    /// listlockunspent - Returns list of temporarily unspendable outputs
-    pub fn list_lock_unspent(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    /// listlockunspent - Returns list of temporarily unspendable outputs, in
+    /// the order of divid's std::set<COutPoint>: txid as a 256-bit number
+    /// (the hex as written), then output (rpcwallet.cpp:2816-2848)
+    pub fn list_lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        crate::core_help::check_arguments("listlockunspent", params, (0, 0), 0)?;
         let wallet_guard = self.wallet.read();
         let wallet = wallet_guard
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
-        let result: Vec<_> = wallet
-            .locked_coins()
+        let mut locked = wallet.locked_coins();
+        locked.sort_by_key(|o| (o.txid.to_string(), o.vout));
+        let result: Vec<_> = locked
             .iter()
             .map(|outpoint| {
                 serde_json::json!({
