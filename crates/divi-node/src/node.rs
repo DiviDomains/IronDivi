@@ -220,7 +220,9 @@ impl Node {
 
         // Divi Core keeps the index flags with the chain database: a changed
         // -txindex refuses to start, and -addressindex/-spentindex take effect
-        // only on a new chain database (init.cpp:1103-1106, txdb.cpp:498-523)
+        // only on a new chain database or with -reindex, which builds every
+        // index again (init.cpp:1103-1106, txdb.cpp:498-523,
+        // ChainExtensionService.cpp:703-707)
         let requested = divi_storage::search_index::IndexFlags {
             txindex: config.index.txindex,
             addressindex: config.index.addressindex,
@@ -247,6 +249,24 @@ impl Node {
         )
         .map_err(damaged)?;
         let mut check_unflagged_index = false;
+        // The address and spent indexes of such a database are stored as off
+        // (load_or_init); asked for, they are built from the blocks below
+        let mut build_unflagged_search = false;
+        if unflagged && (requested.addressindex || requested.spentindex) {
+            match snapshot_base {
+                Some(base) => tracing::warn!(
+                    "This chain database was installed from a snapshot and has no blocks \
+                     below height {}, so it cannot have full address and spent indexes: \
+                     they are off",
+                    base
+                ),
+                None => {
+                    flags.addressindex = requested.addressindex;
+                    flags.spentindex = requested.spentindex;
+                    build_unflagged_search = true;
+                }
+            }
+        }
         if unflagged && requested.txindex {
             match snapshot_base {
                 Some(base) => tracing::warn!(
@@ -268,6 +288,11 @@ impl Node {
         let rebuild_tx_index = config.index.reindex && requested.txindex;
         if config.index.reindex && flags.txindex != requested.txindex {
             flags.txindex = requested.txindex;
+        }
+        // and the address and spent indexes with the options now given
+        if config.index.reindex {
+            flags.addressindex = requested.addressindex;
+            flags.spentindex = requested.spentindex;
         }
         // A snapshot database cannot build a full index; it runs without one
         if snapshot_base.is_some() && !flags.txindex && requested.txindex {
@@ -340,22 +365,57 @@ impl Node {
             }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
-        // The flags change only once the index they name is complete
-        if config.index.reindex || check_unflagged_index {
-            flags.store(&db).map_err(damaged)?;
+        let build_search = config.index.reindex || build_unflagged_search;
+        if build_search && !(flags.addressindex || flags.spentindex) {
+            // Switched off: remove the entries an earlier index left
+            divi_storage::SearchIndex::new(db.clone(), false, false)
+                .clear()
+                .map_err(damaged)?;
         }
-
         if flags.addressindex || flags.spentindex {
-            chain.enable_search_index(Arc::new(divi_storage::SearchIndex::new(
+            let search = Arc::new(divi_storage::SearchIndex::new(
                 db.clone(),
                 flags.addressindex,
                 flags.spentindex,
-            )));
+            ));
+            if build_search {
+                tracing::info!("Building the address and spent indexes from the stored blocks");
+                let started = std::time::Instant::now();
+                match chain.rebuild_search_index(search) {
+                    Ok(blocks) => tracing::info!(
+                        "Address and spent indexes built for {} blocks in {} ms",
+                        blocks,
+                        started.elapsed().as_millis()
+                    ),
+                    Err(e) if config.index.reindex => {
+                        return Err(NodeError::Init(format!(
+                            "Failed to build the address and spent indexes: {}",
+                            e
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "No index settings were stored with this chain database and the \
+                             address and spent indexes cannot be built ({}): they are off",
+                            e
+                        );
+                        flags.addressindex = false;
+                        flags.spentindex = false;
+                    }
+                }
+            } else {
+                chain.enable_search_index(search);
+            }
             tracing::info!(
                 "Address index {}, spent index {}",
                 if flags.addressindex { "on" } else { "off" },
                 if flags.spentindex { "on" } else { "off" },
             );
+        }
+
+        // The flags change only once the indexes they name are complete
+        if config.index.reindex || check_unflagged_index || build_unflagged_search {
+            flags.store(&db).map_err(damaged)?;
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the

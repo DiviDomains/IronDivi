@@ -564,6 +564,66 @@ impl Chain {
         self.search_index = Some(search_index);
     }
 
+    /// Build the address and spent indexes for an existing chain: remove
+    /// their entries, then write each active block's from block 1 to the
+    /// tip, with the coins it spent taken from its undo data, as Divi Core's
+    /// -reindex writes them while it connects the blocks again
+    /// (init.cpp:663-680, BlockConnectionService.cpp:152-174). Refused when a
+    /// block or the undo data of a block that spends coins is not stored,
+    /// since the indexes would miss entries.
+    pub fn rebuild_search_index(&mut self, search: Arc<SearchIndex>) -> Result<u32, StorageError> {
+        search.clear()?;
+        let tip = self.height();
+        let mut built = 0;
+        for height in 1..=tip {
+            let missing = |what: &str| {
+                StorageError::ChainState(format!(
+                    "{} of block {} is not stored, so the address and spent indexes cannot cover it",
+                    what, height
+                ))
+            };
+            let hash = self
+                .db
+                .get_height_mapping(height)?
+                .ok_or_else(|| missing("the block"))?;
+            let block = self
+                .db
+                .get_block(&hash)?
+                .ok_or_else(|| missing("the block"))?;
+            let mut prevouts = HashMap::new();
+            if let Some(bytes) = self.db.get_undo_data(&hash)? {
+                if !bytes.is_empty() {
+                    for entry in BlockUndo::from_bytes(&bytes)?.entries {
+                        prevouts.insert(
+                            entry.outpoint,
+                            (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
+                        );
+                    }
+                }
+            }
+            let spends_unknown_coin = block
+                .transactions
+                .iter()
+                .filter(|tx| !tx.is_coinbase())
+                .flat_map(|tx| &tx.vin)
+                .any(|input| !input.prevout.is_null() && !prevouts.contains_key(&input.prevout));
+            if spends_unknown_coin {
+                return Err(missing("the undo data"));
+            }
+            let updates = search_index::collect_connect(
+                &block,
+                height,
+                &prevouts,
+                search.address_enabled(),
+                search.spent_enabled(),
+            );
+            search.apply_connect(&updates)?;
+            built += 1;
+        }
+        self.search_index = Some(search);
+        Ok(built)
+    }
+
     /// The address and spent indexes, when enabled
     pub fn search_index(&self) -> Option<&Arc<SearchIndex>> {
         self.search_index.as_ref()

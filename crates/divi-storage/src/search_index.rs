@@ -385,6 +385,32 @@ impl SearchIndex {
             .ok_or_else(|| StorageError::ChainState(format!("{} column family not found", name)))
     }
 
+    /// Remove every address and spent index entry, before the indexes are
+    /// built again
+    pub fn clear(&self) -> Result<(), StorageError> {
+        let db = self.db.inner_db();
+        for name in [CF_ADDRESS_DELTA, CF_ADDRESS_UNSPENT, CF_SPENT] {
+            let cf = self.cf(name)?;
+            loop {
+                let keys: Vec<Box<[u8]>> = db
+                    .iterator_cf(cf, rocksdb::IteratorMode::Start)
+                    .take(10_000)
+                    .map(|item| item.map(|(k, _)| k))
+                    .collect::<Result<_, _>>()
+                    .map_err(StorageError::Database)?;
+                if keys.is_empty() {
+                    break;
+                }
+                let mut batch = rocksdb::WriteBatch::default();
+                for key in keys {
+                    batch.delete_cf(cf, key);
+                }
+                db.write(batch).map_err(StorageError::Database)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write the updates of a connected block (Core
     /// `ApplyConnectionUpdateIndexToDBs`, BlockConnectionService.cpp:152-174)
     pub fn apply_connect(&self, updates: &IndexUpdates) -> Result<(), StorageError> {
