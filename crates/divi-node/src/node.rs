@@ -295,6 +295,8 @@ impl Node {
         if let Some(proxy) = proxy {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
+        // -timeout for outbound connections
+        divi_network::set_connect_timeout_ms(config.p2p.connect_timeout_ms);
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,
