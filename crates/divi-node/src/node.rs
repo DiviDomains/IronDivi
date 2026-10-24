@@ -167,6 +167,10 @@ pub struct Node {
     shutdown_tx: broadcast::Sender<()>,
 }
 
+/// Chain database metadata present while a -reindex is under way (Divi Core's
+/// DB_REINDEXINGFLAG, txdb.cpp:192-204)
+const REINDEXING_KEY: &[u8] = b"reindexing";
+
 impl Node {
     /// Create a new node with the given configuration
     pub fn new(config: NodeConfig) -> Result<Self, NodeError> {
@@ -232,6 +236,22 @@ impl Node {
         // only on a new chain database or with -reindex, which builds every
         // index again (init.cpp:1103-1106, txdb.cpp:498-523,
         // ChainExtensionService.cpp:703-707)
+        // As Divi Core, a -reindex is recorded in the chain database before it
+        // starts and erased only once it is done, so one that was stopped
+        // (kill, power loss) is carried out again at the next start
+        // (init.cpp:1072-1073, :679; BlockIndexLoading.cpp:287-290;
+        // txdb.cpp:192-204)
+        let interrupted = db.get_metadata(REINDEXING_KEY).map_err(damaged)?.is_some();
+        if interrupted && !config.index.reindex {
+            tracing::warn!(
+                "A -reindex was stopped before it finished; the indexes are built again now"
+            );
+        }
+        let reindex = config.index.reindex || interrupted;
+        if reindex {
+            db.put_metadata_synced(REINDEXING_KEY, b"1")
+                .map_err(damaged)?;
+        }
         let requested = divi_storage::search_index::IndexFlags {
             txindex: config.index.txindex,
             addressindex: config.index.addressindex,
@@ -294,12 +314,12 @@ impl Node {
         // given, as Divi Core's -reindex writes the flags anew
         // (ChainExtensionService.cpp:703-707). Here the index is built from
         // the stored blocks; the chain state is kept.
-        let rebuild_tx_index = config.index.reindex && requested.txindex;
-        if config.index.reindex && flags.txindex != requested.txindex {
+        let rebuild_tx_index = reindex && requested.txindex;
+        if reindex && flags.txindex != requested.txindex {
             flags.txindex = requested.txindex;
         }
         // and the address and spent indexes with the options now given
-        if config.index.reindex {
+        if reindex {
             flags.addressindex = requested.addressindex;
             flags.spentindex = requested.spentindex;
         }
@@ -328,7 +348,7 @@ impl Node {
         }
 
         let txindex_path = config.data_dir.join("txindex");
-        if config.index.reindex && txindex_path.exists() {
+        if reindex && txindex_path.exists() {
             // Entries of an earlier index may name blocks no longer active
             std::fs::remove_dir_all(&txindex_path).map_err(|e| {
                 NodeError::Init(format!(
@@ -374,7 +394,7 @@ impl Node {
             }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
-        let build_search = config.index.reindex || build_unflagged_search;
+        let build_search = reindex || build_unflagged_search;
         if build_search && !(flags.addressindex || flags.spentindex) {
             // Switched off: remove the entries an earlier index left
             divi_storage::SearchIndex::new(db.clone(), false, false)
@@ -396,7 +416,7 @@ impl Node {
                         blocks,
                         started.elapsed().as_millis()
                     ),
-                    Err(e) if config.index.reindex => {
+                    Err(e) if reindex => {
                         return Err(NodeError::Init(format!(
                             "Failed to build the address and spent indexes: {}",
                             e
@@ -423,8 +443,11 @@ impl Node {
         }
 
         // The flags change only once the indexes they name are complete
-        if config.index.reindex || check_unflagged_index || build_unflagged_search {
+        if reindex || check_unflagged_index || build_unflagged_search {
             flags.store(&db).map_err(damaged)?;
+        }
+        if reindex {
+            db.delete_metadata(REINDEXING_KEY).map_err(damaged)?;
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the
