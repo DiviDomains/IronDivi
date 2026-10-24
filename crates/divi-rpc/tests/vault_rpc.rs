@@ -1073,3 +1073,24 @@ fn debitvaultbyname_of_a_vault_without_coins_fails_coin_selection() {
     }
     assert!(s.net.submitted.lock().is_empty());
 }
+
+/// fundvault with a manager address only takes the owner key from the
+/// keypool and puts it in the address book with the name "", as Divi Core's
+/// parseVaultAddressEncoding (rpcwallet.cpp:935-947)
+#[test]
+fn fundvault_manager_only_labels_the_owner_key() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.owner);
+    let funded = rpc
+        .fund_vault(&p(vec![json!(s.manager_addr.to_string()), json!(5.0)]))
+        .unwrap_or_else(|e| panic!("manager-only fundvault failed: {}", error_message(e)));
+    let encoding = funded["vault"][0]["encoding"].as_str().unwrap().to_string();
+    let (owner, manager) = encoding.split_once(':').unwrap();
+    assert_eq!(manager, s.manager_addr.to_string());
+    let owner = Address::from_base58(owner).unwrap();
+    assert!(
+        s.owner.in_address_book(&owner),
+        "owner key not in the address book"
+    );
+    assert_eq!(s.owner.get_account(&owner), "");
+}
