@@ -13,7 +13,7 @@
 //!
 //! This module defines all the P2P protocol messages.
 
-use crate::constants::Magic;
+use crate::constants::{Magic, MAX_HEADERS_RESULTS};
 use crate::error::NetworkError;
 use crate::message::{InvItem, MessageHeader, NetAddr};
 use crate::version::VersionMessage;
@@ -286,6 +286,15 @@ impl NetworkMessage {
 
             "headers" => {
                 let count = r.size()?;
+                // No node sends more than MAX_HEADERS_RESULTS headers at once
+                // (Divi Core main.cpp:696), so a larger count is refused
+                // before any header is read
+                if count > MAX_HEADERS_RESULTS {
+                    return Err(NetworkError::Deserialization(format!(
+                        "headers count {} above {}",
+                        count, MAX_HEADERS_RESULTS
+                    )));
+                }
                 let mut headers = Vec::with_capacity(r.capacity(count, 81));
                 for _ in 0..count {
                     // Block headers are 80 bytes (v3) or 112 bytes (v4)
