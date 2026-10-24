@@ -36,7 +36,7 @@ scripts/fee-estimate/run.sh target/release ~/divi-3.0.0/bin 54100 /var/tmp
 - `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.2 (divid p2p and RPC, then irondivid's).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about 3 minutes and is stopped after 10. However it ends, both nodes are stopped and their directories
+A run takes about a minute and is stopped after 10 minutes. However it ends, both nodes are stopped and their directories
 deleted. Needs bash and python3 (standard library only). RPC passwords are made at random for each run and kept in
 the 0600 `divi.conf`. The wallet phrase is read from divid's `dumphdinfo` and handed to irondivid in its environment
 (`WALLET_MNEMONIC`); it is never printed or put on a command line.
