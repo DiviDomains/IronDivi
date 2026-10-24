@@ -381,8 +381,9 @@ impl Node {
         // Create transaction relay manager
         let tx_relay = TxRelay::new(Arc::clone(&peer_manager));
 
-        // Create spork synchronization manager
-        let spork_manager = SporkManager::new(Arc::clone(&peer_manager));
+        // Create spork synchronization manager; sporks are kept in the chain
+        // database across restarts, as Divi Core keeps them in its spork database
+        let spork_manager = SporkManager::with_db(Arc::clone(&peer_manager), Arc::clone(&db));
 
         // Initialize masternode manager with database persistence
         let masternode_manager = match MasternodeManager::with_db(db.db_arc()) {
