@@ -21,12 +21,14 @@ use divi_primitives::{
     ChainMode,
 };
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::{
+    free_port, log_len, log_tail, port_taken_since, wait_up, Started, START_TRIES,
+};
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,24 +73,44 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Start irondivid with `args`; wait for RPC unless `rpc` is false
+    /// Start irondivid with `args`; wait for RPC unless `rpc` is false. A
+    /// node that lost its -rpcport or -port to another process is started
+    /// again with new ones; `rpc_port` of the result is the one it uses.
     fn start(args: &[String], env: &[(&str, &str)], rpc_port: u16, rpc: bool) -> Daemon {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
-        cmd.args(args).stdout(Stdio::null()).stderr(Stdio::null());
-        for (k, v) in env {
-            cmd.env(k, v);
+        let datadir = PathBuf::from(
+            args.iter()
+                .find_map(|a| a.strip_prefix("-datadir="))
+                .unwrap_or_default(),
+        );
+        let (mut args, mut rpc_port) = (args.to_vec(), rpc_port);
+        for _ in 0..START_TRIES {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::null());
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let from = log_len(&datadir);
+            let mut child = cmd.spawn().expect("spawn irondivid");
+            if !rpc
+                || wait_up(&mut child, &datadir, from, || {
+                    local(rpc_port, "getblockcount", json!([])).is_some()
+                }) == Started::Up
+            {
+                return Daemon { child, rpc_port };
+            }
+            rpc_port = free_port();
+            for a in args.iter_mut() {
+                if a.starts_with("-rpcport=") {
+                    *a = format!("-rpcport={rpc_port}");
+                } else if a.starts_with("-port=") {
+                    *a = format!("-port={}", free_port());
+                }
+            }
         }
-        let child = cmd.spawn().expect("spawn irondivid");
-        let mut daemon = Daemon { child, rpc_port };
-        if rpc {
-            let datadir = args.iter().find_map(|a| a.strip_prefix("-datadir="));
-            wait_started(
-                &mut daemon.child,
-                Path::new(datadir.unwrap_or_default()),
-                || local(rpc_port, "getblockcount", json!([])).is_some(),
-            );
-        }
-        daemon
+        panic!(
+            "irondivid lost a port {START_TRIES} times; its log ends:\n{}",
+            log_tail(&datadir)
+        );
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
@@ -139,6 +161,16 @@ fn output_within(cmd: &mut Command) -> Output {
         std::thread::sleep(Duration::from_millis(100));
     }
     child.wait_with_output().unwrap()
+}
+
+/// SIGKILL `pid` if it is still an irondivid (a pid read from a pid file may
+/// have exited, and its number be reused, by the time it is killed)
+fn kill_irondivid(pid: i32) {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let is_irondivid = String::from_utf8_lossy(&cmdline).contains("irondivid");
+    if is_irondivid || !Path::new("/proc/self").exists() {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 /// Wait up to 120 s for `f` to be true, as long as `Daemon::start` waits for
@@ -335,7 +367,7 @@ fn rpcallowip_lets_the_allowed_subnets_in() {
     let mut args = divid_args(dir.path(), rpc_port);
     args.push("-rpcallowip=192.0.2.0/24".into());
     let daemon = Daemon::start(&args, &[], rpc_port, true);
-    let (status, _) = http_rpc(ip, rpc_port, "getblockcount", &json!([])).expect("connects");
+    let (status, _) = http_rpc(ip, daemon.rpc_port, "getblockcount", &json!([])).expect("connects");
     assert_eq!(status, 403);
     drop(daemon);
 
@@ -343,8 +375,9 @@ fn rpcallowip_lets_the_allowed_subnets_in() {
     let rpc_port = free_port();
     let mut args = divid_args(dir.path(), rpc_port);
     args.push(format!("-rpcallowip={}", ip));
-    let _daemon = Daemon::start(&args, &[], rpc_port, true);
-    let (status, body) = http_rpc(ip, rpc_port, "getblockcount", &json!([])).expect("connects");
+    let daemon = Daemon::start(&args, &[], rpc_port, true);
+    let (status, body) =
+        http_rpc(ip, daemon.rpc_port, "getblockcount", &json!([])).expect("connects");
     assert_eq!((status, body["result"].clone()), (200, json!(0)));
 }
 
@@ -406,18 +439,6 @@ fn blocknotify_and_walletnotify_run_their_commands() {
 fn pid_file_and_wallet_are_in_the_data_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("irondivi.conf"), "wallet=w2\n").unwrap();
-    let rpc_port = free_port();
-    let status = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .args(["--daemon", "--regtest", "--datadir"])
-        .arg(dir.path())
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &free_port().to_string(), "--bind", "127.0.0.1"])
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success());
     let pid_file = dir.path().join("divid.pid");
     // The file can exist before the pid is written into it
     let read_pid = || {
@@ -425,18 +446,45 @@ fn pid_file_and_wallet_are_in_the_data_directory() {
             .ok()
             .and_then(|p| p.trim().parse::<i32>().ok())
     };
-    let mut pid = None;
-    eventually(|| {
-        pid = read_pid();
-        pid.is_some()
-    });
-    let up = eventually(|| local(rpc_port, "getblockcount", json!([])).is_some());
+    // The daemon forks away, so a lost port shows only in its log: then it
+    // is started again on new ports
+    let (mut rpc_port, mut pid, mut up) = (0, None, false);
+    for _ in 0..START_TRIES {
+        rpc_port = free_port();
+        let from = log_len(dir.path());
+        let status = Command::new(env!("CARGO_BIN_EXE_irondivid"))
+            .args(["--daemon", "--regtest", "--datadir"])
+            .arg(dir.path())
+            .args(["--rpcport", &rpc_port.to_string()])
+            .args(["--port", &free_port().to_string(), "--bind", "127.0.0.1"])
+            .args(["--rpcuser", "test", "--rpcpassword", "test"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        eventually(|| {
+            pid = read_pid();
+            pid.is_some()
+        });
+        up = eventually(|| {
+            local(rpc_port, "getblockcount", json!([])).is_some()
+                || port_taken_since(dir.path(), from)
+        });
+        if !port_taken_since(dir.path(), from) {
+            break;
+        }
+        if let Some(pid) = pid.take() {
+            kill_irondivid(pid);
+        }
+        let _ = std::fs::remove_file(&pid_file);
+    }
     let wallet_dir = dir.path().join("w2").exists();
     // Stop it however it was started
     let _ = local(rpc_port, "stop", json!([]));
     std::thread::sleep(Duration::from_secs(2));
     if let Some(pid) = pid {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        kill_irondivid(pid);
     }
     assert!(pid.is_some(), "no divid.pid in the data directory");
     assert!(up, "the daemon did not come up");

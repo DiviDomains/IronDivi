@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::start_node;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -47,26 +47,26 @@ struct Node {
 
 impl Node {
     fn start(datadir: &std::path::Path, extra: &[&str]) -> Node {
-        let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-            .arg("--regtest")
-            .arg("--datadir")
-            .arg(datadir)
-            .args(["--rpcport", &port.to_string()])
-            .args(["--port", &free_port().to_string()])
-            .args(["--bind", "127.0.0.1", "--staking=false"])
-            .args(["--connect", "127.0.0.1:1"])
-            .args(["--rpcuser", "test", "--rpcpassword", "test"])
-            .args(extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut node = Node { child, port };
-        wait_started(&mut node.child, datadir, || {
-            try_rpc(port, "getblockcount", &json!([])).is_some()
-        });
-        node
+        let (child, port, _) = start_node(
+            datadir,
+            |rpc_port, p2p_port| {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+                cmd.arg("--regtest")
+                    .arg("--datadir")
+                    .arg(datadir)
+                    .args(["--rpcport", &rpc_port.to_string()])
+                    .args(["--port", &p2p_port.to_string()])
+                    .args(["--bind", "127.0.0.1", "--staking=false"])
+                    .args(["--connect", "127.0.0.1:1"])
+                    .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                    .args(extra)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Node { child, port }
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {

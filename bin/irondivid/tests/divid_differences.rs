@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -78,20 +78,19 @@ fn debug_log(datadir: &Path) -> String {
 #[test]
 fn unknown_and_unsupported_options_start_with_a_log_line() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let mut a = args(dir.path(), rpc_port, p2p_port);
-    a.push("-bogusflag=1".into());
-    a.push("-dbcache=100".into());
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .args(&a)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    wait_started(&mut node.0, dir.path(), || {
-        rpc(rpc_port, "getblockcount", json!([])).is_some()
-    });
+    let (child, _, _) = start_node(
+        dir.path(),
+        |rpc_port, p2p_port| {
+            let mut a = args(dir.path(), rpc_port, p2p_port);
+            a.push("-bogusflag=1".into());
+            a.push("-dbcache=100".into());
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.args(&a).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
+    );
+    let _node = Node(child);
     let log = debug_log(dir.path());
     assert!(
         log.contains("Unknown option -bogusflag; ignored"),
@@ -154,19 +153,18 @@ fn masternode_option_is_refused() {
 #[test]
 fn negated_unknown_option_is_named_as_written() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let mut a = args(dir.path(), rpc_port, p2p_port);
-    a.push("-nobogusflag".into());
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .args(&a)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    wait_started(&mut node.0, dir.path(), || {
-        rpc(rpc_port, "getblockcount", json!([])).is_some()
-    });
+    let (child, _, _) = start_node(
+        dir.path(),
+        |rpc_port, p2p_port| {
+            let mut a = args(dir.path(), rpc_port, p2p_port);
+            a.push("-nobogusflag".into());
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.args(&a).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
+    );
+    let _node = Node(child);
     let log = debug_log(dir.path());
     assert!(
         log.contains("Unknown option -nobogusflag; ignored"),

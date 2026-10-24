@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::start_node;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -59,41 +59,42 @@ impl Drop for Node {
     }
 }
 
-fn start(dir: &Path, rpc_port: u16, p2p_port: u16) -> Node {
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("-regtest")
-        .arg(format!("-datadir={}", dir.display()))
-        .arg(format!("-rpcport={rpc_port}"))
-        .arg(format!("-port={p2p_port}"))
-        .args([
-            "-bind=127.0.0.1",
-            "-rpcuser=test",
-            "-rpcpassword=test",
-            "-staking=0",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    wait_started(&mut node.0, dir, || {
-        rpc(rpc_port, "getblockcount", json!([])).is_some()
-    });
-    node
+/// A regtest node on `dir` and its RPC port
+fn start(dir: &Path) -> (Node, u16) {
+    let (child, rpc_port, _) = start_node(
+        dir,
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("-regtest")
+                .arg(format!("-datadir={}", dir.display()))
+                .arg(format!("-rpcport={rpc_port}"))
+                .arg(format!("-port={p2p_port}"))
+                .args([
+                    "-bind=127.0.0.1",
+                    "-rpcuser=test",
+                    "-rpcpassword=test",
+                    "-staking=0",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
+    );
+    (Node(child), rpc_port)
 }
 
 #[test]
 fn restart_keeps_the_keypool_size() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let node = start(dir.path(), rpc_port, p2p_port);
+    let (node, rpc_port) = start(dir.path());
     // Taking a key leaves the pool one short until the next take
     ok(rpc_port, "getnewaddress", json!([]));
     let before = ok(rpc_port, "getwalletinfo", json!([]))["keypoolsize"].clone();
     ok(rpc_port, "stop", json!([]));
     drop(node);
 
-    let _node = start(dir.path(), rpc_port, p2p_port);
+    let (_node, rpc_port) = start(dir.path());
     let after = ok(rpc_port, "getwalletinfo", json!([]))["keypoolsize"].clone();
     assert_eq!(after, before, "the restart changed the keypool");
 }

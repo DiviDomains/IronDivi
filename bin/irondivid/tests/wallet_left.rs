@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::start_node;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -60,22 +60,23 @@ impl Drop for Node {
 #[test]
 fn wallet_send_fee_follows_minrelaytxfee() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (free_port(), free_port());
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("-regtest")
-        .arg(format!("-datadir={}", dir.path().display()))
-        .arg(format!("-rpcport={rpc_port}"))
-        .arg(format!("-port={p2p_port}"))
-        .args(["-bind=127.0.0.1", "-rpcuser=test", "-rpcpassword=test"])
-        .args(["-staking=0", "-minrelaytxfee=0.0005"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = Node(child);
-    wait_started(&mut node.0, dir.path(), || {
-        rpc(rpc_port, "getblockcount", json!([])).is_some()
-    });
+    let (child, rpc_port, _) = start_node(
+        dir.path(),
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("-regtest")
+                .arg(format!("-datadir={}", dir.path().display()))
+                .arg(format!("-rpcport={rpc_port}"))
+                .arg(format!("-port={p2p_port}"))
+                .args(["-bind=127.0.0.1", "-rpcuser=test", "-rpcpassword=test"])
+                .args(["-staking=0", "-minrelaytxfee=0.0005"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
+    );
+    let _node = Node(child);
 
     // Mature coins: regtest coinbase maturity is 20
     ok(rpc_port, "setgenerate", json!([25]));

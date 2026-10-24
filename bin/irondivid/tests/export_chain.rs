@@ -18,7 +18,7 @@ use divi_primitives::hash::Hash256;
 use divi_primitives::serialize::{deserialize, serialize};
 use divi_primitives::transaction::Transaction;
 use divi_storage::BlockExport;
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -92,17 +92,17 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path) -> Daemon {
-        let rpc_port = free_port();
-        let child = irondivid(datadir, rpc_port)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut daemon = Daemon { child, rpc_port };
-        wait_started(&mut daemon.child, datadir, || {
-            try_rpc(rpc_port, "getblockcount", &json!([])).is_some()
-        });
-        daemon
+        // `irondivid` takes a new P2P port from free_port for each start
+        let (child, rpc_port, _) = start_node(
+            datadir,
+            |rpc_port, _| {
+                let mut cmd = irondivid(datadir, rpc_port);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Daemon { child, rpc_port }
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {

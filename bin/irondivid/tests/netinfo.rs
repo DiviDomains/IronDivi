@@ -15,7 +15,7 @@
 
 #![cfg(unix)]
 
-use divi_test_support::{free_port, wait_started};
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -69,21 +69,20 @@ fn command(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Comm
 
 impl Daemon {
     fn start(datadir: &Path, extra: &[&str]) -> Daemon {
-        let (rpc_port, p2p_port) = (free_port(), free_port());
-        let child = command(datadir, rpc_port, p2p_port, extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut d = Daemon {
+        let (child, rpc_port, p2p_port) = start_node(
+            datadir,
+            |rpc_port, p2p_port| {
+                let mut cmd = command(datadir, rpc_port, p2p_port, extra);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", json!([])).is_some(),
+        );
+        Daemon {
             child,
             rpc_port,
             p2p_port,
-        };
-        wait_started(&mut d.child, datadir, || {
-            try_rpc(rpc_port, "getblockcount", json!([])).is_some()
-        });
-        d
+        }
     }
 
     fn rpc(&self, method: &str) -> Value {
