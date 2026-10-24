@@ -15,23 +15,16 @@
 
 #![cfg(unix)]
 
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const REGTEST_MAGIC: [u8; 4] = [0xa1, 0xcf, 0x7e, 0xac];
 const WAIT: Duration = Duration::from_secs(30);
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// One JSON-RPC call (test:test); None while the server is not up
 fn try_rpc(port: u16, method: &str, params: Value) -> Option<Value> {
@@ -76,24 +69,20 @@ fn command(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Comm
 
 impl Daemon {
     fn start(datadir: &Path, extra: &[&str]) -> Daemon {
-        let (rpc_port, p2p_port) = (free_port(), free_port());
-        let child = command(datadir, rpc_port, p2p_port, extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut d = Daemon {
+        let (child, rpc_port, p2p_port) = start_node(
+            datadir,
+            |rpc_port, p2p_port| {
+                let mut cmd = command(datadir, rpc_port, p2p_port, extra);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", json!([])).is_some(),
+        );
+        Daemon {
             child,
             rpc_port,
             p2p_port,
-        };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", json!([])).is_none() {
-            assert!(d.child.try_wait().unwrap().is_none(), "irondivid exited");
-            assert!(Instant::now() < deadline, "RPC did not come up");
-            std::thread::sleep(Duration::from_millis(250));
         }
-        d
     }
 
     fn rpc(&self, method: &str) -> Value {

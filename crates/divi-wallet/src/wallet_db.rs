@@ -330,6 +330,9 @@ pub struct WalletDb {
     /// Divi Core's -vault: addvault and removevault change the wallet only
     /// when it is on (wallet.cpp:152, :693-716)
     vault_mode: std::sync::atomic::AtomicBool,
+    /// Divi Core's -spendzeroconfchange: a send may also use unconfirmed
+    /// outputs of our own transactions (wallet.cpp:1848)
+    spend_zero_conf_change: std::sync::atomic::AtomicBool,
     /// The relay fee rate the wallet pays, satoshis per 1000 bytes (Divi
     /// Core's -minrelaytxfee, which its wallet follows: rpcwallet.cpp:470-473)
     relay_fee_per_kb: std::sync::atomic::AtomicI64,
@@ -390,6 +393,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
@@ -426,6 +430,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
@@ -466,6 +471,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
@@ -769,6 +775,7 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
@@ -918,7 +925,13 @@ impl WalletDb {
         let accounts = db.load_accounts()?;
         {
             let mut accounts_map = self.accounts.write();
-            for (account, addresses) in accounts {
+            for (account, mut addresses) in accounts {
+                // Divi Core reads its "name" records in key order (the address
+                // string after its length) and an account's current address is
+                // the last one read (walletdb.cpp:242-251,
+                // AddressBookManager.cpp:17-22), so after a restart it is the
+                // greatest address, not the last one handed out
+                addresses.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
                 accounts_map.insert(account, addresses);
             }
         }
@@ -1963,16 +1976,24 @@ impl WalletDb {
     /// Coins a send may use, as Divi Core's `AvailableCoins` gives them to a
     /// send: confirmed (at least `min_confirmations`, never fewer than one),
     /// mature, unspent and not locked by `lockunspent`. Our own unconfirmed
-    /// change is not spent: Core spends it only with `-spendzeroconfchange`,
-    /// which is off by default (wallet.cpp:1843, AvailableUtxoCollector.cpp:33-43).
-    /// The send's coin selection orders them.
+    /// outputs are added only with `-spendzeroconfchange`, which is off by
+    /// default: those of wallet transactions whose inputs are all ours
+    /// (wallet.cpp:1848, AvailableUtxoCollector.cpp:33-43,
+    /// AvailableUtxoCalculator.cpp:84-85). The send's coin selection orders them.
     pub fn get_send_candidates(
         &self,
         current_height: u32,
         min_confirmations: u32,
     ) -> Vec<WalletUtxo> {
-        self.get_spendable_utxos(current_height, min_confirmations.max(1))
+        let zero_conf = self
+            .spend_zero_conf_change
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.get_spendable_utxos(current_height, 0)
             .into_iter()
+            .filter(|utxo| {
+                let confirmations = utxo.confirmations(current_height);
+                confirmations >= min_confirmations.max(1) || (zero_conf && confirmations == 0)
+            })
             .filter(|utxo| !self.is_coin_locked(&utxo.outpoint()))
             .collect()
     }
@@ -3581,6 +3602,13 @@ impl WalletDb {
     /// Turn Divi Core's -vault on or off
     pub fn set_vault_mode(&self, on: bool) {
         self.vault_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Let sends use unconfirmed outputs of our own transactions (Divi
+    /// Core's -spendzeroconfchange, off by default)
+    pub fn set_spend_zero_conf_change(&self, on: bool) {
+        self.spend_zero_conf_change
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 

@@ -52,6 +52,7 @@ pub mod auth_cookie;
 pub mod blockchain;
 mod core_help;
 pub mod error;
+pub mod http;
 pub mod json_spirit_text;
 pub mod lite_wallet;
 pub mod masternode;

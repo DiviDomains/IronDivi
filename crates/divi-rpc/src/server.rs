@@ -27,8 +27,8 @@ use divi_storage::{AddressIndex, Chain};
 use divi_wallet::WalletDb;
 
 use axum::{
-    extract::{Path, Request as HttpRequest, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Path, Request as HttpRequest, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Version},
     middleware::{self, Next},
     response::IntoResponse,
     routing::post,
@@ -84,7 +84,7 @@ async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
                 .map(|c| c.0.ip());
             match peer {
                 Some(ip) if !allowed.iter().any(|s| s.contains(ip)) => {
-                    StatusCode::FORBIDDEN.into_response()
+                    crate::http::error_page(StatusCode::FORBIDDEN)
                 }
                 _ => next.run(req).await,
             }
@@ -341,16 +341,8 @@ impl RpcServer {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        // Wallet data (balance, keypoololdest, keypoolsize)
-        let (balance, keypoololdest, keypoolsize) = match self.wallet.get_wallet_info(&Params::None)
-        {
-            Ok(info) => (
-                info["balance"].as_f64().unwrap_or(0.0),
-                info["keypoololdest"].as_u64().unwrap_or(0),
-                info["keypoolsize"].as_u64().unwrap_or(0),
-            ),
-            Err(_) => (0.0, 0, 0),
-        };
+        // Wallet data, none without a wallet
+        let wallet_info = self.wallet.get_wallet_info(&Params::None).ok();
 
         // Staking status from staking subsystem
         let staking_status_text = match self.staking.get_staking_status(&Params::None) {
@@ -361,10 +353,9 @@ impl RpcServer {
             Err(_) => "Staking Not Active".to_string(),
         };
 
-        Ok(serde_json::json!({
+        let mut info = serde_json::json!({
             "version": "3.0.0.0",
             "protocolversion": divi_network::constants::protocol_version(),
-            "walletversion": 120200,
             "blocks": height,
             "timeoffset": 0,
             "connections": connections,
@@ -372,14 +363,29 @@ impl RpcServer {
             "difficulty": difficulty,
             "testnet": matches!(network_type, NetworkType::Testnet),
             "moneysupply": self.blockchain.money_supply(),
-            "keypoololdest": keypoololdest,
-            "keypoolsize": keypoolsize,
-            "balance": balance,
-            "paytxfee": 0.0,
             "relayfee": self.blockchain.relay_fee(),
             "staking status": staking_status_text,
             "errors": ""
-        }))
+        });
+        // Divi Core has the wallet members only with a wallet
+        // (rpcmisc.cpp:139-144)
+        if let (Some(wallet), Some(map)) = (wallet_info, info.as_object_mut()) {
+            map.insert("walletversion".into(), serde_json::json!(120200));
+            map.insert(
+                "balance".into(),
+                serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0)),
+            );
+            map.insert(
+                "keypoololdest".into(),
+                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0)),
+            );
+            map.insert(
+                "keypoolsize".into(),
+                serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0)),
+            );
+            map.insert("paytxfee".into(), serde_json::json!(0.0));
+        }
+        Ok(info)
     }
 
     /// setmocktime - C++ only honours this on regtest; this node has no mock clock at all.
@@ -531,13 +537,7 @@ impl RpcServer {
             "setban" => self.network.read().set_ban(params),
             "ban" => self.network.read().ban(params),
             "setmocktime" => self.set_mock_time(params),
-            "getinvalid" => Ok(serde_json::json!([{
-                // C++ 3.0.0 builds these from empty maps, so the report is always empty
-                "addresses_with_invalid": {},
-                "total_unspent": "0.00",
-                "total_minted": "0.00",
-                "total_valid_used": "0.00",
-            }])),
+            "getinvalid" => self.blockchain.get_invalid(params),
             "listbanned" => self.network.read().list_banned(params),
             "clearbanned" => self.network.read().clear_banned(params),
             "disconnectnode" => self.network.read().disconnect_node(params),
@@ -1140,10 +1140,9 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "backupwallet" => &[(0, "str")],
         // rpcmisc.cpp:65
         "ban" => &[(0, "str")],
-        // rpcdump.cpp:295
-        "bip38decrypt" => &[(0, "str"), (1, "str")],
-        // rpcdump.cpp:249
-        "bip38paperwallet" => &[(0, "str")],
+        // bip38decrypt, bip38paperwallet, dumpprivkey and importprivkey check
+        // that the wallet is unlocked before they read an argument
+        // (rpcdump.cpp:59, :184, :262, :309), so they check their own types
         // rpcmasternode.cpp:361
         "broadcaststartmasternode" => &[(0, "str"), (1, "str")],
         // rpcrawtransaction.cpp:361
@@ -1154,8 +1153,6 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "decoderawtransaction" => &[(0, "str")],
         // rpcrawtransaction.cpp:527
         "decodescript" => &[(0, "str")],
-        // rpcdump.cpp:170
-        "dumpprivkey" => &[(0, "str")],
         // rpcwallet.cpp:2692
         "encryptwallet" => &[(0, "str")],
         // rpcmining.cpp:120
@@ -1200,14 +1197,16 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "importaddress" => &[(0, "str"), (1, "str"), (2, "bool")],
         // rpcmasternode.cpp:595
         "importmnbroadcast" => &[(0, "str")],
-        // rpcdump.cpp:41
-        "importprivkey" => &[(0, "str"), (1, "str"), (2, "bool")],
         // rpcblockchain.cpp:612
         "invalidateblock" => &[(0, "str")],
         // rpcwallet.cpp:2544
         "keypoolrefill" => &[(0, "int")],
         // rpcwallet.cpp:2320
         "listaccounts" => &[(0, "int"), (1, "bool")],
+        // rpcwallet.cpp:1798-1808
+        "listreceivedbyaccount" | "listreceivedbyaddress" => {
+            &[(0, "int"), (1, "bool"), (2, "bool")]
+        }
         // rpcmasternode.cpp:263
         "listmasternodes" => &[(0, "str")],
         // rpcwallet.cpp:2364
@@ -1320,6 +1319,19 @@ fn argument_count(method: &str) -> Option<(usize, usize)> {
         "setgenerate" => (1, 1),
         // rpcmining.cpp:123
         "generateblock" => (0, 1),
+        // rpcdump.cpp:43, :107, :172, :251, :297
+        "importprivkey" | "importaddress" => (1, 3),
+        "dumpprivkey" | "bip38paperwallet" => (1, 1),
+        "bip38decrypt" => (2, 2),
+        // rpcwallet.cpp:2527, :2546
+        "backupwallet" => (1, 1),
+        "keypoolrefill" => (0, 1),
+        // rpcwallet.cpp:283, :540, :588, :626, :652, :1501, :1946, :2322
+        "getnewaddress" => (0, 1),
+        "getaccountaddress" | "getaccount" | "getaddressesbyaccount" => (1, 1),
+        "setaccount" | "getreceivedbyaccount" => (1, 2),
+        "listreceivedbyaccount" => (0, 3),
+        "listaccounts" => (0, 2),
         _ => return None,
     })
 }
@@ -1357,17 +1369,50 @@ fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
 }
 
 /// HTTP handler for JSON-RPC requests
-async fn handle_rpc(State(server): State<Arc<RpcServer>>, body: String) -> impl IntoResponse {
+async fn handle_rpc(
+    State(server): State<Arc<RpcServer>>,
+    version: Version,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
     debug!("RPC request: {}", body);
     let (status, reply) = server.handle_http_body(&body);
     debug!("RPC response: {}", reply);
-    (status, [(header::CONTENT_TYPE, "application/json")], reply)
+    json_reply(status, reply, &version, &headers)
+}
+
+/// A JSON-RPC reply with Divi Core's headers: application/json, and the
+/// connection kept only after a 200 to a request that keeps it
+fn json_reply(
+    status: StatusCode,
+    reply: String,
+    version: &Version,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let keep = crate::http::keep_alive(*version, headers);
+    (
+        status,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CONNECTION,
+                crate::http::connection_header(status, keep),
+            ),
+        ],
+        reply,
+    )
+        .into_response()
 }
 
 /// HTTP handler for wallet-specific JSON-RPC requests
 async fn handle_wallet_rpc(
     State(server): State<Arc<RpcServer>>,
     Path(wallet_name): Path<String>,
+    version: Version,
+    headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     debug!("RPC request for wallet '{}': {}", wallet_name, body);
@@ -1377,7 +1422,7 @@ async fn handle_wallet_rpc(
     // This enables multi-wallet CLI support even if server only has one wallet loaded
     let (status, reply) = server.handle_http_body(&body);
     debug!("RPC response for wallet '{}': {}", wallet_name, reply);
-    (status, [(header::CONTENT_TYPE, "application/json")], reply)
+    json_reply(status, reply, &version, &headers)
 }
 
 /// A reply object as Divi Core writes it (rpcprotocol.cpp JSONRPCReplyObj):
@@ -1417,7 +1462,8 @@ impl RpcServer {
         // divi-cli's byte escapes of non-ASCII text, read as divid reads them
         let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
         let body = body.as_deref().unwrap_or(body_text);
-        let request: Value = match serde_json::from_str(body) {
+        // json_spirit's reading: of two equal keys the first counts
+        let request: Value = match crate::http::parse_json(body) {
             Ok(v) => v,
             Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
         };
@@ -1488,41 +1534,83 @@ fn build_router(
     credentials: Option<Arc<(String, String)>>,
     rest: bool,
 ) -> Router {
-    // Every other path: REST or 404, without credentials, as divid
-    let other_paths = crate::rest::router(server.clone(), rest);
+    // /rest/ paths: REST when on, without credentials, as divid
+    let rest_paths = crate::rest::router(server.clone(), rest);
+    // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:150-152);
+    // bodies up to Divi Core's MAX_SIZE
     let router = Router::new()
-        .route("/", post(handle_rpc))
-        .route("/wallet/:wallet_name", post(handle_wallet_rpc))
-        .with_state(server);
+        .route("/", post(handle_rpc).get(handle_rpc))
+        .route(
+            "/wallet/:wallet_name",
+            post(handle_wallet_rpc).get(handle_wallet_rpc),
+        )
+        .with_state(server)
+        .layer(DefaultBodyLimit::max(crate::http::MAX_BODY));
+
+    // A declared body above MAX_SIZE is not read: Divi Core parses an empty
+    // request, a parse error (rpcprotocol.cpp:218-220, rpcserver.cpp:960-961)
+    let router = router.layer(middleware::from_fn(
+        |req: HttpRequest, next: Next| async move {
+            if crate::http::body_too_large(req.headers()) {
+                let (status, reply) = error_reply(RpcError::parse_error(), serde_json::Value::Null);
+                return json_reply(status, reply, &req.version(), req.headers());
+            }
+            next.run(req).await
+        },
+    ));
 
     // No credentials means no request can authenticate, never an open server.
+    // Wrong credentials are refused after Divi Core's delay (rpcserver.cpp:940-956).
     let router = router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
         let creds = credentials.clone();
         async move {
             let authorization = req
                 .headers()
                 .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok());
+                .map(|v| v.to_str().unwrap_or(""));
             let authorized = creds
                 .as_ref()
                 .is_some_and(|c| basic_auth_matches(authorization, &c.0, &c.1));
             if authorized {
                 next.run(req).await
             } else {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    [(
-                        header::WWW_AUTHENTICATE,
-                        HeaderValue::from_static("Basic realm=\"jsonrpc\""),
-                    )],
-                )
-                    .into_response()
+                if authorization.is_some() {
+                    tokio::time::sleep(crate::http::WRONG_CREDENTIALS_DELAY).await;
+                }
+                crate::http::unauthorized()
             }
         }
     }));
 
+    // REST outside the credentials
+    let router = router.merge(rest_paths);
+
+    // Before the credentials, as Divi Core: GET and POST only, and the JSON-RPC
+    // paths only, the query included, or /rest/ when REST is on
+    // (rpcserver.cpp:1019-1031)
+    let router = router.layer(middleware::from_fn(
+        move |req: HttpRequest, next: Next| async move {
+            if !crate::http::method_served(req.method()) {
+                return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
+            }
+            let uri = req.uri();
+            let path = uri.path();
+            let rpc_path = path == "/"
+                || path
+                    .strip_prefix("/wallet/")
+                    .is_some_and(|w| !w.is_empty() && !w.contains('/'));
+            if rest && path.starts_with("/rest/") {
+                return next.run(req).await;
+            }
+            if uri.query().is_some() || !rpc_path {
+                return crate::http::error_page(StatusCode::NOT_FOUND);
+            }
+            next.run(req).await
+        },
+    ));
+
     // No cross-origin headers on RPC replies, as Divi Core sends none
-    router.merge(other_paths)
+    router
 }
 
 /// The credentials to enforce: both must be set. `None` means no request can
@@ -1544,10 +1632,8 @@ fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
 fn basic_auth_matches(authorization: Option<&str>, user: &str, password: &str) -> bool {
     use base64::Engine;
 
-    let Some(encoded) = authorization.and_then(|h| {
-        h.strip_prefix("Basic ")
-            .or_else(|| h.strip_prefix("basic "))
-    }) else {
+    // The scheme as Divi Core takes it: "Basic " exactly (rpcserver.cpp:492)
+    let Some(encoded) = authorization.and_then(|h| h.strip_prefix("Basic ")) else {
         return false;
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
@@ -1854,7 +1940,8 @@ mod tests {
         let r = call(&server, "getinfo", Params::None).result.unwrap();
         assert!(r["version"].is_string());
         assert!(r["moneysupply"].is_number());
-        assert_eq!(r["walletversion"], serde_json::json!(120200));
+        // No wallet on this server: no wallet members (rpcmisc.cpp:139-144)
+        assert!(r.get("walletversion").is_none());
     }
 
     #[test]

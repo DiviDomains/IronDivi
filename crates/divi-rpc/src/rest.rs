@@ -12,9 +12,10 @@
 //! Divi Core's REST interface (rest.cpp), served on the RPC port beside the
 //! JSON-RPC paths and, as in divid, without credentials.
 //!
-//! divid answers every path but `/` here (rpcserver.cpp:1019-1033): a path
-//! starting `/rest/` goes to REST when -rest is on (default off), anything else
-//! is `404 Not Found`. REST serves three prefixes (rest.cpp:238-242):
+//! divid sends a path starting `/rest/` to REST when -rest is on (default
+//! off) and answers any other path but the JSON-RPC ones `404 Not Found`
+//! (rpcserver.cpp:1019-1033); the RPC server's outer layer makes that choice
+//! and passes the REST paths here. REST serves three prefixes (rest.cpp:238-242):
 //! `/rest/tx/<txid>`, `/rest/block/notxdetails/<hash>` and
 //! `/rest/block/<hash>`, each with `.bin`, `.hex` or `.json`. Each answer is
 //! built from the RPC reply divid builds it from (getrawtransaction, getblock,
@@ -24,7 +25,7 @@ use crate::protocol::{write_core_json, Params, Request, RequestId};
 use crate::server::RpcServer;
 use axum::{
     extract::State,
-    http::{header, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode, Uri, Version},
     response::{IntoResponse, Response},
     Router,
 };
@@ -68,7 +69,7 @@ fn text(status: StatusCode, body: String) -> Response {
 
 /// divid's HTTPError(HTTP_NOT_FOUND) (rpcprotocol.cpp:85-108)
 fn not_found() -> Response {
-    text(StatusCode::NOT_FOUND, "Not Found".into())
+    crate::http::error_page(StatusCode::NOT_FOUND)
 }
 
 /// A REST error: the message and CRLF, as text (rest.cpp:263-265)
@@ -287,12 +288,24 @@ fn answer(server: &RpcServer, enabled: bool, uri: &str) -> Response {
 pub fn router(server: Arc<RpcServer>, enabled: bool) -> Router {
     Router::new()
         .fallback(
-            move |State(server): State<Arc<RpcServer>>, uri: Uri| async move {
+            move |State(server): State<Arc<RpcServer>>,
+                  version: Version,
+                  headers: HeaderMap,
+                  uri: Uri| async move {
                 let text = uri
                     .path_and_query()
                     .map(|p| p.as_str().to_string())
                     .unwrap_or_else(|| uri.path().to_string());
-                answer(&server, enabled, &text)
+                let mut res = answer(&server, enabled, &text);
+                // A 200 keeps the connection as a JSON-RPC reply does, every
+                // error closes it (rest.cpp:138-152, :264; rpcserver.cpp:1031)
+                let status = res.status();
+                let keep = crate::http::keep_alive(version, &headers);
+                res.headers_mut().insert(
+                    header::CONNECTION,
+                    crate::http::connection_header(status, keep),
+                );
+                res
             },
         )
         .with_state(server)
@@ -317,30 +330,61 @@ mod tests {
     /// Serve `router` on a loopback port and send one request as is: (status,
     /// Content-Type, body)
     async fn send(router: &Router, method: &str, path: &str, body: &str) -> (u16, String, Vec<u8>) {
+        let (status, head, body) =
+            exchange(router, method, path, body, "Connection: close\r\n").await;
+        (status, header_of(&head, "content-type"), body)
+    }
+
+    fn header_of(head: &str, name: &str) -> String {
+        head.lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix(&format!("{name}: "))
+                    .map(String::from)
+            })
+            .unwrap_or_default()
+    }
+
+    /// One request with `extra` headers: (status, head, body)
+    async fn exchange(
+        router: &Router,
+        method: &str,
+        path: &str,
+        body: &str,
+        extra: &str,
+    ) -> (u16, String, Vec<u8>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router.clone();
         tokio::spawn(async move { axum::serve(listener, app).await });
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{extra}\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
+        // Read the head, then the body by its Content-Length: a kept
+        // connection does not end
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.unwrap();
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let mut buf = [0u8; 4096];
+        let split = loop {
+            if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i;
+            }
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed before the head");
+            raw.extend_from_slice(&buf[..n]);
+        };
         let head = String::from_utf8_lossy(&raw[..split]).to_string();
         let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let ctype = head
-            .lines()
-            .find_map(|l| {
-                l.to_ascii_lowercase()
-                    .strip_prefix("content-type: ")
-                    .map(String::from)
-            })
-            .unwrap_or_default();
-        (status, ctype, raw[split + 4..].to_vec())
+        let len: usize = header_of(&head, "content-length").parse().unwrap();
+        let mut body = raw[split + 4..].to_vec();
+        while body.len() < len {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed before the body");
+            body.extend_from_slice(&buf[..n]);
+        }
+        (status, head, body)
     }
 
     async fn get(router: &Router, path: &str) -> (u16, String, Vec<u8>) {
@@ -514,5 +558,44 @@ mod tests {
         let keys: Vec<&String> = got.as_object().unwrap().keys().collect();
         let plain_keys: Vec<&String> = plain.as_object().unwrap().keys().collect();
         assert_eq!(keys, plain_keys);
+    }
+
+    /// On the RPC port: REST without credentials and only when on, beside
+    /// integration's HTTP rules (405 for other methods, 404 for other paths);
+    /// a 200 keeps the connection, an error closes it, as divid
+    #[tokio::test]
+    async fn on_the_rpc_port_as_divid() {
+        let (server, _dir, genesis) = server();
+        let config = |rest| crate::server::RpcConfig {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            rest,
+            ..Default::default()
+        };
+        let on = crate::server::create_router_with_auth(server.clone(), &config(true));
+        let off = crate::server::create_router_with_auth(server, &config(false));
+        let path = format!("/rest/block/{genesis}.hex");
+
+        let (status, head, _) = exchange(&on, "GET", &path, "", "").await;
+        assert_eq!(status, 200);
+        assert_eq!(header_of(&head, "connection"), "keep-alive");
+        let (status, head, _) = exchange(&on, "POST", &path, "", "Connection: close\r\n").await;
+        assert_eq!(status, 200);
+        assert_eq!(header_of(&head, "connection"), "close");
+        let (status, head, body) = exchange(&on, "GET", "/rest/tx/xyz.json", "", "").await;
+        assert_eq!((status, body), (400, b"Invalid hash: xyz\r\n".to_vec()));
+        assert_eq!(header_of(&head, "connection"), "close");
+
+        for (router, path) in [(&on, "/foo".to_string()), (&off, path.clone())] {
+            let (status, head, body) = exchange(router, "GET", &path, "", "").await;
+            assert_eq!((status, body), (404, b"Not Found".to_vec()), "{path}");
+            assert_eq!(header_of(&head, "content-type"), "text/plain");
+            assert_eq!(header_of(&head, "connection"), "close");
+        }
+        let (status, _, _) = exchange(&on, "PUT", &path, "", "").await;
+        assert_eq!(status, 405);
+        // the JSON-RPC path still asks for credentials
+        let (status, _, _) = exchange(&on, "POST", "/", "{}", "Connection: close\r\n").await;
+        assert_eq!(status, 401);
     }
 }

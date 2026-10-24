@@ -104,17 +104,13 @@ async fn whitelisted_peer_comes_in_though_banned() {
 /// listen address are not
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn whitebind_peers_are_whitelisted() {
-    let white_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let white_port = divi_test_support::free_port();
     let t = TestNode::start_with(|c| {
         c.p2p.white_bind = vec![std::net::SocketAddr::from(([127, 0, 0, 1], white_port))];
     })
     .await;
     // The -whitebind listener comes up on a task of its own
-    let stream = tokio::time::timeout(WAIT, async {
+    let stream = tokio::time::timeout(divi_test_support::START_WAIT, async {
         loop {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
             socket.bind("127.0.0.4:0".parse().unwrap()).unwrap();

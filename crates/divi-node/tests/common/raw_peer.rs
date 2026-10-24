@@ -11,6 +11,7 @@
 use divi_node::config::NodeConfig;
 use divi_node::Node;
 use divi_primitives::ChainMode;
+use divi_test_support::free_port;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,27 +30,6 @@ pub struct TestNode {
     pub node: Node,
     pub port: u16,
     _dir: tempfile::TempDir,
-}
-
-/// A port nothing listens on now, for the node to listen on.
-///
-/// Below the kernel's ephemeral range (32768-60999 on Linux, 49152-65535 on
-/// macOS), which every outgoing connection on the host draws from: a port
-/// from 127.0.0.1:0 can be taken by one of them before it is bound. Picked at
-/// random so that test processes running at the same time do not try the
-/// same ports in the same order.
-fn free_port() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    let seed = std::collections::hash_map::RandomState::new();
-    for i in 0u32..1000 {
-        let mut h = seed.build_hasher();
-        h.write_u32(i);
-        let port = 20000 + (h.finish() % 12768) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in 20000-32767");
 }
 
 impl TestNode {
@@ -88,28 +68,33 @@ impl TestNode {
         self.node.start().await.unwrap();
         let port = self.port;
         // The listener comes up on a spawned task
-        let mut probe = tokio::time::timeout(WAIT, async {
+        let stream = tokio::time::timeout(divi_test_support::START_WAIT, async {
             loop {
                 if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
-                    break stream;
+                    return stream;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
         .expect("node listens");
-        // The probe is an inbound connection from the moment the node accepts
-        // it, which can be after it connected (the socket is bound before the
-        // accept loop runs). Close our side and read until the node closes
-        // its own, so the node has taken the probe and let it go; then wait
-        // until its slot is free, so it holds none when a test connects (a
-        // test with one inbound slot was refused).
-        let _ = probe.shutdown().await;
-        let mut sink = [0u8; 64];
-        let _ = tokio::time::timeout(WAIT, async {
-            while matches!(probe.read(&mut sink).await, Ok(n) if n > 0) {}
-        })
-        .await;
+        // The kernel completes the probe's connect from its backlog before the
+        // node accepts it, so the node may not have counted it yet. Keep it open
+        // until the node answers its version (or drops it), so it has been
+        // accepted; then close it and wait until it has gone, so it holds no
+        // inbound slot when a test connects (a test with one inbound slot was
+        // refused)
+        let mut probe = RawPeer {
+            stream,
+            ip: IpAddr::from([127, 0, 0, 1]),
+        };
+        probe
+            .send(
+                "version",
+                &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/probe:1/"),
+            )
+            .await;
+        let _ = probe.expect("version", WAIT).await;
         drop(probe);
         let pm = self.node.peer_manager();
         tokio::time::timeout(WAIT, async {

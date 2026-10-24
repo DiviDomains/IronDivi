@@ -12,19 +12,12 @@
 
 #![cfg(unix)]
 
+use divi_test_support::start_node;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use std::time::Duration;
 
 /// (status, Content-Type, body) of a request without credentials; None while
 /// nothing listens
@@ -70,42 +63,43 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path, rest: bool) -> Daemon {
-        let rpc = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-            .arg("-regtest")
-            .arg(format!("-datadir={}", datadir.display()))
-            .arg(format!("-rpcport={rpc}"))
-            .arg(format!("-port={}", free_port()))
-            .args([
-                "-bind=127.0.0.1",
-                "-rpcuser=test",
-                "-rpcpassword=test",
-                "-staking=0",
-            ])
-            .arg(format!("-rest={}", u8::from(rest)))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut d = Daemon { child, rpc };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while d.genesis().is_none() {
-            assert!(d.child.try_wait().unwrap().is_none(), "irondivid exited");
-            assert!(Instant::now() < deadline, "RPC did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        d
+        let (child, rpc, _) = start_node(
+            datadir,
+            |rpc, p2p| {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+                cmd.arg("-regtest")
+                    .arg(format!("-datadir={}", datadir.display()))
+                    .arg(format!("-rpcport={rpc}"))
+                    .arg(format!("-port={p2p}"))
+                    .args([
+                        "-bind=127.0.0.1",
+                        "-rpcuser=test",
+                        "-rpcpassword=test",
+                        "-staking=0",
+                    ])
+                    .arg(format!("-rest={}", u8::from(rest)))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                cmd
+            },
+            |rpc| genesis(rpc).is_some(),
+        );
+        Daemon { child, rpc }
     }
 
     fn genesis(&self) -> Option<String> {
-        let body = r#"{"method":"getblockhash","params":[0],"id":1}"#;
-        let (status, _, reply) = request(self.rpc, "POST", "/", body, true)?;
-        if status != 200 {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_slice(&reply).ok()?;
-        v["result"].as_str().map(String::from)
+        genesis(self.rpc)
     }
+}
+
+fn genesis(rpc: u16) -> Option<String> {
+    let body = r#"{"method":"getblockhash","params":[0],"id":1}"#;
+    let (status, _, reply) = request(rpc, "POST", "/", body, true)?;
+    if status != 200 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&reply).ok()?;
+    v["result"].as_str().map(String::from)
 }
 
 impl Drop for Daemon {

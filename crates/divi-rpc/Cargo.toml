@@ -30,5 +30,6 @@ bip39 = "2.0"
 futures = "0.3"
 
 [dev-dependencies]
+divi-test-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }

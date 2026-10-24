@@ -110,8 +110,6 @@ ones (`<call>: fields divid lacks` rows).
 
 - `getblock <hash> 1`: irondivid takes verbosity 0, 1 or 2, as Bitcoin Core does (2: the transactions decoded).
   divid reads a bool (`rpcblockchain.cpp:216`).
-- `getrawtransaction <txid> true`: irondivid takes verbose as a bool or as numeric text. divid reads an int
-  (`rpcrawtransaction.cpp:205-207`).
 
 **Open, not closed yet.** These are listed so the run stays usable. A fix turns the row into a FAIL until it is
 taken out here and in `KNOWN` in `check.py`.
@@ -122,12 +120,11 @@ taken out here and in `KNOWN` in `check.py`.
     `preserve_order` in Cargo.toml; docs/divid-differences.md R6).
   - divid keeps the order given (`rpcrawtransaction.cpp:400-410`).
   - The array form (`[{"addr": n}, ...]`) keeps the order on irondivid, and that row passes.
-- `sendrawtransaction` of an unsigned spend (open: rpc-left, RPC-LEFT.md row 8): irondivid answers -25 `""`, divid
-  -26 `"16: mandatory-script-verify-flag-failed (...)"`.
-- `sendrawtransaction` of a spend of a spent coin (open: rpc-left, RPC-LEFT.md row 6).
-  - irondivid answers -26 `"18: bad-txns-inputs-spent"`, divid -26 `"Unknown inputs being spent"`. divid checks the
-    inputs against the coin set before the mempool (`rpcrawtransaction.cpp:878-881`).
-  - The coin's transaction keeps another unspent output here. When none is left, irondivid answers divid's text.
+- `sendrawtransaction` of an unsigned spend: irondivid answers -25 `""`, divid -26
+  `"16: mandatory-script-verify-flag-failed (...)"`.
+  - **Cause:** divid runs here with `acceptnonstandard=1`, which skips its input standardness check
+    (`MempoolConsensus.cpp:274`, `:362-364`), so its script check answers. irondivid has no `-acceptnonstandard`.
+  - Without the option divid answers -25 `""` too (the `unsigned` row of `scripts/reject-replies`).
 
 ## Proving a difference is caught
 

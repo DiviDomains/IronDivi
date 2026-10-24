@@ -39,10 +39,10 @@ The divid owner listens; the other three dial it (`connect=`), so all four see o
 
 Every step that sends is made on divid first, then on irondivid once every node has seen divid's transaction. The two replies are compared with txids masked, and the two transactions are compared by the roles and values of their outputs: destination, vault (whose keys), wallet change, other.
 
-1. **Coins:** divid's owner mines 101 blocks. The owner address `OWN` is the divid owner's and the manager address `MGR` the divid manager's.
+1. **Coins:** divid's owner mines 101 blocks. The owner address `OWN` is the divid owner's and the manager address `MGR` the divid manager's. Every address the script takes from a divid node with `getnewaddress` (`OWN`, `MGR`, the destination `DEST` and the owners of the extra vaults) is given to its irondivid twin with `setaccount <address> ""`. That way both address books hold it, and listunspent shows the same `account` on its coins on both sides (`rpcrawtransaction.cpp:335-339`); a key both wallets hold but only one handed out is in only one address book.
 2. **fundvault**, two forms:
    - `"OWN:MGR" 100`;
-   - the manager-only form `"MGR" 50`, where the owner key comes from each wallet's own keypool, so the owner half of the encoding is compared as "a new key".
+   - the manager-only form `"MGR" 50`, where the owner key comes from each wallet's own keypool, so the owner half of the encoding is compared as "a new key". Each wallet puts that new owner key in its address book (`rpcwallet.cpp:943`); the script then gives each side's new owner key to the other twin with `setaccount <key> ""`, since the twins draw their keypools apart and the other one may hold the same key unlabelled (a coinbase key, for example).
 3. **addvault** `"OWN:MGR" <funding txid>` on both managers, for divid's and for irondivid's funding.
 4. **The owner spends**, a block between each:
    - `debitvaultbyname "OWN:MGR" DEST 10`, plain and with `receiver_pays`;
@@ -52,7 +52,7 @@ Every step that sends is made on divid first, then on irondivid once every node 
 6. **The managers stake a vault coin with `setgenerate 1`.** Each manager first gets fresh vault coins, and the script waits until the clock passes the tip's time, because divid looks for a stake time back from the clock. The coinstakes are compared by the roles of their outputs, since the coins each combines differ.
 7. **removevault** `"OWN:MGR"`, then again (the vault is no longer registered), then with a second `tx_hash` argument.
 8. **Refusals:**
-   - a bad manager-only encoding, a bad owner, a bad manager;
+   - a bad manager-only encoding, a bad owner, a bad manager. The refused manager-only call still takes and labels a new owner key on each side, as divid does (`rpcwallet.cpp:932-940`, the manager is checked after, at `:955`), so the key each side labelled is given to its twin with `setaccount`;
    - an amount too high;
    - addvault or removevault without `:`, on the wrong wallet, with an unknown funding txid;
    - debitvaultbyname from the manager wallet, with a bad destination, with a bad fee mode;
@@ -87,7 +87,6 @@ By design:
 - `removevault` with a second argument: irondivid still takes it for older IronDivi callers (its help says so); divid takes exactly one and answers with its help text (`rpcwallet.cpp:1194-1201`).
 
 Open, not closed yet. Each is listed so the run stays usable; a fix turns the row into a FAIL until it is taken out here and in `KNOWN` in `check.py`.
-- **`reclaimvaultfunds` replies:** divid answers the txid as a string (`rpcwallet.cpp:1189`), irondivid an object `{amount, fee, txid}`. This is RPC-LEFT row 2, open: rpc-left.
 - **After `removevault`, the manager's `listtransactions` and the manager's `gettransaction` of the vault transactions:**
   - divid's `removevault` only drops the vault script from memory (`wallet.cpp:707-716`). It keeps the wallet's transactions and amounts, and reads the script back from its wallet file at the next start, so after a restart the vault is managed again.
   - irondivid removes the vault and its records for good.
