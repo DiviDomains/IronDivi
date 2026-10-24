@@ -20,6 +20,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Divi Core's addnode help, the error for a call it cannot take
+/// (rpcnet.cpp:156-170)
+const ADDNODE_USAGE: &str = "addnode \"node\" \"add|remove|onetry\"\n\nAttempts add or remove a node from the addnode list.\nOr try a connection to a node once.\n\nArguments:\n1. \"node\"     (string, required) The node (see getpeerinfo for nodes)\n2. \"command\"  (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n\nExamples:\n> divi-cli addnode \"192.168.0.6:51472\" \"onetry\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:51472\", \"onetry\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
+
 /// Network RPC handler
 pub struct NetworkRpc {
     /// Peer manager for network queries
@@ -192,46 +196,49 @@ impl NetworkRpc {
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Peer manager not available"))?;
 
-        let addr_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing node address"))?;
-
-        let command = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing command (add/remove/onetry)"))?;
-
-        // Parse the address
-        let addr: std::net::SocketAddr = if addr_str.contains(':') {
-            addr_str.parse().map_err(|_| {
-                RpcError::new(codes::CLIENT_INVALID_IP_OR_SUBNET, "Invalid address format")
-            })?
-        } else {
-            // Default port is 51472
-            format!("{}:51472", addr_str).parse().map_err(|_| {
-                RpcError::new(codes::CLIENT_INVALID_IP_OR_SUBNET, "Invalid address format")
-            })?
+        // Divi Core takes exactly a node and one of its three commands, as
+        // written; anything else is answered with its help (rpcnet.cpp:156-170)
+        let usage = || RpcError::new(codes::MISC_ERROR, ADDNODE_USAGE);
+        let command = match (params.len(), params.get_str(0), params.get_str(1)) {
+            (2, Some(_), Some(c)) if ["add", "remove", "onetry"].contains(&c) => c,
+            _ => return Err(usage().into()),
         };
+        let addr_str = params.get_str(0).unwrap_or_default();
 
-        match command.to_lowercase().as_str() {
+        // An address without a port gets the network's (Params().GetDefaultPort())
+        let addr: std::net::SocketAddr = addr_str
+            .parse()
+            .or_else(|_| {
+                addr_str
+                    .parse::<IpAddr>()
+                    .map(|ip| std::net::SocketAddr::new(ip, peer_manager.default_port()))
+            })
+            .map_err(|_| {
+                RpcError::new(codes::CLIENT_INVALID_IP_OR_SUBNET, "Invalid address format")
+            })?;
+
+        match command {
             "add" => {
                 if !peer_manager.add_node(addr) {
-                    return Err(RpcError::new(codes::MISC_ERROR, "Node already added").into());
+                    return Err(RpcError::new(
+                        codes::CLIENT_NODE_ALREADY_ADDED,
+                        "Error: Node already added",
+                    )
+                    .into());
                 }
             }
             "remove" => {
                 if !peer_manager.remove_added_node(&addr) {
-                    return Err(RpcError::new(codes::MISC_ERROR, "Node has not been added").into());
+                    return Err(RpcError::new(
+                        codes::CLIENT_NODE_NOT_ADDED,
+                        "Error: Node has not been added.",
+                    )
+                    .into());
                 }
             }
-            "onetry" => {
+            _ => {
                 // Divi Core dials it once, now, and does not keep it in the list
                 peer_manager.connect_once(addr);
-            }
-            _ => {
-                return Err(RpcError::invalid_params(
-                    "Command must be 'add', 'remove', or 'onetry'",
-                )
-                .into());
             }
         }
 
@@ -754,6 +761,72 @@ mod tests {
             .get_network_info(&Params::None)
             .unwrap();
         assert_eq!(ni["networks"][0]["proxy"], "");
+    }
+
+    /// The code and message of an RPC error
+    fn rpc_err(r: Result<serde_json::Value, Error>) -> (i32, String) {
+        match r {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("expected an RPC error, got {other:?}"),
+        }
+    }
+
+    fn regtest_peers() -> Arc<PeerManager> {
+        PeerManager::new(divi_network::PeerManagerConfig {
+            default_port: 51476,
+            ..quiet_config()
+        })
+    }
+
+    /// addnode as Divi Core answers it (rpcnet.cpp:156-186): -23 and -24 with
+    /// its texts, its help for a call it cannot take, and the network's port
+    /// for an address given without one
+    #[test]
+    fn addnode_replies_as_divid() {
+        let pm = regtest_peers();
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&pm));
+        let call = |args: Vec<serde_json::Value>| rpc.add_node(&Params::Array(args));
+        let (add, remove) = (serde_json::json!("add"), serde_json::json!("remove"));
+        let node = serde_json::json!("192.0.2.1");
+
+        assert_eq!(
+            call(vec![node.clone(), add.clone()]).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            pm.get_added_node_info()[0].addr,
+            "192.0.2.1:51476".parse().unwrap()
+        );
+        assert_eq!(
+            rpc_err(call(vec![
+                serde_json::json!("192.0.2.1:51476"),
+                add.clone()
+            ])),
+            (-23, "Error: Node already added".to_string())
+        );
+        assert_eq!(
+            call(vec![node.clone(), remove.clone()]).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            rpc_err(call(vec![node.clone(), remove])),
+            (-24, "Error: Node has not been added.".to_string())
+        );
+        for bad in [
+            vec![],
+            vec![node.clone()],
+            vec![node.clone(), serde_json::json!("ADD")],
+            vec![node.clone(), serde_json::json!("badcommand")],
+            vec![node, add, serde_json::json!(1)],
+        ] {
+            let (code, message) = rpc_err(call(bad.clone()));
+            assert_eq!(code, -1, "{bad:?}");
+            assert!(
+                message.starts_with("addnode \"node\" \"add|remove|onetry\"\n\nAttempts add")
+                    && message.ends_with("http://127.0.0.1:51473/\n"),
+                "{bad:?}: {message}"
+            );
+        }
     }
 
     #[test]
