@@ -333,6 +333,19 @@ pub struct Chain {
 /// Metadata marker: the one-time height index repair has run on this datadir.
 const HEIGHT_INDEX_REPAIR_KEY: &[u8] = b"height_index_repair_v1";
 
+/// The block a reorganization is moving the chain to, kept until it is done,
+/// so a node stopped part-way through finishes it at the next start (Divi Core
+/// calls ActivateBestChain at start, init.cpp)
+const REORG_TARGET_KEY: &[u8] = b"reorg_target";
+
+/// "0" while a node runs on the database, "1" once it has stopped cleanly
+/// (Divi Core's "shutdown" flag, BlockIndexLoading.cpp:253-282)
+const CLEAN_STOP_KEY: &[u8] = b"clean_stop";
+
+/// Blocks indexed again at start when the transaction index cannot say how
+/// far it got (Divi's deepest reorganization is 100 blocks)
+const TX_INDEX_RECHECK: u32 = 100;
+
 /// Result of [`Chain::repair_height_index`].
 #[derive(Debug, Default, Clone)]
 pub struct HeightIndexAudit {
@@ -383,9 +396,73 @@ impl Chain {
         Ok(chain)
     }
 
-    /// Enable transaction index for O(1) transaction lookups
+    /// Enable transaction index for O(1) transaction lookups. An index that
+    /// is behind the chain (the two databases recover separately after a
+    /// power loss) is first filled in from the stored blocks.
     pub fn enable_tx_index(&mut self, tx_index: Arc<TxIndex>) {
+        match self.catch_up_tx_index(&tx_index) {
+            Ok(0) => {}
+            Ok(n) => info!("Transaction index filled in for {} blocks", n),
+            Err(e) => error!("Transaction index could not be filled in: {}", e),
+        }
         self.tx_index = Some(tx_index);
+    }
+
+    /// Index the transactions of the active blocks above the newest block the
+    /// index recorded. When that block is not on the active chain, or the
+    /// index never recorded one, the last `TX_INDEX_RECHECK` blocks are
+    /// indexed again (rewriting an entry is harmless).
+    fn catch_up_tx_index(&self, tx_index: &TxIndex) -> Result<u32, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(0);
+        };
+        let from = match tx_index.indexed_tip()? {
+            Some((height, hash))
+                if height <= tip.height && self.db.get_height_mapping(height)? == Some(hash) =>
+            {
+                height + 1
+            }
+            _ => tip.height.saturating_sub(TX_INDEX_RECHECK),
+        }
+        .max(1);
+        let mut indexed = 0;
+        for height in from..=tip.height {
+            let Some(hash) = self.db.get_height_mapping(height)? else {
+                continue;
+            };
+            let Some(block) = self.db.get_block(&hash)? else {
+                continue; // pruned or imported without bodies
+            };
+            let txids: Vec<Hash256> = block
+                .transactions
+                .iter()
+                .map(|tx| self.compute_txid(tx))
+                .collect();
+            let locations = Self::tx_locations(&block, &txids, &hash);
+            tx_index.put_block_tx_locations(&locations, height, &hash)?;
+            indexed += 1;
+        }
+        Ok(indexed)
+    }
+
+    /// A block's transactions under txid and bare txid
+    fn tx_locations(
+        block: &Block,
+        txids: &[Hash256],
+        block_hash: &Hash256,
+    ) -> Vec<(Hash256, Hash256, TxLocation)> {
+        txids
+            .iter()
+            .zip(&block.transactions)
+            .enumerate()
+            .map(|(i, (txid, tx))| {
+                (
+                    *txid,
+                    crate::txindex::bare_txid(tx),
+                    TxLocation::new(*block_hash, i as u32),
+                )
+            })
+            .collect()
     }
 
     /// Keep Divi Core's address and spent indexes as blocks are connected
@@ -399,9 +476,10 @@ impl Chain {
         self.search_index.as_ref()
     }
 
-    /// Write a connected block (UTXOs, undo data, tip) and then its address
-    /// and spent index entries, as Divi Core's ConnectBlock does once the
-    /// block's transactions have been checked
+    /// Write a connected block (UTXOs, undo data, tip) together with its
+    /// address and spent index entries, in one batch, as Divi Core's
+    /// ConnectBlock writes the indexes with the block's best-block hash
+    /// (BlockConnectionService.cpp:152-174)
     fn commit_connected_block(
         &self,
         block: &Block,
@@ -409,27 +487,36 @@ impl Chain {
         undo_bytes: &[u8],
         index: &BlockIndex,
     ) -> Result<(), StorageError> {
-        self.db
-            .atomic_connect_block(utxo_batch, undo_bytes, &index.hash, index)?;
-        if let Some(ref search) = self.search_index {
-            let mut prevouts = HashMap::new();
-            if !undo_bytes.is_empty() {
-                for entry in BlockUndo::from_bytes(undo_bytes)?.entries {
-                    prevouts.insert(
-                        entry.outpoint,
-                        (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
-                    );
+        let updates = match self.search_index {
+            Some(ref search) => {
+                let mut prevouts = HashMap::new();
+                if !undo_bytes.is_empty() {
+                    for entry in BlockUndo::from_bytes(undo_bytes)?.entries {
+                        prevouts.insert(
+                            entry.outpoint,
+                            (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
+                        );
+                    }
                 }
+                Some(search_index::collect_connect(
+                    block,
+                    index.height,
+                    &prevouts,
+                    search.address_enabled(),
+                    search.spent_enabled(),
+                ))
             }
-            let updates = search_index::collect_connect(
-                block,
-                index.height,
-                &prevouts,
-                search.address_enabled(),
-                search.spent_enabled(),
-            );
-            search.apply_connect(&updates)?;
-        }
+            None => None,
+        };
+        self.db
+            .atomic_connect_block(utxo_batch, undo_bytes, &index.hash, index, &|wb| match (
+                &self.search_index,
+                &updates,
+            ) {
+                (Some(search), Some(updates)) => search.add_to_batch(wb, updates, false),
+                _ => Ok(()),
+            })?;
+        stop_point!("block connected");
         Ok(())
     }
 
@@ -931,7 +1018,106 @@ impl Chain {
             above = Some(index);
             checked += 1;
         }
+        self.verify_utxo_set_at_tip(&tip, lowest.max(1))?;
         Ok(checked)
+    }
+
+    /// Undo the blocks from the tip down to `lowest` in memory, as Divi Core's
+    /// VerifyDB does at level 3 (verifyDb.cpp:110-127): every output a block
+    /// created must be in the UTXO set once the blocks above it are undone, and
+    /// every coin it spent must be absent until its undo data puts it back. A
+    /// UTXO set that does not belong to the tip fails here instead of being
+    /// built on. The walk stops at a block whose body or undo data is not kept
+    /// (pruned, imported from a snapshot, or connected before undo data existed).
+    fn verify_utxo_set_at_tip(&self, tip: &BlockIndex, lowest: u32) -> Result<(), StorageError> {
+        let damaged = |height: u32, what: String| {
+            StorageError::ChainState(format!(
+                "database is damaged at height {height}: the UTXO set does not match the chain ({what})"
+            ))
+        };
+        // What the undone blocks changed: Some = put back, None = removed
+        let mut view: HashMap<OutPoint, Option<Utxo>> = HashMap::new();
+        let mut height = tip.height;
+        while height >= lowest {
+            let hash = if height == tip.height {
+                tip.hash
+            } else {
+                match self.db.get_height_mapping(height)? {
+                    Some(hash) => hash,
+                    None => break,
+                }
+            };
+            let (Some(block), Some(undo)) =
+                (self.db.get_block(&hash)?, self.db.get_undo_data(&hash)?)
+            else {
+                break;
+            };
+            let mut undo: HashMap<OutPoint, Utxo> = if undo.is_empty() {
+                HashMap::new()
+            } else {
+                BlockUndo::from_bytes(&undo)?
+                    .entries
+                    .into_iter()
+                    .map(|e| (e.outpoint, e.prev_utxo))
+                    .collect()
+            };
+            for tx in block.transactions.iter().rev() {
+                let txid = self.compute_txid(tx);
+                for (vout, out) in tx.vout.iter().enumerate() {
+                    let outpoint = OutPoint::new(txid, vout as u32);
+                    let current = match view.get(&outpoint) {
+                        Some(entry) => entry.clone(),
+                        None => self.db.get_utxo(&outpoint)?,
+                    };
+                    match current {
+                        Some(u)
+                            if u.value == out.value
+                                && u.script_pubkey == out.script_pubkey
+                                && u.height == height => {}
+                        _ => {
+                            return Err(damaged(
+                                height,
+                                format!("output {txid}:{vout} of block {hash} is missing"),
+                            ))
+                        }
+                    }
+                    view.insert(outpoint, None);
+                }
+                if tx.is_coinbase() {
+                    continue;
+                }
+                for input in &tx.vin {
+                    if tx.is_coinstake() && input.prevout.is_null() {
+                        continue;
+                    }
+                    let prev = undo.remove(&input.prevout).ok_or_else(|| {
+                        damaged(
+                            height,
+                            format!(
+                                "undo data of block {hash} lacks the coin {}:{}",
+                                input.prevout.txid, input.prevout.vout
+                            ),
+                        )
+                    })?;
+                    let present = match view.get(&input.prevout) {
+                        Some(entry) => entry.is_some(),
+                        None => self.db.get_utxo(&input.prevout)?.is_some(),
+                    };
+                    if present {
+                        return Err(damaged(
+                            height,
+                            format!(
+                                "coin {}:{} spent by block {hash} is still unspent",
+                                input.prevout.txid, input.prevout.vout
+                            ),
+                        ));
+                    }
+                    view.insert(input.prevout, Some(prev));
+                }
+            }
+            height -= 1;
+        }
+        Ok(())
     }
 
     /// Get the current chain tip
@@ -1860,6 +2046,9 @@ impl Chain {
             );
         }
 
+        self.db
+            .put_metadata(REORG_TARGET_KEY, new_index.hash.as_bytes())?;
+
         // Flush UTXO cache before reorg to ensure disconnect sees consistent state
         if self.db.has_utxo_cache() {
             match self.db.flush_utxo_cache() {
@@ -1887,8 +2076,15 @@ impl Chain {
             let mut index_mut = index.clone();
             if let Err(e) = self.disconnect_block(block, &mut index_mut) {
                 warn!("Failed to disconnect block {}: {}", index.hash, e);
+                // Each disconnect moved the tip on disk; follow it
+                if let Some(at) = self.db.get_best_block()? {
+                    if let Some(at) = self.db.get_block_index(&at)? {
+                        *self.tip.write() = Some(at);
+                    }
+                }
                 return Err(e);
             }
+            pause_point!("reorg disconnected");
         }
 
         // Connect blocks (in order from ancestor to new tip)
@@ -1938,9 +2134,13 @@ impl Chain {
                     &blocks_to_disconnect,
                     old_tip,
                 )?;
+                self.db.delete_metadata(REORG_TARGET_KEY)?;
                 return Err(e);
             }
         }
+
+        self.db.delete_metadata(REORG_TARGET_KEY)?;
+        pause_point!("reorg done");
 
         // Update in-memory tip (DB tip already written by last atomic_connect_block)
         info!(
@@ -2034,9 +2234,6 @@ impl Chain {
                 let (utxo_batch, undo_bytes) = self.connect_block(block, &mut stored)?;
                 self.commit_connected_block(block, &utxo_batch, &undo_bytes, &stored)?;
             }
-            // disconnect_block does not move the DB tip; when no old block was
-            // reconnected it would still name a rolled-back block.
-            self.db.set_best_block(&old_tip.hash)?;
             if self.db.has_utxo_cache() {
                 self.db.flush_utxo_cache()?;
             }
@@ -2113,7 +2310,6 @@ impl Chain {
                     .ok_or_else(|| {
                         StorageError::BlockNotFound(block.header.prev_block.to_string())
                     })?;
-                self.db.set_best_block(&parent.hash)?;
                 if self.db.has_utxo_cache() {
                     self.db.flush_utxo_cache()?;
                 }
@@ -2125,6 +2321,64 @@ impl Chain {
             }
         }
         self.activate_best_valid_chain()
+    }
+
+    /// Record that a node now runs on this database. Returns whether the run
+    /// before it stopped cleanly (a database written before this was kept
+    /// counts as clean).
+    pub fn begin_run(&self) -> Result<bool, StorageError> {
+        let clean = self.db.get_metadata(CLEAN_STOP_KEY)?.as_deref() != Some(b"0");
+        self.db.put_metadata_synced(CLEAN_STOP_KEY, b"0")?;
+        Ok(clean)
+    }
+
+    /// Record a clean stop: everything the node keeps has been written
+    pub fn end_run(&self) -> Result<(), StorageError> {
+        self.db.flush()?;
+        self.db.put_metadata_synced(CLEAN_STOP_KEY, b"1")
+    }
+
+    /// Finish a reorganization that a stop interrupted: the chain on disk is
+    /// whole at the block it had reached, and the blocks of the branch it was
+    /// moving to are stored, so connect them now, as Divi Core's
+    /// ActivateBestChain does at start. Returns whether the tip moved.
+    pub fn finish_interrupted_reorg(&self) -> Result<bool, StorageError> {
+        let Some(raw) = self.db.get_metadata(REORG_TARGET_KEY)? else {
+            return Ok(false);
+        };
+        let _chain_guard = self.chain_lock.lock();
+        let target = match <[u8; 32]>::try_from(raw.as_slice()) {
+            Ok(bytes) => self.db.get_block_index(&Hash256::from_bytes(bytes))?,
+            Err(_) => None,
+        };
+        let moved = match target {
+            Some(target) => {
+                info!(
+                    "A reorganization to block {} at height {} was interrupted; finishing it",
+                    target.hash, target.height
+                );
+                *self.best_known_block.write() = Some(target);
+                match self.activate_best_chain_inner() {
+                    Ok(result) => result.is_some(),
+                    Err(e) if Self::is_consensus_invalid(&e) => {
+                        warn!("The interrupted reorganization's branch is invalid: {}", e);
+                        false
+                    }
+                    Err(e) => {
+                        let tip = self.tip.read().clone();
+                        *self.best_known_block.write() = tip;
+                        return Err(e);
+                    }
+                }
+            }
+            None => false,
+        };
+        if !moved {
+            let tip = self.tip.read().clone();
+            *self.best_known_block.write() = tip;
+        }
+        self.db.delete_metadata(REORG_TARGET_KEY)?;
+        Ok(moved)
     }
 
     /// Clear the invalid flag on a block, its ancestors and its descendants
@@ -2237,8 +2491,18 @@ impl Chain {
                     "  ├─ Restoring {} spent UTXOs from undo data",
                     block_undo.entries.len()
                 );
+                // A coin created and spent in this block goes with the block:
+                // Divi Core undoes the spender (putting the coin back) and then
+                // the creator (taking it away again)
+                let created: std::collections::HashSet<Hash256> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| self.compute_txid(tx))
+                    .collect();
                 for entry in block_undo.entries {
-                    utxo_batch.add(entry.outpoint, entry.prev_utxo);
+                    if !created.contains(&entry.outpoint.txid) {
+                        utxo_batch.add(entry.outpoint, entry.prev_utxo);
+                    }
                 }
             }
             // else: block had no non-coinbase inputs, nothing to restore
@@ -2285,51 +2549,54 @@ impl Chain {
 
         // Divi Core DisconnectBlock: reverse the block's address and spent
         // index entries from the outputs its inputs spent
-        if let Some(ref search) = self.search_index {
-            let prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
-                .adds
-                .iter()
-                .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
-                .collect();
-            let updates = search_index::collect_disconnect(
-                block,
-                index.height,
-                &prevouts,
-                search.address_enabled(),
-                search.spent_enabled(),
-            );
-            search.apply_disconnect(&updates)?;
-        }
+        let updates = match self.search_index {
+            Some(ref search) => {
+                let prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
+                    .adds
+                    .iter()
+                    .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
+                    .collect();
+                Some(search_index::collect_disconnect(
+                    block,
+                    index.height,
+                    &prevouts,
+                    search.address_enabled(),
+                    search.spent_enabled(),
+                ))
+            }
+            None => None,
+        };
 
-        // Flush all UTXO changes in a single atomic write
-        if !utxo_batch.is_empty() {
-            trace!(
-                "  ├─ Flushing disconnect UTXO batch: {} adds (restores), {} removes",
-                utxo_batch.add_count(),
-                utxo_batch.remove_count()
-            );
-            self.db.flush_utxo_batch(&utxo_batch)?;
-        }
+        let parent = self
+            .db
+            .get_block_index(&block.header.prev_block)?
+            .ok_or_else(|| StorageError::BlockNotFound(block.header.prev_block.to_string()))?;
 
-        // Clean up undo data for this block
-        let _ = self.db.delete_undo_data(&index.hash);
-
-        // Update block status
-        index.status.remove(BlockStatus::ON_MAIN_CHAIN);
-        self.db.store_block_index_entry(index)?;
-
-        // Update height mapping to remove this block's height entry
-        // (the previous block at this height is on a different fork)
-        self.db.remove_height_mapping(index.height)?;
-
-        // The transaction index keeps the block's entries: Divi Core's
+        // UTXO changes, undo data removed, index entry off the main chain, height
+        // entry removed and the tip moved to the parent, in one write. The
+        // transaction index keeps the block's entries: Divi Core's
         // DisconnectBlock leaves them, so getrawtransaction still finds a
         // transaction of a disconnected block.
+        trace!(
+            "  ├─ Disconnect batch: {} adds (restores), {} removes",
+            utxo_batch.add_count(),
+            utxo_batch.remove_count()
+        );
+        index.status.remove(BlockStatus::ON_MAIN_CHAIN);
+        self.db
+            .atomic_disconnect_block(&utxo_batch, index, &parent, &|wb| match (
+                &self.search_index,
+                &updates,
+            ) {
+                (Some(search), Some(updates)) => search.add_to_batch(wb, updates, true),
+                _ => Ok(()),
+            })?;
 
         info!(
             "Disconnected block {} at height {}",
             index.hash, index.height
         );
+        stop_point!("block disconnected");
         Ok(())
     }
 
@@ -3699,15 +3966,8 @@ impl Chain {
         );
 
         if let Some(ref tx_index) = self.tx_index {
-            let mut locations = Vec::with_capacity(block.transactions.len());
-            for (tx_idx, (txid, tx)) in txids.iter().zip(&block.transactions).enumerate() {
-                locations.push((
-                    *txid,
-                    crate::txindex::bare_txid(tx),
-                    TxLocation::new(index.hash, tx_idx as u32),
-                ));
-            }
-            tx_index.put_tx_locations(&locations)?;
+            let locations = Self::tx_locations(block, &txids, &index.hash);
+            tx_index.put_block_tx_locations(&locations, index.height, &index.hash)?;
         }
 
         debug!("  ├─ Lottery winners update");
@@ -4809,6 +5069,8 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
 
 #[cfg(test)]
 mod tests {
+    mod crash;
+
     use super::*;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;

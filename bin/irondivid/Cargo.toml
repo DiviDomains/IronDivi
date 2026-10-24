@@ -43,5 +43,8 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 toml = "0.8"
 
+[features]
+fault-injection = ["divi-storage/fault-injection"]
+
 [dev-dependencies]
 tempfile = { workspace = true }

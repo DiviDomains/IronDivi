@@ -1038,8 +1038,16 @@ impl RotatingLog {
     }
 }
 
+/// Set by SIGHUP: the next log write reopens debug.log (it may have been
+/// moved away by logrotate)
+static REOPEN_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl std::io::Write for RotatingLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.file = None;
+            self.reopen()?;
+        }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
         }
@@ -1918,10 +1926,19 @@ async fn run_daemon(
     info!("Stopping node...");
     node.stop().await.with_context(|| "Failed to stop node")?;
 
+    let mut clean = true;
     if let Some(wallet) = wallet_for_shutdown {
         match wallet.save() {
             Ok(()) => info!("Wallet saved"),
-            Err(e) => error!("Failed to save wallet on shutdown: {}", e),
+            Err(e) => {
+                error!("Failed to save wallet on shutdown: {}", e);
+                clean = false;
+            }
+        }
+    }
+    if clean {
+        if let Err(e) = node.chain().end_run() {
+            error!("Failed to record the clean stop: {}", e);
         }
     }
 
@@ -2333,6 +2350,20 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Set up shutdown channel
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
+    // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
+    // (init.cpp:513-516), so a logrotate postrotate line does not stop it
+    #[cfg(unix)]
+    {
+        let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
+            .context("Failed to install SIGHUP handler")?;
+        tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                REOPEN_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
+                info!("Received SIGHUP, reopening debug.log");
+            }
+        });
+    }
+
     // Set up signal handler
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -2383,6 +2414,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             source = err.source();
         }
         std::process::exit(1);
+    }
+
+    // Divi Core removes its pid file at a clean stop (init.cpp:396)
+    let pid_file = data_dir.join("irondivid.pid");
+    if std::fs::read_to_string(&pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string())
+    {
+        let _ = std::fs::remove_file(&pid_file);
     }
 
     info!("IronDivi shutdown complete");
