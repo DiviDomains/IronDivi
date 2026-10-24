@@ -150,7 +150,7 @@ fn one(addr: SocketAddr, req: Vec<u8>) -> Reply {
 
 const GOOD: &str = r#"{"method":"getblockcount","params":[],"id":1}"#;
 
-/// No or wrong credentials: Divi Core's 401 (rpcprotocol.cpp:91-108), after a
+/// No or wrong credentials: Divi Core's 401 (rpcprotocol.cpp:85-105), after a
 /// 250 ms delay when credentials were given (rpcserver.cpp:940-956); the scheme
 /// must be "Basic " as written (rpcserver.cpp:492)
 #[test]
@@ -191,7 +191,7 @@ fn credentials_are_refused_as_divid_refuses_them() {
 }
 
 /// GET is served as POST; another path, a query or another method is not
-/// (rpcprotocol.cpp:113-138, rpcserver.cpp:1019-1031)
+/// (rpcprotocol.cpp:138-160, rpcserver.cpp:1019-1031)
 #[test]
 fn methods_and_paths_as_divid() {
     let s = served();
@@ -212,7 +212,7 @@ fn methods_and_paths_as_divid() {
 }
 
 /// Every reply names the connection: kept after a 200 on HTTP/1.1, closed
-/// after an error reply (rpcprotocol.cpp:291-297, rpcserver.cpp:500-511)
+/// after an error reply (rpcprotocol.cpp:239-245, rpcserver.cpp:500-511)
 #[test]
 fn connection_is_kept_after_a_reply_and_closed_after_an_error() {
     let s = served();
@@ -240,7 +240,7 @@ fn connection_is_kept_after_a_reply_and_closed_after_an_error() {
 }
 
 /// Bodies up to Divi Core's MAX_SIZE (32 MiB, serialize.h:34) are read; a
-/// declared larger one is not, and is a parse error (rpcprotocol.cpp:276-277)
+/// declared larger one is not, and is a parse error (rpcprotocol.cpp:218-220)
 #[test]
 fn bodies_up_to_divid_s_max_size() {
     let s = served();

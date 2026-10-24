@@ -22,14 +22,14 @@ use serde_json::{Map, Value};
 use std::fmt;
 
 /// The most request body Divi Core reads (MAX_SIZE, serialize.h:34); above it
-/// the body is not read at all (rpcprotocol.cpp:276-277)
+/// the body is not read at all (rpcprotocol.cpp:218-220)
 pub const MAX_BODY: usize = 0x0200_0000;
 
 /// How long Divi Core waits before it refuses wrong credentials
 /// (rpcserver.cpp:948-952)
 pub const WRONG_CREDENTIALS_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Divi Core's 401 body (rpcprotocol.cpp:91-108)
+/// Divi Core's 401 body (rpcprotocol.cpp:85-105)
 const UNAUTHORIZED_BODY: &str =
     "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\"\r\n\
 \"http://www.w3.org/TR/1999/REC-html401-19991224/loose.dtd\">\r\n\
@@ -63,7 +63,7 @@ pub fn unauthorized() -> Response<Body> {
 }
 
 /// Divi Core's HTTPError for another status: the status text as a text/plain
-/// body, and the connection closed (rpcprotocol.cpp:109-111)
+/// body, and the connection closed (rpcprotocol.cpp:106-108)
 pub fn error_page(status: StatusCode) -> Response<Body> {
     let text = status.canonical_reason().unwrap_or("");
     let mut res = Response::new(Body::from(text));
@@ -76,7 +76,7 @@ pub fn error_page(status: StatusCode) -> Response<Body> {
 
 /// Whether Divi Core keeps the connection after a reply to this request: a
 /// "Connection" of "keep-alive", or none (or another value) on HTTP/1.1; never
-/// with "close" (rpcprotocol.cpp:291-297, rpcserver.cpp:1014-1017)
+/// with "close" (rpcprotocol.cpp:239-245, rpcserver.cpp:1014-1017)
 pub fn keep_alive(version: Version, headers: &HeaderMap) -> bool {
     match headers
         .get(header::CONNECTION)
@@ -99,7 +99,7 @@ pub fn connection_header(status: StatusCode, keep: bool) -> HeaderValue {
 }
 
 /// The requests Divi Core serves at all: GET or POST (any other method closes
-/// the connection unanswered, rpcprotocol.cpp:121-123)
+/// the connection unanswered, rpcprotocol.cpp:150-152)
 pub fn method_served(method: &Method) -> bool {
     method == Method::GET || method == Method::POST
 }

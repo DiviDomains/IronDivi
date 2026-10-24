@@ -1237,7 +1237,7 @@ pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Ro
 }
 
 fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
-    // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:121-123);
+    // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:150-152);
     // bodies up to Divi Core's MAX_SIZE
     let router = Router::new()
         .route("/", post(handle_rpc).get(handle_rpc))
@@ -1249,7 +1249,7 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
         .layer(DefaultBodyLimit::max(crate::http::MAX_BODY));
 
     // A declared body above MAX_SIZE is not read: Divi Core parses an empty
-    // request, a parse error (rpcprotocol.cpp:276-277, rpcserver.cpp:960-961)
+    // request, a parse error (rpcprotocol.cpp:218-220, rpcserver.cpp:960-961)
     let router = router.layer(middleware::from_fn(
         |req: HttpRequest, next: Next| async move {
             if crate::http::body_too_large(req.headers()) {
