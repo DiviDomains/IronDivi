@@ -286,11 +286,14 @@ impl MasternodeRpc {
 
     /// Masternode sync control
     pub fn mnsync(&self, params: &Params) -> Result<Value, Error> {
-        let command = params.get_str(0).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: command (status|reset)")
-        })?;
+        // Divi Core takes exactly one mode, "status" or "reset" as written, and
+        // answers anything else with its help (rpcmisc.cpp:160-197)
+        let command = match (params.len(), params.get_str(0)) {
+            (1, Some(c)) if c == "status" || c == "reset" => c,
+            _ => return Err(RpcError::new(codes::MISC_ERROR, MNSYNC_USAGE).into()),
+        };
 
-        match command.to_lowercase().as_str() {
+        match command {
             "status" => {
                 // Return basic sync status
                 Ok(json!({
@@ -307,16 +310,19 @@ impl MasternodeRpc {
                     "nominalNumberOfMasternodeWinnersReceived": 0
                 }))
             }
-            "reset" | "next" => {
+            "reset" => {
                 Err(RpcError::new(
                     codes::MISC_ERROR,
                     "Masternode sync control requires full masternode subsystem. mnsync manages the synchronization of masternode lists, winners, and governance data across the P2P network. For masternode sync operations, please use the C++ Divi client."
                 ).into())
             }
-            _ => Err(RpcError::invalid_params("Command must be 'status', 'reset', or 'next'").into()),
+            _ => unreachable!("mode checked above"),
         }
     }
 }
+
+/// Divi Core's mnsync help, the error for a call it cannot take
+const MNSYNC_USAGE: &str = "mnsync \"status|reset\"\n\nReturns the sync status or resets sync.\n\nArguments:\n1. \"mode\"    (string, required) either 'status' or 'reset'\n\nResult ('status' mode):\n{\n  \"IsBlockchainSynced\": true|false,    (boolean) 'true' if blockchain is synced\n  \"timestampOfLastMasternodeListUpdate\": xxxx,        (numeric) Timestamp of last MN list message\n  \"timestampOfLastMasternodeWinnerUpdate\": xxxx,      (numeric) Timestamp of last MN winner message\n  \"lastBudgetItem\": xxxx,            (numeric) Timestamp of last MN budget message\n  \"timestampOfLastFailedSync\": xxxx,           (numeric) Timestamp of last failed sync\n  \"countOfFailedSyncAttempts\": n,           (numeric) Number of failed syncs (total)\n  \"nominalNumberOfMasternodeBroadcastsReceived\": n,        (numeric) Number of MN list messages (total)\n  \"nominalNumberOfMasternodeWinnersReceived\": n,      (numeric) Number of MN winner messages (total)\n  \"sumBudgetItemProp\": n,        (numeric) Number of MN budget messages (total)\n  \"sumBudgetItemFin\": n,         (numeric) Number of MN budget finalization messages (total)\n  \"fulfilledMasternodeListSyncRequests\": n,      (numeric) Number of MN list messages (local)\n  \"fulfilledMasternodeWinnerSyncRequests\": n,    (numeric) Number of MN winner messages (local)\n  \"countBudgetItemProp\": n,      (numeric) Number of MN budget messages (local)\n  \"countBudgetItemFin\": n,       (numeric) Number of MN budget finalization messages (local)\n  \"currentMasternodeSyncStatus\": n, (numeric) Status code of last sync phase\n  \"totalSuccessivePeerSyncRequests\": n, (numeric) Status code of last sync attempt\n}\n\nResult ('reset' mode):\n\"status\"     (string) 'success'\n\nExamples:\n> divi-cli mnsync \"status\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"mnsync\", \"params\": [\"status\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
 
 impl Default for MasternodeRpc {
     fn default() -> Self {
@@ -344,6 +350,28 @@ mod tests {
             rpc_err(MasternodeRpc::new().get_masternode_status(&Params::None)),
             (-1, "This is not a masternode".to_string())
         );
+    }
+
+    /// mnsync takes one mode, "status" or "reset" as written; anything else is
+    /// Divi Core's help (rpcmisc.cpp:160-197)
+    #[test]
+    fn mnsync_answers_a_call_it_cannot_take_with_divid_s_help() {
+        let rpc = MasternodeRpc::new();
+        let call = |args: &[&str]| {
+            rpc.mnsync(&Params::Array(
+                args.iter().map(|a| serde_json::json!(a)).collect(),
+            ))
+        };
+        assert!(call(&["status"]).is_ok());
+        for bad in [&[][..], &["bad"], &["next"], &["Status"], &["status", "x"]] {
+            let (code, message) = rpc_err(call(bad));
+            assert_eq!(code, -1, "{bad:?}");
+            assert!(
+                message.starts_with("mnsync \"status|reset\"\n\nReturns the sync status")
+                    && message.ends_with("\"params\": [\"status\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n"),
+                "{bad:?}: {message}"
+            );
+        }
     }
 
     #[test]
