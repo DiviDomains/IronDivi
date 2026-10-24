@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::free_port;
+use common::{free_port, log_tail};
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -85,10 +85,13 @@ impl Daemon {
         if rpc {
             let deadline = Instant::now() + Duration::from_secs(120);
             while local(rpc_port, "getblockcount", json!([])).is_none() {
-                assert!(
-                    daemon.child.try_wait().unwrap().is_none(),
-                    "irondivid exited before its RPC server came up"
-                );
+                if daemon.child.try_wait().unwrap().is_some() {
+                    let datadir = args.iter().find_map(|a| a.strip_prefix("-datadir="));
+                    panic!(
+                        "irondivid exited before its RPC server came up; its log ends:\n{}",
+                        datadir.map(|d| log_tail(Path::new(d))).unwrap_or_default()
+                    );
+                }
                 assert!(Instant::now() < deadline, "RPC server did not come up");
                 std::thread::sleep(Duration::from_millis(250));
             }

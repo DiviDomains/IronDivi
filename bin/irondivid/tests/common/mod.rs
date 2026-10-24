@@ -8,9 +8,13 @@
 
 //! Helpers shared by the tests that start irondivid
 
+// Each test file uses its own subset
+#![allow(dead_code)]
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::TcpListener;
+use std::path::Path;
 
 /// A port nothing listens on now, for a node to listen on.
 ///
@@ -32,4 +36,14 @@ pub fn free_port() -> u16 {
         }
     }
     panic!("no free port in 20000-32767");
+}
+
+/// The last lines of the node's debug.log in `datadir`, for a failure
+/// message: a node that exits at start says why only there
+pub fn log_tail(datadir: &Path) -> String {
+    let log = std::fs::read_to_string(datadir.join("debug.log"))
+        .or_else(|_| std::fs::read_to_string(datadir.join("regtest").join("debug.log")))
+        .unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(15)..].join("\n")
 }
