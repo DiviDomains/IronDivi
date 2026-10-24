@@ -435,7 +435,7 @@ impl RpcServer {
         };
 
         Ok(serde_json::json!({
-            "version": "3.0.0.0",
+            "version": crate::network::CLIENT_VERSION_STR,
             "protocolversion": divi_network::constants::protocol_version(),
             "walletversion": 120200,
             "blocks": height,
