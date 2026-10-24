@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,25 @@ fn divid_args(datadir: &Path, rpc_port: u16) -> Vec<String> {
     ]
 }
 
+/// Run `cmd` to its exit; panic if it is still running after 30 s
+fn output_within(cmd: &mut Command) -> Output {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn irondivid");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("irondivid did not exit within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.wait_with_output().unwrap()
+}
+
 /// Wait up to 20 s for `f` to be true
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -205,10 +224,7 @@ fn divid_command_line_starts_the_node() {
 fn start_up_refusals_are_divid_s() {
     let bin = env!("CARGO_BIN_EXE_irondivid");
     let missing = std::env::temp_dir().join("irondivid-no-such-datadir-for-this-test");
-    let out = Command::new(bin)
-        .arg(format!("-datadir={}", missing.display()))
-        .output()
-        .unwrap();
+    let out = output_within(Command::new(bin).arg(format!("-datadir={}", missing.display())));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         format!(
@@ -220,11 +236,11 @@ fn start_up_refusals_are_divid_s() {
     assert!(!missing.exists(), "the data directory was created");
 
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(bin)
-        .arg(format!("-datadir={}", dir.path().display()))
-        .args(["-testnet", "-regtest"])
-        .output()
-        .unwrap();
+    let out = output_within(
+        Command::new(bin)
+            .arg(format!("-datadir={}", dir.path().display()))
+            .args(["-testnet", "-regtest"]),
+    );
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "Error: Invalid combination of -regtest and -testnet.\n"
@@ -232,7 +248,7 @@ fn start_up_refusals_are_divid_s() {
     assert_eq!(out.status.code(), Some(1));
 
     for flag in ["-help", "-?", "-version"] {
-        let out = Command::new(bin).arg(flag).output().unwrap();
+        let out = output_within(Command::new(bin).arg(flag));
         assert!(
             String::from_utf8_lossy(&out.stdout).starts_with("IronDivi Daemon version v"),
             "{flag}"
