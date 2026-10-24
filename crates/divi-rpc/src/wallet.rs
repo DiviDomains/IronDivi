@@ -3629,6 +3629,20 @@ impl WalletRpc {
             .into());
         }
 
+        let path = wallet.hd_account_path().unwrap_or_default();
+        // A wallet made from a seed has no words: Core shows the seed and an
+        // empty mnemonic (rpcdump.cpp:229-231)
+        if wallet.mnemonic().is_none() {
+            if let Some(seed) = wallet.hd_seed() {
+                return Ok(serde_json::json!({
+                    "hdseed": hex::encode(&seed[..]),
+                    "mnemonic": "",
+                    "mnemonicpassphrase": "",
+                    "hdaccountpath": path
+                }));
+            }
+        }
+
         let mnemonic = wallet
             .mnemonic()
             .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "No mnemonic found in wallet"))?;
@@ -3643,70 +3657,32 @@ impl WalletRpc {
         let seed = mnemonic_obj.to_seed(passphrase.as_str());
         let hdseed_hex = hex::encode(&seed[0..64]);
 
+        // The account path names the coin type, so a restore elsewhere can
+        // use the same one (wallets made before the coin type followed the
+        // network keep 301 on testnet)
         Ok(serde_json::json!({
             "hdseed": hdseed_hex,
             "mnemonic": mnemonic,
-            "mnemonicpassphrase": passphrase
+            "mnemonicpassphrase": passphrase,
+            "hdaccountpath": path
         }))
     }
 
-    /// backupwallet - Copy wallet.dat to destination
+    /// backupwallet - write a consistent copy of the wallet to destination
     pub fn backup_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let destination = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Destination path required"))?;
 
         let wallet = self.get_wallet()?;
-
-        // Get the wallet database path
-        let wallet_path = wallet.database_path();
-
-        let src = std::path::Path::new(&wallet_path);
-        let dst = std::path::Path::new(destination);
-
-        // RocksDB uses a directory; legacy wallets use a single file.
-        if src.is_dir() {
-            Self::copy_dir_recursively(src, dst).map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to backup wallet: {}", e),
-                )
+        wallet
+            .backup_to(std::path::Path::new(destination))
+            .map_err(|e| {
+                // Core's reply (rpcwallet.cpp:2538); the cause goes to the log
+                warn!("backupwallet to {}: {}", destination, e);
+                RpcError::new(codes::WALLET_ERROR, "Error: Wallet backup failed!")
             })?;
-        } else {
-            // Ensure parent directory exists for file destination
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    RpcError::new(
-                        codes::WALLET_ERROR,
-                        format!("Failed to create destination directory: {}", e),
-                    )
-                })?;
-            }
-            std::fs::copy(src, dst).map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to backup wallet: {}", e),
-                )
-            })?;
-        }
-
-        info!("Wallet backed up to: {}", destination);
         Ok(serde_json::Value::Null)
-    }
-
-    fn copy_dir_recursively(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            let dst_path = dst.join(entry.file_name());
-            if ty.is_dir() {
-                Self::copy_dir_recursively(&entry.path(), &dst_path)?;
-            } else {
-                std::fs::copy(entry.path(), dst_path)?;
-            }
-        }
-        Ok(())
     }
 }
 
