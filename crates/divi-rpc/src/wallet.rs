@@ -2213,6 +2213,24 @@ impl WalletRpc {
                     )
                     .into());
                 }
+                // Then the fee total reads GetValueOut, which throws for a
+                // negative output or a sum past the int64 range
+                // (primitives/transaction.cpp:245-259): -1 with its message
+                let out_of_range = |what: &str| {
+                    RpcError::new(
+                        codes::MISC_ERROR,
+                        format!("CTransaction::GetValueOut() : value out of range : {what}"),
+                    )
+                };
+                let mut value_out: i64 = 0;
+                for o in &tx.vout {
+                    if o.value.as_sat() < 0 {
+                        return Err(out_of_range("less than 0").into());
+                    }
+                    value_out = value_out
+                        .checked_add(o.value.as_sat())
+                        .ok_or_else(|| out_of_range("wraps the int64_t boundary"))?;
+                }
             }
             // Fee cap. Inputs still in the mempool are not visible here; such a
             // transaction is checked by the mempool only.
