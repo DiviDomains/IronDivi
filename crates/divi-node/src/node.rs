@@ -259,6 +259,20 @@ impl Node {
             );
         }
 
+        // Divi Core notes an unclean stop at start and brings the chain to the
+        // best block it knows; here every chain write is whole, so what is left
+        // is a reorganization the stop interrupted
+        if !chain.begin_run().map_err(damaged)? {
+            tracing::warn!("irondivid did not stop cleanly last time");
+        }
+        if chain.finish_interrupted_reorg().map_err(damaged)? {
+            tracing::info!(
+                "Finished the interrupted reorganization; tip {} at height {}",
+                chain.tip().map(|t| t.hash.to_string()).unwrap_or_default(),
+                chain.height()
+            );
+        }
+
         // Initialize mempool
         let mempool = Arc::new(Mempool::new(config.mempool.clone()));
 
