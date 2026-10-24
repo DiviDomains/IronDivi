@@ -90,7 +90,14 @@ fn reindex_turns_on_the_transaction_index_for_an_existing_chain() {
     let node = start(dir.path(), false, false).unwrap();
     let txids: Vec<Hash256> = (0..30).map(|_| mine(&node)).collect();
     let (early, late) = (txids[4], txids[28]); // blocks 5 and 29
-    assert!(raw_tx(&node, &early).is_err(), "found without the index");
+    assert!(!node.chain().has_tx_index());
+    // Without the index divid still finds a transaction through an unspent
+    // output of it (TransactionDiskAccessor.cpp:88-96); these coinbases are unspent
+    assert!(raw_tx(&node, &early).is_ok(), "not found through its coin");
+    assert!(
+        raw_tx(&node, &Hash256::from_bytes([3; 32])).is_err(),
+        "an unknown txid was found"
+    );
     drop(node);
 
     // -txindex=1 alone keeps refusing, with Core's message
@@ -120,7 +127,7 @@ fn reindex_turns_on_the_transaction_index_for_an_existing_chain() {
 
     // -reindex with -txindex=0 turns it off again, as divid does
     let node = start(dir.path(), false, true).unwrap();
-    assert!(raw_tx(&node, &late).is_err(), "index still used");
+    assert!(!node.chain().has_tx_index(), "index still used");
     drop(node);
     assert!(start(dir.path(), false, false).is_ok());
     let e = refused(start(dir.path(), true, false));
