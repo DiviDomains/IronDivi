@@ -336,6 +336,9 @@ pub struct Staker {
     block_connected_callback: RwLock<Option<BlockConnectedCallback>>,
     /// Per-tip cache to avoid repeated DB reads for stake_modifier, MTP, and confirmation blocks
     cache: RwLock<StakerCache>,
+    /// Held while a block is built and accepted, so the staking loop and
+    /// `setgenerate` never build on the same tip at once
+    producing: parking_lot::Mutex<()>,
 }
 
 impl Staker {
@@ -363,6 +366,7 @@ impl Staker {
             hashed_block_timestamps: RwLock::new(HashMap::new()),
             block_connected_callback: RwLock::new(None),
             cache: RwLock::new(StakerCache::new()),
+            producing: parking_lot::Mutex::new(()),
         }
     }
 
@@ -626,94 +630,33 @@ impl Staker {
                 continue;
             }
 
-            // Try to stake
-            match self.try_stake() {
-                StakeResult::Success {
-                    block,
-                    block_hash,
-                    height,
-                    reward,
-                } => {
-                    // Step 1: Self-accept into our chain BEFORE broadcasting.
-                    // This advances our tip immediately so we can start staking the
-                    // next height while the block propagates to peers (~1-2s savings).
-                    // Reorg safety: if a competing block arrives via P2P, accept_block
-                    // triggers reorganize_chain which calls disconnect_block on ours.
-                    match self.chain.accept_block(block.clone()) {
-                        Ok(result) => {
-                            if let Some(fork_height) = result.reorg_fork_height {
-                                warn!(
-                                    "Reorg detected during self-accept of staked block {} (fork height {})",
-                                    block_hash, fork_height
-                                );
-                                // Undo what the wallet recorded from the disconnected
-                                // blocks; the callback below rescans the new branch
-                                self.wallet.handle_reorg(fork_height);
-                                // Return their transactions to the mempool, as for a
-                                // reorganisation a peer's block causes
-                                crate::node::update_mempool_after_reorg(
-                                    &self.chain,
-                                    &self.mempool,
-                                    result.orphaned_transactions,
-                                );
-                            }
-                            info!(
-                                "Self-accepted staked block {} at height {}",
-                                block_hash, height
-                            );
-                            // Fire the block connected callback (wallet scan, mempool cleanup, fee estimation)
-                            if let Some(ref callback) = *self.block_connected_callback.read() {
-                                callback(&block, height);
-                            }
-                            // Step 3: Announce block to peers via inv message (standard protocol).
-                            // Only broadcast after successful self-acceptance — if the block
-                            // fails our own validation, peers would reject it too.
-                            self.peer_manager.broadcast_block_inv(block_hash);
-                        }
-                        Err(e) => {
-                            let err_msg = format!("{}", e);
-                            warn!(
-                                "Failed to self-accept staked block {}: {} (not broadcasting)",
-                                block_hash, err_msg
-                            );
-                            // If the failure is due to a phantom UTXO (spent on chain but
-                            // still in wallet), evict the coinstake input to prevent the
-                            // staker from repeatedly trying to use it.
-                            if err_msg.contains("UTXO not found")
-                                || err_msg.contains("UtxoNotFound")
-                            {
-                                // The coinstake tx is always at index 1, and its first
-                                // non-empty input is the kernel UTXO we tried to stake with.
-                                if block.transactions.len() > 1 {
-                                    for input in &block.transactions[1].vin {
-                                        if !input.prevout.txid.is_zero() {
-                                            let outpoint = &input.prevout;
-                                            // Only a coin the chain really lacks is a phantom;
-                                            // the error may name a different tx's input.
-                                            let gone =
-                                                matches!(self.chain.has_utxo(outpoint), Ok(false));
-                                            if gone && self.wallet.has_utxo(outpoint) {
-                                                self.wallet.spend_utxo(outpoint);
-                                                warn!(
-                                                    "Evicted phantom UTXO {}:{} from wallet after failed self-accept",
-                                                    outpoint.txid, outpoint.vout
-                                                );
-                                            }
-                                        }
-                                    }
-                                    // Persist the eviction
-                                    if let Err(save_err) = self.wallet.save_incremental() {
-                                        warn!(
-                                            "Failed to save wallet after phantom UTXO eviction: {}",
-                                            save_err
-                                        );
-                                    }
-                                }
-                            }
+            // Try to stake; skip the round while setgenerate is producing
+            let result = match self.producing.try_lock() {
+                Some(_producing) => {
+                    let result = self.try_stake();
+                    if let StakeResult::Success {
+                        block,
+                        block_hash,
+                        height,
+                        ..
+                    } = &result
+                    {
+                        // Self-accept into our chain BEFORE broadcasting
+                        if self.accept_own_block(block, *block_hash, *height).is_err() {
                             continue;
                         }
                     }
-
+                    result
+                }
+                None => StakeResult::NoProofFound,
+            };
+            match result {
+                StakeResult::Success {
+                    block_hash,
+                    height,
+                    reward,
+                    ..
+                } => {
                     info!(
                         "Staked block {} at height {} (reward: {})",
                         block_hash, height, reward
@@ -772,6 +715,198 @@ impl Staker {
     /// Whether a peer is connected to receive a staked block
     fn has_peers(&self) -> bool {
         self.peer_manager.peer_count() > 0
+    }
+
+    /// Connect a block we built ourselves, then tell the wallet and peers.
+    ///
+    /// The block goes into our chain before it is announced, so the next block
+    /// can be built while this one propagates. Reorg safety: if a competing
+    /// block arrives via P2P, accept_block triggers reorganize_chain which
+    /// disconnects ours.
+    fn accept_own_block(
+        &self,
+        block: &Block,
+        block_hash: Hash256,
+        height: u32,
+    ) -> Result<(), String> {
+        match self.chain.accept_block(block.clone()) {
+            Ok(result) => {
+                if let Some(fork_height) = result.reorg_fork_height {
+                    warn!(
+                        "Reorg detected during self-accept of staked block {} (fork height {})",
+                        block_hash, fork_height
+                    );
+                    // Undo what the wallet recorded from the disconnected
+                    // blocks; the callback below rescans the new branch
+                    self.wallet.handle_reorg(fork_height);
+                    // Return their transactions to the mempool, as for a
+                    // reorganisation a peer's block causes
+                    crate::node::update_mempool_after_reorg(
+                        &self.chain,
+                        &self.mempool,
+                        result.orphaned_transactions,
+                    );
+                }
+                info!(
+                    "Self-accepted staked block {} at height {}",
+                    block_hash, height
+                );
+                // Fire the block connected callback (wallet scan, mempool cleanup, fee estimation)
+                if let Some(ref callback) = *self.block_connected_callback.read() {
+                    callback(block, height);
+                }
+                // Announce block to peers via inv message (standard protocol).
+                // Only broadcast after successful self-acceptance — if the block
+                // fails our own validation, peers would reject it too.
+                self.peer_manager.broadcast_block_inv(block_hash);
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                warn!(
+                    "Failed to self-accept staked block {}: {} (not broadcasting)",
+                    block_hash, err_msg
+                );
+                // If the failure is due to a phantom UTXO (spent on chain but
+                // still in wallet), evict the coinstake input to prevent the
+                // staker from repeatedly trying to use it.
+                if err_msg.contains("UTXO not found") || err_msg.contains("UtxoNotFound") {
+                    // The coinstake tx is always at index 1, and its first
+                    // non-empty input is the kernel UTXO we tried to stake with.
+                    if block.transactions.len() > 1 {
+                        for input in &block.transactions[1].vin {
+                            if !input.prevout.txid.is_zero() {
+                                let outpoint = &input.prevout;
+                                // Only a coin the chain really lacks is a phantom;
+                                // the error may name a different tx's input.
+                                let gone = matches!(self.chain.has_utxo(outpoint), Ok(false));
+                                if gone && self.wallet.has_utxo(outpoint) {
+                                    self.wallet.spend_utxo(outpoint);
+                                    warn!(
+                                        "Evicted phantom UTXO {}:{} from wallet after failed self-accept",
+                                        outpoint.txid, outpoint.vout
+                                    );
+                                }
+                            }
+                        }
+                        // Persist the eviction
+                        if let Err(save_err) = self.wallet.save_incremental() {
+                            warn!(
+                                "Failed to save wallet after phantom UTXO eviction: {}",
+                                save_err
+                            );
+                        }
+                    }
+                }
+                Err(err_msg)
+            }
+        }
+    }
+
+    /// Regtest `setgenerate`: mine `n` blocks to this wallet now and return
+    /// their hashes. Proof-of-work up to the last PoW height, proof-of-stake
+    /// after it, as Divi Core does. The staking loop's pacing guards (rate
+    /// limit, stale tip, minimum coin age, reserve balance) do not apply.
+    pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, String> {
+        if self.wallet.is_locked() {
+            return Err("wallet is locked".to_string());
+        }
+        let _producing = self.producing.lock();
+        let mut hashes = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let tip = self.chain.tip().ok_or("no chain tip")?;
+            let height = tip.height + 1;
+            let block = if height <= divi_storage::chain::LAST_POW_BLOCK {
+                self.build_work_block(&tip)?
+            } else {
+                self.build_generated_stake_block(&tip)?
+            };
+            let block_hash = compute_block_hash(&block.header);
+            self.accept_own_block(&block, block_hash, height)?;
+            hashes.push(block_hash);
+        }
+        Ok(hashes)
+    }
+
+    /// Earliest time a block on `tip` may carry: now, but past the median time
+    fn next_block_time(&self, tip: &divi_storage::BlockIndex) -> u32 {
+        (current_timestamp() as u32).max(self.get_median_time_past(&tip.hash) + 1)
+    }
+
+    /// A proof-of-work block on `tip` whose coinbase pays this wallet
+    fn build_work_block(&self, tip: &divi_storage::BlockIndex) -> Result<Block, String> {
+        let height = tip.height + 1;
+        let bits = self.chain.get_next_bits(tip).map_err(|e| e.to_string())?;
+        let time = self.next_block_time(tip);
+        let pay_to = self
+            .wallet
+            .new_receiving_address()
+            .map_err(|e| e.to_string())?;
+        // Height, then the height again so each coinbase txid is unique
+        let mut script_sig = divi_storage::bip34_height_script(height);
+        script_sig.extend_from_slice(&height.to_le_bytes());
+        let mut transactions = vec![Transaction {
+            version: 1,
+            lock_time: 0,
+            vin: vec![TxIn::coinbase(Script::from_bytes(script_sig))],
+            vout: vec![TxOut::new(
+                self.chain.pow_block_reward(height),
+                pay_to.script_pubkey(),
+            )],
+        }];
+        transactions.extend(self.mempool_block_txs(height, time));
+        let mut header = BlockHeader {
+            version: 4,
+            prev_block: tip.hash,
+            merkle_root: compute_merkle_root(&transactions),
+            time,
+            bits,
+            nonce: 0,
+            accumulator_checkpoint: Hash256::zero(),
+        };
+        let target = Hash256::from_compact(bits);
+        while compute_block_hash(&header) > target {
+            header.nonce = header
+                .nonce
+                .checked_add(1)
+                .ok_or("no proof-of-work nonce found")?;
+        }
+        Ok(Block {
+            header,
+            transactions,
+            block_sig: Vec::new(),
+        })
+    }
+
+    /// A proof-of-stake block on `tip`, its search starting past the median
+    /// time so blocks made back to back stay valid
+    fn build_generated_stake_block(&self, tip: &divi_storage::BlockIndex) -> Result<Block, String> {
+        match self.build_stake_block(tip, self.next_block_time(tip)) {
+            StakeResult::Success { block, .. } => Ok(block),
+            StakeResult::NoStakeableUtxos => Err("no coins to stake".to_string()),
+            StakeResult::Error(e) => Err(e),
+            _ => Err("no coin found a proof of stake".to_string()),
+        }
+    }
+
+    /// Mempool transactions to put in a block at `height` and `timestamp`
+    fn mempool_block_txs(&self, height: u32, timestamp: u32) -> Vec<Transaction> {
+        // Add mempool transactions up to block limit
+        let max_block_size = block_max_size(self.config.read().max_block_size);
+        let mempool_txs = self.mempool.get_block_txs(max_block_size);
+        // A stale mempool tx (an input already spent on chain) would make our own
+        // block fail self-accept and waste the stake, so keep only spendable ones.
+        let mempool_txs =
+            retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
+        // Recheck each one against this block, as Divi Core's block assembler does
+        select_block_txs(
+            mempool_txs,
+            height,
+            timestamp,
+            max_block_size,
+            self.chain.params().coinbase_maturity,
+            |op| self.chain.get_utxo(op).ok().flatten(),
+        )
     }
 
     /// Check if we should limit staking speed at current height
@@ -869,7 +1004,6 @@ impl Staker {
         };
 
         let current_height = tip.height;
-        let next_height = current_height + 1;
 
         // Don't stake while actively syncing (IBD mode).
         if self.chain.is_ibd() {
@@ -923,11 +1057,22 @@ impl Staker {
         // Only record if we pass rate limiting
         self.record_staking_attempt(current_height, current_time as u64);
 
+        self.build_stake_block(&tip, current_time)
+    }
+
+    /// A proof-of-stake block on `tip` at `current_time` or up to the hash
+    /// drift before it, staked with the first coin of the stake set that finds
+    /// a proof (Divi Core BlockFactory::CreateNewPoSBlock). The staking loop's
+    /// pacing guards are the caller's.
+    fn build_stake_block(&self, tip: &divi_storage::BlockIndex, current_time: u32) -> StakeResult {
+        let current_height = tip.height;
+        let next_height = current_height + 1;
+
         // Compute the NEXT block's difficulty bits.
         // Each block has its own difficulty computed by get_next_work_required(),
         // which adjusts based on the actual spacing between recent blocks.
         // The block header must contain the correct bits or C++ peers will reject it.
-        let n_bits = match self.chain.get_next_bits(&tip) {
+        let n_bits = match self.chain.get_next_bits(tip) {
             Ok(bits) => bits,
             Err(e) => {
                 debug!("Failed to compute next difficulty: {}", e);
@@ -1196,7 +1341,7 @@ impl Staker {
                 );
 
                 // Create the block
-                match self.create_stake_block(&tip, candidate, timestamp, n_bits, &combine_pool) {
+                match self.create_stake_block(tip, candidate, timestamp, n_bits, &combine_pool) {
                     Ok(block) => {
                         let block_hash = compute_block_hash(&block.header);
                         let height = current_height + 1;
@@ -1457,22 +1602,7 @@ impl Staker {
             coinstake,
         ];
 
-        // Add mempool transactions up to block limit
-        let max_block_size = block_max_size(self.config.read().max_block_size);
-        let mempool_txs = self.mempool.get_block_txs(max_block_size);
-        // A stale mempool tx (an input already spent on chain) would make our own
-        // block fail self-accept and waste the stake, so keep only spendable ones.
-        let mempool_txs =
-            retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
-        // Recheck each one against this block, as Divi Core's block assembler does
-        transactions.extend(select_block_txs(
-            mempool_txs,
-            height,
-            timestamp,
-            max_block_size,
-            self.chain.params().coinbase_maturity,
-            |op| self.chain.get_utxo(op).ok().flatten(),
-        ));
+        transactions.extend(self.mempool_block_txs(height, timestamp));
 
         // Compute merkle root
         let merkle_root = compute_merkle_root(&transactions);

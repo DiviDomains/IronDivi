@@ -560,10 +560,17 @@ fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
     );
     println!("Blocks: {}", blockchain["blocks"]);
     println!("Headers: {}", blockchain["headers"]);
-    println!(
-        "Verification: {:.4}%",
-        blockchain["verificationprogress"].as_f64().unwrap_or(0.0) * 100.0
-    );
+    // divid's getblockchaininfo has no verificationprogress: blocks over headers
+    let progress = blockchain["verificationprogress"]
+        .as_f64()
+        .unwrap_or_else(|| {
+            let blocks = blockchain["blocks"].as_f64().unwrap_or(0.0);
+            match blockchain["headers"].as_f64() {
+                Some(headers) if headers > 0.0 => (blocks / headers).min(1.0),
+                _ => 0.0,
+            }
+        });
+    println!("Verification: {:.4}%", progress * 100.0);
     println!("Difficulty: {}", blockchain["difficulty"]);
     println!();
     println!("Network: {}", network["subversion"].as_str().unwrap_or(""));

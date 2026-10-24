@@ -33,7 +33,9 @@ pub enum RequestId {
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    /// JSON-RPC version (should be "2.0")
+    /// JSON-RPC version ("2.0", "1.0", or absent: Bitcoin-style clients
+    /// such as BasicSwap send only method/params/id, which divid accepts)
+    #[serde(default)]
     pub jsonrpc: String,
     /// Request ID
     #[serde(default)]
@@ -200,6 +202,16 @@ mod tests {
         let req: Request = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.id, RequestId::Number(1));
+        assert_eq!(req.method, "getblockcount");
+    }
+
+    #[test]
+    fn test_request_without_version() {
+        let json = r#"{"method":"getblockcount","params":[],"id":1}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.jsonrpc, "");
         assert_eq!(req.id, RequestId::Number(1));
         assert_eq!(req.method, "getblockcount");
     }

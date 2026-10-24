@@ -32,6 +32,7 @@ pub struct BlockchainRpc {
     money_supply_cache: RwLock<Option<(Hash256, f64)>>,
     /// Fetches blocks this node has pruned from full-history peers
     block_fetcher: RwLock<Option<Arc<dyn BlockFetcher>>>,
+    block_sync: RwLock<Option<Arc<divi_network::BlockSync>>>,
 }
 
 /// Source for block bodies this node no longer stores (to avoid a dependency on divi-node).
@@ -146,7 +147,7 @@ pub trait MempoolProvider: Send + Sync {
 
     /// Estimate fee for confirmation within target blocks
     fn estimate_fee(&self, _conf_target: u32) -> f64 {
-        0.00001 // Default minimum fee
+        0.0001 // Divi Core's default relay floor, 10000 sat/kB
     }
 
     /// Estimate smart fee with block count used
@@ -179,6 +180,7 @@ impl BlockchainRpc {
             mempool: RwLock::new(None),
             money_supply_cache: RwLock::new(None),
             block_fetcher: RwLock::new(None),
+            block_sync: RwLock::new(None),
         }
     }
 
@@ -315,8 +317,31 @@ impl BlockchainRpc {
         *self.mempool.write() = Some(mempool);
     }
 
+    /// The minimum relay fee in DIVI/kB that getinfo and getnetworkinfo
+    /// report (Divi Core's getMinimumRelayFeeRate, -minrelaytxfee)
+    pub fn relay_fee(&self) -> f64 {
+        match self.mempool.read().as_ref() {
+            Some(mempool) => mempool.get_stats().min_fee,
+            None => 0.0001,
+        }
+    }
+
     pub fn set_block_fetcher(&self, fetcher: Arc<dyn BlockFetcher>) {
         *self.block_fetcher.write() = Some(fetcher);
+    }
+
+    /// Let `getblockchaininfo` report the headers the sync holds
+    pub fn set_block_sync(&self, sync: Arc<divi_network::BlockSync>) {
+        *self.block_sync.write() = Some(sync);
+    }
+
+    /// Divi Core's GetBestHeaderBlockHeight: the best header's height, never
+    /// below the tip
+    fn best_header_height(&self, height: u32) -> u32 {
+        match self.block_sync.read().as_ref() {
+            Some(sync) => sync.best_header_height().max(height),
+            None => height,
+        }
     }
 
     /// Load a block body, asking a full-history peer if it is pruned locally.
@@ -573,6 +598,8 @@ impl BlockchainRpc {
             ),
         };
 
+        let headers = self.best_header_height(height);
+
         Ok(json!({
             "chain": match self.chain.network_type() {
                 NetworkType::Mainnet => "main",
@@ -580,11 +607,10 @@ impl BlockchainRpc {
                 NetworkType::Regtest => "regtest",
             },
             "blocks": height,
-            "headers": height,
+            "headers": headers,
             "bestblockhash": best_hash,
             "difficulty": difficulty,
             "mediantime": mediantime,
-            "verificationprogress": 1.0,
             "chainwork": chain_work,
             "pruned": self.chain.prune_height() > 0,
             "pruneheight": self.chain.prune_height(),
@@ -623,7 +649,7 @@ impl BlockchainRpc {
             "keypoololdest": 0,
             "keypoolsize": 0,
             "paytxfee": 0.0,
-            "relayfee": 0.00001,
+            "relayfee": self.relay_fee(),
             "staking status": "Staking Not Active",
             "errors": ""
         }))
@@ -953,14 +979,6 @@ impl BlockchainRpc {
         Err(RpcError::new(
             codes::MISC_ERROR,
             "generateblock is not yet implemented - requires full mining subsystem",
-        )
-        .into())
-    }
-
-    pub fn set_generate(&self, _params: &Params) -> Result<Value, Error> {
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "setgenerate is not yet implemented - requires full mining subsystem",
         )
         .into())
     }
@@ -1335,7 +1353,9 @@ impl BlockchainRpc {
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
 
-                    if addrs.is_empty() {
+                    // An empty array names no address and gets an empty
+                    // reply (Divi Core rpcmisc.cpp:580-589)
+                    if addrs.len() != arr.len() {
                         return Err(RpcError::invalid_params(
                             "'addresses' array is empty or invalid",
                         )

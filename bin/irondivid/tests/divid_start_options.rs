@@ -401,3 +401,37 @@ fn pid_file_and_wallet_are_in_the_data_directory() {
     assert!(up, "the daemon did not come up");
     assert!(wallet_dir, "-wallet=w2 is not in the data directory");
 }
+
+/// A new wallet is made from mnemonic= in divi.conf, as Divi Core takes
+/// -mnemonic from its file (wallet.cpp:2298-2304): BasicSwap seeds divid
+/// that way, started with -noconnect -nodnsseed -nolisten. The phrase is
+/// never written to the log.
+#[test]
+fn mnemonic_in_divi_conf_seeds_a_new_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("regtest=1\nmnemonic={MNEMONIC}\n"),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let mut args = divid_args(dir.path(), rpc_port);
+    args.retain(|a| a != "-bind=127.0.0.1");
+    args.extend(["-noconnect", "-nodnsseed", "-nolisten"].map(String::from));
+    let daemon = Daemon::start(&args, &[], rpc_port, true);
+
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let first = WalletDb::with_hd_wallet(Network::Regtest, hd)
+        .new_receiving_address()
+        .unwrap();
+    let info = daemon.rpc("validateaddress", json!([first.to_string()]));
+    assert_eq!(info["ismine"], true, "{info}");
+    assert_eq!(daemon.rpc("getconnectioncount", json!([])), 0);
+    drop(daemon);
+
+    let log = std::fs::read_to_string(dir.path().join("regtest").join("debug.log"))
+        .or_else(|_| std::fs::read_to_string(dir.path().join("debug.log")))
+        .unwrap_or_default();
+    assert!(!log.is_empty(), "no debug.log");
+    assert!(!log.contains(MNEMONIC), "the mnemonic was logged");
+}

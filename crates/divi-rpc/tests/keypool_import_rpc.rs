@@ -60,6 +60,36 @@ fn encrypted_rpc(path: &Path) -> (WalletRpc, Arc<WalletDb>) {
     (rpc, db)
 }
 
+/// As Core: unlocked_until is sent only for an encrypted wallet, so BasicSwap
+/// (which reads its presence as "encrypted") sees a plain wallet as unlocked
+#[test]
+fn getwalletinfo_sends_unlocked_until_only_when_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = WalletRpc::with_wallet(Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("plain"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    ));
+    let info = plain.get_wallet_info(&Params::None).unwrap();
+    assert_eq!(info["encryption_status"], "unencrypted");
+    assert!(info.get("unlocked_until").is_none());
+
+    let (rpc, _db) = encrypted_rpc(&dir.path().join("enc"));
+    assert_eq!(
+        rpc.get_wallet_info(&Params::None).unwrap()["unlocked_until"],
+        0
+    );
+    rpc.wallet_passphrase(&p(vec![json!(PASS), json!(60)]))
+        .unwrap();
+    let until = rpc.get_wallet_info(&Params::None).unwrap()["unlocked_until"]
+        .as_u64()
+        .unwrap();
+    assert!(until > 0);
+}
+
 #[test]
 fn getnewaddress_while_locked_keeps_label_and_key_across_restart() {
     let dir = tempfile::tempdir().unwrap();

@@ -305,6 +305,11 @@ impl RpcServer {
         self.blockchain.set_block_fetcher(fetcher);
     }
 
+    /// Let `getblockchaininfo` report real headers and sync progress
+    pub fn set_block_sync(&self, sync: Arc<divi_network::BlockSync>) {
+        self.blockchain.set_block_sync(sync);
+    }
+
     /// Set the spork manager that backs the `spork` RPC
     pub fn set_spork_manager(&self, sporks: Arc<divi_network::SporkManager>) {
         self.spork.set_manager(sporks);
@@ -445,7 +450,7 @@ impl RpcServer {
             "keypoolsize": keypoolsize,
             "balance": balance,
             "paytxfee": 0.0,
-            "relayfee": 0.0001,
+            "relayfee": self.blockchain.relay_fee(),
             "staking status": staking_status_text,
             "errors": ""
         }))
@@ -470,6 +475,25 @@ impl RpcServer {
             "setmocktime is not supported by this node",
         )
         .into())
+    }
+
+    /// setgenerate - mines blocks to the wallet at once (Divi Core
+    /// rpcmining.cpp:52-118): exactly one argument, regtest only
+    fn set_generate(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_storage::chain::NetworkType;
+
+        if params.len() != 1 {
+            let help = self.help(&Params::Array(vec![serde_json::json!("setgenerate")]))?;
+            return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
+        }
+        if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method disabled: invalid networks setting (regtest only)",
+            )
+            .into());
+        }
+        self.staking.set_generate(params)
     }
 
     /// Handle a single RPC request
@@ -519,10 +543,17 @@ impl RpcServer {
 
             // Mining/generation methods
             "generateblock" => self.blockchain.generate_block(params),
-            "setgenerate" => self.blockchain.set_generate(params),
+            "setgenerate" => self.set_generate(params),
 
             // Network methods
-            "getnetworkinfo" => self.network.read().get_network_info(params),
+            "getnetworkinfo" => self
+                .network
+                .read()
+                .get_network_info(params)
+                .map(|mut info| {
+                    info["relayfee"] = serde_json::json!(self.blockchain.relay_fee());
+                    info
+                }),
             "getpeerinfo" => self.network.read().get_peer_info(params),
             "getconnectioncount" => self.network.read().get_connection_count(params),
             "ping" => self.network.read().ping(params),
@@ -716,7 +747,7 @@ impl RpcServer {
                 "prioritisetransaction" => "prioritisetransaction <txid> <priority delta> <fee delta>\n\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.",
                 "generateblock" => "generateblock ( options )\n\nTry to generate a single block with extra options (regtest only - not yet implemented).",
-                "setgenerate" => "setgenerate numberofblocks\n\nGenerate blocks immediately (regtest only - not yet implemented).",
+                "setgenerate" => "setgenerate numberofblocks\n\nMine blocks to this wallet immediately (-regtest only): proof-of-work up to block 100, proof-of-stake after it.\n\nArguments:\n1. numberofblocks  (numeric, required) How many blocks to mine; below 1 mines none\n\nResult:\n[ \"blockhash\", ... ]  (array) Hashes of the mined blocks",
                 "getinfo" => "getinfo\n\nReturns an object containing various state info (version, blocks, connections, difficulty, balance, staking status).",
                 "getinvalid" => "getinvalid ( \"all\" )\n\nGet a summary of invalidated outpoints.\n\nArguments:\n1. all   (string, optional) return a full list of outpoints even if they are spent",
                 "invalidateblock" => "invalidateblock \"hash\"\n\nPermanently marks a block as invalid, as if it violated a consensus rule.\n\nArguments:\n1. hash   (string, required) the hash of the block to mark as invalid",
@@ -1517,6 +1548,17 @@ mod tests {
             Params::Array(vec![serde_json::json!(1)]),
         );
         assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn test_setgenerate_is_regtest_only() {
+        let (server, _dir) = create_test_server();
+        let resp = call(
+            &server,
+            "setgenerate",
+            Params::Array(vec![serde_json::json!(1)]),
+        );
+        assert_eq!(resp.error.unwrap().code, -32601);
     }
 
     #[test]
