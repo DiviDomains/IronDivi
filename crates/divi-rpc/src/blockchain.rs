@@ -750,28 +750,16 @@ impl BlockchainRpc {
 
     /// invalidateblock / reconsiderblock / reverseblocktransactions
     pub fn invalidate_block_family(&self, method: &str, params: &Params) -> Result<Value, Error> {
-        let returned = self.move_chain(method, params)?;
-        self.return_to_mempool(returned);
-        Ok(Value::Null)
-    }
-
-    /// The chain side of invalidateblock / reconsiderblock /
-    /// reverseblocktransactions: returns the transactions of the blocks
-    /// disconnected (none for reconsiderblock). The caller hands them to
-    /// `return_to_mempool` once the wallet has left those blocks, so the
-    /// wallet takes them as unconfirmed when the mempool does.
-    pub fn move_chain(
-        &self,
-        method: &str,
-        params: &Params,
-    ) -> Result<Vec<divi_primitives::transaction::Transaction>, Error> {
         let usage = || RpcError::invalid_params(format!("{} \"hash\"", method));
         if params.len() != 1 {
             return Err(usage().into());
         }
         let hash_str = params.get_str(0).ok_or_else(usage)?;
-        // C++ uint256S: an unparseable hash becomes the zero hash, which is never found
-        let hash = Hash256::from_hex(hash_str).unwrap_or_else(|_| Hash256::zero());
+        // As Divi Core reads it, uint256(strHash) or uint256S: leading space
+        // and "0x" skipped, a short hash read as a number, text without
+        // digits the zero hash, which is never found (rpcblockchain.cpp:589,
+        // :625, :663)
+        let hash = crate::wallet::uint256_set_hex(hash_str);
         let map_err = |e: divi_storage::StorageError| -> Error {
             match e {
                 divi_storage::StorageError::BlockNotFound(_) => {
@@ -798,15 +786,10 @@ impl BlockchainRpc {
                 .reverse_block_transactions(&hash)
                 .map_err(map_err)?,
         };
-        Ok(returned)
-    }
-
-    /// The mempool side: the disconnected blocks' transactions go back to the
-    /// mempool and what the chain now holds leaves it (the reorg hook)
-    pub fn return_to_mempool(&self, returned: Vec<divi_primitives::transaction::Transaction>) {
         if let Some(hook) = self.reorg_hook.read().clone() {
             hook(returned);
         }
+        Ok(Value::Null)
     }
 
     /// getinvalid ( "all" ): Divi Core 3.0.0 builds its summary from empty

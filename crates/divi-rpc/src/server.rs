@@ -397,13 +397,14 @@ impl RpcServer {
         Ok(info)
     }
 
-    /// setmocktime - C++ only honours this on regtest; this node has no mock clock at all.
+    /// setmocktime - sets the node's clock on regtest; 0 goes back to the
+    /// system time (Divi Core rpcmisc.cpp:526-541, utiltime.cpp)
     fn set_mock_time(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_storage::chain::NetworkType;
 
-        if params.get_i64(0).is_none() {
-            return Err(RpcError::invalid_params("setmocktime timestamp").into());
-        }
+        let time = params
+            .get_i64(0)
+            .ok_or_else(|| RpcError::invalid_params("setmocktime timestamp"))?;
         if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
             return Err(RpcError::new(
                 codes::MISC_ERROR,
@@ -411,11 +412,8 @@ impl RpcServer {
             )
             .into());
         }
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "setmocktime is not supported by this node",
-        )
-        .into())
+        divi_primitives::clock::set_mock_time(time);
+        Ok(serde_json::Value::Null)
     }
 
     /// setgenerate - mines blocks to the wallet at once (Divi Core
@@ -500,15 +498,10 @@ impl RpcServer {
             "getinfo" => self.get_info(params),
             "getchaintips" => self.blockchain.get_chain_tips(params),
             "invalidateblock" | "reconsiderblock" | "reverseblocktransactions" => {
-                let result = self.blockchain.move_chain(method, params);
-                // The active chain may have changed without a block notification.
-                // The wallet leaves the disconnected blocks first, so it takes
-                // their transactions as unconfirmed when the mempool does.
+                let result = self.blockchain.invalidate_block_family(method, params);
+                // The active chain may have changed without a block notification
                 self.wallet.sync_with_chain();
-                result.map(|disconnected| {
-                    self.blockchain.return_to_mempool(disconnected);
-                    serde_json::Value::Null
-                })
+                result
             }
             "getdifficulty" => self.blockchain.get_difficulty(params),
             "gettxoutsetinfo" => self.blockchain.get_txout_set_info(params),
@@ -757,8 +750,8 @@ impl RpcServer {
                 "listbanned" => "listbanned\n\nList all banned IPs/subnets.",
                 "clearbanned" => "clearbanned\n\nClear all banned IPs.",
                 "disconnectnode" => "disconnectnode \"address\"\n\nDisconnects a peer by address.\n\nArguments:\n1. \"address\"  (string, required) The IP address:port of the node",
-                "ban" => "ban \"ip_address\"\n\nBans the connected peer with this IP address.\n('outdated' is refused: peer versions are not recorded after the handshake.)\n\nArguments:\n1. \"ip_address\"  (string, required) The IP address of a connected peer",
-                "setmocktime" => "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only).\nThis node has no mock clock, so the call always returns an error.\n\nArguments:\n1. timestamp  (integer, required) Unix seconds-since-epoch timestamp",
+                "ban" => "ban [outdated|<ip_address>]\n\nBans the connected peers older than Divi Core 3.0.0.0 ('outdated') or the connected peer with this IP address.\n\nArguments:\n1. \"outdated\" or \"ip_address\"  (string, required) The IP address of a connected peer",
+                "setmocktime" => "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only).\n\nArguments:\n1. timestamp  (integer, required) Unix seconds-since-epoch timestamp",
                 "getpeerscores" => "getpeerscores\n\nReturns peer scoring and reliability information for debugging.",
                 // Wallet
                 "getnewaddress" => "getnewaddress ( \"label\" )\n\nReturns a new Divi address for receiving payments.",
@@ -1970,14 +1963,18 @@ mod tests {
     }
 
     #[test]
-    fn test_setmocktime_is_an_honest_error() {
+    fn test_setmocktime_is_regtest_only() {
         let (server, _dir) = create_test_server();
         let resp = call(
             &server,
             "setmocktime",
             Params::Array(vec![serde_json::json!(1)]),
         );
-        assert!(resp.error.is_some());
+        assert_eq!(
+            resp.error.unwrap().message,
+            "setmocktime for regression testing (-regtest mode) only"
+        );
+        assert_eq!(divi_primitives::clock::mock_time(), 0);
     }
 
     #[test]

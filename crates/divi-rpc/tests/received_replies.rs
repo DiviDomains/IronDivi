@@ -403,9 +403,10 @@ fn validateaddress_describes_a_multisig_address() {
     assert!(hex.starts_with("52") && hex.ends_with("52ae"), "{v}");
 }
 
-/// invalidateblock hands the disconnected block's transactions to the mempool,
-/// as Divi Core's DisconnectTip does, once the wallet has left the block, so
-/// the wallet takes them as unconfirmed; reconsiderblock lets the mempool drop
+/// invalidateblock hands the disconnected block's transactions to the reorg
+/// hook, which brings the wallet to the tip before the mempool takes them
+/// back, as Divi Core's DisconnectTip does, so the wallet takes them as
+/// unconfirmed; reconsiderblock lets the mempool drop
 /// what the block confirms again (ChainTipManager.cpp:139-141, :175-182)
 #[test]
 fn invalidateblock_returns_transactions_to_the_mempool() {
@@ -416,10 +417,13 @@ fn invalidateblock_returns_transactions_to_the_mempool() {
     let handed: Arc<Mutex<Vec<Vec<Transaction>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = handed.clone();
     let wallet = f.n.wallet.clone();
-    // As irondivid's reorg hook and mempool do: what the mempool takes back
-    // reaches the wallet
+    let chain = f.n.chain.clone();
+    // As irondivid's reorg hook does (bin/irondivid/src/main.rs
+    // mempool_reorg_hook): the wallet is brought to the tip first, then the
+    // mempool takes the transactions back and hands them to the wallet
     f.n.server
         .set_reorg_hook(Arc::new(move |txs: Vec<Transaction>| {
+            divi_rpc::wallet::sync_wallet_with_chain(&wallet, &chain);
             for tx in &txs {
                 wallet.add_mempool_tx(tx);
             }

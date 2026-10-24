@@ -32,7 +32,6 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
 
@@ -446,9 +445,11 @@ impl Staker {
                 .into_iter()
                 .map(|(u, _)| u),
         );
+        // A locked coin is not stakable (AvailableUtxoCalculator.cpp:91)
         let stakeable: Vec<_> = utxos
             .into_iter()
             .filter(|u| u.value.as_sat() >= self.config.read().min_stake_amount)
+            .filter(|u| !self.wallet.is_coin_locked(&u.outpoint()))
             .collect();
 
         let stake_weight: u64 = stakeable.iter().map(|u| u.value.as_sat() as u64).sum();
@@ -476,7 +477,8 @@ impl Staker {
 
     /// Divi Core `HasAgedCoins`: the wallet holds a coin the staker could use
     /// now, i.e. mature, at least the minimum stake amount, and older than the
-    /// minimum coin age (vault coins count, as in Divi Core's stakable coins)
+    /// minimum coin age (vault coins count, as in Divi Core's stakable coins;
+    /// a locked coin does not, AvailableUtxoCalculator.cpp:91)
     pub fn has_mintable_coins(&self) -> bool {
         let height = self.chain.height();
         let now = current_timestamp() as u32;
@@ -487,6 +489,7 @@ impl Staker {
         };
         let aged = |utxo: &divi_wallet::WalletUtxo| {
             utxo.value.as_sat() >= min_amount
+                && !self.wallet.is_coin_locked(&utxo.outpoint())
                 && utxo.is_mature(height, maturity)
                 && utxo
                     .height
@@ -1181,10 +1184,7 @@ impl Staker {
         // break a network-wide stall; doing that by default lets a node that has
         // lost its peers mint a private fork (vps1 testnet stall at 208,970).
         {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0);
+            let now = current_timestamp() as u32;
             let (max_age, allow_stale) = {
                 let c = self.config.read();
                 (c.max_tip_age_secs, c.allow_stale_tip)
@@ -2212,11 +2212,9 @@ pub(crate) fn superblock_payout(
 }
 
 /// Get current Unix timestamp
+/// The node's clock (Core GetAdjustedTime and GetTime: setmocktime sets it)
 fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    divi_primitives::clock::now().max(0) as u64
 }
 
 /// Create a minimal coinbase marker transaction for PoS blocks
@@ -2834,6 +2832,62 @@ mod tests {
             .expect("a work block on a locked wallet");
         assert_eq!(hashes.len(), 1);
         assert_eq!(chain.height(), 1);
+    }
+
+    /// A coin lockunspent locked is neither stake weight nor an aged coin:
+    /// divid's stakable coins skip it (AvailableUtxoCalculator.cpp:91)
+    #[test]
+    fn locked_coins_are_not_stakable() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(WalletDb::with_hd_wallet(
+            Network::Regtest,
+            HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+        ));
+        let staker = Staker::new(
+            wallet.clone(),
+            chain.clone(),
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig {
+                min_coin_age: 0,
+                ..Default::default()
+            },
+        );
+        staker.generate_blocks(22).unwrap();
+        wallet.sync_to_tip(
+            chain.height(),
+            |h| {
+                chain
+                    .get_block_index_by_height(h)
+                    .ok()
+                    .flatten()
+                    .map(|i| i.hash)
+            },
+            |h| {
+                let hash = chain.get_block_index_by_height(h).ok().flatten()?.hash;
+                chain.get_block(&hash).ok().flatten().map(|b| (hash, b))
+            },
+        );
+        let coins = wallet.get_spendable_utxos(chain.height(), 1);
+        assert!(!coins.is_empty());
+        assert!(staker.has_mintable_coins());
+        assert!(staker.get_status().stake_weight > 0);
+
+        for coin in &coins {
+            wallet.set_coin_locked(coin.outpoint(), true);
+        }
+        assert!(!staker.has_mintable_coins());
+        assert_eq!(staker.get_status().stake_weight, 0);
+        assert_eq!(staker.get_status().utxo_count, 0);
     }
 
     #[test]
