@@ -394,3 +394,28 @@ fn listunspent_leaves_out_locked_and_immature_coins() {
     .unwrap();
     assert_eq!(listed(&rpc), vec![30 * COIN]);
 }
+
+/// -maxtxfee bounds the wallet's fee: a send whose inputs would cost more is
+/// refused (MinimumFeeCoinSelectionAlgorithm.cpp:97, wallet.cpp:1559-1562)
+#[test]
+fn a_send_costing_more_than_maxtxfee_is_refused() {
+    let net = Net::new();
+    net.fund(&vec![COIN; 40]);
+    let rpc = net.rpc();
+    // 31 inputs at 10,000 sat/kB: some 46,000 sat of fee
+    net.wallet.set_max_tx_fee(20_000);
+    let err = rpc
+        .send_to_address(&p(vec![json!(dest().to_string()), json!(30.0)]))
+        .unwrap_err();
+    assert!(
+        format!("{:?}", err)
+            .contains("Insufficient funds to meet coin selection algorithm requirements."),
+        "{:?}",
+        err
+    );
+    assert!(net.submitted.lock().is_empty());
+    net.wallet.set_max_tx_fee(100 * COIN);
+    rpc.send_to_address(&p(vec![json!(dest().to_string()), json!(30.0)]))
+        .unwrap();
+    assert!(net.fee_of(&net.last_submitted()) > 20_000);
+}

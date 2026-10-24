@@ -336,6 +336,9 @@ pub struct WalletDb {
     /// The relay fee rate the wallet pays, satoshis per 1000 bytes (Divi
     /// Core's -minrelaytxfee, which its wallet follows: rpcwallet.cpp:470-473)
     relay_fee_per_kb: std::sync::atomic::AtomicI64,
+    /// The highest fee a send may pay, satoshis (Divi Core's -maxtxfee:
+    /// MinimumFeeCoinSelectionAlgorithm.cpp:97, wallet.cpp:1559-1562)
+    max_tx_fee: std::sync::atomic::AtomicI64,
     /// The position each transaction was first seen at, and the next one
     /// (Divi Core's nOrderPos, the order listtransactions follows)
     tx_order: RwLock<(HashMap<Hash256, u64>, u64)>,
@@ -395,6 +398,7 @@ impl WalletDb {
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         }
@@ -432,6 +436,7 @@ impl WalletDb {
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         }
@@ -473,6 +478,7 @@ impl WalletDb {
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         };
@@ -777,6 +783,7 @@ impl WalletDb {
             vault_mode: std::sync::atomic::AtomicBool::new(false),
             spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         };
@@ -3589,13 +3596,19 @@ impl WalletDb {
             .store(per_kb, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the highest fee the wallet's sends may pay (-maxtxfee)
+    pub fn set_max_tx_fee(&self, sat: i64) {
+        self.max_tx_fee
+            .store(sat, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Fee rate and limit of the wallet's sends
     pub fn fee_policy(&self) -> crate::send::FeePolicy {
         crate::send::FeePolicy {
             per_kb: self
                 .relay_fee_per_kb
                 .load(std::sync::atomic::Ordering::Relaxed),
-            ..Default::default()
+            max_fee: Amount::from_sat(self.max_tx_fee.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }
 

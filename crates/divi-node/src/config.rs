@@ -674,6 +674,11 @@ pub struct MempoolConfig {
     /// `-minrelaytxfee`, kept unrounded as `CFeeRate` keeps it)
     pub min_relay_fee_per_kb: i64,
 
+    /// The highest fee in satoshis a send may pay without an override (Divi
+    /// Core's `-maxtxfee`, FeeAndPriorityCalculator::SetMaxFee, init.cpp:844)
+    #[serde(default = "default_max_tx_fee")]
+    pub max_tx_fee: i64,
+
     /// Maximum orphan transactions
     pub max_orphan_txs: usize,
 
@@ -686,10 +691,16 @@ impl Default for MempoolConfig {
         MempoolConfig {
             max_size: 300 * 1024 * 1024,  // 300 MB
             min_relay_fee_per_kb: 10_000, // C++ Divi CFeeRate(10000)
+            max_tx_fee: default_max_tx_fee(),
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
         }
     }
+}
+
+/// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)
+fn default_max_tx_fee() -> i64 {
+    100 * 100_000_000
 }
 
 /// Debug configuration
