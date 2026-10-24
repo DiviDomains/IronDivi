@@ -178,6 +178,8 @@ pub struct PeerManager {
     /// Tracks (consecutive_failures, last_attempt_time) so that repeatedly-failing
     /// peers are skipped for exponentially longer periods (up to 30 minutes).
     static_peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
+    /// The inbound listener, bound before the node starts (bind_listener)
+    listener: parking_lot::Mutex<Option<TcpListener>>,
 }
 
 impl PeerManager {
@@ -201,6 +203,7 @@ impl PeerManager {
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
+            listener: parking_lot::Mutex::new(None),
         })
     }
 
@@ -495,6 +498,34 @@ impl PeerManager {
         self.added_nodes.read().contains(addr)
     }
 
+    /// Bind the inbound listener before the node starts. Divi Core does not
+    /// start when it cannot listen: "Unable to bind to ... on this computer"
+    /// (net.cpp:1355-1365) and "Failed to listen on any port. Use -listen=0
+    /// if you want this." (net.cpp:1829-1831). Without this the node ran on
+    /// with no listener and only logged the error.
+    pub async fn bind_listener(&self) -> Result<(), String> {
+        let Some(addr) = self.config.listen_addr else {
+            return Ok(());
+        };
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                *self.listener.lock() = Some(listener);
+                Ok(())
+            }
+            Err(e) => {
+                let why = if e.kind() == std::io::ErrorKind::AddrInUse {
+                    "Divi Core or irondivid is probably already running.".to_string()
+                } else {
+                    format!("(bind returned error {e})")
+                };
+                Err(format!(
+                    "Unable to bind to {addr} on this computer. {why} \
+                     Failed to listen on any port. Use -listen=0 if you want this."
+                ))
+            }
+        }
+    }
+
     /// Start the peer manager
     pub async fn start(self: Arc<Self>) -> Result<(), NetworkError> {
         info!("Starting peer manager");
@@ -600,7 +631,11 @@ impl PeerManager {
 
     /// Run the inbound connection listener
     async fn run_listener(self: Arc<Self>, addr: SocketAddr) -> Result<(), NetworkError> {
-        let listener = TcpListener::bind(addr).await?;
+        let bound = self.listener.lock().take();
+        let listener = match bound {
+            Some(listener) => listener,
+            None => TcpListener::bind(addr).await?,
+        };
         info!("Listening for connections on {}", addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
