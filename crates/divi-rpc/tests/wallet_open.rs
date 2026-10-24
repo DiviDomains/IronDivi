@@ -180,6 +180,12 @@ fn divi(v: &Value) -> f64 {
     v.as_f64().unwrap()
 }
 
+/// A funded address handed out by getnewaddress (so it is in the address book)
+fn book_address(net: &Net) -> Address {
+    let a = net.rpc().get_new_address(&Params::None).unwrap();
+    Address::from_base58(a.as_str().unwrap()).unwrap()
+}
+
 /// ListReceived counts a watched address only with includeWatchonly, and
 /// marks it involvesWatchonly (rpcwallet.cpp:1805-1809, :1843, :1874-1875)
 #[test]
@@ -237,4 +243,46 @@ fn listreceived_counts_watched_addresses_on_request() {
         .clone();
     assert_eq!(divi(&watch["amount"]), 7.0, "{watch}");
     assert_eq!(watch["involvesWatchonly"], json!(true));
+}
+
+/// listaccounts gives every address-book name its GetAccountBalance; the ""
+/// account holds the unnamed addresses' coins (rpcwallet.cpp:2320-2350, :383-412)
+#[test]
+fn listaccounts_is_each_names_account_balance() {
+    let net = Net::new();
+    let coin = net.mature_coin();
+    let plain = book_address(&net);
+    let named = book_address(&net);
+    net.rpc()
+        .set_account(&p(vec![json!(named.to_string()), json!("savings")]))
+        .unwrap();
+    let watched = watched_address(0x42);
+    net.rpc()
+        .import_address(&p(vec![
+            json!(watched.to_string()),
+            json!("watch"),
+            json!(false),
+        ]))
+        .unwrap();
+    net.mine(
+        vec![net.pay(
+            &coin,
+            &[(plain, 5 * COIN), (named, 3 * COIN), (watched, 2 * COIN)],
+        )],
+        &net.miner,
+    );
+    let rpc = net.rpc();
+    let accounts = rpc.list_accounts(&Params::None).unwrap();
+    assert_eq!(divi(&accounts[""]), 5.0, "{accounts}");
+    assert_eq!(divi(&accounts["savings"]), 3.0, "{accounts}");
+    assert!(accounts.get("watch").is_none(), "{accounts}");
+    let with_watch = rpc.list_accounts(&p(vec![json!(1), json!(true)])).unwrap();
+    assert_eq!(divi(&with_watch["watch"]), 2.0, "{with_watch}");
+    for name in ["", "savings"] {
+        assert_eq!(
+            divi(&accounts[name]),
+            divi(&rpc.get_balance(&p(vec![json!(name)])).unwrap()),
+            "listaccounts and getbalance disagree for {name:?}"
+        );
+    }
 }

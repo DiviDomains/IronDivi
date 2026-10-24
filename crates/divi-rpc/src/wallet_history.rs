@@ -656,6 +656,30 @@ impl<'a> History<'a> {
         tally
     }
 
+    /// listaccounts (rpcwallet.cpp:2320-2350): for every address-book name
+    /// with an address the wallet owns (or watches, with `watch`), that
+    /// account's GetAccountBalance
+    pub(crate) fn account_balances(&self, min_depth: i64, watch: bool) -> Vec<(String, i64)> {
+        let mut names: Vec<String> = Vec::new();
+        for (address, name) in self.wallet.address_book() {
+            let Ok(address) = Address::from_base58(&address) else {
+                continue;
+            };
+            if Self::requested(self.mine(&address.script_pubkey()), watch) && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let balance = self.account_balance(&name, min_depth, watch);
+                (name, balance)
+            })
+            .collect()
+    }
+
     /// GetBlocksToMaturity (MerkleTxConfirmationNumberCalculator.cpp:54-59)
     fn blocks_to_maturity(&self, depth: i64) -> i64 {
         (self.maturity as i64 + 1 - depth).max(0)

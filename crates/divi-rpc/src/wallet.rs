@@ -4337,40 +4337,16 @@ impl WalletRpc {
     }
 
     pub fn list_accounts(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // listaccounts (rpcwallet.cpp:2320-2350): each address-book name with
+        // an address the wallet owns (or watches), and its GetAccountBalance
         let wallet = self.get_wallet()?;
-
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-        let _include_watchonly = params.get_bool(1).unwrap_or(false);
-
-        let height = self.current_height();
-        let accounts = wallet.list_accounts();
-
+        let min_depth = params.get_i64(0).unwrap_or(1);
+        let watch = params.get_bool(1).unwrap_or(false);
         let mut result = serde_json::Map::new();
-
-        for (account_name, addresses) in accounts {
-            let mut account_balance = Amount::ZERO;
-
-            for addr_str in addresses {
-                let utxos = wallet.get_utxos();
-                for utxo in utxos {
-                    if utxo.address == addr_str {
-                        let confs = utxo.confirmations(height);
-                        if confs >= min_conf && utxo.is_mature(height, wallet.coinbase_maturity()) {
-                            account_balance += utxo.value;
-                        }
-                    }
-                }
-            }
-
-            let divi = account_balance.as_sat() as f64 / 100_000_000.0;
-            result.insert(account_name, serde_json::json!(divi));
+        for (name, balance) in self.history(&wallet).account_balances(min_depth, watch) {
+            result.insert(name, json!(balance as f64 / 100_000_000.0));
         }
-        // C++ always lists the default account ""
-        result
-            .entry(String::new())
-            .or_insert(serde_json::json!(0.0));
-
-        Ok(serde_json::json!(result))
+        Ok(serde_json::Value::Object(result))
     }
 
     pub fn get_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
