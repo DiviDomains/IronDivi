@@ -85,6 +85,8 @@ impl ChainDatabase {
         path: P,
         block_cache_size: usize,
     ) -> Result<Self, StorageError> {
+        crate::datadir::refuse_foreign_database(path.as_ref())?;
+
         // === Database-wide options ===
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -418,6 +420,22 @@ impl ChainDatabase {
     pub fn put_metadata(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db.put_cf(cf, key, value)?;
+        Ok(())
+    }
+
+    /// Write a raw metadata value and sync the log before returning
+    pub fn put_metadata_synced(&self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db.put_cf_opt(cf, key, value, &opts)?;
+        Ok(())
+    }
+
+    /// Remove a raw metadata value.
+    pub fn delete_metadata(&self, key: &[u8]) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db.delete_cf(cf, key)?;
         Ok(())
     }
 
@@ -798,12 +816,15 @@ impl ChainDatabase {
 
     /// Atomically flush UTXO changes + undo data + tip update in a single WriteBatch.
     /// This is the C++ pattern: all state changes for a connected block are atomic.
+    /// `extra` adds the block's other entries (address and spent index) to the
+    /// same batch, as Divi Core writes them with the block's best-block hash.
     pub fn atomic_connect_block(
         &self,
         utxo_batch: &BatchedUtxoWriter,
         undo_data: &[u8],
         block_hash: &Hash256,
         block_index: &BlockIndex,
+        extra: &dyn Fn(&mut WriteBatch) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
         let removed_set: std::collections::HashSet<&OutPoint> = utxo_batch.removes.iter().collect();
         let added_set: std::collections::HashSet<&OutPoint> =
@@ -850,6 +871,7 @@ impl ChainDatabase {
             height_key(block_index.height),
             block_index.hash.as_bytes(),
         );
+        extra(&mut wb)?;
 
         // Single atomic write
         self.db.write(wb)?;
@@ -874,6 +896,70 @@ impl ChainDatabase {
         self.height_to_hash_cache
             .insert(block_index.height, block_index.hash);
 
+        Ok(())
+    }
+
+    /// Write a disconnected block in one batch: its UTXO changes, its undo data
+    /// removed, its index entry (`index`, no longer on the main chain), its
+    /// height entry removed and the tip moved to `new_tip`, its parent. `extra`
+    /// adds the address and spent index changes. Divi Core flushes the coins and
+    /// the best block together after every disconnect (ChainTipManager.cpp:157-173),
+    /// so a stop between two disconnects of a reorg leaves a chain that matches
+    /// its UTXO set.
+    pub fn atomic_disconnect_block(
+        &self,
+        utxo_batch: &BatchedUtxoWriter,
+        index: &BlockIndex,
+        new_tip: &BlockIndex,
+        extra: &dyn Fn(&mut WriteBatch) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let removed_set: std::collections::HashSet<&OutPoint> = utxo_batch.removes.iter().collect();
+        let added_set: std::collections::HashSet<&OutPoint> =
+            utxo_batch.adds.iter().map(|(op, _)| op).collect();
+
+        let cf_utxo = self.db.cf_handle(CF_UTXO).unwrap();
+        let cf_undo = self.db.cf_handle(CF_UNDO).unwrap();
+        let cf_metadata = self.db.cf_handle(CF_METADATA).unwrap();
+        let cf_block_index = self.db.cf_handle(CF_BLOCK_INDEX).unwrap();
+
+        let mut wb = WriteBatch::default();
+        for outpoint in &utxo_batch.removes {
+            if !added_set.contains(outpoint) {
+                wb.delete_cf(&cf_utxo, utxo_key(outpoint));
+            }
+        }
+        for (outpoint, utxo) in &utxo_batch.adds {
+            if !removed_set.contains(outpoint) {
+                wb.put_cf(&cf_utxo, utxo_key(outpoint), utxo.to_bytes());
+            }
+        }
+        wb.delete_cf(&cf_undo, index.hash.as_bytes());
+        wb.put_cf(
+            &cf_block_index,
+            block_index_key(&index.hash),
+            index.to_bytes(),
+        );
+        wb.delete_cf(&cf_block_index, height_key(index.height));
+        wb.put_cf(&cf_metadata, KEY_BEST_BLOCK, new_tip.hash.as_bytes());
+        wb.put_cf(&cf_metadata, KEY_CHAIN_HEIGHT, new_tip.height.to_le_bytes());
+        extra(&mut wb)?;
+
+        self.db.write(wb)?;
+
+        if let Some(ref cache) = self.utxo_cache {
+            for outpoint in &utxo_batch.removes {
+                if !added_set.contains(outpoint) {
+                    cache.remove(*outpoint);
+                }
+            }
+            for (outpoint, utxo) in &utxo_batch.adds {
+                if !removed_set.contains(outpoint) {
+                    cache.insert(*outpoint, utxo.clone());
+                }
+            }
+        }
+        self.block_index_cache.insert(index.hash, index.clone());
+        self.height_to_hash_cache.invalidate(&index.height);
         Ok(())
     }
 

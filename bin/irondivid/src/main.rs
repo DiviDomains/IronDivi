@@ -21,11 +21,11 @@
 //!   irondivid --testnet --datadir=/path/to/data
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
+mod core_files;
+mod settings;
 mod snapshot_sig;
 
 use anyhow::{Context, Result};
-use clap::builder::BoolishValueParser;
-use clap::Parser;
 use divi_crypto::compute_block_hash;
 use divi_node::config::{LogConfig, NetworkType, NodeConfig};
 use divi_node::{Node, Staker, StakingConfig};
@@ -34,6 +34,7 @@ use divi_primitives::transaction::Transaction;
 use divi_primitives::ChainMode;
 use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
+use settings::Settings;
 use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,202 +43,158 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-/// IronDivi Daemon - Rust implementation of Divi node
-#[derive(Parser, Debug, Clone)]
-#[command(name = "irondivid")]
-#[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "IronDivi daemon - Rust implementation of Divi full node")]
-#[command(long_about = None)]
+/// irondivid's start-up options. They are read as Divi Core's divid reads
+/// its own (settings.rs): `-name=value` or `--name value` on the command line,
+/// then the config file, which fills only what the command line left unset.
+#[derive(Debug, Clone, Default)]
 struct Args {
-    /// Configuration file path
-    #[arg(short = 'c', long = "conf")]
     conf: Option<PathBuf>,
-
-    /// Data directory
-    #[arg(short = 'd', long = "datadir")]
     datadir: Option<PathBuf>,
-
-    /// Use testnet
-    #[arg(long)]
     testnet: bool,
-
-    /// Use regtest (regression test mode)
-    #[arg(long)]
     regtest: bool,
-
-    /// Chain mode: divi (default) or privatedivi
-    #[arg(long, value_parser = ["divi", "privatedivi"])]
     mode: Option<String>,
-
-    /// Run in background as daemon
-    #[arg(long)]
     daemon: bool,
-
-    /// Print to console instead of log file
-    #[arg(long)]
     printtoconsole: bool,
-
-    /// RPC username
-    #[arg(long)]
-    rpcuser: Option<String>,
-
-    /// RPC password
-    #[arg(long)]
-    rpcpassword: Option<String>,
-
-    /// RPC port
-    #[arg(long)]
-    rpcport: Option<u16>,
-
-    /// RPC bind address
-    #[arg(long)]
-    rpcbind: Option<String>,
-
-    /// P2P port
-    #[arg(long)]
-    port: Option<u16>,
-
-    /// P2P bind address
-    #[arg(long)]
-    bind: Option<String>,
-
-    /// Add a node to connect to
-    #[arg(long = "addnode")]
-    addnode: Vec<String>,
-
-    /// Keep a connection to a full-history node (a pruned node fetches old blocks from it)
-    #[arg(long = "fullnode")]
-    fullnode: Vec<String>,
-
-    /// Connect only to specified node(s)
-    #[arg(long = "connect")]
-    connect: Vec<String>,
-
-    /// How many of the newest blocks to check at start (default 100; 0 = all blocks)
-    #[arg(long, value_name = "N")]
-    checkblocks: Option<u32>,
-
-    /// Refuse a block N or more blocks below the tip (default 100, as Divi Core's -maxreorg)
-    #[arg(long, value_name = "N")]
-    maxreorg: Option<u32>,
-
-    /// Make outbound P2P connections through this SOCKS5 proxy (ip:port, port 9050 if
-    /// omitted). DNS seeds are then not resolved locally.
-    #[arg(long, value_name = "IP:PORT")]
-    proxy: Option<String>,
-
-    /// Enable debug logging
-    #[arg(long)]
     debug: bool,
-
-    /// Wallet directory (default: datadir/wallet)
-    #[arg(long)]
     wallet: Option<PathBuf>,
-
-    /// Disable wallet (run without wallet support)
-    #[arg(long)]
     disablewallet: bool,
-
-    /// Enable transaction index (required for PoS validation and getrawtransaction RPC;
-    /// default on). Unset keeps the config-file value.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
-    txindex: Option<bool>,
-
-    /// Start the staker at boot (`--staking=false` = C++ `-staking=0`; RPC setstaking can still start it)
-    #[arg(long)]
-    staking: Option<bool>,
-
-    /// Stake even when the chain tip is older than 24h (restart a stalled network).
-    /// Off by default: staking on a stale tip mints a private fork.
-    #[arg(long)]
-    stakeonstaletip: bool,
-
-    /// Misbehaviour score at which a peer is disconnected and banned (C++ -banscore, default 100)
-    #[arg(long)]
-    banscore: Option<u32>,
-
-    /// Seconds a misbehaving peer stays banned (C++ -bantime, default 86400)
-    #[arg(long)]
-    bantime: Option<u64>,
-
-    /// Stake split threshold in DIVI, reported by getstakingstatus (C++ -stakesplitthreshold, default 20000)
-    #[arg(long)]
-    stakesplitthreshold: Option<f64>,
-
-    /// Enable spent index for gettxout RPC. Unset keeps the config-file value.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
-    spentindex: Option<bool>,
-
-    /// Enable address index for address-based queries. Unset keeps the config-file value.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = BoolishValueParser::new())]
-    addressindex: Option<bool>,
-
-    /// Export blockchain to JSON format (requires start and end height, and output directory)
-    #[arg(long)]
+    pid: Option<PathBuf>,
     export_chain: bool,
-
-    /// Start height for chain export
-    #[arg(long, requires = "export_chain")]
     export_start: Option<u32>,
-
-    /// End height for chain export
-    #[arg(long, requires = "export_chain")]
     export_end: Option<u32>,
-
-    /// Output directory for chain export
-    #[arg(long, requires = "export_chain")]
     export_output: Option<PathBuf>,
-
-    /// Write a thin chain-state snapshot of this node's chainstate into DIR (node must be stopped).
-    #[arg(long, value_name = "DIR", conflicts_with = "import_snapshot")]
     export_snapshot: Option<PathBuf>,
-
-    /// Install the snapshot in DIR as this node's chainstate (must be empty or missing), then exit.
-    #[arg(long, value_name = "DIR")]
     import_snapshot: Option<PathBuf>,
-
-    /// With --import-snapshot: refuse unless the snapshot's root hash equals this value.
-    #[arg(long, value_name = "HEX", requires = "import_snapshot")]
     snapshot_root: Option<String>,
-
-    /// Sign the root hash of the snapshot in DIR and write DIR/ROOT.sig. The 32-byte signing key
-    /// is read from stdin as 64 hex characters (never as an argument), then the node exits.
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["export_snapshot", "import_snapshot"])]
     sign_snapshot: Option<PathBuf>,
-
-    /// Check DIR/ROOT.sig against --snapshot-signer, then exit.
-    #[arg(long, value_name = "DIR", requires = "snapshot_signer", conflicts_with_all = ["export_snapshot", "import_snapshot", "sign_snapshot"])]
     verify_snapshot: Option<PathBuf>,
-
-    /// Divi address whose key must have signed the snapshot's root hash. With --import-snapshot
-    /// the import is refused unless DIR/ROOT.sig verifies against this address.
-    #[arg(long, value_name = "ADDRESS")]
     snapshot_signer: Option<String>,
-
-    /// UTXO cache size in number of entries (0 = disabled, default).
-    /// Use 10000000 (~500MB) for memory-constrained systems.
-    #[arg(long)]
-    utxocachesize: Option<u64>,
-
-    /// Discard block data older than this age so the node can stake without the full chain.
-    /// Units: s, m (minutes), h, d, w, mo (months = 30d), y (years = 365d), e.g. 30d.
-    /// -1 = never expire (default); 0 = keep only the minimum needed to stake and validate.
-    /// Also settable via IRONDIVI_EXPIRE or `expire` in irondivi.conf (flag > env > conf).
-    #[arg(long, allow_hyphen_values = true)]
+    /// `--expire` from the command line (flag > IRONDIVI_EXPIRE > file)
     expire: Option<String>,
-
-    /// Maximum log file size in MB (default: 1)
-    #[arg(long)]
     maxlogsize: Option<u32>,
-
-    /// Number of log files to keep (default: 5)
-    #[arg(long)]
     maxlogfiles: Option<u32>,
+    help: bool,
+    version: bool,
+    /// The command line alone
+    cli: Settings,
+    /// The command line, then the config file once it is read
+    settings: Settings,
+    conf_loaded: bool,
 }
+
+const USAGE: &str = "Usage:\n  irondivid [options]                     Start IronDivi Daemon\n\n\
+Options are read as divid reads them: -name=value (or --name value), -noname\n\
+to turn an option off, then the config file (irondivi.conf, else divi.conf, in\n\
+the data directory) for whatever the command line left unset. Among them:\n  \
+-conf=<file> -datadir=<dir> -testnet -regtest -mode=<divi|privatedivi>\n  \
+-daemon -pid=<file> -printtoconsole -debug -disablewallet -wallet=<name>\n  \
+-port=<port> -bind=<addr> -listen -connect=<ip> -addnode=<ip> -dnsseed\n  \
+-maxconnections=<n> -proxy=<ip:port> -banscore=<n> -bantime=<n> -timeout=<ms>\n  \
+-server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
+-rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
+-maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
+-blocknotify=<cmd> -walletnotify=<cmd>\n\
+IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
+-utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
+--export-chain --export-start N --export-end N --export-output DIR\n  \
+--export-snapshot DIR --import-snapshot DIR [--snapshot-root HEX]\n  \
+--sign-snapshot DIR --verify-snapshot DIR --snapshot-signer ADDRESS\n";
 
 impl Args {
     fn chain_mode(&self) -> ChainMode {
         parse_chain_mode(self.mode.as_deref().unwrap_or("divi"))
+    }
+
+    /// Read the command line (the first item is the program name)
+    fn try_parse_from<I, T>(argv: I) -> Result<Args>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let argv: Vec<String> = argv.into_iter().skip(1).map(Into::into).collect();
+        let cli = Settings::from_command_line(&argv);
+        let mut args = Args {
+            cli: cli.clone(),
+            settings: cli,
+            ..Args::default()
+        };
+        args.refresh()?;
+        Ok(args)
+    }
+
+    #[cfg(test)]
+    fn parse_from<I, T>(argv: I) -> Args
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        Args::try_parse_from(argv).unwrap_or_else(|e| {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1)
+        })
+    }
+
+    /// Take the option values from the settings read so far
+    fn refresh(&mut self) -> Result<()> {
+        let s = &self.settings;
+        let path = |key: &str| s.get(key).map(PathBuf::from);
+        let cli_path = |key: &str| self.cli.get(key).map(PathBuf::from);
+        let number = |key: &str| -> Result<Option<u32>> {
+            self.cli
+                .get(key)
+                .map(|v| {
+                    v.trim()
+                        .parse::<u32>()
+                        .with_context(|| format!("invalid value '{}' for --{}", v, key))
+                })
+                .transpose()
+        };
+        if let Some(mode) = s.get("mode") {
+            if !matches!(mode, "divi" | "privatedivi") {
+                anyhow::bail!(
+                    "invalid value '{}' for '--mode <MODE>' [possible values: divi, privatedivi]",
+                    mode
+                );
+            }
+        }
+        self.conf = path("conf");
+        self.datadir = path("datadir");
+        self.testnet = s.get_bool("testnet", false);
+        self.regtest = s.get_bool("regtest", false);
+        self.mode = s.get("mode").map(String::from);
+        self.daemon = s.get_bool("daemon", false);
+        self.printtoconsole = s.get_bool("printtoconsole", false);
+        // -debug=<category> may repeat; -debug=0 is no debugging
+        let debug = s.get_multi("debug");
+        self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.wallet = path("wallet");
+        self.disablewallet = s.get_bool("disablewallet", false);
+        self.pid = path("pid");
+        self.export_chain = self.cli.get_bool("export-chain", false);
+        self.export_start = number("export-start")?;
+        self.export_end = number("export-end")?;
+        self.export_output = cli_path("export-output");
+        self.export_snapshot = cli_path("export-snapshot");
+        self.import_snapshot = cli_path("import-snapshot");
+        self.snapshot_root = self.cli.get("snapshot-root").map(String::from);
+        self.sign_snapshot = cli_path("sign-snapshot");
+        self.verify_snapshot = cli_path("verify-snapshot");
+        self.snapshot_signer = self.cli.get("snapshot-signer").map(String::from);
+        self.expire = self.cli.get("expire").map(String::from);
+        let positive = |key: &str| {
+            s.get(key)
+                .map(settings::atoi)
+                .filter(|i| *i > 0 && *i <= u32::MAX as i64)
+                .map(|i| i as u32)
+        };
+        self.maxlogsize = positive("maxlogsize");
+        self.maxlogfiles = positive("maxlogfiles").filter(|n| *n <= 100);
+        self.help = ["?", "help", "h"].iter().any(|k| self.cli.is_set(k));
+        self.version = ["version", "V"].iter().any(|k| self.cli.is_set(k));
+        if self.export_chain && (self.export_start.is_none() && self.cli.is_set("export-start")) {
+            anyhow::bail!("invalid --export-start");
+        }
+        Ok(())
     }
 }
 
@@ -270,535 +227,439 @@ fn default_data_dir() -> PathBuf {
     }
 }
 
-/// Load configuration from file if it exists.
-///
-/// Both formats are read: TOML (`rpcuser = "foo"`, what IronDivi documented) and the
-/// Divi Core / Bitcoin `key=value` format (`rpcuser=foo`, `addnode=` repeated). A file
-/// that parses as TOML is read as TOML, so existing files keep their meaning.
-fn load_config_file(path: &PathBuf) -> Result<Option<toml::Table>> {
-    if path.exists() {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {:?}", path))?;
-        let table = match content.parse::<toml::Table>() {
-            Ok(table) => table,
-            Err(_) => parse_divi_config(&content),
-        };
-        Ok(Some(normalize_config(table)))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Parse a Divi Core style config file: one `key=value` per line, `#` starts a comment,
-/// surrounding whitespace is ignored, a bare `key` means `key=1`, a repeated key becomes
-/// a list, and settings under a `[section]` header are ignored (C++ ReadConfigFile with
-/// boost's config parser).
-fn parse_divi_config(content: &str) -> toml::Table {
-    let mut table = toml::Table::new();
-    let mut section: Option<String> = None;
-    for (n, raw) in content.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            warn!(
-                "config file line {}: section {} is not supported; its settings are ignored",
-                n + 1,
-                line
-            );
-            section = Some(line.to_string());
-            continue;
-        }
-        // Divi Core 3.0 ignores settings under a section header too
-        if section.is_some() {
-            continue;
-        }
-        let (key, value) = match line.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim()),
-            None => (line, "1"),
-        };
-        if key.is_empty() {
-            warn!("config file line {}: no key, ignored", n + 1);
-            continue;
-        }
-        let value = toml::Value::String(value.trim_matches('"').to_string());
-        match table.get_mut(key) {
-            Some(toml::Value::Array(list)) => list.push(value),
-            Some(first) => {
-                let first = first.clone();
-                table.insert(key.to_string(), toml::Value::Array(vec![first, value]));
-            }
-            None => {
-                table.insert(key.to_string(), value);
-            }
-        }
-    }
-    table
-}
-
-#[derive(Clone, Copy)]
-enum ConfKind {
-    Str,
-    Int,
-    Bool,
-    List,
-}
-
-fn conf_kind(key: &str) -> Option<ConfKind> {
-    use ConfKind::*;
-    Some(match key {
-        "rpcuser" | "rpcpassword" | "rpcbind" | "bind" | "proxy" | "mode" | "expire" => Str,
-        "rpcport" | "port" | "checkblocks" | "maxreorg" | "maxlogsize" | "maxlogfiles"
-        | "utxocachesize" | "banscore" | "bantime" => Int,
-        "listen" | "testnet" | "regtest" | "daemon" | "printtoconsole" | "staking"
-        | "stakeonstaletip" | "txindex" | "spentindex" | "addressindex" | "disablewallet" => Bool,
-        "addnode" | "fullnode" | "connect" => List,
-        _ => return None,
-    })
-}
-
-/// Give every known key the value type `apply_config_file` expects, whichever format the
-/// file was in: `txindex=1` / `"1"` / `true` all become a boolean, `rpcport="51473"` an
-/// integer, `rpcpassword = 12345` a string. A repeated single-value key keeps its last
-/// value, as in C++. Values that do not convert are left for `apply_config_file` to warn about.
-fn normalize_config(table: toml::Table) -> toml::Table {
-    use toml::Value;
-    let scalar_text = |v: &Value| match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Integer(i) => Some(i.to_string()),
-        Value::Boolean(b) => Some(if *b { "1" } else { "0" }.to_string()),
-        Value::Float(f) => Some(f.to_string()),
-        _ => None,
-    };
-    table
-        .into_iter()
-        .map(|(key, value)| {
-            let Some(kind) = conf_kind(&key) else {
-                return (key, value);
-            };
-            let value = match (kind, value) {
-                (ConfKind::List, v) => v,
-                (_, Value::Array(list)) if !list.is_empty() => list.last().cloned().unwrap(),
-                (_, v) => v,
-            };
-            let converted = match kind {
-                ConfKind::List => None,
-                ConfKind::Str => match &value {
-                    Value::String(_) => None,
-                    v => scalar_text(v).map(Value::String),
-                },
-                ConfKind::Int => match &value {
-                    Value::String(s) => s.trim().parse::<i64>().ok().map(Value::Integer),
-                    _ => None,
-                },
-                ConfKind::Bool => match &value {
-                    Value::Integer(i) => Some(Value::Boolean(*i != 0)),
-                    Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
-                        "1" | "true" | "yes" | "on" => Some(Value::Boolean(true)),
-                        "0" | "false" | "no" | "off" => Some(Value::Boolean(false)),
-                        other => other.parse::<i64>().ok().map(|i| Value::Boolean(i != 0)),
-                    },
-                    _ => None,
-                },
-            };
-            (key, converted.unwrap_or(value))
-        })
-        .collect()
-}
-
-/// Where the config file is: `--conf`, else `irondivi.conf` in the data directory
+/// The config file, as divid finds its own (Settings::GetConfigFile): `-conf`,
+/// relative to the data directory, else `irondivi.conf` there, else divid's
+/// `divi.conf`
 fn config_path(args: &Args) -> PathBuf {
-    args.conf
-        .clone()
-        .unwrap_or_else(|| compute_data_dir(args).join("irondivi.conf"))
+    let dir = compute_data_dir(args);
+    match &args.conf {
+        Some(conf) if conf.is_relative() => dir.join(conf),
+        Some(conf) => conf.clone(),
+        None if dir.join("irondivi.conf").exists() => dir.join("irondivi.conf"),
+        None => dir.join("divi.conf"),
+    }
 }
 
-/// Fill the options that are needed before the node config exists (network, chain mode,
-/// daemon, console and log-file settings) from the config file when the command line does
-/// not set them; the command line always wins. Pins `conf` to the file read, so a network
-/// chosen by the file does not make the node look for a different file.
+/// Read the config file into the settings: irondivid's TOML, else divid's
+/// `name=value` format. Values the command line set are kept. Pins `conf` to
+/// the file read, so a network chosen by the file does not move it.
 fn resolve_args(mut args: Args) -> Result<Args> {
-    let path = config_path(&args);
-    let Some(table) = load_config_file(&path)? else {
+    if args.conf_loaded {
         return Ok(args);
-    };
-    let flag = |key: &str| table.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
-    if !args.testnet && !args.regtest {
-        args.testnet = flag("testnet");
-        args.regtest = flag("regtest");
     }
-    if args.mode.is_none() {
-        args.mode = table
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .filter(|m| matches!(*m, "divi" | "privatedivi"))
-            .map(String::from);
+    let path = config_path(&args);
+    if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Error reading configuration file: {:?}", path))?;
+        match content.parse::<toml::Table>() {
+            Ok(table) => args.settings.read_toml(&table),
+            Err(_) => args.settings.read_config(&content),
+        }
     }
-    args.daemon |= flag("daemon");
-    args.printtoconsole |= flag("printtoconsole");
-    args.disablewallet |= flag("disablewallet");
-    // C++ debug= takes a category (debug=1, debug=net); anything but 0 turns debug logging on
-    args.debug |= table
-        .get("debug")
-        .and_then(|v| match v {
-            toml::Value::String(s) => Some(!matches!(s.trim(), "" | "0")),
-            toml::Value::Integer(i) => Some(*i != 0),
-            toml::Value::Boolean(b) => Some(*b),
-            toml::Value::Array(list) => Some(!list.is_empty()),
-            _ => None,
-        })
-        .unwrap_or(false);
-    let positive = |key: &str| {
-        table
-            .get(key)
-            .and_then(|v| v.as_integer())
-            .filter(|i| *i > 0 && *i <= u32::MAX as i64)
-            .map(|i| i as u32)
-    };
-    if args.maxlogsize.is_none() {
-        args.maxlogsize = positive("maxlogsize");
-    }
-    if args.maxlogfiles.is_none() {
-        args.maxlogfiles = positive("maxlogfiles").filter(|n| *n <= 100);
-    }
+    args.refresh()?;
     args.conf = Some(path);
+    args.conf_loaded = true;
     Ok(args)
 }
 
-/// Apply configuration values from TOML table to NodeConfig
-fn apply_config_file(config: &mut NodeConfig, file_config: &toml::Table) {
-    for (key, value) in file_config {
-        match key.as_str() {
-            // RPC settings
-            "rpcuser" => {
-                if let Some(s) = value.as_str() {
-                    config.rpc.username = Some(s.to_string());
-                } else {
-                    warn!("Invalid rpcuser value in config file, expected string");
-                }
-            }
-            "rpcpassword" => {
-                if let Some(s) = value.as_str() {
-                    config.rpc.password = Some(s.to_string());
-                } else {
-                    warn!("Invalid rpcpassword value in config file, expected string");
-                }
-            }
-            "rpcport" => {
-                if let Some(i) = value.as_integer() {
-                    if i > 0 && i <= 65535 {
-                        config.rpc.port = i as u16;
-                    } else {
-                        warn!("Invalid rpcport value in config file, must be 1-65535");
-                    }
-                } else {
-                    warn!("Invalid rpcport value in config file, expected integer");
-                }
-            }
-            "rpcbind" => {
-                if let Some(s) = value.as_str() {
-                    config.rpc.listen_addr = s.to_string();
-                } else {
-                    warn!("Invalid rpcbind value in config file, expected string");
-                }
-            }
-            // P2P settings
-            "port" => {
-                if let Some(i) = value.as_integer() {
-                    if i > 0 && i <= 65535 {
-                        config.p2p.port = i as u16;
-                    } else {
-                        warn!("Invalid port value in config file, must be 1-65535");
-                    }
-                } else {
-                    warn!("Invalid port value in config file, expected integer");
-                }
-            }
-            "bind" => {
-                if let Some(s) = value.as_str() {
-                    config.p2p.listen_addr = s.to_string();
-                } else {
-                    warn!("Invalid bind value in config file, expected string");
-                }
-            }
-            "checkblocks" => {
-                if let Some(i) = value
-                    .as_integer()
-                    .filter(|i| (0..=u32::MAX as i64).contains(i))
-                {
-                    config.check_blocks = i as u32;
-                } else {
-                    warn!(
-                        "Invalid checkblocks value in config file, expected a non-negative integer"
-                    );
-                }
-            }
-            "maxreorg" => {
-                if let Some(i) = value
-                    .as_integer()
-                    .filter(|i| (0..=u32::MAX as i64).contains(i))
-                {
-                    config.max_reorg = Some(i as u32);
-                } else {
-                    warn!("Invalid maxreorg value in config file, expected a non-negative integer");
-                }
-            }
-            "proxy" => {
-                if let Some(s) = value.as_str() {
-                    config.p2p.proxy = Some(s.to_string());
-                } else {
-                    warn!("Invalid proxy value in config file, expected string");
-                }
-            }
-            "listen" => {
-                if let Some(b) = value.as_bool() {
-                    config.p2p.listen = Some(b);
-                } else if let Some(i) = value.as_integer() {
-                    config.p2p.listen = Some(i != 0);
-                } else {
-                    warn!("Invalid listen value in config file, expected boolean or integer");
-                }
-            }
-            // Network type settings (only applied if not overridden by CLI)
-            "testnet" => {
-                if let Some(b) = value.as_bool() {
-                    if b {
-                        debug!("testnet=1 in config file (CLI flags take precedence)");
-                    }
-                } else if let Some(i) = value.as_integer() {
-                    if i != 0 {
-                        debug!("testnet=1 in config file (CLI flags take precedence)");
-                    }
-                }
-            }
-            "regtest" => {
-                if let Some(b) = value.as_bool() {
-                    if b {
-                        debug!("regtest=1 in config file (CLI flags take precedence)");
-                    }
-                } else if let Some(i) = value.as_integer() {
-                    if i != 0 {
-                        debug!("regtest=1 in config file (CLI flags take precedence)");
-                    }
-                }
-            }
-            // Daemon mode (informational only, handled by CLI)
-            "daemon" => {
-                if let Some(b) = value.as_bool() {
-                    if b {
-                        debug!("daemon=1 in config file (use --daemon flag)");
-                    }
-                } else if let Some(i) = value.as_integer() {
-                    if i != 0 {
-                        debug!("daemon=1 in config file (use --daemon flag)");
-                    }
-                }
-            }
-            // Read before the node config is built (resolve_args)
-            "disablewallet" | "debug" => {}
-            "printtoconsole" => {
-                if let Some(b) = value.as_bool() {
-                    if b {
-                        debug!("printtoconsole=1 in config file (use --printtoconsole flag)");
-                    }
-                } else if let Some(i) = value.as_integer() {
-                    if i != 0 {
-                        debug!("printtoconsole=1 in config file (use --printtoconsole flag)");
-                    }
-                }
-            }
-            "staking" => {
-                if let Some(b) = value.as_bool() {
-                    config.staking.enabled = b;
-                } else if let Some(i) = value.as_integer() {
-                    config.staking.enabled = i != 0;
-                } else {
-                    warn!("Invalid staking value in config file, expected boolean or integer");
-                }
-            }
-            "banscore" => match value.as_integer() {
-                Some(i) if i >= 0 => config.p2p.ban_score = i.min(u32::MAX as i64) as u32,
-                _ => {
-                    warn!("Invalid banscore value in config file, expected a non-negative integer")
-                }
-            },
-            "bantime" => match value.as_integer() {
-                Some(i) if i >= 0 => config.p2p.ban_time = i as u64,
-                _ => warn!("Invalid bantime value in config file, expected a non-negative integer"),
-            },
-            "stakeonstaletip" => {
-                if let Some(b) = value.as_bool() {
-                    config.staking.stake_on_stale_tip = b;
-                } else if let Some(i) = value.as_integer() {
-                    config.staking.stake_on_stale_tip = i != 0;
-                } else {
-                    warn!(
-                        "Invalid stakeonstaletip value in config file, expected boolean or integer"
-                    );
-                }
-            }
-            "stakesplitthreshold" => {
-                let divi = value
-                    .as_float()
-                    .or_else(|| value.as_integer().map(|i| i as f64))
-                    .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
-                match divi {
-                    Some(d) if d >= 0.0 => {
-                        config.staking.split_threshold = (d * 100_000_000.0).round() as i64
-                    }
-                    _ => warn!("Invalid stakesplitthreshold value in config file, expected DIVI"),
-                }
-            }
-            // Index settings
-            "txindex" => {
-                if let Some(b) = value.as_bool() {
-                    config.index.txindex = b;
-                } else if let Some(i) = value.as_integer() {
-                    config.index.txindex = i != 0;
-                } else {
-                    warn!("Invalid txindex value in config file, expected boolean or integer");
-                }
-            }
-            "spentindex" => {
-                if let Some(b) = value.as_bool() {
-                    config.index.spentindex = b;
-                } else if let Some(i) = value.as_integer() {
-                    config.index.spentindex = i != 0;
-                } else {
-                    warn!("Invalid spentindex value in config file, expected boolean or integer");
-                }
-            }
-            "addressindex" => {
-                if let Some(b) = value.as_bool() {
-                    config.index.addressindex = b;
-                } else if let Some(i) = value.as_integer() {
-                    config.index.addressindex = i != 0;
-                } else {
-                    warn!("Invalid addressindex value in config file, expected boolean or integer");
-                }
-            }
-            // Peer settings
-            "addnode" => {
-                if let Some(s) = value.as_str() {
-                    config.network.static_peers.push(s.to_string());
-                } else if let Some(arr) = value.as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            config.network.static_peers.push(s.to_string());
-                        } else {
-                            warn!("Invalid addnode array element, expected string");
-                        }
-                    }
-                } else {
-                    warn!("Invalid addnode value in config file, expected string or array");
-                }
-            }
-            "fullnode" => {
-                if let Some(s) = value.as_str() {
-                    config.network.static_peers.push(s.to_string());
-                } else if let Some(arr) = value.as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            config.network.static_peers.push(s.to_string());
-                        } else {
-                            warn!("Invalid fullnode array element, expected string");
-                        }
-                    }
-                } else {
-                    warn!("Invalid fullnode value in config file, expected string or array");
-                }
-            }
-            "connect" => {
-                if let Some(s) = value.as_str() {
-                    config.p2p.connect.push(s.to_string());
-                    config.p2p.enable_discovery = false;
-                } else if let Some(arr) = value.as_array() {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            config.p2p.connect.push(s.to_string());
-                        } else {
-                            warn!("Invalid connect array element, expected string");
-                        }
-                    }
-                    config.p2p.enable_discovery = false;
-                } else {
-                    warn!("Invalid connect value in config file, expected string or array");
-                }
-            }
-            // Logging settings
-            "maxlogsize" => {
-                if let Some(i) = value.as_integer() {
-                    if i > 0 {
-                        config.log.max_file_size = i as u64 * 1_048_576; // Convert MB to bytes
-                    } else {
-                        warn!("Invalid maxlogsize value in config file, must be positive");
-                    }
-                } else {
-                    warn!("Invalid maxlogsize value in config file, expected integer");
-                }
-            }
-            "maxlogfiles" => {
-                if let Some(i) = value.as_integer() {
-                    if i > 0 && i <= 100 {
-                        config.log.max_files = i as u32;
-                    } else {
-                        warn!("Invalid maxlogfiles value in config file, must be 1-100");
-                    }
-                } else {
-                    warn!("Invalid maxlogfiles value in config file, expected integer");
-                }
-            }
-            "mode" => {
-                if let Some(s) = value.as_str() {
-                    match s {
-                        "divi" | "privatedivi" => {
-                            debug!("mode={} in config file (CLI flags take precedence)", s);
-                        }
-                        _ => {
-                            warn!("Invalid mode value in config file, expected 'divi' or 'privatedivi'");
-                        }
-                    }
-                } else {
-                    warn!("Invalid mode value in config file, expected string");
-                }
-            }
-            // UTXO cache
-            "utxocachesize" => {
-                if let Some(i) = value.as_integer() {
-                    if i >= 0 {
-                        config.utxo_cache_size = i as u64;
-                    } else {
-                        warn!("Invalid utxocachesize, must be >= 0");
-                    }
-                } else {
-                    warn!("Invalid utxocachesize, expected integer");
-                }
-            }
-            // Block-expiry pruning: "30d", "-1", "0" (a bare TOML integer -1 / 0 also works)
-            "expire" => {
-                let text = match (value.as_str(), value.as_integer()) {
-                    (Some(s), _) => s.to_string(),
-                    (None, Some(i)) => i.to_string(),
-                    _ => {
-                        eprintln!("Invalid expire in config file, expected string like \"30d\"");
-                        std::process::exit(1);
-                    }
-                };
-                match divi_storage::prune::Expire::parse(&text) {
-                    Ok(e) => config.expire = e,
-                    Err(e) => {
-                        eprintln!("config file: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            // Unknown key - log warning
-            _ => {
-                warn!("Unknown configuration key in config file: {}", key);
-            }
+/// Options divid takes that irondivid has nothing for: accepted, with a warning
+const UNSUPPORTED_OPTIONS: &[&str] = &[
+    "alertnotify",
+    "alerts",
+    "blockmaxsize",
+    "blockminsize",
+    "blockprioritysize",
+    "budgetvotemode",
+    "checklevel",
+    "createwalletbackups",
+    "datacarrier",
+    "datacarriersize",
+    "dbcache",
+    "disablesystemnotifications",
+    "discover",
+    "dns",
+    "externalip",
+    "forcednsseed",
+    "forcestart",
+    "genproclimit",
+    "hdseed",
+    "keypool",
+    "listenonion",
+    "litemode",
+    "loadblock",
+    "logips",
+    "logtimestamps",
+    "masternode",
+    "masternodeaddr",
+    "masternodeprivkey",
+    "maxreceivebuffer",
+    "maxsendbuffer",
+    "maxtxfee",
+    "mining",
+    "mnconf",
+    "mnconflock",
+    "mnemonic",
+    "mnemonicpassphrase",
+    "monthlybackups",
+    "onion",
+    "onlynet",
+    "par",
+    "peerbloomfilters",
+    "permitbaremultisig",
+    "proxyrandomize",
+    "reindex",
+    "rescan",
+    "rest",
+    "resync",
+    "rpckeepalive",
+    "rpcthreads",
+    "salvagewallet",
+    "seednode",
+    "sendfreetransactions",
+    "shrinkdebugfile",
+    "spendzeroconfchange",
+    "sysperms",
+    "torcontrol",
+    "torpassword",
+    "txconfirmtarget",
+    "upgradewallet",
+    "upnp",
+    "vault",
+    "vault_min",
+    "whitebind",
+    "whitelist",
+    "zmqpubhashblock",
+    "zmqpubhashtx",
+    "zmqpubrawblock",
+    "zmqpubrawtx",
+];
+
+/// Options read elsewhere (before the node config is built, or by a command)
+const READ_ELSEWHERE: &[&str] = &[
+    "conf",
+    "datadir",
+    "testnet",
+    "regtest",
+    "mode",
+    "daemon",
+    "printtoconsole",
+    "debug",
+    "wallet",
+    "disablewallet",
+    "pid",
+    "export-chain",
+    "export-start",
+    "export-end",
+    "export-output",
+    "export-snapshot",
+    "import-snapshot",
+    "snapshot-root",
+    "sign-snapshot",
+    "verify-snapshot",
+    "snapshot-signer",
+    "maxlogsize",
+    "maxlogfiles",
+    "?",
+    "help",
+    "h",
+    "version",
+    "V",
+];
+
+/// The value of a numeric option as divid reads it (atoi64), or None and a
+/// warning when it is not a number in `range`
+fn number_option(s: &Settings, key: &str, range: std::ops::RangeInclusive<i64>) -> Option<i64> {
+    let text = s.get(key)?;
+    let n = settings::atoi(text);
+    if text.trim().is_empty() || !range.contains(&n) {
+        warn!("Invalid -{}={}: ignored", key, text);
+        return None;
+    }
+    Some(n)
+}
+
+/// An address with an optional port, as -bind and -rpcbind give it
+fn host_and_port(value: &str) -> (String, Option<u16>) {
+    if let Ok(sa) = value.parse::<std::net::SocketAddr>() {
+        let host = match sa.ip() {
+            std::net::IpAddr::V6(v6) => format!("[{}]", v6),
+            v4 => v4.to_string(),
+        };
+        return (host, Some(sa.port()));
+    }
+    if let Ok(ip) = value.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V6(v6) => (format!("[{}]", v6), None),
+            v4 => (v4.to_string(), None),
+        };
+    }
+    match value.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().ok()),
+        _ => (value.to_string(), None),
+    }
+}
+
+/// Apply the settings to the node config, with divid's interactions between
+/// options (init.cpp, net.cpp SetNetworkingParameters, rpcserver.cpp)
+fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
+    let mut s = settings.clone();
+    let regtest = config.network.network_type == NetworkType::Regtest;
+    // -bind means listening; -connect means no DNS seeds and no listening;
+    // -proxy means no listening (net.cpp:1672-1700)
+    if s.is_set("bind") {
+        s.soft_set_bool("listen", true);
+    }
+    if !s.get_multi("connect").is_empty() {
+        s.soft_set_bool("dnsseed", false);
+        s.soft_set_bool("listen", false);
+    }
+    if s.is_set("proxy") {
+        s.soft_set_bool("listen", false);
+    }
+    // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
+    if regtest && !s.is_set("staking") {
+        s.set("staking", "0", false);
+    }
+    if s.get_bool("disablewallet", false) {
+        s.soft_set_bool("staking", false);
+    }
+
+    let port = |key: &str| number_option(&s, key, 1..=65535).map(|p| p as u16);
+
+    if let Some(user) = s.get("rpcuser") {
+        config.rpc.username = Some(user.to_string());
+    }
+    if let Some(password) = s.get("rpcpassword") {
+        config.rpc.password = Some(password.to_string());
+    }
+    if let Some(p) = port("rpcport") {
+        config.rpc.port = p;
+    }
+    // divid serves RPC unless -server=0 (divid.cpp:139)
+    config.rpc.enabled = s.get_bool("server", true);
+    // The RPC server listens on the loopback unless -rpcallowip lets others
+    // in; then on -rpcbind, else on every interface (rpcserver.cpp:633-706)
+    let allowed = s.get_multi("rpcallowip").to_vec();
+    for subnet in &allowed {
+        if divi_rpc::Subnet::parse(subnet).is_none() {
+            anyhow::bail!(
+                "Invalid -rpcallowip subnet specification: {}. Valid are a single IP (e.g. 1.2.3.4), \
+                 a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24).",
+                subnet
+            );
         }
     }
+    let rpcbind = s.get_multi("rpcbind");
+    if allowed.is_empty() {
+        config.rpc.listen_addr = "127.0.0.1".to_string();
+        if !rpcbind.is_empty() {
+            warn!("option -rpcbind was ignored because -rpcallowip was not specified, refusing to allow everyone to connect");
+        }
+    } else if let Some(first) = rpcbind.first() {
+        let (host, p) = host_and_port(first);
+        config.rpc.listen_addr = host;
+        if let Some(p) = p {
+            config.rpc.port = p;
+        }
+        if rpcbind.len() > 1 {
+            warn!(
+                "irondivid listens on one -rpcbind address: {} (the others are ignored)",
+                first
+            );
+        }
+    } else {
+        config.rpc.listen_addr = "[::]".to_string();
+    }
+    config.rpc.allowed_ips = allowed;
+
+    if let Some(p) = port("port") {
+        config.p2p.port = p;
+    }
+    if let Some(first) = s.get_multi("bind").first() {
+        let (host, p) = host_and_port(first);
+        config.p2p.listen_addr = host;
+        if let Some(p) = p {
+            config.p2p.port = p;
+        }
+    }
+    if s.is_set("listen") {
+        config.p2p.listen = Some(s.get_bool("listen", true));
+    }
+    let connect = s.get_multi("connect");
+    if !connect.is_empty() {
+        config.p2p.connect.extend(connect.iter().cloned());
+        config.p2p.enable_discovery = false;
+    }
+    config
+        .network
+        .static_peers
+        .extend(s.get_multi("addnode").iter().cloned());
+    config
+        .network
+        .static_peers
+        .extend(s.get_multi("fullnode").iter().cloned());
+    if !s.get_bool("dnsseed", true) {
+        config.network.dns_seeds.clear();
+    }
+    // -maxconnections counts inbound and outbound; at most 16 are outbound
+    // (net.cpp:106, :757, :1727)
+    if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
+        let n = n as usize;
+        config.p2p.max_outbound = n.min(16);
+        config.p2p.max_inbound = n.saturating_sub(16);
+    }
+    if let Some(ms) = s.get("timeout") {
+        // net.cpp: a timeout of 0 or less is the default
+        let ms = settings::atoi(ms);
+        config.p2p.connect_timeout_ms = if ms > 0 { ms as u64 } else { 5000 };
+    }
+    if let Some(proxy) = s.get("proxy") {
+        config.p2p.proxy = Some(proxy.to_string());
+    }
+    if let Some(n) = number_option(&s, "banscore", 0..=i64::from(u32::MAX)) {
+        config.p2p.ban_score = n as u32;
+    }
+    if let Some(n) = number_option(&s, "bantime", 0..=i64::MAX) {
+        config.p2p.ban_time = n as u64;
+    }
+    if let Some(n) = number_option(&s, "checkblocks", 0..=i64::from(u32::MAX)) {
+        config.check_blocks = n as u32;
+    }
+    if let Some(n) = number_option(&s, "maxreorg", 0..=i64::from(u32::MAX)) {
+        config.max_reorg = Some(n as u32);
+    }
+    if let Some(n) = number_option(&s, "maxorphantx", 0..=i64::MAX) {
+        config.mempool.max_orphan_txs = n as usize;
+    }
+    if let Some(text) = s.get("minrelaytxfee") {
+        // ParseMoney; refused when it is not an amount (init.cpp)
+        let sat = parse_money(text).ok_or_else(|| {
+            anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount>: '{}'", text)
+        })?;
+        config.mempool.min_relay_fee = sat / 1000;
+    }
+    config.staking.enabled = s.get_bool("staking", true);
+    if s.is_set("stakeonstaletip") {
+        config.staking.stake_on_stale_tip = s.get_bool("stakeonstaletip", false);
+    }
+    if let Some(text) = s.get("stakesplitthreshold") {
+        match text.trim().parse::<f64>() {
+            Ok(d) if d >= 0.0 => {
+                config.staking.split_threshold = (d * 100_000_000.0).round() as i64
+            }
+            _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
+        }
+    }
+    for (key, slot) in [
+        ("txindex", &mut config.index.txindex),
+        ("spentindex", &mut config.index.spentindex),
+        ("addressindex", &mut config.index.addressindex),
+    ] {
+        if s.is_set(key) {
+            *slot = s.get_bool(key, false);
+        }
+    }
+    if let Some(n) = number_option(&s, "maxlogsize", 1..=i64::from(u32::MAX)) {
+        config.log.max_file_size = n as u64 * 1_048_576;
+    }
+    if let Some(n) = number_option(&s, "maxlogfiles", 1..=100) {
+        config.log.max_files = n as u32;
+    }
+    if let Some(n) = number_option(&s, "utxocachesize", 0..=i64::MAX) {
+        config.utxo_cache_size = n as u64;
+    }
+    if let Some(text) = s.get("expire") {
+        config.expire = divi_storage::prune::Expire::parse(text)
+            .map_err(|e| anyhow::anyhow!("config file: {}", e))?;
+    }
+    config.blocknotify = s
+        .get("blocknotify")
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+    config.walletnotify = s
+        .get("walletnotify")
+        .filter(|c| !c.is_empty())
+        .map(String::from);
+
+    const APPLIED: &[&str] = &[
+        "rpcuser",
+        "rpcpassword",
+        "rpcport",
+        "server",
+        "rpcallowip",
+        "rpcbind",
+        "port",
+        "bind",
+        "listen",
+        "connect",
+        "addnode",
+        "fullnode",
+        "dnsseed",
+        "maxconnections",
+        "timeout",
+        "proxy",
+        "banscore",
+        "bantime",
+        "checkblocks",
+        "maxreorg",
+        "maxorphantx",
+        "minrelaytxfee",
+        "staking",
+        "stakeonstaletip",
+        "stakesplitthreshold",
+        "txindex",
+        "spentindex",
+        "addressindex",
+        "utxocachesize",
+        "expire",
+        "blocknotify",
+        "walletnotify",
+    ];
+    let mut keys: Vec<&String> = settings.keys().collect();
+    keys.sort();
+    for key in keys {
+        let k = key.as_str();
+        if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) {
+            continue;
+        }
+        if UNSUPPORTED_OPTIONS.contains(&k) {
+            if k == "masternode" {
+                // divid reads -masternode=<alias> as "run as the masternode
+                // <alias> of masternode.conf" and refuses to start without it
+                // (MasternodeModule.cpp:163-190); irondivid cannot run as one
+                anyhow::bail!(
+                    "-masternode={}: irondivid does not run as a masternode; remove the masternode= line to start it",
+                    settings.get("masternode").unwrap_or("")
+                );
+            } else {
+                warn!("Option -{} is not supported by irondivid; ignored", k);
+            }
+        } else {
+            warn!("Unknown option -{}; ignored", k);
+        }
+    }
+    Ok(())
+}
+
+/// Divi Core's ParseMoney: up to 8 decimals, no sign, no exponent. In satoshis.
+fn parse_money(text: &str) -> Option<i64> {
+    let t = text.trim();
+    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
+    if whole.is_empty() && frac.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+        || frac.len() > 8
+        || whole.len() > 10
+    {
+        return None;
+    }
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let frac: i64 = format!("{:0<8}", frac).parse().ok()?;
+    Some(whole * 100_000_000 + frac)
 }
 
 /// Build node configuration from CLI args and config file
@@ -819,117 +680,27 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     } else {
         NodeConfig::mainnet(chain_mode)
     };
-
-    // Set data directory
-    let data_dir = args.datadir.clone().unwrap_or_else(|| {
-        let mut dir = default_data_dir();
-        if args.chain_mode() == ChainMode::PrivateDivi {
-            dir = dir.join("privatedivi");
-        }
-        if args.testnet {
-            dir = dir.join("testnet");
-        } else if args.regtest {
-            dir = dir.join("regtest");
-        }
-        dir
-    });
-    config.data_dir = data_dir;
-
-    // Try to load config file and apply its settings
-    let conf_path = args
-        .conf
-        .clone()
-        .unwrap_or_else(|| config.data_dir.join("irondivi.conf"));
-
-    if let Some(file_config) = load_config_file(&conf_path)? {
-        info!("Loaded config from {:?}", conf_path);
-        apply_config_file(&mut config, &file_config);
-    }
-
-    // Environment overrides the config file (and is itself overridden by the CLI below)
-    if let Some(v) = env_expire {
-        if !v.trim().is_empty() {
-            config.expire = divi_storage::prune::Expire::parse(&v)
-                .map_err(|e| anyhow::anyhow!("IRONDIVI_EXPIRE: {}", e))?;
+    config.data_dir = compute_data_dir(args);
+    if let Some(conf) = &args.conf {
+        if conf.exists() {
+            info!("Loaded config from {:?}", conf);
         }
     }
 
-    // Apply CLI overrides (these take precedence over config file)
-    if let Some(rpcuser) = &args.rpcuser {
-        config.rpc.username = Some(rpcuser.clone());
-    }
-    if let Some(rpcpassword) = &args.rpcpassword {
-        config.rpc.password = Some(rpcpassword.clone());
-    }
-    if let Some(rpcport) = args.rpcport {
-        config.rpc.port = rpcport;
-    }
-    if let Some(rpcbind) = &args.rpcbind {
-        config.rpc.listen_addr = rpcbind.clone();
-    }
-    if let Some(port) = args.port {
-        config.p2p.port = port;
-    }
-    if let Some(bind) = &args.bind {
-        config.p2p.listen_addr = bind.clone();
-    }
-    if let Some(n) = args.checkblocks {
-        config.check_blocks = n;
-    }
-    if let Some(n) = args.maxreorg {
-        config.max_reorg = Some(n);
-    }
-    if let Some(proxy) = &args.proxy {
-        config.p2p.proxy = Some(proxy.clone());
-    }
-    if args.debug {
-        config.debug.debug_logging = true;
-        config.debug.log_rpc = true;
-    }
-
-    if let Some(staking) = args.staking {
-        config.staking.enabled = staking;
-    }
-    if args.stakeonstaletip {
-        config.staking.stake_on_stale_tip = true;
-    }
-    if let Some(score) = args.banscore {
-        config.p2p.ban_score = score;
-    }
-    if let Some(secs) = args.bantime {
-        config.p2p.ban_time = secs;
-    }
-    if let Some(divi) = args.stakesplitthreshold {
-        config.staking.split_threshold = (divi * 100_000_000.0).round() as i64;
-    }
-    // Only flags given on the command line override the config file
-    if let Some(b) = args.txindex {
-        config.index.txindex = b;
-    }
-    if let Some(b) = args.spentindex {
-        config.index.spentindex = b;
-    }
-    if let Some(b) = args.addressindex {
-        config.index.addressindex = b;
-    }
-
-    if let Some(cache_size) = args.utxocachesize {
-        config.utxo_cache_size = cache_size;
+    // Everything from the command line and the file, the command line first;
+    // IRONDIVI_EXPIRE then --expire override the file's expire
+    let mut settings = args.settings.clone();
+    if let Some(v) = env_expire.filter(|v| !v.trim().is_empty()) {
+        divi_storage::prune::Expire::parse(&v)
+            .map_err(|e| anyhow::anyhow!("IRONDIVI_EXPIRE: {}", e))?;
+        if !args.cli.is_set("expire") {
+            settings.set("expire", &v, false);
+        }
     }
     if let Some(v) = &args.expire {
-        config.expire = divi_storage::prune::Expire::parse(v)
-            .map_err(|e| anyhow::anyhow!("--expire: {}", e))?;
+        divi_storage::prune::Expire::parse(v).map_err(|e| anyhow::anyhow!("--expire: {}", e))?;
     }
-
-    // Add static peers from CLI (append to any from config file)
-    if !args.connect.is_empty() {
-        // Connect-only: resolved by NodeConfig::peer_sources().
-        config.p2p.connect.extend(args.connect.clone());
-        config.p2p.enable_discovery = false; // Don't discover when using -connect
-    } else {
-        config.network.static_peers.extend(args.addnode.clone());
-        config.network.static_peers.extend(args.fullnode.clone());
-    }
+    apply_settings(&mut config, &settings)?;
 
     Ok(config)
 }
@@ -1038,8 +809,16 @@ impl RotatingLog {
     }
 }
 
+/// Set by SIGHUP: the next log write reopens debug.log (it may have been
+/// moved away by logrotate)
+static REOPEN_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl std::io::Write for RotatingLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.file = None;
+            self.reopen()?;
+        }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
         }
@@ -1378,6 +1157,11 @@ async fn run_daemon(
     info!("Initializing node...");
     let node = Node::new(config.clone()).with_context(|| "Failed to initialize node")?;
 
+    // -blocknotify, before any block comes in (init.cpp:1563-1564)
+    if let Some(cmd) = config.blocknotify.clone() {
+        spawn_block_notify(node.chain().clone(), cmd);
+    }
+
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
 
@@ -1410,7 +1194,7 @@ async fn run_daemon(
 
         None
     } else {
-        let wallet_dir = wallet_path.unwrap_or_else(|| config.data_dir.join("wallet"));
+        let wallet_dir = core_files::wallet_dir(&config.data_dir, wallet_path.as_deref());
         let wallet_network = match config.network.network_type {
             NetworkType::Mainnet => WalletNetwork::Mainnet,
             NetworkType::Testnet => WalletNetwork::Testnet,
@@ -1421,6 +1205,9 @@ async fn run_daemon(
             wallet_network,
             config.network.chain_mode,
         )?);
+        if let Some(ref w) = wallet {
+            core_files::lock_masternode_collateral(w, &config.data_dir);
+        }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
         if let Some(ref wallet_arc) = wallet {
@@ -1725,6 +1512,12 @@ async fn run_daemon(
         None => info!("RPC authentication: rpcuser/rpcpassword"),
     }
     let rpc_config = RpcConfig {
+        allowed: config
+            .rpc
+            .allowed_ips
+            .iter()
+            .filter_map(|a| divi_rpc::Subnet::parse(a))
+            .collect(),
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
@@ -1746,7 +1539,17 @@ async fn run_daemon(
     });
     let wallet_for_shutdown = wallet.clone();
 
-    if let Some(wallet) = wallet {
+    // -walletnotify (-blocknotify is set before the node starts)
+    if let (Some(cmd), Some(wallet)) = (config.walletnotify.clone(), wallet.clone()) {
+        spawn_wallet_notify(wallet, cmd);
+    }
+
+    if !config.rpc.enabled {
+        // -server=0: no RPC server, the node runs until it is told to stop
+        info!("RPC server disabled (-server=0)");
+        let _ = shutdown_rx.recv().await;
+        info!("Shutdown signal received");
+    } else if let Some(wallet) = wallet {
         // Setup staker callbacks if enabled
         let staker_ref = staker.clone();
         let wallet_for_staking_status = Arc::clone(&wallet);
@@ -1918,15 +1721,72 @@ async fn run_daemon(
     info!("Stopping node...");
     node.stop().await.with_context(|| "Failed to stop node")?;
 
+    let mut clean = true;
     if let Some(wallet) = wallet_for_shutdown {
         match wallet.save() {
             Ok(()) => info!("Wallet saved"),
-            Err(e) => error!("Failed to save wallet on shutdown: {}", e),
+            Err(e) => {
+                error!("Failed to save wallet on shutdown: {}", e);
+                clean = false;
+            }
+        }
+    }
+    if clean {
+        if let Err(e) = node.chain().end_run() {
+            error!("Failed to record the clean stop: {}", e);
         }
     }
 
     info!("Node stopped");
     Ok(())
+}
+
+/// Run a notify command as divid's runCommand: through the shell, `%s`
+/// replaced, not waited for
+fn run_notify(cmd: &str, value: &str) {
+    let cmd = cmd.replace("%s", value);
+    std::thread::spawn(move || {
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .status()
+        {
+            Ok(status) if !status.success() => warn!("runCommand error: {} ({})", cmd, status),
+            Ok(_) => {}
+            Err(e) => warn!("runCommand error: {} ({})", cmd, e),
+        }
+    });
+}
+
+/// -blocknotify: run the command each time the best block changes, with the
+/// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
+fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
+    chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+}
+
+/// -walletnotify: run the command each time a wallet transaction is added or
+/// updated (in the mempool, then in a block), with its txid
+/// (init.cpp:1132-1143)
+fn spawn_wallet_notify(wallet: Arc<WalletDb>, cmd: String) {
+    tokio::spawn(async move {
+        let state = |w: &WalletDb| -> std::collections::HashMap<divi_primitives::hash::Hash256, Option<u32>> {
+            w.get_transactions(None)
+                .into_iter()
+                .map(|t| (t.txid, t.block_height))
+                .collect()
+        };
+        let mut known = state(&wallet);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let now = state(&wallet);
+            for (txid, height) in &now {
+                if known.get(txid) != Some(height) {
+                    run_notify(&cmd, &txid.to_string());
+                }
+            }
+            known = now;
+        }
+    });
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
@@ -2207,18 +2067,64 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// -pid, default divid.pid, relative to the data directory (util.cpp:115-119)
+fn pid_file_path(args: &Args, data_dir: &std::path::Path) -> PathBuf {
+    match &args.pid {
+        Some(p) if p.is_absolute() => p.clone(),
+        Some(p) => data_dir.join(p),
+        None => data_dir.join("divid.pid"),
+    }
+}
+
 fn main() -> Result<()> {
     // Parse CLI arguments, completed from the config file where they are unset
-    let args = match resolve_args(Args::parse()) {
+    let args = match Args::try_parse_from(std::env::args()) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("Error: {:#}", e);
             std::process::exit(1);
         }
     };
+    // divid's AppInit: -?, -help and -version print and exit 1 (divid.cpp)
+    if args.help || args.version {
+        print!(
+            "IronDivi Daemon version v{}\n{}",
+            env!("CARGO_PKG_VERSION"),
+            if args.help { USAGE } else { "" }
+        );
+        std::process::exit(1);
+    }
+    // ... a -datadir that is not a directory is refused (divid.cpp)
+    if let Some(dir) = &args.datadir {
+        if !dir.is_dir() {
+            eprintln!(
+                "Error: Specified data directory \"{}\" does not exist.",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    let args = match resolve_args(args) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    };
+    // ... and so are -testnet and -regtest together
+    if args.testnet && args.regtest {
+        eprintln!("Error: Invalid combination of -regtest and -testnet.");
+        std::process::exit(1);
+    }
 
     // Compute data directory early (needed for daemonization and logging)
     let data_dir = compute_data_dir(&args);
+    if let Err(e) =
+        core_files::refuse_at_start(&data_dir, args.wallet.as_deref(), args.disablewallet)
+    {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
 
     // Handle daemonization BEFORE initializing tokio runtime (Unix only)
     #[cfg(unix)]
@@ -2231,7 +2137,7 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
 
-        let pid_file = data_dir.join("irondivid.pid");
+        let pid_file = pid_file_path(&args, &data_dir);
         let log_file = data_dir.join("debug.log");
 
         eprintln!("Logging to {:?}", log_file);
@@ -2300,6 +2206,9 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
+    // Removed at a clean stop, after `args` has been taken apart
+    let pid_file = pid_file_path(&args, &data_dir);
+
     // Build log config from CLI args
     let log_config = LogConfig {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
@@ -2317,6 +2226,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Print banner
     print_banner(&config);
+    core_files::warn_core_wallet(&config.data_dir);
 
     // Check for conflicting network options
     if args.testnet && args.regtest {
@@ -2338,6 +2248,20 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Set up shutdown channel
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+    // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
+    // (init.cpp:513-516), so a logrotate postrotate line does not stop it
+    #[cfg(unix)]
+    {
+        let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
+            .context("Failed to install SIGHUP handler")?;
+        tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                REOPEN_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
+                info!("Received SIGHUP, reopening debug.log");
+            }
+        });
+    }
 
     // Set up signal handler
     let shutdown_tx_clone = shutdown_tx.clone();
@@ -2389,6 +2313,12 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             source = err.source();
         }
         std::process::exit(1);
+    }
+
+    // Divi Core removes its pid file at a clean stop (init.cpp:396)
+    if std::fs::read_to_string(&pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string())
+    {
+        let _ = std::fs::remove_file(&pid_file);
     }
 
     info!("IronDivi shutdown complete");
@@ -2575,12 +2505,13 @@ mod config_format_tests {
         assert_eq!(cfg("", &[]).unwrap().p2p.port, 51472);
     }
 
-    /// Divi Core 3.0 does not read [section] settings; they must not leak into the main ones.
+    /// Divi Core 3.0 applies [section] settings on every network
+    /// (ParseNetworkSpecificFlag); the first value of a name still wins
     #[test]
-    fn section_settings_are_not_applied() {
+    fn section_settings_apply_first_value_wins() {
         let c = cfg("rpcuser=foo\n[test]\nrpcport=1\nrpcuser=bar\n", &[]).unwrap();
         assert_eq!(c.rpc.username.as_deref(), Some("foo"));
-        assert_eq!(c.rpc.port, 51473);
+        assert_eq!(c.rpc.port, 1);
     }
 
     /// Log-file and console settings in the file reach the logger (they were overwritten
@@ -3207,5 +3138,136 @@ mod submit_error_tests {
             }
             other => panic!("expected Rejected, got {other:?}"),
         }
+    }
+}
+
+/// The same divi.conf lines and command line give the node divid's values
+/// (Settings.cpp, init.cpp, net.cpp, rpcserver.cpp)
+#[cfg(test)]
+mod divid_option_tests {
+    use super::*;
+
+    fn cfg_in(file: &str, conf: &str, extra: &[&str]) -> Result<NodeConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(file), conf).unwrap();
+        let mut argv = vec![
+            "irondivid".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(argv))
+    }
+
+    fn cfg(conf: &str) -> NodeConfig {
+        cfg_in("irondivi.conf", conf, &[]).unwrap()
+    }
+
+    /// divid reads divi.conf in its data directory
+    #[test]
+    fn divi_conf_in_the_data_directory_is_read() {
+        let c = cfg_in("divi.conf", "rpcuser=u\nrpcpassword=p\nrpcport=1234\n", &[]).unwrap();
+        assert_eq!(c.rpc.port, 1234);
+        assert_eq!(c.rpc.username.as_deref(), Some("u"));
+    }
+
+    /// -conf is relative to the data directory (Settings::GetConfigFile)
+    #[test]
+    fn conf_is_relative_to_the_data_directory() {
+        let c = cfg_in(
+            "alt.conf",
+            "rpcuser=u\nrpcport=1235\n",
+            &["--conf=alt.conf"],
+        )
+        .unwrap();
+        assert_eq!(c.rpc.port, 1235);
+    }
+
+    /// The file's first value of an option wins; the command line wins over it
+    #[test]
+    fn first_value_in_the_file_wins() {
+        assert_eq!(cfg("rpcuser=x\nrpcport=1\nrpcport=2\n").rpc.port, 1);
+        let c = cfg_in("irondivi.conf", "rpcuser=x\nrpcport=1\n", &["--rpcport=3"]).unwrap();
+        assert_eq!(c.rpc.port, 3);
+    }
+
+    /// `nolisten=1` is `listen=0`, and divid reads `listen=true` as 0 (atoi)
+    #[test]
+    fn negation_and_divid_booleans() {
+        assert_eq!(cfg("rpcuser=x\nnolisten=1\n").p2p.listen, Some(false));
+        assert_eq!(cfg("rpcuser=x\nlisten=true\n").p2p.listen, Some(false));
+        assert_eq!(cfg("rpcuser=x\nlisten=1\n").p2p.listen, Some(true));
+    }
+
+    /// -bind means listening even with -connect; -proxy means no listening
+    #[test]
+    fn bind_and_proxy_change_listening_as_in_divid() {
+        let c = cfg("rpcuser=x\nconnect=127.0.0.1:1\nbind=127.0.0.1\n");
+        assert!(c.peer_sources().listen);
+        let c = cfg("rpcuser=x\nproxy=127.0.0.1:9050\n");
+        assert!(!c.peer_sources().listen);
+    }
+
+    /// -dnsseed=0, -maxconnections, -server=0, -maxorphantx, -minrelaytxfee
+    #[test]
+    fn network_and_relay_options_are_applied() {
+        assert!(cfg("rpcuser=x\ndnsseed=0\n").network.dns_seeds.is_empty());
+        let c = cfg("rpcuser=x\nmaxconnections=20\n");
+        assert_eq!((c.p2p.max_inbound, c.p2p.max_outbound), (4, 16));
+        let c = NodeConfig::mainnet(ChainMode::Divi);
+        assert_eq!((c.p2p.max_inbound, c.p2p.max_outbound), (109, 16));
+        assert!(!cfg("rpcuser=x\nserver=0\n").rpc.enabled);
+        assert_eq!(cfg("rpcuser=x\nmaxorphantx=7\n").mempool.max_orphan_txs, 7);
+        assert_eq!(
+            cfg("rpcuser=x\nminrelaytxfee=0.0002\n")
+                .mempool
+                .min_relay_fee,
+            20
+        );
+        assert!(cfg_in("irondivi.conf", "rpcuser=x\nminrelaytxfee=abc\n", &[]).is_err());
+    }
+
+    /// Without -rpcallowip divid listens on the loopback and ignores -rpcbind
+    #[test]
+    fn rpcbind_needs_rpcallowip() {
+        assert_eq!(
+            cfg("rpcuser=x\nrpcbind=0.0.0.0\n").rpc.listen_addr,
+            "127.0.0.1"
+        );
+    }
+
+    /// Regtest does not stake unless asked; nor does a node without a wallet
+    #[test]
+    fn regtest_and_disablewallet_do_not_stake() {
+        let c = cfg_in("irondivi.conf", "rpcuser=x\n", &["--regtest"]).unwrap();
+        assert!(!c.staking.enabled);
+        let c = cfg_in("irondivi.conf", "rpcuser=x\nstaking=1\n", &["--regtest"]).unwrap();
+        assert!(c.staking.enabled);
+        assert!(!cfg("rpcuser=x\ndisablewallet=1\n").staking.enabled);
+        assert!(cfg("rpcuser=x\n").staking.enabled);
+    }
+
+    /// divid reads any masternode=<alias> as running as that masternode and
+    /// refuses to start when it cannot; irondivid cannot run as one at all.
+    /// masternodeprivkey and masternodeaddr alone do nothing in either.
+    #[test]
+    fn a_masternode_line_is_refused() {
+        for value in ["1", "0", "mn1"] {
+            let conf = format!("rpcuser=x\nmasternode={}\n", value);
+            assert!(cfg_in("irondivi.conf", &conf, &[]).is_err(), "{value}");
+        }
+        let c = cfg_in(
+            "irondivi.conf",
+            "rpcuser=x\nmasternodeprivkey=abc\nmasternodeaddr=1.2.3.4:51472\n",
+            &[],
+        );
+        assert!(c.is_ok());
+    }
+
+    /// divid's default RPC ports (chainparamsbase.cpp:25, 53)
+    #[test]
+    fn default_rpc_ports_are_divid_s() {
+        assert_eq!(NodeConfig::mainnet(ChainMode::Divi).rpc.port, 51473);
+        assert_eq!(NodeConfig::testnet(ChainMode::Divi).rpc.port, 51475);
+        assert_eq!(NodeConfig::regtest(ChainMode::Divi).rpc.port, 51475);
     }
 }

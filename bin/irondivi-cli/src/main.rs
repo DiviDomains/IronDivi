@@ -242,7 +242,7 @@ fn version_line() -> String {
 fn version_text() -> String {
     version_line()
         + "\nUsage:\n  irondivi-cli [options] <command> [params]  Send command to IronDivi\n  irondivi-cli [options] help                List commands\n  irondivi-cli [options] help <command>      Get help for a command\n"
-        + "\nOptions:\n  -?                     This help message\n  -conf=<file>           Configuration file (default: irondivi.conf, else divi.conf, in the data directory)\n  -datadir=<dir>         Data directory\n  -testnet               Use the test network\n  -regtest               Use the regression test network\n  -mode=<divi|privatedivi>  Chain mode (default: divi)\n  -rpcconnect=<ip>       Send commands to node running on <ip> (default: 127.0.0.1)\n  -rpcport=<port>        Connect to JSON-RPC on <port> (default: 51473, testnet 51475, regtest 51475)\n  -rpcwait               Wait for RPC server to start\n  -rpcuser=<user>        Username for JSON-RPC connections\n  -rpcpassword=<pw>      Password for JSON-RPC connections (without either, the node's .cookie)\n  -rpcwallet=<name>      Wallet of a multi-wallet node\n  -named                 Pass named arguments (name=value) instead of positional ones\n  -stdin                 Read extra arguments from standard input, one per line\n  -stdinrpcpass          Read the RPC password from standard input\n  -stdinwalletpassphrase Read the wallet passphrase(s) from standard input\n  -getinfo, -netinfo [level], -generate <n>  Summary commands\n  Options may also be written --name value.\n"
+        + "\nOptions:\n  -?                     This help message\n  -conf=<file>           Configuration file (default: irondivi.conf, else divi.conf, in the data directory)\n  -datadir=<dir>         Data directory\n  -testnet               Use the test network\n  -regtest               Use the regression test network\n  -mode=<divi|privatedivi>  Chain mode (default: divi)\n  -rpcconnect=<ip>       Send commands to node running on <ip> (default: 127.0.0.1)\n  -rpcport=<port>        Connect to JSON-RPC on <port> (default: 51473, testnet and regtest 51475)\n  -rpcwait               Wait for RPC server to start\n  -rpcuser=<user>        Username for JSON-RPC connections\n  -rpcpassword=<pw>      Password for JSON-RPC connections (without either, the node's .cookie)\n  -rpcwallet=<name>      Wallet of a multi-wallet node\n  -named                 Pass named arguments (name=value) instead of positional ones\n  -stdin                 Read extra arguments from standard input, one per line\n  -stdinrpcpass          Read the RPC password from standard input\n  -stdinwalletpassphrase Read the wallet passphrase(s) from standard input\n  -getinfo, -netinfo [level], -generate <n>  Summary commands\n  Options may also be written --name value.\n"
 }
 
 /// Get default RPC port based on network
@@ -251,7 +251,6 @@ fn default_rpc_port(testnet: bool, regtest: bool, privatedivi: bool) -> u16 {
         (true, true, _) => 52475,
         (true, _, true) => 52473,
         (true, _, _) => 52471,
-        // Divi Core's RPC ports (chainparamsbase.cpp:25, :53), which irondivid serves
         (_, true, _) => 51475,
         (_, _, true) => 51475,
         _ => 51473,

@@ -37,10 +37,21 @@
 //! assert_ne!(addr1.to_string(), addr2.to_string());
 //! ```
 
+/// A point where a test can stop the operation, as if the process died there
+/// (see `fault`); nothing outside test builds
+macro_rules! stop_point {
+    ($point:expr) => {
+        #[cfg(test)]
+        crate::fault::check($point)?;
+    };
+}
+
 pub mod address;
 pub mod coin_selection;
 pub mod coinstake;
 pub mod error;
+#[cfg(test)]
+mod fault;
 pub mod hd;
 pub mod keystore;
 pub mod persistence;
