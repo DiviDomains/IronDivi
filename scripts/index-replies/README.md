@@ -79,10 +79,6 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 ## KNOWN differences
 
-- **Address index off:** `no index:` rows of `getaddressbalance`, `getaddressdeltas`, `getaddresstxids` and
-  `getaddressutxos` (8 rows). divid answers -5 "No information available for address" (rpcmisc.cpp:658, :662).
-  irondivid answers -5 with a text that names the option to set (docs/divid-differences.md R7). An address that is
-  not valid is still refused first with divid's -5 "Invalid address".
 - **`getlotteryblockwinners -1`:** not sent to divid. divid reads the block at height -1, a null pointer
   (rpclottery.cpp:48-51), and stops. irondivid answers for genesis; the row shows irondivid's answer only.
 - **`no index: getlotteryblockwinners, chain below block 101`:** not sent to divid. Before the first lottery block

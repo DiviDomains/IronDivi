@@ -37,11 +37,6 @@ START_TIMEOUT = 120
 # README.md with divid's source line; a KNOWN row that starts to match divid is a
 # FAIL, so the list stays true.
 KNOWN = {}
-INDEX_OFF = ("divid answers -5 \"No information available for address\" (rpcmisc.cpp:658, :662); irondivid "
-             "names the option to set (docs/divid-differences.md R7)")
-for _m in ("getaddressbalance", "getaddressdeltas", "getaddresstxids", "getaddressutxos"):
-    for _f in ("address", "{addresses: [A, B]}"):
-        KNOWN[f"no index: {_m} {_f}"] = INDEX_OFF
 KNOWN["no index: getlotteryblockwinners, chain below block 101"] = (
     "not sent to divid: before the first lottery block (101 on regtest) it reads the last lottery block as the "
     "missing block 101 (LotteryWinnersCalculator.cpp:63-68) and stops on its null pointer (rpclottery.cpp:53-56); "
