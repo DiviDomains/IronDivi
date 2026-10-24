@@ -93,6 +93,11 @@ pub struct MempoolTxInfo {
     pub time: i64,
     /// Unconfirmed in-pool parents
     pub depends: Vec<Hash256>,
+    /// Chain height when the transaction entered the pool
+    pub height: u32,
+    /// Coin-age priority when it entered, and at the current height
+    pub starting_priority: f64,
+    pub current_priority: f64,
 }
 
 /// Fee estimation result
@@ -880,7 +885,7 @@ impl BlockchainRpc {
         };
 
         if verbose {
-            let height = self.chain.height();
+            // Divi Core rpcblockchain.cpp:122-128
             let mut out = serde_json::Map::new();
             for info in mempool.get_tx_infos() {
                 out.insert(
@@ -889,9 +894,9 @@ impl BlockchainRpc {
                         "size": info.size,
                         "fee": info.fee_sat as f64 / 100_000_000.0,
                         "time": info.time,
-                        "height": height,
-                        "startingpriority": 0.0,
-                        "currentpriority": 0.0,
+                        "height": info.height,
+                        "startingpriority": info.starting_priority,
+                        "currentpriority": info.current_priority,
                         "depends": info.depends.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
                     }),
                 );
