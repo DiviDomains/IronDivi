@@ -464,6 +464,13 @@ impl BlockSync {
         *self.state.read()
     }
 
+    /// Height of the best header this node holds: the chain tip plus the
+    /// headers waiting for their blocks, which follow on from it (Divi Core's
+    /// pindexBestHeader)
+    pub fn best_header_height(&self) -> u32 {
+        self.chain.height() + self.pending_headers.read().len() as u32
+    }
+
     /// Get current sync progress
     pub fn progress(&self) -> SyncProgress {
         let stats = self.stats.read();

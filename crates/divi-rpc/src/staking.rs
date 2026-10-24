@@ -58,12 +58,17 @@ pub type SetStakingCallback = Arc<dyn Fn(bool) -> Result<(), String> + Send + Sy
 /// value, and returns the current one
 pub type SplitThresholdCallback = Arc<dyn Fn(Option<i64>) -> i64 + Send + Sync>;
 
+/// Callback that mines blocks to the wallet at once (regtest setgenerate) and
+/// returns their hashes
+pub type GenerateCallback = Arc<dyn Fn(u32) -> Result<Vec<String>, String> + Send + Sync>;
+
 const COIN: i64 = 100_000_000;
 
 pub struct StakingRpc {
     status_callback: RwLock<Option<StakingStatusCallback>>,
     set_staking_callback: RwLock<Option<SetStakingCallback>>,
     split_threshold_callback: RwLock<Option<SplitThresholdCallback>>,
+    generate_callback: RwLock<Option<GenerateCallback>>,
     reserve_balance: RwLock<f64>,
 }
 
@@ -73,6 +78,7 @@ impl StakingRpc {
             status_callback: RwLock::new(None),
             set_staking_callback: RwLock::new(None),
             split_threshold_callback: RwLock::new(None),
+            generate_callback: RwLock::new(None),
             reserve_balance: RwLock::new(0.0),
         }
     }
@@ -90,6 +96,11 @@ impl StakingRpc {
     /// Set the stake split threshold callback
     pub fn set_split_threshold_control(&self, callback: SplitThresholdCallback) {
         *self.split_threshold_callback.write() = Some(callback);
+    }
+
+    /// Set the block generation callback
+    pub fn set_generate_control(&self, callback: GenerateCallback) {
+        *self.generate_callback.write() = Some(callback);
     }
 
     fn split_threshold(&self, new_sats: Option<i64>) -> Result<i64, Error> {
@@ -215,6 +226,44 @@ impl StakingRpc {
         Ok(serde_json::json!({
             "staking": enable
         }))
+    }
+
+    /// setgenerate - mine blocks to the wallet at once, as Divi Core does on
+    /// regtest: `setgenerate N` returns the hashes of the N new blocks, null
+    /// for N < 1. The caller checks the argument count and the network.
+    pub fn set_generate(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // json_spirit's get_int
+        let value = params.get(0).cloned().unwrap_or(serde_json::Value::Null);
+        let count = value.as_i64().filter(|_| !value.is_f64()).ok_or_else(|| {
+            let type_name = match &value {
+                serde_json::Value::Object(_) => "obj",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::String(_) => "str",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(n) if n.is_f64() => "real",
+                serde_json::Value::Number(_) => "int",
+                serde_json::Value::Null => "null",
+            };
+            RpcError::new(
+                codes::MISC_ERROR,
+                format!("value is type {}, expected int", type_name),
+            )
+        })?;
+        if count < 1 {
+            return Ok(serde_json::Value::Null);
+        }
+        let count = u32::try_from(count)
+            .map_err(|_| RpcError::invalid_params("numberofblocks is too large"))?;
+
+        let callback = self.generate_callback.read().clone();
+        let callback = callback.ok_or_else(|| {
+            RpcError::new(codes::MISC_ERROR, "setgenerate needs a wallet to mine to")
+        })?;
+        let hashes = callback(count).map_err(|e| {
+            info!("setgenerate failed: {}", e);
+            RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block")
+        })?;
+        Ok(serde_json::json!(hashes))
     }
 
     pub fn reserve_balance(&self, params: &Params) -> Result<serde_json::Value, Error> {
