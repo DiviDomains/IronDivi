@@ -512,3 +512,34 @@ fn mnemonicpassphrase_alone_makes_new_words_with_it() {
         !dir.path().join("wallet").exists() && !dir.path().join("regtest").join("wallet").exists()
     );
 }
+
+/// Without -daemon divid writes divid.pid too (init.cpp:1470) and removes it
+/// at a clean stop and after a failed start (init.cpp:396)
+#[test]
+fn pid_file_is_written_without_daemon_and_removed_at_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc_port = free_port();
+    let pid_file = dir.path().join("divid.pid");
+    let daemon = Daemon::start(
+        &divid_args(dir.path(), rpc_port),
+        &[("WALLET_MNEMONIC", MNEMONIC)],
+        rpc_port,
+        true,
+    );
+    let written = std::fs::read_to_string(&pid_file).unwrap_or_default();
+    assert_eq!(written.trim(), daemon.child.id().to_string(), "divid.pid");
+    daemon.rpc("stop", json!([]));
+    assert!(
+        eventually(|| !pid_file.exists()),
+        "divid.pid left after a clean stop"
+    );
+    drop(daemon);
+
+    // A start that fails after the pid file is written: the chain database
+    // belongs to regtest, the node is started for testnet
+    let mut args = divid_args(dir.path(), free_port());
+    args[0] = "-testnet".into();
+    let out = output_within(Command::new(env!("CARGO_BIN_EXE_irondivid")).args(&args));
+    assert!(!out.status.success());
+    assert!(!pid_file.exists(), "divid.pid left after a failed start");
+}

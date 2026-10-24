@@ -33,8 +33,8 @@ pub enum RequestId {
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    /// JSON-RPC version ("2.0", "1.0", or absent: Bitcoin-style clients
-    /// such as BasicSwap send only method/params/id, which divid accepts)
+    /// JSON-RPC version. Divi Core's divi-cli and other JSON-RPC 1.0 clients
+    /// leave it out, and divid never reads it (rpcserver.cpp:876-901)
     #[serde(default)]
     pub jsonrpc: String,
     /// Request ID

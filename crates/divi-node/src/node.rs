@@ -529,6 +529,10 @@ impl Node {
 
                         // Update sync with peer's height
                         block_sync.update_peer_height(peer_id, version.start_height.max(0) as u32);
+
+                        if peer_manager.is_inbound(peer_id) {
+                            spork_manager.inbound_peer_connected(peer_id).await;
+                        }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
                         tracing::warn!("Peer {} disconnected: {}", peer_id, reason);

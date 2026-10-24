@@ -1899,6 +1899,57 @@ mod tests {
         );
     }
 
+    /// The request exactly as Divi Core 3.0.0's divi-cli sends it: JSON-RPC
+    /// 1.0 with no "jsonrpc" member, which divid accepts
+    #[tokio::test]
+    async fn requests_from_divi_cli_are_answered() {
+        let (server, _dir) = create_test_server();
+        let config = RpcConfig {
+            allowed: Vec::new(),
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..RpcConfig::default()
+        };
+        let router = create_router_with_auth(server, &config);
+        for (path, body) in [
+            (
+                "/",
+                "{\"method\":\"getblockcount\",\"params\":[],\"id\":1}\n",
+            ),
+            (
+                "/wallet/w",
+                "{\"method\":\"getblockcount\",\"params\":[],\"id\":1}\n",
+            ),
+            (
+                "/",
+                "[{\"method\":\"getblockcount\",\"params\":[],\"id\":1}]",
+            ),
+        ] {
+            let post = format!(
+                "POST {path} HTTP/1.1\r\nUser-Agent: divi-json-rpc/v3.0.0\r\nHost: {{addr}}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\
+                 Accept: application/json\r\nAuthorization: {}\r\n\r\n{body}",
+                body.len(),
+                basic("alice", "s3cret"),
+            );
+            let response = raw_response(router.clone(), post).await;
+            let reply = &response[response.find("\r\n\r\n").unwrap() + 4..];
+            let reply: serde_json::Value = serde_json::from_str(reply).unwrap();
+            let reply = if reply.is_array() {
+                reply[0].clone()
+            } else {
+                reply
+            };
+            assert!(reply["error"].is_null(), "{path} {body}: {reply}");
+            assert_eq!(
+                reply["result"],
+                serde_json::json!(0),
+                "{path} {body}: {reply}"
+            );
+            assert_eq!(reply["id"], serde_json::json!(1), "{path} {body}: {reply}");
+        }
+    }
+
     #[tokio::test]
     async fn cookie_credentials_authenticate() {
         let (server, dir) = create_test_server();

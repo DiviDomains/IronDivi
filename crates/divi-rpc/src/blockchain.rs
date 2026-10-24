@@ -378,14 +378,16 @@ impl BlockchainRpc {
             .get_i64(0)
             .ok_or_else(|| RpcError::invalid_params("Missing height parameter"))?;
 
-        let height = height as u32;
-        match self.chain.get_block_index_by_height(height)? {
+        // Divi Core: a height below 0 or above the tip is out of range
+        // (rpcblockchain.cpp:168-170)
+        let out_of_range =
+            || RpcError::new(codes::INVALID_PARAMETER, "Block height out of range").into();
+        if height < 0 || height > i64::from(self.chain.height()) {
+            return Err(out_of_range());
+        }
+        match self.chain.get_block_index_by_height(height as u32)? {
             Some(index) => Ok(json!(index.hash.to_string())),
-            None => Err(RpcError::invalid_params(format!(
-                "Block height {} not in main chain",
-                height
-            ))
-            .into()),
+            None => Err(out_of_range()),
         }
     }
 
@@ -1541,6 +1543,35 @@ mod tests {
     fn header_of(rpc: &BlockchainRpc, hash: Hash256) -> Value {
         rpc.get_block_header(&Params::Array(vec![json!(hash.to_string())]))
             .unwrap()
+    }
+
+    /// getblockhash answers a height outside the active chain as Divi Core
+    /// does: RPC_INVALID_PARAMETER "Block height out of range"
+    #[test]
+    fn getblockhash_out_of_range_is_divid_s_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(divi_storage::ChainDatabase::open(dir.path()).unwrap());
+        let params = divi_storage::ChainParams::for_network(
+            NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        for blk in pow_chain(&chain, 2, 0xA1, 0) {
+            chain.accept_block(blk).unwrap();
+        }
+        let rpc = BlockchainRpc::new(chain);
+        let at = |h: i64| rpc.get_block_hash(&Params::Array(vec![json!(h)]));
+        assert!(at(0).is_ok());
+        assert!(at(2).is_ok());
+        for height in [3, 99_999, -1] {
+            match at(height) {
+                Err(Error::Rpc(e)) => {
+                    assert_eq!(e.code, codes::INVALID_PARAMETER, "{height}");
+                    assert_eq!(e.message, "Block height out of range", "{height}");
+                }
+                other => panic!("{height}: {other:?}"),
+            }
+        }
     }
 
     #[test]
