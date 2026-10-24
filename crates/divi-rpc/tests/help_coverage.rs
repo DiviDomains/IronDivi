@@ -66,10 +66,17 @@ fn help_covers_every_dispatched_method() {
         if m == "stop" {
             continue; // reaching the handler would ask the node to shut down
         }
+        // (a regtest-only method off regtest is "Method disabled", -32601 too)
         if let Some(e) = call(&server, m, vec![]).error {
-            // A wallet call on a node without a wallet is dispatched, and
-            // answers -32601 as Divi Core does (rpcserver.cpp:1043-1047)
-            assert_ne!(e.message, "Method not found", "{m} is not dispatched");
+            // -32601 here is never "Method not found": either a call that
+            // works on regtest only ("Method disabled: ...") or a wallet call
+            // on a node without a wallet (rpcserver.cpp:1043-1047)
+            assert!(
+                e.code != -32601
+                    || e.message.starts_with("Method disabled")
+                    || e.message == "Method unavailable due to manually disabled wallet",
+                "{m} is not dispatched"
+            );
         }
     }
 

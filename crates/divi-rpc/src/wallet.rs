@@ -1633,6 +1633,7 @@ impl WalletRpc {
             .into());
         }
         check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
+        wallet.note_committed(&tx.txid());
         self.submit_transaction(tx)
     }
 

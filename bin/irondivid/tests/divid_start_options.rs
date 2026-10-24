@@ -12,6 +12,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::{free_port, log_tail};
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -24,7 +27,7 @@ use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -32,14 +35,6 @@ use std::time::{Duration, Instant};
 
 const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon about";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// The HTTP status and JSON body of one call to `ip:port`; None if the
 /// connection fails
@@ -90,10 +85,13 @@ impl Daemon {
         if rpc {
             let deadline = Instant::now() + Duration::from_secs(120);
             while local(rpc_port, "getblockcount", json!([])).is_none() {
-                assert!(
-                    daemon.child.try_wait().unwrap().is_none(),
-                    "irondivid exited before its RPC server came up"
-                );
+                if daemon.child.try_wait().unwrap().is_some() {
+                    let datadir = args.iter().find_map(|a| a.strip_prefix("-datadir="));
+                    panic!(
+                        "irondivid exited before its RPC server came up; its log ends:\n{}",
+                        datadir.map(|d| log_tail(Path::new(d))).unwrap_or_default()
+                    );
+                }
                 assert!(Instant::now() < deadline, "RPC server did not come up");
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -131,28 +129,30 @@ fn divid_args(datadir: &Path, rpc_port: u16) -> Vec<String> {
     ]
 }
 
-/// Run `cmd` to its exit; panic if it is still running after 30 s
+/// Run `cmd` to its exit; panic if it is still running after 120 s (a slow,
+/// loaded host can take far longer than an idle one)
 fn output_within(cmd: &mut Command) -> Output {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn irondivid");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("irondivid did not exit within 30 s");
+            panic!("irondivid did not exit within 120 s");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     child.wait_with_output().unwrap()
 }
 
-/// Wait up to 20 s for `f` to be true
+/// Wait up to 120 s for `f` to be true, as long as `Daemon::start` waits for
+/// RPC: a node started on a loaded host can take far longer than 20 s
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         if f() {
             return true;
@@ -254,6 +254,35 @@ fn start_up_refusals_are_divid_s() {
             "{flag}"
         );
         assert_eq!(out.status.code(), Some(1), "{flag}");
+    }
+}
+
+/// divid refuses any -checklevel at start, whatever the level
+/// (init.cpp:782-784); -checkblocks is taken
+#[test]
+fn checklevel_is_refused_at_start() {
+    let bin = env!("CARGO_BIN_EXE_irondivid");
+    for level in ["0", "3", "4"] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = output_within(
+            Command::new(bin)
+                .arg(format!("-datadir={}", dir.path().display()))
+                .args([
+                    "-regtest",
+                    "-checkblocks=1",
+                    &format!("-checklevel={level}"),
+                ]),
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            text.contains("Unsupported argument -checklevel found. Checklevel must be level 4."),
+            "-checklevel={level}: {text}"
+        );
+        assert!(!out.status.success(), "-checklevel={level} started");
     }
 }
 
@@ -408,6 +437,53 @@ fn blocknotify_and_walletnotify_run_their_commands() {
     );
 }
 
+/// -walletnotify runs each time divid's wallet adds or updates a
+/// transaction (wallet.cpp:1283): a send twice (CommitTransaction, then the
+/// mempool, :1878) and its block once
+#[test]
+fn walletnotify_runs_as_often_as_divid_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let first = WalletDb::with_hd_wallet(Network::Regtest, hd)
+        .new_receiving_address()
+        .unwrap();
+    mine_offline(dir.path(), &first, 25);
+    let txs = dir.path().join("txs.txt");
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("walletnotify=echo %s >> {}\n", txs.display()),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(
+        &divid_args(dir.path(), rpc_port),
+        &[("WALLET_MNEMONIC", MNEMONIC), ("WALLET_LOOKAHEAD", "5")],
+        rpc_port,
+        true,
+    );
+    let count = |txid: &str| {
+        std::fs::read_to_string(&txs)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == txid)
+            .count()
+    };
+    let settled = |txid: &str, n: usize| {
+        let reached = eventually(|| count(txid) >= n);
+        // Nothing more comes for this step
+        std::thread::sleep(Duration::from_secs(2));
+        reached && count(txid) == n
+    };
+
+    let to = daemon.rpc("getnewaddress", json!([]));
+    let txid = daemon.rpc("sendtoaddress", json!([to, 1]));
+    let txid = txid.as_str().unwrap().to_string();
+    assert!(settled(&txid, 2), "send: {} calls", count(&txid));
+
+    daemon.rpc("setgenerate", json!([1]));
+    assert!(settled(&txid, 3), "block: {} calls", count(&txid));
+}
+
 /// With -daemon the pid goes to divid.pid in the data directory, or to -pid
 /// (util.cpp:115-119); -wallet names a wallet within the data directory
 #[test]
@@ -427,12 +503,16 @@ fn pid_file_and_wallet_are_in_the_data_directory() {
         .unwrap();
     assert!(status.success());
     let pid_file = dir.path().join("divid.pid");
-    let pid = eventually(|| pid_file.exists()).then(|| {
+    // The file can exist before the pid is written into it
+    let read_pid = || {
         std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap()
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+    };
+    let mut pid = None;
+    eventually(|| {
+        pid = read_pid();
+        pid.is_some()
     });
     let up = eventually(|| local(rpc_port, "getblockcount", json!([])).is_some());
     let wallet_dir = dir.path().join("w2").exists();

@@ -156,3 +156,45 @@ fn getblock_takes_a_verbosity_number() {
         assert!(reply.error.is_none(), "verbosity {v}: {:?}", reply.error);
     }
 }
+
+/// getmempoolinfo: divid gives size and bytes (rpcblockchain.cpp:569-574);
+/// irondivid adds usage, maxmempool and mempoolminfee
+#[test]
+fn getmempoolinfo_has_fields_divid_lacks() {
+    let (server, _dir) = server();
+    let info = result(&server, "getmempoolinfo", vec![]);
+    assert_eq!(
+        keys(&info),
+        ["bytes", "maxmempool", "mempoolminfee", "size", "usage"]
+    );
+}
+
+/// generateblock answers on regtest only, as setgenerate; divid has no
+/// network check for it (rpcmining.cpp:121-210)
+#[test]
+fn generateblock_is_regtest_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+    let chain = Arc::new(
+        Chain::new(
+            db,
+            ChainParams::for_network(NetworkType::Testnet, ChainMode::Divi),
+        )
+        .unwrap(),
+    );
+    // with a wallet, as divid reaches generateblock only with one
+    // (rpcserver.cpp:369, :1043-1047)
+    let wallet = Arc::new(WalletDb::with_hd_wallet(
+        Network::Testnet,
+        HdWallet::new(ChainMode::Divi).unwrap(),
+    ));
+    let server = RpcServer::with_wallet(chain, wallet);
+    let error = call(&server, "generateblock", vec![])
+        .error
+        .expect("refused");
+    assert_eq!(error.code, -32601);
+    assert_eq!(
+        error.message,
+        "Method disabled: invalid networks setting (regtest only)"
+    );
+}

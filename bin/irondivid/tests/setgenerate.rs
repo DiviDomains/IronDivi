@@ -9,20 +9,15 @@
 //! `setgenerate N` on regtest mines N blocks to the wallet: proof of work up
 //! to the last PoW block, proof of stake after it (BasicSwap's test setup).
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// POST one JSON-RPC call; None while the server is not up yet.
 fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {

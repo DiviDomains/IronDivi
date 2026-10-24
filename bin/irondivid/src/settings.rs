@@ -30,6 +30,8 @@ const VALUE_OPTIONS: &[&str] = &[
     "rpcport",
     "rpcbind",
     "rpcallowip",
+    "whitelist",
+    "whitebind",
     "port",
     "bind",
     "addnode",

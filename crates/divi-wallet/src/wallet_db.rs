@@ -263,6 +263,12 @@ struct MempoolWalletTx {
 }
 
 /// Wallet database
+/// Called with the txid of a wallet transaction each time the wallet adds or
+/// updates it, as Divi Core's NotifyTransactionChanged NEW or UPDATED
+/// (wallet.cpp:1283): committed by a send, seen in the mempool, in a block
+/// connected or disconnected, or found by a scan.
+pub type TxListener = std::sync::Arc<dyn Fn(&Hash256) + Send + Sync>;
+
 pub struct WalletDb {
     /// Key store
     keystore: KeyStore,
@@ -312,6 +318,8 @@ pub struct WalletDb {
     /// catch-up, reorg rollback and rescans must not interleave, or a spend
     /// can be scanned before the coin it spends and be lost
     scan_lock: Mutex<()>,
+    /// Told each wallet transaction added or seen again (-walletnotify)
+    tx_listener: RwLock<Option<TxListener>>,
     /// Rows removed from memory that must also be deleted from disk on the
     /// next save (a save only writes what is in memory)
     pending_deletes: RwLock<PendingDeletes>,
@@ -378,6 +386,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
@@ -413,6 +422,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
@@ -452,6 +462,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
@@ -754,6 +765,7 @@ impl WalletDb {
             mempool_txs: RwLock::new(HashMap::new()),
             detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
@@ -2813,6 +2825,7 @@ impl WalletDb {
 
             self.add_transaction(wallet_tx);
             debug!("Wallet tx {} {} {} sats", category, txid, net_amount.abs());
+            self.tx_changed(&txid);
         }
 
         if block_hash.is_some() {
@@ -2854,7 +2867,30 @@ impl WalletDb {
     /// made it answers; the confirmed state is left to the block scan, which
     /// records the transaction once it confirms.
     pub fn add_mempool_tx(&self, tx: &divi_primitives::transaction::Transaction) -> bool {
-        self.track_mempool_tx(tx, None)
+        let added = self.track_mempool_tx(tx, None);
+        if added {
+            self.tx_changed(&tx.txid());
+        }
+        added
+    }
+
+    /// Tell the listener about every later change of a wallet transaction
+    pub fn set_tx_listener(&self, listener: TxListener) {
+        *self.tx_listener.write() = Some(listener);
+    }
+
+    /// A send was signed and is handed to the node: Divi Core's
+    /// CommitTransaction adds it to the wallet before the mempool sees it
+    /// (wallet.cpp:1878), one notification of its own
+    pub fn note_committed(&self, txid: &Hash256) {
+        self.tx_changed(txid);
+    }
+
+    fn tx_changed(&self, txid: &Hash256) {
+        let listener = self.tx_listener.read().clone();
+        if let Some(listener) = listener {
+            listener(txid);
+        }
     }
 
     /// Add a transaction to the mempool overlay. `restored_time` is set when it
@@ -3232,9 +3268,11 @@ impl WalletDb {
             dirty.spent = true;
         }
         drop(pending);
-        // Kept, at depth -1, until a block or the mempool has them again
+        // Kept, at depth -1, until a block or the mempool has them again;
+        // Divi Core updates each one as its block is disconnected
         for (txid, timestamp) in disconnected {
             self.detach(txid, timestamp, None);
+            self.tx_changed(&txid);
         }
     }
 
@@ -5054,6 +5092,35 @@ mod tests {
             );
             assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
             assert!(wallet.get_transaction(&send.txid()).is_none());
+        }
+
+        /// -walletnotify's points, Divi Core's addToWallet (wallet.cpp:1283):
+        /// a send committed, then seen in the mempool, its block, the block
+        /// disconnected, and the mempool again
+        #[test]
+        fn tx_listener_hears_each_wallet_change() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = std::sync::Arc::clone(&heard);
+            wallet.set_tx_listener(std::sync::Arc::new(move |txid: &Hash256| {
+                into.lock().unwrap().push(*txid)
+            }));
+            let count =
+                |txid: Hash256| heard.lock().unwrap().iter().filter(|t| **t == txid).count();
+
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            assert_eq!(count(fund.txid()), 1, "received in a block");
+            wallet.note_committed(&send.txid());
+            assert!(wallet.add_mempool_tx(&send));
+            assert_eq!(count(send.txid()), 2, "committed, then in the mempool");
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            assert_eq!(count(send.txid()), 3, "in a block");
+            wallet.handle_reorg(1);
+            assert_eq!(count(send.txid()), 4, "its block disconnected");
+            assert!(wallet.add_mempool_tx(&send));
+            assert_eq!(count(send.txid()), 5, "back in the mempool");
+            assert_eq!(count(fund.txid()), 1, "below the fork, untouched");
         }
 
         #[test]

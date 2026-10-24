@@ -63,85 +63,9 @@ impl Default for RpcConfig {
     }
 }
 
-/// A network an RPC client may connect from, as Divi Core's CSubNet reads an
-/// -rpcallowip value: a single IP, `ip/bits` or `ip/netmask`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Subnet {
-    network: std::net::IpAddr,
-    mask: std::net::IpAddr,
-}
-
-impl Subnet {
-    /// Parse an -rpcallowip value; None if it is not a valid subnet
-    pub fn parse(text: &str) -> Option<Subnet> {
-        use std::net::IpAddr;
-        let (ip, mask) = match text.split_once('/') {
-            Some((ip, mask)) => (ip.parse::<IpAddr>().ok()?, Some(mask)),
-            None => (text.parse::<IpAddr>().ok()?, None),
-        };
-        let bits = match ip {
-            IpAddr::V4(_) => 32u32,
-            IpAddr::V6(_) => 128,
-        };
-        let mask = match mask {
-            None => mask_of(ip, bits),
-            Some(m) => match m.parse::<u32>() {
-                Ok(n) if n <= bits => mask_of(ip, n),
-                Ok(_) => return None,
-                Err(_) => {
-                    let m = m.parse::<IpAddr>().ok()?;
-                    if m.is_ipv4() != ip.is_ipv4() {
-                        return None;
-                    }
-                    m
-                }
-            },
-        };
-        Some(Subnet {
-            network: apply_mask(ip, mask),
-            mask,
-        })
-    }
-
-    /// Whether `ip` is in the subnet
-    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
-        let ip = match ip {
-            std::net::IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(std::net::IpAddr::V4)
-                .unwrap_or(std::net::IpAddr::V6(v6)),
-            v4 => v4,
-        };
-        ip.is_ipv4() == self.network.is_ipv4() && apply_mask(ip, self.mask) == self.network
-    }
-
-    /// Divi Core always lets the local host in (127.0.0.0/8 and ::1)
-    pub fn loopback() -> [Subnet; 2] {
-        [
-            Subnet::parse("127.0.0.0/8").unwrap(),
-            Subnet::parse("::1").unwrap(),
-        ]
-    }
-}
-
-fn mask_of(ip: std::net::IpAddr, bits: u32) -> std::net::IpAddr {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    match ip {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(u32::MAX.checked_shl(32 - bits).unwrap_or(0))),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(
-            u128::MAX.checked_shl(128 - bits).unwrap_or(0),
-        )),
-    }
-}
-
-fn apply_mask(ip: std::net::IpAddr, mask: std::net::IpAddr) -> std::net::IpAddr {
-    use std::net::IpAddr;
-    match (ip, mask) {
-        (IpAddr::V4(a), IpAddr::V4(m)) => IpAddr::V4((u32::from(a) & u32::from(m)).into()),
-        (IpAddr::V6(a), IpAddr::V6(m)) => IpAddr::V6((u128::from(a) & u128::from(m)).into()),
-        (a, _) => a,
-    }
-}
+/// A network an RPC client may connect from (-rpcallowip), as Divi Core's
+/// CSubNet reads it
+pub use divi_network::Subnet;
 
 /// Serve `app` on the configured address, refusing (HTTP 403, as Divi Core)
 /// connections from outside the local host and the allowed subnets
@@ -481,10 +405,6 @@ impl RpcServer {
     fn set_generate(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_storage::chain::NetworkType;
 
-        if params.len() != 1 {
-            let help = self.help(&Params::Array(vec![serde_json::json!("setgenerate")]))?;
-            return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
-        }
         if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
             return Err(RpcError::new(
                 codes::METHOD_NOT_FOUND,
@@ -493,6 +413,21 @@ impl RpcServer {
             .into());
         }
         self.staking.set_generate(params)
+    }
+
+    /// generateblock - one block with Divi Core's test options
+    /// (rpcmining.cpp:121-210); regtest only, as setgenerate
+    fn generate_block(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_storage::chain::NetworkType;
+
+        if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method disabled: invalid networks setting (regtest only)",
+            )
+            .into());
+        }
+        self.staking.generate_block(params)
     }
 
     /// Handle a single RPC request
@@ -572,7 +507,7 @@ impl RpcServer {
             "getaddressutxos" => self.blockchain.get_address_utxos(params),
 
             // Mining/generation methods
-            "generateblock" => self.blockchain.generate_block(params),
+            "generateblock" => self.generate_block(params),
             "setgenerate" => self.set_generate(params),
 
             // Network methods
@@ -773,10 +708,10 @@ impl RpcServer {
                 "getchaintips" => "getchaintips\n\nReturn information about all known tips in the block tree.",
                 "getdifficulty" => "getdifficulty\n\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.",
                 "gettxoutsetinfo" => "gettxoutsetinfo\n\nReturns statistics about the unspent transaction output set.",
-                "getrawmempool" => "getrawmempool\n\nReturns all transaction ids in memory pool.",
+                "getrawmempool" => "getrawmempool ( verbose )\n\nReturns all transaction ids in memory pool.\n\nArguments:\n1. verbose  (boolean, optional, default=false) true for a json object, false for array of transaction ids",
                 "prioritisetransaction" => "prioritisetransaction <txid> <priority delta> <fee delta>\n\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.",
-                "generateblock" => "generateblock ( options )\n\nTry to generate a single block with extra options (regtest only - not yet implemented).",
+                "generateblock" => "generateblock ( options )\n\nTry to generate a single block with some extra options (-regtest only).\n\nArguments:\n1. options          (object, optional) extra options for generating the block\n    {\n      \"extratx\" : [\"hex\", ...],   (array of strings, optional) transactions to include as hex\n      \"coinstake\" : \"hex\",        (string, optional) coinstake transaction to use as hex\n      \"ignoreMempool\" : true,       (bool, optional) if set, do not include mempool transactions\n      \"blockBitsShift\" : unsigned (integer, optional) if set, use custom block bits\n    }\n\nResult\nblockhash     (string) hash of the generated block",
                 "setgenerate" => "setgenerate numberofblocks\n\nMine blocks to this wallet immediately (-regtest only): proof-of-work up to block 100, proof-of-stake after it.\n\nArguments:\n1. numberofblocks  (numeric, required) How many blocks to mine; below 1 mines none\n\nResult:\n[ \"blockhash\", ... ]  (array) Hashes of the mined blocks",
                 "getinfo" => "getinfo\n\nReturns an object containing various state info (version, blocks, connections, difficulty, balance, staking status).",
                 "getinvalid" => "getinvalid ( \"all\" )\n\nGet a summary of invalidated outpoints.\n\nArguments:\n1. all   (string, optional) return a full list of outpoints even if they are spent",
@@ -1341,11 +1276,9 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
     Ok(())
 }
 
-/// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
-/// for the calls that run it: each given argument must have the listed type
-/// (null too where Core allows it), else -3 "Expected type X, got Y"
 /// How many arguments Divi Core takes for a call, as its `fHelp` check counts
-/// them (rpcblockchain.cpp:36-406, rpcmisc.cpp:103, rpcrawtransaction.cpp:141-830)
+/// them (rpcblockchain.cpp:36-557, rpcmining.cpp:54-253, rpcmisc.cpp:103,
+/// rpcrawtransaction.cpp:141-830)
 fn argument_count(method: &str) -> Option<(usize, usize)> {
     Some(match method {
         "getblockchaininfo" | "getblockcount" | "getbestblockhash" | "getdifficulty"
@@ -1356,10 +1289,23 @@ fn argument_count(method: &str) -> Option<(usize, usize)> {
         "verifychain" => (0, 2),
         "createrawtransaction" => (2, 2),
         "signrawtransaction" => (1, 4),
+        // rpcmining.cpp:227, rpcblockchain.cpp:557
+        "getmininginfo" | "getmempoolinfo" => (0, 0),
+        // rpcblockchain.cpp:82
+        "getrawmempool" => (0, 1),
+        // rpcmining.cpp:253
+        "prioritisetransaction" => (3, 3),
+        // rpcmining.cpp:54
+        "setgenerate" => (1, 1),
+        // rpcmining.cpp:123
+        "generateblock" => (0, 1),
         _ => return None,
     })
 }
 
+/// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
+/// for the calls that run it: each given argument must have the listed type
+/// (null too where Core allows it), else -3 "Expected type X, got Y"
 fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
     let (expected, allow_null): (&[&str], bool) = match method {
         "setmocktime" => (&["int"], false),
