@@ -89,6 +89,10 @@ The brief this script was written for gave regtest's cycles as 200 and 201. Thos
 | `getlotteryblockwinners <argument>` | no argument, 0, 100 (before the start), 101, 105, 110, 111, 150, the tip, above the tip, text, a real, two arguments |
 | `<call>: field order` | the order of the members of each kind of reply (see KNOWN) |
 
+The number of rows varies a little from run to run: which coins stake, and so who wins and how many payees a
+superblock has, depends on the stake kernels found on that run (368 to 372 rows in three runs). The checks are the
+same every run.
+
 How a row compares:
 - Both must have the same outcome: a result, or an error with the same code and message.
 - For a result, every member, type and value must match, and list items must come in divid's order.
