@@ -263,6 +263,10 @@ impl Connection {
             debug!("Failed to send sendheaders to {}: {}", self.info.addr, e);
         }
 
+        // The peer's services are readable before anyone hears of it: block
+        // download picks peers by NODE_NETWORK
+        self.info.publish(&self.stats);
+
         // Notify connection established
         if let Some(version) = self.info.version.clone() {
             let _ = self.event_tx.send(PeerEvent::Connected {
@@ -271,8 +275,6 @@ impl Connection {
                 version,
             });
         }
-
-        self.info.publish(&self.stats);
 
         // Main message loop
         self.message_loop().await

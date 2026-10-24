@@ -11,6 +11,7 @@
 
 //! Node error types
 
+use divi_primitives::hash::Hash256;
 use thiserror::Error;
 
 /// Node errors
@@ -67,6 +68,11 @@ pub enum NodeError {
     /// Transaction validation error
     #[error("transaction validation failed: {0}")]
     TransactionValidation(String),
+
+    /// A transaction spends a coin a mempool transaction already spends
+    /// (Divi Core keeps no reject state for this, MempoolConsensus.cpp:303-313)
+    #[error("conflicts with transaction {0}")]
+    MempoolConflict(Hash256),
 
     /// The mempool refused a transaction, with Divi Core's reject code and
     /// reason (e.g. 64 "dust", 66 "insufficient fee") and the misbehaviour

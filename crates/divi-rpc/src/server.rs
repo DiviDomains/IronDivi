@@ -432,6 +432,16 @@ impl RpcServer {
 
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
+        // Divi Core's `if (fHelp || params.size() ...)` comes first: a wrong
+        // argument count answers -1 with the call's help text
+        if let Some((min, max)) = argument_count(method) {
+            if !matches!(params, Params::Object(_)) && !(min..=max).contains(&params.len()) {
+                let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
+                return Err(
+                    RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into(),
+                );
+            }
+        }
         rpc_type_check(method, params)?;
         match method {
             // Blockchain methods
@@ -1001,6 +1011,22 @@ impl RpcServer {
 /// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
 /// for the calls that run it: each given argument must have the listed type
 /// (null too where Core allows it), else -3 "Expected type X, got Y"
+/// How many arguments Divi Core takes for a call, as its `fHelp` check counts
+/// them (rpcblockchain.cpp:36-406, rpcmisc.cpp:103, rpcrawtransaction.cpp:141-830)
+fn argument_count(method: &str) -> Option<(usize, usize)> {
+    Some(match method {
+        "getblockchaininfo" | "getblockcount" | "getbestblockhash" | "getdifficulty"
+        | "getchaintips" | "gettxoutsetinfo" | "getinfo" => (0, 0),
+        "getblockhash" | "decoderawtransaction" | "decodescript" => (1, 1),
+        "getblock" | "getblockheader" | "getrawtransaction" | "sendrawtransaction" => (1, 2),
+        "gettxout" => (2, 3),
+        "verifychain" => (0, 2),
+        "createrawtransaction" => (2, 2),
+        "signrawtransaction" => (1, 4),
+        _ => return None,
+    })
+}
+
 fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
     let (expected, allow_null): (&[&str], bool) = match method {
         "setmocktime" => (&["int"], false),

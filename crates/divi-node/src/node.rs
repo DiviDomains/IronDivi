@@ -13,6 +13,7 @@
 //!
 //! Orchestrates all node components: storage, networking, RPC, and wallet.
 
+use crate::block_import::ImportResult;
 use crate::config::NodeConfig;
 use crate::error::NodeError;
 use crate::fee_estimator::FeeEstimator;
@@ -114,6 +115,11 @@ pub enum NodeEvent {
 pub struct Node {
     /// Node configuration
     config: NodeConfig,
+
+    /// The thread importing bootstrap.dat and -loadblock files, and the flag
+    /// that stops it
+    import_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<ImportResult>>>,
+    import_stop: Arc<std::sync::atomic::AtomicBool>,
 
     /// Current status
     status: RwLock<NodeStatus>,
@@ -435,15 +441,6 @@ impl Node {
             );
         }
 
-        // bootstrap.dat and -loadblock files, after any -reindex and before
-        // any peer is connected (Divi Core's import thread, init.cpp:684-722)
-        crate::block_import::import_at_start(
-            &chain,
-            &config.data_dir,
-            &config.load_block,
-            config.network.magic,
-        );
-
         // Initialize mempool
         let mempool = Arc::new(Mempool::new(config.mempool.clone()));
 
@@ -587,6 +584,8 @@ impl Node {
 
         Ok(Node {
             config,
+            import_thread: parking_lot::Mutex::new(None),
+            import_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status: RwLock::new(NodeStatus::Stopped),
             chain,
             mempool,
@@ -656,11 +655,59 @@ impl Node {
     }
 
     /// Start the node
+    /// Import bootstrap.dat and the -loadblock files on a thread of their
+    /// own while the node starts and runs, as Divi Core does
+    /// (init.cpp:1580); until it is done blocks from peers are neither asked
+    /// for nor taken
+    pub fn spawn_import(&self) {
+        let mut slot = self.import_thread.lock();
+        if slot.is_some() {
+            return;
+        }
+        let chain = Arc::clone(&self.chain);
+        let stop = Arc::clone(&self.import_stop);
+        let bootstrap_dir = self
+            .config
+            .bootstrap_dir
+            .clone()
+            .unwrap_or_else(|| self.config.data_dir.clone());
+        let load_block = self.config.load_block.clone();
+        let magic = self.config.network.magic;
+        chain.set_importing(true);
+        let spawned = std::thread::Builder::new()
+            .name("divi-loadblk".into())
+            .spawn(move || {
+                let result = crate::block_import::import_at_start(
+                    &chain,
+                    &bootstrap_dir,
+                    &load_block,
+                    magic,
+                    &stop,
+                );
+                chain.set_importing(false);
+                result
+            });
+        match spawned {
+            Ok(handle) => *slot = Some(handle),
+            Err(e) => {
+                self.chain.set_importing(false);
+                tracing::error!("Could not start the block import: {}", e);
+            }
+        }
+    }
+
+    /// Wait for the block import to finish; None if none was started
+    pub fn wait_for_import(&self) -> Option<ImportResult> {
+        let handle = self.import_thread.lock().take()?;
+        handle.join().ok()
+    }
+
     pub async fn start(&self) -> Result<(), NodeError> {
         let current_status = *self.status.read();
         if current_status != NodeStatus::Stopped {
             return Err(NodeError::AlreadyRunning);
         }
+        self.spawn_import();
 
         tracing::info!("Starting Divi node...");
         *self.status.write() = NodeStatus::Starting;
@@ -1211,6 +1258,23 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
+
+        // Stop the block import between two records and wait for it, for a
+        // minute at most (a read can block where the flag is not seen)
+        self.import_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = self.import_thread.lock().take();
+        if let Some(handle) = handle {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                tracing::warn!("The block import did not stop within a minute; not waiting for it");
+            }
+        }
 
         // Disconnect all peers
         self.peer_manager.disconnect_all();

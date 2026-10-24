@@ -462,6 +462,11 @@ impl PeerManager {
         self.peers.read().values().filter(|p| !p.inbound).count()
     }
 
+    /// The network's P2P port, used for an address given without one
+    pub fn default_port(&self) -> u16 {
+        self.config.default_port
+    }
+
     /// Add a node manually (via RPC addnode command)
     ///
     /// This adds the node to the list of nodes we should try to stay connected to.
@@ -871,6 +876,12 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) fn insert_test_peer(&self, handle: PeerHandle) {
         self.peers.write().insert(handle.id, handle);
+    }
+
+    /// The live stats of a test peer (tests set its services)
+    #[cfg(test)]
+    pub(crate) fn test_peer_stats(&self, id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {
+        self.peers.read().get(&id).map(|p| Arc::clone(&p.stats))
     }
 
     /// Send a message to a specific peer
