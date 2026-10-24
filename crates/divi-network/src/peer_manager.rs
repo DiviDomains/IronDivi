@@ -32,6 +32,9 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+/// Reads the node's current chain height
+pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
+
 /// Configuration for the peer manager
 #[derive(Debug, Clone)]
 pub struct PeerManagerConfig {
@@ -185,6 +188,11 @@ pub struct PeerManager {
     /// Tracks (consecutive_failures, last_attempt_time) so that repeatedly-failing
     /// peers are skipped for exponentially longer periods (up to 30 minutes).
     static_peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
+    /// Reads the current chain height for version messages (set by the node)
+    height_source: RwLock<Option<HeightSource>>,
+    /// Listeners bound before the node starts (bind_listeners): address,
+    /// whether its peers are whitelisted, socket. None until bound.
+    prebound: parking_lot::Mutex<Option<Vec<(SocketAddr, bool, TcpListener)>>>,
     /// Inbound connections accepted whose handshake has not finished yet
     inbound_handshaking: AtomicUsize,
 }
@@ -210,6 +218,8 @@ impl PeerManager {
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
+            height_source: RwLock::new(None),
+            prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
         })
     }
@@ -326,6 +336,20 @@ impl PeerManager {
     /// Update our best block height
     pub fn set_height(&self, height: u32) {
         *self.our_height.write() = height;
+    }
+
+    /// Read the height for version messages from `source` from now on, as
+    /// Divi Core reads its chain height in each PushVersion (Node.cpp:994)
+    pub fn set_height_source(&self, source: HeightSource) {
+        *self.height_source.write() = Some(source);
+    }
+
+    /// The height a new version message names
+    fn current_height(&self) -> u32 {
+        match self.height_source.read().as_ref() {
+            Some(source) => source(),
+            None => *self.our_height.read(),
+        }
     }
 
     /// Set the service bits we advertise to peers. A node that has pruned
@@ -512,6 +536,48 @@ impl PeerManager {
         self.added_nodes.read().contains(addr)
     }
 
+    /// Bind the listeners before the node starts: the listen address and each
+    /// -whitebind address. As Divi Core, an address that cannot be bound is
+    /// reported ("Unable to bind to ... on this computer", net.cpp:1355-1365,
+    /// reported by Bind, net.cpp:1638-1649), and the node does not start when
+    /// none could be bound ("Failed to listen on any port. Use -listen=0 if
+    /// you want this.", net.cpp:1829-1831). Before, a listener that could not
+    /// bind only logged it, and the node ran on without listening.
+    pub async fn bind_listeners(&self) -> Result<(), String> {
+        let wanted: Vec<(SocketAddr, bool)> = self
+            .config
+            .listen_addr
+            .iter()
+            .map(|a| (*a, false))
+            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
+            .collect();
+        let mut bound = Vec::new();
+        let mut failures = Vec::new();
+        for (addr, white) in wanted.iter().copied() {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => bound.push((addr, white, listener)),
+                Err(e) => {
+                    let why = if e.kind() == std::io::ErrorKind::AddrInUse {
+                        "Divi Core or irondivid is probably already running.".to_string()
+                    } else {
+                        format!("(bind returned error {e})")
+                    };
+                    let msg = format!("Unable to bind to {addr} on this computer. {why}");
+                    error!("{}", msg);
+                    failures.push(msg);
+                }
+            }
+        }
+        if !wanted.is_empty() && bound.is_empty() {
+            return Err(format!(
+                "{} Failed to listen on any port. Use -listen=0 if you want this.",
+                failures.join(" ")
+            ));
+        }
+        *self.prebound.lock() = Some(bound);
+        Ok(())
+    }
+
     /// Start the peer manager
     pub async fn start(self: Arc<Self>) -> Result<(), NetworkError> {
         info!("Starting peer manager");
@@ -525,12 +591,24 @@ impl PeerManager {
             .map(|a| (*a, false))
             .chain(self.config.white_listen.iter().map(|a| (*a, true)))
             .collect();
-        let listener_handles: Vec<_> = listeners
+        // The sockets bind_listeners bound, when it ran; else bind each here
+        let to_run: Vec<(SocketAddr, bool, Option<TcpListener>)> = match self.prebound.lock().take()
+        {
+            Some(bound) => bound
+                .into_iter()
+                .map(|(addr, white, listener)| (addr, white, Some(listener)))
+                .collect(),
+            None => listeners
+                .into_iter()
+                .map(|(addr, white)| (addr, white, None))
+                .collect(),
+        };
+        let listener_handles: Vec<_> = to_run
             .into_iter()
-            .map(|(listen_addr, white)| {
+            .map(|(listen_addr, white, bound)| {
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
-                    if let Err(e) = self_clone.run_listener(listen_addr, white).await {
+                    if let Err(e) = self_clone.run_listener(listen_addr, white, bound).await {
                         error!("Listener error: {}", e);
                     }
                 })
@@ -625,12 +703,17 @@ impl PeerManager {
     }
 
     /// Run the inbound connection listener
+    /// (`bound`: the socket bind_listeners bound for `addr`, else bind it now)
     async fn run_listener(
         self: Arc<Self>,
         addr: SocketAddr,
         white: bool,
+        bound: Option<TcpListener>,
     ) -> Result<(), NetworkError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = match bound {
+            Some(listener) => listener,
+            None => TcpListener::bind(addr).await?,
+        };
         info!("Listening for connections on {}", addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -748,7 +831,7 @@ impl PeerManager {
         // Mark address as connecting
         self.connecting_addrs.write().insert(addr);
 
-        let our_height = *self.our_height.read();
+        let our_height = self.current_height();
 
         let result = Connection::connect(
             addr,
@@ -829,7 +912,7 @@ impl PeerManager {
             )));
         }
 
-        let our_height = *self.our_height.read();
+        let our_height = self.current_height();
 
         let (conn, handle) = Connection::accept(
             stream,
@@ -876,6 +959,12 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) fn insert_test_peer(&self, handle: PeerHandle) {
         self.peers.write().insert(handle.id, handle);
+    }
+
+    /// Drop a test peer, as a disconnect does
+    #[cfg(test)]
+    pub(crate) fn remove_test_peer(&self, id: PeerId) {
+        self.peers.write().remove(&id);
     }
 
     /// The live stats of a test peer (tests set its services)
@@ -1604,10 +1693,7 @@ mod tests {
     /// to the peer) and completes the handshake end to end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_outbound_connection_goes_through_socks5_proxy() {
-        let listen: SocketAddr = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap()
-        };
+        let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let server = PeerManager::new(local_only(Some(listen), None));
         tokio::spawn(Arc::clone(&server).start());
         let (proxy, seen) = crate::socks5::stub::start().await;
@@ -1644,10 +1730,7 @@ mod tests {
     async fn test_dead_proxy_does_not_fall_back_to_direct() {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
-        let dead_proxy = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let dead_proxy = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let client = PeerManager::new(local_only(None, Some(dead_proxy)));
         let err = Arc::clone(&client).connect_to_peer(target_addr).await;
         assert!(err.is_err());

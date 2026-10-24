@@ -81,8 +81,6 @@ By design (the same rows as in `scripts/chain-replies`):
   writes it (`rpcrawtransaction.cpp:96-97`). divid's decoderawtransaction writes value only (`TxToJSON`,
   `JsonTxHelpers.cpp:66`).
 - `decodescript`: irondivid adds `hex`, the script given (divid: `rpcrawtransaction.cpp:556-563`).
-- `getrawtransaction <txid> "1"`: irondivid takes verbose as a bool or as numeric text. divid reads an int
-  (`rpcrawtransaction.cpp:205-207`).
 
 **Outputs in name order.** `createrawtransaction` with outputs given as an object keeps them in the order given on
 divid, and sorted by address on irondivid. That is an open row in `scripts/chain-replies`. Here the outputs are given

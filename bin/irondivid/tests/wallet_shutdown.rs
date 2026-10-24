@@ -16,9 +16,6 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::free_port;
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -28,6 +25,7 @@ use divi_primitives::{
     ChainMode,
 };
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use divi_test_support::start_node;
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -87,33 +85,27 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path) -> Daemon {
-        let rpc_port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-            .arg("--regtest")
-            .arg("--datadir")
-            .arg(datadir)
-            .args(["--rpcport", &rpc_port.to_string()])
-            .args(["--port", &free_port().to_string()])
-            .args(["--bind", "127.0.0.1", "--staking=false"])
-            // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
-            .args(["--rpcuser", "test", "--rpcpassword", "test"])
-            .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
-            .env("WALLET_LOOKAHEAD", "5")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        daemon
+        let (child, rpc_port, _) = start_node(
+            datadir,
+            |rpc_port, p2p_port| {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+                cmd.arg("--regtest")
+                    .arg("--datadir")
+                    .arg(datadir)
+                    .args(["--rpcport", &rpc_port.to_string()])
+                    .args(["--port", &p2p_port.to_string()])
+                    .args(["--bind", "127.0.0.1", "--staking=false"])
+                    // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
+                    .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                    .env("WALLET_MNEMONIC", WALLET_MNEMONIC)
+                    .env("WALLET_LOOKAHEAD", "5")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Daemon { child, rpc_port }
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {

@@ -14,9 +14,7 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::free_port;
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -98,24 +96,20 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Start `cmd` (made by `irondivid` with `rpc_port`) and wait for its RPC
-    fn start(mut cmd: Command, rpc_port: u16) -> Daemon {
-        let child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        daemon
+    /// Start the node `command(rpc_port)` makes (with `irondivid`), whose
+    /// data directory is `datadir`, and wait for its RPC
+    fn start(datadir: &Path, mut command: impl FnMut(u16) -> Command) -> Daemon {
+        // `irondivid` takes a new P2P port from free_port for each start
+        let (child, rpc_port, _) = start_node(
+            datadir,
+            |rpc_port, _| {
+                let mut cmd = command(rpc_port);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Daemon { child, rpc_port }
     }
 
     fn call(&self, method: &str, params: Value) -> Value {
@@ -261,10 +255,11 @@ fn wallet_option_at_a_plain_file_or_a_core_folder_is_refused() {
 #[test]
 fn hdseed_option_makes_cores_wallet() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = free_port();
-    let mut cmd = irondivid(Some(dir.path()), "--regtest", rpc_port);
-    cmd.arg(format!("-hdseed={SEED}"));
-    let daemon = Daemon::start(cmd, rpc_port);
+    let daemon = Daemon::start(dir.path(), |rpc_port| {
+        let mut cmd = irondivid(Some(dir.path()), "--regtest", rpc_port);
+        cmd.arg(format!("-hdseed={SEED}"));
+        cmd
+    });
     let info = daemon.rpc("validateaddress", json!([CORE_FIRST_ADDRESS]));
     assert_eq!(info["ismine"], true, "{info}");
     let hd = daemon.rpc("dumphdinfo", json!([]));
@@ -274,10 +269,11 @@ fn hdseed_option_makes_cores_wallet() {
     assert!(!debug_log(dir.path()).contains(SEED), "the seed was logged");
 
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = free_port();
-    let mut cmd = irondivid(Some(dir.path()), "--regtest", rpc_port);
-    cmd.arg("-hdseed=not-hex");
-    let daemon = Daemon::start(cmd, rpc_port);
+    let daemon = Daemon::start(dir.path(), |rpc_port| {
+        let mut cmd = irondivid(Some(dir.path()), "--regtest", rpc_port);
+        cmd.arg("-hdseed=not-hex");
+        cmd
+    });
     let hd = daemon.rpc("dumphdinfo", json!([]));
     assert_eq!(
         hd["mnemonic"],
@@ -312,10 +308,11 @@ fn masternode_conf_lock_is_always_on_and_unusable_lines_are_skipped() {
         ),
     )
     .unwrap();
-    let rpc_port = free_port();
-    let mut cmd = irondivid(Some(datadir), "--regtest", rpc_port);
-    cmd.arg("-mnconflock=0");
-    let daemon = Daemon::start(cmd, rpc_port);
+    let daemon = Daemon::start(datadir, |rpc_port| {
+        let mut cmd = irondivid(Some(datadir), "--regtest", rpc_port);
+        cmd.arg("-mnconflock=0");
+        cmd
+    });
     assert_eq!(
         daemon.rpc("listlockunspent", json!([])),
         json!([{"txid": txid, "vout": 1}])
@@ -341,10 +338,13 @@ fn default_data_folder_is_kept_apart_from_cores() {
     core_chain_data(&core.join("regtest"));
     std::fs::write(core.join("divi.conf"), "rpcuser=core\nrpcpassword=core\n").unwrap();
     let before = snapshot(&core);
-    let rpc_port = free_port();
-    let mut cmd = irondivid(None, "--regtest", rpc_port);
-    cmd.env("HOME", home.path());
-    Daemon::start(cmd, rpc_port).stop();
+    // With no -datadir the node uses $HOME/.irondivi
+    Daemon::start(&home.path().join(".irondivi"), |rpc_port| {
+        let mut cmd = irondivid(None, "--regtest", rpc_port);
+        cmd.env("HOME", home.path());
+        cmd
+    })
+    .stop();
     let own = home.path().join(".irondivi/regtest");
     assert!(own.join("chainstate").is_dir(), "no chainstate in {own:?}");
     assert!(own.join("wallet").is_dir(), "no wallet in {own:?}");
@@ -357,8 +357,9 @@ fn default_data_folder_is_kept_apart_from_cores() {
 #[test]
 fn bulk_wallet_dump_is_not_there_as_in_divid() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = free_port();
-    let daemon = Daemon::start(irondivid(Some(dir.path()), "--regtest", rpc_port), rpc_port);
+    let daemon = Daemon::start(dir.path(), |rpc_port| {
+        irondivid(Some(dir.path()), "--regtest", rpc_port)
+    });
     for (method, params) in [
         (
             "dumpwallet",

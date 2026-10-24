@@ -564,14 +564,6 @@ mod tests {
         assert_eq!(result, serde_json::json!(0));
     }
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     fn quiet_config() -> divi_network::PeerManagerConfig {
         divi_network::PeerManagerConfig {
             dns_seeds: vec![],
@@ -587,7 +579,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_peer_counters_and_connection_split_are_real() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
         let server = PeerManager::new(divi_network::PeerManagerConfig {
             listen_addr: Some(listen),
             ..quiet_config()
@@ -651,7 +645,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ping_rpc_pings_every_peer() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
         let server = PeerManager::new(divi_network::PeerManagerConfig {
             listen_addr: Some(listen),
             ..quiet_config()
@@ -728,7 +724,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_addnode_onetry_dials_once_now() {
         use std::time::Duration;
-        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
         let server = PeerManager::new(divi_network::PeerManagerConfig {
             listen_addr: Some(listen),
             ..quiet_config()

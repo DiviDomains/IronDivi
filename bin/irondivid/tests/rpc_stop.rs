@@ -8,9 +8,7 @@
 
 //! The `stop` RPC must shut the daemon down the same way SIGTERM does.
 
-mod common;
-
-use common::free_port;
+use divi_test_support::{free_port, start_node};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -47,37 +45,27 @@ impl Drop for KillOnDrop {
 #[test]
 fn rpc_stop_exits_the_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = free_port();
-    let p2p_port = free_port();
-
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(dir.path())
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &p2p_port.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=false"])
-        // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
+    let (child, rpc_port, _) = start_node(
+        dir.path(),
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(dir.path())
+                .args(["--rpcport", &rpc_port.to_string()])
+                .args(["--port", &p2p_port.to_string()])
+                .args(["--bind", "127.0.0.1", "--staking=false"])
+                // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount").is_some(),
+    );
     let mut node = KillOnDrop(child);
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if let Some(body) = rpc(rpc_port, "getblockcount") {
-            assert!(body.contains("\"result\""), "getblockcount: {body}");
-            break;
-        }
-        assert!(
-            node.0.try_wait().unwrap().is_none(),
-            "irondivid exited before its RPC server came up"
-        );
-        assert!(Instant::now() < deadline, "RPC server did not come up");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    let body = rpc(rpc_port, "getblockcount").expect("getblockcount reply");
+    assert!(body.contains("\"result\""), "getblockcount: {body}");
 
     let reply = rpc(rpc_port, "stop").expect("stop reply");
     assert!(reply.contains("DIVI server stopping"), "stop: {reply}");
