@@ -738,9 +738,16 @@ impl RpcServer {
 
     /// Help method - list available methods
     fn help(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let method = params.get_str(0);
+        // Divi Core's help: more than one argument answers its own help text,
+        // and the command must be a string (rpcserver.cpp:291-304)
+        crate::core_help::check_arguments("help", params, (0, 1), 1)?;
+        // An empty command lists them all, as no command does
+        let method = params.get_str(0).filter(|m| !m.is_empty());
 
         if let Some(method) = method {
+            if let Some(text) = crate::core_help::text(method) {
+                return Ok(serde_json::Value::String(text.to_string()));
+            }
             // Return help for specific method
             let help = match method {
                 // Blockchain
@@ -1063,7 +1070,20 @@ impl RpcServer {
                 "help",
                 "stop",
             ];
-            Ok(serde_json::Value::String(methods.join("\n")))
+            // (category, name) of each call above
+            let mut category = "";
+            let mut calls = Vec::new();
+            for line in methods {
+                if let Some(title) = line.strip_prefix("== ").and_then(|l| l.strip_suffix(" ==")) {
+                    category = title;
+                } else if !line.is_empty() {
+                    calls.push((category, line));
+                }
+            }
+            let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+            Ok(serde_json::Value::String(crate::core_help::list(
+                &calls, encrypted,
+            )))
         }
     }
 

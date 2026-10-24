@@ -772,6 +772,8 @@ impl WalletRpc {
 
     /// validateaddress - Validate a Divi address
     pub fn validate_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // rpcmisc.cpp:320-321, :337
+        crate::core_help::check_arguments("validateaddress", params, (1, 1), 1)?;
         let addr_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
@@ -794,11 +796,16 @@ impl WalletRpc {
                 let mut result = serde_json::json!({
                     "isvalid": true,
                     "address": addr_str,
-                    "scriptPubKey": format!("76a914{}88ac", hex::encode(addr.hash.as_bytes())),
+                    "scriptPubKey": addr.script_pubkey().to_hex(),
                     "ismine": is_mine,
-                    "iswatchonly": is_watch_only,
-                    "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
                 });
+                // Divi Core adds these only for an address of the wallet
+                // (rpcmisc.cpp:350-354, DescribeAddressVisitor :236-247)
+                if known {
+                    result["iswatchonly"] = serde_json::json!(is_watch_only);
+                    result["isscript"] =
+                        serde_json::json!(addr.addr_type == divi_wallet::AddressType::P2SH);
+                }
 
                 if let (true, Some(wallet)) = (known, wallet_guard.as_ref()) {
                     result["account"] = serde_json::json!(wallet.get_account(&addr));
@@ -856,7 +863,7 @@ impl WalletRpc {
 
         let mut response = serde_json::json!({
             "address": addr_str,
-            "scriptPubKey": format!("76a914{}88ac", hex::encode(addr.hash.as_bytes())),
+            "scriptPubKey": addr.script_pubkey().to_hex(),
             "ismine": is_mine,
             "iswatchonly": is_watch_only,
             "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
@@ -4033,12 +4040,12 @@ pub fn message_magic_hash(message: &[u8]) -> [u8; 32] {
 impl WalletRpc {
     /// signmessage - Sign a message with the private key of an address
     pub fn sign_message(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if params.len() < 2 || params.len() > 4 {
-            return Err(RpcError::invalid_params(
-                "signmessage \"diviaddress\" \"message\" ( \"input_format\" \"output_format\" )",
-            )
-            .into());
-        }
+        // rpcwallet.cpp:1366-1367; the arguments are read once the wallet is
+        // unlocked (:1384-1390)
+        crate::core_help::check_arguments("signmessage", params, (2, 4), 0)?;
+        let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
+        crate::core_help::check_arguments("signmessage", params, (2, 4), 4)?;
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
@@ -4057,10 +4064,6 @@ impl WalletRpc {
             _ => text.as_bytes().to_vec(),
         };
         let hex_output = params.len() == 4 && format(3)? == "hex";
-
-        let wallet = self.get_wallet()?;
-
-        ensure_fully_unlocked(&wallet)?;
 
         // Parse address (error codes as Divi Core's signmessage)
         let address = self
@@ -4101,12 +4104,8 @@ impl WalletRpc {
 
     /// verifymessage - Verify a signed message
     pub fn verify_message(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if params.len() != 3 {
-            return Err(RpcError::invalid_params(
-                "verifymessage \"diviaddress\" \"signature\" \"message\"",
-            )
-            .into());
-        }
+        // rpcmisc.cpp:487-488
+        crate::core_help::check_arguments("verifymessage", params, (3, 3), 3)?;
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
