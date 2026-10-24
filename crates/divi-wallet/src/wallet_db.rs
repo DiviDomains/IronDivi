@@ -3458,6 +3458,26 @@ impl WalletDb {
         db.write_batch_sync(batch)
     }
 
+    /// The address book: every address with its name (Divi Core's
+    /// mapAddressBook; addresses the wallet handed out or was told about)
+    pub fn address_book(&self) -> Vec<(String, String)> {
+        let mut book: Vec<(String, String)> = self
+            .address_accounts
+            .read()
+            .iter()
+            .map(|(a, n)| (a.clone(), n.clone()))
+            .collect();
+        book.sort();
+        book
+    }
+
+    /// Whether `address` has an address-book entry (its name may be "")
+    pub fn in_address_book(&self, address: &Address) -> bool {
+        self.address_accounts
+            .read()
+            .contains_key(&address.to_string())
+    }
+
     pub fn get_account(&self, address: &Address) -> String {
         let addr_str = address.to_string();
         self.address_accounts
