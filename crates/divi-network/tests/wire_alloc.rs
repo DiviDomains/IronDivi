@@ -250,6 +250,7 @@ fn decoders_take_bounded_memory() {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
         )
         .await
         .unwrap();

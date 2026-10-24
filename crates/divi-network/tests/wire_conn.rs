@@ -64,6 +64,7 @@ async fn connected_peer() -> (TcpStream, (PeerHandle, broadcast::Sender<()>)) {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Default::default(),
+        Default::default(),
     )
     .await
     .unwrap();
