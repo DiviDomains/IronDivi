@@ -532,11 +532,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.mempool.max_orphan_txs = n as usize;
     }
     if let Some(text) = s.get("minrelaytxfee") {
-        // ParseMoney; refused when it is not an amount (init.cpp)
-        let sat = parse_money(text).ok_or_else(|| {
+        // ParseMoney; refused unless it is an amount above zero, and kept in
+        // satoshis per kB (init.cpp:823-829, FeeRate.cpp)
+        let sat = parse_money(text).filter(|&sat| sat > 0).ok_or_else(|| {
             anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount>: '{}'", text)
         })?;
-        config.mempool.min_relay_fee = sat / 1000;
+        config.mempool.min_relay_fee_per_kb = sat;
     }
     config.staking.enabled = s.get_bool("staking", true);
     if s.is_set("stakeonstaletip") {
@@ -3401,10 +3402,40 @@ mod divid_option_tests {
         assert_eq!(
             cfg("rpcuser=x\nminrelaytxfee=0.0002\n")
                 .mempool
-                .min_relay_fee,
-            20
+                .min_relay_fee_per_kb,
+            20_000
         );
         assert!(cfg_in("irondivi.conf", "rpcuser=x\nminrelaytxfee=abc\n", &[]).is_err());
+    }
+
+    /// Divi Core keeps -minrelaytxfee in satoshis per kB (FeeRate.cpp) and
+    /// refuses an amount that is not above zero (init.cpp:823-829)
+    #[test]
+    fn minrelaytxfee_keeps_satoshis_per_kb_as_core() {
+        let floor = |text: &str| {
+            let c = cfg(&format!("rpcuser=x\nminrelaytxfee={text}\n"));
+            let mempool = divi_node::Mempool::new(c.mempool);
+            (
+                mempool.min_relay_fee_per_kb(),
+                mempool.min_relay_fee_for(250),
+            )
+        };
+        assert_eq!(floor("0.000015"), (1500, 375));
+        assert_eq!(floor("0.000005"), (500, 125));
+        assert_eq!(floor("0.0001"), (10_000, 2500));
+        for zero in ["0", "0.0"] {
+            let err = cfg_in(
+                "irondivi.conf",
+                &format!("rpcuser=x\nminrelaytxfee={zero}\n"),
+                &[],
+            )
+            .err()
+            .map(|e| e.to_string());
+            assert_eq!(
+                err.as_deref(),
+                Some(format!("Invalid amount for -minrelaytxfee=<amount>: '{zero}'").as_str())
+            );
+        }
     }
 
     /// Without -rpcallowip divid listens on the loopback and ignores -rpcbind

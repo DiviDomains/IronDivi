@@ -1371,7 +1371,7 @@ impl Node {
             protocol_version: self.config.network.protocol_version,
             connections: self.peer_manager.peer_count(),
             networks: vec!["ipv4".to_string(), "ipv6".to_string()],
-            relay_fee: (self.config.mempool.min_relay_fee as f64 * 1000.0) / 100_000_000.0,
+            relay_fee: self.config.mempool.min_relay_fee_per_kb as f64 / 100_000_000.0,
         }
     }
 
