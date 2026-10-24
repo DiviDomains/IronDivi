@@ -86,8 +86,13 @@ pub struct StakingConfig {
     pub reserve_balance: i64,
     /// Minimum UTXO age for staking (seconds)
     pub min_coin_age: u32,
-    /// Maximum block size (bytes)
+    /// Maximum block size (bytes), Divi Core `-blockmaxsize`
     pub max_block_size: usize,
+    /// Bytes filled by priority before fee rate, Divi Core `-blockprioritysize`
+    pub block_priority_size: usize,
+    /// Size below which transactions under the fee floor still go in, Divi
+    /// Core `-blockminsize`
+    pub block_min_size: usize,
     /// Maximum block weight
     pub max_block_weight: usize,
     /// Staking loop interval (milliseconds)
@@ -253,6 +258,8 @@ impl Default for StakingConfig {
             reserve_balance: 0,
             min_coin_age: 60 * 60, // 1 hour
             max_block_size: DEFAULT_BLOCK_MAX_SIZE,
+            block_priority_size: DEFAULT_BLOCK_PRIORITY_SIZE,
+            block_min_size: DEFAULT_BLOCK_MIN_SIZE,
             max_block_weight: 4_000_000,
             loop_interval_ms: 500, // Try every 500ms
             max_tip_age_secs: DEFAULT_MAX_TIP_AGE_SECS,
@@ -891,19 +898,22 @@ impl Staker {
 
     /// Mempool transactions to put in a block at `height` and `timestamp`
     fn mempool_block_txs(&self, height: u32, timestamp: u32) -> Vec<Transaction> {
-        // Add mempool transactions up to block limit
-        let max_block_size = block_max_size(self.config.read().max_block_size);
-        let mempool_txs = self.mempool.get_block_txs(max_block_size);
-        // A stale mempool tx (an input already spent on chain) would make our own
-        // block fail self-accept and waste the stake, so keep only spendable ones.
-        let mempool_txs =
-            retain_spendable_txs(mempool_txs, |op| self.chain.has_utxo(op).unwrap_or(true));
-        // Recheck each one against this block, as Divi Core's block assembler does
+        let limits = {
+            let c = self.config.read();
+            BlockAssembly::new(
+                c.max_block_size,
+                c.block_priority_size,
+                c.block_min_size,
+                self.mempool.min_relay_fee_per_kb(),
+            )
+        };
+        // Chosen and checked against this block as Divi Core's block assembler
+        // does; a stale transaction (an input already spent on chain) is left out
         select_block_txs(
-            mempool_txs,
+            self.mempool.block_candidates(height),
             height,
             timestamp,
-            max_block_size,
+            &limits,
             self.chain.params().coinbase_maturity,
             |op| self.chain.get_utxo(op).ok().flatten(),
         )
@@ -2135,33 +2145,145 @@ fn block_max_size(configured: usize) -> usize {
     configured.clamp(1000, MAX_BLOCK_SIZE - 1000)
 }
 
+/// Divi Core `DEFAULT_BLOCK_PRIORITY_SIZE` (defaultValues.h:50): `-blockprioritysize` default
+pub const DEFAULT_BLOCK_PRIORITY_SIZE: usize = 50_000;
+
+/// Divi Core `DEFAULT_BLOCK_MIN_SIZE` (defaultValues.h:48): `-blockminsize` default
+pub const DEFAULT_BLOCK_MIN_SIZE: usize = 0;
+
+/// The sizes and fee floor block assembly works to, as Divi Core's
+/// `BlockMemoryPoolTransactionCollector` constructor sets them
+/// (BlockMemoryPoolTransactionCollector.cpp:18-42, :103-105; the fee floor is
+/// the minimum relay fee, miner.cpp:71-89)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockAssembly {
+    pub max_size: usize,
+    pub priority_size: usize,
+    pub min_size: usize,
+    pub fee_floor_per_kb: i64,
+}
+
+impl BlockAssembly {
+    /// `-blockmaxsize` kept between 1,000 bytes and 1,000 below the network
+    /// limit; `-blockprioritysize` and `-blockminsize` at most that
+    pub fn new(max_size: usize, priority_size: usize, min_size: usize, fee_floor: i64) -> Self {
+        let max_size = block_max_size(max_size);
+        BlockAssembly {
+            max_size,
+            priority_size: priority_size.min(max_size),
+            min_size: min_size.min(max_size),
+            fee_floor_per_kb: fee_floor,
+        }
+    }
+}
+
+/// A candidate's place in Divi Core's `TxPriorityCompare`
+/// (BlockMemoryPoolTransactionCollector.cpp:65-87): by priority with ties by
+/// fee rate, or by fee rate with ties by priority. Core's heap leaves equal
+/// keys in no set order; here they go by txid.
+struct HeapItem {
+    by_fee: bool,
+    index: usize,
+    priority: f64,
+    fee_rate: i64,
+    txid: Hash256,
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for HeapItem {}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let by_priority = self.priority.total_cmp(&other.priority);
+        let by_fee = self.fee_rate.cmp(&other.fee_rate);
+        let order = if self.by_fee {
+            by_fee.then(by_priority)
+        } else {
+            by_priority.then(by_fee)
+        };
+        // The lower txid first among equal keys (a max-heap pops the greatest)
+        order.then_with(|| other.txid.cmp(&self.txid))
+    }
+}
+
 /// Divi Core `PrioritizeTransactionsByBlockSpaceUsage`
-/// (BlockMemoryPoolTransactionCollector.cpp:261-342) for transactions already
-/// in order (parents first): each must be final in this block, keep the block
-/// under `max_block_size` (counting 1,000 bytes for the header and block-reward
-/// transactions) and under 40,000 sigops (counting 100), spend only outputs
-/// still available, and pass CheckInputs with the mandatory script flags
-/// (coinbase/coinstake maturity, value in at least value out, scripts). One
-/// that fails is left out, and so is everything spending it.
+/// (BlockMemoryPoolTransactionCollector.cpp:261-342), with the candidates of
+/// `ComputeMempoolTransactionPriorities` (:212-251). Final transactions are
+/// taken highest priority first. A transaction waits until every pool
+/// transaction it spends is in the block (:156-166). Once the block reaches
+/// `priority_size`, or the best one left must pay a fee (`AllowFree`), the
+/// rest go by fee rate (:296-306), and from then a transaction below the fee
+/// floor that has no prioritisetransaction delta is left out once the block
+/// would reach `min_size` (:308-311, :232-238). Each one kept must keep the
+/// block under the size limit (counting 1,000 bytes for the header and
+/// block-reward transactions) and under 40,000 sigops (counting 100), spend
+/// only outputs still available, and pass CheckInputs with the mandatory
+/// script flags (coinbase/coinstake maturity, value in at least value out,
+/// scripts). One that fails is left out, and so is everything spending it.
 fn select_block_txs(
-    txs: Vec<Transaction>,
+    candidates: Vec<crate::mempool::BlockCandidate>,
     height: u32,
     time: u32,
-    max_block_size: usize,
+    limits: &BlockAssembly,
     maturity: u32,
     utxo: impl Fn(&OutPoint) -> Option<divi_storage::Utxo>,
 ) -> Vec<Transaction> {
-    use std::collections::HashSet;
+    use std::collections::{BinaryHeap, HashSet};
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| c.tx.is_final(height, time))
+        .collect();
+    let index: HashMap<Hash256, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.txid, i))
+        .collect();
+    // Children waiting for each parent, and how many parents each still needs.
+    // A parent that is not final is not a candidate: its children never go in.
+    let mut waiting: HashMap<Hash256, Vec<usize>> = HashMap::new();
+    let mut needs: Vec<usize> = vec![0; candidates.len()];
+    let mut blocked: Vec<bool> = vec![false; candidates.len()];
+    for (i, c) in candidates.iter().enumerate() {
+        for parent in &c.parents {
+            if index.contains_key(parent) {
+                waiting.entry(*parent).or_default().push(i);
+                needs[i] += 1;
+            } else {
+                blocked[i] = true;
+            }
+        }
+    }
+    let mut by_fee = limits.priority_size == 0;
+    let item = |i: usize, by_fee: bool| HeapItem {
+        by_fee,
+        index: i,
+        priority: candidates[i].priority,
+        fee_rate: candidates[i].fee_rate_per_kb,
+        txid: candidates[i].txid,
+    };
+    let mut heap: BinaryHeap<HeapItem> = (0..candidates.len())
+        .filter(|&i| needs[i] == 0 && !blocked[i])
+        .map(|i| item(i, by_fee))
+        .collect();
+
     let mut kept = Vec::new();
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
     let mut block_size = 1000usize;
     let mut block_sig_ops = 100u32;
-    'next: for tx in txs {
-        if !tx.is_final(height, time) {
-            continue;
-        }
-        let size = tx.size();
+    while let Some(best) = heap.pop() {
+        let c = &candidates[best.index];
+        let tx = &c.tx;
+        let size = c.size;
+        let must_pay = !crate::mempool::allow_free(c.priority);
         let mut sig_ops: u32 = tx
             .vin
             .iter()
@@ -2172,15 +2294,27 @@ fn select_block_txs(
                     .map(|o| divi_script::sig_op_count(o.script_pubkey.as_bytes(), false)),
             )
             .sum();
-        if block_size + size >= max_block_size || block_sig_ops + sig_ops >= MAX_BLOCK_SIGOPS {
+        if block_size + size >= limits.max_size || block_sig_ops + sig_ops >= MAX_BLOCK_SIGOPS {
+            continue;
+        }
+        if !by_fee {
+            // This one is still weighed below, now by fee
+            if block_size + size >= limits.priority_size || must_pay {
+                by_fee = true;
+                heap = heap.into_iter().map(|h| item(h.index, true)).collect();
+            }
+        } else if !c.prioritised
+            && c.fee_rate_per_kb < limits.fee_floor_per_kb
+            && block_size + size >= limits.min_size
+        {
             continue;
         }
 
         let mut inputs: Vec<(Script, Amount)> = Vec::with_capacity(tx.vin.len());
         let mut value_in = Amount::ZERO;
-        for input in &tx.vin {
+        let usable = tx.vin.iter().all(|input| {
             if spent.contains(&input.prevout) {
-                continue 'next;
+                return false;
             }
             let (script, value) = if let Some(out) = created.get(&input.prevout) {
                 (out.script_pubkey.clone(), out.value)
@@ -2188,11 +2322,11 @@ fn select_block_txs(
                 if (coin.is_coinbase || coin.is_coinstake)
                     && height.saturating_sub(coin.height) < maturity
                 {
-                    continue 'next;
+                    return false;
                 }
                 (coin.script_pubkey, coin.value)
             } else {
-                continue 'next;
+                return false;
             };
             if divi_script::is_p2sh(script.as_bytes()) {
                 sig_ops +=
@@ -2200,74 +2334,41 @@ fn select_block_txs(
             }
             value_in += value;
             inputs.push((script, value));
-        }
-        if block_sig_ops + sig_ops >= MAX_BLOCK_SIGOPS {
+            true
+        });
+        if !usable || block_sig_ops + sig_ops >= MAX_BLOCK_SIGOPS {
             continue;
         }
         let value_out = tx.vout.iter().fold(Amount::ZERO, |sum, o| sum + o.value);
         if value_in < value_out {
             continue;
         }
-        for (i, (script, value)) in inputs.iter().enumerate() {
-            if divi_script::verify_input_with_flags(
-                &tx,
+        let scripts_pass = inputs.iter().enumerate().all(|(i, (script, value))| {
+            divi_script::verify_input_with_flags(
+                tx,
                 i,
                 script,
                 *value,
                 divi_script::ScriptFlags::mandatory(),
             )
-            .is_err()
-            {
-                continue 'next;
-            }
+            .is_ok()
+        });
+        if !scripts_pass {
+            continue;
         }
 
         block_size += size;
         block_sig_ops += sig_ops;
         spent.extend(tx.vin.iter().map(|i| i.prevout));
-        let txid = tx.txid();
         for (n, out) in tx.vout.iter().enumerate() {
-            created.insert(OutPoint::new(txid, n as u32), out.clone());
+            created.insert(OutPoint::new(c.txid, n as u32), out.clone());
         }
-        kept.push(tx);
-    }
-    kept
-}
-
-/// Keep only mempool transactions whose inputs are all spendable: present in the
-/// chain UTXO set (`on_chain`) or created by another kept transaction. Order is
-/// preserved; a tx that double-spends an earlier kept tx is dropped. Production
-/// side only: this changes what we put in blocks we build, not block validation.
-fn retain_spendable_txs(
-    txs: Vec<Transaction>,
-    on_chain: impl Fn(&OutPoint) -> bool,
-) -> Vec<Transaction> {
-    use std::collections::HashSet;
-    let mut remaining = txs;
-    let mut kept: Vec<Transaction> = Vec::new();
-    let mut created: HashSet<Hash256> = HashSet::new();
-    let mut spent: HashSet<OutPoint> = HashSet::new();
-    // Repeat so a child listed before its parent is still kept once the parent is.
-    loop {
-        let mut progressed = false;
-        let mut next = Vec::new();
-        for tx in remaining {
-            let ok = tx.vin.iter().all(|i| {
-                !spent.contains(&i.prevout)
-                    && (created.contains(&i.prevout.txid) || on_chain(&i.prevout))
-            });
-            if ok {
-                created.insert(tx.txid());
-                spent.extend(tx.vin.iter().map(|i| i.prevout));
-                kept.push(tx);
-                progressed = true;
-            } else {
-                next.push(tx);
+        kept.push(tx.clone());
+        for &child in waiting.get(&c.txid).map(Vec::as_slice).unwrap_or(&[]) {
+            needs[child] -= 1;
+            if needs[child] == 0 && !blocked[child] {
+                heap.push(item(child, by_fee));
             }
-        }
-        remaining = next;
-        if !progressed || remaining.is_empty() {
-            break;
         }
     }
     kept
@@ -3225,56 +3326,16 @@ mod tests {
                     sequence: 0xffffffff,
                 })
                 .collect(),
+            // Spendable by a child with an empty scriptSig
             vout: vec![TxOut {
                 value: Amount::ZERO,
-                script_pubkey: Script::default(),
+                script_pubkey: Script::from_bytes(vec![0x51]),
             }],
         }
     }
 
     fn op(n: u8, vout: u32) -> OutPoint {
         OutPoint::new(Hash256::from_bytes([n; 32]), vout)
-    }
-
-    #[test]
-    fn stale_mempool_tx_is_left_out_of_a_stake_block() {
-        let live = op(1, 0);
-        let stale = op(2, 5); // spent on chain: not in the UTXO set
-        let good = spend_tx(&[live], 1);
-        let bad = spend_tx(&[stale], 2);
-        let kept = retain_spendable_txs(vec![bad, good.clone()], |p| *p == live);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].txid(), good.txid());
-    }
-
-    #[test]
-    fn child_of_a_kept_mempool_tx_is_kept_even_when_listed_first() {
-        let live = op(1, 0);
-        let parent = spend_tx(&[live], 1);
-        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
-        let kept = retain_spendable_txs(vec![child.clone(), parent.clone()], |p| *p == live);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].txid(), parent.txid(), "parent must precede child");
-        assert_eq!(kept[1].txid(), child.txid());
-    }
-
-    #[test]
-    fn double_spend_between_mempool_txs_keeps_only_the_first() {
-        let live = op(1, 0);
-        let a = spend_tx(&[live], 1);
-        let b = spend_tx(&[live], 2);
-        let kept = retain_spendable_txs(vec![a.clone(), b], |p| *p == live);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].txid(), a.txid());
-    }
-
-    #[test]
-    fn orphan_child_of_a_dropped_tx_is_dropped() {
-        let stale = op(2, 5);
-        let parent = spend_tx(&[stale], 1);
-        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
-        let kept = retain_spendable_txs(vec![parent, child], |_| false);
-        assert!(kept.is_empty());
     }
 
     fn chain_coin(value: i64, script: &[u8], height: u32, coinstake: bool) -> divi_storage::Utxo {
@@ -3296,6 +3357,313 @@ mod tests {
 
     const OP_TRUE: &[u8] = &[0x51];
 
+    /// The pool in list order: falling priorities, all above Divi Core's
+    /// AllowFree threshold, so it is taken in that order except where a
+    /// parent must go first
+    fn in_order(txs: Vec<Transaction>) -> Vec<crate::mempool::BlockCandidate> {
+        let ids: Vec<Hash256> = txs.iter().map(|t| t.txid()).collect();
+        let n = txs.len();
+        txs.into_iter()
+            .enumerate()
+            .map(|(i, tx)| crate::mempool::BlockCandidate {
+                txid: tx.txid(),
+                size: tx.size(),
+                fee: Amount::ZERO,
+                priority: 1e12 * (n - i) as f64,
+                fee_rate_per_kb: 0,
+                prioritised: false,
+                parents: tx
+                    .vin
+                    .iter()
+                    .map(|v| v.prevout.txid)
+                    .filter(|p| ids.contains(p))
+                    .collect(),
+                tx,
+            })
+            .collect()
+    }
+
+    fn limits(max_size: usize) -> BlockAssembly {
+        BlockAssembly::new(max_size, max_size, 0, 10_000)
+    }
+
+    /// A pool transaction with the priority and fee rate block assembly sees
+    fn cand(
+        tx: &Transaction,
+        priority: f64,
+        fee_rate_per_kb: i64,
+        parents: &[&Transaction],
+    ) -> crate::mempool::BlockCandidate {
+        crate::mempool::BlockCandidate {
+            tx: tx.clone(),
+            txid: tx.txid(),
+            size: tx.size(),
+            fee: Amount::ZERO,
+            priority,
+            fee_rate_per_kb,
+            prioritised: false,
+            parents: parents.iter().map(|p| p.txid()).collect(),
+        }
+    }
+
+    /// Four spendable coins and a transaction spending each
+    fn four_spends() -> (
+        Vec<Transaction>,
+        impl Fn(&OutPoint) -> Option<divi_storage::Utxo>,
+    ) {
+        let coins: Vec<OutPoint> = (1..=4).map(|n| op(n, 0)).collect();
+        let set = utxos(
+            coins
+                .iter()
+                .map(|o| (*o, chain_coin(10, OP_TRUE, 1, false)))
+                .collect(),
+        );
+        let txs = coins
+            .iter()
+            .enumerate()
+            .map(|(i, c)| spend_tx(&[*c], i as u32 + 1))
+            .collect();
+        (txs, set)
+    }
+
+    fn ids(txs: &[Transaction]) -> Vec<Hash256> {
+        txs.iter().map(|t| t.txid()).collect()
+    }
+
+    /// Above Divi Core's AllowFree threshold (COIN * 1440 / 250)
+    const HIGH: f64 = 1e12;
+
+    /// Within the priority area an old, free transaction goes before a young
+    /// one paying a high fee (BlockMemoryPoolTransactionCollector.cpp:77-85)
+    #[test]
+    fn high_priority_free_transaction_goes_first() {
+        let (t, set) = four_spends();
+        let pool = vec![cand(&t[0], 1e9, 90_000, &[]), cand(&t[1], HIGH, 0, &[])];
+        let kept = select_block_txs(
+            pool,
+            50,
+            0,
+            &BlockAssembly::new(750_000, 50_000, 0, 10_000),
+            20,
+            set,
+        );
+        assert_eq!(ids(&kept), ids(&[t[1].clone(), t[0].clone()]));
+    }
+
+    /// Past the priority area the rest go by fee rate: the transaction that
+    /// reaches it is still taken, then the highest fee rate
+    /// (BlockMemoryPoolTransactionCollector.cpp:296-306)
+    #[test]
+    fn priority_area_is_capped_by_size() {
+        let (t, set) = four_spends();
+        let pool = vec![
+            cand(&t[0], 4.0 * HIGH, 10_000, &[]),
+            cand(&t[1], 3.0 * HIGH, 20_000, &[]),
+            cand(&t[2], 2.0 * HIGH, 10_000, &[]),
+            cand(&t[3], HIGH, 90_000, &[]),
+        ];
+        // Room for the first by priority; the second reaches the area
+        let area = 1000 + t[0].size() + 1;
+        let kept = select_block_txs(
+            pool.clone(),
+            50,
+            0,
+            &BlockAssembly::new(750_000, area, 0, 10_000),
+            20,
+            &set,
+        );
+        assert_eq!(
+            ids(&kept),
+            ids(&[t[0].clone(), t[1].clone(), t[3].clone(), t[2].clone()])
+        );
+        // -blockprioritysize=0: by fee rate from the start, ties by priority
+        let kept = select_block_txs(
+            pool,
+            50,
+            0,
+            &BlockAssembly::new(750_000, 0, 0, 10_000),
+            20,
+            &set,
+        );
+        assert_eq!(
+            ids(&kept),
+            ids(&[t[3].clone(), t[1].clone(), t[0].clone(), t[2].clone()])
+        );
+    }
+
+    /// A transaction that must pay a fee (AllowFree false) ends the priority
+    /// area at once (BlockMemoryPoolTransactionCollector.cpp:274, :296-306)
+    #[test]
+    fn low_priority_transaction_switches_to_fee_order() {
+        let (t, set) = four_spends();
+        let pool = vec![
+            cand(&t[0], 1.0, 20_000, &[]),
+            cand(&t[1], 0.5, 90_000, &[]),
+            cand(&t[2], 0.0, 30_000, &[]),
+        ];
+        let kept = select_block_txs(
+            pool,
+            50,
+            0,
+            &BlockAssembly::new(750_000, 50_000, 0, 10_000),
+            20,
+            set,
+        );
+        // t0 is taken off by priority and switches; the rest by fee rate
+        assert_eq!(ids(&kept), ids(&[t[0].clone(), t[1].clone(), t[2].clone()]));
+    }
+
+    /// A child is never taken before its parent, even with the higher fee
+    /// rate (BlockMemoryPoolTransactionCollector.cpp:156-166, :236-240)
+    #[test]
+    fn child_never_goes_before_its_parent() {
+        let (t, set) = four_spends();
+        let parent = t[0].clone();
+        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 9);
+        let pool = vec![
+            cand(&child, HIGH * 2.0, 90_000, &[&parent]),
+            cand(&t[1], HIGH, 20_000, &[]),
+            cand(&parent, 0.0, 10_000, &[]),
+        ];
+        let by_fee = BlockAssembly::new(750_000, 0, 0, 10_000);
+        let kept = select_block_txs(pool.clone(), 50, 0, &by_fee, 20, &set);
+        assert_eq!(
+            ids(&kept),
+            ids(&[t[1].clone(), parent.clone(), child.clone()])
+        );
+        let by_priority = BlockAssembly::new(750_000, 50_000, 0, 10_000);
+        let kept = select_block_txs(pool, 50, 0, &by_priority, 20, &set);
+        let at = |tx: &Transaction| kept.iter().position(|k| k.txid() == tx.txid()).unwrap();
+        assert!(at(&parent) < at(&child), "child before parent");
+    }
+
+    /// By fee rate, one below the fee floor is left out once the block would
+    /// reach -blockminsize, unless it was given a prioritisetransaction delta
+    /// (BlockMemoryPoolTransactionCollector.cpp:232-238, :308-311)
+    #[test]
+    fn cheap_transactions_are_left_out_past_the_minimum_size() {
+        let (t, set) = four_spends();
+        let mut prioritised = cand(&t[2], 0.0, 5_000, &[]);
+        prioritised.prioritised = true;
+        let pool = vec![
+            cand(&t[0], 0.0, 20_000, &[]),
+            cand(&t[1], 0.0, 9_999, &[]),
+            prioritised,
+        ];
+        let kept = select_block_txs(
+            pool.clone(),
+            50,
+            0,
+            &BlockAssembly::new(750_000, 0, 0, 10_000),
+            20,
+            &set,
+        );
+        assert_eq!(ids(&kept), ids(&[t[0].clone(), t[2].clone()]));
+        // Below -blockminsize they still go in
+        let kept = select_block_txs(
+            pool,
+            50,
+            0,
+            &BlockAssembly::new(750_000, 0, 100_000, 10_000),
+            20,
+            &set,
+        );
+        assert_eq!(ids(&kept), ids(&[t[0].clone(), t[1].clone(), t[2].clone()]));
+    }
+
+    /// The sizes are kept within -blockmaxsize, which is kept between 1,000
+    /// bytes and 1,000 below the network limit (:18-42)
+    #[test]
+    fn block_assembly_sizes_are_cores() {
+        let a = BlockAssembly::new(750_000, 50_000, 0, 10_000);
+        assert_eq!(
+            (a.max_size, a.priority_size, a.min_size),
+            (750_000, 50_000, 0)
+        );
+        let a = BlockAssembly::new(10, 50_000, 90_000, 10_000);
+        assert_eq!(
+            (a.max_size, a.priority_size, a.min_size),
+            (1000, 1000, 1000)
+        );
+        let a = BlockAssembly::new(usize::MAX, usize::MAX, 5, 10_000);
+        assert_eq!(
+            (a.max_size, a.priority_size, a.min_size),
+            (1_999_000, 1_999_000, 5)
+        );
+    }
+
+    #[test]
+    fn stale_mempool_tx_is_left_out_of_a_stake_block() {
+        let live = op(1, 0);
+        let stale = op(2, 5); // spent on chain: not in the UTXO set
+        let set = utxos(vec![(live, chain_coin(10, OP_TRUE, 1, false))]);
+        let good = spend_tx(&[live], 1);
+        let bad = spend_tx(&[stale], 2);
+        let kept = select_block_txs(
+            in_order(vec![bad, good.clone()]),
+            50,
+            0,
+            &limits(750_000),
+            20,
+            set,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), good.txid());
+    }
+
+    #[test]
+    fn child_of_a_kept_mempool_tx_is_kept_even_when_listed_first() {
+        let live = op(1, 0);
+        let set = utxos(vec![(live, chain_coin(10, OP_TRUE, 1, false))]);
+        let parent = spend_tx(&[live], 1);
+        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
+        let kept = select_block_txs(
+            in_order(vec![child.clone(), parent.clone()]),
+            50,
+            0,
+            &limits(750_000),
+            20,
+            set,
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].txid(), parent.txid(), "parent must precede child");
+        assert_eq!(kept[1].txid(), child.txid());
+    }
+
+    #[test]
+    fn double_spend_between_mempool_txs_keeps_only_the_first() {
+        let live = op(1, 0);
+        let set = utxos(vec![(live, chain_coin(10, OP_TRUE, 1, false))]);
+        let a = spend_tx(&[live], 1);
+        let b = spend_tx(&[live], 2);
+        let kept = select_block_txs(
+            in_order(vec![a.clone(), b]),
+            50,
+            0,
+            &limits(750_000),
+            20,
+            set,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].txid(), a.txid());
+    }
+
+    #[test]
+    fn orphan_child_of_a_dropped_tx_is_dropped() {
+        let stale = op(2, 5);
+        let parent = spend_tx(&[stale], 1);
+        let child = spend_tx(&[OutPoint::new(parent.txid(), 0)], 2);
+        let kept = select_block_txs(
+            in_order(vec![parent, child]),
+            50,
+            0,
+            &limits(750_000),
+            20,
+            |_| None,
+        );
+        assert!(kept.is_empty());
+    }
+
     /// A coinstake output may be spent 20 blocks on (regtest), in a block at
     /// height 120 one from height 100; an earlier spend, and anything spending
     /// it, is left out of the block (Core's CheckInputs in the block assembler)
@@ -3310,7 +3678,14 @@ mod tests {
         let a = spend_tx(&[mature], 1);
         let b = spend_tx(&[young], 2);
         let child = spend_tx(&[OutPoint::new(b.txid(), 0)], 3);
-        let kept = select_block_txs(vec![a.clone(), b, child], 120, 0, 750_000, 20, set);
+        let kept = select_block_txs(
+            in_order(vec![a.clone(), b, child]),
+            120,
+            0,
+            &limits(750_000),
+            20,
+            set,
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].txid(), a.txid());
     }
@@ -3329,7 +3704,14 @@ mod tests {
         overspend.vout[0].value = Amount::from_sat(1);
         let fails = spend_tx(&[locked], 2);
         let ok = spend_tx(&[fine], 3);
-        let kept = select_block_txs(vec![overspend, fails, ok.clone()], 50, 0, 750_000, 20, set);
+        let kept = select_block_txs(
+            in_order(vec![overspend, fails, ok.clone()]),
+            50,
+            0,
+            &limits(750_000),
+            20,
+            set,
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].txid(), ok.txid());
     }
@@ -3347,7 +3729,7 @@ mod tests {
         let b = spend_tx(&coins[1..2], 2);
         // 1,000 bytes counted for the header and reward transactions
         let max = 1000 + a.size() + b.size();
-        let kept = select_block_txs(vec![a.clone(), b], 50, 0, max, 20, &set);
+        let kept = select_block_txs(in_order(vec![a.clone(), b]), 50, 0, &limits(max), 20, &set);
         assert_eq!(kept.len(), 1, "a block stays under the size limit");
 
         // 100 sigops counted for the reward transactions; 20 per CHECKMULTISIG
@@ -3358,7 +3740,14 @@ mod tests {
         };
         let at_limit = with_sigops(coins[2], 1995, 3);
         let under = with_sigops(coins[3], 1994, 4);
-        let kept = select_block_txs(vec![at_limit, under.clone()], 50, 0, 750_000, 20, &set);
+        let kept = select_block_txs(
+            in_order(vec![at_limit, under.clone()]),
+            50,
+            0,
+            &limits(750_000),
+            20,
+            &set,
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].txid(), under.txid());
     }

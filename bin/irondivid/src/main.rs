@@ -94,6 +94,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
+-blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
 -blocknotify=<cmd> -walletnotify=<cmd>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
@@ -267,9 +268,6 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
     "alerts",
-    "blockmaxsize",
-    "blockminsize",
-    "blockprioritysize",
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
@@ -567,6 +565,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
         }
     }
+    // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    for (key, slot) in [
+        ("blockmaxsize", &mut config.staking.block_max_size),
+        ("blockprioritysize", &mut config.staking.block_priority_size),
+        ("blockminsize", &mut config.staking.block_min_size),
+    ] {
+        if let Some(n) = number_option(&s, key, 0..=i64::from(u32::MAX)) {
+            *slot = n as usize;
+        }
+    }
     for (key, slot) in [
         ("txindex", &mut config.index.txindex),
         ("spentindex", &mut config.index.spentindex),
@@ -628,6 +636,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "staking",
         "stakeonstaletip",
         "stakesplitthreshold",
+        "blockmaxsize",
+        "blockprioritysize",
+        "blockminsize",
         "txindex",
         "spentindex",
         "addressindex",
@@ -1988,6 +1999,9 @@ fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> Sta
             || config.network.network_type == NetworkType::Regtest,
         stake_split_threshold: config.staking.split_threshold,
         min_coin_age: chain.min_stake_age,
+        max_block_size: config.staking.block_max_size,
+        block_priority_size: config.staking.block_priority_size,
+        block_min_size: config.staking.block_min_size,
         ..StakingConfig::default()
     }
 }
