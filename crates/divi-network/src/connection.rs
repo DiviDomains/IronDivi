@@ -327,8 +327,7 @@ impl Connection {
         }
 
         // Store their version info
-        self.info.time_offset =
-            their_version.timestamp - crate::peer::unix_now_us() as i64 / 1_000_000;
+        self.info.time_offset = their_version.timestamp - divi_primitives::clock::now();
         // An inbound peer names the address it reached us at (Divi Core
         // main.cpp:402-404 SeenLocal)
         if self.info.direction == PeerDirection::Inbound {
@@ -388,10 +387,8 @@ impl Connection {
         let version = VersionMessage {
             version: crate::constants::protocol_version(),
             services: self.our_services,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            // GetTime or GetAdjustedTime, both from the mocked clock (Node.cpp PushVersion)
+            timestamp: divi_primitives::clock::now(),
             addr_recv,
             addr_from: self
                 .local
@@ -501,6 +498,7 @@ impl Connection {
         let bytes_received = HEADER_SIZE as u64 + header.payload_size as u64;
         self.info.bytes_recv += bytes_received;
         self.info.last_recv = std::time::Instant::now();
+        self.info.last_recv_unix = crate::peer::unix_now();
         self.total_bytes_recv
             .fetch_add(bytes_received, Ordering::Relaxed);
 
@@ -626,6 +624,7 @@ impl Connection {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
                             info.last_recv = std::time::Instant::now();
+                            info.last_recv_unix = crate::peer::unix_now();
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
                             if let Some(answer) = malformed_reject(&command) {
@@ -642,6 +641,7 @@ impl Connection {
                             // Update stats
                             info.bytes_recv += bytes_received;
                             info.last_recv = std::time::Instant::now();
+                            info.last_recv_unix = crate::peer::unix_now();
                             info.last_message_command = Some(msg.command().to_string());
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
 
@@ -764,6 +764,7 @@ impl Connection {
         let bytes_sent = bytes.len() as u64;
         info.bytes_sent += bytes_sent;
         info.last_send = std::time::Instant::now();
+        info.last_send_unix = crate::peer::unix_now();
         total_bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
 
         // Log outgoing messages for debugging
@@ -781,6 +782,7 @@ impl Connection {
         let bytes_sent = bytes.len() as u64;
         self.info.bytes_sent += bytes_sent;
         self.info.last_send = std::time::Instant::now();
+        self.info.last_send_unix = crate::peer::unix_now();
         self.total_bytes_sent
             .fetch_add(bytes_sent, Ordering::Relaxed);
 

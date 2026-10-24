@@ -75,8 +75,8 @@ pub mod utxo_cache;
 pub use address_index::{AddressHistoryEntry, AddressIndex, AddressUtxo, TxIndexEntry};
 pub use block_index::{BlockIndex, BlockStatus};
 pub use chain::{
-    bip34_height_script, check_transaction, AcceptBlockResult, Chain, ChainParams, ChainTip,
-    ChainTipStatus, HeightIndexAudit, NetworkType,
+    bip34_height_script, check_transaction, AcceptBlockResult, BlockListener, Chain, ChainEvent,
+    ChainParams, ChainTip, ChainTipStatus, HeightIndexAudit, NetworkType, TipListener,
 };
 pub use database::{ChainDatabase, UtxoStats};
 pub use difficulty::{get_next_work_required, DifficultyParams};

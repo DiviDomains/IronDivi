@@ -95,7 +95,9 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n\
+-blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
+-zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
@@ -331,10 +333,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "txconfirmtarget",
     "upnp",
     "vault_min",
-    "zmqpubhashblock",
-    "zmqpubhashtx",
-    "zmqpubrawblock",
-    "zmqpubrawtx",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -694,6 +692,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("walletnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    // Divi Core takes each -zmqpub* that is set, even empty (its bind then
+    // fails), as given (zmqnotificationinterface.cpp:38-50)
+    let zmq_address = |key: &str| s.get(key).map(String::from);
+    config.zmq = divi_node::zmq::ZmqConfig {
+        hashblock: zmq_address("zmqpubhashblock"),
+        hashtx: zmq_address("zmqpubhashtx"),
+        rawblock: zmq_address("zmqpubrawblock"),
+        rawtx: zmq_address("zmqpubrawtx"),
+    };
     config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
@@ -748,6 +755,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "expire",
         "blocknotify",
         "walletnotify",
+        "zmqpubhashblock",
+        "zmqpubhashtx",
+        "zmqpubrawblock",
+        "zmqpubrawtx",
         "whitelist",
         "whitebind",
     ];
@@ -1598,6 +1609,10 @@ async fn run_daemon(
         spawn_block_notify(node.chain().clone(), cmd);
     }
 
+    // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
+    // Kept for the life of the node; none if an address cannot be bound.
+    let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
+
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
 
@@ -1720,7 +1735,7 @@ async fn run_daemon(
             {
                 let wallet_for_added = Arc::clone(wallet_arc);
                 node.mempool()
-                    .set_added_listener(Arc::new(move |tx: &Transaction| {
+                    .add_added_listener(Arc::new(move |tx: &Transaction| {
                         if wallet_for_added.add_mempool_tx(tx) {
                             info!("Wallet sees unconfirmed tx {}", tx.txid());
                         }
@@ -2054,7 +2069,7 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
-        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2209,7 +2224,7 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
-        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2310,7 +2325,7 @@ fn run_notify(cmd: &str, value: &str) {
 /// -blocknotify: run the command each time the best block changes, with the
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
-    chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+    chain.add_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
@@ -2421,11 +2436,25 @@ fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::
 
 /// The mempool side of invalidateblock and its family: the disconnected
 /// blocks' transactions go back to the mempool and what the chain now spends
-/// leaves it, as after any reorganization
-fn mempool_reorg_hook(node: &Node) -> divi_rpc::blockchain::ReorgHook {
+/// leaves it, as after any reorganization. The wallet is brought to the tip
+/// first, as Divi Core's disconnectTip and connectTip tell it of every block
+/// that leaves or joins the chain (SyncTransactions, ChainTipManager.cpp:189,
+/// :150): blocks that left are rolled back, blocks that joined are scanned.
+/// Before the mempool, so a returned transaction reaches a wallet that no
+/// longer holds it as confirmed.
+fn mempool_reorg_hook(
+    node: &Node,
+    wallet: Option<Arc<WalletDb>>,
+) -> divi_rpc::blockchain::ReorgHook {
     let chain = node.chain().clone();
     let mempool = node.mempool().clone();
     Arc::new(move |disconnected| {
+        if let Some(wallet) = &wallet {
+            sync_wallet_to_tip(wallet, &chain);
+            if let Err(e) = wallet.save_incremental() {
+                error!("Failed to save the wallet after the chain moved: {}", e);
+            }
+        }
         divi_node::update_mempool_after_reorg(&chain, &mempool, disconnected)
     })
 }
