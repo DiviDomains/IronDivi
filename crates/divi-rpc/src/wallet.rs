@@ -297,6 +297,30 @@ pub(crate) fn parse_hex_v(value: &str, name: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// Divi Core's ParseHashV (JsonParseHelpers.cpp:5-15): the text of a string
+/// value (else ""), which must be hex as IsHex takes it (non-empty, even
+/// length), else -8 "<name> must be hexadecimal string (not '<text>')"; then
+/// uint256::SetHex, which reads the last 64 digits as a number, so "11" is the
+/// hash 00..0011
+pub(crate) fn parse_hash_v(
+    value: Option<&serde_json::Value>,
+    name: &str,
+) -> Result<Hash256, Error> {
+    let text = value.and_then(|v| v.as_str()).unwrap_or("");
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMETER,
+            format!("{name} must be hexadecimal string (not '{text}')"),
+        )
+        .into());
+    }
+    let digits = &text[text.len().saturating_sub(64)..];
+    Ok(Hash256::from_hex(&format!("{digits:0>64}")).expect("64 hex digits"))
+}
+
 /// Decoded transaction as `getrawtransaction <txid> 1` shows it (without the block fields),
 /// with addresses encoded for `network`.
 pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Value {
@@ -1736,14 +1760,15 @@ impl WalletRpc {
 
         // Add inputs
         for input in inputs {
-            // ParseHashO(o, "txid")
-            let txid_str = input.get("txid").and_then(|v| v.as_str()).unwrap_or("");
-            let txid = Hash256::from_hex(txid_str).map_err(|_| {
-                RpcError::new(
-                    codes::INVALID_PARAMETER,
-                    format!("txid must be hexadecimal string (not '{txid_str}')"),
+            // input.get_obj(), then ParseHashO(o, "txid") (rpcrawtransaction.cpp:413-415)
+            if !input.is_object() {
+                return Err(RpcError::new(
+                    codes::MISC_ERROR,
+                    format!("value is type {}, expected obj", json_spirit_type(input)),
                 )
-            })?;
+                .into());
+            }
+            let txid = parse_hash_v(input.get("txid"), "txid")?;
 
             let vout = input.get("vout").and_then(|v| v.as_i64()).ok_or_else(|| {
                 RpcError::new(
@@ -2132,17 +2157,8 @@ impl WalletRpc {
     /// one, the block an unspent output of it records, as Divi Core's
     /// GetTransaction does (TransactionDiskAccessor.cpp:49-110).
     pub fn get_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let txid_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("txid required"))?;
-
-        // ParseHashV (rpcrawtransaction.cpp:166)
-        let txid = Hash256::from_hex(txid_str).map_err(|_| {
-            RpcError::new(
-                codes::INVALID_PARAMETER,
-                format!("parameter 1 must be hexadecimal string (not '{txid_str}')"),
-            )
-        })?;
+        // ParseHashV(params[0], "parameter 1") (rpcrawtransaction.cpp:203)
+        let txid = parse_hash_v(params.get(0), "parameter 1")?;
 
         // Accept both bool and numeric types for verbose parameter
         // Test script passes "1" as string, which get_bool() rejects
