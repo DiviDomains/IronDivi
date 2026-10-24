@@ -3874,7 +3874,8 @@ impl Chain {
     }
 
     /// Per-block rewards at `height`
-    fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
+    /// Divi Core's CBlockRewards for a height (GetBlockSubsidity)
+    pub fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
         let mut rewards = divi_consensus::block_subsidy::get_block_subsidy_for_chain(
             self.params.chain_mode,
             self.network_type() == NetworkType::Mainnet,

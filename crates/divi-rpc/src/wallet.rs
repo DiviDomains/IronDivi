@@ -112,6 +112,13 @@ fn coins_value(coins: &[divi_wallet::WalletUtxo]) -> Amount {
     Amount::from_sat(coins.iter().map(|u| u.value.as_sat()).sum())
 }
 
+/// Divi Core's GetSpendableBalance (WalletBalanceCalculator.cpp:80-87):
+/// confirmed mature coins plus unconfirmed ones whose inputs were all ours,
+/// vaults left out
+fn spendable_balance(wallet: &WalletDb, height: u32) -> Amount {
+    coins_value(&wallet.get_spendable_utxos(height, 0))
+}
+
 /// IronDivi's `subtractfeefromamount` for sendmany (Divi Core has none): the
 /// fee is split evenly over the listed outputs, the first taking the
 /// remainder, and the sender keeps that much more as change; if that change
@@ -231,7 +238,7 @@ pub(crate) fn json_spirit_type(value: &serde_json::Value) -> &'static str {
 /// their bare txid as equal to the normal txid (clearing the coinbase
 /// scriptSig would otherwise collide distinct coinbases on the same bare
 /// txid); mirror that special case here.
-fn bare_txid(tx: &Transaction) -> Hash256 {
+pub(crate) fn bare_txid(tx: &Transaction) -> Hash256 {
     if tx.is_coinbase() {
         return tx.txid();
     }
@@ -513,14 +520,6 @@ pub struct WalletRpc {
     block_fetcher: RwLock<Option<Arc<dyn crate::blockchain::BlockFetcher>>>,
     /// Node mempool: unconfirmed spends, and `getrawtransaction` for pool transactions
     mempool: RwLock<Option<Arc<dyn crate::blockchain::MempoolProvider>>>,
-}
-
-/// A history entry's amount as Core shows it: the net change to the wallet
-/// without the fee, which is reported separately (`fee`). A 1 DIVI send with a
-/// 0.00003 fee is amount -1, fee -0.00003.
-fn amount_without_fee(tx: &divi_wallet::WalletTx) -> f64 {
-    let fee = tx.fee.map_or(0, |f| f.as_sat());
-    (tx.amount + fee) as f64 / 100_000_000.0
 }
 
 /// Scan the active chain into the wallet, in order, from its last scanned
@@ -1039,194 +1038,127 @@ impl WalletRpc {
         Ok(serde_json::json!(result))
     }
 
-    /// gettransaction - Get detailed information about a wallet transaction
+    /// History entries as Divi Core builds them, for one call
+    fn history<'a>(&'a self, wallet: &'a WalletDb) -> crate::wallet_history::History<'a> {
+        crate::wallet_history::History::new(
+            wallet,
+            self.chain.as_deref(),
+            self.mempool.read().clone(),
+            self.address_network(),
+            self.current_height(),
+        )
+    }
+
+    /// gettransaction as Divi Core (rpcwallet.cpp:2452-2490)
     pub fn get_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let txid_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("txid required"))?;
-
-        let txid = divi_primitives::hash::Hash256::from_hex(txid_str)
-            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid txid"))?;
+        let watch = params.get_bool(1).unwrap_or(false);
+        let not_wallet = || {
+            RpcError::new(
+                codes::INVALID_ADDRESS_OR_KEY,
+                "Invalid or non-wallet transaction id",
+            )
+        };
+        // `hash.SetHex(...)`: text that is no hash names no wallet transaction
+        let txid = Hash256::from_hex(txid_str).map_err(|_| not_wallet())?;
 
         let wallet = self.get_wallet()?;
-
-        let tx = wallet
-            .get_transaction(&txid)
-            .ok_or_else(|| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Transaction not found"))?;
-
-        let height = self.current_height();
-        let confirmations = match tx.block_height {
-            Some(h) if height >= h => height - h + 1,
-            _ => 0,
-        };
-
-        let divi_amount = amount_without_fee(&tx);
-        // Fee is shown as negative for sent transactions (C++ Divi convention)
-        let divi_fee = tx.fee.map(|f| -(f.as_sat() as f64 / 100_000_000.0));
-
-        Ok(serde_json::json!({
-            "amount": divi_amount,
-            "fee": divi_fee,
-            "confirmations": confirmations,
-            "blockhash": tx.block_hash.map(|h| h.to_string()),
-            "blockheight": tx.block_height,
-            "blocktime": tx.timestamp,
-            "txid": tx.txid.to_string(),
-            "time": tx.timestamp,
-            "timereceived": tx.timestamp,
-            "details": [match divi_fee {
-                Some(fee) => serde_json::json!({
-                    "category": tx.category,
-                    "amount": divi_amount,
-                    "fee": fee,
-                }),
-                None => serde_json::json!({
-                    "category": tx.category,
-                    "amount": divi_amount,
-                }),
-            }],
-        }))
+        let record = wallet.history_record(&txid).ok_or_else(not_wallet)?;
+        self.history(&wallet)
+            .transaction(&record, watch)
+            .ok_or_else(|| not_wallet().into())
     }
 
-    /// listtransactions - List recent transactions
-    /// C++ signature: listtransactions ( "account" count skip )
-    /// params[0] = account (string, ignored — we don't use accounts)
-    /// params[1] = count (default 10)
-    /// params[2] = skip (default 0)
+    /// listtransactions ( "account" count from includeWatchonly ) as Divi Core
+    /// (rpcwallet.cpp:2215-2318): one entry per output sent or received, the
+    /// newest `count` after skipping `from`, oldest first
     pub fn list_transactions(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        // params[0] is account name (string) — skip it
-        // params[1] is count, params[2] is skip
-        let count = params.get_u64(1).unwrap_or(10) as usize;
-        let skip = params.get_u64(2).unwrap_or(0) as usize;
-
-        let height = self.current_height();
-        let mut txs = wallet.get_transactions(None);
-
-        // Apply skip and count
-        if skip > 0 {
-            txs = txs.into_iter().skip(skip).collect();
+        let account = params.get_str(0).unwrap_or("*").to_string();
+        let count = params.get_i64(1).unwrap_or(10);
+        let from = params.get_i64(2).unwrap_or(0);
+        let watch = params.get_bool(3).unwrap_or(false);
+        if count < 0 {
+            return Err(RpcError::new(codes::INVALID_PARAMETER, "Negative count").into());
         }
-        txs.truncate(count);
+        if from < 0 {
+            return Err(RpcError::new(codes::INVALID_PARAMETER, "Negative from").into());
+        }
+        let (count, from) = (count as usize, from as usize);
 
-        let result: Vec<_> = txs
-            .iter()
-            .map(|tx| {
-                let confirmations = match tx.block_height {
-                    Some(h) if height >= h => height - h + 1,
-                    _ => 0,
-                };
-                let divi_amount = amount_without_fee(tx);
-
-                let mut entry = serde_json::json!({
-                    "category": tx.category,
-                    "amount": divi_amount,
-                    "confirmations": confirmations,
-                    "blockhash": tx.block_hash.map(|h| h.to_string()),
-                    "blockheight": tx.block_height,
-                    "txid": tx.txid.to_string(),
-                    "time": tx.timestamp,
-                    "timereceived": tx.timestamp,
-                });
-
-                // Include fee for sent transactions (C++ Divi compatibility)
-                if let Some(fee) = tx.fee {
-                    let fee_divi = fee.as_sat() as f64 / 100_000_000.0;
-                    entry["fee"] = serde_json::json!(-fee_divi); // Negative as per C++ convention
-                }
-
-                entry
-            })
-            .collect();
-
-        Ok(serde_json::json!(result))
+        let history = self.history(&wallet);
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        // newest transaction first, each one's entries in order
+        for record in history.ordered_records().iter().rev() {
+            history.details(record, &account, 0, true, watch, &mut entries);
+            if entries.len() >= count + from {
+                break;
+            }
+        }
+        let from = from.min(entries.len());
+        let count = count.min(entries.len() - from);
+        let mut window: Vec<_> = entries.drain(from..from + count).collect();
+        window.reverse();
+        Ok(serde_json::json!(window))
     }
 
-    /// listsinceblock - List transactions since a given block
+    /// listsinceblock ( "blockhash" target-confirmations includeWatchonly ) as
+    /// Divi Core (rpcwallet.cpp:2364-2450)
     pub fn list_since_block(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
+        let height = self.current_height();
 
-        let since_height = if let Some(blockhash_str) = params.get_str(0) {
-            let blockhash = Hash256::from_hex(blockhash_str)
-                .map_err(|_| RpcError::invalid_params("Invalid block hash"))?;
-
-            if let Some(chain) = &self.chain {
-                let block_index = chain
-                    .get_block_index(&blockhash)
-                    .map_err(|e| RpcError::internal_error(format!("Failed to get block: {}", e)))?
-                    .ok_or_else(|| RpcError::new(codes::INVALID_PARAMETER, "Block not found"))?;
-                block_index.height
-            } else {
-                return Err(RpcError::internal_error("Chain not available").into());
-            }
-        } else {
-            0
-        };
-
-        let target_confirmations = params.get_u64(1).unwrap_or(1) as u32;
-        let current_height = self.current_height();
-        let all_txs = wallet.get_transactions(None);
-
-        let filtered_txs: Vec<_> = all_txs
-            .iter()
-            .filter(|tx| {
-                if let Some(tx_height) = tx.block_height {
-                    if tx_height <= since_height {
-                        return false;
-                    }
-                    let confirmations = if current_height >= tx_height {
-                        current_height - tx_height + 1
-                    } else {
-                        0
-                    };
-                    confirmations >= target_confirmations
-                } else {
-                    target_confirmations == 0
-                }
+        // An unknown or malformed hash lists everything
+        let since_height = params
+            .get_str(0)
+            .and_then(|h| Hash256::from_hex(h).ok())
+            .and_then(|hash| {
+                self.chain
+                    .as_ref()
+                    .and_then(|c| c.get_block_index(&hash).ok().flatten())
             })
-            .map(|tx| {
-                let confirmations = match tx.block_height {
-                    Some(h) if current_height >= h => current_height - h + 1,
-                    _ => 0,
-                };
-                let divi_amount = amount_without_fee(tx);
-
-                let mut entry = serde_json::json!({
-                    "category": tx.category,
-                    "amount": divi_amount,
-                    "confirmations": confirmations,
-                    "blockhash": tx.block_hash.map(|h| h.to_string()),
-                    "blockheight": tx.block_height,
-                    "txid": tx.txid.to_string(),
-                    "time": tx.timestamp,
-                    "timereceived": tx.timestamp,
-                });
-
-                // Include fee for sent transactions (C++ Divi compatibility)
-                if let Some(fee) = tx.fee {
-                    let fee_divi = fee.as_sat() as f64 / 100_000_000.0;
-                    entry["fee"] = serde_json::json!(-fee_divi); // Negative as per C++ convention
-                }
-
-                entry
-            })
-            .collect();
-
-        let lastblock = if let Some(chain) = &self.chain {
-            chain
-                .tip()
-                .map(|tip| tip.hash.to_string())
-                .unwrap_or_else(|| {
-                    String::from("0000000000000000000000000000000000000000000000000000000000000000")
-                })
-        } else {
-            String::from("0000000000000000000000000000000000000000000000000000000000000000")
+            .map(|index| index.height);
+        let target = match params.get(1) {
+            None => 1,
+            Some(_) => params.get_i64(1).unwrap_or(0),
         };
+        if target < 1 {
+            return Err(RpcError::new(codes::INVALID_PARAMETER, "Invalid parameter").into());
+        }
+        let watch = params.get_bool(2).unwrap_or(false);
+        let depth = since_height.map(|h| 1 + height as i64 - h as i64);
+
+        let history = self.history(&wallet);
+        let mut transactions = Vec::new();
+        for record in history.ordered_records() {
+            let mut entries = Vec::new();
+            history.details(&record, "*", 0, true, watch, &mut entries);
+            let keep = |e: &serde_json::Value| match depth {
+                None => true,
+                Some(d) => e["confirmations"].as_i64().unwrap_or(0) < d,
+            };
+            transactions.extend(entries.into_iter().filter(keep));
+        }
+
+        // chain[Height() + 1 - target_confirms]; null (zeros) below genesis
+        let last_height = height as i64 + 1 - target;
+        let lastblock = (last_height >= 0)
+            .then(|| self.chain.as_ref())
+            .flatten()
+            .and_then(|c| {
+                c.get_block_index_by_height(last_height as u32)
+                    .ok()
+                    .flatten()
+            })
+            .map(|i| i.hash)
+            .unwrap_or_else(Hash256::zero);
 
         Ok(serde_json::json!({
-            "transactions": filtered_txs,
-            "lastblock": lastblock
+            "transactions": transactions,
+            "lastblock": lastblock.to_string()
         }))
     }
 
@@ -1688,7 +1620,7 @@ impl WalletRpc {
         ensure_fully_unlocked(&wallet)?;
 
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
-        check_send_total(&payees, wallet.get_balance())?;
+        check_send_total(&payees, spendable_balance(&wallet, self.current_height()))?;
         ensure_not_dust(send_amount, &dest_addr.script_pubkey())?;
 
         let height = self.current_height();
@@ -2284,29 +2216,66 @@ impl WalletRpc {
     }
 
     /// listreceivedbyaddress - List amounts received by address
+    /// listreceivedbyaddress ( minconf includeempty includeWatchonly ) as Divi
+    /// Core's ListReceived (rpcwallet.cpp:1793-1912): address-book addresses
+    /// (not change) with the amount received, the fewest confirmations and the
+    /// transactions; with includeempty also those that received nothing
     pub fn list_received_by_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
         let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-        let _include_empty = params.get_bool(1).unwrap_or(false);
+        let include_empty = params.get_bool(1).unwrap_or(false);
 
-        // Aggregate by address, including coins since spent
-        let by_addr = self.received_by_address(&wallet, min_conf);
+        let height = self.current_height();
+        let mut by_addr: HashMap<String, (i64, u32, Vec<String>)> = HashMap::new();
+        for output in wallet.received_outputs() {
+            let confs = output.confirmations(height);
+            if output.is_coinbase || confs < min_conf {
+                continue;
+            }
+            let entry = by_addr
+                .entry(output.address.clone())
+                .or_insert((0, u32::MAX, Vec::new()));
+            entry.0 += output.value.as_sat();
+            entry.1 = entry.1.min(confs);
+            entry.2.push(output.txid.to_string());
+        }
 
-        let result: Vec<_> = by_addr
+        let mut addresses: Vec<String> = wallet
+            .list_accounts()
+            .into_values()
+            .flatten()
+            .filter(|a| !wallet.is_change_address_str(a))
+            .collect();
+        for addr in by_addr.keys() {
+            if !wallet.is_change_address_str(addr) && !addresses.contains(addr) {
+                addresses.push(addr.clone());
+            }
+        }
+        addresses.sort();
+        addresses.dedup();
+
+        let result: Vec<_> = addresses
             .iter()
-            .map(|(addr, (amount, confs))| {
-                let divi = *amount as f64 / 100_000_000.0;
+            .filter_map(|addr| {
+                let tally = by_addr.get(addr);
+                if tally.is_none() && !include_empty {
+                    return None;
+                }
+                let (sat, confs, txids) = tally.cloned().unwrap_or((0, u32::MAX, Vec::new()));
+                let confs = if confs == u32::MAX { 0 } else { confs };
                 let label = Address::from_base58(addr)
                     .map(|a| wallet.get_account(&a))
                     .unwrap_or_default();
-                serde_json::json!({
+                Some(serde_json::json!({
                     "address": addr,
                     "account": label,
-                    "amount": divi,
+                    "amount": sat as f64 / 100_000_000.0,
                     "confirmations": confs,
+                    "bcconfirmations": confs,
+                    "txids": txids,
                     "label": label,
-                })
+                }))
             })
             .collect();
 
@@ -2769,7 +2738,7 @@ impl WalletRpc {
         let owner_addr = Some(owner_addr);
         let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
         let payees = [TxOut::new(send_amount, vault_script.clone())];
-        check_send_total(&payees, wallet.get_balance())?;
+        check_send_total(&payees, spendable_balance(&wallet, self.current_height()))?;
         ensure_not_dust(send_amount, &vault_script)?;
 
         let height = self.current_height();
@@ -3292,7 +3261,7 @@ impl WalletRpc {
 
         // No recipients is a total of 0: -8 "Invalid amount", as Divi Core
         let available = if account.is_empty() {
-            wallet.get_balance()
+            spendable_balance(&wallet, height)
         } else {
             coins_value(&Self::account_coins(
                 &wallet,
@@ -3751,7 +3720,7 @@ impl WalletRpc {
 
         let height = self.current_height();
         let available = if account.is_empty() {
-            wallet.get_balance()
+            spendable_balance(&wallet, height)
         } else {
             coins_value(&Self::account_coins(
                 &wallet,
@@ -6050,8 +6019,11 @@ mod accounting_tests {
             .rpc
             .get_transaction(&Params::Array(vec![json!(txid)]))
             .unwrap();
-        assert_eq!(tx["amount"], json!(-1000.0));
-        assert_eq!(tx["fee"], json!(-0.01));
+        // Divi Core's gettransaction: amount is credit less debit (the fee
+        // included) and fee is positive; the send entry keeps amount and a
+        // negative fee (rpcwallet.cpp:2476-2480, :2167-2173)
+        assert_eq!(tx["amount"], json!(-1000.01));
+        assert_eq!(tx["fee"], json!(0.01));
         assert_eq!(tx["details"][0]["amount"], json!(-1000.0));
         assert_eq!(tx["details"][0]["fee"], json!(-0.01));
 
@@ -6063,7 +6035,7 @@ mod accounting_tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["txid"] == json!(txid))
+            .find(|e| e["txid"] == json!(txid) && e["address"] == json!(stranger_address()))
             .expect("send listed");
         assert_eq!(entry["amount"], json!(-1000.0));
         assert_eq!(entry["fee"], json!(-0.01));
@@ -6073,7 +6045,7 @@ mod accounting_tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["txid"] == json!(txid))
+            .find(|e| e["txid"] == json!(txid) && e["address"] == json!(stranger_address()))
             .expect("send in listsinceblock");
         assert_eq!(entry["amount"], json!(-1000.0));
         assert_eq!(entry["fee"], json!(-0.01));

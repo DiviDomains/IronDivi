@@ -233,6 +233,19 @@ impl CoinSource {
     }
 }
 
+/// A wallet transaction that left the chain or the mempool without
+/// confirming: conflicted by another spend, evicted, or in a block that was
+/// disconnected. Divi Core keeps such transactions in the wallet, at depth -1
+/// (MerkleTxConfirmationNumberCalculator.cpp:43-47).
+#[derive(Debug, Clone)]
+pub struct DetachedTx {
+    /// When the wallet first saw it
+    pub timestamp: u64,
+    /// The transaction, when the wallet had it (a disconnected block's
+    /// transactions are left to the chain's transaction index)
+    pub tx: Option<divi_primitives::transaction::Transaction>,
+}
+
 #[derive(Debug, Clone)]
 struct MempoolWalletTx {
     /// Every outpoint the transaction spends (ours or not), for conflict checks
@@ -292,6 +305,9 @@ pub struct WalletDb {
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
     /// Wallet transactions in the mempool (stored on disk as raw transactions)
     mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
+    /// Wallet transactions that left the chain or the mempool unconfirmed
+    /// (stored on disk), listed at depth -1 as Divi Core lists them
+    detached_txs: RwLock<HashMap<Hash256, DetachedTx>>,
     /// Serializes block scanning: live block notifications, the startup
     /// catch-up, reorg rollback and rescans must not interleave, or a spend
     /// can be scanned before the coin it spends and be lost
@@ -344,6 +360,7 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
@@ -374,6 +391,7 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
@@ -408,6 +426,7 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
@@ -426,6 +445,7 @@ impl WalletDb {
         }
         // Needs keys, UTXOs, spent set, history and vaults loaded first
         wallet.restore_unconfirmed_txs(&db)?;
+        wallet.restore_detached_txs(&db)?;
         debug!("Restored {} vaults", wallet.vaults.read().len());
 
         // Wallets written before removevault dropped its outputs still hold them
@@ -468,6 +488,7 @@ impl WalletDb {
                 if !confirmed {
                     // Its outputs never existed, so whatever spends them is void too
                     dropped.insert(txid);
+                    self.detach(txid, timestamp, Some(tx.clone()));
                 }
             } else {
                 restored += 1;
@@ -477,6 +498,126 @@ impl WalletDb {
             info!("Restored {} unconfirmed wallet transaction(s)", restored);
         }
         Ok(())
+    }
+
+    /// Load the detached transactions stored on disk, forgetting those the
+    /// wallet has since recorded from a block or holds in the mempool overlay
+    fn restore_detached_txs(&self, db: &WalletDatabase) -> Result<(), WalletError> {
+        for (txid, timestamp, raw) in db.load_detached_txs()? {
+            if self.is_recorded(&txid) {
+                db.remove_detached_tx(&txid)?;
+                continue;
+            }
+            let tx = if raw.is_empty() {
+                None
+            } else {
+                match divi_primitives::deserialize(&raw) {
+                    Ok(tx) => Some(tx),
+                    Err(e) => {
+                        tracing::warn!("Skipping unreadable detached wallet tx {}: {}", txid, e);
+                        continue;
+                    }
+                }
+            };
+            self.detached_txs
+                .write()
+                .insert(txid, DetachedTx { timestamp, tx });
+        }
+        Ok(())
+    }
+
+    /// Recorded from a block, or in the mempool overlay
+    fn is_recorded(&self, txid: &Hash256) -> bool {
+        matches!(self.transactions.read().get(txid), Some(t) if t.block_height.is_some())
+            || self.mempool_txs.read().contains_key(txid)
+    }
+
+    /// Keep a wallet transaction that left the chain or the mempool unconfirmed
+    fn detach(
+        &self,
+        txid: Hash256,
+        timestamp: u64,
+        tx: Option<divi_primitives::transaction::Transaction>,
+    ) {
+        if self.is_recorded(&txid) {
+            return;
+        }
+        let raw = tx
+            .as_ref()
+            .map(divi_primitives::serialize)
+            .unwrap_or_default();
+        {
+            let mut detached = self.detached_txs.write();
+            if let Some(known) = detached.get(&txid) {
+                if known.tx.is_some() || tx.is_none() {
+                    return;
+                }
+            }
+            detached.insert(txid, DetachedTx { timestamp, tx });
+        }
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.store_detached_tx(&txid, timestamp, &raw) {
+                tracing::warn!("Failed to store detached wallet tx {}: {}", txid, e);
+            }
+        }
+    }
+
+    /// A detached transaction is in a block or the mempool again
+    fn reattach(&self, txid: &Hash256) {
+        if self.detached_txs.write().remove(txid).is_some() {
+            if let Some(ref db) = self.db {
+                if let Err(e) = db.remove_detached_tx(txid) {
+                    tracing::warn!("Failed to forget detached wallet tx {}: {}", txid, e);
+                }
+            }
+        }
+    }
+
+    /// Wallet transactions that left the chain or the mempool unconfirmed
+    pub fn detached_transactions(&self) -> Vec<(Hash256, DetachedTx)> {
+        self.detached_txs
+            .read()
+            .iter()
+            .map(|(id, d)| (*id, d.clone()))
+            .collect()
+    }
+
+    /// Every wallet transaction as Divi Core's wallet keeps them: recorded,
+    /// in the mempool, and detached (block fields empty)
+    pub fn history_records(&self) -> Vec<WalletTx> {
+        let mut list = self.get_transactions(None);
+        let known: HashSet<Hash256> = list.iter().map(|t| t.txid).collect();
+        list.extend(
+            self.detached_txs
+                .read()
+                .iter()
+                .filter(|(id, _)| !known.contains(id))
+                .map(|(id, d)| Self::detached_record(*id, d)),
+        );
+        list
+    }
+
+    /// One wallet transaction, detached ones included
+    pub fn history_record(&self, txid: &Hash256) -> Option<WalletTx> {
+        self.get_transaction(txid).or_else(|| {
+            self.detached_txs
+                .read()
+                .get(txid)
+                .map(|d| Self::detached_record(*txid, d))
+        })
+    }
+
+    fn detached_record(txid: Hash256, d: &DetachedTx) -> WalletTx {
+        WalletTx {
+            txid,
+            block_hash: None,
+            block_height: None,
+            timestamp: d.timestamp,
+            amount: 0,
+            fee: None,
+            category: String::new(),
+            confirmations: 0,
+        }
     }
 
     /// Unconfirmed wallet transactions, parents before children, to resubmit
@@ -569,6 +710,7 @@ impl WalletDb {
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
@@ -1782,8 +1924,12 @@ impl WalletDb {
     /// Add a transaction to history
     pub fn add_transaction(&self, tx: WalletTx) {
         debug!("Adding transaction {} to history", tx.txid);
+        let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
         self.transactions.write().insert(tx.txid, tx);
         self.dirty.write().transactions = true;
+        if confirmed {
+            self.reattach(&txid);
+        }
     }
 
     /// Get transaction history
@@ -2643,6 +2789,7 @@ impl WalletDb {
                 }
             }
         }
+        self.reattach(&txid);
         true
     }
 
@@ -2662,11 +2809,13 @@ impl WalletDb {
     /// The wallet mirrors the mempool, so only this entry is dropped; any
     /// child still in the mempool gets its own removal notice.
     pub fn remove_mempool_tx(&self, txid: &Hash256) -> bool {
-        let removed = self.mempool_txs.write().remove(txid).is_some();
-        if removed {
+        let removed = self.mempool_txs.write().remove(txid);
+        if let Some(entry) = &removed {
             self.forget_stored_unconfirmed(&[*txid]);
+            // Evicted unconfirmed: kept, at depth -1, as Divi Core keeps it
+            self.detach(*txid, entry.record.timestamp, Some(entry.tx.clone()));
         }
-        removed
+        removed.is_some()
     }
 
     /// Number of wallet transactions currently tracked in the mempool
@@ -2699,9 +2848,11 @@ impl WalletDb {
             .filter(|(_, e)| e.inputs.iter().any(|op| confirmed_inputs.contains(op)))
             .map(|(id, _)| *id)
             .collect();
+        let mut conflicted = Vec::new();
         while let Some(id) = doomed.pop() {
-            if overlay.remove(&id).is_some() {
+            if let Some(entry) = overlay.remove(&id) {
                 forgotten.push(id);
+                conflicted.push((id, entry.record.timestamp, entry.tx));
                 info!("Dropped mempool wallet tx {} (conflicts with {})", id, txid);
                 doomed.extend(
                     overlay
@@ -2713,6 +2864,9 @@ impl WalletDb {
         }
         drop(overlay);
         self.forget_stored_unconfirmed(&forgotten);
+        for (id, timestamp, tx) in conflicted {
+            self.detach(id, timestamp, Some(tx));
+        }
     }
 
     /// Update confirmation counts for all transactions
@@ -2760,6 +2914,7 @@ impl WalletDb {
             gone.len()
         };
 
+        let mut disconnected = Vec::new();
         let removed_txs = {
             let mut txs = self.transactions.write();
             let gone: Vec<Hash256> = txs
@@ -2768,7 +2923,9 @@ impl WalletDb {
                 .map(|(txid, _)| *txid)
                 .collect();
             for txid in &gone {
-                txs.remove(txid);
+                if let Some(record) = txs.remove(txid) {
+                    disconnected.push((*txid, record.timestamp));
+                }
                 pending.transactions.insert(*txid);
             }
             gone.len()
@@ -2819,10 +2976,17 @@ impl WalletDb {
             start, stop, removed_utxos, removed_txs, restored
         );
 
-        let mut dirty = self.dirty.write();
-        dirty.utxos = true;
-        dirty.transactions = true;
-        dirty.spent = true;
+        {
+            let mut dirty = self.dirty.write();
+            dirty.utxos = true;
+            dirty.transactions = true;
+            dirty.spent = true;
+        }
+        drop(pending);
+        // Kept, at depth -1, until a block or the mempool has them again
+        for (txid, timestamp) in disconnected {
+            self.detach(txid, timestamp, None);
+        }
     }
 
     /// Scan the active chain's blocks above the last scanned height, in

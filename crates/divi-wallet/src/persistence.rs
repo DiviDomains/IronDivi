@@ -994,6 +994,69 @@ impl WalletDatabase {
             .map_err(|e| WalletError::Storage(e.to_string()))
     }
 
+    /// Key prefix of wallet transactions that left the chain or the mempool
+    /// without confirming
+    const DETACHED_TX_PREFIX: &'static [u8] = b"detached_tx_";
+
+    fn detached_tx_key(txid: &Hash256) -> Vec<u8> {
+        let mut key = Self::DETACHED_TX_PREFIX.to_vec();
+        key.extend_from_slice(txid.as_bytes());
+        key
+    }
+
+    /// Store a detached wallet transaction: the time the wallet first saw it
+    /// and the raw transaction (empty when only the chain has it)
+    pub fn store_detached_tx(
+        &self,
+        txid: &Hash256,
+        timestamp: u64,
+        raw_tx: &[u8],
+    ) -> Result<(), WalletError> {
+        let mut value = Vec::with_capacity(8 + raw_tx.len());
+        value.extend_from_slice(&timestamp.to_le_bytes());
+        value.extend_from_slice(raw_tx);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_DEFAULT), Self::detached_tx_key(txid), &value);
+        self.write_batch_sync(batch)
+    }
+
+    /// Forget a detached wallet transaction (seen again in a block or the mempool)
+    pub fn remove_detached_tx(&self, txid: &Hash256) -> Result<(), WalletError> {
+        self.db
+            .delete_cf(self.cf(CF_DEFAULT), Self::detached_tx_key(txid))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load every detached wallet transaction as (txid, timestamp, raw tx)
+    pub fn load_detached_txs(&self) -> Result<Vec<(Hash256, u64, Vec<u8>)>, WalletError> {
+        let iter = self.db.iterator_cf(
+            self.cf(CF_DEFAULT),
+            rocksdb::IteratorMode::From(Self::DETACHED_TX_PREFIX, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if !key.starts_with(Self::DETACHED_TX_PREFIX) {
+                break;
+            }
+            let id = &key[Self::DETACHED_TX_PREFIX.len()..];
+            if value.len() < 8 || id.len() != 32 {
+                debug!("Skipping corrupt detached tx entry");
+                continue;
+            }
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(id);
+            let mut ts = [0u8; 8];
+            ts.copy_from_slice(&value[..8]);
+            results.push((
+                Hash256::from_bytes(txid),
+                u64::from_le_bytes(ts),
+                value[8..].to_vec(),
+            ));
+        }
+        Ok(results)
+    }
+
     /// Load every stored unconfirmed wallet transaction as (timestamp, raw tx)
     pub fn load_unconfirmed_txs(&self) -> Result<Vec<(u64, Vec<u8>)>, WalletError> {
         let iter = self.db.iterator_cf(
