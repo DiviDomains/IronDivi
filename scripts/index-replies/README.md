@@ -26,7 +26,7 @@ scripts/index-replies/run.sh target/release ~/divi-3.0.0/bin 53950 /var/tmp
   pairs of nodes use the same four ports, one pair after the other.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about 3 minutes and is stopped after 10 minutes. However it ends, every node is stopped and its directory
+A run takes about 15 seconds and is stopped after 10 minutes. However it ends, every node is stopped and its directory
 deleted. Needs bash and python3 (standard library only). RPC passwords are made for the run and written only to each
 node's `divi.conf`, which only the user can read; nothing secret is printed or put on a command line.
 
