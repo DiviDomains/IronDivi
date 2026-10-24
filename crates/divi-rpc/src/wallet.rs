@@ -2299,6 +2299,14 @@ impl WalletRpc {
                 RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
             })?;
         let unable = || RpcError::new(codes::WALLET_ERROR, "Unable to sign for input");
+        // A key of the HD chain is derived from the seed when it signs; with the
+        // wallet locked divid's GetKey throws (wallet.cpp:543-544), which the RPC
+        // layer answers as -1 with its text
+        if entry.hd_path.is_some() && !entry.is_watch_only && wallet.is_locked() {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "GetKey: DecryptHDChainSeed failed").into(),
+            );
+        }
         let secret = entry
             .secret
             .as_ref()

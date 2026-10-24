@@ -22,7 +22,7 @@ Implemented or fixed:
 | Item | Change |
 |---|---|
 | `getchaintips` | real implementation: side branches, `branchlen`, C++ status values |
-| `ban`, `bip38paperwallet`, `getinvalid`, `setmocktime` | were missing, now dispatched (`setmocktime` is an honest error: no mock clock) |
+| `ban`, `bip38paperwallet`, `getinvalid`, `setmocktime` | were missing, now dispatched; `setmocktime` sets the node's clock on regtest (peer times, block times, ban ends) |
 | `disconnectnode` | bug: disconnected the *first* peer regardless of address; now the exact peer |
 | `getinfo` | real `moneysupply` (UTXO sum, cached per tip), string `version`, `walletversion` |
 | error codes | usage/internal errors now `-1` like C++ (were JSON-RPC `-32602`/`-32603`) |
@@ -59,7 +59,7 @@ corrupts the coin DB on purpose is not reproduced).
 - `getblock`: `acc_checkpoint` now present; `moneysupply` is recorded per block in the block index (trailing optional field, old databases still load) and shown only for blocks connected since that field was added, so an existing database shows it only after a resync/reindex. Genesis supply is 0, as in C++.
 - `getaddressesbylabel` returns all addresses; `loadwallet` (multi-wallet), `allocatefunds`,
   rescan variants are stubs.
-- `ban outdated`: peer versions are not tracked, returns an error.
+- `ban outdated`: bans the peers below Divi Core 3.0.0.0 as divid does (net.cpp:357-393); a peer whose sub-version divid cannot read (`std::stoi` throws, so divid answers -1 `stoi`) is left alone.
 
 **Shape differences (extras in Rust are harmless to clients; *missing* keys are bugs):**
 `getblockchaininfo`, `getmempoolinfo`, `getmininginfo`, `gettxoutsetinfo`

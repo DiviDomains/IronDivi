@@ -32,7 +32,6 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
 
@@ -1181,10 +1180,7 @@ impl Staker {
         // break a network-wide stall; doing that by default lets a node that has
         // lost its peers mint a private fork (vps1 testnet stall at 208,970).
         {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0);
+            let now = current_timestamp() as u32;
             let (max_age, allow_stale) = {
                 let c = self.config.read();
                 (c.max_tip_age_secs, c.allow_stale_tip)
@@ -2212,11 +2208,9 @@ pub(crate) fn superblock_payout(
 }
 
 /// Get current Unix timestamp
+/// The node's clock (Core GetAdjustedTime and GetTime: setmocktime sets it)
 fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    divi_primitives::clock::now().max(0) as u64
 }
 
 /// Create a minimal coinbase marker transaction for PoS blocks
