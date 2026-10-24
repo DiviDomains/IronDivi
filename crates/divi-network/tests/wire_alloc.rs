@@ -131,7 +131,12 @@ fn lying_payloads() -> Vec<(&'static str, Vec<u8>)> {
     // script MAX_SIZE long: three nested reservations
     out.push((
         "block",
-        [&v4[..], &max, &tx_head(&[&max[..], &[0u8; 36], &max].concat())].concat(),
+        [
+            &v4[..],
+            &max,
+            &tx_head(&[&max[..], &[0u8; 36], &max].concat()),
+        ]
+        .concat(),
     ));
     // Many announced headers
     out.push(("headers", compact(1_000_000)));
