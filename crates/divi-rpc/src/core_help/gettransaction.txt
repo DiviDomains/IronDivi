@@ -1,0 +1,37 @@
+gettransaction "txid" ( includeWatchonly )
+
+Get detailed information about in-wallet transaction <txid>
+
+Arguments:
+1. "txid"    (string, required) The transaction id
+2. "includeWatchonly"    (bool, optional, default=false) Whether to include watchonly addresses in balance calculation and details[]
+
+Result:
+{
+  "amount" : x.xxx,        (numeric) The transaction amount in DIVI
+  "confirmations" : n,     (numeric) The number of confirmations
+  "bcconfirmations" : n,   (numeric) The number of blockchain confirmations
+  "blockhash" : "hash",  (string) The block hash
+  "blockindex" : xx,       (numeric) The block index
+  "blocktime" : ttt,       (numeric) The time in seconds since epoch (1 Jan 1970 GMT)
+  "txid" : "transactionid",   (string) The transaction id.
+  "baretxid" : "baretxid",    (string) The bare txid (without signatures)
+  "time" : ttt,            (numeric) The transaction time in seconds since epoch (1 Jan 1970 GMT)
+  "timereceived" : ttt,    (numeric) The time received in seconds since epoch (1 Jan 1970 GMT)
+  "details" : [
+    {
+      "account" : "accountname",  (string) The account name involved in the transaction, can be "" for the default account.
+      "address" : "diviaddress",   (string) The divi address involved in the transaction
+      "category" : "send|receive",    (string) The category, either 'send' or 'receive'
+      "amount" : x.xxx                  (numeric) The amount in DIVI
+      "vout" : n,                       (numeric) the vout value
+    }
+    ,...
+  ],
+  "hex" : "data"         (string) Raw data for transaction
+}
+
+Examples:
+> divi-cli gettransaction "hash"
+> divi-cli gettransaction "hash" true
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "gettransaction", "params": ["hash"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

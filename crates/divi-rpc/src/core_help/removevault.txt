@@ -1,0 +1,7 @@
+removevault "<owner_address>:<manager_address>"
+
+Allows vault manager to reject staking the indicated vault script.
+
+Arguments:
+1. "<owner_address>:<manager_address>"  (string, required) Vault representation as a pair of addresses.
+1. "tx_hash"  (string, required) The transaction hash to search for the initial funding.

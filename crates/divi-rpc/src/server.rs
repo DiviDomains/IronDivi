@@ -460,13 +460,10 @@ impl RpcServer {
         }
         // Then the call's own `if (fHelp || params.size() ...)`: a wrong
         // argument count answers -1 with the call's help text
-        if let Some((min, max)) = argument_count(method) {
-            if !matches!(params, Params::Object(_)) && !(min..=max).contains(&params.len()) {
-                let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
-                return Err(
-                    RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into(),
-                );
-            }
+        let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+        if crate::core_help::usage_refused(method, params, encrypted) {
+            let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
+            return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
         }
         rpc_type_check(method, params)?;
         // The wallet passphrase calls check the encryption state before they
@@ -700,8 +697,14 @@ impl RpcServer {
         let method = params.get_str(0).filter(|m| !m.is_empty());
 
         if let Some(method) = method {
-            if let Some(text) = crate::core_help::text(method) {
-                return Ok(serde_json::Value::String(text.to_string()));
+            // A Divi Core call: its text in this wallet state, or Core's "unknown
+            // command" where divid gives none (rpcserver.cpp:256-258, :283-285)
+            if crate::core_help::is_core_call(method) {
+                let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+                let text = crate::core_help::text_for(method, encrypted)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("help: unknown command: {method}"));
+                return Ok(serde_json::Value::String(text));
             }
             // Return help for specific method
             let help = match method {
@@ -1293,46 +1296,6 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
     Ok(())
 }
 
-/// How many arguments Divi Core takes for a call, as its `fHelp` check counts
-/// them (rpcblockchain.cpp:36-557, rpcmining.cpp:54-253, rpcmisc.cpp:103,
-/// rpcrawtransaction.cpp:141-830)
-fn argument_count(method: &str) -> Option<(usize, usize)> {
-    Some(match method {
-        "getblockchaininfo" | "getblockcount" | "getbestblockhash" | "getdifficulty"
-        | "getchaintips" | "gettxoutsetinfo" | "getinfo" => (0, 0),
-        "getblockhash" | "decoderawtransaction" | "decodescript" => (1, 1),
-        "getblock" | "getblockheader" | "getrawtransaction" | "sendrawtransaction" => (1, 2),
-        "gettxout" => (2, 3),
-        "verifychain" => (0, 2),
-        "createrawtransaction" => (2, 2),
-        "signrawtransaction" => (1, 4),
-        // rpcmining.cpp:227, rpcblockchain.cpp:557
-        "getmininginfo" | "getmempoolinfo" => (0, 0),
-        // rpcblockchain.cpp:82
-        "getrawmempool" => (0, 1),
-        // rpcmining.cpp:253
-        "prioritisetransaction" => (3, 3),
-        // rpcmining.cpp:54
-        "setgenerate" => (1, 1),
-        // rpcmining.cpp:123
-        "generateblock" => (0, 1),
-        // rpcdump.cpp:43, :107, :172, :251, :297
-        "importprivkey" | "importaddress" => (1, 3),
-        "dumpprivkey" | "bip38paperwallet" => (1, 1),
-        "bip38decrypt" => (2, 2),
-        // rpcwallet.cpp:2527, :2546
-        "backupwallet" => (1, 1),
-        "keypoolrefill" => (0, 1),
-        // rpcwallet.cpp:283, :540, :588, :626, :652, :1501, :1946, :2322
-        "getnewaddress" => (0, 1),
-        "getaccountaddress" | "getaccount" | "getaddressesbyaccount" => (1, 1),
-        "setaccount" | "getreceivedbyaccount" => (1, 2),
-        "listreceivedbyaccount" => (0, 3),
-        "listaccounts" => (0, 2),
-        _ => return None,
-    })
-}
-
 /// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
 /// for the calls that run it: each given argument must have the listed type
 /// (null too where Core allows it), else -3 "Expected type X, got Y"
@@ -1805,7 +1768,7 @@ mod tests {
         let response = server.handle_request(request);
         assert!(response.result.is_some());
         let help = response.result.unwrap();
-        assert!(help.as_str().unwrap().contains("longest blockchain"));
+        assert_eq!(help.as_str(), crate::core_help::text("getblockcount"));
     }
 
     #[test]
