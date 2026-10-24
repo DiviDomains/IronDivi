@@ -163,6 +163,8 @@ pub struct PeerManager {
     scoring: PeerScoring,
     /// Nonces of our version messages on open connections (self-connection check)
     local_nonces: crate::connection::LocalNonces,
+    /// The node's own addresses (Divi Core mapLocalHost)
+    local_addresses: RwLock<Arc<crate::local::LocalAddresses>>,
     /// Manually added nodes (via addnode RPC)
     added_nodes: RwLock<HashSet<SocketAddr>>,
     /// Addresses currently being connected to (connection attempt in progress)
@@ -193,6 +195,7 @@ impl PeerManager {
             shutdown_tx,
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
+            local_addresses: RwLock::new(Arc::new(Default::default())),
             added_nodes: RwLock::new(HashSet::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -321,6 +324,16 @@ impl PeerManager {
         self.our_services.store(services, Ordering::Relaxed);
     }
 
+    /// Set the node's own addresses, before any connection starts
+    pub fn set_local_addresses(&self, local: crate::local::LocalAddresses) {
+        *self.local_addresses.write() = Arc::new(local);
+    }
+
+    /// The node's own addresses
+    pub fn local_addresses(&self) -> Arc<crate::local::LocalAddresses> {
+        Arc::clone(&self.local_addresses.read())
+    }
+
     /// Service bits we currently advertise
     pub fn services(&self) -> u64 {
         self.our_services.load(Ordering::Relaxed)
@@ -430,6 +443,11 @@ impl PeerManager {
     /// Get count of outbound connections
     pub fn outbound_count(&self) -> usize {
         self.peers.read().values().filter(|p| !p.inbound).count()
+    }
+
+    /// The network's P2P port, used for an address given without one
+    pub fn default_port(&self) -> u16 {
+        self.config.default_port
     }
 
     /// Add a node manually (via RPC addnode command)
@@ -708,6 +726,7 @@ impl PeerManager {
             self.bytes_sent_counter(),
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
+            self.local_addresses(),
         )
         .await;
 
@@ -771,6 +790,7 @@ impl PeerManager {
             self.bytes_sent_counter(),
             self.bytes_recv_counter(),
             Arc::clone(&self.local_nonces),
+            self.local_addresses(),
         )
         .await?;
 
@@ -802,6 +822,12 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) fn insert_test_peer(&self, handle: PeerHandle) {
         self.peers.write().insert(handle.id, handle);
+    }
+
+    /// The live stats of a test peer (tests set its services)
+    #[cfg(test)]
+    pub(crate) fn test_peer_stats(&self, id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {
+        self.peers.read().get(&id).map(|p| Arc::clone(&p.stats))
     }
 
     /// Send a message to a specific peer

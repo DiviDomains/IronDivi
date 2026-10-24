@@ -45,6 +45,15 @@ struct Loaded {
     block: Option<(Hash256, u32, u32, usize)>,
 }
 
+/// What ListReceived counts for one destination
+pub(crate) struct Tally {
+    pub(crate) amount: i64,
+    /// The fewest confirmations of its transactions (i64::MAX when none)
+    pub(crate) confirmations: i64,
+    pub(crate) txids: Vec<String>,
+    pub(crate) watch_only: bool,
+}
+
 /// Builds history entries for one RPC call (lookups are cached for the call)
 pub(crate) struct History<'a> {
     wallet: &'a WalletDb,
@@ -95,12 +104,20 @@ impl<'a> History<'a> {
         }
     }
 
-    /// The wallet's records, oldest first (Core's OrderedTxItems order)
+    /// The wallet's records, oldest first (Core's OrderedTxItems order): by
+    /// the position each was first seen at (nOrderPos, wallet.cpp:1046);
+    /// records kept before positions were stored come first, by time, then
+    /// block position
     pub(crate) fn ordered_records(&self) -> Vec<WalletTx> {
         let mut records = self.wallet.history_records();
         records.sort_by_key(|r| {
             let index = self.load(r).and_then(|l| l.block.map(|b| b.3)).unwrap_or(0);
-            (r.timestamp, r.block_height.unwrap_or(u32::MAX), index)
+            (
+                self.wallet.order_position(&r.txid),
+                r.timestamp,
+                r.block_height.unwrap_or(u32::MAX),
+                index,
+            )
         });
         records
     }
@@ -348,6 +365,11 @@ impl<'a> History<'a> {
         entry.insert("walletconflicts".into(), json!(self.conflicts(&loaded.tx)));
         entry.insert("time".into(), json!(record.timestamp));
         entry.insert("timereceived".into(), json!(record.timestamp));
+        // The notes the send kept with the transaction (mapValue,
+        // rpcwallet.cpp:268-269)
+        for (key, value) in self.wallet.tx_notes(&record.txid) {
+            entry.insert(key, json!(value));
+        }
     }
 
     /// GetConflicts: wallet transactions spending an input of `tx`, `tx`
@@ -526,6 +548,136 @@ impl<'a> History<'a> {
                 push(entry, out);
             }
         }
+    }
+
+    /// GetAccountBalance (rpcwallet.cpp:383-412) with GetAccountAmounts
+    /// (:187-242): for a named account, every output to an address of that
+    /// name received and every spent output from one sent; for "", the
+    /// outputs of the requested kinds whose address has no name. A receive
+    /// counts at `min_depth`; transactions not final, immature or off the
+    /// chain are left out. Satoshis.
+    pub(crate) fn account_balance(&self, account: &str, min_depth: i64, watch: bool) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        let labelled = |script: &Script| self.account_of(&self.destination(script));
+        let counts = |script: &Script| {
+            let label = labelled(script);
+            if account.is_empty() {
+                label.is_empty() && Self::requested(self.mine(script), watch)
+            } else {
+                label == account
+            }
+        };
+        let mut balance = 0i64;
+        for record in self.wallet.history_records() {
+            let Some(loaded) = self.load(&record) else {
+                continue;
+            };
+            let tx = &loaded.tx;
+            let depth = self.depth(&record.txid, &loaded);
+            let generated = tx.is_coinbase() || tx.is_coinstake();
+            if !tx.is_final(self.height, now)
+                || (generated && self.blocks_to_maturity(depth) > 0)
+                || depth < 0
+            {
+                continue;
+            }
+            // previousOutputsSpent: collected only when the wallet is debited
+            let mut sent = 0i64;
+            if self.debit(tx, watch) > 0 && !tx.is_coinbase() {
+                for n in 0..tx.vin.len() {
+                    let prev = self.wallet_prevout(tx, n).or_else(|| {
+                        let prevout = &tx.vin[n].prevout;
+                        self.chain
+                            .and_then(|c| c.get_transaction(&prevout.txid).ok().flatten())
+                            .and_then(|p| p.vout.get(prevout.vout as usize).cloned())
+                    });
+                    if let Some(prev) = prev.filter(|p| counts(&p.script_pubkey)) {
+                        sent += prev.value.as_sat();
+                    }
+                }
+            }
+            let received: i64 = tx
+                .vout
+                .iter()
+                .filter(|out| counts(&out.script_pubkey))
+                .map(|out| out.value.as_sat())
+                .sum();
+            if received != 0 && depth >= min_depth {
+                balance += received;
+            }
+            balance -= sent;
+        }
+        balance
+    }
+
+    /// The tally of ListReceived (rpcwallet.cpp:1814-1844): for every
+    /// destination, the outputs paid to it by wallet transactions that are
+    /// not coinbases, final and at least `min_depth` deep, when the wallet owns
+    /// the destination spendably (or watches it, with `watch`)
+    pub(crate) fn received_tally(&self, min_depth: i64, watch: bool) -> HashMap<String, Tally> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        let mut tally: HashMap<String, Tally> = HashMap::new();
+        for record in self.ordered_records() {
+            let Some(loaded) = self.load(&record) else {
+                continue;
+            };
+            let tx = &loaded.tx;
+            if tx.is_coinbase() || !tx.is_final(self.height, now) {
+                continue;
+            }
+            let depth = self.depth(&record.txid, &loaded);
+            if depth < min_depth {
+                continue;
+            }
+            for out in &tx.vout {
+                let Some(address) = self.destination(&out.script_pubkey) else {
+                    continue;
+                };
+                let mine = self.mine(&address.script_pubkey());
+                if !Self::requested(mine, watch) {
+                    continue;
+                }
+                let item = tally.entry(address.to_base58()).or_insert(Tally {
+                    amount: 0,
+                    confirmations: i64::MAX,
+                    txids: Vec::new(),
+                    watch_only: false,
+                });
+                item.amount += out.value.as_sat();
+                item.confirmations = item.confirmations.min(depth);
+                item.txids.push(record.txid.to_string());
+                item.watch_only |= mine == Mine::WatchOnly;
+            }
+        }
+        tally
+    }
+
+    /// listaccounts (rpcwallet.cpp:2320-2350): for every address-book name
+    /// with an address the wallet owns (or watches, with `watch`), that
+    /// account's GetAccountBalance
+    pub(crate) fn account_balances(&self, min_depth: i64, watch: bool) -> Vec<(String, i64)> {
+        let mut names: Vec<String> = Vec::new();
+        for (address, name) in self.wallet.address_book() {
+            let Ok(address) = Address::from_base58(&address) else {
+                continue;
+            };
+            if Self::requested(self.mine(&address.script_pubkey()), watch) && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let balance = self.account_balance(&name, min_depth, watch);
+                (name, balance)
+            })
+            .collect()
     }
 
     /// GetBlocksToMaturity (MerkleTxConfirmationNumberCalculator.cpp:54-59)

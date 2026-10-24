@@ -319,6 +319,18 @@ pub struct WalletDb {
     /// sync notices a chain switch it was not told about (invalidateblock,
     /// a missed reorg notification) and rolls back to the fork first
     scanned_hashes: RwLock<BTreeMap<u32, Hash256>>,
+    /// Divi Core's -vault: addvault and removevault change the wallet only
+    /// when it is on (wallet.cpp:152, :693-716)
+    vault_mode: std::sync::atomic::AtomicBool,
+    /// The relay fee rate the wallet pays, satoshis per 1000 bytes (Divi
+    /// Core's -minrelaytxfee, which its wallet follows: rpcwallet.cpp:470-473)
+    relay_fee_per_kb: std::sync::atomic::AtomicI64,
+    /// The position each transaction was first seen at, and the next one
+    /// (Divi Core's nOrderPos, the order listtransactions follows)
+    tx_order: RwLock<(HashMap<Hash256, u64>, u64)>,
+    /// Notes kept with a transaction by the call that sent it (Divi Core's
+    /// mapValue: comment, to, FromAccount), in key order as Core's std::map
+    tx_notes: RwLock<HashMap<Hash256, BTreeMap<String, String>>>,
 }
 
 /// Unlock state of an encrypted wallet (Divi Core `walletStakingOnly` plus the
@@ -368,6 +380,10 @@ impl WalletDb {
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -399,6 +415,10 @@ impl WalletDb {
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -434,6 +454,10 @@ impl WalletDb {
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         };
 
         // Load wallet data from database
@@ -732,6 +756,10 @@ impl WalletDb {
             scan_lock: Mutex::new(()),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         };
 
         Ok(wallet_db)
@@ -754,6 +782,22 @@ impl WalletDb {
                     "Network mismatch: wallet is {:?}, expected {:?}",
                     stored_network, self.network
                 )));
+            }
+        }
+
+        {
+            let mut order = self.tx_order.write();
+            for (txid, position) in db.load_tx_order()? {
+                order.0.insert(txid, position);
+                order.1 = order.1.max(position + 1);
+            }
+        }
+        for (txid, raw) in db.load_tx_notes()? {
+            match serde_json::from_slice::<BTreeMap<String, String>>(&raw) {
+                Ok(notes) => {
+                    self.tx_notes.write().insert(txid, notes);
+                }
+                Err(e) => debug!("Skipping unreadable notes of {}: {}", txid, e),
             }
         }
 
@@ -2046,6 +2090,7 @@ impl WalletDb {
     pub fn add_transaction(&self, tx: WalletTx) {
         debug!("Adding transaction {} to history", tx.txid);
         let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
+        self.note_first_seen(&txid);
         self.transactions.write().insert(tx.txid, tx);
         self.dirty.write().transactions = true;
         if confirmed {
@@ -2591,6 +2636,11 @@ impl WalletDb {
         self.keystore.keypool_size()
     }
 
+    /// How many keys of each chain the keypool is filled to (-keypool)
+    pub fn keypool_target(&self) -> u32 {
+        self.keystore.keypool_target()
+    }
+
     /// Get the timestamp of the oldest key in the keypool
     pub fn keypool_oldest(&self) -> u64 {
         self.keystore.keypool_oldest()
@@ -2938,8 +2988,58 @@ impl WalletDb {
                 }
             }
         }
+        self.note_first_seen(&txid);
         self.reattach(&txid);
         true
+    }
+
+    /// Give `txid` the next position if the wallet has not seen it before
+    fn note_first_seen(&self, txid: &Hash256) {
+        let position = {
+            let mut order = self.tx_order.write();
+            if order.0.contains_key(txid) {
+                return;
+            }
+            let position = order.1;
+            order.0.insert(*txid, position);
+            order.1 += 1;
+            position
+        };
+        if let Some(db) = &self.db {
+            if let Err(e) = db.store_tx_order(txid, position) {
+                tracing::warn!("Failed to store the position of {}: {}", txid, e);
+            }
+        }
+    }
+
+    /// The position at which the wallet first saw `txid` (None for a
+    /// transaction recorded before positions were kept)
+    pub fn order_position(&self, txid: &Hash256) -> Option<u64> {
+        self.tx_order.read().0.get(txid).copied()
+    }
+
+    /// Keep `notes` with a transaction the wallet sent (Divi Core's mapValue;
+    /// comment, to, FromAccount). Stored at once, synced.
+    pub fn set_tx_notes(&self, txid: &Hash256, notes: BTreeMap<String, String>) {
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(db) = &self.db {
+            match serde_json::to_vec(&notes) {
+                Ok(raw) => {
+                    if let Err(e) = db.store_tx_notes(txid, &raw) {
+                        tracing::error!("Failed to store the notes of {}: {}", txid, e);
+                    }
+                }
+                Err(e) => tracing::error!("Failed to encode the notes of {}: {}", txid, e),
+            }
+        }
+        self.tx_notes.write().insert(*txid, notes);
+    }
+
+    /// The notes kept with `txid`, in key order
+    pub fn tx_notes(&self, txid: &Hash256) -> BTreeMap<String, String> {
+        self.tx_notes.read().get(txid).cloned().unwrap_or_default()
     }
 
     /// Delete stored unconfirmed transactions that left the overlay
@@ -3363,6 +3463,26 @@ impl WalletDb {
         db.write_batch_sync(batch)
     }
 
+    /// The address book: every address with its name (Divi Core's
+    /// mapAddressBook; addresses the wallet handed out or was told about)
+    pub fn address_book(&self) -> Vec<(String, String)> {
+        let mut book: Vec<(String, String)> = self
+            .address_accounts
+            .read()
+            .iter()
+            .map(|(a, n)| (a.clone(), n.clone()))
+            .collect();
+        book.sort();
+        book
+    }
+
+    /// Whether `address` has an address-book entry (its name may be "")
+    pub fn in_address_book(&self, address: &Address) -> bool {
+        self.address_accounts
+            .read()
+            .contains_key(&address.to_string())
+    }
+
     pub fn get_account(&self, address: &Address) -> String {
         let addr_str = address.to_string();
         self.address_accounts
@@ -3401,6 +3521,33 @@ impl WalletDb {
 
     pub fn get_script(&self, script_hash: &Hash160) -> Option<Script> {
         self.scripts.read().get(script_hash).cloned()
+    }
+
+    /// Set the relay fee rate the wallet's sends pay (-minrelaytxfee)
+    pub fn set_relay_fee_per_kb(&self, per_kb: i64) {
+        self.relay_fee_per_kb
+            .store(per_kb, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fee rate and limit of the wallet's sends
+    pub fn fee_policy(&self) -> crate::send::FeePolicy {
+        crate::send::FeePolicy {
+            per_kb: self
+                .relay_fee_per_kb
+                .load(std::sync::atomic::Ordering::Relaxed),
+            ..Default::default()
+        }
+    }
+
+    /// Turn Divi Core's -vault on or off
+    pub fn set_vault_mode(&self, on: bool) {
+        self.vault_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether vaults may be added or removed (Divi Core's -vault)
+    pub fn vault_mode(&self) -> bool {
+        self.vault_mode.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Store vault metadata

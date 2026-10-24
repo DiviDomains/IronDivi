@@ -346,7 +346,7 @@ pub fn setup_masternode(
         pubkey_masternode: mn_pubkey,
         signature: Vec::new(),
         sig_time,
-        protocol_version: divi_network::constants::PROTOCOL_VERSION,
+        protocol_version: divi_network::constants::protocol_version(),
         last_ping: ping,
         tier,
     };

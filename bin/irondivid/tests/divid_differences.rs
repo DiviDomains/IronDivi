@@ -114,7 +114,8 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
 #[test]
 fn masternode_option_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut a = args(dir.path(), free_port(), free_port());
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let mut a = args(dir.path(), rpc_port, p2p_port);
     a.push("-masternode=mn1".into());
     let mut child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
         .args(&a)

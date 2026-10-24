@@ -106,7 +106,7 @@ fn getwalletinfo_has_fields_divid_lacks() {
 }
 
 /// getinfo reports divid's version; getnetworkinfo reports irondivid's own
-/// version, and both report irondivid's peer protocol version
+/// version, and both report divid's protocol version, 70915 (version.h:21)
 #[test]
 fn versions_name_irondivid() {
     let (server, _dir) = server();
@@ -118,8 +118,8 @@ fn versions_name_irondivid() {
         format!("{}.0", env!("CARGO_PKG_VERSION")),
         "{net}"
     );
-    assert_eq!(net["protocolversion"], 70920);
-    assert_eq!(info["protocolversion"], 70920);
+    assert_eq!(net["protocolversion"], 70915);
+    assert_eq!(info["protocolversion"], 70915);
 }
 
 /// Members of a result come in name order, not in divid's insertion order

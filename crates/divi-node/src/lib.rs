@@ -44,12 +44,13 @@
 //!
 //! // Get network info
 //! let net_info = node.get_network_info();
-//! assert_eq!(net_info.protocol_version, 70920);
+//! assert_eq!(net_info.protocol_version, 70915);
 //!
 //! // Clean up
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+pub mod block_import;
 pub mod config;
 pub mod error;
 pub mod fee_estimator;
@@ -61,7 +62,7 @@ pub mod staker;
 pub use config::{NetworkConfig, NetworkType, NodeConfig, P2pConfig, RpcConfig};
 pub use error::NodeError;
 pub use fee_estimator::{FeeEstimator, FeeEstimatorStats};
-pub use mempool::MempoolValidator;
+pub use mempool::{Admission, MempoolValidator};
 pub use mempool::{Mempool, MempoolEntry, MempoolStats};
 pub use node::{
     accept_relayed_transaction, check_mempool_transaction, getblocks_reply,

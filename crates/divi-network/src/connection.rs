@@ -15,7 +15,7 @@
 //! Uses tokio-util's FramedRead for cancellation-safe message reading.
 
 use crate::codec::{Decoded, DiviCodec};
-use crate::constants::{Magic, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
+use crate::constants::{Magic, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION};
 use crate::error::NetworkError;
 use crate::message::NetAddr;
 use crate::peer::{
@@ -92,6 +92,8 @@ pub struct Connection {
     local_nonces: LocalNonces,
     /// The nonce of our version message on this connection, removed when it ends
     sent_nonce: Option<NonceGuard>,
+    /// The node's own addresses (our address in the version message)
+    local: Arc<crate::local::LocalAddresses>,
 }
 
 /// Nonces in the version messages a node has sent on its open connections:
@@ -125,6 +127,7 @@ impl Connection {
         total_bytes_sent: Arc<AtomicU64>,
         total_bytes_recv: Arc<AtomicU64>,
         local_nonces: LocalNonces,
+        local: Arc<crate::local::LocalAddresses>,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         // Establish TCP connection with timeout; never fall back to a direct
         // connection when the proxy fails
@@ -176,6 +179,7 @@ impl Connection {
             stats,
             local_nonces,
             sent_nonce: None,
+            local,
         };
 
         Ok((conn, handle))
@@ -193,6 +197,7 @@ impl Connection {
         total_bytes_sent: Arc<AtomicU64>,
         total_bytes_recv: Arc<AtomicU64>,
         local_nonces: LocalNonces,
+        local: Arc<crate::local::LocalAddresses>,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         let addr = stream.peer_addr()?;
         info!("Accepting connection from {}", addr);
@@ -228,6 +233,7 @@ impl Connection {
             stats,
             local_nonces,
             sent_nonce: None,
+            local,
         };
 
         Ok((conn, handle))
@@ -257,6 +263,10 @@ impl Connection {
             debug!("Failed to send sendheaders to {}: {}", self.info.addr, e);
         }
 
+        // The peer's services are readable before anyone hears of it: block
+        // download picks peers by NODE_NETWORK
+        self.info.publish(&self.stats);
+
         // Notify connection established
         if let Some(version) = self.info.version.clone() {
             let _ = self.event_tx.send(PeerEvent::Connected {
@@ -265,8 +275,6 @@ impl Connection {
                 version,
             });
         }
-
-        self.info.publish(&self.stats);
 
         // Main message loop
         self.message_loop().await
@@ -316,6 +324,14 @@ impl Connection {
         // Store their version info
         self.info.time_offset =
             their_version.timestamp - crate::peer::unix_now_us() as i64 / 1_000_000;
+        // An inbound peer names the address it reached us at (Divi Core
+        // main.cpp:402-404 SeenLocal)
+        if self.info.direction == PeerDirection::Inbound {
+            let ours = their_version.addr_recv.socket_addr();
+            if crate::local::is_routable(&ours.ip()) {
+                self.local.seen(&ours);
+            }
+        }
         self.info.services = their_version.services;
         self.info.start_height = their_version.start_height as u32;
         self.info.version = Some(their_version);
@@ -355,15 +371,26 @@ impl Connection {
 
     /// Send our version message
     async fn send_version(&mut self) -> Result<(), NetworkError> {
+        // Divi Core CNode::PushVersion (Node.cpp:992-1005): the peer's address
+        // when routable, else 0.0.0.0:0, and our best address for it, else
+        // 0.0.0.0 with our listen port
+        let peer = self.info.addr;
+        let addr_recv = if crate::local::is_routable(&peer.ip()) {
+            NetAddr::from_socket_addr(peer, crate::constants::services::NODE_NETWORK)
+        } else {
+            NetAddr::from_ipv4([0, 0, 0, 0], 0, crate::constants::services::NODE_NETWORK)
+        };
         let version = VersionMessage {
-            version: PROTOCOL_VERSION,
+            version: crate::constants::protocol_version(),
             services: self.our_services,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
-            addr_recv: NetAddr::from_ipv4([0, 0, 0, 0], 0, 0),
-            addr_from: NetAddr::from_ipv4([0, 0, 0, 0], 0, self.our_services),
+            addr_recv,
+            addr_from: self
+                .local
+                .version_address(Some(&self.info.addr.ip()), self.our_services),
             nonce: self.new_local_nonce(),
             user_agent: USER_AGENT.to_string(),
             start_height: self.our_height as i32,
@@ -429,7 +456,10 @@ impl Connection {
             "{} from {} does not parse: {}",
             command, self.info.addr, error
         );
-        self.send_message(malformed_reject(command)).await
+        match malformed_reject(command) {
+            Some(answer) => self.send_message(answer).await,
+            None => Ok(()),
+        }
     }
 
     /// Read a message during handshake (not cancellation-safe, but OK since no
@@ -452,8 +482,16 @@ impl Connection {
             });
         }
 
-        let mut payload = vec![0u8; header.payload_size as usize];
-        self.stream.read_exact(&mut payload).await?;
+        // Read the payload as it arrives instead of reserving all of it
+        // up front for a size the peer has only announced
+        let mut payload = Vec::new();
+        (&mut self.stream)
+            .take(u64::from(header.payload_size))
+            .read_to_end(&mut payload)
+            .await?;
+        if payload.len() != header.payload_size as usize {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
 
         let bytes_received = HEADER_SIZE as u64 + header.payload_size as u64;
         self.info.bytes_recv += bytes_received;
@@ -493,6 +531,7 @@ impl Connection {
             total_bytes_recv,
             stats,
             local_nonces: _,
+            local: _,
             // Kept until the loop ends: the nonce leaves the node's set then
             sent_nonce: _nonce_guard,
         } = self;
@@ -581,9 +620,11 @@ impl Connection {
                             info.last_recv = std::time::Instant::now();
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
-                            if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, malformed_reject(&command)).await {
-                                error!("Failed to send reject to {}: {}", info.addr, e);
-                                break;
+                            if let Some(answer) = malformed_reject(&command) {
+                                if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, answer).await {
+                                    error!("Failed to send reject to {}: {}", info.addr, e);
+                                    break;
+                                }
                             }
                         }
                         Ok(Some(Ok(Decoded::Message(msg)))) => {
@@ -763,8 +804,16 @@ fn reject(command: &str, code: u8, reason: &str) -> NetworkMessage {
 }
 
 /// The `reject` Divi Core sends for a message that does not parse
-fn malformed_reject(command: &str) -> NetworkMessage {
-    reject(command, REJECT_MALFORMED, "error parsing message")
+/// (main.cpp:1054). None for a `reject`, which Divi Core reads only with
+/// -debug and whose parse errors it swallows (main.cpp:940-962), and for
+/// `headers`, which it never reads (main.cpp:669, HeadersFirstSyncingActive
+/// is false on every network): answering those could only start an
+/// exchange of rejects.
+fn malformed_reject(command: &str) -> Option<NetworkMessage> {
+    match command {
+        "reject" | "headers" => None,
+        _ => Some(reject(command, REJECT_MALFORMED, "error parsing message")),
+    }
 }
 
 fn duplicate_version_reject() -> NetworkMessage {

@@ -64,6 +64,19 @@ pub struct NodeConfig {
     #[serde(default)]
     pub max_reorg: Option<u32>,
 
+    /// Block files to import at start (-loadblock), after bootstrap.dat
+    #[serde(default)]
+    pub load_block: Vec<PathBuf>,
+
+    /// Directory of the bootstrap.dat imported at start: Divi Core's
+    /// network data directory (unset = the data directory)
+    #[serde(default)]
+    pub bootstrap_dir: Option<PathBuf>,
+
+    /// Stop once the block files are imported (-stopafterblockimport)
+    #[serde(default)]
+    pub stop_after_block_import: bool,
+
     /// Command run when the best block changes, `%s` replaced by its hash
     /// (Divi Core's -blocknotify)
     #[serde(default)]
@@ -73,6 +86,10 @@ pub struct NodeConfig {
     /// replaced by its txid (Divi Core's -walletnotify)
     #[serde(default)]
     pub walletnotify: Option<String>,
+
+    /// Vaults may be added and removed (Divi Core's -vault, default off)
+    #[serde(default)]
+    pub vault: bool,
 }
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
@@ -98,8 +115,12 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            load_block: Vec::new(),
+            bootstrap_dir: None,
+            stop_after_block_import: false,
             blocknotify: None,
             walletnotify: None,
+            vault: false,
         }
     }
 }
@@ -201,7 +222,7 @@ pub struct NetworkConfig {
     /// Magic bytes for network messages
     pub magic: [u8; 4],
 
-    /// Protocol version
+    /// Protocol version sent and reported (Divi Core's, or -protocolversion)
     pub protocol_version: u32,
 
     /// Minimum supported protocol version
@@ -237,7 +258,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Mainnet,
                 chain_mode,
                 magic: [0xdf, 0xa0, 0x8d, 0x8f],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::divi::MAINNET
                     .iter()
@@ -253,7 +274,7 @@ impl NetworkConfig {
                 chain_mode,
                 // 2026-04-20 relaunch (PrivateDivi Core 21de13166, chainparams.cpp:172-175)
                 magic: [0x70, 0xd2, 0x76, 0x11],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::privatedivi::MAINNET
                     .iter()
@@ -288,7 +309,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Testnet,
                 chain_mode,
                 magic: [0xdf, 0xa0, 0x8d, 0x78],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::divi::TESTNET
                     .iter()
@@ -300,7 +321,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Testnet,
                 chain_mode,
                 magic: [0x70, 0xd1, 0x76, 0x12],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::privatedivi::TESTNET
                     .iter()
@@ -324,7 +345,7 @@ impl NetworkConfig {
             network_type: NetworkType::Regtest,
             chain_mode,
             magic,
-            protocol_version: 70920,
+            protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
             min_protocol_version: 70915,
             dns_seeds: Vec::new(),
             static_peers: Vec::new(),
@@ -385,6 +406,19 @@ pub struct P2pConfig {
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+
+    /// Learn local addresses from the bound address and the machine's
+    /// interfaces (Divi Core -discover)
+    #[serde(default = "default_discover")]
+    pub discover: bool,
+
+    /// Addresses this node is reachable at (Divi Core -externalip)
+    #[serde(default)]
+    pub external_ips: Vec<SocketAddr>,
+
+    /// The machine's interface addresses, found at start with `discover`
+    #[serde(default)]
+    pub interface_ips: Vec<std::net::IpAddr>,
 }
 
 impl P2pConfig {
@@ -420,6 +454,10 @@ impl P2pConfig {
     }
 }
 
+fn default_discover() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -446,6 +484,9 @@ impl Default for P2pConfig {
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             connect_timeout_ms: default_connect_timeout_ms(),
+            discover: default_discover(),
+            external_ips: Vec::new(),
+            interface_ips: Vec::new(),
         }
     }
 }
@@ -565,6 +606,23 @@ pub struct StakingConfig {
     /// Allow staking on a tip older than 24h (`stakeonstaletip`). Default off.
     #[serde(default)]
     pub stake_on_stale_tip: bool,
+
+    /// Divi Core `-blockmaxsize`, `-blockprioritysize` and `-blockminsize`
+    /// (defaultValues.h:47-50)
+    #[serde(default = "default_block_max_size")]
+    pub block_max_size: usize,
+    #[serde(default = "default_block_priority_size")]
+    pub block_priority_size: usize,
+    #[serde(default)]
+    pub block_min_size: usize,
+}
+
+fn default_block_max_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_MAX_SIZE
+}
+
+fn default_block_priority_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_PRIORITY_SIZE
 }
 
 impl Default for StakingConfig {
@@ -576,6 +634,9 @@ impl Default for StakingConfig {
             split_threshold: 2_000_000_000_000, // 20,000 DIVI (C++ -stakesplitthreshold default)
             combine_threshold: 100_000_000_000, // 1,000 DIVI
             stake_on_stale_tip: false,
+            block_max_size: default_block_max_size(),
+            block_priority_size: default_block_priority_size(),
+            block_min_size: crate::staker::DEFAULT_BLOCK_MIN_SIZE,
         }
     }
 }

@@ -22,6 +22,7 @@
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
 mod core_files;
+mod interfaces;
 mod settings;
 mod snapshot_sig;
 
@@ -93,6 +94,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
+-blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
 -blocknotify=<cmd> -walletnotify=<cmd>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
@@ -266,9 +268,6 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
     "alerts",
-    "blockmaxsize",
-    "blockminsize",
-    "blockprioritysize",
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
@@ -276,16 +275,13 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "datacarriersize",
     "dbcache",
     "disablesystemnotifications",
-    "discover",
     "dns",
-    "externalip",
     "forcednsseed",
     "forcestart",
     "genproclimit",
     "keypool",
     "listenonion",
     "litemode",
-    "loadblock",
     "logips",
     "logtimestamps",
     "masternode",
@@ -320,7 +316,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "txconfirmtarget",
     "upgradewallet",
     "upnp",
-    "vault",
     "vault_min",
     "whitebind",
     "whitelist",
@@ -414,6 +409,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
+    }
+    // -proxy, -listen=0 and -externalip each turn -discover off unless it is
+    // given (net.cpp:1690-1716)
+    if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
+        s.soft_set_bool("discover", false);
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
@@ -515,12 +515,28 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(proxy) = s.get("proxy") {
         config.p2p.proxy = Some(proxy.to_string());
     }
+    config.p2p.discover = s.get_bool("discover", true);
+    // -externalip=<ip>[:port], the listen port when none is given; one that
+    // does not resolve to a valid address stops the start (net.cpp:1834-1839)
+    for raw in s.get_multi("externalip") {
+        let addr = resolve_service(raw, config.p2p.port)
+            .filter(|a| divi_network::local::is_valid(&a.ip()))
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
+        config.p2p.external_ips.push(addr);
+    }
+    // Divi Core SetProtocolVersion (init.cpp:1450-1452)
+    if let Some(n) = number_option(&s, "protocolversion", 0..=i64::from(i32::MAX)) {
+        config.network.protocol_version = n as u32;
+    }
     if let Some(n) = number_option(&s, "banscore", 0..=i64::from(u32::MAX)) {
         config.p2p.ban_score = n as u32;
     }
     if let Some(n) = number_option(&s, "bantime", 0..=i64::MAX) {
         config.p2p.ban_time = n as u64;
     }
+    // -loadblock files as given, relative to the working directory as in divid
+    config.load_block = s.get_multi("loadblock").iter().map(PathBuf::from).collect();
+    config.stop_after_block_import = s.get_bool("stopafterblockimport", false);
     if let Some(n) = number_option(&s, "checkblocks", 0..=i64::from(u32::MAX)) {
         config.check_blocks = n as u32;
     }
@@ -538,6 +554,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
+    if let Some(wif) = s.get("sporkkey") {
+        // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
+        // network's spork key stops the start
+        let mainnet = config.network.magic == divi_network::constants::MAINNET_MAGIC;
+        let spork = divi_network::spork::spork_key(&config.network.magic);
+        if !spork.is_some_and(|spork| is_spork_key(wif, mainnet, &spork)) {
+            anyhow::bail!("Unable to sign spork message, wrong key?");
+        }
+        warn!(
+            "-sporkkey is this network's spork key, but irondivid does not sign sporks; not used"
+        );
+    }
     config.staking.enabled = s.get_bool("staking", true);
     if s.is_set("stakeonstaletip") {
         config.staking.stake_on_stale_tip = s.get_bool("stakeonstaletip", false);
@@ -548,6 +576,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 config.staking.split_threshold = (d * 100_000_000.0).round() as i64
             }
             _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
+        }
+    }
+    // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    for (key, slot) in [
+        ("blockmaxsize", &mut config.staking.block_max_size),
+        ("blockprioritysize", &mut config.staking.block_priority_size),
+        ("blockminsize", &mut config.staking.block_min_size),
+    ] {
+        if let Some(n) = number_option(&s, key, 0..=i64::from(u32::MAX)) {
+            *slot = n as usize;
         }
     }
     for (key, slot) in [
@@ -581,8 +619,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("walletnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
+        "vault",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -599,15 +639,24 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxconnections",
         "timeout",
         "proxy",
+        "discover",
+        "externalip",
+        "protocolversion",
         "banscore",
         "bantime",
         "checkblocks",
+        "loadblock",
+        "stopafterblockimport",
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "sporkkey",
         "staking",
         "stakeonstaletip",
         "stakesplitthreshold",
+        "blockmaxsize",
+        "blockprioritysize",
+        "blockminsize",
         "txindex",
         "spentindex",
         "addressindex",
@@ -644,6 +693,57 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A start the node refuses for a stated reason gives that reason alone, as
+/// Divi Core's InitError prints its text after "Error: " (noui.cpp:38-40), e.g.
+/// the -txindex change of init.cpp:1104-1105; other errors keep the step that
+/// failed
+fn start_error(e: divi_node::NodeError) -> anyhow::Error {
+    match e {
+        divi_node::NodeError::Init(reason) => anyhow::Error::msg(reason),
+        e => anyhow::Error::new(e).context("Failed to initialize node"),
+    }
+}
+
+/// Whether `wif` is a private key of this network (mainnet or not) whose public
+/// key is `spork`, as Divi Core's CSporkManager::SetPrivKey checks it: the
+/// secret is read as this network's (CBitcoinSecret) and its key id compared
+/// with the spork key's (spork.cpp:461-475)
+fn is_spork_key(wif: &str, mainnet: bool, spork: &[u8]) -> bool {
+    let Ok(key) = divi_wallet::decode_wif(wif) else {
+        return false;
+    };
+    if (key.network == WalletNetwork::Mainnet) != mainnet {
+        return false;
+    }
+    let Ok(secret) = divi_crypto::keys::SecretKey::from_bytes(&key.key_bytes) else {
+        return false;
+    };
+    let public = secret.public_key();
+    if key.compressed {
+        public.serialize_compressed()[..] == *spork
+    } else {
+        public.serialize_uncompressed()[..] == *spork
+    }
+}
+
+/// A host with an optional port, as Divi Core's CService reads it: `ip`,
+/// `ip:port`, `[ipv6]:port`, or a name, with `default_port` when none is given
+fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+    let text = text.trim();
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = text.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+    let (host, port) = match text.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, p.parse().ok()?),
+        _ => (text, default_port),
+    };
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 /// Divi Core's ParseMoney: up to 8 decimals, no sign, no exponent. In satoshis.
@@ -686,6 +786,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
         NodeConfig::mainnet(chain_mode)
     };
     config.data_dir = compute_data_dir(args);
+    config.bootstrap_dir = Some(core_network_dir(args));
     if let Some(conf) = &args.conf {
         if conf.exists() {
             info!("Loaded config from {:?}", conf);
@@ -708,6 +809,26 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     apply_settings(&mut config, &settings)?;
 
     Ok(config)
+}
+
+/// Divi Core's network data directory, GetDataDir(): the data directory, with
+/// testnet3/ or regtest/ for those networks (chainparamsbase.cpp:54, :68).
+/// bootstrap.dat is read there, as divid reads it (init.cpp:698-699).
+fn core_network_dir(args: &Args) -> PathBuf {
+    let base = args.datadir.clone().unwrap_or_else(|| {
+        let mut dir = default_data_dir();
+        if args.chain_mode() == ChainMode::PrivateDivi {
+            dir = dir.join("privatedivi");
+        }
+        dir
+    });
+    if args.testnet {
+        base.join("testnet3")
+    } else if args.regtest {
+        base.join("regtest")
+    } else {
+        base
+    }
 }
 
 /// Compute data directory from args (used before config is built)
@@ -1084,9 +1205,14 @@ fn load_or_restore_wallet_with_seed(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
-        // As Divi Core at start: fill the keypool while the seed is in memory
-        // (an encrypted wallet starts locked and is topped up on unlock)
-        if !wallet.is_locked() {
+        // Divi Core does not refill the keypool when it loads a wallet: it tops
+        // up only before it takes a key (wallet.cpp:2122-2131), so a pool may
+        // sit one key short per chain. Only a pool below that, which divid
+        // never has (a wallet stored before its keypool was), is filled here,
+        // so payments to its next keys are still found. A locked wallet is
+        // topped up on unlock.
+        let at_rest = 2 * wallet.keypool_target().saturating_sub(1);
+        if !wallet.is_locked() && wallet.keypool_size() < at_rest {
             if let Err(e) = wallet.top_up_keypool() {
                 warn!("Could not top up the keypool: {}", e);
             }
@@ -1243,7 +1369,7 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
 
 /// Run the daemon
 async fn run_daemon(
-    config: NodeConfig,
+    mut config: NodeConfig,
     wallet_path: Option<PathBuf>,
     wallet_seed: WalletSeed,
     disable_wallet: bool,
@@ -1254,9 +1380,14 @@ async fn run_daemon(
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
 
+    // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
+    if config.p2p.discover {
+        config.p2p.interface_ips = interfaces::addresses();
+    }
+
     // Initialize the node
     info!("Initializing node...");
-    let node = Node::new(config.clone()).with_context(|| "Failed to initialize node")?;
+    let node = Node::new(config.clone()).map_err(start_error)?;
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -1265,6 +1396,20 @@ async fn run_daemon(
 
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
+
+    // Divi Core's -stopafterblockimport: the import thread asks for shutdown
+    // once it is done (init.cpp:724-727)
+    if config.stop_after_block_import {
+        let chain = node.chain().clone();
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            while chain.is_importing() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            info!("Stopping after block import");
+            let _ = tx.send(());
+        });
+    }
 
     info!("Node started, chain height: {}", node.chain().height());
 
@@ -1309,6 +1454,8 @@ async fn run_daemon(
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
+            w.set_vault_mode(config.vault);
+            w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
         }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
@@ -1658,6 +1805,9 @@ async fn run_daemon(
 
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
+    // An RPC server that cannot run (its port taken) stops the node, which
+    // then exits with failure, as divid's InitError does
+    let mut rpc_error = None;
 
     // RPC `stop` takes the same path as SIGTERM. The short delay lets the
     // "DIVI server stopping" reply reach the client before the server is dropped.
@@ -1809,6 +1959,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
+                    rpc_error = Some(e.to_string());
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -1854,6 +2005,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
+                    rpc_error = Some(e.to_string());
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -1883,7 +2035,10 @@ async fn run_daemon(
     }
 
     info!("Node stopped");
-    Ok(())
+    match rpc_error {
+        Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        None => Ok(()),
+    }
 }
 
 /// Run a notify command as divid's runCommand: through the shell, `%s`
@@ -1945,6 +2100,9 @@ fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> Sta
             || config.network.network_type == NetworkType::Regtest,
         stake_split_threshold: config.staking.split_threshold,
         min_coin_age: chain.min_stake_age,
+        max_block_size: config.staking.block_max_size,
+        block_priority_size: config.staking.block_priority_size,
+        block_min_size: config.staking.block_min_size,
         ..StakingConfig::default()
     }
 }
@@ -1960,6 +2118,9 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
         NodeError::TxRejected { reason, .. } if reason == "bad-txns-nonstandard-inputs" => {
             TxSubmitError::Failed(String::new())
         }
+        // A coin a mempool transaction already spends: AcceptToMemoryPool returns
+        // false without a reject state (MempoolConsensus.cpp:303-313), so -25 ""
+        NodeError::MempoolConflict(_) => TxSubmitError::Failed(String::new()),
         NodeError::TxRejected { code, reason, .. } => TxSubmitError::Rejected { code, reason },
         NodeError::MissingInputs => TxSubmitError::UnknownInputs,
         NodeError::NonFinal => TxSubmitError::Rejected {
@@ -2210,6 +2371,12 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     chain
         .export_chain(start_height, end_height, output_dir)
         .map_err(|e| anyhow::anyhow!("Failed to export chain: {}", e))?;
+    // The same blocks as a block file divid and irondivid read with -loadblock
+    let block_file = output_dir.join("bootstrap.dat");
+    let written = chain
+        .export_block_file(start_height, end_height, config.network.magic, &block_file)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", block_file.display(), e))?;
+    info!("Wrote {} blocks to {}", written, block_file.display());
 
     info!("Export complete!");
     Ok(())
@@ -2709,34 +2876,48 @@ mod config_format_tests {
 mod wallet_log_tests {
     use super::*;
 
-    /// Run `f` under a subscriber that records every event at every level, and
-    /// return its result with the formatted log text.
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-        use std::io::Write;
-        use std::sync::Mutex;
+    thread_local! {
+        /// Where the test subscriber writes this thread's events while a
+        /// capture runs on it
+        static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    struct ThreadBuf;
+    impl std::io::Write for ThreadBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            CAPTURED.with(|c| {
+                if let Some(buf) = c.borrow_mut().as_mut() {
+                    buf.extend_from_slice(bytes);
+                }
+            });
+            Ok(bytes.len())
         }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        (out, logs)
+    /// Run `f` and return its result with the formatted text of every event it
+    /// logged on this thread, at every level. One subscriber is installed for
+    /// the whole test process, so tests running at the same time cannot change
+    /// which events are enabled (a scoped subscriber per test could: tracing
+    /// caches whether an event is wanted across threads).
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(|| ThreadBuf)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in the test process");
+        });
+        CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let bytes = CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default();
+        (out, String::from_utf8(bytes).unwrap())
     }
 
     /// Fail if the log text holds the phrase, or any run of three of its words.
@@ -3283,6 +3464,21 @@ mod staking_config_tests {
 mod submit_error_tests {
     use super::*;
 
+    /// sendrawtransaction of a spend of a coin a mempool transaction spends:
+    /// Divi Core's AcceptToMemoryPool keeps no reject state for it
+    /// (MempoolConsensus.cpp:303-313), so the reply is -25 with an empty message
+    /// (rpcrawtransaction.cpp:883-886)
+    #[test]
+    fn mempool_conflict_answers_like_core() {
+        use divi_primitives::hash::Hash256;
+        match submit_error(divi_node::NodeError::MempoolConflict(Hash256::from_bytes(
+            [3; 32],
+        ))) {
+            divi_rpc::TxSubmitError::Failed(message) => assert_eq!(message, ""),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     /// A refusal Divi Core makes without a reject state reaches the RPC as
     /// -25 with an empty message; refusals with a state keep code and reason
     #[test]
@@ -3481,6 +3677,63 @@ mod divid_option_tests {
                 Some(format!("Invalid amount for -minrelaytxfee=<amount>: '{zero}'").as_str())
             );
         }
+    }
+
+    /// divid refuses to start with a -sporkkey that is not the network's spork
+    /// key (init.cpp:971-974), whatever is wrong with it
+    #[test]
+    fn sporkkey_that_is_not_the_spork_key_stops_the_start() {
+        let other = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(other.as_bytes());
+        for wif in [
+            divi_wallet::encode_wif(&bytes, true, WalletNetwork::Testnet),
+            divi_wallet::encode_wif(&bytes, true, WalletNetwork::Mainnet),
+            "not a key".to_string(),
+            String::new(),
+        ] {
+            let err = cfg_in(
+                "irondivi.conf",
+                &format!("rpcuser=x\nregtest=1\nsporkkey={wif}\n"),
+                &[],
+            )
+            .err()
+            .map(|e| e.to_string());
+            assert_eq!(
+                err.as_deref(),
+                Some("Unable to sign spork message, wrong key?")
+            );
+        }
+    }
+
+    /// The spork key check: this network's secret of that public key, in the
+    /// compressed or uncompressed form the key was given in
+    #[test]
+    fn spork_key_check_matches_the_public_key_and_network() {
+        let secret = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(secret.as_bytes());
+        let public = secret.public_key();
+        let compressed = public.serialize_compressed();
+        let uncompressed = public.serialize_uncompressed();
+        let testnet = divi_wallet::encode_wif(&bytes, true, WalletNetwork::Testnet);
+        let mainnet = divi_wallet::encode_wif(&bytes, true, WalletNetwork::Mainnet);
+        let testnet_long = divi_wallet::encode_wif(&bytes, false, WalletNetwork::Testnet);
+        assert!(is_spork_key(&testnet, false, &compressed));
+        assert!(is_spork_key(&mainnet, true, &compressed));
+        assert!(is_spork_key(&testnet_long, false, &uncompressed));
+        assert!(!is_spork_key(&testnet, true, &compressed), "other network");
+        assert!(!is_spork_key(&mainnet, false, &compressed), "other network");
+        assert!(
+            !is_spork_key(&testnet_long, false, &compressed),
+            "other key id"
+        );
+        let other = divi_crypto::keys::SecretKey::new_random().public_key();
+        assert!(!is_spork_key(
+            &testnet,
+            false,
+            &other.serialize_compressed()
+        ));
     }
 
     /// Without -rpcallowip divid listens on the loopback and ignores -rpcbind

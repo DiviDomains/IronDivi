@@ -50,6 +50,16 @@ pub struct MempoolEntry {
 
     /// Descendants (transactions that depend on this)
     pub descendants: HashSet<Hash256>,
+
+    /// Chain tip height when the transaction entered the pool
+    pub height: u32,
+
+    /// Coin age of the inputs per byte when it entered (Divi Core's
+    /// `initialCoinAgePerByteOfInputs`, MemPoolEntry.cpp:43)
+    pub starting_priority: f64,
+
+    /// Size counted for priority (Divi Core `CalculateModifiedSize`)
+    pub mod_size: usize,
 }
 
 impl MempoolEntry {
@@ -59,6 +69,7 @@ impl MempoolEntry {
         let size = tx.size();
         let fee_rate = fee.as_sat() as f64 / size as f64;
 
+        let mod_size = modified_size(&tx, size);
         MempoolEntry {
             tx,
             txid,
@@ -68,13 +79,64 @@ impl MempoolEntry {
             fee_rate,
             ancestors: HashSet::new(),
             descendants: HashSet::new(),
+            height: 0,
+            starting_priority: 0.0,
+            mod_size,
         }
+    }
+
+    /// The entry as Divi Core makes it (MempoolConsensus.cpp:384-386): the tip
+    /// height and the coin age of the inputs there (`ComputeInputCoinAge`)
+    pub fn with_coin_age(mut self, height: u32, coin_age: f64) -> Self {
+        self.height = height;
+        self.starting_priority = if self.mod_size > 0 {
+            coin_age / self.mod_size as f64
+        } else {
+            0.0
+        };
+        self
+    }
+
+    /// Divi Core `ComputeInputCoinAgePerByte` (MemPoolEntry.cpp:52-57): the
+    /// starting priority plus the value in aged by the blocks since entry.
+    /// Core subtracts unsigned heights, which wraps below the entry height
+    /// after a reorganisation; here that counts as no blocks since entry.
+    pub fn priority_at(&self, height: u32) -> f64 {
+        if self.mod_size == 0 {
+            return self.starting_priority;
+        }
+        let value_out: i64 = self.tx.vout.iter().map(|o| o.value.as_sat()).sum();
+        let value_in = value_out + self.fee.as_sat();
+        self.starting_priority
+            + height.saturating_sub(self.height) as f64 * value_in as f64 / self.mod_size as f64
     }
 
     /// Get age of the entry
     pub fn age(&self) -> Duration {
         self.time.elapsed()
     }
+}
+
+/// A pool transaction as block assembly weighs it (Divi Core
+/// BlockMemoryPoolTransactionCollector.cpp:122-147)
+#[derive(Debug, Clone)]
+pub struct BlockCandidate {
+    pub tx: Transaction,
+    pub txid: Hash256,
+    pub size: usize,
+    /// Fee the transaction pays
+    pub fee: Amount,
+    /// Coin age per byte at the block's height, plus the prioritisetransaction
+    /// priority delta (`ComputeInputCoinAgePerByte`, `ApplyDeltas`)
+    pub priority: f64,
+    /// The fee plus the fee delta per 1,000 bytes, truncated as `CFeeRate`
+    /// keeps it (FeeRate.cpp:27-33)
+    pub fee_rate_per_kb: i64,
+    /// Given a delta with prioritisetransaction
+    /// (`CTxMemPool::IsPrioritizedTransaction`, txmempool.cpp:330-336)
+    pub prioritised: bool,
+    /// Pool transactions it spends, which must be in the block before it
+    pub parents: Vec<Hash256>,
 }
 
 /// Entry for priority queue ordering by fee rate
@@ -130,7 +192,17 @@ fn unix_now() -> u32 {
 /// returns its fee; see [`Mempool::set_validator`]. The flag is Core's
 /// `fLimitFree`: true for a transaction a peer relayed.
 pub type MempoolValidator =
-    Arc<dyn Fn(&Mempool, &Transaction, bool) -> Result<Amount, NodeError> + Send + Sync>;
+    Arc<dyn Fn(&Mempool, &Transaction, bool) -> Result<Admission, NodeError> + Send + Sync>;
+
+/// What the checks found for a transaction entering the pool: its fee, the
+/// chain tip height and the coin age of its inputs there (Divi Core
+/// `CCoinsViewCache::ComputeInputCoinAge`)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Admission {
+    pub fee: Amount,
+    pub height: u32,
+    pub coin_age: f64,
+}
 
 /// Divi Core `DEFAULT_BLOCK_PRIORITY_SIZE` (defaultValues.h:50)
 pub const DEFAULT_BLOCK_PRIORITY_SIZE: usize = 50_000;
@@ -309,14 +381,21 @@ impl Mempool {
         // Every check, in Divi Core's order (called without holding any
         // mempool lock: the validator looks up parent transactions here)
         let validator = self.validator.read().clone();
-        let fee = match validator {
+        let admission = match validator {
             Some(validator) => validator(self, &tx, limit_free)?,
             None => {
                 self.check_without_chain(&tx, fee)?;
-                fee
+                // No chain to look the inputs up in: no coin age
+                Admission {
+                    fee,
+                    height: self.tip_height(),
+                    coin_age: 0.0,
+                }
             }
         };
-        let entry = MempoolEntry::new(tx.clone(), fee);
+        let fee = admission.fee;
+        let entry =
+            MempoolEntry::new(tx.clone(), fee).with_coin_age(admission.height, admission.coin_age);
 
         // Check size limits
         let new_size = *self.total_size.read() + entry.size;
@@ -648,6 +727,41 @@ impl Mempool {
         result
     }
 
+    /// Every pool transaction weighed for a block at `height`, in no order
+    pub fn block_candidates(&self, height: u32) -> Vec<BlockCandidate> {
+        let txs = self.txs.read();
+        let deltas = self.priority_deltas.read();
+        txs.values()
+            .map(|e| {
+                let delta = deltas.get(&e.txid).copied();
+                let (priority_delta, fee_delta) = delta.unwrap_or((0.0, 0));
+                let nominal_fee = e.fee.as_sat() + fee_delta;
+                let mut parents: Vec<Hash256> =
+                    e.tx.vin
+                        .iter()
+                        .map(|i| i.prevout.txid)
+                        .filter(|p| txs.contains_key(p))
+                        .collect();
+                parents.sort();
+                parents.dedup();
+                BlockCandidate {
+                    tx: e.tx.clone(),
+                    txid: e.txid,
+                    size: e.size,
+                    fee: e.fee,
+                    priority: e.priority_at(height) + priority_delta,
+                    fee_rate_per_kb: if e.size > 0 {
+                        nominal_fee * 1000 / e.size as i64
+                    } else {
+                        0
+                    },
+                    prioritised: delta.is_some(),
+                    parents,
+                }
+            })
+            .collect()
+    }
+
     /// Check if an outpoint is spent by a mempool transaction
     pub fn is_spent(&self, txid: &Hash256, vout: u32) -> bool {
         self.spenders.read().contains_key(&(*txid, vout))
@@ -731,16 +845,19 @@ impl Mempool {
         }
     }
 
+    /// Divi Core `CTxMemPool::PrioritiseTransaction` (txmempool.cpp:318-328):
+    /// the fee delta is added to the fee and, as a number, to the priority;
+    /// the priority delta argument is not used (rpcmining.cpp:270-275)
     pub fn prioritise_transaction(
         &self,
         txid: &Hash256,
-        priority_delta: f64,
+        _priority_delta: f64,
         fee_delta: i64,
     ) -> bool {
         let mut deltas = self.priority_deltas.write();
 
         let entry = deltas.entry(*txid).or_insert((0.0, 0));
-        entry.0 += priority_delta;
+        entry.0 += fee_delta as f64;
         entry.1 += fee_delta;
 
         true
@@ -806,15 +923,30 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.txs
-            .read()
-            .values()
+        let tip_height = self.tip_height();
+        let txs = self.txs.read();
+        txs.values()
             .map(|e| divi_rpc::blockchain::MempoolTxInfo {
                 txid: e.txid,
                 size: e.size,
                 fee_sat: e.fee.as_sat(),
                 time: now - e.time.elapsed().as_secs() as i64,
-                depends: e.ancestors.iter().copied().collect(),
+                // Inputs from pool transactions, each once in hex order, as
+                // Divi Core's std::set<string> (rpcblockchain.cpp:130-136)
+                depends: {
+                    let mut parents: Vec<Hash256> =
+                        e.tx.vin
+                            .iter()
+                            .map(|i| i.prevout.txid)
+                            .filter(|p| txs.contains_key(p))
+                            .collect();
+                    parents.sort_by_key(|p| p.to_string());
+                    parents.dedup();
+                    parents
+                },
+                height: e.height,
+                starting_priority: e.priority_at(e.height),
+                current_priority: e.priority_at(tip_height),
             })
             .collect()
     }
@@ -874,7 +1006,7 @@ fn rejected(code: u8, reason: &str) -> NodeError {
 }
 
 fn conflict(existing: &Hash256) -> NodeError {
-    NodeError::TransactionValidation(format!("Conflicts with transaction {}", existing))
+    NodeError::MempoolConflict(*existing)
 }
 
 #[cfg(test)]
@@ -1061,6 +1193,43 @@ mod tests {
         let tx2 = create_test_tx([1u8; 32], 40);
         let result = mempool.add(tx2, Amount::from_sat(10000));
         assert!(result.is_err());
+    }
+
+    /// Block assembly sees a delta as Divi Core applies it: the fee delta adds
+    /// to the fee rate and, as a number, to the priority; the priority delta
+    /// argument is not used (txmempool.cpp:318-348, rpcmining.cpp:270-275).
+    /// The fee the block collects stays the fee paid.
+    #[test]
+    fn block_candidates_carry_prioritisetransaction_deltas() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let tx = create_test_tx([1; 32], 1);
+        let txid = tx.txid();
+        let size = tx.size() as i64;
+        mempool.add(tx, Amount::from_sat(10_000)).unwrap();
+
+        // At the entry height (no tip provider: 0) there is no coin age yet
+        let c = &mempool.block_candidates(0)[0];
+        assert!(!c.prioritised);
+        assert_eq!(c.fee_rate_per_kb, 10_000 * 1000 / size);
+
+        mempool.prioritise_transaction(&txid, 999.0, 50_000);
+        let c = &mempool.block_candidates(0)[0];
+        assert!(c.prioritised);
+        assert_eq!(c.fee_rate_per_kb, 60_000 * 1000 / size);
+        assert_eq!(c.priority, 50_000.0);
+        assert_eq!(c.fee, Amount::from_sat(10_000));
+
+        // Any delta, even zero, marks the transaction as prioritised
+        let other = create_test_tx([2; 32], 1);
+        let other_id = other.txid();
+        mempool.add(other, Amount::from_sat(10_000)).unwrap();
+        mempool.prioritise_transaction(&other_id, 0.0, 0);
+        let c = mempool
+            .block_candidates(0)
+            .into_iter()
+            .find(|c| c.txid == other_id)
+            .unwrap();
+        assert!(c.prioritised);
     }
 
     #[test]
@@ -1342,11 +1511,10 @@ mod tests {
 
         // Should be rejected
         assert!(result.is_err());
-        if let Err(NodeError::TransactionValidation(msg)) = result {
-            assert!(msg.contains("Conflicts"));
-        } else {
-            panic!("Expected TransactionValidation error");
-        }
+        assert!(
+            matches!(result, Err(NodeError::MempoolConflict(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

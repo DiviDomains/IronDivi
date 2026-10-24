@@ -13,6 +13,7 @@
 //!
 //! Orchestrates all node components: storage, networking, RPC, and wallet.
 
+use crate::block_import::ImportResult;
 use crate::config::NodeConfig;
 use crate::error::NodeError;
 use crate::fee_estimator::FeeEstimator;
@@ -114,6 +115,11 @@ pub enum NodeEvent {
 pub struct Node {
     /// Node configuration
     config: NodeConfig,
+
+    /// The thread importing bootstrap.dat and -loadblock files, and the flag
+    /// that stops it
+    import_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<ImportResult>>>,
+    import_stop: Arc<std::sync::atomic::AtomicBool>,
 
     /// Current status
     status: RwLock<NodeStatus>,
@@ -220,7 +226,9 @@ impl Node {
 
         // Divi Core keeps the index flags with the chain database: a changed
         // -txindex refuses to start, and -addressindex/-spentindex take effect
-        // only on a new chain database (init.cpp:1103-1106, txdb.cpp:498-523)
+        // only on a new chain database or with -reindex, which builds every
+        // index again (init.cpp:1103-1106, txdb.cpp:498-523,
+        // ChainExtensionService.cpp:703-707)
         let requested = divi_storage::search_index::IndexFlags {
             txindex: config.index.txindex,
             addressindex: config.index.addressindex,
@@ -247,6 +255,24 @@ impl Node {
         )
         .map_err(damaged)?;
         let mut check_unflagged_index = false;
+        // The address and spent indexes of such a database are stored as off
+        // (load_or_init); asked for, they are built from the blocks below
+        let mut build_unflagged_search = false;
+        if unflagged && (requested.addressindex || requested.spentindex) {
+            match snapshot_base {
+                Some(base) => tracing::warn!(
+                    "This chain database was installed from a snapshot and has no blocks \
+                     below height {}, so it cannot have full address and spent indexes: \
+                     they are off",
+                    base
+                ),
+                None => {
+                    flags.addressindex = requested.addressindex;
+                    flags.spentindex = requested.spentindex;
+                    build_unflagged_search = true;
+                }
+            }
+        }
         if unflagged && requested.txindex {
             match snapshot_base {
                 Some(base) => tracing::warn!(
@@ -268,6 +294,11 @@ impl Node {
         let rebuild_tx_index = config.index.reindex && requested.txindex;
         if config.index.reindex && flags.txindex != requested.txindex {
             flags.txindex = requested.txindex;
+        }
+        // and the address and spent indexes with the options now given
+        if config.index.reindex {
+            flags.addressindex = requested.addressindex;
+            flags.spentindex = requested.spentindex;
         }
         // A snapshot database cannot build a full index; it runs without one
         if snapshot_base.is_some() && !flags.txindex && requested.txindex {
@@ -340,22 +371,57 @@ impl Node {
             }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
-        // The flags change only once the index they name is complete
-        if config.index.reindex || check_unflagged_index {
-            flags.store(&db).map_err(damaged)?;
+        let build_search = config.index.reindex || build_unflagged_search;
+        if build_search && !(flags.addressindex || flags.spentindex) {
+            // Switched off: remove the entries an earlier index left
+            divi_storage::SearchIndex::new(db.clone(), false, false)
+                .clear()
+                .map_err(damaged)?;
         }
-
         if flags.addressindex || flags.spentindex {
-            chain.enable_search_index(Arc::new(divi_storage::SearchIndex::new(
+            let search = Arc::new(divi_storage::SearchIndex::new(
                 db.clone(),
                 flags.addressindex,
                 flags.spentindex,
-            )));
+            ));
+            if build_search {
+                tracing::info!("Building the address and spent indexes from the stored blocks");
+                let started = std::time::Instant::now();
+                match chain.rebuild_search_index(search) {
+                    Ok(blocks) => tracing::info!(
+                        "Address and spent indexes built for {} blocks in {} ms",
+                        blocks,
+                        started.elapsed().as_millis()
+                    ),
+                    Err(e) if config.index.reindex => {
+                        return Err(NodeError::Init(format!(
+                            "Failed to build the address and spent indexes: {}",
+                            e
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "No index settings were stored with this chain database and the \
+                             address and spent indexes cannot be built ({}): they are off",
+                            e
+                        );
+                        flags.addressindex = false;
+                        flags.spentindex = false;
+                    }
+                }
+            } else {
+                chain.enable_search_index(search);
+            }
             tracing::info!(
                 "Address index {}, spent index {}",
                 if flags.addressindex { "on" } else { "off" },
                 if flags.spentindex { "on" } else { "off" },
             );
+        }
+
+        // The flags change only once the indexes they name are complete
+        if config.index.reindex || check_unflagged_index || build_unflagged_search {
+            flags.store(&db).map_err(damaged)?;
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the
@@ -504,6 +570,8 @@ impl Node {
 
         Ok(Node {
             config,
+            import_thread: parking_lot::Mutex::new(None),
+            import_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status: RwLock::new(NodeStatus::Stopped),
             chain,
             mempool,
@@ -572,11 +640,59 @@ impl Node {
     }
 
     /// Start the node
+    /// Import bootstrap.dat and the -loadblock files on a thread of their
+    /// own while the node starts and runs, as Divi Core does
+    /// (init.cpp:1580); until it is done blocks from peers are neither asked
+    /// for nor taken
+    pub fn spawn_import(&self) {
+        let mut slot = self.import_thread.lock();
+        if slot.is_some() {
+            return;
+        }
+        let chain = Arc::clone(&self.chain);
+        let stop = Arc::clone(&self.import_stop);
+        let bootstrap_dir = self
+            .config
+            .bootstrap_dir
+            .clone()
+            .unwrap_or_else(|| self.config.data_dir.clone());
+        let load_block = self.config.load_block.clone();
+        let magic = self.config.network.magic;
+        chain.set_importing(true);
+        let spawned = std::thread::Builder::new()
+            .name("divi-loadblk".into())
+            .spawn(move || {
+                let result = crate::block_import::import_at_start(
+                    &chain,
+                    &bootstrap_dir,
+                    &load_block,
+                    magic,
+                    &stop,
+                );
+                chain.set_importing(false);
+                result
+            });
+        match spawned {
+            Ok(handle) => *slot = Some(handle),
+            Err(e) => {
+                self.chain.set_importing(false);
+                tracing::error!("Could not start the block import: {}", e);
+            }
+        }
+    }
+
+    /// Wait for the block import to finish; None if none was started
+    pub fn wait_for_import(&self) -> Option<ImportResult> {
+        let handle = self.import_thread.lock().take()?;
+        handle.join().ok()
+    }
+
     pub async fn start(&self) -> Result<(), NodeError> {
         let current_status = *self.status.read();
         if current_status != NodeStatus::Stopped {
             return Err(NodeError::AlreadyRunning);
         }
+        self.spawn_import();
 
         tracing::info!("Starting Divi node...");
         *self.status.write() = NodeStatus::Starting;
@@ -592,6 +708,9 @@ impl Node {
         let prunes = self.config.expire.is_enabled() || self.chain.prune_height() > 0;
         self.peer_manager
             .set_services(divi_network::constants::advertised_services(prunes));
+        divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
+        self.peer_manager
+            .set_local_addresses(self.local_addresses());
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -1103,6 +1222,23 @@ impl Node {
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
 
+        // Stop the block import between two records and wait for it, for a
+        // minute at most (a read can block where the flag is not seen)
+        self.import_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = self.import_thread.lock().take();
+        if let Some(handle) = handle {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                tracing::warn!("The block import did not stop within a minute; not waiting for it");
+            }
+        }
+
         // Disconnect all peers
         self.peer_manager.disconnect_all();
 
@@ -1456,6 +1592,38 @@ impl Node {
     }
 
     /// Get network info
+    /// The node's own addresses, learned as Divi Core learns them: a routable
+    /// bound address (net.cpp:1379-1380), -externalip (net.cpp:1834-1839),
+    /// then the interfaces (net.cpp:1385-1425)
+    fn local_addresses(&self) -> divi_network::local::LocalAddresses {
+        use divi_network::local::{LocalAddresses, LOCAL_BIND, LOCAL_IF, LOCAL_MANUAL};
+        let p2p = &self.config.p2p;
+        let listen = self.config.peer_sources().listen;
+        let local = LocalAddresses::new(listen, p2p.discover, p2p.port);
+        let bound = p2p
+            .listen_addr
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>();
+        if let (true, Ok(ip)) = (listen, bound) {
+            local.add(std::net::SocketAddr::new(ip, p2p.port), LOCAL_BIND);
+        }
+        for addr in &p2p.external_ips {
+            local.add(*addr, LOCAL_MANUAL);
+        }
+        for ip in &p2p.interface_ips {
+            local.add(std::net::SocketAddr::new(*ip, p2p.port), LOCAL_IF);
+        }
+        for a in local.list() {
+            tracing::info!(
+                "Local address {} port {} score {}",
+                a.address,
+                a.port,
+                a.score
+            );
+        }
+        local
+    }
+
     pub fn get_network_info(&self) -> NetworkInfo {
         NetworkInfo {
             version: self.config.network.protocol_version,
@@ -1713,7 +1881,7 @@ pub fn check_mempool_transaction(
     mempool: &Mempool,
     tx: &Transaction,
     limit_free: bool,
-) -> Result<divi_primitives::amount::Amount, NodeError> {
+) -> Result<crate::mempool::Admission, NodeError> {
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -1922,7 +2090,11 @@ pub fn check_mempool_transaction(
             );
         }
     }
-    Ok(Amount::from_sat(fee))
+    Ok(crate::mempool::Admission {
+        fee: Amount::from_sat(fee),
+        height: tip_height,
+        coin_age,
+    })
 }
 
 fn money_range(
@@ -2091,7 +2263,8 @@ mod tests {
         let node = Node::new(config).unwrap();
 
         let info = node.get_network_info();
-        assert_eq!(info.protocol_version, 70920);
+        // Divi Core 3.0.0's PROTOCOL_VERSION (version.h:21)
+        assert_eq!(info.protocol_version, 70915);
     }
 
     #[test]

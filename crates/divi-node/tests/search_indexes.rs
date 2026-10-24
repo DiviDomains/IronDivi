@@ -792,3 +792,241 @@ fn snapshot_database_runs_without_a_transaction_index() {
     drop(db);
     assert!(start_node(dir.path(), &txindex).is_ok());
 }
+
+fn start_reindex(dir: &Path, indexes: &Indexes) -> Result<Node, divi_node::NodeError> {
+    let mut config = NodeConfig::regtest(ChainMode::Divi);
+    config.data_dir = dir.to_path_buf();
+    config.index.txindex = indexes.txindex;
+    config.index.addressindex = indexes.addressindex;
+    config.index.spentindex = indexes.spentindex;
+    config.index.reindex = true;
+    Node::new(config)
+}
+
+/// The blocks of `t`'s active chain, block 1 to the tip
+fn active_blocks(t: &TestNode) -> Vec<Block> {
+    (1..=t.height())
+        .map(|h| {
+            let index = t
+                .node
+                .chain()
+                .get_block_index_by_height(h)
+                .unwrap()
+                .unwrap();
+            t.node.chain().get_block(&index.hash).unwrap().unwrap()
+        })
+        .collect()
+}
+
+/// A node with every index on from the start, given `blocks`
+fn reference_node(blocks: &[Block]) -> TestNode {
+    let r = TestNode::new(&ALL);
+    for block in blocks {
+        r.node.chain().accept_block(block.clone()).unwrap();
+    }
+    r
+}
+
+/// The address and spent index replies a client reads, for the addresses
+/// and outputs of `s`
+fn index_replies(call: &dyn Fn(&str, Value) -> Value, s: &Sends, own: &str) -> Vec<Value> {
+    let mut replies = Vec::new();
+    for addr in [
+        address(s.payee),
+        script_address(s.script_hash),
+        own.to_string(),
+    ] {
+        for method in [
+            "getaddressbalance",
+            "getaddresstxids",
+            "getaddressutxos",
+            "getaddressdeltas",
+        ] {
+            replies.push(call(method, json!([{ "addresses": [addr] }])));
+        }
+    }
+    replies.push(call(
+        "getaddressutxos",
+        json!([address(s.vault_owner), true]),
+    ));
+    for (txid, index) in [(s.first.txid(), 0), (s.coin.txid, s.coin.vout)] {
+        replies.push(call(
+            "getspentinfo",
+            json!([{"txid": txid.to_string(), "index": index}]),
+        ));
+    }
+    replies
+}
+
+fn rpc_caller(node: &Node) -> impl Fn(&str, Value) -> Value {
+    let rpc = RpcServer::new(node.chain().clone());
+    move |method: &str, params: Value| {
+        let request = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        }))
+        .unwrap();
+        let reply = serde_json::to_value(rpc.handle_request(request)).unwrap();
+        if reply["error"].is_null() {
+            reply["result"].clone()
+        } else {
+            json!({"error": reply["error"]["message"]})
+        }
+    }
+}
+
+const NONE: Indexes = Indexes {
+    txindex: true,
+    addressindex: false,
+    spentindex: false,
+};
+
+/// A chain run without the address and spent indexes, its own address and
+/// the expected replies (from a node that had both indexes from the start)
+fn chain_without_search_indexes() -> (tempfile::TempDir, Sends, String, Vec<Value>) {
+    let t = TestNode::new(&NONE);
+    let s = make_sends(&t);
+    let own = address(hash160(&t.key));
+    let blocks = active_blocks(&t);
+    let r = reference_node(&blocks);
+    let expected = index_replies(&|m, p| r.ok(m, p), &s, &own);
+    let dir = t.dir;
+    drop(t.rpc);
+    drop(t.node);
+    (dir, s, own, expected)
+}
+
+/// -addressindex=1 on a chain made without it: as in Divi Core the stored
+/// setting stays (no refusal, txdb.cpp:498-511) until -reindex builds the
+/// index from the blocks (init.cpp:663-680, ChainExtensionService.cpp:703-707)
+#[test]
+fn reindex_builds_the_address_index_from_the_blocks() {
+    let (dir, s, own, expected) = chain_without_search_indexes();
+    let address_on = Indexes {
+        txindex: true,
+        addressindex: true,
+        spentindex: false,
+    };
+
+    // Without -reindex the node starts with the index still off
+    let node = start_node(dir.path(), &address_on).unwrap();
+    let reply = rpc_caller(&node)("getaddressbalance", json!([address(s.payee)]));
+    assert!(
+        reply.get("error").is_some(),
+        "index on without -reindex: {reply}"
+    );
+    drop(node);
+
+    // With -reindex it is built and answers as a node that always had it
+    let node = start_reindex(dir.path(), &address_on).unwrap();
+    let call = rpc_caller(&node);
+    let got = index_replies(&call, &s, &own);
+    for (i, (g, e)) in got.iter().zip(&expected).enumerate().take(13) {
+        assert_eq!(g, e, "address index reply {i}");
+    }
+    drop(call);
+    drop(node);
+
+    // and later starts keep it
+    let node = start_node(dir.path(), &address_on).unwrap();
+    assert_eq!(
+        rpc_caller(&node)("getaddressbalance", json!([address(s.payee)])),
+        expected[0]
+    );
+}
+
+/// The same for -spentindex=1
+#[test]
+fn reindex_builds_the_spent_index_from_the_blocks() {
+    let (dir, s, own, expected) = chain_without_search_indexes();
+    let spent_on = Indexes {
+        txindex: true,
+        addressindex: false,
+        spentindex: true,
+    };
+    let spent = |node: &Node| {
+        let call = rpc_caller(node);
+        index_replies(&call, &s, &own)[13..].to_vec()
+    };
+
+    let node = start_node(dir.path(), &spent_on).unwrap();
+    assert!(
+        spent(&node)[0].get("error").is_some(),
+        "spent index on without -reindex"
+    );
+    drop(node);
+
+    let node = start_reindex(dir.path(), &spent_on).unwrap();
+    assert_eq!(spent(&node), expected[13..].to_vec());
+    drop(node);
+    let node = start_node(dir.path(), &spent_on).unwrap();
+    assert_eq!(spent(&node), expected[13..].to_vec());
+}
+
+/// -reindex without the options switches both indexes off again
+#[test]
+fn reindex_switches_the_address_and_spent_indexes_off() {
+    let (dir, s, _own, _expected) = chain_without_search_indexes();
+    drop(start_reindex(dir.path(), &ALL).unwrap());
+    let node = start_reindex(dir.path(), &NONE).unwrap();
+    let call = rpc_caller(&node);
+    assert!(call("getaddressbalance", json!([address(s.payee)]))
+        .get("error")
+        .is_some());
+    assert!(call(
+        "getspentinfo",
+        json!([{"txid": s.first.txid().to_string(), "index": 0}])
+    )
+    .get("error")
+    .is_some());
+    drop(call);
+    drop(node);
+    let db = divi_storage::ChainDatabase::open(dir.path().join("chainstate")).unwrap();
+    let flags = divi_storage::search_index::IndexFlags::load(&db)
+        .unwrap()
+        .unwrap();
+    assert!(!flags.addressindex && !flags.spentindex);
+}
+
+/// A database with no stored index flags (made before they were kept) and
+/// -addressindex=1 -spentindex=1: the indexes are built from the blocks
+/// rather than recorded as off with no entries
+#[test]
+fn search_indexes_asked_for_over_an_unflagged_database_are_built() {
+    let (dir, s, own, expected) = chain_without_search_indexes();
+    forget_index_flags(dir.path());
+    let node = start_node(dir.path(), &ALL).unwrap();
+    let call = rpc_caller(&node);
+    assert_eq!(index_replies(&call, &s, &own), expected);
+}
+
+/// A snapshot install asked for the address and spent indexes: it has no
+/// blocks below its base, so both are recorded as off, the node starts, and
+/// later starts asking for them still start
+#[test]
+fn snapshot_database_runs_without_address_and_spent_indexes() {
+    let t = TestNode::new(&NONE);
+    for _ in 0..5 {
+        t.mine(&[]);
+    }
+    let tip = t.tip();
+    let dir = t.dir;
+    drop(t.rpc);
+    drop(t.node);
+    forget_index_flags(dir.path());
+    {
+        let db = divi_storage::ChainDatabase::open(dir.path().join("chainstate")).unwrap();
+        db.set_snapshot_base(5, &tip).unwrap();
+    }
+    drop(start_node(dir.path(), &ALL).unwrap());
+    let db = divi_storage::ChainDatabase::open(dir.path().join("chainstate")).unwrap();
+    let flags = divi_storage::search_index::IndexFlags::load(&db)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !flags.addressindex && !flags.spentindex,
+        "{:?}",
+        (flags.addressindex, flags.spentindex)
+    );
+    drop(db);
+    assert!(start_node(dir.path(), &ALL).is_ok());
+}

@@ -67,6 +67,16 @@ impl Net {
     fn wallet(&mut self) -> Arc<WalletDb> {
         let hd = HdWallet::new(ChainMode::Divi).unwrap();
         let w = Arc::new(WalletDb::with_hd_wallet(Network::Regtest, hd));
+        // The wallets run as a node started with -vault=1
+        w.set_vault_mode(true);
+        self.wallets.push(w.clone());
+        w
+    }
+
+    /// A wallet of a node started without -vault
+    fn wallet_without_vault_option(&mut self) -> Arc<WalletDb> {
+        let hd = HdWallet::new(ChainMode::Divi).unwrap();
+        let w = Arc::new(WalletDb::with_hd_wallet(Network::Regtest, hd));
         self.wallets.push(w.clone());
         w
     }
@@ -865,8 +875,7 @@ fn removevault_one_and_two_arguments() {
     let res = rpc
         .remove_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
         .unwrap();
-    assert_eq!(res["removal_status"], json!(true), "{}", res);
-    assert_eq!(res["tx_hash"], json!(s.fund_txid.to_string()));
+    assert_eq!(res, json!({"removal_status": true}));
     assert!(s.manager.get_all_vaults().is_empty());
 }
 
@@ -908,4 +917,159 @@ fn reclaim_drops_change_below_the_vault_dust_limit() {
         );
     }
     assert!(output_to(&tx, &s.vault).is_empty());
+}
+
+// ----------------------------------------------------------------
+
+/// Without Divi Core's -vault option addvault fails and stores nothing
+/// (CWallet::AddVault, wallet.cpp:693-706; the RPC answers -32600)
+#[test]
+fn addvault_needs_the_vault_option() {
+    let mut s = setup();
+    let fresh = s.net.wallet_without_vault_option();
+    let manager_key = s
+        .manager
+        .keystore()
+        .get_key(&s.manager_addr.hash)
+        .unwrap()
+        .secret
+        .unwrap();
+    fresh.import_key(manager_key, None);
+    let rpc = s.net.rpc(&fresh);
+    let e = rpc
+        .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .expect_err("addvault without the vault option must fail");
+    match e {
+        divi_rpc::Error::Rpc(r) => {
+            assert_eq!(r.code, -32600, "{}", r.message);
+            assert!(r.message.contains("vault=1"), "{}", r.message);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fresh.get_all_vaults().is_empty());
+}
+
+/// Without the option removevault reports false and keeps the vault
+/// (CWallet::RemoveVault, wallet.cpp:707-716; rpcwallet.cpp:1227)
+#[test]
+fn removevault_needs_the_vault_option() {
+    let s = setup();
+    s.manager.set_vault_mode(false);
+    let res = s
+        .net
+        .rpc(&s.manager)
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap();
+    assert_eq!(res, json!({"removal_status": false}));
+    assert_eq!(s.manager.get_all_vaults().len(), 1);
+}
+
+/// removevault answers as divid: {removal_status} alone (rpcwallet.cpp:1226),
+/// true again for a vault no longer held (RemoveVault, wallet.cpp:707-713),
+/// and -5 "Vault Registry Failed: ..." for a bad manager or owner address,
+/// the manager checked first (rpcwallet.cpp:1215-1221)
+#[test]
+fn removevault_replies_as_divid() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let res = rpc.remove_vault(&p(vec![json!(s.encoding)])).unwrap();
+    assert_eq!(res, json!({"removal_status": true}));
+    let again = rpc
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap_or_else(|e| panic!("removevault of a vault not held: {}", error_message(e)));
+    assert_eq!(again, json!({"removal_status": true}));
+
+    for (encoding, text) in [
+        (
+            format!("{}:notanaddress", s.owner_addr),
+            "Vault Registry Failed: Invalid manager DIVI address",
+        ),
+        (
+            format!("notanaddress:{}", s.manager_addr),
+            "Vault Registry Failed: Invalid owner DIVI address",
+        ),
+        (
+            "notanaddress:notanaddress".to_string(),
+            "Vault Registry Failed: Invalid manager DIVI address",
+        ),
+    ] {
+        match rpc.remove_vault(&p(vec![json!(encoding)])).unwrap_err() {
+            divi_rpc::Error::Rpc(r) => assert_eq!((r.code, r.message.as_str()), (-5, text)),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// debitvaultbyname from a wallet without the owner key names the owner
+/// address's ownership type as divid does (rpcwallet.cpp:1103-1104;
+/// isminetype, IsMineType.h: 0 not mine, 1 watch-only)
+#[test]
+fn debitvaultbyname_names_the_ownership_type() {
+    let s = setup();
+    let dest = s.manager.new_receiving_address().unwrap();
+    let refusal = |wallet: &Arc<WalletDb>| match s
+        .net
+        .rpc(wallet)
+        .debit_vault_by_name(&p(vec![
+            json!(s.encoding),
+            json!(dest.to_string()),
+            json!(1.0),
+        ]))
+        .unwrap_err()
+    {
+        divi_rpc::Error::Rpc(r) => (r.code, r.message),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        refusal(&s.manager),
+        (
+            -5,
+            format!(
+                "Vault owner key is unknown: ownership=0 address={}",
+                s.owner_addr
+            )
+        )
+    );
+    // A wallet that watches the owner address
+    s.manager
+        .import_watch_only_address(&s.owner_addr, None)
+        .unwrap();
+    assert_eq!(
+        refusal(&s.manager),
+        (
+            -5,
+            format!(
+                "Vault owner key is unknown: ownership=1 address={}",
+                s.owner_addr
+            )
+        )
+    );
+}
+
+/// debitvaultbyname of a vault with no spendable coin while the wallet's
+/// vaults hold enough: divid's balance check is over all vaults and passes
+/// (GetVaultedBalance, rpcwallet.cpp:727-734); its coin selection for this
+/// vault then fails, -4 with the selection's text (rpcwallet.cpp:796-800,
+/// wallet.cpp:1779)
+#[test]
+fn debitvaultbyname_of_a_vault_without_coins_fails_coin_selection() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.owner);
+    let other_manager = s.manager.new_receiving_address().unwrap();
+    let empty = format!("{}:{}", s.owner_addr, other_manager);
+    let dest = s.owner.new_receiving_address().unwrap();
+    match rpc
+        .debit_vault_by_name(&p(vec![json!(empty), json!(dest.to_string()), json!(1.0)]))
+        .unwrap_err()
+    {
+        divi_rpc::Error::Rpc(r) => assert_eq!(
+            (r.code, r.message.as_str()),
+            (
+                -4,
+                "Insufficient funds to meet coin selection algorithm requirements."
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.net.submitted.lock().is_empty());
 }
