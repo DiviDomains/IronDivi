@@ -590,6 +590,8 @@ impl Node {
                 }
             }
         }
+        // The addresses learnt before the last stop (Divi Core peers.dat, net.cpp:1431-1438)
+        peer_manager.address_book().open(&config.data_dir);
         // Divi Core -banscore / -bantime
         peer_manager.scoring().set_ban_policy(
             config.p2p.ban_score.min(i32::MAX as u32) as i32,
@@ -846,6 +848,11 @@ impl Node {
 
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
+                        } else {
+                            // An outbound peer that answered (addrman Good, main.cpp:443)
+                            peer_manager
+                                .address_book()
+                                .connected(addr, version.services);
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
@@ -1129,13 +1136,30 @@ impl Node {
                                 );
                             }
                             NetworkMessage::Addr(addrs) => {
-                                // IronDivi keeps no address book; only Divi Core's limit applies
+                                // Kept in the address book, as Divi Core's addrman
+                                // keeps them (main.cpp:521-558)
                                 if addrs.len() > 1000 {
                                     peer_manager.report_misbehavior_score(
                                         peer_id,
                                         20,
                                         "Requested too many addresses",
                                     );
+                                } else {
+                                    peer_manager.address_book().add(&addrs);
+                                }
+                            }
+                            // An inbound peer asking for addresses gets a share of
+                            // the book (main.cpp:863-869), at most 1000 per message
+                            NetworkMessage::GetAddr if peer_manager.is_inbound(peer_id) => {
+                                let sample = peer_manager.address_book().sample();
+                                for chunk in sample.chunks(1000) {
+                                    if let Err(e) = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::Addr(chunk.to_vec()))
+                                        .await
+                                    {
+                                        tracing::debug!("Failed to send addr to peer {}: {}", peer_id, e);
+                                        break;
+                                    }
                                 }
                             }
                             // IronDivi does not offer NODE_BLOOM, and Divi Core without
@@ -1211,6 +1235,19 @@ impl Node {
         self.keep(tokio::spawn(async move {
             if let Err(e) = peer_manager.start().await {
                 tracing::error!("Peer manager error: {}", e);
+            }
+        }));
+
+        // peers.dat every 15 minutes, as Divi Core's dumpaddr thread (net.cpp:83, :1060-1068)
+        let book = Arc::clone(self.peer_manager.address_book());
+        self.keep(tokio::spawn(async move {
+            let mut every = tokio::time::interval(divi_network::addrbook::DUMP_INTERVAL);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                if let Err(e) = book.save() {
+                    tracing::warn!("Failed to write peers.dat: {}", e);
+                }
             }
         }));
 
@@ -1389,6 +1426,13 @@ impl Node {
         let started = std::time::Instant::now();
         self.peer_manager.disconnect_all();
         shutdown_stage("peers disconnected", started);
+
+        // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
+        let started = std::time::Instant::now();
+        if let Err(e) = self.peer_manager.address_book().save() {
+            tracing::error!("Failed to write peers.dat: {}", e);
+        }
+        shutdown_stage("peers.dat written", started);
 
         // Persist masternode state before shutdown
         let started = std::time::Instant::now();

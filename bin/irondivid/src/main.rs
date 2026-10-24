@@ -1576,6 +1576,8 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // divid reads masternode.conf at every start and makes it when missing
+    core_files::ensure_masternode_conf(&config.data_dir);
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {

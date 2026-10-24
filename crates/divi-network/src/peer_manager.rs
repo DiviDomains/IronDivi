@@ -196,11 +196,14 @@ pub struct PeerManager {
     prebound: parking_lot::Mutex<Option<Vec<(SocketAddr, bool, TcpListener)>>>,
     /// Inbound connections accepted whose handshake has not finished yet
     inbound_handshaking: AtomicUsize,
+    /// Addresses of other nodes learnt from peers (Divi Core's addrman)
+    address_book: Arc<crate::addrbook::AddressBook>,
 }
 
 impl PeerManager {
     /// Create a new peer manager
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
+        let config_magic = config.magic;
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -222,7 +225,37 @@ impl PeerManager {
             height_source: RwLock::new(None),
             prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
+            address_book: Arc::new(crate::addrbook::AddressBook::new(config_magic)),
         })
+    }
+
+    /// The addresses learnt from peers
+    pub fn address_book(&self) -> &Arc<crate::addrbook::AddressBook> {
+        &self.address_book
+    }
+
+    /// Dial addresses learnt from peers into free outbound slots, as Divi Core
+    /// dials from its address manager (net.cpp ThreadOpenConnections); not with
+    /// -connect, which dials only its own peers
+    fn dial_learnt(self: &Arc<Self>) {
+        if self.config.connect_only || !self.can_connect_outbound() {
+            return;
+        }
+        for addr in self.address_book.candidates(self.config.max_outbound * 4) {
+            if !self.can_connect_outbound() {
+                break;
+            }
+            if self.is_banned(&addr.ip()) || !self.claim_dial(addr, DialRule::Automatic) {
+                continue;
+            }
+            debug!("Dialling learnt address {}", addr);
+            let self_clone = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = self_clone.connect_to_peer(addr).await {
+                    debug!("Failed to connect to learnt address {}: {}", addr, e);
+                }
+            });
+        }
     }
 
     /// The network magic of this peer manager's network
@@ -644,7 +677,8 @@ impl PeerManager {
             let _ = handle.await;
         }
 
-        // Fill remaining slots from DNS seeds
+        // Then addresses learnt from peers, then DNS seeds
+        self.dial_learnt();
         Arc::clone(&self).discover_peers().await;
 
         // Wait for the listeners (if started)
@@ -1283,7 +1317,10 @@ impl PeerManager {
                 }
             }
 
-            // 3. Re-query DNS seeds as last resort
+            // 3. Addresses learnt from peers
+            self.dial_learnt();
+
+            // 4. Re-query DNS seeds as last resort
             if self.can_connect_outbound() && !self.config.dns_seeds.is_empty() {
                 info!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;
