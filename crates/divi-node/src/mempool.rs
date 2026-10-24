@@ -50,6 +50,16 @@ pub struct MempoolEntry {
 
     /// Descendants (transactions that depend on this)
     pub descendants: HashSet<Hash256>,
+
+    /// Chain tip height when the transaction entered the pool
+    pub height: u32,
+
+    /// Coin age of the inputs per byte when it entered (Divi Core's
+    /// `initialCoinAgePerByteOfInputs`, MemPoolEntry.cpp:43)
+    pub starting_priority: f64,
+
+    /// Size counted for priority (Divi Core `CalculateModifiedSize`)
+    pub mod_size: usize,
 }
 
 impl MempoolEntry {
@@ -59,6 +69,7 @@ impl MempoolEntry {
         let size = tx.size();
         let fee_rate = fee.as_sat() as f64 / size as f64;
 
+        let mod_size = modified_size(&tx, size);
         MempoolEntry {
             tx,
             txid,
@@ -68,7 +79,36 @@ impl MempoolEntry {
             fee_rate,
             ancestors: HashSet::new(),
             descendants: HashSet::new(),
+            height: 0,
+            starting_priority: 0.0,
+            mod_size,
         }
+    }
+
+    /// The entry as Divi Core makes it (MempoolConsensus.cpp:384-386): the tip
+    /// height and the coin age of the inputs there (`ComputeInputCoinAge`)
+    pub fn with_coin_age(mut self, height: u32, coin_age: f64) -> Self {
+        self.height = height;
+        self.starting_priority = if self.mod_size > 0 {
+            coin_age / self.mod_size as f64
+        } else {
+            0.0
+        };
+        self
+    }
+
+    /// Divi Core `ComputeInputCoinAgePerByte` (MemPoolEntry.cpp:52-57): the
+    /// starting priority plus the value in aged by the blocks since entry.
+    /// Core subtracts unsigned heights, which wraps below the entry height
+    /// after a reorganisation; here that counts as no blocks since entry.
+    pub fn priority_at(&self, height: u32) -> f64 {
+        if self.mod_size == 0 {
+            return self.starting_priority;
+        }
+        let value_out: i64 = self.tx.vout.iter().map(|o| o.value.as_sat()).sum();
+        let value_in = value_out + self.fee.as_sat();
+        self.starting_priority
+            + height.saturating_sub(self.height) as f64 * value_in as f64 / self.mod_size as f64
     }
 
     /// Get age of the entry
@@ -130,7 +170,17 @@ fn unix_now() -> u32 {
 /// returns its fee; see [`Mempool::set_validator`]. The flag is Core's
 /// `fLimitFree`: true for a transaction a peer relayed.
 pub type MempoolValidator =
-    Arc<dyn Fn(&Mempool, &Transaction, bool) -> Result<Amount, NodeError> + Send + Sync>;
+    Arc<dyn Fn(&Mempool, &Transaction, bool) -> Result<Admission, NodeError> + Send + Sync>;
+
+/// What the checks found for a transaction entering the pool: its fee, the
+/// chain tip height and the coin age of its inputs there (Divi Core
+/// `CCoinsViewCache::ComputeInputCoinAge`)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Admission {
+    pub fee: Amount,
+    pub height: u32,
+    pub coin_age: f64,
+}
 
 /// Divi Core `DEFAULT_BLOCK_PRIORITY_SIZE` (defaultValues.h:50)
 pub const DEFAULT_BLOCK_PRIORITY_SIZE: usize = 50_000;
@@ -309,14 +359,21 @@ impl Mempool {
         // Every check, in Divi Core's order (called without holding any
         // mempool lock: the validator looks up parent transactions here)
         let validator = self.validator.read().clone();
-        let fee = match validator {
+        let admission = match validator {
             Some(validator) => validator(self, &tx, limit_free)?,
             None => {
                 self.check_without_chain(&tx, fee)?;
-                fee
+                // No chain to look the inputs up in: no coin age
+                Admission {
+                    fee,
+                    height: self.tip_height(),
+                    coin_age: 0.0,
+                }
             }
         };
-        let entry = MempoolEntry::new(tx.clone(), fee);
+        let fee = admission.fee;
+        let entry =
+            MempoolEntry::new(tx.clone(), fee).with_coin_age(admission.height, admission.coin_age);
 
         // Check size limits
         let new_size = *self.total_size.read() + entry.size;
@@ -806,15 +863,30 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.txs
-            .read()
-            .values()
+        let tip_height = self.tip_height();
+        let txs = self.txs.read();
+        txs.values()
             .map(|e| divi_rpc::blockchain::MempoolTxInfo {
                 txid: e.txid,
                 size: e.size,
                 fee_sat: e.fee.as_sat(),
                 time: now - e.time.elapsed().as_secs() as i64,
-                depends: e.ancestors.iter().copied().collect(),
+                // Inputs from pool transactions, each once in hex order, as
+                // Divi Core's std::set<string> (rpcblockchain.cpp:130-136)
+                depends: {
+                    let mut parents: Vec<Hash256> =
+                        e.tx.vin
+                            .iter()
+                            .map(|i| i.prevout.txid)
+                            .filter(|p| txs.contains_key(p))
+                            .collect();
+                    parents.sort_by_key(|p| p.to_string());
+                    parents.dedup();
+                    parents
+                },
+                height: e.height,
+                starting_priority: e.priority_at(e.height),
+                current_priority: e.priority_at(tip_height),
             })
             .collect()
     }

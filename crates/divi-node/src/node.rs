@@ -1773,7 +1773,7 @@ pub fn check_mempool_transaction(
     mempool: &Mempool,
     tx: &Transaction,
     limit_free: bool,
-) -> Result<divi_primitives::amount::Amount, NodeError> {
+) -> Result<crate::mempool::Admission, NodeError> {
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -1982,7 +1982,11 @@ pub fn check_mempool_transaction(
             );
         }
     }
-    Ok(Amount::from_sat(fee))
+    Ok(crate::mempool::Admission {
+        fee: Amount::from_sat(fee),
+        height: tip_height,
+        coin_age,
+    })
 }
 
 fn money_range(
