@@ -755,8 +755,11 @@ impl BlockchainRpc {
             return Err(usage().into());
         }
         let hash_str = params.get_str(0).ok_or_else(usage)?;
-        // C++ uint256S: an unparseable hash becomes the zero hash, which is never found
-        let hash = Hash256::from_hex(hash_str).unwrap_or_else(|_| Hash256::zero());
+        // As Divi Core reads it, uint256(strHash) or uint256S: leading space
+        // and "0x" skipped, a short hash read as a number, text without
+        // digits the zero hash, which is never found (rpcblockchain.cpp:589,
+        // :625, :663)
+        let hash = crate::wallet::uint256_set_hex(hash_str);
         let map_err = |e: divi_storage::StorageError| -> Error {
             match e {
                 divi_storage::StorageError::BlockNotFound(_) => {

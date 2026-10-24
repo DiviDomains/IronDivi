@@ -2069,7 +2069,7 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
-        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2224,7 +2224,7 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
-        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2436,11 +2436,25 @@ fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::
 
 /// The mempool side of invalidateblock and its family: the disconnected
 /// blocks' transactions go back to the mempool and what the chain now spends
-/// leaves it, as after any reorganization
-fn mempool_reorg_hook(node: &Node) -> divi_rpc::blockchain::ReorgHook {
+/// leaves it, as after any reorganization. The wallet is brought to the tip
+/// first, as Divi Core's disconnectTip and connectTip tell it of every block
+/// that leaves or joins the chain (SyncTransactions, ChainTipManager.cpp:189,
+/// :150): blocks that left are rolled back, blocks that joined are scanned.
+/// Before the mempool, so a returned transaction reaches a wallet that no
+/// longer holds it as confirmed.
+fn mempool_reorg_hook(
+    node: &Node,
+    wallet: Option<Arc<WalletDb>>,
+) -> divi_rpc::blockchain::ReorgHook {
     let chain = node.chain().clone();
     let mempool = node.mempool().clone();
     Arc::new(move |disconnected| {
+        if let Some(wallet) = &wallet {
+            sync_wallet_to_tip(wallet, &chain);
+            if let Err(e) = wallet.save_incremental() {
+                error!("Failed to save the wallet after the chain moved: {}", e);
+            }
+        }
         divi_node::update_mempool_after_reorg(&chain, &mempool, disconnected)
     })
 }
