@@ -132,7 +132,7 @@ fn network_name(params: &ChainParams) -> &'static str {
 /// hash, header fields, chain work, stake modifier and whether it was generated, proof-of-stake
 /// flag, money supply), the lottery-winner lists at the heights consensus reads after the tip
 /// (the tip and every block just before a lottery block), and every UTXO entry byte for byte
-/// in key order. Local bookkeeping (file positions, status flags, side branches) is left out,
+/// in key order, each in the layout of a version-1 transaction's record. Local bookkeeping (file positions, status flags, side branches) is left out,
 /// so two nodes on the same chain get the same hash whatever they pruned. On the way it checks
 /// that every stored header hashes to its entry and links to the one below.
 pub fn compute_state_hash(
@@ -214,6 +214,14 @@ pub fn compute_state_hash(
     let mut utxos = 0u64;
     for item in raw.iterator_cf(cf, rocksdb::IteratorMode::Start) {
         let (key, value) = item?;
+        // Each record as it was written before records kept their transaction's
+        // version, so nodes with and without versions agree on the known states
+        let record = crate::utxo::Utxo::from_bytes(&value)?;
+        let value = if record.version == 1 {
+            value
+        } else {
+            record.with_version(1).to_bytes().into_boxed_slice()
+        };
         utxo_hash.update((key.len() as u64).to_le_bytes());
         utxo_hash.update(&key);
         utxo_hash.update((value.len() as u64).to_le_bytes());
@@ -538,6 +546,33 @@ mod tests {
                 REGTEST_GENESIS_STATE.to_string()
             )
         );
+    }
+
+    /// A record that keeps its transaction's version hashes as the same coin
+    /// written without it, so the known states hold for nodes with either
+    #[test]
+    fn state_hash_leaves_out_the_transaction_version() {
+        use divi_primitives::{amount::Amount, script::Script, transaction::OutPoint, Hash256};
+        let states: Vec<String> = [1, 2]
+            .into_iter()
+            .map(|version| {
+                let work = tempdir().unwrap();
+                let db = Arc::new(ChainDatabase::open(work.path()).unwrap());
+                let chain = Chain::new(db.clone(), params()).unwrap();
+                let coin = crate::utxo::Utxo::new(
+                    Amount::from_sat(5),
+                    Script::new_p2pkh(&[0x42; 20]),
+                    0,
+                    false,
+                    false,
+                )
+                .with_version(version);
+                db.add_utxo(&OutPoint::new(Hash256::from_bytes([7; 32]), 0), &coin)
+                    .unwrap();
+                compute_state_hash(&db, &chain, 0).unwrap()
+            })
+            .collect();
+        assert_eq!(states[0], states[1]);
     }
 
     #[test]
