@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use divi_test_support::log_tail;
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -99,10 +99,7 @@ fn start(datadir: &Path, rpc_port: u16, p2p_port: u16) -> Node {
     .is_none()
     {
         if let Ok(Some(status)) = node.0.try_wait() {
-            panic!(
-                "irondivid exited at start: {status}\n{}",
-                common::log_tail(datadir)
-            );
+            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
         }
         assert!(
             Instant::now() < deadline,
@@ -171,7 +168,7 @@ fn exits_without_closing_the_databases_after_the_clean_stop() {
         panic!(
             "irondivid still running {} s after SIGINT\n{}",
             took.as_secs(),
-            common::log_tail(dir.path())
+            log_tail(dir.path())
         )
     });
     assert!(took < EXIT_LIMIT, "exit took {} s", took.as_secs_f32());
@@ -191,7 +188,7 @@ fn exits_without_closing_the_databases_after_the_clean_stop() {
     assert!(
         log.contains("Shutdown: databases synced and the clean stop recorded"),
         "{}",
-        common::log_tail(dir.path())
+        log_tail(dir.path())
     );
     drop(node);
 
@@ -204,7 +201,7 @@ fn exits_without_closing_the_databases_after_the_clean_stop() {
     assert!(
         !restart.contains("did not stop cleanly"),
         "{}",
-        common::log_tail(dir.path())
+        log_tail(dir.path())
     );
     ok(rpc_port, "setgenerate", json!([1]));
     drop(node);
