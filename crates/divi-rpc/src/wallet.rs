@@ -226,6 +226,92 @@ fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amou
     Ok(amount)
 }
 
+/// The addresses a script pays and the signatures it needs, as Divi Core's
+/// ExtractDestinations (standard.cpp) gives them for decodescript and
+/// validateaddress: none for a script that is not standard
+fn script_destinations(
+    script_type: divi_script::ScriptType,
+    solutions: &[Vec<u8>],
+    network: Network,
+) -> (Vec<String>, Option<usize>) {
+    let mut addresses: Vec<String> = Vec::new();
+    let mut req_sigs: Option<usize> = None;
+
+    match script_type {
+        divi_script::ScriptType::PubKeyHash => {
+            if solutions.len() == 1 && solutions[0].len() == 20 {
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(&solutions[0]);
+                let addr = Address::from_pubkey_hash(Hash160(hash), network);
+                addresses.push(addr.to_string());
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::ScriptHash => {
+            if solutions.len() == 1 && solutions[0].len() == 20 {
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(&solutions[0]);
+                let addr = Address::p2sh(Hash160(hash), network);
+                addresses.push(addr.to_string());
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::PubKey => {
+            // P2PK: compute hash160 of pubkey to get address
+            if solutions.len() == 1 && (solutions[0].len() == 33 || solutions[0].len() == 65) {
+                let hash = divi_crypto::hash160(&solutions[0]);
+                let addr = Address::from_pubkey_hash(hash, network);
+                addresses.push(addr.to_string());
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::Multisig => {
+            // Multisig: first solution is m, last is n, middle are pubkeys
+            if solutions.len() >= 3 {
+                let m = solutions[0].first().copied().unwrap_or(0) as usize;
+                let _n = solutions
+                    .last()
+                    .and_then(|s| s.first().copied())
+                    .unwrap_or(0) as usize;
+                req_sigs = Some(m);
+
+                // Skip first (m) and last (n) elements
+                for pubkey in &solutions[1..solutions.len() - 1] {
+                    if pubkey.len() == 33 || pubkey.len() == 65 {
+                        let hash = divi_crypto::hash160(pubkey);
+                        let addr = Address::from_pubkey_hash(hash, network);
+                        addresses.push(addr.to_string());
+                    }
+                }
+            }
+        }
+        divi_script::ScriptType::Vault => {
+            // Vault scripts have owner and vault hashes
+            if solutions.len() == 2 {
+                // First is owner hash, second is vault hash
+                for sol in solutions.iter() {
+                    if sol.len() == 20 {
+                        let mut hash = [0u8; 20];
+                        hash.copy_from_slice(sol);
+                        let addr = Address::from_pubkey_hash(Hash160(hash), network);
+                        addresses.push(addr.to_string());
+                    }
+                }
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::NullData => {
+            // OP_RETURN data scripts have no addresses
+            req_sigs = Some(0);
+        }
+        _ => {
+            // NonStandard, HTLC, etc. - no addresses extracted
+        }
+    }
+
+    (addresses, req_sigs)
+}
+
 /// The type name json_spirit gives a value in its "value is type X, expected Y"
 /// errors (json_spirit_value.h Value_type_name)
 pub(crate) fn json_spirit_type(value: &serde_json::Value) -> &'static str {
@@ -903,6 +989,29 @@ impl WalletRpc {
                     result["iswatchonly"] = serde_json::json!(is_watch_only);
                     result["isscript"] =
                         serde_json::json!(addr.addr_type == divi_wallet::AddressType::P2SH);
+                }
+                // A script address of the wallet: its redeem script as far as the
+                // wallet has it (empty when only the address is watched), the
+                // script's type, the addresses it pays and, for a multisig, how
+                // many sign (DescribeAddressVisitor, rpcmisc.cpp:249-270)
+                if let (true, true, Some(wallet)) = (
+                    known,
+                    addr.addr_type == divi_wallet::AddressType::P2SH,
+                    wallet_guard.as_ref(),
+                ) {
+                    let subscript = wallet
+                        .get_script(&addr.hash)
+                        .map(|s| s.as_bytes().to_vec())
+                        .unwrap_or_default();
+                    let (kind, solutions) = divi_script::extract_script_type(&subscript);
+                    let (addresses, req_sigs) =
+                        script_destinations(kind, &solutions, wallet.network());
+                    result["script"] = serde_json::json!(divi_script::get_script_type_name(kind));
+                    result["hex"] = serde_json::json!(hex::encode(&subscript));
+                    result["addresses"] = serde_json::json!(addresses);
+                    if kind == divi_script::ScriptType::Multisig {
+                        result["sigsrequired"] = serde_json::json!(req_sigs.unwrap_or(0));
+                    }
                 }
 
                 // Only an address of the address book has an account
@@ -3421,81 +3530,7 @@ impl WalletRpc {
 
         let network = self.address_network();
 
-        // Extract addresses based on script type
-        let mut addresses: Vec<String> = Vec::new();
-        let mut req_sigs: Option<usize> = None;
-
-        match script_type {
-            divi_script::ScriptType::PubKeyHash => {
-                if solutions.len() == 1 && solutions[0].len() == 20 {
-                    let mut hash = [0u8; 20];
-                    hash.copy_from_slice(&solutions[0]);
-                    let addr = Address::from_pubkey_hash(Hash160(hash), network);
-                    addresses.push(addr.to_string());
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::ScriptHash => {
-                if solutions.len() == 1 && solutions[0].len() == 20 {
-                    let mut hash = [0u8; 20];
-                    hash.copy_from_slice(&solutions[0]);
-                    let addr = Address::p2sh(Hash160(hash), network);
-                    addresses.push(addr.to_string());
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::PubKey => {
-                // P2PK: compute hash160 of pubkey to get address
-                if solutions.len() == 1 && (solutions[0].len() == 33 || solutions[0].len() == 65) {
-                    let hash = divi_crypto::hash160(&solutions[0]);
-                    let addr = Address::from_pubkey_hash(hash, network);
-                    addresses.push(addr.to_string());
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::Multisig => {
-                // Multisig: first solution is m, last is n, middle are pubkeys
-                if solutions.len() >= 3 {
-                    let m = solutions[0].first().copied().unwrap_or(0) as usize;
-                    let _n = solutions
-                        .last()
-                        .and_then(|s| s.first().copied())
-                        .unwrap_or(0) as usize;
-                    req_sigs = Some(m);
-
-                    // Skip first (m) and last (n) elements
-                    for pubkey in &solutions[1..solutions.len() - 1] {
-                        if pubkey.len() == 33 || pubkey.len() == 65 {
-                            let hash = divi_crypto::hash160(pubkey);
-                            let addr = Address::from_pubkey_hash(hash, network);
-                            addresses.push(addr.to_string());
-                        }
-                    }
-                }
-            }
-            divi_script::ScriptType::Vault => {
-                // Vault scripts have owner and vault hashes
-                if solutions.len() == 2 {
-                    // First is owner hash, second is vault hash
-                    for sol in solutions.iter() {
-                        if sol.len() == 20 {
-                            let mut hash = [0u8; 20];
-                            hash.copy_from_slice(sol);
-                            let addr = Address::from_pubkey_hash(Hash160(hash), network);
-                            addresses.push(addr.to_string());
-                        }
-                    }
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::NullData => {
-                // OP_RETURN data scripts have no addresses
-                req_sigs = Some(0);
-            }
-            _ => {
-                // NonStandard, HTLC, etc. - no addresses extracted
-            }
-        }
+        let (addresses, req_sigs) = script_destinations(script_type, &solutions, network);
 
         // Build response
         let mut result = serde_json::json!({
