@@ -819,6 +819,8 @@ impl WalletRpc {
 
     /// validateaddress - Validate a Divi address
     pub fn validate_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // rpcmisc.cpp:320-321, :337
+        crate::core_help::check_arguments("validateaddress", params, (1, 1), 1)?;
         let addr_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
@@ -841,11 +843,16 @@ impl WalletRpc {
                 let mut result = serde_json::json!({
                     "isvalid": true,
                     "address": addr_str,
-                    "scriptPubKey": format!("76a914{}88ac", hex::encode(addr.hash.as_bytes())),
+                    "scriptPubKey": addr.script_pubkey().to_hex(),
                     "ismine": is_mine,
-                    "iswatchonly": is_watch_only,
-                    "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
                 });
+                // Divi Core adds these only for an address of the wallet
+                // (rpcmisc.cpp:350-354, DescribeAddressVisitor :236-247)
+                if known {
+                    result["iswatchonly"] = serde_json::json!(is_watch_only);
+                    result["isscript"] =
+                        serde_json::json!(addr.addr_type == divi_wallet::AddressType::P2SH);
+                }
 
                 if let (true, Some(wallet)) = (known, wallet_guard.as_ref()) {
                     result["account"] = serde_json::json!(wallet.get_account(&addr));
@@ -903,7 +910,7 @@ impl WalletRpc {
 
         let mut response = serde_json::json!({
             "address": addr_str,
-            "scriptPubKey": format!("76a914{}88ac", hex::encode(addr.hash.as_bytes())),
+            "scriptPubKey": addr.script_pubkey().to_hex(),
             "ismine": is_mine,
             "iswatchonly": is_watch_only,
             "isscript": addr.addr_type == divi_wallet::AddressType::P2SH,
@@ -2176,6 +2183,26 @@ impl WalletRpc {
                 )
                 .into());
             }
+            // ComputeFeeTotalsAndIfInputsAreKnown (rpcrawtransaction.cpp:810-826,
+            // :875-881): each input must be an output in the chain's coins or of
+            // a mempool transaction, else -26 "Unknown inputs being spent". A
+            // transaction already in the mempool skips this, as in Core.
+            let mempool = self.mempool.read().clone();
+            let pooled = |id: &Hash256| mempool.as_ref().and_then(|m| m.get_transaction(id));
+            if pooled(&txid).is_none() {
+                let known = tx.vin.iter().all(|i| {
+                    matches!(chain.get_utxo(&i.prevout), Ok(Some(_)))
+                        || pooled(&i.prevout.txid)
+                            .is_some_and(|p| (i.prevout.vout as usize) < p.vout.len())
+                });
+                if !known {
+                    return Err(RpcError::new(
+                        codes::VERIFY_REJECTED,
+                        "Unknown inputs being spent",
+                    )
+                    .into());
+                }
+            }
             // Fee cap. Inputs still in the mempool are not visible here; such a
             // transaction is checked by the mempool only.
             let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
@@ -3037,13 +3064,8 @@ impl WalletRpc {
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
         let plan = self.plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
-        let (received, fee) = (plan.outputs[0].value, plan.fee);
-
-        Ok(json!({
-            "txid": txid.to_string(),
-            "amount": received.as_divi_f64(),
-            "fee": fee.as_divi_f64()
-        }))
+        // SendMoneyToAddress: the txid alone (rpcwallet.cpp:1189)
+        Ok(json!(txid.to_string()))
     }
 
     /// BIP38 encrypt private key
@@ -3593,12 +3615,9 @@ impl WalletRpc {
             )
         })?;
 
-        // Unlike C++ Divi, the node keeps running: the wallet is already locked and
-        // its plaintext secrets are gone from memory and disk.
-        Ok(serde_json::json!(
-            "wallet encrypted; the wallet is now locked. Use walletpassphrase to unlock it. \
-             Back up your wallet again: earlier backups are not encrypted."
-        ))
+        // As Divi Core 3.0.0 the node keeps running with the wallet reloaded,
+        // encrypted and locked (rpcwallet.cpp:2732-2733)
+        Ok(serde_json::json!("Wallet reloaded!"))
     }
 
     /// getreceivedbyaddress - Get total amount received by an address
@@ -3941,6 +3960,7 @@ impl WalletRpc {
 
     /// lockunspent - Lock or unlock UTXOs
     pub fn lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // Divi Core lockunspent (rpcwallet.cpp:2742-2814)
         if params.is_empty() || params.len() > 2 {
             return Err(RpcError::invalid_params(
                 "lockunspent unlock [{\"txid\":\"txid\",\"vout\":n},...]",
@@ -3948,37 +3968,53 @@ impl WalletRpc {
             .into());
         }
         let unlock = params
-            .get_bool(0)
-            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected boolean for unlock"))?;
+            .get(0)
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type bool"))?;
 
-        let outputs_array = params
-            .get(1)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| RpcError::invalid_params("outputs array required"))?;
+        let wallet = self.get_wallet()?;
 
-        let wallet_guard = self.wallet.read();
-        let wallet = wallet_guard
-            .as_ref()
-            .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
+        // With no list, true unlocks every coin and false does nothing
+        let Some(outputs) = params.get(1).filter(|_| params.len() == 2) else {
+            if unlock {
+                for outpoint in wallet.locked_coins() {
+                    wallet.set_coin_locked(outpoint, false);
+                }
+            }
+            return Ok(serde_json::Value::Bool(true));
+        };
+        let outputs = outputs
+            .as_array()
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type array"))?;
 
-        for output in outputs_array {
-            let txid_str = output
-                .get("txid")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| RpcError::invalid_params("txid required"))?;
-
-            let vout = output
-                .get("vout")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| RpcError::invalid_params("vout required"))?
-                as u32;
-
+        let invalid = |m: &str| -> Error { RpcError::new(codes::INVALID_PARAMETER, m).into() };
+        for output in outputs {
+            let Some(o) = output.as_object() else {
+                return Err(invalid("Invalid parameter, expected object"));
+            };
+            // RPCTypeCheck(o, {txid: str, vout: int}), in key order
+            for (key, want) in [("txid", "str"), ("vout", "int")] {
+                let v = o.get(key).unwrap_or(&serde_json::Value::Null);
+                if v.is_null() {
+                    return Err(RpcError::new(codes::TYPE_ERROR, format!("Missing {key}")).into());
+                }
+                let got = json_spirit_type(v);
+                if got != want {
+                    return Err(RpcError::new(
+                        codes::TYPE_ERROR,
+                        format!("Expected type {want} for {key}, got {got}"),
+                    )
+                    .into());
+                }
+            }
+            let txid_str = o["txid"].as_str().unwrap_or_default();
             let txid = Hash256::from_hex(txid_str)
-                .map_err(|_| RpcError::invalid_params("Invalid txid"))?;
-
-            let outpoint = OutPoint { txid, vout };
-
-            wallet.set_coin_locked(outpoint, !unlock);
+                .map_err(|_| invalid("Invalid parameter, expected hex txid"))?;
+            let vout = o["vout"].as_i64().unwrap_or(-1);
+            if vout < 0 {
+                return Err(invalid("Invalid parameter, vout must be positive"));
+            }
+            wallet.set_coin_locked(OutPoint::new(txid, vout as u32), !unlock);
         }
 
         Ok(serde_json::Value::Bool(true))
@@ -4101,12 +4137,12 @@ pub fn message_magic_hash(message: &[u8]) -> [u8; 32] {
 impl WalletRpc {
     /// signmessage - Sign a message with the private key of an address
     pub fn sign_message(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if params.len() < 2 || params.len() > 4 {
-            return Err(RpcError::invalid_params(
-                "signmessage \"diviaddress\" \"message\" ( \"input_format\" \"output_format\" )",
-            )
-            .into());
-        }
+        // rpcwallet.cpp:1366-1367; the arguments are read once the wallet is
+        // unlocked (:1384-1390)
+        crate::core_help::check_arguments("signmessage", params, (2, 4), 0)?;
+        let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
+        crate::core_help::check_arguments("signmessage", params, (2, 4), 4)?;
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
@@ -4125,10 +4161,6 @@ impl WalletRpc {
             _ => text.as_bytes().to_vec(),
         };
         let hex_output = params.len() == 4 && format(3)? == "hex";
-
-        let wallet = self.get_wallet()?;
-
-        ensure_fully_unlocked(&wallet)?;
 
         // Parse address (error codes as Divi Core's signmessage)
         let address = self
@@ -4169,12 +4201,8 @@ impl WalletRpc {
 
     /// verifymessage - Verify a signed message
     pub fn verify_message(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if params.len() != 3 {
-            return Err(RpcError::invalid_params(
-                "verifymessage \"diviaddress\" \"signature\" \"message\"",
-            )
-            .into());
-        }
+        // rpcmisc.cpp:487-488
+        crate::core_help::check_arguments("verifymessage", params, (3, 3), 3)?;
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
