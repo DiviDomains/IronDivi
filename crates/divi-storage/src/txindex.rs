@@ -29,6 +29,10 @@ const CF_TXINDEX: &str = "txindex";
 /// is the bare 32 bytes
 const BARE_TXID_PREFIX: u8 = b'b';
 
+/// Key of the newest block whose transactions were indexed (no txid key is
+/// this short)
+const INDEXED_TIP_KEY: &[u8] = b"tip";
+
 /// The txid of `tx` with every input's scriptSig cleared (Core's
 /// `CTransaction::GetBareTxid`); a coinbase's bare txid is its txid
 pub fn bare_txid(tx: &Transaction) -> Hash256 {
@@ -182,6 +186,52 @@ impl TxIndex {
         self.db
             .write(batch)
             .map_err(|e| StorageError::ChainState(e.to_string()))
+    }
+
+    /// Index a connected block's transactions and record the block as the
+    /// newest one indexed, in one write
+    pub fn put_block_tx_locations(
+        &self,
+        entries: &[(Hash256, Hash256, TxLocation)],
+        height: u32,
+        block_hash: &Hash256,
+    ) -> Result<(), StorageError> {
+        let cf = self
+            .db
+            .cf_handle(CF_TXINDEX)
+            .ok_or_else(|| StorageError::ChainState("Column family not found".to_string()))?;
+
+        let mut batch = WriteBatch::default();
+        for (txid, bare, location) in entries {
+            batch.put_cf(cf, txid.as_bytes(), location.to_bytes());
+            batch.put_cf(cf, bare_key(bare), location.to_bytes());
+        }
+        let mut tip = height.to_le_bytes().to_vec();
+        tip.extend_from_slice(block_hash.as_bytes());
+        batch.put_cf(cf, INDEXED_TIP_KEY, tip);
+
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::ChainState(e.to_string()))
+    }
+
+    /// Height and hash of the newest block whose transactions were indexed
+    /// (None for an index written before this was kept)
+    pub fn indexed_tip(&self) -> Result<Option<(u32, Hash256)>, StorageError> {
+        let cf = self
+            .db
+            .cf_handle(CF_TXINDEX)
+            .ok_or_else(|| StorageError::ChainState("Column family not found".to_string()))?;
+        let raw = self
+            .db
+            .get_cf(cf, INDEXED_TIP_KEY)
+            .map_err(|e| StorageError::ChainState(e.to_string()))?;
+        Ok(raw.filter(|v| v.len() == 36).map(|v| {
+            let height = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&v[4..]);
+            (height, Hash256::from_bytes(hash))
+        }))
     }
 
     pub fn delete_location(&self, txid: &Hash256) -> Result<(), StorageError> {

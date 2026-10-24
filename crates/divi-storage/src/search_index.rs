@@ -401,6 +401,21 @@ impl SearchIndex {
 
     fn apply(&self, updates: &IndexUpdates, disconnect: bool) -> Result<(), StorageError> {
         let mut batch = rocksdb::WriteBatch::default();
+        self.add_to_batch(&mut batch, updates, disconnect)?;
+        self.db
+            .inner_db()
+            .write(batch)
+            .map_err(StorageError::Database)
+    }
+
+    /// Add the updates of a connected (or disconnected) block to `batch`, so
+    /// they are written with the block itself
+    pub fn add_to_batch(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        updates: &IndexUpdates,
+        disconnect: bool,
+    ) -> Result<(), StorageError> {
         if self.address {
             let deltas = self.cf(CF_ADDRESS_DELTA)?;
             for (key, value) in &updates.deltas {
@@ -428,10 +443,7 @@ impl SearchIndex {
                 }
             }
         }
-        self.db
-            .inner_db()
-            .write(batch)
-            .map_err(StorageError::Database)
+        Ok(())
     }
 
     /// An address's deltas in key order (Core `ReadAddressIndex`,
