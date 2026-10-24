@@ -39,7 +39,15 @@ START_TIMEOUT = 240
 # Differences irondivid has on purpose, one per row name, each with the shape
 # it must have: (reason, shape(divid's reply, irondivid's reply)). A KNOWN row
 # that matches divid, or differs in another way, is a FAIL, so the list stays true.
-KNOWN = {}
+KNOWN = {
+    "field order: irondivid writes members in name order": (
+        "difference R6 of docs/divid-differences.md: irondivid writes every JSON object's members in name order "
+        "(serde_json without preserve_order); divid in the order it pushes them (json_spirit Object, e.g. "
+        "rpcmisc.cpp:778-783). Each row checks that irondivid's order is exactly the name order of divid's members",
+        lambda c, i: i is True),
+}
+# Rows whose objects irondivid writes in name order (R6), counted for the KNOWN row
+name_order_seen = []
 
 fails = 0
 counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0}
@@ -145,7 +153,8 @@ class Node:
 # --- how replies are compared ---------------------------------------------------------
 
 def first_difference(a, b, path="$"):
-    """Where two replies first differ, or None: field names and their order,
+    """Where two replies first differ, or None: field names and their order
+    (divid's, or on irondivid exactly the name order of divid's members, R6),
     JSON types and values, list items in order. Reals are compared as written."""
     if isinstance(a, dict) and isinstance(b, dict):
         for k in sorted(set(a) | set(b)):
@@ -157,6 +166,9 @@ def first_difference(a, b, path="$"):
             if d:
                 return d
         if list(a) != list(b):
+            if list(b) == sorted(a):
+                name_order_seen.append(path)
+                return None
             return f"{path} field order {','.join(a)} vs {','.join(b)}"
         return None
     if isinstance(a, list) and isinstance(b, list):
@@ -509,6 +521,9 @@ start_both("-reindex", *ON)
 view("after -reindex with the indexes")
 
 stop_both()
+seen = bool(name_order_seen)
+row("field order: irondivid writes members in name order", "divid's order",
+    "name order" if seen else "divid's order", not seen, (None, seen))
 print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
 print(f"FAILS {fails}", flush=True)
 sys.exit(min(fails, 254))

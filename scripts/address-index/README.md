@@ -87,8 +87,9 @@ mempool holds each of the run's transactions.
 How a row compares:
 - Both must have the same outcome: a result, or an error with the same code and message (divid's help texts by
   their first line).
-- For a result, the field names, their order, JSON types and values must match. Satoshis are integers, as divid
-  prints them.
+- For a result, the field names, JSON types and values must match. Satoshis are integers, as divid prints them.
+- Field order must be divid's. On irondivid it may instead be exactly the name order of divid's fields (difference
+  R6, below); any other order is a FAIL.
 - List items must be in divid's order:
   - `getaddresstxids` and `getaddressdeltas` in the order of divid's index, or, for several addresses, as divid
     sorts or concatenates them.
@@ -104,7 +105,12 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 ## KNOWN differences
 
-None: no row differs from divid.
+- `field order: irondivid writes members in name order`: difference R6 of `docs/divid-differences.md`. irondivid
+  writes every JSON object's members in name order (serde_json without `preserve_order`). divid writes them in the
+  order it pushes them (json_spirit `Object`, e.g. `rpcmisc.cpp:778-783` for a delta). Each row accepts only that
+  exact order on irondivid, and this one row is KNOWN while some row needed it.
+
+No other row differs from divid.
 
 ## Proving a difference is caught
 
