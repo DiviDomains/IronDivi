@@ -3807,7 +3807,7 @@ impl WalletRpc {
     /// refused before the wallet is looked at, 0 (or none) is the default size,
     /// and the pool must hold at least the size asked for afterwards
     pub fn keypool_refill(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let size = if params.len() > 0 {
+        let size = if !params.is_empty() {
             spirit_int(params, 0)?
         } else {
             0
