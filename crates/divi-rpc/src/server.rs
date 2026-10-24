@@ -1042,6 +1042,13 @@ fn argument_count(method: &str) -> Option<(usize, usize)> {
         "setgenerate" => (1, 1),
         // rpcmining.cpp:123
         "generateblock" => (0, 1),
+        // rpcdump.cpp:43, :107, :172, :251, :297
+        "importprivkey" | "importaddress" => (1, 3),
+        "dumpprivkey" | "bip38paperwallet" => (1, 1),
+        "bip38decrypt" => (2, 2),
+        // rpcwallet.cpp:2527, :2546
+        "backupwallet" => (1, 1),
+        "keypoolrefill" => (0, 1),
         _ => return None,
     })
 }
