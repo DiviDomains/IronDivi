@@ -613,6 +613,20 @@ impl ChainDatabase {
         }
     }
 
+    /// Value of every stored output, unspendable (OP_META) ones included: the
+    /// money supply at the tip, as Divi Core counts it (every output a block
+    /// creates minus every output it spends, TransactionInputChecker.cpp:79-80)
+    pub fn utxo_value_total(&self) -> Result<i64, StorageError> {
+        let snapshot = self.db.snapshot();
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut total = 0i64;
+        for item in snapshot.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (_, value) = item?;
+            total += Utxo::from_bytes(&value)?.value.as_sat();
+        }
+        Ok(total)
+    }
+
     /// The UTXO set's statistics, as Divi Core's `gettxoutsetinfo` reports them
     ///
     /// Reads one RocksDB snapshot, so the best block and the outputs are from the
