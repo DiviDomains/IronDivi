@@ -22,6 +22,7 @@
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
 mod core_files;
+mod interfaces;
 mod settings;
 mod snapshot_sig;
 
@@ -276,9 +277,7 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "datacarriersize",
     "dbcache",
     "disablesystemnotifications",
-    "discover",
     "dns",
-    "externalip",
     "forcednsseed",
     "forcestart",
     "genproclimit",
@@ -304,7 +303,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
-    "reindex",
     "rescan",
     "rest",
     "resync",
@@ -416,6 +414,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
     }
+    // -proxy, -listen=0 and -externalip each turn -discover off unless it is
+    // given (net.cpp:1690-1716)
+    if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
+        s.soft_set_bool("discover", false);
+    }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
         s.set("staking", "0", false);
@@ -516,6 +519,19 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(proxy) = s.get("proxy") {
         config.p2p.proxy = Some(proxy.to_string());
     }
+    config.p2p.discover = s.get_bool("discover", true);
+    // -externalip=<ip>[:port], the listen port when none is given; one that
+    // does not resolve to a valid address stops the start (net.cpp:1834-1839)
+    for raw in s.get_multi("externalip") {
+        let addr = resolve_service(raw, config.p2p.port)
+            .filter(|a| divi_network::local::is_valid(&a.ip()))
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
+        config.p2p.external_ips.push(addr);
+    }
+    // Divi Core SetProtocolVersion (init.cpp:1450-1452)
+    if let Some(n) = number_option(&s, "protocolversion", 0..=i64::from(i32::MAX)) {
+        config.network.protocol_version = n as u32;
+    }
     if let Some(n) = number_option(&s, "banscore", 0..=i64::from(u32::MAX)) {
         config.p2p.ban_score = n as u32;
     }
@@ -560,6 +576,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             *slot = s.get_bool(key, false);
         }
     }
+    config.index.reindex = s.get_bool("reindex", false);
     if let Some(n) = number_option(&s, "maxlogsize", 1..=i64::from(u32::MAX)) {
         config.log.max_file_size = n as u64 * 1_048_576;
     }
@@ -599,6 +616,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxconnections",
         "timeout",
         "proxy",
+        "discover",
+        "externalip",
+        "protocolversion",
         "banscore",
         "bantime",
         "checkblocks",
@@ -611,6 +631,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "txindex",
         "spentindex",
         "addressindex",
+        "reindex",
         "utxocachesize",
         "expire",
         "blocknotify",
@@ -643,6 +664,24 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A host with an optional port, as Divi Core's CService reads it: `ip`,
+/// `ip:port`, `[ipv6]:port`, or a name, with `default_port` when none is given
+fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+    let text = text.trim();
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = text.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+    let (host, port) = match text.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, p.parse().ok()?),
+        _ => (text, default_port),
+    };
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 /// Divi Core's ParseMoney: up to 8 decimals, no sign, no exponent. In satoshis.
@@ -1242,7 +1281,7 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
 
 /// Run the daemon
 async fn run_daemon(
-    config: NodeConfig,
+    mut config: NodeConfig,
     wallet_path: Option<PathBuf>,
     wallet_seed: WalletSeed,
     disable_wallet: bool,
@@ -1252,6 +1291,11 @@ async fn run_daemon(
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
+
+    // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
+    if config.p2p.discover {
+        config.p2p.interface_ips = interfaces::addresses();
+    }
 
     // Initialize the node
     info!("Initializing node...");
@@ -2465,6 +2509,12 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     .await
     {
         error!("Daemon error: {:#}", e);
+        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
+        // writer may not get to write the line before the process exits
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
+        }
         // Print the full error chain
         let mut source: Option<&(dyn StdError + 'static)> = e.source();
         while let Some(err) = source {

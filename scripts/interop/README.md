@@ -50,8 +50,9 @@ and a block from X reaching A shows that it announces to an outbound one.
 - **`getblockhash`** of 99999 and of -1 gives divid's error (code and message, compared with A's reply).
 - **Sends both ways:**
   - A → X 5000: X's balance rises by 5000; `gettransaction` amount and block agree; `listunspent` shows the coin.
-  - X → A 1234.5: the transaction reaches A's mempool within 10 s; after a block both sides agree on amount and block,
-    and A's `listunspent` shows the coin.
+  - X → A 1234.5: the transaction reaches A's mempool within 10 s; after a block both sides agree on amount and block
+    (X's `gettransaction` amount is the amount sent and the fee, with a positive `fee`, as Divi Core's sender shows
+    them: `divi/src/rpcwallet.cpp:2504-2510`), and A's `listunspent` shows the coin.
 - **Stops:**
   - RPC `stop`: X ends within 60 s, the pid file is removed, and after a restart the height, tip, balance and coins
     are the same.

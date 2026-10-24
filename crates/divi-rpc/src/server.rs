@@ -394,7 +394,6 @@ impl RpcServer {
     /// this method composes data from blockchain, network, wallet, and staking.
     fn get_info(&self, _params: &Params) -> Result<serde_json::Value, Error> {
         use divi_consensus::bits_to_difficulty;
-        use divi_network::constants::PROTOCOL_VERSION;
         use divi_storage::chain::NetworkType;
 
         let chain = self.blockchain.chain();
@@ -437,7 +436,7 @@ impl RpcServer {
 
         Ok(serde_json::json!({
             "version": "3.0.0.0",
-            "protocolversion": PROTOCOL_VERSION,
+            "protocolversion": divi_network::constants::protocol_version(),
             "walletversion": 120200,
             "blocks": height,
             "timeoffset": 0,

@@ -220,16 +220,90 @@ impl Node {
 
         // Divi Core keeps the index flags with the chain database: a changed
         // -txindex refuses to start, and -addressindex/-spentindex take effect
-        // only on a new chain database (init.cpp:1103-1106, txdb.cpp:498-523)
+        // only on a new chain database or with -reindex, which builds every
+        // index again (init.cpp:1103-1106, txdb.cpp:498-523,
+        // ChainExtensionService.cpp:703-707)
         let requested = divi_storage::search_index::IndexFlags {
             txindex: config.index.txindex,
             addressindex: config.index.addressindex,
             spentindex: config.index.spentindex,
         };
-        let flags =
-            divi_storage::search_index::IndexFlags::load_or_init(&db, chain.height(), requested)
-                .map_err(damaged)?;
-        if flags.txindex != requested.txindex {
+        // A database with blocks but no stored flags (made before they were
+        // kept, or installed from a snapshot) has a transaction index of
+        // unknown extent. Divi Core always has the flags (written at genesis),
+        // so its "txindex on" means every block is indexed: here the flag is
+        // first stored as off, and set on only once the index is known to
+        // cover the chain.
+        let unflagged = chain.height() > 0
+            && divi_storage::search_index::IndexFlags::load(&db)
+                .map_err(damaged)?
+                .is_none();
+        let snapshot_base = chain.snapshot_base().map(|(height, _)| height);
+        let mut flags = divi_storage::search_index::IndexFlags::load_or_init(
+            &db,
+            chain.height(),
+            divi_storage::search_index::IndexFlags {
+                txindex: requested.txindex && !unflagged,
+                ..requested
+            },
+        )
+        .map_err(damaged)?;
+        let mut check_unflagged_index = false;
+        // The address and spent indexes of such a database are stored as off
+        // (load_or_init); asked for, they are built from the blocks below
+        let mut build_unflagged_search = false;
+        if unflagged && (requested.addressindex || requested.spentindex) {
+            match snapshot_base {
+                Some(base) => tracing::warn!(
+                    "This chain database was installed from a snapshot and has no blocks \
+                     below height {}, so it cannot have full address and spent indexes: \
+                     they are off",
+                    base
+                ),
+                None => {
+                    flags.addressindex = requested.addressindex;
+                    flags.spentindex = requested.spentindex;
+                    build_unflagged_search = true;
+                }
+            }
+        }
+        if unflagged && requested.txindex {
+            match snapshot_base {
+                Some(base) => tracing::warn!(
+                    "This chain database was installed from a snapshot and has no blocks \
+                     below height {}, so it cannot have a full transaction index: the \
+                     transaction index is off",
+                    base
+                ),
+                None => {
+                    flags.txindex = true;
+                    check_unflagged_index = true;
+                }
+            }
+        }
+        // -reindex builds the transaction index again with the -txindex now
+        // given, as Divi Core's -reindex writes the flags anew
+        // (ChainExtensionService.cpp:703-707). Here the index is built from
+        // the stored blocks; the chain state is kept.
+        let rebuild_tx_index = config.index.reindex && requested.txindex;
+        if config.index.reindex && flags.txindex != requested.txindex {
+            flags.txindex = requested.txindex;
+        }
+        // and the address and spent indexes with the options now given
+        if config.index.reindex {
+            flags.addressindex = requested.addressindex;
+            flags.spentindex = requested.spentindex;
+        }
+        // A snapshot database cannot build a full index; it runs without one
+        if snapshot_base.is_some() && !flags.txindex && requested.txindex {
+            if !unflagged {
+                tracing::warn!(
+                    "Transaction index off: this chain database was installed from a \
+                     snapshot and has no blocks below height {}",
+                    snapshot_base.unwrap_or_default()
+                );
+            }
+        } else if flags.txindex != requested.txindex {
             return Err(NodeError::Init(
                 "You need to rebuild the database using -reindex to change -txindex".into(),
             ));
@@ -244,27 +318,104 @@ impl Node {
             );
         }
 
+        let txindex_path = config.data_dir.join("txindex");
+        if config.index.reindex && txindex_path.exists() {
+            // Entries of an earlier index may name blocks no longer active
+            std::fs::remove_dir_all(&txindex_path).map_err(|e| {
+                NodeError::Init(format!(
+                    "Failed to remove the old transaction index {:?}: {}",
+                    txindex_path, e
+                ))
+            })?;
+        }
         if flags.txindex {
-            let txindex_path = config.data_dir.join("txindex");
             let tx_index = divi_storage::TxIndex::open(&txindex_path).map_err(|e| {
                 tracing::error!("Failed to open transaction index: {}", e);
                 NodeError::Init(format!("Failed to open transaction index: {}", e))
             })?;
-            chain.enable_tx_index(Arc::new(tx_index));
+            let tx_index = Arc::new(tx_index);
+            let build = rebuild_tx_index
+                || (check_unflagged_index
+                    && !chain
+                        .tx_index_covers_chain(&tx_index, 16)
+                        .map_err(damaged)?);
+            if check_unflagged_index && !rebuild_tx_index {
+                tracing::info!(
+                    "No index settings were stored with this chain database; {}",
+                    if build {
+                        "the transaction index does not cover it and is built now"
+                    } else {
+                        "the transaction index covers it"
+                    }
+                );
+            }
+            if build {
+                tracing::info!("Building the transaction index from the stored blocks");
+                let started = std::time::Instant::now();
+                let blocks = chain.rebuild_tx_index(tx_index).map_err(|e| {
+                    NodeError::Init(format!("Failed to build the transaction index: {}", e))
+                })?;
+                tracing::info!(
+                    "Transaction index built for {} blocks in {} ms",
+                    blocks,
+                    started.elapsed().as_millis()
+                );
+            } else {
+                chain.enable_tx_index(tx_index);
+            }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
-
+        let build_search = config.index.reindex || build_unflagged_search;
+        if build_search && !(flags.addressindex || flags.spentindex) {
+            // Switched off: remove the entries an earlier index left
+            divi_storage::SearchIndex::new(db.clone(), false, false)
+                .clear()
+                .map_err(damaged)?;
+        }
         if flags.addressindex || flags.spentindex {
-            chain.enable_search_index(Arc::new(divi_storage::SearchIndex::new(
+            let search = Arc::new(divi_storage::SearchIndex::new(
                 db.clone(),
                 flags.addressindex,
                 flags.spentindex,
-            )));
+            ));
+            if build_search {
+                tracing::info!("Building the address and spent indexes from the stored blocks");
+                let started = std::time::Instant::now();
+                match chain.rebuild_search_index(search) {
+                    Ok(blocks) => tracing::info!(
+                        "Address and spent indexes built for {} blocks in {} ms",
+                        blocks,
+                        started.elapsed().as_millis()
+                    ),
+                    Err(e) if config.index.reindex => {
+                        return Err(NodeError::Init(format!(
+                            "Failed to build the address and spent indexes: {}",
+                            e
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "No index settings were stored with this chain database and the \
+                             address and spent indexes cannot be built ({}): they are off",
+                            e
+                        );
+                        flags.addressindex = false;
+                        flags.spentindex = false;
+                    }
+                }
+            } else {
+                chain.enable_search_index(search);
+            }
             tracing::info!(
                 "Address index {}, spent index {}",
                 if flags.addressindex { "on" } else { "off" },
                 if flags.spentindex { "on" } else { "off" },
             );
+        }
+
+        // The flags change only once the indexes they name are complete
+        if config.index.reindex || check_unflagged_index || build_unflagged_search {
+            flags.store(&db).map_err(damaged)?;
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the
@@ -501,6 +652,9 @@ impl Node {
         let prunes = self.config.expire.is_enabled() || self.chain.prune_height() > 0;
         self.peer_manager
             .set_services(divi_network::constants::advertised_services(prunes));
+        divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
+        self.peer_manager
+            .set_local_addresses(self.local_addresses());
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -1365,6 +1519,38 @@ impl Node {
     }
 
     /// Get network info
+    /// The node's own addresses, learned as Divi Core learns them: a routable
+    /// bound address (net.cpp:1379-1380), -externalip (net.cpp:1834-1839),
+    /// then the interfaces (net.cpp:1385-1425)
+    fn local_addresses(&self) -> divi_network::local::LocalAddresses {
+        use divi_network::local::{LocalAddresses, LOCAL_BIND, LOCAL_IF, LOCAL_MANUAL};
+        let p2p = &self.config.p2p;
+        let listen = self.config.peer_sources().listen;
+        let local = LocalAddresses::new(listen, p2p.discover, p2p.port);
+        let bound = p2p
+            .listen_addr
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>();
+        if let (true, Ok(ip)) = (listen, bound) {
+            local.add(std::net::SocketAddr::new(ip, p2p.port), LOCAL_BIND);
+        }
+        for addr in &p2p.external_ips {
+            local.add(*addr, LOCAL_MANUAL);
+        }
+        for ip in &p2p.interface_ips {
+            local.add(std::net::SocketAddr::new(*ip, p2p.port), LOCAL_IF);
+        }
+        for a in local.list() {
+            tracing::info!(
+                "Local address {} port {} score {}",
+                a.address,
+                a.port,
+                a.score
+            );
+        }
+        local
+    }
+
     pub fn get_network_info(&self) -> NetworkInfo {
         NetworkInfo {
             version: self.config.network.protocol_version,
@@ -1622,7 +1808,7 @@ pub fn check_mempool_transaction(
     mempool: &Mempool,
     tx: &Transaction,
     limit_free: bool,
-) -> Result<divi_primitives::amount::Amount, NodeError> {
+) -> Result<crate::mempool::Admission, NodeError> {
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -1831,7 +2017,11 @@ pub fn check_mempool_transaction(
             );
         }
     }
-    Ok(Amount::from_sat(fee))
+    Ok(crate::mempool::Admission {
+        fee: Amount::from_sat(fee),
+        height: tip_height,
+        coin_age,
+    })
 }
 
 fn money_range(
@@ -2000,7 +2190,8 @@ mod tests {
         let node = Node::new(config).unwrap();
 
         let info = node.get_network_info();
-        assert_eq!(info.protocol_version, 70920);
+        // Divi Core 3.0.0's PROTOCOL_VERSION (version.h:21)
+        assert_eq!(info.protocol_version, 70915);
     }
 
     #[test]

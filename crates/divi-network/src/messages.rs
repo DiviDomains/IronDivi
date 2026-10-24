@@ -13,7 +13,7 @@
 //!
 //! This module defines all the P2P protocol messages.
 
-use crate::constants::Magic;
+use crate::constants::{Magic, MAX_HEADERS_RESULTS};
 use crate::error::NetworkError;
 use crate::message::{InvItem, MessageHeader, NetAddr};
 use crate::version::VersionMessage;
@@ -123,7 +123,7 @@ pub enum NetworkMessage {
 
 impl NetworkMessage {
     /// Get the command name for this message
-    pub fn command(&self) -> &'static str {
+    pub fn command(&self) -> &str {
         match self {
             NetworkMessage::Version(_) => "version",
             NetworkMessage::Verack => "verack",
@@ -155,11 +155,7 @@ impl NetworkMessage {
             NetworkMessage::MasternodeBroadcast(_) => "mnb",
             NetworkMessage::MasternodePing(_) => "mnp",
             NetworkMessage::MasternodeWinner(_) => "mnw",
-            NetworkMessage::Unknown(cmd, _) => {
-                // Note: This is a bit awkward since we return &'static str
-                // but command is dynamic. This should only be used for logging.
-                Box::leak(cmd.clone().into_boxed_str())
-            }
+            NetworkMessage::Unknown(cmd, _) => cmd,
         }
     }
 
@@ -290,6 +286,15 @@ impl NetworkMessage {
 
             "headers" => {
                 let count = r.size()?;
+                // No node sends more than MAX_HEADERS_RESULTS headers at once
+                // (Divi Core main.cpp:696), so a larger count is refused
+                // before any header is read
+                if count > MAX_HEADERS_RESULTS {
+                    return Err(NetworkError::Deserialization(format!(
+                        "headers count {} above {}",
+                        count, MAX_HEADERS_RESULTS
+                    )));
+                }
                 let mut headers = Vec::with_capacity(r.capacity(count, 81));
                 for _ in 0..count {
                     // Block headers are 80 bytes (v3) or 112 bytes (v4)
@@ -368,7 +373,7 @@ impl GetBlocksMessage {
     /// Create a new GetBlocks message
     pub fn new(locator_hashes: Vec<Hash256>, stop_hash: Hash256) -> Self {
         GetBlocksMessage {
-            version: crate::constants::PROTOCOL_VERSION,
+            version: crate::constants::protocol_version(),
             locator_hashes,
             stop_hash,
         }
@@ -424,6 +429,14 @@ impl GetBlocksMessage {
 /// GetHeaders message (same format as GetBlocks)
 pub type GetHeadersMessage = GetBlocksMessage;
 
+/// Longest command a reject names (Divi Core
+/// `LIMITED_STRING(strMsg, CMessageHeader::COMMAND_SIZE)`, main.cpp:946)
+pub const MAX_REJECT_COMMAND_LENGTH: usize = crate::message::COMMAND_SIZE;
+
+/// Longest reason a reject gives (Divi Core `MAX_REJECT_MESSAGE_LENGTH`,
+/// defaultValues.h:94)
+pub const MAX_REJECT_MESSAGE_LENGTH: usize = 111;
+
 /// Reject message
 #[derive(Debug, Clone)]
 pub struct RejectMessage {
@@ -461,9 +474,9 @@ impl RejectMessage {
     /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
         let mut r = Reader::new(data);
-        let message = String::from_utf8_lossy(r.var_bytes()?).into_owned();
+        let message = r.limited_string(MAX_REJECT_COMMAND_LENGTH)?;
         let code = r.u8()?;
-        let reason = String::from_utf8_lossy(r.var_bytes()?).into_owned();
+        let reason = r.limited_string(MAX_REJECT_MESSAGE_LENGTH)?;
         let extra_data = r.take(r.remaining())?.to_vec();
 
         Ok(RejectMessage {
@@ -592,6 +605,13 @@ mod tests {
         } else {
             panic!("Expected Ping message");
         }
+    }
+
+    /// Divi Core main.cpp:946 and defaultValues.h:94
+    #[test]
+    fn reject_limits_are_cores() {
+        assert_eq!(MAX_REJECT_COMMAND_LENGTH, 12);
+        assert_eq!(MAX_REJECT_MESSAGE_LENGTH, 111);
     }
 
     #[test]

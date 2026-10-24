@@ -444,6 +444,48 @@ impl Chain {
         self.tx_index = Some(tx_index);
     }
 
+    /// Build a transaction index for an existing chain: index every active
+    /// block from the stored blocks, then use it. Divi Core's -reindex builds
+    /// the index again from its block files (init.cpp:663-680); an index that
+    /// cannot cover every active block is refused, since a lookup would miss.
+    pub fn rebuild_tx_index(&mut self, tx_index: Arc<TxIndex>) -> Result<u32, StorageError> {
+        let indexed = self.index_tx_blocks(&tx_index, 1, true)?;
+        self.tx_index = Some(tx_index);
+        Ok(indexed)
+    }
+
+    /// Whether `tx_index` holds the first transaction of `samples` active
+    /// blocks spread from block 1 to the tip: an index kept since the chain
+    /// began does, one switched on later (or never built) does not
+    pub fn tx_index_covers_chain(
+        &self,
+        tx_index: &TxIndex,
+        samples: u32,
+    ) -> Result<bool, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(true);
+        };
+        let samples = samples.max(1);
+        for i in 0..samples {
+            let height = 1
+                + (u64::from(tip.height.saturating_sub(1)) * u64::from(i)
+                    / u64::from(samples.saturating_sub(1).max(1))) as u32;
+            let Some(hash) = self.db.get_height_mapping(height)? else {
+                return Ok(false);
+            };
+            let Some(block) = self.db.get_block(&hash)? else {
+                return Ok(false);
+            };
+            let Some(tx) = block.transactions.first() else {
+                continue;
+            };
+            if tx_index.get_location(&self.compute_txid(tx))?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Index the transactions of the active blocks above the newest block the
     /// index recorded. When that block is not on the active chain, or the
     /// index never recorded one, the last `TX_INDEX_RECHECK` blocks are
@@ -459,14 +501,34 @@ impl Chain {
                 height + 1
             }
             _ => tip.height.saturating_sub(TX_INDEX_RECHECK),
-        }
-        .max(1);
+        };
+        self.index_tx_blocks(tx_index, from, false)
+    }
+
+    /// Index the transactions of the active blocks from `from` to the tip.
+    /// A block without a stored body is skipped, or with `every_block` an error.
+    fn index_tx_blocks(
+        &self,
+        tx_index: &TxIndex,
+        from: u32,
+        every_block: bool,
+    ) -> Result<u32, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(0);
+        };
         let mut indexed = 0;
-        for height in from..=tip.height {
-            let Some(hash) = self.db.get_height_mapping(height)? else {
-                continue;
+        for height in from.max(1)..=tip.height {
+            let block = match self.db.get_height_mapping(height)? {
+                Some(hash) => self.db.get_block(&hash)?.map(|b| (hash, b)),
+                None => None,
             };
-            let Some(block) = self.db.get_block(&hash)? else {
+            let Some((hash, block)) = block else {
+                if every_block {
+                    return Err(StorageError::ChainState(format!(
+                        "block {} is not stored, so the transaction index cannot cover it",
+                        height
+                    )));
+                }
                 continue; // pruned or imported without bodies
             };
             let txids: Vec<Hash256> = block
@@ -505,6 +567,66 @@ impl Chain {
     /// and disconnected
     pub fn enable_search_index(&mut self, search_index: Arc<SearchIndex>) {
         self.search_index = Some(search_index);
+    }
+
+    /// Build the address and spent indexes for an existing chain: remove
+    /// their entries, then write each active block's from block 1 to the
+    /// tip, with the coins it spent taken from its undo data, as Divi Core's
+    /// -reindex writes them while it connects the blocks again
+    /// (init.cpp:663-680, BlockConnectionService.cpp:152-174). Refused when a
+    /// block or the undo data of a block that spends coins is not stored,
+    /// since the indexes would miss entries.
+    pub fn rebuild_search_index(&mut self, search: Arc<SearchIndex>) -> Result<u32, StorageError> {
+        search.clear()?;
+        let tip = self.height();
+        let mut built = 0;
+        for height in 1..=tip {
+            let missing = |what: &str| {
+                StorageError::ChainState(format!(
+                    "{} of block {} is not stored, so the address and spent indexes cannot cover it",
+                    what, height
+                ))
+            };
+            let hash = self
+                .db
+                .get_height_mapping(height)?
+                .ok_or_else(|| missing("the block"))?;
+            let block = self
+                .db
+                .get_block(&hash)?
+                .ok_or_else(|| missing("the block"))?;
+            let mut prevouts = HashMap::new();
+            if let Some(bytes) = self.db.get_undo_data(&hash)? {
+                if !bytes.is_empty() {
+                    for entry in BlockUndo::from_bytes(&bytes)?.entries {
+                        prevouts.insert(
+                            entry.outpoint,
+                            (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
+                        );
+                    }
+                }
+            }
+            let spends_unknown_coin = block
+                .transactions
+                .iter()
+                .filter(|tx| !tx.is_coinbase())
+                .flat_map(|tx| &tx.vin)
+                .any(|input| !input.prevout.is_null() && !prevouts.contains_key(&input.prevout));
+            if spends_unknown_coin {
+                return Err(missing("the undo data"));
+            }
+            let updates = search_index::collect_connect(
+                &block,
+                height,
+                &prevouts,
+                search.address_enabled(),
+                search.spent_enabled(),
+            );
+            search.apply_connect(&updates)?;
+            built += 1;
+        }
+        self.search_index = Some(search);
+        Ok(built)
     }
 
     /// The address and spent indexes, when enabled

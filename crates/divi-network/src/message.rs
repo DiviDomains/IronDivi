@@ -272,6 +272,24 @@ impl NetAddr {
         NetAddr { services, ip, port }
     }
 
+    /// Create from a socket address (IPv4 mapped into IPv6)
+    pub fn from_socket_addr(addr: std::net::SocketAddr, services: u64) -> Self {
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) => Self::from_ipv4(v4.octets(), addr.port(), services),
+            std::net::IpAddr::V6(v6) => Self::from_ipv6(v6.octets(), addr.port(), services),
+        }
+    }
+
+    /// The address as a socket address (a mapped IPv4 address as IPv4)
+    pub fn socket_addr(&self) -> std::net::SocketAddr {
+        let v6 = std::net::Ipv6Addr::from(self.ip);
+        let ip = match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        };
+        std::net::SocketAddr::new(ip, self.port)
+    }
+
     /// Serialize the address (without time)
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(26);

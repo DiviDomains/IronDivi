@@ -272,10 +272,12 @@ check "irondivid -> Divi Core 1234.5 reaches Divi Core's mempool within ${WAIT}s
 a setgenerate 1 >/dev/null
 H=$(a getblockcount)
 within 30 height_is x "$H"
+# The sender's gettransaction amount is credit less debit, the fee included, and
+# its fee is positive, as Divi Core gives them (divi/src/rpcwallet.cpp:2504-2510)
 sides_agree() {
     local core mine
-    core=$(a gettransaction "$1" | json "'%s %s' % (j['amount'], j['blockhash'])") || return 1
-    mine=$(x gettransaction "$1" | json "'%s %s' % (-j['amount'], j['blockhash'])") || return 1
+    core=$(a gettransaction "$1" | json "'%.8f %s' % (j['amount'], j['blockhash'])") || return 1
+    mine=$(x gettransaction "$1" | json "'%.8f %s' % (-j['amount'] - j['fee'], j['blockhash']) if j['fee'] > 0 else 'fee not above 0'") || return 1
     [ "$core" = "$mine" ]
 }
 check "irondivid -> Divi Core: gettransaction amount and block agree" sides_agree "${T2:-none}"
