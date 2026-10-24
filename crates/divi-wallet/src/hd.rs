@@ -141,13 +141,20 @@ pub struct HdWallet {
 impl HdWallet {
     /// Create a new HD wallet with random 24-word mnemonic
     pub fn new(chain_mode: ChainMode) -> Result<Self, WalletError> {
+        Self::generate(None, chain_mode)
+    }
+
+    /// Create a new HD wallet with a random 24-word mnemonic and the BIP39
+    /// `passphrase`, as Divi Core makes new words for -mnemonicpassphrase
+    /// without -mnemonic (hdchain.cpp:56-67)
+    pub fn generate(passphrase: Option<&str>, chain_mode: ChainMode) -> Result<Self, WalletError> {
         // Generate 32 bytes (256 bits) of entropy for 24 words
         let mut entropy = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut entropy);
 
         let mnemonic = Mnemonic::from_entropy(&entropy)
             .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
-        Self::from_mnemonic(&mnemonic.to_string(), None, chain_mode)
+        Self::from_mnemonic(&mnemonic.to_string(), passphrase, chain_mode)
     }
 
     /// Create from mnemonic phrase
