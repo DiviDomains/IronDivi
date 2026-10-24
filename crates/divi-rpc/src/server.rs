@@ -27,8 +27,8 @@ use divi_storage::{AddressIndex, Chain};
 use divi_wallet::WalletDb;
 
 use axum::{
-    extract::{Path, Request as HttpRequest, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Path, Request as HttpRequest, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Version},
     middleware::{self, Next},
     response::IntoResponse,
     routing::post,
@@ -81,7 +81,7 @@ async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
                 .map(|c| c.0.ip());
             match peer {
                 Some(ip) if !allowed.iter().any(|s| s.contains(ip)) => {
-                    StatusCode::FORBIDDEN.into_response()
+                    crate::http::error_page(StatusCode::FORBIDDEN)
                 }
                 _ => next.run(req).await,
             }
@@ -1079,17 +1079,50 @@ fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
 }
 
 /// HTTP handler for JSON-RPC requests
-async fn handle_rpc(State(server): State<Arc<RpcServer>>, body: String) -> impl IntoResponse {
+async fn handle_rpc(
+    State(server): State<Arc<RpcServer>>,
+    version: Version,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
     debug!("RPC request: {}", body);
     let (status, reply) = server.handle_http_body(&body);
     debug!("RPC response: {}", reply);
-    (status, [(header::CONTENT_TYPE, "application/json")], reply)
+    json_reply(status, reply, &version, &headers)
+}
+
+/// A JSON-RPC reply with Divi Core's headers: application/json, and the
+/// connection kept only after a 200 to a request that keeps it
+fn json_reply(
+    status: StatusCode,
+    reply: String,
+    version: &Version,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let keep = crate::http::keep_alive(*version, headers);
+    (
+        status,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CONNECTION,
+                crate::http::connection_header(status, keep),
+            ),
+        ],
+        reply,
+    )
+        .into_response()
 }
 
 /// HTTP handler for wallet-specific JSON-RPC requests
 async fn handle_wallet_rpc(
     State(server): State<Arc<RpcServer>>,
     Path(wallet_name): Path<String>,
+    version: Version,
+    headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     debug!("RPC request for wallet '{}': {}", wallet_name, body);
@@ -1099,7 +1132,7 @@ async fn handle_wallet_rpc(
     // This enables multi-wallet CLI support even if server only has one wallet loaded
     let (status, reply) = server.handle_http_body(&body);
     debug!("RPC response for wallet '{}': {}", wallet_name, reply);
-    (status, [(header::CONTENT_TYPE, "application/json")], reply)
+    json_reply(status, reply, &version, &headers)
 }
 
 /// A reply object as Divi Core writes it (rpcprotocol.cpp JSONRPCReplyObj):
@@ -1136,7 +1169,8 @@ impl RpcServer {
     /// status and the reply text.
     pub fn handle_http_body(&self, body: &str) -> (StatusCode, String) {
         use serde_json::Value;
-        let request: Value = match serde_json::from_str(body) {
+        // json_spirit's reading: of two equal keys the first counts
+        let request: Value = match crate::http::parse_json(body) {
             Ok(v) => v,
             Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
         };
@@ -1203,36 +1237,71 @@ pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Ro
 }
 
 fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
+    // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:121-123);
+    // bodies up to Divi Core's MAX_SIZE
     let router = Router::new()
-        .route("/", post(handle_rpc))
-        .route("/wallet/:wallet_name", post(handle_wallet_rpc))
-        .with_state(server);
+        .route("/", post(handle_rpc).get(handle_rpc))
+        .route(
+            "/wallet/:wallet_name",
+            post(handle_wallet_rpc).get(handle_wallet_rpc),
+        )
+        .with_state(server)
+        .layer(DefaultBodyLimit::max(crate::http::MAX_BODY));
+
+    // A declared body above MAX_SIZE is not read: Divi Core parses an empty
+    // request, a parse error (rpcprotocol.cpp:276-277, rpcserver.cpp:960-961)
+    let router = router.layer(middleware::from_fn(
+        |req: HttpRequest, next: Next| async move {
+            if crate::http::body_too_large(req.headers()) {
+                let (status, reply) = error_reply(RpcError::parse_error(), serde_json::Value::Null);
+                return json_reply(status, reply, &req.version(), req.headers());
+            }
+            next.run(req).await
+        },
+    ));
 
     // No credentials means no request can authenticate, never an open server.
+    // Wrong credentials are refused after Divi Core's delay (rpcserver.cpp:940-956).
     let router = router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
         let creds = credentials.clone();
         async move {
             let authorization = req
                 .headers()
                 .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok());
+                .map(|v| v.to_str().unwrap_or(""));
             let authorized = creds
                 .as_ref()
                 .is_some_and(|c| basic_auth_matches(authorization, &c.0, &c.1));
             if authorized {
                 next.run(req).await
             } else {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    [(
-                        header::WWW_AUTHENTICATE,
-                        HeaderValue::from_static("Basic realm=\"jsonrpc\""),
-                    )],
-                )
-                    .into_response()
+                if authorization.is_some() {
+                    tokio::time::sleep(crate::http::WRONG_CREDENTIALS_DELAY).await;
+                }
+                crate::http::unauthorized()
             }
         }
     }));
+
+    // Before the credentials, as Divi Core: GET and POST only, and the JSON-RPC
+    // paths only, the query included (rpcserver.cpp:1019-1031)
+    let router = router.layer(middleware::from_fn(
+        |req: HttpRequest, next: Next| async move {
+            if !crate::http::method_served(req.method()) {
+                return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
+            }
+            let uri = req.uri();
+            let path = uri.path();
+            let rpc_path = path == "/"
+                || path
+                    .strip_prefix("/wallet/")
+                    .is_some_and(|w| !w.is_empty() && !w.contains('/'));
+            if uri.query().is_some() || !rpc_path {
+                return crate::http::error_page(StatusCode::NOT_FOUND);
+            }
+            next.run(req).await
+        },
+    ));
 
     // No cross-origin headers on RPC replies, as Divi Core sends none
     router
@@ -1257,10 +1326,8 @@ fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
 fn basic_auth_matches(authorization: Option<&str>, user: &str, password: &str) -> bool {
     use base64::Engine;
 
-    let Some(encoded) = authorization.and_then(|h| {
-        h.strip_prefix("Basic ")
-            .or_else(|| h.strip_prefix("basic "))
-    }) else {
+    // The scheme as Divi Core takes it: "Basic " exactly (rpcserver.cpp:492)
+    let Some(encoded) = authorization.and_then(|h| h.strip_prefix("Basic ")) else {
         return false;
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
