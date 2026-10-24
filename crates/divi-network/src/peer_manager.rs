@@ -819,6 +819,12 @@ impl PeerManager {
         self.peers.write().insert(handle.id, handle);
     }
 
+    /// The live stats of a test peer (tests set its services)
+    #[cfg(test)]
+    pub(crate) fn test_peer_stats(&self, id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {
+        self.peers.read().get(&id).map(|p| Arc::clone(&p.stats))
+    }
+
     /// Send a message to a specific peer
     pub async fn send_to_peer(
         &self,
