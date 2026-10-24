@@ -393,6 +393,25 @@ pub(crate) fn parse_hash_v(
     Ok(Hash256::from_hex(&format!("{digits:0>64}")).expect("64 hex digits"))
 }
 
+/// uint256::SetHex as Divi Core reads a hash from text (uint256.cpp:186-212):
+/// leading white space and a "0x" are skipped, then the hex digits up to the
+/// first other character are a number, of which the last 64 digits count (a
+/// shorter number has leading zeros). Text with no digits is the zero hash.
+pub(crate) fn uint256_set_hex(text: &str) -> Hash256 {
+    // C's isspace: space, \t, \n, \v, \f, \r
+    let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    let end = text
+        .bytes()
+        .position(|b| !b.is_ascii_hexdigit())
+        .unwrap_or(text.len());
+    let digits = &text[end.saturating_sub(64)..end];
+    Hash256::from_hex(&format!("{digits:0>64}")).expect("64 hex digits")
+}
+
 /// Decoded transaction as `getrawtransaction <txid> 1` shows it (without the block fields),
 /// with addresses encoded for `network`.
 pub(crate) fn tx_to_json(tx: &Transaction, network: Network) -> serde_json::Value {
@@ -2855,16 +2874,24 @@ impl WalletRpc {
 
         // C++ shape (AvailableUtxoCalculator): Vaulted = vaults we own,
         // Stakable = plain coins plus vaults we manage, Spendable = plain coins.
-        // The node has no coin-age filter here.
-        let owned_vaults = wallet.get_owned_vault_utxos(height, 1);
-        let plain = wallet.get_spendable_utxos(height, 1);
+        // The node has no coin-age filter here. A locked coin is in none of
+        // them, as AvailableCoins skips it for every type
+        // (AvailableUtxoCalculator.cpp:91).
+        let unlocked = |us: Vec<divi_wallet::wallet_db::WalletUtxo>| {
+            us.into_iter()
+                .filter(|u| !wallet.is_coin_locked(&u.outpoint()))
+                .collect::<Vec<_>>()
+        };
+        let owned_vaults = unlocked(wallet.get_owned_vault_utxos(height, 1));
+        let plain = unlocked(wallet.get_spendable_utxos(height, 1));
         let mut stakable = plain.clone();
-        stakable.extend(
+        stakable.extend(unlocked(
             wallet
                 .get_stakeable_vault_utxos(height, 1)
                 .into_iter()
-                .map(|(u, _)| u),
-        );
+                .map(|(u, _)| u)
+                .collect(),
+        ));
         let network = wallet.network();
         let sum = |us: &[divi_wallet::wallet_db::WalletUtxo]| -> f64 {
             us.iter()
@@ -3286,7 +3313,10 @@ impl WalletRpc {
         Ok(json!({ "Address": address.to_string() }))
     }
 
-    /// loadwallet "filename" — refused: the wallet cannot be swapped on a running node.
+    /// loadwallet "filename" — the loaded wallet's own name ("wallet.dat", the
+    /// name getwalletinfo gives it) answers null, as Divi Core does when the
+    /// name is the wallet it runs (init.cpp:263); any other is refused: the
+    /// wallet cannot be swapped on a running node.
     ///
     /// irondivid hands its one wallet to the block, mempool and reorg callbacks, the
     /// staker and the pruner at start, so replacing it here would leave them writing to
@@ -3297,6 +3327,9 @@ impl WalletRpc {
         let filename = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: filename"))?;
+        if filename == "wallet.dat" && self.wallet.read().is_some() {
+            return Ok(serde_json::Value::Null);
+        }
 
         let current = self
             .wallet
@@ -3735,7 +3768,13 @@ impl WalletRpc {
         })?;
 
         // As Divi Core 3.0.0 the node keeps running with the wallet reloaded,
-        // encrypted and locked (rpcwallet.cpp:2732-2733)
+        // encrypted and locked (rpcwallet.cpp:2732-2733). The reloaded wallet
+        // is a new one, so lockunspent's locks are gone, the masternode
+        // collateral's too: LoadAndSelectWallet does not lock it again
+        // (init.cpp:282-292, :1291-1318)
+        for outpoint in wallet.locked_coins() {
+            wallet.set_coin_locked(outpoint, false);
+        }
         Ok(serde_json::json!("Wallet reloaded!"))
     }
 
@@ -4149,9 +4188,16 @@ impl WalletRpc {
                     .into());
                 }
             }
+            // IsHex (non-empty, even length, hex digits), then uint256(txid),
+            // which reads a shorter txid as a number (rpcwallet.cpp:2793-2802)
             let txid_str = o["txid"].as_str().unwrap_or_default();
-            let txid = Hash256::from_hex(txid_str)
-                .map_err(|_| invalid("Invalid parameter, expected hex txid"))?;
+            if txid_str.is_empty()
+                || !txid_str.len().is_multiple_of(2)
+                || !txid_str.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid("Invalid parameter, expected hex txid"));
+            }
+            let txid = uint256_set_hex(txid_str);
             let vout = o["vout"].as_i64().unwrap_or(-1);
             if vout < 0 {
                 return Err(invalid("Invalid parameter, vout must be positive"));
@@ -6485,6 +6531,211 @@ mod accounting_tests {
         assert!(listed
             .iter()
             .all(|u| u["scriptPubKey"] != json!(hex::encode(vault.as_bytes()))));
+    }
+
+    fn rpc_code(e: Error) -> i32 {
+        match e {
+            Error::Rpc(r) => r.code,
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    fn locks(rpc: &WalletRpc) -> serde_json::Value {
+        rpc.list_lock_unspent(&Params::None).unwrap()
+    }
+
+    fn lock(
+        rpc: &WalletRpc,
+        unlock: bool,
+        items: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        rpc.lock_unspent(&Params::Array(vec![json!(unlock), items]))
+    }
+
+    /// lockunspent takes any even-length hex as a txid and reads a short one
+    /// as a number, as uint256(txid) does (rpcwallet.cpp:2793-2802)
+    #[test]
+    fn lockunspent_reads_a_short_txid_as_a_number() {
+        let f = fixture();
+        assert_eq!(
+            lock(&f.rpc, false, json!([{"txid": "ab", "vout": 0}])).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            locks(&f.rpc),
+            json!([{"txid": format!("{:0>64}", "ab"), "vout": 0}])
+        );
+        for bad in ["abc", "", "zz"] {
+            let e = lock(&f.rpc, false, json!([{"txid": bad, "vout": 0}])).unwrap_err();
+            assert_eq!(rpc_code(e), codes::INVALID_PARAMETER, "{bad:?}");
+        }
+        // More than 64 digits: the last 64 count
+        let long = format!("ff{}", "1".repeat(64));
+        lock(&f.rpc, true, json!([{"txid": long, "vout": 0}])).unwrap();
+        lock(&f.rpc, false, json!([{"txid": long, "vout": 0}])).unwrap();
+        assert!(locks(&f.rpc)
+            .as_array()
+            .unwrap()
+            .contains(&json!({"txid": "1".repeat(64), "vout": 0})));
+    }
+
+    /// uint256::SetHex (uint256.cpp:186-212)
+    #[test]
+    fn uint256_set_hex_reads_text_as_divid() {
+        let h = |t: &str| uint256_set_hex(t).to_string();
+        let full = "0123456789abcdef".repeat(4);
+        assert_eq!(h(&full), full);
+        assert_eq!(h(&format!("0x{full}")), full);
+        assert_eq!(h(&format!("  0X{full}")), full);
+        assert_eq!(h(&full.to_uppercase()), full);
+        assert_eq!(h("ab"), format!("{:0>64}", "ab"));
+        assert_eq!(h("abc"), format!("{:0>64}", "abc"));
+        assert_eq!(h("12xyz"), format!("{:0>64}", "12"));
+        assert_eq!(h("xyz"), "0".repeat(64));
+        assert_eq!(h(""), "0".repeat(64));
+        assert_eq!(h(&format!("ff{full}")), full);
+    }
+
+    /// getcoinavailability leaves a locked coin out of all three sums, as
+    /// AvailableCoins does for every coin type (AvailableUtxoCalculator.cpp:91)
+    #[test]
+    fn getcoinavailability_leaves_locked_coins_out() {
+        let f = fixture();
+        let sums = |rpc: &WalletRpc| {
+            let r = rpc.get_coin_availability(&Params::None).unwrap();
+            (
+                r["Stakable"].as_f64().unwrap(),
+                r["Spendable"].as_f64().unwrap(),
+            )
+        };
+        let all = BALANCE as f64 / COIN as f64;
+        assert_eq!(sums(&f.rpc), (all, all));
+        let change = json!([{"txid": f.spend.txid().to_string(), "vout": 1}]);
+        lock(&f.rpc, false, change.clone()).unwrap();
+        let rest = (BALANCE - (250 * COIN - 1_000_000)) as f64 / COIN as f64;
+        assert_eq!(sums(&f.rpc), (rest, rest));
+        lock(&f.rpc, true, change).unwrap();
+        assert_eq!(sums(&f.rpc), (all, all));
+    }
+
+    /// encryptwallet reloads the wallet as a new one, which has no locks
+    /// (rpcwallet.cpp:2732, init.cpp:282-292)
+    #[test]
+    fn encryptwallet_leaves_no_coin_locked() {
+        let f = fixture_with(|dir| {
+            let hd = HdWallet::new(ChainMode::Divi).unwrap();
+            WalletDb::create_persistent(&dir.join("wallet"), Network::Regtest, hd).unwrap()
+        });
+        lock(
+            &f.rpc,
+            false,
+            json!([{"txid": f.spend.txid().to_string(), "vout": 1}]),
+        )
+        .unwrap();
+        assert_eq!(locks(&f.rpc).as_array().unwrap().len(), 1);
+        let reply = f
+            .rpc
+            .encrypt_wallet(&Params::Array(vec![json!("a test passphrase")]))
+            .unwrap();
+        assert_eq!(reply, json!("Wallet reloaded!"));
+        assert_eq!(locks(&f.rpc), json!([]));
+    }
+
+    /// loadwallet with the loaded wallet's name is null, as divid's
+    /// SwitchCoinMintingModuleToWallet answers true at once (init.cpp:263)
+    #[test]
+    fn loadwallet_of_the_loaded_wallet_is_null() {
+        let f = fixture();
+        let load = |name: &str| f.rpc.load_wallet(&Params::Array(vec![json!(name)]));
+        assert_eq!(load("wallet.dat").unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            rpc_code(load("other.dat").unwrap_err()),
+            codes::WALLET_ERROR
+        );
+    }
+
+    /// What the block-sync callbacks were told: fork heights, returned
+    /// transactions, connected heights
+    #[derive(Default)]
+    struct Told {
+        forks: Vec<u32>,
+        returned: Vec<Vec<Hash256>>,
+        connected: Vec<u32>,
+    }
+
+    fn listening_sync(
+        chain: &Arc<Chain>,
+    ) -> (Arc<divi_network::BlockSync>, Arc<parking_lot::Mutex<Told>>) {
+        let sync = divi_network::BlockSync::new(
+            chain.clone(),
+            divi_network::PeerManager::new(divi_network::PeerManagerConfig::default()),
+        );
+        let told = Arc::new(parking_lot::Mutex::new(Told::default()));
+        let t = told.clone();
+        sync.set_reorg_callback(Arc::new(move |fork| t.lock().forks.push(fork)));
+        let t = told.clone();
+        sync.set_orphaned_tx_callback(Arc::new(move |txs: Vec<Transaction>| {
+            t.lock()
+                .returned
+                .push(txs.iter().map(|tx| tx.txid()).collect())
+        }));
+        let t = told.clone();
+        sync.set_block_connected_callback(Arc::new(move |_, height| {
+            t.lock().connected.push(height)
+        }));
+        (sync, told)
+    }
+
+    /// invalidateblock, reverseblocktransactions and reconsiderblock tell the
+    /// wallet and the mempool what they disconnected and connected, as divid's
+    /// disconnectTip returns a block's transactions to the mempool and its
+    /// wallet hears of both (ChainTipManager.cpp:139-183); the hash is read
+    /// as uint256 reads it, "0x" and all
+    #[test]
+    fn moving_the_tip_by_rpc_reaches_the_wallet_and_the_mempool() {
+        let f = fixture();
+        let rpc = crate::blockchain::BlockchainRpc::new(f.chain.clone());
+        let (sync, told) = listening_sync(&f.chain);
+        rpc.set_block_sync(sync);
+        let tip = f.chain.tip().unwrap().hash.to_string();
+        let call = |method: &str, hash: String| {
+            rpc.invalidate_block_family(method, &Params::Array(vec![json!(hash)]))
+        };
+
+        call("invalidateblock", tip.clone()).unwrap();
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT - 1);
+        {
+            let t = told.lock();
+            assert_eq!(t.forks, vec![FIXTURE_HEIGHT - 1]);
+            assert_eq!(t.returned, vec![vec![f.spend.txid()]]);
+        }
+        call("reconsiderblock", tip.clone()).unwrap();
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT);
+        assert_eq!(told.lock().connected, vec![FIXTURE_HEIGHT]);
+
+        call("reverseblocktransactions", format!("0x{tip}")).unwrap();
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT - 1);
+        assert_eq!(told.lock().returned.len(), 2);
+        call("reconsiderblock", format!("  {tip}")).unwrap();
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT);
+
+        // The genesis block: every block above it goes, divid answers null
+        // (BlockInvalidationHelpers.cpp:134-143)
+        let genesis = f
+            .chain
+            .get_block_index_by_height(0)
+            .unwrap()
+            .unwrap()
+            .hash
+            .to_string();
+        assert_eq!(
+            call("reverseblocktransactions", genesis).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(f.chain.height(), 0);
+        let t = told.lock();
+        assert_eq!(t.forks.last(), Some(&0));
+        assert_eq!(t.returned.last(), Some(&vec![f.spend.txid()]));
     }
 }
 

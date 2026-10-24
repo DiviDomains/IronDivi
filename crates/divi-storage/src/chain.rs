@@ -2673,11 +2673,28 @@ impl Chain {
     /// clear the invalid mark again without moving the tip, as Core's
     /// reconsiderBlock (ChainExtensionService.cpp:662-689) does there. The
     /// tip stays at the block's parent until another block is connected.
+    ///
+    /// For the genesis block Core disconnects every block above it, fails to
+    /// disconnect the genesis block itself and still answers null
+    /// (BlockInvalidationHelpers.cpp:134-143, rpcblockchain.cpp:605-609): the
+    /// tip is the genesis block, so here the reversal starts at block 1.
     pub fn reverse_block_transactions(&self, hash: &Hash256) -> Result<(), StorageError> {
         self.notifying_tip(|| {
-            self.invalidate_block_unnotified(hash, false)?;
+            let target = self
+                .db
+                .get_block_index(hash)?
+                .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
+            let first = if target.height == 0 {
+                match self.get_block_index_by_height(1)? {
+                    Some(block_1) => block_1.hash,
+                    None => return Ok(()),
+                }
+            } else {
+                *hash
+            };
+            self.invalidate_block_unnotified(&first, false)?;
             let _chain_guard = self.chain_lock.lock();
-            self.clear_failed_marks(hash)
+            self.clear_failed_marks(&first)
         })
     }
 

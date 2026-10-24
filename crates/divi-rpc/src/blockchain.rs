@@ -735,8 +735,11 @@ impl BlockchainRpc {
             return Err(usage().into());
         }
         let hash_str = params.get_str(0).ok_or_else(usage)?;
-        // C++ uint256S: an unparseable hash becomes the zero hash, which is never found
-        let hash = Hash256::from_hex(hash_str).unwrap_or_else(|_| Hash256::zero());
+        // As Divi Core reads it, uint256(strHash) or uint256S: leading space
+        // and "0x" skipped, a short hash read as a number, text without
+        // digits the zero hash, which is never found (rpcblockchain.cpp:589,
+        // :625, :663)
+        let hash = crate::wallet::uint256_set_hex(hash_str);
         let map_err = |e: divi_storage::StorageError| -> Error {
             match e {
                 divi_storage::StorageError::BlockNotFound(_) => {
@@ -745,20 +748,83 @@ impl BlockchainRpc {
                 other => RpcError::database_error(other.to_string()).into(),
             }
         };
+        let before = self.chain.tip();
+        let result = self.run_invalidate_family(method, &hash).map_err(map_err);
+        // The tip may have moved even when the call failed part way
+        if let Some(before) = before {
+            self.after_chain_moved(before);
+        }
+        result?;
+        Ok(Value::Null)
+    }
+
+    fn run_invalidate_family(
+        &self,
+        method: &str,
+        hash: &Hash256,
+    ) -> Result<(), divi_storage::StorageError> {
         match method {
-            "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
-            "reconsiderblock" => self.chain.reconsider_block(&hash).map_err(map_err)?,
-            _ => {
-                // C++ reverseblocktransactions invalidates (reversing the block's
-                // transactions in the coin DB) then clears the invalid mark
-                // without moving the tip, which stays at the block's parent
-                // until another block comes (rpcblockchain.cpp:577-603)
-                self.chain
-                    .reverse_block_transactions(&hash)
-                    .map_err(map_err)?;
+            "invalidateblock" => self.chain.invalidate_block(hash),
+            "reconsiderblock" => self.chain.reconsider_block(hash),
+            // C++ reverseblocktransactions invalidates (reversing the block's
+            // transactions in the coin DB) then clears the invalid mark
+            // without moving the tip, which stays at the block's parent
+            // until another block comes (rpcblockchain.cpp:577-603)
+            _ => self.chain.reverse_block_transactions(hash),
+        }
+    }
+
+    /// After a call moved the active chain from `before`: the blocks that left
+    /// it give their transactions back to the mempool and the wallet forgets
+    /// them, the blocks that joined it are scanned by the wallet and leave the
+    /// mempool, through the same callbacks a reorganisation in block sync
+    /// runs (Divi Core's disconnectTip and connectTip, ChainTipManager.cpp:139-183)
+    fn after_chain_moved(&self, before: divi_storage::BlockIndex) {
+        let Some(after) = self.chain.tip() else {
+            return;
+        };
+        if after.hash == before.hash {
+            return;
+        }
+        let Some(sync) = self.block_sync.read().clone() else {
+            return;
+        };
+        let parent =
+            |i: &divi_storage::BlockIndex| self.chain.get_block_index(&i.prev_hash).ok().flatten();
+        let (mut old, mut new) = (Some(before), Some(after));
+        let (mut left, mut joined) = (Vec::new(), Vec::new());
+        // Walk both tips back to the block they share
+        while let (Some(o), Some(n)) = (old.clone(), new.clone()) {
+            if o.hash == n.hash {
+                break;
+            }
+            if o.height >= n.height {
+                old = parent(&o);
+                left.push(o);
+            } else {
+                new = parent(&n);
+                joined.push(n);
             }
         }
-        Ok(Value::Null)
+        let Some(fork) = old else {
+            return;
+        };
+        let block = |i: &divi_storage::BlockIndex| self.chain.get_block(&i.hash).ok().flatten();
+        // Parents first: the lowest block first, each in its own order
+        let disconnected = (!left.is_empty()).then(|| {
+            left.iter()
+                .rev()
+                .filter_map(block)
+                .flat_map(|b| b.transactions.into_iter())
+                .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
+                .collect::<Vec<_>>()
+        });
+        let connected: Vec<_> = joined
+            .iter()
+            .rev()
+            .filter_map(|i| block(i).map(|b| (b, i.height)))
+            .collect();
+        sync.chain_moved(fork.height, disconnected, &connected);
     }
 
     /// getinvalid ( "all" ): Divi Core 3.0.0 builds its summary from empty
