@@ -1142,8 +1142,8 @@ impl BlockchainRpc {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 match (
-                    obj.get("start").and_then(|v| v.as_i64()),
-                    obj.get("end").and_then(|v| v.as_i64()),
+                    obj.get("start").and_then(json_spirit_int),
+                    obj.get("end").and_then(json_spirit_int),
                 ) {
                     (Some(start), Some(end)) => {
                         if start <= 0 || end <= 0 {
@@ -1218,7 +1218,12 @@ impl BlockchainRpc {
         let (start, end) = params
             .get(0)
             .and_then(|p| p.as_object())
-            .and_then(|obj| Some((obj.get("start")?.as_i64()?, obj.get("end")?.as_i64()?)))
+            .and_then(|obj| {
+                Some((
+                    json_spirit_int(obj.get("start")?)?,
+                    json_spirit_int(obj.get("end")?)?,
+                ))
+            })
             .filter(|(start, end)| *start > 0 && *end > 0)
             .unwrap_or((0, 0));
         let index = self.address_index()?;
@@ -1308,10 +1313,8 @@ impl BlockchainRpc {
             (1, Some(Value::Object(obj))) => obj,
             _ => return Err(RpcError::invalid_params("getspentinfo {txid:,index:}").into()),
         };
-        let (txid, index) = match (obj.get("txid"), obj.get("index")) {
-            (Some(Value::String(txid)), Some(Value::Number(n))) if n.is_i64() || n.is_u64() => {
-                (txid.as_str(), n.as_i64().unwrap_or(i64::MAX))
-            }
+        let (txid, index) = match (obj.get("txid"), obj.get("index").and_then(json_spirit_int)) {
+            (Some(Value::String(txid)), Some(index)) => (txid.as_str(), index),
             _ => {
                 return Err(
                     RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid txid or index").into(),
@@ -1542,6 +1545,21 @@ fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
     }
     let tail = &s[s.len().saturating_sub(64)..];
     Hash256::from_hex(&format!("{tail:0>64}")).map_err(|_| not_hex())
+}
+
+/// json_spirit's `get_int()` of an integer: its 64 bits cut to a C++ `int`
+/// (json_spirit_value.h, `static_cast<int>`), so 2^32 + 5 reads as 5; None for
+/// anything but an integer
+fn json_spirit_int(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) if n.is_i64() || n.is_u64() => {
+            let wide = n
+                .as_i64()
+                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64);
+            Some(i64::from(wide as i32))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
