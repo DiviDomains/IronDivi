@@ -354,13 +354,13 @@ impl RpcServer {
         let wallet_info = self.wallet.get_wallet_info(&Params::None).ok();
 
         // Staking status from staking subsystem
+        // Divi Core: "Staking Active" when the node tried to stake lately
+        // (rpcmisc.cpp:154-155), the bool getstakingstatus reports
         let staking_status_text = match self.staking.get_staking_status(&Params::None) {
-            Ok(info) => info["staking status"]
-                .as_str()
-                .unwrap_or("Staking Not Active")
-                .to_string(),
-            Err(_) => "Staking Not Active".to_string(),
-        };
+            Ok(info) if info["staking status"] == serde_json::Value::Bool(true) => "Staking Active",
+            _ => "Staking Not Active",
+        }
+        .to_string();
 
         let mut info = serde_json::json!({
             "version": "3.0.0.0",

@@ -2403,6 +2403,7 @@ fn staking_info(
         // IronDivi keeps no masternode list sync of its own; Divi Core's
         // starts once the chain is synced
         mnsync: synced,
+        recently_attempted: status.recently_attempted,
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
@@ -3575,6 +3576,7 @@ mod staking_status_tests {
             expected_time: None,
             last_stake_time: 0,
             blocks: 100,
+            recently_attempted: false,
         };
         let info = staking_info(&status, true, 0, 0, false, 5000.0);
         assert!(!info.wallet_unlocked, "locked wallet reported unlocked");

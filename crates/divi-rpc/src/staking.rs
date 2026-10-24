@@ -42,6 +42,9 @@ pub struct StakingInfo {
     pub mintable_coins: bool,
     pub enough_coins: bool,
     pub mnsync: bool,
+    /// Divi Core's `staking status`: the node tried to stake at the tip
+    /// lately (HasRecentlyAttemptedToGenerateProofOfStake, init.cpp:155-175)
+    pub recently_attempted: bool,
     /// Current chain height
     pub blocks: u32,
     /// Stake split threshold in DIVI (`-stakesplitthreshold`)
@@ -205,7 +208,8 @@ impl StakingRpc {
             "staking_balance": info.staking_balance,
             "enoughcoins": info.enough_coins,
             "mnsync": info.mnsync,
-            "staking status": info.staking && info.enabled,
+            // rpcmisc.cpp:1071-1072
+            "staking status": info.recently_attempted,
             "staking status text": staking_status_text,
             "stake split threshold": split_threshold,
         }))
@@ -486,6 +490,7 @@ mod tests {
             mintable_coins: false,
             enough_coins: false,
             mnsync: true,
+            recently_attempted: false,
             blocks: 0,
             // the value irondivid passes from its start-up config
             stake_split_threshold: 20000.0,
@@ -532,6 +537,7 @@ mod tests {
             mintable_coins: true,
             enough_coins: true,
             mnsync: true,
+            recently_attempted: true,
             blocks: 12345,
             stake_split_threshold: 20000.0,
         }));
