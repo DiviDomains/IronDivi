@@ -315,18 +315,25 @@ impl BlockchainRpc {
         }))
     }
 
+    /// The tip's money supply, as Divi Core's getinfo reports it
+    /// (`chain.Tip()->nMoneySupply`, rpcmisc.cpp:152). A tip without a
+    /// recorded supply (the chain opened before it was filled in) gets it from
+    /// the UTXO set, which holds the same value.
     pub fn money_supply(&self) -> f64 {
         let Some(tip) = self.chain.tip() else {
             return 0.0;
         };
+        if let Some(supply) = tip.money_supply.or((tip.height == 0).then_some(0)) {
+            return supply as f64 / 100_000_000.0;
+        }
         if let Some((hash, supply)) = *self.money_supply_cache.read() {
             if hash == tip.hash {
                 return supply;
             }
         }
-        match self.chain.get_utxo_stats() {
-            Ok(stats) => {
-                let supply = stats.total_amount as f64 / 100_000_000.0;
+        match self.chain.utxo_value_total() {
+            Ok(total) => {
+                let supply = total as f64 / 100_000_000.0;
                 *self.money_supply_cache.write() = Some((tip.hash, supply));
                 supply
             }
@@ -685,7 +692,7 @@ impl BlockchainRpc {
             "proxy": "",
             "difficulty": difficulty,
             "testnet": matches!(self.chain.network_type(), NetworkType::Testnet),
-            "moneysupply": 0,
+            "moneysupply": self.money_supply(),
             "keypoololdest": 0,
             "keypoolsize": 0,
             "paytxfee": 0.0,
@@ -757,13 +764,12 @@ impl BlockchainRpc {
     }
 
     /// Get TXOUT set info
+    ///
+    /// Divi Core rpcblockchain.cpp:293-327: height, best block and every value
+    /// from one view of the UTXO set; bytes_serialized and hash_serialized over
+    /// Core's coin records (txdb.cpp:105-157). bogosize (irondivid only) is the
+    /// size of irondivid's own records.
     pub fn get_txout_set_info(&self, _params: &Params) -> Result<Value, Error> {
-        let tip = self.chain.tip();
-        let (height, best_hash) = match tip {
-            Some(t) => (t.height, t.hash.to_string()),
-            None => (0, Hash256::zero().to_string()),
-        };
-
         let stats = self.chain.get_utxo_stats().map_err(|e| {
             RpcError::new(
                 codes::MISC_ERROR,
@@ -773,16 +779,14 @@ impl BlockchainRpc {
 
         let total_amount_divi = stats.total_amount as f64 / 100_000_000.0;
 
-        let hash_serialized = hex::encode(stats.hash_serialized);
-
         Ok(json!({
-            "height": height,
-            "bestblock": best_hash,
+            "height": stats.height,
+            "bestblock": stats.best_block.to_string(),
             "transactions": stats.transactions,
             "txouts": stats.txouts,
-            "bogosize": stats.bytes_serialized,
+            "bogosize": stats.bogosize,
             "bytes_serialized": stats.bytes_serialized,
-            "hash_serialized": hash_serialized,
+            "hash_serialized": stats.hash_serialized.to_string(),
             "total_amount": total_amount_divi
         }))
     }
@@ -973,22 +977,30 @@ impl BlockchainRpc {
             None => Hash256::zero().to_string(),
         };
         let network = self.address_network();
+        // Divi Core keeps no OP_META output in its coins (CCoins::ClearUnspendable,
+        // coins.cpp:54-61), from a block or from the mempool, so gettxout gives null
         if let Some(utxo) = self.chain.get_utxo(&outpoint)? {
+            if utxo.script_pubkey.is_op_return() {
+                return Ok(Value::Null);
+            }
             let confirmations = self.chain.height().saturating_sub(utxo.height) + 1;
             return Ok(json!({
                 "bestblock": best_block_hash,
                 "confirmations": confirmations,
                 "value": utxo.value.as_divi_f64(),
                 "scriptPubKey": crate::wallet::script_pubkey_to_json(utxo.script_pubkey.as_bytes(), network, true),
-                // The UTXO set keeps no transaction version; standard transactions are 1
-                "version": 1,
+                "version": utxo.version,
                 "coinbase": utxo.is_coinbase,
                 "coinstake": utxo.is_coinstake,
             }));
         }
         let in_pool = mempool.and_then(|m| m.get_transaction(&txid));
         if let Some(tx) = in_pool {
-            if let Some(out) = tx.vout.get(outpoint.vout as usize) {
+            if let Some(out) = tx
+                .vout
+                .get(outpoint.vout as usize)
+                .filter(|o| !o.script_pubkey.is_op_return())
+            {
                 return Ok(json!({
                     "bestblock": best_block_hash,
                     "confirmations": 0,

@@ -2151,8 +2151,9 @@ impl WalletRpc {
 
     /// getrawtransaction - Get raw transaction data
     ///
-    /// Looks in the mempool first, then the transaction index, as Divi Core's
-    /// GetTransaction does.
+    /// Looks in the mempool first, then the transaction index or, without
+    /// one, the block an unspent output of it records, as Divi Core's
+    /// GetTransaction does (TransactionDiskAccessor.cpp:49-110).
     pub fn get_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let txid_str = params
             .get_str(0)
@@ -2188,23 +2189,17 @@ impl WalletRpc {
         let (tx, location) = match in_mempool {
             Some(tx) => (tx, None),
             None => {
-                let found = chain.get_transaction_with_location(&txid).map_err(|e| {
-                    RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
-                })?;
-                let found = match found {
-                    Some(found) => Some(found),
-                    // Without the transaction index, Divi Core finds the block
-                    // through an unspent output of the transaction
-                    // (TransactionDiskAccessor.cpp:88-110)
-                    None if !chain.has_tx_index() => Self::find_through_coins(chain, &txid),
-                    None => None,
-                };
-                let (tx, location) = found.ok_or_else(|| {
-                    RpcError::new(
-                        codes::INVALID_ADDRESS_OR_KEY,
-                        "No information available about transaction",
-                    )
-                })?;
+                let (tx, location) = chain
+                    .locate_transaction(&txid)
+                    .map_err(|e| {
+                        RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
+                    })?
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            codes::INVALID_ADDRESS_OR_KEY,
+                            "No information available about transaction",
+                        )
+                    })?;
                 (tx, Some(location))
             }
         };
@@ -2246,30 +2241,6 @@ impl WalletRpc {
             }
         }
         Ok(result)
-    }
-
-    /// The transaction and its place in the block that an unspent output of it
-    /// names, scanned for the txid or the bare txid
-    fn find_through_coins(
-        chain: &Chain,
-        txid: &Hash256,
-    ) -> Option<(Transaction, divi_storage::txindex::TxLocation)> {
-        let height = chain.spendable_output_height_of(txid).ok().flatten()?;
-        if height == 0 {
-            return None;
-        }
-        let index = chain.get_block_index_by_height(height).ok().flatten()?;
-        let block = chain.get_block(&index.hash).ok().flatten()?;
-        block
-            .transactions
-            .iter()
-            .position(|t| t.txid() == *txid || bare_txid(t) == *txid)
-            .map(|pos| {
-                (
-                    block.transactions[pos].clone(),
-                    divi_storage::txindex::TxLocation::new(index.hash, pos as u32),
-                )
-            })
     }
 
     /// decoderawtransaction - Decode a raw transaction hex string

@@ -94,6 +94,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
+-blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
 -blocknotify=<cmd> -walletnotify=<cmd>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
@@ -267,9 +268,6 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
     "alerts",
-    "blockmaxsize",
-    "blockminsize",
-    "blockprioritysize",
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
@@ -556,6 +554,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
+    if let Some(wif) = s.get("sporkkey") {
+        // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
+        // network's spork key stops the start
+        let mainnet = config.network.magic == divi_network::constants::MAINNET_MAGIC;
+        let spork = divi_network::spork::spork_key(&config.network.magic);
+        if !spork.is_some_and(|spork| is_spork_key(wif, mainnet, &spork)) {
+            anyhow::bail!("Unable to sign spork message, wrong key?");
+        }
+        warn!(
+            "-sporkkey is this network's spork key, but irondivid does not sign sporks; not used"
+        );
+    }
     config.staking.enabled = s.get_bool("staking", true);
     if s.is_set("stakeonstaletip") {
         config.staking.stake_on_stale_tip = s.get_bool("stakeonstaletip", false);
@@ -566,6 +576,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                 config.staking.split_threshold = (d * 100_000_000.0).round() as i64
             }
             _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
+        }
+    }
+    // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    for (key, slot) in [
+        ("blockmaxsize", &mut config.staking.block_max_size),
+        ("blockprioritysize", &mut config.staking.block_priority_size),
+        ("blockminsize", &mut config.staking.block_min_size),
+    ] {
+        if let Some(n) = number_option(&s, key, 0..=i64::from(u32::MAX)) {
+            *slot = n as usize;
         }
     }
     for (key, slot) in [
@@ -630,9 +650,13 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "sporkkey",
         "staking",
         "stakeonstaletip",
         "stakesplitthreshold",
+        "blockmaxsize",
+        "blockprioritysize",
+        "blockminsize",
         "txindex",
         "spentindex",
         "addressindex",
@@ -669,6 +693,39 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A start the node refuses for a stated reason gives that reason alone, as
+/// Divi Core's InitError prints its text after "Error: " (noui.cpp:38-40), e.g.
+/// the -txindex change of init.cpp:1104-1105; other errors keep the step that
+/// failed
+fn start_error(e: divi_node::NodeError) -> anyhow::Error {
+    match e {
+        divi_node::NodeError::Init(reason) => anyhow::Error::msg(reason),
+        e => anyhow::Error::new(e).context("Failed to initialize node"),
+    }
+}
+
+/// Whether `wif` is a private key of this network (mainnet or not) whose public
+/// key is `spork`, as Divi Core's CSporkManager::SetPrivKey checks it: the
+/// secret is read as this network's (CBitcoinSecret) and its key id compared
+/// with the spork key's (spork.cpp:461-475)
+fn is_spork_key(wif: &str, mainnet: bool, spork: &[u8]) -> bool {
+    let Ok(key) = divi_wallet::decode_wif(wif) else {
+        return false;
+    };
+    if (key.network == WalletNetwork::Mainnet) != mainnet {
+        return false;
+    }
+    let Ok(secret) = divi_crypto::keys::SecretKey::from_bytes(&key.key_bytes) else {
+        return false;
+    };
+    let public = secret.public_key();
+    if key.compressed {
+        public.serialize_compressed()[..] == *spork
+    } else {
+        public.serialize_uncompressed()[..] == *spork
+    }
 }
 
 /// A host with an optional port, as Divi Core's CService reads it: `ip`,
@@ -729,6 +786,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
         NodeConfig::mainnet(chain_mode)
     };
     config.data_dir = compute_data_dir(args);
+    config.bootstrap_dir = Some(core_network_dir(args));
     if let Some(conf) = &args.conf {
         if conf.exists() {
             info!("Loaded config from {:?}", conf);
@@ -751,6 +809,26 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     apply_settings(&mut config, &settings)?;
 
     Ok(config)
+}
+
+/// Divi Core's network data directory, GetDataDir(): the data directory, with
+/// testnet3/ or regtest/ for those networks (chainparamsbase.cpp:54, :68).
+/// bootstrap.dat is read there, as divid reads it (init.cpp:698-699).
+fn core_network_dir(args: &Args) -> PathBuf {
+    let base = args.datadir.clone().unwrap_or_else(|| {
+        let mut dir = default_data_dir();
+        if args.chain_mode() == ChainMode::PrivateDivi {
+            dir = dir.join("privatedivi");
+        }
+        dir
+    });
+    if args.testnet {
+        base.join("testnet3")
+    } else if args.regtest {
+        base.join("regtest")
+    } else {
+        base
+    }
 }
 
 /// Compute data directory from args (used before config is built)
@@ -1304,12 +1382,7 @@ async fn run_daemon(
 
     // Initialize the node
     info!("Initializing node...");
-    let node = Node::new(config.clone()).with_context(|| "Failed to initialize node")?;
-    // Divi Core's -stopafterblockimport (init.cpp:724-727)
-    if config.stop_after_block_import {
-        info!("Stopping after block import");
-        return Ok(());
-    }
+    let node = Node::new(config.clone()).map_err(start_error)?;
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -1318,6 +1391,20 @@ async fn run_daemon(
 
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
+
+    // Divi Core's -stopafterblockimport: the import thread asks for shutdown
+    // once it is done (init.cpp:724-727)
+    if config.stop_after_block_import {
+        let chain = node.chain().clone();
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            while chain.is_importing() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            info!("Stopping after block import");
+            let _ = tx.send(());
+        });
+    }
 
     info!("Node started, chain height: {}", node.chain().height());
 
@@ -2000,6 +2087,9 @@ fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> Sta
             || config.network.network_type == NetworkType::Regtest,
         stake_split_threshold: config.staking.split_threshold,
         min_coin_age: chain.min_stake_age,
+        max_block_size: config.staking.block_max_size,
+        block_priority_size: config.staking.block_priority_size,
+        block_min_size: config.staking.block_min_size,
         ..StakingConfig::default()
     }
 }
@@ -3556,6 +3646,63 @@ mod divid_option_tests {
                 Some(format!("Invalid amount for -minrelaytxfee=<amount>: '{zero}'").as_str())
             );
         }
+    }
+
+    /// divid refuses to start with a -sporkkey that is not the network's spork
+    /// key (init.cpp:971-974), whatever is wrong with it
+    #[test]
+    fn sporkkey_that_is_not_the_spork_key_stops_the_start() {
+        let other = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(other.as_bytes());
+        for wif in [
+            divi_wallet::encode_wif(&bytes, true, WalletNetwork::Testnet),
+            divi_wallet::encode_wif(&bytes, true, WalletNetwork::Mainnet),
+            "not a key".to_string(),
+            String::new(),
+        ] {
+            let err = cfg_in(
+                "irondivi.conf",
+                &format!("rpcuser=x\nregtest=1\nsporkkey={wif}\n"),
+                &[],
+            )
+            .err()
+            .map(|e| e.to_string());
+            assert_eq!(
+                err.as_deref(),
+                Some("Unable to sign spork message, wrong key?")
+            );
+        }
+    }
+
+    /// The spork key check: this network's secret of that public key, in the
+    /// compressed or uncompressed form the key was given in
+    #[test]
+    fn spork_key_check_matches_the_public_key_and_network() {
+        let secret = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(secret.as_bytes());
+        let public = secret.public_key();
+        let compressed = public.serialize_compressed();
+        let uncompressed = public.serialize_uncompressed();
+        let testnet = divi_wallet::encode_wif(&bytes, true, WalletNetwork::Testnet);
+        let mainnet = divi_wallet::encode_wif(&bytes, true, WalletNetwork::Mainnet);
+        let testnet_long = divi_wallet::encode_wif(&bytes, false, WalletNetwork::Testnet);
+        assert!(is_spork_key(&testnet, false, &compressed));
+        assert!(is_spork_key(&mainnet, true, &compressed));
+        assert!(is_spork_key(&testnet_long, false, &uncompressed));
+        assert!(!is_spork_key(&testnet, true, &compressed), "other network");
+        assert!(!is_spork_key(&mainnet, false, &compressed), "other network");
+        assert!(
+            !is_spork_key(&testnet_long, false, &compressed),
+            "other key id"
+        );
+        let other = divi_crypto::keys::SecretKey::new_random().public_key();
+        assert!(!is_spork_key(
+            &testnet,
+            false,
+            &other.serialize_compressed()
+        ));
     }
 
     /// Without -rpcallowip divid listens on the loopback and ignores -rpcbind

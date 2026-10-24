@@ -68,6 +68,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub load_block: Vec<PathBuf>,
 
+    /// Directory of the bootstrap.dat imported at start: Divi Core's
+    /// network data directory (unset = the data directory)
+    #[serde(default)]
+    pub bootstrap_dir: Option<PathBuf>,
+
     /// Stop once the block files are imported (-stopafterblockimport)
     #[serde(default)]
     pub stop_after_block_import: bool,
@@ -111,6 +116,7 @@ impl Default for NodeConfig {
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
             load_block: Vec::new(),
+            bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
             walletnotify: None,
@@ -600,6 +606,23 @@ pub struct StakingConfig {
     /// Allow staking on a tip older than 24h (`stakeonstaletip`). Default off.
     #[serde(default)]
     pub stake_on_stale_tip: bool,
+
+    /// Divi Core `-blockmaxsize`, `-blockprioritysize` and `-blockminsize`
+    /// (defaultValues.h:47-50)
+    #[serde(default = "default_block_max_size")]
+    pub block_max_size: usize,
+    #[serde(default = "default_block_priority_size")]
+    pub block_priority_size: usize,
+    #[serde(default)]
+    pub block_min_size: usize,
+}
+
+fn default_block_max_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_MAX_SIZE
+}
+
+fn default_block_priority_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_PRIORITY_SIZE
 }
 
 impl Default for StakingConfig {
@@ -611,6 +634,9 @@ impl Default for StakingConfig {
             split_threshold: 2_000_000_000_000, // 20,000 DIVI (C++ -stakesplitthreshold default)
             combine_threshold: 100_000_000_000, // 1,000 DIVI
             stake_on_stale_tip: false,
+            block_max_size: default_block_max_size(),
+            block_priority_size: default_block_priority_size(),
+            block_min_size: crate::staker::DEFAULT_BLOCK_MIN_SIZE,
         }
     }
 }

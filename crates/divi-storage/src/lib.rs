@@ -48,6 +48,7 @@ macro_rules! pause_point {
 pub mod address_index;
 pub mod block_index;
 pub mod chain;
+pub mod core_coins;
 pub mod database;
 pub mod datadir;
 pub mod difficulty;
