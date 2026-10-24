@@ -28,6 +28,8 @@ use std::sync::Arc;
 pub struct BlockchainRpc {
     chain: Arc<Chain>,
     mempool: RwLock<Option<Arc<dyn MempoolProvider>>>,
+    /// The mempool's side of invalidateblock and its family
+    reorg_hook: RwLock<Option<ReorgHook>>,
     /// Money supply cached against the tip hash it was computed for
     money_supply_cache: RwLock<Option<(Hash256, f64)>>,
     /// Fetches blocks this node has pruned from full-history peers
@@ -109,6 +111,11 @@ pub struct FeeEstimate {
     pub blocks: u32,
 }
 
+/// Takes the transactions of blocks `invalidateblock` or
+/// `reverseblocktransactions` disconnected back into the mempool and drops
+/// what the chain now spends (called with none after `reconsiderblock`)
+pub type ReorgHook = Arc<dyn Fn(Vec<divi_primitives::transaction::Transaction>) + Send + Sync>;
+
 /// Trait for mempool access (to avoid circular dependency)
 pub trait MempoolProvider: Send + Sync {
     fn get_txids(&self) -> Vec<Hash256>;
@@ -148,6 +155,12 @@ pub trait MempoolProvider: Send + Sync {
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()
+    }
+
+    /// The highest fee sendrawtransaction takes without allowhighfees
+    /// (-maxtxfee; Divi Core's DEFAULT_TRANSACTION_MAXFEE, defaultValues.h:34)
+    fn max_tx_fee(&self) -> divi_primitives::amount::Amount {
+        divi_primitives::amount::Amount::from_sat(100 * 100_000_000)
     }
 
     /// Estimate fee for confirmation within target blocks
@@ -205,6 +218,7 @@ impl BlockchainRpc {
         BlockchainRpc {
             chain,
             mempool: RwLock::new(None),
+            reorg_hook: RwLock::new(None),
             money_supply_cache: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             block_sync: RwLock::new(None),
@@ -355,6 +369,12 @@ impl BlockchainRpc {
     /// Set the mempool provider
     pub fn set_mempool(&self, mempool: Arc<dyn MempoolProvider>) {
         *self.mempool.write() = Some(mempool);
+    }
+
+    /// Set what invalidateblock, reconsiderblock and reverseblocktransactions
+    /// do to the mempool
+    pub fn set_reorg_hook(&self, hook: ReorgHook) {
+        *self.reorg_hook.write() = Some(hook);
     }
 
     /// The minimum relay fee in DIVI/kB that getinfo and getnetworkinfo
@@ -748,83 +768,28 @@ impl BlockchainRpc {
                 other => RpcError::database_error(other.to_string()).into(),
             }
         };
-        let before = self.chain.tip();
-        let result = self.run_invalidate_family(method, &hash).map_err(map_err);
-        // The tip may have moved even when the call failed part way
-        if let Some(before) = before {
-            self.after_chain_moved(before);
-        }
-        result?;
-        Ok(Value::Null)
-    }
-
-    fn run_invalidate_family(
-        &self,
-        method: &str,
-        hash: &Hash256,
-    ) -> Result<(), divi_storage::StorageError> {
-        match method {
-            "invalidateblock" => self.chain.invalidate_block(hash),
-            "reconsiderblock" => self.chain.reconsider_block(hash),
+        // The disconnected blocks' transactions go back to the mempool, as
+        // Divi Core's disconnectTip puts them back; after a reconsider the
+        // mempool drops what the chain now holds
+        let returned = match method {
+            "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
+            "reconsiderblock" => {
+                self.chain.reconsider_block(&hash).map_err(map_err)?;
+                Vec::new()
+            }
             // C++ reverseblocktransactions invalidates (reversing the block's
             // transactions in the coin DB) then clears the invalid mark
             // without moving the tip, which stays at the block's parent
             // until another block comes (rpcblockchain.cpp:577-603)
-            _ => self.chain.reverse_block_transactions(hash),
-        }
-    }
-
-    /// After a call moved the active chain from `before`: the blocks that left
-    /// it give their transactions back to the mempool and the wallet forgets
-    /// them, the blocks that joined it are scanned by the wallet and leave the
-    /// mempool, through the same callbacks a reorganisation in block sync
-    /// runs (Divi Core's disconnectTip and connectTip, ChainTipManager.cpp:139-183)
-    fn after_chain_moved(&self, before: divi_storage::BlockIndex) {
-        let Some(after) = self.chain.tip() else {
-            return;
+            _ => self
+                .chain
+                .reverse_block_transactions(&hash)
+                .map_err(map_err)?,
         };
-        if after.hash == before.hash {
-            return;
+        if let Some(hook) = self.reorg_hook.read().clone() {
+            hook(returned);
         }
-        let Some(sync) = self.block_sync.read().clone() else {
-            return;
-        };
-        let parent =
-            |i: &divi_storage::BlockIndex| self.chain.get_block_index(&i.prev_hash).ok().flatten();
-        let (mut old, mut new) = (Some(before), Some(after));
-        let (mut left, mut joined) = (Vec::new(), Vec::new());
-        // Walk both tips back to the block they share
-        while let (Some(o), Some(n)) = (old.clone(), new.clone()) {
-            if o.hash == n.hash {
-                break;
-            }
-            if o.height >= n.height {
-                old = parent(&o);
-                left.push(o);
-            } else {
-                new = parent(&n);
-                joined.push(n);
-            }
-        }
-        let Some(fork) = old else {
-            return;
-        };
-        let block = |i: &divi_storage::BlockIndex| self.chain.get_block(&i.hash).ok().flatten();
-        // Parents first: the lowest block first, each in its own order
-        let disconnected = (!left.is_empty()).then(|| {
-            left.iter()
-                .rev()
-                .filter_map(block)
-                .flat_map(|b| b.transactions.into_iter())
-                .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
-                .collect::<Vec<_>>()
-        });
-        let connected: Vec<_> = joined
-            .iter()
-            .rev()
-            .filter_map(|i| block(i).map(|b| (b, i.height)))
-            .collect();
-        sync.chain_moved(fork.height, disconnected, &connected);
+        Ok(Value::Null)
     }
 
     /// getinvalid ( "all" ): Divi Core 3.0.0 builds its summary from empty

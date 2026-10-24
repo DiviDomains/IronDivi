@@ -2308,17 +2308,21 @@ impl WalletRpc {
                         .ok_or_else(|| out_of_range("wraps the int64_t boundary"))?;
                 }
             }
-            // Fee cap. Inputs still in the mempool are not visible here; such a
-            // transaction is checked by the mempool only.
+            // Fee cap, -maxtxfee: the inputs are read from the chain's coins and
+            // the mempool's outputs, as CCoinsViewMemPool reads them
+            // (rpcrawtransaction.cpp:810-826, :882). A transaction already in the
+            // mempool is relayed again without it (:875).
+            let max_fee = mempool.as_ref().map_or(MAX_TX_FEE, |m| m.max_tx_fee());
             let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
                 .get_utxo(&i.prevout)
             {
                 Ok(Some(u)) => Some(sum + u.value),
-                _ => None,
+                _ => pooled(&i.prevout.txid)
+                    .and_then(|p| p.vout.get(i.prevout.vout as usize).map(|o| sum + o.value)),
             });
             if let Some(inputs) = inputs {
                 let outputs = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
-                if !allow_high_fees && inputs - outputs > MAX_TX_FEE {
+                if !allow_high_fees && pooled(&txid).is_none() && inputs - outputs > max_fee {
                     return Err(RpcError::new(
                         codes::VERIFY_REJECTED,
                         "Fees being paid are in excess of maximum fee, but fee override is not provided",
@@ -6654,73 +6658,38 @@ mod accounting_tests {
         );
     }
 
-    /// What the block-sync callbacks were told: fork heights, returned
-    /// transactions, connected heights
-    #[derive(Default)]
-    struct Told {
-        forks: Vec<u32>,
-        returned: Vec<Vec<Hash256>>,
-        connected: Vec<u32>,
+    /// The transactions each call handed the reorg hook
+    fn listening_hook(
+        rpc: &crate::blockchain::BlockchainRpc,
+    ) -> Arc<parking_lot::Mutex<Vec<Vec<Hash256>>>> {
+        let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let t = told.clone();
+        rpc.set_reorg_hook(Arc::new(move |txs: Vec<Transaction>| {
+            t.lock().push(txs.iter().map(|tx| tx.txid()).collect())
+        }));
+        told
     }
 
-    fn listening_sync(
-        chain: &Arc<Chain>,
-    ) -> (Arc<divi_network::BlockSync>, Arc<parking_lot::Mutex<Told>>) {
-        let sync = divi_network::BlockSync::new(
-            chain.clone(),
-            divi_network::PeerManager::new(divi_network::PeerManagerConfig::default()),
-        );
-        let told = Arc::new(parking_lot::Mutex::new(Told::default()));
-        let t = told.clone();
-        sync.set_reorg_callback(Arc::new(move |fork| t.lock().forks.push(fork)));
-        let t = told.clone();
-        sync.set_orphaned_tx_callback(Arc::new(move |txs: Vec<Transaction>| {
-            t.lock()
-                .returned
-                .push(txs.iter().map(|tx| tx.txid()).collect())
-        }));
-        let t = told.clone();
-        sync.set_block_connected_callback(Arc::new(move |_, height| {
-            t.lock().connected.push(height)
-        }));
-        (sync, told)
-    }
-
-    /// invalidateblock, reverseblocktransactions and reconsiderblock tell the
-    /// wallet and the mempool what they disconnected and connected, as divid's
-    /// disconnectTip returns a block's transactions to the mempool and its
-    /// wallet hears of both (ChainTipManager.cpp:139-183); the hash is read
-    /// as uint256 reads it, "0x" and all
+    /// reverseblocktransactions reads the hash as uint256 reads it, "0x" and
+    /// leading space included (rpcblockchain.cpp:589), and hands the reorg
+    /// hook what it disconnected; for the genesis block it disconnects every
+    /// block above it and answers null (BlockInvalidationHelpers.cpp:134-143)
     #[test]
-    fn moving_the_tip_by_rpc_reaches_the_wallet_and_the_mempool() {
+    fn reverseblocktransactions_reads_hashes_and_reverses_down_to_genesis() {
         let f = fixture();
         let rpc = crate::blockchain::BlockchainRpc::new(f.chain.clone());
-        let (sync, told) = listening_sync(&f.chain);
-        rpc.set_block_sync(sync);
+        let told = listening_hook(&rpc);
         let tip = f.chain.tip().unwrap().hash.to_string();
         let call = |method: &str, hash: String| {
             rpc.invalidate_block_family(method, &Params::Array(vec![json!(hash)]))
         };
 
-        call("invalidateblock", tip.clone()).unwrap();
-        assert_eq!(f.chain.height(), FIXTURE_HEIGHT - 1);
-        {
-            let t = told.lock();
-            assert_eq!(t.forks, vec![FIXTURE_HEIGHT - 1]);
-            assert_eq!(t.returned, vec![vec![f.spend.txid()]]);
-        }
-        call("reconsiderblock", tip.clone()).unwrap();
-        assert_eq!(f.chain.height(), FIXTURE_HEIGHT);
-        assert_eq!(told.lock().connected, vec![FIXTURE_HEIGHT]);
-
         call("reverseblocktransactions", format!("0x{tip}")).unwrap();
         assert_eq!(f.chain.height(), FIXTURE_HEIGHT - 1);
-        assert_eq!(told.lock().returned.len(), 2);
+        assert_eq!(told.lock().last(), Some(&vec![f.spend.txid()]));
         call("reconsiderblock", format!("  {tip}")).unwrap();
         assert_eq!(f.chain.height(), FIXTURE_HEIGHT);
 
-        // The genesis block: every block above it goes, divid answers null
-        // (BlockInvalidationHelpers.cpp:134-143)
         let genesis = f
             .chain
             .get_block_index_by_height(0)
@@ -6733,9 +6702,7 @@ mod accounting_tests {
             serde_json::Value::Null
         );
         assert_eq!(f.chain.height(), 0);
-        let t = told.lock();
-        assert_eq!(t.forks.last(), Some(&0));
-        assert_eq!(t.returned.last(), Some(&vec![f.spend.txid()]));
+        assert_eq!(told.lock().last(), Some(&vec![f.spend.txid()]));
     }
 }
 

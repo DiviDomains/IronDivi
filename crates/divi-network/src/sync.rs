@@ -467,30 +467,6 @@ impl BlockSync {
         }
     }
 
-    /// The active chain moved outside block sync (invalidateblock,
-    /// reconsiderblock, reverseblocktransactions): run the callbacks a
-    /// reorganisation here runs. `fork_height` is the height of the last block
-    /// the old and new tips share; `disconnected` the transactions of the blocks
-    /// that left the active chain, parents first; `connected` the blocks that
-    /// joined it with their heights, lowest first. As Divi Core's disconnectTip
-    /// and connectTip, which every way of moving the tip goes through
-    /// (ChainTipManager.cpp:139-183)
-    pub fn chain_moved(
-        &self,
-        fork_height: u32,
-        disconnected: Option<Vec<Transaction>>,
-        connected: &[(Block, u32)],
-    ) {
-        if let Some(txs) = disconnected {
-            self.fire_reorg_callbacks(fork_height, txs);
-        }
-        if let Some(callback) = self.block_connected_callback.read().as_ref() {
-            for (block, height) in connected {
-                callback(block, *height);
-            }
-        }
-    }
-
     /// Subscribe to sync progress updates
     pub fn subscribe(&self) -> broadcast::Receiver<SyncProgress> {
         self.progress_tx.subscribe()

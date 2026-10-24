@@ -82,6 +82,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub blocknotify: Option<String>,
 
+    /// The ZMQ notifier addresses (Divi Core's -zmqpub* options)
+    #[serde(default)]
+    pub zmq: crate::zmq::ZmqConfig,
+
     /// Command run when a wallet transaction is added or updated, `%s`
     /// replaced by its txid (Divi Core's -walletnotify)
     #[serde(default)]
@@ -119,6 +123,7 @@ impl Default for NodeConfig {
             bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
+            zmq: Default::default(),
             walletnotify: None,
             vault: false,
         }
@@ -384,6 +389,12 @@ pub struct P2pConfig {
     #[serde(default)]
     pub connect: Vec<String>,
 
+    /// `-addnode` peers, as given: the node's first added nodes, which
+    /// getaddednodeinfo lists (Divi Core net.cpp:1218). They are dialled as
+    /// static peers.
+    #[serde(default)]
+    pub addnode: Vec<String>,
+
     /// Accept inbound connections. `None` = default: listen unless `connect`
     /// is set (C++ soft-sets `-listen=0` under `-connect`).
     #[serde(default)]
@@ -498,6 +509,7 @@ impl Default for P2pConfig {
             max_outbound: 16,
             enable_discovery: true,
             connect: Vec::new(),
+            addnode: Vec::new(),
             listen: None,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),
@@ -583,9 +595,18 @@ pub struct RpcConfig {
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 
+    /// Keep a connection open after a reply when the request asks for it
+    /// (Divi Core's -rpckeepalive, default on)
+    #[serde(default = "default_rpc_keep_alive")]
+    pub keep_alive: bool,
+
     /// Serve the REST interface (Divi Core's -rest, default off)
     #[serde(default)]
     pub rest: bool,
+}
+
+fn default_rpc_keep_alive() -> bool {
+    true
 }
 
 impl Default for RpcConfig {
@@ -599,6 +620,7 @@ impl Default for RpcConfig {
             max_request_size: 10 * 1024 * 1024, // 10 MB
             timeout: 30,
             allowed_ips: Vec::new(),
+            keep_alive: true,
             rest: false,
         }
     }
@@ -679,6 +701,11 @@ pub struct MempoolConfig {
     /// `-minrelaytxfee`, kept unrounded as `CFeeRate` keeps it)
     pub min_relay_fee_per_kb: i64,
 
+    /// The highest fee in satoshis a send may pay without an override (Divi
+    /// Core's `-maxtxfee`, FeeAndPriorityCalculator::SetMaxFee, init.cpp:844)
+    #[serde(default = "default_max_tx_fee")]
+    pub max_tx_fee: i64,
+
     /// Maximum orphan transactions
     pub max_orphan_txs: usize,
 
@@ -691,10 +718,16 @@ impl Default for MempoolConfig {
         MempoolConfig {
             max_size: 300 * 1024 * 1024,  // 300 MB
             min_relay_fee_per_kb: 10_000, // C++ Divi CFeeRate(10000)
+            max_tx_fee: default_max_tx_fee(),
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
         }
     }
+}
+
+/// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)
+fn default_max_tx_fee() -> i64 {
+    100 * 100_000_000
 }
 
 /// Debug configuration

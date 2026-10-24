@@ -35,6 +35,37 @@ async fn inbound_peers_stop_at_the_inbound_limit() {
     assert!(first.alive().await, "the first inbound peer was dropped");
 }
 
+/// The -addnode values are the node's first added nodes, in their order
+/// (net.cpp:1218), so getaddednodeinfo lists them; one given without a port
+/// takes the network's
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn addnode_values_are_the_first_added_nodes() {
+    let t = TestNode::start_with(|c| {
+        c.p2p.addnode = vec![
+            "127.0.0.2:11".into(),
+            "127.0.0.3".into(),
+            "127.0.0.2:12".into(),
+        ];
+    })
+    .await;
+    let listed: Vec<String> = t
+        .node
+        .peer_manager()
+        .get_added_node_info()
+        .iter()
+        .map(|n| n.addr.to_string())
+        .collect();
+    let port = t.node.peer_manager().default_port();
+    assert_eq!(
+        listed,
+        [
+            "127.0.0.2:11".to_string(),
+            format!("127.0.0.3:{port}"),
+            "127.0.0.2:12".to_string()
+        ]
+    );
+}
+
 fn addr_payload(count: usize) -> Vec<u8> {
     let mut v = compact(count as u64);
     for i in 0..count {
