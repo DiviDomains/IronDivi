@@ -74,6 +74,7 @@ pub mod relay;
 pub mod scoring;
 pub mod socks5;
 pub mod spork;
+pub mod subnet;
 pub mod sync;
 
 pub use constants::{
@@ -99,4 +100,5 @@ pub use peer_manager::{
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
 pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};
 pub use spork::{SporkManager, SporkSyncProgress, SporkSyncState};
+pub use subnet::Subnet;
 pub use sync::{BlockConnectedCallback, BlockSync, ReorgCallback, SyncProgress, SyncState};

@@ -68,4 +68,4 @@ pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DI
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore};
 pub use persistence::WalletDatabase;
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
-pub use wallet_db::{DetachedTx, Ownership, WalletDb, WalletTx, WalletUtxo};
+pub use wallet_db::{DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo};

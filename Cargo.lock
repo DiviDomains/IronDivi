@@ -2794,6 +2794,7 @@ dependencies = [
  "divi-test-support",
  "divi-wallet",
  "parking_lot",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "tempfile",

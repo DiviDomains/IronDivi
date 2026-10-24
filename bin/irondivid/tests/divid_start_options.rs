@@ -281,6 +281,35 @@ fn start_up_refusals_are_divid_s() {
     }
 }
 
+/// divid refuses any -checklevel at start, whatever the level
+/// (init.cpp:782-784); -checkblocks is taken
+#[test]
+fn checklevel_is_refused_at_start() {
+    let bin = env!("CARGO_BIN_EXE_irondivid");
+    for level in ["0", "3", "4"] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = output_within(
+            Command::new(bin)
+                .arg(format!("-datadir={}", dir.path().display()))
+                .args([
+                    "-regtest",
+                    "-checkblocks=1",
+                    &format!("-checklevel={level}"),
+                ]),
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            text.contains("Unsupported argument -checklevel found. Checklevel must be level 4."),
+            "-checklevel={level}: {text}"
+        );
+        assert!(!out.status.success(), "-checklevel={level} started");
+    }
+}
+
 /// A start the node refuses prints divid's InitError line, "Error: " and the
 /// reason alone (noui.cpp:38-40), and exits 1 (divid.cpp:180): a changed
 /// -txindex without -reindex (init.cpp:1104-1105) and a -sporkkey that is not
@@ -431,6 +460,53 @@ fn blocknotify_and_walletnotify_run_their_commands() {
         "walletnotify wrote: {:?}",
         read(&txs)
     );
+}
+
+/// -walletnotify runs each time divid's wallet adds or updates a
+/// transaction (wallet.cpp:1283): a send twice (CommitTransaction, then the
+/// mempool, :1878) and its block once
+#[test]
+fn walletnotify_runs_as_often_as_divid_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let first = WalletDb::with_hd_wallet(Network::Regtest, hd)
+        .new_receiving_address()
+        .unwrap();
+    mine_offline(dir.path(), &first, 25);
+    let txs = dir.path().join("txs.txt");
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("walletnotify=echo %s >> {}\n", txs.display()),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(
+        &divid_args(dir.path(), rpc_port),
+        &[("WALLET_MNEMONIC", MNEMONIC), ("WALLET_LOOKAHEAD", "5")],
+        rpc_port,
+        true,
+    );
+    let count = |txid: &str| {
+        std::fs::read_to_string(&txs)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == txid)
+            .count()
+    };
+    let settled = |txid: &str, n: usize| {
+        let reached = eventually(|| count(txid) >= n);
+        // Nothing more comes for this step
+        std::thread::sleep(Duration::from_secs(2));
+        reached && count(txid) == n
+    };
+
+    let to = daemon.rpc("getnewaddress", json!([]));
+    let txid = daemon.rpc("sendtoaddress", json!([to, 1]));
+    let txid = txid.as_str().unwrap().to_string();
+    assert!(settled(&txid, 2), "send: {} calls", count(&txid));
+
+    daemon.rpc("setgenerate", json!([1]));
+    assert!(settled(&txid, 3), "block: {} calls", count(&txid));
 }
 
 /// With -daemon the pid goes to divid.pid in the data directory, or to -pid

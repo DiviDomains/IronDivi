@@ -43,8 +43,6 @@ START_TIMEOUT = 120
 KNOWN = {
     "*getcoinavailability: fields divid lacks":
         "total_vaults and vaults, kept as extra fields (divid getcoinavailability, rpcwallet.cpp:818-987, has Vaulted, Stakable, Spendable)",
-    "*owner listunspent":
-        "open: account \"\" on coins of keys divid never put in its address book (its miner takes them from the keypool); divid leaves account out (rpcrawtransaction.cpp:320-325); the same row is open in scripts/wallet-replies",
     "reclaimvaultfunds*: reply":
         "open: rpc-left: divid answers the txid as a string (rpcwallet.cpp:1189), irondivid an object {amount, fee, txid}",
     "removevault with tx_hash: reply":
@@ -73,8 +71,6 @@ KNOWN = {
         "open: the same",
     "after restart: manager gettransaction of * reclaimvaultfunds metadata":
         "open: the same",
-    "after restart: *getwalletinfo":
-        "open: keypoolsize is 1999 on divid and 2000 on irondivid after the restart (equal before it); the same row is open in scripts/wallet-replies",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named

@@ -882,7 +882,22 @@ impl BlockchainRpc {
     }
 
     pub fn get_raw_mempool(&self, params: &Params) -> Result<Value, Error> {
-        let verbose = params.get(0).and_then(|v| v.as_bool()).unwrap_or(false);
+        // params[0].get_bool(): json_spirit takes only a boolean
+        // (rpcblockchain.cpp:110-112)
+        let verbose = match params.get(0) {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(v) => {
+                return Err(RpcError::new(
+                    crate::error::codes::MISC_ERROR,
+                    format!(
+                        "value is type {}, expected bool",
+                        crate::wallet::json_spirit_type(v)
+                    ),
+                )
+                .into())
+            }
+        };
         let mempool_guard = self.mempool.read();
         let Some(ref mempool) = *mempool_guard else {
             return Ok(if verbose { json!({}) } else { json!([]) });
@@ -917,31 +932,27 @@ impl BlockchainRpc {
         Ok(json!(txids))
     }
 
+    /// prioritisetransaction as Divi Core (rpcmining.cpp:251-276): the txid
+    /// through ParseHashStr, the fee delta as an integer; the priority delta
+    /// is not read, and the answer is always true
     pub fn prioritise_transaction(&self, params: &Params) -> Result<Value, Error> {
-        let txid_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing txid parameter"))?;
-
-        let priority_delta = match params.get(1) {
-            Some(value) => value
-                .as_f64()
-                .ok_or_else(|| RpcError::invalid_params("Priority delta must be a number"))?,
-            None => return Err(RpcError::invalid_params("Missing priority delta parameter").into()),
+        let txid = match params.get(0) {
+            Some(Value::String(s)) => core_parse_hash_str(s, "txid")?,
+            v => return Err(json_spirit_type_error(v, "str").into()),
         };
-
-        let fee_delta = params
-            .get_i64(2)
-            .ok_or_else(|| RpcError::invalid_params("Missing fee delta parameter"))?;
-
-        let txid = parse_hash(txid_str)?;
+        let fee_delta = match params.get(2) {
+            Some(Value::Number(n)) if n.is_i64() => n.as_i64().unwrap_or_default(),
+            v => return Err(json_spirit_type_error(v, "int").into()),
+        };
 
         let mempool_guard = self.mempool.read();
         let Some(ref mempool) = *mempool_guard else {
             return Err(RpcError::new(codes::MISC_ERROR, "Mempool not available").into());
         };
 
-        let success = mempool.prioritise_transaction(&txid, priority_delta, fee_delta);
-        Ok(json!(success))
+        // Core's PrioritiseTransaction takes the fee delta only (txmempool.cpp:318-328)
+        mempool.prioritise_transaction(&txid, 0.0, fee_delta);
+        Ok(json!(true))
     }
 
     /// gettxout as Divi Core (rpcblockchain.cpp:330-402): null for an output
@@ -1033,14 +1044,6 @@ impl BlockchainRpc {
             }
         }
         Ok(Value::Null)
-    }
-
-    pub fn generate_block(&self, _params: &Params) -> Result<Value, Error> {
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "generateblock is not yet implemented - requires full mining subsystem",
-        )
-        .into())
     }
 
     /// decodescript as Divi Core (rpcrawtransaction.cpp:527-564): the script
@@ -1262,9 +1265,16 @@ impl BlockchainRpc {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'index' field"))?;
 
+        // GetSpentIndex failing without the index (TransactionSearchIndexes.cpp:43-44)
         let search = match self.chain.search_index() {
             Some(search) if search.spent_enabled() => search,
-            _ => return Err(self.address_index_not_enabled()),
+            _ => {
+                return Err(RpcError::new(
+                    codes::INVALID_ADDRESS_OR_KEY,
+                    "Unable to get spent info",
+                )
+                .into())
+            }
         };
         match search.read_spent(&divi_storage::SpentIndexKey::new(txid, index as u32))? {
             Some(value) => Ok(json!({
@@ -1328,16 +1338,10 @@ impl BlockchainRpc {
     // Helper methods for address index
 
     fn address_index_not_enabled(&self) -> Error {
+        // GetAddressIndex / GetAddressUnspent failing (rpcmisc.cpp:658, :760, :851, :976)
         RpcError::new(
-            -5,
-            "Address index not enabled. To use address index features, you must:\n\
-             1. Stop IronDivi\n\
-             2. Add -addressindex=1 to your configuration\n\
-             3. Add -reindex=1 for the next startup (one time only)\n\
-             4. Restart IronDivi and wait for full blockchain reindex\n\
-             \n\
-             Warning: Reindexing can take 40-60 hours depending on blockchain size.\n\
-             The address index allows querying transaction history and balances for any address.",
+            codes::INVALID_ADDRESS_OR_KEY,
+            "No information available for address",
         )
         .into()
     }
@@ -1457,7 +1461,9 @@ impl BlockchainRpc {
 
     /// Get mining information
     /// getmininginfo
-    pub fn getmininginfo(&self, _params: &Params) -> Result<Value, Error> {
+    pub fn getmininginfo(&self, params: &Params) -> Result<Value, Error> {
+        // Divi Core sends these seven members (rpcmining.cpp:220-247)
+        crate::core_help::check_arguments("getmininginfo", params, (0, 0), 0)?;
         let tip = self.chain.tip();
         let (blocks, difficulty) = match &tip {
             Some(t) => (t.height, bits_to_difficulty(t.bits)),
@@ -1474,10 +1480,9 @@ impl BlockchainRpc {
             }
         };
 
+        // Divi Core's members (rpcmining.cpp:229-236)
         Ok(json!({
             "blocks": blocks,
-            "currentblocksize": 0,
-            "currentblocktx": 0,
             "difficulty": difficulty,
             "errors": "",
             "pooledtx": pooled_tx,
@@ -1502,6 +1507,35 @@ fn block_hash_like_core(s: &str) -> Result<Hash256, Error> {
         )
         .into()
     })
+}
+
+/// json_spirit's error for a value read as the wrong type
+fn json_spirit_type_error(value: Option<&Value>, want: &str) -> RpcError {
+    let got = value.map_or("null", crate::wallet::json_spirit_type);
+    RpcError::new(
+        crate::error::codes::MISC_ERROR,
+        format!("value is type {got}, expected {want}"),
+    )
+}
+
+/// Divi Core ParseHashStr (core_io.cpp:139-147): a non-empty, even-length hex
+/// string, else -1 "<name> must be hexadecimal string (not '<value>')", read as
+/// uint256::SetHex reads it (uint256.cpp:186-212): its last 64 digits, a
+/// shorter one with leading zeros
+fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
+    let is_hex =
+        !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let not_hex = || {
+        RpcError::new(
+            crate::error::codes::MISC_ERROR,
+            format!("{name} must be hexadecimal string (not '{s}')"),
+        )
+    };
+    if !is_hex {
+        return Err(not_hex());
+    }
+    let tail = &s[s.len().saturating_sub(64)..];
+    Hash256::from_hex(&format!("{tail:0>64}")).map_err(|_| not_hex())
 }
 
 fn parse_hash(s: &str) -> Result<Hash256, Error> {
