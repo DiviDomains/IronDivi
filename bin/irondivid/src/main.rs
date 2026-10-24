@@ -1805,6 +1805,9 @@ async fn run_daemon(
 
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
+    // An RPC server that cannot run (its port taken) stops the node, which
+    // then exits with failure, as divid's InitError does
+    let mut rpc_error = None;
 
     // RPC `stop` takes the same path as SIGTERM. The short delay lets the
     // "DIVI server stopping" reply reach the client before the server is dropped.
@@ -1956,6 +1959,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
+                    rpc_error = Some(e.to_string());
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -2001,6 +2005,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
+                    rpc_error = Some(e.to_string());
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -2030,7 +2035,10 @@ async fn run_daemon(
     }
 
     info!("Node stopped");
-    Ok(())
+    match rpc_error {
+        Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        None => Ok(()),
+    }
 }
 
 /// Run a notify command as divid's runCommand: through the shell, `%s`
