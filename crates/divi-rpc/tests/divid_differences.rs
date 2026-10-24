@@ -57,8 +57,9 @@ fn keys(v: &Value) -> Vec<String> {
     v.as_object().unwrap().keys().cloned().collect()
 }
 
-/// Core 3.0.0 has no estimatefee / estimatesmartfee (not in rpcserver.cpp's
-/// table); irondivid answers both, at or above the relay floor, for BasicSwap
+/// Core 3.0.0 has no estimatefee / estimatesmartfee / estimatepriority (not in
+/// rpcserver.cpp's table); irondivid answers the fee estimates at or above the
+/// relay floor, for BasicSwap, and estimatepriority with the text "-1"
 #[test]
 fn fee_estimates_exist() {
     let (server, _dir) = server();
@@ -66,6 +67,10 @@ fn fee_estimates_exist() {
     assert!(fee.as_f64().unwrap() >= 0.0001, "{fee}");
     let smart = result(&server, "estimatesmartfee", vec![json!(2)]);
     assert!(smart["feerate"].as_f64().unwrap() >= 0.0001, "{smart}");
+    assert_eq!(
+        result(&server, "estimatepriority", vec![json!(2)]),
+        json!("-1")
+    );
 }
 
 /// getblockchaininfo carries fields divid lacks (Core sends chain, blocks,

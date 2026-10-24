@@ -138,18 +138,16 @@ pub struct KeyStore {
 pub struct HdPublicIds {
     /// hash160 of the master public key (`hdmasterkeyid`)
     pub master_key_id: [u8; 20],
-    /// sha256 of the master public key (`hdchainid`)
+    /// Double SHA-256 of the seed (`hdchainid`, shown byte-reversed as
+    /// Divi Core's uint256)
     pub chain_id: [u8; 32],
 }
 
 impl HdPublicIds {
     /// Derive the ids from an HD wallet
     pub fn of(wallet: &HdWallet) -> Option<Self> {
-        use sha2::{Digest, Sha256};
-
         let master_key_id = wallet.master_key_id().ok()?;
-        let master_pubkey = wallet.get_master_pubkey().ok()?;
-        let chain_id: [u8; 32] = Sha256::digest(master_pubkey.to_bytes()).into();
+        let chain_id = wallet.seed_hash()?;
         Some(HdPublicIds {
             master_key_id,
             chain_id,
@@ -465,19 +463,12 @@ impl KeyStore {
             .collect()
     }
 
-    /// Get HD chain ID (SHA256 hash of master pubkey)
+    /// HD chain id as Divi Core shows it (CHDChain::GetID().GetHex(): the
+    /// seed hash, byte-reversed)
     pub fn get_hd_chain_id(&self) -> Option<String> {
-        use sha2::{Digest, Sha256};
-
-        let wallet = self.hd_wallet.read();
-        let Some(wallet) = wallet.as_ref() else {
-            return self.hd_public_ids().map(|ids| hex::encode(ids.chain_id));
-        };
-
-        let master_pubkey = wallet.get_master_pubkey().ok()?;
-        let pubkey_bytes = master_pubkey.to_bytes();
-        let hash = Sha256::digest(&pubkey_bytes);
-        Some(hex::encode(hash))
+        let mut id = self.hd_public_ids()?.chain_id;
+        id.reverse();
+        Some(hex::encode(id))
     }
 
     /// Get the current keypool size (number of pre-generated unused keys)
@@ -627,6 +618,27 @@ mod tests {
     use divi_primitives::ChainMode;
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// divid -regtest -mnemonic=<TEST_MNEMONIC>: validateaddress shows this
+    /// hdchainid (Hash of the BIP39 seed, hdchain.cpp:116-119, as GetHex)
+    #[test]
+    fn hd_chain_id_is_cores() {
+        const CORE_ID: &str = "98093d2dca56fdc3b2934a7a394890f5f735991b6bc7fdf9166e49f75d99d21b";
+        let words = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let store = KeyStore::with_hd_wallet(Network::Regtest, words);
+        assert_eq!(store.get_hd_chain_id().as_deref(), Some(CORE_ID));
+
+        // The same seed given as bytes (-hdseed) has the same id
+        let seed = bip39::Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
+        let bytes = HdWallet::from_seed(&seed, ChainMode::Divi).unwrap();
+        let store = KeyStore::with_hd_wallet(Network::Regtest, bytes);
+        assert_eq!(store.get_hd_chain_id().as_deref(), Some(CORE_ID));
+
+        // A passphrase makes another seed, so another id
+        let other = HdWallet::from_mnemonic(TEST_MNEMONIC, Some("pw"), ChainMode::Divi).unwrap();
+        let store = KeyStore::with_hd_wallet(Network::Regtest, other);
+        assert_ne!(store.get_hd_chain_id().as_deref(), Some(CORE_ID));
+    }
 
     #[test]
     fn test_keystore_new() {

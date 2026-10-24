@@ -1461,7 +1461,9 @@ impl BlockchainRpc {
 
     /// Get mining information
     /// getmininginfo
-    pub fn getmininginfo(&self, _params: &Params) -> Result<Value, Error> {
+    pub fn getmininginfo(&self, params: &Params) -> Result<Value, Error> {
+        // Divi Core sends these seven members (rpcmining.cpp:220-247)
+        crate::core_help::check_arguments("getmininginfo", params, (0, 0), 0)?;
         let tip = self.chain.tip();
         let (blocks, difficulty) = match &tip {
             Some(t) => (t.height, bits_to_difficulty(t.bits)),

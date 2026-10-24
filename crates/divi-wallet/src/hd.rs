@@ -209,6 +209,18 @@ impl HdWallet {
         self.seed.as_ref().map(|s| s.as_slice())
     }
 
+    /// Divi Core's HD chain id: the double SHA-256 of the seed, the BIP39
+    /// seed of the words for a mnemonic wallet (hdchain.cpp:116-119)
+    pub fn seed_hash(&self) -> Option<[u8; 32]> {
+        if let Some(seed) = self.seed() {
+            return Some(divi_crypto::double_sha256(seed));
+        }
+        let mnemonic: Mnemonic = self.mnemonic.as_deref()?.parse().ok()?;
+        let seed =
+            zeroize::Zeroizing::new(mnemonic.to_seed(self.passphrase.as_deref().unwrap_or("")));
+        Some(divi_crypto::double_sha256(seed.as_slice()))
+    }
+
     /// Path of the account the wallet's keys derive from, m/44'/coin'/0'
     /// (Divi Core hdchain.cpp:121-145; keys are .../change/index)
     pub fn account_path(&self) -> String {

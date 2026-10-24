@@ -300,7 +300,7 @@ impl LiteWalletRpc {
     }
 
     pub fn estimate_priority(&self, _params: &Params) -> Result<serde_json::Value, Error> {
-        // Deprecated command - return "-1" as string (matches C++ Divi)
+        // Not in Divi Core 3.0.0 (docs/divid-differences.md R1); "-1" as text
         Ok(serde_json::Value::String("-1".to_string()))
     }
 
