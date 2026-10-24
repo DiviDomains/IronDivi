@@ -39,10 +39,10 @@ The divid owner listens; the other three dial it (`connect=`), so all four see o
 
 Every step that sends is made on divid first, then on irondivid once every node has seen divid's transaction. The two replies are compared with txids masked, and the two transactions are compared by the roles and values of their outputs: destination, vault (whose keys), wallet change, other.
 
-1. **Coins:** divid's owner mines 101 blocks. The owner address `OWN` is the divid owner's and the manager address `MGR` the divid manager's.
+1. **Coins:** divid's owner mines 101 blocks. The owner address `OWN` is the divid owner's and the manager address `MGR` the divid manager's. Every address the script takes from a divid node with `getnewaddress` (`OWN`, `MGR`, the destination `DEST` and the owners of the extra vaults) is given to its irondivid twin with `setaccount <address> ""`. That way both address books hold it, and listunspent shows the same `account` on its coins on both sides (`rpcrawtransaction.cpp:335-339`); a key both wallets hold but only one handed out is in only one address book.
 2. **fundvault**, two forms:
    - `"OWN:MGR" 100`;
-   - the manager-only form `"MGR" 50`, where the owner key comes from each wallet's own keypool, so the owner half of the encoding is compared as "a new key".
+   - the manager-only form `"MGR" 50`, where the owner key comes from each wallet's own keypool, so the owner half of the encoding is compared as "a new key". Each wallet puts that new owner key in its address book (`rpcwallet.cpp:943`); the script then gives each side's new owner key to the other twin with `setaccount <key> ""`, since the twins draw their keypools apart and the other one may hold the same key unlabelled (a coinbase key, for example).
 3. **addvault** `"OWN:MGR" <funding txid>` on both managers, for divid's and for irondivid's funding.
 4. **The owner spends**, a block between each:
    - `debitvaultbyname "OWN:MGR" DEST 10`, plain and with `receiver_pays`;

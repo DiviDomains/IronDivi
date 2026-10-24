@@ -380,10 +380,20 @@ def seen_by_all(txid):
 
 
 mine(101)
-OWN = CO.rpc("getnewaddress")      # an owner address; irondivid's owner has its key too
-MGR = CM.rpc("getnewaddress")      # a manager address; irondivid's manager has its key too
+def shared_address(node, twin):
+    """A new address of `node`'s wallet that `twin` (same keys) has in its
+    address book too: getnewaddress puts it in divid's (rpcwallet.cpp:310),
+    setaccount "" in irondivid's (rpcwallet.cpp:616), so listunspent shows
+    the same account on both (rpcrawtransaction.cpp:335-339)"""
+    address = node.rpc("getnewaddress")
+    twin.rpc("setaccount", address, "")
+    return address
+
+
+OWN = shared_address(CO, IO)       # an owner address; irondivid's owner has its key too
+MGR = shared_address(CM, IM)       # a manager address; irondivid's manager has its key too
 VAULT = f"{OWN}:{MGR}"
-DEST = CO.rpc("getnewaddress")     # where the owner withdraws to
+DEST = shared_address(CO, IO)      # where the owner withdraws to
 NAMES = {OWN: "<owner>", MGR: "<manager>", DEST: "<dest>"}
 
 tracked = []   # (what, divid's txid, irondivid's txid)
@@ -514,8 +524,31 @@ def refusals(when):
 
 # 1. fundvault, owner:manager form and manager-only form
 step_pair("fundvault owner:manager", lambda: CO.call("fundvault", VAULT, 100), lambda: IO.call("fundvault", VAULT, 100))
-step_pair("fundvault manager-only", lambda: CO.call("fundvault", MGR, 50), lambda: IO.call("fundvault", MGR, 50),
+owner_only = {}
+step_pair("fundvault manager-only",
+          lambda: owner_only.setdefault(CO, CO.call("fundvault", MGR, 50)),
+          lambda: owner_only.setdefault(IO, IO.call("fundvault", MGR, 50)),
           reply_mask=lambda v: masked(re_owner(v), NAMES))
+
+
+def new_owners(v):
+    """The owner halves of the encodings in a fundvault reply that are no known address"""
+    if isinstance(v, dict):
+        return [o for x in v.values() for o in new_owners(x)]
+    if isinstance(v, list):
+        return [o for x in v for o in new_owners(x)]
+    if isinstance(v, str) and v.count(":") == 1 and v.split(":")[0] not in NAMES:
+        return [v.split(":")[0]]
+    return []
+
+
+# Each wallet put its new owner key in its own address book (rpcwallet.cpp:943). The
+# twins take keys from their keypools independently, so the other twin may hold that key
+# unlabelled (e.g. as a coinbase key): give it the same entry, as shared_address does.
+for node, twin in ((CO, IO), (IO, CO)):
+    reply = owner_only[node]
+    for owner in set(new_owners(reply[1] if reply[0] == "ok" else None)):
+        twin.rpc("setaccount", owner, "")
 
 
 mine(1)
@@ -548,7 +581,7 @@ step_pair("reclaimvaultfunds metadata", lambda: CO.call("reclaimvaultfunds", DES
           lambda: IO.call("reclaimvaultfunds", DEST, 10, "metadata", "rent", "landlord"))
 mine(1)
 # sweep_funds spends a whole vault, so each side sweeps one funded just before it
-SWEEP = f"{CO.rpc('getnewaddress')}:{MGR}"
+SWEEP = f"{shared_address(CO, IO)}:{MGR}"
 NAMES[SWEEP.split(':')[0]] = "<sweep owner>"
 sweeps = []
 for node in (CO, IO):
@@ -569,8 +602,8 @@ views("after the owner spent")
 # has confirmed coins: divid's balance check is over all vaults and passes
 # (GetVaultedBalance, rpcwallet.cpp:727-734), then its coin selection for this
 # vault finds nothing (rpcwallet.cpp:796-800)
-UNCONF = f"{CO.rpc('getnewaddress')}:{MGR}"
-OTHER = f"{CO.rpc('getnewaddress')}:{MGR}"
+UNCONF = f"{shared_address(CO, IO)}:{MGR}"
+OTHER = f"{shared_address(CO, IO)}:{MGR}"
 NAMES[UNCONF.split(':')[0]] = "<unconfirmed-vault owner>"
 NAMES[OTHER.split(':')[0]] = "<other-vault owner>"
 f = CO.rpc("fundvault", OTHER, 50)
