@@ -102,7 +102,7 @@ impl NodeConfig {
     /// CLI and `DEFAULT_RPC_PORT_PRIVATEDIVI_MAINNET` already assume.
     pub fn mainnet(chain_mode: ChainMode) -> Self {
         let (p2p_port, rpc_port) = match chain_mode {
-            ChainMode::Divi => (51472, 51471),
+            ChainMode::Divi => (51472, 51473),
             ChainMode::PrivateDivi => (52472, 52471),
         };
         NodeConfig {
@@ -122,7 +122,7 @@ impl NodeConfig {
     /// Create a new config with default testnet settings
     pub fn testnet(chain_mode: ChainMode) -> Self {
         let (p2p_port, rpc_port) = match chain_mode {
-            ChainMode::Divi => (51474, 51473),
+            ChainMode::Divi => (51474, 51475),
             ChainMode::PrivateDivi => (52474, 52473),
         };
         NodeConfig {
@@ -494,7 +494,8 @@ impl Default for RpcConfig {
         RpcConfig {
             enabled: true,
             listen_addr: "127.0.0.1".to_string(),
-            port: 51471,
+            // Divi Core mainnet RPC port (chainparamsbase.cpp:25)
+            port: 51473,
             username: None,
             password: None,
             max_request_size: 10 * 1024 * 1024, // 10 MB
@@ -653,7 +654,7 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert_eq!(config.p2p.port, 51472);
-        assert_eq!(config.rpc.port, 51471);
+        assert_eq!(config.rpc.port, 51473);
     }
 
     #[test]
@@ -668,7 +669,7 @@ mod tests {
         let config = NodeConfig::testnet(ChainMode::Divi);
         assert_eq!(config.network.network_type, NetworkType::Testnet);
         assert_eq!(config.p2p.port, 51474);
-        assert_eq!(config.rpc.port, 51473);
+        assert_eq!(config.rpc.port, 51475);
     }
 
     #[test]
@@ -686,7 +687,7 @@ mod tests {
         assert_eq!(p2p_addr.port(), 51472);
 
         let rpc_addr = config.rpc.socket_addr();
-        assert_eq!(rpc_addr.port(), 51471);
+        assert_eq!(rpc_addr.port(), 51473);
     }
 
     #[test]
@@ -730,20 +731,28 @@ mod tests {
 
     /// Every default port across both modes and all networks is distinct,
     /// so a Divi and a PrivateDivi node (or two PrivateDivi networks) can
-    /// run side by side on one host.
+    /// run side by side on one host. The one exception is Divi Core's own:
+    /// Divi testnet and regtest share RPC port 51475 (chainparamsbase.cpp:53,
+    /// regtest inherits it).
     #[test]
     fn default_ports_never_collide() {
         let mut ports = Vec::new();
         for mode in [ChainMode::Divi, ChainMode::PrivateDivi] {
-            for c in [
-                NodeConfig::mainnet(mode),
-                NodeConfig::testnet(mode),
-                NodeConfig::regtest(mode),
+            for (network, c) in [
+                ("main", NodeConfig::mainnet(mode)),
+                ("test", NodeConfig::testnet(mode)),
+                ("regtest", NodeConfig::regtest(mode)),
             ] {
                 ports.push(c.p2p.port);
-                ports.push(c.rpc.port);
+                if !(mode == ChainMode::Divi && network == "regtest") {
+                    ports.push(c.rpc.port);
+                }
             }
         }
+        assert_eq!(
+            NodeConfig::regtest(ChainMode::Divi).rpc.port,
+            NodeConfig::testnet(ChainMode::Divi).rpc.port
+        );
         let mut uniq = ports.clone();
         uniq.sort_unstable();
         uniq.dedup();

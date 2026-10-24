@@ -373,6 +373,7 @@ impl RpcServer {
 
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
+        rpc_type_check(method, params)?;
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
@@ -924,10 +925,43 @@ impl RpcServer {
         };
         info!("RPC stop received, shutting down");
         shutdown();
+        // rpcserver.cpp:317
         Ok(serde_json::Value::String(
-            "Divi server stopping".to_string(),
+            "DIVI server stopping".to_string(),
         ))
     }
+}
+
+/// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
+/// for the calls that run it: each given argument must have the listed type
+/// (null too where Core allows it), else -3 "Expected type X, got Y"
+fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
+    let (expected, allow_null): (&[&str], bool) = match method {
+        "setmocktime" => (&["int"], false),
+        "listunspent" => (&["int", "int", "array"], false),
+        "createrawtransaction" => (&["array"], false),
+        "decoderawtransaction" | "decodescript" => (&["str"], false),
+        "signrawtransaction" | "signrawtransactionwithwallet" => {
+            (&["str", "array", "array", "str"], true)
+        }
+        "sendrawtransaction" => (&["str", "bool"], false),
+        "lockunspent" => (&["bool", "array"], false),
+        "generateblock" => (&["obj"], true),
+        _ => return Ok(()),
+    };
+    let Params::Array(values) = params else {
+        return Ok(());
+    };
+    for (value, want) in values.iter().zip(expected) {
+        let got = crate::wallet::json_spirit_type(value);
+        if got != *want && !(allow_null && value.is_null()) {
+            return Err(RpcError::new(
+                codes::TYPE_ERROR,
+                format!("Expected type {want}, got {got}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// HTTP handler for JSON-RPC requests
@@ -1397,7 +1431,7 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         let r = call(&server, "stop", Params::None);
-        assert_eq!(r.result, Some(serde_json::json!("Divi server stopping")));
+        assert_eq!(r.result, Some(serde_json::json!("DIVI server stopping")));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

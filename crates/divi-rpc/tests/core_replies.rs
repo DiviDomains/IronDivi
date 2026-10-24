@@ -380,3 +380,65 @@ fn vault_errors() {
         (-8, "Could not parse vault encoding!".to_string())
     );
 }
+
+/// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212,
+/// used by rpcmisc.cpp:539, rpcrawtransaction.cpp:286, :396, :514, :550, :649,
+/// :847, rpcwallet.cpp:2776-2778): -3 "Expected type X, got Y"; getblockhash's
+/// get_int is json_spirit's -1 "value is type X, expected int"
+#[test]
+fn argument_types_are_checked_as_core_checks_them() {
+    let n = node();
+    let expected = |want: &str, got: &str| (-3, format!("Expected type {want}, got {got}"));
+    assert_eq!(
+        n.err("decoderawtransaction", vec![json!(5)]),
+        expected("str", "int")
+    );
+    assert_eq!(
+        n.err("decodescript", vec![json!(true)]),
+        expected("str", "bool")
+    );
+    assert_eq!(
+        n.err("sendrawtransaction", vec![json!([])]),
+        expected("str", "array")
+    );
+    assert_eq!(
+        n.err("sendrawtransaction", vec![json!("00"), json!(1)]),
+        expected("bool", "int")
+    );
+    assert_eq!(
+        n.err("listunspent", vec![json!("1")]),
+        expected("int", "str")
+    );
+    assert_eq!(
+        n.err("listunspent", vec![json!(1), json!(9), json!("x")]),
+        expected("array", "str")
+    );
+    assert_eq!(
+        n.err("createrawtransaction", vec![json!({}), json!({})]),
+        expected("array", "obj")
+    );
+    assert_eq!(
+        n.err("lockunspent", vec![json!(1)]),
+        expected("bool", "int")
+    );
+    assert_eq!(
+        n.err("signrawtransaction", vec![json!(1)]),
+        expected("str", "int")
+    );
+    assert_eq!(
+        n.err("getblockhash", vec![json!("1")]),
+        (-1, "value is type str, expected int".to_string())
+    );
+    assert_eq!(
+        n.err("getblockhash", vec![json!(1.5)]),
+        (-1, "value is type real, expected int".to_string())
+    );
+}
+
+/// stop answers as divid does (rpcserver.cpp:317)
+#[test]
+fn stop_reply_text() {
+    let n = node();
+    n.server.set_shutdown_callback(Arc::new(|| {}));
+    assert_eq!(n.ok("stop", vec![]), json!("DIVI server stopping"));
+}

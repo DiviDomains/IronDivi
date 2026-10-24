@@ -85,11 +85,11 @@ pub const DEFAULT_PORT_PRIVATEDIVI_TESTNET: u16 = 52474;
 /// Default port for PrivateDivi regtest
 pub const DEFAULT_PORT_PRIVATEDIVI_REGTEST: u16 = 52476;
 
-/// Default RPC port for Divi mainnet
-pub const DEFAULT_RPC_PORT_MAINNET: u16 = 51471;
+/// Default RPC port for Divi mainnet (Divi Core chainparamsbase.cpp:25)
+pub const DEFAULT_RPC_PORT_MAINNET: u16 = 51473;
 
-/// Default RPC port for Divi testnet
-pub const DEFAULT_RPC_PORT_TESTNET: u16 = 51473;
+/// Default RPC port for Divi testnet (Divi Core chainparamsbase.cpp:53)
+pub const DEFAULT_RPC_PORT_TESTNET: u16 = 51475;
 
 /// Default RPC port for Divi regtest
 pub const DEFAULT_RPC_PORT_REGTEST: u16 = 51475;

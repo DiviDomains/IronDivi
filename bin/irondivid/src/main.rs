@@ -1736,7 +1736,7 @@ async fn run_daemon(
     let mut shutdown_rx = shutdown_rx;
 
     // RPC `stop` takes the same path as SIGTERM. The short delay lets the
-    // "Divi server stopping" reply reach the client before the server is dropped.
+    // "DIVI server stopping" reply reach the client before the server is dropped.
     let rpc_stop: divi_rpc::ShutdownCallback = Arc::new(move || {
         let tx = shutdown_tx.clone();
         tokio::spawn(async move {
@@ -2580,7 +2580,7 @@ mod config_format_tests {
     fn section_settings_are_not_applied() {
         let c = cfg("rpcuser=foo\n[test]\nrpcport=1\nrpcuser=bar\n", &[]).unwrap();
         assert_eq!(c.rpc.username.as_deref(), Some("foo"));
-        assert_eq!(c.rpc.port, 51471);
+        assert_eq!(c.rpc.port, 51473);
     }
 
     /// Log-file and console settings in the file reach the logger (they were overwritten
@@ -2797,7 +2797,7 @@ mod mode_tests {
                 N::Mainnet,
                 [0xdf, 0xa0, 0x8d, 0x8f],
                 51472,
-                51471,
+                51473,
             ),
             (
                 &["--testnet"],
@@ -2805,7 +2805,7 @@ mod mode_tests {
                 N::Testnet,
                 [0xdf, 0xa0, 0x8d, 0x78],
                 51474,
-                51473,
+                51475,
             ),
             (
                 &["--regtest"],

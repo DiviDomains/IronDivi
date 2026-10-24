@@ -371,9 +371,21 @@ impl BlockchainRpc {
 
     /// Get block hash by height
     pub fn get_block_hash(&self, params: &Params) -> Result<Value, Error> {
-        let height = params
-            .get_i64(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing height parameter"))?;
+        // params[0].get_int(): json_spirit takes only an integer
+        let height = match params.get(0) {
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => n.as_i64().unwrap_or(i64::MAX),
+            Some(v) => {
+                return Err(RpcError::new(
+                    crate::error::codes::MISC_ERROR,
+                    format!(
+                        "value is type {}, expected int",
+                        crate::wallet::json_spirit_type(v)
+                    ),
+                )
+                .into())
+            }
+            None => return Err(RpcError::invalid_params("Missing height parameter").into()),
+        };
 
         // rpcblockchain.cpp:162-163
         let out_of_range = || {
