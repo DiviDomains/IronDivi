@@ -3958,15 +3958,6 @@ impl Chain {
             }
         }
 
-        // IMPORTANT: Validate treasury payments BEFORE modifying any state
-        // This prevents UTXO corruption if validation fails
-        debug!(
-            "  ├─ Treasury validation check (network: {:?})",
-            self.network_type()
-        );
-        self.validate_treasury_payments(block, index)?;
-        debug!("  ├─ Treasury validation: ✅ PASS");
-
         debug!("  ├─ Processing {} transactions", block.transactions.len());
         let mut total_inputs = 0;
         let mut total_outputs = 0;
@@ -4600,6 +4591,12 @@ impl Chain {
                 mint, expected_mint, height
             )));
         }
+
+        // The payees after the amount, as Divi Core's
+        // CheckMintTotalsAndBlockPayees (BlockConnectionService.cpp:77-98): a
+        // block paying too much is refused with DoS 100 even when it also
+        // pays the wrong payee (DoS 0); the UTXO changes are not written yet
+        self.validate_treasury_payments(block, index)?;
 
         // Validate lottery payments on lottery blocks
         if is_lottery {
@@ -5678,6 +5675,26 @@ mod tests {
             assert_eq!(err.misbehaviour_score(), 0, "{what}: bad-cb-payee scores 0");
         }
 
+        // In the block's value check: the payees are checked there, after the
+        // amount, so paying too much is bad-cb-amount (DoS 100) first
+        // (BlockConnectionService.cpp:84-97)
+        let limit = Chain::stake_reward(&chain.block_rewards(150)) + t + c;
+        let under = block_paying(vec![pay(&treasury, less), pay(&charity, c)]);
+        let err = chain
+            .validate_block_value(&under, &index, limit, Amount::ZERO)
+            .expect_err("a treasury paid one satoshi less");
+        assert_eq!(err.misbehaviour_score(), 0);
+        let over = block_paying(vec![
+            pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+            pay(&charity, c),
+        ]);
+        let err = chain
+            .validate_block_value(&over, &index, limit + Amount::from_sat(1), Amount::ZERO)
+            .expect_err("a treasury paid one satoshi more");
+        assert_eq!(err.misbehaviour_score(), 100, "{err}");
+        assert!(chain
+            .validate_block_value(&ok, &index, limit, Amount::ZERO)
+            .is_ok());
     }
 
     thread_local! {
