@@ -2863,9 +2863,18 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
         if wallet.vault_role(&vault_script) != Some(divi_wallet::wallet_db::VaultRole::Owned) {
+            // Divi Core names the owner address's isminetype: 0 not mine,
+            // 1 watch-only (rpcwallet.cpp:1103-1104, IsMineType.h)
+            let ownership = match self.decode_address(&owner_addr) {
+                Ok(addr) if wallet.is_watch_only(&addr) => 1,
+                _ => 0,
+            };
             return Err(RpcError::new(
                 codes::INVALID_ADDRESS_OR_KEY,
-                format!("Vault owner key is unknown: address={}", owner_addr),
+                format!(
+                    "Vault owner key is unknown: ownership={} address={}",
+                    ownership, owner_addr
+                ),
             )
             .into());
         }

@@ -999,3 +999,49 @@ fn removevault_replies_as_divid() {
         }
     }
 }
+
+/// debitvaultbyname from a wallet without the owner key names the owner
+/// address's ownership type as divid does (rpcwallet.cpp:1103-1104;
+/// isminetype, IsMineType.h: 0 not mine, 1 watch-only)
+#[test]
+fn debitvaultbyname_names_the_ownership_type() {
+    let s = setup();
+    let dest = s.manager.new_receiving_address().unwrap();
+    let refusal = |wallet: &Arc<WalletDb>| match s
+        .net
+        .rpc(wallet)
+        .debit_vault_by_name(&p(vec![
+            json!(s.encoding),
+            json!(dest.to_string()),
+            json!(1.0),
+        ]))
+        .unwrap_err()
+    {
+        divi_rpc::Error::Rpc(r) => (r.code, r.message),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        refusal(&s.manager),
+        (
+            -5,
+            format!(
+                "Vault owner key is unknown: ownership=0 address={}",
+                s.owner_addr
+            )
+        )
+    );
+    // A wallet that watches the owner address
+    s.manager
+        .import_watch_only_address(&s.owner_addr, None)
+        .unwrap();
+    assert_eq!(
+        refusal(&s.manager),
+        (
+            -5,
+            format!(
+                "Vault owner key is unknown: ownership=1 address={}",
+                s.owner_addr
+            )
+        )
+    );
+}
