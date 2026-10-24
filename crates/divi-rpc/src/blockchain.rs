@@ -761,6 +761,19 @@ impl BlockchainRpc {
         Ok(Value::Null)
     }
 
+    /// getinvalid ( "all" ): Divi Core 3.0.0 builds its summary from empty
+    /// maps, so it is always empty (rpcblockchain.cpp:687-725); at most one
+    /// argument, a string
+    pub fn get_invalid(&self, params: &Params) -> Result<Value, Error> {
+        crate::core_help::check_arguments("getinvalid", params, (0, 1), 1)?;
+        Ok(json!([{
+            "addresses_with_invalid": {},
+            "total_unspent": "0.00",
+            "total_minted": "0.00",
+            "total_valid_used": "0.00",
+        }]))
+    }
+
     /// Get difficulty
     pub fn get_difficulty(&self, _params: &Params) -> Result<Value, Error> {
         let tip = self.chain.tip();
