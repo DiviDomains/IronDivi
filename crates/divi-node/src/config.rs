@@ -63,6 +63,16 @@ pub struct NodeConfig {
     /// unset = the network's depth, 100 on Divi)
     #[serde(default)]
     pub max_reorg: Option<u32>,
+
+    /// Command run when the best block changes, `%s` replaced by its hash
+    /// (Divi Core's -blocknotify)
+    #[serde(default)]
+    pub blocknotify: Option<String>,
+
+    /// Command run when a wallet transaction is added or updated, `%s`
+    /// replaced by its txid (Divi Core's -walletnotify)
+    #[serde(default)]
+    pub walletnotify: Option<String>,
 }
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
@@ -88,6 +98,8 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            blocknotify: None,
+            walletnotify: None,
         }
     }
 }
@@ -102,7 +114,8 @@ impl NodeConfig {
     /// CLI and `DEFAULT_RPC_PORT_PRIVATEDIVI_MAINNET` already assume.
     pub fn mainnet(chain_mode: ChainMode) -> Self {
         let (p2p_port, rpc_port) = match chain_mode {
-            ChainMode::Divi => (51472, 51471),
+            // divid's ports (chainparams.cpp:177, chainparamsbase.cpp:25)
+            ChainMode::Divi => (51472, 51473),
             ChainMode::PrivateDivi => (52472, 52471),
         };
         NodeConfig {
@@ -122,7 +135,8 @@ impl NodeConfig {
     /// Create a new config with default testnet settings
     pub fn testnet(chain_mode: ChainMode) -> Self {
         let (p2p_port, rpc_port) = match chain_mode {
-            ChainMode::Divi => (51474, 51473),
+            // divid's ports (chainparams.cpp:393, chainparamsbase.cpp:53)
+            ChainMode::Divi => (51474, 51475),
             ChainMode::PrivateDivi => (52474, 52473),
         };
         NodeConfig {
@@ -367,6 +381,10 @@ pub struct P2pConfig {
     /// SOCKS5 proxy for outbound connections (`-proxy=<ip:port>`, port 9050 if omitted)
     #[serde(default)]
     pub proxy: Option<String>,
+
+    /// Connection timeout in milliseconds (Divi Core's -timeout)
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
 }
 
 impl P2pConfig {
@@ -406,13 +424,20 @@ fn default_ban_score() -> u32 {
     100
 }
 
+/// Divi Core's DEFAULT_CONNECT_TIMEOUT
+fn default_connect_timeout_ms() -> u64 {
+    5000
+}
+
 impl Default for P2pConfig {
     fn default() -> Self {
         P2pConfig {
             listen_addr: "0.0.0.0".to_string(),
             port: 51472,
-            max_inbound: 125,
-            max_outbound: 8,
+            // Divi Core: -maxconnections 125 in all, 16 of them outbound
+            // (net.cpp:106, :757), so 109 inbound
+            max_inbound: 109,
+            max_outbound: 16,
             enable_discovery: true,
             connect: Vec::new(),
             listen: None,
@@ -420,6 +445,7 @@ impl Default for P2pConfig {
             ban_score: default_ban_score(),
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
+            connect_timeout_ms: default_connect_timeout_ms(),
         }
     }
 }
@@ -487,6 +513,11 @@ pub struct RpcConfig {
 
     /// Request timeout (seconds)
     pub timeout: u64,
+
+    /// Subnets allowed to connect besides the local host (Divi Core's
+    /// -rpcallowip); with none, the server listens on the loopback only
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
 }
 
 impl Default for RpcConfig {
@@ -494,11 +525,12 @@ impl Default for RpcConfig {
         RpcConfig {
             enabled: true,
             listen_addr: "127.0.0.1".to_string(),
-            port: 51471,
+            port: 51473,
             username: None,
             password: None,
             max_request_size: 10 * 1024 * 1024, // 10 MB
             timeout: 30,
+            allowed_ips: Vec::new(),
         }
     }
 }
@@ -653,7 +685,7 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert_eq!(config.p2p.port, 51472);
-        assert_eq!(config.rpc.port, 51471);
+        assert_eq!(config.rpc.port, 51473);
     }
 
     #[test]
@@ -668,7 +700,7 @@ mod tests {
         let config = NodeConfig::testnet(ChainMode::Divi);
         assert_eq!(config.network.network_type, NetworkType::Testnet);
         assert_eq!(config.p2p.port, 51474);
-        assert_eq!(config.rpc.port, 51473);
+        assert_eq!(config.rpc.port, 51475);
     }
 
     #[test]
@@ -686,7 +718,7 @@ mod tests {
         assert_eq!(p2p_addr.port(), 51472);
 
         let rpc_addr = config.rpc.socket_addr();
-        assert_eq!(rpc_addr.port(), 51471);
+        assert_eq!(rpc_addr.port(), 51473);
     }
 
     #[test]
@@ -730,9 +762,13 @@ mod tests {
 
     /// Every default port across both modes and all networks is distinct,
     /// so a Divi and a PrivateDivi node (or two PrivateDivi networks) can
-    /// run side by side on one host.
+    /// run side by side on one host, except where divid's own collide: Divi
+    /// testnet and regtest both serve RPC on 51475 (chainparamsbase.cpp:53,
+    /// regtest inheriting testnet's)
     #[test]
     fn default_ports_never_collide() {
+        assert_eq!(NodeConfig::testnet(ChainMode::Divi).rpc.port, 51475);
+        assert_eq!(NodeConfig::regtest(ChainMode::Divi).rpc.port, 51475);
         let mut ports = Vec::new();
         for mode in [ChainMode::Divi, ChainMode::PrivateDivi] {
             for c in [
@@ -741,7 +777,9 @@ mod tests {
                 NodeConfig::regtest(mode),
             ] {
                 ports.push(c.p2p.port);
-                ports.push(c.rpc.port);
+                if !(mode == ChainMode::Divi && c.network.network_type == NetworkType::Regtest) {
+                    ports.push(c.rpc.port);
+                }
             }
         }
         let mut uniq = ports.clone();

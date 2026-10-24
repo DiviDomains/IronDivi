@@ -62,6 +62,8 @@ const KEY_HD_COIN_TYPE: &[u8] = b"hd_coin_type";
 pub(crate) const KEY_MNEMONIC_PASSPHRASE: &[u8] = b"mnemonic_passphrase";
 pub(crate) const KEY_ENCRYPTED_MNEMONIC_PASSPHRASE: &[u8] = b"encrypted_mnemonic_passphrase";
 pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
+/// Hashes of the most recently scanned blocks, written with the scan height
+pub(crate) const KEY_SCANNED_HASHES: &[u8] = b"scanned_hashes";
 
 /// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
 pub(crate) const ENCRYPTED_SECRET_SUFFIX: u8 = 0x01;
@@ -72,6 +74,29 @@ pub(crate) fn encode_hd_public_ids(ids: &HdPublicIds) -> Vec<u8> {
     data.extend_from_slice(&ids.master_key_id);
     data.extend_from_slice(&ids.chain_id);
     data
+}
+
+/// Scanned blocks as height (4 bytes LE) and hash (32 bytes) each
+pub(crate) fn encode_scanned_hashes(hashes: &[(u32, Hash256)]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(hashes.len() * 36);
+    for (height, hash) in hashes {
+        data.extend_from_slice(&height.to_le_bytes());
+        data.extend_from_slice(hash.as_bytes());
+    }
+    data
+}
+
+fn decode_scanned_hashes(data: &[u8]) -> Vec<(u32, Hash256)> {
+    data.as_chunks::<36>()
+        .0
+        .iter()
+        .map(|c| {
+            let height = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&c[4..]);
+            (height, Hash256::from_bytes(hash))
+        })
+        .collect()
 }
 
 /// Salt and encrypted master key pair
@@ -407,20 +432,20 @@ impl WalletDatabase {
         }
     }
 
-    /// Store encryption metadata (salt and encrypted master key)
+    /// Store encryption metadata (salt and encrypted master key) in one synced
+    /// write: the salt is only of use with the master key sealed under it, so
+    /// the two are never on disk apart (Divi Core keeps both in one `mkey`
+    /// record, walletdb.cpp:135-139)
     pub fn store_encryption_metadata(
         &self,
         salt: &[u8],
         encrypted_master_key: &[u8],
     ) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
-        self.db
-            .put_cf(cf, KEY_ENCRYPTION_SALT, salt)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
-        self.db
-            .put_cf(cf, KEY_ENCRYPTED_MASTER_KEY, encrypted_master_key)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
-        Ok(())
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf, KEY_ENCRYPTION_SALT, salt);
+        batch.put_cf(cf, KEY_ENCRYPTED_MASTER_KEY, encrypted_master_key);
+        self.write_batch_sync(batch)
     }
 
     /// Load encryption metadata (salt and encrypted master key)
@@ -496,6 +521,16 @@ impl WalletDatabase {
             .put_cf(cf, KEY_LAST_SCAN_HEIGHT, height.to_le_bytes())
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Load the hashes of the most recently scanned blocks by height
+    pub fn load_scanned_hashes(&self) -> Result<Vec<(u32, Hash256)>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        let raw = self
+            .db
+            .get_cf(cf, KEY_SCANNED_HASHES)
+            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        Ok(raw.map(|v| decode_scanned_hashes(&v)).unwrap_or_default())
     }
 
     /// Load last scan height
