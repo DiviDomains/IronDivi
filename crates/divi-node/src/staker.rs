@@ -499,10 +499,9 @@ impl Staker {
         let aged = |utxo: &divi_wallet::WalletUtxo| {
             utxo.value.as_sat() >= min_amount
                 && utxo.is_mature(height, maturity)
-                && utxo
-                    .height
-                    .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
-                    .is_some_and(|idx| now.saturating_sub(idx.time) >= min_age)
+                && self
+                    .coin_time(utxo)
+                    .is_some_and(|t| older_than(now, t, min_age))
         };
         let regular = self.wallet.get_spendable_utxos(height, 1);
         regular
@@ -514,6 +513,20 @@ impl Staker {
                 .get_stakeable_vault_utxos(height, 1)
                 .iter()
                 .any(|(u, _)| aged(u))
+    }
+
+    /// When a coin came, as Divi Core's HasAgedCoins counts it: the wallet's
+    /// time for its transaction (GetTxTime, at most when the wallet received
+    /// it), else its block's time
+    fn coin_time(&self, utxo: &divi_wallet::WalletUtxo) -> Option<u32> {
+        let block_time = utxo
+            .height
+            .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
+            .map(|idx| idx.time);
+        match self.wallet.get_transaction(&utxo.txid) {
+            Some(record) => Some(u32::try_from(record.timestamp).unwrap_or(u32::MAX)),
+            None => block_time,
+        }
     }
 
     /// Calculate expected time to stake a block
@@ -2231,6 +2244,13 @@ pub(crate) fn superblock_payout(
     )
 }
 
+/// Divi Core HasAgedCoins: a coin counts once the time since it came is more
+/// than the minimum age (`GetAdjustedTime() - nTxTime > MinCoinAge`,
+/// wallet.cpp:1477); a coin dated ahead of the clock does not
+fn older_than(now: u32, coin_time: u32, min_age: u32) -> bool {
+    i64::from(now) - i64::from(coin_time) > i64::from(min_age)
+}
+
 /// Get current Unix timestamp
 fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -3306,6 +3326,119 @@ mod tests {
             StakingConfig::default(),
         );
         assert!(!staker.has_peers());
+    }
+
+    /// Blocks a test wallet scans when the test says
+    type DatedBlocks = Vec<(Hash256, u32, u32, Vec<Transaction>)>;
+
+    /// A staker on a regtest chain of `blocks` proof-of-work blocks paying its
+    /// wallet, the first dated `start` and each next one 60 s later; the wallet
+    /// has not scanned them yet
+    fn staker_with_dated_blocks(
+        start: u32,
+        blocks: u32,
+    ) -> (Staker, Arc<WalletDb>, DatedBlocks, tempfile::TempDir) {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        let pay_to = wallet.new_receiving_address().unwrap().script_pubkey();
+        let mut mined = Vec::new();
+        for k in 0..blocks {
+            let tip = chain.tip().unwrap();
+            let height = tip.height + 1;
+            let mut tag = divi_storage::bip34_height_script(height);
+            tag.extend_from_slice(&height.to_le_bytes());
+            let mut block = Block::default();
+            block.header.version = 4;
+            block.header.prev_block = tip.hash;
+            block.header.time = start + 60 * k;
+            block.header.bits = 0x207fffff;
+            block.transactions = vec![Transaction {
+                version: 1,
+                vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
+                vout: vec![TxOut::new(
+                    Amount::from_sat(1250 * 100_000_000),
+                    pay_to.clone(),
+                )],
+                lock_time: 0,
+            }];
+            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+            let target = Hash256::from_compact(block.header.bits);
+            while compute_block_hash(&block.header) > target {
+                block.header.nonce += 1;
+            }
+            let hash = compute_block_hash(&block.header);
+            mined.push((hash, height, block.header.time, block.transactions.clone()));
+            chain.accept_block(block).unwrap();
+        }
+        let config = StakingConfig {
+            min_coin_age: 0,
+            ..StakingConfig::default()
+        };
+        let staker = Staker::new(
+            Arc::clone(&wallet),
+            chain,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            config,
+        );
+        (staker, wallet, mined, temp_dir)
+    }
+
+    fn scan(wallet: &WalletDb, blocks: &DatedBlocks) {
+        for (hash, height, time, txs) in blocks {
+            wallet.scan_block(*hash, *height, *time, txs);
+        }
+    }
+
+    /// Divi Core HasAgedCoins counts a coin only once it is older than the
+    /// minimum age (wallet.cpp:1477, strictly), from the wallet's time for it,
+    /// which is at most when the wallet received it (GetTxTime). With a minimum
+    /// of 0 (regtest, chainparams.cpp:498): mature coins from two hours ago are
+    /// mintable; coins in blocks dated ahead of the clock are not in the second
+    /// they arrive, and are once a moment has passed
+    #[test]
+    fn mintable_coins_count_from_their_arrival() {
+        let now = current_timestamp() as u32;
+        let (past, wallet, blocks, _a) = staker_with_dated_blocks(now - 7200, 30);
+        scan(&wallet, &blocks);
+        assert!(past.has_mintable_coins(), "mature coins from two hours ago");
+
+        let (ahead, wallet, blocks, _b) = staker_with_dated_blocks(now + 300, 30);
+        // Scanned and checked within one second
+        let mut seen = None;
+        for _ in 0..20 {
+            let second = current_timestamp();
+            scan(&wallet, &blocks);
+            let mintable = ahead.has_mintable_coins();
+            if current_timestamp() == second {
+                seen = Some(mintable);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(seen, Some(false), "coins that arrived this very second");
+
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(
+            ahead.has_mintable_coins(),
+            "the same coins two seconds later"
+        );
     }
 
     #[test]
