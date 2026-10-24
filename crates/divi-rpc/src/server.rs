@@ -1137,10 +1137,9 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "backupwallet" => &[(0, "str")],
         // rpcmisc.cpp:65
         "ban" => &[(0, "str")],
-        // rpcdump.cpp:295
-        "bip38decrypt" => &[(0, "str"), (1, "str")],
-        // rpcdump.cpp:249
-        "bip38paperwallet" => &[(0, "str")],
+        // bip38decrypt, bip38paperwallet, dumpprivkey and importprivkey check
+        // that the wallet is unlocked before they read an argument
+        // (rpcdump.cpp:59, :184, :262, :309), so they check their own types
         // rpcmasternode.cpp:361
         "broadcaststartmasternode" => &[(0, "str"), (1, "str")],
         // rpcrawtransaction.cpp:361
@@ -1151,8 +1150,6 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "decoderawtransaction" => &[(0, "str")],
         // rpcrawtransaction.cpp:527
         "decodescript" => &[(0, "str")],
-        // rpcdump.cpp:170
-        "dumpprivkey" => &[(0, "str")],
         // rpcwallet.cpp:2692
         "encryptwallet" => &[(0, "str")],
         // rpcmining.cpp:120
@@ -1197,8 +1194,6 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "importaddress" => &[(0, "str"), (1, "str"), (2, "bool")],
         // rpcmasternode.cpp:595
         "importmnbroadcast" => &[(0, "str")],
-        // rpcdump.cpp:41
-        "importprivkey" => &[(0, "str"), (1, "str"), (2, "bool")],
         // rpcblockchain.cpp:612
         "invalidateblock" => &[(0, "str")],
         // rpcwallet.cpp:2544
@@ -1321,6 +1316,13 @@ fn argument_count(method: &str) -> Option<(usize, usize)> {
         "setgenerate" => (1, 1),
         // rpcmining.cpp:123
         "generateblock" => (0, 1),
+        // rpcdump.cpp:43, :107, :172, :251, :297
+        "importprivkey" | "importaddress" => (1, 3),
+        "dumpprivkey" | "bip38paperwallet" => (1, 1),
+        "bip38decrypt" => (2, 2),
+        // rpcwallet.cpp:2527, :2546
+        "backupwallet" => (1, 1),
+        "keypoolrefill" => (0, 1),
         // rpcwallet.cpp:283, :540, :588, :626, :652, :1501, :1946, :2322
         "getnewaddress" => (0, 1),
         "getaccountaddress" | "getaccount" | "getaddressesbyaccount" => (1, 1),
