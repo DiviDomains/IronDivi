@@ -314,3 +314,34 @@ fn listunspent_account_only_for_address_book_addresses() {
     assert_eq!(find(&handed_out)["account"], json!(""));
     assert!(find(&pooled).get("account").is_none(), "{}", find(&pooled));
 }
+
+/// Moving an account's unused current address to another account gives the
+/// old account a new current address (setaccount, rpcwallet.cpp:609-615)
+#[test]
+fn setaccount_of_the_current_address_gives_the_old_account_a_new_one() {
+    let net = Net::new();
+    let rpc = net.rpc();
+    let first = book_address(&net);
+    assert_eq!(
+        rpc.get_account_address(&p(vec![json!("")])).unwrap(),
+        json!(first.to_string())
+    );
+    rpc.set_account(&p(vec![json!(first.to_string()), json!("moved")]))
+        .unwrap();
+    let current = rpc.get_account_address(&p(vec![json!("")])).unwrap();
+    assert_ne!(current, json!(first.to_string()));
+    let unnamed = rpc.get_addresses_by_account(&p(vec![json!("")])).unwrap();
+    assert_eq!(unnamed, json!([current]), "{unnamed}");
+
+    // An address that is not the account's current one moves alone
+    let second = book_address(&net);
+    let third = book_address(&net);
+    rpc.set_account(&p(vec![json!(second.to_string()), json!("moved")]))
+        .unwrap();
+    let unnamed = rpc.get_addresses_by_account(&p(vec![json!("")])).unwrap();
+    assert_eq!(unnamed.as_array().unwrap().len(), 2, "{unnamed}");
+    assert!(unnamed
+        .as_array()
+        .unwrap()
+        .contains(&json!(third.to_string())));
+}

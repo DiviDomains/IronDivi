@@ -4289,6 +4289,14 @@ impl WalletRpc {
             .into());
         }
 
+        // Moving the unused current address of an account away gives that
+        // account a new one (rpcwallet.cpp:609-615)
+        if wallet.in_address_book(&address) {
+            let old = wallet.get_account(&address);
+            if Self::account_address(&wallet, &old, false)? == address.to_string() {
+                Self::account_address(&wallet, &old, true)?;
+            }
+        }
         wallet.set_account(&address, account);
 
         wallet.save().map_err(|e| {
@@ -4304,14 +4312,20 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Account required"))?;
 
         let wallet = self.get_wallet()?;
+        Ok(serde_json::json!(Self::account_address(
+            &wallet, account, false
+        )?))
+    }
 
-        // Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
-        // last address, unless a wallet transaction already pays it
+    /// Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
+    /// last address, unless a wallet transaction already pays it or
+    /// `force_new`; otherwise a new key from the pool labelled with the account
+    fn account_address(wallet: &WalletDb, account: &str, force_new: bool) -> Result<String, Error> {
         let addresses = wallet.get_addresses_by_account(account);
-        if let Some(last) = addresses.last() {
+        if let (Some(last), false) = (addresses.last(), force_new) {
             let paid = wallet.received_outputs().iter().any(|o| &o.address == last);
             if !paid {
-                return Ok(serde_json::json!(last));
+                return Ok(last.clone());
             }
         }
 
@@ -4321,7 +4335,7 @@ impl WalletRpc {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
-        Ok(serde_json::json!(new_addr.to_string()))
+        Ok(new_addr.to_string())
     }
 
     pub fn get_addresses_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
