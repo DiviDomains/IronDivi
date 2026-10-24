@@ -466,7 +466,13 @@ mine(1)
 settled()
 event_rows("a block with that transaction")
 
+# b reaches both followers before c is sent: the miner (divid) announces two
+# transactions to each peer in its own order (main.cpp:1144-1185 holds 3 of 4
+# tx invs back for a random trickle peer); when c does not spend b's change,
+# sent back to back each follower could accept, and announce, them in a
+# different order
 b = M.rpc("sendtoaddress", M.rpc("getnewaddress"), 5)
+settled([b])
 c = M.rpc("sendtoaddress", M.rpc("getnewaddress"), 7)
 settled([b, c])
 mine(1)

@@ -42,7 +42,7 @@ socket), and `rawblock` and `rawtx` have one each.
 | 25 blocks | mines 25 blocks, one at a time |
 | a transaction | sends 10 DIVI to itself |
 | a block with that transaction | mines one block |
-| two transactions, then a block with both | two sends, then a block |
+| two transactions, then a block with both | a send, a second send once both followers have the first, then a block |
 | a transaction and its block before the reorganization | a send, then a block with it |
 | reorganization: two blocks replace one | `invalidateblock` on its tip, then two blocks on the parent; the followers switch when the second arrives |
 | after restart, before any block | both followers are stopped and started again (nothing may be published) |
