@@ -1045,3 +1045,31 @@ fn debitvaultbyname_names_the_ownership_type() {
         )
     );
 }
+
+/// debitvaultbyname of a vault with no spendable coin while the wallet's
+/// vaults hold enough: divid's balance check is over all vaults and passes
+/// (GetVaultedBalance, rpcwallet.cpp:727-734); its coin selection for this
+/// vault then fails, -4 with the selection's text (rpcwallet.cpp:796-800,
+/// wallet.cpp:1779)
+#[test]
+fn debitvaultbyname_of_a_vault_without_coins_fails_coin_selection() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.owner);
+    let other_manager = s.manager.new_receiving_address().unwrap();
+    let empty = format!("{}:{}", s.owner_addr, other_manager);
+    let dest = s.owner.new_receiving_address().unwrap();
+    match rpc
+        .debit_vault_by_name(&p(vec![json!(empty), json!(dest.to_string()), json!(1.0)]))
+        .unwrap_err()
+    {
+        divi_rpc::Error::Rpc(r) => assert_eq!(
+            (r.code, r.message.as_str()),
+            (
+                -4,
+                "Insufficient funds to meet coin selection algorithm requirements."
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.net.submitted.lock().is_empty());
+}

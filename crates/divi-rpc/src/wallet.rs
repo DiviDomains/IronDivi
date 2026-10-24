@@ -2898,10 +2898,13 @@ impl WalletRpc {
             .into_iter()
             .filter(|u| u.script_pubkey == vault_script)
             .collect();
+        // The balance check above is over all vaults, as Divi Core's; coin
+        // selection for this vault then finds nothing, -4 with its text
+        // (rpcwallet.cpp:796-800, wallet.cpp:1779)
         if candidates.is_empty() {
             return Err(RpcError::new(
-                codes::WALLET_INSUFFICIENT_FUNDS,
-                format!("No funds available in vault {}", vault_encoding),
+                codes::WALLET_ERROR,
+                "Insufficient funds to meet coin selection algorithm requirements.",
             )
             .into());
         }
