@@ -9,13 +9,11 @@
 //! `setgenerate N` on regtest mines N blocks to the wallet: proof of work up
 //! to the last PoW block, proof of stake after it (BasicSwap's test setup).
 
-mod common;
-
-use common::free_port;
+use divi_test_support::start_node;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -58,34 +56,26 @@ impl Drop for KillOnDrop {
 #[test]
 fn setgenerate_mines_pow_then_pos() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = free_port();
-    let p2p_port = free_port();
-
-    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-        .arg("--regtest")
-        .arg("--datadir")
-        .arg(dir.path())
-        .args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &p2p_port.to_string()])
-        // BasicSwap starts the node with staking off and mines with setgenerate
-        .args(["--bind", "127.0.0.1", "--staking=false"])
-        // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
-        .args(["--rpcuser", "test", "--rpcpassword", "test"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn irondivid");
-    let mut node = KillOnDrop(child);
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while rpc(rpc_port, "getblockcount", serde_json::json!([])).is_none() {
-        assert!(
-            node.0.try_wait().unwrap().is_none(),
-            "irondivid exited before its RPC server came up"
-        );
-        assert!(Instant::now() < deadline, "RPC server did not come up");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    let (child, rpc_port, _) = start_node(
+        dir.path(),
+        |rpc_port, p2p_port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+            cmd.arg("--regtest")
+                .arg("--datadir")
+                .arg(dir.path())
+                .args(["--rpcport", &rpc_port.to_string()])
+                .args(["--port", &p2p_port.to_string()])
+                // BasicSwap starts the node with staking off and mines with setgenerate
+                .args(["--bind", "127.0.0.1", "--staking=false"])
+                // RPC always requires credentials; "dGVzdDp0ZXN0" is base64 of test:test
+                .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount", serde_json::json!([])).is_some(),
+    );
+    let _node = KillOnDrop(child);
 
     assert!(ok(rpc_port, "setgenerate", serde_json::json!([0])).is_null());
 

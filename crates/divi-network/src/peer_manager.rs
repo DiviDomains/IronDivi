@@ -1693,10 +1693,7 @@ mod tests {
     /// to the peer) and completes the handshake end to end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_outbound_connection_goes_through_socks5_proxy() {
-        let listen: SocketAddr = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap()
-        };
+        let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let server = PeerManager::new(local_only(Some(listen), None));
         tokio::spawn(Arc::clone(&server).start());
         let (proxy, seen) = crate::socks5::stub::start().await;
@@ -1733,10 +1730,7 @@ mod tests {
     async fn test_dead_proxy_does_not_fall_back_to_direct() {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
-        let dead_proxy = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let dead_proxy = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let client = PeerManager::new(local_only(None, Some(dead_proxy)));
         let err = Arc::clone(&client).connect_to_peer(target_addr).await;
         assert!(err.is_err());

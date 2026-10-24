@@ -11,6 +11,7 @@
 use divi_node::config::NodeConfig;
 use divi_node::Node;
 use divi_primitives::ChainMode;
+use divi_test_support::free_port;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,27 +30,6 @@ pub struct TestNode {
     pub node: Node,
     pub port: u16,
     _dir: tempfile::TempDir,
-}
-
-/// A port nothing listens on now, for the node to listen on.
-///
-/// Below the kernel's ephemeral range (32768-60999 on Linux, 49152-65535 on
-/// macOS), which every outgoing connection on the host draws from: a port
-/// from 127.0.0.1:0 can be taken by one of them before it is bound. Picked at
-/// random so that test processes running at the same time do not try the
-/// same ports in the same order.
-fn free_port() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    let seed = std::collections::hash_map::RandomState::new();
-    for i in 0u32..1000 {
-        let mut h = seed.build_hasher();
-        h.write_u32(i);
-        let port = 20000 + (h.finish() % 12768) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in 20000-32767");
 }
 
 impl TestNode {
@@ -88,7 +68,7 @@ impl TestNode {
         self.node.start().await.unwrap();
         let port = self.port;
         // The listener comes up on a spawned task
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(divi_test_support::START_WAIT, async {
             while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
