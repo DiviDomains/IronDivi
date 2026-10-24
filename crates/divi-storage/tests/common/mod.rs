@@ -36,6 +36,7 @@ pub struct Coin {
 
 pub struct TestChain {
     _dir: TempDir,
+    pub db: Arc<ChainDatabase>,
     pub chain: Chain,
     pub key: SecretKey,
     pub pay: Script,
@@ -108,11 +109,12 @@ impl TestChain {
     pub fn new(params: ChainParams) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
-        let chain = Chain::new(db, params).unwrap();
+        let chain = Chain::new(Arc::clone(&db), params).unwrap();
         let key = SecretKey::from_bytes(&[7u8; 32]).unwrap();
         let pay = Script::new_p2pkh(key.public_key().pubkey_hash().as_bytes());
         TestChain {
             _dir: dir,
+            db,
             chain,
             key,
             pay,

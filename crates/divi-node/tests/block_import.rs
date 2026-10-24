@@ -82,7 +82,14 @@ fn height_after_loadblock(file: &[u8]) -> u32 {
     std::fs::write(&path, file).unwrap();
     let mut config = config(&dir.path().join("node"));
     config.load_block = vec![path];
-    Node::new(config).unwrap().chain().height()
+    imported(Node::new(config).unwrap()).chain().height()
+}
+
+/// `node` once its block import (started as Node::start starts it) is done
+fn imported(node: Node) -> Node {
+    node.spawn_import();
+    node.wait_for_import();
+    node
 }
 
 /// bootstrap.dat in the data directory is imported at start and renamed
@@ -96,7 +103,7 @@ fn bootstrap_dat_in_the_datadir_is_imported_and_renamed() {
         block_file(&blocks, regtest_magic()),
     )
     .unwrap();
-    let node = Node::new(config(dir.path())).unwrap();
+    let node = imported(Node::new(config(dir.path())).unwrap());
     assert_eq!(node.chain().height(), 12, "bootstrap.dat was not imported");
     assert_eq!(
         node.chain().tip().unwrap().hash,
@@ -106,7 +113,12 @@ fn bootstrap_dat_in_the_datadir_is_imported_and_renamed() {
     assert!(!dir.path().join("bootstrap.dat").exists());
     assert!(dir.path().join("bootstrap.dat.old").exists());
     // Imported once: the next start has nothing to import and keeps the chain
-    assert_eq!(Node::new(config(dir.path())).unwrap().chain().height(), 12);
+    assert_eq!(
+        imported(Node::new(config(dir.path())).unwrap())
+            .chain()
+            .height(),
+        12
+    );
 }
 
 /// -loadblock files: the whole chain, junk between records skipped, the
@@ -162,5 +174,5 @@ fn a_missing_loadblock_file_is_passed_over() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path());
     config.load_block = vec![dir.path().join("no-such-file.dat")];
-    assert_eq!(Node::new(config).unwrap().chain().height(), 0);
+    assert_eq!(imported(Node::new(config).unwrap()).chain().height(), 0);
 }

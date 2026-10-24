@@ -33,46 +33,18 @@ START_TIMEOUT = 120
 # a KNOWN row that matches divid, or differs in another way, is a FAIL.
 
 
-def unspent_lookup(c, i):
-    return c[0] == "ok" and i[:2] == ("err", -5)
-
-
-def refusal_prefix(c, i):
-    return (c[0] == i[0] == "exit" and c[1] == i[1] and c[2].startswith("Error: ")
-            and i[2].startswith("Error: ") and i[2] != c[2] and i[2].endswith(": " + c[2][len("Error: "):]))
-
-
 def core_aborts(c, i):
     return c[0] == i[0] == "exit" and c[1] == -6 and i[1] == 1 and c[2] == i[2]
 
 
-def sporkkey_ignored(c, i):
-    return c == ("exit", 1, "Error: Unable to sign spork message, wrong key?") and i[0] == "up"
-
-
-UNSPENT = ("without -txindex divid still finds a tx with an unspent output: it reads the block at the "
-           "height its coins have (divi/src/TransactionDiskAccessor.cpp:88-110); irondivid looks only in "
-           "the mempool and the transaction index", unspent_lookup)
-PREFIX = ("same exit code and divid's text, but irondivid puts 'Failed to initialize node: initialization "
-          "error: ' before it (divid: divi/src/init.cpp:1104-1105, :1530, printed by noui.cpp:38-40)",
-          refusal_prefix)
 ABORT = ("same message; divid then aborts (SIGABRT) in the shutdown after this early InitError: "
          "PrepareShutdown's FlushStateToDisk (divi/src/init.cpp:381) asserts in ChainstateManager::Get "
          "(divi/src/ChainstateManager.cpp:102) before the chain state exists; irondivid exits 1", core_aborts)
 KNOWN = {
-    "-txindex=0: getrawtransaction of an unspent tx": UNSPENT,
-    "-txindex=0 after -reindex: getrawtransaction of an unspent tx": UNSPENT,
-    "restart -txindex=1 without -reindex": PREFIX,
-    "restart -txindex=0 without -reindex": PREFIX,
-    "restart with -txindex left at its default after it was switched off": PREFIX,
     "start -minrelaytxfee=0": ABORT,
     "start -minrelaytxfee=0.0": ABORT,
     "start -minrelaytxfee=abc": ABORT,
     "start -minrelaytxfee=-0.0001": ABORT,
-    "start -sporkkey=<a key that is not the spork key>": (
-        "divid refuses a -sporkkey that is not the network's spork key (divi/src/init.cpp:971-974); "
-        "irondivid does not sign sporks and starts, with 'Unknown option -sporkkey; ignored' in its log",
-        sporkkey_ignored),
 }
 
 fails = 0

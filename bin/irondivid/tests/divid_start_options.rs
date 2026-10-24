@@ -257,6 +257,51 @@ fn start_up_refusals_are_divid_s() {
     }
 }
 
+/// A start the node refuses prints divid's InitError line, "Error: " and the
+/// reason alone (noui.cpp:38-40), and exits 1 (divid.cpp:180): a changed
+/// -txindex without -reindex (init.cpp:1104-1105) and a -sporkkey that is not
+/// the network's spork key (init.cpp:971-974)
+#[test]
+fn refused_starts_print_divid_s_error_line() {
+    // The lines of stderr that report an error ("Logging to ..." comes first)
+    let errors = |out: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter(|l| l.starts_with("Error"))
+            .map(String::from)
+            .collect()
+    };
+    let bin = env!("CARGO_BIN_EXE_irondivid");
+    let dir = tempfile::tempdir().unwrap();
+    let rpc_port = free_port();
+    let mut args = divid_args(dir.path(), rpc_port);
+    args.push("-txindex=0".into());
+    drop(Daemon::start(&args, &[], rpc_port, true));
+
+    let mut args = divid_args(dir.path(), free_port());
+    args.push("-txindex=1".into());
+    let out = output_within(Command::new(bin).args(&args));
+    assert_eq!(
+        errors(&out),
+        ["Error: You need to rebuild the database using -reindex to change -txindex"]
+    );
+    assert_eq!(out.status.code(), Some(1));
+
+    // A key made here, in divi.conf: not regtest's spork key
+    let key = divi_crypto::keys::SecretKey::new_random();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(key.as_bytes());
+    let wif = divi_wallet::encode_wif(&bytes, true, Network::Testnet);
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::write(fresh.path().join("divi.conf"), format!("sporkkey={wif}\n")).unwrap();
+    let out = output_within(Command::new(bin).args(divid_args(fresh.path(), free_port())));
+    assert_eq!(
+        errors(&out),
+        ["Error: Unable to sign spork message, wrong key?"]
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
 /// -server=0: the node runs, with no RPC server
 #[test]
 fn server_0_runs_without_rpc() {

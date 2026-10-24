@@ -571,6 +571,14 @@ impl ChainDatabase {
     /// `CCoins::IsPruned` is false: OP_META outputs never count). RocksDB holds
     /// every UTXO write, so a prefix scan sees them all.
     pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
+        Ok(self.spendable_output_height_of(txid)?.is_some())
+    }
+
+    /// The height of the block holding `txid`, from any of its unspent
+    /// spendable outputs: what Divi Core's coins entry for it records
+    /// (`CCoins::nHeight`); None once every such output is spent. Read from
+    /// the database, which every UTXO change is written to.
+    pub fn spendable_output_height_of(&self, txid: &Hash256) -> Result<Option<u32>, StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).unwrap();
         let mut prefix = Vec::with_capacity(33);
         prefix.push(b'u');
@@ -584,11 +592,12 @@ impl ChainDatabase {
             if !key.starts_with(&prefix) {
                 break;
             }
-            if !Utxo::from_bytes(&value)?.script_pubkey.is_op_return() {
-                return Ok(true);
+            let utxo = Utxo::from_bytes(&value)?;
+            if !utxo.script_pubkey.is_op_return() {
+                return Ok(Some(utxo.height));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Get a UTXO directly from database (bypassing cache)
@@ -611,6 +620,20 @@ impl ChainDatabase {
         } else {
             Ok(0)
         }
+    }
+
+    /// Value of every stored output, unspendable (OP_META) ones included: the
+    /// money supply at the tip, as Divi Core counts it (every output a block
+    /// creates minus every output it spends, TransactionInputChecker.cpp:79-80)
+    pub fn utxo_value_total(&self) -> Result<i64, StorageError> {
+        let snapshot = self.db.snapshot();
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut total = 0i64;
+        for item in snapshot.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (_, value) = item?;
+            total += Utxo::from_bytes(&value)?.value.as_sat();
+        }
+        Ok(total)
     }
 
     /// The UTXO set's statistics, as Divi Core's `gettxoutsetinfo` reports them

@@ -45,8 +45,8 @@ coins:
 
 | step | rows (each on both nodes) |
 |---|---|
-| fresh start `-txindex=0` | starts; `getrawtransaction` of T1 (-5) and of T2; `getnetworkinfo` `relayfee` (0.0001); `spork show` |
-| restart `-txindex=1` | refused: exit 1, `Error: You need to rebuild the database using -reindex to change -txindex` |
+| fresh start `-txindex=0` | starts; `getrawtransaction` of T1 (-5) and of T2 (found without the index, from the block its unspent output records: `divi/src/TransactionDiskAccessor.cpp:88-110`); `getnetworkinfo` `relayfee` (0.0001); `spork show` |
+| restart `-txindex=1` | refused: exit 1, `Error: You need to rebuild the database using -reindex to change -txindex` (`divi/src/init.cpp:1104-1105`, given to `InitError` at `:1530`, which prints `Error: <text>`: `divi/src/noui.cpp:38-40`) |
 | restart `-txindex=1 -reindex` | starts; same tip as before; T1 and T2 found, T1's hex is the one sent; `spork show` the same as before the restart |
 | restart, `-txindex` not given | starts (the default is on); same tip; T1 and T2 found |
 | restart `-txindex=0` | refused as above |
@@ -54,7 +54,7 @@ coins:
 | restart, `-txindex` not given | refused as above (the default is on, the index is off) |
 | `-minrelaytxfee=0`, `0.0`, `abc`, `-0.0001` | refused: `Error: Invalid amount for -minrelaytxfee=<amount>: '<value>'` |
 | `-minrelaytxfee=0.000015` | starts; same tip; `relayfee` 0.000015 in `getnetworkinfo` and `getinfo`; a 0.01 coin sent paying 200 satoshis is refused (-26 `66: insufficient priority`, the floor is about 285 for its 190 or so bytes), paying 400 it is accepted |
-| `-sporkkey=<a key made here>` | divid refuses it; see KNOWN |
+| `-sporkkey=<a key made here>` | refused: exit 1, `Error: Unable to sign spork message, wrong key?` (`divi/src/init.cpp:971-974`) |
 | restart `-txindex=0` | starts; same tip |
 | `--export-chain` (irondivid only) | see below |
 
@@ -80,21 +80,10 @@ With irondivid stopped, on its synced datadir, as `--export-chain --export-start
 Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f76c). Each KNOWN row checks that the
 difference is exactly this one; any other outcome is a FAIL.
 
-- **`getrawtransaction` of T2 without `-txindex`** (two rows): divid still finds a transaction that has an unspent
-  output: it reads the block at the height its coins record (`divi/src/TransactionDiskAccessor.cpp:88-110`).
-  irondivid looks only in the mempool and the transaction index, and answers -5 `No information available about
-  transaction`. A fully spent transaction (T1) is -5 on both.
-- **A refused `-txindex` change** (three rows): same exit code 1 and divid's text, but irondivid's line is
-  `Error: Failed to initialize node: initialization error: You need to rebuild the database using -reindex to
-  change -txindex`. divid: `divi/src/init.cpp:1104-1105`, given to `InitError` at `:1530`, which prints
-  `Error: <text>` (`divi/src/noui.cpp:38-40`).
 - **`-minrelaytxfee` refused** (four rows): the same `Error:` line on both. divid then aborts (SIGABRT, exit -6
   here): the shutdown after this early `InitError` (`divi/src/init.cpp:823-829`) flushes the chain state
   (`divi/src/init.cpp:381`), and `ChainstateManager::Get` asserts (`divi/src/ChainstateManager.cpp:102`) because no
-  chain state exists yet. irondivid exits 1.
-- **`-sporkkey` that is not the spork key**: divid refuses to start with `Error: Unable to sign spork message, wrong
-  key?` (`divi/src/init.cpp:971-974`). irondivid does not sign sporks: it starts and logs `Unknown option
-  -sporkkey; ignored`.
+  chain state exists yet. irondivid exits 1: divid's abort is not copied.
 - **A spork set on regtest and kept across a restart: not run.** Regtest uses testnet's spork key
   (`divi/src/chainparams.cpp:443`; `CRegTestParams` derives from `CTestNetParams`, `:457`) and its private key is
   not public, so no spork can be signed here. `spork show` across a restart is compared with the default values
@@ -103,4 +92,4 @@ difference is exactly this one; any other outcome is a FAIL.
 ## Proving a difference is caught
 
 `RESTART_OPTIONS_INJECT=txindex-refusal` starts irondivid with `-txindex=1 -reindex` where both should be refused for
-`-txindex=1` alone. That row then prints `FAIL` (`listed as KNOWN, but differs in another way`) and the run exits 1.
+`-txindex=1` alone. That row then prints `FAIL` and the run exits 1.

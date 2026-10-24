@@ -20,18 +20,22 @@ use std::path::Path;
 const NETWORK_KEY: &[u8] = b"network";
 
 /// The reason `path` is a database irondivid did not make, if it is one: a
-/// folder with a LevelDB `CURRENT` file and no RocksDB `OPTIONS-*` file, as
-/// Divi Core's `chainstate/` and `blocks/index/` are. RocksDB writes an
-/// options file into every database it opens.
+/// folder with a LevelDB `CURRENT` file and neither a RocksDB `OPTIONS-*` nor
+/// `IDENTITY` file, as Divi Core's `chainstate/` and `blocks/index/` are.
+/// RocksDB writes an options file into every database it opens, but only at
+/// the end of the open; a new database gets its `IDENTITY` file before its
+/// `CURRENT` file (db_impl_open.cc, DBImpl::NewDB), so a first open cut short
+/// by a crash is still recognised as irondivid's. LevelDB has no `IDENTITY`.
 pub fn foreign_database(path: &Path) -> Option<String> {
     if !path.join("CURRENT").is_file() {
         return None;
     }
     let entries = std::fs::read_dir(path).ok()?;
-    let has_options = entries
-        .flatten()
-        .any(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"));
-    (!has_options).then(|| {
+    let has_rocksdb_file = entries.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.starts_with("OPTIONS-") || name == "IDENTITY"
+    });
+    (!has_rocksdb_file).then(|| {
         format!(
             "{} holds a LevelDB database, which irondivid did not make \
              (Divi Core keeps its chain in LevelDB databases like this one)",
@@ -183,6 +187,33 @@ mod tests {
         assert!(foreign_database(&path).is_none());
         ChainDatabase::open(&path).unwrap();
         assert!(divi_core_datadir(dir.path()).is_none());
+    }
+
+    /// A RocksDB folder whose first open was cut short before RocksDB wrote
+    /// its options file, as a kill -9 at the first start leaves it
+    fn cut_short(path: &Path) {
+        for e in std::fs::read_dir(path).unwrap().flatten() {
+            if e.file_name().to_string_lossy().starts_with("OPTIONS-") {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
+        assert!(path.join("IDENTITY").is_file() && path.join("CURRENT").is_file());
+    }
+
+    #[test]
+    fn database_cut_short_at_its_first_open_opens_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let chainstate = dir.path().join("chainstate");
+        drop(ChainDatabase::open(&chainstate).unwrap());
+        cut_short(&chainstate);
+        assert!(foreign_database(&chainstate).is_none());
+        assert!(divi_core_datadir(dir.path()).is_none());
+        ChainDatabase::open(&chainstate).unwrap();
+
+        let txindex = dir.path().join("txindex");
+        drop(crate::txindex::TxIndex::open(&txindex).unwrap());
+        cut_short(&txindex);
+        crate::txindex::TxIndex::open(&txindex).unwrap();
     }
 
     #[test]

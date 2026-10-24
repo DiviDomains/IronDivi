@@ -517,33 +517,18 @@ impl RpcServer {
         }
     }
 
-    /// Divi Core answers a call with a wrong number of arguments with the
-    /// method's help as a -1 error (`if (fHelp || params.size() ...) throw
-    /// runtime_error(help)`), before any argument is read
-    fn argument_count_check(&self, method: &str, params: &Params) -> Result<(), Error> {
-        let allowed = match method {
-            // rpcmining.cpp:227, rpcblockchain.cpp:557
-            "getmininginfo" | "getmempoolinfo" => 0..=0,
-            // rpcblockchain.cpp:82
-            "getrawmempool" => 0..=1,
-            // rpcmining.cpp:253
-            "prioritisetransaction" => 3..=3,
-            // rpcmining.cpp:54
-            "setgenerate" => 1..=1,
-            // rpcmining.cpp:123
-            "generateblock" => 0..=1,
-            _ => return Ok(()),
-        };
-        if allowed.contains(&params.len()) {
-            return Ok(());
-        }
-        let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
-        Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into())
-    }
-
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
-        self.argument_count_check(method, params)?;
+        // Divi Core's `if (fHelp || params.size() ...)` comes first: a wrong
+        // argument count answers -1 with the call's help text
+        if let Some((min, max)) = argument_count(method) {
+            if !matches!(params, Params::Object(_)) && !(min..=max).contains(&params.len()) {
+                let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
+                return Err(
+                    RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into(),
+                );
+            }
+        }
         rpc_type_check(method, params)?;
         match method {
             // Blockchain methods
@@ -1108,6 +1093,33 @@ impl RpcServer {
             "DIVI server stopping".to_string(),
         ))
     }
+}
+
+/// How many arguments Divi Core takes for a call, as its `fHelp` check counts
+/// them (rpcblockchain.cpp:36-557, rpcmining.cpp:54-253, rpcmisc.cpp:103,
+/// rpcrawtransaction.cpp:141-830)
+fn argument_count(method: &str) -> Option<(usize, usize)> {
+    Some(match method {
+        "getblockchaininfo" | "getblockcount" | "getbestblockhash" | "getdifficulty"
+        | "getchaintips" | "gettxoutsetinfo" | "getinfo" => (0, 0),
+        "getblockhash" | "decoderawtransaction" | "decodescript" => (1, 1),
+        "getblock" | "getblockheader" | "getrawtransaction" | "sendrawtransaction" => (1, 2),
+        "gettxout" => (2, 3),
+        "verifychain" => (0, 2),
+        "createrawtransaction" => (2, 2),
+        "signrawtransaction" => (1, 4),
+        // rpcmining.cpp:227, rpcblockchain.cpp:557
+        "getmininginfo" | "getmempoolinfo" => (0, 0),
+        // rpcblockchain.cpp:82
+        "getrawmempool" => (0, 1),
+        // rpcmining.cpp:253
+        "prioritisetransaction" => (3, 3),
+        // rpcmining.cpp:54
+        "setgenerate" => (1, 1),
+        // rpcmining.cpp:123
+        "generateblock" => (0, 1),
+        _ => return None,
+    })
 }
 
 /// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)

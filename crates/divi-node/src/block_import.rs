@@ -22,6 +22,7 @@ use divi_storage::{Chain, StorageError};
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Divi Core MAX_BLOCK_SIZE_CURRENT: a record larger than this is skipped
 const MAX_BLOCK_SIZE: usize = 2_000_000;
@@ -112,10 +113,14 @@ fn is_system_error(e: &StorageError) -> bool {
 /// - a block already stored is skipped
 /// - any other block is checked and connected as a block from a peer; a
 ///   refused block is skipped, a storage failure stops the file
+///
+/// `stop` ends the import between records, as a shutdown interrupts Divi
+/// Core's import thread (init.cpp:576).
 pub fn import_block_file(
     chain: &Chain,
     path: &Path,
     message_start: [u8; 4],
+    stop: &AtomicBool,
 ) -> std::io::Result<ImportResult> {
     let started = std::time::Instant::now();
     let mut window = Window {
@@ -129,6 +134,10 @@ pub fn import_block_file(
     let mut rewind = 0usize;
     // Locate each record header
     while let Some(at) = window.find(rewind, message_start[0])? {
+        if stop.load(Ordering::SeqCst) {
+            tracing::info!("Block import of {} stopped", path.display());
+            break;
+        }
         rewind = at + 1;
         if !window.have(at, 8)? {
             break; // no full header left
@@ -228,14 +237,17 @@ pub fn import_block_file(
     Ok(result)
 }
 
-/// Import `<data_dir>/bootstrap.dat`, then renamed to bootstrap.dat.old, and
-/// then each `-loadblock` file in turn, as Divi Core does at start
-/// (init.cpp:684-722). A file that cannot be opened is logged and passed.
+/// Import `<bootstrap_dir>/bootstrap.dat`, then renamed to bootstrap.dat.old,
+/// and then each `-loadblock` file in turn, as Divi Core does on its import
+/// thread (init.cpp:684-722). A file that cannot be opened is logged and
+/// passed; `stop` ends the import, leaving bootstrap.dat in place if it was
+/// not read to the end.
 pub fn import_at_start(
     chain: &Chain,
-    data_dir: &Path,
+    bootstrap_dir: &Path,
     load_block: &[std::path::PathBuf],
     message_start: [u8; 4],
+    stop: &AtomicBool,
 ) -> ImportResult {
     let mut total = ImportResult::default();
     let mut add = |r: ImportResult| {
@@ -245,13 +257,14 @@ pub fn import_at_start(
         total.refused += r.refused;
         total.unreadable += r.unreadable;
     };
-    let bootstrap = data_dir.join("bootstrap.dat");
+    let bootstrap = bootstrap_dir.join("bootstrap.dat");
     if bootstrap.exists() {
         tracing::info!("Importing bootstrap.dat...");
-        match import_block_file(chain, &bootstrap, message_start) {
+        match import_block_file(chain, &bootstrap, message_start, stop) {
+            Ok(_) if stop.load(Ordering::SeqCst) => return total,
             Ok(r) => {
                 add(r);
-                let old = data_dir.join("bootstrap.dat.old");
+                let old = bootstrap_dir.join("bootstrap.dat.old");
                 if let Err(e) = std::fs::rename(&bootstrap, &old) {
                     tracing::warn!("Could not rename bootstrap.dat to bootstrap.dat.old: {}", e);
                 }
@@ -264,8 +277,11 @@ pub fn import_at_start(
         }
     }
     for path in load_block {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         tracing::info!("Importing blocks file {}...", path.display());
-        match import_block_file(chain, path, message_start) {
+        match import_block_file(chain, path, message_start, stop) {
             Ok(r) => add(r),
             Err(e) => tracing::warn!(
                 "Warning: could not open blocks file {}: {}",
