@@ -9,9 +9,11 @@
 //! (rpcmining.cpp, rpcblockchain.cpp), checked against divid with
 //! scripts/mining-replies/run.sh.
 
+use divi_primitives::hash::Hash256;
 use divi_primitives::ChainMode;
 use divi_rpc::{Params, Request, RequestId, Response, RpcError, RpcServer};
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -141,4 +143,83 @@ fn getrawmempool_verbose_is_a_boolean() {
             format!("value is type {type_name}, expected bool")
         );
     }
+}
+
+/// A pool that records what prioritisetransaction hands it
+#[derive(Default)]
+struct Deltas(Mutex<Vec<(Hash256, f64, i64)>>);
+
+impl divi_rpc::blockchain::MempoolProvider for Deltas {
+    fn get_txids(&self) -> Vec<Hash256> {
+        Vec::new()
+    }
+    fn prioritise_transaction(&self, txid: &Hash256, priority: f64, fee: i64) -> bool {
+        self.0.lock().push((*txid, priority, fee));
+        true
+    }
+}
+
+/// prioritisetransaction as Divi Core reads it (rpcmining.cpp:251-276): the
+/// txid through ParseHashStr, the priority delta never read, the fee delta an
+/// integer; the answer is true, for a transaction not in the pool as well
+#[test]
+fn prioritisetransaction_reads_its_arguments_as_divid() {
+    let (server, _dir) = server();
+    let pool = Arc::new(Deltas::default());
+    server.set_mempool(pool.clone());
+    let txid = "ab".repeat(32);
+
+    // The priority delta may be anything: Core does not read it
+    for priority in [json!(0.0), json!("x"), json!(null), json!([1])] {
+        let r = result(
+            &server,
+            "prioritisetransaction",
+            vec![json!(txid), priority, json!(1000)],
+        );
+        assert_eq!(r, json!(true));
+    }
+    // A short hex txid is padded as uint256::SetHex pads it
+    result(
+        &server,
+        "prioritisetransaction",
+        vec![json!("aa"), json!(0), json!(-5)],
+    );
+    let calls = pool.0.lock().clone();
+    assert_eq!(calls.len(), 5);
+    assert!(calls[..4]
+        .iter()
+        .all(|(t, _, fee)| t.to_string() == txid && *fee == 1000));
+    assert_eq!(calls[4].0.to_string(), format!("{}aa", "0".repeat(62)));
+    assert_eq!(calls[4].2, -5);
+
+    for (args, message) in [
+        (
+            vec![json!("zz"), json!(0), json!(1)],
+            "txid must be hexadecimal string (not 'zz')",
+        ),
+        (
+            vec![json!("abc"), json!(0), json!(1)],
+            "txid must be hexadecimal string (not 'abc')",
+        ),
+        (
+            vec![json!(""), json!(0), json!(1)],
+            "txid must be hexadecimal string (not '')",
+        ),
+        (
+            vec![json!(1), json!(0), json!(1)],
+            "value is type int, expected str",
+        ),
+        (
+            vec![json!(txid), json!(0), json!("1000")],
+            "value is type str, expected int",
+        ),
+        (
+            vec![json!(txid), json!(0), json!(1.5)],
+            "value is type real, expected int",
+        ),
+    ] {
+        let e = error(&server, "prioritisetransaction", args.clone());
+        assert_eq!((e.code, e.message.as_str()), (-1, message), "{args:?}");
+    }
+    assert_eq!(pool.0.lock().len(), 5, "a refused call changes nothing");
 }
