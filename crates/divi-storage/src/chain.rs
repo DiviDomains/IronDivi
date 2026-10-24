@@ -423,8 +423,33 @@ impl Chain {
             );
             chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         }
+        chain.fill_tip_money_supply()?;
 
         Ok(chain)
+    }
+
+    /// Record the tip's money supply when the database has none for it (blocks
+    /// connected before the block index kept a supply). Divi Core's supply at a
+    /// block is the value of every output not yet spent, OP_META outputs
+    /// included, which is the sum of the UTXO set; blocks connected after this
+    /// carry it forward, and a disconnect works it back to the parent.
+    fn fill_tip_money_supply(&self) -> Result<(), StorageError> {
+        let Some(mut tip) = self.tip() else {
+            return Ok(());
+        };
+        if tip.height == 0 || tip.money_supply.is_some() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        tip.money_supply = Some(self.db.utxo_value_total()?);
+        self.db.store_block_index_entry(&tip)?;
+        info!(
+            "Recorded the money supply at height {} from the UTXO set in {} ms",
+            tip.height,
+            started.elapsed().as_millis()
+        );
+        *self.tip.write() = Some(tip);
+        Ok(())
     }
 
     /// Enable transaction index for O(1) transaction lookups. An index that
@@ -1428,6 +1453,11 @@ impl Chain {
 
     pub fn get_utxo_stats(&self) -> Result<crate::database::UtxoStats, StorageError> {
         self.db.get_utxo_stats()
+    }
+
+    /// Value of every stored output, OP_META ones included: the tip's money supply
+    pub fn utxo_value_total(&self) -> Result<i64, StorageError> {
+        self.db.utxo_value_total()
     }
 
     /// Get a block by hash
@@ -2701,9 +2731,15 @@ impl Chain {
             }
         }
 
+        // Value the block's inputs spent, known when its undo data is
+        let mut undo_spent: Option<i64> = None;
+
         // Restore spent UTXOs from undo data
         if let Some(ref undo_bytes) = undo_data {
-            if !undo_bytes.is_empty() {
+            if undo_bytes.is_empty() {
+                // the block had no non-coinbase inputs, nothing to restore
+                undo_spent = Some(0);
+            } else {
                 let block_undo = BlockUndo::from_bytes(undo_bytes)?;
                 trace!(
                     "  ├─ Restoring {} spent UTXOs from undo data",
@@ -2717,13 +2753,19 @@ impl Chain {
                     .iter()
                     .map(|tx| self.compute_txid(tx))
                     .collect();
+                undo_spent = Some(
+                    block_undo
+                        .entries
+                        .iter()
+                        .map(|e| e.prev_utxo.value.as_sat())
+                        .sum(),
+                );
                 for entry in block_undo.entries {
                     if !created.contains(&entry.outpoint.txid) {
                         utxo_batch.add(entry.outpoint, entry.prev_utxo);
                     }
                 }
             }
-            // else: block had no non-coinbase inputs, nothing to restore
         } else {
             // Fallback for blocks connected before undo data was implemented:
             // Use the old brute-force search method
@@ -2786,10 +2828,24 @@ impl Chain {
             None => None,
         };
 
-        let parent = self
+        let mut parent = self
             .db
             .get_block_index(&block.header.prev_block)?
             .ok_or_else(|| StorageError::BlockNotFound(block.header.prev_block.to_string()))?;
+        // A parent connected before the block index kept a supply gets it from
+        // this block's: Divi Core's rule (TransactionInputChecker.cpp:79-80) run backwards
+        let parent_supply = match (parent.money_supply, index.money_supply, undo_spent) {
+            (None, Some(supply), Some(spent)) if parent.height > 0 => {
+                let created: i64 = block
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| tx.vout.iter())
+                    .map(|o| o.value.as_sat())
+                    .sum();
+                Some(supply - created + spent)
+            }
+            _ => None,
+        };
 
         // UTXO changes, undo data removed, index entry off the main chain, height
         // entry removed and the tip moved to the parent, in one write. The
@@ -2810,6 +2866,11 @@ impl Chain {
                 (Some(search), Some(updates)) => search.add_to_batch(wb, updates, true),
                 _ => Ok(()),
             })?;
+
+        if let Some(supply) = parent_supply {
+            parent.money_supply = Some(supply);
+            self.db.store_block_index_entry(&parent)?;
+        }
 
         info!(
             "Disconnected block {} at height {}",
