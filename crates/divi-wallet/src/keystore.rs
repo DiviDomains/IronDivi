@@ -325,6 +325,19 @@ impl KeyStore {
         self.keys.read().len()
     }
 
+    /// The seed of an HD wallet made from a seed rather than words
+    pub fn hd_seed(&self) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        self.hd_wallet
+            .read()
+            .as_ref()
+            .and_then(|w| w.seed().map(|s| zeroize::Zeroizing::new(s.to_vec())))
+    }
+
+    /// Account path the HD keys derive from (if HD wallet configured)
+    pub fn hd_account_path(&self) -> Option<String> {
+        self.hd_wallet.read().as_ref().map(|w| w.account_path())
+    }
+
     /// Get mnemonic (if HD wallet configured)
     pub fn mnemonic(&self) -> Option<String> {
         self.hd_wallet

@@ -978,7 +978,16 @@ fn load_or_create_wallet(
     let restoring = std::env::var("WALLET_MNEMONIC").ok();
     // Divi Core's -mnemonicpassphrase: the BIP39 passphrase of the seed
     let passphrase = std::env::var("WALLET_MNEMONIC_PASSPHRASE").ok();
-    load_or_restore_wallet(wallet_path, network, chain_mode, restoring, passphrase)
+    // Divi Core's -hdseed: a hex seed, preferred over a mnemonic (init.cpp:947-951)
+    let seed = std::env::var("WALLET_HDSEED").ok();
+    load_or_restore_wallet_with_seed(
+        wallet_path,
+        network,
+        chain_mode,
+        restoring,
+        passphrase,
+        seed,
+    )
 }
 
 /// `load_or_restore_wallet` with no mnemonic passphrase
@@ -995,6 +1004,7 @@ fn load_or_create_wallet_from(
 /// Load the wallet at `wallet_path`, or create it: restored from `restoring`
 /// when a mnemonic is given (with its BIP39 `passphrase`), otherwise from a
 /// fresh random seed.
+#[cfg(test)]
 fn load_or_restore_wallet(
     wallet_path: &PathBuf,
     network: WalletNetwork,
@@ -1002,8 +1012,35 @@ fn load_or_restore_wallet(
     restoring: Option<String>,
     passphrase: Option<String>,
 ) -> Result<Arc<WalletDb>> {
+    load_or_restore_wallet_with_seed(
+        wallet_path,
+        network,
+        chain_mode,
+        restoring,
+        passphrase,
+        None,
+    )
+}
+
+/// `load_or_restore_wallet`, where a new wallet may instead come from a hex
+/// `seed` (Divi Core's -hdseed, taken over a mnemonic)
+fn load_or_restore_wallet_with_seed(
+    wallet_path: &PathBuf,
+    network: WalletNetwork,
+    chain_mode: ChainMode,
+    restoring: Option<String>,
+    passphrase: Option<String>,
+    seed: Option<String>,
+) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
+        // Divi Core copies the wallet into backups/ (and monthlyBackups/) at
+        // every start, before it opens it (init.cpp:1479)
+        if let Some(data_dir) = wallet_path.parent() {
+            if let Err(e) = divi_wallet::backup::backup_at_start(wallet_path, data_dir) {
+                warn!("Failed to create backup: {}", e);
+            }
+        }
         info!("Loading wallet from {:?}", wallet_path);
         let wallet = WalletDb::open(wallet_path, network)
             .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
@@ -1030,7 +1067,30 @@ fn load_or_restore_wallet(
     std::fs::create_dir_all(wallet_path)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
 
-    let hd_wallet = if let Some(ref mnemonic) = restoring {
+    // Divi Core takes -hdseed when it is hex and logs anything else, then
+    // goes on with the mnemonic or a new seed (wallet.cpp:2286-2297)
+    let seed = match seed {
+        Some(hex_seed) => match hex::decode(hex_seed.trim()) {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            _ => {
+                warn!("WALLET_HDSEED is not a hex seed; not using it");
+                None
+            }
+        },
+        None => None,
+    };
+    if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
+        warn!(
+            "WALLET_HDSEED and WALLET_MNEMONIC/WALLET_MNEMONIC_PASSPHRASE together: using the seed"
+        );
+    }
+    let restoring = if seed.is_some() { None } else { restoring };
+    let passphrase = if seed.is_some() { None } else { passphrase };
+    let hd_wallet = if let Some(ref seed) = seed {
+        info!("Restoring wallet from the WALLET_HDSEED environment variable");
+        HdWallet::from_seed(seed, chain_mode)
+            .with_context(|| "Failed to restore HD wallet from seed")?
+    } else if let Some(ref mnemonic) = restoring {
         // Use WALLET_CHAIN_MODE env var to override chain mode for mnemonic restore.
         // Falls back to the --mode flag value so PrivateDivi nodes derive correct addresses.
         let restore_chain_mode = std::env::var("WALLET_CHAIN_MODE")
@@ -1067,8 +1127,7 @@ fn load_or_restore_wallet(
     // from genesis recognises every keypool key. WALLET_LOOKAHEAD sets how many
     // keys of each chain a restore pre-generates (default: the keypool size).
     // They stay in the keypool, so the receiving and change indices stay low.
-    let lookahead = restoring
-        .is_some()
+    let lookahead = (restoring.is_some() || seed.is_some())
         .then(|| std::env::var("WALLET_LOOKAHEAD").ok()?.parse::<u32>().ok())
         .flatten();
     let generated = wallet
@@ -1356,6 +1415,35 @@ async fn run_daemon(
             }
 
             resubmit_wallet_txs(&node, wallet_arc);
+
+            // Divi Core checks once a day whether a monthly backup is due
+            // (LegacyWalletDatabaseEndpointFactory.cpp:111-121; on regtest
+            // that loop runs on mock time)
+            if config.network.network_type != NetworkType::Regtest {
+                let wallet_for_backup = Arc::clone(wallet_arc);
+                let backup_root = wallet_dir.parent().map(|p| p.to_path_buf());
+                tokio::spawn(async move {
+                    let Some(root) = backup_root else { return };
+                    let mut daily =
+                        tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+                    daily.tick().await;
+                    loop {
+                        daily.tick().await;
+                        let wallet = Arc::clone(&wallet_for_backup);
+                        let root = root.clone();
+                        let made = tokio::task::spawn_blocking(move || {
+                            divi_wallet::backup::monthly_backup(&wallet, &root)
+                        })
+                        .await;
+                        match made {
+                            Ok(Ok(Some(path))) => info!("Monthly wallet backup {}", path.display()),
+                            Ok(Ok(None)) => {}
+                            Ok(Err(e)) => warn!("Monthly wallet backup failed: {}", e),
+                            Err(e) => warn!("Monthly wallet backup failed: {}", e),
+                        }
+                    }
+                });
+            }
         }
 
         wallet
@@ -3106,6 +3194,65 @@ mod staking_config_tests {
             let staking = staking_config(&config, &params);
             assert_eq!(staking.min_coin_age, age, "{network:?}");
             assert_eq!(staking.min_stake_amount, 0, "{network:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod wallet_move_tests {
+    use super::*;
+
+    /// Divi Core 3.0.0 regtest with -hdseed=000102030405060708090a0b0c0d0e0f
+    /// gives this address at m/44'/1'/0'/0/0
+    const CORE_FIRST_ADDRESS: &str = "y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz";
+
+    /// WALLET_HDSEED restores a wallet from a hex seed, as Core's -hdseed, and
+    /// is taken over WALLET_MNEMONIC (the only test here that sets them)
+    #[test]
+    fn hex_seed_restores_cores_first_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        std::env::set_var("WALLET_HDSEED", "000102030405060708090a0b0c0d0e0f");
+        std::env::set_var(
+            "WALLET_MNEMONIC",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        );
+        let wallet = load_or_create_wallet(&path, WalletNetwork::Regtest, ChainMode::Divi);
+        std::env::remove_var("WALLET_HDSEED");
+        std::env::remove_var("WALLET_MNEMONIC");
+        let wallet = wallet.unwrap();
+        let addresses: Vec<String> = wallet
+            .get_addresses()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert!(
+            addresses.iter().any(|a| a == CORE_FIRST_ADDRESS),
+            "first address differs from Core's for the same seed"
+        );
+        assert!(wallet.mnemonic().is_none());
+    }
+
+    /// Opening an existing wallet first copies it into backups/ and
+    /// monthlyBackups/ next to it, as Divi Core does at every start
+    #[test]
+    fn start_makes_wallet_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        drop(
+            load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+                .unwrap(),
+        );
+        let wallet =
+            load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+                .unwrap();
+        for sub in ["backups", "monthlyBackups"] {
+            let entries: Vec<_> = std::fs::read_dir(dir.path().join(sub))
+                .map(|r| r.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert_eq!(entries.len(), 1, "{sub}: {entries:?}");
+            let copy = WalletDb::open(&entries[0], WalletNetwork::Regtest).unwrap();
+            assert_eq!(copy.mnemonic(), wallet.mnemonic());
         }
     }
 }
