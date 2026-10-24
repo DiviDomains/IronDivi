@@ -28,6 +28,11 @@ A run takes about 35 seconds and is stopped after 10 minutes. However it ends, a
 directories deleted. Needs bash and python3 (standard library only). RPC passwords are made at random for each run
 and kept in each node's 0600 `divi.conf`.
 
+A node that exits while starting is reported with its exit code and the last 15 lines of its `debug.log` (or of its
+stderr when it wrote no log). If those lines say `Address already in use` or `Unable to bind`, the node is given two
+ports free at that moment (picked by the system) and started again, up to 5 times; the node that dials it follows, as
+each `divi.conf` is written from the nodes' current ports at every start.
+
 ## Nodes
 
 Node 1 of each kind listens; node 2 dials it (`connect=`). Node 1 mines 5 blocks and node 2 follows. All run with
