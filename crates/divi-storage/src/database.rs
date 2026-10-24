@@ -85,11 +85,32 @@ impl ChainDatabase {
         path: P,
         block_cache_size: usize,
     ) -> Result<Self, StorageError> {
-        crate::datadir::refuse_foreign_database(path.as_ref())?;
+        Self::open_inner(path.as_ref(), block_cache_size, true)
+    }
+
+    /// Open the chain database at `path` only if there is one: a missing or
+    /// empty folder is refused and nothing is created
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        if !path.join("CURRENT").is_file() {
+            return Err(StorageError::NotFound(format!(
+                "no chain database in {}",
+                path.display()
+            )));
+        }
+        Self::open_inner(path, DEFAULT_BLOCK_CACHE_SIZE, false)
+    }
+
+    fn open_inner(
+        path: &Path,
+        block_cache_size: usize,
+        create: bool,
+    ) -> Result<Self, StorageError> {
+        crate::datadir::refuse_foreign_database(path)?;
 
         // === Database-wide options ===
         let mut opts = Options::default();
-        opts.create_if_missing(true);
+        opts.create_if_missing(create);
         opts.create_missing_column_families(true);
 
         // Performance tuning for blockchain workload

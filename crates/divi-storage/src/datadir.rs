@@ -81,7 +81,7 @@ pub fn divi_core_datadir(dir: &Path) -> Option<String> {
     })
 }
 
-fn network_name(params: &ChainParams) -> String {
+pub(crate) fn network_name(params: &ChainParams) -> String {
     let network = match params.network_type {
         NetworkType::Mainnet => "mainnet",
         NetworkType::Testnet => "testnet",
