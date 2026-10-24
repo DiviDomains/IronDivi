@@ -88,16 +88,29 @@ impl TestNode {
         self.node.start().await.unwrap();
         let port = self.port;
         // The listener comes up on a spawned task
-        tokio::time::timeout(WAIT, async {
-            while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        let mut probe = tokio::time::timeout(WAIT, async {
+            loop {
+                if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
+                    break stream;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
         .expect("node listens");
-        // The probe above is an inbound connection until the node sees it
-        // close; wait until it has gone, so it holds no inbound slot when a
-        // test connects (a test with one inbound slot was refused)
+        // The probe is an inbound connection from the moment the node accepts
+        // it, which can be after it connected (the socket is bound before the
+        // accept loop runs). Close our side and read until the node closes
+        // its own, so the node has taken the probe and let it go; then wait
+        // until its slot is free, so it holds none when a test connects (a
+        // test with one inbound slot was refused).
+        let _ = probe.shutdown().await;
+        let mut sink = [0u8; 64];
+        let _ = tokio::time::timeout(WAIT, async {
+            while matches!(probe.read(&mut sink).await, Ok(n) if n > 0) {}
+        })
+        .await;
+        drop(probe);
         let pm = self.node.peer_manager();
         tokio::time::timeout(WAIT, async {
             while pm.inbound_count() > 0 || !pm.has_inbound_room() {
