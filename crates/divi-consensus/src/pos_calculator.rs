@@ -179,9 +179,10 @@ impl ProofOfStakeCalculator {
             );
         }
 
-        // Calculate time weight (capped at maximum)
+        // Calculate time weight (capped at maximum). The difference wraps as Divi Core's
+        // unsigned one does when the search goes below the coin's confirmation time.
         let time_weight = std::cmp::min(
-            (hashproof_timestamp - self.coinstake_start_time) as i64,
+            hashproof_timestamp.wrapping_sub(self.coinstake_start_time) as i64,
             MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING,
         );
 
@@ -614,6 +615,29 @@ mod tests {
         assert!(!result.succeeded());
         assert!(!result.failed_at_setup()); // Failed generation, not setup
         assert_eq!(result, HashproofResult::FailedGeneration);
+    }
+
+    /// The search walks back past the coin's confirmation time without panicking. As in Divi Core
+    /// (ProofOfStakeCalculator.cpp:53) the unsigned difference wraps and the weight is capped.
+    #[test]
+    fn test_create_hashproof_walks_below_coinstake_start_time() {
+        let staking_data = StakingData::new(
+            0x01000001, // Extremely hard target
+            1_000_000,
+            Hash256::from_bytes([0u8; 32]),
+            OutPoint::new(Hash256::from_bytes([0u8; 32]), 0),
+            Amount::from_sat(100_000_000),
+            Hash256::from_bytes([0u8; 32]),
+        );
+        let calculator = ProofOfStakeCalculator::new(&staking_data, 0);
+
+        let result = create_hashproof(&calculator, 1_000_010);
+        assert_eq!(result, HashproofResult::FailedGeneration);
+
+        let mut proof = Hash256::zero();
+        assert!(calculator
+            .compute_and_check_target(999_990, &mut proof, false)
+            .is_ok());
     }
 
     /// The check_only flag skips hash computation but still checks the (old) hash against target.

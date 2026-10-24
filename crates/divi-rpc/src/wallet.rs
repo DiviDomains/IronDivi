@@ -2860,16 +2860,17 @@ impl WalletRpc {
         )?;
 
         // parseVaultAddressEncoding (rpcwallet.cpp:920-950): without an owner
-        // a new key of the wallet owns the vault
+        // a new key of the wallet owns the vault, put in the address book
+        // with the name "" (rpcwallet.cpp:943)
         let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
             Some((owner, manager)) => (owner.to_string(), manager.to_string()),
-            None => (
-                wallet
-                    .new_receiving_address()
-                    .map_err(new_key_error)?
-                    .to_base58(),
-                vault_encoding.to_string(),
-            ),
+            None => {
+                let owner = wallet.new_receiving_address().map_err(new_key_error)?;
+                wallet.set_label(&owner, "").map_err(|e| {
+                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                })?;
+                (owner.to_base58(), vault_encoding.to_string())
+            }
         };
         // validateAndConstructVaultScriptFromParsedAddresses (rpcwallet.cpp:952-966)
         let key_hash = |address: &str, which: &str| -> Result<[u8; 20], Error> {
