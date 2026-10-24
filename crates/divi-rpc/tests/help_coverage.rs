@@ -67,7 +67,9 @@ fn help_covers_every_dispatched_method() {
             continue; // reaching the handler would ask the node to shut down
         }
         if let Some(e) = call(&server, m, vec![]).error {
-            assert_ne!(e.code, -32601, "{m} is not dispatched");
+            // A wallet call on a node without a wallet is dispatched, and
+            // answers -32601 as Divi Core does (rpcserver.cpp:1043-1047)
+            assert_ne!(e.message, "Method not found", "{m} is not dispatched");
         }
     }
 
