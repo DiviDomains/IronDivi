@@ -87,12 +87,10 @@ By design:
 - `removevault` with a second argument: irondivid still takes it for older IronDivi callers (its help says so); divid takes exactly one and answers with its help text (`rpcwallet.cpp:1194-1201`).
 
 Open, not closed yet. Each is listed so the run stays usable; a fix turns the row into a FAIL until it is taken out here and in `KNOWN` in `check.py`.
-- **`owner listunspent`:** irondivid gives `account ""` on coins of keys divid never put in its address book (its miner takes them from the keypool); divid leaves `account` out (`rpcrawtransaction.cpp:320-325`). The same row is open in `scripts/wallet-replies`.
 - **`reclaimvaultfunds` replies:** divid answers the txid as a string (`rpcwallet.cpp:1189`), irondivid an object `{amount, fee, txid}`. This is RPC-LEFT row 2, open: rpc-left.
 - **After `removevault`, the manager's `listtransactions` and the manager's `gettransaction` of the vault transactions:**
   - divid's `removevault` only drops the vault script from memory (`wallet.cpp:707-716`). It keeps the wallet's transactions and amounts, and reads the script back from its wallet file at the next start, so after a restart the vault is managed again.
   - irondivid removes the vault and its records for good.
-- **`after restart: getwalletinfo`:** `keypoolsize` is 1999 on divid and 2000 on irondivid after the restart (equal before it). The same row is open in `scripts/wallet-replies`.
 
 ## Proving a difference is caught
 
