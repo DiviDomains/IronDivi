@@ -18,15 +18,14 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 fn server() -> (RpcServer, tempfile::TempDir) {
+    server_on(NetworkType::Regtest)
+}
+
+fn server_on(network: NetworkType) -> (RpcServer, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
-    let chain = Arc::new(
-        Chain::new(
-            db,
-            ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
-        )
-        .unwrap(),
-    );
+    let chain =
+        Arc::new(Chain::new(db, ChainParams::for_network(network, ChainMode::Divi)).unwrap());
     (RpcServer::new(chain), dir)
 }
 
@@ -222,4 +221,82 @@ fn prioritisetransaction_reads_its_arguments_as_divid() {
         assert_eq!((e.code, e.message.as_str()), (-1, message), "{args:?}");
     }
     assert_eq!(pool.0.lock().len(), 5, "a refused call changes nothing");
+}
+
+/// A coinstake (vin[0] not null, vout[0] empty, two outputs) paying OP_TRUE
+const COINSTAKE: &str = concat!(
+    "01000000",
+    "01",
+    "2222222222222222222222222222222222222222222222222222222222222222",
+    "00000000",
+    "00",
+    "ffffffff",
+    "02",
+    "0000000000000000",
+    "00",
+    "00e1f50500000000",
+    "01",
+    "51",
+    "00000000"
+);
+
+/// generateblock checks its options before making a block, as Divi Core
+/// (rpcmining.cpp:126-176): types in name order (-3), each extratx a string
+/// (-1) that decodes (-22), the coinstake decoded and a coinstake (-8)
+#[test]
+fn generateblock_checks_its_options_as_divid() {
+    let (server, _dir) = server();
+    let plain_tx = COINSTAKE.replacen("02000000000000000000", "01000000000000000000", 1);
+    for (options, code, message) in [
+        (json!("x"), -3, "Expected type obj, got str".to_string()),
+        (
+            json!({"extratx": "x"}),
+            -3,
+            "Expected type array for extratx, got str".into(),
+        ),
+        (
+            json!({"ignoreMempool": 1}),
+            -3,
+            "Expected type bool for ignoreMempool, got int".into(),
+        ),
+        (
+            json!({"blockBitsShift": 1.5}),
+            -3,
+            "Expected type int for blockBitsShift, got real".into(),
+        ),
+        (
+            json!({"coinstake": 1}),
+            -3,
+            "Expected type str for coinstake, got int".into(),
+        ),
+        // Name order: blockBitsShift is checked before extratx
+        (
+            json!({"extratx": "x", "blockBitsShift": "y"}),
+            -3,
+            "Expected type int for blockBitsShift, got str".into(),
+        ),
+        (
+            json!({"extratx": [1]}),
+            -1,
+            "value is type int, expected str".into(),
+        ),
+        (json!({"extratx": ["zz"]}), -22, "TX decode failed".into()),
+        (json!({"extratx": [""]}), -22, "TX decode failed".into()),
+        (json!({"coinstake": "zz"}), -22, "TX decode failed".into()),
+        (
+            json!({"coinstake": plain_tx}),
+            -8,
+            "TX is not a coinstake".into(),
+        ),
+    ] {
+        let e = error(&server, "generateblock", vec![options.clone()]);
+        assert_eq!((e.code, e.message), (code, message), "{options}");
+    }
+    // Options that pass the checks reach the block maker (none here)
+    let e = error(
+        &server,
+        "generateblock",
+        vec![json!({"coinstake": COINSTAKE})],
+    );
+    assert_eq!(e.message, "generateblock needs a wallet to mine to");
 }

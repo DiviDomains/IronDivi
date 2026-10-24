@@ -491,6 +491,21 @@ impl RpcServer {
         self.staking.set_generate(params)
     }
 
+    /// generateblock - one block with Divi Core's test options
+    /// (rpcmining.cpp:121-210); regtest only, as setgenerate
+    fn generate_block(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_storage::chain::NetworkType;
+
+        if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method disabled: invalid networks setting (regtest only)",
+            )
+            .into());
+        }
+        self.staking.generate_block(params)
+    }
+
     /// Handle a single RPC request
     pub fn handle_request(&self, request: Request) -> Response {
         let id = request.id.clone();
@@ -563,7 +578,7 @@ impl RpcServer {
             "getaddressutxos" => self.blockchain.get_address_utxos(params),
 
             // Mining/generation methods
-            "generateblock" => self.blockchain.generate_block(params),
+            "generateblock" => self.generate_block(params),
             "setgenerate" => self.set_generate(params),
 
             // Network methods
@@ -767,7 +782,7 @@ impl RpcServer {
                 "getrawmempool" => "getrawmempool ( verbose )\n\nReturns all transaction ids in memory pool.\n\nArguments:\n1. verbose  (boolean, optional, default=false) true for a json object, false for array of transaction ids",
                 "prioritisetransaction" => "prioritisetransaction <txid> <priority delta> <fee delta>\n\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.",
-                "generateblock" => "generateblock ( options )\n\nTry to generate a single block with extra options (regtest only - not yet implemented).",
+                "generateblock" => "generateblock ( options )\n\nTry to generate a single block with some extra options (-regtest only).\n\nArguments:\n1. options          (object, optional) extra options for generating the block\n    {\n      \"extratx\" : [\"hex\", ...],   (array of strings, optional) transactions to include as hex\n      \"coinstake\" : \"hex\",        (string, optional) coinstake transaction to use as hex\n      \"ignoreMempool\" : true,       (bool, optional) if set, do not include mempool transactions\n      \"blockBitsShift\" : unsigned (integer, optional) if set, use custom block bits\n    }\n\nResult\nblockhash     (string) hash of the generated block",
                 "setgenerate" => "setgenerate numberofblocks\n\nMine blocks to this wallet immediately (-regtest only): proof-of-work up to block 100, proof-of-stake after it.\n\nArguments:\n1. numberofblocks  (numeric, required) How many blocks to mine; below 1 mines none\n\nResult:\n[ \"blockhash\", ... ]  (array) Hashes of the mined blocks",
                 "getinfo" => "getinfo\n\nReturns an object containing various state info (version, blocks, connections, difficulty, balance, staking status).",
                 "getinvalid" => "getinvalid ( \"all\" )\n\nGet a summary of invalidated outpoints.\n\nArguments:\n1. all   (string, optional) return a full list of outpoints even if they are spent",

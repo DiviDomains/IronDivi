@@ -1011,14 +1011,6 @@ impl BlockchainRpc {
         Ok(Value::Null)
     }
 
-    pub fn generate_block(&self, _params: &Params) -> Result<Value, Error> {
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "generateblock is not yet implemented - requires full mining subsystem",
-        )
-        .into())
-    }
-
     /// decodescript as Divi Core (rpcrawtransaction.cpp:527-564): the script
     /// fields of ScriptPubKeyToJSON without hex, then the script's P2SH address
     pub fn decode_script(&self, params: &Params) -> Result<Value, Error> {
