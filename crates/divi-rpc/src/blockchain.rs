@@ -875,7 +875,22 @@ impl BlockchainRpc {
     }
 
     pub fn get_raw_mempool(&self, params: &Params) -> Result<Value, Error> {
-        let verbose = params.get(0).and_then(|v| v.as_bool()).unwrap_or(false);
+        // params[0].get_bool(): json_spirit takes only a boolean
+        // (rpcblockchain.cpp:110-112)
+        let verbose = match params.get(0) {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(v) => {
+                return Err(RpcError::new(
+                    crate::error::codes::MISC_ERROR,
+                    format!(
+                        "value is type {}, expected bool",
+                        crate::wallet::json_spirit_type(v)
+                    ),
+                )
+                .into())
+            }
+        };
         let mempool_guard = self.mempool.read();
         let Some(ref mempool) = *mempool_guard else {
             return Ok(if verbose { json!({}) } else { json!([]) });

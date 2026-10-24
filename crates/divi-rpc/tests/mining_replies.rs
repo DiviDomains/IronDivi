@@ -117,3 +117,28 @@ fn getmininginfo_has_divids_members() {
     assert_eq!(info["testnet"], false);
     assert_eq!(info["pooledtx"], 0);
 }
+
+/// getrawmempool's verbose argument is a JSON boolean, as json_spirit's
+/// get_bool takes it (rpcblockchain.cpp:110-112)
+#[test]
+fn getrawmempool_verbose_is_a_boolean() {
+    let (server, _dir) = server();
+    assert_eq!(result(&server, "getrawmempool", vec![]), json!([]));
+    assert_eq!(
+        result(&server, "getrawmempool", vec![json!(false)]),
+        json!([])
+    );
+    for (arg, type_name) in [
+        (json!(1), "int"),
+        (json!("true"), "str"),
+        (json!(null), "null"),
+        (json!(1.5), "real"),
+    ] {
+        let e = error(&server, "getrawmempool", vec![arg.clone()]);
+        assert_eq!(e.code, -1, "{arg}");
+        assert_eq!(
+            e.message,
+            format!("value is type {type_name}, expected bool")
+        );
+    }
+}
