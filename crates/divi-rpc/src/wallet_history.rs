@@ -35,6 +35,9 @@ enum Mine {
     Spendable,
 }
 
+/// Adds one entry (with the transaction fields when listing)
+type PushEntry<'p> = dyn Fn(Map<String, Value>, &mut Vec<Value>) + 'p;
+
 /// A wallet transaction with what its entries need
 struct Loaded {
     tx: Transaction,
@@ -405,7 +408,7 @@ impl<'a> History<'a> {
         };
 
         if tx.is_coinstake() {
-            self.coinstake_details(record, &loaded, account, &push, out);
+            self.coinstake_details(&loaded, account, &push, out);
             return;
         }
 
@@ -533,10 +536,9 @@ impl<'a> History<'a> {
     /// The coinstake branch of ParseTransactionDetails (rpcwallet.cpp:2034-2107)
     fn coinstake_details(
         &self,
-        record: &WalletTx,
         loaded: &Loaded,
         account: &str,
-        push: &dyn Fn(Map<String, Value>, &mut Vec<Value>),
+        push: &PushEntry,
         out: &mut Vec<Value>,
     ) {
         let tx = &loaded.tx;
@@ -622,7 +624,6 @@ impl<'a> History<'a> {
                 push(entry, out);
             }
         }
-        let _ = record;
     }
 
     /// gettransaction (rpcwallet.cpp:2452-2490)

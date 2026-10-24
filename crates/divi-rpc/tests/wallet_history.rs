@@ -440,3 +440,47 @@ fn transaction_of_a_disconnected_block_is_kept() {
     let t = f.n.ok("gettransaction", vec![json!(txid)]);
     assert_eq!(t["confirmations"], json!(1), "{t}");
 }
+
+/// getaccountaddress hands out the account's last address until something
+/// pays it, then a new one (rpcwallet.cpp:315-375)
+#[test]
+fn getaccountaddress_moves_on_once_paid() {
+    let f = funded(&[COIN]);
+    let paid = f.addresses[0].to_base58();
+    let next = f.n.ok("getaccountaddress", vec![json!("acct0")]);
+    assert_ne!(next, json!(paid));
+    assert_eq!(f.n.ok("getaccountaddress", vec![json!("acct0")]), next);
+    let fresh = f.n.ok("getaccountaddress", vec![json!("unused")]);
+    assert_eq!(f.n.ok("getaccountaddress", vec![json!("unused")]), fresh);
+}
+
+/// listsinceblock and listunspent come in txid order, the wallet map's order
+/// in Divi Core (rpcwallet.cpp:2396-2402, rpcrawtransaction.cpp:296)
+#[test]
+fn listsinceblock_and_listunspent_in_txid_order() {
+    let f = funded(&[COIN]);
+    for _ in 0..3 {
+        let addr = Address::from_base58(f.n.ok("getnewaddress", vec![]).as_str().unwrap()).unwrap();
+        f.n.mine(vec![], &addr);
+    }
+    let since = f.n.ok("listsinceblock", vec![]);
+    let ids: Vec<String> = since["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["txid"].as_str().unwrap().to_string())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+    let unspent = f.n.ok("listunspent", vec![json!(0)]);
+    let ids: Vec<String> = unspent
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["txid"].as_str().unwrap().to_string())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+}

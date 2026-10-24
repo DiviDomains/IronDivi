@@ -985,7 +985,9 @@ impl WalletRpc {
         // vault or watched output), mature, not spent by a wallet transaction,
         // unconfirmed ones only when every input was ours, and not locked by
         // lockunspent
-        let utxos = wallet.get_spendable_utxos(height, 0);
+        let mut utxos = wallet.get_spendable_utxos(height, 0);
+        // In txid order, as Divi Core walks its wallet map
+        utxos.sort_by_key(|u| (u.txid.to_string(), u.vout));
 
         let result: Vec<_> = utxos
             .iter()
@@ -1133,7 +1135,10 @@ impl WalletRpc {
 
         let history = self.history(&wallet);
         let mut transactions = Vec::new();
-        for record in history.ordered_records() {
+        // Divi Core walks its wallet map, which is in txid order
+        let mut records = history.ordered_records();
+        records.sort_by_key(|r| r.txid.to_string());
+        for record in records {
             let mut entries = Vec::new();
             history.details(&record, "*", 0, true, watch, &mut entries);
             let keep = |e: &serde_json::Value| match depth {
@@ -1145,9 +1150,10 @@ impl WalletRpc {
 
         // chain[Height() + 1 - target_confirms]; null (zeros) below genesis
         let last_height = height as i64 + 1 - target;
-        let lastblock = (last_height >= 0)
-            .then(|| self.chain.as_ref())
-            .flatten()
+        let lastblock = self
+            .chain
+            .as_ref()
+            .filter(|_| last_height >= 0)
             .and_then(|c| {
                 c.get_block_index_by_height(last_height as u32)
                     .ok()
@@ -2735,7 +2741,6 @@ impl WalletRpc {
         let manager_hash = key_hash(&manager_addr, "manager")?;
         let owner_hash = key_hash(&owner_addr, "owner")?;
         let encoding = format!("{owner_addr}:{manager_addr}");
-        let owner_addr = Some(owner_addr);
         let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
         let payees = [TxOut::new(send_amount, vault_script.clone())];
         check_send_total(&payees, spendable_balance(&wallet, self.current_height()))?;
@@ -2757,7 +2762,7 @@ impl WalletRpc {
 
         // Register the vault in the wallet so it can be tracked for staking/reclaiming
         let metadata = VaultMetadata {
-            owner_address: owner_addr.unwrap(),
+            owner_address: owner_addr,
             manager_address: manager_addr,
             vault_script: vault_script_bytes,
             funding_txid: *txid.as_bytes(),
@@ -4248,10 +4253,14 @@ impl WalletRpc {
 
         let wallet = self.get_wallet()?;
 
+        // Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
+        // last address, unless a wallet transaction already pays it
         let addresses = wallet.get_addresses_by_account(account);
-
-        if let Some(existing_addr) = addresses.first() {
-            return Ok(serde_json::json!(existing_addr));
+        if let Some(last) = addresses.last() {
+            let paid = wallet.received_outputs().iter().any(|o| &o.address == last);
+            if !paid {
+                return Ok(serde_json::json!(last));
+            }
         }
 
         let new_addr = wallet.new_receiving_address().map_err(new_key_error)?;
