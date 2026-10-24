@@ -3110,19 +3110,81 @@ impl WalletRpc {
         .into())
     }
 
-    /// Allocate treasury funds
+    /// allocatefunds as Divi Core (rpcmasternode.cpp:63-120): `allocatefunds
+    /// masternode <alias> <tier>` sends the tier's collateral to the account
+    /// address of "alloc-><alias>" and returns the transaction and the output
+    /// that holds it
     pub fn allocate_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let _target = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: target"))?;
-        let _locktime = params
-            .get_i64(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: locktime"))?;
+        const USAGE: &str = "allocatefunds purpose alias tier ( \"pay wallet\" ( \"voting wallet\" ) )\n\nStarts escrows funds for some purpose.\n";
+        if params.len() != 3 {
+            return Err(RpcError::new(codes::MISC_ERROR, USAGE).into());
+        }
+        let arg = |i: usize| -> Result<&str, Error> {
+            Ok(crate::masternode::str_arg(params, i)?.unwrap_or(""))
+        };
+        if arg(0)? != "masternode" {
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "Surely you meant the first argument to be masternode . . . . ",
+            )
+            .into());
+        }
+        let wallet = self
+            .get_wallet()
+            .map_err(|_| RpcError::new(codes::WALLET_ERROR, "Invalid masternode tier"))?;
+        // Core takes the account address before it looks at the tier
+        let address = Self::account_address(&wallet, &format!("alloc->{}", arg(1)?), false)?;
+        use divi_masternode::MasternodeTier;
+        let tier = match arg(2)?.to_lowercase().as_str() {
+            "copper" => MasternodeTier::Copper,
+            "silver" => MasternodeTier::Silver,
+            "gold" => MasternodeTier::Gold,
+            "platinum" => MasternodeTier::Platinum,
+            "diamond" => MasternodeTier::Diamond,
+            _ => {
+                return Err(
+                    RpcError::new(codes::INVALID_PARAMETER, "Invalid masternode tier").into(),
+                )
+            }
+        };
+        ensure_fully_unlocked(&wallet)?;
 
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "Treasury fund allocation requires governance subsystem implementation. This RPC command is used for treasury and governance operations to allocate funds for community proposals. The governance system requires masternode voting integration. This feature will be added in a future release. For treasury operations, please use the C++ Divi client."
-        ).into())
+        // Regtest collaterals are a thousandth of the others (chainparams.cpp:147-153)
+        let regtest = self
+            .chain
+            .as_ref()
+            .is_some_and(|c| c.network_type() == divi_storage::chain::NetworkType::Regtest);
+        let collateral =
+            Amount::from_sat(tier.collateral_amount() / if regtest { 1000 } else { 1 });
+        let dest_addr = self
+            .decode_address(&address)
+            .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        let payees = [TxOut::new(collateral, dest_addr.script_pubkey())];
+        let height = self.current_height();
+        check_send_total(&payees, spendable_balance(&wallet, height))?;
+        let coins = Self::send_coins(&wallet, wallet.get_send_candidates(height, 1), height);
+        let mode = parse_fee_mode(None, true)?;
+        let plan = self.plan(&payees, &coins, mode, ChangeKind::P2pkh, &ChangeTo::NewKey)?;
+        // The outputs in the order sign_and_submit writes them: payees, then change
+        let vout = plan
+            .outputs
+            .iter()
+            .map(|o| o.value)
+            .chain(plan.change)
+            .position(|v| v == collateral);
+        let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        let vout = vout.ok_or_else(|| {
+            RpcError::new(
+                codes::VERIFY_ERROR,
+                "Couldn't verify transaction has correct collateral",
+            )
+        })?;
+        info!(
+            "Allocated {} DIVI for masternode collateral (txid: {})",
+            collateral.as_divi_f64(),
+            txid
+        );
+        Ok(serde_json::json!({ "txhash": txid.to_string(), "vout": vout }))
     }
 
     /// Decode a script
@@ -6222,5 +6284,99 @@ mod accounting_tests {
         assert!(listed
             .iter()
             .all(|u| u["scriptPubKey"] != json!(hex::encode(vault.as_bytes()))));
+    }
+}
+
+/// allocatefunds as Divi Core (rpcmasternode.cpp:63-120)
+#[cfg(test)]
+mod allocate_funds {
+    use super::*;
+    use divi_primitives::ChainMode;
+    use divi_wallet::HdWallet;
+
+    fn p(values: &[serde_json::Value]) -> Params {
+        Params::Array(values.to_vec())
+    }
+
+    fn err(result: Result<serde_json::Value, Error>) -> (i32, String) {
+        match result {
+            Err(Error::Rpc(r)) => (r.code, r.message.lines().next().unwrap_or("").to_string()),
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    /// A testnet wallet holding one confirmed coin of 200000 DIVI; submitted
+    /// transactions are captured
+    fn funded() -> (WalletRpc, Arc<parking_lot::Mutex<Vec<Transaction>>>) {
+        let db = Arc::new(WalletDb::with_hd_wallet(
+            Network::Testnet,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        ));
+        let addr = db.new_receiving_address().unwrap();
+        db.add_utxo(divi_wallet::WalletUtxo {
+            txid: Hash256::from_bytes([5; 32]),
+            vout: 0,
+            value: Amount::from_divi(200_000),
+            script_pubkey: Script::new_p2pkh(addr.hash.as_bytes()),
+            height: Some(100),
+            is_coinbase: false,
+            is_coinstake: false,
+            address: addr.to_string(),
+        });
+        let rpc = WalletRpc::with_wallet(db);
+        rpc.set_height(200);
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = sent.clone();
+        rpc.set_tx_submit(Arc::new(move |tx: Transaction| {
+            let txid = tx.txid();
+            capture.lock().push(tx);
+            Ok(txid)
+        }));
+        (rpc, sent)
+    }
+
+    #[test]
+    fn allocatefunds_checks_its_arguments_as_divid() {
+        let (rpc, sent) = funded();
+        let usage = "allocatefunds purpose alias tier ( \"pay wallet\" ( \"voting wallet\" ) )";
+        assert_eq!(err(rpc.allocate_funds(&p(&[]))), (-1, usage.into()));
+        assert_eq!(
+            err(rpc.allocate_funds(&p(&[json!("masternode"), json!("mn1")]))),
+            (-1, usage.into())
+        );
+        assert_eq!(
+            err(rpc.allocate_funds(&p(&[json!("vault"), json!("mn1"), json!("copper")]))),
+            (
+                -1,
+                "Surely you meant the first argument to be masternode . . . . ".into()
+            )
+        );
+        assert_eq!(
+            err(rpc.allocate_funds(&p(&[json!("masternode"), json!("mn1"), json!("bronze")]))),
+            (-8, "Invalid masternode tier".into())
+        );
+        assert_eq!(
+            err(rpc.allocate_funds(&p(&[json!("masternode"), json!(1), json!("copper")]))),
+            (-1, "value is type int, expected str".into())
+        );
+        assert!(sent.lock().is_empty(), "nothing is sent on a refused call");
+    }
+
+    #[test]
+    fn allocatefunds_sends_the_collateral_to_the_alias_account() {
+        let (rpc, sent) = funded();
+        let reply = rpc
+            .allocate_funds(&p(&[json!("masternode"), json!("mn1"), json!("Copper")]))
+            .unwrap();
+        let txs = sent.lock();
+        assert_eq!(txs.len(), 1);
+        let tx = &txs[0];
+        assert_eq!(reply["txhash"], json!(tx.txid().to_string()));
+        let vout = reply["vout"].as_u64().unwrap() as usize;
+        assert_eq!(tx.vout[vout].value, Amount::from_divi(100_000));
+        let account = rpc.get_account_address(&p(&[json!("alloc->mn1")])).unwrap();
+        let dest = Address::from_base58(account.as_str().unwrap()).unwrap();
+        assert_eq!(tx.vout[vout].script_pubkey, dest.script_pubkey());
+        assert_eq!(reply.as_object().unwrap().len(), 2);
     }
 }
