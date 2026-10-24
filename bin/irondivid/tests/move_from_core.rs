@@ -14,9 +14,6 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::free_port;
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -26,6 +23,7 @@ use divi_primitives::{
     ChainMode,
 };
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use divi_test_support::{free_port, start_node};
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -110,23 +108,17 @@ struct Daemon {
 
 impl Daemon {
     fn start(datadir: &Path) -> Daemon {
-        let rpc_port = free_port();
-        let child = irondivid(datadir, "--regtest", rpc_port)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        daemon
+        // `irondivid` takes a new P2P port from free_port for each start
+        let (child, rpc_port, _) = start_node(
+            datadir,
+            |rpc_port, _| {
+                let mut cmd = irondivid(datadir, "--regtest", rpc_port);
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Daemon { child, rpc_port }
     }
 
     fn call(&self, method: &str, params: Value) -> Value {

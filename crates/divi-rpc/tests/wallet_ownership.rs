@@ -513,3 +513,40 @@ fn mnemonic_passphrase_is_kept() {
     let info = rpc.dump_hd_info(&p(vec![])).unwrap();
     assert_eq!(info["mnemonicpassphrase"], json!("TREZOR"));
 }
+
+/// addmultisigaddress puts the new script-hash address in the address book
+/// with the account given, "" without one, as Divi Core's SetAddressLabel
+/// (rpcwallet.cpp:1765-1773); listunspent then shows that account on its coins
+/// (rpcrawtransaction.cpp:335-339)
+#[test]
+fn addmultisigaddress_labels_the_address() {
+    let net = Net::new();
+    let rpc = net.rpc();
+    let address_of = |v: Value| {
+        let s = v["address"].as_str().or(v.as_str()).unwrap().to_string();
+        divi_wallet::Address::from_base58(&s).unwrap()
+    };
+    let named = address_of(
+        rpc.add_multisig_address(&p(vec![
+            json!(1),
+            json!([hex::encode(net.new_pubkey())]),
+            json!("ms"),
+        ]))
+        .unwrap(),
+    );
+    assert!(
+        net.wallet.in_address_book(&named),
+        "not in the address book"
+    );
+    assert_eq!(net.wallet.get_account(&named), "ms");
+
+    let unnamed = address_of(
+        rpc.add_multisig_address(&p(vec![json!(1), json!([hex::encode(net.new_pubkey())])]))
+            .unwrap(),
+    );
+    assert!(
+        net.wallet.in_address_book(&unnamed),
+        "not in the address book"
+    );
+    assert_eq!(net.wallet.get_account(&unnamed), "");
+}

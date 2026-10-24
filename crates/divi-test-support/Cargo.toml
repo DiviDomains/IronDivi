@@ -1,0 +1,9 @@
+[package]
+license = "AGPL-3.0-only"
+name = "divi-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Helpers for the workspace's tests: free ports and waiting for a started node"
+
+[dependencies]

@@ -13,11 +13,11 @@
 
 #![cfg(unix)]
 
+use divi_test_support::start_node;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 /// A coinstake (vin[0] not null, vout[0] empty, two outputs) paying OP_TRUE,
@@ -37,18 +37,6 @@ const COINSTAKE: &str = concat!(
     "51",
     "00000000"
 );
-
-/// A free port in 54100-54149, the range these tests may use
-fn port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    for _ in 0..50 {
-        let p = 54100 + NEXT.fetch_add(1, Ordering::Relaxed) % 50;
-        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-    panic!("no free port in 54100-54149");
-}
 
 /// One JSON-RPC call; None while the server is not up.
 /// "dGVzdDp0ZXN0" is base64 of test:test
@@ -77,31 +65,25 @@ struct Node {
 
 impl Node {
     fn start(datadir: &std::path::Path) -> Node {
-        let port = port();
-        let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
-            .arg("--regtest")
-            .arg("--datadir")
-            .arg(datadir)
-            .args(["--rpcport", &port.to_string()])
-            .args(["--port", &self::port().to_string()])
-            .args(["--bind", "127.0.0.1", "--staking=false"])
-            .args(["--connect", "127.0.0.1:1"])
-            .args(["--rpcuser", "test", "--rpcpassword", "test"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn irondivid");
-        let mut node = Node { child, port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                node.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        node
+        let (child, port, _) = start_node(
+            datadir,
+            |rpc_port, p2p_port| {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+                cmd.arg("--regtest")
+                    .arg("--datadir")
+                    .arg(datadir)
+                    .args(["--rpcport", &rpc_port.to_string()])
+                    .args(["--port", &p2p_port.to_string()])
+                    .args(["--bind", "127.0.0.1", "--staking=false"])
+                    .args(["--connect", "127.0.0.1:1"])
+                    .args(["--rpcuser", "test", "--rpcpassword", "test"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
+        Node { child, port }
     }
 
     fn call(&self, method: &str, params: Value) -> Value {

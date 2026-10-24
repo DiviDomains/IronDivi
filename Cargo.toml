@@ -11,6 +11,7 @@ members = [
     "crates/divi-rpc",
     "crates/divi-node",
     "crates/divi-masternode",
+    "crates/divi-test-support",
     "bin/irondivid",
     "bin/irondivi-cli",
     "crates/divi-swap",
@@ -46,6 +47,7 @@ divi-wallet = { path = "crates/divi-wallet" }
 divi-rpc = { path = "crates/divi-rpc" }
 divi-node = { path = "crates/divi-node" }
 divi-masternode = { path = "crates/divi-masternode" }
+divi-test-support = { path = "crates/divi-test-support" }
 divi-swap = { path = "crates/divi-swap" }
 swap-chain-divi = { path = "crates/swap-chain-divi" }
 swap-chain-btc = { path = "crates/swap-chain-btc" }

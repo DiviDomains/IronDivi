@@ -43,8 +43,6 @@ KNOWN = {
         "valueSat beside value on each output, as divid's getrawtransaction writes it (rpcrawtransaction.cpp:96-97); divid's decoderawtransaction writes value only (TxToJSON, JsonTxHelpers.cpp:66)",
     "decodescript: fields divid lacks":
         "hex, the script given (divid: rpcrawtransaction.cpp:556-563)",
-    "getrawtransaction verbose as text":
-        "verbose as a bool or numeric text is taken; divid reads an int (rpcrawtransaction.cpp:205-207); the same row in scripts/chain-replies",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named

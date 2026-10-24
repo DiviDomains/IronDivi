@@ -14,25 +14,13 @@
 
 #![cfg(unix)]
 
+use divi_test_support::{free_port, start_node};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
-
-/// A free port in 53720-53749, the range these tests may use
-fn port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    for _ in 0..30 {
-        let p = 53720 + NEXT.fetch_add(1, Ordering::Relaxed) % 30;
-        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-    panic!("no free port in 53720-53749");
-}
 
 /// POST one JSON-RPC call; None while the server is not up
 fn try_rpc(port: u16, method: &str, params: &Value) -> Option<Value> {
@@ -60,7 +48,7 @@ fn irondivid(datadir: &Path, rpc_port: u16) -> Command {
     cmd.arg("-regtest")
         .arg(format!("-datadir={}", datadir.display()))
         .arg(format!("-rpcport={rpc_port}"))
-        .arg(format!("-port={}", port()))
+        .arg(format!("-port={}", free_port()))
         .args(["-bind=127.0.0.1", "-connect=127.0.0.1:1"])
         .args(["-rpcuser=test", "-rpcpassword=test"])
         .env("WALLET_LOOKAHEAD", "5")
@@ -75,28 +63,18 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn spawn(datadir: &Path, extra: &[String]) -> Daemon {
-        let rpc_port = port();
-        let child = irondivid(datadir, rpc_port)
-            .args(extra)
-            .spawn()
-            .expect("spawn irondivid");
+    /// Start a node on `datadir` and wait until its RPC server answers
+    fn start(datadir: &Path, extra: &[String]) -> Daemon {
+        let (child, rpc_port, _) = start_node(
+            datadir,
+            |rpc_port, _| {
+                let mut cmd = irondivid(datadir, rpc_port);
+                cmd.args(extra);
+                cmd
+            },
+            |rpc_port| try_rpc(rpc_port, "getblockcount", &json!([])).is_some(),
+        );
         Daemon { child, rpc_port }
-    }
-
-    /// Wait at most `secs` for the RPC server to answer
-    fn answers_within(&mut self, secs: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        while Instant::now() < deadline {
-            if self.child.try_wait().unwrap().is_some() {
-                return false;
-            }
-            if try_rpc(self.rpc_port, "getblockcount", &json!([])).is_some() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        false
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
@@ -138,12 +116,11 @@ impl Drop for Daemon {
 fn exported_chain(dir: &Path, n: u64) -> Vec<u8> {
     let source = dir.join("source");
     std::fs::create_dir_all(&source).unwrap();
-    let mut node = Daemon::spawn(&source, &[]);
-    assert!(node.answers_within(120), "source node did not start");
+    let node = Daemon::start(&source, &[]);
     node.rpc("setgenerate", json!([n]));
     node.stop();
     let out = dir.join("export");
-    let mut child = irondivid(&source, port())
+    let mut child = irondivid(&source, free_port())
         .args(["--export-chain", "--export-start", "0", "--export-end"])
         .arg(n.to_string())
         .arg("--export-output")
@@ -172,18 +149,14 @@ fn rpc_answers_while_a_block_file_is_imported() {
 
     let datadir = dir.path().join("node");
     std::fs::create_dir_all(&datadir).unwrap();
-    let mut node = Daemon::spawn(&datadir, &[format!("-loadblock={}", fifo.display())]);
-    let answered = node.answers_within(60);
+    // The RPC server must answer while the file is still unwritten: a node
+    // that does not is stopped by `start`, which fails with its log
+    let node = Daemon::start(&datadir, &[format!("-loadblock={}", fifo.display())]);
 
-    // Feed the pipe in any case, so a node blocked on it can finish
     let writer = std::thread::spawn(move || {
         let mut pipe = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
         pipe.write_all(&file).unwrap();
     });
-    assert!(
-        answered,
-        "the RPC server did not answer while the block file was being read"
-    );
     assert_eq!(
         node.rpc("getblockcount", json!([])),
         0,
@@ -207,8 +180,7 @@ fn bootstrap_dat_is_read_from_the_network_directory() {
     let datadir = dir.path().join("node");
     std::fs::create_dir_all(datadir.join("regtest")).unwrap();
     std::fs::write(datadir.join("regtest").join("bootstrap.dat"), &file).unwrap();
-    let mut node = Daemon::spawn(&datadir, &[]);
-    assert!(node.answers_within(120), "node did not start");
+    let node = Daemon::start(&datadir, &[]);
     assert!(
         node.height_reaches(12, 60),
         "regtest/bootstrap.dat was not imported"

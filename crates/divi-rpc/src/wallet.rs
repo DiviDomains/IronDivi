@@ -181,6 +181,17 @@ fn ensure_fully_unlocked(wallet: &WalletDb) -> Result<(), Error> {
     Ok(())
 }
 
+/// Divi Core's AccountFromValue (rpcwallet.cpp:273-279): "*" names no
+/// account
+fn account_from_value(account: &str) -> Result<&str, Error> {
+    if account == "*" {
+        return Err(
+            RpcError::new(codes::WALLET_INVALID_ACCOUNT_NAME, "Invalid account name").into(),
+        );
+    }
+    Ok(account)
+}
+
 /// RPC error for a failed getnewaddress-style key request, as Divi Core
 fn new_key_error(e: divi_wallet::WalletError) -> Error {
     match e {
@@ -834,7 +845,7 @@ impl WalletRpc {
     pub fn get_new_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
-        let label = params.get_str(0).unwrap_or("");
+        let label = account_from_value(params.get_str(0).unwrap_or(""))?;
 
         let address = wallet.new_receiving_address().map_err(new_key_error)?;
         wallet.set_label(&address, label).map_err(|e| {
@@ -2900,16 +2911,17 @@ impl WalletRpc {
         )?;
 
         // parseVaultAddressEncoding (rpcwallet.cpp:920-950): without an owner
-        // a new key of the wallet owns the vault
+        // a new key of the wallet owns the vault, put in the address book
+        // with the name "" (rpcwallet.cpp:943)
         let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
             Some((owner, manager)) => (owner.to_string(), manager.to_string()),
-            None => (
-                wallet
-                    .new_receiving_address()
-                    .map_err(new_key_error)?
-                    .to_base58(),
-                vault_encoding.to_string(),
-            ),
+            None => {
+                let owner = wallet.new_receiving_address().map_err(new_key_error)?;
+                wallet.set_label(&owner, "").map_err(|e| {
+                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                })?;
+                (owner.to_base58(), vault_encoding.to_string())
+            }
         };
         // validateAndConstructVaultScriptFromParsedAddresses (rpcwallet.cpp:952-966)
         let key_hash = |address: &str, which: &str| -> Result<[u8; 20], Error> {
@@ -3474,9 +3486,11 @@ impl WalletRpc {
     /// sendmany - Send to multiple addresses in one transaction
     pub fn send_many(&self, params: &Params) -> Result<serde_json::Value, Error> {
         // Divi Core spends only the named account's coins ("" for all)
-        let account = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Account required"))?;
+        let account = account_from_value(
+            params
+                .get_str(0)
+                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
+        )?;
 
         // Get amounts object {"address": amount, ...}
         let amounts = params
@@ -3938,9 +3952,11 @@ impl WalletRpc {
 
     /// sendfrom - Send from a specific account (legacy)
     pub fn send_from(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let account = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Account required"))?;
+        let account = account_from_value(
+            params
+                .get_str(0)
+                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
+        )?;
 
         let addr_str = params
             .get_str(1)
@@ -4465,12 +4481,11 @@ impl WalletRpc {
         let address_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
-        // C++: the account is optional (defaults to "") and the address is checked first
-        let account = params.get_str(1).unwrap_or("");
-
         let address = self
             .decode_address(address_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
+        // C++: the account is optional (defaults to "") and read after the address
+        let account = account_from_value(params.get_str(1).unwrap_or(""))?;
 
         let wallet = self.get_wallet()?;
 
@@ -4500,9 +4515,11 @@ impl WalletRpc {
     }
 
     pub fn get_account_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let account = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Account required"))?;
+        let account = account_from_value(
+            params
+                .get_str(0)
+                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
+        )?;
 
         let wallet = self.get_wallet()?;
         Ok(serde_json::json!(Self::account_address(
@@ -4532,9 +4549,11 @@ impl WalletRpc {
     }
 
     pub fn get_addresses_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let account = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Account required"))?;
+        let account = account_from_value(
+            params
+                .get_str(0)
+                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
+        )?;
 
         let wallet = self.get_wallet()?;
         let addresses = wallet.get_addresses_by_account(account);
@@ -4556,11 +4575,13 @@ impl WalletRpc {
     }
 
     pub fn get_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let account = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Account required"))?;
-
         let min_conf = params.get_u64(1).unwrap_or(1) as u32;
+        // Read after minconf (rpcwallet.cpp:1517-1523)
+        let account = account_from_value(
+            params
+                .get_str(0)
+                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
+        )?;
 
         let wallet = self.get_wallet()?;
         let received = self.received_by_address(&wallet, min_conf);

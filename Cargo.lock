@@ -2764,6 +2764,7 @@ dependencies = [
  "divi-primitives",
  "divi-script",
  "divi-storage",
+ "divi-test-support",
  "futures",
  "hex",
  "parking_lot",
@@ -2790,6 +2791,7 @@ dependencies = [
  "divi-rpc",
  "divi-script",
  "divi-storage",
+ "divi-test-support",
  "divi-wallet",
  "parking_lot",
  "rand 0.8.8",
@@ -2832,6 +2834,7 @@ dependencies = [
  "divi-primitives",
  "divi-script",
  "divi-storage",
+ "divi-test-support",
  "divi-wallet",
  "futures",
  "hex",
@@ -3005,6 +3008,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "divi-test-support"
+version = "0.2.6"
 
 [[package]]
 name = "divi-wallet"
@@ -4143,6 +4150,7 @@ version = "0.2.6"
 dependencies = [
  "anyhow",
  "dirs",
+ "divi-test-support",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -4164,6 +4172,7 @@ dependencies = [
  "divi-primitives",
  "divi-rpc",
  "divi-storage",
+ "divi-test-support",
  "divi-wallet",
  "hex",
  "libc",

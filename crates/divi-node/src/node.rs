@@ -707,6 +707,11 @@ impl Node {
         if current_status != NodeStatus::Stopped {
             return Err(NodeError::AlreadyRunning);
         }
+        // As Divi Core, do not start without the listening socket
+        self.peer_manager
+            .bind_listeners()
+            .await
+            .map_err(NodeError::Init)?;
         self.spawn_import();
 
         tracing::info!("Starting Divi node...");
@@ -717,6 +722,10 @@ impl Node {
 
         // Set peer manager height
         self.peer_manager.set_height(self.chain.height());
+        // Version messages name the height at the time they are sent
+        let chain_for_height = Arc::clone(&self.chain);
+        self.peer_manager
+            .set_height_source(Arc::new(move || chain_for_height.height()));
 
         // A pruning node must not advertise NODE_NETWORK (full history). Key it off the
         // database too, so a node that pruned earlier stays honest if expire is later off.
@@ -2208,6 +2217,9 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut config = NodeConfig::testnet(ChainMode::Divi);
         config.data_dir = temp_dir.keep();
+        // A port of its own: a node that cannot listen does not start
+        config.p2p.listen_addr = "127.0.0.1".into();
+        config.p2p.port = 0;
         config
     }
 
@@ -2349,6 +2361,39 @@ mod tests {
         let info = node.get_blockchain_info();
         assert_eq!(info.chain, "test");
         assert_eq!(info.blocks, 0);
+    }
+
+    /// As Divi Core ("Unable to bind to ... on this computer", net.cpp:1355-1365;
+    /// "Failed to listen on any port", net.cpp:1829-1831), a node whose P2P
+    /// port is taken does not start
+    #[tokio::test]
+    async fn node_does_not_start_when_its_port_is_taken() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = test_config();
+        config.p2p.port = taken.local_addr().unwrap().port();
+        let node = Node::new(config).unwrap();
+        let err = node.start().await.expect_err("the port is taken");
+        let text = err.to_string();
+        assert!(text.contains("Unable to bind to 127.0.0.1:"), "{text}");
+        assert!(text.contains("Failed to listen on any port"), "{text}");
+
+        // With its own port the same node starts and listens
+        let mut config = test_config();
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        config.p2p.port = free.local_addr().unwrap().port();
+        drop(free);
+        let port = config.p2p.port;
+        let node = Node::new(config).unwrap();
+        node.start().await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            assert!(std::time::Instant::now() < deadline, "listening");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        node.stop().await.ok();
     }
 
     #[test]
