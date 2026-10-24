@@ -271,9 +271,15 @@ C.rpc("setgenerate", 30)
 addr = C.rpc("getnewaddress")
 confirmed = C.rpc("sendtoaddress", addr, 12.5)
 C.rpc("setgenerate", 1)
+# irondivid has the chain before the unconfirmed transaction is sent: one
+# announced while it still lacks the block with its input is an orphan, which
+# divid does not announce again either (and neither node retries on a block)
+if not synced():
+    print("FAIL   setup: irondivid did not follow divid's chain", flush=True)
+    sys.exit(1)
 unconfirmed = C.rpc("sendtoaddress", addr, 3.25)
-if not synced() or not in_mempool(I, unconfirmed):
-    print("FAIL   setup: irondivid did not follow divid's chain and mempool", flush=True)
+if not in_mempool(I, unconfirmed):
+    print("FAIL   setup: irondivid did not follow divid's mempool", flush=True)
     sys.exit(1)
 tip = C.rpc("getbestblockhash")
 genesis = C.rpc("getblockhash", 0)
