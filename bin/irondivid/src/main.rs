@@ -2055,6 +2055,9 @@ async fn run_daemon(
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2076,9 +2079,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2206,6 +2209,9 @@ async fn run_daemon(
         let block_sync_for_rpc = node.block_sync().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2226,9 +2232,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);

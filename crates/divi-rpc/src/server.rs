@@ -243,6 +243,12 @@ impl RpcServer {
     }
 
     /// Set the masternode manager
+    /// The masternodes the network announced (Core's list), read by
+    /// listmasternodes and getmasternodecount
+    pub fn set_masternode_list(&self, list: Arc<crate::mn_list::MasternodeList>) {
+        self.masternode.set_network_list(list);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -621,12 +627,16 @@ impl RpcServer {
             "getlitewalletinfo" => self.lite_wallet.read().get_lite_wallet_info(params),
 
             // Masternode methods
-            "getmasternodecount" => self.masternode.get_masternode_count(params),
+            "getmasternodecount" => self
+                .masternode
+                .get_masternode_count(params, self.blockchain.chain()),
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
                 .get_masternode_winners(params, self.blockchain.tip_height()),
-            "listmasternodes" => self.masternode.list_masternodes(params),
+            "listmasternodes" => self
+                .masternode
+                .list_masternodes(params, self.blockchain.chain()),
             "setupmasternode"
             | "startmasternode"
             | "broadcaststartmasternode"
