@@ -300,12 +300,10 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
-    "rescan",
     "rest",
     "resync",
     "rpckeepalive",
     "rpcthreads",
-    "salvagewallet",
     "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
@@ -637,6 +635,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
 
     const APPLIED: &[&str] = &[
         "vault",
+        "rescan",
+        "salvagewallet",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1414,6 +1414,7 @@ async fn run_daemon(
     wallet_path: Option<PathBuf>,
     wallet_seed: WalletSeed,
     disable_wallet: bool,
+    rescan: bool,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -1608,8 +1609,15 @@ async fn run_daemon(
             // lock and its scan height, so neither side skips or reorders a block.
             // A chain lower than the scan height (rebuilt or reindexed) rolls the
             // wallet back to the tip; the sync that follows scans those blocks again.
-            let last_scan = wallet_arc.last_scan_height();
+            // -rescan: scan the whole active chain again, keeping what the
+            // wallet holds, as Divi Core's verifySyncToActiveChain from the
+            // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
+            if rescan {
+                info!("Rescanning... from height 0 to {}", chain_height);
+                wallet_arc.set_last_scan_height(0);
+            }
+            let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
                 info!(
                     "Wallet scanned to height {} but the chain is at {}; rescanning above it as the chain syncs",
@@ -2659,6 +2667,10 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     });
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
+    // -salvagewallet sets -rescan unless -rescan is given (init.cpp:763-766)
+    let rescan = args
+        .settings
+        .get_bool("rescan", args.settings.get_bool("salvagewallet", false));
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -2666,6 +2678,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         args.wallet,
         wallet_seed,
         args.disablewallet,
+        rescan,
         shutdown_tx,
         shutdown_rx,
     )

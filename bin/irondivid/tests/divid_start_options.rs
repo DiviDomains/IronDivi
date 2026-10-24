@@ -437,6 +437,59 @@ fn blocknotify_and_walletnotify_run_their_commands() {
     );
 }
 
+/// -rescan scans the wallet from the first block when it loads
+/// (init.cpp:1242, wallet.cpp:279-313), and -salvagewallet sets -rescan
+/// (init.cpp:763-766): a key imported without a rescan shows its coins after
+/// such a start, and not after a plain one
+#[test]
+fn rescan_and_salvagewallet_find_the_coins_of_a_key_imported_without_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let first = WalletDb::with_hd_wallet(Network::Regtest, hd)
+        .new_receiving_address()
+        .unwrap();
+    mine_offline(dir.path(), &first, 25);
+    let rpc_port = free_port();
+    let args = divid_args(dir.path(), rpc_port);
+    let wif = {
+        let daemon = Daemon::start(
+            &args,
+            &[("WALLET_MNEMONIC", MNEMONIC), ("WALLET_LOOKAHEAD", "5")],
+            rpc_port,
+            true,
+        );
+        let to = daemon.rpc("getnewaddress", json!([]));
+        daemon.rpc("sendtoaddress", json!([to, 3]));
+        daemon.rpc("setgenerate", json!([1]));
+        daemon.rpc("dumpprivkey", json!([to]))
+    };
+    let start = |wallet: &str, extra: &[&str]| {
+        let mut args = args.clone();
+        args.push(format!("-wallet={wallet}"));
+        args.extend(extra.iter().map(|a| a.to_string()));
+        Daemon::start(&args, &[], rpc_port, true)
+    };
+    for (wallet, option) in [("w-rescan", "-rescan"), ("w-salvage", "-salvagewallet")] {
+        let daemon = start(wallet, &[]);
+        daemon.rpc("importprivkey", json!([wif, "", false]));
+        assert_eq!(daemon.rpc("getbalance", json!([])), json!(0.0));
+        drop(daemon);
+        let daemon = start(wallet, &[]);
+        assert_eq!(
+            daemon.rpc("getbalance", json!([])),
+            json!(0.0),
+            "{wallet}: a plain start does not rescan"
+        );
+        drop(daemon);
+        let daemon = start(wallet, &[option]);
+        assert_eq!(
+            daemon.rpc("getbalance", json!([])),
+            json!(3.0),
+            "{wallet}: {option} finds the imported key's coin"
+        );
+    }
+}
+
 /// -walletnotify runs each time divid's wallet adds or updates a
 /// transaction (wallet.cpp:1283): a send twice (CommitTransaction, then the
 /// mempool, :1878) and its block once
