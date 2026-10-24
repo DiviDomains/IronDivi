@@ -232,11 +232,13 @@ impl Settings {
 
     /// Fill the options the command line left unset from a config file in
     /// divid's format (Settings::ReadConfigFile with boost's parser): one
-    /// `name=value` per line, `#` starting a comment, a bare `name` meaning
-    /// an empty value. A `[section]` header and a `net.name` prefix do not
-    /// keep a setting from applying: Divi Core 3.0.0 applies them on every
-    /// network (ParseNetworkSpecificFlag tests "testnet" without its dash).
-    pub fn read_config(&mut self, content: &str) {
+    /// `name=value` per line, `#` starting a comment. A line that is neither
+    /// that nor a `[section]` header is boost's error, which stops divid's
+    /// start (divid.cpp:95-99); its text is returned. A `[section]` header and
+    /// a `net.name` prefix do not keep a setting from applying: Divi Core
+    /// 3.0.0 applies them on every network (ParseNetworkSpecificFlag tests
+    /// "testnet" without its dash).
+    pub fn read_config(&mut self, content: &str) -> Result<(), String> {
         let mut section: Option<String> = None;
         for raw in content.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -249,7 +251,11 @@ impl Settings {
             }
             let (key, value) = match line.split_once('=') {
                 Some((k, v)) => (k.trim(), v.trim()),
-                None => (line, ""),
+                None => {
+                    return Err(format!(
+                        "the options configuration file contains an invalid line '{line}'"
+                    ))
+                }
             };
             if key.is_empty() {
                 continue;
@@ -264,6 +270,7 @@ impl Settings {
             };
             self.set(&key, value.trim_matches('"'), true);
         }
+        Ok(())
     }
 
     /// Fill the options the command line left unset from irondivid's TOML
@@ -345,8 +352,9 @@ mod tests {
         let mut s = cli(&["-port=1", "-addnode=a"]);
         s.read_config(
             "port=2\nrpcport=3 # comment\nrpcport=4\naddnode=b\naddnode=c\nnolisten=1\n\
-             regtest.timeout=7\n[test]\nmaxconnections=9\nbare\nstaking=true\n",
-        );
+             regtest.timeout=7\n[test]\nmaxconnections=9\nbare=\nstaking=true\n",
+        )
+        .unwrap();
         assert_eq!(s.get("port"), Some("1"));
         assert_eq!(s.get("rpcport"), Some("3"), "the file's first value wins");
         assert_eq!(s.get_multi("addnode"), ["a", "b", "c"]);
@@ -355,6 +363,19 @@ mod tests {
         assert_eq!(s.get("timeout"), Some("7"));
         assert!(s.get_bool("bare", false));
         assert!(!s.get_bool("staking", true), "atoi(\"true\") is 0");
+    }
+
+    /// A line with no "=" is boost's error, which stops divid's start
+    /// (divid.cpp:95-99); comments and spaces around it are not part of it
+    #[test]
+    fn config_line_without_a_value_is_refused_as_divid_refuses_it() {
+        let mut s = cli(&[]);
+        assert_eq!(
+            s.read_config("port=2\n  listen   # no value\nrpcport=3\n"),
+            Err("the options configuration file contains an invalid line 'listen'".to_string())
+        );
+        let mut s = cli(&[]);
+        assert!(s.read_config("# only\n\n[main]\nport=2\n").is_ok());
     }
 
     #[test]

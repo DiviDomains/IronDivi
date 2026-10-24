@@ -466,7 +466,7 @@ impl P2pConfig {
             .ok()
             .and_then(|mut a| a.next())
             .map(Some)
-            .ok_or_else(|| format!("invalid proxy address '{raw}'"))
+            .ok_or_else(|| format!("Invalid -proxy address or hostname: '{raw}'"))
     }
 }
 
@@ -920,7 +920,11 @@ mod tests {
             with("::1").proxy_addr(),
             Ok(Some("[::1]:9050".parse().unwrap()))
         );
-        assert!(with("not a proxy!").proxy_addr().is_err());
+        // Divi Core's text (init.cpp's -proxy check)
+        assert_eq!(
+            with("not a proxy!").proxy_addr(),
+            Err("Invalid -proxy address or hostname: 'not a proxy!'".to_string())
+        );
     }
 
     #[test]

@@ -191,8 +191,10 @@ impl Args {
         };
         self.maxlogsize = positive("maxlogsize");
         self.maxlogfiles = positive("maxlogfiles").filter(|n| *n <= 100);
-        self.help = ["?", "help", "h"].iter().any(|k| self.cli.is_set(k));
-        self.version = ["version", "V"].iter().any(|k| self.cli.is_set(k));
+        // divid's AppInit takes -? and -help, and -version (divid.cpp:70-85);
+        // -h and -V are not its options
+        self.help = ["?", "help"].iter().any(|k| self.cli.is_set(k));
+        self.version = self.cli.is_set("version");
         if self.export_chain && (self.export_start.is_none() && self.cli.is_set("export-start")) {
             anyhow::bail!("invalid --export-start");
         }
@@ -242,6 +244,18 @@ fn config_path(args: &Args) -> PathBuf {
     }
 }
 
+/// A config file divid's parser refuses, with boost's text
+#[derive(Debug)]
+struct ConfigFileError(String);
+
+impl std::fmt::Display for ConfigFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigFileError {}
+
 /// Read the config file into the settings: irondivid's TOML, else divid's
 /// `name=value` format. Values the command line set are kept. Pins `conf` to
 /// the file read, so a network chosen by the file does not move it.
@@ -255,7 +269,10 @@ fn resolve_args(mut args: Args) -> Result<Args> {
             .with_context(|| format!("Error reading configuration file: {:?}", path))?;
         match content.parse::<toml::Table>() {
             Ok(table) => args.settings.read_toml(&table),
-            Err(_) => args.settings.read_config(&content),
+            Err(_) => args
+                .settings
+                .read_config(&content)
+                .map_err(ConfigFileError)?,
         }
     }
     args.refresh()?;
@@ -448,6 +465,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             warn!("option -rpcbind was ignored because -rpcallowip was not specified, refusing to allow everyone to connect");
         }
     } else if let Some(first) = rpcbind.first() {
+        // Each must be a numeric address, with a port or not (ParseEndpoint,
+        // rpcserver.cpp:623-629, :693-703)
+        for addr in rpcbind {
+            let (host, _) = host_and_port(addr);
+            if host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_err()
+            {
+                anyhow::bail!("Could not parse -rpcbind value {} as network address", addr);
+            }
+        }
         let (host, p) = host_and_port(first);
         config.rpc.listen_addr = host;
         if let Some(p) = p {
@@ -562,6 +591,34 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount>: '{}'", text)
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
+    }
+    // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
+    // above 10 DIVI a warning (init.cpp:831-845)
+    if let Some(text) = s.get("maxtxfee") {
+        let invalid = || anyhow::anyhow!("Invalid amount for -maxtxfee=<amount>: '{}'", text);
+        let max_fee = parse_money(text).ok_or_else(invalid)?;
+        if max_fee > 10 * 100_000_000 {
+            warn!("Warning: -maxtxfee is set very high! Fees this large could be paid on a single transaction.");
+        }
+        let relay = config.mempool.min_relay_fee_per_kb;
+        if max_fee < relay {
+            anyhow::bail!(
+                "Invalid amount for -maxtxfee=<amount>: '{}' (must be at least the minrelay fee of {}.{:08} DIV/kB to prevent stuck transactions)",
+                text,
+                relay / 100_000_000,
+                relay % 100_000_000
+            );
+        }
+    }
+    // -onlynet: each one of Divi Core's network names (ParseNetwork,
+    // netbase.cpp:70-77; init.cpp:1734-1740)
+    for net in s.get_multi("onlynet") {
+        if !matches!(
+            net.to_lowercase().as_str(),
+            "ipv4" | "ipv6" | "tor" | "onion"
+        ) {
+            anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
+        }
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -1474,6 +1531,26 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
     );
 }
 
+/// Lock `<datadir>/.lock` as Divi Core does; a data directory another process
+/// holds stops the start with Divi Core's error
+fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(".lock"))
+        .with_context(|| format!("Failed to open {:?}", dir.join(".lock")))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
+            dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("Failed to lock {:?}", dir.join(".lock")))
+        }
+    }
+}
+
 /// Run the daemon
 async fn run_daemon(
     mut config: NodeConfig,
@@ -1487,6 +1564,9 @@ async fn run_daemon(
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
+    // One process per data directory, held until this one exits
+    // (TryLockDataDirectory, init.cpp:850-862)
+    let _datadir_lock = lock_data_dir(&config.data_dir)?;
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -2553,7 +2633,11 @@ fn main() -> Result<()> {
     let args = match resolve_args(args) {
         Ok(args) => args,
         Err(e) => {
-            eprintln!("Error: {:#}", e);
+            // divid prints its config file errors under their own heading (divid.cpp:97-98)
+            match e.downcast_ref::<ConfigFileError>() {
+                Some(c) => eprintln!("Error reading configuration file: {}", c),
+                None => eprintln!("Error: {:#}", e),
+            }
             std::process::exit(1);
         }
     };
@@ -3984,5 +4068,134 @@ mod divid_option_tests {
         assert_eq!(NodeConfig::mainnet(ChainMode::Divi).rpc.port, 51473);
         assert_eq!(NodeConfig::testnet(ChainMode::Divi).rpc.port, 51475);
         assert_eq!(NodeConfig::regtest(ChainMode::Divi).rpc.port, 51475);
+    }
+}
+
+/// Starts divid refuses, refused with its text (init.cpp, divid.cpp, rpcserver.cpp)
+#[cfg(test)]
+mod start_errors {
+    use super::*;
+
+    fn start(conf: &str, argv: &[&str]) -> Result<NodeConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("divi.conf"), conf).unwrap();
+        let mut v = vec![
+            "irondivid".to_string(),
+            format!("-datadir={}", dir.path().display()),
+        ];
+        v.extend(argv.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(v))
+    }
+
+    fn refused(conf: &str, argv: &[&str]) -> String {
+        format!(
+            "{:#}",
+            start(conf, argv).expect_err("the start must be refused")
+        )
+    }
+
+    const CONF: &str = "regtest=1\nrpcuser=u\nrpcpassword=p\n";
+
+    /// -maxtxfee as init.cpp:831-845: ParseMoney, then at least the relay fee
+    #[test]
+    fn maxtxfee_is_refused_as_divid_refuses_it() {
+        for bad in ["abc", "-1", "99999999999", "1e3"] {
+            assert_eq!(
+                refused(CONF, &[&format!("-maxtxfee={bad}")]),
+                format!("Invalid amount for -maxtxfee=<amount>: '{bad}'")
+            );
+        }
+        assert_eq!(
+            refused(CONF, &["-maxtxfee=0.00001", "-minrelaytxfee=0.0001"]),
+            "Invalid amount for -maxtxfee=<amount>: '0.00001' (must be at least the minrelay \
+             fee of 0.00010000 DIV/kB to prevent stuck transactions)"
+        );
+        assert!(start(CONF, &["-maxtxfee=0.5"]).is_ok());
+        assert!(
+            start(CONF, &["-maxtxfee=100"]).is_ok(),
+            "very high is a warning only"
+        );
+    }
+
+    /// -onlynet takes ipv4, ipv6, tor or onion (netbase.cpp:70-77, init.cpp:1734-1740)
+    #[test]
+    fn onlynet_names_a_network_divid_knows() {
+        assert_eq!(
+            refused(CONF, &["-onlynet=bogus"]),
+            "Unknown network specified in -onlynet: 'bogus'"
+        );
+        for good in ["ipv4", "IPv6", "tor", "onion"] {
+            assert!(
+                start(CONF, &[&format!("-onlynet={good}")]).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    /// -rpcbind is a numeric address, read only with -rpcallowip
+    /// (rpcserver.cpp:623-629, :685-703)
+    #[test]
+    fn rpcbind_must_be_a_numeric_address() {
+        assert_eq!(
+            refused(CONF, &["-rpcallowip=127.0.0.1", "-rpcbind=garbage"]),
+            "Could not parse -rpcbind value garbage as network address"
+        );
+        assert_eq!(
+            refused(
+                CONF,
+                &[
+                    "-rpcallowip=127.0.0.1",
+                    "-rpcbind=127.0.0.1",
+                    "-rpcbind=localhost"
+                ]
+            ),
+            "Could not parse -rpcbind value localhost as network address"
+        );
+        assert!(
+            start(CONF, &["-rpcbind=garbage"]).is_ok(),
+            "ignored without -rpcallowip"
+        );
+        assert!(start(CONF, &["-rpcallowip=127.0.0.1", "-rpcbind=127.0.0.1:1234"]).is_ok());
+        assert!(start(CONF, &["-rpcallowip=::1", "-rpcbind=[::1]:1234"]).is_ok());
+    }
+
+    /// A divi.conf line with no "=" is boost's error (divid.cpp:95-99)
+    #[test]
+    fn config_line_without_a_value_stops_the_start() {
+        assert_eq!(
+            refused(&format!("{CONF}listen\n"), &[]),
+            "the options configuration file contains an invalid line 'listen'"
+        );
+    }
+
+    /// divid takes -? and -help, and -version; -h and -V are not its options
+    /// (divid.cpp:70-85)
+    #[test]
+    fn help_and_version_are_divid_s_options() {
+        let parse = |a: &str| Args::parse_from(["irondivid", a]);
+        assert!(parse("-?").help && parse("-help").help && parse("--help").help);
+        assert!(parse("-version").version);
+        assert!(!parse("-h").help && !parse("-h").version);
+        assert!(!parse("-V").version);
+    }
+
+    /// One process per data directory, with divid's text (init.cpp:850-862)
+    #[test]
+    fn a_held_data_directory_stops_a_second_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).unwrap();
+        let e = format!("{:#}", lock_data_dir(dir.path()).unwrap_err());
+        assert_eq!(
+            e,
+            format!(
+                "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
+                dir.path().display()
+            )
+        );
+        drop(first);
+        assert!(
+            lock_data_dir(dir.path()).is_ok(),
+            "free again once the first exits"
+        );
     }
 }
