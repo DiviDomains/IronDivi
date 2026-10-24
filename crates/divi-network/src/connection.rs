@@ -455,8 +455,16 @@ impl Connection {
             });
         }
 
-        let mut payload = vec![0u8; header.payload_size as usize];
-        self.stream.read_exact(&mut payload).await?;
+        // Read the payload as it arrives instead of reserving all of it
+        // up front for a size the peer has only announced
+        let mut payload = Vec::new();
+        (&mut self.stream)
+            .take(u64::from(header.payload_size))
+            .read_to_end(&mut payload)
+            .await?;
+        if payload.len() != header.payload_size as usize {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
 
         let bytes_received = HEADER_SIZE as u64 + header.payload_size as u64;
         self.info.bytes_recv += bytes_received;
