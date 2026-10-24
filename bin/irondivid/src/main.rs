@@ -555,6 +555,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
+    if let Some(wif) = s.get("sporkkey") {
+        // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
+        // network's spork key stops the start
+        let mainnet = config.network.magic == divi_network::constants::MAINNET_MAGIC;
+        let spork = divi_network::spork::spork_key(&config.network.magic);
+        if !spork.is_some_and(|spork| is_spork_key(wif, mainnet, &spork)) {
+            anyhow::bail!("Unable to sign spork message, wrong key?");
+        }
+        warn!(
+            "-sporkkey is this network's spork key, but irondivid does not sign sporks; not used"
+        );
+    }
     config.staking.enabled = s.get_bool("staking", true);
     if s.is_set("stakeonstaletip") {
         config.staking.stake_on_stale_tip = s.get_bool("stakeonstaletip", false);
@@ -625,6 +637,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "sporkkey",
         "staking",
         "stakeonstaletip",
         "stakesplitthreshold",
@@ -664,6 +677,39 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A start the node refuses for a stated reason gives that reason alone, as
+/// Divi Core's InitError prints its text after "Error: " (noui.cpp:38-40), e.g.
+/// the -txindex change of init.cpp:1104-1105; other errors keep the step that
+/// failed
+fn start_error(e: divi_node::NodeError) -> anyhow::Error {
+    match e {
+        divi_node::NodeError::Init(reason) => anyhow::Error::msg(reason),
+        e => anyhow::Error::new(e).context("Failed to initialize node"),
+    }
+}
+
+/// Whether `wif` is a private key of this network (mainnet or not) whose public
+/// key is `spork`, as Divi Core's CSporkManager::SetPrivKey checks it: the
+/// secret is read as this network's (CBitcoinSecret) and its key id compared
+/// with the spork key's (spork.cpp:461-475)
+fn is_spork_key(wif: &str, mainnet: bool, spork: &[u8]) -> bool {
+    let Ok(key) = divi_wallet::decode_wif(wif) else {
+        return false;
+    };
+    if (key.network == WalletNetwork::Mainnet) != mainnet {
+        return false;
+    }
+    let Ok(secret) = divi_crypto::keys::SecretKey::from_bytes(&key.key_bytes) else {
+        return false;
+    };
+    let public = secret.public_key();
+    if key.compressed {
+        public.serialize_compressed()[..] == *spork
+    } else {
+        public.serialize_uncompressed()[..] == *spork
+    }
 }
 
 /// A host with an optional port, as Divi Core's CService reads it: `ip`,
@@ -1299,7 +1345,7 @@ async fn run_daemon(
 
     // Initialize the node
     info!("Initializing node...");
-    let node = Node::new(config.clone()).with_context(|| "Failed to initialize node")?;
+    let node = Node::new(config.clone()).map_err(start_error)?;
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -3524,6 +3570,63 @@ mod divid_option_tests {
                 Some(format!("Invalid amount for -minrelaytxfee=<amount>: '{zero}'").as_str())
             );
         }
+    }
+
+    /// divid refuses to start with a -sporkkey that is not the network's spork
+    /// key (init.cpp:971-974), whatever is wrong with it
+    #[test]
+    fn sporkkey_that_is_not_the_spork_key_stops_the_start() {
+        let other = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(other.as_bytes());
+        for wif in [
+            divi_wallet::encode_wif(&bytes, true, WalletNetwork::Testnet),
+            divi_wallet::encode_wif(&bytes, true, WalletNetwork::Mainnet),
+            "not a key".to_string(),
+            String::new(),
+        ] {
+            let err = cfg_in(
+                "irondivi.conf",
+                &format!("rpcuser=x\nregtest=1\nsporkkey={wif}\n"),
+                &[],
+            )
+            .err()
+            .map(|e| e.to_string());
+            assert_eq!(
+                err.as_deref(),
+                Some("Unable to sign spork message, wrong key?")
+            );
+        }
+    }
+
+    /// The spork key check: this network's secret of that public key, in the
+    /// compressed or uncompressed form the key was given in
+    #[test]
+    fn spork_key_check_matches_the_public_key_and_network() {
+        let secret = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(secret.as_bytes());
+        let public = secret.public_key();
+        let compressed = public.serialize_compressed();
+        let uncompressed = public.serialize_uncompressed();
+        let testnet = divi_wallet::encode_wif(&bytes, true, WalletNetwork::Testnet);
+        let mainnet = divi_wallet::encode_wif(&bytes, true, WalletNetwork::Mainnet);
+        let testnet_long = divi_wallet::encode_wif(&bytes, false, WalletNetwork::Testnet);
+        assert!(is_spork_key(&testnet, false, &compressed));
+        assert!(is_spork_key(&mainnet, true, &compressed));
+        assert!(is_spork_key(&testnet_long, false, &uncompressed));
+        assert!(!is_spork_key(&testnet, true, &compressed), "other network");
+        assert!(!is_spork_key(&mainnet, false, &compressed), "other network");
+        assert!(
+            !is_spork_key(&testnet_long, false, &compressed),
+            "other key id"
+        );
+        let other = divi_crypto::keys::SecretKey::new_random().public_key();
+        assert!(!is_spork_key(
+            &testnet,
+            false,
+            &other.serialize_compressed()
+        ));
     }
 
     /// Without -rpcallowip divid listens on the loopback and ignores -rpcbind
