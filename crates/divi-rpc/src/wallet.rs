@@ -308,15 +308,18 @@ pub(crate) fn script_pubkey_to_json(
 ) -> serde_json::Value {
     use divi_script::{extract_destinations, extract_script_type, get_script_type_name, to_asm};
     let (script_type, _solutions) = extract_script_type(script_bytes);
-    let mut script_obj = json!({
-        "asm": to_asm(script_bytes),
-        "type": get_script_type_name(script_type),
-    });
+    // Members in the order ScriptPubKeyToJSON writes them: asm, hex, then
+    // reqSigs, type and addresses, or only type for a script with no
+    // destination (JsonTxHelpers.cpp:15-37)
+    let mut script_obj = serde_json::Map::new();
+    script_obj.insert("asm".into(), json!(to_asm(script_bytes)));
     if include_hex {
-        script_obj["hex"] = json!(hex::encode(script_bytes));
+        script_obj.insert("hex".into(), json!(hex::encode(script_bytes)));
     }
+    let type_name = json!(get_script_type_name(script_type));
     if let Some((_stype, destinations, req_sigs)) = extract_destinations(script_bytes) {
-        script_obj["reqSigs"] = json!(req_sigs);
+        script_obj.insert("reqSigs".into(), json!(req_sigs));
+        script_obj.insert("type".into(), type_name);
         let addresses: Vec<String> = destinations
             .iter()
             .map(|dest| match dest {
@@ -328,9 +331,11 @@ pub(crate) fn script_pubkey_to_json(
                 }
             })
             .collect();
-        script_obj["addresses"] = json!(addresses);
+        script_obj.insert("addresses".into(), json!(addresses));
+    } else {
+        script_obj.insert("type".into(), type_name);
     }
-    script_obj
+    serde_json::Value::Object(script_obj)
 }
 
 /// Divi Core's ParseHexV (rpcserver.cpp): a non-empty, even-length hex string,

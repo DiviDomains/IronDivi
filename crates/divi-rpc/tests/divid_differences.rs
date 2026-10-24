@@ -127,19 +127,6 @@ fn versions_name_irondivid() {
     assert_eq!(info["protocolversion"], 70915);
 }
 
-/// Members of a result come in name order, not in divid's insertion order
-#[test]
-fn result_members_are_in_name_order() {
-    let (server, _dir) = server();
-    for method in ["getinfo", "getblockchaininfo", "getwalletinfo"] {
-        let info = result(&server, method, vec![]);
-        let names = keys(&info);
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted, "{method}");
-    }
-}
-
 /// loadwallet exists in divid (rpcserver.cpp:439) and is refused here: the
 /// wallet is chosen at start
 #[test]
