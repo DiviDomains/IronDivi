@@ -6203,7 +6203,7 @@ mod accounting_tests {
     }
 
     #[test]
-    fn send_does_not_spend_own_unconfirmed_change() {
+    fn send_spends_own_unconfirmed_change_only_with_spendzeroconfchange() {
         let f = fixture();
         // Our own tx spends every confirmed coin: 100 DIVI change comes back
         // unconfirmed (trusted, as all inputs are ours)
@@ -6249,6 +6249,15 @@ mod accounting_tests {
             .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
             .is_err());
         assert!(submitted.lock().is_none());
+
+        // With -spendzeroconfchange it may (wallet.cpp:1848)
+        f.wallet.set_spend_zero_conf_change(true);
+        assert!(f
+            .rpc
+            .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
+            .is_ok());
+        let sent = submitted.lock().clone().expect("a transaction was sent");
+        assert!(sent.vin.iter().any(|i| i.prevout.txid == own.txid()));
     }
 
     #[test]

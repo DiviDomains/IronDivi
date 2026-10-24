@@ -490,6 +490,32 @@ fn rescan_and_salvagewallet_find_the_coins_of_a_key_imported_without_rescan() {
     }
 }
 
+/// -keypool sets how many keys of each chain the keypool is topped up to
+/// (wallet.cpp:2071-2080). A new wallet is filled to it and gives one key to
+/// the default key (wallet.cpp:342-356); a key taken is topped up first; a
+/// load leaves the pool as it is (wallet.cpp:2122-2131); keypoolrefill tops
+/// it up to the current -keypool. The numbers are divid's.
+#[test]
+fn keypool_option_sets_the_keypool_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc_port = free_port();
+    let start = |keypool: u32| {
+        let mut args = divid_args(dir.path(), rpc_port);
+        args.push(format!("-keypool={keypool}"));
+        Daemon::start(&args, &[], rpc_port, true)
+    };
+    let size = |d: &Daemon| d.rpc("getwalletinfo", json!([]))["keypoolsize"].clone();
+    let daemon = start(5);
+    assert_eq!(size(&daemon), json!(9), "a new wallet with -keypool=5");
+    daemon.rpc("getnewaddress", json!([]));
+    assert_eq!(size(&daemon), json!(9), "after getnewaddress");
+    drop(daemon);
+    let daemon = start(8);
+    assert_eq!(size(&daemon), json!(9), "loaded with -keypool=8");
+    daemon.rpc("keypoolrefill", json!([]));
+    assert_eq!(size(&daemon), json!(16), "keypoolrefill with -keypool=8");
+}
+
 /// -walletnotify runs each time divid's wallet adds or updates a
 /// transaction (wallet.cpp:1283): a send twice (CommitTransaction, then the
 /// mempool, :1878) and its block once

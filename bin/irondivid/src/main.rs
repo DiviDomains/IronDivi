@@ -35,7 +35,7 @@ use divi_primitives::transaction::Transaction;
 use divi_primitives::ChainMode;
 use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
-use settings::Settings;
+use settings::{atoi, Settings};
 use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -279,7 +279,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "forcednsseed",
     "forcestart",
     "genproclimit",
-    "keypool",
     "listenonion",
     "litemode",
     "logips",
@@ -307,7 +306,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
-    "spendzeroconfchange",
     "sysperms",
     "torcontrol",
     "torpassword",
@@ -637,6 +635,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "vault",
         "rescan",
         "salvagewallet",
+        "spendzeroconfchange",
+        "keypool",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1158,12 +1158,39 @@ impl WalletSeed {
     }
 }
 
+/// Wallet start options
+#[derive(Debug, Clone, Copy, Default)]
+struct WalletOptions {
+    /// -rescan: scan the whole chain at the start; -salvagewallet sets it
+    /// unless it is given (init.cpp:763-766, :1242)
+    rescan: bool,
+    /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
+    /// transactions (wallet.cpp:1848)
+    spend_zero_conf_change: bool,
+    /// -keypool: keys of each chain the keypool is topped up to, read as a
+    /// number and at least one (wallet.cpp:2071-2080)
+    keypool: Option<u32>,
+}
+
+impl WalletOptions {
+    fn from_settings(settings: &Settings) -> Self {
+        WalletOptions {
+            rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
+            keypool: settings
+                .get("keypool")
+                .map(|v| atoi(v).clamp(1, u32::MAX as i64) as u32),
+        }
+    }
+}
+
 /// Load or create wallet
 fn load_or_create_wallet(
     wallet_path: &PathBuf,
     network: WalletNetwork,
     chain_mode: ChainMode,
     seed: WalletSeed,
+    keypool: Option<u32>,
 ) -> Result<Arc<WalletDb>> {
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
@@ -1183,6 +1210,7 @@ fn load_or_create_wallet(
         mnemonic,
         passphrase,
         hdseed,
+        keypool,
     )
 }
 
@@ -1215,6 +1243,7 @@ fn load_or_restore_wallet(
         restoring,
         passphrase,
         None,
+        None,
     )
 }
 
@@ -1227,6 +1256,7 @@ fn load_or_restore_wallet_with_seed(
     restoring: Option<String>,
     passphrase: Option<String>,
     seed: Option<String>,
+    keypool: Option<u32>,
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
@@ -1246,14 +1276,16 @@ fn load_or_restore_wallet_with_seed(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
+        if let Some(size) = keypool {
+            wallet.keystore().set_keypool_target(size);
+        }
         // Divi Core does not refill the keypool when it loads a wallet: it tops
         // up only before it takes a key (wallet.cpp:2122-2131), so a pool may
-        // sit one key short per chain. Only a pool below that, which divid
-        // never has (a wallet stored before its keypool was), is filled here,
-        // so payments to its next keys are still found. A locked wallet is
-        // topped up on unlock.
-        let at_rest = 2 * wallet.keypool_target().saturating_sub(1);
-        if !wallet.is_locked() && wallet.keypool_size() < at_rest {
+        // sit one key short per chain, or below a -keypool raised since. Only
+        // an empty pool, which divid never has (a wallet stored before its
+        // keypool was), is filled here, so payments to its next keys are
+        // still found. A locked wallet is topped up on unlock.
+        if !wallet.is_locked() && wallet.keypool_size() == 0 {
             if let Err(e) = wallet.top_up_keypool() {
                 warn!("Could not top up the keypool: {}", e);
             }
@@ -1329,6 +1361,9 @@ fn load_or_restore_wallet_with_seed(
 
     let wallet = WalletDb::create_persistent(wallet_path, network, hd_wallet)
         .with_context(|| "Failed to create wallet")?;
+    if let Some(size) = keypool {
+        wallet.keystore().set_keypool_target(size);
+    }
 
     // A new or restored wallet starts with a full keypool, as in Divi Core,
     // whose restore finds the coins of exactly these keys: the catch-up scan
@@ -1414,7 +1449,7 @@ async fn run_daemon(
     wallet_path: Option<PathBuf>,
     wallet_seed: WalletSeed,
     disable_wallet: bool,
-    rescan: bool,
+    wallet_options: WalletOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -1493,10 +1528,12 @@ async fn run_daemon(
             wallet_network,
             config.network.chain_mode,
             wallet_seed,
+            wallet_options.keypool,
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
             w.set_vault_mode(config.vault);
+            w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
@@ -1613,7 +1650,7 @@ async fn run_daemon(
             // wallet holds, as Divi Core's verifySyncToActiveChain from the
             // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
-            if rescan {
+            if wallet_options.rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
             }
@@ -2667,10 +2704,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     });
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
-    // -salvagewallet sets -rescan unless -rescan is given (init.cpp:763-766)
-    let rescan = args
-        .settings
-        .get_bool("rescan", args.settings.get_bool("salvagewallet", false));
+    let wallet_options = WalletOptions::from_settings(&args.settings);
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -2678,7 +2712,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         args.wallet,
         wallet_seed,
         args.disablewallet,
-        rescan,
+        wallet_options,
         shutdown_tx,
         shutdown_rx,
     )
@@ -3628,6 +3662,7 @@ mod wallet_move_tests {
             WalletNetwork::Regtest,
             ChainMode::Divi,
             WalletSeed::default(),
+            None,
         );
         std::env::remove_var("WALLET_HDSEED");
         std::env::remove_var("WALLET_MNEMONIC");
