@@ -2636,6 +2636,11 @@ impl WalletDb {
         self.keystore.keypool_size()
     }
 
+    /// How many keys of each chain the keypool is filled to (-keypool)
+    pub fn keypool_target(&self) -> u32 {
+        self.keystore.keypool_target()
+    }
+
     /// Get the timestamp of the oldest key in the keypool
     pub fn keypool_oldest(&self) -> u64 {
         self.keystore.keypool_oldest()

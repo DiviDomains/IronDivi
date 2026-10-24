@@ -1184,9 +1184,14 @@ fn load_or_restore_wallet_with_seed(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
-        // As Divi Core at start: fill the keypool while the seed is in memory
-        // (an encrypted wallet starts locked and is topped up on unlock)
-        if !wallet.is_locked() {
+        // Divi Core does not refill the keypool when it loads a wallet: it tops
+        // up only before it takes a key (wallet.cpp:2122-2131), so a pool may
+        // sit one key short per chain. Only a pool below that, which divid
+        // never has (a wallet stored before its keypool was), is filled here,
+        // so payments to its next keys are still found. A locked wallet is
+        // topped up on unlock.
+        let at_rest = 2 * wallet.keypool_target().saturating_sub(1);
+        if !wallet.is_locked() && wallet.keypool_size() < at_rest {
             if let Err(e) = wallet.top_up_keypool() {
                 warn!("Could not top up the keypool: {}", e);
             }
