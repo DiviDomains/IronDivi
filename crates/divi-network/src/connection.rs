@@ -333,7 +333,7 @@ impl Connection {
             }
         }
         self.info.services = their_version.services;
-        self.info.start_height = their_version.start_height as u32;
+        self.info.start_height = their_version.start_height;
         self.info.version = Some(their_version);
         self.info.state = PeerState::VersionReceived;
 
