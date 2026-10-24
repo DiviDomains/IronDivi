@@ -318,7 +318,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "txconfirmtarget",
     "upgradewallet",
     "upnp",
-    "vault",
     "vault_min",
     "whitebind",
     "whitelist",
@@ -600,8 +599,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("walletnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
+        "vault",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1361,6 +1362,8 @@ async fn run_daemon(
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
+            w.set_vault_mode(config.vault);
+            w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
         }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
@@ -2767,34 +2770,48 @@ mod config_format_tests {
 mod wallet_log_tests {
     use super::*;
 
-    /// Run `f` under a subscriber that records every event at every level, and
-    /// return its result with the formatted log text.
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-        use std::io::Write;
-        use std::sync::Mutex;
+    thread_local! {
+        /// Where the test subscriber writes this thread's events while a
+        /// capture runs on it
+        static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    struct ThreadBuf;
+    impl std::io::Write for ThreadBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            CAPTURED.with(|c| {
+                if let Some(buf) = c.borrow_mut().as_mut() {
+                    buf.extend_from_slice(bytes);
+                }
+            });
+            Ok(bytes.len())
         }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        (out, logs)
+    /// Run `f` and return its result with the formatted text of every event it
+    /// logged on this thread, at every level. One subscriber is installed for
+    /// the whole test process, so tests running at the same time cannot change
+    /// which events are enabled (a scoped subscriber per test could: tracing
+    /// caches whether an event is wanted across threads).
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(|| ThreadBuf)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in the test process");
+        });
+        CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let bytes = CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default();
+        (out, String::from_utf8(bytes).unwrap())
     }
 
     /// Fail if the log text holds the phrase, or any run of three of its words.

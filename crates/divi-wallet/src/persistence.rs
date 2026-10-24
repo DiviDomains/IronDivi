@@ -1037,6 +1037,75 @@ impl WalletDatabase {
     // written by this version still opens with an older one (RocksDB refuses
     // to open a database with an unknown column family).
 
+    /// Key prefix of the position a wallet transaction was first seen at
+    /// (Divi Core's nOrderPos)
+    const TX_ORDER_PREFIX: &'static [u8] = b"tx_order_";
+    /// Key prefix of a wallet transaction's notes (Divi Core's mapValue:
+    /// comment, to, FromAccount)
+    const TX_NOTES_PREFIX: &'static [u8] = b"tx_notes_";
+
+    fn prefixed_txid_key(prefix: &[u8], txid: &Hash256) -> Vec<u8> {
+        let mut key = prefix.to_vec();
+        key.extend_from_slice(txid.as_bytes());
+        key
+    }
+
+    /// Every row under `prefix` as (txid, value)
+    fn load_prefixed(&self, prefix: &[u8]) -> Result<Vec<(Hash256, Vec<u8>)>, WalletError> {
+        let iter = self.db.iterator_cf(
+            self.cf(CF_DEFAULT),
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+        let mut rows = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let Ok(txid) = <[u8; 32]>::try_from(&key[prefix.len()..]) else {
+                continue;
+            };
+            rows.push((Hash256::from_bytes(txid), value.to_vec()));
+        }
+        Ok(rows)
+    }
+
+    /// Store the position at which the wallet first saw a transaction
+    pub fn store_tx_order(&self, txid: &Hash256, position: u64) -> Result<(), WalletError> {
+        self.db
+            .put_cf(
+                self.cf(CF_DEFAULT),
+                Self::prefixed_txid_key(Self::TX_ORDER_PREFIX, txid),
+                position.to_le_bytes(),
+            )
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Every stored transaction position
+    pub fn load_tx_order(&self) -> Result<Vec<(Hash256, u64)>, WalletError> {
+        Ok(self
+            .load_prefixed(Self::TX_ORDER_PREFIX)?
+            .into_iter()
+            .filter_map(|(txid, v)| Some((txid, u64::from_le_bytes(v.try_into().ok()?))))
+            .collect())
+    }
+
+    /// Store a transaction's notes (JSON object of strings), synced
+    pub fn store_tx_notes(&self, txid: &Hash256, notes: &[u8]) -> Result<(), WalletError> {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf(CF_DEFAULT),
+            Self::prefixed_txid_key(Self::TX_NOTES_PREFIX, txid),
+            notes,
+        );
+        self.write_batch_sync(batch)
+    }
+
+    /// Every stored transaction's notes
+    pub fn load_tx_notes(&self) -> Result<Vec<(Hash256, Vec<u8>)>, WalletError> {
+        self.load_prefixed(Self::TX_NOTES_PREFIX)
+    }
+
     /// Key prefix of unconfirmed wallet transactions
     const UNCONFIRMED_TX_PREFIX: &'static [u8] = b"unconfirmed_tx_";
 
