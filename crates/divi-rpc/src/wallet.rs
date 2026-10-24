@@ -333,6 +333,44 @@ pub(crate) fn script_pubkey_to_json(
     script_obj
 }
 
+/// validateaddress's fields of a script address (DescribeAddressVisitor,
+/// rpcmisc.cpp:249-270): the redeem script's kind (ExtractDestinations, so
+/// "nonstandard" with no addresses for a script the wallet lacks), its hex,
+/// the address of each key, and sigsrequired for multisig
+fn redeem_script_fields(
+    redeem: Option<Script>,
+    network: Network,
+) -> Vec<(&'static str, serde_json::Value)> {
+    use divi_script::{
+        extract_destinations, extract_script_type, get_script_type_name, ScriptType,
+    };
+    let bytes = redeem.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+    let (kind, destinations, required) = match extract_destinations(&bytes) {
+        Some((kind, destinations, required)) => (kind, destinations, required),
+        None => (extract_script_type(&bytes).0, Vec::new(), 0),
+    };
+    let addresses: Vec<String> = destinations
+        .iter()
+        .map(|dest| match dest {
+            divi_script::Destination::PubKeyHash(h) => {
+                Address::from_pubkey_hash(Hash160::from_bytes(*h), network).to_base58()
+            }
+            divi_script::Destination::ScriptHash(h) => {
+                Address::p2sh(Hash160::from_bytes(*h), network).to_base58()
+            }
+        })
+        .collect();
+    let mut fields = vec![
+        ("script", json!(get_script_type_name(kind))),
+        ("hex", json!(hex::encode(&bytes))),
+        ("addresses", json!(addresses)),
+    ];
+    if kind == ScriptType::Multisig {
+        fields.push(("sigsrequired", json!(required)));
+    }
+    fields
+}
+
 /// Where `address` comes in Divi Core's address book, a std::map keyed by
 /// CTxDestination: key hashes before script hashes (the variant's order), each
 /// by its uint160, which compares as a number stored from the last byte up
@@ -900,6 +938,16 @@ impl WalletRpc {
                     result["iswatchonly"] = serde_json::json!(is_watch_only);
                     result["isscript"] =
                         serde_json::json!(addr.addr_type == divi_wallet::AddressType::P2SH);
+                }
+                // A script of the wallet: its kind, hex, addresses and, for
+                // multisig, the signatures it needs (rpcmisc.cpp:249-270)
+                if let (true, divi_wallet::AddressType::P2SH, Some(wallet)) =
+                    (known, addr.addr_type, wallet_guard.as_ref())
+                {
+                    let network = self.network();
+                    for (k, v) in redeem_script_fields(wallet.get_script(&addr.hash), network) {
+                        result[k] = v;
+                    }
                 }
 
                 // Only an address of the address book has an account

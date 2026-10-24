@@ -367,3 +367,20 @@ fn listreceivedbyaddress_in_address_book_order() {
     sorted.sort();
     assert_eq!(txids, sorted);
 }
+
+/// validateaddress of a multisig address of the wallet gives the redeem
+/// script's kind, hex, key addresses and sigsrequired (rpcmisc.cpp:249-270)
+#[test]
+fn validateaddress_describes_a_multisig_address() {
+    let n = node();
+    let k1 = new_address(&n, "").to_base58();
+    let k2 = new_address(&n, "").to_base58();
+    let ms = n.ok("addmultisigaddress", vec![json!(2), json!([k1, k2])]);
+    let v = n.ok("validateaddress", vec![ms]);
+    assert_eq!(v["isscript"], json!(true), "{v}");
+    assert_eq!(v["script"], json!("multisig"), "{v}");
+    assert_eq!(v["addresses"], json!([k1, k2]), "{v}");
+    assert_eq!(v["sigsrequired"], json!(2), "{v}");
+    let hex = v["hex"].as_str().unwrap();
+    assert!(hex.starts_with("52") && hex.ends_with("52ae"), "{v}");
+}
