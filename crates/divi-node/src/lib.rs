@@ -67,7 +67,7 @@ pub use mempool::{Admission, MempoolValidator};
 pub use mempool::{Mempool, MempoolEntry, MempoolStats};
 pub use node::{
     accept_orphans, accept_relayed_transaction, check_mempool_transaction, getblocks_reply,
-    update_mempool_after_reorg, BlockchainInfo, MempoolInfo, NetworkInfo, Node, NodeEvent,
-    NodeStatus, GETBLOCKS_LIMIT,
+    relay_reject, update_mempool_after_reorg, BlockchainInfo, MempoolInfo, NetworkInfo, Node,
+    NodeEvent, NodeStatus, GETBLOCKS_LIMIT,
 };
 pub use staker::{StakeResult, Staker, StakerEvent, StakingConfig, StakingStatus};

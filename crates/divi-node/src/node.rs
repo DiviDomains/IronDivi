@@ -1169,7 +1169,6 @@ impl Node {
         // Start transaction relay event handler (adds received txs to mempool)
         let tx_relay_for_mempool = Arc::clone(&self.tx_relay);
         let mempool_for_relay = Arc::clone(&self.mempool);
-        let chain_for_relay = Arc::clone(&self.chain);
         let event_tx_for_relay = self.event_tx.clone();
         let peers_for_relay = Arc::clone(&self.peer_manager);
         let orphans_for_relay = Arc::clone(&self.orphans);
@@ -1177,13 +1176,19 @@ impl Node {
         let mut tx_events = tx_relay_for_mempool.subscribe();
         tokio::spawn(async move {
             while let Ok(event) = tx_events.recv().await {
-                match accept_relayed_transaction(
-                    &chain_for_relay,
-                    &mempool_for_relay,
-                    &peers_for_relay,
-                    &event,
-                ) {
+                let result = mempool_for_relay
+                    .add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
+                // The reject goes out before the peer is scored, so a peer
+                // the refusal bans still gets it (main.cpp:803-811)
+                if let Err(e) = &result {
+                    if let Some(msg) = relay_reject(e, &event.txid) {
+                        let _ = peers_for_relay.send_to_peer(event.from_peer, msg).await;
+                    }
+                    score_relayed_refusal(&peers_for_relay, &event, e);
+                }
+                match result {
                     Ok(txid) => {
+                        tracing::debug!("Added relayed tx {} to mempool", txid);
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         for txid in accept_orphans(
                             &mempool_for_relay,
@@ -1789,15 +1794,48 @@ pub fn accept_relayed_transaction(
     let result = mempool.add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
     match &result {
         Ok(txid) => tracing::debug!("Added relayed tx {} to mempool", txid),
-        Err(e) => {
-            peers.report_misbehavior_score(
-                event.from_peer,
-                e.misbehaviour_score(),
-                &format!("tx {} rejected by the mempool: {}", event.txid, e),
-            );
-        }
+        Err(e) => score_relayed_refusal(peers, event, e),
     }
     result
+}
+
+/// The misbehaviour score of a refused relayed transaction, charged to the
+/// peer that sent it
+fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent, e: &NodeError) {
+    peers.report_misbehavior_score(
+        event.from_peer,
+        e.misbehaviour_score(),
+        &format!("tx {} rejected by the mempool: {}", event.txid, e),
+    );
+}
+
+/// The `reject` Divi Core sends the peer that relayed a transaction its
+/// mempool refused (main.cpp:803-809): only for a refusal with a reject
+/// state, with its code, its reason cut to MAX_REJECT_MESSAGE_LENGTH (111,
+/// defaultValues.h:94) and the txid. A missing input (an orphan), a coin a
+/// mempool transaction already spends and non-standard inputs leave no
+/// reject state (MempoolConsensus.cpp:296-313, :363-364), so no reject.
+pub fn relay_reject(e: &NodeError, txid: &Hash256) -> Option<divi_network::NetworkMessage> {
+    let (code, reason) = match e {
+        NodeError::TxRejected { reason, .. } if reason == "bad-txns-nonstandard-inputs" => {
+            return None
+        }
+        NodeError::TxRejected { code, reason, .. } => (*code, reason.as_str()),
+        NodeError::NonFinal => (crate::error::reject::NONSTANDARD, "non-final"),
+        _ => return None,
+    };
+    let mut cut = reason.len().min(111);
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(divi_network::NetworkMessage::Reject(
+        divi_network::RejectMessage {
+            message: "tx".to_string(),
+            code,
+            reason: reason[..cut].to_string(),
+            data: txid.as_bytes().to_vec(),
+        },
+    ))
 }
 
 /// Divi Core's orphan resolution after `txid` entered the mempool
