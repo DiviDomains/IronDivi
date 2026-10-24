@@ -2717,7 +2717,8 @@ impl Chain {
                                     prev_height,
                                     prev_is_coinbase,
                                     prev_is_coinstake,
-                                );
+                                )
+                                .with_version(prev_tx.version);
                                 utxo_batch.add(input.prevout, utxo);
                             }
                         } else {
@@ -4082,7 +4083,8 @@ impl Chain {
                     height,
                     is_coinbase,
                     is_coinstake,
-                );
+                )
+                .with_version(tx.version);
                 // Track UTXOs created in this block
                 created_in_block.insert(outpoint);
                 // Queue UTXO addition in batch
@@ -7453,6 +7455,7 @@ mod tests {
                     height: KERNEL_HEIGHT,
                     is_coinbase: false,
                     is_coinstake: true,
+                    version: 1,
                 },
             )
             .unwrap();
