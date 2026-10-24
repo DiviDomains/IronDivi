@@ -841,6 +841,149 @@ pub fn text_for(method: &str, encrypted: Option<bool>) -> Option<&'static str> {
     }
 }
 
+/// Whether Divi Core answers `method` with these arguments by its help text
+/// (-1): each call's `if (fHelp || params.size() ...)` check
+/// (rpcblockchain.cpp, rpcmining.cpp, rpcmisc.cpp, rpcnet.cpp,
+/// rpcrawtransaction.cpp, rpcwallet.cpp, rpcdump.cpp, rpcmasternode.cpp,
+/// rpclottery.cpp). `encrypted` is None without a wallet. Named parameters
+/// are left to the call.
+pub fn usage_refused(method: &str, params: &Params, encrypted: Option<bool>) -> bool {
+    if matches!(params, Params::Object(_)) {
+        return false;
+    }
+    let n = params.len();
+    let word = |i: usize| params.get(i).and_then(|v| v.as_str());
+    let is_object = |i: usize| params.get(i).is_some_and(|v| v.is_object());
+    let (min, max) = match method {
+        // rpcnet.cpp:157-161: the command is read first (get_str), then checked
+        "addnode" => {
+            return n != 2 || word(1).is_some_and(|c| !matches!(c, "add" | "remove" | "onetry"))
+        }
+        // rpcmisc.cpp:166
+        "mnsync" => return n != 1 || word(0).is_some_and(|m| !matches!(m, "status" | "reset")),
+        // rpcmisc.cpp:277-312: anything but show, active or a name and a value
+        "spork" => return !(n == 2 || (n == 1 && matches!(word(0), Some("show" | "active")))),
+        // rpcmisc.cpp:881
+        "getspentinfo" => return n != 1 || !is_object(0),
+        // rpcwallet.cpp:1039
+        "fundvault" => return !(1..=2).contains(&n) || (n == 1 && !is_object(0)),
+        // rpcwallet.cpp:2669, :2575, :2630: counted only on an encrypted wallet
+        "walletlock" if encrypted == Some(true) => (0, 0),
+        "walletpassphrase" if encrypted == Some(true) => (2, 3),
+        "walletpassphrasechange" if encrypted == Some(true) => (2, 2),
+        "walletlock" | "walletpassphrase" | "walletpassphrasechange" => return false,
+        // rpcwallet.cpp:2694: counted only on an unencrypted wallet
+        "encryptwallet" if encrypted == Some(true) => return false,
+        // rpcwallet.cpp:1194 takes exactly one; irondivid still takes the second
+        // argument older IronDivi callers send (see scripts/vault-replies)
+        "removevault" => (1, 2),
+        // rpcwallet.cpp:2366, rpcrawtransaction.cpp:568: no count
+        "listsinceblock" | "signtransactionwithaddresskey" => return false,
+        _ => match argument_count(method) {
+            Some(range) => range,
+            None => return false,
+        },
+    };
+    !(min..=max).contains(&n)
+}
+
+/// The fewest and most arguments of the Divi Core calls whose check is a count
+fn argument_count(method: &str) -> Option<(usize, usize)> {
+    Some(match method {
+        "getinfo"
+        | "getnetworkinfo"
+        | "getconnectioncount"
+        | "getnettotals"
+        | "getpeerinfo"
+        | "ping"
+        | "getblockchaininfo"
+        | "getbestblockhash"
+        | "getblockcount"
+        | "getchaintips"
+        | "getdifficulty"
+        | "getmempoolinfo"
+        | "gettxoutsetinfo"
+        | "getmininginfo"
+        | "getmasternodecount"
+        | "getmasternodestatus"
+        | "listmnbroadcasts"
+        | "dumphdinfo"
+        | "getstakingstatus"
+        | "getunconfirmedbalance"
+        | "getwalletinfo"
+        | "listlockunspent" => (0, 0),
+        "help"
+        | "stop"
+        | "getlotteryblockwinners"
+        | "getrawmempool"
+        | "getinvalid"
+        | "generateblock"
+        | "listmasternodes"
+        | "clearbanned"
+        | "listbanned"
+        | "getnewaddress"
+        | "getrawchangeaddress"
+        | "keypoolrefill"
+        | "getcoinavailability" => (0, 1),
+        "verifychain" | "listaccounts" => (0, 2),
+        "getmasternodewinners"
+        | "getbalance"
+        | "listreceivedbyaccount"
+        | "listreceivedbyaddress"
+        | "listunspent" => (0, 3),
+        "listtransactions" => (0, 4),
+        "getblockhash"
+        | "reverseblocktransactions"
+        | "invalidateblock"
+        | "reconsiderblock"
+        | "setgenerate"
+        | "decoderawtransaction"
+        | "decodescript"
+        | "validateaddress"
+        | "setmocktime"
+        | "signmnbroadcast"
+        | "importmnbroadcast"
+        | "ban"
+        | "backupwallet"
+        | "dumpprivkey"
+        | "bip38paperwallet"
+        | "encryptwallet"
+        | "getaccountaddress"
+        | "getaccount"
+        | "getaddressesbyaccount"
+        | "loadwallet" => (1, 1),
+        "getaddednodeinfo"
+        | "getblock"
+        | "getblockheader"
+        | "getrawtransaction"
+        | "sendrawtransaction"
+        | "broadcaststartmasternode"
+        | "startmasternode"
+        | "getreceivedbyaccount"
+        | "getreceivedbyaddress"
+        | "gettransaction"
+        | "lockunspent"
+        | "setaccount"
+        | "getaddressbalance"
+        | "getaddressdeltas"
+        | "getaddresstxids"
+        | "getaddressutxos" => (1, 2),
+        "importprivkey" | "importaddress" => (1, 3),
+        "signrawtransaction" => (1, 4),
+        "createrawtransaction" | "createmultisig" | "bip38decrypt" | "addvault" => (2, 2),
+        "addmultisigaddress" => (2, 3),
+        "sendmany" | "signmessage" => (2, 4),
+        "sendtoaddress" | "reclaimvaultfunds" => (2, 5),
+        "gettxout" => (2, 3),
+        "prioritisetransaction" | "verifymessage" | "allocatefunds" => (3, 3),
+        "sendfrom" => (3, 5),
+        "debitvaultbyname" => (3, 4),
+        "verifymasternodesetup" => (4, 4),
+        "setupmasternode" => (5, 6),
+        _ => return None,
+    })
+}
+
 /// Divi Core's answer to a call made with the wrong number of arguments, or to
 /// a string argument given as another type (json_spirit's get_str): -1 with
 /// the call's help text, or "value is type X, expected str"
