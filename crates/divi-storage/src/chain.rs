@@ -381,6 +381,8 @@ impl Chain {
             script_stats: ScriptStats::default(),
         };
 
+        crate::datadir::check_network(&chain.db, &chain.params)?;
+
         // Load tip from database
         chain.load_tip()?;
 

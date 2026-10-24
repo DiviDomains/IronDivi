@@ -188,6 +188,14 @@ impl Node {
 
         // Initialize chain state
         let damaged = |e: divi_storage::StorageError| {
+            // Not damage: the database belongs to another network
+            if let divi_storage::StorageError::WrongNetwork(_) = e {
+                return NodeError::Init(format!(
+                    "Chain database {}: {}",
+                    config.chainstate_path().display(),
+                    e
+                ));
+            }
             NodeError::Init(format!(
                 "Chain database {} cannot be used: {}. Stopping instead of building on it. \
                  To recover, stop irondivid, move that directory aside and start again to \
