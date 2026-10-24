@@ -2636,6 +2636,11 @@ impl WalletDb {
         self.keystore.keypool_size()
     }
 
+    /// How many keys of each chain the keypool is filled to (-keypool)
+    pub fn keypool_target(&self) -> u32 {
+        self.keystore.keypool_target()
+    }
+
     /// Get the timestamp of the oldest key in the keypool
     pub fn keypool_oldest(&self) -> u64 {
         self.keystore.keypool_oldest()
@@ -3456,6 +3461,26 @@ impl WalletDb {
             label.as_bytes(),
         );
         db.write_batch_sync(batch)
+    }
+
+    /// The address book: every address with its name (Divi Core's
+    /// mapAddressBook; addresses the wallet handed out or was told about)
+    pub fn address_book(&self) -> Vec<(String, String)> {
+        let mut book: Vec<(String, String)> = self
+            .address_accounts
+            .read()
+            .iter()
+            .map(|(a, n)| (a.clone(), n.clone()))
+            .collect();
+        book.sort();
+        book
+    }
+
+    /// Whether `address` has an address-book entry (its name may be "")
+    pub fn in_address_book(&self, address: &Address) -> bool {
+        self.address_accounts
+            .read()
+            .contains_key(&address.to_string())
     }
 
     pub fn get_account(&self, address: &Address) -> String {

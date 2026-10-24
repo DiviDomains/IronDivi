@@ -1047,11 +1047,10 @@ impl WalletRpc {
                 if utxo.address.is_empty() {
                     entry.as_object_mut().map(|o| o.remove("address"));
                 }
-                // Divi Core gives the account of an address-book address (not
-                // change) and a P2SH coin's redeem script
-                // (rpcrawtransaction.cpp:320-334)
+                // Divi Core gives the account of an address-book address and
+                // a P2SH coin's redeem script (rpcrawtransaction.cpp:336-349)
                 if let Ok(addr) = Address::from_base58(&utxo.address) {
-                    if !is_change {
+                    if wallet.in_address_book(&addr) {
                         entry["account"] = json!(wallet.get_account(&addr));
                     }
                     if addr.addr_type == divi_wallet::address::AddressType::P2SH {
@@ -2272,64 +2271,70 @@ impl WalletRpc {
     /// (not change) with the amount received, the fewest confirmations and the
     /// transactions; with includeempty also those that received nothing
     pub fn list_received_by_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.list_received(params, false)
+    }
+
+    /// ListReceived (rpcwallet.cpp:1793-1912): the tally of every address-book
+    /// address by address, or by account with `by_accounts`; watched addresses
+    /// count with includeWatchonly
+    fn list_received(
+        &self,
+        params: &Params,
+        by_accounts: bool,
+    ) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
-
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
+        let min_depth = params.get_i64(0).unwrap_or(1);
         let include_empty = params.get_bool(1).unwrap_or(false);
+        let watch = params.get_bool(2).unwrap_or(false);
 
-        let height = self.current_height();
-        let mut by_addr: HashMap<String, (i64, u32, Vec<String>)> = HashMap::new();
-        for output in wallet.received_outputs() {
-            let confs = output.confirmations(height);
-            if output.is_coinbase || confs < min_conf {
+        let tally = self.history(&wallet).received_tally(min_depth, watch);
+        let confs = |c: i64| if c == i64::MAX { 0 } else { c };
+        let mut result = Vec::new();
+        // Per account: amount, fewest confirmations, watch-only (the last
+        // address's flag, as Core assigns it)
+        let mut accounts: std::collections::BTreeMap<String, (i64, i64, bool)> =
+            std::collections::BTreeMap::new();
+        for (address, account) in wallet.address_book() {
+            let item = tally.get(&address);
+            if item.is_none() && !include_empty {
                 continue;
             }
-            let entry = by_addr
-                .entry(output.address.clone())
-                .or_insert((0, u32::MAX, Vec::new()));
-            entry.0 += output.value.as_sat();
-            entry.1 = entry.1.min(confs);
-            entry.2.push(output.txid.to_string());
-        }
-
-        let mut addresses: Vec<String> = wallet
-            .list_accounts()
-            .into_values()
-            .flatten()
-            .filter(|a| !wallet.is_change_address_str(a))
-            .collect();
-        for addr in by_addr.keys() {
-            if !wallet.is_change_address_str(addr) && !addresses.contains(addr) {
-                addresses.push(addr.clone());
+            let (amount, conf, txids, watch_only) = match item {
+                Some(t) => (t.amount, t.confirmations, t.txids.clone(), t.watch_only),
+                None => (0, i64::MAX, Vec::new(), false),
+            };
+            if by_accounts {
+                let entry = accounts.entry(account).or_insert((0, i64::MAX, false));
+                entry.0 += amount;
+                entry.1 = entry.1.min(conf);
+                entry.2 = watch_only;
+                continue;
             }
+            let mut obj = serde_json::Map::new();
+            if watch_only {
+                obj.insert("involvesWatchonly".into(), json!(true));
+            }
+            obj.insert("address".into(), json!(address));
+            obj.insert("account".into(), json!(account));
+            obj.insert("amount".into(), json!(amount as f64 / 100_000_000.0));
+            obj.insert("confirmations".into(), json!(confs(conf)));
+            obj.insert("bcconfirmations".into(), json!(confs(conf)));
+            obj.insert("txids".into(), json!(txids));
+            // IronDivi also gives the address-book name as `label`
+            obj.insert("label".into(), json!(account));
+            result.push(serde_json::Value::Object(obj));
         }
-        addresses.sort();
-        addresses.dedup();
-
-        let result: Vec<_> = addresses
-            .iter()
-            .filter_map(|addr| {
-                let tally = by_addr.get(addr);
-                if tally.is_none() && !include_empty {
-                    return None;
-                }
-                let (sat, confs, txids) = tally.cloned().unwrap_or((0, u32::MAX, Vec::new()));
-                let confs = if confs == u32::MAX { 0 } else { confs };
-                let label = Address::from_base58(addr)
-                    .map(|a| wallet.get_account(&a))
-                    .unwrap_or_default();
-                Some(serde_json::json!({
-                    "address": addr,
-                    "account": label,
-                    "amount": sat as f64 / 100_000_000.0,
-                    "confirmations": confs,
-                    "bcconfirmations": confs,
-                    "txids": txids,
-                    "label": label,
-                }))
-            })
-            .collect();
-
+        for (account, (amount, conf, watch_only)) in accounts {
+            let mut obj = serde_json::Map::new();
+            if watch_only {
+                obj.insert("involvesWatchonly".into(), json!(true));
+            }
+            obj.insert("account".into(), json!(account));
+            obj.insert("amount".into(), json!(amount as f64 / 100_000_000.0));
+            obj.insert("confirmations".into(), json!(confs(conf)));
+            obj.insert("bcconfirmations".into(), json!(confs(conf)));
+            result.push(serde_json::Value::Object(obj));
+        }
         Ok(serde_json::json!(result))
     }
 
@@ -4284,6 +4289,14 @@ impl WalletRpc {
             .into());
         }
 
+        // Moving the unused current address of an account away gives that
+        // account a new one (rpcwallet.cpp:609-615)
+        if wallet.in_address_book(&address) {
+            let old = wallet.get_account(&address);
+            if Self::account_address(&wallet, &old, false)? == address.to_string() {
+                Self::account_address(&wallet, &old, true)?;
+            }
+        }
         wallet.set_account(&address, account);
 
         wallet.save().map_err(|e| {
@@ -4299,14 +4312,20 @@ impl WalletRpc {
             .ok_or_else(|| RpcError::invalid_params("Account required"))?;
 
         let wallet = self.get_wallet()?;
+        Ok(serde_json::json!(Self::account_address(
+            &wallet, account, false
+        )?))
+    }
 
-        // Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
-        // last address, unless a wallet transaction already pays it
+    /// Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
+    /// last address, unless a wallet transaction already pays it or
+    /// `force_new`; otherwise a new key from the pool labelled with the account
+    fn account_address(wallet: &WalletDb, account: &str, force_new: bool) -> Result<String, Error> {
         let addresses = wallet.get_addresses_by_account(account);
-        if let Some(last) = addresses.last() {
+        if let (Some(last), false) = (addresses.last(), force_new) {
             let paid = wallet.received_outputs().iter().any(|o| &o.address == last);
             if !paid {
-                return Ok(serde_json::json!(last));
+                return Ok(last.clone());
             }
         }
 
@@ -4316,7 +4335,7 @@ impl WalletRpc {
             RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
-        Ok(serde_json::json!(new_addr.to_string()))
+        Ok(new_addr.to_string())
     }
 
     pub fn get_addresses_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
@@ -4331,40 +4350,16 @@ impl WalletRpc {
     }
 
     pub fn list_accounts(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // listaccounts (rpcwallet.cpp:2320-2350): each address-book name with
+        // an address the wallet owns (or watches), and its GetAccountBalance
         let wallet = self.get_wallet()?;
-
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-        let _include_watchonly = params.get_bool(1).unwrap_or(false);
-
-        let height = self.current_height();
-        let accounts = wallet.list_accounts();
-
+        let min_depth = params.get_i64(0).unwrap_or(1);
+        let watch = params.get_bool(1).unwrap_or(false);
         let mut result = serde_json::Map::new();
-
-        for (account_name, addresses) in accounts {
-            let mut account_balance = Amount::ZERO;
-
-            for addr_str in addresses {
-                let utxos = wallet.get_utxos();
-                for utxo in utxos {
-                    if utxo.address == addr_str {
-                        let confs = utxo.confirmations(height);
-                        if confs >= min_conf && utxo.is_mature(height, wallet.coinbase_maturity()) {
-                            account_balance += utxo.value;
-                        }
-                    }
-                }
-            }
-
-            let divi = account_balance.as_sat() as f64 / 100_000_000.0;
-            result.insert(account_name, serde_json::json!(divi));
+        for (name, balance) in self.history(&wallet).account_balances(min_depth, watch) {
+            result.insert(name, json!(balance as f64 / 100_000_000.0));
         }
-        // C++ always lists the default account ""
-        result
-            .entry(String::new())
-            .or_insert(serde_json::json!(0.0));
-
-        Ok(serde_json::json!(result))
+        Ok(serde_json::Value::Object(result))
     }
 
     pub fn get_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
@@ -4389,40 +4384,7 @@ impl WalletRpc {
     }
 
     pub fn list_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let wallet = self.get_wallet()?;
-
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-        let include_empty = params.get_bool(1).unwrap_or(false);
-        let _include_watchonly = params.get_bool(2).unwrap_or(false);
-
-        let accounts = wallet.list_accounts();
-        let received = self.received_by_address(&wallet, min_conf);
-
-        let mut result = Vec::new();
-
-        for (account_name, addresses) in accounts {
-            let mut account_total = Amount::ZERO;
-            let mut min_confirmations = u32::MAX;
-
-            for addr_str in addresses {
-                if let Some((amount, confs)) = received.get(&addr_str) {
-                    account_total += Amount::from_sat(*amount);
-                    min_confirmations = min_confirmations.min(*confs);
-                }
-            }
-
-            if account_total > Amount::ZERO || include_empty {
-                let divi = account_total.as_sat() as f64 / 100_000_000.0;
-                result.push(serde_json::json!({
-                    "account": account_name,
-                    "amount": divi,
-                    "confirmations": if min_confirmations == u32::MAX { 0 } else { min_confirmations },
-                    "bcconfirmations": if min_confirmations == u32::MAX { 0 } else { min_confirmations }
-                }));
-            }
-        }
-
-        Ok(serde_json::json!(result))
+        self.list_received(params, true)
     }
 }
 
