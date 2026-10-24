@@ -1007,9 +1007,6 @@ fn load_or_create_wallet(
     let passphrase = seed
         .passphrase
         .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
-    if passphrase.as_ref().is_some_and(|p| p.len() > 256) {
-        anyhow::bail!("Mnemonic passphrase is too long, must be at most 256 characters");
-    }
     // -hdseed is preferred over a mnemonic (init.cpp:947-951)
     let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
@@ -1094,10 +1091,8 @@ fn load_or_restore_wallet_with_seed(
         return Ok(Arc::new(wallet));
     }
 
-    // Create new wallet (from WALLET_MNEMONIC env var if set, otherwise random)
-    info!("Creating new wallet at {:?}", wallet_path);
-    std::fs::create_dir_all(wallet_path)
-        .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
+    // Create a new wallet: from -hdseed, else from -mnemonic or new words,
+    // with -mnemonicpassphrase (Divi Core GenerateNewHDChain, wallet.cpp:2282-2316)
 
     // Divi Core takes -hdseed when it is hex and logs anything else, then
     // goes on with the mnemonic or a new seed (wallet.cpp:2286-2297)
@@ -1116,6 +1111,17 @@ fn load_or_restore_wallet_with_seed(
     }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
+    // Checked only when words make the wallet, before anything is written
+    // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
+    if passphrase.as_ref().is_some_and(|p| p.len() > 256) {
+        anyhow::bail!(
+            "Error loading or creating wallet.dat, GenerateNewHDChain: Mnemonic passphrase is too long, must be at most 256 characters"
+        );
+    }
+
+    info!("Creating new wallet at {:?}", wallet_path);
+    std::fs::create_dir_all(wallet_path)
+        .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
     let hd_wallet = if let Some(ref seed) = seed {
         info!("Restoring wallet from -hdseed");
         HdWallet::from_seed(seed, chain_mode)
@@ -1138,11 +1144,11 @@ fn load_or_restore_wallet_with_seed(
         HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode)
             .with_context(|| "Failed to restore HD wallet from mnemonic")?
     } else {
-        HdWallet::new(chain_mode).with_context(|| "Failed to generate HD wallet")?
+        // No mnemonic: new words, with the passphrase if one is given
+        // (hdchain.cpp:56-67)
+        HdWallet::generate(passphrase.as_deref(), chain_mode)
+            .with_context(|| "Failed to generate HD wallet")?
     };
-    if passphrase.is_some() && restoring.is_none() {
-        warn!("-mnemonicpassphrase is used only with -mnemonic");
-    }
 
     // Never log the mnemonic: logs go to journald and log files, which are
     // neither encrypted nor access-controlled like the wallet. Point the

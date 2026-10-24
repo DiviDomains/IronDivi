@@ -435,3 +435,80 @@ fn mnemonic_in_divi_conf_seeds_a_new_wallet() {
     assert!(!log.is_empty(), "no debug.log");
     assert!(!log.contains(MNEMONIC), "the mnemonic was logged");
 }
+
+/// With -mnemonicpassphrase and no -mnemonic a new wallet gets new words and
+/// that passphrase, as Divi Core's GenerateNewHDChain (wallet.cpp:2298-2307,
+/// hdchain.cpp:56-67): its first address is the one the dumped words give
+/// with the passphrase. An existing wallet is left as it is, and a
+/// passphrase over 256 characters stops the start of a new wallet.
+#[test]
+fn mnemonicpassphrase_alone_makes_new_words_with_it() {
+    const PASSPHRASE: &str = "regtest passphrase 1";
+    let first_address = |words: &str, passphrase: Option<&str>| {
+        let hd = HdWallet::from_mnemonic(words, passphrase, ChainMode::Divi).unwrap();
+        WalletDb::with_hd_wallet(Network::Regtest, hd)
+            .new_receiving_address()
+            .unwrap()
+            .to_string()
+    };
+
+    // A new wallet
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("regtest=1\nmnemonicpassphrase={PASSPHRASE}\n"),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(&divid_args(dir.path(), rpc_port), &[], rpc_port, true);
+    let info = daemon.rpc("dumphdinfo", json!([]));
+    let words = info["mnemonic"].as_str().unwrap().to_string();
+    assert_eq!(words.split_whitespace().count(), 24);
+    assert_eq!(info["mnemonicpassphrase"], PASSPHRASE);
+    let mine = |a: &str| daemon.rpc("validateaddress", json!([a]))["ismine"].clone();
+    assert_eq!(mine(&first_address(&words, Some(PASSPHRASE))), true);
+    assert_eq!(mine(&first_address(&words, None)), false);
+    drop(daemon);
+    let log = std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
+    assert!(!log.is_empty(), "no debug.log");
+    assert!(!log.contains(&words) && !log.contains(PASSPHRASE));
+
+    // An existing wallet is unchanged by a passphrase given later
+    let dir = tempfile::tempdir().unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(&divid_args(dir.path(), rpc_port), &[], rpc_port, true);
+    let before = daemon.rpc("dumphdinfo", json!([]));
+    drop(daemon);
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("regtest=1\nmnemonicpassphrase={PASSPHRASE}\n"),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(&divid_args(dir.path(), rpc_port), &[], rpc_port, true);
+    assert_eq!(daemon.rpc("dumphdinfo", json!([])), before);
+    assert_eq!(before["mnemonicpassphrase"], "");
+    drop(daemon);
+
+    // Over 256 characters: no wallet is made and the node does not start
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("regtest=1\nmnemonicpassphrase={}\n", "p".repeat(257)),
+    )
+    .unwrap();
+    let out = output_within(
+        Command::new(env!("CARGO_BIN_EXE_irondivid")).args(divid_args(dir.path(), free_port())),
+    );
+    assert!(!out.status.success());
+    let log = std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default()
+        + &String::from_utf8_lossy(&out.stderr)
+        + &String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("Mnemonic passphrase is too long, must be at most 256 characters"),
+        "{log}"
+    );
+    assert!(
+        !dir.path().join("wallet").exists() && !dir.path().join("regtest").join("wallet").exists()
+    );
+}
