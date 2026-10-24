@@ -32,6 +32,9 @@ pub struct Utxo {
     pub is_coinbase: bool,
     /// Whether this is from a coinstake transaction
     pub is_coinstake: bool,
+    /// Version of the transaction that created this output (Divi Core's
+    /// `CCoins::nVersion`)
+    pub version: i32,
 }
 
 impl Utxo {
@@ -49,7 +52,14 @@ impl Utxo {
             height,
             is_coinbase,
             is_coinstake,
+            version: 1,
         }
+    }
+
+    /// The same output, created by a transaction of version `version`
+    pub fn with_version(mut self, version: i32) -> Self {
+        self.version = version;
+        self
     }
 
     /// Check if this UTXO is mature enough to be spent
@@ -103,6 +113,12 @@ impl Utxo {
         }
         buf.push(flags);
 
+        // Transaction version (4 bytes), only when it is not 1, so records of
+        // version-1 transactions keep the layout they always had
+        if self.version != 1 {
+            buf.write_i32::<LittleEndian>(self.version).unwrap();
+        }
+
         buf
     }
 
@@ -128,12 +144,19 @@ impl Utxo {
         let is_coinbase = (flags & 1) != 0;
         let is_coinstake = (flags & 2) != 0;
 
+        let version = if (cursor.position() as usize) < data.len() {
+            cursor.read_i32::<LittleEndian>()?
+        } else {
+            1
+        };
+
         Ok(Utxo {
             value,
             script_pubkey,
             height,
             is_coinbase,
             is_coinstake,
+            version,
         })
     }
 }
@@ -190,6 +213,21 @@ mod tests {
         assert_eq!(decoded.height, utxo.height);
         assert_eq!(decoded.is_coinbase, utxo.is_coinbase);
         assert_eq!(decoded.is_coinstake, utxo.is_coinstake);
+    }
+
+    #[test]
+    fn utxo_keeps_its_transaction_version() {
+        let v1 = Utxo::new(
+            Amount::from_sat(7),
+            Script::new_p2pkh(&[3; 20]),
+            9,
+            false,
+            false,
+        );
+        let v2 = v1.clone().with_version(2);
+        assert_eq!(v2.to_bytes().len(), v1.to_bytes().len() + 4);
+        assert_eq!(Utxo::from_bytes(&v1.to_bytes()).unwrap().version, 1);
+        assert_eq!(Utxo::from_bytes(&v2.to_bytes()).unwrap(), v2);
     }
 
     #[test]

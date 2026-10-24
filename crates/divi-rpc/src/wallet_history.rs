@@ -95,12 +95,20 @@ impl<'a> History<'a> {
         }
     }
 
-    /// The wallet's records, oldest first (Core's OrderedTxItems order)
+    /// The wallet's records, oldest first (Core's OrderedTxItems order): by
+    /// the position each was first seen at (nOrderPos, wallet.cpp:1046);
+    /// records kept before positions were stored come first, by time, then
+    /// block position
     pub(crate) fn ordered_records(&self) -> Vec<WalletTx> {
         let mut records = self.wallet.history_records();
         records.sort_by_key(|r| {
             let index = self.load(r).and_then(|l| l.block.map(|b| b.3)).unwrap_or(0);
-            (r.timestamp, r.block_height.unwrap_or(u32::MAX), index)
+            (
+                self.wallet.order_position(&r.txid),
+                r.timestamp,
+                r.block_height.unwrap_or(u32::MAX),
+                index,
+            )
         });
         records
     }
@@ -348,6 +356,11 @@ impl<'a> History<'a> {
         entry.insert("walletconflicts".into(), json!(self.conflicts(&loaded.tx)));
         entry.insert("time".into(), json!(record.timestamp));
         entry.insert("timereceived".into(), json!(record.timestamp));
+        // The notes the send kept with the transaction (mapValue,
+        // rpcwallet.cpp:268-269)
+        for (key, value) in self.wallet.tx_notes(&record.txid) {
+            entry.insert(key, json!(value));
+        }
     }
 
     /// GetConflicts: wallet transactions spending an input of `tx`, `tx`
@@ -526,6 +539,68 @@ impl<'a> History<'a> {
                 push(entry, out);
             }
         }
+    }
+
+    /// GetAccountBalance (rpcwallet.cpp:383-412) with GetAccountAmounts
+    /// (:187-242): for a named account, every output to an address of that
+    /// name received and every spent output from one sent; for "", the
+    /// outputs of the requested kinds whose address has no name. A receive
+    /// counts at `min_depth`; transactions not final, immature or off the
+    /// chain are left out. Satoshis.
+    pub(crate) fn account_balance(&self, account: &str, min_depth: i64, watch: bool) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        let labelled = |script: &Script| self.account_of(&self.destination(script));
+        let counts = |script: &Script| {
+            let label = labelled(script);
+            if account.is_empty() {
+                label.is_empty() && Self::requested(self.mine(script), watch)
+            } else {
+                label == account
+            }
+        };
+        let mut balance = 0i64;
+        for record in self.wallet.history_records() {
+            let Some(loaded) = self.load(&record) else {
+                continue;
+            };
+            let tx = &loaded.tx;
+            let depth = self.depth(&record.txid, &loaded);
+            let generated = tx.is_coinbase() || tx.is_coinstake();
+            if !tx.is_final(self.height, now)
+                || (generated && self.blocks_to_maturity(depth) > 0)
+                || depth < 0
+            {
+                continue;
+            }
+            // previousOutputsSpent: collected only when the wallet is debited
+            let mut sent = 0i64;
+            if self.debit(tx, watch) > 0 && !tx.is_coinbase() {
+                for n in 0..tx.vin.len() {
+                    let prev = self.wallet_prevout(tx, n).or_else(|| {
+                        let prevout = &tx.vin[n].prevout;
+                        self.chain
+                            .and_then(|c| c.get_transaction(&prevout.txid).ok().flatten())
+                            .and_then(|p| p.vout.get(prevout.vout as usize).cloned())
+                    });
+                    if let Some(prev) = prev.filter(|p| counts(&p.script_pubkey)) {
+                        sent += prev.value.as_sat();
+                    }
+                }
+            }
+            let received: i64 = tx
+                .vout
+                .iter()
+                .filter(|out| counts(&out.script_pubkey))
+                .map(|out| out.value.as_sat())
+                .sum();
+            if received != 0 && depth >= min_depth {
+                balance += received;
+            }
+            balance -= sent;
+        }
+        balance
     }
 
     /// GetBlocksToMaturity (MerkleTxConfirmationNumberCalculator.cpp:54-59)
