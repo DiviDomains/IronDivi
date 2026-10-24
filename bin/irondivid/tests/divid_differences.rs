@@ -150,3 +150,30 @@ fn masternode_option_is_refused() {
         "{text}"
     );
 }
+
+/// An unknown option given as `-no<name>` is named as it was written
+#[test]
+fn negated_unknown_option_is_named_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (53994, 53995);
+    let mut a = args(dir.path(), rpc_port, p2p_port);
+    a.push("-nobogusflag".into());
+    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
+        .args(&a)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn irondivid");
+    let mut node = Node(child);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while rpc(rpc_port, "getblockcount", json!([])).is_none() {
+        assert!(node.0.try_wait().unwrap().is_none(), "irondivid exited");
+        assert!(Instant::now() < deadline, "RPC server did not come up");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let log = debug_log(dir.path());
+    assert!(
+        log.contains("Unknown option -nobogusflag; ignored"),
+        "no line naming -nobogusflag"
+    );
+}

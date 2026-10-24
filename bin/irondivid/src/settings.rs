@@ -76,6 +76,9 @@ const BOOL_WITH_VALUE: &[&str] = &["staking", "txindex", "spentindex", "addressi
 pub struct Settings {
     single: HashMap<String, String>,
     multi: HashMap<String, Vec<String>>,
+    /// The name an option was last given as, where it differs from its key
+    /// (`-nofoo` is kept as `foo`)
+    written: HashMap<String, String>,
     /// Words that are not options (divid ignores them too)
     pub stray: Vec<String>,
 }
@@ -114,6 +117,7 @@ impl Settings {
     /// replaced unless `once` (the config file) and already set; every value
     /// is kept for options that repeat
     pub fn set(&mut self, key: &str, value: &str, once: bool) {
+        let as_written = key;
         let (key, value) = match key.strip_prefix("no") {
             Some(rest) if key.len() > 2 && !is_known_no_word(key) => (
                 rest.to_string(),
@@ -121,6 +125,11 @@ impl Settings {
             ),
             _ => (key.to_string(), value.to_string()),
         };
+        if as_written == key {
+            self.written.remove(&key);
+        } else {
+            self.written.insert(key.clone(), as_written.to_string());
+        }
         if !once || !self.single.contains_key(&key) {
             self.single.insert(key.clone(), value.clone());
         }
@@ -157,6 +166,12 @@ impl Settings {
     /// Every option name that has a value
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.single.keys()
+    }
+
+    /// The name `key` was given as on the command line or in the config file
+    /// (`nofoo` for `-nofoo`)
+    pub fn written_name<'a>(&'a self, key: &'a str) -> &'a str {
+        self.written.get(key).map_or(key, String::as_str)
     }
 
     /// Read the command line (without the program name). Both divid's

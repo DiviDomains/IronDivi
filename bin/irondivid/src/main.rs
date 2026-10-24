@@ -632,10 +632,13 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                     settings.get("masternode").unwrap_or("")
                 );
             } else {
-                warn!("Option -{} is not supported by irondivid; ignored", k);
+                warn!(
+                    "Option -{} is not supported by irondivid; ignored",
+                    settings.written_name(k)
+                );
             }
         } else {
-            warn!("Unknown option -{}; ignored", k);
+            warn!("Unknown option -{}; ignored", settings.written_name(k));
         }
     }
     Ok(())
