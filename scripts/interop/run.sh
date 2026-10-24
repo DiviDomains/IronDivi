@@ -41,7 +41,7 @@ PIDS=()
 
 stop_all() {
     for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
-    for d in "$W"/core-a "$W"/core-b; do
+    for d in "$W"/core-*; do
         [ -d "$d" ] && "$DCLI" -datadir="$d" stop >/dev/null 2>&1
     done
     local deadline=$((SECONDS + 60))
@@ -105,6 +105,13 @@ A_P2P=$BASE A_RPC=$((BASE + 1))
 B_P2P=$((BASE + 2)) B_RPC=$((BASE + 3))
 X_P2P=$((BASE + 10)) X_RPC=$((BASE + 11))
 Z_P2P=$((BASE + 20)) Z_RPC=$((BASE + 21))
+C=$W/core-c D=$W/core-d E=$W/core-e F=$W/core-f Y=$W/y P=$W/p
+C_P2P=$((BASE + 4)) C_RPC=$((BASE + 5))
+D_P2P=$((BASE + 6)) D_RPC=$((BASE + 7))
+E_P2P=$((BASE + 8)) E_RPC=$((BASE + 9))
+F_P2P=$((BASE + 14)) F_RPC=$((BASE + 15))
+Y_P2P=$((BASE + 12)) Y_RPC=$((BASE + 13))
+P_P2P=$((BASE + 22)) P_RPC=$((BASE + 23))
 
 conf() { # conf <dir> <lines...>: a 0600 divi.conf with the RPC credentials
     local d=$1; shift
@@ -118,6 +125,11 @@ conf() { # conf <dir> <lines...>: a 0600 divi.conf with the RPC credentials
 }
 
 a() { "$DCLI" -datadir="$A" "$@"; }
+d() { "$DCLI" -datadir="$D" "$@"; }
+e() { "$DCLI" -datadir="$E" "$@"; }
+f() { "$DCLI" -datadir="$F" "$@"; }
+y() { "$ICLI" -datadir="$Y" -conf="$Y/divi.conf" "$@"; }
+pw() { "$ICLI" -datadir="$P" -conf="$P/divi.conf" "$@"; }
 b() { "$DCLI" -datadir="$B" "$@"; }
 x() { "$ICLI" -datadir="$X" -conf="$X/divi.conf" "$@"; }
 height_is() { [ "$($1 getblockcount 2>/dev/null)" = "$2" ]; }
@@ -169,6 +181,21 @@ check "Divi Core A starts from divi.conf" within 60 a getblockcount
 check "irondivid starts from divi.conf (-datadir only)" start_x
 "$DIVID" -datadir="$B" >/dev/null 2>&1
 check "Divi Core B starts from divi.conf" within 60 b getblockcount
+
+# Two nodes on one IP, one on each port: Divi Core C beside A. irondivid Y
+# and Divi Core D are each given both as addnode= lines.
+conf "$C" "daemon=1" "port=$C_P2P" "rpcport=$C_RPC" "bind=127.0.0.1" "listen=1" "staking=0"
+conf "$D" "daemon=1" "port=$D_P2P" "rpcport=$D_RPC" "listen=0" "staking=0" \
+    "addnode=127.0.0.1:$A_P2P" "addnode=127.0.0.1:$C_P2P"
+conf "$Y" "port=$Y_P2P" "rpcport=$Y_RPC" "listen=0" "staking=0" \
+    "addnode=127.0.0.1:$A_P2P" "addnode=127.0.0.1:$C_P2P"
+"$DIVID" -datadir="$C" >/dev/null 2>&1
+within 60 "$DCLI" -datadir="$C" getblockcount
+"$DIVID" -datadir="$D" >/dev/null 2>&1
+setsid "$IRD" -datadir="$Y" >>"$W/y.out" 2>&1 &
+PIDS+=("$!")
+Y_START=$SECONDS
+check "irondivid Y (two addnode= lines on one IP) starts from divi.conf" within 120 y getblockcount
 
 pid_file_is() { [ "$(cat "$X/node.pid" 2>/dev/null)" = "$1" ]; }
 no_pid_file() { [ ! -e "$X/node.pid" ]; }
@@ -296,6 +323,94 @@ check "pid file with -daemon holds the daemon's pid" pid_file_is "${DPID:-none}"
 x stop >/dev/null 2>&1
 x_exits
 check "pid file removed at the clean stop (-daemon)" no_pid_file
+
+# ---------------------------------------------------------------- one connection per address
+
+outbound_count() { $1 getpeerinfo 2>/dev/null | json "sum(1 for p in j if not p.get('inbound'))"; }
+# Let both nodes run their dial loops at least once more (irondivid every 30 s)
+while [ $((SECONDS - Y_START)) -lt 40 ]; do sleep 1; done
+N=$(outbound_count d)
+if [ "$N" = 1 ]; then pass "divid: two addnode= lines on one IP make 1 outbound connection"
+else fail "divid: two addnode= lines on one IP make 1 outbound connection (got $N)"; fi
+N=$(outbound_count y)
+if [ "$N" = 1 ]; then pass "irondivid: two addnode= lines on one IP make 1 outbound connection, as divid"
+else fail "irondivid: two addnode= lines on one IP make 1 outbound connection, as divid (got $N)"; fi
+
+# ---------------------------------------------------------------- words made with a passphrase
+
+# A new irondivid wallet with only mnemonicpassphrase= set. The passphrase
+# and the words stay in 0600 files and divi.conf files; nothing prints them.
+(umask 077; head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$W/pass")
+conf "$P" "port=$P_P2P" "rpcport=$P_RPC" "listen=0" "staking=0" "connect=127.0.0.1:$A_P2P" \
+    "mnemonicpassphrase=$(cat "$W/pass")"
+setsid "$IRD" -datadir="$P" >>"$W/p.out" 2>&1 &
+PIDS+=("$!")
+check "irondivid starts a new wallet with only mnemonicpassphrase= in divi.conf" within 120 pw getblockcount
+(umask 077; pw dumphdinfo > "$W/hd.json" 2>/dev/null)
+python3 - "$W" <<'PY'
+import json, os, sys
+w = sys.argv[1]
+os.umask(0o077)
+try:
+    hd = json.load(open(os.path.join(w, "hd.json")))
+except Exception:
+    hd = {}
+open(os.path.join(w, "words"), "w").write(hd.get("mnemonic", ""))
+open(os.path.join(w, "words-pass"), "w").write(hd.get("mnemonicpassphrase", ""))
+PY
+same_passphrase() { cmp -s "$W/pass" "$W/words-pass"; }
+check "irondivid's dumphdinfo reports the passphrase from divi.conf" same_passphrase
+P_ADDR=$(pw getaddressesbyaccount "" 2>/dev/null | json 'j[0]' 2>/dev/null)
+
+# Divi Core restores irondivid's words: E with the passphrase, F without it
+conf "$E" "daemon=1" "port=$E_P2P" "rpcport=$E_RPC" "bind=127.0.0.1" "listen=1" "staking=0" \
+    "connect=127.0.0.1:$A_P2P" "mnemonic=$(cat "$W/words")" "mnemonicpassphrase=$(cat "$W/pass")"
+conf "$F" "daemon=1" "port=$F_P2P" "rpcport=$F_RPC" "listen=0" "staking=0" \
+    "connect=127.0.0.1:$A_P2P" "mnemonic=$(cat "$W/words")"
+"$DIVID" -datadir="$E" >/dev/null 2>&1
+"$DIVID" -datadir="$F" >/dev/null 2>&1
+within 120 e getblockcount
+within 120 f getblockcount
+is_mine() { [ -n "$2" ] && $1 validateaddress "$2" 2>/dev/null | json "j.get('ismine')" | grep -q True; }
+not_mine() { [ -n "$2" ] && $1 validateaddress "$2" 2>/dev/null | json "j.get('ismine')" | grep -q False; }
+check "Divi Core given irondivid's words and passphrase owns irondivid's first address" is_mine e "$P_ADDR"
+check "Divi Core given the words without the passphrase does not" not_mine f "$P_ADDR"
+
+# The words and the passphrase as grep patterns, read from a 0600 file so they
+# are never on a command line
+(umask 077; { cat "$W/words"; echo; cat "$W/pass"; echo; } > "$W/secrets")
+secret_in_logs() { # the words or the passphrase in any log of <dirs...>
+    [ -s "$W/words" ] && [ -s "$W/pass" ] || return 0
+    find "$@" -type f \( -name 'debug.log*' -o -name 'db.log' -o -name '*.out' \) -print0 |
+        xargs -0 -r grep -qF -f "$W/secrets"
+}
+# Logs are debug.log (and its rotations), Divi Core's db.log and each node's
+# captured output. Database files (the wallet's own records) are not logs.
+# Which log files hold which secret: names only, never the matching lines
+where_secrets() {
+    local f found=
+    while IFS= read -r -d '' f; do
+        grep -qxF -f <(cat "$W/words"; echo) <(grep -oF -f <(cat "$W/words"; echo) "$f") 2>/dev/null &&
+            found="$found ${f#$W/}:words"
+        grep -qF -f <(cat "$W/pass"; echo) "$f" 2>/dev/null && found="$found ${f#$W/}:passphrase"
+    done < <(find "$@" -type f \( -name 'debug.log*' -o -name 'db.log' -o -name '*.out' \) -print0)
+    echo "${found:- none}"
+}
+for side in irondivid "Divi Core"; do
+    if [ "$side" = irondivid ]; then dirs=("$W"/p "$W"/p.out "$W"/x "$W"/y); else dirs=("$E" "$F"); fi
+    if secret_in_logs "${dirs[@]}"; then
+        fail "neither the words nor the passphrase appear in $side's logs (found in:$(where_secrets "${dirs[@]}"))"
+    else
+        pass "neither the words nor the passphrase appear in $side's logs"
+    fi
+done
+
+# addnode onetry: dialled at once, by address and port, and not kept
+outbound_to_e() { outbound_to y "$E_P2P"; }
+y addnode "127.0.0.1:$E_P2P" onetry >/dev/null 2>&1
+check "irondivid: addnode onetry dials at once (within ${WAIT}s)" within $WAIT outbound_to_e
+not_added() { y getaddednodeinfo true 2>/dev/null | json "all(not n.get('addednode', '').endswith(':$E_P2P') for n in j)" | grep -q True; }
+check "irondivid: an onetry node is not listed by getaddednodeinfo" not_added
 
 # ---------------------------------------------------------------- Divi Core's files
 

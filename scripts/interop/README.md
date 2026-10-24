@@ -17,7 +17,7 @@ scripts/interop/run.sh target/release ~/divi-3.0.0/bin 53850 /var/tmp
 - `<port-base>`: the run uses ports `<port-base>` to `<port-base>+29` on 127.0.0.1. Nothing else may be using them.
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
-A run takes about a minute and is stopped after 10 minutes (`INTEROP_LIMIT=<seconds>` changes that). However it ends —
+A run takes about two minutes and is stopped after 10 minutes (`INTEROP_LIMIT=<seconds>` changes that). However it ends —
 finished, failed, interrupted or timed out — every node it started is stopped and its directory deleted. Needs bash,
 python3 and `ss`. No other dependencies.
 
@@ -28,6 +28,10 @@ python3 and `ss`. No other dependencies.
 | Divi Core A | `divi.conf` (`daemon=1`, listens) | — |
 | irondivid X | `divi.conf`, `-datadir` only | dials A (`connect=`), listens |
 | Divi Core B | `divi.conf` (`daemon=1`, `listen=0`) | dials X only (`connect=`) |
+| Divi Core C | `divi.conf` (`daemon=1`, listens) | — (a second node on A's IP) |
+| irondivid Y, Divi Core D | `divi.conf`, `listen=0` | `addnode=` A and `addnode=` C |
+| irondivid P | `divi.conf` with `mnemonicpassphrase=` only, new wallet | dials A |
+| Divi Core E, F | `divi.conf` with P's words, E also with its passphrase | dial A; E listens |
 
 B reaches the network only through X. So a block reaching B shows that irondivid relays to an inbound Divi Core peer,
 and a block from X reaching A shows that it announces to an outbound one.
@@ -54,6 +58,18 @@ and a block from X reaching A shows that it announces to an outbound one.
   - SIGTERM while A mines 30 blocks: X shuts down cleanly and removes the pid file; after a restart it catches up to
     A's tip with its balance unchanged; no ERROR in its log.
   - With `-daemon`: the pid file holds the daemon's pid and is removed at a clean stop.
+- **One connection per address:**
+  - Y and D are each given two `addnode=` lines for one IP (A and C, two ports). After their dial loops have run
+    (40 s) each holds exactly one outbound connection.
+  - `addnode <E> onetry` on Y connects within 10 s, and `getaddednodeinfo true` does not list it.
+- **Words made with a passphrase:**
+  - P starts a new wallet with only `mnemonicpassphrase=` set, and `dumphdinfo` reports that passphrase.
+  - Divi Core E, given P's words and the passphrase, owns P's first address (`validateaddress` ismine). F, given the
+    words without it, does not.
+  - The passphrase is random, kept in a 0600 file and the nodes' `divi.conf`. It and the words are never printed or
+    put on a command line.
+  - Neither appears in any node's logs (`debug.log*`, Core's `db.log`, captured output). Database files, where a
+    wallet keeps its own words, are not searched.
 - **Divi Core's files:**
   - irondivid refuses B's datadir (both B itself and `B/regtest`), and leaves it byte for byte as it was.
   - `-wallet=wallet.dat` at Core's wallet file gets a plain refusal.
