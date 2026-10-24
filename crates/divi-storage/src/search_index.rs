@@ -588,6 +588,38 @@ impl IndexFlags {
         db.put_metadata(FLAG_SPENTINDEX, byte(flags.spentindex))?;
         Ok(flags)
     }
+
+    /// The flags stored with the chain database, or None when none are (a
+    /// database from before they were kept, or one installed from a snapshot)
+    pub fn load(db: &ChainDatabase) -> Result<Option<IndexFlags>, StorageError> {
+        let read = |key: &[u8]| -> Result<Option<bool>, StorageError> {
+            Ok(db.get_metadata(key)?.map(|v| v.first() == Some(&b'1')))
+        };
+        Ok(
+            match (
+                read(FLAG_TXINDEX)?,
+                read(FLAG_ADDRESSINDEX)?,
+                read(FLAG_SPENTINDEX)?,
+            ) {
+                (Some(txindex), Some(addressindex), Some(spentindex)) => Some(IndexFlags {
+                    txindex,
+                    addressindex,
+                    spentindex,
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    /// Keep these flags with the chain database, as Divi Core writes them
+    /// after a -reindex (txdb.cpp:513-523)
+    pub fn store(&self, db: &ChainDatabase) -> Result<(), StorageError> {
+        let byte = |b: bool| if b { b"1" } else { b"0" };
+        db.put_metadata(FLAG_TXINDEX, byte(self.txindex))?;
+        db.put_metadata(FLAG_ADDRESSINDEX, byte(self.addressindex))?;
+        db.put_metadata(FLAG_SPENTINDEX, byte(self.spentindex))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

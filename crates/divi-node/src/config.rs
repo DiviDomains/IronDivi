@@ -637,6 +637,10 @@ pub struct IndexConfig {
 
     /// Enable address index (-addressindex)
     pub addressindex: bool,
+
+    /// Build the transaction index again from the stored blocks (-reindex);
+    /// this is how -txindex is changed for an existing chain database
+    pub reindex: bool,
 }
 
 impl Default for IndexConfig {
@@ -646,6 +650,7 @@ impl Default for IndexConfig {
             txindex: true,
             spentindex: false,
             addressindex: false,
+            reindex: false,
         }
     }
 }

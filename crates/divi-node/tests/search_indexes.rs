@@ -651,3 +651,144 @@ fn index_settings_stay_with_the_chain_database() {
     drop(node);
     assert!(start_node(fresh.path(), &no_txindex).is_ok());
 }
+
+/// Drop the stored index flags, as a database from before they were kept
+fn forget_index_flags(dir: &Path) {
+    let db = divi_storage::ChainDatabase::open(dir.join("chainstate")).unwrap();
+    for key in [
+        &b"flag_txindex"[..],
+        b"flag_addressindex",
+        b"flag_spentindex",
+    ] {
+        db.delete_metadata(key).unwrap();
+    }
+}
+
+/// A database with no stored index flags that ran with -txindex=0, started
+/// with the default -txindex=1: as in Divi Core, either the index covers
+/// every block or the start is refused (init.cpp:1103-1106), never an index
+/// of only the newest blocks. The chain is longer than the 100 blocks the
+/// index catch-up rechecks; it is written straight to the chain database
+/// (proof-of-work blocks past 100, no index flags, no transaction index), as
+/// an older irondivid run with -txindex=0 left it.
+#[test]
+fn txindex_switched_on_over_an_unflagged_database_covers_every_block() {
+    let start = |dir: &Path, txindex: bool| {
+        start_node(
+            dir,
+            &Indexes {
+                txindex,
+                addressindex: false,
+                spentindex: false,
+            },
+        )
+    };
+    let mine = |chain: &divi_storage::Chain| -> Hash256 {
+        let parent = chain.tip().unwrap();
+        let mut sig = divi_storage::bip34_height_script(parent.height + 1);
+        sig.push(0);
+        let coinbase = Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
+            vout: vec![TxOut::new(
+                Amount::from_sat(COIN),
+                Script::new_p2pkh(&[7; 20]),
+            )],
+            lock_time: 0,
+        };
+        let txid = coinbase.txid();
+        let mut block = Block::default();
+        block.header.version = 4;
+        block.header.prev_block = parent.hash;
+        block.header.time = parent.time + 60;
+        block.header.bits = 0x207fffff;
+        block.transactions = vec![coinbase];
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        chain.accept_block(block).unwrap();
+        txid
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let block2 = {
+        let db = std::sync::Arc::new(
+            divi_storage::ChainDatabase::open(dir.path().join("chainstate")).unwrap(),
+        );
+        let mut params = divi_storage::ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            ChainMode::Divi,
+        );
+        params.check_block_work = false;
+        let chain = divi_storage::Chain::new(db, params).unwrap();
+        let txids: Vec<Hash256> = (0..120).map(|_| mine(&chain)).collect();
+        assert_eq!(chain.height(), 120);
+        txids[1]
+    };
+    forget_index_flags(dir.path());
+
+    match start(dir.path(), true) {
+        Err(e) => assert!(e.to_string().contains("-reindex to change -txindex"), "{e}"),
+        Ok(node) => {
+            let rpc = RpcServer::new(node.chain().clone());
+            let request = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "getrawtransaction",
+                "params": [block2.to_string()],
+            }))
+            .unwrap();
+            let reply = serde_json::to_value(rpc.handle_request(request)).unwrap();
+            assert!(
+                reply["error"].is_null() && reply["result"].is_string(),
+                "block 2's transaction is not indexed: {reply}"
+            );
+            drop(rpc);
+            drop(node);
+            // and the next start keeps it
+            assert!(start(dir.path(), true).is_ok());
+        }
+    }
+}
+
+/// A database installed from a snapshot has no blocks below its base, so it
+/// cannot have a full transaction index: the index is recorded as off, the
+/// node starts, and later starts with the default -txindex=1 still start
+#[test]
+fn snapshot_database_runs_without_a_transaction_index() {
+    let none = Indexes {
+        txindex: false,
+        addressindex: false,
+        spentindex: false,
+    };
+    let t = TestNode::new(&none);
+    for _ in 0..5 {
+        t.mine(&[]);
+    }
+    let tip = t.tip();
+    let dir = t.dir;
+    drop(t.rpc);
+    drop(t.node);
+    forget_index_flags(dir.path());
+    {
+        let db = divi_storage::ChainDatabase::open(dir.path().join("chainstate")).unwrap();
+        db.set_snapshot_base(5, &tip).unwrap();
+    }
+
+    let txindex = Indexes {
+        txindex: true,
+        addressindex: false,
+        spentindex: false,
+    };
+    drop(start_node(dir.path(), &txindex).unwrap());
+    let db = divi_storage::ChainDatabase::open(dir.path().join("chainstate")).unwrap();
+    let flags = divi_storage::search_index::IndexFlags::load(&db)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !flags.txindex,
+        "a snapshot database recorded the index as on"
+    );
+    drop(db);
+    assert!(start_node(dir.path(), &txindex).is_ok());
+}
