@@ -24,6 +24,11 @@ use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::{debug, trace, warn};
 
+/// How far ahead of the bytes received the buffer grows for a payload, so
+/// a header announcing 2 MiB does not reserve 2 MiB before they are sent
+/// (Divi Core `CNetMessage::readData`, Node.cpp:80-84)
+const RECEIVE_AHEAD: usize = 256 * 1024;
+
 /// Codec for Divi P2P protocol messages
 ///
 /// Message format:
@@ -121,7 +126,7 @@ impl Decoder for DiviCodec {
                 DecodeState::Payload { header } => {
                     let payload_size = header.payload_size as usize;
                     if src.len() < payload_size {
-                        src.reserve(payload_size - src.len());
+                        src.reserve((payload_size - src.len()).min(RECEIVE_AHEAD));
                         return Ok(None);
                     }
 
