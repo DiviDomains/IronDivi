@@ -1031,6 +1031,65 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
 }
 
 /// Initialize logging
+/// The file log's writer thread, kept until `flush_log`
+static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
+    std::sync::Mutex::new(None);
+
+/// Write out the lines the file log's writer thread still holds, before the
+/// process ends. Neither `std::process::exit` nor the end of `main` drops a
+/// static, so without this the last lines, a start-up error among them, are
+/// lost whenever the writer thread has not run yet (a loaded host).
+fn flush_log() {
+    flush_log_from(&LOG_GUARD);
+}
+
+/// Drop the writer's guard in `guard`: it hands the thread a shutdown behind
+/// the lines it holds and waits (up to about a second) until they are written
+fn flush_log_from(guard: &std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>) {
+    let guard = guard.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
+}
+
+#[cfg(test)]
+mod flush_log_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// A log file on a loaded host: each write takes a while
+    #[derive(Clone)]
+    struct SlowFile(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SlowFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lines handed to the writer just before the process ends are in the
+    /// file once `flush_log_from` returns, however slow the writer is
+    #[test]
+    fn flush_writes_out_every_line_the_writer_holds() {
+        let file = SlowFile(Arc::new(Mutex::new(Vec::new())));
+        let (mut writer, guard) = tracing_appender::non_blocking(file.clone());
+        let slot = std::sync::Mutex::new(Some(guard));
+        for i in 0..5 {
+            writer.write_all(format!("line {i}\n").as_bytes()).unwrap();
+        }
+        flush_log_from(&slot);
+        let text = String::from_utf8(file.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 5, "{text:?}");
+        assert!(slot.lock().unwrap().is_none());
+        // A second flush (the end of main after an exit path flushed) is a no-op
+        flush_log_from(&slot);
+    }
+}
+
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -1091,11 +1150,8 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // Create a non-blocking writer to avoid blocking the async runtime
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-        // Store the guard in a static to keep the writer alive
-        // This is safe because we only initialize logging once
-        static GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-            std::sync::OnceLock::new();
-        let _ = GUARD.set(_guard);
+        // Keep the writer alive until `flush_log`
+        *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
         // Set up file logging with timestamps
         tracing_subscriber::registry()
@@ -2556,11 +2612,13 @@ fn main() -> Result<()> {
     }
 
     // Now enter the tokio runtime (after daemonization)
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("Failed to build tokio runtime")?
-        .block_on(async_main(args, data_dir))
+        .block_on(async_main(args, data_dir));
+    flush_log();
+    result
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
@@ -2590,6 +2648,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Check for conflicting network options
     if args.testnet && args.regtest {
         error!("Cannot use both --testnet and --regtest");
+        flush_log();
         std::process::exit(1);
     }
 
@@ -2672,8 +2731,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     .await
     {
         error!("Daemon error: {:#}", e);
-        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
-        // writer may not get to write the line before the process exits
+        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
@@ -2685,6 +2743,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             source = err.source();
         }
         remove_pid_file(&pid_file);
+        flush_log();
         std::process::exit(1);
     }
 
