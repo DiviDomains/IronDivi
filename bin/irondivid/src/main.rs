@@ -316,7 +316,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
-    "rest",
     "resync",
     "rpckeepalive",
     "rpcthreads",
@@ -446,6 +445,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // divid serves RPC unless -server=0 (divid.cpp:139)
     config.rpc.enabled = s.get_bool("server", true);
+    // The REST interface, off unless asked for (Divi Core -rest, rpcserver.cpp:1025)
+    config.rpc.rest = s.get_bool("rest", false);
     // The RPC server listens on the loopback unless -rpcallowip lets others
     // in; then on -rpcbind, else on every interface (rpcserver.cpp:633-706)
     let allowed = s.get_multi("rpcallowip").to_vec();
@@ -698,6 +699,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "rpcpassword",
         "rpcport",
         "server",
+        "rest",
         "rpcallowip",
         "rpcbind",
         "port",
@@ -2003,6 +2005,7 @@ async fn run_daemon(
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
+        rest: config.rpc.rest,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);

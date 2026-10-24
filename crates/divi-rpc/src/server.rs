@@ -50,6 +50,8 @@ pub struct RpcConfig {
     pub password: Option<String>,
     /// Who may connect besides the local host (Divi Core's -rpcallowip)
     pub allowed: Vec<Subnet>,
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    pub rest: bool,
 }
 
 impl Default for RpcConfig {
@@ -59,6 +61,7 @@ impl Default for RpcConfig {
             username: None,
             password: None,
             allowed: Vec::new(),
+            rest: false,
         }
     }
 }
@@ -1486,10 +1489,16 @@ impl RpcServer {
 /// is never served open (irondivid fills in cookie credentials when none are
 /// configured, see [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
-    build_router(server, rpc_credentials(config))
+    build_router(server, rpc_credentials(config), config.rest)
 }
 
-fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
+fn build_router(
+    server: Arc<RpcServer>,
+    credentials: Option<Arc<(String, String)>>,
+    rest: bool,
+) -> Router {
+    // /rest/ paths: REST when on, without credentials, as divid
+    let rest_paths = crate::rest::router(server.clone(), rest);
     // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:150-152);
     // bodies up to Divi Core's MAX_SIZE
     let router = Router::new()
@@ -1536,10 +1545,14 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
         }
     }));
 
+    // REST outside the credentials
+    let router = router.merge(rest_paths);
+
     // Before the credentials, as Divi Core: GET and POST only, and the JSON-RPC
-    // paths only, the query included (rpcserver.cpp:1019-1031)
+    // paths only, the query included, or /rest/ when REST is on
+    // (rpcserver.cpp:1019-1031)
     let router = router.layer(middleware::from_fn(
-        |req: HttpRequest, next: Next| async move {
+        move |req: HttpRequest, next: Next| async move {
             if !crate::http::method_served(req.method()) {
                 return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
             }
@@ -1549,6 +1562,9 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
                 || path
                     .strip_prefix("/wallet/")
                     .is_some_and(|w| !w.is_empty() && !w.contains('/'));
+            if rest && path.starts_with("/rest/") {
+                return next.run(req).await;
+            }
             if uri.query().is_some() || !rpc_path {
                 return crate::http::error_page(StatusCode::NOT_FOUND);
             }

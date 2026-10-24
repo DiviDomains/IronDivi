@@ -582,6 +582,10 @@ pub struct RpcConfig {
     /// -rpcallowip); with none, the server listens on the loopback only
     #[serde(default)]
     pub allowed_ips: Vec<String>,
+
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    #[serde(default)]
+    pub rest: bool,
 }
 
 impl Default for RpcConfig {
@@ -595,6 +599,7 @@ impl Default for RpcConfig {
             max_request_size: 10 * 1024 * 1024, // 10 MB
             timeout: 30,
             allowed_ips: Vec::new(),
+            rest: false,
         }
     }
 }
