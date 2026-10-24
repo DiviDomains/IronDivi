@@ -231,7 +231,12 @@ impl RpcClient {
             params,
         };
 
-        let client = reqwest::blocking::Client::new();
+        // No time limit: divi-cli waits for a call however long the node
+        // takes (a rescan, a send from a big wallet, stop)
+        let client = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .build()
+            .map_err(|e| CliError::General(e.to_string()))?;
         let mut req = client
             .post(&self.url)
             .header("Content-Type", "application/json")
