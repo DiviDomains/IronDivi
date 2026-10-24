@@ -32,10 +32,14 @@ fn node() -> Node {
         )
         .unwrap(),
     );
-    let wallet = Arc::new(WalletDb::with_hd_wallet(
-        Network::Regtest,
-        HdWallet::new(ChainMode::Divi).unwrap(),
-    ));
+    let wallet = Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("wallet"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    );
     Node {
         server: RpcServer::with_wallet(chain, wallet.clone()),
         wallet,
@@ -58,6 +62,16 @@ impl Node {
         reply
             .error
             .unwrap_or_else(|| panic!("{method} {params:?} answered {:?}", reply.result))
+    }
+
+    fn ok(&self, method: &str, params: Vec<Value>) -> Value {
+        let reply = self.call(method, params.clone());
+        assert!(
+            reply.error.is_none(),
+            "{method} {params:?}: {:?}",
+            reply.error
+        );
+        reply.result.expect("result")
     }
 }
 
@@ -94,4 +108,94 @@ fn wrong_argument_counts_answer_with_the_help() {
             e.message
         );
     }
+}
+
+fn code_and_text(e: RpcError) -> (i32, String) {
+    (e.code, e.message)
+}
+
+/// Arguments are read as json_spirit reads them (get_str, get_bool, get_int),
+/// in Divi Core's order (rpcdump.cpp:57-66, :111-129, :178;
+/// rpcwallet.cpp:2531, :2552-2556)
+#[test]
+fn arguments_are_read_as_divid_reads_them() {
+    let n = node();
+    let addr = n.wallet.new_receiving_address().unwrap().to_string();
+    let typed = |t: &str, wanted: &str| (-1, format!("value is type {t}, expected {wanted}"));
+    for (method, params, expected) in [
+        ("importprivkey", vec![json!(1)], typed("int", "str")),
+        (
+            "importprivkey",
+            vec![json!("k"), json!(7)],
+            typed("int", "str"),
+        ),
+        (
+            "importprivkey",
+            vec![json!("k"), json!("x"), json!("yes")],
+            typed("str", "bool"),
+        ),
+        ("importaddress", vec![json!(1)], typed("int", "str")),
+        (
+            "importaddress",
+            vec![json!(addr), json!("watch"), json!("no")],
+            typed("str", "bool"),
+        ),
+        ("dumpprivkey", vec![json!(1)], typed("int", "str")),
+        ("backupwallet", vec![json!(1)], typed("int", "str")),
+        ("keypoolrefill", vec![json!("5")], typed("str", "int")),
+        ("keypoolrefill", vec![json!(1.5)], typed("real", "int")),
+        (
+            "keypoolrefill",
+            vec![json!(-1)],
+            (-8, "Invalid parameter, expected valid size.".to_string()),
+        ),
+        (
+            "importaddress",
+            vec![json!(addr)],
+            (
+                -4,
+                "The wallet already contains the private key for this address or script"
+                    .to_string(),
+            ),
+        ),
+    ] {
+        assert_eq!(
+            code_and_text(n.err(method, params.clone())),
+            expected,
+            "{method} {params:?}"
+        );
+    }
+    // 0 is the default size (rpcwallet.cpp:2551-2556)
+    assert_eq!(n.ok("keypoolrefill", vec![json!(0)]), Value::Null);
+    assert_eq!(n.ok("keypoolrefill", vec![]), Value::Null);
+}
+
+/// On a locked wallet the calls that unlock first answer -13 whatever their
+/// arguments; keypoolrefill checks its size before (rpcdump.cpp:55, :176;
+/// rpcwallet.cpp:2552-2559)
+#[test]
+fn locked_wallet_is_checked_where_divid_checks_it() {
+    let n = node();
+    n.wallet.encrypt_wallet("pass").unwrap();
+    let locked = (
+        -13,
+        "Error: Please enter the wallet passphrase with walletpassphrase first.".to_string(),
+    );
+    for (method, params) in [
+        ("dumpprivkey", vec![json!("notanaddress")]),
+        ("dumpprivkey", vec![json!(1)]),
+        ("importprivkey", vec![json!(1)]),
+        ("importprivkey", vec![json!("notakey")]),
+        ("keypoolrefill", vec![json!(5)]),
+    ] {
+        assert_eq!(
+            code_and_text(n.err(method, params.clone())),
+            locked,
+            "{method} {params:?}"
+        );
+    }
+    assert_eq!(
+        code_and_text(n.err("keypoolrefill", vec![json!(-1)])),
+        (-8, "Invalid parameter, expected valid size.".to_string())
+    );
 }

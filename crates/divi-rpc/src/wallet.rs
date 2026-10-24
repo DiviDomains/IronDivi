@@ -229,6 +229,44 @@ pub(crate) fn json_spirit_type(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// json_spirit's typed reads of positional argument `index` (json_spirit_value.h
+/// get_str, get_bool, get_int): the value as that type, else -1 "value is type
+/// <type>, expected <wanted>"
+fn spirit_type_error(value: Option<&serde_json::Value>, wanted: &str) -> Error {
+    RpcError::new(
+        codes::MISC_ERROR,
+        format!(
+            "value is type {}, expected {wanted}",
+            value.map_or("null", json_spirit_type)
+        ),
+    )
+    .into()
+}
+
+pub(crate) fn spirit_str(params: &Params, index: usize) -> Result<&str, Error> {
+    match params.get(index) {
+        Some(serde_json::Value::String(s)) => Ok(s),
+        other => Err(spirit_type_error(other, "str")),
+    }
+}
+
+pub(crate) fn spirit_bool(params: &Params, index: usize) -> Result<bool, Error> {
+    match params.get(index) {
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        other => Err(spirit_type_error(other, "bool")),
+    }
+}
+
+/// get_int: a JSON integer, taken as a C++ int
+pub(crate) fn spirit_int(params: &Params, index: usize) -> Result<i32, Error> {
+    match params.get(index) {
+        Some(serde_json::Value::Number(n)) if !n.is_f64() => {
+            Ok(n.as_i64().unwrap_or(i64::MAX) as i32)
+        }
+        other => Err(spirit_type_error(other, "int")),
+    }
+}
+
 /// Compute the "bare txid": the txid of `tx` with every input's `scriptSig`
 /// cleared, matching Core's `CTransaction::GetBareTxid()`
 /// (primitives/transaction.cpp). Signing a transaction fills in scriptSigs,
@@ -1265,17 +1303,15 @@ impl WalletRpc {
     pub fn dump_privkey(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_wallet::address::{encode_wif, Network};
 
-        let addr_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Address required"))?;
+        // As Divi Core: the wallet must be unlocked before the address is read
+        // (rpcdump.cpp:176-180)
+        let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
 
+        let addr_str = spirit_str(params, 0)?;
         let addr = self
             .decode_address(addr_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
-
-        let wallet = self.get_wallet()?;
-
-        ensure_fully_unlocked(&wallet)?;
 
         // rpcdump.cpp:186-193: a script address is -3, an unknown key -4
         if addr.addr_type == divi_wallet::address::AddressType::P2SH {
@@ -1308,18 +1344,22 @@ impl WalletRpc {
     }
 
     pub fn import_privkey(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let wif = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Private key required"))?;
-
-        // Optional label parameter
-        let label = params.get_str(1).map(|s| s.to_string());
-
-        let rescan = params.get_bool(2).unwrap_or(true);
-
+        // As Divi Core: the wallet must be unlocked before the arguments are
+        // read, each as json_spirit reads it (rpcdump.cpp:57-66)
         let wallet = self.get_wallet()?;
-
         ensure_fully_unlocked(&wallet)?;
+
+        let wif = spirit_str(params, 0)?;
+        let label = if params.len() > 1 {
+            Some(spirit_str(params, 1)?.to_string())
+        } else {
+            None
+        };
+        let rescan = if params.len() > 2 {
+            spirit_bool(params, 2)?
+        } else {
+            true
+        };
 
         // Decode the WIF private key
         // rpcdump.cpp:70-73
@@ -3508,13 +3548,9 @@ impl WalletRpc {
 
     /// importaddress - Import a watch-only address
     pub fn import_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let addr_or_script = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Address or script required"))?;
-
-        let label = params.get_str(1);
-        let rescan = params.get_bool(2).unwrap_or(true);
-        let _p2sh = params.get_bool(3).unwrap_or(false);
+        // As Divi Core (rpcdump.cpp:111-129): the address or script first, then
+        // the label and the rescan flag, each as json_spirit reads it
+        let addr_or_script = spirit_str(params, 0)?;
 
         let wallet = self.get_wallet()?;
 
@@ -3549,11 +3585,22 @@ impl WalletRpc {
                 .into());
             }
         };
+        let label = if params.len() > 1 {
+            Some(spirit_str(params, 1)?)
+        } else {
+            None
+        };
+        let rescan = if params.len() > 2 {
+            spirit_bool(params, 2)?
+        } else {
+            true
+        };
 
+        // rpcdump.cpp:142-143
         if wallet.is_mine(&addr) && !wallet.is_watch_only(&addr) {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
-                "The wallet already contains the private key for this address",
+                "The wallet already contains the private key for this address or script",
             )
             .into());
         }
@@ -3731,26 +3778,36 @@ impl WalletRpc {
     /// * `newsize` - Optional new keypool target size (default: 100)
     ///
     /// This pre-generates HD-derived keys for faster address generation.
+    /// keypoolrefill as Divi Core (rpcwallet.cpp:2552-2566): a size below 0 is
+    /// refused before the wallet is looked at, 0 (or none) is the default size,
+    /// and the pool must hold at least the size asked for afterwards
     pub fn keypool_refill(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let newsize = params.get_u64(0).map(|s| s as u32);
-
-        if let Some(size) = newsize {
-            if size == 0 {
-                return Err(RpcError::invalid_params("Keypool size must be at least 1").into());
-            }
+        let size = if params.len() > 0 {
+            spirit_int(params, 0)?
+        } else {
+            0
+        };
+        if size < 0 {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Invalid parameter, expected valid size.",
+            )
+            .into());
         }
 
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
 
-        // Actually refill the keypool
+        let newsize = (size > 0).then_some(size as u32);
         let generated = wallet
             .refill_keypool(newsize)
             .map_err(|e| RpcError::internal_error(format!("Failed to refill keypool: {}", e)))?;
-
         info!("Keypool refilled with {} new keys", generated);
 
+        if wallet.keypool_size() < size as u32 {
+            return Err(RpcError::new(codes::WALLET_ERROR, "Error refreshing keypool.").into());
+        }
         Ok(serde_json::Value::Null)
     }
 
@@ -3973,9 +4030,7 @@ impl WalletRpc {
 
     /// backupwallet - write a consistent copy of the wallet to destination
     pub fn backup_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let destination = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Destination path required"))?;
+        let destination = spirit_str(params, 0)?;
 
         let wallet = self.get_wallet()?;
         wallet
