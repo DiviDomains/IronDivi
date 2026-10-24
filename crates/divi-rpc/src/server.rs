@@ -1207,6 +1207,10 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "keypoolrefill" => &[(0, "int")],
         // rpcwallet.cpp:2320
         "listaccounts" => &[(0, "int"), (1, "bool")],
+        // rpcwallet.cpp:1798-1808
+        "listreceivedbyaccount" | "listreceivedbyaddress" => {
+            &[(0, "int"), (1, "bool"), (2, "bool")]
+        }
         // rpcmasternode.cpp:263
         "listmasternodes" => &[(0, "str")],
         // rpcwallet.cpp:2364
@@ -1319,6 +1323,12 @@ fn argument_count(method: &str) -> Option<(usize, usize)> {
         "setgenerate" => (1, 1),
         // rpcmining.cpp:123
         "generateblock" => (0, 1),
+        // rpcwallet.cpp:283, :540, :588, :626, :652, :1501, :1946, :2322
+        "getnewaddress" => (0, 1),
+        "getaccountaddress" | "getaccount" | "getaddressesbyaccount" => (1, 1),
+        "setaccount" | "getreceivedbyaccount" => (1, 2),
+        "listreceivedbyaccount" => (0, 3),
+        "listaccounts" => (0, 2),
         _ => return None,
     })
 }
