@@ -80,8 +80,6 @@ By design:
   `PeerBanningService.cpp:23-34`); irondivid gives an array of bans (`docs/rpc-parity-audit.md`).
 - `setban`, `disconnectnode`: not divid methods (`rpcserver.cpp:325-409`, divid answers `Method not found`); irondivid
   has them. The row checks irondivid's exact reply.
-- `ban outdated`: irondivid does not ban outdated peers and says so (`docs/rpc-parity-audit.md`; divid:
-  `net.cpp:357-393`).
 - `ban <ip>` of node 2's address: divid compares the address given with each peer's `ip:port` text, so it never finds
   a connected peer (`net.cpp:395-407`) and answers `Could not find matching node to ban`; irondivid bans node 2. So
   after it `getconnectioncount` is 1 on divid and 0 on irondivid, and irondivid's `listbanned` has the entry. Neither
