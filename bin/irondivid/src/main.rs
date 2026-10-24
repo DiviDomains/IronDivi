@@ -2168,7 +2168,7 @@ fn snapshot_command(config: &NodeConfig, args: &Args) -> Result<()> {
 }
 
 async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
-    use divi_storage::{Chain, ChainDatabase, ChainParams};
+    use divi_storage::{Chain, ChainDatabase, StorageError};
 
     let start_height = args.export_start.context("Missing --export-start")?;
     let end_height = args.export_end.context("Missing --export-end")?;
@@ -2177,21 +2177,24 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
         .as_ref()
         .context("Missing --export-output")?;
 
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
-
-    info!("Opening blockchain database...");
-    let db_path = config.data_dir.join("blocks");
-    let db = Arc::new(ChainDatabase::open(&db_path).with_context(|| "Failed to open database")?);
-
-    info!("Loading chain...");
-    let network_type = match config.network.network_type {
-        NetworkType::Mainnet => divi_storage::NetworkType::Mainnet,
-        NetworkType::Testnet => divi_storage::NetworkType::Testnet,
-        NetworkType::Regtest => divi_storage::NetworkType::Regtest,
+    // The node's own chain database, opened only if it is there: nothing is
+    // created, and another network's database is refused as at start
+    let db_path = config.chainstate_path();
+    info!("Opening chain database {}", db_path.display());
+    let no_chain = |e: StorageError| match e {
+        StorageError::NotFound(_) => anyhow::anyhow!(
+            "No chain database in {}; nothing to export (start irondivid on this data \
+             directory to sync it first)",
+            db_path.display()
+        ),
+        StorageError::ChainState(_) => anyhow::anyhow!(
+            "Chain database {} holds no blocks; nothing to export",
+            db_path.display()
+        ),
+        e => anyhow::anyhow!("Chain database {}: {}", db_path.display(), e),
     };
-    let params = ChainParams::for_network(network_type, config.network.chain_mode);
-    let chain = Chain::new(db, params).with_context(|| "Failed to load chain")?;
+    let db = Arc::new(ChainDatabase::open_existing(&db_path).map_err(no_chain)?);
+    let chain = Chain::open_existing(db, storage_params(&config)).map_err(no_chain)?;
 
     info!("Current chain height: {}", chain.height());
     info!(
@@ -2201,7 +2204,7 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
 
     chain
         .export_chain(start_height, end_height, output_dir)
-        .with_context(|| "Failed to export chain")?;
+        .map_err(|e| anyhow::anyhow!("Failed to export chain: {}", e))?;
 
     info!("Export complete!");
     Ok(())
@@ -2358,7 +2361,8 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
-        print_to_console: args.printtoconsole,
+        // An export only reads the data directory: it logs to the console
+        print_to_console: args.printtoconsole || args.export_chain,
     };
 
     // Initialize logging (writes to debug.log in data_dir by default)

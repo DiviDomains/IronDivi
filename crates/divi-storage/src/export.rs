@@ -175,6 +175,15 @@ impl Chain {
                 "start_height must be <= end_height".to_string(),
             ));
         }
+        // Blocks above the tip are not there: refuse before writing anything
+        // rather than write a partial export
+        if end_height > self.height() {
+            return Err(StorageError::InvalidParameter(format!(
+                "end height {} is above the chain height {}",
+                end_height,
+                self.height()
+            )));
+        }
 
         // Create output directory structure
         fs::create_dir_all(output_dir).map_err(StorageError::Io)?;
@@ -235,7 +244,7 @@ impl Chain {
         };
 
         let manifest = ExportManifest {
-            chain: "mainnet".to_string(),
+            chain: crate::datadir::network_name(self.params()),
             exported_at: chrono::Utc::now().to_rfc3339(),
             block_count: exported_count,
             start_height,

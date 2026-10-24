@@ -368,6 +368,23 @@ pub struct HeightIndexAudit {
 impl Chain {
     /// Create a new chain with the given database and parameters
     pub fn new(db: Arc<ChainDatabase>, params: ChainParams) -> Result<Self, StorageError> {
+        Self::load(db, params, true)
+    }
+
+    /// `Chain::new` for a chain that must already hold blocks: an empty
+    /// database is refused instead of being given a genesis block
+    pub fn open_existing(
+        db: Arc<ChainDatabase>,
+        params: ChainParams,
+    ) -> Result<Self, StorageError> {
+        Self::load(db, params, false)
+    }
+
+    fn load(
+        db: Arc<ChainDatabase>,
+        params: ChainParams,
+        init_if_empty: bool,
+    ) -> Result<Self, StorageError> {
         let mut chain = Chain {
             db,
             tx_index: None,
@@ -388,6 +405,11 @@ impl Chain {
 
         // Initialize genesis block if chain is empty
         if chain.tip().is_none() {
+            if !init_if_empty {
+                return Err(StorageError::ChainState(
+                    "the chain database holds no blocks".to_string(),
+                ));
+            }
             chain.init_genesis()?;
             chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         } else if chain.db.get_metadata(HEIGHT_INDEX_REPAIR_KEY)?.is_none() {
