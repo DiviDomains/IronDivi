@@ -286,3 +286,31 @@ fn listaccounts_is_each_names_account_balance() {
         );
     }
 }
+
+/// listunspent names the account of an address-book address only; a coin of a
+/// key the wallet never handed out has no account (rpcrawtransaction.cpp:336-339)
+#[test]
+fn listunspent_account_only_for_address_book_addresses() {
+    let net = Net::new();
+    let coin = net.mature_coin();
+    let handed_out = book_address(&net);
+    let pooled = net.wallet.new_receiving_address().unwrap();
+    net.mine(
+        vec![net.pay(
+            &coin,
+            &[(handed_out.clone(), 4 * COIN), (pooled.clone(), 6 * COIN)],
+        )],
+        &net.miner,
+    );
+    let list = net.rpc().list_unspent(&Params::None).unwrap();
+    let find = |a: &Address| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["address"] == json!(a.to_string()))
+            .unwrap_or_else(|| panic!("{a} not listed: {list}"))
+            .clone()
+    };
+    assert_eq!(find(&handed_out)["account"], json!(""));
+    assert!(find(&pooled).get("account").is_none(), "{}", find(&pooled));
+}

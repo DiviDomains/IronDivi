@@ -1047,11 +1047,10 @@ impl WalletRpc {
                 if utxo.address.is_empty() {
                     entry.as_object_mut().map(|o| o.remove("address"));
                 }
-                // Divi Core gives the account of an address-book address (not
-                // change) and a P2SH coin's redeem script
-                // (rpcrawtransaction.cpp:320-334)
+                // Divi Core gives the account of an address-book address and
+                // a P2SH coin's redeem script (rpcrawtransaction.cpp:336-349)
                 if let Ok(addr) = Address::from_base58(&utxo.address) {
-                    if !is_change {
+                    if wallet.in_address_book(&addr) {
                         entry["account"] = json!(wallet.get_account(&addr));
                     }
                     if addr.addr_type == divi_wallet::address::AddressType::P2SH {
