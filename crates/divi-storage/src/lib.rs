@@ -19,6 +19,32 @@
 //! - Address index (for lite wallet services)
 //! - Chain export (for validation and cross-reference)
 
+/// A point where a test can stop the operation, as if the process died there
+/// (see `fault`); nothing outside test builds
+macro_rules! stop_point {
+    ($point:expr) => {
+        #[cfg(test)]
+        crate::fault::check($point)?;
+    };
+}
+
+/// With the `fault-injection` feature, sleep at `point` when IRONDIVI_PAUSE_AT
+/// names it (IRONDIVI_PAUSE_SECS, default 30), so a test run can kill the
+/// process there; nothing otherwise
+macro_rules! pause_point {
+    ($point:expr) => {
+        #[cfg(feature = "fault-injection")]
+        if std::env::var("IRONDIVI_PAUSE_AT").as_deref() == Ok($point) {
+            let secs = std::env::var("IRONDIVI_PAUSE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            tracing::warn!("pausing {}s at {}", secs, $point);
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+        }
+    };
+}
+
 pub mod address_index;
 pub mod block_index;
 pub mod chain;
@@ -27,6 +53,8 @@ pub mod datadir;
 pub mod difficulty;
 pub mod error;
 pub mod export;
+#[cfg(test)]
+mod fault;
 pub mod fork_activation;
 pub mod lottery;
 pub mod masternode;

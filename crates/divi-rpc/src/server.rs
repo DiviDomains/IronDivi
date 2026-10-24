@@ -48,6 +48,8 @@ pub struct RpcConfig {
     pub username: Option<String>,
     /// RPC password (optional)
     pub password: Option<String>,
+    /// Who may connect besides the local host (Divi Core's -rpcallowip)
+    pub allowed: Vec<Subnet>,
 }
 
 impl Default for RpcConfig {
@@ -56,8 +58,118 @@ impl Default for RpcConfig {
             bind_address: "127.0.0.1:9998".parse().unwrap(),
             username: None,
             password: None,
+            allowed: Vec::new(),
         }
     }
+}
+
+/// A network an RPC client may connect from, as Divi Core's CSubNet reads an
+/// -rpcallowip value: a single IP, `ip/bits` or `ip/netmask`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subnet {
+    network: std::net::IpAddr,
+    mask: std::net::IpAddr,
+}
+
+impl Subnet {
+    /// Parse an -rpcallowip value; None if it is not a valid subnet
+    pub fn parse(text: &str) -> Option<Subnet> {
+        use std::net::IpAddr;
+        let (ip, mask) = match text.split_once('/') {
+            Some((ip, mask)) => (ip.parse::<IpAddr>().ok()?, Some(mask)),
+            None => (text.parse::<IpAddr>().ok()?, None),
+        };
+        let bits = match ip {
+            IpAddr::V4(_) => 32u32,
+            IpAddr::V6(_) => 128,
+        };
+        let mask = match mask {
+            None => mask_of(ip, bits),
+            Some(m) => match m.parse::<u32>() {
+                Ok(n) if n <= bits => mask_of(ip, n),
+                Ok(_) => return None,
+                Err(_) => {
+                    let m = m.parse::<IpAddr>().ok()?;
+                    if m.is_ipv4() != ip.is_ipv4() {
+                        return None;
+                    }
+                    m
+                }
+            },
+        };
+        Some(Subnet {
+            network: apply_mask(ip, mask),
+            mask,
+        })
+    }
+
+    /// Whether `ip` is in the subnet
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(v6)),
+            v4 => v4,
+        };
+        ip.is_ipv4() == self.network.is_ipv4() && apply_mask(ip, self.mask) == self.network
+    }
+
+    /// Divi Core always lets the local host in (127.0.0.0/8 and ::1)
+    pub fn loopback() -> [Subnet; 2] {
+        [
+            Subnet::parse("127.0.0.0/8").unwrap(),
+            Subnet::parse("::1").unwrap(),
+        ]
+    }
+}
+
+fn mask_of(ip: std::net::IpAddr, bits: u32) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(u32::MAX.checked_shl(32 - bits).unwrap_or(0))),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(
+            u128::MAX.checked_shl(128 - bits).unwrap_or(0),
+        )),
+    }
+}
+
+fn apply_mask(ip: std::net::IpAddr, mask: std::net::IpAddr) -> std::net::IpAddr {
+    use std::net::IpAddr;
+    match (ip, mask) {
+        (IpAddr::V4(a), IpAddr::V4(m)) => IpAddr::V4((u32::from(a) & u32::from(m)).into()),
+        (IpAddr::V6(a), IpAddr::V6(m)) => IpAddr::V6((u128::from(a) & u128::from(m)).into()),
+        (a, _) => a,
+    }
+}
+
+/// Serve `app` on the configured address, refusing (HTTP 403, as Divi Core)
+/// connections from outside the local host and the allowed subnets
+async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
+    let mut allowed: Vec<Subnet> = Subnet::loopback().to_vec();
+    allowed.extend(config.allowed.iter().copied());
+    let app = app.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
+        let allowed = allowed.clone();
+        async move {
+            let peer = req
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip());
+            match peer {
+                Some(ip) if !allowed.iter().any(|s| s.contains(ip)) => {
+                    StatusCode::FORBIDDEN.into_response()
+                }
+                _ => next.run(req).await,
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Log configuration for RPC queries
@@ -1100,10 +1212,7 @@ pub async fn start_server(config: RpcConfig, chain: Arc<Chain>) -> Result<(), Er
 
     info!("Starting RPC server on {}", config.bind_address);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    serve(&config, app).await
 }
 
 /// Start the RPC server with peer manager
@@ -1132,10 +1241,7 @@ where
 
     info!("Starting RPC server on {}", config.bind_address);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    serve(&config, app).await
 }
 
 /// Start the RPC server with wallet, peer manager, and optional staker
@@ -1162,10 +1268,7 @@ where
 
     info!("Starting RPC server on {}", config.bind_address);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    serve(&config, app).await
 }
 
 /// Start the RPC server with wallet and peer manager
@@ -1184,6 +1287,27 @@ mod tests {
     use crate::protocol::RequestId;
     use divi_storage::{ChainDatabase, ChainParams};
     use tempfile::tempdir;
+
+    /// -rpcallowip values as Divi Core's CSubNet reads them
+    #[test]
+    fn rpcallowip_subnets_are_divi_core_s() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let one = Subnet::parse("1.2.3.4").unwrap();
+        assert!(one.contains(ip("1.2.3.4")) && !one.contains(ip("1.2.3.5")));
+        let cidr = Subnet::parse("10.0.0.0/8").unwrap();
+        assert!(cidr.contains(ip("10.9.8.7")) && !cidr.contains(ip("11.0.0.1")));
+        let mask = Subnet::parse("192.168.1.0/255.255.255.0").unwrap();
+        assert!(mask.contains(ip("192.168.1.200")) && !mask.contains(ip("192.168.2.1")));
+        // An IPv4 client reaching a dual-stack socket comes as ::ffff:a.b.c.d
+        assert!(cidr.contains(ip("::ffff:10.1.1.1")));
+        let v6 = Subnet::parse("fe80::/10").unwrap();
+        assert!(v6.contains(ip("fe80::1")) && !v6.contains(ip("10.0.0.1")));
+        for bad in ["", "1.2.3", "1.2.3.4/33", "1.2.3.4/x", "host.example"] {
+            assert!(Subnet::parse(bad).is_none(), "{bad}");
+        }
+        let [lo4, lo6] = Subnet::loopback();
+        assert!(lo4.contains(ip("127.0.0.53")) && lo6.contains(ip("::1")));
+    }
 
     fn create_test_server() -> (Arc<RpcServer>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -1662,6 +1786,7 @@ mod tests {
         for (user, pass) in [(None, None), (Some("alice"), None), (Some(""), Some(""))] {
             let (server, _dir) = create_test_server();
             let config = RpcConfig {
+                allowed: Vec::new(),
                 username: user.map(String::from),
                 password: pass.map(String::from),
                 ..RpcConfig::default()
@@ -1699,6 +1824,7 @@ mod tests {
     async fn rpc_replies_carry_no_cross_origin_headers() {
         let (server, _dir) = create_test_server();
         let config = RpcConfig {
+            allowed: Vec::new(),
             username: Some("alice".into()),
             password: Some("s3cret".into()),
             ..RpcConfig::default()
@@ -1738,6 +1864,7 @@ mod tests {
             crate::auth_cookie::resolve_rpc_auth(None, None, dir.path()).unwrap();
         assert!(cookie.is_some());
         let config = RpcConfig {
+            allowed: Vec::new(),
             username: Some(user.clone()),
             password: Some(password.clone()),
             ..RpcConfig::default()

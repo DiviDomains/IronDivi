@@ -16,7 +16,7 @@ use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::OutPoint;
 use divi_wallet::WalletDb;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// What the recovery phrase does not carry, said wherever a Core wallet is met
@@ -43,6 +43,16 @@ pub fn is_berkeley_db(path: &Path) -> bool {
         .any(|m| magic == m.to_le_bytes() || magic == m.to_be_bytes())
 }
 
+/// The wallet folder: `-wallet=<name>` is within the data directory, as
+/// divid's, and the default is `<datadir>/wallet`
+pub fn wallet_dir(data_dir: &Path, wallet: Option<&Path>) -> PathBuf {
+    match wallet {
+        Some(p) if p.is_relative() => data_dir.join(p),
+        Some(p) => p.to_path_buf(),
+        None => data_dir.join("wallet"),
+    }
+}
+
 /// Refuse to start on a Divi Core data directory, or with a wallet path that
 /// is a file or a folder holding Core's wallet.dat. Runs before irondivid
 /// opens or writes anything, so the folder is left exactly as it was.
@@ -59,8 +69,7 @@ pub fn refuse_at_start(data_dir: &Path, wallet: Option<&Path>, disable_wallet: b
     if disable_wallet {
         return Ok(());
     }
-    let default_wallet = data_dir.join("wallet");
-    let wallet = wallet.unwrap_or(&default_wallet);
+    let wallet = &wallet_dir(data_dir, wallet);
     if wallet.is_file() {
         if is_berkeley_db(wallet) {
             bail!(
@@ -167,6 +176,9 @@ mod tests {
             err.to_string().contains("holds a Divi Core wallet.dat"),
             "{err}"
         );
+        // -wallet=wallet.dat (divid's default name) is within the data directory
+        let err = refuse_at_start(&core, Some(Path::new("wallet.dat")), false).unwrap_err();
+        assert!(err.to_string().contains("Divi Core wallet file"), "{err}");
         // --disablewallet: the wallet path is not used
         refuse_at_start(&data, Some(&core.join("wallet.dat")), true).unwrap();
         // The default wallet folder, and a wallet.dat beside it (warned, not refused)

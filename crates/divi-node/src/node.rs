@@ -267,6 +267,20 @@ impl Node {
             );
         }
 
+        // Divi Core notes an unclean stop at start and brings the chain to the
+        // best block it knows; here every chain write is whole, so what is left
+        // is a reorganization the stop interrupted
+        if !chain.begin_run().map_err(damaged)? {
+            tracing::warn!("irondivid did not stop cleanly last time");
+        }
+        if chain.finish_interrupted_reorg().map_err(damaged)? {
+            tracing::info!(
+                "Finished the interrupted reorganization; tip {} at height {}",
+                chain.tip().map(|t| t.hash.to_string()).unwrap_or_default(),
+                chain.height()
+            );
+        }
+
         // Initialize mempool
         let mempool = Arc::new(Mempool::new(config.mempool.clone()));
 
@@ -289,6 +303,8 @@ impl Node {
         if let Some(proxy) = proxy {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
+        // -timeout for outbound connections
+        divi_network::set_connect_timeout_ms(config.p2p.connect_timeout_ms);
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,

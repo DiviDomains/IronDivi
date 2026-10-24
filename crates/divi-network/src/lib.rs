@@ -88,7 +88,7 @@ pub use version::VersionMessage;
 
 // P2P types
 pub use codec::DiviCodec;
-pub use connection::Connection;
+pub use connection::{connect_timeout, set_connect_timeout_ms, Connection};
 pub use masternode_handler::MasternodeHandler;
 pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_manager::{

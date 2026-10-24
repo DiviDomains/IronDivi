@@ -249,7 +249,11 @@ fn core_datadir(root: &Path, net: &str) {
     leveldb(&d.join("chainstate"));
     std::fs::write(d.join("blocks/blk00000.dat"), [0xfa, 0xbf, 0xb5, 0xda]).unwrap();
     core_wallet_file(&d.join("wallet.dat"));
-    std::fs::write(root.join("divi.conf"), "regtest=1\n").unwrap();
+    std::fs::write(
+        root.join("divi.conf"),
+        "rpcuser=core\nrpcpassword=core\nserver=1\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -288,7 +292,9 @@ fn wallet_option_at_a_core_wallet_file_gives_a_plain_message() {
     let core = dir.path().join("divi");
     std::fs::create_dir_all(&core).unwrap();
     core_wallet_file(&core.join("wallet.dat"));
+    // -datadir must exist, as divid's
     let datadir = dir.path().join("irondivi");
+    std::fs::create_dir_all(&datadir).unwrap();
     let before = snapshot(&core);
     let mut cmd = irondivid(&datadir, "--regtest", free_port());
     cmd.arg("--wallet").arg(core.join("wallet.dat"));
@@ -301,7 +307,10 @@ fn wallet_option_at_a_core_wallet_file_gives_a_plain_message() {
     );
     assert!(stderr.contains("recovery phrase"), "{stderr}");
     assert!(snapshot(&core) == before, "wallet.dat changed");
-    assert!(!datadir.exists(), "nothing written before the refusal");
+    assert!(
+        snapshot(&datadir).is_empty(),
+        "nothing written before the refusal"
+    );
 }
 
 #[test]

@@ -36,8 +36,19 @@ use tokio::time::timeout;
 use tokio_util::codec::FramedRead;
 use tracing::{debug, error, info, trace, warn};
 
-/// Timeout for connection establishment
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout for connection establishment in milliseconds: Divi Core's
+/// -timeout, default 5000 (net.cpp DEFAULT_CONNECT_TIMEOUT)
+static CONNECT_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5000);
+
+/// Set the connection timeout (Divi Core's -timeout, at least 1 ms)
+pub fn set_connect_timeout_ms(ms: u64) {
+    CONNECT_TIMEOUT_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The connection timeout in force
+pub fn connect_timeout() -> Duration {
+    Duration::from_millis(CONNECT_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Timeout for handshake completion
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,13 +131,13 @@ impl Connection {
         let stream = match proxy {
             Some(proxy) => {
                 info!("Connecting to peer {} via proxy {}", addr, proxy);
-                timeout(CONNECT_TIMEOUT, crate::socks5::connect(proxy, addr))
+                timeout(connect_timeout(), crate::socks5::connect(proxy, addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)??
             }
             None => {
                 info!("Connecting to peer {}", addr);
-                timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                timeout(connect_timeout(), TcpStream::connect(addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)?
                     .map_err(|e| NetworkError::Connection(e.to_string()))?
@@ -787,9 +798,10 @@ fn inactivity_exceeded(
 mod tests {
     use super::*;
 
+    /// Divi Core's -timeout default: 5000 ms
     #[test]
     fn test_connect_timeout() {
-        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(connect_timeout(), Duration::from_millis(5000));
     }
 
     #[test]

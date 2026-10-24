@@ -320,6 +320,10 @@ struct UnlockState {
 /// How many recently scanned block hashes the wallet remembers
 const SCANNED_HASHES_KEPT: usize = 10_000;
 
+/// How many of them are saved with the scan height (more than Divi's deepest
+/// reorganization of 100 blocks)
+const SCANNED_HASHES_SAVED: usize = 128;
+
 impl WalletDb {
     /// Create a new in-memory wallet
     pub fn new(network: Network) -> Self {
@@ -692,6 +696,9 @@ impl WalletDb {
 
         // Load last scan height
         *self.last_scan_height.write() = db.load_last_scan_height()?;
+        self.scanned_hashes
+            .write()
+            .extend(db.load_scanned_hashes()?);
 
         // Load accounts
         let accounts = db.load_accounts()?;
@@ -866,15 +873,11 @@ impl WalletDb {
             self.put_key(&mut batch, db, &hash, &entry);
         }
 
-        // Delete rows dropped from memory (reorg, rescan) before writing the
-        // current state, so they do not come back on the next load
+        // Delete rows dropped from memory (reorg, rescan) so they do not come
+        // back on the next load; the rows written below come after them in the
+        // batch and win over them
         let pending = self.pending_deletes_snapshot();
-        if !pending.is_empty() {
-            let mut batch = db.create_batch();
-            Self::put_pending_deletes(&mut batch, db, &pending);
-            db.write_batch(batch)?;
-            self.clear_pending_deletes(&pending);
-        }
+        Self::put_pending_deletes(&mut batch, db, &pending);
 
         // Save UTXOs and remove spent ones from the UTXO table.
         // First, delete any spent outpoints from the UTXO column family so they
@@ -907,12 +910,7 @@ impl WalletDb {
             [*self.encrypted.read() as u8],
         );
 
-        // Save last scan height
-        batch.put_cf(
-            db.cf_metadata(),
-            b"last_scan_height",
-            self.last_scan_height.read().to_le_bytes(),
-        );
+        self.put_scan_state(&mut batch, db);
 
         // Save accounts
         for (account, addresses) in self.accounts.read().iter() {
@@ -934,6 +932,8 @@ impl WalletDb {
 
         // Synced, so it is on disk when this returns; no memtable flush needed
         db.write_batch_sync(batch)?;
+        self.clear_pending_deletes(&pending);
+        stop_point!("wallet deletes written");
 
         // Clear dirty flags since everything was just written
         self.dirty.write().clear();
@@ -979,9 +979,34 @@ impl WalletDb {
     /// Save only the last scan height to database (lightweight, no flush)
     pub fn save_scan_height(&self) -> Result<(), WalletError> {
         if let Some(db) = &self.db {
-            db.store_last_scan_height(*self.last_scan_height.read())?;
+            let mut batch = db.create_batch();
+            self.put_scan_state(&mut batch, db);
+            db.write_batch(batch)?;
         }
         Ok(())
+    }
+
+    /// The scan height and the hashes of the blocks scanned up to it, so a
+    /// restart on a chain where those blocks were replaced rolls them back, as
+    /// Divi Core's wallet starts from the fork of its best-block locator
+    /// (wallet.cpp:258-293). Enough heights are kept to cover the deepest
+    /// reorganization.
+    fn put_scan_state(&self, batch: &mut rocksdb::WriteBatch, db: &WalletDatabase) {
+        let last = *self.last_scan_height.read();
+        batch.put_cf(db.cf_metadata(), b"last_scan_height", last.to_le_bytes());
+        let recent: Vec<(u32, Hash256)> = self
+            .scanned_hashes
+            .read()
+            .range(..=last)
+            .rev()
+            .take(SCANNED_HASHES_SAVED)
+            .map(|(h, hash)| (*h, *hash))
+            .collect();
+        batch.put_cf(
+            db.cf_metadata(),
+            crate::persistence::KEY_SCANNED_HASHES,
+            crate::persistence::encode_scanned_hashes(&recent),
+        );
     }
 
     /// Incrementally save only dirty wallet data using an atomic WriteBatch.
@@ -1007,11 +1032,7 @@ impl WalletDb {
         Self::put_pending_deletes(&mut batch, db, &pending);
 
         // Always update scan height
-        batch.put_cf(
-            db.cf_metadata(),
-            b"last_scan_height",
-            self.last_scan_height.read().to_le_bytes(),
-        );
+        self.put_scan_state(&mut batch, db);
 
         if flags.utxos || flags.spent {
             // Remove spent outpoints from UTXO CF and add to spent CF
@@ -2229,6 +2250,7 @@ impl WalletDb {
         rand::rngs::OsRng.fill_bytes(&mut new_salt);
         let new_key = Zeroizing::new(derive_key_from_passphrase(new_pass, &new_salt));
         db.store_encryption_metadata(&new_salt, &seal_master_key(&master_key, &new_key))?;
+        stop_point!("passphrase salt written");
         db.flush()?;
 
         info!("Wallet passphrase changed successfully");
@@ -4375,6 +4397,8 @@ mod tests {
 
     /// Confirmed-state accounting: blocks scanned twice, reorgs, restarts
     mod chain_accounting {
+        mod crash;
+
         use super::*;
         use divi_primitives::block::Block;
         use divi_primitives::transaction::{OutPoint as TxOutPoint, Transaction, TxIn, TxOut};
