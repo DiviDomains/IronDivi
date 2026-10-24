@@ -214,8 +214,8 @@ impl NetworkRpc {
                 }
             }
             "onetry" => {
-                // Just add it - connection will be attempted on next cycle
-                peer_manager.add_node(addr);
+                // Divi Core dials it once, now, and does not keep it in the list
+                peer_manager.connect_once(addr);
             }
             _ => {
                 return Err(RpcError::invalid_params(
@@ -683,6 +683,44 @@ mod tests {
         assert_eq!(n(&s1, "bytesrecv"), n(&s0, "bytesrecv") + 32);
         assert!(c1["pingtime"].as_f64().unwrap() > 0.0);
         assert!(c1.get("pingwait").is_none(), "pong was matched: {c1}");
+        client.disconnect_all();
+        server.disconnect_all();
+    }
+
+    /// Divi Core `addnode … onetry` (net.cpp addNode): dials now, by address and
+    /// port even when a peer from that IP is connected, and is not kept in the
+    /// added-node list
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_addnode_onetry_dials_once_now() {
+        use std::time::Duration;
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let server = PeerManager::new(divi_network::PeerManagerConfig {
+            listen_addr: Some(listen),
+            ..quiet_config()
+        });
+        tokio::spawn(Arc::clone(&server).start());
+        let client = PeerManager::new(quiet_config());
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "client did not connect to the server");
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&client));
+        rpc.add_node(&Params::Array(vec![
+            serde_json::json!(target_addr.to_string()),
+            serde_json::json!("onetry"),
+        ]))
+        .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(10), target.accept()).await;
+        assert!(accepted.is_ok(), "onetry did not dial");
+        assert!(!client.is_added_node(&target_addr));
         client.disconnect_all();
         server.disconnect_all();
     }

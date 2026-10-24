@@ -348,6 +348,7 @@ impl Node {
             },
             default_port: config.network.default_p2p_port(),
             proxy,
+            connect_only: !config.p2p.connect.is_empty(),
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // Divi Core -banscore / -bantime
