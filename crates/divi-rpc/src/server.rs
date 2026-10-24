@@ -1371,9 +1371,26 @@ async fn handle_rpc(
     body: String,
 ) -> impl IntoResponse {
     debug!("RPC request: {}", body);
-    let (status, reply) = server.handle_http_body(&body);
+    let (status, reply) = handle_body(server, body).await;
     debug!("RPC response: {}", reply);
     json_reply(status, reply, &version, &headers)
+}
+
+/// Run a request's calls on the runtime's blocking threads. The calls are
+/// synchronous; on a worker thread a long one (keypoolrefill, verifychain)
+/// would keep that worker from serving other connections until it ends.
+/// Divi Core serves other connections from its other RPC threads meanwhile
+/// (rpcserver.cpp:755-757).
+async fn handle_body(server: Arc<RpcServer>, body: String) -> (StatusCode, String) {
+    match tokio::task::spawn_blocking(move || server.handle_http_body(&body)).await {
+        Ok(reply) => reply,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Cancelled: the runtime is shutting down
+        Err(_) => error_reply(
+            RpcError::internal_error("RPC server stopping"),
+            serde_json::Value::Null,
+        ),
+    }
 }
 
 /// A JSON-RPC reply with Divi Core's headers: application/json, and the
@@ -1415,7 +1432,7 @@ async fn handle_wallet_rpc(
     // TODO: In the future, we could use wallet_name to route to specific wallet instances
     // For now, we just log it and pass through to the default wallet
     // This enables multi-wallet CLI support even if server only has one wallet loaded
-    let (status, reply) = server.handle_http_body(&body);
+    let (status, reply) = handle_body(server, body).await;
     debug!("RPC response for wallet '{}': {}", wallet_name, reply);
     json_reply(status, reply, &version, &headers)
 }
