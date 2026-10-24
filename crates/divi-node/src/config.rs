@@ -384,6 +384,12 @@ pub struct P2pConfig {
     #[serde(default)]
     pub connect: Vec<String>,
 
+    /// `-addnode` peers, as given: the node's first added nodes, which
+    /// getaddednodeinfo lists (Divi Core net.cpp:1218). They are dialled as
+    /// static peers.
+    #[serde(default)]
+    pub addnode: Vec<String>,
+
     /// Accept inbound connections. `None` = default: listen unless `connect`
     /// is set (C++ soft-sets `-listen=0` under `-connect`).
     #[serde(default)]
@@ -498,6 +504,7 @@ impl Default for P2pConfig {
             max_outbound: 16,
             enable_discovery: true,
             connect: Vec::new(),
+            addnode: Vec::new(),
             listen: None,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),

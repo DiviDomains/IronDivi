@@ -256,7 +256,8 @@ impl std::fmt::Display for ConfigFileError {
 
 impl std::error::Error for ConfigFileError {}
 
-/// Read the config file into the settings: irondivid's TOML, else divid's
+/// Read the config file into the settings: irondivid's TOML when the file is
+/// its own (`irondivi.conf` or `*.toml`) and parses as TOML, else divid's
 /// `name=value` format. Values the command line set are kept. Pins `conf` to
 /// the file read, so a network chosen by the file does not move it.
 fn resolve_args(mut args: Args) -> Result<Args> {
@@ -267,9 +268,13 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Error reading configuration file: {:?}", path))?;
+        // Only irondivid's own file may be TOML: a divi.conf that happens to
+        // parse as TOML still means what it means to divid
+        let own = path.file_name().is_some_and(|n| n == "irondivi.conf")
+            || path.extension().is_some_and(|e| e == "toml");
         match content.parse::<toml::Table>() {
-            Ok(table) => args.settings.read_toml(&table),
-            Err(_) => args
+            Ok(table) if own => args.settings.read_toml(&table),
+            _ => args
                 .settings
                 .read_config(&content)
                 .map_err(ConfigFileError)?,
@@ -529,6 +534,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.connect.extend(connect.iter().cloned());
         config.p2p.enable_discovery = false;
     }
+    config.p2p.addnode = s.get_multi("addnode").to_vec();
     config
         .network
         .static_peers
@@ -3907,6 +3913,46 @@ mod divid_option_tests {
         let c = cfg_in("divi.conf", "rpcuser=u\nrpcpassword=p\nrpcport=1234\n", &[]).unwrap();
         assert_eq!(c.rpc.port, 1234);
         assert_eq!(c.rpc.username.as_deref(), Some("u"));
+    }
+
+    /// A divi.conf that happens to be valid TOML still means what it means to
+    /// divid: a [section] line does not hide the keys after it
+    /// (Settings.cpp:159-184) and quotes stay in the value. Only irondivid's
+    /// own file, irondivi.conf or a .toml file, is read as TOML.
+    #[test]
+    fn divi_conf_is_read_as_divid_reads_it_even_when_it_is_toml() {
+        let conf = "rpcuser=1\nrpcpassword=2\nrpcport=1234\n[test]\nrpcport=5\ntimeout=7\n";
+        for file in ["divi.conf", "other.conf"] {
+            let extra = format!("--conf={file}");
+            let c = cfg_in(file, conf, &[&extra]).unwrap();
+            assert_eq!(c.rpc.port, 1234, "{file}: the first value wins");
+            assert_eq!(c.p2p.connect_timeout_ms, 7, "{file}: [test] keys apply");
+        }
+        let c = cfg_in("divi.conf", "rpcuser=\"u\"\nrpcpassword=2\n", &[]).unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("\"u\""));
+
+        for file in ["irondivi.conf", "node.toml"] {
+            let extra = format!("--conf={file}");
+            let c = cfg_in(file, "rpcuser = \"u\"\nrpcport = 1236\n", &[&extra]).unwrap();
+            assert_eq!(c.rpc.username.as_deref(), Some("u"), "{file}");
+            assert_eq!(c.rpc.port, 1236, "{file}");
+        }
+    }
+
+    /// -addnode keeps every value, the command line's first, for the added
+    /// node list as well as the peers dialled
+    #[test]
+    fn addnode_values_in_order_command_line_first() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\naddnode=127.0.0.2:11\naddnode=127.0.0.2:12\n",
+            &["-addnode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.addnode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.2:12"]
+        );
     }
 
     /// -conf is relative to the data directory (Settings::GetConfigFile)
