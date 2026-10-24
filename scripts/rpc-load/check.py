@@ -459,6 +459,7 @@ def held_connections(node, held):
 
 LONG_CALL = ("keypoolrefill", 3000)
 long_secs = {}
+short_secs = {}
 
 
 def long_and_short(node, tag):
@@ -477,8 +478,10 @@ def long_and_short(node, tag):
     th = threading.Thread(target=long_call)
     th.start()
     time.sleep(0.3)
+    sent = time.time()
     node.call("getblockcount", timeout=300)
     done["short"] = time.time()
+    short_secs[f"{tag} {node.name}"] = done["short"] - sent
     th.join(300)
     return "short first" if done.get("short", 1e18) < done.get("long", 0) else "short after the long call"
 
@@ -593,7 +596,8 @@ i = stop_mid_call(I)
 row("stop while 8 clients are mid-call", c, i, c == i and "exited 0" in c)
 
 print("# long call (" + " ".join(map(str, LONG_CALL)) + "+) seconds: " +
-      ", ".join(f"{k} {v:.1f}" for k, v in long_secs.items()), flush=True)
+      ", ".join(f"{k} {v:.1f}" for k, v in long_secs.items()) + "; short call seconds: " +
+      ", ".join(f"{k} {v:.1f}" for k, v in short_secs.items()), flush=True)
 print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
 print(f"FAILS {fails}", flush=True)
 sys.exit(min(fails, 254))
