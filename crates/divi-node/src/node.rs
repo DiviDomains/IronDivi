@@ -432,6 +432,15 @@ impl Node {
             );
         }
 
+        // bootstrap.dat and -loadblock files, after any -reindex and before
+        // any peer is connected (Divi Core's import thread, init.cpp:684-722)
+        crate::block_import::import_at_start(
+            &chain,
+            &config.data_dir,
+            &config.load_block,
+            config.network.magic,
+        );
+
         // Initialize mempool
         let mempool = Arc::new(Mempool::new(config.mempool.clone()));
 

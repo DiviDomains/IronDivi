@@ -285,7 +285,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "keypool",
     "listenonion",
     "litemode",
-    "loadblock",
     "logips",
     "logtimestamps",
     "masternode",
@@ -521,6 +520,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(n) = number_option(&s, "bantime", 0..=i64::MAX) {
         config.p2p.ban_time = n as u64;
     }
+    // -loadblock files as given, relative to the working directory as in divid
+    config.load_block = s.get_multi("loadblock").iter().map(PathBuf::from).collect();
+    config.stop_after_block_import = s.get_bool("stopafterblockimport", false);
     if let Some(n) = number_option(&s, "checkblocks", 0..=i64::from(u32::MAX)) {
         config.check_blocks = n as u32;
     }
@@ -602,6 +604,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "banscore",
         "bantime",
         "checkblocks",
+        "loadblock",
+        "stopafterblockimport",
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
@@ -1257,6 +1261,11 @@ async fn run_daemon(
     // Initialize the node
     info!("Initializing node...");
     let node = Node::new(config.clone()).with_context(|| "Failed to initialize node")?;
+    // Divi Core's -stopafterblockimport (init.cpp:724-727)
+    if config.stop_after_block_import {
+        info!("Stopping after block import");
+        return Ok(());
+    }
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -2210,6 +2219,12 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     chain
         .export_chain(start_height, end_height, output_dir)
         .map_err(|e| anyhow::anyhow!("Failed to export chain: {}", e))?;
+    // The same blocks as a block file divid and irondivid read with -loadblock
+    let block_file = output_dir.join("bootstrap.dat");
+    let written = chain
+        .export_block_file(start_height, end_height, config.network.magic, &block_file)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", block_file.display(), e))?;
+    info!("Wrote {} blocks to {}", written, block_file.display());
 
     info!("Export complete!");
     Ok(())
