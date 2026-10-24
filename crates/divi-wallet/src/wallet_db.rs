@@ -2269,9 +2269,10 @@ impl WalletDb {
 
         if let Some(hd) = hd_wallet {
             self.keystore.set_hd_wallet(hd);
-            // Wallets encrypted before the ids were stored get them on first unlock
-            if db.load_hd_public_ids()?.is_none() {
-                if let Some(ids) = self.keystore.hd_public_ids() {
+            // Wallets encrypted before the ids were stored, or stored with an
+            // older chain id, get them on unlock
+            if let Some(ids) = self.keystore.hd_public_ids() {
+                if db.load_hd_public_ids()? != Some(ids) {
                     db.store_hd_public_ids(&ids)?;
                 }
             }

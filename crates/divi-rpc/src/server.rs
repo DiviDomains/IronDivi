@@ -443,7 +443,16 @@ impl RpcServer {
 
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
-        // Divi Core's `if (fHelp || params.size() ...)` comes first: a wrong
+        // Divi Core's dispatcher refuses a wallet call without a wallet before
+        // the call runs (rpcserver.cpp:1043-1047)
+        if WALLET_CALLS.contains(&method) && self.wallet.wallet_db().is_none() {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method unavailable due to manually disabled wallet",
+            )
+            .into());
+        }
+        // Then the call's own `if (fHelp || params.size() ...)`: a wrong
         // argument count answers -1 with the call's help text
         if let Some((min, max)) = argument_count(method) {
             if !matches!(params, Params::Object(_)) && !(min..=max).contains(&params.len()) {
@@ -454,6 +463,17 @@ impl RpcServer {
             }
         }
         rpc_type_check(method, params)?;
+        // The wallet passphrase calls check the encryption state before they
+        // read an argument (rpcwallet.cpp:2596, :2642, :2715)
+        let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+        let state_first = match method {
+            "walletpassphrase" | "walletpassphrasechange" => encrypted == Some(false),
+            "encryptwallet" => encrypted == Some(true),
+            _ => false,
+        };
+        if !state_first {
+            json_spirit_getter_check(method, params)?;
+        }
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
@@ -673,9 +693,16 @@ impl RpcServer {
 
     /// Help method - list available methods
     fn help(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let method = params.get_str(0);
+        // Divi Core's help: more than one argument answers its own help text,
+        // and the command must be a string (rpcserver.cpp:291-304)
+        crate::core_help::check_arguments("help", params, (0, 1), 1)?;
+        // An empty command lists them all, as no command does
+        let method = params.get_str(0).filter(|m| !m.is_empty());
 
         if let Some(method) = method {
+            if let Some(text) = crate::core_help::text(method) {
+                return Ok(serde_json::Value::String(text.to_string()));
+            }
             // Return help for specific method
             let help = match method {
                 // Blockchain
@@ -998,7 +1025,20 @@ impl RpcServer {
                 "help",
                 "stop",
             ];
-            Ok(serde_json::Value::String(methods.join("\n")))
+            // (category, name) of each call above
+            let mut category = "";
+            let mut calls = Vec::new();
+            for line in methods {
+                if let Some(title) = line.strip_prefix("== ").and_then(|l| l.strip_suffix(" ==")) {
+                    category = title;
+                } else if !line.is_empty() {
+                    calls.push((category, line));
+                }
+            }
+            let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+            Ok(serde_json::Value::String(crate::core_help::list(
+                &calls, encrypted,
+            )))
         }
     }
 
@@ -1017,6 +1057,236 @@ impl RpcServer {
             "DIVI server stopping".to_string(),
         ))
     }
+}
+
+/// The calls Divi Core's table marks as needing a wallet (requiresWalletLock or
+/// requiresWalletInstance, rpcserver.cpp:329-465); without one they answer
+/// -32601 before they run (rpcserver.cpp:1043-1047)
+const WALLET_CALLS: &[&str] = &[
+    "addmultisigaddress",
+    "addvault",
+    "allocatefunds",
+    "backupwallet",
+    "bip38decrypt",
+    "bip38paperwallet",
+    "debitvaultbyname",
+    "dumphdinfo",
+    "dumpprivkey",
+    "encryptwallet",
+    "fundvault",
+    "generateblock",
+    "getaccount",
+    "getaccountaddress",
+    "getaddressesbyaccount",
+    "getbalance",
+    "getcoinavailability",
+    "getnewaddress",
+    "getrawchangeaddress",
+    "getreceivedbyaccount",
+    "getreceivedbyaddress",
+    "getstakingstatus",
+    "gettransaction",
+    "getunconfirmedbalance",
+    "getwalletinfo",
+    "importaddress",
+    "importprivkey",
+    "keypoolrefill",
+    "listaccounts",
+    "listlockunspent",
+    "listreceivedbyaccount",
+    "listreceivedbyaddress",
+    "listsinceblock",
+    "listtransactions",
+    "listunspent",
+    "loadwallet",
+    "lockunspent",
+    "reclaimvaultfunds",
+    "removevault",
+    "sendfrom",
+    "sendmany",
+    "sendtoaddress",
+    "setaccount",
+    "setgenerate",
+    "setupmasternode",
+    "signmessage",
+    "signmnbroadcast",
+    "signtransactionwithaddresskey",
+    "startmasternode",
+    "verifymasternodesetup",
+    "walletlock",
+    "walletpassphrase",
+    "walletpassphrasechange",
+];
+
+/// The arguments Divi Core reads with json_spirit's get_str/get_int/get_bool/
+/// get_array/get_obj, by position (an argument read as more than one type, or
+/// whose type the call checks itself, is left out): a given argument of another JSON type makes the getter throw,
+/// -1 "value is type X, expected Y" (json_spirit_value.h:339-349,
+/// rpcserver.cpp:1107-1108)
+fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
+    match method {
+        // rpcwallet.cpp:1736
+        "addmultisigaddress" => &[(2, "str")],
+        // rpcnet.cpp:156
+        "addnode" => &[(0, "str"), (1, "str")],
+        // rpcwallet.cpp:1231
+        "addvault" => &[(0, "str"), (1, "str")],
+        // rpcmasternode.cpp:63
+        "allocatefunds" => &[(0, "str"), (1, "str"), (2, "str")],
+        // rpcwallet.cpp:2525
+        "backupwallet" => &[(0, "str")],
+        // rpcmisc.cpp:65
+        "ban" => &[(0, "str")],
+        // bip38decrypt, bip38paperwallet, dumpprivkey and importprivkey check
+        // that the wallet is unlocked before they read an argument
+        // (rpcdump.cpp:59, :184, :262, :309), so they check their own types
+        // rpcmasternode.cpp:361
+        "broadcaststartmasternode" => &[(0, "str"), (1, "str")],
+        // rpcrawtransaction.cpp:361
+        "createrawtransaction" => &[(0, "array")],
+        // rpcwallet.cpp:1080
+        "debitvaultbyname" => &[(0, "str"), (1, "str"), (3, "str")],
+        // rpcrawtransaction.cpp:464
+        "decoderawtransaction" => &[(0, "str")],
+        // rpcrawtransaction.cpp:527
+        "decodescript" => &[(0, "str")],
+        // rpcwallet.cpp:2692
+        "encryptwallet" => &[(0, "str")],
+        // rpcmining.cpp:120
+        "generateblock" => &[(0, "obj")],
+        // rpcwallet.cpp:624
+        "getaccount" => &[(0, "str")],
+        // rpcwallet.cpp:538
+        "getaccountaddress" => &[(0, "str")],
+        // rpcnet.cpp:188
+        "getaddednodeinfo" => &[(0, "bool"), (1, "str")],
+        // rpcwallet.cpp:650
+        "getaddressesbyaccount" => &[(0, "str")],
+        // rpcwallet.cpp:1554
+        "getbalance" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcblockchain.cpp:176
+        // verbose: IronDivi also takes 0, 1 and 2 (verbosity 2 decodes the
+        // transactions), so a number is not refused here
+        "getblock" => &[(0, "str")],
+        // rpcblockchain.cpp:153
+        "getblockhash" => &[(0, "int")],
+        // rpcblockchain.cpp:240
+        "getblockheader" => &[(0, "str"), (1, "bool")],
+        // rpcwallet.cpp:818
+        "getcoinavailability" => &[(0, "bool")],
+        // rpcwallet.cpp:281
+        "getnewaddress" => &[(0, "str")],
+        // rpcblockchain.cpp:80
+        "getrawmempool" => &[(0, "bool")],
+        // rpcrawtransaction.cpp:139
+        "getrawtransaction" => &[(1, "int")],
+        // rpcwallet.cpp:1499
+        "getreceivedbyaccount" => &[(0, "str"), (1, "int")],
+        // rpcwallet.cpp:1432
+        "getreceivedbyaddress" => &[(0, "str"), (1, "int")],
+        // rpcwallet.cpp:2452
+        "gettransaction" => &[(0, "str"), (1, "bool")],
+        // rpcblockchain.cpp:330
+        "gettxout" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcserver.cpp:289
+        "help" => &[(0, "str")],
+        // rpcdump.cpp:105
+        "importaddress" => &[(0, "str"), (1, "str"), (2, "bool")],
+        // rpcmasternode.cpp:595
+        "importmnbroadcast" => &[(0, "str")],
+        // rpcblockchain.cpp:612
+        "invalidateblock" => &[(0, "str")],
+        // rpcwallet.cpp:2544
+        "keypoolrefill" => &[(0, "int")],
+        // rpcwallet.cpp:2320
+        "listaccounts" => &[(0, "int"), (1, "bool")],
+        // rpcmasternode.cpp:263
+        "listmasternodes" => &[(0, "str")],
+        // rpcwallet.cpp:2364
+        "listsinceblock" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcwallet.cpp:2215
+        "listtransactions" => &[(0, "str"), (1, "int"), (2, "int"), (3, "bool")],
+        // rpcrawtransaction.cpp:251
+        "listunspent" => &[(0, "int"), (1, "int"), (2, "array")],
+        // rpcwallet.cpp:524
+        "loadwallet" => &[(0, "str")],
+        // rpcwallet.cpp:2742
+        "lockunspent" => &[(0, "bool"), (1, "array")],
+        // rpcmisc.cpp:160
+        "mnsync" => &[(0, "str")],
+        // rpcmining.cpp:251
+        "prioritisetransaction" => &[(0, "str"), (2, "int")],
+        // rpcwallet.cpp:1139
+        "reclaimvaultfunds" => &[(0, "str"), (2, "str"), (3, "str"), (4, "str")],
+        // rpcblockchain.cpp:649
+        "reconsiderblock" => &[(0, "str")],
+        // rpcwallet.cpp:1192
+        "removevault" => &[(0, "str")],
+        // rpcblockchain.cpp:577
+        "reverseblocktransactions" => &[(0, "str")],
+        // rpcwallet.cpp:1606
+        "sendfrom" => &[(0, "str"), (1, "str"), (3, "str"), (4, "str")],
+        // rpcwallet.cpp:1694
+        "sendmany" => &[(0, "str"), (1, "obj"), (2, "str")],
+        // rpcrawtransaction.cpp:828
+        "sendrawtransaction" => &[(0, "str"), (1, "bool")],
+        // rpcwallet.cpp:1306
+        "sendtoaddress" => &[(0, "str"), (2, "str"), (3, "str"), (4, "str")],
+        // rpcwallet.cpp:586
+        "setaccount" => &[(0, "str"), (1, "str")],
+        // rpcmining.cpp:52
+        "setgenerate" => &[(0, "int")],
+        // rpcmisc.cpp:526
+        "setmocktime" => &[(0, "int")],
+        // rpcmasternode.cpp:183
+        "setupmasternode" => &[(0, "str"), (1, "str"), (2, "str"), (3, "str"), (4, "str")],
+        // rpcwallet.cpp:1364
+        "signmessage" => &[(0, "str"), (1, "str"), (2, "str"), (3, "str")],
+        // rpcmasternode.cpp:161
+        "signmnbroadcast" => &[(0, "str")],
+        // rpcrawtransaction.cpp:602
+        "signrawtransaction" => &[(1, "array"), (2, "array"), (3, "str")],
+        // rpcrawtransaction.cpp:566
+        "signtransactionwithaddresskey" => &[(1, "str"), (2, "int")],
+        // rpcmisc.cpp:277
+        "spork" => &[(0, "str"), (1, "str")],
+        // rpcmasternode.cpp:393
+        "startmasternode" => &[(0, "str"), (1, "bool")],
+        // rpcmisc.cpp:318
+        "validateaddress" => &[(0, "str")],
+        // rpcblockchain.cpp:404
+        "verifychain" => &[(1, "int")],
+        // rpcmisc.cpp:485
+        "verifymessage" => &[(0, "str"), (1, "str"), (2, "str")],
+        // rpcwallet.cpp:2573
+        "walletpassphrase" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcwallet.cpp:2628
+        "walletpassphrasechange" => &[(0, "str"), (1, "str")],
+        _ => &[],
+    }
+}
+
+/// Refuse an argument of the wrong JSON type as json_spirit's getter does. A
+/// null is left to the call, as Divi Core mostly reads optional arguments only
+/// when they are not null.
+fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcError> {
+    let Params::Array(values) = params else {
+        return Ok(());
+    };
+    for (index, want) in core_argument_types(method) {
+        let Some(value) = values.get(*index) else {
+            continue;
+        };
+        let got = crate::wallet::json_spirit_type(value);
+        if value.is_null() || got == *want {
+            continue;
+        }
+        return Err(RpcError::new(
+            codes::MISC_ERROR,
+            format!("value is type {got}, expected {want}"),
+        ));
+    }
+    Ok(())
 }
 
 /// How many arguments Divi Core takes for a call, as its `fHelp` check counts
@@ -1141,8 +1411,11 @@ impl RpcServer {
     /// Serve one HTTP JSON-RPC body as Divi Core does (rpcserver.cpp
     /// HTTPReq_JSONRPC): a request object or a batch array; returns the HTTP
     /// status and the reply text.
-    pub fn handle_http_body(&self, body: &str) -> (StatusCode, String) {
+    pub fn handle_http_body(&self, body_text: &str) -> (StatusCode, String) {
         use serde_json::Value;
+        // divi-cli's byte escapes of non-ASCII text, read as divid reads them
+        let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
+        let body = body.as_deref().unwrap_or(body_text);
         let request: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
@@ -1664,7 +1937,12 @@ mod tests {
         // Without a staking callback registered, the method returns an error
         // but it IS a registered method (not -32601 method-not-found)
         if let Some(err) = response.error {
-            assert_ne!(err.code, -32601, "Should not be method-not-found");
+            // Without a wallet Divi Core answers -32601 "Method unavailable
+            // due to manually disabled wallet", not "Method not found"
+            assert_ne!(
+                err.message, "Method not found",
+                "Should not be method-not-found"
+            );
         }
         // It either succeeded (if a default is available) or errored with a non-method-not-found code
     }

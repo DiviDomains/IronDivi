@@ -115,7 +115,7 @@ fn code_and_text(e: RpcError) -> (i32, String) {
 }
 
 /// Arguments are read as json_spirit reads them (get_str, get_bool, get_int),
-/// in Divi Core's order (rpcdump.cpp:57-66, :111-129, :178;
+/// in Divi Core's order (rpcdump.cpp:59-70, :111-129, :184-186;
 /// rpcwallet.cpp:2531, :2552-2556)
 #[test]
 fn arguments_are_read_as_divid_reads_them() {
@@ -171,7 +171,7 @@ fn arguments_are_read_as_divid_reads_them() {
 }
 
 /// On a locked wallet the calls that unlock first answer -13 whatever their
-/// arguments; keypoolrefill checks its size before (rpcdump.cpp:55, :176;
+/// arguments; keypoolrefill checks its size before (rpcdump.cpp:59, :184;
 /// rpcwallet.cpp:2552-2559)
 #[test]
 fn locked_wallet_is_checked_where_divid_checks_it() {

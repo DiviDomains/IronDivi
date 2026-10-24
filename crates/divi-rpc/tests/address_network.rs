@@ -78,4 +78,33 @@ fn rpc_addresses_use_the_node_network() {
         ms["address"],
         json!(Address::p2sh(divi_crypto::hash160(&redeem), net).to_base58())
     );
+
+    // bip38decrypt adds the key and answers its address in the node's network;
+    // like Divi Core it needs a wallet (rpcserver.cpp:425, rpcdump.cpp:295-347)
+    let wallet = Arc::new(divi_wallet::WalletDb::with_hd_wallet(
+        net,
+        divi_wallet::HdWallet::new(ChainMode::Divi).unwrap(),
+    ));
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = Arc::new(ChainDatabase::open(dir2.path()).unwrap());
+    let params2 = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
+    let with_wallet = RpcServer::with_wallet(Arc::new(Chain::new(db2, params2).unwrap()), wallet);
+    let key = [7u8; 32];
+    let encrypted = divi_crypto::bip38_encrypt(
+        &key,
+        "pw",
+        true,
+        divi_wallet::address::PUBKEY_ADDRESS_VERSION_TESTNET,
+    )
+    .unwrap();
+    let r = call(
+        &with_wallet,
+        "bip38decrypt",
+        vec![json!(encrypted), json!("pw")],
+    );
+    let public = SecretKey::from_bytes(&key).unwrap().public_key();
+    assert_eq!(
+        r,
+        json!({"Address": Address::p2pkh(&public, net).to_base58()})
+    );
 }
