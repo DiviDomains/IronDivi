@@ -2452,6 +2452,12 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     .await
     {
         error!("Daemon error: {:#}", e);
+        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
+        // writer may not get to write the line before the process exits
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
+        }
         // Print the full error chain
         let mut source: Option<&(dyn StdError + 'static)> = e.source();
         while let Some(err) = source {
