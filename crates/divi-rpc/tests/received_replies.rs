@@ -307,3 +307,63 @@ fn null_arguments_are_refused() {
         null("str")
     );
 }
+
+/// The address book in Divi Core's order, a std::map of CTxDestination: key
+/// addresses before script addresses, each by its hash as a uint160 compares,
+/// from the last byte; and each address's txids in txid order (the wallet map)
+#[test]
+fn listreceivedbyaddress_in_address_book_order() {
+    let f = funded(&[100 * COIN]);
+    let mut keys = Vec::new();
+    for _ in 0..6 {
+        keys.push(new_address(&f.n, "many").to_base58());
+    }
+    let multisig = f.n.ok(
+        "addmultisigaddress",
+        vec![json!(1), json!([keys[0]]), json!("ms")],
+    );
+    let multisig2 = f.n.ok(
+        "addmultisigaddress",
+        vec![json!(1), json!([keys[1]]), json!("ms")],
+    );
+    for _ in 0..4 {
+        send_and_mine(&f, &keys[2], 1.0);
+    }
+    let listed = f.n.ok("listreceivedbyaddress", vec![json!(0), json!(true)]);
+    let listed = listed.as_array().unwrap();
+    let order: Vec<String> = listed
+        .iter()
+        .map(|e| e["address"].as_str().unwrap().to_string())
+        .collect();
+    let mut want = order.clone();
+    want.sort_by_key(|a| {
+        let a = Address::from_base58(a).unwrap();
+        let mut hash = a.hash.as_bytes().to_vec();
+        hash.reverse();
+        (a.addr_type == divi_wallet::AddressType::P2SH, hash)
+    });
+    assert_eq!(order, want);
+    let last_two: Vec<&String> = order.iter().rev().take(2).collect();
+    assert!(
+        last_two.contains(&&multisig.as_str().unwrap().to_string()),
+        "{order:?}"
+    );
+    assert!(
+        last_two.contains(&&multisig2.as_str().unwrap().to_string()),
+        "{order:?}"
+    );
+    let paid = listed
+        .iter()
+        .find(|e| e["address"] == json!(keys[2]))
+        .unwrap();
+    let txids: Vec<String> = paid["txids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(txids.len(), 4, "{paid}");
+    let mut sorted = txids.clone();
+    sorted.sort();
+    assert_eq!(txids, sorted);
+}

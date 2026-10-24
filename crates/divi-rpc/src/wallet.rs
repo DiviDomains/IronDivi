@@ -333,6 +333,22 @@ pub(crate) fn script_pubkey_to_json(
     script_obj
 }
 
+/// Where `address` comes in Divi Core's address book, a std::map keyed by
+/// CTxDestination: key hashes before script hashes (the variant's order), each
+/// by its uint160, which compares as a number stored from the last byte up
+/// (uint256.cpp:139-148)
+fn address_book_key(address: &str) -> (u8, Vec<u8>, String) {
+    match Address::from_base58(address) {
+        Ok(a) => {
+            let rank = u8::from(a.addr_type == divi_wallet::AddressType::P2SH);
+            let mut hash = a.hash.as_bytes().to_vec();
+            hash.reverse();
+            (rank, hash, String::new())
+        }
+        Err(_) => (2, Vec::new(), address.to_string()),
+    }
+}
+
 /// Divi Core's ParseHexV (rpcserver.cpp): a non-empty, even-length hex string,
 /// else -8 "<name> must be hexadecimal string (not '<value>')"
 pub(crate) fn parse_hex_v(value: &str, name: &str) -> Result<Vec<u8>, Error> {
@@ -2455,7 +2471,9 @@ impl WalletRpc {
         // address's flag, as Core assigns it)
         let mut accounts: std::collections::BTreeMap<String, (i64, i64, bool)> =
             std::collections::BTreeMap::new();
-        for (address, account) in wallet.address_book() {
+        let mut book = wallet.address_book();
+        book.sort_by_key(|(address, _)| address_book_key(address));
+        for (address, account) in book {
             let item = tally.get(&address);
             if item.is_none() && !include_empty {
                 continue;

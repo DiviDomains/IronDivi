@@ -621,7 +621,7 @@ impl<'a> History<'a> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as u32);
         let mut tally: HashMap<String, Tally> = HashMap::new();
-        for record in self.ordered_records() {
+        for record in self.records_by_txid() {
             let Some(loaded) = self.load(&record) else {
                 continue;
             };
