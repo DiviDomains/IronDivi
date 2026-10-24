@@ -2012,6 +2012,8 @@ impl BlockSync {
         let mut order: Vec<PeerId> = Vec::new();
         let mut batches: HashMap<PeerId, Vec<Hash256>> = HashMap::new();
         let mut assigned: HashSet<Hash256> = HashSet::new();
+        // Blocks whose peers are all full for now, kept in queue order
+        let mut waiting: Vec<(Hash256, PeerId)> = Vec::new();
 
         loop {
             let next = self.pending_block_requests.write().pop_front();
@@ -2036,7 +2038,25 @@ impl BlockSync {
                 continue;
             }
 
-            let candidates: Vec<PeerId> = if full.is_empty() {
+            // A block announced by a peer that is still connected, may be
+            // asked (a full peer, or any peer when none is full) and has not
+            // failed it is asked of that peer only. Divi Core answers an inv
+            // with a getdata to its sender (main.cpp:584-610) and otherwise
+            // asks a peer only for blocks it has shown it has
+            // (FindNextBlocksToDownload, main.cpp:1211-1214); a peer that has
+            // not announced the block may not have it and would hold it until
+            // the request times out. With the announcer's slots full the block
+            // waits for one of them.
+            let announcer = self.block_retry.read().get(&hash).and_then(|r| {
+                r.announced_by.filter(|a| {
+                    connected.contains(a)
+                        && (full.is_empty() || full.contains(a))
+                        && !r.failed_peers.contains(a)
+                })
+            });
+            let candidates: Vec<PeerId> = if let Some(announcer) = announcer {
+                vec![announcer]
+            } else if full.is_empty() {
                 // No full peer: only the announcer, as Divi Core's inv reply
                 let announcer = self
                     .block_retry
@@ -2059,15 +2079,22 @@ impl BlockSync {
                 .into_iter()
                 .find(|p| per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER);
             let Some(peer) = chosen else {
-                // Every eligible peer is full, or none is connected: wait
+                // Every peer this block may be asked of is full, or none is
+                // connected: it waits. Blocks behind it are still placed while
+                // some connected peer has a free slot (one announced by another
+                // peer, or one any peer may be asked for)
                 trace!(
                     "No peer with a free slot for block {}; {} queued",
                     hash,
                     self.pending_block_requests.read().len() + 1
                 );
-                self.pending_block_requests
-                    .write()
-                    .push_front((hash, assigned_peer));
+                waiting.push((hash, assigned_peer));
+                let any_free = connected.iter().any(|p| {
+                    per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                });
+                if any_free {
+                    continue;
+                }
                 break;
             };
             *per_peer.entry(peer).or_default() += 1;
@@ -2076,6 +2103,12 @@ impl BlockSync {
                 order.push(peer);
             }
             batches.entry(peer).or_default().push(hash);
+        }
+        {
+            let mut pending = self.pending_block_requests.write();
+            for entry in waiting.into_iter().rev() {
+                pending.push_front(entry);
+            }
         }
 
         for peer in order {
@@ -3545,6 +3578,53 @@ mod tests {
             8,
             "the rest wait for a free slot"
         );
+    }
+
+    /// Blocks a peer announced are asked of that peer, not of another peer
+    /// that has not shown it has them: with the announcer's 16 slots full the
+    /// rest wait for its slots (Divi Core main.cpp:584-610, :1211-1214).
+    /// Spread over a peer that lacked them, they stayed in flight there until
+    /// the request timed out.
+    #[tokio::test]
+    async fn announced_blocks_are_asked_of_the_announcer_only() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes: Vec<Hash256> = (0..28u8)
+            .map(|i| Hash256::from_bytes([i + 1; 32]))
+            .collect();
+        sync.handle_inv(
+            1,
+            hashes
+                .iter()
+                .map(|h| InvItem::new(InvType::Block, *h))
+                .collect(),
+        )
+        .await;
+        let asked = block_getdatas(&mut rxs);
+        assert!(!asked.contains_key(&2), "peer 2 was asked: {asked:?}");
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), None, "{per:?}");
+        assert_eq!(sync.pending_block_requests.read().len(), 12);
+
+        // A block from the announcer frees a slot there for the next one
+        let first = *sync
+            .blocks_in_flight
+            .read()
+            .keys()
+            .next()
+            .expect("a block in flight");
+        sync.blocks_in_flight.write().remove(&first);
+        sync.request_queued_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), None, "{per:?}");
+        assert_eq!(sync.pending_block_requests.read().len(), 11);
+
+        // Once the announcer fails a block, another peer may be asked for it
+        let stuck = *sync.blocks_in_flight.read().keys().next().unwrap();
+        expire_request(&sync, &stuck);
+        sync.check_timeouts().await;
+        assert_eq!(in_flight_peer(&sync, &stuck), Some(2));
     }
 
     /// Divi Core fills each peer's free slots with the next blocks in chain
