@@ -414,3 +414,28 @@ fn lockunspent_as_core() {
         (-8, "Invalid parameter, vout must be positive".to_string())
     );
 }
+
+/// encryptwallet answers "Wallet reloaded!", as Divi Core 3.0.0 does after
+/// reloading the encrypted wallet (rpcwallet.cpp:2732-2733)
+#[test]
+fn encryptwallet_reply_as_core() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(FULL);
+    let w = Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("wallet"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    );
+    let server = RpcServer::with_wallet(n.chain.clone(), w.clone());
+    let r = server.handle_request(Request {
+        jsonrpc: "1.0".to_string(),
+        id: RequestId::Number(1),
+        method: "encryptwallet".to_string(),
+        params: Params::Array(vec![json!("pw")]),
+    });
+    assert_eq!(r.result, Some(json!("Wallet reloaded!")), "{:?}", r.error);
+    assert!(w.is_encrypted() && w.is_locked());
+}
