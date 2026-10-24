@@ -590,9 +590,18 @@ pub struct RpcConfig {
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 
+    /// Keep a connection open after a reply when the request asks for it
+    /// (Divi Core's -rpckeepalive, default on)
+    #[serde(default = "default_rpc_keep_alive")]
+    pub keep_alive: bool,
+
     /// Serve the REST interface (Divi Core's -rest, default off)
     #[serde(default)]
     pub rest: bool,
+}
+
+fn default_rpc_keep_alive() -> bool {
+    true
 }
 
 impl Default for RpcConfig {
@@ -606,6 +615,7 @@ impl Default for RpcConfig {
             max_request_size: 10 * 1024 * 1024, // 10 MB
             timeout: 30,
             allowed_ips: Vec::new(),
+            keep_alive: true,
             rest: false,
         }
     }
