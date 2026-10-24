@@ -64,6 +64,14 @@ pub struct NodeConfig {
     #[serde(default)]
     pub max_reorg: Option<u32>,
 
+    /// Block files to import at start (-loadblock), after bootstrap.dat
+    #[serde(default)]
+    pub load_block: Vec<PathBuf>,
+
+    /// Stop once the block files are imported (-stopafterblockimport)
+    #[serde(default)]
+    pub stop_after_block_import: bool,
+
     /// Command run when the best block changes, `%s` replaced by its hash
     /// (Divi Core's -blocknotify)
     #[serde(default)]
@@ -98,6 +106,8 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            load_block: Vec::new(),
+            stop_after_block_import: false,
             blocknotify: None,
             walletnotify: None,
         }
