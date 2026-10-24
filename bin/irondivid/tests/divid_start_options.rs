@@ -257,6 +257,35 @@ fn start_up_refusals_are_divid_s() {
     }
 }
 
+/// divid refuses any -checklevel at start, whatever the level
+/// (init.cpp:782-784); -checkblocks is taken
+#[test]
+fn checklevel_is_refused_at_start() {
+    let bin = env!("CARGO_BIN_EXE_irondivid");
+    for level in ["0", "3", "4"] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = output_within(
+            Command::new(bin)
+                .arg(format!("-datadir={}", dir.path().display()))
+                .args([
+                    "-regtest",
+                    "-checkblocks=1",
+                    &format!("-checklevel={level}"),
+                ]),
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            text.contains("Unsupported argument -checklevel found. Checklevel must be level 4."),
+            "-checklevel={level}: {text}"
+        );
+        assert!(!out.status.success(), "-checklevel={level} started");
+    }
+}
+
 /// -server=0: the node runs, with no RPC server
 #[test]
 fn server_0_runs_without_rpc() {

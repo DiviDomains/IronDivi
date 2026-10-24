@@ -669,6 +669,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                     "-masternode={}: irondivid does not run as a masternode; remove the masternode= line to start it",
                     settings.get("masternode").unwrap_or("")
                 );
+            } else if k == "checklevel" {
+                // divid refuses any -checklevel: it always checks at level 4
+                // (init.cpp:782-784)
+                anyhow::bail!(
+                    "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
+                );
             } else {
                 warn!(
                     "Option -{} is not supported by irondivid; ignored",
