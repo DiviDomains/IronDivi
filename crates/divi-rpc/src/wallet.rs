@@ -2334,17 +2334,21 @@ impl WalletRpc {
                         .ok_or_else(|| out_of_range("wraps the int64_t boundary"))?;
                 }
             }
-            // Fee cap. Inputs still in the mempool are not visible here; such a
-            // transaction is checked by the mempool only.
+            // Fee cap, -maxtxfee: the inputs are read from the chain's coins and
+            // the mempool's outputs, as CCoinsViewMemPool reads them
+            // (rpcrawtransaction.cpp:810-826, :882). A transaction already in the
+            // mempool is relayed again without it (:875).
+            let max_fee = mempool.as_ref().map_or(MAX_TX_FEE, |m| m.max_tx_fee());
             let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
                 .get_utxo(&i.prevout)
             {
                 Ok(Some(u)) => Some(sum + u.value),
-                _ => None,
+                _ => pooled(&i.prevout.txid)
+                    .and_then(|p| p.vout.get(i.prevout.vout as usize).map(|o| sum + o.value)),
             });
             if let Some(inputs) = inputs {
                 let outputs = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
-                if !allow_high_fees && inputs - outputs > MAX_TX_FEE {
+                if !allow_high_fees && pooled(&txid).is_none() && inputs - outputs > max_fee {
                     return Err(RpcError::new(
                         codes::VERIFY_REJECTED,
                         "Fees being paid are in excess of maximum fee, but fee override is not provided",

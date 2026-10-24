@@ -388,6 +388,9 @@ pub struct BlockSync {
     /// fetched across several rounds; this lets each round resume from where
     /// the side chain ends instead of from the fork point.
     side_chain_tip: RwLock<Option<(Hash256, u32)>>,
+    /// Peers sent the getblocks that starts a sync when they connected
+    /// (Divi Core CNodeState::Syncing, NodeState.cpp)
+    sync_started_peers: RwLock<HashSet<PeerId>>,
 }
 
 /// Sync statistics
@@ -429,6 +432,7 @@ impl BlockSync {
             stall_counter: RwLock::new(((0, 0), 0)),
             stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
+            sync_started_peers: RwLock::new(HashSet::new()),
         })
     }
 
@@ -449,18 +453,6 @@ impl BlockSync {
     /// drop what the new chain confirmed or made unspendable.
     pub fn set_orphaned_tx_callback(&self, callback: OrphanedTxCallback) {
         *self.orphaned_tx_callback.write() = Some(callback);
-    }
-
-    /// Hand the orphaned-tx callback the transactions of blocks disconnected
-    /// outside a reorganization of its own (invalidateblock,
-    /// reverseblocktransactions), or none after the chain moved up again
-    /// (reconsiderblock): the mempool takes them back and drops what the
-    /// active chain now confirms or makes unspendable, as Divi Core's
-    /// DisconnectTip and ConnectTip do
-    pub fn chain_moved(&self, disconnected: Vec<Transaction>) {
-        if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
-            callback(disconnected);
-        }
     }
 
     /// Fire reorg callbacks: notifies the reorg callback with `fork_height`,
@@ -563,6 +555,49 @@ impl BlockSync {
         }
     }
 
+    /// A peer finished its handshake (`services` from its version): ask it
+    /// for blocks from our tip, as
+    /// Divi Core's BeginSyncingWithPeer does (main.cpp:1130-1142) whatever
+    /// height the peer named. Core asks a full-node peer (not fClient), once,
+    /// when no peer has been asked yet or its best block is less than six
+    /// hours old; so a node learns of a peer's blocks even when the peer named
+    /// a lower height than it has. Nothing is asked while importing (the
+    /// answer would be ignored, main.cpp:581-587).
+    pub async fn begin_syncing_with_peer(&self, peer_id: PeerId, services: u64) {
+        if self.chain.is_importing() {
+            return;
+        }
+        if services & crate::constants::services::NODE_NETWORK == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let recent = self
+            .chain
+            .tip()
+            .is_some_and(|tip| u64::from(tip.time) + 6 * 60 * 60 > now);
+        {
+            let mut started = self.sync_started_peers.write();
+            if started.contains(&peer_id) || !(started.is_empty() || recent) {
+                return;
+            }
+            started.insert(peer_id);
+        }
+        let locator = self.build_block_locator();
+        let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
+        info!(
+            "Sending getblocks to peer {} from height {} (start of sync)",
+            peer_id,
+            self.chain.height()
+        );
+        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+            warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
+            self.sync_started_peers.write().remove(&peer_id);
+        }
+    }
+
     /// Get a peer's known height (for testing and diagnostics)
     pub fn get_peer_height(&self, peer_id: PeerId) -> Option<u32> {
         self.peer_heights.read().get(&peer_id).copied()
@@ -573,6 +608,7 @@ impl BlockSync {
 
     /// Remove peer from tracking
     pub fn remove_peer(&self, peer_id: PeerId) {
+        self.sync_started_peers.write().remove(&peer_id);
         let removed_height = self.peer_heights.write().remove(&peer_id);
         let remaining_peers = self.peer_heights.read().len();
 

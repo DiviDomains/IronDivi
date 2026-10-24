@@ -9,7 +9,6 @@
 //! 3.0.0 gives them; each test names the Core lines it follows.
 
 use divi_crypto::compute_merkle_root;
-use divi_network::{BlockSync, PeerManager, PeerManagerConfig};
 use divi_primitives::{
     amount::Amount,
     block::Block,
@@ -417,18 +416,15 @@ fn invalidateblock_returns_transactions_to_the_mempool() {
     let handed: Arc<Mutex<Vec<Vec<Transaction>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = handed.clone();
     let wallet = f.n.wallet.clone();
-    let sync = BlockSync::new(
-        f.n.chain.clone(),
-        PeerManager::new(PeerManagerConfig::default()),
-    );
-    // As irondivid's mempool does: what it takes back reaches the wallet
-    sync.set_orphaned_tx_callback(Arc::new(move |txs: Vec<Transaction>| {
-        for tx in &txs {
-            wallet.add_mempool_tx(tx);
-        }
-        sink.lock().push(txs);
-    }));
-    f.n.server.set_block_sync(sync);
+    // As irondivid's reorg hook and mempool do: what the mempool takes back
+    // reaches the wallet
+    f.n.server
+        .set_reorg_hook(Arc::new(move |txs: Vec<Transaction>| {
+            for tx in &txs {
+                wallet.add_mempool_tx(tx);
+            }
+            sink.lock().push(txs);
+        }));
     let tip = f.n.ok("getbestblockhash", vec![]);
     f.n.ok("invalidateblock", vec![tip.clone()]);
     {

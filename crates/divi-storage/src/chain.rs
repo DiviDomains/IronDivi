@@ -2525,16 +2525,17 @@ impl Chain {
     /// Mark a block (and so every chain through it) invalid, as the
     /// `invalidateblock` RPC does. If the block is on the active chain the tip
     /// is rolled back to its parent, then the best remaining valid chain is
-    /// activated. Returns the transactions of the blocks disconnected, other
-    /// than coinbases and coinstakes, parents before children: Divi Core's
-    /// DisconnectTip offers them to the mempool (ChainTipManager.cpp:175-182).
+    /// activated.
     pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
         self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
     }
 
     /// Mark the block failed and disconnect it and the blocks above it; with
     /// `activate`, then move to the best valid chain left. Returns the
-    /// disconnected blocks' transactions as `invalidate_block` does.
+    /// transactions of the disconnected blocks, coinbases and coinstakes left
+    /// out, from the lowest block up, for the mempool to take back as Divi
+    /// Core's disconnectTip does (ChainTipManager.cpp disconnectTip:
+    /// "Resurrect mempool transactions from the disconnected block").
     fn invalidate_block_unnotified(
         &self,
         hash: &Hash256,
@@ -2553,7 +2554,7 @@ impl Chain {
         }
         self.mark_block_failed(hash)?;
 
-        let mut disconnected: Vec<Block> = Vec::new();
+        let mut disconnected: Vec<Vec<Transaction>> = Vec::new();
         if target.is_on_main_chain() {
             if self.db.has_utxo_cache() {
                 self.db.flush_utxo_cache()?;
@@ -2574,6 +2575,14 @@ impl Chain {
                     .unwrap_or_else(|| tip.clone());
                 self.disconnect_block(&block, &mut stored)?;
                 self.mark_block_failed(&tip.hash)?;
+                disconnected.push(
+                    block
+                        .transactions
+                        .iter()
+                        .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
+                        .cloned()
+                        .collect(),
+                );
                 let parent = self
                     .db
                     .get_block_index(&block.header.prev_block)?
@@ -2585,7 +2594,6 @@ impl Chain {
                 }
                 *self.tip.write() = Some(parent.clone());
                 *self.best_known_block.write() = Some(parent);
-                disconnected.push(block);
                 if tip.hash == *hash {
                     break;
                 }
@@ -2594,14 +2602,7 @@ impl Chain {
         if activate {
             self.activate_best_valid_chain()?;
         }
-        // From the lowest block up, so a transaction comes after those it spends
-        Ok(disconnected
-            .iter()
-            .rev()
-            .flat_map(|block| block.transactions.iter())
-            .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
-            .cloned()
-            .collect())
+        Ok(disconnected.into_iter().rev().flatten().collect())
     }
 
     /// Record that a node now runs on this database. Returns whether the run

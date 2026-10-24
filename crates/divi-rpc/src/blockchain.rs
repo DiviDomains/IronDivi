@@ -18,7 +18,6 @@ use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::serialize::serialize;
-use divi_primitives::transaction::Transaction;
 use divi_storage::chain::NetworkType;
 use divi_storage::Chain;
 use parking_lot::RwLock;
@@ -29,6 +28,8 @@ use std::sync::Arc;
 pub struct BlockchainRpc {
     chain: Arc<Chain>,
     mempool: RwLock<Option<Arc<dyn MempoolProvider>>>,
+    /// The mempool's side of invalidateblock and its family
+    reorg_hook: RwLock<Option<ReorgHook>>,
     /// Money supply cached against the tip hash it was computed for
     money_supply_cache: RwLock<Option<(Hash256, f64)>>,
     /// Fetches blocks this node has pruned from full-history peers
@@ -110,6 +111,11 @@ pub struct FeeEstimate {
     pub blocks: u32,
 }
 
+/// Takes the transactions of blocks `invalidateblock` or
+/// `reverseblocktransactions` disconnected back into the mempool and drops
+/// what the chain now spends (called with none after `reconsiderblock`)
+pub type ReorgHook = Arc<dyn Fn(Vec<divi_primitives::transaction::Transaction>) + Send + Sync>;
+
 /// Trait for mempool access (to avoid circular dependency)
 pub trait MempoolProvider: Send + Sync {
     fn get_txids(&self) -> Vec<Hash256>;
@@ -149,6 +155,12 @@ pub trait MempoolProvider: Send + Sync {
     /// Get mempool statistics
     fn get_stats(&self) -> MempoolStats {
         MempoolStats::default()
+    }
+
+    /// The highest fee sendrawtransaction takes without allowhighfees
+    /// (-maxtxfee; Divi Core's DEFAULT_TRANSACTION_MAXFEE, defaultValues.h:34)
+    fn max_tx_fee(&self) -> divi_primitives::amount::Amount {
+        divi_primitives::amount::Amount::from_sat(100 * 100_000_000)
     }
 
     /// Estimate fee for confirmation within target blocks
@@ -206,6 +218,7 @@ impl BlockchainRpc {
         BlockchainRpc {
             chain,
             mempool: RwLock::new(None),
+            reorg_hook: RwLock::new(None),
             money_supply_cache: RwLock::new(None),
             block_fetcher: RwLock::new(None),
             block_sync: RwLock::new(None),
@@ -356,6 +369,12 @@ impl BlockchainRpc {
     /// Set the mempool provider
     pub fn set_mempool(&self, mempool: Arc<dyn MempoolProvider>) {
         *self.mempool.write() = Some(mempool);
+    }
+
+    /// Set what invalidateblock, reconsiderblock and reverseblocktransactions
+    /// do to the mempool
+    pub fn set_reorg_hook(&self, hook: ReorgHook) {
+        *self.reorg_hook.write() = Some(hook);
     }
 
     /// The minimum relay fee in DIVI/kB that getinfo and getnetworkinfo
@@ -729,18 +748,23 @@ impl BlockchainRpc {
         ))
     }
 
-    /// invalidateblock / reconsiderblock / reverseblocktransactions, then the
-    /// mempool brought in line with the chain (`return_to_mempool`)
+    /// invalidateblock / reconsiderblock / reverseblocktransactions
     pub fn invalidate_block_family(&self, method: &str, params: &Params) -> Result<Value, Error> {
-        let disconnected = self.move_chain(method, params)?;
-        self.return_to_mempool(disconnected);
+        let returned = self.move_chain(method, params)?;
+        self.return_to_mempool(returned);
         Ok(Value::Null)
     }
 
     /// The chain side of invalidateblock / reconsiderblock /
     /// reverseblocktransactions: returns the transactions of the blocks
-    /// disconnected (none for reconsiderblock)
-    pub fn move_chain(&self, method: &str, params: &Params) -> Result<Vec<Transaction>, Error> {
+    /// disconnected (none for reconsiderblock). The caller hands them to
+    /// `return_to_mempool` once the wallet has left those blocks, so the
+    /// wallet takes them as unconfirmed when the mempool does.
+    pub fn move_chain(
+        &self,
+        method: &str,
+        params: &Params,
+    ) -> Result<Vec<divi_primitives::transaction::Transaction>, Error> {
         let usage = || RpcError::invalid_params(format!("{} \"hash\"", method));
         if params.len() != 1 {
             return Err(usage().into());
@@ -756,32 +780,32 @@ impl BlockchainRpc {
                 other => RpcError::database_error(other.to_string()).into(),
             }
         };
-        let disconnected = match method {
+        // The disconnected blocks' transactions go back to the mempool, as
+        // Divi Core's disconnectTip puts them back; after a reconsider the
+        // mempool drops what the chain now holds
+        let returned = match method {
             "invalidateblock" => self.chain.invalidate_block(&hash).map_err(map_err)?,
             "reconsiderblock" => {
                 self.chain.reconsider_block(&hash).map_err(map_err)?;
                 Vec::new()
             }
-            _ => {
-                // C++ reverseblocktransactions invalidates (reversing the block's
-                // transactions in the coin DB) then clears the invalid mark
-                // without moving the tip, which stays at the block's parent
-                // until another block comes (rpcblockchain.cpp:577-603)
-                self.chain
-                    .reverse_block_transactions(&hash)
-                    .map_err(map_err)?
-            }
+            // C++ reverseblocktransactions invalidates (reversing the block's
+            // transactions in the coin DB) then clears the invalid mark
+            // without moving the tip, which stays at the block's parent
+            // until another block comes (rpcblockchain.cpp:577-603)
+            _ => self
+                .chain
+                .reverse_block_transactions(&hash)
+                .map_err(map_err)?,
         };
-        Ok(disconnected)
+        Ok(returned)
     }
 
-    /// After the chain moved without a block notification: the transactions of
-    /// the disconnected blocks go back to the mempool, and what a reconnected
-    /// block confirms leaves it, as Divi Core's DisconnectTip and ConnectTip
-    /// do (ChainTipManager.cpp:139-141, :175-182)
-    pub fn return_to_mempool(&self, disconnected: Vec<Transaction>) {
-        if let Some(sync) = self.block_sync.read().as_ref() {
-            sync.chain_moved(disconnected);
+    /// The mempool side: the disconnected blocks' transactions go back to the
+    /// mempool and what the chain now holds leaves it (the reorg hook)
+    pub fn return_to_mempool(&self, returned: Vec<divi_primitives::transaction::Transaction>) {
+        if let Some(hook) = self.reorg_hook.read().clone() {
+            hook(returned);
         }
     }
 

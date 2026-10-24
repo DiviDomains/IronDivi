@@ -108,6 +108,24 @@ pub fn warn_core_wallet(data_dir: &Path) {
     }
 }
 
+/// Divi Core's masternode.conf header, written when there is no file
+/// (masternodeconfig.cpp:53-64)
+const MASTERNODE_CONF_HEADER: &str = "# Masternode config file\n\
+# Format: alias IP:port masternodeprivkey collateral_output_txid collateral_output_index\n\
+# Example: mn1 127.0.0.2:51472 93HaYBVUCYjEMeeH1Y4sBGLALQZE1Yc1K64xiqgX37tGBDQL8Xg 2bcd3c84c84f87eaa86e4e56834c92927a07f9e18718810b92e0d0324456a67c 0\n";
+
+/// Make `masternode.conf` with Divi Core's header when the data directory has
+/// none, as divid does at every start; an existing file is left as it is
+pub fn ensure_masternode_conf(data_dir: &Path) {
+    let path = data_dir.join("masternode.conf");
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, MASTERNODE_CONF_HEADER) {
+        warn!("Could not create {}: {}", path.display(), e);
+    }
+}
+
 /// Lock the collateral of every `masternode.conf` entry in the wallet, as
 /// Divi Core does when the wallet loads (init.cpp:1246-1258,
 /// MasternodeModule.cpp:454-466, `-mnconflock` default 1): coin selection
@@ -188,6 +206,28 @@ mod tests {
             std::fs::read_dir(&data).unwrap().count(),
             1,
             "nothing written"
+        );
+    }
+
+    /// A data directory without masternode.conf gets divid's header file; an
+    /// existing one is not touched
+    #[test]
+    fn masternode_conf_is_made_with_divid_s_header() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_masternode_conf(dir.path());
+        let made = std::fs::read_to_string(dir.path().join("masternode.conf")).unwrap();
+        assert!(made.starts_with("# Masternode config file\n# Format: alias IP:port"));
+        assert_eq!(made.lines().count(), 3);
+        assert!(divi_rpc::mn_broadcast::read_conf(&dir.path().join("masternode.conf")).is_empty());
+        std::fs::write(
+            dir.path().join("masternode.conf"),
+            "mn1 1.2.3.4:51472 k t 0\n",
+        )
+        .unwrap();
+        ensure_masternode_conf(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("masternode.conf")).unwrap(),
+            "mn1 1.2.3.4:51472 k t 0\n"
         );
     }
 
