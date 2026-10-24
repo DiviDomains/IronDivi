@@ -1335,7 +1335,9 @@ impl BlockchainRpc {
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
 
-                    if addrs.is_empty() {
+                    // An empty array names no address and gets an empty
+                    // reply (Divi Core rpcmisc.cpp:580-589)
+                    if addrs.len() != arr.len() {
                         return Err(RpcError::invalid_params(
                             "'addresses' array is empty or invalid",
                         )
