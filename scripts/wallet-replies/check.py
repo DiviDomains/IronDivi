@@ -27,8 +27,8 @@ IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), 
 # For the proof that a difference is caught: irondivid's reply of the named row is
 # changed before it is compared
 INJECT = os.environ.get("WALLET_REPLIES_INJECT", "")
-# A directory to write both replies of every row that is not PASS (for looking
-# into a FAIL); nothing is written without it
+# A directory to write both replies of every compared row to (for looking into
+# a FAIL); nothing is written without it
 DUMP = os.environ.get("WALLET_REPLIES_DUMP", "")
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
@@ -36,8 +36,6 @@ START_TIMEOUT = 120
 # Differences irondivid has on purpose, one per row name. Each is listed in
 # README.md with divid's source line; a KNOWN row that starts to match divid is a
 # FAIL, so the list stays true.
-# Rows marked "open" are gaps not closed yet, kept here so the run stays usable
-# while they are; they are listed in README.md for whoever closes them.
 KNOWN = {
     "getwalletinfo: fields divid lacks":
         "walletname, keypoololdest, paytxfee, hdmasterkeyid (docs/divid-differences.md R4)",
@@ -45,20 +43,6 @@ KNOWN = {
         "label, kept as an extra field (divid ListReceived, rpcwallet.cpp:1793-1912, has account only)",
     "listunspent: fields divid lacks":
         "ischange, solvable, kept as extra fields (divid listunspent, rpcrawtransaction.cpp:320-334)",
-    "listreceivedbyaddress [0, true, true]":
-        "open: includeWatchonly is not read, so the watched address is left out (divid rpcwallet.cpp:1805-1809, :1843)",
-    "listreceivedbyaccount [0, true, true]":
-        "open: the same; the watched address's account shows 0 (divid rpcwallet.cpp:1805-1809)",
-    "listaccounts":
-        "open: sums the coins of labelled addresses, so the \"\" account shows 0; divid gives GetAccountBalance per address-book name (rpcwallet.cpp:2320-2350, :383-412)",
-    "listunspent":
-        "open: account \"\" on coins of keys divid never put in its address book (its miner takes them from the keypool); divid leaves account out (rpcrawtransaction.cpp:320-325)",
-    "listunspent 0":
-        "open: the same",
-    "after restart: getwalletinfo":
-        "open: keypoolsize is 1999 on divid and 2000 on irondivid after the restart (equal before it); cause not looked into yet",
-    "listaccounts 0 true":
-        "open: the same, and includeWatchonly is not read (rpcwallet.cpp:2333-2336)",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named
@@ -238,7 +222,7 @@ def compare(name, core, iron, drop=MOMENT | NOTES, order=None):
         a, b = sorted(a, key=order), sorted(b, key=order)
     a, b = unordered(a), unordered(b)
     d = first_difference(a, b)
-    if d and DUMP:
+    if DUMP:
         safe = "".join(ch if ch.isalnum() else "_" for ch in name)[:80]
         with open(os.path.join(DUMP, safe + ".json"), "w") as f:
             json.dump({"divid": a, "irondivid": b}, f, indent=1, sort_keys=True)

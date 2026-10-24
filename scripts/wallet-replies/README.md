@@ -69,28 +69,17 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 ## KNOWN differences
 
-By design (extra fields; the run checks they are still the only ones):
+All by design (extra fields; the run checks they are still the only ones):
 
 - `getwalletinfo`: irondivid adds `walletname`, `keypoololdest`, `paytxfee`, `hdmasterkeyid`
   (docs/divid-differences.md R4).
 - `listreceivedbyaddress`: irondivid adds `label` (divid's ListReceived, `rpcwallet.cpp:1793-1912`, has `account`).
 - `listunspent`: irondivid adds `ischange`, `solvable` (divid: `rpcrawtransaction.cpp:320-334`).
 
-Open, not closed yet (listed so the run stays usable; a fix turns the row into a FAIL until it is taken out here and in
-`KNOWN` in `check.py`):
-
-- `listreceivedbyaddress 0 true true`, `listreceivedbyaccount 0 true true`: irondivid does not read includeWatchonly,
-  so the watched address (and its account's amount) is left out (`rpcwallet.cpp:1805-1809`, `:1843`).
-- `listaccounts`, `listaccounts 0 true`: irondivid sums the coins of labelled addresses, so the `""` account shows 0,
-  and it does not read includeWatchonly; divid gives GetAccountBalance for each address-book name
-  (`rpcwallet.cpp:2320-2350`, `:383-412`).
-- `listunspent`, `listunspent 0`: irondivid gives `account ""` on coins of keys divid never put in its address book
-  (divid's miner takes them from the keypool); divid leaves `account` out (`rpcrawtransaction.cpp:320-325`).
-- `after restart: getwalletinfo`: `keypoolsize` is 1999 on divid and 2000 on irondivid after the restart (equal
-  before it); the cause is not looked into yet.
+No other row differs from divid.
 
 ## Proving a difference is caught
 
 `WALLET_REPLIES_INJECT=<row name>` changes irondivid's reply of that row before it is compared, e.g.
 `WALLET_REPLIES_INJECT='getbalance []'`: that row prints `FAIL` and the run exits 1.
-`WALLET_REPLIES_DUMP=<dir>` writes both replies of every row that differs to `<dir>`, for looking into a FAIL.
+`WALLET_REPLIES_DUMP=<dir>` writes both replies of every compared row to `<dir>`, for looking into a FAIL.
