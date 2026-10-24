@@ -3607,7 +3607,13 @@ impl WalletRpc {
             .and_then(|v| v.as_array())
             .ok_or_else(|| RpcError::invalid_params("Keys array required"))?;
 
-        let _account = params.get_str(2).unwrap_or("");
+        // AccountFromValue (rpcwallet.cpp:273-278)
+        let account = params.get_str(2).unwrap_or("");
+        if account == "*" {
+            return Err(
+                RpcError::new(codes::WALLET_INVALID_ACCOUNT_NAME, "Invalid account name").into(),
+            );
+        }
 
         if nrequired < 1 {
             return Err(RpcError::invalid_params("nrequired must be at least 1").into());
@@ -3711,6 +3717,11 @@ impl WalletRpc {
                 codes::WALLET_ERROR,
                 format!("Failed to store redeem script: {}", e),
             )
+        })?;
+        // The address goes in the address book with the account, "" without
+        // one (rpcwallet.cpp:1765-1773)
+        wallet.set_label(&p2sh_addr, account).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
         wallet.save().map_err(|e| {
