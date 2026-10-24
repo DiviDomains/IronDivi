@@ -9,13 +9,11 @@
 //! `setgenerate N` on regtest mines N blocks to the wallet: proof of work up
 //! to the last PoW block, proof of stake after it (BasicSwap's test setup).
 
-mod common;
-
-use common::free_port;
+use divi_test_support::{free_port, wait_started};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -77,15 +75,9 @@ fn setgenerate_mines_pow_then_pos() {
         .expect("spawn irondivid");
     let mut node = KillOnDrop(child);
 
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while rpc(rpc_port, "getblockcount", serde_json::json!([])).is_none() {
-        assert!(
-            node.0.try_wait().unwrap().is_none(),
-            "irondivid exited before its RPC server came up"
-        );
-        assert!(Instant::now() < deadline, "RPC server did not come up");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    wait_started(&mut node.0, dir.path(), || {
+        rpc(rpc_port, "getblockcount", serde_json::json!([])).is_some()
+    });
 
     assert!(ok(rpc_port, "setgenerate", serde_json::json!([0])).is_null());
 

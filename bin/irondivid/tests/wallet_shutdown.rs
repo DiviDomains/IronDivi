@@ -16,9 +16,6 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::free_port;
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -28,6 +25,7 @@ use divi_primitives::{
     ChainMode,
 };
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+use divi_test_support::{free_port, wait_started};
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -104,15 +102,9 @@ impl Daemon {
             .spawn()
             .expect("spawn irondivid");
         let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        wait_started(&mut daemon.child, datadir, || {
+            try_rpc(rpc_port, "getblockcount", &json!([])).is_some()
+        });
         daemon
     }
 

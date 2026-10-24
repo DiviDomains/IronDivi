@@ -15,23 +15,16 @@
 
 #![cfg(unix)]
 
+use divi_test_support::{free_port, wait_started};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const REGTEST_MAGIC: [u8; 4] = [0xa1, 0xcf, 0x7e, 0xac];
 const WAIT: Duration = Duration::from_secs(30);
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// One JSON-RPC call (test:test); None while the server is not up
 fn try_rpc(port: u16, method: &str, params: Value) -> Option<Value> {
@@ -87,12 +80,9 @@ impl Daemon {
             rpc_port,
             p2p_port,
         };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", json!([])).is_none() {
-            assert!(d.child.try_wait().unwrap().is_none(), "irondivid exited");
-            assert!(Instant::now() < deadline, "RPC did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        wait_started(&mut d.child, datadir, || {
+            try_rpc(rpc_port, "getblockcount", json!([])).is_some()
+        });
         d
     }
 

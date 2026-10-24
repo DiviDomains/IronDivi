@@ -11,9 +11,7 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::free_port;
+use divi_test_support::{free_port, wait_started};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -91,12 +89,9 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         .spawn()
         .expect("spawn irondivid");
     let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while rpc(rpc_port, "getblockcount", json!([])).is_none() {
-        assert!(node.0.try_wait().unwrap().is_none(), "irondivid exited");
-        assert!(Instant::now() < deadline, "RPC server did not come up");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    wait_started(&mut node.0, dir.path(), || {
+        rpc(rpc_port, "getblockcount", json!([])).is_some()
+    });
     let log = debug_log(dir.path());
     assert!(
         log.contains("Unknown option -bogusflag; ignored"),
@@ -169,12 +164,9 @@ fn negated_unknown_option_is_named_as_written() {
         .spawn()
         .expect("spawn irondivid");
     let mut node = Node(child);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while rpc(rpc_port, "getblockcount", json!([])).is_none() {
-        assert!(node.0.try_wait().unwrap().is_none(), "irondivid exited");
-        assert!(Instant::now() < deadline, "RPC server did not come up");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    wait_started(&mut node.0, dir.path(), || {
+        rpc(rpc_port, "getblockcount", json!([])).is_some()
+    });
     let log = debug_log(dir.path());
     assert!(
         log.contains("Unknown option -nobogusflag; ignored"),

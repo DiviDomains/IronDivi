@@ -14,9 +14,7 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::free_port;
+use divi_test_support::{free_port, wait_started};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -100,21 +98,21 @@ struct Daemon {
 impl Daemon {
     /// Start `cmd` (made by `irondivid` with `rpc_port`) and wait for its RPC
     fn start(mut cmd: Command, rpc_port: u16) -> Daemon {
+        let datadir = cmd
+            .get_args()
+            .skip_while(|a| *a != "--datadir")
+            .nth(1)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
         let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn irondivid");
         let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up"
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        wait_started(&mut daemon.child, &datadir, || {
+            try_rpc(rpc_port, "getblockcount", &json!([])).is_some()
+        });
         daemon
     }
 

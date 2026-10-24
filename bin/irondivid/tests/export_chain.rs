@@ -13,14 +13,12 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use common::{free_port, log_tail};
 use divi_primitives::block::{Block, BlockHeader};
 use divi_primitives::hash::Hash256;
 use divi_primitives::serialize::{deserialize, serialize};
 use divi_primitives::transaction::Transaction;
 use divi_storage::BlockExport;
+use divi_test_support::{free_port, wait_started};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -101,16 +99,9 @@ impl Daemon {
             .spawn()
             .expect("spawn irondivid");
         let mut daemon = Daemon { child, rpc_port };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() {
-            assert!(
-                daemon.child.try_wait().unwrap().is_none(),
-                "irondivid exited before its RPC server came up; its log ends:\n{}",
-                log_tail(datadir)
-            );
-            assert!(Instant::now() < deadline, "RPC server did not come up");
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        wait_started(&mut daemon.child, datadir, || {
+            try_rpc(rpc_port, "getblockcount", &json!([])).is_some()
+        });
         daemon
     }
 
