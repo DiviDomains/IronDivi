@@ -511,6 +511,23 @@ impl From<String> for TxSubmitError {
 const MAX_TX_FEE: Amount = Amount::from_sat(100 * 100_000_000);
 
 /// Wallet RPC handler
+/// The notes a send keeps with its transaction (Divi Core's TxTextMetadata):
+/// FromAccount as given (also ""), comment and to when given and not empty
+fn send_notes(pairs: &[(&str, Option<&str>)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .filter(|v| *key == "FromAccount" || !v.is_empty())
+                .map(|v| (key.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// addvault and removevault without Divi Core's -vault option
+const VAULT_MODE_OFF: &str =
+    "Vaults can be added or removed only with the vault option: start irondivid with -vault=1 (or vault=1 in divi.conf)";
+
 pub struct WalletRpc {
     wallet: Arc<RwLock<Option<Arc<WalletDb>>>>,
     height: Arc<RwLock<u32>>,
@@ -867,12 +884,17 @@ impl WalletRpc {
         let height = self.current_height();
         let balance = if params.is_empty() || params.get_str(0) == Some("*") {
             wallet.get_balance()
+        } else if let Some(account) = params.get_str(0) {
+            // An account: GetAccountBalance, watch-only outputs with the
+            // third argument (rpcwallet.cpp:1580-1593)
+            let min_depth = params.get_i64(1).unwrap_or(1);
+            let watch = params.get_bool(2).unwrap_or(false);
+            divi_primitives::amount::Amount::from_sat(
+                self.history(&wallet)
+                    .account_balance(account, min_depth, watch),
+            )
         } else {
-            let min_conf = if params.get_str(0).is_some() {
-                params.get_u64(1).unwrap_or(1)
-            } else {
-                params.get_u64(0).unwrap_or(1)
-            } as u32;
+            let min_conf = params.get_u64(0).unwrap_or(1) as u32;
             wallet.get_confirmed_balance(height, min_conf)
         };
 
@@ -1526,6 +1548,7 @@ impl WalletRpc {
 
     /// Plan a send as Divi Core's CreateTransaction does
     fn plan(
+        &self,
         payees: &[TxOut],
         coins: &[SendCoin],
         mode: FeeMode,
@@ -1538,9 +1561,17 @@ impl WalletRpc {
             mode,
             kind,
             &change_to.template(),
-            FeePolicy::default(),
+            self.fee_policy(),
         )
         .map_err(send_error)
+    }
+
+    /// The wallet's fee rate (Divi Core's wallet pays -minrelaytxfee,
+    /// rpcwallet.cpp:470-473, :510-513)
+    fn fee_policy(&self) -> FeePolicy {
+        self.get_wallet()
+            .map(|w| w.fee_policy())
+            .unwrap_or_default()
     }
 
     /// Sign a planned send, check it as Divi Core does once signed, and
@@ -1602,7 +1633,7 @@ impl WalletRpc {
             )
             .into());
         }
-        check_signed(&tx, plan.fee, FeePolicy::default()).map_err(send_error)?;
+        check_signed(&tx, plan.fee, self.fee_policy()).map_err(send_error)?;
         self.submit_transaction(tx)
     }
 
@@ -1636,8 +1667,16 @@ impl WalletRpc {
 
         let height = self.current_height();
         let coins = Self::send_coins(&wallet, wallet.get_send_candidates(height, 1), height);
-        let plan = Self::plan(&payees, &coins, mode, ChangeKind::P2pkh, &ChangeTo::NewKey)?;
+        let plan = self.plan(&payees, &coins, mode, ChangeKind::P2pkh, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        // The "metadata" mode carries a comment and a comment-to
+        // (rpcwallet.cpp:1346-1352)
+        if params.get_str(2) == Some("metadata") {
+            wallet.set_tx_notes(
+                &txid,
+                send_notes(&[("comment", params.get_str(3)), ("to", params.get_str(4))]),
+            );
+        }
 
         info!(
             "Sent {} DIVI to {} (txid: {})",
@@ -2463,6 +2502,11 @@ impl WalletRpc {
             return Err(sync_failed().into());
         }
 
+        // Divi Core's AddVault changes nothing without -vault (wallet.cpp:693-706)
+        if !self.get_wallet()?.vault_mode() {
+            return Err(RpcError::invalid_request(VAULT_MODE_OFF).into());
+        }
+
         // Only coins still in the UTXO set and not spent by a mempool
         // transaction can be staked; a spent funding output is refused
         let mempool = self.mempool.read().clone();
@@ -2559,6 +2603,12 @@ impl WalletRpc {
         let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
 
         let wallet = self.get_wallet()?;
+        // Divi Core's RemoveVault changes nothing without -vault and reports
+        // false (wallet.cpp:707-716, rpcwallet.cpp:1227)
+        if !wallet.vault_mode() {
+            tracing::warn!("removevault: {}", VAULT_MODE_OFF);
+            return Ok(serde_json::json!({ "removal_status": false }));
+        }
 
         let vault_script_bytes = vault_script.as_bytes().to_vec();
         let vault_exists = wallet.get_vault(&vault_script_bytes).is_some();
@@ -2755,7 +2805,7 @@ impl WalletRpc {
 
         // An ordinary send to the vault script (Divi Core fundvault: not from vaults)
         let coins = Self::send_coins(&wallet, wallet.get_send_candidates(height, 1), height);
-        let plan = Self::plan(
+        let plan = self.plan(
             &payees,
             &coins,
             FeeMode::SenderPays,
@@ -2859,7 +2909,7 @@ impl WalletRpc {
         let coins = Self::send_coins(&wallet, candidates, height);
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
         let change_to = ChangeTo::Script(vault_script);
-        let plan = Self::plan(&payees, &coins, mode, ChangeKind::Vault, &change_to)?;
+        let plan = self.plan(&payees, &coins, mode, ChangeKind::Vault, &change_to)?;
         let txid = self.sign_and_submit(&wallet, &plan, change_to)?;
         Ok(json!(txid.to_string()))
     }
@@ -2909,7 +2959,7 @@ impl WalletRpc {
         // wallet.cpp:1905-1910)
         let coins = Self::send_coins(&wallet, owned_vault_utxos, height);
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
-        let plan = Self::plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
+        let plan = self.plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
         let (received, fee) = (plan.outputs[0].value, plan.fee);
 
@@ -3290,7 +3340,7 @@ impl WalletRpc {
             wallet.get_send_candidates(height, min_conf),
         );
         let coins = Self::send_coins(&wallet, candidates, height);
-        let mut plan = Self::plan(
+        let mut plan = self.plan(
             &payees,
             &coins,
             FeeMode::SenderPays,
@@ -3301,6 +3351,14 @@ impl WalletRpc {
             subtract_fee_from_outputs(&mut plan, &subtract_outputs)?;
         }
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        // FromAccount and a comment (rpcwallet.cpp:1718-1723)
+        wallet.set_tx_notes(
+            &txid,
+            send_notes(&[
+                ("FromAccount", Some(account)),
+                ("comment", params.get_str(2)),
+            ]),
+        );
 
         info!("Sent {} outputs (txid: {})", plan.outputs.len(), txid);
 
@@ -3717,8 +3775,6 @@ impl WalletRpc {
         )?;
 
         let min_conf = params.get_u64(3).unwrap_or(1) as u32;
-        let _comment = params.get_str(4);
-        let _comment_to = params.get_str(5);
 
         let dest_addr = self
             .decode_address(addr_str)
@@ -3760,7 +3816,7 @@ impl WalletRpc {
         );
         let coins = Self::send_coins(&wallet, candidates, height);
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
-        let plan = Self::plan(
+        let plan = self.plan(
             &payees,
             &coins,
             FeeMode::SenderPays,
@@ -3768,6 +3824,15 @@ impl WalletRpc {
             &ChangeTo::NewKey,
         )?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
+        // FromAccount, a comment and a comment-to (rpcwallet.cpp:1636-1642)
+        wallet.set_tx_notes(
+            &txid,
+            send_notes(&[
+                ("FromAccount", Some(account)),
+                ("comment", params.get_str(3)),
+                ("to", params.get_str(4)),
+            ]),
+        );
 
         info!(
             "Sent {} DIVI from account '{}' to {} (txid: {})",

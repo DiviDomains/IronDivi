@@ -73,6 +73,10 @@ pub struct NodeConfig {
     /// replaced by its txid (Divi Core's -walletnotify)
     #[serde(default)]
     pub walletnotify: Option<String>,
+
+    /// Vaults may be added and removed (Divi Core's -vault, default off)
+    #[serde(default)]
+    pub vault: bool,
 }
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
@@ -100,6 +104,7 @@ impl Default for NodeConfig {
             max_reorg: None,
             blocknotify: None,
             walletnotify: None,
+            vault: false,
         }
     }
 }
