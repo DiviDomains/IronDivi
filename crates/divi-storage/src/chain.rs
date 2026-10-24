@@ -2933,14 +2933,25 @@ impl Chain {
         }
 
         // Divi Core DisconnectBlock: reverse the block's address and spent
-        // index entries from the outputs its inputs spent
+        // index entries from the outputs its inputs spent. A coin made and
+        // spent in the block is not restored, but Core's view still holds it
+        // when the spender is reversed, so its spend is erased too
         let updates = match self.search_index {
             Some(ref search) => {
-                let prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
+                let mut prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
                     .adds
                     .iter()
                     .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
                     .collect();
+                for tx in &block.transactions {
+                    let txid = self.compute_txid(tx);
+                    for (k, out) in tx.vout.iter().enumerate() {
+                        prevouts.insert(
+                            OutPoint::new(txid, k as u32),
+                            (out.value, out.script_pubkey.clone()),
+                        );
+                    }
+                }
                 Some(search_index::collect_disconnect(
                     block,
                     index.height,
