@@ -3846,6 +3846,7 @@ impl WalletRpc {
 
     /// lockunspent - Lock or unlock UTXOs
     pub fn lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // Divi Core lockunspent (rpcwallet.cpp:2742-2814)
         if params.is_empty() || params.len() > 2 {
             return Err(RpcError::invalid_params(
                 "lockunspent unlock [{\"txid\":\"txid\",\"vout\":n},...]",
@@ -3853,37 +3854,53 @@ impl WalletRpc {
             .into());
         }
         let unlock = params
-            .get_bool(0)
-            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected boolean for unlock"))?;
+            .get(0)
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type bool"))?;
 
-        let outputs_array = params
-            .get(1)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| RpcError::invalid_params("outputs array required"))?;
+        let wallet = self.get_wallet()?;
 
-        let wallet_guard = self.wallet.read();
-        let wallet = wallet_guard
-            .as_ref()
-            .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
+        // With no list, true unlocks every coin and false does nothing
+        let Some(outputs) = params.get(1).filter(|_| params.len() == 2) else {
+            if unlock {
+                for outpoint in wallet.locked_coins() {
+                    wallet.set_coin_locked(outpoint, false);
+                }
+            }
+            return Ok(serde_json::Value::Bool(true));
+        };
+        let outputs = outputs
+            .as_array()
+            .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type array"))?;
 
-        for output in outputs_array {
-            let txid_str = output
-                .get("txid")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| RpcError::invalid_params("txid required"))?;
-
-            let vout = output
-                .get("vout")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| RpcError::invalid_params("vout required"))?
-                as u32;
-
+        let invalid = |m: &str| -> Error { RpcError::new(codes::INVALID_PARAMETER, m).into() };
+        for output in outputs {
+            let Some(o) = output.as_object() else {
+                return Err(invalid("Invalid parameter, expected object"));
+            };
+            // RPCTypeCheck(o, {txid: str, vout: int}), in key order
+            for (key, want) in [("txid", "str"), ("vout", "int")] {
+                let v = o.get(key).unwrap_or(&serde_json::Value::Null);
+                if v.is_null() {
+                    return Err(RpcError::new(codes::TYPE_ERROR, format!("Missing {key}")).into());
+                }
+                let got = json_spirit_type(v);
+                if got != want {
+                    return Err(RpcError::new(
+                        codes::TYPE_ERROR,
+                        format!("Expected type {want} for {key}, got {got}"),
+                    )
+                    .into());
+                }
+            }
+            let txid_str = o["txid"].as_str().unwrap_or_default();
             let txid = Hash256::from_hex(txid_str)
-                .map_err(|_| RpcError::invalid_params("Invalid txid"))?;
-
-            let outpoint = OutPoint { txid, vout };
-
-            wallet.set_coin_locked(outpoint, !unlock);
+                .map_err(|_| invalid("Invalid parameter, expected hex txid"))?;
+            let vout = o["vout"].as_i64().unwrap_or(-1);
+            if vout < 0 {
+                return Err(invalid("Invalid parameter, vout must be positive"));
+            }
+            wallet.set_coin_locked(OutPoint::new(txid, vout as u32), !unlock);
         }
 
         Ok(serde_json::Value::Bool(true))

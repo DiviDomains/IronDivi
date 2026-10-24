@@ -351,3 +351,45 @@ fn getrawtransaction_without_txindex_finds_unspent_coins() {
         (-5, "No information available about transaction".to_string())
     );
 }
+
+/// lockunspent true with no list unlocks every coin, false with no list does
+/// nothing, and entries are checked as Divi Core checks them
+/// (rpcwallet.cpp:2742-2814)
+#[test]
+fn lockunspent_as_core() {
+    let n = node(FULL);
+    let me = Address::from_base58(n.ok("getnewaddress", vec![]).as_str().unwrap()).unwrap();
+    let cb = n.mine(vec![], &me);
+    let coin = json!([{"txid": cb.txid().to_string(), "vout": 0}]);
+    assert_eq!(n.ok("lockunspent", vec![json!(false), coin]), json!(true));
+    assert_eq!(n.ok("listlockunspent", vec![]).as_array().unwrap().len(), 1);
+    assert_eq!(n.ok("lockunspent", vec![json!(false)]), json!(true));
+    assert_eq!(n.ok("listlockunspent", vec![]).as_array().unwrap().len(), 1);
+    assert_eq!(n.ok("lockunspent", vec![json!(true)]), json!(true));
+    assert_eq!(n.ok("listlockunspent", vec![]), json!([]));
+
+    let p = |entry: Value| vec![json!(false), json!([entry])];
+    assert_eq!(
+        n.err("lockunspent", p(json!(5))),
+        (-8, "Invalid parameter, expected object".to_string())
+    );
+    assert_eq!(
+        n.err("lockunspent", p(json!({"vout": 0}))),
+        (-3, "Missing txid".to_string())
+    );
+    assert_eq!(
+        n.err("lockunspent", p(json!({"txid": 5, "vout": 0}))),
+        (-3, "Expected type str for txid, got int".to_string())
+    );
+    assert_eq!(
+        n.err("lockunspent", p(json!({"txid": "zz", "vout": 0}))),
+        (-8, "Invalid parameter, expected hex txid".to_string())
+    );
+    assert_eq!(
+        n.err(
+            "lockunspent",
+            p(json!({"txid": "11".repeat(32), "vout": -1}))
+        ),
+        (-8, "Invalid parameter, vout must be positive".to_string())
+    );
+}
