@@ -150,14 +150,14 @@ fn getblock_takes_a_verbosity_number() {
 }
 
 /// getmempoolinfo: divid gives size and bytes (rpcblockchain.cpp:569-574);
-/// irondivid adds usage, maxmempool and mempoolminfee
+/// irondivid adds usage, maxmempool and mempoolminfee after them
 #[test]
 fn getmempoolinfo_has_fields_divid_lacks() {
     let (server, _dir) = server();
     let info = result(&server, "getmempoolinfo", vec![]);
     assert_eq!(
         keys(&info),
-        ["bytes", "maxmempool", "mempoolminfee", "size", "usage"]
+        ["size", "bytes", "usage", "maxmempool", "mempoolminfee"]
     );
 }
 
