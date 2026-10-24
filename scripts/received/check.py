@@ -596,6 +596,10 @@ staking("getstakingstatus (mature coins)")
 mine(1, C)
 stake_tx = C.rpc("getblock", C.rpc("getbestblockhash"))["tx"][1]
 mine(1, I)
+# divid's mintablecoins needs a coin older than the minimum age, 0 on regtest,
+# by its wallet's time, which is when the coin was received (HasAgedCoins,
+# wallet.cpp:1474-1478): a coin of this very second does not count yet
+time.sleep(2)
 staking("getstakingstatus (after stake blocks)")
 # More coins for the sends (the coins staked are immature for 20 blocks)
 for _ in range(12):
@@ -790,6 +794,13 @@ mine(1)
 # --- sendfrom --------------------------------------------------------------------------------
 
 send_both("sendfrom \"\" X 1", "sendfrom", "", X, 1)
+# acct1's balance falls by the whole value of each of its coins a send spends
+# (the change has no account, rpcwallet.cpp:204-209), and irondivid's call
+# comes after divid's send: two large coins from the miner keep acct1 able to
+# pay on both
+for _ in range(2):
+    M.rpc("sendtoaddress", X, 100)
+mine(1)
 send_both("sendfrom \"acct1\" Y 1 (an account with coins)", "sendfrom", "acct1", Y, 1)
 send_both("sendfrom \"nosuch\" Y 1 (an account without coins)", "sendfrom", "nosuch", Y, 1)
 send_both("sendfrom \"acct1\" Y 100000 (more than the account has)", "sendfrom", "acct1", Y, 100000)

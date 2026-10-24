@@ -67,7 +67,9 @@ pays the twins as another wallet.
    - after `invalidateblock` of the block with the sends, on all three nodes (and `getrawmempool`);
    - after `reconsiderblock`.
 10. **Arguments** of the received-by calls.
-11. **`getaccountaddress` rows**, then `sendfrom` rows.
+11. **`getaccountaddress` rows**, then `sendfrom` rows. Before `sendfrom "acct1"`, the miner pays X 2×100 and a block
+    confirms it. An account's balance falls by the whole value of each of its coins a send spends (the change has no
+    account), and irondivid's call comes after divid's send, so acct1 must be able to pay twice.
 12. **Locked wallet:** both wallets are encrypted; rows locked, unlocked for staking only, and unlocked.
 
 ## Rows
