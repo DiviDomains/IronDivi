@@ -29,7 +29,7 @@ mod snapshot_sig;
 use anyhow::{Context, Result};
 use divi_crypto::compute_block_hash;
 use divi_node::config::{LogConfig, NetworkType, NodeConfig};
-use divi_node::{Node, Staker, StakingConfig};
+use divi_node::{shutdown_stage, Node, Staker, StakingConfig};
 use divi_primitives::amount::Amount;
 use divi_primitives::transaction::Transaction;
 use divi_primitives::ChainMode;
@@ -1091,11 +1091,9 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // Create a non-blocking writer to avoid blocking the async runtime
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-        // Store the guard in a static to keep the writer alive
-        // This is safe because we only initialize logging once
-        static GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-            std::sync::OnceLock::new();
-        let _ = GUARD.set(_guard);
+        // Kept until the process exits, when `flush_log` writes out what it
+        // still holds
+        *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
         // Set up file logging with timestamps
         tracing_subscriber::registry()
@@ -1111,6 +1109,20 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size, log_config.max_files
         );
     }
+}
+
+/// The writer thread of debug.log (non-blocking): dropping its guard writes
+/// out the lines it still holds
+static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
+    std::sync::Mutex::new(None);
+
+/// Write out the log lines not yet in debug.log (waits a second at most)
+fn flush_log() {
+    let guard = LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
 }
 
 /// Print startup banner
@@ -1428,7 +1440,9 @@ async fn run_daemon(
 
     // Initialize the node
     info!("Initializing node...");
-    let node = Node::new(config.clone()).map_err(start_error)?;
+    // Never dropped: the process ends without running the destructors of the
+    // node's state (databases, caches, mempool), see `exit_after_stop`
+    let node = std::mem::ManuallyDrop::new(Node::new(config.clone()).map_err(start_error)?);
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -2080,10 +2094,13 @@ async fn run_daemon(
 
     // Stop the node
     info!("Stopping node...");
+    let started = std::time::Instant::now();
     node.stop().await.with_context(|| "Failed to stop node")?;
+    shutdown_stage("node stopped", started);
 
     let mut clean = true;
     if let Some(wallet) = wallet_for_shutdown {
+        let started = std::time::Instant::now();
         match wallet.save() {
             Ok(()) => info!("Wallet saved"),
             Err(e) => {
@@ -2091,11 +2108,14 @@ async fn run_daemon(
                 clean = false;
             }
         }
+        shutdown_stage("wallet saved", started);
     }
     if clean {
+        let started = std::time::Instant::now();
         if let Err(e) = node.chain().end_run() {
             error!("Failed to record the clean stop: {}", e);
         }
+        shutdown_stage("databases synced and the clean stop recorded", started);
     }
 
     info!("Node stopped");
@@ -2556,11 +2576,38 @@ fn main() -> Result<()> {
     }
 
     // Now enter the tokio runtime (after daemonization)
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("Failed to build tokio runtime")?
-        .block_on(async_main(args, data_dir))
+        .context("Failed to build tokio runtime")?;
+    let result = runtime.block_on(async_main(args, data_dir));
+    exit_after_stop(runtime, result)
+}
+
+/// End the process once `async_main` has stopped the node and recorded the
+/// clean stop. The runtime is not dropped: that would wait, with no deadline,
+/// for every worker and blocking thread, and run the destructors of all the
+/// node's state still held by its tasks, among them the databases' close and
+/// the freeing of its caches, which reads back every page of them that is in
+/// swap. The next start needs none of it: `end_run` has synced the databases'
+/// logs. Divi Core likewise exits once its Shutdown() steps are done
+/// (init.cpp).
+fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
+    let started = std::time::Instant::now();
+    let code = match &result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            1
+        }
+    };
+    // Let the runtime's threads go without waiting for them
+    std::mem::forget(runtime);
+    shutdown_stage("exit", started);
+    flush_log();
+    // _exit: no atexit handlers or C++ static destructors either (RocksDB's
+    // thread pools would be joined there)
+    unsafe { libc::_exit(code) }
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
