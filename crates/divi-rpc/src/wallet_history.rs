@@ -45,6 +45,15 @@ struct Loaded {
     block: Option<(Hash256, u32, u32, usize)>,
 }
 
+/// What ListReceived counts for one destination
+pub(crate) struct Tally {
+    pub(crate) amount: i64,
+    /// The fewest confirmations of its transactions (i64::MAX when none)
+    pub(crate) confirmations: i64,
+    pub(crate) txids: Vec<String>,
+    pub(crate) watch_only: bool,
+}
+
 /// Builds history entries for one RPC call (lookups are cached for the call)
 pub(crate) struct History<'a> {
     wallet: &'a WalletDb,
@@ -601,6 +610,74 @@ impl<'a> History<'a> {
             balance -= sent;
         }
         balance
+    }
+
+    /// The tally of ListReceived (rpcwallet.cpp:1814-1844): for every
+    /// destination, the outputs paid to it by wallet transactions that are
+    /// not coinbases, final and at least `min_depth` deep, when the wallet owns
+    /// the destination spendably (or watches it, with `watch`)
+    pub(crate) fn received_tally(&self, min_depth: i64, watch: bool) -> HashMap<String, Tally> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as u32);
+        let mut tally: HashMap<String, Tally> = HashMap::new();
+        for record in self.ordered_records() {
+            let Some(loaded) = self.load(&record) else {
+                continue;
+            };
+            let tx = &loaded.tx;
+            if tx.is_coinbase() || !tx.is_final(self.height, now) {
+                continue;
+            }
+            let depth = self.depth(&record.txid, &loaded);
+            if depth < min_depth {
+                continue;
+            }
+            for out in &tx.vout {
+                let Some(address) = self.destination(&out.script_pubkey) else {
+                    continue;
+                };
+                let mine = self.mine(&address.script_pubkey());
+                if !Self::requested(mine, watch) {
+                    continue;
+                }
+                let item = tally.entry(address.to_base58()).or_insert(Tally {
+                    amount: 0,
+                    confirmations: i64::MAX,
+                    txids: Vec::new(),
+                    watch_only: false,
+                });
+                item.amount += out.value.as_sat();
+                item.confirmations = item.confirmations.min(depth);
+                item.txids.push(record.txid.to_string());
+                item.watch_only |= mine == Mine::WatchOnly;
+            }
+        }
+        tally
+    }
+
+    /// listaccounts (rpcwallet.cpp:2320-2350): for every address-book name
+    /// with an address the wallet owns (or watches, with `watch`), that
+    /// account's GetAccountBalance
+    pub(crate) fn account_balances(&self, min_depth: i64, watch: bool) -> Vec<(String, i64)> {
+        let mut names: Vec<String> = Vec::new();
+        for (address, name) in self.wallet.address_book() {
+            let Ok(address) = Address::from_base58(&address) else {
+                continue;
+            };
+            if Self::requested(self.mine(&address.script_pubkey()), watch) && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let balance = self.account_balance(&name, min_depth, watch);
+                (name, balance)
+            })
+            .collect()
     }
 
     /// GetBlocksToMaturity (MerkleTxConfirmationNumberCalculator.cpp:54-59)

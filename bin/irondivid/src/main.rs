@@ -1205,9 +1205,14 @@ fn load_or_restore_wallet_with_seed(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
-        // As Divi Core at start: fill the keypool while the seed is in memory
-        // (an encrypted wallet starts locked and is topped up on unlock)
-        if !wallet.is_locked() {
+        // Divi Core does not refill the keypool when it loads a wallet: it tops
+        // up only before it takes a key (wallet.cpp:2122-2131), so a pool may
+        // sit one key short per chain. Only a pool below that, which divid
+        // never has (a wallet stored before its keypool was), is filled here,
+        // so payments to its next keys are still found. A locked wallet is
+        // topped up on unlock.
+        let at_rest = 2 * wallet.keypool_target().saturating_sub(1);
+        if !wallet.is_locked() && wallet.keypool_size() < at_rest {
             if let Err(e) = wallet.top_up_keypool() {
                 warn!("Could not top up the keypool: {}", e);
             }
@@ -1800,6 +1805,9 @@ async fn run_daemon(
 
     // Run RPC server with shutdown handling
     let mut shutdown_rx = shutdown_rx;
+    // An RPC server that cannot run (its port taken) stops the node, which
+    // then exits with failure, as divid's InitError does
+    let mut rpc_error = None;
 
     // RPC `stop` takes the same path as SIGTERM. The short delay lets the
     // "DIVI server stopping" reply reach the client before the server is dropped.
@@ -1951,6 +1959,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
+                    rpc_error = Some(e.to_string());
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -1996,6 +2005,7 @@ async fn run_daemon(
             ) => {
                 if let Err(e) = result {
                     error!("RPC server error: {}", e);
+                    rpc_error = Some(e.to_string());
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -2025,7 +2035,10 @@ async fn run_daemon(
     }
 
     info!("Node stopped");
-    Ok(())
+    match rpc_error {
+        Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        None => Ok(()),
+    }
 }
 
 /// Run a notify command as divid's runCommand: through the shell, `%s`
@@ -2105,6 +2118,9 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
         NodeError::TxRejected { reason, .. } if reason == "bad-txns-nonstandard-inputs" => {
             TxSubmitError::Failed(String::new())
         }
+        // A coin a mempool transaction already spends: AcceptToMemoryPool returns
+        // false without a reject state (MempoolConsensus.cpp:303-313), so -25 ""
+        NodeError::MempoolConflict(_) => TxSubmitError::Failed(String::new()),
         NodeError::TxRejected { code, reason, .. } => TxSubmitError::Rejected { code, reason },
         NodeError::MissingInputs => TxSubmitError::UnknownInputs,
         NodeError::NonFinal => TxSubmitError::Rejected {
@@ -3447,6 +3463,21 @@ mod staking_config_tests {
 #[cfg(test)]
 mod submit_error_tests {
     use super::*;
+
+    /// sendrawtransaction of a spend of a coin a mempool transaction spends:
+    /// Divi Core's AcceptToMemoryPool keeps no reject state for it
+    /// (MempoolConsensus.cpp:303-313), so the reply is -25 with an empty message
+    /// (rpcrawtransaction.cpp:883-886)
+    #[test]
+    fn mempool_conflict_answers_like_core() {
+        use divi_primitives::hash::Hash256;
+        match submit_error(divi_node::NodeError::MempoolConflict(Hash256::from_bytes(
+            [3; 32],
+        ))) {
+            divi_rpc::TxSubmitError::Failed(message) => assert_eq!(message, ""),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 
     /// A refusal Divi Core makes without a reject state reaches the RPC as
     /// -25 with an empty message; refusals with a state keep code and reason

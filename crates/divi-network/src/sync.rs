@@ -999,13 +999,17 @@ impl BlockSync {
     /// MAX_BLOCKS_IN_TRANSIT_PER_PEER blocks in flight gets the next blocks in
     /// chain order that are neither downloaded nor in flight, within
     /// BLOCK_DOWNLOAD_WINDOW of the first missing one.
+    ///
+    /// Only peers that advertise NODE_NETWORK are asked (Divi Core skips
+    /// fClient peers, main.cpp:1211), and each peer's blocks go in one getdata
+    /// (main.cpp:1205-1224 collects vGetData and sends it once).
     async fn request_blocks(&self) {
         if self.chain.is_importing() {
             return;
         }
-        let peer_ids = self.peer_manager.connected_peers();
+        let peer_ids = self.peer_manager.full_history_peers();
         if peer_ids.is_empty() {
-            debug!("No connected peers available for block download");
+            debug!("No connected peer with NODE_NETWORK available for block download");
             return;
         }
         let per_peer = self.in_flight_per_peer();
@@ -1054,38 +1058,55 @@ impl BlockSync {
             return;
         }
 
-        // Each peer takes the next blocks up to its free slots
+        // Each peer takes the next blocks up to its free slots, in one getdata
         let mut next = hashes_to_request.into_iter();
         for (peer_id, n) in free {
             let batch: Vec<Hash256> = next.by_ref().take(n).collect();
-            for hash in batch {
-                let inv = vec![InvItem::new(InvType::Block, hash)];
-                let msg = NetworkMessage::GetData(inv);
-
-                debug!("Requesting block {} from peer {}", hash, peer_id);
-
-                if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-                    warn!("Failed to request block from peer {}: {}", peer_id, e);
-                    continue;
-                }
-
-                // Track the request
-                self.blocks_in_flight.write().insert(
-                    hash,
-                    BlockRequest {
-                        peer_id,
-                        _hash: hash,
-                        requested_at: Instant::now(),
-                    },
-                );
-
+            if batch.is_empty() {
+                break;
+            }
+            if self.send_block_getdata(peer_id, &batch).await {
                 self.peer_block_requests
                     .write()
                     .entry(peer_id)
                     .or_default()
-                    .insert(hash);
+                    .extend(batch);
             }
         }
+    }
+
+    /// Ask `peer_id` for `hashes` in one getdata (split at MAX_INV_SIZE items)
+    /// and track each block on its own, so each times out and is re-requested
+    /// alone. False if the peer could not be sent to.
+    async fn send_block_getdata(&self, peer_id: PeerId, hashes: &[Hash256]) -> bool {
+        for chunk in hashes.chunks(crate::constants::MAX_INV_SIZE) {
+            let items = chunk
+                .iter()
+                .map(|h| InvItem::new(InvType::Block, *h))
+                .collect();
+            if let Err(e) = self
+                .peer_manager
+                .send_to_peer(peer_id, NetworkMessage::GetData(items))
+                .await
+            {
+                warn!("Failed to request blocks from peer {}: {}", peer_id, e);
+                return false;
+            }
+            debug!("Requested {} blocks from peer {}", chunk.len(), peer_id);
+            let now = Instant::now();
+            let mut in_flight = self.blocks_in_flight.write();
+            for hash in chunk {
+                in_flight.insert(
+                    *hash,
+                    BlockRequest {
+                        peer_id,
+                        _hash: *hash,
+                        requested_at: now,
+                    },
+                );
+            }
+        }
+        true
     }
 
     /// A block was accepted: it no longer needs its source
@@ -1927,53 +1948,47 @@ impl BlockSync {
     }
 
     /// Request blocks from the pending queue, at most MAX_BLOCKS_IN_TRANSIT_PER_PEER
-    /// in flight per peer: a block goes to the first of its preferred peers with
-    /// a free slot, and waits while every peer is full.
+    /// in flight per peer: a block goes to the first of its preferred peers
+    /// with a free slot, and waits while every peer is full. The blocks given to
+    /// one peer in a pass go in one getdata, in queue order (Divi Core asks for
+    /// an inv's wanted blocks in one getdata, main.cpp:584-610).
+    ///
+    /// Only peers that advertise NODE_NETWORK are chosen (Divi Core's fClient,
+    /// main.cpp:410, :1133, :1211). With no such peer connected, a block is asked
+    /// of the peer that announced it, as Divi Core answers any inv with a
+    /// getdata to its sender; a block nobody connected announced waits.
     ///
     /// Uses only actually-connected peers (via `peer_manager`) rather than the
-    /// potentially-stale `peer_heights` map. Includes a circuit breaker: if we
-    /// encounter 3 consecutive failures (no connected peers or all sends fail),
-    /// we stop processing the queue to avoid a tight spin loop. Unassigned or
-    /// dead-peer blocks will be retried the next time this method is called
-    /// (e.g., from `check_timeouts` or when a new block arrives).
+    /// potentially-stale `peer_heights` map. Blocks that cannot be sent stay
+    /// queued and are retried the next time this method is called (e.g., from
+    /// `check_timeouts` or when a new block arrives).
     async fn request_queued_blocks(&self) {
         if self.chain.is_importing() {
             return;
         }
-        let mut consecutive_failures: u32 = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        let connected = self.peer_manager.connected_peers();
+        if connected.is_empty() {
+            return;
+        }
+        let full: HashSet<PeerId> = self.peer_manager.full_history_peers().into_iter().collect();
+        let mut per_peer = self.in_flight_per_peer();
+        // Peers in the order they were first given a block, and their blocks
+        let mut order: Vec<PeerId> = Vec::new();
+        let mut batches: HashMap<PeerId, Vec<Hash256>> = HashMap::new();
+        let mut assigned: HashSet<Hash256> = HashSet::new();
 
         loop {
-            // Circuit breaker: stop after too many consecutive failures
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                let queued = self.pending_block_requests.read().len();
-                if queued > 0 {
-                    debug!(
-                        "Circuit breaker: {} consecutive send failures, {} blocks still queued — will retry later",
-                        consecutive_failures, queued
-                    );
-                }
-                break;
-            }
-
-            // Get next block to request
-            let next = {
-                let mut pending = self.pending_block_requests.write();
-                pending.pop_front()
-            };
-
+            let next = self.pending_block_requests.write().pop_front();
             let Some((hash, assigned_peer)) = next else {
                 break; // Queue empty
             };
 
-            // Double-check we don't already have it
+            // Already have it, already asked for it, or given up on it
             if self.chain.has_block(&hash).unwrap_or(false) {
                 self.block_retry.write().remove(&hash);
-                consecutive_failures = 0;
                 continue;
             }
-            if self.blocks_in_flight.read().contains_key(&hash) {
-                consecutive_failures = 0;
+            if self.blocks_in_flight.read().contains_key(&hash) || assigned.contains(&hash) {
                 continue;
             }
             if self
@@ -1982,80 +1997,59 @@ impl BlockSync {
                 .get(&hash)
                 .is_some_and(|r| r.gave_up_at.is_some())
             {
-                consecutive_failures = 0;
                 continue;
             }
 
-            let connected = self.peer_manager.connected_peers();
-            if connected.is_empty() {
-                // No connected peers at all — put the block back as unassigned
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, Self::UNASSIGNED_PEER));
-                consecutive_failures += 1;
-                continue;
-            }
-
-            let per_peer = self.in_flight_per_peer();
-            let peers_to_try: Vec<PeerId> = self
-                .order_peers_for_block(&hash, assigned_peer, connected)
+            let candidates: Vec<PeerId> = if full.is_empty() {
+                // No full peer: only the announcer, as Divi Core's inv reply
+                let announcer = self
+                    .block_retry
+                    .read()
+                    .get(&hash)
+                    .and_then(|r| r.announced_by)
+                    .unwrap_or(assigned_peer);
+                connected
+                    .iter()
+                    .copied()
+                    .filter(|p| *p == announcer && *p != Self::UNASSIGNED_PEER)
+                    .collect()
+            } else {
+                self.order_peers_for_block(&hash, assigned_peer, connected.clone())
+                    .into_iter()
+                    .filter(|p| full.contains(p))
+                    .collect()
+            };
+            let chosen = candidates
                 .into_iter()
-                .filter(|p| per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
-                .collect();
-            if peers_to_try.is_empty() {
-                // Every peer is full: wait for a free slot
+                .find(|p| per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER);
+            let Some(peer) = chosen else {
+                // Every eligible peer is full, or none is connected: wait
                 trace!(
-                    "Every peer has {} blocks in flight, waiting",
-                    MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    "No peer with a free slot for block {}; {} queued",
+                    hash,
+                    self.pending_block_requests.read().len() + 1
                 );
                 self.pending_block_requests
                     .write()
                     .push_front((hash, assigned_peer));
                 break;
-            }
-
-            // Try each peer until one succeeds
-            let item = InvItem {
-                inv_type: InvType::Block,
-                hash,
             };
-            let mut sent = false;
-
-            for &try_peer in &peers_to_try {
-                let msg = NetworkMessage::GetData(vec![item.clone()]);
-                match self.peer_manager.send_to_peer(try_peer, msg).await {
-                    Ok(()) => {
-                        debug!("Requested block {} from peer {}", hash, try_peer);
-                        self.blocks_in_flight.write().insert(
-                            hash,
-                            BlockRequest {
-                                peer_id: try_peer,
-                                _hash: hash,
-                                requested_at: Instant::now(),
-                            },
-                        );
-                        sent = true;
-                        consecutive_failures = 0;
-                        break;
-                    }
-                    Err(_) => {
-                        // This peer failed, try the next one
-                        continue;
-                    }
-                }
+            *per_peer.entry(peer).or_default() += 1;
+            assigned.insert(hash);
+            if !batches.contains_key(&peer) {
+                order.push(peer);
             }
+            batches.entry(peer).or_default().push(hash);
+        }
 
-            if !sent {
-                // All peers failed — put block back as unassigned for later retry
-                debug!(
-                    "All {} peers failed for block {}, re-queuing as unassigned",
-                    peers_to_try.len(),
-                    hash
-                );
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, Self::UNASSIGNED_PEER));
-                consecutive_failures += 1;
+        for peer in order {
+            let hashes = batches.remove(&peer).unwrap_or_default();
+            if !self.send_block_getdata(peer, &hashes).await {
+                // The peer went away: queue its blocks again for any peer
+                let mut pending = self.pending_block_requests.write();
+                for hash in hashes {
+                    pending.push_back((hash, Self::UNASSIGNED_PEER));
+                }
             }
         }
     }
@@ -3291,12 +3285,17 @@ mod tests {
         let mut rxs = HashMap::new();
         for id in 1..=n {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
+            // Test peers serve every block (NODE_NETWORK), as Divi Core peers do
+            let stats: Arc<crate::peer::LivePeerStats> = Default::default();
+            stats
+                .services
+                .store(crate::constants::services::NODE_NETWORK, Ordering::Relaxed);
             sync.peer_manager.insert_test_peer(PeerHandle {
                 id,
                 addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
                 tx,
                 inbound: false,
-                stats: Default::default(),
+                stats,
             });
             rxs.insert(id, rx);
         }
@@ -3448,6 +3447,148 @@ mod tests {
         sync.request_blocks().await;
         assert_eq!(in_flight_peer(&sync, &hashes[32]), Some(peer));
         assert!(in_flight_peer(&sync, &hashes[33]).is_none());
+    }
+
+    /// Every block getdata each peer received since the last drain, as hash lists
+    fn block_getdatas(
+        rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+    ) -> HashMap<PeerId, Vec<Vec<Hash256>>> {
+        let mut got: HashMap<PeerId, Vec<Vec<Hash256>>> = HashMap::new();
+        for (&id, rx) in rxs.iter_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                if let NetworkMessage::GetData(items) = msg {
+                    let blocks: Vec<Hash256> = items
+                        .iter()
+                        .filter(|i| i.inv_type == InvType::Block)
+                        .map(|i| i.hash)
+                        .collect();
+                    if !blocks.is_empty() {
+                        got.entry(id).or_default().push(blocks);
+                    }
+                }
+            }
+        }
+        got
+    }
+
+    /// A peer that keeps only recent blocks (no NODE_NETWORK), as a pruning node
+    fn make_pruned(sync: &BlockSync, peer: PeerId) {
+        let stats = sync.peer_manager.test_peer_stats(peer).unwrap();
+        stats.services.store(
+            crate::constants::services::NODE_NETWORK_LIMITED,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Divi Core asks for every wanted block of a pass in one getdata
+    /// (main.cpp:584-610 for an inv; main.cpp:1205-1224 collects vGetData and
+    /// sends it once), in chain order
+    #[tokio::test]
+    async fn blocks_for_one_peer_go_in_one_getdata() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes = queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        for peer in [1, 2] {
+            let msgs = &got[&peer];
+            assert_eq!(msgs.len(), 1, "peer {peer}: {} getdata", msgs.len());
+            assert_eq!(msgs[0].len(), 16, "peer {peer}");
+            // consecutive blocks in chain order
+            let start = hashes.iter().position(|h| *h == msgs[0][0]).unwrap();
+            assert_eq!(msgs[0], hashes[start..start + 16].to_vec(), "peer {peer}");
+        }
+
+        // Announced blocks: one getdata per peer as well
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let announced: Vec<Hash256> = (0..40u8)
+            .map(|i| Hash256::from_bytes([i + 1; 32]))
+            .collect();
+        for h in &announced {
+            sync.pending_block_requests.write().push_back((*h, 1));
+        }
+        sync.request_queued_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        assert_eq!(got[&1], vec![announced[..16].to_vec()]);
+        assert_eq!(got[&2], vec![announced[16..32].to_vec()]);
+    }
+
+    /// Divi Core does not download from a peer without NODE_NETWORK (fClient,
+    /// main.cpp:410 and :1211), nor start a sync with one (main.cpp:1133)
+    #[tokio::test]
+    async fn peers_without_node_network_get_no_block_requests() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        make_pruned(&sync, 3);
+        queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        assert!(!got.contains_key(&3), "{:?}", got.keys());
+        assert_eq!(in_flight_per_peer(&sync).values().sum::<usize>(), 32);
+
+        // Blocks the pruned peer announced go to the full peers
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        make_pruned(&sync, 3);
+        for i in 0..10u8 {
+            sync.pending_block_requests
+                .write()
+                .push_back((Hash256::from_bytes([i + 1; 32]), 3));
+        }
+        sync.request_queued_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        assert!(!got.contains_key(&3), "{:?}", got.keys());
+        assert_eq!(in_flight_per_peer(&sync).values().sum::<usize>(), 10);
+    }
+
+    /// With no full peer at all, a block is still asked of the peer that
+    /// announced it, as Divi Core answers any inv (main.cpp:584-610)
+    #[tokio::test]
+    async fn announcer_without_node_network_is_asked_when_no_full_peer_is_connected() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        make_pruned(&sync, 1);
+        make_pruned(&sync, 2);
+        let hash = Hash256::from_bytes([0x42; 32]);
+        sync.pending_block_requests.write().push_back((hash, 2));
+        sync.request_queued_blocks().await;
+        assert_eq!(block_getdatas(&mut rxs).get(&2), Some(&vec![vec![hash]]));
+        // and a block nobody announced waits
+        let other = Hash256::from_bytes([0x43; 32]);
+        sync.pending_block_requests
+            .write()
+            .push_back((other, BlockSync::UNASSIGNED_PEER));
+        sync.request_queued_blocks().await;
+        assert!(in_flight_peer(&sync, &other).is_none());
+    }
+
+    /// A batched getdata answered in part: each missing block times out and is
+    /// re-requested on its own
+    #[tokio::test]
+    async fn a_partly_answered_batch_is_re_requested_per_block() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes = queue_headers(&sync, 4);
+        sync.request_blocks().await;
+        let first = block_getdatas(&mut rxs);
+        let (peer, batch) = first
+            .iter()
+            .next()
+            .map(|(p, m)| (*p, m[0].clone()))
+            .unwrap();
+        assert_eq!(batch.len(), 4);
+        // two of the four arrive; the other two time out
+        for h in &hashes[..2] {
+            sync.blocks_in_flight.write().remove(h);
+            sync.pending_headers.write().pop_front();
+        }
+        for h in &hashes[2..] {
+            expire_request(&sync, h);
+        }
+        sync.check_timeouts().await;
+        for h in &hashes[2..] {
+            let now = in_flight_peer(&sync, h).expect("re-requested");
+            assert_ne!(now, peer, "not from the peer that failed it");
+            assert_eq!(sync.block_retry.read()[h].attempts, 1);
+        }
+        for h in &hashes[..2] {
+            assert!(in_flight_peer(&sync, h).is_none());
+        }
     }
 
     #[tokio::test]

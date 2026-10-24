@@ -107,3 +107,45 @@ fn rpc_stop_exits_the_daemon() {
         "RPC still answering after stop"
     );
 }
+
+/// A taken RPC port stops irondivid with a failing exit status, as divid's
+/// "Unable to bind any endpoint for RPC server" InitError does: a service
+/// manager or script must not take it for a clean stop
+#[test]
+fn rpc_port_in_use_exits_with_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let rpc_port = taken.local_addr().unwrap().port();
+    let p2p_port = free_port();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
+        .arg("--regtest")
+        .arg("--datadir")
+        .arg(dir.path())
+        .args(["--rpcport", &rpc_port.to_string()])
+        .args(["--port", &p2p_port.to_string()])
+        .args(["--bind", "127.0.0.1", "--staking=false"])
+        .args(["--rpcuser", "test", "--rpcpassword", "test"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn irondivid");
+    let mut node = KillOnDrop(child);
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = node.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "irondivid still running 120 s after its RPC port was found taken"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        !status.success(),
+        "irondivid exit status with its RPC port taken: {status}"
+    );
+    drop(taken);
+}
