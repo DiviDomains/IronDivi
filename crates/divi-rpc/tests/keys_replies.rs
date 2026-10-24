@@ -229,8 +229,12 @@ fn bip38decrypt_adds_the_key_as_divid() {
     let encrypted = divi_crypto::bip38_encrypt(&key, "pw", true, REGTEST_P2PKH).unwrap();
     let address = divi_wallet::Address::p2pkh(&secret.public_key(), Network::Regtest);
 
+    // Compared without printing the reply, which could hold a key
     let r = n.ok("bip38decrypt", vec![json!(encrypted), json!("pw")]);
-    assert_eq!(r, json!({"Address": address.to_string()}));
+    assert!(
+        r == json!({"Address": address.to_string()}),
+        "bip38decrypt did not answer the key's address"
+    );
     assert!(n.wallet.is_mine(&address) && !n.wallet.is_watch_only(&address));
 
     let wallet_error = |text: &str| (-4, text.to_string());
