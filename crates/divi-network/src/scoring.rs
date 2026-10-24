@@ -95,6 +95,9 @@ pub struct PeerStats {
     pub connection_failures: u32,
     /// Last connection attempt
     pub last_connect_attempt: Option<Instant>,
+    /// Whitelisted (Divi Core -whitelist, -whitebind): never disconnected or
+    /// banned for misbehaviour
+    pub whitelisted: bool,
 }
 
 impl PeerStats {
@@ -116,6 +119,7 @@ impl PeerStats {
             last_activity: now,
             connection_failures: 0,
             last_connect_attempt: None,
+            whitelisted: false,
         }
     }
 
@@ -286,6 +290,13 @@ impl PeerScoring {
         debug!("Registered peer {} ({})", peer_id, ip);
     }
 
+    /// Mark a registered peer whitelisted
+    pub fn set_whitelisted(&self, peer_id: PeerId) {
+        if let Some(stats) = self.stats.write().get_mut(&peer_id) {
+            stats.whitelisted = true;
+        }
+    }
+
     /// Unregister a peer
     pub fn unregister_peer(&self, peer_id: PeerId) {
         self.stats.write().remove(&peer_id);
@@ -333,7 +344,7 @@ impl PeerScoring {
             return MisbehaviourOutcome::Scored;
         }
         let threshold = *self.ban_threshold.read();
-        let (ip, crossed) = {
+        let (ip, crossed, whitelisted) = {
             let mut stats = self.stats.write();
             let Some(peer_stats) = stats.get_mut(&peer_id) else {
                 return MisbehaviourOutcome::Scored;
@@ -353,9 +364,17 @@ impl PeerScoring {
                     peer_id, peer_stats.ip, before, after, cause
                 );
             }
-            (peer_stats.ip, crossed)
+            (peer_stats.ip, crossed, peer_stats.whitelisted)
         };
         if !crossed {
+            return MisbehaviourOutcome::Scored;
+        }
+        if whitelisted {
+            // CheckForBanAndDisconnectIfNotWhitelisted (main.cpp:1111-1114)
+            warn!(
+                "Warning: not punishing whitelisted peer {} ({})!",
+                peer_id, ip
+            );
             return MisbehaviourOutcome::Scored;
         }
         if ip.is_loopback() || ip.is_unspecified() {

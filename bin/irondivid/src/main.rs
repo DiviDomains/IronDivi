@@ -317,8 +317,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "upgradewallet",
     "upnp",
     "vault_min",
-    "whitebind",
-    "whitelist",
     "zmqpubhashblock",
     "zmqpubhashtx",
     "zmqpubrawblock",
@@ -398,9 +396,9 @@ fn host_and_port(value: &str) -> (String, Option<u16>) {
 fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let mut s = settings.clone();
     let regtest = config.network.network_type == NetworkType::Regtest;
-    // -bind means listening; -connect means no DNS seeds and no listening;
-    // -proxy means no listening (net.cpp:1672-1700)
-    if s.is_set("bind") {
+    // -bind or -whitebind means listening; -connect means no DNS seeds and
+    // no listening; -proxy means no listening (net.cpp:1672-1700)
+    if s.is_set("bind") || s.is_set("whitebind") {
         s.soft_set_bool("listen", true);
     }
     if !s.get_multi("connect").is_empty() {
@@ -483,6 +481,22 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if s.is_set("listen") {
         config.p2p.listen = Some(s.get_bool("listen", true));
+    }
+    // -whitelist networks; one that is not a network stops the start
+    // (net.cpp:1749-1755)
+    for net in s.get_multi("whitelist") {
+        if divi_network::Subnet::parse(net).is_none() {
+            anyhow::bail!("Invalid netmask specified in -whitelist: '{}'", net);
+        }
+        config.p2p.whitelist.push(net.clone());
+    }
+    // -whitebind: a numeric address with its port; with -whitebind and no
+    // -bind, only the -whitebind addresses are listened on (net.cpp:1808-1823)
+    for raw in s.get_multi("whitebind") {
+        config.p2p.white_bind.push(white_bind_address(raw)?);
+    }
+    if s.is_set("whitebind") && !s.is_set("bind") {
+        config.p2p.listen_on_addr = false;
     }
     let connect = s.get_multi("connect");
     if !connect.is_empty() {
@@ -665,6 +679,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "expire",
         "blocknotify",
         "walletnotify",
+        "whitelist",
+        "whitebind",
     ];
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
@@ -682,6 +698,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
                     "-masternode={}: irondivid does not run as a masternode; remove the masternode= line to start it",
                     settings.get("masternode").unwrap_or("")
                 );
+            } else if k == "checklevel" {
+                // divid refuses any -checklevel: it always checks at level 4
+                // (init.cpp:782-784)
+                anyhow::bail!(
+                    "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
+                );
             } else {
                 warn!(
                     "Option -{} is not supported by irondivid; ignored",
@@ -693,6 +715,25 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A -whitebind value as Divi Core's Lookup reads it without name lookup:
+/// `ip:port` or `[ipv6]:port`; the port must be given (net.cpp:1815-1821)
+fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
+    let text = text.trim();
+    let addr = text.parse::<std::net::SocketAddr>().ok().or_else(|| {
+        text.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, 0))
+    });
+    match addr {
+        None => anyhow::bail!("Cannot resolve -whitebind address: '{}'", text),
+        Some(a) if a.port() == 0 => {
+            anyhow::bail!("Need to specify a port with -whitebind: '{}'", text)
+        }
+        Some(a) => Ok(a),
+    }
 }
 
 /// A start the node refuses for a stated reason gives that reason alone, as
@@ -1456,6 +1497,11 @@ async fn run_daemon(
             core_files::lock_masternode_collateral(w, &config.data_dir);
             w.set_vault_mode(config.vault);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
+            // -walletnotify, before the wallet catches up with the chain
+            // (init.cpp:1199, before the rescan at :1242)
+            if let Some(cmd) = config.walletnotify.clone() {
+                w.set_tx_listener(Arc::new(move |txid| run_notify(&cmd, &txid.to_string())));
+            }
         }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
@@ -1820,11 +1866,6 @@ async fn run_daemon(
     });
     let wallet_for_shutdown = wallet.clone();
 
-    // -walletnotify (-blocknotify is set before the node starts)
-    if let (Some(cmd), Some(wallet)) = (config.walletnotify.clone(), wallet.clone()) {
-        spawn_wallet_notify(wallet, cmd);
-    }
-
     if !config.rpc.enabled {
         // -server=0: no RPC server, the node runs until it is told to stop
         info!("RPC server disabled (-server=0)");
@@ -2062,31 +2103,6 @@ fn run_notify(cmd: &str, value: &str) {
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
     chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
-}
-
-/// -walletnotify: run the command each time a wallet transaction is added or
-/// updated (in the mempool, then in a block), with its txid
-/// (init.cpp:1132-1143)
-fn spawn_wallet_notify(wallet: Arc<WalletDb>, cmd: String) {
-    tokio::spawn(async move {
-        let state = |w: &WalletDb| -> std::collections::HashMap<divi_primitives::hash::Hash256, Option<u32>> {
-            w.get_transactions(None)
-                .into_iter()
-                .map(|t| (t.txid, t.block_height))
-                .collect()
-        };
-        let mut known = state(&wallet);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let now = state(&wallet);
-            for (txid, height) in &now {
-                if known.get(txid) != Some(height) {
-                    run_notify(&cmd, &txid.to_string());
-                }
-            }
-            known = now;
-        }
-    });
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
@@ -2869,6 +2885,58 @@ mod config_format_tests {
         .unwrap();
         assert_eq!(a.maxlogsize, Some(2));
         assert_eq!(a.chain_mode(), ChainMode::Divi);
+    }
+
+    /// -whitelist and -whitebind as divid reads them: a bad network or a
+    /// -whitebind without a port stops the start, and -whitebind alone means
+    /// listening only there (net.cpp:1749-1755, :1808-1823)
+    #[test]
+    fn whitelist_and_whitebind_are_divid_s() {
+        let c = cfg(
+            "regtest=1\nwhitelist=10.0.0.0/8\nwhitelist=192.168.1.5\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.whitelist, ["10.0.0.0/8", "192.168.1.5"]);
+        assert!(c.p2p.listen_on_addr && c.p2p.white_bind.is_empty());
+
+        let err = cfg("regtest=1\nwhitelist=not-a-net\n", &[]).unwrap_err();
+        assert_eq!(
+            format!("{:#}", err),
+            "Invalid netmask specified in -whitelist: 'not-a-net'"
+        );
+
+        let c = cfg(
+            "regtest=1\nconnect=127.0.0.1:1\nwhitebind=127.0.0.1:53999\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.white_bind, ["127.0.0.1:53999".parse().unwrap()]);
+        assert!(
+            !c.p2p.listen_on_addr,
+            "-whitebind alone also listens elsewhere"
+        );
+        assert_eq!(c.p2p.listen, Some(true), "-whitebind turns listening on");
+        let c = cfg(
+            "regtest=1\nbind=127.0.0.1\nwhitebind=127.0.0.1:53999\n",
+            &[],
+        )
+        .unwrap();
+        assert!(c.p2p.listen_on_addr);
+
+        for (bad, why) in [
+            (
+                "127.0.0.1",
+                "Need to specify a port with -whitebind: '127.0.0.1'",
+            ),
+            (
+                "localhost:53999",
+                "Cannot resolve -whitebind address: 'localhost:53999'",
+            ),
+        ] {
+            let err = cfg(&format!("regtest=1\nwhitebind={bad}\n"), &[]).unwrap_err();
+            assert_eq!(format!("{:#}", err), why);
+        }
     }
 }
 

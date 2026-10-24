@@ -25,7 +25,7 @@ use divi_primitives::hash::Hash256;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -55,6 +55,11 @@ pub struct PeerManagerConfig {
     /// `static_peers` are `-connect` peers (dialled by address and port, as
     /// Divi Core dials `-connect`) rather than `-addnode` and built-in peers
     pub connect_only: bool,
+    /// Inbound peers from these networks are whitelisted (Divi Core -whitelist)
+    pub whitelist: Vec<crate::Subnet>,
+    /// More listen addresses; every peer coming in on one is whitelisted
+    /// (Divi Core -whitebind)
+    pub white_listen: Vec<SocketAddr>,
 }
 
 /// The check Divi Core makes before a dial (net.cpp OpenNetworkConnection,
@@ -130,6 +135,8 @@ impl Default for PeerManagerConfig {
             default_port: 51472, // Mainnet P2P port
             proxy: None,
             connect_only: false,
+            whitelist: Vec::new(),
+            white_listen: Vec::new(),
         }
     }
 }
@@ -178,6 +185,8 @@ pub struct PeerManager {
     /// Tracks (consecutive_failures, last_attempt_time) so that repeatedly-failing
     /// peers are skipped for exponentially longer periods (up to 30 minutes).
     static_peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
+    /// Inbound connections accepted whose handshake has not finished yet
+    inbound_handshaking: AtomicUsize,
 }
 
 impl PeerManager {
@@ -201,6 +210,7 @@ impl PeerManager {
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
+            inbound_handshaking: AtomicUsize::new(0),
         })
     }
 
@@ -440,6 +450,13 @@ impl PeerManager {
         self.peers.read().values().filter(|p| p.inbound).count()
     }
 
+    /// Whether another inbound connection may be taken: fewer inbound peers,
+    /// counting those still in their handshake, than `max_inbound`
+    pub fn has_inbound_room(&self) -> bool {
+        self.inbound_count() + self.inbound_handshaking.load(Ordering::SeqCst)
+            < self.config.max_inbound
+    }
+
     /// Get count of outbound connections
     pub fn outbound_count(&self) -> usize {
         self.peers.read().values().filter(|p| !p.inbound).count()
@@ -499,17 +516,26 @@ impl PeerManager {
     pub async fn start(self: Arc<Self>) -> Result<(), NetworkError> {
         info!("Starting peer manager");
 
-        // Start listener for inbound connections
-        let listener_handle = if let Some(listen_addr) = self.config.listen_addr {
-            let self_clone = Arc::clone(&self);
-            Some(tokio::spawn(async move {
-                if let Err(e) = self_clone.run_listener(listen_addr).await {
-                    error!("Listener error: {}", e);
-                }
-            }))
-        } else {
-            None
-        };
+        // Start listeners for inbound connections: the listen address, and
+        // each -whitebind address, whose peers are whitelisted
+        let listeners: Vec<(SocketAddr, bool)> = self
+            .config
+            .listen_addr
+            .iter()
+            .map(|a| (*a, false))
+            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
+            .collect();
+        let listener_handles: Vec<_> = listeners
+            .into_iter()
+            .map(|(listen_addr, white)| {
+                let self_clone = Arc::clone(&self);
+                tokio::spawn(async move {
+                    if let Err(e) = self_clone.run_listener(listen_addr, white).await {
+                        error!("Listener error: {}", e);
+                    }
+                })
+            })
+            .collect();
 
         // Connect to static peers first (they report accurate heights)
         let rule = self.static_rule();
@@ -537,8 +563,8 @@ impl PeerManager {
         // Fill remaining slots from DNS seeds
         Arc::clone(&self).discover_peers().await;
 
-        // Wait for listener (if started)
-        if let Some(handle) = listener_handle {
+        // Wait for the listeners (if started)
+        for handle in listener_handles {
             let _ = handle.await;
         }
 
@@ -599,7 +625,11 @@ impl PeerManager {
     }
 
     /// Run the inbound connection listener
-    async fn run_listener(self: Arc<Self>, addr: SocketAddr) -> Result<(), NetworkError> {
+    async fn run_listener(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        white: bool,
+    ) -> Result<(), NetworkError> {
         let listener = TcpListener::bind(addr).await?;
         info!("Listening for connections on {}", addr);
 
@@ -617,17 +647,22 @@ impl PeerManager {
                         Ok((stream, peer_addr)) => {
                             info!("Accepted connection from {}", peer_addr);
 
-                            // Check connection limit
-                            if self.peers.read().len() >= self.config.max_inbound + self.config.max_outbound {
-                                warn!("Connection limit reached, rejecting {}", peer_addr);
+                            // Divi Core counts every inbound connection, handshake
+                            // done or not, against -maxconnections less the outbound
+                            // slots; outbound peers do not use them (net.cpp:744-759)
+                            if !self.has_inbound_room() {
+                                warn!("Connection from {} dropped (full)", peer_addr);
                                 continue;
                             }
 
+                            self.inbound_handshaking.fetch_add(1, Ordering::SeqCst);
                             let self_clone = Arc::clone(&self);
                             tokio::spawn(async move {
-                                if let Err(e) = self_clone.handle_inbound(stream).await {
+                                let pm = Arc::clone(&self_clone);
+                                if let Err(e) = self_clone.handle_inbound(stream, white).await {
                                     debug!("Inbound connection error from {}: {}", peer_addr, e);
                                 }
+                                pm.inbound_handshaking.fetch_sub(1, Ordering::SeqCst);
                             });
                         }
                         Err(e) => {
@@ -763,14 +798,30 @@ impl PeerManager {
         Ok(peer_id)
     }
 
+    /// Whether an inbound peer from `ip` is whitelisted: it came in on a
+    /// -whitebind address or is in a -whitelist network (net.cpp:742)
+    fn whitelisted_inbound(&self, ip: IpAddr, white_listener: bool) -> bool {
+        white_listener || self.config.whitelist.iter().any(|n| n.contains(ip))
+    }
+
+    /// Whether a connected peer is whitelisted
+    pub fn is_whitelisted(&self, peer_id: PeerId) -> bool {
+        self.scoring
+            .get_stats(peer_id)
+            .is_some_and(|s| s.whitelisted)
+    }
+
     /// Handle an inbound connection
     async fn handle_inbound(
         self: Arc<Self>,
         stream: tokio::net::TcpStream,
+        white_listener: bool,
     ) -> Result<PeerId, NetworkError> {
-        // Get peer address and check if banned
+        // Get peer address and check if banned; a whitelisted peer comes in
+        // although its address is banned (net.cpp:760)
         let peer_addr = stream.peer_addr()?;
-        if self.is_banned(&peer_addr.ip()) {
+        let whitelisted = self.whitelisted_inbound(peer_addr.ip(), white_listener);
+        if !whitelisted && self.is_banned(&peer_addr.ip()) {
             warn!("Rejecting connection from banned IP {}", peer_addr.ip());
             return Err(NetworkError::ConnectionRefused(format!(
                 "{} is banned",
@@ -799,6 +850,9 @@ impl PeerManager {
 
         // Register with scoring system
         self.scoring.register_peer(peer_id, addr.ip());
+        if whitelisted {
+            self.scoring.set_whitelisted(peer_id);
+        }
 
         // Store the handle
         self.peers.write().insert(peer_id, handle);
@@ -1440,6 +1494,34 @@ mod tests {
     fn test_can_connect_outbound_when_empty() {
         let pm = PeerManager::new(PeerManagerConfig::default());
         assert!(pm.can_connect_outbound());
+    }
+
+    /// Divi Core's inbound limit (net.cpp:757): inbound peers only, so
+    /// outbound peers never take an inbound slot
+    #[test]
+    fn inbound_room_counts_inbound_peers_only() {
+        let pm = PeerManager::new(PeerManagerConfig {
+            max_inbound: 1,
+            ..PeerManagerConfig::default()
+        });
+        for i in 0..16 {
+            pm.insert_test_peer(test_handle(&format!("10.0.{}.1:51476", i), false));
+        }
+        assert!(
+            pm.has_inbound_room(),
+            "outbound peers used the inbound slot"
+        );
+        pm.insert_test_peer(test_handle("10.1.0.1:40000", true));
+        assert!(
+            !pm.has_inbound_room(),
+            "a second inbound peer would be taken"
+        );
+
+        let none = PeerManager::new(PeerManagerConfig {
+            max_inbound: 0,
+            ..PeerManagerConfig::default()
+        });
+        assert!(!none.has_inbound_room());
     }
 
     #[test]
