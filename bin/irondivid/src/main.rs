@@ -282,7 +282,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "forcednsseed",
     "forcestart",
     "genproclimit",
-    "hdseed",
     "keypool",
     "listenonion",
     "litemode",
@@ -298,8 +297,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "mining",
     "mnconf",
     "mnconflock",
-    "mnemonic",
-    "mnemonicpassphrase",
     "monthlybackups",
     "onion",
     "onlynet",
@@ -337,6 +334,9 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
     "conf",
+    "hdseed",
+    "mnemonic",
+    "mnemonicpassphrase",
     "datadir",
     "testnet",
     "regtest",
@@ -969,24 +969,56 @@ fn print_banner(config: &NodeConfig) {
     info!("========================================");
 }
 
+/// What a new wallet is made from: Divi Core's -mnemonic, -mnemonicpassphrase
+/// and -hdseed, from the command line or divi.conf (wallet.cpp:2286-2304),
+/// else the WALLET_MNEMONIC, WALLET_MNEMONIC_PASSPHRASE and WALLET_HDSEED
+/// environment variables. Never logged.
+#[derive(Default)]
+struct WalletSeed {
+    mnemonic: Option<String>,
+    passphrase: Option<String>,
+    hdseed: Option<String>,
+}
+
+impl WalletSeed {
+    fn from_settings(settings: &Settings) -> Self {
+        let get = |key: &str| settings.get(key).map(str::to_string);
+        WalletSeed {
+            mnemonic: get("mnemonic"),
+            passphrase: get("mnemonicpassphrase"),
+            hdseed: get("hdseed"),
+        }
+    }
+}
+
 /// Load or create wallet
 fn load_or_create_wallet(
     wallet_path: &PathBuf,
     network: WalletNetwork,
     chain_mode: ChainMode,
+    seed: WalletSeed,
 ) -> Result<Arc<WalletDb>> {
-    let restoring = std::env::var("WALLET_MNEMONIC").ok();
-    // Divi Core's -mnemonicpassphrase: the BIP39 passphrase of the seed
-    let passphrase = std::env::var("WALLET_MNEMONIC_PASSPHRASE").ok();
-    // Divi Core's -hdseed: a hex seed, preferred over a mnemonic (init.cpp:947-951)
-    let seed = std::env::var("WALLET_HDSEED").ok();
+    let env = |name: &str| std::env::var(name).ok();
+    // An empty mnemonic asks for a new one, as in Core
+    let mnemonic = seed
+        .mnemonic
+        .or_else(|| env("WALLET_MNEMONIC"))
+        .filter(|m| !m.trim().is_empty());
+    let passphrase = seed
+        .passphrase
+        .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
+    if passphrase.as_ref().is_some_and(|p| p.len() > 256) {
+        anyhow::bail!("Mnemonic passphrase is too long, must be at most 256 characters");
+    }
+    // -hdseed is preferred over a mnemonic (init.cpp:947-951)
+    let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
         wallet_path,
         network,
         chain_mode,
-        restoring,
+        mnemonic,
         passphrase,
-        seed,
+        hdseed,
     )
 }
 
@@ -1073,21 +1105,19 @@ fn load_or_restore_wallet_with_seed(
         Some(hex_seed) => match hex::decode(hex_seed.trim()) {
             Ok(bytes) if !bytes.is_empty() => Some(bytes),
             _ => {
-                warn!("WALLET_HDSEED is not a hex seed; not using it");
+                warn!("-hdseed is not a hex seed; not using it");
                 None
             }
         },
         None => None,
     };
     if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
-        warn!(
-            "WALLET_HDSEED and WALLET_MNEMONIC/WALLET_MNEMONIC_PASSPHRASE together: using the seed"
-        );
+        warn!("-hdseed and -mnemonic/-mnemonicpassphrase together: using the seed");
     }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
     let hd_wallet = if let Some(ref seed) = seed {
-        info!("Restoring wallet from the WALLET_HDSEED environment variable");
+        info!("Restoring wallet from -hdseed");
         HdWallet::from_seed(seed, chain_mode)
             .with_context(|| "Failed to restore HD wallet from seed")?
     } else if let Some(ref mnemonic) = restoring {
@@ -1102,7 +1132,7 @@ fn load_or_restore_wallet_with_seed(
             })
             .unwrap_or(chain_mode);
         info!(
-            "Restoring wallet from WALLET_MNEMONIC environment variable (chain_mode={:?})",
+            "Restoring wallet from -mnemonic (chain_mode={:?})",
             restore_chain_mode
         );
         HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode)
@@ -1111,7 +1141,7 @@ fn load_or_restore_wallet_with_seed(
         HdWallet::new(chain_mode).with_context(|| "Failed to generate HD wallet")?
     };
     if passphrase.is_some() && restoring.is_none() {
-        warn!("WALLET_MNEMONIC_PASSPHRASE is used only with WALLET_MNEMONIC");
+        warn!("-mnemonicpassphrase is used only with -mnemonic");
     }
 
     // Never log the mnemonic: logs go to journald and log files, which are
@@ -1204,6 +1234,7 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
 async fn run_daemon(
     config: NodeConfig,
     wallet_path: Option<PathBuf>,
+    wallet_seed: WalletSeed,
     disable_wallet: bool,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -1263,6 +1294,7 @@ async fn run_daemon(
             &wallet_dir,
             wallet_network,
             config.network.chain_mode,
+            wallet_seed,
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
@@ -2391,10 +2423,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         let _ = shutdown_tx_clone.send(());
     });
 
+    let wallet_seed = WalletSeed::from_settings(&args.settings);
+
     // Run the daemon
     if let Err(e) = run_daemon(
         config,
         args.wallet,
+        wallet_seed,
         args.disablewallet,
         shutdown_tx,
         shutdown_rx,
@@ -3231,7 +3266,12 @@ mod wallet_move_tests {
             "WALLET_MNEMONIC",
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         );
-        let wallet = load_or_create_wallet(&path, WalletNetwork::Regtest, ChainMode::Divi);
+        let wallet = load_or_create_wallet(
+            &path,
+            WalletNetwork::Regtest,
+            ChainMode::Divi,
+            WalletSeed::default(),
+        );
         std::env::remove_var("WALLET_HDSEED");
         std::env::remove_var("WALLET_MNEMONIC");
         let wallet = wallet.unwrap();
