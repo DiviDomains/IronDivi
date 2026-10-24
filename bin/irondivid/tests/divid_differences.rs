@@ -11,22 +11,15 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::free_port;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-/// A port nothing listens on now, picked by the kernel: fixed ports collide
-/// with other nodes and with other runs of these tests on the same host
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// One JSON-RPC call on 127.0.0.1 with test:test; None until the server is up
 fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {

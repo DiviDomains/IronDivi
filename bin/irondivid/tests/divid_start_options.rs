@@ -12,6 +12,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::free_port;
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
@@ -24,7 +27,7 @@ use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
 use divi_wallet::{HdWallet, Network, WalletDb};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -32,14 +35,6 @@ use std::time::{Duration, Instant};
 
 const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon about";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// The HTTP status and JSON body of one call to `ip:port`; None if the
 /// connection fails

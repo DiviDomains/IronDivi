@@ -19,6 +19,27 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// A port nothing listens on now, for a fake node started a moment later.
+///
+/// Below the kernel's ephemeral range (32768-60999 on Linux, 49152-65535 on
+/// macOS), which every outgoing connection on the host draws from: a port
+/// from 127.0.0.1:0 can be taken by one of them before it is bound. Picked at
+/// random so that test processes running at the same time do not try the
+/// same ports in the same order.
+fn free_port() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let seed = std::collections::hash_map::RandomState::new();
+    for i in 0u32..1000 {
+        let mut h = seed.build_hasher();
+        h.write_u32(i);
+        let port = 20000 + (h.finish() % 12768) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in 20000-32767");
+}
+
 /// A reply of the fake node
 #[derive(Clone)]
 struct Reply {
@@ -69,11 +90,7 @@ impl Fake {
 
     /// Start listening on a free port only after `after`
     fn start_later(replies: Vec<Reply>, after: Duration) -> Fake {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let log = requests.clone();
         std::thread::spawn(move || {
