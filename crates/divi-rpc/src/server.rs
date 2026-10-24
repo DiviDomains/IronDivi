@@ -1134,8 +1134,11 @@ impl RpcServer {
     /// Serve one HTTP JSON-RPC body as Divi Core does (rpcserver.cpp
     /// HTTPReq_JSONRPC): a request object or a batch array; returns the HTTP
     /// status and the reply text.
-    pub fn handle_http_body(&self, body: &str) -> (StatusCode, String) {
+    pub fn handle_http_body(&self, body_text: &str) -> (StatusCode, String) {
         use serde_json::Value;
+        // divi-cli's byte escapes of non-ASCII text, read as divid reads them
+        let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
+        let body = body.as_deref().unwrap_or(body_text);
         let request: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
