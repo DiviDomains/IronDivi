@@ -1,0 +1,20 @@
+getaddressbalance <address>|<addresses> (only_vaults)
+
+Returns the balance for an address(es) (requires addressindex to be enabled).
+
+Arguments:
+address: (string) The base58check encoded address
+"addresses": (JSON object) An object with field '"addresses"' holding array
+               of base58check encoded addresses
+"only_vaults" (boolean, optional) Only return utxos spendable by the specified addresses
+
+Result:
+{
+  "balance"  (string) The current balance in satoshis
+  "received"  (string) The total number of satoshis received (including change)
+}
+
+Examples:
+> divi-cli getaddressbalance '"diviaddress"'
+> divi-cli getaddressbalance '{"addresses": ["diviaddress"]}'
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressbalance", "params": [{"addresses": ["diviaddress"]}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

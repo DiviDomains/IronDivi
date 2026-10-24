@@ -1,0 +1,26 @@
+getaddressutxos <address>|<addresses> (only_vaults)
+
+Returns all unspent outputs for an address (requires addressindex to be enabled).
+
+Arguments:
+address: (string) The base58check encoded address
+"addresses": (optional JSON object) An object with fields:
+               (1) '"addresses"' (required) array of base58check encoded addresses
+               (2) '"chainInfo"' (optional field) bool flag to include chain info
+"only_vaults" (boolean, optional) Only return utxos spendable by the specified addresses
+
+Result
+[
+  {
+    "address"  (string) The address base58check encoded
+    "txid"  (string) The output txid
+    "height"  (number) The block height
+    "outputIndex"  (number) The output index
+    "script"  (strin) The script hex encoded
+    "satoshis"  (number) The number of satoshis of the output
+  }
+]
+
+Examples:
+> divi-cli getaddressutxos '{"addresses": ["diviaddress"]}'
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressutxos", "params": [{"addresses": ["diviaddress"]}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

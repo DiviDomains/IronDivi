@@ -700,8 +700,14 @@ impl RpcServer {
         let method = params.get_str(0).filter(|m| !m.is_empty());
 
         if let Some(method) = method {
-            if let Some(text) = crate::core_help::text(method) {
-                return Ok(serde_json::Value::String(text.to_string()));
+            // A Divi Core call: its text in this wallet state, or Core's "unknown
+            // command" where divid gives none (rpcserver.cpp:256-258, :283-285)
+            if crate::core_help::is_core_call(method) {
+                let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+                let text = crate::core_help::text_for(method, encrypted)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("help: unknown command: {method}"));
+                return Ok(serde_json::Value::String(text));
             }
             // Return help for specific method
             let help = match method {
@@ -1726,7 +1732,7 @@ mod tests {
         let response = server.handle_request(request);
         assert!(response.result.is_some());
         let help = response.result.unwrap();
-        assert!(help.as_str().unwrap().contains("longest blockchain"));
+        assert_eq!(help.as_str(), crate::core_help::text("getblockcount"));
     }
 
     #[test]
