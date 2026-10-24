@@ -1596,6 +1596,40 @@ impl Chain {
         Ok(None)
     }
 
+    /// A transaction outside the mempool, as Divi Core's GetTransaction finds
+    /// it (TransactionDiskAccessor.cpp:63-110): with the transaction index on,
+    /// only through the index; with it off, in the active block at the height
+    /// one of its unspent outputs records, by txid or bare txid. Without the
+    /// index a transaction whose outputs are all spent is not found.
+    pub fn locate_transaction(
+        &self,
+        txid: &Hash256,
+    ) -> Result<Option<(Transaction, TxLocation)>, StorageError> {
+        if self.tx_index.is_some() {
+            return self.get_transaction_with_location(txid);
+        }
+        // `nHeight > 0`: the genesis block's transactions are never found
+        let Some(height) = self.db.spendable_output_height_of(txid)?.filter(|&h| h > 0) else {
+            return Ok(None);
+        };
+        let Some(index) = self.get_block_index_by_height(height)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.get_block(&index.hash)? else {
+            return Ok(None);
+        };
+        Ok(block
+            .transactions
+            .iter()
+            .position(|tx| tx.txid() == *txid || crate::txindex::bare_txid(tx) == *txid)
+            .map(|i| {
+                (
+                    block.transactions[i].clone(),
+                    TxLocation::new(index.hash, i as u32),
+                )
+            }))
+    }
+
     /// Calculate the median time past for a block index
     ///
     /// Returns the median timestamp of the last 11 blocks (or fewer if near genesis).

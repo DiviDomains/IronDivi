@@ -2131,8 +2131,9 @@ impl WalletRpc {
 
     /// getrawtransaction - Get raw transaction data
     ///
-    /// Looks in the mempool first, then the transaction index, as Divi Core's
-    /// GetTransaction does.
+    /// Looks in the mempool first, then the transaction index or, without
+    /// one, the block an unspent output of it records, as Divi Core's
+    /// GetTransaction does (TransactionDiskAccessor.cpp:49-110).
     pub fn get_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let txid_str = params
             .get_str(0)
@@ -2169,7 +2170,7 @@ impl WalletRpc {
             Some(tx) => (tx, None),
             None => {
                 let (tx, location) = chain
-                    .get_transaction_with_location(&txid)
+                    .locate_transaction(&txid)
                     .map_err(|e| {
                         RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
                     })?

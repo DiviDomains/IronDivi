@@ -571,6 +571,14 @@ impl ChainDatabase {
     /// `CCoins::IsPruned` is false: OP_META outputs never count). RocksDB holds
     /// every UTXO write, so a prefix scan sees them all.
     pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
+        Ok(self.spendable_output_height_of(txid)?.is_some())
+    }
+
+    /// The height of the block holding `txid`, from any of its unspent
+    /// spendable outputs: what Divi Core's coins entry for it records
+    /// (`CCoins::nHeight`); None once every such output is spent. Read from
+    /// the database, which every UTXO change is written to.
+    pub fn spendable_output_height_of(&self, txid: &Hash256) -> Result<Option<u32>, StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).unwrap();
         let mut prefix = Vec::with_capacity(33);
         prefix.push(b'u');
@@ -584,11 +592,12 @@ impl ChainDatabase {
             if !key.starts_with(&prefix) {
                 break;
             }
-            if !Utxo::from_bytes(&value)?.script_pubkey.is_op_return() {
-                return Ok(true);
+            let utxo = Utxo::from_bytes(&value)?;
+            if !utxo.script_pubkey.is_op_return() {
+                return Ok(Some(utxo.height));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Get a UTXO directly from database (bypassing cache)
