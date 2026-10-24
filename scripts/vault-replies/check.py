@@ -43,8 +43,6 @@ START_TIMEOUT = 120
 KNOWN = {
     "*getcoinavailability: fields divid lacks":
         "total_vaults and vaults, kept as extra fields (divid getcoinavailability, rpcwallet.cpp:818-987, has Vaulted, Stakable, Spendable)",
-    "reclaimvaultfunds*: reply":
-        "open: rpc-left: divid answers the txid as a string (rpcwallet.cpp:1189), irondivid an object {amount, fee, txid}",
     "removevault with tx_hash: reply":
         "by design: irondivid still takes a second argument for older IronDivi callers (its help says so); divid takes exactly one (rpcwallet.cpp:1194-1201)",
     "after removevault: manager listtransactions * 100 0 true":
