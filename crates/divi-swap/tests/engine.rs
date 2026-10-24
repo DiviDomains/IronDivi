@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use divi_swap::api::{AcceptRequest, Direction, LockNotice, Offer, Quote};
 use divi_swap::htlc::ScriptVersion;
-use divi_swap::mock::{MockBackend, MockChain};
+use divi_swap::mock::{MockBackend, MockChain, TxCounts};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Maker, Outpoint, Profile,
@@ -77,6 +77,8 @@ struct H {
     maker_id: String,
     taker_id: String,
     restarts: u32,
+    /// Restart at every checkpoint instead of once at an armed crash state.
+    restart_every: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -159,6 +161,7 @@ impl H {
             maker_id: String::new(),
             taker_id: String::new(),
             restarts: 0,
+            restart_every: false,
         };
         h.maker = build_maker(&h, store.clone());
         h.taker = Taker::new(
@@ -208,6 +211,10 @@ impl H {
 
     /// Restart once if the armed crash state has been reached.
     fn maybe_crash(&mut self, crash: Option<Crash>) {
+        if self.restart_every && !(self.maker_id.is_empty() && self.taker_id.is_empty()) {
+            self.restart();
+            return;
+        }
         if self.restarts > 0 || self.maker_id.is_empty() && self.taker_id.is_empty() {
             return;
         }
@@ -620,6 +627,181 @@ both!(
     crash_at_every_taker_state,
     rev_crash_at_every_taker_state,
     crash_taker_body
+);
+
+/// Everything a finished swap left behind: both terminal states, every key's balance on
+/// both chains, the funding / claim / refund txs each chain accepted, and how often each
+/// side selected coins for its lock.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    maker: SwapState,
+    taker: TakerState,
+    balances: [u64; 4],
+    taker_leg_txs: TxCounts,
+    maker_leg_txs: TxCounts,
+    coin_selections: (u64, u64),
+}
+
+impl H {
+    fn outcome(&self) -> Outcome {
+        Outcome {
+            maker: self.maker_state(),
+            taker: self.taker_state(),
+            balances: [
+                self.divi.balance(&self.mdivi.pubkey()).0,
+                self.btc.balance(&self.mbtc.pubkey()).0,
+                self.divi.balance(&self.tdivi.pubkey()).0,
+                self.btc.balance(&self.tbtc.pubkey()).0,
+            ],
+            taker_leg_txs: self.tl_chain().tx_counts(),
+            maker_leg_txs: self.ml_chain().tx_counts(),
+            coin_selections: (self.m_ml().funding_calls(), self.t_tl().funding_calls()),
+        }
+    }
+
+    /// Restart once more after the swap finished and keep both engines running: a
+    /// finished swap must not broadcast anything again.
+    async fn restart_and_settle(&mut self) {
+        self.restart();
+        for _ in 0..3 {
+            let _ = self.maker.tick().await;
+            let view = self.maker.view(&self.maker_id).unwrap();
+            let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
+            self.mine_all(1);
+        }
+    }
+}
+
+/// Restart points: every state each side persists, terminal ones included.
+const MAKER_RESTART_POINTS: [SwapState; 10] = [
+    SwapState::Accepted,
+    SwapState::TakerLockSeen,
+    SwapState::TakerLockConfirmed,
+    SwapState::MakerLocked,
+    SwapState::MakerLockConfirmed,
+    SwapState::TakerClaimed,
+    SwapState::MakerClaimed,
+    SwapState::MakerRefundable,
+    SwapState::MakerRefunded,
+    SwapState::Done,
+];
+const TAKER_RESTART_POINTS: [TakerState; 7] = [
+    TakerState::Prepared,
+    TakerState::Accepted,
+    TakerState::Locked,
+    TakerState::MakerLockConfirmed,
+    TakerState::Claimed,
+    TakerState::Refunded,
+    TakerState::Done,
+];
+
+/// Restart safety, the whole matrix: for the happy and the refund scenario, an in-process
+/// restart (both engines dropped, the same DB file reopened, the same mock chains) right
+/// after each state either side persists, plus one run that restarts at every checkpoint.
+/// Each run must end exactly like the run with no restart: same terminal states, same
+/// balances to the sat, one funding per leg, exactly one claim (happy) or one refund
+/// (refund) per leg and nothing else, one coin selection per side. A second restart after
+/// the swap finished must change nothing.
+async fn restart_matrix_body(dir: Direction) {
+    use SwapState as M;
+    use TakerState as T;
+    for scn in [Scn::Happy, Scn::Refund] {
+        let mut base = H::with(dir);
+        base.run(scn, None, &[]).await;
+        assert_atomic(&base, scn);
+        base.restart_and_settle().await;
+        let want = base.outcome();
+        let happy = u64::from(scn == Scn::Happy);
+        let leg = TxCounts {
+            funds: 1,
+            claims: happy,
+            refunds: 1 - happy,
+        };
+        assert_eq!(
+            (want.taker_leg_txs, want.maker_leg_txs),
+            (leg, leg),
+            "{scn:?}"
+        );
+        assert_eq!(want.coin_selections, (1, 1), "{scn:?}");
+        assert_eq!((want.maker, want.taker), (M::Done, T::Done), "{scn:?}");
+
+        let crashes = MAKER_RESTART_POINTS
+            .iter()
+            .map(|s| Crash::Maker(*s))
+            .chain(TAKER_RESTART_POINTS.iter().map(|s| Crash::Taker(*s)));
+        let mut hit = Vec::new();
+        for crash in crashes {
+            let mut h = H::with(dir);
+            h.run(scn, Some(crash), &[]).await;
+            if h.restarts == 1 {
+                hit.push(format!("{crash:?}"));
+            }
+            assert_atomic(&h, scn);
+            h.restart_and_settle().await;
+            assert_eq!(
+                h.outcome(),
+                want,
+                "{dir:?} {scn:?}: restart after {crash:?}"
+            );
+        }
+
+        let mut h = H::with(dir);
+        h.restart_every = true;
+        h.run(scn, None, &[]).await;
+        assert!(h.restarts >= 10, "only {} restarts", h.restarts);
+        h.restart_and_settle().await;
+        assert_eq!(
+            h.outcome(),
+            want,
+            "{dir:?} {scn:?}: restart at every checkpoint"
+        );
+
+        // Every state the scenario passes through was a restart point.
+        let path: Vec<Crash> = match scn {
+            Scn::Happy => [M::TakerClaimed, M::MakerClaimed]
+                .iter()
+                .map(|s| Crash::Maker(*s))
+                .chain(
+                    [T::MakerLockConfirmed, T::Claimed]
+                        .iter()
+                        .map(|s| Crash::Taker(*s)),
+                )
+                .collect(),
+            Scn::Refund => [M::MakerRefundable, M::MakerRefunded]
+                .iter()
+                .map(|s| Crash::Maker(*s))
+                .chain([T::Refunded].iter().map(|s| Crash::Taker(*s)))
+                .collect(),
+        };
+        let common = [
+            Crash::Maker(M::Accepted),
+            Crash::Maker(M::TakerLockSeen),
+            Crash::Maker(M::TakerLockConfirmed),
+            Crash::Maker(M::MakerLocked),
+            Crash::Maker(M::MakerLockConfirmed),
+            Crash::Maker(M::Done),
+            Crash::Taker(T::Prepared),
+            Crash::Taker(T::Accepted),
+            Crash::Taker(T::Locked),
+            Crash::Taker(T::Done),
+        ];
+        for c in common.iter().chain(path.iter()) {
+            assert!(
+                hit.contains(&format!("{c:?}")),
+                "{dir:?} {scn:?}: restart after {c:?} never triggered (hit: {hit:?})"
+            );
+        }
+        eprintln!(
+            "{dir:?} {scn:?}: {} restart points triggered, every-checkpoint run restarted {} times",
+            hit.len(),
+            h.restarts
+        );
+    }
+}
+both!(
+    restart_matrix_same_outcome,
+    rev_restart_matrix_same_outcome,
+    restart_matrix_body
 );
 
 const MAKER_STATES: [SwapState; 9] = [

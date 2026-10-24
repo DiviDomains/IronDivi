@@ -70,6 +70,14 @@ struct ChainState {
     blind: HashSet<Txid>,
 }
 
+/// How many funding, claim and refund txs a [`MockChain`] has accepted (mempool or mined).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TxCounts {
+    pub funds: u64,
+    pub claims: u64,
+    pub refunds: u64,
+}
+
 /// A simulated chain shared by several backends.
 #[derive(Debug, Clone)]
 pub struct MockChain {
@@ -185,6 +193,20 @@ impl MockChain {
     /// Current height.
     pub fn height(&self) -> u64 {
         self.state.lock().height
+    }
+
+    /// Every tx this chain has accepted, by kind. A rebroadcast of a known tx is not counted
+    /// twice, so a second funding or a claim plus a refund shows up here.
+    pub fn tx_counts(&self) -> TxCounts {
+        let mut c = TxCounts::default();
+        for (tx, _) in self.state.lock().txs.values() {
+            match tx {
+                MockTx::Fund { .. } => c.funds += 1,
+                MockTx::Claim { .. } => c.claims += 1,
+                MockTx::Refund { .. } => c.refunds += 1,
+            }
+        }
+        c
     }
 
     /// Spendable balance of a backend's key.
