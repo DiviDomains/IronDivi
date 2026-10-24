@@ -303,8 +303,18 @@ pub struct ChainTip {
     pub status: ChainTipStatus,
 }
 
-/// A listener for a new chain tip (see `Chain::set_tip_listener`)
+/// A listener for a new chain tip (see `Chain::add_tip_listener`)
 pub type TipListener = Arc<dyn Fn(&BlockIndex) + Send + Sync>;
+
+/// A block the active chain took or gave up (see `Chain::add_block_listener`)
+#[derive(Debug, Clone)]
+pub enum ChainEvent {
+    Connected(Block),
+    Disconnected(Block),
+}
+
+/// A listener for connected and disconnected blocks
+pub type BlockListener = Arc<dyn Fn(&ChainEvent) + Send + Sync>;
 
 /// Chain state
 pub struct Chain {
@@ -318,7 +328,14 @@ pub struct Chain {
     tip: RwLock<Option<BlockIndex>>,
     /// Called with the new tip when a chain operation ends with another tip
     /// than it started with (Divi Core's UpdatedBlockTip, for -blocknotify)
-    tip_listener: RwLock<Option<TipListener>>,
+    tip_listeners: RwLock<Vec<TipListener>>,
+    /// Called with each block connected or disconnected, in order, when the
+    /// chain operation ends and before the tip listeners
+    block_listeners: RwLock<Vec<BlockListener>>,
+    /// Blocks connected or disconnected by the running operation
+    pending_events: Mutex<Vec<ChainEvent>>,
+    /// Whether this start wrote the genesis block (a new data directory)
+    created_genesis: std::sync::atomic::AtomicBool,
     /// Best known block index (block with the highest chain work we've seen).
     /// Used by `activate_best_chain` to detect when a side-chain has accumulated
     /// more work than the current tip and a reorganization is needed.
@@ -392,7 +409,10 @@ impl Chain {
             tx_index: None,
             search_index: None,
             tip: RwLock::new(None),
-            tip_listener: RwLock::new(None),
+            tip_listeners: RwLock::new(Vec::new()),
+            block_listeners: RwLock::new(Vec::new()),
+            pending_events: Mutex::new(Vec::new()),
+            created_genesis: std::sync::atomic::AtomicBool::new(false),
             best_known_block: RwLock::new(None),
             params,
             chain_lock: Mutex::new(()),
@@ -414,6 +434,9 @@ impl Chain {
                 ));
             }
             chain.init_genesis()?;
+            chain
+                .created_genesis
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         } else if chain.db.get_metadata(HEIGHT_INDEX_REPAIR_KEY)?.is_none() {
             // One-time repair of height -> hash entries written for side-chain
@@ -697,6 +720,7 @@ impl Chain {
                 (Some(search), Some(updates)) => search.add_to_batch(wb, updates, false),
                 _ => Ok(()),
             })?;
+        self.record_event(|| ChainEvent::Connected(block.clone()));
         stop_point!("block connected");
         Ok(())
     }
@@ -1721,18 +1745,50 @@ impl Chain {
 
     /// Call `listener` with the new tip whenever an operation on the chain
     /// ends with a different tip
-    pub fn set_tip_listener(&self, listener: TipListener) {
-        *self.tip_listener.write() = Some(listener);
+    pub fn add_tip_listener(&self, listener: TipListener) {
+        self.tip_listeners.write().push(listener);
     }
 
-    /// Run `op`, then tell the tip listener if the tip moved
+    /// Call `listener` with each block the active chain connects or
+    /// disconnects, in the order the chain did it, when the operation ends
+    pub fn add_block_listener(&self, listener: BlockListener) {
+        self.block_listeners.write().push(listener);
+    }
+
+    /// Whether this start wrote the genesis block, as on a new data directory
+    pub fn created_genesis(&self) -> bool {
+        self.created_genesis
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keep `event` for the block listeners, if there are any
+    fn record_event(&self, event: impl FnOnce() -> ChainEvent) {
+        if !self.block_listeners.read().is_empty() {
+            self.pending_events.lock().push(event());
+        }
+    }
+
+    /// Run `op`, then give the block listeners the blocks it connected and
+    /// disconnected, and tell the tip listeners if the tip moved
     fn notifying_tip<T>(&self, op: impl FnOnce() -> T) -> T {
         let before = self.tip.read().as_ref().map(|t| t.hash);
         let result = op();
+        let events = std::mem::take(&mut *self.pending_events.lock());
+        if !events.is_empty() {
+            let listeners = self.block_listeners.read().clone();
+            for event in &events {
+                for listener in &listeners {
+                    listener(event);
+                }
+            }
+        }
         let after = self.tip.read().clone();
         if after.as_ref().map(|t| t.hash) != before {
-            if let (Some(tip), Some(listener)) = (after, self.tip_listener.read().clone()) {
-                listener(&tip);
+            if let Some(tip) = after {
+                let listeners = self.tip_listeners.read().clone();
+                for listener in &listeners {
+                    listener(&tip);
+                }
             }
         }
         result
@@ -2526,17 +2582,21 @@ impl Chain {
     /// `invalidateblock` RPC does. If the block is on the active chain the tip
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
-    pub fn invalidate_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+    pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
         self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
     }
 
     /// Mark the block failed and disconnect it and the blocks above it; with
-    /// `activate`, then move to the best valid chain left
+    /// `activate`, then move to the best valid chain left. Returns the
+    /// transactions of the disconnected blocks, coinbases and coinstakes left
+    /// out, from the lowest block up, for the mempool to take back as Divi
+    /// Core's disconnectTip does (ChainTipManager.cpp disconnectTip:
+    /// "Resurrect mempool transactions from the disconnected block").
     fn invalidate_block_unnotified(
         &self,
         hash: &Hash256,
         activate: bool,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Vec<Transaction>, StorageError> {
         let _chain_guard = self.chain_lock.lock();
         let target = self
             .db
@@ -2550,6 +2610,7 @@ impl Chain {
         }
         self.mark_block_failed(hash)?;
 
+        let mut disconnected: Vec<Vec<Transaction>> = Vec::new();
         if target.is_on_main_chain() {
             if self.db.has_utxo_cache() {
                 self.db.flush_utxo_cache()?;
@@ -2570,6 +2631,14 @@ impl Chain {
                     .unwrap_or_else(|| tip.clone());
                 self.disconnect_block(&block, &mut stored)?;
                 self.mark_block_failed(&tip.hash)?;
+                disconnected.push(
+                    block
+                        .transactions
+                        .iter()
+                        .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
+                        .cloned()
+                        .collect(),
+                );
                 let parent = self
                     .db
                     .get_block_index(&block.header.prev_block)?
@@ -2589,7 +2658,7 @@ impl Chain {
         if activate {
             self.activate_best_valid_chain()?;
         }
-        Ok(())
+        Ok(disconnected.into_iter().rev().flatten().collect())
     }
 
     /// Record that a node now runs on this database. Returns whether the run
@@ -2673,11 +2742,15 @@ impl Chain {
     /// clear the invalid mark again without moving the tip, as Core's
     /// reconsiderBlock (ChainExtensionService.cpp:662-689) does there. The
     /// tip stays at the block's parent until another block is connected.
-    pub fn reverse_block_transactions(&self, hash: &Hash256) -> Result<(), StorageError> {
+    pub fn reverse_block_transactions(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Vec<Transaction>, StorageError> {
         self.notifying_tip(|| {
-            self.invalidate_block_unnotified(hash, false)?;
+            let disconnected = self.invalidate_block_unnotified(hash, false)?;
             let _chain_guard = self.chain_lock.lock();
-            self.clear_failed_marks(hash)
+            self.clear_failed_marks(hash)?;
+            Ok(disconnected)
         })
     }
 
@@ -2927,6 +3000,7 @@ impl Chain {
             "Disconnected block {} at height {}",
             index.hash, index.height
         );
+        self.record_event(|| ChainEvent::Disconnected(block.clone()));
         stop_point!("block disconnected");
         Ok(())
     }

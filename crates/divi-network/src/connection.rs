@@ -56,8 +56,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for reading a message
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Interval for proactive keepalive pings (must be < C++ node's 60s inactivity timeout)
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Divi Core's PING_INTERVAL (Node.cpp:1045): a keepalive ping goes out this
+/// long after the last ping was sent, when none is unanswered
+const PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
+
+/// How often the connection checks whether a keepalive ping is due (Divi Core
+/// checks on each pass of its send loop, about every 100 ms)
+const PING_CHECK: Duration = Duration::from_secs(1);
 
 /// Channel buffer size for outgoing messages
 const OUTBOUND_BUFFER: usize = 100;
@@ -543,10 +548,11 @@ impl Connection {
         let codec = DiviCodec::new(magic);
         let mut framed = FramedRead::new(reader, codec);
 
-        // Proactive keepalive timer to prevent C++ node's inactivity timeout (~60s).
-        // Its first tick fires at once, so the round trip is measured right after the
-        // handshake (as C++ queues a ping for every new peer) instead of 30 s later.
-        let mut ping_timer = tokio::time::interval(PING_INTERVAL);
+        // Keepalive pings as Divi Core's MaybeSendPing: the first check comes at
+        // once, so a ping goes out right after the handshake, then one each
+        // PING_INTERVAL after the last ping sent (a `ping` call included)
+        let mut ping_timer = tokio::time::interval(PING_CHECK);
+        let mut last_ping_sent: Option<std::time::Instant> = None;
 
         loop {
             info.publish(&stats);
@@ -573,6 +579,7 @@ impl Connection {
                             let nonce = rand::random();
                             info.ping_nonce = Some(nonce);
                             info.ping_time = Some(std::time::Instant::now());
+                            last_ping_sent = info.ping_time;
                             NetworkMessage::Ping(nonce)
                         }
                         other => other,
@@ -589,11 +596,12 @@ impl Connection {
                         info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
                         break;
                     }
-                    // Like Divi Core, no new keepalive ping while one is unanswered
-                    if info.ping_nonce.is_none() {
+                    let now = std::time::Instant::now();
+                    if keepalive_ping_due(info.ping_nonce.is_some(), last_ping_sent, now) {
                         let nonce = rand::random();
                         info.ping_nonce = Some(nonce);
-                        info.ping_time = Some(std::time::Instant::now());
+                        info.ping_time = Some(now);
+                        last_ping_sent = Some(now);
                         if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
                             error!("Failed to send keepalive ping to {}: {}", info.addr, e);
                             break;
@@ -655,19 +663,11 @@ impl Connection {
                             break;
                         }
                         Err(_) => {
+                            // A quiet peer gets no extra ping: the keepalive above
+                            // runs on its own interval, as in Divi Core
                             if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
                                 info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
                                 break;
-                            }
-                            if info.ping_nonce.is_none() {
-                                debug!("Read timeout from {}, sending ping", info.addr);
-                                let nonce = rand::random();
-                                info.ping_nonce = Some(nonce);
-                                info.ping_time = Some(std::time::Instant::now());
-                                if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
-                                    error!("Failed to send ping to {}: {}", info.addr, e);
-                                    break;
-                                }
                             }
                         }
                     }
@@ -843,9 +843,45 @@ fn inactivity_exceeded(
         || ping_sent.is_some_and(|sent| now.saturating_duration_since(sent) > TIMEOUT_INTERVAL)
 }
 
+/// Divi Core MaybeSendPing (Node.cpp:1043-1069): a keepalive ping is due when
+/// none is unanswered and none was sent in the last PING_INTERVAL
+fn keepalive_ping_due(
+    ping_unanswered: bool,
+    last_ping_sent: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    !ping_unanswered
+        && last_ping_sent.is_none_or(|sent| now.saturating_duration_since(sent) >= PING_INTERVAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Divi Core's PING_INTERVAL: 2 minutes (Node.cpp:1045)
+    #[test]
+    fn ping_interval_is_two_minutes() {
+        assert_eq!(PING_INTERVAL, Duration::from_secs(120));
+    }
+
+    /// A keepalive ping 2 minutes after the last ping sent, and not while one
+    /// is unanswered (Divi Core MaybeSendPing, Node.cpp:1043-1069)
+    #[test]
+    fn keepalive_pings_two_minutes_apart() {
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        assert!(
+            keepalive_ping_due(false, None, start),
+            "the first one at once"
+        );
+        assert!(!keepalive_ping_due(false, Some(start), at(30)));
+        assert!(!keepalive_ping_due(false, Some(start), at(119)));
+        assert!(keepalive_ping_due(false, Some(start), at(120)));
+        assert!(
+            !keepalive_ping_due(true, Some(start), at(300)),
+            "one unanswered"
+        );
+    }
 
     /// Divi Core's -timeout default: 5000 ms
     #[test]

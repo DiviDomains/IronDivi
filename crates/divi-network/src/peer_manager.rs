@@ -175,8 +175,9 @@ pub struct PeerManager {
     local_nonces: crate::connection::LocalNonces,
     /// The node's own addresses (Divi Core mapLocalHost)
     local_addresses: RwLock<Arc<crate::local::LocalAddresses>>,
-    /// Manually added nodes (via addnode RPC)
-    added_nodes: RwLock<HashSet<SocketAddr>>,
+    /// Added nodes, in the order they were added: -addnode, then the addnode
+    /// RPC (Divi Core's vAddedNodes list, net.cpp:1218)
+    added_nodes: RwLock<Vec<SocketAddr>>,
     /// Addresses currently being connected to (connection attempt in progress)
     connecting_addrs: RwLock<HashSet<SocketAddr>>,
     /// Total bytes sent across all peers (cumulative since node start)
@@ -195,11 +196,14 @@ pub struct PeerManager {
     prebound: parking_lot::Mutex<Option<Vec<(SocketAddr, bool, TcpListener)>>>,
     /// Inbound connections accepted whose handshake has not finished yet
     inbound_handshaking: AtomicUsize,
+    /// Addresses of other nodes learnt from peers (Divi Core's addrman)
+    address_book: Arc<crate::addrbook::AddressBook>,
 }
 
 impl PeerManager {
     /// Create a new peer manager
     pub fn new(config: PeerManagerConfig) -> Arc<Self> {
+        let config_magic = config.magic;
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -213,7 +217,7 @@ impl PeerManager {
             scoring: PeerScoring::new(),
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
-            added_nodes: RwLock::new(HashSet::new()),
+            added_nodes: RwLock::new(Vec::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
@@ -221,7 +225,37 @@ impl PeerManager {
             height_source: RwLock::new(None),
             prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
+            address_book: Arc::new(crate::addrbook::AddressBook::new(config_magic)),
         })
+    }
+
+    /// The addresses learnt from peers
+    pub fn address_book(&self) -> &Arc<crate::addrbook::AddressBook> {
+        &self.address_book
+    }
+
+    /// Dial addresses learnt from peers into free outbound slots, as Divi Core
+    /// dials from its address manager (net.cpp ThreadOpenConnections); not with
+    /// -connect, which dials only its own peers
+    fn dial_learnt(self: &Arc<Self>) {
+        if self.config.connect_only || !self.can_connect_outbound() {
+            return;
+        }
+        for addr in self.address_book.candidates(self.config.max_outbound * 4) {
+            if !self.can_connect_outbound() {
+                break;
+            }
+            if self.is_banned(&addr.ip()) || !self.claim_dial(addr, DialRule::Automatic) {
+                continue;
+            }
+            debug!("Dialling learnt address {}", addr);
+            let self_clone = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = self_clone.connect_to_peer(addr).await {
+                    debug!("Failed to connect to learnt address {}: {}", addr, e);
+                }
+            });
+        }
     }
 
     /// The network magic of this peer manager's network
@@ -499,14 +533,19 @@ impl PeerManager {
         if added.contains(&addr) {
             return false; // Already added
         }
-        added.insert(addr);
+        added.push(addr);
         info!("Added node: {}", addr);
         true
     }
 
     /// Remove a manually added node
     pub fn remove_added_node(&self, addr: &SocketAddr) -> bool {
-        let removed = self.added_nodes.write().remove(addr);
+        let removed = {
+            let mut added = self.added_nodes.write();
+            let before = added.len();
+            added.retain(|a| a != addr);
+            added.len() != before
+        };
         if removed {
             info!("Removed node: {}", addr);
         }
@@ -638,7 +677,8 @@ impl PeerManager {
             let _ = handle.await;
         }
 
-        // Fill remaining slots from DNS seeds
+        // Then addresses learnt from peers, then DNS seeds
+        self.dial_learnt();
         Arc::clone(&self).discover_peers().await;
 
         // Wait for the listeners (if started)
@@ -1277,7 +1317,10 @@ impl PeerManager {
                 }
             }
 
-            // 3. Re-query DNS seeds as last resort
+            // 3. Addresses learnt from peers
+            self.dial_learnt();
+
+            // 4. Re-query DNS seeds as last resort
             if self.can_connect_outbound() && !self.config.dns_seeds.is_empty() {
                 info!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;
@@ -1468,6 +1511,27 @@ mod tests {
         let pm = PeerManager::new(PeerManagerConfig::default());
         pm.set_height(12345);
         assert_eq!(*pm.our_height.read(), 12345);
+    }
+
+    /// Divi Core keeps its added nodes as a list, in the order they were
+    /// added: the -addnode values first (net.cpp:1218), then addnode RPC
+    /// calls (rpcnet.cpp:170-185); getaddednodeinfo lists them in that order
+    #[test]
+    fn added_nodes_keep_their_order() {
+        let pm = PeerManager::new(PeerManagerConfig::default());
+        let addrs: Vec<SocketAddr> = (1..=10)
+            .map(|i| format!("10.0.0.{}:51472", 11 - i).parse().unwrap())
+            .collect();
+        for a in &addrs {
+            assert!(pm.add_node(*a));
+        }
+        let listed: Vec<SocketAddr> = pm.get_added_node_info().iter().map(|n| n.addr).collect();
+        assert_eq!(listed, addrs);
+        assert!(pm.remove_added_node(&addrs[4]));
+        let listed: Vec<SocketAddr> = pm.get_added_node_info().iter().map(|n| n.addr).collect();
+        let mut rest = addrs.clone();
+        rest.remove(4);
+        assert_eq!(listed, rest);
     }
 
     #[test]
