@@ -2070,6 +2070,14 @@ fn pid_file_path(args: &Args, data_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Divi Core removes its pid file in Shutdown, which also runs after a failed
+/// start (init.cpp:396); only a file this process wrote is removed
+fn remove_pid_file(pid_file: &std::path::Path) {
+    if std::fs::read_to_string(pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string()) {
+        let _ = std::fs::remove_file(pid_file);
+    }
+}
+
 fn main() -> Result<()> {
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match Args::try_parse_from(std::env::args()) {
@@ -2131,7 +2139,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
 
-        let pid_file = pid_file_path(&args, &data_dir);
         let log_file = data_dir.join("debug.log");
 
         eprintln!("Logging to {:?}", log_file);
@@ -2181,9 +2188,6 @@ fn main() -> Result<()> {
             // Close stdin
             libc::close(libc::STDIN_FILENO);
         }
-
-        // Write PID file
-        let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
     }
 
     #[cfg(not(unix))]
@@ -2241,6 +2245,10 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     }
 
     // Set up shutdown channel
+    // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
+    #[cfg(unix)]
+    let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
+
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
@@ -2306,14 +2314,11 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             error!("  Caused by: {}", err);
             source = err.source();
         }
+        remove_pid_file(&pid_file);
         std::process::exit(1);
     }
 
-    // Divi Core removes its pid file at a clean stop (init.cpp:396)
-    if std::fs::read_to_string(&pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string())
-    {
-        let _ = std::fs::remove_file(&pid_file);
-    }
+    remove_pid_file(&pid_file);
 
     info!("IronDivi shutdown complete");
     Ok(())
