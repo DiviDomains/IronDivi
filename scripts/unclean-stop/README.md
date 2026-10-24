@@ -32,8 +32,9 @@ One line per kill point:
 
 - `PASS <row>#<n> <what happened>`: the delay drawn, how the node came up again, where it stood, what was compared;
 - `FAIL <row>#<n> <reason>`;
+- `DIVID-OK <row>-divid#1 ...` / `DIVID-BAD <row>-divid#1 ...`: the same kill point on divid (not counted);
 - `AS CORE <row> ...` / `DIFFERS <row> ...`: the divid run of the row next to irondivid's (pass/fail, and whether
-  either needed `-reindex` to start again). A `DIFFERS` line is not counted as a failure.
+  either needed `-reindex` to start again). A `DIFFERS` line is not counted as a failure either.
 
 The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or over time).
 A kill point that is not consistent, or a node that does not start again, is a `FAIL`. A node that refuses to start

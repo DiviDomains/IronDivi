@@ -81,7 +81,7 @@ class Node:
             try:
                 return self.start_once(datadir, conf, args, wait)
             except Failed as e:
-                if "bind" not in str(e).lower() or attempt == 5:
+                if not re.search(r"bind|already in use", str(e).lower()) or attempt == 5:
                     raise
                 note(f"{self.name}: port busy, starting again")
                 time.sleep(3)
@@ -375,12 +375,14 @@ def copy_of(template, name):
 def kill_point(row, k, fn, delay):
     """Run one kill point; its outcome is one PASS/FAIL line"""
     t = time.time()
+    # divid's points are for comparison: their own words, not counted as FAILs
+    good, bad = ("DIVID-OK", "DIVID-BAD") if row.endswith("-divid") else ("PASS", "FAIL")
     try:
         detail = fn()
-        out("PASS", f"{row}#{k}", f"{detail} ({time.time() - t:.0f}s)")
+        out(good, f"{row}#{k}", f"{detail} ({time.time() - t:.0f}s)")
         return True, detail
     except Failed as e:
-        out("FAIL", f"{row}#{k}", f"delay={delay * 1000:.1f}ms: {str(e)[:400]}")
+        out(bad, f"{row}#{k}", f"delay={delay * 1000:.1f}ms: {str(e)[:400]}")
         for n in (V, K):
             if n.proc is not None and n.alive():
                 n.kill9()
@@ -835,9 +837,7 @@ def reorg_point(node, k, d, W, L):
         trig = "after 'Disconnecting'" if by_log else "after addnode"
         return (f"delay={delay * 1000:.0f}ms {trig}; reorg {a}->{b} blocks; restart={how}; "
                 f"{where}, UTXO set as clean; synced to {L.name} h{u[0]}")
-    r = kill_point(f"reorg-kill{'-divid' if node.core else ''}", k, run, delay)
-    join(W, L)
-    return r
+    return kill_point(f"reorg-kill{'-divid' if node.core else ''}", k, run, delay)
 
 
 def reorg_rows():
@@ -847,13 +847,20 @@ def reorg_rows():
     d = copy_of(TMPL, "r2-irondivid")
     results = []
     W, L = C1, C2
-    for k in range(1, KILLS + 1):
-        results.append(reorg_point(V, k, d, W, L))
-        W, L = L, W
+    core = (False, "not run: the miners did not join")
+    try:
+        for k in range(1, KILLS + 1):
+            results.append(reorg_point(V, k, d, W, L))
+            join(W, L)
+            W, L = L, W
+        dk = copy_of(TMPL_C, "r2-divid")
+        core = reorg_point(K, 1, dk, W, L)
+        done_with(dk, core)
+    except Failed as e:
+        # Without two miners on one chain the next points cannot be set up
+        out("FAIL", "reorg-setup", str(e)[:300])
+        results.append((False, str(e)))
     done_with(d, (all(ok for ok, _ in results), ""))
-    dk = copy_of(TMPL_C, "r2-divid")
-    core = reorg_point(K, 1, dk, W, L)
-    done_with(dk, core)
     return results, core
 
 
