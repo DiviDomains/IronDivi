@@ -824,6 +824,12 @@ impl PeerManager {
         self.peers.write().insert(handle.id, handle);
     }
 
+    /// Drop a test peer, as a disconnect does
+    #[cfg(test)]
+    pub(crate) fn remove_test_peer(&self, id: PeerId) {
+        self.peers.write().remove(&id);
+    }
+
     /// The live stats of a test peer (tests set its services)
     #[cfg(test)]
     pub(crate) fn test_peer_stats(&self, id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {

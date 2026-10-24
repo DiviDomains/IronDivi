@@ -706,9 +706,21 @@ impl BlockSync {
         }
     }
 
-    /// Select the best peer for syncing
+    /// Select the best peer for syncing.
+    ///
+    /// Only a peer that advertises NODE_NETWORK can be chosen: Divi Core starts
+    /// a sync only with a peer that is not fClient (main.cpp:1133, fClient set
+    /// at main.cpp:410), and with none such it syncs with nobody. Among them
+    /// irondivid prefers a peer at the best known height, else the highest.
     fn select_sync_peer(&self) -> Option<PeerId> {
-        let heights = self.peer_heights.read();
+        let full: HashSet<PeerId> = self.peer_manager.full_history_peers().into_iter().collect();
+        let heights: HashMap<PeerId, u32> = self
+            .peer_heights
+            .read()
+            .iter()
+            .filter(|(id, _)| full.contains(id))
+            .map(|(&id, &h)| (id, h))
+            .collect();
         let best_height = *self.best_peer_height.read();
 
         // Debug: log peer_heights state
@@ -746,7 +758,7 @@ impl BlockSync {
 
         if peer.is_none() && heights.is_empty() {
             warn!(
-                "select_sync_peer: peer_heights is EMPTY! best_peer_height={}",
+                "select_sync_peer: no connected peer with NODE_NETWORK (best_peer_height={})",
                 best_height
             );
         }
@@ -2283,12 +2295,14 @@ impl BlockSync {
         let current_sync = *self.sync_peer.read();
         *self.sync_peer.write() = None;
 
-        // Try to find a peer that's NOT the current sync peer
+        // Try to find a peer that's NOT the current sync peer, with NODE_NETWORK
         let alt_peer = {
+            let full: HashSet<PeerId> =
+                self.peer_manager.full_history_peers().into_iter().collect();
             let peer_heights = self.peer_heights.read();
             peer_heights
                 .iter()
-                .filter(|(&id, _)| Some(id) != current_sync)
+                .filter(|(&id, _)| Some(id) != current_sync && full.contains(&id))
                 .max_by_key(|(_, &h)| h)
                 .map(|(&id, _)| id)
         };
@@ -2410,7 +2424,8 @@ mod tests {
         // height peer when no peer has height >= best_peer_height.
         // This can happen when best_peer_height is updated from inv announcements
         // but peer_heights only has the initial heights from version messages.
-        let (sync, _dir) = create_test_sync();
+        // Peers with NODE_NETWORK, the only ones divid syncs from
+        let (sync, _rxs, _dir) = sync_with_peers(3);
 
         // Add peers with initial heights
         sync.update_peer_height(1, 1000);
@@ -2436,7 +2451,8 @@ mod tests {
 
     #[test]
     fn test_select_sync_peer_exact_match() {
-        let (sync, _dir) = create_test_sync();
+        // Peers with NODE_NETWORK, the only ones divid syncs from
+        let (sync, _rxs, _dir) = sync_with_peers(3);
 
         sync.update_peer_height(1, 1000);
         sync.update_peer_height(2, 1500);
@@ -2589,7 +2605,8 @@ mod tests {
 
     #[test]
     fn test_select_sync_peer_prefers_higher() {
-        let (sync, _dir) = create_test_sync();
+        // Peers with NODE_NETWORK, the only ones divid syncs from
+        let (sync, _rxs, _dir) = sync_with_peers(3);
 
         sync.update_peer_height(1, 500);
         sync.update_peer_height(2, 1000);
@@ -3589,6 +3606,80 @@ mod tests {
         for h in &hashes[..2] {
             assert!(in_flight_peer(&sync, h).is_none());
         }
+    }
+
+    /// getblocks sent to each peer since the last drain
+    fn getblocks_recipients(
+        rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+    ) -> Vec<PeerId> {
+        let mut got = Vec::new();
+        for (&id, rx) in rxs.iter_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                if matches!(
+                    msg,
+                    NetworkMessage::GetBlocks(_) | NetworkMessage::GetHeaders(_)
+                ) {
+                    got.push(id);
+                }
+            }
+        }
+        got.sort_unstable();
+        got
+    }
+
+    /// Divi Core starts a sync (getblocks) only with a peer that advertises
+    /// NODE_NETWORK (main.cpp:1133, fClient set at main.cpp:410)
+    #[tokio::test]
+    async fn sync_peer_is_never_a_peer_without_node_network() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        make_pruned(&sync, 1);
+        sync.update_peer_height(1, 500);
+        sync.update_peer_height(2, 400);
+        assert_eq!(sync.select_sync_peer(), Some(2));
+        sync.request_headers().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![2]);
+        assert_eq!(*sync.sync_peer.read(), Some(2));
+    }
+
+    /// With no NODE_NETWORK peer there is no sync peer and nothing is sent
+    #[tokio::test]
+    async fn no_sync_peer_when_no_peer_has_node_network() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        make_pruned(&sync, 1);
+        make_pruned(&sync, 2);
+        sync.update_peer_height(1, 500);
+        sync.update_peer_height(2, 400);
+        assert_eq!(sync.select_sync_peer(), None);
+        sync.request_headers().await;
+        assert!(getblocks_recipients(&mut rxs).is_empty());
+        assert_eq!(*sync.sync_peer.read(), None);
+    }
+
+    /// When the sync peer disconnects, the next sync goes to another
+    /// NODE_NETWORK peer (Divi Core: CNodeState::Finalize drops it from the
+    /// syncing count, NodeState.cpp:34-36, so main.cpp:1133-1141 starts anew),
+    /// never to a client-only one
+    #[tokio::test]
+    async fn after_the_sync_peer_disconnects_only_a_full_peer_takes_over() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        make_pruned(&sync, 3);
+        sync.update_peer_height(1, 500);
+        sync.update_peer_height(2, 450);
+        sync.update_peer_height(3, 900);
+        sync.request_headers().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+        sync.remove_peer(1);
+        sync.peer_manager.remove_test_peer(1);
+        sync.request_headers().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![2]);
+        sync.remove_peer(2);
+        sync.peer_manager.remove_test_peer(2);
+        sync.request_headers().await;
+        assert!(
+            getblocks_recipients(&mut rxs).is_empty(),
+            "only the client-only peer is left"
+        );
+        assert_eq!(*sync.sync_peer.read(), None);
     }
 
     #[tokio::test]
