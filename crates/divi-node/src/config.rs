@@ -201,7 +201,7 @@ pub struct NetworkConfig {
     /// Magic bytes for network messages
     pub magic: [u8; 4],
 
-    /// Protocol version
+    /// Protocol version sent and reported (Divi Core's, or -protocolversion)
     pub protocol_version: u32,
 
     /// Minimum supported protocol version
@@ -237,7 +237,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Mainnet,
                 chain_mode,
                 magic: [0xdf, 0xa0, 0x8d, 0x8f],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::divi::MAINNET
                     .iter()
@@ -253,7 +253,7 @@ impl NetworkConfig {
                 chain_mode,
                 // 2026-04-20 relaunch (PrivateDivi Core 21de13166, chainparams.cpp:172-175)
                 magic: [0x70, 0xd2, 0x76, 0x11],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::privatedivi::MAINNET
                     .iter()
@@ -288,7 +288,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Testnet,
                 chain_mode,
                 magic: [0xdf, 0xa0, 0x8d, 0x78],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::divi::TESTNET
                     .iter()
@@ -300,7 +300,7 @@ impl NetworkConfig {
                 network_type: NetworkType::Testnet,
                 chain_mode,
                 magic: [0x70, 0xd1, 0x76, 0x12],
-                protocol_version: 70920,
+                protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
                 min_protocol_version: 70915,
                 dns_seeds: dns_seeds::privatedivi::TESTNET
                     .iter()
@@ -324,7 +324,7 @@ impl NetworkConfig {
             network_type: NetworkType::Regtest,
             chain_mode,
             magic,
-            protocol_version: 70920,
+            protocol_version: divi_network::constants::PROTOCOL_VERSION as u32,
             min_protocol_version: 70915,
             dns_seeds: Vec::new(),
             static_peers: Vec::new(),
@@ -385,6 +385,19 @@ pub struct P2pConfig {
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+
+    /// Learn local addresses from the bound address and the machine's
+    /// interfaces (Divi Core -discover)
+    #[serde(default = "default_discover")]
+    pub discover: bool,
+
+    /// Addresses this node is reachable at (Divi Core -externalip)
+    #[serde(default)]
+    pub external_ips: Vec<SocketAddr>,
+
+    /// The machine's interface addresses, found at start with `discover`
+    #[serde(default)]
+    pub interface_ips: Vec<std::net::IpAddr>,
 }
 
 impl P2pConfig {
@@ -420,6 +433,10 @@ impl P2pConfig {
     }
 }
 
+fn default_discover() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -446,6 +463,9 @@ impl Default for P2pConfig {
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             connect_timeout_ms: default_connect_timeout_ms(),
+            discover: default_discover(),
+            external_ips: Vec::new(),
+            interface_ips: Vec::new(),
         }
     }
 }

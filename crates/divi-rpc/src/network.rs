@@ -61,7 +61,7 @@ impl NetworkRpc {
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
             "subversion": divi_network::USER_AGENT,
-            "protocolversion": 70920,
+            "protocolversion": divi_network::constants::protocol_version(),
             "localservices": format!("{:016x}", local_services),
             "timeoffset": self.time_offset(),
             "connections": connections,
@@ -92,7 +92,17 @@ impl NetworkRpc {
                 }
             ],
             "relayfee": 0.0001,
-            "localaddresses": []
+            // Divi Core gives port and score as strings (NetworkLocalAddressHelpers.cpp:45-51)
+            "localaddresses": pm
+                .map(|pm| pm.local_addresses().list())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| serde_json::json!({
+                    "address": a.address.to_string(),
+                    "port": a.port.to_string(),
+                    "score": a.score.to_string(),
+                }))
+                .collect::<Vec<_>>()
         }))
     }
 

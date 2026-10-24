@@ -44,7 +44,7 @@
 //!
 //! // Get network info
 //! let net_info = node.get_network_info();
-//! assert_eq!(net_info.protocol_version, 70920);
+//! assert_eq!(net_info.protocol_version, 70915);
 //!
 //! // Clean up
 //! let _ = std::fs::remove_dir_all(&temp_dir);
