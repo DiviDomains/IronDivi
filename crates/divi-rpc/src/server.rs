@@ -1177,8 +1177,6 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         "getblockheader" => &[(0, "str"), (1, "bool")],
         // rpcwallet.cpp:818
         "getcoinavailability" => &[(0, "bool")],
-        // rpclottery.cpp:16
-        "getlotteryblockwinners" => &[(0, "int")],
         // rpcwallet.cpp:281
         "getnewaddress" => &[(0, "str")],
         // rpcblockchain.cpp:80
