@@ -1,7 +1,8 @@
 #!/bin/bash
 # Compare irondivid's mining and mempool RPC replies with Divi Core 3.0.0's
 # divid on regtest, one row per call: SAME / DIFFERS / ABSENT. The exit code
-# is the number of rows that are not SAME. See README.md.
+# is the number of rows that are neither SAME nor a difference kept on purpose
+# (docs/divid-differences.md). See README.md.
 #
 # Usage: run.sh <irondivid-bin-dir> <divid-bin-dir> <port-base> [<datadir-root>]
 #   <irondivid-bin-dir>  directory holding irondivid
