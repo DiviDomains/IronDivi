@@ -57,8 +57,8 @@ pub struct PeerManagerConfig {
 impl Default for PeerManagerConfig {
     fn default() -> Self {
         PeerManagerConfig {
-            max_outbound: 8,
-            max_inbound: 125,
+            max_outbound: 16,
+            max_inbound: 109,
             magic: crate::MAINNET_MAGIC,
             dns_seeds: vec!["autoseeds.diviseed.diviproject.org".to_string()],
             static_peers: vec![

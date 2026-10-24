@@ -303,6 +303,9 @@ pub struct ChainTip {
     pub status: ChainTipStatus,
 }
 
+/// A listener for a new chain tip (see `Chain::set_tip_listener`)
+pub type TipListener = Arc<dyn Fn(&BlockIndex) + Send + Sync>;
+
 /// Chain state
 pub struct Chain {
     /// Database for persistent storage
@@ -313,6 +316,9 @@ pub struct Chain {
     search_index: Option<Arc<SearchIndex>>,
     /// Current chain tip
     tip: RwLock<Option<BlockIndex>>,
+    /// Called with the new tip when a chain operation ends with another tip
+    /// than it started with (Divi Core's UpdatedBlockTip, for -blocknotify)
+    tip_listener: RwLock<Option<TipListener>>,
     /// Best known block index (block with the highest chain work we've seen).
     /// Used by `activate_best_chain` to detect when a side-chain has accumulated
     /// more work than the current tip and a reorganization is needed.
@@ -354,6 +360,7 @@ impl Chain {
             tx_index: None,
             search_index: None,
             tip: RwLock::new(None),
+            tip_listener: RwLock::new(None),
             best_known_block: RwLock::new(None),
             params,
             chain_lock: Mutex::new(()),
@@ -1300,8 +1307,31 @@ impl Chain {
         Ok(timestamps[median_idx])
     }
 
+    /// Call `listener` with the new tip whenever an operation on the chain
+    /// ends with a different tip
+    pub fn set_tip_listener(&self, listener: TipListener) {
+        *self.tip_listener.write() = Some(listener);
+    }
+
+    /// Run `op`, then tell the tip listener if the tip moved
+    fn notifying_tip<T>(&self, op: impl FnOnce() -> T) -> T {
+        let before = self.tip.read().as_ref().map(|t| t.hash);
+        let result = op();
+        let after = self.tip.read().clone();
+        if after.as_ref().map(|t| t.hash) != before {
+            if let (Some(tip), Some(listener)) = (after, self.tip_listener.read().clone()) {
+                listener(&tip);
+            }
+        }
+        result
+    }
+
     /// Accept a new block into the chain
     pub fn accept_block(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
+        self.notifying_tip(|| self.accept_block_unnotified(block))
+    }
+
+    fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
         // Acquire exclusive lock for chain state modifications
         trace!("accept_block: Waiting for chain lock...");
         let _chain_guard = self.chain_lock.lock();
@@ -2074,6 +2104,10 @@ impl Chain {
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
     pub fn invalidate_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+        self.notifying_tip(|| self.invalidate_block_unnotified(hash))
+    }
+
+    fn invalidate_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
         let _chain_guard = self.chain_lock.lock();
         let target = self
             .db
@@ -2130,6 +2164,10 @@ impl Chain {
     /// Clear the invalid flag on a block, its ancestors and its descendants
     /// (`reconsiderblock`), then activate the best valid chain.
     pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+        self.notifying_tip(|| self.reconsider_block_unnotified(hash))
+    }
+
+    fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
         let _chain_guard = self.chain_lock.lock();
         let target = self
             .db
@@ -3196,8 +3234,10 @@ impl Chain {
     /// (e.g., the sync layer after processing orphan blocks). For the internal
     /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
     pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
-        let _chain_guard = self.chain_lock.lock();
-        self.activate_best_chain_inner()
+        self.notifying_tip(|| {
+            let _chain_guard = self.chain_lock.lock();
+            self.activate_best_chain_inner()
+        })
     }
 
     /// Inner implementation of activate_best_chain (caller must hold chain_lock).
