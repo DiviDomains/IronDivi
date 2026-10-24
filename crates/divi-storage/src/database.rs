@@ -580,6 +580,30 @@ impl ChainDatabase {
         Ok(false)
     }
 
+    /// The height of the block holding `txid`, from any unspent output of it
+    /// (Divi Core's CCoins nHeight); None when every output is spent
+    pub fn spendable_output_height_of(&self, txid: &Hash256) -> Result<Option<u32>, StorageError> {
+        let cf = self.db.cf_handle(CF_UTXO).unwrap();
+        let mut prefix = Vec::with_capacity(33);
+        prefix.push(b'u');
+        prefix.extend_from_slice(txid.as_bytes());
+        let iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let utxo = Utxo::from_bytes(&value)?;
+            if !utxo.script_pubkey.is_op_return() {
+                return Ok(Some(utxo.height));
+            }
+        }
+        Ok(None)
+    }
+
     /// Get a UTXO directly from database (bypassing cache)
     fn get_utxo_direct(&self, outpoint: &OutPoint) -> Result<Option<Utxo>, StorageError> {
         let cf = self.db.cf_handle(CF_UTXO).unwrap();

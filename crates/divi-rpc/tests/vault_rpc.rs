@@ -630,6 +630,25 @@ fn submitted_tx(s: &Setup) -> Transaction {
     txs[0].clone()
 }
 
+/// The fee of a transaction spending the one vault coin
+fn vault_fee(tx: &Transaction) -> i64 {
+    VAULT_DIVI * COIN - tx.vout.iter().map(|o| o.value.as_sat()).sum::<i64>()
+}
+
+/// reclaimvaultfunds answers the txid as a string, as SendMoneyToAddress
+/// does (rpcwallet.cpp:1189)
+#[test]
+fn reclaim_answers_the_txid_alone() {
+    let s = setup();
+    let rpc = make_self_vault(&s);
+    let dest = s.owner.new_receiving_address().unwrap();
+    let res = rpc
+        .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
+        .unwrap();
+    let tx = submitted_tx(&s);
+    assert_eq!(res, json!(tx.txid().to_string()));
+}
+
 fn output_to(tx: &Transaction, script: &Script) -> Vec<i64> {
     tx.vout
         .iter()
@@ -651,7 +670,9 @@ fn reclaim_partial_sends_remainder_to_a_new_owner_key() {
         .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(40.0)]))
         .unwrap();
     let tx = submitted_tx(&s);
-    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    // Divi Core answers the txid alone (rpcwallet.cpp:1189)
+    assert_eq!(res, json!(tx.txid().to_string()));
+    let fee = vault_fee(&tx);
     assert!(fee > 0);
     assert_eq!(
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
@@ -685,7 +706,9 @@ fn reclaim_receiver_pays_takes_fee_from_amount() {
         ]))
         .unwrap();
     let tx = submitted_tx(&s);
-    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    // Divi Core answers the txid alone (rpcwallet.cpp:1189)
+    assert_eq!(res, json!(tx.txid().to_string()));
+    let fee = vault_fee(&tx);
     assert!(fee > 0);
     assert_eq!(
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),
@@ -720,7 +743,9 @@ fn reclaim_sweep_funds_sends_everything() {
         ]))
         .unwrap();
     let tx = submitted_tx(&s);
-    let fee = (divi(&res["fee"]) * COIN as f64).round() as i64;
+    // Divi Core answers the txid alone (rpcwallet.cpp:1189)
+    assert_eq!(res, json!(tx.txid().to_string()));
+    let fee = vault_fee(&tx);
     assert_eq!(tx.vout.len(), 1, "sweep left change");
     assert_eq!(
         output_to(&tx, &Script::new_p2pkh(dest.hash.as_bytes())),

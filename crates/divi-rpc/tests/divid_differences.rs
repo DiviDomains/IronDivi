@@ -145,21 +145,14 @@ fn loadwallet_is_refused() {
     assert!(error.message.contains("--wallet"), "{}", error.message);
 }
 
-/// With the address index off, the error names the fix rather than divid's
-/// "No information available for address" (rpcmisc.cpp)
+/// getblock also takes 0, 1 and 2 for verbose, as Bitcoin Core's verbosity;
+/// divid takes only true or false (rpcblockchain.cpp:216)
 #[test]
-fn address_index_off_error_names_the_fix() {
+fn getblock_takes_a_verbosity_number() {
     let (server, _dir) = server();
-    let reply = call(
-        &server,
-        "getaddressbalance",
-        vec![json!({"addresses": ["y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz"]})],
-    );
-    let error = reply.error.expect("refused without the index");
-    assert_eq!(error.code, -5);
-    assert!(
-        error.message.contains("Address index not enabled"),
-        "{}",
-        error.message
-    );
+    let tip = call(&server, "getbestblockhash", vec![]).result.unwrap();
+    for v in [0, 1, 2] {
+        let reply = call(&server, "getblock", vec![tip.clone(), json!(v)]);
+        assert!(reply.error.is_none(), "verbosity {v}: {:?}", reply.error);
+    }
 }

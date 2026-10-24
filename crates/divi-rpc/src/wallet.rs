@@ -2062,6 +2062,26 @@ impl WalletRpc {
                 )
                 .into());
             }
+            // ComputeFeeTotalsAndIfInputsAreKnown (rpcrawtransaction.cpp:810-826,
+            // :875-881): each input must be an output in the chain's coins or of
+            // a mempool transaction, else -26 "Unknown inputs being spent". A
+            // transaction already in the mempool skips this, as in Core.
+            let mempool = self.mempool.read().clone();
+            let pooled = |id: &Hash256| mempool.as_ref().and_then(|m| m.get_transaction(id));
+            if pooled(&txid).is_none() {
+                let known = tx.vin.iter().all(|i| {
+                    matches!(chain.get_utxo(&i.prevout), Ok(Some(_)))
+                        || pooled(&i.prevout.txid)
+                            .is_some_and(|p| (i.prevout.vout as usize) < p.vout.len())
+                });
+                if !known {
+                    return Err(RpcError::new(
+                        codes::VERIFY_REJECTED,
+                        "Unknown inputs being spent",
+                    )
+                    .into());
+                }
+            }
             // Fee cap. Inputs still in the mempool are not visible here; such a
             // transaction is checked by the mempool only.
             let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
@@ -2129,17 +2149,23 @@ impl WalletRpc {
         let (tx, location) = match in_mempool {
             Some(tx) => (tx, None),
             None => {
-                let (tx, location) = chain
-                    .get_transaction_with_location(&txid)
-                    .map_err(|e| {
-                        RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
-                    })?
-                    .ok_or_else(|| {
-                        RpcError::new(
-                            codes::INVALID_ADDRESS_OR_KEY,
-                            "No information available about transaction",
-                        )
-                    })?;
+                let found = chain.get_transaction_with_location(&txid).map_err(|e| {
+                    RpcError::new(codes::DATABASE_ERROR, format!("Database error: {}", e))
+                })?;
+                let found = match found {
+                    Some(found) => Some(found),
+                    // Without the transaction index, Divi Core finds the block
+                    // through an unspent output of the transaction
+                    // (TransactionDiskAccessor.cpp:88-110)
+                    None if !chain.has_tx_index() => Self::find_through_coins(chain, &txid),
+                    None => None,
+                };
+                let (tx, location) = found.ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        "No information available about transaction",
+                    )
+                })?;
                 (tx, Some(location))
             }
         };
@@ -2181,6 +2207,30 @@ impl WalletRpc {
             }
         }
         Ok(result)
+    }
+
+    /// The transaction and its place in the block that an unspent output of it
+    /// names, scanned for the txid or the bare txid
+    fn find_through_coins(
+        chain: &Chain,
+        txid: &Hash256,
+    ) -> Option<(Transaction, divi_storage::txindex::TxLocation)> {
+        let height = chain.spendable_output_height_of(txid).ok().flatten()?;
+        if height == 0 {
+            return None;
+        }
+        let index = chain.get_block_index_by_height(height).ok().flatten()?;
+        let block = chain.get_block(&index.hash).ok().flatten()?;
+        block
+            .transactions
+            .iter()
+            .position(|t| t.txid() == *txid || bare_txid(t) == *txid)
+            .map(|pos| {
+                (
+                    block.transactions[pos].clone(),
+                    divi_storage::txindex::TxLocation::new(index.hash, pos as u32),
+                )
+            })
     }
 
     /// decoderawtransaction - Decode a raw transaction hex string
@@ -2911,13 +2961,8 @@ impl WalletRpc {
         let payees = [TxOut::new(send_amount, dest_addr.script_pubkey())];
         let plan = Self::plan(&payees, &coins, mode, ChangeKind::Vault, &ChangeTo::NewKey)?;
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
-        let (received, fee) = (plan.outputs[0].value, plan.fee);
-
-        Ok(json!({
-            "txid": txid.to_string(),
-            "amount": received.as_divi_f64(),
-            "fee": fee.as_divi_f64()
-        }))
+        // SendMoneyToAddress: the txid alone (rpcwallet.cpp:1189)
+        Ok(json!(txid.to_string()))
     }
 
     /// BIP38 encrypt private key

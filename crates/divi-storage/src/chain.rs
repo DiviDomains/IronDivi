@@ -430,6 +430,11 @@ impl Chain {
     /// Enable transaction index for O(1) transaction lookups. An index that
     /// is behind the chain (the two databases recover separately after a
     /// power loss) is first filled in from the stored blocks.
+    /// Whether the transaction index is kept
+    pub fn has_tx_index(&self) -> bool {
+        self.tx_index.is_some()
+    }
+
     pub fn enable_tx_index(&mut self, tx_index: Arc<TxIndex>) {
         match self.catch_up_tx_index(&tx_index) {
             Ok(0) => {}
@@ -4728,6 +4733,12 @@ impl Chain {
     /// Whether any spendable output of `txid` is unspent (Core's `HaveCoins`)
     pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
         self.db.has_spendable_output_of(txid)
+    }
+
+    /// The height of the block holding `txid`, found through an unspent output
+    /// of it; None when every output is spent
+    pub fn spendable_output_height_of(&self, txid: &Hash256) -> Result<Option<u32>, StorageError> {
+        self.db.spendable_output_height_of(txid)
     }
 
     /// Check if a UTXO exists
