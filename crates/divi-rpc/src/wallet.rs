@@ -297,6 +297,29 @@ pub(crate) fn parse_hex_v(value: &str, name: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// Divi Core's RPCTypeCheck of an object (rpcserver.cpp:214-229): each name, in
+/// name order, must be present (-3 "Missing <name>") with the json_spirit type
+/// given (-3 "Expected type <type> for <name>, got <type>")
+pub(crate) fn rpc_type_check_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[(&str, &str)],
+) -> Result<(), Error> {
+    for (name, want) in expected {
+        let got = object.get(*name).map_or("null", json_spirit_type);
+        if got == "null" {
+            return Err(RpcError::new(codes::TYPE_ERROR, format!("Missing {name}")).into());
+        }
+        if got != *want {
+            return Err(RpcError::new(
+                codes::TYPE_ERROR,
+                format!("Expected type {want} for {name}, got {got}"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Divi Core's ParseHashV (JsonParseHelpers.cpp:5-15): the text of a string
 /// value (else ""), which must be hex as IsHex takes it (non-empty, even
 /// length), else -8 "<name> must be hexadecimal string (not '<text>')"; then
@@ -1820,6 +1843,29 @@ impl WalletRpc {
         Ok(serde_json::json!(hex::encode(raw)))
     }
 
+    /// The script of a coin signrawtransaction's view holds in Divi Core
+    /// (rpcrawtransaction.cpp:672-690): an output of a mempool transaction, else
+    /// an unspent output in the chain; an OP_META output is no coin
+    fn coin_script(&self, outpoint: &OutPoint) -> Option<Script> {
+        let in_pool = self
+            .mempool
+            .read()
+            .as_ref()
+            .and_then(|m| m.get_transaction(&outpoint.txid));
+        let script = match in_pool {
+            Some(tx) => tx.vout.get(outpoint.vout as usize)?.script_pubkey.clone(),
+            None => {
+                self.chain
+                    .as_ref()?
+                    .get_utxo(outpoint)
+                    .ok()
+                    .flatten()?
+                    .script_pubkey
+            }
+        };
+        Some(script).filter(|s| !s.is_op_return())
+    }
+
     /// signrawtransaction - Sign a raw transaction with wallet keys
     pub fn sign_raw_transaction(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_script::SigHashType;
@@ -1878,8 +1924,9 @@ impl WalletRpc {
         let mut tx: Transaction = deserialize(&tx_bytes)
             .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
 
-        // Previous outputs given in the call, matched to inputs by outpoint, and any
-        // redeem scripts given with P2SH outputs
+        // Previous outputs given in the call, matched to inputs by outpoint, and the
+        // redeem scripts given with P2SH outputs, read as Divi Core reads them
+        // (rpcrawtransaction.cpp:712-754)
         let mut given: std::collections::HashMap<OutPoint, Script> = Default::default();
         let mut redeem_scripts: std::collections::HashMap<Hash160, Script> = Default::default();
         if let Some(prevtxs) = params.get(1).filter(|v| !v.is_null()) {
@@ -1887,25 +1934,19 @@ impl WalletRpc {
                 .as_array()
                 .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "prevtxs must be an array"))?;
             for prevtx in prevtxs {
-                let bad = || {
-                    RpcError::new(
+                let Some(prevtx) = prevtx.as_object() else {
+                    return Err(RpcError::new(
                         codes::DESERIALIZATION_ERROR,
                         "expected object with {\"txid'\",\"vout\",\"scriptPubKey\"}",
                     )
+                    .into());
                 };
-                let txid = prevtx
-                    .get("txid")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(bad)
-                    .and_then(|t| {
-                        Hash256::from_hex(t).map_err(|_| {
-                            RpcError::new(codes::INVALID_PARAMETER, "txid must be hexadecimal")
-                        })
-                    })?;
-                let vout = prevtx
-                    .get("vout")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(bad)?;
+                rpc_type_check_object(
+                    prevtx,
+                    &[("scriptPubKey", "str"), ("txid", "str"), ("vout", "int")],
+                )?;
+                let txid = parse_hash_v(prevtx.get("txid"), "txid")?;
+                let vout = prevtx["vout"].as_i64().unwrap_or(i64::MAX);
                 if vout < 0 {
                     return Err(RpcError::new(
                         codes::DESERIALIZATION_ERROR,
@@ -1913,35 +1954,46 @@ impl WalletRpc {
                     )
                     .into());
                 }
-                let script_hex = prevtx
-                    .get("scriptPubKey")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(bad)?;
-                let script_pubkey = Script::from_bytes(hex::decode(script_hex).map_err(|_| {
-                    RpcError::new(codes::INVALID_PARAMETER, "scriptPubKey must be hexadecimal")
-                })?);
-
-                if let Some(rs_hex) = prevtx.get("redeemScript").filter(|v| !v.is_null()) {
-                    let rs_bytes = rs_hex
-                        .as_str()
-                        .and_then(|h| hex::decode(h).ok())
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                codes::INVALID_PARAMETER,
-                                "redeemScript must be hexadecimal",
-                            )
-                        })?;
-                    let rs_hash = divi_crypto::hash160(&rs_bytes);
-                    if script_pubkey.extract_p2sh_hash() != Some(*rs_hash.as_bytes()) {
+                let outpoint = OutPoint::new(txid, vout as u32);
+                let script_pubkey = Script::from_bytes(parse_hex_v(
+                    prevtx["scriptPubKey"].as_str().unwrap_or_default(),
+                    "scriptPubKey",
+                )?);
+                // A coin the chain or the mempool holds must have the script given
+                if let Some(held) = self.coin_script(&outpoint) {
+                    if held != script_pubkey {
                         return Err(RpcError::new(
-                            codes::INVALID_PARAMETER,
-                            "redeemScript does not match scriptPubKey",
+                            codes::DESERIALIZATION_ERROR,
+                            format!(
+                                "Previous output scriptPubKey mismatch:\n{}\nvs:\n{}",
+                                divi_script::to_asm(held.as_bytes()),
+                                divi_script::to_asm(script_pubkey.as_bytes())
+                            ),
                         )
                         .into());
                     }
-                    redeem_scripts.insert(rs_hash, Script::from_bytes(rs_bytes));
                 }
-                given.insert(OutPoint::new(txid, vout as u32), script_pubkey);
+                // A redeem script is read, and needed, only with given keys
+                if given_keys.is_some() && script_pubkey.is_p2sh() {
+                    rpc_type_check_object(
+                        prevtx,
+                        &[
+                            ("redeemScript", "str"),
+                            ("scriptPubKey", "str"),
+                            ("txid", "str"),
+                            ("vout", "int"),
+                        ],
+                    )?;
+                    let rs_bytes = parse_hex_v(
+                        prevtx["redeemScript"].as_str().unwrap_or_default(),
+                        "redeemScript",
+                    )?;
+                    redeem_scripts.insert(
+                        divi_crypto::hash160(&rs_bytes),
+                        Script::from_bytes(rs_bytes),
+                    );
+                }
+                given.insert(outpoint, script_pubkey);
             }
         }
 
