@@ -102,12 +102,10 @@ impl RpcError {
         Self::new(codes::INVALID_REQUEST, msg)
     }
 
-    /// Standard method not found error
-    pub fn method_not_found(method: &str) -> Self {
-        Self::new(
-            codes::METHOD_NOT_FOUND,
-            format!("Method not found: {}", method),
-        )
+    /// Method not found, worded as Divi Core (rpcserver.cpp:1041): the
+    /// method name is not repeated
+    pub fn method_not_found(_method: &str) -> Self {
+        Self::new(codes::METHOD_NOT_FOUND, "Method not found")
     }
 
     /// Standard invalid params error
@@ -122,12 +120,9 @@ impl RpcError {
         Self::new(codes::MISC_ERROR, msg)
     }
 
-    /// Block not found error
-    pub fn block_not_found(hash: &str) -> Self {
-        Self::new(
-            codes::INVALID_ADDRESS_OR_KEY,
-            format!("Block not found: {}", hash),
-        )
+    /// Block not found, worded as Divi Core (rpcblockchain.cpp:216)
+    pub fn block_not_found(_hash: &str) -> Self {
+        Self::new(codes::INVALID_ADDRESS_OR_KEY, "Block not found")
     }
 
     /// Transaction not found error

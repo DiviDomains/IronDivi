@@ -664,7 +664,7 @@ impl RpcServer {
                 "walletpassphrasechange" => "walletpassphrasechange \"oldpassphrase\" \"newpassphrase\"\n\nChanges the wallet passphrase from 'oldpassphrase' to 'newpassphrase'.\n\nArguments:\n1. \"oldpassphrase\"  (string) The current passphrase\n2. \"newpassphrase\"  (string) The new passphrase",
                 "getreceivedbyaddress" => "getreceivedbyaddress \"address\" ( minconf )\n\nReturns the total amount received by the given address in transactions with at least minconf confirmations.\n\nArguments:\n1. \"address\"  (string, required) The divi address for transactions\n2. minconf     (numeric, optional, default=1) Only include transactions confirmed at least this many times\n\nResult:\namount         (numeric) The total amount in DIVI received at this address.",
                 "importaddress" => "importaddress \"address\" ( \"label\" rescan p2sh )\n\nAdds an address or script (in hex) that can be watched as if it were in your wallet but cannot be used to spend.\n\nArguments:\n1. \"address\"  (string, required) The address\n2. \"label\"    (string, optional, default=\"\") An optional label\n3. rescan      (boolean, optional, default=true) Rescan the wallet for transactions\n4. p2sh        (boolean, optional, default=false) Add as P2SH address\n\nNote: This call can take minutes to complete if rescan is true.",
-                "addmultisigaddress" => "addmultisigaddress nrequired [\"key\",...] ( \"account\" )\n\nAdd a nrequired-to-sign multisignature address to the wallet.\nEach key is a DIVI address or hex-encoded public key.\nIf 'account' is specified, assign address to that account.\n\nArguments:\n1. nrequired      (numeric, required) The number of required signatures out of the n keys\n2. \"keys\"        (array, required) A json array of divi addresses or hex-encoded public keys\n     [\n       \"address\"  (string) divi address or hex-encoded public key\n       ...,\n     ]\n3. \"account\"     (string, optional) An account to assign the addresses to\n\nResult:\n{\n  \"address\":\"multisigaddress\",    (string) The value of the new multisig address\n  \"redeemScript\":\"script\"         (string) The string value of the hex-encoded redemption script\n}",
+                "addmultisigaddress" => "addmultisigaddress nrequired [\"key\",...] ( \"account\" )\n\nAdd a nrequired-to-sign multisignature address to the wallet.\nEach key is a DIVI address or hex-encoded public key.\nIf 'account' is specified, assign address to that account.\n\nArguments:\n1. nrequired      (numeric, required) The number of required signatures out of the n keys\n2. \"keys\"        (array, required) A json array of divi addresses or hex-encoded public keys\n     [\n       \"address\"  (string) divi address or hex-encoded public key\n       ...,\n     ]\n3. \"account\"     (string, optional) An account to assign the addresses to\n\nResult:\n\"diviaddress\"  (string) A divi address associated with the keys.",
                 "keypoolrefill" => "keypoolrefill ( newsize )\n\nFills the keypool.\n\nArguments:\n1. newsize  (numeric, optional, default=100) The new keypool size",
                 "getkeypoolsize" => "getkeypoolsize\n\nReturns the number of keys in the keypool.\n\nResult:\n  n    (numeric) The number of pre-generated but unused keys in the keypool",
                 "decodescript" => "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. \"hexstring\"  (string) the hex encoded script\n\nResult:\n{\n  \"asm\":\"asm\",      (string) Script public key\n  \"hex\":\"hex\",      (string) hex encoded public key\n  \"type\":\"type\",    (string) The output type\n  \"reqSigs\": n,      (numeric) The required signatures\n  \"addresses\": [     (json array of string)\n     \"address\"       (string) divi address\n     ,...\n  ],\n  \"p2sh\":\"address\"   (string) address of P2SH script wrapping this redeem script\n}",
@@ -737,7 +737,12 @@ impl RpcServer {
                 // Control
                 "help" => "help ( \"command\" )\n\nList all commands, or get help for a specified command.",
                 "stop" => "stop\n\nStop Divi server.",
-                _ => return Err(RpcError::method_not_found(method).into()),
+                // Divi Core answers an unknown command with text, not an error (rpcserver.cpp:283-285)
+                _ => {
+                    return Ok(serde_json::Value::String(format!(
+                        "help: unknown command: {method}"
+                    )))
+                }
             };
             Ok(serde_json::Value::String(help.to_string()))
         } else {
@@ -928,41 +933,9 @@ impl RpcServer {
 /// HTTP handler for JSON-RPC requests
 async fn handle_rpc(State(server): State<Arc<RpcServer>>, body: String) -> impl IntoResponse {
     debug!("RPC request: {}", body);
-
-    // Parse the JSON-RPC request
-    let response = match serde_json::from_str::<Request>(&body) {
-        Ok(request) => server.handle_request(request),
-        Err(e) => {
-            // Try to parse as batch request
-            if let Ok(requests) = serde_json::from_str::<Vec<Request>>(&body) {
-                // Handle batch request
-                let responses: Vec<Response> = requests
-                    .into_iter()
-                    .map(|req| server.handle_request(req))
-                    .collect();
-
-                let json = serde_json::to_string(&responses).unwrap_or_default();
-                return (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json,
-                );
-            }
-
-            // Parse error
-            error!("Failed to parse RPC request: {}", e);
-            Response::error_only(RpcError::parse_error())
-        }
-    };
-
-    let json = serde_json::to_string(&response).unwrap_or_default();
-    debug!("RPC response: {}", json);
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        json,
-    )
+    let (status, reply) = server.handle_http_body(&body);
+    debug!("RPC response: {}", reply);
+    (status, [(header::CONTENT_TYPE, "application/json")], reply)
 }
 
 /// HTTP handler for wallet-specific JSON-RPC requests
@@ -976,41 +949,101 @@ async fn handle_wallet_rpc(
     // TODO: In the future, we could use wallet_name to route to specific wallet instances
     // For now, we just log it and pass through to the default wallet
     // This enables multi-wallet CLI support even if server only has one wallet loaded
+    let (status, reply) = server.handle_http_body(&body);
+    debug!("RPC response for wallet '{}': {}", wallet_name, reply);
+    (status, [(header::CONTENT_TYPE, "application/json")], reply)
+}
 
-    // Parse the JSON-RPC request
-    let response = match serde_json::from_str::<Request>(&body) {
-        Ok(request) => server.handle_request(request),
-        Err(e) => {
-            // Try to parse as batch request
-            if let Ok(requests) = serde_json::from_str::<Vec<Request>>(&body) {
-                // Handle batch request
-                let responses: Vec<Response> = requests
-                    .into_iter()
-                    .map(|req| server.handle_request(req))
-                    .collect();
-
-                let json = serde_json::to_string(&responses).unwrap_or_default();
-                return (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json,
-                );
-            }
-
-            // Parse error
-            error!("Failed to parse RPC request: {}", e);
-            Response::error_only(RpcError::parse_error())
-        }
+/// A reply object as Divi Core writes it (rpcprotocol.cpp JSONRPCReplyObj):
+/// "result" (null on error), "error" (null on success), "id", in that order
+fn reply_text(outcome: Result<serde_json::Value, RpcError>, id: &serde_json::Value) -> String {
+    use crate::protocol::write_core_json;
+    let (result, error) = match outcome {
+        Ok(result) => (write_core_json(&result), "null".to_string()),
+        Err(e) => (
+            "null".to_string(),
+            write_core_json(&serde_json::json!({"code": e.code, "message": e.message})),
+        ),
     };
-
-    let json = serde_json::to_string(&response).unwrap_or_default();
-    debug!("RPC response for wallet '{}': {}", wallet_name, json);
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        json,
+    format!(
+        "{{\"result\":{result},\"error\":{error},\"id\":{}}}",
+        write_core_json(id)
     )
+}
+
+/// An error reply with Divi Core's HTTP status (rpcserver.cpp ErrorReply):
+/// 400 for an invalid request, 404 for an unknown method, else 500
+fn error_reply(error: RpcError, id: serde_json::Value) -> (StatusCode, String) {
+    let status = match error.code {
+        codes::INVALID_REQUEST => StatusCode::BAD_REQUEST,
+        codes::METHOD_NOT_FOUND => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, reply_text(Err(error), &id) + "\n")
+}
+
+impl RpcServer {
+    /// Serve one HTTP JSON-RPC body as Divi Core does (rpcserver.cpp
+    /// HTTPReq_JSONRPC): a request object or a batch array; returns the HTTP
+    /// status and the reply text.
+    pub fn handle_http_body(&self, body: &str) -> (StatusCode, String) {
+        use serde_json::Value;
+        let request: Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
+        };
+        match &request {
+            Value::Object(_) => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                match self.execute_json_request(&request) {
+                    Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
+                    Err(e) => error_reply(e, id),
+                }
+            }
+            Value::Array(requests) => {
+                // JSONRPCExecBatch: every entry answered, the batch itself is 200
+                let replies: Vec<String> = requests
+                    .iter()
+                    .map(|r| {
+                        let id = r.get("id").cloned().unwrap_or(Value::Null);
+                        reply_text(self.execute_json_request(r), &id)
+                    })
+                    .collect();
+                (StatusCode::OK, format!("[{}]\n", replies.join(",")))
+            }
+            _ => error_reply(
+                RpcError::new(codes::PARSE_ERROR, "Top-level object parse error"),
+                Value::Null,
+            ),
+        }
+    }
+
+    /// Check and run one request object (rpcserver.cpp JSONRequest::parse):
+    /// "method" must be a string, "params" an array or absent/null
+    fn execute_json_request(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        use serde_json::Value;
+        let Value::Object(obj) = request else {
+            return Err(RpcError::invalid_request("Invalid Request object"));
+        };
+        let method = match obj.get("method") {
+            None | Some(Value::Null) => return Err(RpcError::invalid_request("Missing method")),
+            Some(Value::String(m)) => m,
+            Some(_) => return Err(RpcError::invalid_request("Method must be a string")),
+        };
+        let params = match obj.get("params") {
+            None | Some(Value::Null) => Params::Array(Vec::new()),
+            Some(Value::Array(a)) => Params::Array(a.clone()),
+            Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
+        };
+        match self.dispatch(method, &params) {
+            Ok(result) => Ok(result),
+            Err(Error::Rpc(e)) => Err(e),
+            Err(e) => Err(RpcError::internal_error(e.to_string())),
+        }
+    }
 }
 
 /// Create the axum router for RPC, enforcing HTTP Basic authentication.
@@ -1481,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_help_unknown_method_returns_error() {
+    fn test_help_unknown_method_answers_like_core() {
         let (server, _dir) = create_test_server();
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1491,8 +1524,14 @@ mod tests {
         };
 
         let response = server.handle_request(request);
-        // Help for an unknown method should return an error
-        assert!(response.error.is_some());
+        // Divi Core answers with text, not an error
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!(
+                "help: unknown command: nonexistentmethod"
+            ))
+        );
     }
 
     #[test]
@@ -1559,7 +1598,8 @@ mod tests {
 
         let err = RpcError::method_not_found("testmethod");
         assert_eq!(err.code, codes::METHOD_NOT_FOUND);
-        assert!(err.message.contains("testmethod"));
+        // worded as Divi Core: the method name is not repeated
+        assert_eq!(err.message, "Method not found");
 
         let err = RpcError::invalid_params("bad param");
         assert_eq!(err.code, codes::MISC_ERROR);
