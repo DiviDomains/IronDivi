@@ -532,6 +532,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.connect.extend(connect.iter().cloned());
         config.p2p.enable_discovery = false;
     }
+    config.p2p.addnode = s.get_multi("addnode").to_vec();
     config
         .network
         .static_peers
@@ -3909,6 +3910,22 @@ mod divid_option_tests {
             assert_eq!(c.rpc.username.as_deref(), Some("u"), "{file}");
             assert_eq!(c.rpc.port, 1236, "{file}");
         }
+    }
+
+    /// -addnode keeps every value, the command line's first, for the added
+    /// node list as well as the peers dialled
+    #[test]
+    fn addnode_values_in_order_command_line_first() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\naddnode=127.0.0.2:11\naddnode=127.0.0.2:12\n",
+            &["-addnode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.addnode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.2:12"]
+        );
     }
 
     /// -conf is relative to the data directory (Settings::GetConfigFile)
