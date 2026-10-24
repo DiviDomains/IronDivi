@@ -1838,16 +1838,20 @@ impl WalletRpc {
             ensure_fully_unlocked(&wallet)?;
         }
 
-        // Decode transaction
+        // ParseHexV(params[0], "Transaction hex data"), then "TX decode failed"
+        // (rpcrawtransaction.cpp:651-661; IsHex("") is false)
         let tx_bytes = hex::decode(hex_str)
-            .map_err(|_| RpcError::new(codes::INVALID_PARAMETER, "Invalid transaction hex"))?;
+            .ok()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                RpcError::new(
+                    codes::INVALID_PARAMETER,
+                    format!("Transaction hex data must be hexadecimal string (not '{hex_str}')"),
+                )
+            })?;
 
-        let mut tx: Transaction = deserialize(&tx_bytes).map_err(|e| {
-            RpcError::new(
-                codes::DESERIALIZATION_ERROR,
-                format!("TX decode failed: {}", e),
-            )
-        })?;
+        let mut tx: Transaction = deserialize(&tx_bytes)
+            .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
 
         // Previous outputs given in the call, matched to inputs by outpoint, and any
         // redeem scripts given with P2SH outputs
@@ -2074,16 +2078,10 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Transaction hex required"))?;
 
-        // Decode transaction
-        let tx_bytes = hex::decode(hex_str)
-            .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
-
-        let tx: Transaction = deserialize(&tx_bytes).map_err(|e| {
-            RpcError::new(
-                codes::DESERIALIZATION_ERROR,
-                format!("TX decode failed: {}", e),
-            )
-        })?;
+        // DecodeHexTx failing either way is "TX decode failed" (rpcrawtransaction.cpp:850-852)
+        let decode_failed = || RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed");
+        let tx_bytes = hex::decode(hex_str).map_err(|_| decode_failed())?;
+        let tx: Transaction = deserialize(&tx_bytes).map_err(|_| decode_failed())?;
 
         let txid = tx.txid();
         let allow_high_fees = params.get_bool(1).unwrap_or(false);
