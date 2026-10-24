@@ -456,10 +456,7 @@ impl Node {
                 peer_sources.listen
             );
         }
-        let proxy = config
-            .p2p
-            .proxy_addr()
-            .map_err(|e| NodeError::Init(format!("-proxy: {}", e)))?;
+        let proxy = config.p2p.proxy_addr().map_err(NodeError::Init)?;
         if let Some(proxy) = proxy {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
