@@ -13,10 +13,20 @@
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// A port nothing listens on now, picked by the kernel: fixed ports collide
+/// with other nodes and with other runs of these tests on the same host
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
 
 /// One JSON-RPC call on 127.0.0.1 with test:test; None until the server is up
 fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {
@@ -77,7 +87,7 @@ fn debug_log(datadir: &Path) -> String {
 #[test]
 fn unknown_and_unsupported_options_start_with_a_log_line() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (53990, 53991);
+    let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut a = args(dir.path(), rpc_port, p2p_port);
     a.push("-bogusflag=1".into());
     a.push("-dbcache=100".into());
@@ -111,7 +121,7 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
 #[test]
 fn masternode_option_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let mut a = args(dir.path(), 53992, 53993);
+    let mut a = args(dir.path(), free_port(), free_port());
     a.push("-masternode=mn1".into());
     let mut child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
         .args(&a)
@@ -155,7 +165,7 @@ fn masternode_option_is_refused() {
 #[test]
 fn negated_unknown_option_is_named_as_written() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = (53994, 53995);
+    let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut a = args(dir.path(), rpc_port, p2p_port);
     a.push("-nobogusflag".into());
     let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
