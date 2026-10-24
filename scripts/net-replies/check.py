@@ -57,12 +57,13 @@ PEERINFO = ("services: irondivid does not serve bloom filters and does not adver
             "synced_headers/synced_blocks: irondivid gives -1, divid the peer's synced heights "
             "(rpcnet.cpp:139-140) [open]",
             only("[0].services", "[0].subver", "[0].synced_headers", "[0].synced_blocks"))
-NETINFO_FIELDS = (".connections_in", ".connections_out", ".localservices", ".networks[2].limited", ".subversion")
+NETINFO_FIELDS = (".connections_in", ".connections_out", ".localservices", ".networks[2].limited", ".subversion",
+                  ".version")
 NETINFO = ("connections_in/out: irondivid's extra fields [by design]; localservices: no NODE_BLOOM, as getpeerinfo "
            "[open]; onion limited: irondivid cannot address .onion peers [by design]; subversion: its user agent "
-           "[by design]; version and IPv4/IPv6 reachable: fixed on fix/net-replies (rpcnet.cpp:369, "
-           "NetworkLocalAddressHelpers.cpp:163-167) [open]",
-           only(*NETINFO_FIELDS, ".version", ".networks[0].reachable", ".networks[1].reachable"))
+           "[by design]; version: irondivid's own (docs/divid-differences.md R5) [by design]; IPv4/IPv6 reachable: "
+           "fixed on fix/net-replies (NetworkLocalAddressHelpers.cpp:163-167) [open]",
+           only(*NETINFO_FIELDS, ".networks[0].reachable", ".networks[1].reachable"))
 MNCOUNT = ("irondivid adds the tier counts copper..diamond [by design]",
            only(".copper", ".silver", ".gold", ".platinum", ".diamond"))
 MNSTATUS = ("divid: 'This is not a masternode' (RpcMasternodeFeatures.cpp:219); fixed on fix/net-replies [open]",

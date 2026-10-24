@@ -66,7 +66,8 @@ By design:
 - `getpeerinfo` `subver`, `getnetworkinfo` `subversion`: irondivid names itself (`/IronDivi:<version>/`); divid
   gives `DIVI Core: 3.0.0.0`.
 - `getnetworkinfo`: irondivid adds `connections_in` and `connections_out`; it shows `onion` as `limited`, since it
-  cannot address .onion peers.
+  cannot address .onion peers; its `version` is irondivid's own, where divid gives `3.0.0.0` (`rpcnet.cpp:369`;
+  `docs/divid-differences.md` R5).
 - `getmasternodecount`: irondivid adds the tier counts `copper`, `silver`, `gold`, `platinum`, `diamond`.
 - `listbanned`: divid gives `{"banned:": "[\n<ip>,\n]"}`, one text under a key with a colon (`rpcmisc.cpp:1023-1030`,
   `PeerBanningService.cpp:23-34`); irondivid gives an array of bans (`docs/rpc-parity-audit.md`).
@@ -101,8 +102,7 @@ out):
   `"false"` (`rpcnet.cpp:220-284`); irondivid always gave `connected` and an empty address list.
 - `getmasternodestatus`: divid `This is not a masternode` (`RpcMasternodeFeatures.cpp:219`).
 - `mnsync <bad mode>`: divid's help (`rpcmisc.cpp:160-197`).
-- `getnetworkinfo` `version`: divid `3.0.0.0` (`rpcnet.cpp:369`), as irondivid's `getinfo`; irondivid gave its crate
-  version. `reachable`: divid only once a local address of the network is known
+- `getnetworkinfo` `reachable`: divid only once a local address of the network is known
   (`NetworkLocalAddressHelpers.cpp:73-105`, `:163-167`); irondivid always true for IPv4 and IPv6.
 - `setban` with `absolute`: irondivid's help gives it, but the time was taken as seconds from now.
 
