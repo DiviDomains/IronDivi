@@ -524,6 +524,17 @@ impl WalletDb {
             self.keystore.set_hd_wallet(hd_wallet);
             db.store_chain_mode(new_mode)?;
             info!("Migrated wallet chain_mode to {:?}", new_mode);
+        } else if let Some(seed) = db.load_hd_seed()? {
+            let mut hd_wallet = HdWallet::from_seed(&seed, new_mode)?;
+            if let (ChainMode::Divi, Some(coin_type)) = (new_mode, db.load_hd_coin_type()?) {
+                if coin_type != crate::hd::PRIVATEDIVI_COIN_TYPE {
+                    hd_wallet = hd_wallet.with_coin_type(coin_type);
+                }
+            }
+            db.store_hd_coin_type(hd_wallet.coin_type())?;
+            self.keystore.set_hd_wallet(hd_wallet);
+            db.store_chain_mode(new_mode)?;
+            info!("Migrated wallet chain_mode to {:?}", new_mode);
         }
 
         Ok(())
@@ -545,6 +556,9 @@ impl WalletDb {
         }
         if let Some(passphrase) = wallet.mnemonic_passphrase() {
             db.store_mnemonic_passphrase(passphrase)?;
+        }
+        if let Some(seed) = wallet.seed() {
+            db.store_hd_seed(seed)?;
         }
         db.store_network(network)?;
 
@@ -611,6 +625,8 @@ impl WalletDb {
                 hd_wallet.coin_type()
             );
             self.keystore.set_hd_wallet(hd_wallet);
+        } else if let Some(seed) = db.load_hd_seed()? {
+            self.keystore.set_hd_wallet(stored_seed_wallet(db, &seed)?);
         } else if let Some(ids) = db.load_hd_public_ids()? {
             // Encrypted wallet: the seed stays locked, its public ids do not
             self.keystore.set_hd_public_ids(ids);
@@ -848,6 +864,9 @@ impl WalletDb {
         if !*self.encrypted.read() {
             if let Some(mnemonic) = self.keystore.mnemonic() {
                 batch.put_cf(db.cf_metadata(), b"mnemonic", mnemonic.as_bytes());
+            }
+            if let Some(seed) = self.keystore.hd_seed() {
+                batch.put_cf(db.cf_metadata(), crate::persistence::KEY_HD_SEED, &seed[..]);
             }
         }
 
@@ -1090,6 +1109,9 @@ impl WalletDb {
                 if let Some(mnemonic) = self.keystore.mnemonic() {
                     batch.put_cf(db.cf_metadata(), b"mnemonic", mnemonic.as_bytes());
                 }
+                if let Some(seed) = self.keystore.hd_seed() {
+                    batch.put_cf(db.cf_metadata(), crate::persistence::KEY_HD_SEED, &seed[..]);
+                }
             }
             let network_val = match self.network {
                 Network::Mainnet => b"mainnet".as_slice(),
@@ -1135,6 +1157,84 @@ impl WalletDb {
     /// Get the keystore
     pub fn keystore(&self) -> &KeyStore {
         &self.keystore
+    }
+
+    /// Write a backup of the wallet to `destination`, as `backupwallet`: a
+    /// consistent copy of the open database (a checkpoint, then copied, so the
+    /// backup shares no file with the wallet). An existing folder that is not
+    /// itself a wallet backup gets the copy inside it under the wallet's name,
+    /// as Divi Core appends wallet.dat to a directory (walletdb.cpp:609-610);
+    /// an earlier backup at the destination is replaced. Returns where it went.
+    pub fn backup_to(&self, destination: &Path) -> Result<std::path::PathBuf, WalletError> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| WalletError::Storage("wallet has no database to back up".into()))?;
+        let is_backup = |p: &Path| p.join("CURRENT").is_file();
+        let name = db
+            .path()
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| "wallet".into());
+        let target = if destination.is_dir() && !is_backup(destination) {
+            destination.join(&name)
+        } else {
+            destination.to_path_buf()
+        };
+        if target.is_file() {
+            return Err(WalletError::Storage(format!(
+                "{} is a file; give a folder name for the wallet backup",
+                target.display()
+            )));
+        }
+        if target.exists() && !is_backup(&target) {
+            return Err(WalletError::Storage(format!(
+                "{} exists and is not a wallet backup",
+                target.display()
+            )));
+        }
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| WalletError::Storage(e.to_string()))?;
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut checkpoint_name = std::ffi::OsString::from(".");
+        checkpoint_name.push(&name);
+        checkpoint_name.push(format!(".checkpoint-{stamp}"));
+        let checkpoint = db
+            .path()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(checkpoint_name);
+        let mut staging = target.clone().into_os_string();
+        staging.push(format!(".partial-{stamp}"));
+        let staging = std::path::PathBuf::from(staging);
+
+        let result = (|| {
+            db.checkpoint_to(&checkpoint)?;
+            crate::backup::copy_dir(&checkpoint, &staging)
+                .map_err(|e| WalletError::Storage(format!("Failed to copy backup: {e}")))?;
+            if target.exists() {
+                std::fs::remove_dir_all(&target)
+                    .map_err(|e| WalletError::Storage(e.to_string()))?;
+            }
+            std::fs::rename(&staging, &target).map_err(|e| WalletError::Storage(e.to_string()))
+        })();
+        let _ = std::fs::remove_dir_all(&checkpoint);
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        result?;
+        info!("Wallet backed up to {}", target.display());
+        Ok(target)
     }
 
     pub fn database_path(&self) -> std::path::PathBuf {
@@ -1944,7 +2044,13 @@ impl WalletDb {
                     passphrase.as_ref().map(|p| p.as_str()),
                 )?)
             }
-            None => None,
+            None => match db.load_encrypted_hd_seed()? {
+                Some(blob) => {
+                    let seed = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
+                    Some(stored_seed_wallet(db, &seed)?)
+                }
+                None => None,
+            },
         };
         let mut secrets = Vec::new();
         for (hash, blob) in db.load_encrypted_secrets()? {
@@ -2182,6 +2288,14 @@ impl WalletDb {
             );
             batch.delete_cf(db.cf_metadata(), b"mnemonic");
         }
+        if let Some(seed) = self.keystore.hd_seed() {
+            batch.put_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_ENCRYPTED_HD_SEED,
+                encrypt_blob(&master_key, &seed),
+            );
+            batch.delete_cf(db.cf_metadata(), crate::persistence::KEY_HD_SEED);
+        }
         if let Some(passphrase) = self.keystore.mnemonic_passphrase() {
             let passphrase = Zeroizing::new(passphrase);
             batch.put_cf(
@@ -2293,6 +2407,19 @@ impl WalletDb {
             return None;
         }
         self.keystore.mnemonic()
+    }
+
+    /// The seed of a wallet made from a seed (no words); None while locked
+    pub fn hd_seed(&self) -> Option<Zeroizing<Vec<u8>>> {
+        if *self.locked.read() {
+            return None;
+        }
+        self.keystore.hd_seed()
+    }
+
+    /// Path of the account the wallet's HD keys derive from, m/44'/coin'/0'
+    pub fn hd_account_path(&self) -> Option<String> {
+        self.keystore.hd_account_path()
     }
 
     /// BIP39 passphrase of the HD seed (if one was given and unlocked)
@@ -3346,6 +3473,17 @@ fn stored_hd_wallet(
 ) -> Result<HdWallet, WalletError> {
     let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
     let hd_wallet = HdWallet::from_mnemonic(mnemonic, passphrase, chain_mode)?;
+    Ok(match db.load_hd_coin_type()? {
+        Some(coin_type) => hd_wallet.with_coin_type(coin_type),
+        None => hd_wallet,
+    })
+}
+
+/// The HD wallet of a wallet made from a seed, with the stored chain mode and
+/// coin type
+fn stored_seed_wallet(db: &WalletDatabase, seed: &[u8]) -> Result<HdWallet, WalletError> {
+    let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
+    let hd_wallet = HdWallet::from_seed(seed, chain_mode)?;
     Ok(match db.load_hd_coin_type()? {
         Some(coin_type) => hd_wallet.with_coin_type(coin_type),
         None => hd_wallet,
