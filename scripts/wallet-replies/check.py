@@ -336,9 +336,10 @@ if not synced():
 
 # An address of the wallet with an account on both, and a watched address nobody
 # holds a key for (regtest P2PKH version 139, random bytes)
-X = C.rpc("getnewaddress")
-for n in (C, I):
-    n.rpc("setaccount", X, "acct1")
+# (named when divid hands it out: a setaccount there would also give "" a new
+# current address on divid only, since only divid handed X out)
+X = C.rpc("getnewaddress", "acct1")
+I.rpc("setaccount", X, "acct1")
 W = b58check(bytes([139]) + secrets.token_bytes(20))
 for n in (C, I):
     n.rpc("importaddress", W, "watch", False)

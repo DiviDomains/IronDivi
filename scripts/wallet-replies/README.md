@@ -33,7 +33,8 @@ divid listens; irondivid dials it (`connect=`), so both see one chain, and both 
 with `staking=0`.
 
 1. divid mines 40 blocks; the coinbases are both wallets'.
-2. An address of the wallet gets the account `acct1` on both (`setaccount`); an address nobody holds a key for
+2. divid hands out an address with `getnewaddress acct1`, and irondivid gives it the same account (`setaccount`;
+   the same call on divid would also give `""` a new current address there only, since only divid handed it out); an address nobody holds a key for
    (random bytes) is imported on both with `importaddress <addr> watch false`.
 3. Four sends, each made on divid first and then on irondivid once it has seen divid's (so each wallet has one copy it
    made and one it only saw): `sendtoaddress` to the account's address; `sendtoaddress` to the watched address with
