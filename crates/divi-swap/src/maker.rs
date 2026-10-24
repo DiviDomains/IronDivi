@@ -293,7 +293,8 @@ impl Maker {
     ///
     /// A maker that cannot fund its own leg refuses with [`SwapError::InsufficientFunds`]
     /// (HTTP 409), also before any write: it reads [`ChainBackend::spendable`] on the maker-leg
-    /// chain. No coin is selected or reserved here; that still waits for `TakerLockConfirmed`.
+    /// chain, less what accepted swaps on that chain still have to lock. No coin is selected or
+    /// reserved here; that still waits for `TakerLockConfirmed`.
     pub async fn accept(&self, req: AcceptRequest) -> Result<SwapView> {
         let _g = self.gate_bounded("accept").await?;
         let mut qr = self
@@ -310,12 +311,8 @@ impl Maker {
         if now > qr.quote.expires_at {
             return Err(SwapError::InvalidParams("quote expired".into()));
         }
-        if self
-            .store
-            .list_maker_swaps()?
-            .iter()
-            .any(|s| s.hash == req.hash)
-        {
+        let swaps = self.store.list_maker_swaps()?;
+        if swaps.iter().any(|s| s.hash == req.hash) {
             return Err(SwapError::InvalidParams("hash already in use".into()));
         }
         let (tc, mc) = (qr.quote.taker_chain(), qr.quote.maker_chain());
@@ -357,10 +354,25 @@ impl Maker {
                     self.gate_bound
                 ))
             })??;
+        // Swaps already accepted on this chain whose maker leg is not funded yet draw on the
+        // same coins. One whose taker never locks stops counting when it aborts (lock wait).
+        let promised: u64 = swaps
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    SwapState::Accepted | SwapState::TakerLockSeen | SwapState::TakerLockConfirmed
+                ) && s.maker_leg_funding.is_none()
+                    && s.quote.maker_chain() == mc
+            })
+            .map(|s| s.quote.maker_leg_amount().0)
+            .sum();
         if let Some(have) = have {
-            if have.0 < need.0 {
+            if have.0 < need.0.saturating_add(promised) {
                 return Err(SwapError::InsufficientFunds(format!(
-                    "maker has {have} spendable on {mc}, this swap needs {need}"
+                    "maker has {have} spendable on {mc}, this swap needs {need}, \
+                     accepted swaps not yet funded need {}",
+                    Amount(promised)
                 )));
             }
         }

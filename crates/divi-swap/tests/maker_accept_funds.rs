@@ -98,3 +98,21 @@ async fn accept_refuses_a_swap_the_maker_cannot_fund() {
     assert_eq!(w.store.list_maker_swaps().unwrap().len(), 1);
     assert_eq!(w.mdivi.funding_calls(), 0, "no coin selection at accept");
 }
+
+#[tokio::test]
+async fn accept_counts_what_accepted_swaps_still_have_to_lock() {
+    let w = world(0);
+    let (q1, r1) = request(&w).await;
+    let (q2, r2) = request(&w).await;
+    let need = q1.maker_leg_amount();
+    assert_eq!(q2.maker_leg_amount(), need);
+    // Enough for one swap, not two.
+    fund_maker(&w, need.0 + MOCK_FEE.0);
+
+    w.maker.accept(r1).await.unwrap();
+    let r = w.maker.accept(r2).await;
+    assert!(matches!(r, Err(SwapError::InsufficientFunds(_))), "{r:?}");
+    assert!(!w.store.get_quote(&q2.id).unwrap().unwrap().used);
+    assert_eq!(w.store.list_maker_swaps().unwrap().len(), 1);
+    assert_eq!(w.mdivi.funding_calls(), 0, "no coin selection at accept");
+}
