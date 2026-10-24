@@ -33,7 +33,7 @@ scripts/rpc-load/run.sh target/release ~/divi-3.0.0/bin 53950 /var/tmp
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end. Give an
   absolute path.
 
-A run takes about 3 minutes and is stopped after 10 minutes. However it ends, both nodes are stopped and their
+A run takes 2 to 3 minutes and is stopped after 10 minutes. However it ends, both nodes are stopped and their
 directories deleted. Needs bash and python3 (standard library only); the HTTP is written on raw sockets. The phrase is
 handed to irondivid in its environment (`WALLET_MNEMONIC`) and never printed, written or put on a command line. RPC
 passwords are made by the run and live only in memory and in each node's mode-600 `divi.conf`.
@@ -60,7 +60,7 @@ below block 100 (proof of work) for the whole run. Both nodes are restarted for 
 | a stalled client and an idle keep-alive connection, over 40 s | a half request, and a connection idle after one reply, watched for 40 s | whether and when (5 s steps) each node closes them |
 | 48 connections opened at once, one call each | 48 sockets connected first, then one call on each, in parallel | the tally of statuses |
 | 32 clients with wrong credentials at once, then right ones | 32 parallel calls with a wrong password, then one right call | the tally of statuses; the right call answered |
-| a short call while a long call runs (default and `rpcthreads=1`) | `keypoolrefill` with a larger pool each time (3000 keys and up, 2 to 6 s on either node), and 0.3 s later `getblockcount` | whether the short reply comes before the long one. The long call's time is printed (`# long call` line). |
+| a short call while a long call runs (default and `rpcthreads=1`) | `keypoolrefill` with a larger pool each time (3000 keys and up, 2 to 6 s on either node), and 0.3 s later `getblockcount` | whether the short reply comes before the long one. Both calls' times on each node are printed (`# long call` line). |
 | `rpcthreads=1`: a call while another client holds its connection open; `rpcthreads=2`: while one, and while two, hold theirs | the holders each make one call and keep the keep-alive connection | the other client's call answered; and answered once they close |
 | `rpckeepalive=0`: an HTTP/1.1 call, without and with `Connection: keep-alive` | one call each | `Connection` header, whether the node closes the connection |
 | stop while 8 clients are mid-call | 8 clients loop on `gettxoutsetinfo`; `stop` | the `stop` status, whether the node exits within 30 s and its exit code, whether every client ends cleanly (a reply or a closed connection, none hangs) |
