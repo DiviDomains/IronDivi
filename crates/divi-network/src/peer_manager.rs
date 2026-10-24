@@ -445,6 +445,11 @@ impl PeerManager {
         self.peers.read().values().filter(|p| !p.inbound).count()
     }
 
+    /// The network's P2P port, used for an address given without one
+    pub fn default_port(&self) -> u16 {
+        self.config.default_port
+    }
+
     /// Add a node manually (via RPC addnode command)
     ///
     /// This adds the node to the list of nodes we should try to stay connected to.
