@@ -20,10 +20,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The client version `getinfo` and `getnetworkinfo` give: Divi Core 3.0.0's
-/// CLIENT_VERSION_STR (rpcmisc.cpp getinfo, rpcnet.cpp:369)
-pub const CLIENT_VERSION_STR: &str = "3.0.0.0";
-
 /// Divi Core's addnode help, the error for a call it cannot take
 /// (rpcnet.cpp:156-170)
 const ADDNODE_USAGE: &str = "addnode \"node\" \"add|remove|onetry\"\n\nAttempts add or remove a node from the addnode list.\nOr try a connection to a node once.\n\nArguments:\n1. \"node\"     (string, required) The node (see getpeerinfo for nodes)\n2. \"command\"  (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n\nExamples:\n> divi-cli addnode \"192.168.0.6:51472\" \"onetry\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:51472\", \"onetry\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
@@ -73,7 +69,7 @@ impl NetworkRpc {
         let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
 
         Ok(serde_json::json!({
-            "version": CLIENT_VERSION_STR,
+            "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
             "subversion": divi_network::USER_AGENT,
             "protocolversion": divi_network::constants::protocol_version(),
             "localservices": format!("{:016x}", local_services),
@@ -783,16 +779,6 @@ mod tests {
             .get_network_info(&Params::None)
             .unwrap();
         assert_eq!(ni["networks"][0]["proxy"], "");
-    }
-
-    /// getnetworkinfo gives the same client version as getinfo, Divi Core's
-    /// (rpcnet.cpp:369)
-    #[test]
-    fn getnetworkinfo_version_is_divid_s() {
-        let ni = NetworkRpc::with_peer_manager(PeerManager::new(quiet_config()))
-            .get_network_info(&Params::None)
-            .unwrap();
-        assert_eq!(ni["version"], "3.0.0.0");
     }
 
     /// getnetworkinfo: IPv4 and IPv6 are reachable only once a local address of
