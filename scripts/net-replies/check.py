@@ -464,6 +464,26 @@ def replies(prefix):
 
 replies("")
 
+# A version names the height at the time it is sent (Node.cpp:994-1005), and a
+# node asks a new peer for blocks whatever height it names (main.cpp:1130-1142):
+# node 2 stops, node 1 mines two blocks, node 2 starts again and dials node 1,
+# which is at a height it reached after it started
+for _, b in PAIRS:
+    b.stop()
+for a, _ in PAIRS:
+    a.rpc("setgenerate", 2)
+for _, b in PAIRS:
+    need(b.start(), f"{b.name} did not start again: {b.why}")
+need(wait_for(connected, 90), "node 2 did not connect again")
+for on, what in ((1, "node 1 sees node 2"), (2, "node 2 sees node 1")):
+    c = [p.get("startingheight") for p in (C1 if on == 1 else C2).rpc("getpeerinfo")]
+    i = [p.get("startingheight") for p in (I1 if on == 1 else I2).rpc("getpeerinfo")]
+    compare(f"getpeerinfo startingheight after node 2 restarts ({what})", ("ok", c), ("ok", i))
+caught_up = lambda: all(b.rpc("getblockcount") == 7 for _, b in PAIRS)
+wait_for(caught_up, 60)
+compare("getblockcount on node 2 after it restarts (no new block)", ("ok", C2.rpc("getblockcount")),
+        ("ok", I2.rpc("getblockcount")))
+
 # addnode and getaddednodeinfo
 both("addnode add", "addnode", UNREACHABLE, "add")
 both("addnode add again", "addnode", UNREACHABLE, "add")
