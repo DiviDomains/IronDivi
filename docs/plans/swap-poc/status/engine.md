@@ -410,3 +410,10 @@
 - left: the check is necessary, not sufficient (fees, and coins spent between accept and lock, can still make funding fail later); it is not wired for USDC/XMR; there is no live run with the new binary.
 - needs: nothing
 - decisions: refuse at accept rather than reserve coins at accept, because reserving would lock maker coins for up to `DEFAULT_LOCK_WAIT_SECS` (1800 s) per quote a taker never follows up. Count pending accepted legs, so two quotes cannot each pass against the same coins. `None` never refuses, so a backend that cannot tell behaves as before.
+
+## 2026-10-24 round: usdc-spendable (builder DE, `lane/usdc-spendable`, on `lane/maker-accept-funds-check`)
+- done: `UsdcBackend` implements `ChainBackend::spendable`, so `Maker::accept` refuses an unfundable USDC swap too. It returns the key's ERC-20 `balanceOf` in engine sats (`usdc_units_to_amount`, ×100). A funding is an `approve` plus a `lock`, both paid in ETH, so below `with_min_lock_gas_wei` it returns `InsufficientFunds` instead of a balance. `divi-swapd` sets that floor to its startup gate `MIN_MAKER_ETH_WEI` (0.01 ETH); the builder default is 0.
+- proof: `spendable_is_the_usdc_balance_and_needs_lock_gas` in `crates/swap-chain-evm/src/backend.rs` (wiremock JSON-RPC: 12.5 USDC with gas at the floor gives `Some(1_250_000_000)`; 1 wei under the floor gives `InsufficientFunds`). It fails on the trait default (rc=101, `left: None`) and passes with the impl. swap-chain-evm 25, divi-swap 274, divi-swapd 131, divi-swap-cli 55 tests pass; clippy -D warnings and fmt rc=0.
+- left: XMR keeps `None` (the maker has no Monero wallet RPC), written down as a known gap in `mainnet-readiness.md`. The check reads the balance only and does not count allowance or the exact gas price. Foundry is not on hp1/hp3, so the anvil tests skip.
+- needs: nothing
+- decisions: refuse outright on low gas rather than report a balance of 0, so the 409 says why.

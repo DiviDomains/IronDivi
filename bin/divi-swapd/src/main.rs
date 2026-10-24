@@ -390,7 +390,8 @@ async fn live_usdc(
         .parse()
         .map_err(|e| anyhow::anyhow!("usdc token address: {e}"))?;
     let address = key.address();
-    let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?;
+    let backend = swap_chain_evm::UsdcBackend::new(&rpc_url, key, htlc, token)?
+        .with_min_lock_gas_wei(MIN_MAKER_ETH_WEI);
     let (eth_wei, usdc_units) = backend
         .gas_and_token_balance()
         .await

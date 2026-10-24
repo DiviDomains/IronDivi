@@ -153,6 +153,7 @@ pub struct UsdcBackend {
     wallet: EthereumWallet,
     token: Address,
     compressed_pubkey: [u8; 33],
+    min_lock_gas_wei: U256,
 }
 
 impl std::fmt::Debug for UsdcBackend {
@@ -184,12 +185,20 @@ impl UsdcBackend {
             wallet,
             token,
             compressed_pubkey,
+            min_lock_gas_wei: U256::ZERO,
         })
     }
 
     /// The EVM address this backend signs from.
     pub fn address(&self) -> Address {
         self.client.address()
+    }
+
+    /// The ETH this key must hold before [`ChainBackend::spendable`] reports its USDC: a
+    /// funding is an `approve` plus a `lock`, both paid in gas. Defaults to zero (no floor).
+    pub fn with_min_lock_gas_wei(mut self, wei: u128) -> Self {
+        self.min_lock_gas_wei = U256::from(wei);
+        self
     }
 
     /// This backend's own ETH (gas) and `self.token` (USDC) balances — e.g. to check a
@@ -310,6 +319,20 @@ impl ChainBackend for UsdcBackend {
             .map_err(|e| SwapError::Transient(format!("get_block_by_number: {e}")))?
             .ok_or_else(|| SwapError::Transient("no latest block".into()))?;
         Ok(block.header.timestamp as u32)
+    }
+
+    /// This key's `token` balance, with no allowance or gas taken off. Below the lock-gas
+    /// floor ([`UsdcBackend::with_min_lock_gas_wei`]) the USDC cannot be locked at all, so
+    /// that is refused outright rather than reported as a balance.
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        let (eth_wei, units) = self.gas_and_token_balance().await?;
+        if eth_wei < self.min_lock_gas_wei {
+            return Err(SwapError::InsufficientFunds(format!(
+                "maker has {eth_wei} wei for gas on usdc, a lock needs at least {}",
+                self.min_lock_gas_wei
+            )));
+        }
+        usdc_units_to_amount(units).map(Some)
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
@@ -764,6 +787,63 @@ mod tests {
             "{:?}",
             node.tags.lock().unwrap()
         );
+    }
+
+    /// A node whose `eth_getBalance` is `eth_wei` and whose every `eth_call` returns
+    /// `usdc_units` (`spendable` makes one call, `balanceOf`).
+    async fn balance_node(eth_wei: u128, usdc_units: u64) -> wiremock::MockServer {
+        use serde_json::{json, Value};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let result = match body["method"].as_str().unwrap_or("") {
+                    "eth_getBalance" => json!(format!("0x{eth_wei:x}")),
+                    "eth_call" => json!(format!("0x{usdc_units:064x}")),
+                    "eth_chainId" => json!("0x7a69"),
+                    other => {
+                        return wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                            "jsonrpc": "2.0", "id": body["id"],
+                            "error": {"code": -32601, "message": format!("unmocked {other}")},
+                        }))
+                    }
+                };
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn balance_backend(server: &wiremock::MockServer, min_lock_gas_wei: u128) -> UsdcBackend {
+        UsdcBackend::new(
+            &server.uri(),
+            PrivateKeySigner::random(),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap()
+        .with_min_lock_gas_wei(min_lock_gas_wei)
+    }
+
+    /// `Maker::accept` checks `spendable` on the maker-leg chain, so on USDC it has to be the
+    /// key's USDC in engine sats, and a refusal when there is no gas to lock it. Fails on the
+    /// trait default (`None`, "cannot tell"), with which accept took any USDC swap.
+    #[tokio::test]
+    async fn spendable_is_the_usdc_balance_and_needs_lock_gas() {
+        const FLOOR: u128 = 10_000_000_000_000_000; // 0.01 ETH
+        let server = balance_node(FLOOR, 12_500_000).await; // 12.5 USDC
+        assert_eq!(
+            balance_backend(&server, FLOOR).spendable().await.unwrap(),
+            Some(Amount::from_sat(1_250_000_000))
+        );
+        let server = balance_node(FLOOR - 1, 12_500_000).await;
+        let err = balance_backend(&server, FLOOR)
+            .spendable()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
     }
 
     #[test]
