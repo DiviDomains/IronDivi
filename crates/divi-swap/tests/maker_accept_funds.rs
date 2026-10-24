@@ -27,6 +27,20 @@ struct W {
 
 /// The maker pays DIVI (the maker leg) and starts with `maker_divi`.
 fn world(maker_divi: u64) -> W {
+    world_with(
+        maker_divi,
+        Offer {
+            id: "o1".into(),
+            direction: Direction::TakerPaysBtc,
+            counter_chain: Chain::Btc,
+            divi_sats_per_btc: 50_000_000_000,
+            min_btc_sats: 10_000,
+            max_btc_sats: 5_000_000,
+        },
+    )
+}
+
+fn world_with(maker_divi: u64, offer: Offer) -> W {
     let btc = MockChain::new(Chain::Btc, T0, 600);
     let divi = MockChain::new(Chain::Divi, T0, 60);
     let mdivi = divi.backend(1, Amount(maker_divi));
@@ -34,14 +48,6 @@ fn world(maker_divi: u64) -> W {
     let tdivi = divi.backend(3, Amount(0));
     let tbtc = btc.backend(4, Amount(10_000_000));
     let store = Store::in_memory().unwrap();
-    let offer = Offer {
-        id: "o1".into(),
-        direction: Direction::TakerPaysBtc,
-        counter_chain: Chain::Btc,
-        divi_sats_per_btc: 50_000_000_000,
-        min_btc_sats: 10_000,
-        max_btc_sats: 5_000_000,
-    };
     let maker = Maker::new(
         SwapConfig::profile(Profile::Testnet),
         Arc::new(mdivi.clone()),
@@ -62,7 +68,11 @@ fn world(maker_divi: u64) -> W {
 }
 
 async fn request(w: &W) -> (Quote, AcceptRequest) {
-    let q = w.maker.quote("o1", BTC_SATS).await.unwrap();
+    request_for(w, BTC_SATS).await
+}
+
+async fn request_for(w: &W, btc_sats: u64) -> (Quote, AcceptRequest) {
+    let q = w.maker.quote("o1", btc_sats).await.unwrap();
     let req = w.taker.prepare(&q).await.unwrap().1;
     (q, req)
 }
@@ -115,4 +125,33 @@ async fn accept_counts_what_accepted_swaps_still_have_to_lock() {
     assert!(!w.store.get_quote(&q2.id).unwrap().unwrap().used);
     assert_eq!(w.store.list_maker_swaps().unwrap().len(), 1);
     assert_eq!(w.mdivi.funding_calls(), 0, "no coin selection at accept");
+}
+
+/// The pending legs and this one are summed without wrapping or saturating. Two legs of 2^63
+/// sats need 2^64, more than any balance, so the second is refused even with `u64::MAX`
+/// spendable. A saturating `need + promised` let it through, and once two such legs were
+/// accepted the `.sum()` over them panicked in a debug build (wrapped in release).
+#[tokio::test]
+async fn accept_sums_pending_legs_without_wrapping() {
+    const HALF: u64 = 1 << 63;
+    let w = world_with(
+        u64::MAX,
+        Offer {
+            id: "o1".into(),
+            direction: Direction::TakerPaysBtc,
+            counter_chain: Chain::Btc,
+            divi_sats_per_btc: 100_000_000,
+            min_btc_sats: 1,
+            max_btc_sats: u64::MAX,
+        },
+    );
+    let (q1, r1) = request_for(&w, HALF).await;
+    let (q2, r2) = request_for(&w, HALF).await;
+    assert_eq!(q1.maker_leg_amount(), Amount(HALF));
+
+    w.maker.accept(r1).await.unwrap();
+    let r = w.maker.accept(r2).await;
+    assert!(matches!(r, Err(SwapError::InsufficientFunds(_))), "{r:?}");
+    assert!(!w.store.get_quote(&q2.id).unwrap().unwrap().used);
+    assert_eq!(w.store.list_maker_swaps().unwrap().len(), 1);
 }

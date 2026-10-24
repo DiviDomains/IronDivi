@@ -361,7 +361,8 @@ impl Maker {
             })??;
         // Swaps already accepted on this chain whose maker leg is not funded yet draw on the
         // same coins. One whose taker never locks stops counting when it aborts (lock wait).
-        let promised: u64 = swaps
+        // Summed in u128: legs near `u64::MAX` must not wrap, nor saturate into a pass.
+        let promised: u128 = swaps
             .iter()
             .filter(|s| {
                 matches!(
@@ -370,14 +371,14 @@ impl Maker {
                 ) && s.maker_leg_funding.is_none()
                     && s.quote.maker_chain() == mc
             })
-            .map(|s| s.quote.maker_leg_amount().0)
+            .map(|s| u128::from(s.quote.maker_leg_amount().0))
             .sum();
         if let Some(have) = have {
-            if have.0 < need.0.saturating_add(promised) {
+            if u128::from(have.0) < u128::from(need.0) + promised {
                 return Err(SwapError::InsufficientFunds(format!(
                     "maker has {have} spendable on {mc}, this swap needs {need}, \
                      accepted swaps not yet funded need {}",
-                    Amount(promised)
+                    Amount(u64::try_from(promised).unwrap_or(u64::MAX))
                 )));
             }
         }
