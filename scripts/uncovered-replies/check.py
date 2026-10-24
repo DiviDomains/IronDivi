@@ -40,9 +40,6 @@ START_TIMEOUT = 120
 NOT_SENT_SHORT = ("not sent to divid: signtransactionwithaddresskey has no argument count check and reads "
                   "params[0..2] (rpcrawtransaction.cpp:566-572); with two or one argument it reads past the list "
                   "(\"value is type obj, expected int\"), with none it stops on a segmentation fault")
-NO_MOCK_CLOCK = ("irondivid has no mock clock: each part reads the system clock (block times, mempool, peers), "
-                 "so setmocktime is refused on regtest too and a mined block keeps the real time (divid: "
-                 "SetMockTime, rpcmisc.cpp:526-541, utiltime.cpp)")
 KNOWN = {
     "signtransactionwithaddresskey input index past the inputs": (
         "not sent to divid: SignForOutput reads vin[inputIndex] past the inputs (rpcrawtransaction.cpp:589) and "
@@ -50,9 +47,6 @@ KNOWN = {
     "signtransactionwithaddresskey two arguments": NOT_SENT_SHORT,
     "signtransactionwithaddresskey one argument": NOT_SENT_SHORT,
     "signtransactionwithaddresskey no argument": NOT_SENT_SHORT,
-    "setmocktime": NO_MOCK_CLOCK,
-    "setmocktime: own next block's time minus the mock time": NO_MOCK_CLOCK,
-    "setmocktime 0 (the clock again)": NO_MOCK_CLOCK,
     "loadwallet a file": (
         "irondivid opens one wallet at start and keeps it; loadwallet is refused with a message naming --wallet "
         "and the wallet in use (docs/divid-differences.md R2)"),

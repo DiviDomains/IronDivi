@@ -109,11 +109,6 @@ KNOWN = {
     "setban 192.0.2.11 add <absolute time>": iron_only("setban", ("ok", None)),
     "setban remove of an address not banned": iron_only("setban", ("err", -30, "IP not in ban list")),
     "disconnectnode of an address not connected": iron_only("disconnectnode", ("err", -29, "Node not connected")),
-    "ban outdated (none outdated)": (
-        "irondivid does not ban outdated peers (docs/rpc-parity-audit.md: ban outdated; divid: net.cpp:357-393) "
-        "[by design]",
-        pair(("ok", {"Banned": []}),
-             ("err", -1, "ban outdated is not supported: peer versions are not tracked"))),
     "ban 127.0.0.1 (node 2's address)": (
         "divid compares the address given with each peer's ip:port text, so it never finds a connected peer "
         "(net.cpp:395-407); irondivid bans node 2 [by design]",
