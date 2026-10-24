@@ -66,8 +66,12 @@ fn help_covers_every_dispatched_method() {
         if m == "stop" {
             continue; // reaching the handler would ask the node to shut down
         }
+        // (a regtest-only method off regtest is "Method disabled", -32601 too)
         if let Some(e) = call(&server, m, vec![]).error {
-            assert_ne!(e.code, -32601, "{m} is not dispatched");
+            assert!(
+                e.code != -32601 || e.message.starts_with("Method disabled"),
+                "{m} is not dispatched"
+            );
         }
     }
 

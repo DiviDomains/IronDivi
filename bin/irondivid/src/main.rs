@@ -1993,6 +1993,29 @@ async fn run_daemon(
                                     .generate_blocks(n)
                                     .map(|hashes| hashes.iter().map(|h| h.to_string()).collect())
                             }));
+                        let staker_for_block = Arc::clone(staker_arc);
+                        rpc_server
+                            .staking()
+                            .set_generate_block_control(Arc::new(move |o| {
+                                use divi_node::staker::{BlockOverrides, GenerateBlockError};
+                                use divi_rpc::staking::GenerateBlockFailure;
+                                staker_for_block
+                                    .generate_block_with(&BlockOverrides {
+                                        extra_txs: o.extra_txs,
+                                        coinstake: o.coinstake,
+                                        ignore_mempool: o.ignore_mempool,
+                                        bits_shift: o.bits_shift,
+                                    })
+                                    .map(|hash| hash.to_string())
+                                    .map_err(|e| match e {
+                                        GenerateBlockError::Refused(m) => {
+                                            GenerateBlockFailure::Refused(m)
+                                        }
+                                        GenerateBlockError::Failed(m) => {
+                                            GenerateBlockFailure::Failed(m)
+                                        }
+                                    })
+                            }));
 
                         info!("Staking RPC callbacks registered");
                     }

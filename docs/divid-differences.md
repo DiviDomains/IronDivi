@@ -39,6 +39,9 @@ Core paths are under `divi/src/` of the Divi Core source. IronDivi paths are fro
 | R9 | `setgenerate` on regtest stakes from the current time and answers -25 "failed to generate a valid block" until the clock passes the median time of the last blocks (rpcmining.cpp:110) | Starts the block-time search past the median time, so blocks made back to back succeed (crates/divi-node/src/staker.rs:831-833, :881-883) | BasicSwap's regtest tests mine many blocks in a row; only regtest, no chain or wallet rule changes | `bin/irondivid/tests/setgenerate.rs` `setgenerate_mines_pow_then_pos` (five proof-of-stake blocks back to back) |
 | R10 | `addvault` of a funding output that is already spent is added (with `-vault=1`) | With `-vault=1` too, refused -4 "...the vault output of transaction X is already spent" (crates/divi-rpc/src/wallet.rs:2525) | That coin can never stake; adding it would show a balance that is not there | `crates/divi-rpc/tests/vault_rpc.rs` `addvault_refuses_spent_funding_output`, `addvault_refuses_funding_output_spent_in_mempool` |
 | R12 | `dumphdinfo`: hdseed, mnemonic, mnemonicpassphrase (rpcdump.cpp:221-233) | The same, plus `hdaccountpath` (`m/44'/<coin type>'/0'`) (crates/divi-rpc/src/wallet.rs:3623-3672) | Shows the coin type, so a restore elsewhere uses the same path (older testnet wallets keep 301 where divid uses 1) | `crates/divi-rpc/tests/wallet_move.rs` `dumphdinfo_names_the_account_path` |
+| R13 | `getmempoolinfo`: size, bytes (rpcblockchain.cpp:569-574) | The same, plus `usage` (bytes and 200 per transaction, an estimate), `maxmempool` and `mempoolminfee` (crates/divi-rpc/src/lite_wallet.rs:309-327) | Tools written for other Bitcoin-family nodes read them; readers that ignore unknown members are unaffected | `crates/divi-rpc/tests/divid_differences.rs` `getmempoolinfo_has_fields_divid_lacks` |
+| R14 | `generateblock` with a custom `coinstake` on a proof-of-stake block: the process stops (signal 11 on regtest, seen with scripts/mining-replies) | Replaces the coinstake, signs the block again with the key of its second output, and answers -25 "failed to generate a valid block" when the wallet has no such key or the block is not valid (crates/divi-node/src/staker.rs `generate_block_with`) | The answer divid's code means to give (ExtendedBlockFactory.cpp:75-91, BlockSigning.cpp:39-84), without stopping the node | `bin/irondivid/tests/generateblock.rs` `generateblock_makes_one_block_as_divid` |
+| R15 | `generateblock` answers on every network (rpcmining.cpp:121-210; only `setgenerate` checks for regtest, :67-74) | Regtest only, as `setgenerate`: elsewhere -32601 "Method disabled: invalid networks setting (regtest only)" (crates/divi-rpc/src/server.rs `generate_block`) | Its options exist to make test blocks; on a live network it would stake out of turn | `crates/divi-rpc/tests/divid_differences.rs` `generateblock_is_regtest_only` |
 
 ## Wallet files
 
@@ -50,7 +53,7 @@ Core paths are under `divi/src/` of the Divi Core source. IronDivi paths are fro
 ## Not listed here
 
 Differences that are not choices (work not done yet, or replies that are only shorter or longer texts) are kept with
-the work that found them, not here: for example `getrawmempool` priorities reported as 0, `gettxout` `version`
+the work that found them, not here: for example `gettxout` `version`
 always 1, help texts for wrong argument counts, the
 masternode messages (`mnb`, `mnp`, `mnw`) and a full send queue going unscored (irondivid does not check masternode
 signatures or collateral, and its send queue counts messages, not divid's bytes), and the `-txindex` change message
