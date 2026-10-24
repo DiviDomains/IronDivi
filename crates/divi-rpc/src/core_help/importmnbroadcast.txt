@@ -1,0 +1,9 @@
+importmnbroadcast "broadcast_hex"
+
+Import a pre-signed masternode broadcast into the wallet.
+
+Arguments:
+1. broadcast_hex    (hex, required) hex representation of broadcast data
+
+Result:
+true|false          (boolean) true on success

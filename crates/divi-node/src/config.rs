@@ -466,7 +466,7 @@ impl P2pConfig {
             .ok()
             .and_then(|mut a| a.next())
             .map(Some)
-            .ok_or_else(|| format!("invalid proxy address '{raw}'"))
+            .ok_or_else(|| format!("Invalid -proxy address or hostname: '{raw}'"))
     }
 }
 
@@ -587,6 +587,10 @@ pub struct RpcConfig {
     /// (Divi Core's -rpckeepalive, default on)
     #[serde(default = "default_rpc_keep_alive")]
     pub keep_alive: bool,
+
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    #[serde(default)]
+    pub rest: bool,
 }
 
 fn default_rpc_keep_alive() -> bool {
@@ -605,6 +609,7 @@ impl Default for RpcConfig {
             timeout: 30,
             allowed_ips: Vec::new(),
             keep_alive: true,
+            rest: false,
         }
     }
 }
@@ -930,7 +935,11 @@ mod tests {
             with("::1").proxy_addr(),
             Ok(Some("[::1]:9050".parse().unwrap()))
         );
-        assert!(with("not a proxy!").proxy_addr().is_err());
+        // Divi Core's text (init.cpp's -proxy check)
+        assert_eq!(
+            with("not a proxy!").proxy_addr(),
+            Err("Invalid -proxy address or hostname: 'not a proxy!'".to_string())
+        );
     }
 
     #[test]

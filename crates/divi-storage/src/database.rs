@@ -1099,6 +1099,12 @@ impl ChainDatabase {
         Ok(())
     }
 
+    /// Write the write-ahead log out and sync it to disk
+    pub fn sync_wal(&self) -> Result<(), StorageError> {
+        self.db.flush_wal(true)?;
+        Ok(())
+    }
+
     /// Get reference to the underlying RocksDB instance
     /// Used by modules that need direct column family access (e.g., spent_index)
     pub fn inner_db(&self) -> &DB {

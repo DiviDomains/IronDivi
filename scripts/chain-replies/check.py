@@ -61,7 +61,7 @@ KNOWN = {
     "createrawtransaction two outputs":
         "open: the outputs come out sorted by address, not in the order given: the RPC layer parses requests into serde_json maps, which keep names sorted (Cargo.toml, no preserve_order; docs/divid-differences.md R6); divid keeps the order (rpcrawtransaction.cpp:400-410). The array form of the outputs keeps the order on irondivid",
     "sendrawtransaction unsigned":
-        "open: rpc-left (RPC-LEFT.md row 8): -25 \"\" where divid -26 \"16: mandatory-script-verify-flag-failed (...)\"",
+        "open: divid runs with acceptnonstandard=1 here, which skips its input standardness check, so the script check answers -26 \"16: mandatory-script-verify-flag-failed (...)\" (MempoolConsensus.cpp:274, :362-364); irondivid has no -acceptnonstandard and answers -25 \"\" as divid does without it (scripts/reject-replies, row unsigned)",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named

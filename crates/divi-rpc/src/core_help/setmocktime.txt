@@ -1,0 +1,7 @@
+setmocktime timestamp
+
+Set the local time to given timestamp (-regtest only)
+
+Arguments:
+1. timestamp  (integer, required) Unix seconds-since-epoch timestamp
+   Pass 0 to go back to using the system time.

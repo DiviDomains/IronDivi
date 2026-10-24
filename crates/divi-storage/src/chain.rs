@@ -2601,9 +2601,15 @@ impl Chain {
         Ok(clean)
     }
 
-    /// Record a clean stop: everything the node keeps has been written
+    /// Record a clean stop: everything the node keeps has been written, and
+    /// the write-ahead logs of the chain database and the transaction index
+    /// are on disk, so the next start needs nothing from closing them
     pub fn end_run(&self) -> Result<(), StorageError> {
         self.db.flush()?;
+        if let Some(tx_index) = &self.tx_index {
+            tx_index.sync_wal()?;
+        }
+        self.db.sync_wal()?;
         self.db.put_metadata_synced(CLEAN_STOP_KEY, b"1")
     }
 
