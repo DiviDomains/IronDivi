@@ -2054,6 +2054,7 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2077,6 +2078,7 @@ async fn run_daemon(
                 move |rpc_server| {
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_reorg_hook(reorg_hook_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
@@ -2207,6 +2209,7 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2227,6 +2230,7 @@ async fn run_daemon(
                 move |rpc_server| {
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_reorg_hook(reorg_hook_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
@@ -2413,6 +2417,17 @@ fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::
         .flatten()
         .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
         .is_some_and(|index| index.hash == hash)
+}
+
+/// The mempool side of invalidateblock and its family: the disconnected
+/// blocks' transactions go back to the mempool and what the chain now spends
+/// leaves it, as after any reorganization
+fn mempool_reorg_hook(node: &Node) -> divi_rpc::blockchain::ReorgHook {
+    let chain = node.chain().clone();
+    let mempool = node.mempool().clone();
+    Arc::new(move |disconnected| {
+        divi_node::update_mempool_after_reorg(&chain, &mempool, disconnected)
+    })
 }
 
 /// The mempool side of a block handed over by the sync layer or the staker.
