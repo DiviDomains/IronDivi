@@ -211,3 +211,65 @@ fn encryptwallet_answers_as_divid() {
     );
     assert!(n.wallet.is_locked());
 }
+
+/// The P2PKH version of a regtest address, which BIP38's address hash uses
+const REGTEST_P2PKH: u8 = 139;
+
+/// bip38decrypt as Divi Core (rpcdump.cpp:295-347): it adds the key to the
+/// wallet and answers its address in the node's network; a key already held,
+/// one that does not decrypt and a locked wallet are refused as Core refuses
+/// them. A key Core's bip38paperwallet made (address hash = the first bytes of
+/// SHA256d of the regtest address) decrypts.
+#[test]
+fn bip38decrypt_adds_the_key_as_divid() {
+    let n = node();
+    let secret = divi_crypto::keys::SecretKey::new_random();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(secret.as_bytes());
+    let encrypted = divi_crypto::bip38_encrypt(&key, "pw", true, REGTEST_P2PKH).unwrap();
+    let address = divi_wallet::Address::p2pkh(&secret.public_key(), Network::Regtest);
+
+    let r = n.ok("bip38decrypt", vec![json!(encrypted), json!("pw")]);
+    assert_eq!(r, json!({"Address": address.to_string()}));
+    assert!(n.wallet.is_mine(&address) && !n.wallet.is_watch_only(&address));
+
+    let wallet_error = |text: &str| (-4, text.to_string());
+    assert_eq!(
+        code_and_text(n.err("bip38decrypt", vec![json!(encrypted), json!("pw")])),
+        wallet_error("Key already held by wallet")
+    );
+    assert_eq!(
+        code_and_text(n.err("bip38decrypt", vec![json!("notakey"), json!("pw")])),
+        wallet_error("Failed To Decrypt")
+    );
+    assert_eq!(
+        code_and_text(n.err("bip38decrypt", vec![json!(encrypted), json!("other")])),
+        wallet_error("Failed To Decrypt")
+    );
+    assert_eq!(
+        code_and_text(n.err("bip38decrypt", vec![json!(1), json!("pw")])),
+        (-1, "value is type int, expected str".to_string())
+    );
+
+    // bip38paperwallet's key decrypts in the same network
+    let paper = n.ok("bip38paperwallet", vec![json!("pw2")]);
+    let r = n.ok(
+        "bip38decrypt",
+        vec![paper["Encrypted Key"].clone(), json!("pw2")],
+    );
+    assert_eq!(r["Address"], paper["Address"]);
+
+    n.wallet.encrypt_wallet("pass").unwrap();
+    let locked = (
+        -13,
+        "Error: Please enter the wallet passphrase with walletpassphrase first.".to_string(),
+    );
+    assert_eq!(
+        code_and_text(n.err("bip38decrypt", vec![json!("notakey"), json!("pw")])),
+        locked
+    );
+    assert_eq!(
+        code_and_text(n.err("bip38paperwallet", vec![json!(1)])),
+        locked
+    );
+}

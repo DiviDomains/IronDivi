@@ -3018,6 +3018,16 @@ impl WalletRpc {
         }))
     }
 
+    /// The P2PKH address version of `network`, which BIP38's address hash uses
+    fn bip38_version(network: Network) -> u8 {
+        match network {
+            Network::Mainnet => divi_wallet::address::PUBKEY_ADDRESS_VERSION,
+            Network::Testnet | Network::Regtest => {
+                divi_wallet::address::PUBKEY_ADDRESS_VERSION_TESTNET
+            }
+        }
+    }
+
     /// BIP38 encrypt private key
     pub fn bip38_encrypt(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let addr_str = params
@@ -3058,25 +3068,29 @@ impl WalletRpc {
 
         // Encrypt using BIP38 in the key's own form (as PIVX's bip38encrypt, which this
         // RPC follows; Divi Core's own BIP38 RPCs keep the flag the same way)
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, key_entry.compressed)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("BIP38 encryption failed: {}", e),
-                )
-            })?;
+        let encrypted = divi_crypto::bip38_encrypt(
+            &key_array,
+            passphrase,
+            key_entry.compressed,
+            Self::bip38_version(wallet.network()),
+        )
+        .map_err(|e| {
+            RpcError::new(
+                codes::WALLET_ERROR,
+                format!("BIP38 encryption failed: {}", e),
+            )
+        })?;
 
         Ok(json!(encrypted))
     }
 
-    /// Generate a fresh key (not stored in the wallet) and return it BIP38-encrypted
+    /// bip38paperwallet as Divi Core (rpcdump.cpp:249-293): a fresh compressed
+    /// key, not kept in the wallet, and its BIP38 form. The wallet must be
+    /// unlocked first.
     pub fn bip38_paper_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let passphrase = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: password"))?;
-
         let wallet = self.get_wallet()?;
         ensure_fully_unlocked(&wallet)?;
+        let passphrase = spirit_str(params, 0)?;
         let network = wallet.network();
 
         let secret = divi_crypto::keys::SecretKey::new_random();
@@ -3084,41 +3098,55 @@ impl WalletRpc {
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(secret.as_bytes());
 
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, true).map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("BIP38 encryption failed: {}", e),
-            )
-        })?;
+        let encrypted =
+            divi_crypto::bip38_encrypt(&key_array, passphrase, true, Self::bip38_version(network))
+                .map_err(|e| {
+                    RpcError::new(
+                        codes::WALLET_ERROR,
+                        format!("BIP38 encryption failed: {}", e),
+                    )
+                })?;
 
         Ok(json!({ "Address": address, "Encrypted Key": encrypted }))
     }
 
-    /// BIP38 decrypt private key
+    /// bip38decrypt as Divi Core (rpcdump.cpp:295-347): with the wallet
+    /// unlocked, the key is decrypted, given the label "", refused if already
+    /// held, else added and the chain scanned for it; the answer is its address.
+    /// Unlike Core, a passphrase that does not give the key named by the address
+    /// hash is refused rather than adding whatever key comes out.
     pub fn bip38_decrypt(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let encrypted_key = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: bip38key"))?;
-        let passphrase = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: passphrase"))?;
+        let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
+        let encrypted_key = spirit_str(params, 0)?;
+        let passphrase = spirit_str(params, 1)?;
 
-        // Decrypt the BIP38 encrypted key
-        let (private_key, compressed) = divi_crypto::bip38_decrypt(encrypted_key, passphrase)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("BIP38 decryption failed: {}", e),
-                )
-            })?;
+        let failed = |text: &str| RpcError::new(codes::WALLET_ERROR, text);
+        let (private_key, compressed) = divi_crypto::bip38_decrypt(
+            encrypted_key,
+            passphrase,
+            Self::bip38_version(wallet.network()),
+        )
+        .map_err(|_| failed("Failed To Decrypt"))?;
+        let secret = divi_crypto::keys::SecretKey::from_bytes(&private_key)
+            .map_err(|_| failed("Private Key Not Valid"))?;
 
-        let network = self.address_network();
+        let address =
+            divi_wallet::KeyEntry::imported(secret.clone(), compressed).address(wallet.network());
+        wallet.set_label(&address, "").map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+        })?;
+        if wallet.is_mine(&address) && !wallet.is_watch_only(&address) {
+            return Err(failed("Key already held by wallet").into());
+        }
+        wallet.import_key_with_compression(secret, compressed, Some(String::new()));
+        info!("Imported BIP38 key for address: {}", address);
+        wallet.save().map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
+        })?;
+        self.rescan_after_import(&wallet)?;
 
-        // Encode as WIF
-        use divi_wallet::address::encode_wif;
-        let wif = encode_wif(&private_key, compressed, network);
-
-        Ok(json!(wif))
+        Ok(json!({ "Address": address.to_string() }))
     }
 
     /// loadwallet "filename" — refused: the wallet cannot be swapped on a running node.

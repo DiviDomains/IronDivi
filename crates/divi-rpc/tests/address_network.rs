@@ -17,7 +17,7 @@ use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use divi_primitives::ChainMode;
 use divi_rpc::{Params, Request, RequestId, RpcServer};
 use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
-use divi_wallet::{encode_wif, Address, Network};
+use divi_wallet::{Address, Network};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -78,10 +78,4 @@ fn rpc_addresses_use_the_node_network() {
         ms["address"],
         json!(Address::p2sh(divi_crypto::hash160(&redeem), net).to_base58())
     );
-
-    // bip38decrypt returns the key as WIF for the node's network
-    let key = [7u8; 32];
-    let encrypted = divi_crypto::bip38_encrypt(&key, "pw", true).unwrap();
-    let r = call(&server, "bip38decrypt", vec![json!(encrypted), json!("pw")]);
-    assert_eq!(r, json!(encode_wif(&key, true, net)));
 }
