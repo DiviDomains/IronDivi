@@ -728,6 +728,7 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
         NodeConfig::mainnet(chain_mode)
     };
     config.data_dir = compute_data_dir(args);
+    config.bootstrap_dir = Some(core_network_dir(args));
     if let Some(conf) = &args.conf {
         if conf.exists() {
             info!("Loaded config from {:?}", conf);
@@ -750,6 +751,26 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     apply_settings(&mut config, &settings)?;
 
     Ok(config)
+}
+
+/// Divi Core's network data directory, GetDataDir(): the data directory, with
+/// testnet3/ or regtest/ for those networks (chainparamsbase.cpp:54, :68).
+/// bootstrap.dat is read there, as divid reads it (init.cpp:698-699).
+fn core_network_dir(args: &Args) -> PathBuf {
+    let base = args.datadir.clone().unwrap_or_else(|| {
+        let mut dir = default_data_dir();
+        if args.chain_mode() == ChainMode::PrivateDivi {
+            dir = dir.join("privatedivi");
+        }
+        dir
+    });
+    if args.testnet {
+        base.join("testnet3")
+    } else if args.regtest {
+        base.join("regtest")
+    } else {
+        base
+    }
 }
 
 /// Compute data directory from args (used before config is built)
@@ -1304,11 +1325,6 @@ async fn run_daemon(
     // Initialize the node
     info!("Initializing node...");
     let node = Node::new(config.clone()).with_context(|| "Failed to initialize node")?;
-    // Divi Core's -stopafterblockimport (init.cpp:724-727)
-    if config.stop_after_block_import {
-        info!("Stopping after block import");
-        return Ok(());
-    }
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -1317,6 +1333,20 @@ async fn run_daemon(
 
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
+
+    // Divi Core's -stopafterblockimport: the import thread asks for shutdown
+    // once it is done (init.cpp:724-727)
+    if config.stop_after_block_import {
+        let chain = node.chain().clone();
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            while chain.is_importing() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            info!("Stopping after block import");
+            let _ = tx.send(());
+        });
+    }
 
     info!("Node started, chain height: {}", node.chain().height());
 

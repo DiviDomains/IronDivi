@@ -68,6 +68,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub load_block: Vec<PathBuf>,
 
+    /// Directory of the bootstrap.dat imported at start: Divi Core's
+    /// network data directory (unset = the data directory)
+    #[serde(default)]
+    pub bootstrap_dir: Option<PathBuf>,
+
     /// Stop once the block files are imported (-stopafterblockimport)
     #[serde(default)]
     pub stop_after_block_import: bool,
@@ -107,6 +112,7 @@ impl Default for NodeConfig {
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
             load_block: Vec::new(),
+            bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
             walletnotify: None,
