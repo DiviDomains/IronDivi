@@ -167,6 +167,8 @@ class Node:
                 reply = json.loads(r.read(), parse_float=str)
         except urllib.error.HTTPError as e:
             reply = json.loads(e.read() or b"{}", parse_float=str)
+        except (ConnectionError, urllib.error.URLError, OSError) as e:
+            raise RuntimeError(f"{self.name} {method}: {e}") from None
         err = reply.get("error")
         if err:
             return ("err", err.get("code"), err.get("message", ""))
@@ -209,7 +211,7 @@ class Node:
                      os.path.join(self.dir, "regtest", "debug.log")):
             try:
                 with open(path, errors="replace") as f:
-                    lines += [l.strip() for l in f.readlines() if "rror" in l][-n:]
+                    lines += [l.strip() for l in f.readlines() if "rror" in l or "panic" in l][-n:]
             except OSError:
                 pass
         held = subprocess.run(["ss", "-tanpH"], capture_output=True, text=True).stdout.splitlines()
@@ -343,6 +345,10 @@ def wait_for(fn, secs):
 
 def setup_failed(kind, value, tb):
     print(f"FAIL   setup: {value}"[:300], flush=True)
+    for n in globals().get("NODES", ()):
+        t = n.tail()
+        if t:
+            print(f"#      {n.name}: {t}"[:700], flush=True)
     sys.exit(1)
 
 
