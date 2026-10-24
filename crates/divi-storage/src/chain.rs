@@ -3068,11 +3068,8 @@ impl Chain {
 
         // Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): at most 180 s in the
         // future for a PoS block (MaxFutureBlockDrift, Settings.cpp:215-218), 2 hours
-        // for a PoW block
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| StorageError::ChainState(format!("System time error: {}", e)))?
-            .as_secs();
+        // for a PoW block, past GetAdjustedTime (the clock setmocktime sets)
+        let now = divi_primitives::clock::now().max(0) as u64;
         let max_drift = if block.is_proof_of_stake() {
             MAX_FUTURE_BLOCK_DRIFT_POS
         } else {

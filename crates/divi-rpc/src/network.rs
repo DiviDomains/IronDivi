@@ -377,18 +377,14 @@ impl NetworkRpc {
         };
 
         let bans = peer_manager.scoring().list_bans();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let result: Vec<serde_json::Value> = bans
             .iter()
             .map(|ban| {
                 serde_json::json!({
                     "address": ban.ip.to_string(),
                     // Unix times, as in Bitcoin Core's listbanned
-                    "ban_created": now.saturating_sub(ban.created_at.elapsed().as_secs()),
-                    "banned_until": now + ban.remaining().as_secs(),
+                    "ban_created": ban.created,
+                    "banned_until": ban.until,
                     "ban_reason": ban.reason,
                 })
             })
@@ -459,13 +455,30 @@ impl NetworkRpc {
             .ok_or_else(|| RpcError::new(codes::MISC_ERROR, "Peer manager not available"))?;
 
         if target == "outdated" {
-            // Peer sub-versions are not recorded after the handshake, so "outdated" peers
-            // cannot be identified; refuse rather than report an empty (false) success.
-            return Err(RpcError::new(
-                codes::MISC_ERROR,
-                "ban outdated is not supported: peer versions are not tracked",
-            )
-            .into());
+            // BanOutdatedPeers (net.cpp:357-393): every peer whose sub-version is
+            // below Divi Core 3.0.0.0's gets a lifetime ban and is disconnected;
+            // the reply names each as ip:port, in the order they connected
+            let reference = subversion_index("3.0.0.0").unwrap_or(0);
+            let mut peers = peer_manager.get_peer_details();
+            peers.sort_by_key(|(id, ..)| *id);
+            let mut banned = Vec::new();
+            for (id, addr, _, stats, _) in peers {
+                let subver = stats.subver.lock().clone();
+                // divid throws (std::stoi) on a sub-version it cannot read;
+                // such a peer is left alone here
+                if subversion_index(core_subversion(&subver)).is_some_and(|v| v < reference) {
+                    // Only this peer is dropped; others from its address stay
+                    // until they reconnect (net.cpp:386-388)
+                    peer_manager.scoring().ban_ip(
+                        addr.ip(),
+                        LIFETIME,
+                        "Outdated peer banned via RPC",
+                    );
+                    peer_manager.disconnect(id);
+                    banned.push(serde_json::json!(addr.to_string()));
+                }
+            }
+            return Ok(serde_json::json!({ "Banned": banned }));
         }
 
         // C++ ban reports an unresolvable address the same way as an unknown peer
@@ -547,9 +560,78 @@ impl Default for NetworkRpc {
     }
 }
 
+/// The part of a peer's sub-version divid reads: after the first ": ", or from
+/// the second character when there is none (net.cpp:359-363, where
+/// `find` + 2 wraps to 1)
+fn core_subversion(raw: &str) -> &str {
+    match raw.find(": ") {
+        Some(at) => &raw[at + 2..],
+        None => raw.get(1..).unwrap_or(""),
+    }
+}
+
+/// divid's version index of a sub-version: its first four numbers, split at the
+/// dots and spaces, each read as std::stoi reads it and put 7 bits apart in an
+/// int (net.cpp:364-376). None where divid's std::stoi would throw or fewer than
+/// four parts would be read.
+fn subversion_index(subver: &str) -> Option<i64> {
+    let replaced = subver.replace('.', " ");
+    let parts: Vec<&str> = replaced.split_ascii_whitespace().collect();
+    let mut index: i64 = 0;
+    for (k, part) in parts.get(..4)?.iter().enumerate() {
+        index |= i64::from(stoi(part)?.wrapping_shl(21 - 7 * k as u32));
+    }
+    Some(index)
+}
+
+/// std::stoi: an optional sign and at least one digit, then anything; None
+/// where it throws (no digits, or out of int's range)
+fn stoi(text: &str) -> Option<i32> {
+    let (sign, rest) = match text.as_bytes().first() {
+        Some(b'-') => (-1i64, &text[1..]),
+        Some(b'+') => (1, &text[1..]),
+        _ => (1, text),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let value: i64 = rest[..digits].parse().ok()?;
+    i32::try_from(sign * value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// divid's reading of a sub-version (net.cpp:359-376)
+    #[test]
+    fn subversions_are_read_as_divid_reads_them() {
+        assert_eq!(core_subversion("DIVI Core: 3.0.0.0"), "3.0.0.0");
+        assert_eq!(
+            core_subversion("x2.0.0.0"),
+            "2.0.0.0",
+            "no \": \": from the second character"
+        );
+        assert_eq!(core_subversion(""), "");
+        let v = |s: &str| subversion_index(core_subversion(s));
+        assert_eq!(v("DIVI Core: 3.0.0.0"), Some(3 << 21));
+        assert_eq!(v("Divi Core: 2.4.0.0"), Some((2 << 21) | (4 << 14)));
+        assert_eq!(v("Divi Core: 3.0.0.1(comment)"), Some((3 << 21) | 1));
+        assert_eq!(v("Divi Core: +3.0.0.0"), Some(3 << 21));
+        assert!(v("Divi Core: -1.0.0.0").unwrap() < 0);
+        assert_eq!(
+            v("/IronDivi:0.2.6/"),
+            None,
+            "std::stoi throws on \"IronDivi:0\""
+        );
+        assert_eq!(v("Divi Core: 3.0"), None, "fewer than four parts");
+        assert_eq!(
+            v("Divi Core: 99999999999.0.0.0"),
+            None,
+            "out of int's range"
+        );
+    }
 
     #[test]
     fn test_network_rpc_creation() {

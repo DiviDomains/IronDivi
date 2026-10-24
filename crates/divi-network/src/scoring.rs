@@ -193,10 +193,12 @@ impl PeerStats {
 pub struct BanEntry {
     /// IP address
     pub ip: IpAddr,
-    /// When the ban was created
-    pub created_at: Instant,
-    /// Ban duration
-    pub duration: Duration,
+    /// When the ban was made, Unix seconds on the node's clock
+    pub created: i64,
+    /// When it ends, Unix seconds on the node's clock: Divi Core keeps a ban's
+    /// end and compares it with GetTime, which setmocktime moves
+    /// (PeerBanningService.cpp:37-62)
+    pub until: i64,
     /// Reason for the ban
     pub reason: String,
 }
@@ -204,22 +206,27 @@ pub struct BanEntry {
 impl BanEntry {
     /// Create a new ban entry
     pub fn new(ip: IpAddr, duration: Duration, reason: impl Into<String>) -> Self {
+        let created = divi_primitives::clock::now();
         BanEntry {
             ip,
-            created_at: Instant::now(),
-            duration,
+            created,
+            until: created.saturating_add(duration.as_secs().min(i64::MAX as u64) as i64),
             reason: reason.into(),
         }
     }
 
     /// Check if the ban has expired
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() >= self.duration
+        divi_primitives::clock::now() >= self.until
     }
 
     /// Get remaining ban time
     pub fn remaining(&self) -> Duration {
-        self.duration.saturating_sub(self.created_at.elapsed())
+        Duration::from_secs(
+            self.until
+                .saturating_sub(divi_primitives::clock::now())
+                .max(0) as u64,
+        )
     }
 }
 
@@ -462,9 +469,12 @@ impl PeerScoring {
     pub fn ban_ip(&self, ip: IpAddr, duration: Duration, reason: impl Into<String>) {
         let reason = reason.into();
         info!("Banning IP {} for {:?}: {}", ip, duration, reason);
-        self.bans
-            .write()
-            .insert(ip, BanEntry::new(ip, duration, reason));
+        // A ban is only ever made longer (PeerBanningService.cpp:56-62)
+        let entry = BanEntry::new(ip, duration, reason);
+        let mut bans = self.bans.write();
+        if bans.get(&ip).is_none_or(|old| old.until < entry.until) {
+            bans.insert(ip, entry);
+        }
     }
 
     /// Unban an IP address

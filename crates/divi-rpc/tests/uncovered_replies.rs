@@ -256,3 +256,41 @@ fn getinvalid_checks_its_argument() {
     );
     usage(&server, "getinvalid", vec![json!("all"), json!("x")]);
 }
+
+/// With the wallet locked, divid's GetKey throws for a key of the HD chain
+/// (wallet.cpp:543-544), which the RPC layer answers as -1 with its text; an
+/// address not in the wallet is still -4
+#[test]
+fn signtransactionwithaddresskey_with_the_wallet_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(ChainDatabase::open(dir.path().join("chain")).unwrap());
+    let chain = Arc::new(
+        Chain::new(
+            db,
+            ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi),
+        )
+        .unwrap(),
+    );
+    let wallet = Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("wallet"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    );
+    let server = RpcServer::with_wallet(chain, wallet);
+    let address = ok(&server, "getnewaddress", vec![]);
+    let passphrase = hex::encode(rand::random::<[u8; 16]>());
+    ok(&server, "encryptwallet", vec![json!(passphrase)]);
+    let reply = call(
+        &server,
+        "signtransactionwithaddresskey",
+        vec![json!(two_inputs()), address, json!(0)],
+    );
+    let e = reply.error.expect("refused");
+    assert_eq!(
+        (e.code, e.message.as_str()),
+        (-1, "GetKey: DecryptHDChainSeed failed")
+    );
+}
