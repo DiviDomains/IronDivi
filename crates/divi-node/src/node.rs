@@ -574,6 +574,22 @@ impl Node {
             },
         };
         let peer_manager = PeerManager::new(peer_manager_config);
+        // The -addnode values are the first added nodes (net.cpp:1218)
+        for node in &config.p2p.addnode {
+            let addr = node.parse::<std::net::SocketAddr>().ok().or_else(|| {
+                node.parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(|ip| std::net::SocketAddr::new(ip, config.network.default_p2p_port()))
+            });
+            match addr {
+                Some(addr) => {
+                    peer_manager.add_node(addr);
+                }
+                None => {
+                    tracing::debug!("-addnode {} is not an address; dialled by name only", node)
+                }
+            }
+        }
         // Divi Core -banscore / -bantime
         peer_manager.scoring().set_ban_policy(
             config.p2p.ban_score.min(i32::MAX as u32) as i32,
