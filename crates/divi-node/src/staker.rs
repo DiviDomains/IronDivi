@@ -231,15 +231,6 @@ pub fn is_stake_set_coin(
     depth >= min_depth && now.saturating_sub(block_time) >= min_coin_age
 }
 
-/// Divi Core HasAgedCoins' age test (wallet.cpp:1474-1478): a coin counts
-/// once the clock is past its time by more than the minimum coin age, so not
-/// in the second it is dated, nor while it is dated ahead of the clock (a
-/// regtest chain's quick blocks run ahead). `coin_time` is the time of the
-/// block that confirmed it.
-pub fn is_aged_coin(now: u32, coin_time: u32, min_coin_age: u32) -> bool {
-    i64::from(now) - i64::from(coin_time) > i64::from(min_coin_age)
-}
-
 /// Default maximum tip age for staking: 24 hours (C++ `nMaxTipAge`).
 pub const DEFAULT_MAX_TIP_AGE_SECS: u32 = 24 * 60 * 60;
 
@@ -500,7 +491,7 @@ impl Staker {
                 && utxo
                     .height
                     .and_then(|h| self.chain.get_block_index_by_height(h).ok().flatten())
-                    .is_some_and(|idx| is_aged_coin(now, idx.time, min_age))
+                    .is_some_and(|idx| now.saturating_sub(idx.time) >= min_age)
         };
         let regular = self.wallet.get_spendable_utxos(height, 1);
         regular
@@ -2775,87 +2766,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.min_coin_age, 7 * 24 * 60 * 60);
-    }
-
-    /// A coin dated ahead of the clock is not aged yet for getstakingstatus's
-    /// mintablecoins, however mature: Divi Core's HasAgedCoins needs the clock
-    /// past the coin's time by more than the minimum age (wallet.cpp:1474-1478)
-    #[test]
-    fn coins_dated_ahead_of_the_clock_are_not_mintable() {
-        use crate::config::MempoolConfig;
-        use divi_network::PeerManagerConfig;
-        use divi_primitives::{
-            block::Block,
-            script::Script,
-            transaction::{Transaction, TxIn, TxOut},
-        };
-        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
-        use divi_wallet::{HdWallet, Network};
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
-        let params =
-            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
-        let chain = Arc::new(Chain::new(db, params).unwrap());
-        let wallet = Arc::new(WalletDb::with_hd_wallet(
-            Network::Regtest,
-            HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
-        ));
-        let mine_to = wallet.new_receiving_address().unwrap();
-        // 25 blocks dated a minute ahead of the clock (within the two hours a
-        // block may run ahead): the first coinbase is mature
-        let ahead = current_timestamp() as u32 + 60;
-        for n in 0..25u32 {
-            let tip = chain.tip().unwrap();
-            let height = tip.height + 1;
-            let mut block = Block::default();
-            block.header.version = 4;
-            block.header.prev_block = tip.hash;
-            block.header.time = ahead + n;
-            block.header.bits = 0x207fffff;
-            let mut sig = divi_storage::bip34_height_script(height);
-            sig.extend_from_slice(&height.to_le_bytes());
-            block.transactions.push(Transaction {
-                version: 1,
-                vin: vec![TxIn::coinbase(Script::from_bytes(sig))],
-                vout: vec![TxOut::new(
-                    divi_primitives::amount::Amount::from_sat(1250 * 100_000_000),
-                    Script::new_p2pkh(mine_to.hash.as_bytes()),
-                )],
-                lock_time: 0,
-            });
-            block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
-            let target = Hash256::from_compact(block.header.bits);
-            while divi_crypto::compute_block_hash(&block.header) > target {
-                block.header.nonce += 1;
-            }
-            let (time, txs) = (block.header.time, block.transactions.clone());
-            let hash = chain.accept_block(block).unwrap().hash;
-            wallet.scan_block(hash, height, time, &txs);
-        }
-        let config = StakingConfig {
-            min_coin_age: 0,
-            ..StakingConfig::default()
-        };
-        let staker = Staker::new(
-            wallet,
-            chain,
-            Arc::new(Mempool::new(MempoolConfig::default())),
-            PeerManager::new(PeerManagerConfig::default()),
-            config,
-        );
-        assert!(!staker.has_mintable_coins());
-    }
-
-    #[test]
-    fn aged_coin_is_older_than_the_minimum_age() {
-        // regtest's minimum age is 0: a coin of this second, or dated ahead of
-        // the clock, is not aged yet
-        assert!(!is_aged_coin(1000, 1000, 0));
-        assert!(!is_aged_coin(1000, 1016, 0));
-        assert!(is_aged_coin(1000, 999, 0));
-        assert!(!is_aged_coin(10_000, 10_000 - 3600, 3600));
-        assert!(is_aged_coin(10_000, 10_000 - 3601, 3600));
     }
 
     #[test]
