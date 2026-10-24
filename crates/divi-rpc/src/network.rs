@@ -65,6 +65,12 @@ impl NetworkRpc {
         let local_services = pm
             .map(|pm| pm.services())
             .unwrap_or(divi_network::constants::services::NODE_NETWORK);
+        let local = pm.map(|pm| pm.local_addresses().list()).unwrap_or_default();
+        // Divi Core: a network is reachable once a local address of it is known,
+        // and an IPv6 one marks IPv4 too (NetworkLocalAddressHelpers.cpp:73-105,
+        // :163-167)
+        let ipv6_reachable = local.iter().any(|a| a.address.is_ipv6());
+        let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
 
         Ok(serde_json::json!({
             "version": CLIENT_VERSION_STR,
@@ -79,14 +85,14 @@ impl NetworkRpc {
                 {
                     "name": "ipv4",
                     "limited": false,
-                    "reachable": true,
+                    "reachable": ipv4_reachable,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
                     "limited": false,
-                    "reachable": true,
+                    "reachable": ipv6_reachable,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
@@ -101,9 +107,7 @@ impl NetworkRpc {
             ],
             "relayfee": 0.0001,
             // Divi Core gives port and score as strings (NetworkLocalAddressHelpers.cpp:45-51)
-            "localaddresses": pm
-                .map(|pm| pm.local_addresses().list())
-                .unwrap_or_default()
+            "localaddresses": local
                 .into_iter()
                 .map(|a| serde_json::json!({
                     "address": a.address.to_string(),
@@ -779,6 +783,35 @@ mod tests {
             .get_network_info(&Params::None)
             .unwrap();
         assert_eq!(ni["version"], "3.0.0.0");
+    }
+
+    /// getnetworkinfo: IPv4 and IPv6 are reachable only once a local address of
+    /// them is known, and an IPv6 one marks IPv4 too (Divi Core
+    /// NetworkLocalAddressHelpers.cpp:73-105, :163-167)
+    #[test]
+    fn getnetworkinfo_reachable_follows_the_local_addresses() {
+        let reachable = |pm: &Arc<PeerManager>| {
+            let ni = NetworkRpc::with_peer_manager(Arc::clone(pm))
+                .get_network_info(&Params::None)
+                .unwrap();
+            let nets = ni["networks"].as_array().unwrap().clone();
+            nets.iter()
+                .map(|n| n["reachable"].as_bool().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let pm = PeerManager::new(quiet_config());
+        assert_eq!(reachable(&pm), [false, false, false]);
+        assert!(pm.local_addresses().add(
+            "8.8.4.4:51472".parse().unwrap(),
+            divi_network::local::LOCAL_MANUAL
+        ));
+        assert_eq!(reachable(&pm), [true, false, false]);
+        let pm = PeerManager::new(quiet_config());
+        assert!(pm.local_addresses().add(
+            "[2001:4860:4860::8844]:51472".parse().unwrap(),
+            divi_network::local::LOCAL_MANUAL,
+        ));
+        assert_eq!(reachable(&pm), [true, true, false]);
     }
 
     /// The code and message of an RPC error
