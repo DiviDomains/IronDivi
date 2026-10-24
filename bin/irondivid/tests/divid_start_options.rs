@@ -516,6 +516,42 @@ fn keypool_option_sets_the_keypool_size() {
     assert_eq!(size(&daemon), json!(16), "keypoolrefill with -keypool=8");
 }
 
+/// -upgradewallet limits the version a new wallet may have; one below the
+/// base wallet version, as a bare -upgradewallet is (read as 0), stops the
+/// start, while the client version itself gives the latest
+/// (wallet.cpp:183, :1963-1971; init.cpp:1175). An existing wallet is not
+/// checked.
+#[test]
+fn upgradewallet_below_the_base_version_refuses_a_new_wallet() {
+    let bin = env!("CARGO_BIN_EXE_irondivid");
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = divid_args(dir.path(), free_port());
+    args.push("-upgradewallet".into());
+    let out = output_within(Command::new(bin).args(&args));
+    let errors: Vec<String> = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with("Error"))
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        errors,
+        ["Error: Error loading wallet.dat: database load failure"]
+    );
+    assert_eq!(out.status.code(), Some(1));
+
+    for option in ["-upgradewallet=3000000", "-upgradewallet"] {
+        let rpc_port = free_port();
+        let mut args = divid_args(dir.path(), rpc_port);
+        args.push(option.into());
+        let daemon = Daemon::start(&args, &[], rpc_port, true);
+        assert_eq!(
+            daemon.rpc("getwalletinfo", json!([]))["walletversion"],
+            json!(120200),
+            "{option}"
+        );
+    }
+}
+
 /// -walletnotify runs each time divid's wallet adds or updates a
 /// transaction (wallet.cpp:1283): a send twice (CommitTransaction, then the
 /// mempool, :1878) and its block once

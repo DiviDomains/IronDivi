@@ -310,7 +310,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "torcontrol",
     "torpassword",
     "txconfirmtarget",
-    "upgradewallet",
     "upnp",
     "vault_min",
     "zmqpubhashblock",
@@ -637,6 +636,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "salvagewallet",
         "spendzeroconfchange",
         "keypool",
+        "upgradewallet",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1170,6 +1170,9 @@ struct WalletOptions {
     /// -keypool: keys of each chain the keypool is topped up to, read as a
     /// number and at least one (wallet.cpp:2071-2080)
     keypool: Option<u32>,
+    /// -upgradewallet, read as a number: the highest wallet version a new
+    /// wallet may have (wallet.cpp:1963-1971)
+    upgrade_wallet: Option<i64>,
 }
 
 impl WalletOptions {
@@ -1180,7 +1183,18 @@ impl WalletOptions {
             keypool: settings
                 .get("keypool")
                 .map(|v| atoi(v).clamp(1, u32::MAX as i64) as u32),
+            upgrade_wallet: settings.get("upgradewallet").map(atoi),
         }
+    }
+
+    /// Divi Core gives a new wallet the latest version only when
+    /// -upgradewallet is absent or is its client version; otherwise the
+    /// wallet keeps the base version, and a limit below that stops the load
+    /// (wallet.cpp:183, :1963-1971; init.cpp:1175)
+    fn refuses_new_wallet(&self) -> bool {
+        const CLIENT_VERSION: i64 = 3_000_000;
+        const FEATURE_BASE: i64 = 10_500;
+        matches!(self.upgrade_wallet, Some(v) if v != CLIENT_VERSION && v < FEATURE_BASE)
     }
 }
 
@@ -1190,7 +1204,7 @@ fn load_or_create_wallet(
     network: WalletNetwork,
     chain_mode: ChainMode,
     seed: WalletSeed,
-    keypool: Option<u32>,
+    options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
@@ -1210,7 +1224,7 @@ fn load_or_create_wallet(
         mnemonic,
         passphrase,
         hdseed,
-        keypool,
+        options,
     )
 }
 
@@ -1243,7 +1257,7 @@ fn load_or_restore_wallet(
         restoring,
         passphrase,
         None,
-        None,
+        &WalletOptions::default(),
     )
 }
 
@@ -1256,7 +1270,7 @@ fn load_or_restore_wallet_with_seed(
     restoring: Option<String>,
     passphrase: Option<String>,
     seed: Option<String>,
-    keypool: Option<u32>,
+    options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
@@ -1276,7 +1290,7 @@ fn load_or_restore_wallet_with_seed(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
-        if let Some(size) = keypool {
+        if let Some(size) = options.keypool {
             wallet.keystore().set_keypool_target(size);
         }
         // Divi Core does not refill the keypool when it loads a wallet: it tops
@@ -1315,6 +1329,11 @@ fn load_or_restore_wallet_with_seed(
     }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
+    // The version limit is checked before the seed is made
+    // (wallet.cpp:1963-1979), and before anything is written
+    if options.refuses_new_wallet() {
+        anyhow::bail!("Error loading wallet.dat: database load failure");
+    }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
     if passphrase.as_ref().is_some_and(|p| p.len() > 256) {
@@ -1361,7 +1380,7 @@ fn load_or_restore_wallet_with_seed(
 
     let wallet = WalletDb::create_persistent(wallet_path, network, hd_wallet)
         .with_context(|| "Failed to create wallet")?;
-    if let Some(size) = keypool {
+    if let Some(size) = options.keypool {
         wallet.keystore().set_keypool_target(size);
     }
 
@@ -1528,7 +1547,7 @@ async fn run_daemon(
             wallet_network,
             config.network.chain_mode,
             wallet_seed,
-            wallet_options.keypool,
+            &wallet_options,
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
@@ -3662,7 +3681,7 @@ mod wallet_move_tests {
             WalletNetwork::Regtest,
             ChainMode::Divi,
             WalletSeed::default(),
-            None,
+            &WalletOptions::default(),
         );
         std::env::remove_var("WALLET_HDSEED");
         std::env::remove_var("WALLET_MNEMONIC");
