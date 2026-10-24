@@ -126,5 +126,12 @@ async fn connect_entries_on_one_ip_are_each_dialled() {
         .await,
         "not every -connect entry was dialled"
     );
-    assert_eq!(t.node.peer_manager().outbound_count(), 2);
+    // The listeners count a connection at accept, before the handshake that
+    // registers the peer, so wait for both peers to be registered
+    let pm = t.node.peer_manager();
+    assert!(
+        wait_until(WAIT, || pm.outbound_count() == 2).await,
+        "-connect peers registered: {}",
+        pm.outbound_count()
+    );
 }

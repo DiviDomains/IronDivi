@@ -67,6 +67,16 @@ impl Net {
     fn wallet(&mut self) -> Arc<WalletDb> {
         let hd = HdWallet::new(ChainMode::Divi).unwrap();
         let w = Arc::new(WalletDb::with_hd_wallet(Network::Regtest, hd));
+        // The wallets run as a node started with -vault=1
+        w.set_vault_mode(true);
+        self.wallets.push(w.clone());
+        w
+    }
+
+    /// A wallet of a node started without -vault
+    fn wallet_without_vault_option(&mut self) -> Arc<WalletDb> {
+        let hd = HdWallet::new(ChainMode::Divi).unwrap();
+        let w = Arc::new(WalletDb::with_hd_wallet(Network::Regtest, hd));
         self.wallets.push(w.clone());
         w
     }
@@ -933,4 +943,49 @@ fn reclaim_drops_change_below_the_vault_dust_limit() {
         );
     }
     assert!(output_to(&tx, &s.vault).is_empty());
+}
+
+// ----------------------------------------------------------------
+
+/// Without Divi Core's -vault option addvault fails and stores nothing
+/// (CWallet::AddVault, wallet.cpp:693-706; the RPC answers -32600)
+#[test]
+fn addvault_needs_the_vault_option() {
+    let mut s = setup();
+    let fresh = s.net.wallet_without_vault_option();
+    let manager_key = s
+        .manager
+        .keystore()
+        .get_key(&s.manager_addr.hash)
+        .unwrap()
+        .secret
+        .unwrap();
+    fresh.import_key(manager_key, None);
+    let rpc = s.net.rpc(&fresh);
+    let e = rpc
+        .add_vault(&p(vec![json!(s.encoding), json!(s.fund_txid.to_string())]))
+        .expect_err("addvault without the vault option must fail");
+    match e {
+        divi_rpc::Error::Rpc(r) => {
+            assert_eq!(r.code, -32600, "{}", r.message);
+            assert!(r.message.contains("vault=1"), "{}", r.message);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fresh.get_all_vaults().is_empty());
+}
+
+/// Without the option removevault reports false and keeps the vault
+/// (CWallet::RemoveVault, wallet.cpp:707-716; rpcwallet.cpp:1227)
+#[test]
+fn removevault_needs_the_vault_option() {
+    let s = setup();
+    s.manager.set_vault_mode(false);
+    let res = s
+        .net
+        .rpc(&s.manager)
+        .remove_vault(&p(vec![json!(s.encoding)]))
+        .unwrap();
+    assert_eq!(res, json!({"removal_status": false}));
+    assert_eq!(s.manager.get_all_vaults().len(), 1);
 }
