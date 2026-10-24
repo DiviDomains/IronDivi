@@ -3503,12 +3503,9 @@ impl WalletRpc {
             )
         })?;
 
-        // Unlike C++ Divi, the node keeps running: the wallet is already locked and
-        // its plaintext secrets are gone from memory and disk.
-        Ok(serde_json::json!(
-            "wallet encrypted; the wallet is now locked. Use walletpassphrase to unlock it. \
-             Back up your wallet again: earlier backups are not encrypted."
-        ))
+        // As Divi Core 3.0.0 the node keeps running with the wallet locked, and
+        // answers as Core does after its ReloadActiveWallet (rpcwallet.cpp:2732-2733)
+        Ok(serde_json::json!("Wallet reloaded!"))
     }
 
     /// getreceivedbyaddress - Get total amount received by an address

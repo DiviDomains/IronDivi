@@ -199,3 +199,15 @@ fn locked_wallet_is_checked_where_divid_checks_it() {
         (-8, "Invalid parameter, expected valid size.".to_string())
     );
 }
+
+/// encryptwallet answers as Divi Core 3.0.0 does, and leaves the wallet locked
+/// (rpcwallet.cpp:2729-2733)
+#[test]
+fn encryptwallet_answers_as_divid() {
+    let n = node();
+    assert_eq!(
+        n.ok("encryptwallet", vec![json!("pass")]),
+        json!("Wallet reloaded!")
+    );
+    assert!(n.wallet.is_locked());
+}
