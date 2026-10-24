@@ -227,6 +227,24 @@ fn received_by_counts_watched_addresses() {
     );
 }
 
+/// getaccountaddress moves on from a watched address once a wallet
+/// transaction pays it, as from any other (AccountShouldUseNewKey,
+/// rpcwallet.cpp:314-332)
+#[test]
+fn getaccountaddress_moves_on_from_a_paid_watched_address() {
+    let f = funded(&[10 * COIN]);
+    let w = watched().to_base58();
+    f.n.ok(
+        "importaddress",
+        vec![json!(w), json!("watch"), json!(false)],
+    );
+    assert_eq!(f.n.ok("getaccountaddress", vec![json!("watch")]), json!(w));
+    send_and_mine(&f, &w, 3.0);
+    let next = f.n.ok("getaccountaddress", vec![json!("watch")]);
+    assert_ne!(next, json!(w));
+    assert_eq!(f.n.ok("getaccount", vec![next]), json!("watch"));
+}
+
 /// minconf is an int, any int: -1 counts what is unconfirmed too, and a null is
 /// refused as json_spirit's get_int refuses it; minconf is read only for an
 /// address of the wallet (rpcwallet.cpp:1455-1461), and before the account in

@@ -665,6 +665,19 @@ impl<'a> History<'a> {
         records
     }
 
+    /// Whether an output of a wallet transaction pays exactly `script`
+    pub(crate) fn pays_script(&self, script: &Script) -> bool {
+        self.wallet.history_records().iter().any(|record| {
+            self.load(record).is_some_and(|loaded| {
+                loaded
+                    .tx
+                    .vout
+                    .iter()
+                    .any(|out| &out.script_pubkey == script)
+            })
+        })
+    }
+
     /// The tally of getreceivedbyaddress (rpcwallet.cpp:1466-1483): the outputs
     /// paying exactly `script` in wallet transactions that are not coinbases,
     /// final and at least `min_depth` deep

@@ -3388,7 +3388,7 @@ impl WalletRpc {
             .get_wallet()
             .map_err(|_| RpcError::new(codes::WALLET_ERROR, "Invalid masternode tier"))?;
         // Core takes the account address before it looks at the tier
-        let address = Self::account_address(&wallet, &format!("alloc->{}", arg(1)?), false)?;
+        let address = self.account_address(&wallet, &format!("alloc->{}", arg(1)?), false)?;
         use divi_masternode::MasternodeTier;
         let tier = match arg(2)?.to_lowercase().as_str() {
             "copper" => MasternodeTier::Copper,
@@ -4584,8 +4584,8 @@ impl WalletRpc {
         // account a new one (rpcwallet.cpp:609-615)
         if wallet.in_address_book(&address) {
             let old = wallet.get_account(&address);
-            if Self::account_address(&wallet, &old, false)? == address.to_string() {
-                Self::account_address(&wallet, &old, true)?;
+            if self.account_address(&wallet, &old, false)? == address.to_string() {
+                self.account_address(&wallet, &old, true)?;
             }
         }
         wallet.set_account(&address, account);
@@ -4605,18 +4605,27 @@ impl WalletRpc {
         )?;
 
         let wallet = self.get_wallet()?;
-        Ok(serde_json::json!(Self::account_address(
-            &wallet, account, false
-        )?))
+        Ok(serde_json::json!(
+            self.account_address(&wallet, account, false)?
+        ))
     }
 
     /// Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
     /// last address, unless a wallet transaction already pays it or
     /// `force_new`; otherwise a new key from the pool labelled with the account
-    fn account_address(wallet: &WalletDb, account: &str, force_new: bool) -> Result<String, Error> {
+    fn account_address(
+        &self,
+        wallet: &WalletDb,
+        account: &str,
+        force_new: bool,
+    ) -> Result<String, Error> {
         let addresses = wallet.get_addresses_by_account(account);
         if let (Some(last), false) = (addresses.last(), force_new) {
-            let paid = wallet.received_outputs().iter().any(|o| &o.address == last);
+            // Any wallet transaction paying its script, a watched address's too
+            // (AccountShouldUseNewKey, rpcwallet.cpp:314-332)
+            let paid = Address::from_base58(last)
+                .map(|a| self.history(wallet).pays_script(&a.script_pubkey()))
+                .unwrap_or(false);
             if !paid {
                 return Ok(last.clone());
             }
