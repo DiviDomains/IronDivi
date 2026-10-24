@@ -95,7 +95,9 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n\
+-blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
+-zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
@@ -317,10 +319,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "upgradewallet",
     "upnp",
     "vault_min",
-    "zmqpubhashblock",
-    "zmqpubhashtx",
-    "zmqpubrawblock",
-    "zmqpubrawtx",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -633,6 +631,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("walletnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    // Divi Core takes each -zmqpub* that is set, even empty (its bind then
+    // fails), as given (zmqnotificationinterface.cpp:38-50)
+    let zmq_address = |key: &str| s.get(key).map(String::from);
+    config.zmq = divi_node::zmq::ZmqConfig {
+        hashblock: zmq_address("zmqpubhashblock"),
+        hashtx: zmq_address("zmqpubhashtx"),
+        rawblock: zmq_address("zmqpubrawblock"),
+        rawtx: zmq_address("zmqpubrawtx"),
+    };
     config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
@@ -679,6 +686,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "expire",
         "blocknotify",
         "walletnotify",
+        "zmqpubhashblock",
+        "zmqpubhashtx",
+        "zmqpubrawblock",
+        "zmqpubrawtx",
         "whitelist",
         "whitebind",
     ];
@@ -1435,6 +1446,10 @@ async fn run_daemon(
         spawn_block_notify(node.chain().clone(), cmd);
     }
 
+    // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
+    // Kept for the life of the node; none if an address cannot be bound.
+    let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
+
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
 
@@ -1554,7 +1569,7 @@ async fn run_daemon(
             {
                 let wallet_for_added = Arc::clone(wallet_arc);
                 node.mempool()
-                    .set_added_listener(Arc::new(move |tx: &Transaction| {
+                    .add_added_listener(Arc::new(move |tx: &Transaction| {
                         if wallet_for_added.add_mempool_tx(tx) {
                             info!("Wallet sees unconfirmed tx {}", tx.txid());
                         }
@@ -2125,7 +2140,7 @@ fn run_notify(cmd: &str, value: &str) {
 /// -blocknotify: run the command each time the best block changes, with the
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
-    chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+    chain.add_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core

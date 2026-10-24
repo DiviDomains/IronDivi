@@ -82,6 +82,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub blocknotify: Option<String>,
 
+    /// The ZMQ notifier addresses (Divi Core's -zmqpub* options)
+    #[serde(default)]
+    pub zmq: crate::zmq::ZmqConfig,
+
     /// Command run when a wallet transaction is added or updated, `%s`
     /// replaced by its txid (Divi Core's -walletnotify)
     #[serde(default)]
@@ -119,6 +123,7 @@ impl Default for NodeConfig {
             bootstrap_dir: None,
             stop_after_block_import: false,
             blocknotify: None,
+            zmq: Default::default(),
             walletnotify: None,
             vault: false,
         }

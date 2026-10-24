@@ -254,7 +254,7 @@ pub struct Mempool {
     priority_deltas: RwLock<HashMap<Hash256, (f64, i64)>>,
 
     /// Called after a transaction is inserted (outside any mempool lock)
-    on_added: RwLock<Option<MempoolListener>>,
+    on_added: RwLock<Vec<MempoolListener>>,
 
     /// Called after a transaction is removed for any reason (outside any mempool lock)
     on_removed: RwLock<Option<MempoolListener>>,
@@ -279,7 +279,7 @@ impl Mempool {
             spenders: RwLock::new(HashMap::new()),
             total_size: RwLock::new(0),
             priority_deltas: RwLock::new(HashMap::new()),
-            on_added: RwLock::new(None),
+            on_added: RwLock::new(Vec::new()),
             on_removed: RwLock::new(None),
             tip_height: RwLock::new(None),
             validator: RwLock::new(None),
@@ -307,9 +307,9 @@ impl Mempool {
         }
     }
 
-    /// Register a listener for transactions entering the mempool
-    pub fn set_added_listener(&self, listener: MempoolListener) {
-        *self.on_added.write() = Some(listener);
+    /// Add a listener for transactions entering the mempool
+    pub fn add_added_listener(&self, listener: MempoolListener) {
+        self.on_added.write().push(listener);
     }
 
     /// Install the checks every added transaction must pass. The node sets
@@ -445,8 +445,8 @@ impl Mempool {
             entry.size
         );
 
-        let listener = self.on_added.read().clone();
-        if let Some(listener) = listener {
+        let listeners = self.on_added.read().clone();
+        for listener in &listeners {
             listener(&entry.tx);
         }
 
@@ -667,6 +667,43 @@ impl Mempool {
     /// block's transactions, together with their descendants. They can never
     /// confirm; left in place they kept a double spend in the local mempool
     /// (and the wallet's pending view) forever. Returns how many were removed.
+    /// The transactions `remove_conflicts` would remove for `block_txs`, in
+    /// the order Divi Core's removeConflicts lists them: for each block
+    /// transaction and input in turn, the mempool transaction spending the
+    /// same coin and then its descendants breadth first
+    /// (txmempool.cpp:91-178)
+    pub fn conflicts_with(&self, block_txs: &[Transaction]) -> Vec<Transaction> {
+        let txs = self.txs.read();
+        let spenders = self.spenders.read();
+        let mut listed = HashSet::new();
+        let mut out = Vec::new();
+        for tx in block_txs {
+            let txid = tx.txid();
+            for input in &tx.vin {
+                let Some(first) = spenders.get(&(input.prevout.txid, input.prevout.vout)) else {
+                    continue;
+                };
+                if *first == txid {
+                    continue;
+                }
+                let mut queue = std::collections::VecDeque::from([*first]);
+                while let Some(id) = queue.pop_front() {
+                    let Some(entry) = txs.get(&id) else { continue };
+                    if !listed.insert(id) {
+                        continue;
+                    }
+                    for vout in 0..entry.tx.vout.len() as u32 {
+                        if let Some(child) = spenders.get(&(id, vout)) {
+                            queue.push_back(*child);
+                        }
+                    }
+                    out.push(entry.tx.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn remove_conflicts(&self, block_txs: &[Transaction]) -> usize {
         let mut doomed: Vec<Hash256> = {
             let spenders = self.spenders.read();
