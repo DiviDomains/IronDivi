@@ -12,8 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
-
+use divi_test_support::{free_port, log_tail};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -47,22 +46,6 @@ fn ok(port: u16, method: &str, params: Value) -> Value {
         .unwrap_or_else(|| panic!("{method}: no reply"));
     assert!(reply["error"].is_null(), "{method}: {reply}");
     reply["result"].clone()
-}
-
-/// Two free ports in this lane's range (53950-53999), starting at `from`
-fn free_ports(from: u16) -> (u16, u16) {
-    let free = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
-    let mut found = Vec::new();
-    for i in 0..50u16 {
-        let port = 53950 + (from - 53950 + i) % 50;
-        if free(port) {
-            found.push(port);
-            if found.len() == 2 {
-                return (found[0], found[1]);
-            }
-        }
-    }
-    panic!("no two free ports in 53950-53999");
 }
 
 struct Node(Child);
@@ -99,10 +82,7 @@ fn start(datadir: &Path, rpc_port: u16, p2p_port: u16) -> Node {
     .is_none()
     {
         if let Ok(Some(status)) = node.0.try_wait() {
-            panic!(
-                "irondivid exited at start: {status}\n{}",
-                common::log_tail(datadir)
-            );
+            panic!("irondivid exited at start: {status}\n{}", log_tail(datadir));
         }
         assert!(
             Instant::now() < deadline,
@@ -145,7 +125,7 @@ fn debug_log(datadir: &Path) -> String {
 #[test]
 fn exits_without_closing_the_databases_after_the_clean_stop() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = free_ports(53970);
+    let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut node = start(dir.path(), rpc_port, p2p_port);
     ok(rpc_port, "setgenerate", json!([120]));
     let address = ok(rpc_port, "getnewaddress", json!([]));
@@ -171,7 +151,7 @@ fn exits_without_closing_the_databases_after_the_clean_stop() {
         panic!(
             "irondivid still running {} s after SIGINT\n{}",
             took.as_secs(),
-            common::log_tail(dir.path())
+            log_tail(dir.path())
         )
     });
     assert!(took < EXIT_LIMIT, "exit took {} s", took.as_secs_f32());
@@ -191,7 +171,7 @@ fn exits_without_closing_the_databases_after_the_clean_stop() {
     assert!(
         log.contains("Shutdown: databases synced and the clean stop recorded"),
         "{}",
-        common::log_tail(dir.path())
+        log_tail(dir.path())
     );
     drop(node);
 
@@ -204,7 +184,7 @@ fn exits_without_closing_the_databases_after_the_clean_stop() {
     assert!(
         !restart.contains("did not stop cleanly"),
         "{}",
-        common::log_tail(dir.path())
+        log_tail(dir.path())
     );
     ok(rpc_port, "setgenerate", json!([1]));
     drop(node);
