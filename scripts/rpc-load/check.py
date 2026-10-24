@@ -33,7 +33,13 @@ ANSWER_SECS = 3
 THREADS = ("divid serves -rpcthreads connections at a time, each to its end, keep-alive "
            "included (rpcserver.cpp:578-622, :756, :1000-1033); irondivid serves each "
            "connection on its own task and accepts -rpcthreads without using it")
+CS_MAIN = ("divid runs a call its table does not mark thread-safe only while it holds cs_main, which it "
+           "tries for every 50 ms (rpcserver.cpp:1072-1096): keypoolrefill (rpcserver.cpp:442) holds it while it "
+           "makes the keys, so getblockcount (rpcserver.cpp:345) waits for the long call; irondivid runs calls "
+           "side by side and its chain reads take no wallet or miner lock")
 KNOWN = {
+    "a short call while a long call runs": CS_MAIN,
+    "rpcthreads=1: a short call while a long call runs": THREADS + "; and " + CS_MAIN,
     "rpcthreads=1: a call while another client holds its connection open": THREADS,
     "rpcthreads=2: a call while two clients hold their connections open": THREADS,
 }
@@ -451,14 +457,22 @@ def held_connections(node, held):
     return f"{'answered' if answered else 'not answered'} within {ANSWER_SECS} s; after they close: {'answered' if later else 'not answered'}"
 
 
-def long_and_short(node):
-    """setgenerate 30 in flight, then getblockcount: does the short call come back
-    before the long one?"""
+LONG_CALL = ("keypoolrefill", 3000)
+long_secs = {}
+
+
+def long_and_short(node, tag):
+    """A long call (keypoolrefill, keys made one by one) in flight, then
+    getblockcount: does the short call come back before the long one?"""
     done = {}
+    method, size = LONG_CALL
+    size += len(long_secs) * 500  # a larger pool each time, so each call makes keys
 
     def long_call():
-        node.call("setgenerate", 30, timeout=300)
+        t = time.time()
+        node.call(method, size, timeout=300)
         done["long"] = time.time()
+        long_secs[f"{tag} {node.name}"] = done["long"] - t
 
     th = threading.Thread(target=long_call)
     th.start()
@@ -526,10 +540,8 @@ c, i = connection_close(C, "1.0", ("Connection: keep-alive",)), connection_close
 row("HTTP/1.0 with Connection: keep-alive", c, i, c == i)
 c, i = stalled(C), stalled(I)
 row("a half request and an idle connection, then others' calls", c, i, c == i)
-c = long_and_short(C)
-synced()
-i = long_and_short(I)
-synced()
+c = long_and_short(C, "default")
+i = long_and_short(I, "default")
 row("a short call while a long call runs", c, i, c == i)
 results = {}
 watchers = [threading.Thread(target=lambda n=n: results.__setitem__(n.name, stalled_later(n))) for n in (C, I)]
@@ -549,10 +561,8 @@ row("32 clients with wrong credentials at once, then right ones", c, i, c == i)
 restart(["rpcthreads=1"])
 c, i = held_connections(C, 1), held_connections(I, 1)
 row("rpcthreads=1: a call while another client holds its connection open", c, i, c == i)
-c = long_and_short(C)
-synced()
-i = long_and_short(I)
-synced()
+c = long_and_short(C, "rpcthreads=1")
+i = long_and_short(I, "rpcthreads=1")
 row("rpcthreads=1: a short call while a long call runs", c, i, c == i)
 restart(["rpcthreads=2"])
 c, i = held_connections(C, 1), held_connections(I, 1)
@@ -582,6 +592,8 @@ c = stop_mid_call(C)
 i = stop_mid_call(I)
 row("stop while 8 clients are mid-call", c, i, c == i and "exited 0" in c)
 
+print("# long call (" + " ".join(map(str, LONG_CALL)) + "+) seconds: " +
+      ", ".join(f"{k} {v:.1f}" for k, v in long_secs.items()), flush=True)
 print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
 print(f"FAILS {fails}", flush=True)
 sys.exit(min(fails, 254))
