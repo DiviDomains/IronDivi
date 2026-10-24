@@ -2195,6 +2195,9 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
+    // Removed at a clean stop, after `args` has been taken apart
+    let pid_file = pid_file_path(&args, &data_dir);
+
     // Build log config from CLI args
     let log_config = LogConfig {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
@@ -2301,7 +2304,6 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     }
 
     // Divi Core removes its pid file at a clean stop (init.cpp:396)
-    let pid_file = pid_file_path(&args, &data_dir);
     if std::fs::read_to_string(&pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string())
     {
         let _ = std::fs::remove_file(&pid_file);
