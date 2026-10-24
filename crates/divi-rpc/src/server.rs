@@ -50,6 +50,11 @@ pub struct RpcConfig {
     pub password: Option<String>,
     /// Who may connect besides the local host (Divi Core's -rpcallowip)
     pub allowed: Vec<Subnet>,
+    /// Keep a connection open after a reply when the request asks for it
+    /// (Divi Core's -rpckeepalive, default on)
+    pub keep_alive: bool,
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    pub rest: bool,
 }
 
 impl Default for RpcConfig {
@@ -59,6 +64,8 @@ impl Default for RpcConfig {
             username: None,
             password: None,
             allowed: Vec::new(),
+            keep_alive: true,
+            rest: false,
         }
     }
 }
@@ -221,6 +228,11 @@ impl RpcServer {
         self.blockchain.set_mempool(mempool.clone());
         self.wallet.set_mempool(mempool.clone());
         self.lite_wallet.write().set_mempool(mempool);
+    }
+
+    /// Set what invalidateblock and its family do to the mempool
+    pub fn set_reorg_hook(&self, hook: crate::blockchain::ReorgHook) {
+        self.blockchain.set_reorg_hook(hook);
     }
 
     /// Let `getblock` fetch pruned blocks from full-history peers
@@ -1336,9 +1348,26 @@ async fn handle_rpc(
     body: String,
 ) -> impl IntoResponse {
     debug!("RPC request: {}", body);
-    let (status, reply) = server.handle_http_body(&body);
+    let (status, reply) = handle_body(server, body).await;
     debug!("RPC response: {}", reply);
     json_reply(status, reply, &version, &headers)
+}
+
+/// Run a request's calls on the runtime's blocking threads. The calls are
+/// synchronous; on a worker thread a long one (keypoolrefill, verifychain)
+/// would keep that worker from serving other connections until it ends.
+/// Divi Core serves other connections from its other RPC threads meanwhile
+/// (rpcserver.cpp:755-757).
+async fn handle_body(server: Arc<RpcServer>, body: String) -> (StatusCode, String) {
+    match tokio::task::spawn_blocking(move || server.handle_http_body(&body)).await {
+        Ok(reply) => reply,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Cancelled: the runtime is shutting down
+        Err(_) => error_reply(
+            RpcError::internal_error("RPC server stopping"),
+            serde_json::Value::Null,
+        ),
+    }
 }
 
 /// A JSON-RPC reply with Divi Core's headers: application/json, and the
@@ -1380,7 +1409,7 @@ async fn handle_wallet_rpc(
     // TODO: In the future, we could use wallet_name to route to specific wallet instances
     // For now, we just log it and pass through to the default wallet
     // This enables multi-wallet CLI support even if server only has one wallet loaded
-    let (status, reply) = server.handle_http_body(&body);
+    let (status, reply) = handle_body(server, body).await;
     debug!("RPC response for wallet '{}': {}", wallet_name, reply);
     json_reply(status, reply, &version, &headers)
 }
@@ -1486,10 +1515,28 @@ impl RpcServer {
 /// is never served open (irondivid fills in cookie credentials when none are
 /// configured, see [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
-    build_router(server, rpc_credentials(config))
+    let router = build_router(server, rpc_credentials(config), config.rest);
+    if config.keep_alive {
+        return router;
+    }
+    // -rpckeepalive=0: every reply closes its connection, as Divi Core ends
+    // the connection's loop after it (rpcserver.cpp:1014-1017)
+    router.layer(middleware::map_response(
+        |mut res: axum::response::Response| async move {
+            res.headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            res
+        },
+    ))
 }
 
-fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
+fn build_router(
+    server: Arc<RpcServer>,
+    credentials: Option<Arc<(String, String)>>,
+    rest: bool,
+) -> Router {
+    // /rest/ paths: REST when on, without credentials, as divid
+    let rest_paths = crate::rest::router(server.clone(), rest);
     // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:150-152);
     // bodies up to Divi Core's MAX_SIZE
     let router = Router::new()
@@ -1536,10 +1583,14 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
         }
     }));
 
+    // REST outside the credentials
+    let router = router.merge(rest_paths);
+
     // Before the credentials, as Divi Core: GET and POST only, and the JSON-RPC
-    // paths only, the query included (rpcserver.cpp:1019-1031)
+    // paths only, the query included, or /rest/ when REST is on
+    // (rpcserver.cpp:1019-1031)
     let router = router.layer(middleware::from_fn(
-        |req: HttpRequest, next: Next| async move {
+        move |req: HttpRequest, next: Next| async move {
             if !crate::http::method_served(req.method()) {
                 return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
             }
@@ -1549,6 +1600,9 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
                 || path
                     .strip_prefix("/wallet/")
                     .is_some_and(|w| !w.is_empty() && !w.contains('/'));
+            if rest && path.starts_with("/rest/") {
+                return next.run(req).await;
+            }
             if uri.query().is_some() || !rpc_path {
                 return crate::http::error_page(StatusCode::NOT_FOUND);
             }
