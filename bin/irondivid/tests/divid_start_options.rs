@@ -392,6 +392,53 @@ fn blocknotify_and_walletnotify_run_their_commands() {
     );
 }
 
+/// -walletnotify runs each time divid's wallet adds or updates a
+/// transaction (wallet.cpp:1283): a send twice (CommitTransaction, then the
+/// mempool, :1878) and its block once
+#[test]
+fn walletnotify_runs_as_often_as_divid_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let hd = HdWallet::from_mnemonic(MNEMONIC, None, ChainMode::Divi).unwrap();
+    let first = WalletDb::with_hd_wallet(Network::Regtest, hd)
+        .new_receiving_address()
+        .unwrap();
+    mine_offline(dir.path(), &first, 25);
+    let txs = dir.path().join("txs.txt");
+    std::fs::write(
+        dir.path().join("divi.conf"),
+        format!("walletnotify=echo %s >> {}\n", txs.display()),
+    )
+    .unwrap();
+    let rpc_port = free_port();
+    let daemon = Daemon::start(
+        &divid_args(dir.path(), rpc_port),
+        &[("WALLET_MNEMONIC", MNEMONIC), ("WALLET_LOOKAHEAD", "5")],
+        rpc_port,
+        true,
+    );
+    let count = |txid: &str| {
+        std::fs::read_to_string(&txs)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == txid)
+            .count()
+    };
+    let settled = |txid: &str, n: usize| {
+        let reached = eventually(|| count(txid) >= n);
+        // Nothing more comes for this step
+        std::thread::sleep(Duration::from_secs(2));
+        reached && count(txid) == n
+    };
+
+    let to = daemon.rpc("getnewaddress", json!([]));
+    let txid = daemon.rpc("sendtoaddress", json!([to, 1]));
+    let txid = txid.as_str().unwrap().to_string();
+    assert!(settled(&txid, 2), "send: {} calls", count(&txid));
+
+    daemon.rpc("setgenerate", json!([1]));
+    assert!(settled(&txid, 3), "block: {} calls", count(&txid));
+}
+
 /// With -daemon the pid goes to divid.pid in the data directory, or to -pid
 /// (util.cpp:115-119); -wallet names a wallet within the data directory
 #[test]

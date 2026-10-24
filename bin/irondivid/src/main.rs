@@ -1381,6 +1381,11 @@ async fn run_daemon(
             core_files::lock_masternode_collateral(w, &config.data_dir);
             w.set_vault_mode(config.vault);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
+            // -walletnotify, before the wallet catches up with the chain
+            // (init.cpp:1199, before the rescan at :1242)
+            if let Some(cmd) = config.walletnotify.clone() {
+                w.set_tx_listener(Arc::new(move |txid| run_notify(&cmd, &txid.to_string())));
+            }
         }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
@@ -1742,11 +1747,6 @@ async fn run_daemon(
     });
     let wallet_for_shutdown = wallet.clone();
 
-    // -walletnotify (-blocknotify is set before the node starts)
-    if let (Some(cmd), Some(wallet)) = (config.walletnotify.clone(), wallet.clone()) {
-        spawn_wallet_notify(wallet, cmd);
-    }
-
     if !config.rpc.enabled {
         // -server=0: no RPC server, the node runs until it is told to stop
         info!("RPC server disabled (-server=0)");
@@ -1979,31 +1979,6 @@ fn run_notify(cmd: &str, value: &str) {
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
     chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
-}
-
-/// -walletnotify: run the command each time a wallet transaction is added or
-/// updated (in the mempool, then in a block), with its txid
-/// (init.cpp:1132-1143)
-fn spawn_wallet_notify(wallet: Arc<WalletDb>, cmd: String) {
-    tokio::spawn(async move {
-        let state = |w: &WalletDb| -> std::collections::HashMap<divi_primitives::hash::Hash256, Option<u32>> {
-            w.get_transactions(None)
-                .into_iter()
-                .map(|t| (t.txid, t.block_height))
-                .collect()
-        };
-        let mut known = state(&wallet);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let now = state(&wallet);
-            for (txid, height) in &now {
-                if known.get(txid) != Some(height) {
-                    run_notify(&cmd, &txid.to_string());
-                }
-            }
-            known = now;
-        }
-    });
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
