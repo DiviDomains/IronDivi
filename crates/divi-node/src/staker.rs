@@ -462,7 +462,18 @@ impl Staker {
             expected_time: self.calculate_expected_time(stake_weight),
             last_stake_time: *self.last_stake_time.read(),
             blocks: current_height,
+            recently_attempted: self.recently_attempted(current_height, current_timestamp()),
         }
+    }
+
+    /// Divi Core HasRecentlyAttemptedToGenerateProofOfStake (init.cpp:155-175):
+    /// a stake kernel was hashed at `height` or one of the three below it, less
+    /// than five minutes before `now`
+    fn recently_attempted(&self, height: u32, now: u64) -> bool {
+        let map = self.hashed_block_timestamps.read();
+        (0..4u32)
+            .filter_map(|offset| height.checked_sub(offset))
+            .any(|h| map.get(&h).is_some_and(|&t| now.saturating_sub(t) < 5 * 60))
     }
 
     /// Confirmations a coinbase or coinstake output needs before it can stake
@@ -1440,6 +1451,11 @@ impl Staker {
 
             // Try to find a valid hashproof
             let result = generator.create_hashproof_timestamp(&staking_data, current_time);
+            // Divi Core records the attempt once a kernel passes setup, from the
+            // staking loop and from setgenerate alike (PoSTransactionCreator.cpp:233-237)
+            if !matches!(result, HashproofResult::FailedSetup) {
+                self.record_staking_attempt(current_height, current_timestamp());
+            }
 
             match &result {
                 HashproofResult::Success(ts) => {
@@ -2170,6 +2186,10 @@ pub struct StakingStatus {
     pub last_stake_time: u64,
     /// Current chain height
     pub blocks: u32,
+    /// A stake kernel was hashed at one of the last four tip heights in the
+    /// last five minutes (Divi Core HasRecentlyAttemptedToGenerateProofOfStake,
+    /// init.cpp:155-175), by the staking loop or by setgenerate
+    pub recently_attempted: bool,
 }
 
 /// Which superblock payout a staked block at `height` must carry.
