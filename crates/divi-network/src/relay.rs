@@ -274,9 +274,14 @@ impl TxRelay {
         // Remove from in-flight
         self.txs_in_flight.write().remove(&txid);
 
-        // Check if we've already seen it
+        // Check if we've already seen it. One a whitelisted peer sends is
+        // relayed again, so the node serves as a gateway for nodes behind it
+        // (Divi Core main.cpp:794-799)
         if self.seen_txs.read().contains(&txid) {
             trace!("Already have tx {}", txid);
+            if self.peer_manager.is_whitelisted(peer_id) {
+                self.relay_tx(txid, Some(peer_id)).await;
+            }
             return;
         }
 

@@ -413,6 +413,22 @@ pub struct P2pConfig {
     /// The machine's interface addresses, found at start with `discover`
     #[serde(default)]
     pub interface_ips: Vec<std::net::IpAddr>,
+
+    /// Networks whose inbound peers are whitelisted (Divi Core -whitelist):
+    /// `ip`, `ip/bits` or `ip/netmask`
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+
+    /// More addresses to listen on, each peer coming in on them whitelisted
+    /// (Divi Core -whitebind)
+    #[serde(default)]
+    pub white_bind: Vec<SocketAddr>,
+
+    /// Listen on `listen_addr`. Divi Core listens only on the -bind and
+    /// -whitebind addresses when either is given, so -whitebind alone leaves
+    /// this off (net.cpp:1808-1823)
+    #[serde(default = "default_listen_on_addr")]
+    pub listen_on_addr: bool,
 }
 
 impl P2pConfig {
@@ -452,6 +468,10 @@ fn default_discover() -> bool {
     true
 }
 
+fn default_listen_on_addr() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -481,6 +501,9 @@ impl Default for P2pConfig {
             discover: default_discover(),
             external_ips: Vec::new(),
             interface_ips: Vec::new(),
+            whitelist: Vec::new(),
+            white_bind: Vec::new(),
+            listen_on_addr: true,
         }
     }
 }

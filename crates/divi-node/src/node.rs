@@ -504,7 +504,7 @@ impl Node {
                     }
                 })
                 .collect(),
-            listen_addr: if peer_sources.listen {
+            listen_addr: if peer_sources.listen && config.p2p.listen_on_addr {
                 Some(config.p2p.socket_addr())
             } else {
                 None
@@ -512,6 +512,17 @@ impl Node {
             default_port: config.network.default_p2p_port(),
             proxy,
             connect_only: !config.p2p.connect.is_empty(),
+            whitelist: config
+                .p2p
+                .whitelist
+                .iter()
+                .filter_map(|n| divi_network::Subnet::parse(n))
+                .collect(),
+            white_listen: if peer_sources.listen {
+                config.p2p.white_bind.clone()
+            } else {
+                Vec::new()
+            },
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // Divi Core -banscore / -bantime

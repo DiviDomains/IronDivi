@@ -317,8 +317,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "upgradewallet",
     "upnp",
     "vault_min",
-    "whitebind",
-    "whitelist",
     "zmqpubhashblock",
     "zmqpubhashtx",
     "zmqpubrawblock",
@@ -398,9 +396,9 @@ fn host_and_port(value: &str) -> (String, Option<u16>) {
 fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let mut s = settings.clone();
     let regtest = config.network.network_type == NetworkType::Regtest;
-    // -bind means listening; -connect means no DNS seeds and no listening;
-    // -proxy means no listening (net.cpp:1672-1700)
-    if s.is_set("bind") {
+    // -bind or -whitebind means listening; -connect means no DNS seeds and
+    // no listening; -proxy means no listening (net.cpp:1672-1700)
+    if s.is_set("bind") || s.is_set("whitebind") {
         s.soft_set_bool("listen", true);
     }
     if !s.get_multi("connect").is_empty() {
@@ -483,6 +481,22 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if s.is_set("listen") {
         config.p2p.listen = Some(s.get_bool("listen", true));
+    }
+    // -whitelist networks; one that is not a network stops the start
+    // (net.cpp:1749-1755)
+    for net in s.get_multi("whitelist") {
+        if divi_network::Subnet::parse(net).is_none() {
+            anyhow::bail!("Invalid netmask specified in -whitelist: '{}'", net);
+        }
+        config.p2p.whitelist.push(net.clone());
+    }
+    // -whitebind: a numeric address with its port; with -whitebind and no
+    // -bind, only the -whitebind addresses are listened on (net.cpp:1808-1823)
+    for raw in s.get_multi("whitebind") {
+        config.p2p.white_bind.push(white_bind_address(raw)?);
+    }
+    if s.is_set("whitebind") && !s.is_set("bind") {
+        config.p2p.listen_on_addr = false;
     }
     let connect = s.get_multi("connect");
     if !connect.is_empty() {
@@ -652,6 +666,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "expire",
         "blocknotify",
         "walletnotify",
+        "whitelist",
+        "whitebind",
     ];
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
@@ -686,6 +702,25 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A -whitebind value as Divi Core's Lookup reads it without name lookup:
+/// `ip:port` or `[ipv6]:port`; the port must be given (net.cpp:1815-1821)
+fn white_bind_address(text: &str) -> Result<std::net::SocketAddr> {
+    let text = text.trim();
+    let addr = text.parse::<std::net::SocketAddr>().ok().or_else(|| {
+        text.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, 0))
+    });
+    match addr {
+        None => anyhow::bail!("Cannot resolve -whitebind address: '{}'", text),
+        Some(a) if a.port() == 0 => {
+            anyhow::bail!("Need to specify a port with -whitebind: '{}'", text)
+        }
+        Some(a) => Ok(a),
+    }
 }
 
 /// A host with an optional port, as Divi Core's CService reads it: `ip`,
@@ -2758,6 +2793,58 @@ mod config_format_tests {
         .unwrap();
         assert_eq!(a.maxlogsize, Some(2));
         assert_eq!(a.chain_mode(), ChainMode::Divi);
+    }
+
+    /// -whitelist and -whitebind as divid reads them: a bad network or a
+    /// -whitebind without a port stops the start, and -whitebind alone means
+    /// listening only there (net.cpp:1749-1755, :1808-1823)
+    #[test]
+    fn whitelist_and_whitebind_are_divid_s() {
+        let c = cfg(
+            "regtest=1\nwhitelist=10.0.0.0/8\nwhitelist=192.168.1.5\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.whitelist, ["10.0.0.0/8", "192.168.1.5"]);
+        assert!(c.p2p.listen_on_addr && c.p2p.white_bind.is_empty());
+
+        let err = cfg("regtest=1\nwhitelist=not-a-net\n", &[]).unwrap_err();
+        assert_eq!(
+            format!("{:#}", err),
+            "Invalid netmask specified in -whitelist: 'not-a-net'"
+        );
+
+        let c = cfg(
+            "regtest=1\nconnect=127.0.0.1:1\nwhitebind=127.0.0.1:53999\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.white_bind, ["127.0.0.1:53999".parse().unwrap()]);
+        assert!(
+            !c.p2p.listen_on_addr,
+            "-whitebind alone also listens elsewhere"
+        );
+        assert_eq!(c.p2p.listen, Some(true), "-whitebind turns listening on");
+        let c = cfg(
+            "regtest=1\nbind=127.0.0.1\nwhitebind=127.0.0.1:53999\n",
+            &[],
+        )
+        .unwrap();
+        assert!(c.p2p.listen_on_addr);
+
+        for (bad, why) in [
+            (
+                "127.0.0.1",
+                "Need to specify a port with -whitebind: '127.0.0.1'",
+            ),
+            (
+                "localhost:53999",
+                "Cannot resolve -whitebind address: 'localhost:53999'",
+            ),
+        ] {
+            let err = cfg(&format!("regtest=1\nwhitebind={bad}\n"), &[]).unwrap_err();
+            assert_eq!(format!("{:#}", err), why);
+        }
     }
 }
 
