@@ -1949,6 +1949,12 @@ fn submit_error(e: divi_node::NodeError) -> divi_rpc::TxSubmitError {
     use divi_node::NodeError;
     use divi_rpc::TxSubmitError;
     match e {
+        // AreInputsStandard fails without a reject state in Divi Core
+        // (MempoolConsensus.cpp:363-364), so sendrawtransaction answers -25
+        // with its empty reject reason (rpcrawtransaction.cpp:880-883)
+        NodeError::TxRejected { reason, .. } if reason == "bad-txns-nonstandard-inputs" => {
+            TxSubmitError::Failed(String::new())
+        }
         NodeError::TxRejected { code, reason, .. } => TxSubmitError::Rejected { code, reason },
         NodeError::MissingInputs => TxSubmitError::UnknownInputs,
         NodeError::NonFinal => TxSubmitError::Rejected {
@@ -3175,6 +3181,31 @@ mod staking_config_tests {
             let staking = staking_config(&config, &params);
             assert_eq!(staking.min_coin_age, age, "{network:?}");
             assert_eq!(staking.min_stake_amount, 0, "{network:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod submit_error_tests {
+    use super::*;
+
+    /// A refusal Divi Core makes without a reject state reaches the RPC as
+    /// -25 with an empty message; refusals with a state keep code and reason
+    #[test]
+    fn nonstandard_inputs_answer_like_core() {
+        use divi_node::{error::reject, NodeError};
+        match submit_error(NodeError::rejected(
+            reject::NONSTANDARD,
+            "bad-txns-nonstandard-inputs",
+        )) {
+            divi_rpc::TxSubmitError::Failed(message) => assert_eq!(message, ""),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        match submit_error(NodeError::rejected(reject::NONSTANDARD, "dust")) {
+            divi_rpc::TxSubmitError::Rejected { code, reason } => {
+                assert_eq!((code, reason.as_str()), (reject::NONSTANDARD, "dust"))
+            }
+            other => panic!("expected Rejected, got {other:?}"),
         }
     }
 }

@@ -311,10 +311,12 @@ fn manager_plain_send_never_selects_vault_output() {
     assert!(left > 34 * COIN && left < 35 * COIN, "{}", left);
 
     // fundvault from the manager wallet goes through the same selection
-    let txid = rpc
+    let funded = rpc
         .fund_vault(&p(vec![json!(s.encoding), json!(10.0)]))
         .unwrap_or_else(|e| panic!("manager fundvault failed: {}", error_message(e)));
-    assert!(txid.is_string());
+    // Divi Core answers {"txhash", "vault": [{"encoding"}]}
+    assert!(funded["txhash"].is_string());
+    assert_eq!(funded["vault"][0]["encoding"], json!(s.encoding));
 }
 
 /// The vault output is not part of the manager's Spendable set, and after
@@ -424,7 +426,11 @@ fn manager_cannot_reclaim_vault() {
     let e = rpc
         .reclaim_vault_funds(&p(vec![json!(dest.to_string()), json!(1.0)]))
         .unwrap_err();
-    assert!(error_message(e).contains("No vault funds available to reclaim"));
+    // SendMoney's balance check against the vaulted balance (rpcwallet.cpp:745-753)
+    assert_eq!(
+        error_message(e),
+        "Insufficient funds: 100000000(total requested) is greater than 0(total available)"
+    );
     assert!(s.net.submitted.lock().is_empty());
 }
 

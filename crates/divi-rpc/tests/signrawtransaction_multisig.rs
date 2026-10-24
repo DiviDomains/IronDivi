@@ -71,7 +71,7 @@ fn two_wallets_cosign_a_p2sh_multisig_input() {
     // A stores the redeem script; B only learns it from prevtxs
     let ms_a = call(&a, "addmultisigaddress", vec![json!(2), keys.clone()]);
     let ms_b = call(&b, "createmultisig", vec![json!(2), keys]);
-    assert_eq!(ms_a["address"], ms_b["address"]);
+    assert_eq!(ms_a, ms_b["address"]);
     let redeem = ms_b["redeemScript"].as_str().unwrap().to_string();
     let redeem_bytes = hex::decode(&redeem).unwrap();
     let p2sh = Script::new_p2sh(divi_crypto::hash160(&redeem_bytes).as_bytes());

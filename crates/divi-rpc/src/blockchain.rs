@@ -160,13 +160,35 @@ pub trait MempoolProvider: Send + Sync {
 
 /// Convert chain_work from little-endian storage to big-endian hex for RPC display.
 /// C++ Bitcoin/Divi stores and displays chainwork as big-endian hex.
-fn chainwork_to_hex(chain_work: &[u8; 32]) -> String {
-    let mut be = *chain_work;
-    be.reverse();
-    hex::encode(be)
+///
+/// The stored genesis index has no work of its own, so every stored value is
+/// one genesis proof short of Divi Core's nChainWork (which counts the genesis
+/// block); `genesis_bits` adds it back for display only.
+fn chainwork_to_hex(chain_work: &[u8; 32], genesis_bits: u32) -> String {
+    let genesis = divi_consensus::get_block_proof(genesis_bits);
+    let mut sum = [0u8; 32];
+    let mut carry = 0u16;
+    for i in 0..32 {
+        let v = chain_work[i] as u16 + genesis[i] as u16 + carry;
+        sum[i] = v as u8;
+        carry = v >> 8;
+    }
+    sum.reverse();
+    hex::encode(sum)
 }
 
 impl BlockchainRpc {
+    /// Divi Core's chainwork for a stored block index
+    fn chainwork(&self, index: &divi_storage::BlockIndex) -> String {
+        let genesis_bits = self
+            .chain
+            .get_block_index_by_height(0)
+            .ok()
+            .flatten()
+            .map_or(index.bits, |g| g.bits);
+        chainwork_to_hex(&index.chain_work, genesis_bits)
+    }
+
     /// Current chain tip height
     pub fn tip_height(&self) -> i32 {
         self.chain.height() as i32
@@ -353,14 +375,19 @@ impl BlockchainRpc {
             .get_i64(0)
             .ok_or_else(|| RpcError::invalid_params("Missing height parameter"))?;
 
-        let height = height as u32;
-        match self.chain.get_block_index_by_height(height)? {
+        // rpcblockchain.cpp:162-163
+        let out_of_range = || {
+            RpcError::new(
+                crate::error::codes::INVALID_PARAMETER,
+                "Block height out of range",
+            )
+        };
+        if height < 0 || height > self.chain.height() as i64 {
+            return Err(out_of_range().into());
+        }
+        match self.chain.get_block_index_by_height(height as u32)? {
             Some(index) => Ok(json!(index.hash.to_string())),
-            None => Err(RpcError::invalid_params(format!(
-                "Block height {} not in main chain",
-                height
-            ))
-            .into()),
+            None => Err(out_of_range().into()),
         }
     }
 
@@ -396,7 +423,7 @@ impl BlockchainRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing blockhash parameter"))?;
 
-        let hash = parse_hash(hash_str)?;
+        let hash = block_hash_like_core(hash_str)?;
 
         // 0/false = hex, 1/true = JSON with txids, 2 = JSON with decoded transactions
         let verbosity = match params.get(1) {
@@ -453,19 +480,20 @@ impl BlockchainRpc {
                 "nonce": index.nonce,
                 "bits": format!("{:08x}", index.bits),
                 "difficulty": bits_to_difficulty(index.bits),
-                "chainwork": chainwork_to_hex(&index.chain_work),
+                "chainwork": self.chainwork(&index),
                 "acc_checkpoint": block.header.accumulator_checkpoint.to_string(),
                 "nTx": block.transactions.len(),
-                "previousblockhash": if index.height > 0 {
-                    Some(index.prev_hash.to_string())
-                } else {
-                    None
-                },
             });
+            // The genesis block has no previousblockhash key (JsonBlockHelpers.cpp:68)
+            if index.height > 0 {
+                result["previousblockhash"] = json!(index.prev_hash.to_string());
+            }
 
             // Per-block supply is only known for blocks connected since the
-            // field was added to the block index; omit it otherwise.
-            if let Some(supply) = index.money_supply {
+            // field was added to the block index; omit it otherwise. The
+            // genesis block's supply is 0.
+            let supply = index.money_supply.or((index.height == 0).then_some(0));
+            if let Some(supply) = supply {
                 result["moneysupply"] = json!(supply as f64 / 100_000_000.0);
             }
 
@@ -488,7 +516,7 @@ impl BlockchainRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing blockhash parameter"))?;
 
-        let hash = parse_hash(hash_str)?;
+        let hash = block_hash_like_core(hash_str)?;
         let verbose = params.get_bool(1).unwrap_or(true);
 
         let index = self
@@ -530,14 +558,12 @@ impl BlockchainRpc {
                 "nonce": index.nonce,
                 "bits": format!("{:08x}", index.bits),
                 "difficulty": bits_to_difficulty(index.bits),
-                "chainwork": chainwork_to_hex(&index.chain_work),
+                "chainwork": self.chainwork(&index),
                 "nTx": index.n_tx,
-                "previousblockhash": if index.height > 0 {
-                    Some(index.prev_hash.to_string())
-                } else {
-                    None
-                },
             });
+            if index.height > 0 {
+                result["previousblockhash"] = json!(index.prev_hash.to_string());
+            }
 
             // Add nextblockhash if on the active chain and not the tip
             if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
@@ -560,7 +586,7 @@ impl BlockchainRpc {
             Some(t) => (
                 t.height,
                 t.hash.to_string(),
-                chainwork_to_hex(&t.chain_work),
+                self.chainwork(t),
                 self.get_median_time(t),
                 bits_to_difficulty(t.bits),
             ),
@@ -874,10 +900,12 @@ impl BlockchainRpc {
         Ok(json!(success))
     }
 
+    /// gettxout as Divi Core (rpcblockchain.cpp:330-402): null for an output
+    /// that is spent or unknown; with includemempool (default) an output spent
+    /// in the mempool is null and a mempool transaction's output has 0
+    /// confirmations
     pub fn get_tx_out(&self, params: &Params) -> Result<Value, Error> {
-        use divi_primitives::hash::Hash160;
         use divi_primitives::transaction::OutPoint;
-        use divi_wallet::address::Address;
         let txid_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing txid parameter"))?;
@@ -886,67 +914,53 @@ impl BlockchainRpc {
             .get_i64(1)
             .ok_or_else(|| RpcError::invalid_params("Missing vout parameter"))?;
 
-        let txid = parse_hash(txid_str)?;
-
-        if vout < 0 {
-            return Err(RpcError::invalid_params("vout must be non-negative").into());
+        // `uint256 hash(strHash)`: text that is not a hash names no transaction
+        let Ok(txid) = Hash256::from_hex(txid_str) else {
+            return Ok(Value::Null);
+        };
+        if vout < 0 || vout > u32::MAX as i64 {
+            return Ok(Value::Null);
         }
-        let vout = vout as u32;
+        let outpoint = OutPoint::new(txid, vout as u32);
+        let include_mempool = params.get_bool(2).unwrap_or(true);
+        let mempool = self.mempool.read().clone().filter(|_| include_mempool);
 
-        let _include_mempool = params.get_bool(2).unwrap_or(true);
-
-        let outpoint = OutPoint::new(txid, vout);
-        match self.chain.get_utxo(&outpoint)? {
-            Some(utxo) => {
-                let current_height = self.chain.height();
-                let confirmations = current_height.saturating_sub(utxo.height) + 1;
-
-                let best_block_hash = match self.chain.tip() {
-                    Some(tip) => tip.hash.to_string(),
-                    None => Hash256::zero().to_string(),
-                };
-
-                let address = if let Some(pkh) = utxo.script_pubkey.extract_p2pkh_hash() {
-                    Some(
-                        Address::from_pubkey_hash(Hash160::from_bytes(pkh), self.address_network())
-                            .to_base58(),
-                    )
-                } else {
-                    utxo.script_pubkey.extract_p2sh_hash().map(|sh| {
-                        Address::p2sh(Hash160::from_bytes(sh), self.address_network()).to_base58()
-                    })
-                };
-
-                let script_type = if utxo.script_pubkey.is_p2pkh() {
-                    "pubkeyhash"
-                } else if utxo.script_pubkey.is_p2sh() {
-                    "scripthash"
-                } else {
-                    "nonstandard"
-                };
-
-                let mut script_obj = json!({
-                    "asm": divi_script::to_asm(utxo.script_pubkey.as_bytes()),
-                    "hex": hex::encode(utxo.script_pubkey.as_bytes()),
-                    "type": script_type,
-                });
-
-                if let Some(addr) = address {
-                    script_obj["addresses"] = json!([addr]);
-                }
-
-                Ok(json!({
+        if mempool.as_ref().is_some_and(|m| m.is_spent(&outpoint)) {
+            return Ok(Value::Null);
+        }
+        let best_block_hash = match self.chain.tip() {
+            Some(tip) => tip.hash.to_string(),
+            None => Hash256::zero().to_string(),
+        };
+        let network = self.address_network();
+        if let Some(utxo) = self.chain.get_utxo(&outpoint)? {
+            let confirmations = self.chain.height().saturating_sub(utxo.height) + 1;
+            return Ok(json!({
+                "bestblock": best_block_hash,
+                "confirmations": confirmations,
+                "value": utxo.value.as_divi_f64(),
+                "scriptPubKey": crate::wallet::script_pubkey_to_json(utxo.script_pubkey.as_bytes(), network, true),
+                // The UTXO set keeps no transaction version; standard transactions are 1
+                "version": 1,
+                "coinbase": utxo.is_coinbase,
+                "coinstake": utxo.is_coinstake,
+            }));
+        }
+        let in_pool = mempool.and_then(|m| m.get_transaction(&txid));
+        if let Some(tx) = in_pool {
+            if let Some(out) = tx.vout.get(outpoint.vout as usize) {
+                return Ok(json!({
                     "bestblock": best_block_hash,
-                    "confirmations": confirmations,
-                    "version": 1,
-                    "value": utxo.value.as_divi_f64(),
-                    "scriptPubKey": script_obj,
-                    "coinbase": utxo.is_coinbase,
-                    "coinstake": utxo.is_coinstake,
-                }))
+                    "confirmations": 0,
+                    "value": out.value.as_divi_f64(),
+                    "scriptPubKey": crate::wallet::script_pubkey_to_json(out.script_pubkey.as_bytes(), network, true),
+                    "version": tx.version,
+                    "coinbase": false,
+                    "coinstake": false,
+                }));
             }
-            None => Ok(json!(null)),
         }
+        Ok(Value::Null)
     }
 
     pub fn generate_block(&self, _params: &Params) -> Result<Value, Error> {
@@ -965,70 +979,33 @@ impl BlockchainRpc {
         .into())
     }
 
+    /// decodescript as Divi Core (rpcrawtransaction.cpp:527-564): the script
+    /// fields of ScriptPubKeyToJSON without hex, then the script's P2SH address
     pub fn decode_script(&self, params: &Params) -> Result<Value, Error> {
         use divi_crypto::hash160;
         use divi_primitives::hash::Hash160;
-
-        use divi_script::{
-            extract_destinations, extract_script_type, get_script_type_name, to_asm,
-        };
         use divi_wallet::address::Address;
 
         let hex_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing hex parameter"))?;
 
-        let script_bytes =
-            hex::decode(hex_str).map_err(|_| RpcError::invalid_params("Invalid script hex"))?;
+        // Empty scripts are valid; anything else must be hex (ParseHexV "argument")
+        let script_bytes = if hex_str.is_empty() {
+            Vec::new()
+        } else {
+            crate::wallet::parse_hex_v(hex_str, "argument")?
+        };
 
-        let (script_type, _solutions) = extract_script_type(&script_bytes);
-
-        let asm = to_asm(&script_bytes);
-        let type_name = get_script_type_name(script_type);
-
-        let mut result = json!({
-            "asm": asm,
-            "hex": hex_str,
-            "type": type_name,
-        });
-
-        if let Some((_stype, destinations, req_sigs)) = extract_destinations(&script_bytes) {
-            result["reqSigs"] = json!(req_sigs);
-
-            let addresses: Vec<String> = destinations
-                .iter()
-                .map(|dest| match dest {
-                    divi_script::Destination::PubKeyHash(pkh) => {
-                        let mut bytes = [0u8; 20];
-                        bytes.copy_from_slice(pkh);
-                        let addr = Address::from_pubkey_hash(
-                            Hash160::from_bytes(bytes),
-                            self.address_network(),
-                        );
-                        addr.to_base58()
-                    }
-                    divi_script::Destination::ScriptHash(sh) => {
-                        let mut bytes = [0u8; 20];
-                        bytes.copy_from_slice(sh);
-                        let addr =
-                            Address::p2sh(Hash160::from_bytes(bytes), self.address_network());
-                        addr.to_base58()
-                    }
-                })
-                .collect();
-
-            if !addresses.is_empty() {
-                result["addresses"] = json!(addresses);
-            }
-        }
-
-        if type_name != "scripthash" {
-            let script_hash = hash160(&script_bytes);
-            let mut bytes = [0u8; 20];
-            bytes.copy_from_slice(script_hash.as_ref());
-            let p2sh_addr = Address::p2sh(Hash160::from_bytes(bytes), self.address_network());
-            result["p2sh"] = json!(p2sh_addr.to_base58());
-        }
+        let mut result =
+            crate::wallet::script_pubkey_to_json(&script_bytes, self.address_network(), false);
+        // IronDivi also echoes the script hex
+        result["hex"] = json!(hex_str);
+        let script_hash = hash160(&script_bytes);
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(script_hash.as_ref());
+        let p2sh_addr = Address::p2sh(Hash160::from_bytes(bytes), self.address_network());
+        result["p2sh"] = json!(p2sh_addr.to_base58());
 
         Ok(result)
     }
@@ -1449,6 +1426,18 @@ impl BlockchainRpc {
 }
 
 /// Parse a hash from hex string
+/// A block hash argument as Divi Core reads it (`uint256 hash(strHash)` then a
+/// block map lookup): text that is not a hash names no block, -5 "Block not found"
+fn block_hash_like_core(s: &str) -> Result<Hash256, Error> {
+    Hash256::from_hex(s).map_err(|_| {
+        RpcError::new(
+            crate::error::codes::INVALID_ADDRESS_OR_KEY,
+            "Block not found",
+        )
+        .into()
+    })
+}
+
 fn parse_hash(s: &str) -> Result<Hash256, Error> {
     Hash256::from_hex(s)
         .map_err(|e| RpcError::invalid_params(format!("Invalid hash: {} - {}", s, e)).into())
