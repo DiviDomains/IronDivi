@@ -750,10 +750,12 @@ impl BlockchainRpc {
             "reconsiderblock" => self.chain.reconsider_block(&hash).map_err(map_err)?,
             _ => {
                 // C++ reverseblocktransactions invalidates (reversing the block's
-                // transactions in the coin DB) then reconsiders; the net effect on a
-                // sound database is a roll-back and re-connect of the block.
-                self.chain.invalidate_block(&hash).map_err(map_err)?;
-                self.chain.reconsider_block(&hash).map_err(map_err)?;
+                // transactions in the coin DB) then clears the invalid mark
+                // without moving the tip, which stays at the block's parent
+                // until another block comes (rpcblockchain.cpp:577-603)
+                self.chain
+                    .reverse_block_transactions(&hash)
+                    .map_err(map_err)?;
             }
         }
         Ok(Value::Null)
@@ -1712,6 +1714,36 @@ mod tests {
         }
     }
 
+    /// reverseblocktransactions leaves the tip at the block's parent, and the
+    /// block is not left invalid: a child of it connects (Divi Core
+    /// rpcblockchain.cpp:577-603, ChainExtensionService.cpp:662-689)
+    #[test]
+    fn reverseblocktransactions_leaves_the_tip_at_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(divi_storage::ChainDatabase::open(dir.path()).unwrap());
+        let params = divi_storage::ChainParams::for_network(
+            NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let blocks = pow_chain(&chain, 4, 0xC3, 0);
+        for blk in &blocks[..3] {
+            chain.accept_block(blk.clone()).unwrap();
+        }
+        let rpc = BlockchainRpc::new(chain.clone());
+        let third = divi_crypto::compute_block_hash(&blocks[2].header);
+        let second = divi_crypto::compute_block_hash(&blocks[1].header);
+        rpc.invalidate_block_family(
+            "reverseblocktransactions",
+            &Params::Array(vec![json!(third.to_string())]),
+        )
+        .unwrap();
+        assert_eq!(chain.height(), 2);
+        assert_eq!(chain.tip().unwrap().hash, second);
+        chain.accept_block(blocks[3].clone()).unwrap();
+        assert_eq!(chain.height(), 4, "the reversed block stayed invalid");
+    }
+
     fn header_of(rpc: &BlockchainRpc, hash: Hash256) -> Value {
         rpc.get_block_header(&Params::Array(vec![json!(hash.to_string())]))
             .unwrap()
@@ -1780,7 +1812,9 @@ mod tests {
                 .unwrap(),
             Value::Null
         );
-        assert_eq!(chain.height(), 3);
+        // As divid: the tip stays at the reversed block's parent until another
+        // block comes (rpcblockchain.cpp:577-603)
+        assert_eq!(chain.height(), 1);
 
         let missing = "aa".repeat(32);
         let err = rpc
