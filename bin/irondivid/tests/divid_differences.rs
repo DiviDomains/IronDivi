@@ -11,6 +11,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::free_port;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -36,23 +39,6 @@ fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {
     stream.read_to_string(&mut response).ok()?;
     let (_, body) = response.split_once("\r\n\r\n")?;
     serde_json::from_str(body).ok()
-}
-
-/// Two free ports in this lane's range (53950-53999), starting the search at
-/// `from` so tests running at once look in different places
-fn free_ports(from: u16) -> (u16, u16) {
-    let free = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
-    let mut found = Vec::new();
-    for i in 0..50u16 {
-        let port = 53950 + (from - 53950 + i) % 50;
-        if free(port) {
-            found.push(port);
-            if found.len() == 2 {
-                return (found[0], found[1]);
-            }
-        }
-    }
-    panic!("no two free ports in 53950-53999");
 }
 
 struct Node(Child);
@@ -94,7 +80,7 @@ fn debug_log(datadir: &Path) -> String {
 #[test]
 fn unknown_and_unsupported_options_start_with_a_log_line() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = free_ports(53990);
+    let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut a = args(dir.path(), rpc_port, p2p_port);
     a.push("-bogusflag=1".into());
     a.push("-dbcache=100".into());
@@ -128,7 +114,7 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
 #[test]
 fn masternode_option_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = free_ports(53980);
+    let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut a = args(dir.path(), rpc_port, p2p_port);
     a.push("-masternode=mn1".into());
     let mut child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
@@ -173,7 +159,7 @@ fn masternode_option_is_refused() {
 #[test]
 fn negated_unknown_option_is_named_as_written() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc_port, p2p_port) = free_ports(53970);
+    let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut a = args(dir.path(), rpc_port, p2p_port);
     a.push("-nobogusflag".into());
     let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))

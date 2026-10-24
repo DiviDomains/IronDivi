@@ -14,12 +14,14 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::free_port;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 const WALLET_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
@@ -30,18 +32,6 @@ const WALLET_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
 /// m/44'/1'/0'/0/0
 const SEED: &str = "000102030405060708090a0b0c0d0e0f";
 const CORE_FIRST_ADDRESS: &str = "y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz";
-
-/// A free port in 54100-54149, the range these tests may use
-fn port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    for _ in 0..50 {
-        let p = 54100 + NEXT.fetch_add(1, Ordering::Relaxed) % 50;
-        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-    panic!("no free port in 54100-54149");
-}
 
 /// POST one JSON-RPC call; None while the server is not up
 fn try_rpc(port: u16, method: &str, params: &Value) -> Option<Value> {
@@ -70,7 +60,7 @@ fn irondivid(datadir: Option<&Path>, network: &str, rpc_port: u16) -> Command {
         cmd.arg("--datadir").arg(d);
     }
     cmd.args(["--rpcport", &rpc_port.to_string()])
-        .args(["--port", &port().to_string()])
+        .args(["--port", &free_port().to_string()])
         .args(["--bind", "127.0.0.1", "--staking=false"])
         .args(["--connect", "127.0.0.1:1"])
         // "dGVzdDp0ZXN0" is base64 of test:test
@@ -217,7 +207,7 @@ fn core_testnet3_folder_is_refused_and_left_alone() {
         std::fs::write(root.join("divi.conf"), "rpcuser=core\nrpcpassword=core\n").unwrap();
         let before = snapshot(root);
         let datadir = root.join(given);
-        let out = run_to_exit(irondivid(Some(&datadir), "--testnet", port()), 30)
+        let out = run_to_exit(irondivid(Some(&datadir), "--testnet", free_port()), 30)
             .unwrap_or_else(|| panic!("{given:?}: irondivid kept running"));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{given:?}");
@@ -247,7 +237,7 @@ fn wallet_option_at_a_plain_file_or_a_core_folder_is_refused() {
         (&notes, "is a file; irondivid's wallet is a folder"),
         (&core, "holds a Divi Core wallet.dat"),
     ] {
-        let mut cmd = irondivid(Some(&datadir), "--regtest", port());
+        let mut cmd = irondivid(Some(&datadir), "--regtest", free_port());
         cmd.arg("--wallet").arg(wallet);
         let out = run_to_exit(cmd, 60).unwrap_or_else(|| panic!("{wallet:?}: kept running"));
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -271,7 +261,7 @@ fn wallet_option_at_a_plain_file_or_a_core_folder_is_refused() {
 #[test]
 fn hdseed_option_makes_cores_wallet() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = port();
+    let rpc_port = free_port();
     let mut cmd = irondivid(Some(dir.path()), "--regtest", rpc_port);
     cmd.arg(format!("-hdseed={SEED}"));
     let daemon = Daemon::start(cmd, rpc_port);
@@ -284,7 +274,7 @@ fn hdseed_option_makes_cores_wallet() {
     assert!(!debug_log(dir.path()).contains(SEED), "the seed was logged");
 
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = port();
+    let rpc_port = free_port();
     let mut cmd = irondivid(Some(dir.path()), "--regtest", rpc_port);
     cmd.arg("-hdseed=not-hex");
     let daemon = Daemon::start(cmd, rpc_port);
@@ -322,7 +312,7 @@ fn masternode_conf_lock_is_always_on_and_unusable_lines_are_skipped() {
         ),
     )
     .unwrap();
-    let rpc_port = port();
+    let rpc_port = free_port();
     let mut cmd = irondivid(Some(datadir), "--regtest", rpc_port);
     cmd.arg("-mnconflock=0");
     let daemon = Daemon::start(cmd, rpc_port);
@@ -351,7 +341,7 @@ fn default_data_folder_is_kept_apart_from_cores() {
     core_chain_data(&core.join("regtest"));
     std::fs::write(core.join("divi.conf"), "rpcuser=core\nrpcpassword=core\n").unwrap();
     let before = snapshot(&core);
-    let rpc_port = port();
+    let rpc_port = free_port();
     let mut cmd = irondivid(None, "--regtest", rpc_port);
     cmd.env("HOME", home.path());
     Daemon::start(cmd, rpc_port).stop();
@@ -367,7 +357,7 @@ fn default_data_folder_is_kept_apart_from_cores() {
 #[test]
 fn bulk_wallet_dump_is_not_there_as_in_divid() {
     let dir = tempfile::tempdir().unwrap();
-    let rpc_port = port();
+    let rpc_port = free_port();
     let daemon = Daemon::start(irondivid(Some(dir.path()), "--regtest", rpc_port), rpc_port);
     for (method, params) in [
         (
