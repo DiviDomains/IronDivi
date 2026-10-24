@@ -2079,16 +2079,10 @@ impl WalletRpc {
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Transaction hex required"))?;
 
-        // Decode transaction
-        let tx_bytes = hex::decode(hex_str)
-            .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
-
-        let tx: Transaction = deserialize(&tx_bytes).map_err(|e| {
-            RpcError::new(
-                codes::DESERIALIZATION_ERROR,
-                format!("TX decode failed: {}", e),
-            )
-        })?;
+        // DecodeHexTx failing either way is "TX decode failed" (rpcrawtransaction.cpp:850-852)
+        let decode_failed = || RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed");
+        let tx_bytes = hex::decode(hex_str).map_err(|_| decode_failed())?;
+        let tx: Transaction = deserialize(&tx_bytes).map_err(|_| decode_failed())?;
 
         let txid = tx.txid();
         let allow_high_fees = params.get_bool(1).unwrap_or(false);
