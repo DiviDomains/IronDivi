@@ -64,6 +64,14 @@ pub struct NodeConfig {
     #[serde(default)]
     pub max_reorg: Option<u32>,
 
+    /// Block files to import at start (-loadblock), after bootstrap.dat
+    #[serde(default)]
+    pub load_block: Vec<PathBuf>,
+
+    /// Stop once the block files are imported (-stopafterblockimport)
+    #[serde(default)]
+    pub stop_after_block_import: bool,
+
     /// Command run when the best block changes, `%s` replaced by its hash
     /// (Divi Core's -blocknotify)
     #[serde(default)]
@@ -73,6 +81,10 @@ pub struct NodeConfig {
     /// replaced by its txid (Divi Core's -walletnotify)
     #[serde(default)]
     pub walletnotify: Option<String>,
+
+    /// Vaults may be added and removed (Divi Core's -vault, default off)
+    #[serde(default)]
+    pub vault: bool,
 }
 
 /// C++ `-checkblocks` default (init.cpp: `VerifyChain(4, GetArg("-checkblocks", 100))`)
@@ -98,8 +110,11 @@ impl Default for NodeConfig {
             expire: divi_storage::prune::Expire::Never,
             check_blocks: DEFAULT_CHECK_BLOCKS,
             max_reorg: None,
+            load_block: Vec::new(),
+            stop_after_block_import: false,
             blocknotify: None,
             walletnotify: None,
+            vault: false,
         }
     }
 }
@@ -585,6 +600,23 @@ pub struct StakingConfig {
     /// Allow staking on a tip older than 24h (`stakeonstaletip`). Default off.
     #[serde(default)]
     pub stake_on_stale_tip: bool,
+
+    /// Divi Core `-blockmaxsize`, `-blockprioritysize` and `-blockminsize`
+    /// (defaultValues.h:47-50)
+    #[serde(default = "default_block_max_size")]
+    pub block_max_size: usize,
+    #[serde(default = "default_block_priority_size")]
+    pub block_priority_size: usize,
+    #[serde(default)]
+    pub block_min_size: usize,
+}
+
+fn default_block_max_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_MAX_SIZE
+}
+
+fn default_block_priority_size() -> usize {
+    crate::staker::DEFAULT_BLOCK_PRIORITY_SIZE
 }
 
 impl Default for StakingConfig {
@@ -596,6 +628,9 @@ impl Default for StakingConfig {
             split_threshold: 2_000_000_000_000, // 20,000 DIVI (C++ -stakesplitthreshold default)
             combine_threshold: 100_000_000_000, // 1,000 DIVI
             stake_on_stale_tip: false,
+            block_max_size: default_block_max_size(),
+            block_priority_size: default_block_priority_size(),
+            block_min_size: crate::staker::DEFAULT_BLOCK_MIN_SIZE,
         }
     }
 }

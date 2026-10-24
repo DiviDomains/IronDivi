@@ -50,6 +50,7 @@
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+pub mod block_import;
 pub mod config;
 pub mod error;
 pub mod fee_estimator;

@@ -757,13 +757,12 @@ impl BlockchainRpc {
     }
 
     /// Get TXOUT set info
+    ///
+    /// Divi Core rpcblockchain.cpp:293-327: height, best block and every value
+    /// from one view of the UTXO set; bytes_serialized and hash_serialized over
+    /// Core's coin records (txdb.cpp:105-157). bogosize (irondivid only) is the
+    /// size of irondivid's own records.
     pub fn get_txout_set_info(&self, _params: &Params) -> Result<Value, Error> {
-        let tip = self.chain.tip();
-        let (height, best_hash) = match tip {
-            Some(t) => (t.height, t.hash.to_string()),
-            None => (0, Hash256::zero().to_string()),
-        };
-
         let stats = self.chain.get_utxo_stats().map_err(|e| {
             RpcError::new(
                 codes::MISC_ERROR,
@@ -773,16 +772,14 @@ impl BlockchainRpc {
 
         let total_amount_divi = stats.total_amount as f64 / 100_000_000.0;
 
-        let hash_serialized = hex::encode(stats.hash_serialized);
-
         Ok(json!({
-            "height": height,
-            "bestblock": best_hash,
+            "height": stats.height,
+            "bestblock": stats.best_block.to_string(),
             "transactions": stats.transactions,
             "txouts": stats.txouts,
-            "bogosize": stats.bytes_serialized,
+            "bogosize": stats.bogosize,
             "bytes_serialized": stats.bytes_serialized,
-            "hash_serialized": hash_serialized,
+            "hash_serialized": stats.hash_serialized.to_string(),
             "total_amount": total_amount_divi
         }))
     }
