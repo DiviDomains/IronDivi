@@ -35,8 +35,13 @@ use tracing::{debug, error, info, trace, warn};
 /// Maximum headers to request at once
 const MAX_HEADERS_REQUEST: usize = 2000;
 
-/// Maximum blocks to have in flight at once
-const MAX_BLOCKS_IN_FLIGHT: usize = 128;
+/// Blocks in flight from one peer at most (Divi Core MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+/// defaultValues.h:80, applied in main.cpp:1211-1217)
+const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+
+/// How far past the first missing block downloads may run (Divi Core
+/// BLOCK_DOWNLOAD_WINDOW, defaultValues.h:90; NodeStateRegistry.cpp:182-186)
+const BLOCK_DOWNLOAD_WINDOW: usize = 1024;
 
 /// Timeout for block downloads
 const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -979,15 +984,46 @@ impl BlockSync {
         let _ = self.progress_tx.send(self.progress());
     }
 
-    /// Request blocks from peers
+    /// Blocks in flight from each peer
+    fn in_flight_per_peer(&self) -> HashMap<PeerId, usize> {
+        let mut per = HashMap::new();
+        for req in self.blocks_in_flight.read().values() {
+            *per.entry(req.peer_id).or_default() += 1;
+        }
+        per
+    }
+
+    /// Request the next blocks from peers. As Divi Core's SendMessages does for
+    /// each peer (main.cpp:1205-1224, FindNextBlocksToDownload in
+    /// NodeStateRegistry.cpp:146-234): a peer with fewer than
+    /// MAX_BLOCKS_IN_TRANSIT_PER_PEER blocks in flight gets the next blocks in
+    /// chain order that are neither downloaded nor in flight, within
+    /// BLOCK_DOWNLOAD_WINDOW of the first missing one.
     async fn request_blocks(&self) {
-        let in_flight_count = self.blocks_in_flight.read().len();
-        if in_flight_count >= MAX_BLOCKS_IN_FLIGHT {
-            trace!("Already have {} blocks in flight", in_flight_count);
+        let peer_ids = self.peer_manager.connected_peers();
+        if peer_ids.is_empty() {
+            debug!("No connected peers available for block download");
+            return;
+        }
+        let per_peer = self.in_flight_per_peer();
+        let free: Vec<(PeerId, usize)> = peer_ids
+            .iter()
+            .map(|p| {
+                let used = per_peer.get(p).copied().unwrap_or(0);
+                (*p, MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(used))
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let slots: usize = free.iter().map(|(_, n)| n).sum();
+        if slots == 0 {
+            trace!(
+                "Every peer has {} blocks in flight",
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            );
             return;
         }
 
-        // Get block hashes to request
+        // Block hashes to request, in chain order
         let mut hashes_to_request = Vec::new();
         {
             let pending = self.pending_headers.read();
@@ -995,12 +1031,14 @@ impl BlockSync {
             let downloaded = self.downloaded_blocks.read();
             let retry = self.block_retry.read();
 
-            for header in pending.iter() {
+            for header in pending.iter().take(BLOCK_DOWNLOAD_WINDOW) {
+                if hashes_to_request.len() == slots {
+                    break;
+                }
                 let hash = compute_block_hash(header);
                 if !in_flight.contains_key(&hash)
                     && !downloaded.contains_key(&hash)
                     && retry.get(&hash).is_none_or(|r| r.gave_up_at.is_none())
-                    && hashes_to_request.len() < MAX_BLOCKS_IN_FLIGHT - in_flight_count
                 {
                     hashes_to_request.push(hash);
                 }
@@ -1013,42 +1051,37 @@ impl BlockSync {
             return;
         }
 
-        // Request blocks from actually-connected peers (not stale peer_heights)
-        let peer_ids = self.peer_manager.connected_peers();
-        if peer_ids.is_empty() {
-            debug!("No connected peers available for block download");
-            return;
-        }
+        // Each peer takes the next blocks up to its free slots
+        let mut next = hashes_to_request.into_iter();
+        for (peer_id, n) in free {
+            let batch: Vec<Hash256> = next.by_ref().take(n).collect();
+            for hash in batch {
+                let inv = vec![InvItem::new(InvType::Block, hash)];
+                let msg = NetworkMessage::GetData(inv);
 
-        // Distribute requests across peers
-        for (i, hash) in hashes_to_request.iter().enumerate() {
-            let peer_id = peer_ids[i % peer_ids.len()];
+                debug!("Requesting block {} from peer {}", hash, peer_id);
 
-            let inv = vec![InvItem::new(InvType::Block, *hash)];
-            let msg = NetworkMessage::GetData(inv);
+                if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+                    warn!("Failed to request block from peer {}: {}", peer_id, e);
+                    continue;
+                }
 
-            debug!("Requesting block {} from peer {}", hash, peer_id);
+                // Track the request
+                self.blocks_in_flight.write().insert(
+                    hash,
+                    BlockRequest {
+                        peer_id,
+                        _hash: hash,
+                        requested_at: Instant::now(),
+                    },
+                );
 
-            if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-                warn!("Failed to request block from peer {}: {}", peer_id, e);
-                continue;
+                self.peer_block_requests
+                    .write()
+                    .entry(peer_id)
+                    .or_default()
+                    .insert(hash);
             }
-
-            // Track the request
-            self.blocks_in_flight.write().insert(
-                *hash,
-                BlockRequest {
-                    peer_id,
-                    _hash: *hash,
-                    requested_at: Instant::now(),
-                },
-            );
-
-            self.peer_block_requests
-                .write()
-                .entry(peer_id)
-                .or_default()
-                .insert(*hash);
         }
     }
 
@@ -1877,7 +1910,9 @@ impl BlockSync {
         }
     }
 
-    /// Request blocks from the pending queue, respecting MAX_BLOCKS_IN_FLIGHT.
+    /// Request blocks from the pending queue, at most MAX_BLOCKS_IN_TRANSIT_PER_PEER
+    /// in flight per peer: a block goes to the first of its preferred peers with
+    /// a free slot, and waits while every peer is full.
     ///
     /// Uses only actually-connected peers (via `peer_manager`) rather than the
     /// potentially-stale `peer_heights` map. Includes a circuit breaker: if we
@@ -1899,13 +1934,6 @@ impl BlockSync {
                         consecutive_failures, queued
                     );
                 }
-                break;
-            }
-
-            // Check how many slots are available
-            let in_flight_count = self.blocks_in_flight.read().len();
-            if in_flight_count >= MAX_BLOCKS_IN_FLIGHT {
-                trace!("At max blocks in flight ({}), waiting", in_flight_count);
                 break;
             }
 
@@ -1949,7 +1977,23 @@ impl BlockSync {
                 continue;
             }
 
-            let peers_to_try = self.order_peers_for_block(&hash, assigned_peer, connected);
+            let per_peer = self.in_flight_per_peer();
+            let peers_to_try: Vec<PeerId> = self
+                .order_peers_for_block(&hash, assigned_peer, connected)
+                .into_iter()
+                .filter(|p| per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+                .collect();
+            if peers_to_try.is_empty() {
+                // Every peer is full: wait for a free slot
+                trace!(
+                    "Every peer has {} blocks in flight, waiting",
+                    MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                );
+                self.pending_block_requests
+                    .write()
+                    .push_front((hash, assigned_peer));
+                break;
+            }
 
             // Try each peer until one succeeds
             let item = InvItem {
@@ -3281,6 +3325,83 @@ mod tests {
             order_retry_peers(vec![2, 1], &all, &HashSet::new(), None, 0, 0).len(),
             2
         );
+    }
+
+    /// Blocks in flight per peer
+    fn in_flight_per_peer(sync: &BlockSync) -> HashMap<PeerId, usize> {
+        let mut per = HashMap::new();
+        for req in sync.blocks_in_flight.read().values() {
+            *per.entry(req.peer_id).or_default() += 1;
+        }
+        per
+    }
+
+    /// `n` distinct headers, as if received from a getheaders reply
+    fn queue_headers(sync: &BlockSync, n: u32) -> Vec<Hash256> {
+        let mut pending = sync.pending_headers.write();
+        (0..n)
+            .map(|i| {
+                let header = BlockHeader {
+                    nonce: 1000 + i,
+                    ..Default::default()
+                };
+                pending.push_back(header.clone());
+                compute_block_hash(&header)
+            })
+            .collect()
+    }
+
+    /// Divi Core requests at most MAX_BLOCKS_IN_TRANSIT_PER_PEER (16) blocks
+    /// from one peer (defaultValues.h:80, main.cpp:1211-1217)
+    #[tokio::test]
+    async fn no_peer_gets_more_than_16_blocks_in_flight() {
+        let (sync, _rxs, _dir) = sync_with_peers(2);
+        queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert!(per.values().all(|&n| n <= 16), "{per:?}");
+        assert_eq!(per.values().sum::<usize>(), 32, "{per:?}");
+
+        // Announced blocks are held to the same cap
+        let (sync, _rxs, _dir) = sync_with_peers(2);
+        for i in 0..40u8 {
+            sync.pending_block_requests
+                .write()
+                .push_back((Hash256::from_bytes([i + 1; 32]), 1));
+        }
+        sync.request_queued_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert!(per.values().all(|&n| n <= 16), "{per:?}");
+        assert_eq!(
+            sync.pending_block_requests.read().len(),
+            8,
+            "the rest wait for a free slot"
+        );
+    }
+
+    /// Divi Core fills each peer's free slots with the next blocks in chain
+    /// order (FindNextBlocksToDownload, NodeStateRegistry.cpp:146-234), so
+    /// requests spread over the peers rather than one peer taking them all
+    #[tokio::test]
+    async fn requests_spread_over_two_peers() {
+        let (sync, _rxs, _dir) = sync_with_peers(2);
+        let hashes = queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), Some(&16), "{per:?}");
+        // the first 32 blocks, nothing beyond them
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(in_flight_peer(&sync, hash).is_some(), i < 32, "block {i}");
+        }
+        // a block that arrives frees its peer's slot for the next block
+        let first = hashes[0];
+        let peer = in_flight_peer(&sync, &first).unwrap();
+        sync.blocks_in_flight.write().remove(&first);
+        sync.pending_headers.write().pop_front(); // connected
+        sync.request_blocks().await;
+        assert_eq!(in_flight_peer(&sync, &hashes[32]), Some(peer));
+        assert!(in_flight_peer(&sync, &hashes[33]).is_none());
     }
 
     #[tokio::test]
