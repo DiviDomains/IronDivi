@@ -13,289 +13,236 @@
 //!
 //! Command-line interface for interacting with the IronDivi daemon.
 //!
+//! It reads its options, parses arguments, waits, prints and exits as Divi
+//! Core's divi-cli does (src/divi-cli.cpp, rpcclient.cpp), so scripts written
+//! for divi-cli run unchanged. IronDivi additions (`--name value` options,
+//! cookie authentication, irondivi.conf, `--stdin*`, `--named`, `--rpcwallet`,
+//! `-getinfo`, `-netinfo`, `-generate`) do not change what a divi-cli command
+//! line does.
+//!
 //! Usage:
-//!   irondivi-cli [OPTIONS] <COMMAND> [ARGS...]
+//!   irondivi-cli [options] <command> [params]
 //!
 //! Examples:
 //!   irondivi-cli getblockcount
-//!   irondivi-cli --regtest getblockchaininfo
-//!   irondivi-cli getblock 0000000000000000000...
+//!   irondivi-cli -regtest getblockchaininfo
+//!   irondivi-cli -rpcwait getblock 0000000000000000000...
 //!   irondivi-cli -getinfo
-//!   irondivi-cli -netinfo 1
-//!   irondivi-cli -generate 10
 
-use anyhow::Result;
-use clap::Parser;
-use serde::{Deserialize, Serialize};
+mod json_spirit;
+
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Exit codes matching bitcoin-cli/divi-cli
-mod exit_codes {
-    pub const SUCCESS: i32 = 0;
-    pub const GENERAL_ERROR: i32 = 1;
-    pub const CONNECTION_FAILED: i32 = 2;
-    pub const INVALID_RESPONSE: i32 = 5;
-    pub const INVALID_PARAMS: i32 = 87;
-}
-
-/// CLI error types with appropriate exit codes
+/// A failure, printed and turned into an exit code as divi-cli does
 #[derive(Debug)]
 enum CliError {
-    Connection(String),
-    InvalidResponse(String),
-    InvalidParams(String),
-    RpcError { code: i64, message: String },
-    General(String),
+    /// An error reply from the node: `error: {"code":…,"message":…}` on
+    /// stderr, exit code the absolute value of the code (divi-cli.cpp:166-172)
+    Rpc { code: i64, error: Vec<u8> },
+    /// `error: <message>` on stderr, exit 1 (divi-cli.cpp:194-196)
+    Message(String),
+    /// A message printed as it is on stderr, exit 1 (AppInitRPC's errors)
+    Plain(String),
+    /// Text on stdout, exit 1 (-help, -version, no arguments)
+    Usage(String),
 }
 
 impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
-            CliError::Connection(_) => exit_codes::CONNECTION_FAILED,
-            CliError::InvalidResponse(_) => exit_codes::INVALID_RESPONSE,
-            CliError::InvalidParams(_) => exit_codes::INVALID_PARAMS,
-            CliError::RpcError { .. } => exit_codes::GENERAL_ERROR,
-            CliError::General(_) => exit_codes::GENERAL_ERROR,
+            // exit() keeps the low 8 bits, as for divi-cli's `abs(code)`
+            CliError::Rpc { code, .. } => (code.unsigned_abs() % 256) as i32,
+            _ => 1,
         }
     }
-}
 
-impl std::fmt::Display for CliError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn print(&self) {
         match self {
-            CliError::Connection(msg) => write!(f, "error: couldn't connect to server: {}", msg),
-            CliError::InvalidResponse(msg) => {
-                write!(f, "error: invalid response from server: {}", msg)
+            CliError::Rpc { error, .. } => {
+                let mut line = b"error: ".to_vec();
+                line.extend_from_slice(error);
+                line.push(b'\n');
+                let _ = io::stderr().write_all(&line);
             }
-            CliError::InvalidParams(msg) => write!(f, "error: invalid parameters: {}", msg),
-            CliError::RpcError { code, message } => write!(f, "error code: {}: {}", code, message),
-            CliError::General(msg) => write!(f, "error: {}", msg),
+            CliError::Message(msg) => eprintln!("error: {}", msg),
+            CliError::Plain(msg) => eprintln!("{}", msg),
+            CliError::Usage(text) => print!("{}", text),
         }
     }
 }
 
-impl std::error::Error for CliError {}
+/// The special commands IronDivi adds; divi-cli would read them as options
+const SPECIAL_COMMANDS: [&str; 3] = ["-getinfo", "-netinfo", "-generate"];
 
-/// IronDivi CLI - Command-line JSON-RPC client for IronDivi daemon
-///
-/// This is a drop-in replacement for divi-cli with full command compatibility.
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Command-line JSON-RPC client for IronDivi",
-    after_help = "\
-EXAMPLES:
-  irondivi-cli getblockcount
-  irondivi-cli getblockchaininfo
-  irondivi-cli --testnet getblockchaininfo
-  irondivi-cli --mode privatedivi getblockchaininfo
-  irondivi-cli --named sendtoaddress address=\"addr\" amount=1.0
-  irondivi-cli --rpcwallet=mywallet getbalance
-  irondivi-cli -getinfo
-  irondivi-cli -netinfo 1
-  irondivi-cli -generate 10
+/// Options that take a value. Written `--name value` (IronDivi's form), the
+/// next argument is the value; divi-cli's form is `-name=value`.
+const VALUE_OPTIONS: [&str; 8] = [
+    "conf",
+    "datadir",
+    "rpcconnect",
+    "rpcport",
+    "rpcuser",
+    "rpcpassword",
+    "mode",
+    "rpcwallet",
+];
 
-SPECIAL COMMANDS:
-  -getinfo              Show aggregated blockchain, network, and wallet info
-  -netinfo [level]      Show network peer summary (level 0-4)
-  -generate <n>         Generate n blocks to a new wallet address
-
-CONFIGURATION:
-  Config file (first that exists): --conf path; <datadir>/irondivi.conf with
-  --datadir; else irondivid's default data dir (~/.irondivi on Linux, plus
-  /privatedivi and /testnet or /regtest as for irondivid)/irondivi.conf.
-  Falls back to the Divi Core file: ~/.divi/divi.conf, or
-  ~/.privatedivi/privatedivi.conf with --mode privatedivi
-  Without rpcuser/rpcpassword the .cookie file is used: <datadir>/.cookie (irondivid),
-  else irondivid's default data dir, else the Divi Core directory
-
-EXIT CODES:
-  0   Success
-  1   General error (including RPC errors)
-  2   Connection failed
-  5   Invalid response from server
-  87  Invalid parameters
-"
-)]
+/// The command line, read as divi-cli reads it (Settings::ParseParameters):
+/// options come before the method, `-name=value` or `-name`, `--name` the
+/// same as `-name`, `-noname` its negation; unknown options are ignored.
+#[derive(Debug, Default)]
 struct Args {
-    /// Configuration file path
-    #[arg(short = 'c', long = "conf")]
     conf: Option<PathBuf>,
-
-    /// RPC server address
-    #[arg(long = "rpcconnect", default_value = "127.0.0.1")]
-    rpcconnect: String,
-
-    /// RPC port
-    #[arg(long = "rpcport")]
-    rpcport: Option<u16>,
-
-    /// RPC username
-    #[arg(long = "rpcuser")]
+    rpcconnect: Option<String>,
+    rpcport: Option<String>,
     rpcuser: Option<String>,
-
-    /// RPC password
-    #[arg(long = "rpcpassword")]
     rpcpassword: Option<String>,
-
-    /// Use testnet defaults
-    #[arg(long)]
-    testnet: bool,
-
-    /// Use regtest defaults
-    #[arg(long)]
-    regtest: bool,
-
-    /// Chain mode: divi (default) or privatedivi
-    #[arg(long, default_value = "divi", value_parser = ["divi", "privatedivi"])]
+    testnet: Option<bool>,
+    regtest: Option<bool>,
     mode: String,
-
-    /// Wallet name for multi-wallet RPC
-    #[arg(long)]
     rpcwallet: Option<String>,
-
-    /// Data directory (for cookie authentication)
-    #[arg(long)]
     datadir: Option<PathBuf>,
-
-    /// Read extra arguments from stdin
-    #[arg(long)]
+    rpcwait: Option<bool>,
     stdin: bool,
-
-    /// Read RPC password from stdin
-    #[arg(long)]
     stdinrpcpass: bool,
-
-    /// Read the wallet passphrase from stdin (one line; for walletpassphrasechange
-    /// the old then the new passphrase on two lines) for walletpassphrase,
-    /// walletpassphrasechange and encryptwallet. Not echoed when stdin is a terminal.
-    #[arg(long)]
     stdinwalletpassphrase: bool,
-
-    /// Use named arguments (key=value format)
-    #[arg(long, short = 'n')]
     named: bool,
-
-    /// RPC method and arguments
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    help: bool,
+    version: bool,
+    /// The method and its parameters
     args: Vec<String>,
 }
 
-/// JSON-RPC request
-#[derive(Debug, Serialize)]
-struct RpcRequest {
-    jsonrpc: String,
-    id: u64,
-    method: String,
-    params: Value,
+/// Settings' InterpretBool: empty is true, else the leading integer is not
+/// zero; IronDivi's irondivi.conf also writes `true`
+fn interpret_bool(value: &str) -> bool {
+    if value.is_empty() || value.trim() == "true" {
+        return true;
+    }
+    // atoi: optional sign, then digits up to the first other character
+    let v = value.trim_start();
+    let digits = v.strip_prefix(['-', '+']).unwrap_or(v);
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].bytes().any(|b| b != b'0')
 }
 
-/// JSON-RPC response
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct RpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    #[allow(dead_code)]
-    id: Option<Value>,
-    result: Option<Value>,
-    error: Option<RpcError>,
-}
-
-/// JSON-RPC error
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct RpcError {
-    code: i32,
-    message: String,
-    #[allow(dead_code)]
-    data: Option<Value>,
-}
-
-/// RPC Client
-struct RpcClient {
-    url: String,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-impl RpcClient {
-    fn call(&self, method: &str, params: Value) -> Result<Value, CliError> {
-        let request = RpcRequest {
-            jsonrpc: "1.0".to_string(),
-            id: 1,
-            method: method.to_string(),
-            params,
+impl Args {
+    /// Read the arguments after the program name
+    fn parse(argv: &[String]) -> Result<Args, CliError> {
+        let mut args = Args {
+            mode: "divi".to_string(),
+            ..Args::default()
         };
-
-        let client = reqwest::blocking::Client::new();
-        let mut req = client
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_string(&request).map_err(|e| CliError::General(e.to_string()))?);
-
-        // Add basic auth if credentials provided
-        if let (Some(user), Some(pass)) = (&self.username, &self.password) {
-            req = req.basic_auth(user, Some(pass));
-        }
-
-        let response = req.send().map_err(|e| {
-            if e.is_connect() {
-                CliError::Connection(e.to_string())
-            } else if e.is_timeout() {
-                CliError::Connection("connection timed out".to_string())
-            } else {
-                CliError::General(e.to_string())
-            }
-        })?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .map_err(|e| CliError::InvalidResponse(e.to_string()))?;
-
-        if !status.is_success() {
-            // Try to parse RPC error
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(error) = json.get("error") {
-                    if !error.is_null() {
-                        let code = error["code"].as_i64().unwrap_or(-1);
-                        let message = error["message"]
-                            .as_str()
-                            .unwrap_or("unknown error")
-                            .to_string();
-                        return Err(CliError::RpcError { code, message });
+        let mut settings: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i < argv.len() {
+            let arg = &argv[i];
+            let option = arg.starts_with('-') && !SPECIAL_COMMANDS.contains(&arg.as_str());
+            if !args.args.is_empty() || !option {
+                // divi-cli also reads options among the parameters as settings
+                if option && !args.args.is_empty() {
+                    if let Some(setting) = split_option(arg) {
+                        settings.push((setting.0, setting.1.unwrap_or_default()));
                     }
                 }
+                args.args.push(arg.clone());
+                i += 1;
+                continue;
             }
-            return Err(CliError::InvalidResponse(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
-        }
-
-        let json: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| CliError::InvalidResponse(e.to_string()))?;
-
-        // Check for RPC error in response
-        if let Some(error) = json.get("error") {
-            if !error.is_null() {
-                let code = error["code"].as_i64().unwrap_or(-1);
-                let message = error["message"]
-                    .as_str()
-                    .unwrap_or("unknown error")
-                    .to_string();
-                return Err(CliError::RpcError { code, message });
+            if let Some((key, value)) = split_option(arg) {
+                let value = match value {
+                    Some(v) => v,
+                    // IronDivi's `--name value` and `-c path`
+                    None if (arg.starts_with("--") && VALUE_OPTIONS.contains(&key.as_str()))
+                        || key == "c" =>
+                    {
+                        i += 1;
+                        argv.get(i).cloned().unwrap_or_default()
+                    }
+                    None => String::new(),
+                };
+                settings.push((key, value));
             }
+            i += 1;
         }
-
-        json.get("result")
-            .cloned()
-            .ok_or_else(|| CliError::InvalidResponse("missing 'result' field".to_string()))
+        for (key, value) in settings {
+            args.set(&key, &value)?;
+        }
+        Ok(args)
     }
+
+    /// Apply one setting; a later one wins, as on divi-cli's command line
+    fn set(&mut self, key: &str, value: &str) -> Result<(), CliError> {
+        // -noname=v is -name=!v
+        let (key, value) = match key.strip_prefix("no") {
+            Some(rest) if !rest.is_empty() && !matches!(key, "named") => (
+                rest,
+                if interpret_bool(value) { "0" } else { "1" }.to_string(),
+            ),
+            _ => (key, value.to_string()),
+        };
+        let flag = interpret_bool(&value);
+        match key {
+            "conf" | "c" => self.conf = Some(PathBuf::from(value)),
+            "datadir" => self.datadir = Some(PathBuf::from(value)),
+            "rpcconnect" => self.rpcconnect = Some(value),
+            "rpcport" => self.rpcport = Some(value),
+            "rpcuser" => self.rpcuser = Some(value),
+            "rpcpassword" => self.rpcpassword = Some(value),
+            "rpcwallet" => self.rpcwallet = Some(value),
+            "mode" => {
+                if value != "divi" && value != "privatedivi" {
+                    return Err(CliError::Message(format!(
+                        "invalid value '{}' for -mode: expected divi or privatedivi",
+                        value
+                    )));
+                }
+                self.mode = value;
+            }
+            "testnet" => self.testnet = Some(flag),
+            "regtest" => self.regtest = Some(flag),
+            "rpcwait" => self.rpcwait = Some(flag),
+            "stdin" => self.stdin = flag,
+            "stdinrpcpass" => self.stdinrpcpass = flag,
+            "stdinwalletpassphrase" => self.stdinwalletpassphrase = flag,
+            "named" | "n" => self.named = flag,
+            "?" | "help" | "h" => self.help = true,
+            "version" | "V" => self.version = true,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// An option's name and value: `--x` is `-x`, `---x` is ignored
+fn split_option(arg: &str) -> Option<(String, Option<String>)> {
+    if arg.starts_with("---") {
+        return None;
+    }
+    let body = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    Some(match body.split_once('=') {
+        Some((k, v)) => (k.to_string(), Some(v.to_string())),
+        None => (body.to_string(), None),
+    })
+}
+
+/// divi-cli's -help / -? line, also printed with no arguments
+fn version_line() -> String {
+    format!(
+        "IronDivi RPC client version v{}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// divi-cli's -version text: the version line, usage and options
+fn version_text() -> String {
+    version_line()
+        + "\nUsage:\n  irondivi-cli [options] <command> [params]  Send command to IronDivi\n  irondivi-cli [options] help                List commands\n  irondivi-cli [options] help <command>      Get help for a command\n"
+        + "\nOptions:\n  -?                     This help message\n  -conf=<file>           Configuration file (default: irondivi.conf, else divi.conf, in the data directory)\n  -datadir=<dir>         Data directory\n  -testnet               Use the test network\n  -regtest               Use the regression test network\n  -mode=<divi|privatedivi>  Chain mode (default: divi)\n  -rpcconnect=<ip>       Send commands to node running on <ip> (default: 127.0.0.1)\n  -rpcport=<port>        Connect to JSON-RPC on <port> (default: irondivid's: 51471, testnet 51473, regtest 51475)\n  -rpcwait               Wait for RPC server to start\n  -rpcuser=<user>        Username for JSON-RPC connections\n  -rpcpassword=<pw>      Password for JSON-RPC connections (without either, the node's .cookie)\n  -rpcwallet=<name>      Wallet of a multi-wallet node\n  -named                 Pass named arguments (name=value) instead of positional ones\n  -stdin                 Read extra arguments from standard input, one per line\n  -stdinrpcpass          Read the RPC password from standard input\n  -stdinwalletpassphrase Read the wallet passphrase(s) from standard input\n  -getinfo, -netinfo [level], -generate <n>  Summary commands\n  Options may also be written --name value.\n"
 }
 
 /// Get default RPC port based on network
@@ -310,16 +257,82 @@ fn default_rpc_port(testnet: bool, regtest: bool, privatedivi: bool) -> u16 {
     }
 }
 
-/// Configuration values parsed from config file
+/// Configuration values read from the config file
 #[derive(Default)]
 struct Config {
     rpcuser: Option<String>,
     rpcpassword: Option<String>,
-    rpcport: Option<u16>,
+    rpcport: Option<String>,
     rpcconnect: Option<String>,
-    testnet: bool,
-    regtest: bool,
+    testnet: Option<bool>,
+    regtest: Option<bool>,
+    rpcwait: Option<bool>,
     mode: Option<String>,
+}
+
+/// Read the configuration file. As divi-cli (Settings::ReadConfigFile), the
+/// first value of a key wins and command-line values are not overridden;
+/// IronDivi also reads TOML quoting and `[test]` / `[regtest]` sections.
+fn read_config(path: &Path, network: &str) -> Config {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Config::default(),
+    };
+
+    let mut config = Config::default();
+    let mut current_section = "main".to_string();
+    let target_section = match network {
+        "testnet" => "test",
+        "regtest" => "regtest",
+        _ => "main",
+    };
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Handle section headers like [regtest], [test]
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = line[1..line.len() - 1].to_lowercase();
+            continue;
+        }
+
+        // Only apply settings from main (no header) or matching network section
+        if current_section != "main" && current_section != target_section {
+            continue;
+        }
+
+        // Strip inline comments (value # comment)
+        let line = line.split('#').next().unwrap_or(line).trim();
+
+        if let Some((key, value)) = line.split_once('=') {
+            // irondivid reads the same file as TOML, where strings are quoted.
+            let value = unquote(value).trim().to_string();
+            let first = |slot: &mut Option<String>| {
+                slot.get_or_insert(value.clone());
+            };
+            match key.trim() {
+                "rpcuser" => first(&mut config.rpcuser),
+                "rpcpassword" => first(&mut config.rpcpassword),
+                "rpcport" => first(&mut config.rpcport),
+                "rpcconnect" => first(&mut config.rpcconnect),
+                "mode" => first(&mut config.mode),
+                "testnet" => {
+                    config.testnet.get_or_insert(interpret_bool(&value));
+                }
+                "regtest" => {
+                    config.regtest.get_or_insert(interpret_bool(&value));
+                }
+                "rpcwait" => {
+                    config.rpcwait.get_or_insert(interpret_bool(&value));
+                }
+                _ => {}
+            }
+        }
+    }
+    config
 }
 
 /// The Core data directory for the chain mode: `~/.divi` for Divi and
@@ -396,65 +409,6 @@ fn unquote(value: &str) -> &str {
     v
 }
 
-/// Read configuration file with section header support
-fn read_config(path: &Path, network: &str) -> Config {
-    use std::fs;
-
-    if !path.exists() {
-        return Config::default();
-    }
-
-    let contents = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Config::default(),
-    };
-
-    let mut config = Config::default();
-    let mut current_section = "main".to_string();
-    let target_section = match network {
-        "testnet" => "test",
-        "regtest" => "regtest",
-        _ => "main",
-    };
-
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Handle section headers like [regtest], [test]
-        if line.starts_with('[') && line.ends_with(']') {
-            current_section = line[1..line.len() - 1].to_lowercase();
-            continue;
-        }
-
-        // Only apply settings from main (no header) or matching network section
-        if current_section != "main" && current_section != target_section {
-            continue;
-        }
-
-        // Strip inline comments (value # comment)
-        let line = line.split('#').next().unwrap_or(line).trim();
-
-        if let Some((key, value)) = line.split_once('=') {
-            // irondivid reads the same file as TOML, where strings are quoted.
-            let value = unquote(value);
-            match key.trim() {
-                "rpcuser" => config.rpcuser = Some(value.trim().to_string()),
-                "rpcpassword" => config.rpcpassword = Some(value.trim().to_string()),
-                "rpcport" => config.rpcport = value.trim().parse().ok(),
-                "rpcconnect" => config.rpcconnect = Some(value.trim().to_string()),
-                "testnet" if value.trim() == "1" => config.testnet = true,
-                "regtest" if value.trim() == "1" => config.regtest = true,
-                "mode" => config.mode = Some(value.trim().to_string()),
-                _ => {}
-            }
-        }
-    }
-    config
-}
-
 /// The cookie irondivid writes in its own data directory (`--datadir`, or
 /// its default per mode and network).
 fn irondivi_cookie_path(
@@ -494,36 +448,33 @@ fn read_cookie(path: &Path) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
-/// Handle stdin input (CRITICAL: Read password FIRST when both flags used)
-fn handle_stdin(args: &mut Args) -> Result<(), CliError> {
-    // CRITICAL: Read password FIRST when both flags used
+/// Read what `--stdinrpcpass`, `--stdinwalletpassphrase` and `--stdin` ask
+/// for (the RPC password first). Returns the wallet passphrases, which go in
+/// as the method's first parameters, always as strings.
+fn handle_stdin(args: &mut Args) -> Result<Vec<String>, CliError> {
     if args.stdinrpcpass {
         let mut pass = String::new();
         io::stdin()
             .lock()
             .read_line(&mut pass)
-            .map_err(|e| CliError::General(e.to_string()))?;
+            .map_err(|e| CliError::Message(e.to_string()))?;
         args.rpcpassword = Some(pass.trim().to_string());
     }
 
-    // Then the wallet passphrase(s), inserted as the method's first argument(s)
+    let mut passphrases = Vec::new();
     if args.stdinwalletpassphrase {
         let method = args.args.first().map(String::as_str).unwrap_or("");
         let stdin = io::stdin();
         let terminal = io::IsTerminal::is_terminal(&stdin);
-        let passphrases = read_wallet_passphrases(method, &mut stdin.lock(), terminal)?;
-        for (i, passphrase) in passphrases.into_iter().enumerate() {
-            args.args.insert(1 + i, passphrase);
-        }
+        passphrases = read_wallet_passphrases(method, &mut stdin.lock(), terminal)?;
     }
 
-    // Then read remaining lines for command args
     if args.stdin {
         let mut extra_input = String::new();
         io::stdin()
             .lock()
             .read_to_string(&mut extra_input)
-            .map_err(|e| CliError::General(e.to_string()))?;
+            .map_err(|e| CliError::Message(e.to_string()))?;
         for line in extra_input.lines() {
             if !line.is_empty() {
                 args.args.push(line.to_string());
@@ -531,7 +482,7 @@ fn handle_stdin(args: &mut Args) -> Result<(), CliError> {
         }
     }
 
-    Ok(())
+    Ok(passphrases)
 }
 
 /// Wallet passphrases `method` takes as its first arguments
@@ -543,163 +494,6 @@ fn wallet_passphrase_count(method: &str) -> Option<usize> {
     }
 }
 
-/// Which positional arguments are JSON (numbers, booleans, arrays, objects),
-/// per method, as bitcoin-cli's and PIVX's `vRPCConvertParams`. Divi Core 3.0.0's
-/// divi-cli dropped its table and parses every argument as JSON when it can,
-/// which turns a label, account, comment or passphrase like "1234" or "true" into
-/// a number or boolean that the server then refuses. The positions here follow
-/// what each IronDivi handler reads as a number, boolean, amount, array or
-/// object; every other argument of a listed method is sent as a string.
-const CONVERT_PARAMS: &[(&str, &[usize])] = &[
-    // blockchain
-    ("getblockcount", &[]),
-    ("getbestblockhash", &[]),
-    ("getblockhash", &[0]),
-    ("getblock", &[1]),
-    ("getblockheader", &[1]),
-    ("getblockchaininfo", &[]),
-    ("getinfo", &[]),
-    ("getchaintips", &[]),
-    ("invalidateblock", &[]),
-    ("reconsiderblock", &[]),
-    ("reverseblocktransactions", &[]),
-    ("getdifficulty", &[]),
-    ("gettxoutsetinfo", &[]),
-    ("getrawmempool", &[0]),
-    ("prioritisetransaction", &[1, 2]),
-    ("gettxout", &[1, 2]),
-    ("decodescript", &[]),
-    ("verifychain", &[0, 1]),
-    ("getmininginfo", &[]),
-    ("getaddressdeltas", &[0, 1]),
-    ("getaddresstxids", &[0, 1]),
-    ("getspentinfo", &[0]),
-    ("generateblock", &[0]),
-    ("setgenerate", &[0, 1]),
-    ("getlotteryblockwinners", &[0]),
-    // network
-    ("getnetworkinfo", &[]),
-    ("getpeerinfo", &[]),
-    ("getconnectioncount", &[]),
-    ("ping", &[]),
-    ("getnettotals", &[]),
-    ("addnode", &[]),
-    ("getaddednodeinfo", &[0]),
-    ("setban", &[2, 3]),
-    ("ban", &[]),
-    ("setmocktime", &[0]),
-    ("getinvalid", &[]),
-    ("listbanned", &[]),
-    ("clearbanned", &[]),
-    ("disconnectnode", &[]),
-    ("getpeerscores", &[]),
-    // wallet
-    ("getnewaddress", &[]),
-    ("getrawchangeaddress", &[]),
-    ("validateaddress", &[]),
-    ("getaddressinfo", &[]),
-    ("getbalance", &[0, 1, 2]),
-    ("getunconfirmedbalance", &[]),
-    ("getimmaturebalance", &[]),
-    ("getwalletinfo", &[]),
-    ("listunspent", &[0, 1, 2]),
-    ("gettransaction", &[1]),
-    ("listtransactions", &[1, 2, 3]),
-    ("listsinceblock", &[1, 2]),
-    ("walletpassphrase", &[1, 2]),
-    ("walletpassphrasechange", &[]),
-    ("encryptwallet", &[]),
-    ("walletlock", &[]),
-    ("dumpprivkey", &[]),
-    ("dumphdinfo", &[]),
-    ("importprivkey", &[2]),
-    ("importaddress", &[2, 3]),
-    ("rescanblockchain", &[0, 1]),
-    ("sendtoaddress", &[1]),
-    ("sendfrom", &[2, 3]),
-    ("sendmany", &[1, 2, 4]),
-    ("getaddressesbylabel", &[]),
-    ("listreceivedbyaddress", &[0, 1, 2]),
-    ("getreceivedbyaddress", &[1]),
-    ("backupwallet", &[]),
-    ("signmessage", &[]),
-    ("verifymessage", &[]),
-    ("createmultisig", &[0, 1]),
-    ("addmultisigaddress", &[0, 1]),
-    ("getaccount", &[]),
-    ("setaccount", &[]),
-    ("getaccountaddress", &[]),
-    ("getaddressesbyaccount", &[]),
-    ("listaccounts", &[0, 1]),
-    ("getreceivedbyaccount", &[1]),
-    ("listreceivedbyaccount", &[0, 1, 2]),
-    ("keypoolrefill", &[0]),
-    ("getkeypoolsize", &[]),
-    ("loadwallet", &[]),
-    ("allocatefunds", &[1]),
-    ("listlockunspent", &[]),
-    ("lockunspent", &[0, 1]),
-    // raw transactions
-    ("createrawtransaction", &[0, 1]),
-    ("signrawtransaction", &[1, 2]),
-    ("signrawtransactionwithwallet", &[1, 2]),
-    ("signtransactionwithaddresskey", &[2]),
-    ("sendrawtransaction", &[1]),
-    ("getrawtransaction", &[1]),
-    ("decoderawtransaction", &[]),
-    // staking
-    ("getstakingstatus", &[]),
-    ("getmintinginfo", &[]),
-    ("setstaking", &[0]),
-    ("reservebalance", &[0, 1]),
-    // address index / lite wallet
-    ("getaddressbalance", &[0, 1]),
-    ("getaddressutxos", &[0, 1, 2]),
-    ("getaddresshistory", &[0, 1, 2]),
-    ("gettxindex", &[]),
-    ("estimatefee", &[0]),
-    ("estimatesmartfee", &[0]),
-    ("estimatepriority", &[0]),
-    ("getmempoolinfo", &[]),
-    ("validateaddresses", &[0]),
-    ("getlitewalletinfo", &[]),
-    // masternodes and sporks
-    ("getmasternodecount", &[]),
-    ("getmasternodestatus", &[]),
-    ("getmasternodewinners", &[0]),
-    ("listmasternodes", &[]),
-    ("setupmasternode", &[]),
-    ("startmasternode", &[]),
-    ("broadcaststartmasternode", &[]),
-    ("signmnbroadcast", &[]),
-    ("importmnbroadcast", &[]),
-    ("listmnbroadcasts", &[]),
-    ("verifymasternodesetup", &[]),
-    ("mnsync", &[]),
-    ("spork", &[1]),
-    // vaults
-    ("addvault", &[]),
-    ("removevault", &[]),
-    ("getcoinavailability", &[0]),
-    ("fundvault", &[1]),
-    ("debitvaultbyname", &[2]),
-    ("reclaimvaultfunds", &[1]),
-    // node
-    ("getlogconfig", &[]),
-    ("setlogconfig", &[0]),
-    ("help", &[]),
-    ("stop", &[]),
-];
-
-/// Whether argument `index` of `method` is sent as JSON. Methods missing from
-/// `CONVERT_PARAMS` keep the old behaviour: every argument that parses as JSON.
-fn converts_param(method: &str, index: usize) -> bool {
-    CONVERT_PARAMS
-        .iter()
-        .find(|(m, _)| *m == method)
-        .is_none_or(|(_, positions)| positions.contains(&index))
-}
-
 /// `--stdinwalletpassphrase` (bitcoin-cli `-stdinwalletpassphrase`): read one
 /// passphrase per line, prompting on stderr with echo off when `terminal`.
 fn read_wallet_passphrases(
@@ -708,7 +502,7 @@ fn read_wallet_passphrases(
     terminal: bool,
 ) -> Result<Vec<String>, CliError> {
     let count = wallet_passphrase_count(method).ok_or_else(|| {
-        CliError::InvalidParams(
+        CliError::Message(
             "--stdinwalletpassphrase is only applicable for walletpassphrase, \
              walletpassphrasechange and encryptwallet"
                 .to_string(),
@@ -731,9 +525,9 @@ fn read_wallet_passphrases(
             set_terminal_echo(true);
             eprintln!();
         }
-        let n = read.map_err(|e| CliError::General(e.to_string()))?;
+        let n = read.map_err(|e| CliError::Message(e.to_string()))?;
         if n == 0 {
-            return Err(CliError::General(
+            return Err(CliError::Message(
                 "--stdinwalletpassphrase specified but failed to read from standard input"
                     .to_string(),
             ));
@@ -756,9 +550,9 @@ fn set_terminal_echo(on: bool) {
 
 /// Handle -getinfo special command (aggregates multiple RPC calls)
 fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
-    let blockchain = client.call("getblockchaininfo", Value::Array(vec![]))?;
-    let network = client.call("getnetworkinfo", Value::Array(vec![]))?;
-    let wallet = client.call("getwalletinfo", Value::Array(vec![])).ok();
+    let blockchain = client.call_serde("getblockchaininfo")?;
+    let network = client.call_serde("getnetworkinfo")?;
+    let wallet = client.call_serde("getwalletinfo").ok();
 
     println!(
         "Chain: {}",
@@ -780,7 +574,7 @@ fn handle_getinfo(client: &RpcClient) -> Result<(), CliError> {
         (Some(i), Some(o)) => (i, o),
         // Older servers do not report the split: count it from the peer list
         _ => {
-            let peers = client.call("getpeerinfo", Value::Array(vec![]))?;
+            let peers = client.call_serde("getpeerinfo")?;
             connection_split(&peers)
         }
     };
@@ -810,8 +604,8 @@ fn connection_split(peers: &Value) -> (u64, u64) {
 
 /// Handle -netinfo special command (shows peer connection summary)
 fn handle_netinfo(client: &RpcClient, detail: u8) -> Result<(), CliError> {
-    let peers = client.call("getpeerinfo", Value::Array(vec![]))?;
-    let network = client.call("getnetworkinfo", Value::Array(vec![]))?;
+    let peers = client.call_serde("getpeerinfo")?;
+    let network = client.call_serde("getnetworkinfo")?;
 
     let empty_vec = vec![];
     let peers_arr = peers.as_array().unwrap_or(&empty_vec);
@@ -846,70 +640,181 @@ fn handle_netinfo(client: &RpcClient, detail: u8) -> Result<(), CliError> {
 /// Handle -generate special command (two-step: get address, then generate)
 fn handle_generate(client: &RpcClient, nblocks: u64) -> Result<(), CliError> {
     // Step 1: Get a new address from wallet
-    let address_result = client.call("getnewaddress", Value::Array(vec![]))?;
+    let address_result = client.call_serde("getnewaddress")?;
     let address = address_result
         .as_str()
-        .ok_or_else(|| CliError::General("Failed to get new address".to_string()))?;
+        .ok_or_else(|| CliError::Message("Failed to get new address".to_string()))?;
 
     // Step 2: Generate blocks to that address
-    let result = client.call(
-        "generatetoaddress",
-        Value::Array(vec![json!(nblocks), json!(address)]),
-    )?;
+    let reply = client.post("generatetoaddress", &json!([nblocks, address]))?;
+    rpc_error(&reply, false)?;
+    let result = json_spirit::to_serde(reply.get("result"));
 
     println!(
         "{}",
-        serde_json::to_string_pretty(&result).map_err(|e| CliError::General(e.to_string()))?
+        serde_json::to_string_pretty(&result).map_err(|e| CliError::Message(e.to_string()))?
     );
     Ok(())
 }
 
-/// Parse a single argument (JSON or string)
-fn parse_argument_value(arg: &str) -> Value {
-    // Try to parse as JSON first
-    if let Ok(v) = serde_json::from_str(arg) {
-        return v;
+/// A call failed to connect: divi-cli retries those with -rpcwait
+enum CallError {
+    Connect,
+    Failed(CliError),
+}
+
+/// RPC Client
+struct RpcClient {
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl RpcClient {
+    /// Send one request and return the reply object, checked as divi-cli's
+    /// CallRPC does (divi-cli.cpp:85-134). There is no time limit: divi-cli
+    /// waits for the node however long a call takes.
+    fn post(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<json_spirit::Value, CallError> {
+        let request = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params});
+        let client = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .build()
+            .map_err(|e| CallError::Failed(CliError::Message(e.to_string())))?;
+        let mut req = client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .body(request.to_string());
+        if let (Some(user), Some(pass)) = (&self.username, &self.password) {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let response = match req.send() {
+            Ok(r) => r,
+            // divi-cli: only failing to connect is "couldn't connect"
+            Err(e) if e.is_connect() || e.is_builder() => return Err(CallError::Connect),
+            Err(_) => return Err(fail("no response from server")),
+        };
+        let status = response.status().as_u16();
+        let body = response.bytes().map(|b| b.to_vec()).unwrap_or_default();
+
+        if status == 401 {
+            return Err(fail(
+                "incorrect rpcuser or rpcpassword (authorization failed)",
+            ));
+        }
+        if status > 400 && status != 404 && status != 500 {
+            return Err(fail(&format!("server returned HTTP error {}", status)));
+        }
+        if body.is_empty() {
+            return Err(fail("no response from server"));
+        }
+        let reply =
+            json_spirit::parse(&body).ok_or_else(|| fail("couldn't parse reply from server"))?;
+        match &reply {
+            json_spirit::Value::Object(members) if members.is_empty() => Err(fail(
+                "expected reply to have result, error and id properties",
+            )),
+            json_spirit::Value::Object(_) => Ok(reply),
+            other => Err(fail(&format!(
+                "value is type {}, expected obj",
+                other.type_name()
+            ))),
+        }
     }
-    // If not JSON, try as number
-    if let Ok(num) = arg.parse::<i64>() {
-        return json!(num);
+
+    /// One call for the summary commands: its result, or its error
+    fn call_serde(&self, method: &str) -> Result<serde_json::Value, CliError> {
+        let reply = match self.post(method, &json!([])) {
+            Ok(reply) => reply,
+            Err(CallError::Connect) => {
+                return Err(CliError::Message("couldn't connect to server".into()))
+            }
+            Err(CallError::Failed(e)) => return Err(e),
+        };
+        rpc_error(&reply, false)?;
+        Ok(json_spirit::to_serde(reply.get("result")))
     }
-    if let Ok(num) = arg.parse::<f64>() {
-        return json!(num);
+}
+
+fn fail(message: &str) -> CallError {
+    CallError::Failed(CliError::Message(message.to_string()))
+}
+
+/// The reply's error, as divi-cli reads it: an error object needs an integer
+/// code; with -rpcwait a warmup error (-28) means try again
+fn rpc_error(reply: &json_spirit::Value, wait: bool) -> Result<(), CallError> {
+    let error = reply.get("error");
+    match error {
+        json_spirit::Value::Null => Ok(()),
+        json_spirit::Value::Object(_) => {
+            let code = match error.get("code") {
+                json_spirit::Value::Int(c) => *c,
+                json_spirit::Value::UInt(c) => *c as i64,
+                other => {
+                    return Err(fail(&format!(
+                        "value is type {}, expected int",
+                        other.type_name()
+                    )))
+                }
+            };
+            if wait && code == -28 {
+                return Err(CallError::Connect);
+            }
+            Err(CallError::Failed(CliError::Rpc {
+                code,
+                error: json_spirit::write(error, false),
+            }))
+        }
+        other => Err(fail(&format!(
+            "value is type {}, expected obj",
+            other.type_name()
+        ))),
     }
-    // Booleans
-    if arg == "true" {
-        return json!(true);
+}
+
+impl From<CallError> for CliError {
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Connect => CliError::Message("couldn't connect to server".into()),
+            CallError::Failed(e) => e,
+        }
     }
-    if arg == "false" {
-        return json!(false);
-    }
-    // Otherwise string
-    json!(arg)
 }
 
 /// Parse named arguments in key=value format
-fn parse_named_args(args: &[String]) -> Result<Value, CliError> {
+fn parse_named_args(args: &[String]) -> Result<serde_json::Value, CliError> {
     let mut obj = serde_json::Map::new();
     for arg in args {
         let (key, value) = arg.split_once('=').ok_or_else(|| {
-            CliError::InvalidParams(format!(
+            CliError::Message(format!(
                 "Invalid named argument: {} (expected key=value)",
                 arg
             ))
         })?;
-        obj.insert(key.to_string(), parse_argument_value(value));
+        obj.insert(key.to_string(), parse_argument(value));
     }
-    Ok(Value::Object(obj))
+    Ok(serde_json::Value::Object(obj))
 }
 
-fn format_output(value: &Value) -> String {
-    if value.is_string() {
-        // Print strings without quotes
-        value.as_str().unwrap_or("").to_string()
-    } else {
-        // Pretty print JSON
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+/// An argument as divi-cli's RPCConvertValues sends it (rpcclient.cpp:17-36):
+/// the JSON value when the whole argument is JSON, else the argument itself
+fn parse_argument(arg: &str) -> serde_json::Value {
+    match json_spirit::parse(arg.as_bytes()) {
+        Some(value) => json_spirit::to_serde(&value),
+        None => serde_json::Value::String(arg.to_string()),
+    }
+}
+
+/// The result as divi-cli prints it: nothing for null, a string as it is,
+/// anything else as indented JSON (divi-cli.cpp:174-180, 202-203)
+fn format_result(result: &json_spirit::Value) -> Option<Vec<u8>> {
+    match result {
+        json_spirit::Value::Null => None,
+        json_spirit::Value::Str(s) => Some(s.clone()),
+        other => Some(json_spirit::write(other, true)),
     }
 }
 
@@ -917,35 +822,45 @@ fn format_output(value: &Value) -> String {
 #[derive(Debug)]
 struct Endpoint {
     rpc_connect: String,
-    rpc_port: u16,
+    rpc_port: String,
     rpc_user: Option<String>,
     rpc_password: Option<String>,
+    rpcwait: bool,
+    conf_path: PathBuf,
 }
 
 /// Resolve the RPC endpoint (priority: CLI args > config file > defaults).
 /// The default config file and cookie directory follow `--mode`, so a
 /// PrivateDivi call never picks up a Divi node's `rpcport` or credentials.
-fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
+fn resolve_endpoint(args: &Args, home: &Path) -> Result<Endpoint, CliError> {
     let privatedivi = args.mode == "privatedivi";
 
     // Determine network type
-    let network = if args.regtest {
+    let network = if args.regtest == Some(true) {
         "regtest"
-    } else if args.testnet {
+    } else if args.testnet == Some(true) {
         "testnet"
     } else {
         "mainnet"
     };
 
-    let conf_path = args
-        .conf
-        .clone()
-        .unwrap_or_else(|| find_conf_path(home, args.datadir.as_deref(), privatedivi, network));
+    // divi-cli: -conf is relative to the data directory, divi.conf by default
+    let conf_path = match (&args.conf, &args.datadir) {
+        (Some(conf), Some(dir)) if conf.is_relative() => dir.join(conf),
+        (Some(conf), _) => conf.clone(),
+        (None, Some(dir)) if !dir.join("irondivi.conf").exists() => dir.join("divi.conf"),
+        (None, _) => find_conf_path(home, args.datadir.as_deref(), privatedivi, network),
+    };
     let config = read_config(&conf_path, network);
 
     // Apply config file values if CLI args not provided
-    let testnet = args.testnet || config.testnet;
-    let regtest = args.regtest || config.regtest;
+    let testnet = args.testnet.or(config.testnet).unwrap_or(false);
+    let regtest = args.regtest.or(config.regtest).unwrap_or(false);
+    if testnet && regtest {
+        return Err(CliError::Plain(
+            "Error: Invalid combination of -regtest and -testnet.".to_string(),
+        ));
+    }
 
     // Re-determine network after config
     let network = if regtest {
@@ -956,26 +871,26 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
         "mainnet"
     };
 
-    // Determine RPC connection parameters (CLI > config > defaults)
-    let rpc_connect = if args.rpcconnect == "127.0.0.1" {
-        // If default, check config
-        config.rpcconnect.unwrap_or_else(|| args.rpcconnect.clone())
-    } else {
-        args.rpcconnect.clone()
-    };
+    let rpc_connect = args
+        .rpcconnect
+        .clone()
+        .or(config.rpcconnect.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
 
     let rpc_port = args
         .rpcport
-        .or(config.rpcport)
-        .unwrap_or_else(|| default_rpc_port(testnet, regtest, privatedivi));
+        .clone()
+        .or(config.rpcport.clone())
+        .unwrap_or_else(|| default_rpc_port(testnet, regtest, privatedivi).to_string());
 
     // Determine credentials: CLI > irondivi.conf (or --conf) > irondivid's
     // cookie > the Divi Core fallback conf > a Core-layout cookie. irondivid's
     // own cookie beats ~/.divi/divi.conf credentials, which belong to divid.
     let datadir = args.datadir.as_deref();
-    let conf_is_core_fallback =
-        args.conf.is_none() && conf_path == default_conf_path(home, privatedivi);
-    let conf_creds = match (config.rpcuser, config.rpcpassword) {
+    let conf_is_core_fallback = args.conf.is_none()
+        && args.datadir.is_none()
+        && conf_path == default_conf_path(home, privatedivi);
+    let conf_creds = match (config.rpcuser.clone(), config.rpcpassword.clone()) {
         (Some(u), Some(p)) => Some((u, p)),
         _ => None,
     };
@@ -993,35 +908,59 @@ fn resolve_endpoint(args: &Args, home: &Path) -> Endpoint {
                 }
             };
             match found {
-                Some((u, p)) => (Some(u), Some(p)),
-                None => (args.rpcuser.clone(), args.rpcpassword.clone()),
+                Some((u, p)) => (
+                    args.rpcuser.clone().or(Some(u)),
+                    args.rpcpassword.clone().or(Some(p)),
+                ),
+                None => (
+                    args.rpcuser.clone().or(config.rpcuser),
+                    args.rpcpassword.clone().or(config.rpcpassword),
+                ),
             }
         }
     };
 
-    Endpoint {
+    Ok(Endpoint {
         rpc_connect,
         rpc_port,
         rpc_user,
         rpc_password,
-    }
+        rpcwait: args.rpcwait.or(config.rpcwait).unwrap_or(false),
+        conf_path,
+    })
 }
 
-fn run() -> Result<(), CliError> {
-    let mut args = Args::parse();
-
-    // Handle stdin input
-    handle_stdin(&mut args)?;
-
-    // Need at least one argument (the method name)
-    if args.args.is_empty() {
-        return Err(CliError::InvalidParams(
-            "No method specified. Use --help for usage.".to_string(),
-        ));
+fn run(argv: &[String]) -> Result<Option<Vec<u8>>, CliError> {
+    // divi-cli's AppInitRPC: help and version first, then the data directory,
+    // the configuration file and the network
+    let mut args = Args::parse(argv)?;
+    if argv.is_empty() || args.help {
+        return Err(CliError::Usage(version_line()));
+    }
+    if args.version {
+        return Err(CliError::Usage(version_text()));
+    }
+    if let Some(dir) = &args.datadir {
+        if !dir.is_dir() {
+            return Err(CliError::Plain(format!(
+                "Error: Specified data directory \"{}\" does not exist.",
+                dir.display()
+            )));
+        }
     }
 
     let home = dirs::home_dir().unwrap_or_default();
-    let endpoint = resolve_endpoint(&args, &home);
+    let mut endpoint = resolve_endpoint(&args, &home)?;
+
+    let passphrases = handle_stdin(&mut args)?;
+    if args.stdinrpcpass {
+        endpoint.rpc_password = args.rpcpassword.clone();
+    }
+
+    // CommandLineRPC: a method is needed
+    if args.args.is_empty() {
+        return Err(CliError::Message("too few parameters".to_string()));
+    }
 
     // Build URL with optional wallet
     let url = if let Some(ref wallet) = args.rpcwallet {
@@ -1033,22 +972,43 @@ fn run() -> Result<(), CliError> {
         format!("http://{}:{}", endpoint.rpc_connect, endpoint.rpc_port)
     };
 
-    // Create RPC client
+    let method = args.args[0].clone();
+    let method_args = &args.args[1..];
+
+    // Convert string args to JSON values
+    let params = if args.named {
+        parse_named_args(method_args)?
+    } else {
+        let mut params: Vec<serde_json::Value> = passphrases
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        params.extend(method_args.iter().map(|a| parse_argument(a)));
+        serde_json::Value::Array(params)
+    };
+
+    // CallRPC: credentials are needed (divi-cli.cpp:87-91)
+    let no_user = endpoint.rpc_user.as_deref().unwrap_or("").is_empty();
+    let no_password = endpoint.rpc_password.as_deref().unwrap_or("").is_empty();
+    if no_user && no_password {
+        return Err(CliError::Message(format!(
+            "You must set rpcpassword=<password> in the configuration file:\n{}\n\
+             If the file does not exist, create it with owner-readable-only file permissions.",
+            endpoint.conf_path.display()
+        )));
+    }
+
     let client = RpcClient {
         url,
         username: endpoint.rpc_user,
         password: endpoint.rpc_password,
     };
 
-    // Get method and remaining args
-    let method = &args.args[0];
-    let method_args = &args.args[1..];
-
     // Handle special commands
     match method.as_str() {
         "-getinfo" => {
             handle_getinfo(&client)?;
-            return Ok(());
+            return Ok(None);
         }
         "-netinfo" => {
             let detail = method_args
@@ -1056,7 +1016,7 @@ fn run() -> Result<(), CliError> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0u8);
             handle_netinfo(&client, detail)?;
-            return Ok(());
+            return Ok(None);
         }
         "-generate" => {
             let nblocks = method_args
@@ -1064,60 +1024,38 @@ fn run() -> Result<(), CliError> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1u64);
             handle_generate(&client, nblocks)?;
-            return Ok(());
+            return Ok(None);
         }
         _ => {}
     }
 
-    // Convert string args to JSON values
-    let params: Value = if args.named {
-        // Parse as named arguments (key=value)
-        parse_named_args(method_args)?
-    } else {
-        // Parse as positional arguments (array)
-        Value::Array(
-            method_args
-                .iter()
-                .enumerate()
-                .map(|(index, arg)| {
-                    if !converts_param(method, index) {
-                        return json!(arg);
-                    }
-                    // Try to parse as JSON first (for objects/arrays)
-                    serde_json::from_str(arg).unwrap_or_else(|_| {
-                        // If not valid JSON, try as number
-                        if let Ok(num) = arg.parse::<i64>() {
-                            json!(num)
-                        } else if let Ok(num) = arg.parse::<f64>() {
-                            json!(num)
-                        } else if arg == "true" {
-                            json!(true)
-                        } else if arg == "false" {
-                            json!(false)
-                        } else {
-                            // Otherwise treat as string
-                            json!(arg)
-                        }
-                    })
-                })
-                .collect(),
-        )
-    };
-
-    // Execute RPC call
-    let result = client.call(method, params)?;
-
-    // Print result
-    println!("{}", format_output(&result));
-
-    Ok(())
+    // Execute, waiting for the node with -rpcwait (divi-cli.cpp:156-191)
+    loop {
+        let outcome = client
+            .post(&method, &params)
+            .and_then(|reply| rpc_error(&reply, endpoint.rpcwait).map(|()| reply));
+        match outcome {
+            Ok(reply) => return Ok(format_result(reply.get("result"))),
+            Err(CallError::Connect) if endpoint.rpcwait => {
+                std::thread::sleep(std::time::Duration::from_millis(1000))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn main() {
-    let exit_code = match run() {
-        Ok(()) => exit_codes::SUCCESS,
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let exit_code = match run(&argv) {
+        Ok(output) => {
+            if let Some(mut text) = output {
+                text.push(b'\n');
+                let _ = io::stdout().write_all(&text);
+            }
+            0
+        }
         Err(e) => {
-            eprintln!("{}", e);
+            e.print();
             e.exit_code()
         }
     };
@@ -1128,6 +1066,12 @@ fn main() {
 mod endpoint_tests {
     use super::*;
     use std::fs;
+
+    /// The command line after the program name
+    fn parse_args(argv: &[&str]) -> Args {
+        let argv: Vec<String> = argv[1..].iter().map(|a| a.to_string()).collect();
+        Args::parse(&argv).unwrap()
+    }
 
     /// A home directory holding only a Divi Core testnet `divi.conf`, the
     /// layout found on vps1 where divid and irondivid share one user.
@@ -1162,21 +1106,27 @@ mod endpoint_tests {
     #[test]
     fn privatedivi_ignores_divi_conf() {
         let home = home_with_divi_conf();
-        let args = Args::parse_from([
+        let args = parse_args(&[
             "irondivi-cli",
             "--mode",
             "privatedivi",
             "--testnet",
             "getblockcount",
         ]);
-        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 52473);
+        assert_eq!(
+            resolve_endpoint(&args, home.path()).unwrap().rpc_port,
+            "52473"
+        );
     }
 
     #[test]
     fn divi_still_reads_divi_conf() {
         let home = home_with_divi_conf();
-        let args = Args::parse_from(["irondivi-cli", "getblockcount"]);
-        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 51475);
+        let args = parse_args(&["irondivi-cli", "getblockcount"]);
+        assert_eq!(
+            resolve_endpoint(&args, home.path()).unwrap().rpc_port,
+            "51475"
+        );
     }
 
     #[test]
@@ -1188,14 +1138,17 @@ mod endpoint_tests {
             "[test]\nrpcport=52599\n",
         )
         .unwrap();
-        let args = Args::parse_from([
+        let args = parse_args(&[
             "irondivi-cli",
             "--mode",
             "privatedivi",
             "--testnet",
             "getblockcount",
         ]);
-        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 52599);
+        assert_eq!(
+            resolve_endpoint(&args, home.path()).unwrap().rpc_port,
+            "52599"
+        );
     }
 
     /// Regression: irondivi-cli read only the Core `~/.divi/divi.conf`, so it
@@ -1210,9 +1163,9 @@ mod endpoint_tests {
             "rpcuser = \"u\"\nrpcpassword = \"p\"\nrpcport = 51471\n",
         )
         .unwrap();
-        let args = Args::parse_from(["irondivi-cli", "getblockcount"]);
-        let ep = resolve_endpoint(&args, home.path());
-        assert_eq!(ep.rpc_port, 51471);
+        let args = parse_args(&["irondivi-cli", "getblockcount"]);
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
+        assert_eq!(ep.rpc_port, "51471");
         assert_eq!(ep.rpc_user.as_deref(), Some("u"));
         assert_eq!(ep.rpc_password.as_deref(), Some("p"));
     }
@@ -1223,13 +1176,16 @@ mod endpoint_tests {
         let vault = home.path().join(".irondivi-vault");
         fs::create_dir_all(&vault).unwrap();
         fs::write(vault.join("irondivi.conf"), "rpcport = 51491\n").unwrap();
-        let args = Args::parse_from([
+        let args = parse_args(&[
             "irondivi-cli",
             "--datadir",
             vault.to_str().unwrap(),
             "getblockcount",
         ]);
-        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 51491);
+        assert_eq!(
+            resolve_endpoint(&args, home.path()).unwrap().rpc_port,
+            "51491"
+        );
     }
 
     #[test]
@@ -1260,14 +1216,14 @@ mod endpoint_tests {
         let datadir = home.path().join("node");
         fs::create_dir_all(&datadir).unwrap();
         fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
-        let args = Args::parse_from([
+        let args = parse_args(&[
             "irondivi-cli",
             "--regtest",
             "--datadir",
             datadir.to_str().unwrap(),
             "getblockcount",
         ]);
-        let ep = resolve_endpoint(&args, home.path());
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
         assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
         assert_eq!(ep.rpc_password.as_deref(), Some("feedbeef"));
     }
@@ -1278,8 +1234,8 @@ mod endpoint_tests {
         let dir = irondivi_data_dir(home.path(), false, "regtest");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(".cookie"), "__cookie__:c0ffee").unwrap();
-        let args = Args::parse_from(["irondivi-cli", "--regtest", "getblockcount"]);
-        let ep = resolve_endpoint(&args, home.path());
+        let args = parse_args(&["irondivi-cli", "--regtest", "getblockcount"]);
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
         assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
         assert_eq!(ep.rpc_password.as_deref(), Some("c0ffee"));
     }
@@ -1290,14 +1246,14 @@ mod endpoint_tests {
         let datadir = home.path().join("core");
         fs::create_dir_all(datadir.join("testnet3")).unwrap();
         fs::write(datadir.join("testnet3/.cookie"), "__cookie__:abc").unwrap();
-        let args = Args::parse_from([
+        let args = parse_args(&[
             "irondivi-cli",
             "--testnet",
             "--datadir",
             datadir.to_str().unwrap(),
             "getblockcount",
         ]);
-        let ep = resolve_endpoint(&args, home.path());
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
         assert_eq!(ep.rpc_password.as_deref(), Some("abc"));
     }
 
@@ -1314,19 +1270,20 @@ mod endpoint_tests {
         .unwrap();
         let datadir = home.path().join("node");
         fs::create_dir_all(&datadir).unwrap();
-        let args = Args::parse_from([
+        let args = parse_args(&[
             "irondivi-cli",
             "--regtest",
             "--datadir",
             datadir.to_str().unwrap(),
             "getblockcount",
         ]);
-        // No cookie: the Core conf is still the fallback
-        let ep = resolve_endpoint(&args, home.path());
-        assert_eq!(ep.rpc_user.as_deref(), Some("core"));
+        // No cookie: with -datadir, divi-cli reads <datadir>/divi.conf only,
+        // never ~/.divi/divi.conf
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
+        assert_eq!(ep.rpc_user.as_deref(), None);
 
         fs::write(datadir.join(".cookie"), "__cookie__:feedbeef").unwrap();
-        let ep = resolve_endpoint(&args, home.path());
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
         assert_eq!(ep.rpc_user.as_deref(), Some("__cookie__"));
         assert_eq!(ep.rpc_password.as_deref(), Some("feedbeef"));
 
@@ -1336,22 +1293,27 @@ mod endpoint_tests {
             "rpcuser = \"u\"\nrpcpassword = \"p\"\n",
         )
         .unwrap();
-        let ep = resolve_endpoint(&args, home.path());
+        let ep = resolve_endpoint(&args, home.path()).unwrap();
         assert_eq!(ep.rpc_user.as_deref(), Some("u"));
     }
 
     #[test]
     fn explicit_rpcport_wins() {
         let home = home_with_divi_conf();
-        let args = Args::parse_from(["irondivi-cli", "--rpcport", "1234", "getblockcount"]);
-        assert_eq!(resolve_endpoint(&args, home.path()).rpc_port, 1234);
+        let args = parse_args(&["irondivi-cli", "--rpcport", "1234", "getblockcount"]);
+        assert_eq!(
+            resolve_endpoint(&args, home.path()).unwrap().rpc_port,
+            "1234"
+        );
     }
 
     #[test]
     fn unknown_mode_is_rejected_listing_valid_values() {
-        let err = Args::try_parse_from(["irondivi-cli", "--mode", "irondivi", "getblockcount"])
-            .unwrap_err()
-            .to_string();
+        let err =
+            Args::parse(&["--mode".into(), "irondivi".into(), "getblockcount".into()]).unwrap_err();
+        let CliError::Message(err) = err else {
+            panic!("expected a message")
+        };
         assert!(err.contains("irondivi"), "{err}");
         assert!(err.contains("divi") && err.contains("privatedivi"), "{err}");
     }
@@ -1395,25 +1357,5 @@ mod stdin_passphrase_tests {
         assert!(read_wallet_passphrases("getbalance", &mut input, false).is_err());
         let mut input = io::Cursor::new(Vec::new());
         assert!(read_wallet_passphrases("walletpassphrase", &mut input, false).is_err());
-    }
-
-    #[test]
-    fn passphrase_params_stay_strings() {
-        assert!(!converts_param("walletpassphrase", 0));
-        assert!(converts_param("walletpassphrase", 1));
-        assert!(!converts_param("walletpassphrasechange", 1));
-        assert!(!converts_param("encryptwallet", 0));
-        assert!(!converts_param("getblock", 0));
-        assert!(converts_param("getblock", 1));
-    }
-
-    #[test]
-    fn convert_table_has_no_duplicates_and_unknown_methods_convert() {
-        let mut names: Vec<_> = CONVERT_PARAMS.iter().map(|(m, _)| *m).collect();
-        names.sort();
-        let len = names.len();
-        names.dedup();
-        assert_eq!(names.len(), len, "a method is listed twice");
-        assert!(converts_param("someunlistedmethod", 0));
     }
 }

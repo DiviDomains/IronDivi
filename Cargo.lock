@@ -4140,7 +4140,6 @@ name = "irondivi-cli"
 version = "0.2.6"
 dependencies = [
  "anyhow",
- "clap",
  "dirs",
  "reqwest 0.12.28",
  "serde",

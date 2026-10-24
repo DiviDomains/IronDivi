@@ -110,34 +110,17 @@ fn stdinwalletpassphrase_change_reads_old_and_new() {
     assert_eq!(req["params"], serde_json::json!(["old pass", "new pass"]));
 }
 
-/// Only positions a method reads as JSON are converted (bitcoin-cli's
-/// per-method table); labels, accounts, messages and ids stay strings.
+/// As divi-cli (rpcclient.cpp:17-36): every argument that is a JSON value as
+/// a whole is sent as that value, whatever the method; only passphrases read
+/// with --stdinwalletpassphrase stay strings
 #[test]
-fn string_arguments_that_look_like_json_stay_strings() {
+fn arguments_that_are_json_are_sent_as_json() {
     let req = request_sent(&["setaccount", "yAddr", "1234"], "");
-    assert_eq!(req["params"], serde_json::json!(["yAddr", "1234"]));
+    assert_eq!(req["params"], serde_json::json!(["yAddr", 1234]));
 
-    let req = request_sent(&["signmessage", "yAddr", "true"], "");
-    assert_eq!(req["params"], serde_json::json!(["yAddr", "true"]));
-
-    // outputIndex is read as a string by setupmasternode
-    let req = request_sent(
-        &["setupmasternode", "mn1", "ab", "1", "02ff", "1.2.3.4"],
-        "",
-    );
-    assert_eq!(
-        req["params"],
-        serde_json::json!(["mn1", "ab", "1", "02ff", "1.2.3.4"])
-    );
-
-    // amount converted, comment and comment-to kept
     let req = request_sent(&["sendtoaddress", "yAddr", "1.5", "100", "null"], "");
-    assert_eq!(
-        req["params"],
-        serde_json::json!(["yAddr", 1.5, "100", "null"])
-    );
+    assert_eq!(req["params"], serde_json::json!(["yAddr", 1.5, 100, null]));
 
-    // JSON positions still convert
     let req = request_sent(&["createrawtransaction", "[]", "{\"yAddr\":2}"], "");
     assert_eq!(req["params"], serde_json::json!([[], {"yAddr": 2}]));
 }
