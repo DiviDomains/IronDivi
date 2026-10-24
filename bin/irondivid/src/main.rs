@@ -21,6 +21,7 @@
 //!   irondivid --testnet --datadir=/path/to/data
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
+mod core_files;
 mod snapshot_sig;
 
 use anyhow::{Context, Result};
@@ -1421,6 +1422,9 @@ async fn run_daemon(
             wallet_network,
             config.network.chain_mode,
         )?);
+        if let Some(ref w) = wallet {
+            core_files::lock_masternode_collateral(w, &config.data_dir);
+        }
 
         // Register unified block-connected callback (mempool cleanup + fee estimation + wallet scan)
         if let Some(ref wallet_arc) = wallet {
@@ -2213,6 +2217,12 @@ fn main() -> Result<()> {
 
     // Compute data directory early (needed for daemonization and logging)
     let data_dir = compute_data_dir(&args);
+    if let Err(e) =
+        core_files::refuse_at_start(&data_dir, args.wallet.as_deref(), args.disablewallet)
+    {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
 
     // Handle daemonization BEFORE initializing tokio runtime (Unix only)
     #[cfg(unix)]
@@ -2311,6 +2321,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Print banner
     print_banner(&config);
+    core_files::warn_core_wallet(&config.data_dir);
 
     // Check for conflicting network options
     if args.testnet && args.regtest {
