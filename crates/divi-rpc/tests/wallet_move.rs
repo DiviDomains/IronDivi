@@ -13,7 +13,7 @@ use divi_primitives::ChainMode;
 use divi_rpc::{Params, WalletRpc};
 use divi_wallet::{HdWallet, Network, WalletDatabase, WalletDb};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,11 +43,14 @@ fn backup_taken_while_wallet_writes_opens() {
     wallet.encrypt_wallet("one").unwrap();
     let rpc = WalletRpc::with_wallet(wallet.clone());
 
-    // Writes that flush the database and replace its files, as a busy node's do
+    // Writes that flush the database and replace its files, as a busy node's
+    // do; `committed` is the scan height of the last save that returned
     let stop = Arc::new(AtomicBool::new(false));
+    let committed = Arc::new(AtomicU32::new(0));
     let writer = {
         let wallet = wallet.clone();
         let stop = stop.clone();
+        let committed = committed.clone();
         std::thread::spawn(move || {
             let mut height = 0u32;
             let (mut from, mut to) = ("one", "two");
@@ -55,6 +58,7 @@ fn backup_taken_while_wallet_writes_opens() {
                 height += 1;
                 wallet.set_last_scan_height(height);
                 wallet.save().unwrap();
+                committed.store(height, Ordering::SeqCst);
                 wallet.change_passphrase(from, to).unwrap();
                 std::mem::swap(&mut from, &mut to);
             }
@@ -64,16 +68,23 @@ fn backup_taken_while_wallet_writes_opens() {
 
     let started = Instant::now();
     let mut failures = Vec::new();
-    for i in 0..25 {
-        if started.elapsed() > Duration::from_secs(60) {
+    for i in 0..400 {
+        if started.elapsed() > Duration::from_secs(90) {
             break;
         }
         let target = dir.path().join(format!("backup-{i}"));
+        let before = committed.load(Ordering::SeqCst);
         match rpc.backup_wallet(&p(vec![json!(target.to_string_lossy())])) {
             Ok(_) => match WalletDb::open(&target, Network::Regtest) {
                 Ok(copy) => {
-                    if !copy.is_encrypted() {
-                        failures.push(format!("backup {i}: lost its encryption"));
+                    if copy.last_scan_height() < before {
+                        failures.push(format!(
+                            "backup {i}: scan height {} older than {before}, saved before the backup",
+                            copy.last_scan_height()
+                        ));
+                    }
+                    if copy.unlock("one", 0).is_err() && copy.unlock("two", 0).is_err() {
+                        failures.push(format!("backup {i}: neither passphrase opens it"));
                     }
                 }
                 Err(e) => failures.push(format!("backup {i} does not open: {e}")),
