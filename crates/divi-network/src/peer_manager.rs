@@ -24,7 +24,7 @@ use divi_primitives::hash::Hash256;
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,6 +52,66 @@ pub struct PeerManagerConfig {
     /// SOCKS5 proxy for every outbound connection (C++ `-proxy`). When set, no
     /// outbound connection is made directly and DNS seeds are not resolved locally.
     pub proxy: Option<SocketAddr>,
+    /// `static_peers` are `-connect` peers (dialled by address and port, as
+    /// Divi Core dials `-connect`) rather than `-addnode` and built-in peers
+    pub connect_only: bool,
+}
+
+/// The check Divi Core makes before a dial (net.cpp OpenNetworkConnection,
+/// ConnectNode, ThreadOpenConnections)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialRule {
+    /// `-connect` and `addnode … onetry` dial by name: skipped only while a
+    /// peer with this exact address and port is connected (FindNode(pszDest))
+    ByName,
+    /// `-addnode`, `addnode … add` and the built-in peers: skipped while any
+    /// peer from this IP is connected or being dialled, inbound or outbound
+    /// (FindNode(CNetAddr))
+    ByAddress,
+    /// Peers found through DNS seeds: as `ByAddress`, and at most one
+    /// outbound peer per network group (ThreadOpenConnections setConnected)
+    Automatic,
+}
+
+/// Divi Core CNetAddr::GetGroup for an IP address: /16 for IPv4 (also when
+/// mapped into IPv6), /32 for IPv6; local addresses form one group and
+/// unroutable ones another
+fn net_group(ip: IpAddr) -> Vec<u8> {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if v4.is_loopback() || v4.is_unspecified() {
+                vec![0]
+            } else if v4.is_private()
+                || v4.is_link_local()
+                || v4.is_documentation()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+            {
+                vec![1]
+            } else {
+                vec![4, o[0], o[1]]
+            }
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if v6.is_loopback() || v6.is_unspecified() {
+                vec![0]
+            } else if (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+            {
+                vec![1]
+            } else {
+                let o = v6.octets();
+                vec![6, o[0], o[1], o[2], o[3]]
+            }
+        }
+    }
 }
 
 impl Default for PeerManagerConfig {
@@ -69,6 +129,7 @@ impl Default for PeerManagerConfig {
             listen_addr: None,
             default_port: 51472, // Mainnet P2P port
             proxy: None,
+            connect_only: false,
         }
     }
 }
@@ -433,12 +494,13 @@ impl PeerManager {
         };
 
         // Connect to static peers first (they report accurate heights)
+        let rule = self.static_rule();
         let static_handles: Vec<_> = self
             .config
             .static_peers
             .clone()
             .into_iter()
-            .filter(|_| self.can_connect_outbound())
+            .filter(|addr| self.can_connect_outbound() && self.claim_dial(*addr, rule))
             .map(|addr| {
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
@@ -496,6 +558,9 @@ impl PeerManager {
                 Ok(addrs) => {
                     for addr in addrs {
                         if self.can_connect_outbound() {
+                            if !self.claim_dial(addr, DialRule::Automatic) {
+                                continue;
+                            }
                             info!("Discovered peer: {}", addr);
                             let self_clone = Arc::clone(&self);
                             tokio::spawn(async move {
@@ -558,6 +623,61 @@ impl PeerManager {
         Ok(())
     }
 
+    /// The rule for the configured static peers
+    fn static_rule(&self) -> DialRule {
+        if self.config.connect_only {
+            DialRule::ByName
+        } else {
+            DialRule::ByAddress
+        }
+    }
+
+    /// Whether Divi Core would dial `addr` now under `rule`. If so the address
+    /// is marked as being dialled, so a second dial to it (or, by address, to
+    /// its IP) is skipped until `connect_to_peer` has finished with it.
+    pub fn claim_dial(&self, addr: SocketAddr, rule: DialRule) -> bool {
+        let peers: Vec<(SocketAddr, bool)> = self
+            .peers
+            .read()
+            .values()
+            .map(|p| (p.addr, p.inbound))
+            .collect();
+        let mut connecting = self.connecting_addrs.write();
+        let taken = match rule {
+            DialRule::ByName => connecting.contains(&addr) || peers.iter().any(|(a, _)| *a == addr),
+            DialRule::ByAddress | DialRule::Automatic => {
+                connecting.iter().any(|a| a.ip() == addr.ip())
+                    || peers.iter().any(|(a, _)| a.ip() == addr.ip())
+            }
+        };
+        let group_taken = rule == DialRule::Automatic && {
+            let group = net_group(addr.ip());
+            connecting.iter().any(|a| net_group(a.ip()) == group)
+                || peers
+                    .iter()
+                    .any(|(a, inbound)| !inbound && net_group(a.ip()) == group)
+        };
+        if taken || group_taken {
+            debug!("Not dialling {} ({:?}): already connected", addr, rule);
+            return false;
+        }
+        connecting.insert(addr);
+        true
+    }
+
+    /// Dial `addr` once, now (RPC `addnode … onetry`)
+    pub fn connect_once(self: &Arc<Self>, addr: SocketAddr) {
+        if self.is_banned(&addr.ip()) || !self.claim_dial(addr, DialRule::ByName) {
+            return;
+        }
+        let self_clone = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = self_clone.connect_to_peer(addr).await {
+                debug!("Failed to connect to {}: {}", addr, e);
+            }
+        });
+    }
+
     /// Connect to a specific peer
     pub async fn connect_to_peer(
         self: Arc<Self>,
@@ -565,6 +685,7 @@ impl PeerManager {
     ) -> Result<PeerId, NetworkError> {
         // Check if IP is banned
         if self.is_banned(&addr.ip()) {
+            self.connecting_addrs.write().remove(&addr);
             return Err(NetworkError::ConnectionRefused(format!(
                 "{} is banned",
                 addr.ip()
@@ -590,10 +711,13 @@ impl PeerManager {
         )
         .await;
 
-        // Remove from connecting set regardless of result
-        self.connecting_addrs.write().remove(&addr);
-
-        let (conn, handle) = result?;
+        let (conn, handle) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.connecting_addrs.write().remove(&addr);
+                return Err(e);
+            }
+        };
 
         let peer_id = handle.id;
 
@@ -601,8 +725,9 @@ impl PeerManager {
         self.scoring.register_peer(peer_id, addr.ip());
         self.scoring.reset_connection_failures(peer_id);
 
-        // Store the handle
+        // Store the handle, then stop counting the address as being dialled
         self.peers.write().insert(peer_id, handle);
+        self.connecting_addrs.write().remove(&addr);
 
         // Run the connection handler
         let self_clone = Arc::clone(&self);
@@ -915,17 +1040,11 @@ impl PeerManager {
                 outbound, target
             );
 
-            // Snapshot connected + connecting addresses to avoid duplicates
-            let connected = self.connected_addresses();
-
             // 1. Try added nodes first (manually added via RPC)
             let added: Vec<SocketAddr> = self.added_nodes.read().iter().copied().collect();
             for addr in added {
                 if !self.can_connect_outbound() {
                     break;
-                }
-                if connected.contains(&addr) || self.connecting_addrs.read().contains(&addr) {
-                    continue;
                 }
                 if self.is_banned(&addr.ip()) {
                     continue;
@@ -933,6 +1052,9 @@ impl PeerManager {
                 // Added nodes also respect backoff if they keep failing
                 if !self.peer_backoff_ready(addr) {
                     debug!("Skipping added node {} (in backoff)", addr);
+                    continue;
+                }
+                if !self.claim_dial(addr, DialRule::ByAddress) {
                     continue;
                 }
                 info!("Reconnecting to added node: {}", addr);
@@ -954,18 +1076,19 @@ impl PeerManager {
             // 2. Try static peers (with exponential backoff for known-failing peers)
             if self.can_connect_outbound() {
                 let static_peers = self.config.static_peers.clone();
+                let rule = self.static_rule();
                 for addr in static_peers {
                     if !self.can_connect_outbound() {
                         break;
-                    }
-                    if connected.contains(&addr) || self.connecting_addrs.read().contains(&addr) {
-                        continue;
                     }
                     if self.is_banned(&addr.ip()) {
                         continue;
                     }
                     if !self.peer_backoff_ready(addr) {
                         debug!("Skipping static peer {} (in backoff)", addr);
+                        continue;
+                    }
+                    if !self.claim_dial(addr, rule) {
                         continue;
                     }
                     info!("Reconnecting to static peer: {}", addr);
@@ -1036,6 +1159,71 @@ pub fn regtest_peer_manager(listen_addr: Option<SocketAddr>) -> Arc<PeerManager>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_handle(addr: &str, inbound: bool) -> PeerHandle {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        PeerHandle {
+            id: crate::peer::new_peer_id(),
+            addr: addr.parse().unwrap(),
+            tx,
+            inbound,
+            stats: Default::default(),
+        }
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn dial_rules_follow_divi_core() {
+        let pm = PeerManager::new(PeerManagerConfig::default());
+        pm.insert_test_peer(test_handle("127.0.0.3:40000", true));
+        pm.insert_test_peer(test_handle("8.8.1.1:51472", false));
+
+        // By address: any peer from the IP, inbound or outbound, blocks the dial
+        assert!(!pm.claim_dial(sa("127.0.0.3:51472"), DialRule::ByAddress));
+        assert!(!pm.claim_dial(sa("8.8.1.1:51473"), DialRule::ByAddress));
+        assert!(pm.claim_dial(sa("8.8.2.2:51472"), DialRule::ByAddress));
+        // A dial in progress blocks its IP too
+        assert!(!pm.claim_dial(sa("8.8.2.2:51473"), DialRule::ByAddress));
+
+        // By name: only the exact address and port
+        assert!(pm.claim_dial(sa("127.0.0.3:51472"), DialRule::ByName));
+        assert!(!pm.claim_dial(sa("127.0.0.3:51472"), DialRule::ByName));
+        assert!(!pm.claim_dial(sa("127.0.0.3:40000"), DialRule::ByName));
+
+        // Automatic: one outbound peer per /16; inbound peers do not take the group
+        assert!(!pm.claim_dial(sa("8.8.9.9:51472"), DialRule::Automatic));
+        assert!(pm.claim_dial(sa("9.9.9.9:51472"), DialRule::Automatic));
+        pm.insert_test_peer(test_handle("5.5.1.1:40000", true));
+        assert!(pm.claim_dial(sa("5.5.2.2:51472"), DialRule::Automatic));
+    }
+
+    #[test]
+    fn net_groups_are_divi_core_s() {
+        assert_eq!(net_group("1.2.3.4".parse().unwrap()), vec![4, 1, 2]);
+        assert_eq!(
+            net_group("1.2.3.4".parse().unwrap()),
+            net_group("::ffff:1.2.200.1".parse().unwrap())
+        );
+        assert_ne!(
+            net_group("1.2.3.4".parse().unwrap()),
+            net_group("1.3.3.4".parse().unwrap())
+        );
+        assert_eq!(
+            net_group("127.0.0.1".parse().unwrap()),
+            net_group("::1".parse().unwrap())
+        );
+        assert_eq!(
+            net_group("10.0.0.1".parse().unwrap()),
+            net_group("192.168.1.1".parse().unwrap())
+        );
+        assert_eq!(
+            net_group("2001:470:1:2::1".parse().unwrap()),
+            net_group("2001:470:ffff::1".parse().unwrap())
+        );
+    }
 
     #[test]
     fn test_peer_manager_creation() {
