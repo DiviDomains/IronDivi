@@ -528,13 +528,7 @@ impl RpcServer {
             "setban" => self.network.read().set_ban(params),
             "ban" => self.network.read().ban(params),
             "setmocktime" => self.set_mock_time(params),
-            "getinvalid" => Ok(serde_json::json!([{
-                // C++ 3.0.0 builds these from empty maps, so the report is always empty
-                "addresses_with_invalid": {},
-                "total_unspent": "0.00",
-                "total_minted": "0.00",
-                "total_valid_used": "0.00",
-            }])),
+            "getinvalid" => self.blockchain.get_invalid(params),
             "listbanned" => self.network.read().list_banned(params),
             "clearbanned" => self.network.read().clear_banned(params),
             "disconnectnode" => self.network.read().disconnect_node(params),
