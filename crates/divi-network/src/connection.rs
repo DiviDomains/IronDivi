@@ -429,7 +429,10 @@ impl Connection {
             "{} from {} does not parse: {}",
             command, self.info.addr, error
         );
-        self.send_message(malformed_reject(command)).await
+        match malformed_reject(command) {
+            Some(answer) => self.send_message(answer).await,
+            None => Ok(()),
+        }
     }
 
     /// Read a message during handshake (not cancellation-safe, but OK since no
@@ -581,9 +584,11 @@ impl Connection {
                             info.last_recv = std::time::Instant::now();
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
-                            if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, malformed_reject(&command)).await {
-                                error!("Failed to send reject to {}: {}", info.addr, e);
-                                break;
+                            if let Some(answer) = malformed_reject(&command) {
+                                if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, answer).await {
+                                    error!("Failed to send reject to {}: {}", info.addr, e);
+                                    break;
+                                }
                             }
                         }
                         Ok(Some(Ok(Decoded::Message(msg)))) => {
@@ -763,8 +768,16 @@ fn reject(command: &str, code: u8, reason: &str) -> NetworkMessage {
 }
 
 /// The `reject` Divi Core sends for a message that does not parse
-fn malformed_reject(command: &str) -> NetworkMessage {
-    reject(command, REJECT_MALFORMED, "error parsing message")
+/// (main.cpp:1054). None for a `reject`, which Divi Core reads only with
+/// -debug and whose parse errors it swallows (main.cpp:940-962), and for
+/// `headers`, which it never reads (main.cpp:669, HeadersFirstSyncingActive
+/// is false on every network): answering those could only start an
+/// exchange of rejects.
+fn malformed_reject(command: &str) -> Option<NetworkMessage> {
+    match command {
+        "reject" | "headers" => None,
+        _ => Some(reject(command, REJECT_MALFORMED, "error parsing message")),
+    }
 }
 
 fn duplicate_version_reject() -> NetworkMessage {

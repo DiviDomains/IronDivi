@@ -429,6 +429,14 @@ impl GetBlocksMessage {
 /// GetHeaders message (same format as GetBlocks)
 pub type GetHeadersMessage = GetBlocksMessage;
 
+/// Longest command a reject names (Divi Core
+/// `LIMITED_STRING(strMsg, CMessageHeader::COMMAND_SIZE)`, main.cpp:946)
+pub const MAX_REJECT_COMMAND_LENGTH: usize = crate::message::COMMAND_SIZE;
+
+/// Longest reason a reject gives (Divi Core `MAX_REJECT_MESSAGE_LENGTH`,
+/// defaultValues.h:94)
+pub const MAX_REJECT_MESSAGE_LENGTH: usize = 111;
+
 /// Reject message
 #[derive(Debug, Clone)]
 pub struct RejectMessage {
@@ -466,9 +474,9 @@ impl RejectMessage {
     /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
         let mut r = Reader::new(data);
-        let message = String::from_utf8_lossy(r.var_bytes()?).into_owned();
+        let message = r.limited_string(MAX_REJECT_COMMAND_LENGTH)?;
         let code = r.u8()?;
-        let reason = String::from_utf8_lossy(r.var_bytes()?).into_owned();
+        let reason = r.limited_string(MAX_REJECT_MESSAGE_LENGTH)?;
         let extra_data = r.take(r.remaining())?.to_vec();
 
         Ok(RejectMessage {
@@ -597,6 +605,13 @@ mod tests {
         } else {
             panic!("Expected Ping message");
         }
+    }
+
+    /// Divi Core main.cpp:946 and defaultValues.h:94
+    #[test]
+    fn reject_limits_are_cores() {
+        assert_eq!(MAX_REJECT_COMMAND_LENGTH, 12);
+        assert_eq!(MAX_REJECT_MESSAGE_LENGTH, 111);
     }
 
     #[test]
