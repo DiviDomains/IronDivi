@@ -496,7 +496,14 @@ def refusals(when):
     both = lambda name, c, i, method, *params: compare(p + name, c.call(method, *params), i.call(method, *params),
                                                       mask=lambda v: masked(v, NAMES))
     bad = "notanaddress"
+    # The manager-only form takes and labels a new owner key before it checks the
+    # manager (rpcwallet.cpp:932-940, then :955), so even the refused call adds a key
+    # to each address book: give each side's key to its twin, as after step 1
+    labelled = {n: set(n.rpc("getaddressesbyaccount", "")) for n in (CO, IO)}
     both("fundvault bad manager-only encoding", CO, IO, "fundvault", bad, 1)
+    for node, twin in ((CO, IO), (IO, CO)):
+        for key in set(node.rpc("getaddressesbyaccount", "")) - labelled[node]:
+            twin.rpc("setaccount", key, "")
     both("fundvault bad manager", CO, IO, "fundvault", f"{OWN}:{bad}", 1)
     both("fundvault bad owner", CO, IO, "fundvault", f"{bad}:{MGR}", 1)
     both("fundvault amount too high", CO, IO, "fundvault", VAULT, 90000000)

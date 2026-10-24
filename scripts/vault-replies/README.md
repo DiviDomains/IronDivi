@@ -52,7 +52,7 @@ Every step that sends is made on divid first, then on irondivid once every node 
 6. **The managers stake a vault coin with `setgenerate 1`.** Each manager first gets fresh vault coins, and the script waits until the clock passes the tip's time, because divid looks for a stake time back from the clock. The coinstakes are compared by the roles of their outputs, since the coins each combines differ.
 7. **removevault** `"OWN:MGR"`, then again (the vault is no longer registered), then with a second `tx_hash` argument.
 8. **Refusals:**
-   - a bad manager-only encoding, a bad owner, a bad manager;
+   - a bad manager-only encoding, a bad owner, a bad manager. The refused manager-only call still takes and labels a new owner key on each side, as divid does (`rpcwallet.cpp:932-940`, the manager is checked after, at `:955`), so the key each side labelled is given to its twin with `setaccount`;
    - an amount too high;
    - addvault or removevault without `:`, on the wrong wallet, with an unknown funding txid;
    - debitvaultbyname from the manager wallet, with a bad destination, with a bad fee mode;
