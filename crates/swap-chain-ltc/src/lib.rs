@@ -517,6 +517,12 @@ impl ChainBackend for LtcBackend {
             })
     }
 
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        Ok(Some(Amount(
+            self.my_utxos().await?.iter().map(|c| c.value).sum(),
+        )))
+    }
+
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         let coins = self.my_utxos().await?;
         let built = build_funding_tx(

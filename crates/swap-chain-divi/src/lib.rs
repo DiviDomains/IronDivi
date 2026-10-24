@@ -385,6 +385,10 @@ impl ChainBackend for DiviBackend {
         second_source::agree_mtp(a, b)
     }
 
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        Ok(Some(Amount(self.balance())))
+    }
+
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         htlc.validate()?;
         let target = amount.to_sat();

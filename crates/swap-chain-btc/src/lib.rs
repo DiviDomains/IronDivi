@@ -142,6 +142,33 @@ impl BtcBackend {
             .collect())
     }
 
+    /// This key's coins from the address query, less those [`Self::unreserved`] holds back:
+    /// what funding selects from.
+    async fn my_utxos(&self) -> Result<Vec<Coin>> {
+        let utxos = self
+            .get_json(&format!("/address/{}/utxo", self.address))
+            .await?;
+        let coins = utxos
+            .as_array()
+            .ok_or_else(|| {
+                SwapError::Transient("utxo response is not an array (malformed?)".into())
+            })?
+            .iter()
+            .map(|u| {
+                Ok(Coin {
+                    outpoint: OutPoint::new(
+                        bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
+                            .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
+                        u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
+                    ),
+                    value: u["value"].as_u64().unwrap_or(0),
+                    confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.unreserved(coins)
+    }
+
     /// Before `tx` is posted: reserve the wallet inputs it spends. Only a transaction whose
     /// inputs are all this key's P2WPKH coins (a lock funding, a plain send) is reserved; a
     /// claim or refund spends an HTLC output, never in the address UTXO list, so it is left
@@ -442,29 +469,14 @@ impl ChainBackend for BtcBackend {
             })
     }
 
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        Ok(Some(Amount(
+            self.my_utxos().await?.iter().map(|c| c.value).sum(),
+        )))
+    }
+
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
-        let utxos = self
-            .get_json(&format!("/address/{}/utxo", self.address))
-            .await?;
-        let coins = utxos
-            .as_array()
-            .ok_or_else(|| {
-                SwapError::Transient("utxo response is not an array (malformed?)".into())
-            })?
-            .iter()
-            .map(|u| {
-                Ok(Coin {
-                    outpoint: OutPoint::new(
-                        bitcoin::Txid::from_str(u["txid"].as_str().unwrap_or(""))
-                            .map_err(|e| SwapError::Other(format!("utxo txid: {e}")))?,
-                        u["vout"].as_u64().unwrap_or(u64::MAX) as u32,
-                    ),
-                    value: u["value"].as_u64().unwrap_or(0),
-                    confirmed: u["status"]["confirmed"].as_bool().unwrap_or(false),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let coins = self.unreserved(coins)?;
+        let coins = self.my_utxos().await?;
         let built = build_funding_tx(
             &self.secp,
             &self.key,

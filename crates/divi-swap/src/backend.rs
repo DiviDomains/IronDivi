@@ -112,4 +112,14 @@ pub trait ChainBackend: Send + Sync {
     async fn release_dead_lock(&self, _lock: &SignedTx) -> Result<bool> {
         Ok(false)
     }
+
+    /// What this key could put into a funding transaction now: the sum of the coins
+    /// [`build_funding`](Self::build_funding) selects from, less inputs an unconfirmed lock
+    /// holds, with **no** fee taken off. `spendable >= amount` is therefore necessary for a lock
+    /// of `amount`, not sufficient. Read-only: no coin is selected or reserved.
+    ///
+    /// `None` means this backend cannot tell cheaply; a caller must not refuse on it.
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        Ok(None)
+    }
 }

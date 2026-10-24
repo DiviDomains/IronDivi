@@ -301,6 +301,11 @@ impl ChainBackend for MockBackend {
         Ok(self.chain.mtp())
     }
 
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        self.check_online()?;
+        Ok(Some(self.chain.balance(&self.pubkey)))
+    }
+
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         self.check_online()?;
         htlc.validate()?;

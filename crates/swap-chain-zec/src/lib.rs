@@ -283,6 +283,30 @@ impl ZecBackend {
         &self.address
     }
 
+    /// This key's coins from `GetAddressUtxos`, less those [`Self::unreserved`] holds back:
+    /// what funding selects from.
+    async fn my_coins(&self) -> Result<Vec<tx::Coin>> {
+        let utxos = self
+            .client
+            .address_utxos(&self.encoded_address())
+            .await
+            .map_err(SwapError::from)?;
+        let coins = utxos
+            .into_iter()
+            .map(|u| {
+                Ok(tx::Coin {
+                    outpoint: tx::OutPoint {
+                        txid: Self::txid32(&u.txid, "GetAddressUtxosReply.txid")?,
+                        n: u.index as u32,
+                    },
+                    value: u.value_zat as u64,
+                    script_pubkey: u.script,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.unreserved(coins)
+    }
+
     /// Confirmed balance (sum of `GetAddressUtxos`) in zatoshi.
     pub async fn balance_zatoshi(&self) -> Result<u64> {
         let utxos = self
@@ -438,28 +462,16 @@ impl ChainBackend for ZecBackend {
         median_of_block_times(blocks.iter().map(|b| b.time))
     }
 
+    async fn spendable(&self) -> Result<Option<Amount>> {
+        Ok(Some(Amount(
+            self.my_coins().await?.iter().map(|c| c.value).sum(),
+        )))
+    }
+
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
         let branch_id = self.consensus_branch_id().await?;
         let version = self.tx_version().await?;
-        let utxos = self
-            .client
-            .address_utxos(&self.encoded_address())
-            .await
-            .map_err(SwapError::from)?;
-        let coins = utxos
-            .into_iter()
-            .map(|u| {
-                Ok(tx::Coin {
-                    outpoint: tx::OutPoint {
-                        txid: Self::txid32(&u.txid, "GetAddressUtxosReply.txid")?,
-                        n: u.index as u32,
-                    },
-                    value: u.value_zat as u64,
-                    script_pubkey: u.script,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let coins = self.unreserved(coins)?;
+        let coins = self.my_coins().await?;
         let built = tx::build_funding_tx(
             &self.secp,
             &self.key,

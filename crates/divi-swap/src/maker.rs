@@ -287,9 +287,13 @@ impl Maker {
     /// `median_time_past` read: two accepts of one quote, or of one hash on two quotes, cannot
     /// both pass the checks.
     ///
-    /// Both the wait for `gate` and the read are bounded by `gate_bound`; on timeout the
+    /// Both the wait for `gate` and each chain read are bounded by `gate_bound`; on timeout the
     /// accept fails with [`SwapError::Transient`] (HTTP 503, retryable) before any write, so the
     /// quote stays unused and no swap row exists.
+    ///
+    /// A maker that cannot fund its own leg refuses with [`SwapError::InsufficientFunds`]
+    /// (HTTP 409), also before any write: it reads [`ChainBackend::spendable`] on the maker-leg
+    /// chain. No coin is selected or reserved here; that still waits for `TakerLockConfirmed`.
     pub async fn accept(&self, req: AcceptRequest) -> Result<SwapView> {
         let _g = self.gate_bounded("accept").await?;
         let mut qr = self
@@ -343,6 +347,23 @@ impl Maker {
             script_version: ScriptVersion::V1,
         }
         .validate()?;
+        // Otherwise the taker locks and then waits out its whole timeout for a refund.
+        let need = qr.quote.maker_leg_amount();
+        let have = tokio::time::timeout(self.gate_bound, self.chain(mc)?.spendable())
+            .await
+            .map_err(|_| {
+                SwapError::Transient(format!(
+                    "accept: {mc} balance not read within {:?}; retry",
+                    self.gate_bound
+                ))
+            })??;
+        if let Some(have) = have {
+            if have.0 < need.0 {
+                return Err(SwapError::InsufficientFunds(format!(
+                    "maker has {have} spendable on {mc}, this swap needs {need}"
+                )));
+            }
+        }
 
         let rec = MakerRecord {
             id: uuid::Uuid::new_v4().to_string(),
