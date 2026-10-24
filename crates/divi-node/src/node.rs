@@ -1184,6 +1184,11 @@ impl Node {
                     &event,
                 ) {
                     Ok(txid) => {
+                        // Relayed once the mempool took it, and so is each
+                        // orphan it lets in (Divi Core main.cpp:734, :763)
+                        tx_relay_for_mempool
+                            .relay_accepted(txid, Some(event.from_peer))
+                            .await;
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         for txid in accept_orphans(
                             &mempool_for_relay,
@@ -1191,6 +1196,7 @@ impl Node {
                             &orphans_for_relay,
                             txid,
                         ) {
+                            tx_relay_for_mempool.relay_accepted(txid, None).await;
                             let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         }
                     }
