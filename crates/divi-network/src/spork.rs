@@ -294,6 +294,24 @@ impl SporkManager {
         }
     }
 
+    /// A peer that dialled us. Divi Core tells it how many sporks it holds
+    /// (main.cpp SetPeerVersionAndServices) and waits for no sporks from it
+    /// (Node.cpp CanSendMessagesToPeer, net.cpp GetSporkSyncedOrInboundNodes);
+    /// the peer itself sends nothing else to us until it has that many sporks,
+    /// so the count must match what `getsporks` serves.
+    pub async fn inbound_peer_connected(&self, peer_id: PeerId) {
+        self.peer_states
+            .write()
+            .entry(peer_id)
+            .or_insert(SporkSyncState::Synced);
+        let count = self.active_sporks.read().len() as u32;
+        let _ = self
+            .peer_manager
+            .send_to_peer(peer_id, NetworkMessage::SporkCount(count))
+            .await;
+        self.emit_progress();
+    }
+
     /// Remove a peer's state when disconnected
     pub fn remove_peer(&self, peer_id: PeerId) {
         self.peer_states.write().remove(&peer_id);
