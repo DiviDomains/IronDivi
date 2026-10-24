@@ -1265,9 +1265,16 @@ impl BlockchainRpc {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| RpcError::invalid_params("Missing or invalid 'index' field"))?;
 
+        // GetSpentIndex failing without the index (TransactionSearchIndexes.cpp:43-44)
         let search = match self.chain.search_index() {
             Some(search) if search.spent_enabled() => search,
-            _ => return Err(self.address_index_not_enabled()),
+            _ => {
+                return Err(RpcError::new(
+                    codes::INVALID_ADDRESS_OR_KEY,
+                    "Unable to get spent info",
+                )
+                .into())
+            }
         };
         match search.read_spent(&divi_storage::SpentIndexKey::new(txid, index as u32))? {
             Some(value) => Ok(json!({
@@ -1331,16 +1338,10 @@ impl BlockchainRpc {
     // Helper methods for address index
 
     fn address_index_not_enabled(&self) -> Error {
+        // GetAddressIndex / GetAddressUnspent failing (rpcmisc.cpp:658, :760, :851, :976)
         RpcError::new(
-            -5,
-            "Address index not enabled. To use address index features, you must:\n\
-             1. Stop IronDivi\n\
-             2. Add -addressindex=1 to your configuration\n\
-             3. Add -reindex=1 for the next startup (one time only)\n\
-             4. Restart IronDivi and wait for full blockchain reindex\n\
-             \n\
-             Warning: Reindexing can take 40-60 hours depending on blockchain size.\n\
-             The address index allows querying transaction history and balances for any address.",
+            codes::INVALID_ADDRESS_OR_KEY,
+            "No information available for address",
         )
         .into()
     }
@@ -1460,7 +1461,9 @@ impl BlockchainRpc {
 
     /// Get mining information
     /// getmininginfo
-    pub fn getmininginfo(&self, _params: &Params) -> Result<Value, Error> {
+    pub fn getmininginfo(&self, params: &Params) -> Result<Value, Error> {
+        // Divi Core sends these seven members (rpcmining.cpp:220-247)
+        crate::core_help::check_arguments("getmininginfo", params, (0, 0), 0)?;
         let tip = self.chain.tip();
         let (blocks, difficulty) = match &tip {
             Some(t) => (t.height, bits_to_difficulty(t.bits)),
