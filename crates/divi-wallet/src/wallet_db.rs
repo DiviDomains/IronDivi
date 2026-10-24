@@ -918,7 +918,13 @@ impl WalletDb {
         let accounts = db.load_accounts()?;
         {
             let mut accounts_map = self.accounts.write();
-            for (account, addresses) in accounts {
+            for (account, mut addresses) in accounts {
+                // Divi Core reads its "name" records in key order (the address
+                // string after its length) and an account's current address is
+                // the last one read (walletdb.cpp:242-251,
+                // AddressBookManager.cpp:17-22), so after a restart it is the
+                // greatest address, not the last one handed out
+                addresses.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
                 accounts_map.insert(account, addresses);
             }
         }

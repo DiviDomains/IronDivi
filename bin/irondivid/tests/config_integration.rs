@@ -14,8 +14,9 @@ use std::fs;
 #[test]
 fn test_config_file_integration() {
     // Create a temporary directory for test
-    let temp_dir = std::env::temp_dir().join("irondivi_config_test");
-    fs::create_dir_all(&temp_dir).unwrap();
+    // A directory of its own: two runs at once must not share it
+    let dir = tempfile::tempdir().unwrap();
+    let temp_dir = dir.path();
 
     // Create a test config file with all supported options
     let config_path = temp_dir.join("irondivi.conf");
@@ -72,14 +73,14 @@ anotherkey=anothervalue
     assert!(content.contains("txindex=1"));
 
     // Cleanup
-    fs::remove_dir_all(&temp_dir).unwrap();
 }
 
 #[test]
 fn test_bitcoin_style_config_format() {
     // Test that our parser handles Bitcoin-style config format correctly
-    let temp_dir = std::env::temp_dir().join("irondivi_bitcoin_config_test");
-    fs::create_dir_all(&temp_dir).unwrap();
+    // A directory of its own: two runs at once must not share it
+    let dir = tempfile::tempdir().unwrap();
+    let temp_dir = dir.path();
 
     let config_path = temp_dir.join("divi.conf");
     let config_content = r#"
@@ -107,13 +108,13 @@ addnode=192.168.1.5:51472
     assert!(config_path.exists());
 
     // Cleanup
-    fs::remove_dir_all(&temp_dir).unwrap();
 }
 
 #[test]
 fn test_config_with_network_flags() {
-    let temp_dir = std::env::temp_dir().join("irondivi_network_config_test");
-    fs::create_dir_all(&temp_dir).unwrap();
+    // A directory of its own: two runs at once must not share it
+    let dir = tempfile::tempdir().unwrap();
+    let temp_dir = dir.path();
 
     let config_path = temp_dir.join("irondivi.conf");
 
@@ -147,5 +148,4 @@ txindex=1
     assert!(config_path.exists());
 
     // Cleanup
-    fs::remove_dir_all(&temp_dir).unwrap();
 }

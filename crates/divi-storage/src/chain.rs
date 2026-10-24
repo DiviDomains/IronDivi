@@ -2527,10 +2527,16 @@ impl Chain {
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
     pub fn invalidate_block(&self, hash: &Hash256) -> Result<(), StorageError> {
-        self.notifying_tip(|| self.invalidate_block_unnotified(hash))
+        self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
     }
 
-    fn invalidate_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
+    /// Mark the block failed and disconnect it and the blocks above it; with
+    /// `activate`, then move to the best valid chain left
+    fn invalidate_block_unnotified(
+        &self,
+        hash: &Hash256,
+        activate: bool,
+    ) -> Result<(), StorageError> {
         let _chain_guard = self.chain_lock.lock();
         let target = self
             .db
@@ -2580,7 +2586,10 @@ impl Chain {
                 }
             }
         }
-        self.activate_best_valid_chain()
+        if activate {
+            self.activate_best_valid_chain()?;
+        }
+        Ok(())
     }
 
     /// Record that a node now runs on this database. Returns whether the run
@@ -2649,6 +2658,26 @@ impl Chain {
 
     fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
         let _chain_guard = self.chain_lock.lock();
+        self.clear_failed_marks(hash)?;
+        self.activate_best_valid_chain()
+    }
+
+    /// Divi Core's reverseblocktransactions (rpcblockchain.cpp:577-603):
+    /// disconnect the block and those above it, as invalidateblock does, then
+    /// clear the invalid mark again without moving the tip, as Core's
+    /// reconsiderBlock (ChainExtensionService.cpp:662-689) does there. The
+    /// tip stays at the block's parent until another block is connected.
+    pub fn reverse_block_transactions(&self, hash: &Hash256) -> Result<(), StorageError> {
+        self.notifying_tip(|| {
+            self.invalidate_block_unnotified(hash, false)?;
+            let _chain_guard = self.chain_lock.lock();
+            self.clear_failed_marks(hash)
+        })
+    }
+
+    /// Clear the failed mark of `hash`, its ancestors and its descendants.
+    /// Caller must hold `chain_lock`.
+    fn clear_failed_marks(&self, hash: &Hash256) -> Result<(), StorageError> {
         let target = self
             .db
             .get_block_index(hash)?
@@ -2686,7 +2715,7 @@ impl Chain {
                 }
             }
         }
-        self.activate_best_valid_chain()
+        Ok(())
     }
 
     /// Move the active chain to the most-work valid chain, trying candidates
