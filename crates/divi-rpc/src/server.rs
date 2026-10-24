@@ -50,6 +50,8 @@ pub struct RpcConfig {
     pub password: Option<String>,
     /// Who may connect besides the local host (Divi Core's -rpcallowip)
     pub allowed: Vec<Subnet>,
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    pub rest: bool,
 }
 
 impl Default for RpcConfig {
@@ -59,6 +61,7 @@ impl Default for RpcConfig {
             username: None,
             password: None,
             allowed: Vec::new(),
+            rest: false,
         }
     }
 }
@@ -1477,10 +1480,16 @@ impl RpcServer {
 /// is never served open (irondivid fills in cookie credentials when none are
 /// configured, see [`crate::auth_cookie`]).
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
-    build_router(server, rpc_credentials(config))
+    build_router(server, rpc_credentials(config), config.rest)
 }
 
-fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)>>) -> Router {
+fn build_router(
+    server: Arc<RpcServer>,
+    credentials: Option<Arc<(String, String)>>,
+    rest: bool,
+) -> Router {
+    // Every other path: REST or 404, without credentials, as divid
+    let other_paths = crate::rest::router(server.clone(), rest);
     let router = Router::new()
         .route("/", post(handle_rpc))
         .route("/wallet/:wallet_name", post(handle_wallet_rpc))
@@ -1513,7 +1522,7 @@ fn build_router(server: Arc<RpcServer>, credentials: Option<Arc<(String, String)
     }));
 
     // No cross-origin headers on RPC replies, as Divi Core sends none
-    router
+    router.merge(other_paths)
 }
 
 /// The credentials to enforce: both must be set. `None` means no request can
