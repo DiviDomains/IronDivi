@@ -950,13 +950,34 @@ impl BlockchainRpc {
     /// confirmations
     pub fn get_tx_out(&self, params: &Params) -> Result<Value, Error> {
         use divi_primitives::transaction::OutPoint;
-        let txid_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing txid parameter"))?;
-
-        let vout = params
-            .get_i64(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing vout parameter"))?;
+        // params[0].get_str(), params[1].get_int() and params[2].get_bool():
+        // json_spirit takes only a string, an integer and a boolean
+        // (rpcblockchain.cpp:366-371)
+        let type_error = |v: &Value, want: &str| -> Error {
+            RpcError::new(
+                codes::MISC_ERROR,
+                format!(
+                    "value is type {}, expected {want}",
+                    crate::wallet::json_spirit_type(v)
+                ),
+            )
+            .into()
+        };
+        let txid_str = match params.get(0) {
+            Some(Value::String(t)) => t.as_str(),
+            Some(v) => return Err(type_error(v, "str")),
+            None => return Err(RpcError::invalid_params("Missing txid parameter").into()),
+        };
+        let vout = match params.get(1) {
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => n.as_i64().unwrap_or(i64::MAX),
+            Some(v) => return Err(type_error(v, "int")),
+            None => return Err(RpcError::invalid_params("Missing vout parameter").into()),
+        };
+        let include_mempool = match params.get(2) {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(v) => return Err(type_error(v, "bool")),
+        };
 
         // `uint256 hash(strHash)`: text that is not a hash names no transaction
         let Ok(txid) = Hash256::from_hex(txid_str) else {
@@ -966,7 +987,6 @@ impl BlockchainRpc {
             return Ok(Value::Null);
         }
         let outpoint = OutPoint::new(txid, vout as u32);
-        let include_mempool = params.get_bool(2).unwrap_or(true);
         let mempool = self.mempool.read().clone().filter(|_| include_mempool);
 
         if mempool.as_ref().is_some_and(|m| m.is_spent(&outpoint)) {
