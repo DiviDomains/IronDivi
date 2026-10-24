@@ -109,9 +109,17 @@ pub struct Offer {
 }
 
 impl Offer {
-    /// DIVI sats for `btc_sats` counter-chain sats, rounded down.
+    /// DIVI sats for `btc_sats` counter-chain sats, rounded down, or `None` when that does
+    /// not fit in a `u64`.
+    pub fn checked_divi_for(&self, btc_sats: u64) -> Option<Amount> {
+        let divi = u128::from(btc_sats) * u128::from(self.divi_sats_per_btc) / 100_000_000;
+        u64::try_from(divi).ok().map(Amount)
+    }
+
+    /// DIVI sats for `btc_sats` counter-chain sats, rounded down, saturating at `u64::MAX`
+    /// rather than wrapping. `Maker::quote` refuses instead (`checked_divi_for`).
     pub fn divi_for(&self, btc_sats: u64) -> Amount {
-        Amount(((btc_sats as u128 * self.divi_sats_per_btc as u128) / 100_000_000) as u64)
+        self.checked_divi_for(btc_sats).unwrap_or(Amount(u64::MAX))
     }
 
     /// Chain of the taker leg.
@@ -378,6 +386,7 @@ mod hex33 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn divi_for_rounds_down() {
@@ -390,6 +399,53 @@ mod tests {
             max_btc_sats: 1_000_000,
         };
         assert_eq!(o.divi_for(100_000).0, 3_000 * 100_000_000);
+    }
+
+    #[test]
+    fn checked_divi_for_refuses_what_does_not_fit() {
+        let o = Offer {
+            id: "o".into(),
+            direction: Direction::TakerPaysBtc,
+            counter_chain: Chain::Btc,
+            divi_sats_per_btc: u64::MAX,
+            min_btc_sats: 1,
+            max_btc_sats: u64::MAX,
+        };
+        assert_eq!(o.checked_divi_for(100_000_000), Some(Amount(u64::MAX)));
+        assert_eq!(o.checked_divi_for(100_000_001), None);
+        assert_eq!(o.divi_for(100_000_001), Amount(u64::MAX));
+    }
+
+    fn edge() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            Just(0u64),
+            Just(1),
+            Just(100_000_000),
+            Just(u64::MAX),
+            0..=1_000_000_000_000u64,
+            any::<u64>(),
+        ]
+    }
+
+    proptest! {
+        /// Never wraps: the exact rounded-down quotient when it fits in a `u64`, `u64::MAX`
+        /// when it does not.
+        #[test]
+        fn divi_for_is_exact_or_saturates(rate in edge(), btc_sats in edge()) {
+            let o = Offer {
+                id: "o".into(),
+                direction: Direction::TakerPaysBtc,
+                counter_chain: Chain::Btc,
+                divi_sats_per_btc: rate,
+                min_btc_sats: 0,
+                max_btc_sats: u64::MAX,
+            };
+            let exact = u128::from(btc_sats) * u128::from(rate) / 100_000_000;
+            prop_assert_eq!(
+                u128::from(o.divi_for(btc_sats).0),
+                exact.min(u128::from(u64::MAX))
+            );
+        }
     }
 
     #[test]

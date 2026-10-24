@@ -254,7 +254,12 @@ impl Maker {
                 offer.min_btc_sats, offer.max_btc_sats
             )));
         }
-        let divi_amount = offer.divi_for(btc_sats);
+        let divi_amount = offer.checked_divi_for(btc_sats).ok_or_else(|| {
+            SwapError::InvalidParams(format!(
+                "{btc_sats} sats at {} DIVI sats per BTC is more DIVI than an amount can hold",
+                offer.divi_sats_per_btc
+            ))
+        })?;
         if divi_amount.0 == 0 {
             return Err(SwapError::InvalidParams("swap is worth no DIVI".into()));
         }
