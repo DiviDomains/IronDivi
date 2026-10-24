@@ -172,9 +172,15 @@ impl SwapConfig {
             .unwrap_or(self.btc_mtp_lag_secs)
     }
 
-    /// Required minimum of `taker_timeout − maker_timeout`.
+    /// Required minimum of `taker_timeout − maker_timeout`, saturating at `u32::MAX`.
     pub fn required_gap_secs(&self) -> u32 {
-        Self::MIN_TIMEOUT_GAP_SECS.max(2 * self.max_mtp_lag_secs() + self.claim_margin_secs)
+        u32::try_from(self.required_gap()).unwrap_or(u32::MAX)
+    }
+
+    /// `max(3 h, 2 × max MTP lag + claim margin)`, exact: lag and margin come from config.
+    fn required_gap(&self) -> u64 {
+        let need = 2 * u64::from(self.max_mtp_lag_secs()) + u64::from(self.claim_margin_secs);
+        need.max(u64::from(Self::MIN_TIMEOUT_GAP_SECS))
     }
 
     /// Enforce `taker_timeout − maker_timeout ≥ max(3 h, 2 × max MTP lag + claim margin)`
@@ -194,10 +200,10 @@ impl SwapConfig {
             .ok_or_else(|| {
                 SwapError::InvalidParams("taker timeout must exceed maker timeout".into())
             })?;
-        if gap < self.required_gap_secs() {
+        if u64::from(gap) < self.required_gap() {
             return Err(SwapError::InvalidParams(format!(
                 "timeout gap {gap}s < required {}s",
-                self.required_gap_secs()
+                self.required_gap()
             )));
         }
         if Chain::ALL.into_iter().any(|c| self.confirmations(c) == 0) {
@@ -488,6 +494,21 @@ mod tests {
     use super::*;
     use crate::api::Direction;
     use crate::types::Amount;
+
+    /// A lag near `u32::MAX` (divi-swapd takes `mtp_lag_secs` from the config file) does not
+    /// overflow the required gap: it is computed exactly, so no gap a `u32` holds satisfies it.
+    #[test]
+    fn huge_mtp_lag_does_not_overflow_the_gap() {
+        let mut c = SwapConfig::profile(Profile::Testnet);
+        c.taker_timeout_secs = u32::MAX;
+        c.maker_timeout_secs = 0;
+        c.btc_mtp_lag_secs = u32::MAX / 2;
+        c.claim_margin_secs = 2;
+        assert_eq!(c.required_gap_secs(), u32::MAX);
+        assert!(c.validate().is_err());
+        c.btc_mtp_lag_secs = u32::MAX;
+        assert!(c.validate().is_err());
+    }
 
     #[test]
     fn both_profiles_valid() {
