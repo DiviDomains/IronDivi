@@ -274,7 +274,7 @@ impl LiteWalletRpc {
         let fee_rate = if let Some(ref mempool) = self.mempool {
             mempool.estimate_fee(conf_target)
         } else {
-            0.00001 // Default minimum fee rate
+            0.0001 // Divi Core's default relay floor, 10000 sat/kB
         };
 
         Ok(serde_json::json!(fee_rate))
@@ -293,7 +293,7 @@ impl LiteWalletRpc {
             }))
         } else {
             Ok(serde_json::json!({
-                "feerate": 0.00001,
+                "feerate": 0.0001,
                 "blocks": conf_target,
             }))
         }
@@ -322,7 +322,7 @@ impl LiteWalletRpc {
                 "bytes": 0,
                 "usage": 0,
                 "maxmempool": 300000000,
-                "mempoolminfee": 0.00001,
+                "mempoolminfee": 0.0001,
             }))
         }
     }

@@ -215,6 +215,12 @@ impl Mempool {
         }
     }
 
+    /// The relay floor in DIVI/kB, the unit the fee RPCs report. Nothing below it
+    /// is accepted, so no fee estimate may go below it (C++ `minRelayTxFee`).
+    fn relay_floor_divi_per_kb(&self) -> f64 {
+        self.min_relay_fee_per_kb() as f64 / 100_000_000.0
+    }
+
     /// Register the chain tip height source used for finality checks
     pub fn set_tip_height_provider(&self, provider: TipHeightProvider) {
         *self.tip_height.write() = Some(provider);
@@ -817,7 +823,7 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
             bytes: self.bytes(),
             usage: self.bytes() + self.size() * 200, // Estimate overhead per entry
             max_mempool: self.config.max_size,
-            min_fee: self.config.min_relay_fee as f64 / 100_000_000.0, // Convert satoshis to DIVI/kB
+            min_fee: self.relay_floor_divi_per_kb(),
         }
     }
 
@@ -826,7 +832,7 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
         // Look at fee rates in current mempool
         let txs = self.txs.read();
         if txs.is_empty() {
-            return 0.00001; // Minimum fee rate
+            return self.relay_floor_divi_per_kb();
         }
 
         // Collect all fee rates
@@ -850,7 +856,7 @@ impl divi_rpc::blockchain::MempoolProvider for Mempool {
         let fee_per_kb = fee_per_byte * 1000.0;
         let fee_divi = fee_per_kb / 100_000_000.0;
 
-        fee_divi.max(0.00001) // Ensure minimum fee
+        fee_divi.max(self.relay_floor_divi_per_kb())
     }
 
     fn estimate_smart_fee(&self, conf_target: u32) -> divi_rpc::blockchain::FeeEstimate {
@@ -1122,6 +1128,22 @@ mod tests {
         let tx = create_test_tx([1u8; 32], 50);
         let result = mempool.add(tx, Amount::from_sat(1)); // Very low fee
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fee_estimate_never_below_relay_floor() {
+        use divi_rpc::blockchain::MempoolProvider;
+
+        // Default relay fee is C++ Divi's 10000 sat/kB. BasicSwap prices swap
+        // transactions with estimatesmartfee and refuses a rate below relayfee.
+        let mempool = Mempool::new(MempoolConfig::default());
+        assert_eq!(mempool.min_relay_fee_per_kb(), 10_000);
+        assert_eq!(MempoolProvider::estimate_fee(&mempool, 2), 0.0001);
+        assert_eq!(
+            MempoolProvider::estimate_smart_fee(&mempool, 2).fee_rate,
+            0.0001
+        );
+        assert_eq!(MempoolProvider::get_stats(&mempool).min_fee, 0.0001);
     }
 
     // ============================================================

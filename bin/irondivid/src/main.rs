@@ -282,7 +282,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "forcednsseed",
     "forcestart",
     "genproclimit",
-    "hdseed",
     "keypool",
     "listenonion",
     "litemode",
@@ -298,8 +297,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "mining",
     "mnconf",
     "mnconflock",
-    "mnemonic",
-    "mnemonicpassphrase",
     "monthlybackups",
     "onion",
     "onlynet",
@@ -337,6 +334,9 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
     "conf",
+    "hdseed",
+    "mnemonic",
+    "mnemonicpassphrase",
     "datadir",
     "testnet",
     "regtest",
@@ -969,24 +969,56 @@ fn print_banner(config: &NodeConfig) {
     info!("========================================");
 }
 
+/// What a new wallet is made from: Divi Core's -mnemonic, -mnemonicpassphrase
+/// and -hdseed, from the command line or divi.conf (wallet.cpp:2286-2304),
+/// else the WALLET_MNEMONIC, WALLET_MNEMONIC_PASSPHRASE and WALLET_HDSEED
+/// environment variables. Never logged.
+#[derive(Default)]
+struct WalletSeed {
+    mnemonic: Option<String>,
+    passphrase: Option<String>,
+    hdseed: Option<String>,
+}
+
+impl WalletSeed {
+    fn from_settings(settings: &Settings) -> Self {
+        let get = |key: &str| settings.get(key).map(str::to_string);
+        WalletSeed {
+            mnemonic: get("mnemonic"),
+            passphrase: get("mnemonicpassphrase"),
+            hdseed: get("hdseed"),
+        }
+    }
+}
+
 /// Load or create wallet
 fn load_or_create_wallet(
     wallet_path: &PathBuf,
     network: WalletNetwork,
     chain_mode: ChainMode,
+    seed: WalletSeed,
 ) -> Result<Arc<WalletDb>> {
-    let restoring = std::env::var("WALLET_MNEMONIC").ok();
-    // Divi Core's -mnemonicpassphrase: the BIP39 passphrase of the seed
-    let passphrase = std::env::var("WALLET_MNEMONIC_PASSPHRASE").ok();
-    // Divi Core's -hdseed: a hex seed, preferred over a mnemonic (init.cpp:947-951)
-    let seed = std::env::var("WALLET_HDSEED").ok();
+    let env = |name: &str| std::env::var(name).ok();
+    // An empty mnemonic asks for a new one, as in Core
+    let mnemonic = seed
+        .mnemonic
+        .or_else(|| env("WALLET_MNEMONIC"))
+        .filter(|m| !m.trim().is_empty());
+    let passphrase = seed
+        .passphrase
+        .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
+    if passphrase.as_ref().is_some_and(|p| p.len() > 256) {
+        anyhow::bail!("Mnemonic passphrase is too long, must be at most 256 characters");
+    }
+    // -hdseed is preferred over a mnemonic (init.cpp:947-951)
+    let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
         wallet_path,
         network,
         chain_mode,
-        restoring,
+        mnemonic,
         passphrase,
-        seed,
+        hdseed,
     )
 }
 
@@ -1073,21 +1105,19 @@ fn load_or_restore_wallet_with_seed(
         Some(hex_seed) => match hex::decode(hex_seed.trim()) {
             Ok(bytes) if !bytes.is_empty() => Some(bytes),
             _ => {
-                warn!("WALLET_HDSEED is not a hex seed; not using it");
+                warn!("-hdseed is not a hex seed; not using it");
                 None
             }
         },
         None => None,
     };
     if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
-        warn!(
-            "WALLET_HDSEED and WALLET_MNEMONIC/WALLET_MNEMONIC_PASSPHRASE together: using the seed"
-        );
+        warn!("-hdseed and -mnemonic/-mnemonicpassphrase together: using the seed");
     }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
     let hd_wallet = if let Some(ref seed) = seed {
-        info!("Restoring wallet from the WALLET_HDSEED environment variable");
+        info!("Restoring wallet from -hdseed");
         HdWallet::from_seed(seed, chain_mode)
             .with_context(|| "Failed to restore HD wallet from seed")?
     } else if let Some(ref mnemonic) = restoring {
@@ -1102,7 +1132,7 @@ fn load_or_restore_wallet_with_seed(
             })
             .unwrap_or(chain_mode);
         info!(
-            "Restoring wallet from WALLET_MNEMONIC environment variable (chain_mode={:?})",
+            "Restoring wallet from -mnemonic (chain_mode={:?})",
             restore_chain_mode
         );
         HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode)
@@ -1111,7 +1141,7 @@ fn load_or_restore_wallet_with_seed(
         HdWallet::new(chain_mode).with_context(|| "Failed to generate HD wallet")?
     };
     if passphrase.is_some() && restoring.is_none() {
-        warn!("WALLET_MNEMONIC_PASSPHRASE is used only with WALLET_MNEMONIC");
+        warn!("-mnemonicpassphrase is used only with -mnemonic");
     }
 
     // Never log the mnemonic: logs go to journald and log files, which are
@@ -1204,6 +1234,7 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
 async fn run_daemon(
     config: NodeConfig,
     wallet_path: Option<PathBuf>,
+    wallet_seed: WalletSeed,
     disable_wallet: bool,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
@@ -1263,6 +1294,7 @@ async fn run_daemon(
             &wallet_dir,
             wallet_network,
             config.network.chain_mode,
+            wallet_seed,
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
@@ -1647,6 +1679,7 @@ async fn run_daemon(
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
+        let block_sync_for_rpc = node.block_sync().clone();
         let mempool_for_tx = node.mempool().clone();
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
@@ -1668,6 +1701,7 @@ async fn run_daemon(
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
+                    rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
@@ -1748,6 +1782,16 @@ async fn run_daemon(
                                 staker_for_split.stake_split_threshold()
                             }));
 
+                        // setgenerate (regtest): mine blocks to the wallet now
+                        let staker_for_generate = Arc::clone(staker_arc);
+                        rpc_server
+                            .staking()
+                            .set_generate_control(Arc::new(move |n| {
+                                staker_for_generate
+                                    .generate_blocks(n)
+                                    .map(|hashes| hashes.iter().map(|h| h.to_string()).collect())
+                            }));
+
                         info!("Staking RPC callbacks registered");
                     }
                 }
@@ -1764,6 +1808,7 @@ async fn run_daemon(
         let mempool_for_rpc = node.mempool().clone();
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
+        let block_sync_for_rpc = node.block_sync().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
@@ -1782,6 +1827,7 @@ async fn run_daemon(
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
+                    rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
@@ -2164,6 +2210,14 @@ fn pid_file_path(args: &Args, data_dir: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Divi Core removes its pid file in Shutdown, which also runs after a failed
+/// start (init.cpp:396); only a file this process wrote is removed
+fn remove_pid_file(pid_file: &std::path::Path) {
+    if std::fs::read_to_string(pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string()) {
+        let _ = std::fs::remove_file(pid_file);
+    }
+}
+
 fn main() -> Result<()> {
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match Args::try_parse_from(std::env::args()) {
@@ -2225,7 +2279,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
 
-        let pid_file = pid_file_path(&args, &data_dir);
         let log_file = data_dir.join("debug.log");
 
         eprintln!("Logging to {:?}", log_file);
@@ -2275,9 +2328,6 @@ fn main() -> Result<()> {
             // Close stdin
             libc::close(libc::STDIN_FILENO);
         }
-
-        // Write PID file
-        let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
     }
 
     #[cfg(not(unix))]
@@ -2335,6 +2385,10 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     }
 
     // Set up shutdown channel
+    // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
+    #[cfg(unix)]
+    let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
+
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
@@ -2383,10 +2437,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         let _ = shutdown_tx_clone.send(());
     });
 
+    let wallet_seed = WalletSeed::from_settings(&args.settings);
+
     // Run the daemon
     if let Err(e) = run_daemon(
         config,
         args.wallet,
+        wallet_seed,
         args.disablewallet,
         shutdown_tx,
         shutdown_rx,
@@ -2400,14 +2457,11 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             error!("  Caused by: {}", err);
             source = err.source();
         }
+        remove_pid_file(&pid_file);
         std::process::exit(1);
     }
 
-    // Divi Core removes its pid file at a clean stop (init.cpp:396)
-    if std::fs::read_to_string(&pid_file).is_ok_and(|p| p.trim() == std::process::id().to_string())
-    {
-        let _ = std::fs::remove_file(&pid_file);
-    }
+    remove_pid_file(&pid_file);
 
     info!("IronDivi shutdown complete");
     Ok(())
@@ -3248,7 +3302,12 @@ mod wallet_move_tests {
             "WALLET_MNEMONIC",
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         );
-        let wallet = load_or_create_wallet(&path, WalletNetwork::Regtest, ChainMode::Divi);
+        let wallet = load_or_create_wallet(
+            &path,
+            WalletNetwork::Regtest,
+            ChainMode::Divi,
+            WalletSeed::default(),
+        );
         std::env::remove_var("WALLET_HDSEED");
         std::env::remove_var("WALLET_MNEMONIC");
         let wallet = wallet.unwrap();

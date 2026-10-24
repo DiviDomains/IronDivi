@@ -4213,6 +4213,12 @@ impl Chain {
         rewards.stake + rewards.masternode
     }
 
+    /// What a proof-of-work coinbase at `height` may pay, before fees: the limit
+    /// `validate_block_value` checks it against
+    pub fn pow_block_reward(&self, height: u32) -> Amount {
+        Self::stake_reward(&self.block_rewards(height))
+    }
+
     /// Validate block value (total mint) doesn't exceed expected rewards.
     /// Matches C++ BlockIncentivesPopulator::IsBlockValueValid and HasValidPayees.
     ///

@@ -33,7 +33,8 @@ pub enum RequestId {
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    /// JSON-RPC version; Divi Core neither needs nor checks it
+    /// JSON-RPC version. Divi Core's divi-cli and other JSON-RPC 1.0 clients
+    /// leave it out, and divid never reads it (rpcserver.cpp:876-901)
     #[serde(default)]
     pub jsonrpc: String,
     /// Request ID
@@ -255,6 +256,16 @@ mod tests {
         let req: Request = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.id, RequestId::Number(1));
+        assert_eq!(req.method, "getblockcount");
+    }
+
+    #[test]
+    fn test_request_without_version() {
+        let json = r#"{"method":"getblockcount","params":[],"id":1}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.jsonrpc, "");
         assert_eq!(req.id, RequestId::Number(1));
         assert_eq!(req.method, "getblockcount");
     }

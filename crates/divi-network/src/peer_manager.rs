@@ -317,6 +317,11 @@ impl PeerManager {
         self.peers.read().contains_key(&peer_id)
     }
 
+    /// Whether a connected peer dialled us
+    pub fn is_inbound(&self, peer_id: PeerId) -> bool {
+        self.peers.read().get(&peer_id).is_some_and(|p| p.inbound)
+    }
+
     /// Get peer info for RPC (address and inbound status)
     pub fn get_peer_info(&self) -> Vec<(SocketAddr, bool)> {
         self.peers
