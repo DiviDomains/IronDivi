@@ -386,7 +386,9 @@ impl Mempool {
         if tx.is_coinstake() {
             return Err(rejected(reject::INVALID, "coinstake"));
         }
-        if (fee.as_sat() as f64) / (tx.size() as f64) < self.config.min_relay_fee as f64 {
+        if (fee.as_sat() as i128) * 1000
+            < (self.min_relay_fee_per_kb() as i128) * (tx.size() as i128)
+        {
             return Err(rejected(reject::INSUFFICIENT_FEE, "insufficient fee"));
         }
         let relay_fee_per_kb = self.min_relay_fee_per_kb();
@@ -399,7 +401,7 @@ impl Mempool {
     /// The minimum relay fee in satoshis per 1000 bytes (Core's
     /// `minimumRelayTransactionFee`)
     pub fn min_relay_fee_per_kb(&self) -> i64 {
-        self.config.min_relay_fee * 1000
+        self.config.min_relay_fee_per_kb
     }
 
     /// Divi Core `CFeeRate::GetFee` (FeeRate.cpp:35-43) of the relay fee
@@ -884,7 +886,7 @@ mod tests {
 
     fn test_config() -> MempoolConfig {
         MempoolConfig {
-            min_relay_fee: 1, // Very low for testing
+            min_relay_fee_per_kb: 1000, // Very low for testing
             ..MempoolConfig::default()
         }
     }
@@ -1120,7 +1122,7 @@ mod tests {
     #[test]
     fn test_low_fee_rejection() {
         let config = MempoolConfig {
-            min_relay_fee: 100000, // High minimum
+            min_relay_fee_per_kb: 100_000_000, // High minimum
             ..MempoolConfig::default()
         };
         let mempool = Mempool::new(config);

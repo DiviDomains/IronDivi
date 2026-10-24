@@ -30,14 +30,14 @@ fn call(server: &RpcServer, method: &str, params: Vec<Value>) -> Value {
     r.result.unwrap()
 }
 
-/// The fee figures an empty mempool with `min_relay_fee` sat/byte gives
-fn fees(min_relay_fee: i64) -> [Value; 6] {
+/// The fee figures an empty mempool with a relay floor of `per_kb` sat/kB gives
+fn fees(per_kb: i64) -> [Value; 6] {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
     let params = ChainParams::for_network(NetworkType::Regtest, ChainMode::Divi);
     let server = RpcServer::new(Arc::new(Chain::new(db, params).unwrap()));
     server.set_mempool(Arc::new(Mempool::new(MempoolConfig {
-        min_relay_fee,
+        min_relay_fee_per_kb: per_kb,
         ..Default::default()
     })));
     [
@@ -46,21 +46,28 @@ fn fees(min_relay_fee: i64) -> [Value; 6] {
         call(&server, "getmempoolinfo", vec![])["mempoolminfee"].clone(),
         call(&server, "getnetworkinfo", vec![])["relayfee"].clone(),
         call(&server, "getinfo", vec![])["relayfee"].clone(),
-        json!(min_relay_fee as f64 * 1000.0 / 100_000_000.0),
+        json!(per_kb as f64 / 100_000_000.0),
     ]
 }
 
 #[test]
 fn fee_rpcs_follow_the_relay_floor() {
     // Divi Core's default, 10000 sat/kB
-    let [estimate, smart, mempool_min, network, info, _] = fees(10);
+    let [estimate, smart, mempool_min, network, info, _] = fees(10_000);
     for v in [&estimate, &smart, &mempool_min, &network, &info] {
         assert_eq!(*v, json!(0.0001));
     }
 
     // -minrelaytxfee=0.0002
-    let [estimate, smart, mempool_min, network, info, floor] = fees(20);
+    let [estimate, smart, mempool_min, network, info, floor] = fees(20_000);
     assert_eq!(floor, json!(0.0002));
+    for v in [&estimate, &smart, &mempool_min, &network, &info] {
+        assert_eq!(*v, floor);
+    }
+
+    // -minrelaytxfee=0.000015: not a whole number of satoshis per byte
+    let [estimate, smart, mempool_min, network, info, floor] = fees(1500);
+    assert_eq!(floor, json!(0.000015));
     for v in [&estimate, &smart, &mempool_min, &network, &info] {
         assert_eq!(*v, floor);
     }

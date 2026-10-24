@@ -586,8 +586,9 @@ pub struct MempoolConfig {
     /// Maximum mempool size (bytes)
     pub max_size: usize,
 
-    /// Minimum relay fee (satoshis per byte)
-    pub min_relay_fee: i64,
+    /// Minimum relay fee in satoshis per 1000 bytes (Divi Core's
+    /// `-minrelaytxfee`, kept unrounded as `CFeeRate` keeps it)
+    pub min_relay_fee_per_kb: i64,
 
     /// Maximum orphan transactions
     pub max_orphan_txs: usize,
@@ -599,8 +600,8 @@ pub struct MempoolConfig {
 impl Default for MempoolConfig {
     fn default() -> Self {
         MempoolConfig {
-            max_size: 300 * 1024 * 1024, // 300 MB
-            min_relay_fee: 10, // 10 sat/byte (matches C++ Divi CFeeRate(10000) = 10000 sat/kB)
+            max_size: 300 * 1024 * 1024,  // 300 MB
+            min_relay_fee_per_kb: 10_000, // C++ Divi CFeeRate(10000)
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
         }
