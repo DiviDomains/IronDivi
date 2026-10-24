@@ -94,15 +94,6 @@ Open, not closed yet. Each is listed so the run stays usable; a fix turns the ro
   - irondivid removes the vault and its records for good.
 - **`after restart: getwalletinfo`:** `keypoolsize` is 1999 on divid and 2000 on irondivid after the restart (equal before it). The same row is open in `scripts/wallet-replies`.
 
-Fixed on branch `fix/vault-replies`, which takes them out of this list:
-- `removevault` reply: irondivid adds `result` and `message`; divid answers `{removal_status}` only (`rpcwallet.cpp:1226`).
-- `removevault` of a vault the wallet does not hold: divid answers `{removal_status: true}`, since `RemoveVault` is true in vault mode (`wallet.cpp:707-713`); irondivid refuses with -4.
-- `removevault` with a bad owner or manager: divid -5 "Vault Registry Failed: Invalid owner DIVI address" / "...manager..." (`rpcwallet.cpp:1215-1221`); irondivid -1 with its own text.
-- `debitvaultbyname` from a wallet without the owner key: divid's text names the ownership type, "Vault owner key is unknown: ownership=0 address=..." (`rpcwallet.cpp:1103-1104`).
-- `debitvaultbyname` of a vault with only unconfirmed coins while another vault has confirmed coins:
-  - divid's balance check is over all vaults and passes (`rpcwallet.cpp:727-734`); its coin selection then fails with -4 "Insufficient funds to meet coin selection algorithm requirements." (`rpcwallet.cpp:796-800`, `wallet.cpp:1779`);
-  - irondivid answers -6 "No funds available in vault ...".
-
 ## Proving a difference is caught
 
 `VAULT_REPLIES_INJECT=<row name>` changes irondivid's reply of that row before it is compared, for example `VAULT_REPLIES_INJECT='after fundvault: owner getbalance []'`. That row prints `FAIL` and the run exits 1.

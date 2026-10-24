@@ -73,19 +73,6 @@ KNOWN = {
         "open: the same",
     "after restart: manager gettransaction of * reclaimvaultfunds metadata":
         "open: the same",
-    # Fixed on fix/vault-replies; taken out of this list there
-    "removevault: reply":
-        "open: fixed on fix/vault-replies: irondivid adds result and message; divid answers {removal_status} only (rpcwallet.cpp:1226)",
-    "removevault again: reply":
-        "open: fixed on fix/vault-replies: irondivid refuses -4 for a vault it does not hold; divid's RemoveVault answers true in vault mode (wallet.cpp:707-713)",
-    "*refused removevault bad owner":
-        "open: fixed on fix/vault-replies: divid -5 \"Vault Registry Failed: Invalid owner DIVI address\" (rpcwallet.cpp:1219-1221)",
-    "*refused removevault bad manager":
-        "open: fixed on fix/vault-replies: divid -5 \"Vault Registry Failed: Invalid manager DIVI address\" (rpcwallet.cpp:1215-1217)",
-    "*refused debitvaultbyname from the manager wallet":
-        "open: fixed on fix/vault-replies: divid's text names the ownership type, \"ownership=0 address=...\" (rpcwallet.cpp:1103-1104)",
-    "refused debitvaultbyname with only unconfirmed vault coins":
-        "open: fixed on fix/vault-replies: divid -4 with its coin selection's text (rpcwallet.cpp:796-800, wallet.cpp:1779); irondivid -6 \"No funds available in vault\"",
     "after restart: *getwalletinfo":
         "open: keypoolsize is 1999 on divid and 2000 on irondivid after the restart (equal before it); the same row is open in scripts/wallet-replies",
 }
