@@ -253,7 +253,7 @@ fn send_then_end(how: End) {
 
     let clean = match how {
         End::RpcStop => {
-            assert_eq!(daemon.rpc("stop", json!([])), json!("Divi server stopping"));
+            assert_eq!(daemon.rpc("stop", json!([])), json!("DIVI server stopping"));
             true
         }
         End::Signal(sig) => {

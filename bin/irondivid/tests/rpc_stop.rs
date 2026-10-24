@@ -85,7 +85,7 @@ fn rpc_stop_exits_the_daemon() {
     }
 
     let reply = rpc(rpc_port, "stop").expect("stop reply");
-    assert!(reply.contains("Divi server stopping"), "stop: {reply}");
+    assert!(reply.contains("DIVI server stopping"), "stop: {reply}");
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {

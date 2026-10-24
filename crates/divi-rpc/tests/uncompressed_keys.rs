@@ -286,6 +286,6 @@ fn createmultisig_keeps_an_uncompressed_public_key() {
         "addmultisigaddress",
         vec![json!(1), json!([key.address])],
     ));
-    // (this tree answers {address, redeemScript}; Divi Core answers the address alone)
-    assert_eq!(r3["address"], r["address"]);
+    // Divi Core answers the address alone
+    assert_eq!(r3, r["address"]);
 }

@@ -192,9 +192,63 @@ impl Response {
     }
 }
 
+/// Write `value` as Divi Core's json_spirit writer does
+/// (json/json_spirit_writer_template.h:130): compact, and every real (a number
+/// that is not an integer) with exactly 8 decimals, so 0.0001 is written
+/// `0.00010000` and 1250.0 `1250.00000000`.
+pub fn write_core_json(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_core_value(value, &mut out);
+    out
+}
+
+fn write_core_value(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() => out.push_str(&format!("{f:.8}")),
+            _ => out.push_str(&n.to_string()),
+        },
+        Value::String(s) => out.push_str(&serde_json::to_string(s).unwrap_or_default()),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_core_value(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push(':');
+                write_core_value(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_writer_gives_reals_eight_decimals() {
+        let v = serde_json::json!({"a": 0.0001, "b": 1250.0, "c": 7, "d": -2, "e": [1e-8, null, "x\"y"]});
+        assert_eq!(
+            write_core_json(&v),
+            r#"{"a":0.00010000,"b":1250.00000000,"c":7,"d":-2,"e":[0.00000001,null,"x\"y"]}"#
+        );
+    }
 
     #[test]
     fn test_request_parsing() {
