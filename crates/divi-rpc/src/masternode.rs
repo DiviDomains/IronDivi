@@ -82,13 +82,9 @@ impl MasternodeRpc {
 
     /// Print masternode status
     pub fn get_masternode_status(&self, _params: &Params) -> Result<Value, Error> {
-        // This requires the node to be running as a masternode
-        // For now, return error indicating not running as masternode
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "This node is not configured as a masternode",
-        )
-        .into())
+        // irondivid never runs as a masternode: Divi Core's reply for a node
+        // that is not one (RpcMasternodeFeatures.cpp:219)
+        Err(RpcError::new(codes::MISC_ERROR, "This is not a masternode").into())
     }
 
     /// Print the masternode winners for the last n blocks.
@@ -332,6 +328,23 @@ impl Default for MasternodeRpc {
 mod tests {
     use super::*;
     use crate::protocol::Params;
+
+    fn rpc_err(r: Result<Value, Error>) -> (i32, String) {
+        match r {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("expected an RPC error, got {other:?}"),
+        }
+    }
+
+    /// Divi Core's reply on a node that is not a masternode
+    /// (RpcMasternodeFeatures.cpp:219)
+    #[test]
+    fn getmasternodestatus_on_a_node_that_is_not_a_masternode() {
+        assert_eq!(
+            rpc_err(MasternodeRpc::new().get_masternode_status(&Params::None)),
+            (-1, "This is not a masternode".to_string())
+        );
+    }
 
     #[test]
     fn test_masternode_rpc_without_manager() {
