@@ -2023,7 +2023,12 @@ pub fn check_mempool_transaction(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0);
-    check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+    // Divi Core checks IsStandardTx and AreInputsStandard only without
+    // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
+    let require_standard = mempool.requires_standard();
+    if require_standard {
+        check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+    }
     mempool.check_conflicts(tx)?;
 
     // The transaction's own outputs must not exist yet
@@ -2090,7 +2095,7 @@ pub fn check_mempool_transaction(
     }
 
     // AreInputsStandard: refused without a reject reason in Core
-    for (input, prev) in tx.vin.iter().zip(&spent) {
+    for (input, prev) in tx.vin.iter().zip(&spent).filter(|_| require_standard) {
         if !divi_script::policy::is_input_standard(
             prev.script.as_bytes(),
             input.script_sig.as_bytes(),

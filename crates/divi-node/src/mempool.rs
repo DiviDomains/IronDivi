@@ -477,6 +477,12 @@ impl Mempool {
         self.check_conflicts(tx)
     }
 
+    /// Whether a transaction must be standard to be taken (Divi Core's
+    /// requireStandard, the opposite of `-acceptnonstandard`)
+    pub fn requires_standard(&self) -> bool {
+        !self.config.accept_nonstandard
+    }
+
     /// The minimum relay fee in satoshis per 1000 bytes (Core's
     /// `minimumRelayTransactionFee`)
     pub fn min_relay_fee_per_kb(&self) -> i64 {

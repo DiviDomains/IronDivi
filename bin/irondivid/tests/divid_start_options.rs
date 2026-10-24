@@ -355,6 +355,64 @@ fn refused_starts_print_divid_s_error_line() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// A spend of the node's first coin to one OP_TRUE output, which is not
+/// standard: the P2PKH script createrawtransaction makes is replaced before
+/// signing
+fn spend_to_op_true(daemon: &Daemon) -> String {
+    let coin = daemon.rpc("listunspent", json!([]))[0].clone();
+    let addr = daemon.rpc("getnewaddress", json!([]));
+    let amount = (coin["amount"].as_f64().unwrap() * 1e8).round() as i64 - 100_000;
+    let raw = daemon.rpc(
+        "createrawtransaction",
+        json!([[{"txid": coin["txid"], "vout": coin["vout"]}], {addr.as_str().unwrap(): amount as f64 / 1e8}]),
+    );
+    let raw = raw.as_str().unwrap().to_string();
+    let decoded = daemon.rpc("decoderawtransaction", json!([raw]));
+    let spk = decoded["vout"][0]["scriptPubKey"]["hex"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let raw = raw.replacen(&format!("19{spk}"), "0151", 1);
+    let signed = daemon.rpc("signrawtransaction", json!([raw]));
+    assert_eq!(signed["complete"], json!(true), "{signed}");
+    signed["hex"].as_str().unwrap().to_string()
+}
+
+/// -acceptnonstandard takes a transaction that is not standard, as Divi
+/// Core's AcceptToMemoryPool does with it (MempoolConsensus.cpp:274, :291);
+/// without it the transaction is refused (-26)
+#[test]
+fn acceptnonstandard_takes_a_nonstandard_transaction() {
+    for (flag, taken) in [
+        ("-acceptnonstandard=1", true),
+        ("-acceptnonstandard=0", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc_port = free_port();
+        let mut args = divid_args(dir.path(), rpc_port);
+        args.extend([flag.to_string(), "-listen=0".to_string()]);
+        let daemon = Daemon::start(&args, &[], rpc_port, true);
+        daemon.rpc("setgenerate", json!([21]));
+        let hex = spend_to_op_true(&daemon);
+        let (_, reply) = http_rpc(
+            "127.0.0.1".parse().unwrap(),
+            rpc_port,
+            "sendrawtransaction",
+            &json!([hex]),
+        )
+        .unwrap();
+        if taken {
+            assert!(reply["error"].is_null(), "{flag}: {reply}");
+            assert!(
+                reply["result"].as_str().is_some_and(|t| t.len() == 64),
+                "{reply}"
+            );
+        } else {
+            assert_eq!(reply["error"]["code"], json!(-26), "{flag}: {reply}");
+        }
+    }
+}
+
 /// -server=0: the node runs, with no RPC server
 #[test]
 fn server_0_runs_without_rpc() {

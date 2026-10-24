@@ -679,6 +679,10 @@ pub struct MempoolConfig {
 
     /// Expiry time for transactions (seconds)
     pub expiry_time: u64,
+
+    /// Take transactions that are not standard (Divi Core's
+    /// `-acceptnonstandard`, off by default; MempoolConsensus.cpp:274)
+    pub accept_nonstandard: bool,
 }
 
 impl Default for MempoolConfig {
@@ -688,6 +692,7 @@ impl Default for MempoolConfig {
             min_relay_fee_per_kb: 10_000, // C++ Divi CFeeRate(10000)
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
+            accept_nonstandard: false,
         }
     }
 }

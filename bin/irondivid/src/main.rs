@@ -568,6 +568,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
+    config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
         // network's spork key stops the start
@@ -664,6 +665,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "acceptnonstandard",
         "sporkkey",
         "staking",
         "stakeonstaletip",
