@@ -95,6 +95,17 @@ impl TestNode {
         })
         .await
         .expect("node listens");
+        // The probe above is an inbound connection until the node sees it
+        // close; wait until it has gone, so it holds no inbound slot when a
+        // test connects (a test with one inbound slot was refused)
+        let pm = self.node.peer_manager();
+        tokio::time::timeout(WAIT, async {
+            while pm.inbound_count() > 0 || !pm.has_inbound_room() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the probe connection has gone");
     }
 
     /// The misbehaviour score of the (single) peer connected from `ip`
