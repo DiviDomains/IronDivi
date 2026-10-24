@@ -123,7 +123,7 @@ pub enum NetworkMessage {
 
 impl NetworkMessage {
     /// Get the command name for this message
-    pub fn command(&self) -> &'static str {
+    pub fn command(&self) -> &str {
         match self {
             NetworkMessage::Version(_) => "version",
             NetworkMessage::Verack => "verack",
@@ -155,11 +155,7 @@ impl NetworkMessage {
             NetworkMessage::MasternodeBroadcast(_) => "mnb",
             NetworkMessage::MasternodePing(_) => "mnp",
             NetworkMessage::MasternodeWinner(_) => "mnw",
-            NetworkMessage::Unknown(cmd, _) => {
-                // Note: This is a bit awkward since we return &'static str
-                // but command is dynamic. This should only be used for logging.
-                Box::leak(cmd.clone().into_boxed_str())
-            }
+            NetworkMessage::Unknown(cmd, _) => cmd,
         }
     }
 
