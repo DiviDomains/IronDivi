@@ -15,7 +15,7 @@
 //! Uses tokio-util's FramedRead for cancellation-safe message reading.
 
 use crate::codec::{Decoded, DiviCodec};
-use crate::constants::{Magic, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION};
+use crate::constants::{Magic, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION};
 use crate::error::NetworkError;
 use crate::message::NetAddr;
 use crate::peer::{
@@ -356,7 +356,7 @@ impl Connection {
     /// Send our version message
     async fn send_version(&mut self) -> Result<(), NetworkError> {
         let version = VersionMessage {
-            version: PROTOCOL_VERSION,
+            version: crate::constants::protocol_version(),
             services: self.our_services,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

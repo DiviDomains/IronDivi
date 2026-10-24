@@ -501,6 +501,7 @@ impl Node {
         let prunes = self.config.expire.is_enabled() || self.chain.prune_height() > 0;
         self.peer_manager
             .set_services(divi_network::constants::advertised_services(prunes));
+        divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -2000,7 +2001,8 @@ mod tests {
         let node = Node::new(config).unwrap();
 
         let info = node.get_network_info();
-        assert_eq!(info.protocol_version, 70920);
+        // Divi Core 3.0.0's PROTOCOL_VERSION (version.h:21)
+        assert_eq!(info.protocol_version, 70915);
     }
 
     #[test]

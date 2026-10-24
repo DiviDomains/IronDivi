@@ -61,7 +61,7 @@ impl NetworkRpc {
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
             "subversion": divi_network::USER_AGENT,
-            "protocolversion": 70920,
+            "protocolversion": divi_network::constants::protocol_version(),
             "localservices": format!("{:016x}", local_services),
             "timeoffset": self.time_offset(),
             "connections": connections,

@@ -516,6 +516,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(proxy) = s.get("proxy") {
         config.p2p.proxy = Some(proxy.to_string());
     }
+    // Divi Core SetProtocolVersion (init.cpp:1450-1452)
+    if let Some(n) = number_option(&s, "protocolversion", 0..=i64::from(i32::MAX)) {
+        config.network.protocol_version = n as u32;
+    }
     if let Some(n) = number_option(&s, "banscore", 0..=i64::from(u32::MAX)) {
         config.p2p.ban_score = n as u32;
     }
@@ -599,6 +603,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxconnections",
         "timeout",
         "proxy",
+        "protocolversion",
         "banscore",
         "bantime",
         "checkblocks",

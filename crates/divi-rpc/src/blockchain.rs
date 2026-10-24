@@ -673,7 +673,7 @@ impl BlockchainRpc {
 
         Ok(json!({
             "version": 2000000,
-            "protocolversion": 70020,
+            "protocolversion": divi_network::constants::protocol_version(),
             "blocks": height,
             "timeoffset": 0,
             "connections": 0,

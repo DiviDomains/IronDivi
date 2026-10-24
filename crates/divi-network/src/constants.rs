@@ -42,8 +42,23 @@ pub const PRIVATEDIVI_REGTEST_MAGIC: Magic = [0x70, 0xd1, 0x76, 0x13];
 /// Initial protocol version (used in handshake before negotiation)
 pub const INIT_PROTO_VERSION: i32 = 209;
 
-/// Current protocol version
-pub const PROTOCOL_VERSION: i32 = 70920;
+/// Divi Core's protocol version: 70915 on every network (version.h:21,
+/// version-util.cpp:5-6)
+pub const PROTOCOL_VERSION: i32 = 70915;
+
+static PROTOCOL_VERSION_IN_USE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(PROTOCOL_VERSION);
+
+/// The protocol version this node sends and reports: [`PROTOCOL_VERSION`]
+/// unless -protocolversion set another (Divi Core init.cpp:1450-1452)
+pub fn protocol_version() -> i32 {
+    PROTOCOL_VERSION_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Divi Core's SetProtocolVersion (version-util.cpp:8-12), for -protocolversion
+pub fn set_protocol_version(version: i32) {
+    PROTOCOL_VERSION_IN_USE.store(version, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Minimum peer protocol version after enforcement
 pub const MIN_PEER_PROTO_VERSION: i32 = 70915;

@@ -368,7 +368,7 @@ impl GetBlocksMessage {
     /// Create a new GetBlocks message
     pub fn new(locator_hashes: Vec<Hash256>, stop_hash: Hash256) -> Self {
         GetBlocksMessage {
-            version: crate::constants::PROTOCOL_VERSION,
+            version: crate::constants::protocol_version(),
             locator_hashes,
             stop_hash,
         }
