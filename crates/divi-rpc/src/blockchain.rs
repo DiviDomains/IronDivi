@@ -1485,7 +1485,8 @@ fn json_spirit_type_error(value: Option<&Value>, want: &str) -> RpcError {
 /// uint256::SetHex reads it (uint256.cpp:186-212): its last 64 digits, a
 /// shorter one with leading zeros
 fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
-    let is_hex = !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_hex =
+        !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit());
     let not_hex = || {
         RpcError::new(
             crate::error::codes::MISC_ERROR,
