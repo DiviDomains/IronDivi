@@ -120,6 +120,13 @@ impl TxIndex {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Write the write-ahead log out and sync it to disk
+    pub fn sync_wal(&self) -> Result<(), StorageError> {
+        self.db
+            .flush_wal(true)
+            .map_err(|e| StorageError::ChainState(e.to_string()))
+    }
+
     pub fn get_location(&self, txid: &Hash256) -> Result<Option<TxLocation>, StorageError> {
         let cf = self
             .db

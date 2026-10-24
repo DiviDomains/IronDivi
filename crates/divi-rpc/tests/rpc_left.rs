@@ -270,6 +270,24 @@ fn wallet_calls_without_a_wallet_are_unavailable() {
     }
     // not a wallet call
     assert!(n.call("getblockcount", vec![]).is_ok());
+    // getinfo leaves the wallet members out (rpcmisc.cpp:139-144)
+    let info = n.ok("getinfo", vec![]);
+    for member in [
+        "walletversion",
+        "balance",
+        "keypoololdest",
+        "keypoolsize",
+        "paytxfee",
+    ] {
+        assert!(
+            info.get(member).is_none(),
+            "getinfo has {member} without a wallet"
+        );
+    }
+    let with_wallet = node(FULL).ok("getinfo", vec![]);
+    for member in ["walletversion", "balance"] {
+        assert!(with_wallet.get(member).is_some(), "getinfo lacks {member}");
+    }
 }
 
 /// sendrawtransaction checks that every input is in the chain or the mempool

@@ -72,8 +72,9 @@ pub struct PeerInfo {
     pub version: Option<VersionMessage>,
     /// Services offered by the peer
     pub services: u64,
-    /// Best block height known by peer
-    pub start_height: u32,
+    /// The height the peer named in its version message; -1 before one
+    /// came or when it named none (Divi Core nStartingHeight, Node.cpp:561)
+    pub start_height: i32,
     /// Time of connection
     pub connected_at: Instant,
     /// Last message received time
@@ -111,7 +112,7 @@ impl PeerInfo {
             state: PeerState::Connecting,
             version: None,
             services: 0,
-            start_height: 0,
+            start_height: -1,
             connected_at: now,
             last_recv: now,
             last_send: now,
@@ -212,8 +213,8 @@ pub struct LivePeerStats {
     pub version: AtomicU64,
     /// Peer's advertised services
     pub services: AtomicU64,
-    /// Peer's advertised start height
-    pub start_height: AtomicU64,
+    /// Peer's advertised start height (-1 when it named none)
+    pub start_height: AtomicI64,
     /// Peer's user agent
     pub subver: parking_lot::Mutex<String>,
 }
@@ -255,7 +256,7 @@ impl PeerInfo {
         live.time_offset.store(self.time_offset, Ordering::Relaxed);
         live.services.store(self.services, Ordering::Relaxed);
         live.start_height
-            .store(self.start_height as u64, Ordering::Relaxed);
+            .store(self.start_height as i64, Ordering::Relaxed);
         if let Some(v) = &self.version {
             live.version.store(v.version as u64, Ordering::Relaxed);
             let mut sv = live.subver.lock();

@@ -1,0 +1,9 @@
+signmnbroadcast mnhex
+
+Starts escrows funds for some purpose.
+
+Arguments:
+1. mnhex			    (string, required) Serialized masternode broadcast to be signed. 
+
+Result:
+"broadcast_data"			    (string) Signed broadcast data in serialized format.

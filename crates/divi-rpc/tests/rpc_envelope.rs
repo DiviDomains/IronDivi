@@ -184,7 +184,7 @@ async fn reals_are_written_with_eight_decimals() {
     let n = node().await;
     let (_, body) = post(&n, r#"{"method":"getinfo","params":[],"id":1}"#).await;
     assert!(body.contains("\"relayfee\":0.00010000"), "{body}");
-    assert!(body.contains("\"balance\":0.00000000"), "{body}");
+    assert!(body.contains("\"moneysupply\":0.00000000"), "{body}");
     let (_, body) = post(&n, r#"{"method":"getdifficulty","params":[],"id":1}"#).await;
     let value = body
         .strip_prefix("{\"result\":")

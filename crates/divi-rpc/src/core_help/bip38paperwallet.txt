@@ -1,0 +1,12 @@
+bip38encrypt "password"
+
+Encrypts a fresh private key with <password>.
+
+Arguments:
+1. "diviaddress"   (string, required) The divi address for the private key (you must hold the key already)
+2. "passphrase"   (string, required) The passphrase you want the private key to be encrypted with - Valid special chars: !#$%&'()*+,-./:;<=>?`{|}~ 
+
+Result:
+"key"                (string) The encrypted private key
+
+Examples:

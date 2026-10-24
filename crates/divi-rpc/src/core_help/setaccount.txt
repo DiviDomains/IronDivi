@@ -1,0 +1,11 @@
+setaccount "diviaddress" "account"
+
+Sets the account associated with the given address.
+
+Arguments:
+1. "diviaddress"  (string, required) The divi address to be associated with an account.
+2. "account"         (string, required) The account to assign the address to.
+
+Examples:
+> divi-cli setaccount "diviaddress" "tabby"
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "setaccount", "params": ["diviaddress", "tabby"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

@@ -1,0 +1,17 @@
+getnewaddress ( "account" )
+
+Returns a new DIVI address for receiving payments.
+If 'account' is specified (recommended), it is added to the address book 
+so payments received with the address will be credited to 'account'.
+
+Arguments:
+1. "account"        (string, optional) The account name for the address to be linked to. if not provided, the default account "" is used. It can also be set to the empty string "" to represent the default account. The account does not need to exist, it will be created if there is no account by the given name.
+
+Result:
+"diviaddress"    (string) The new divi address
+
+Examples:
+> divi-cli getnewaddress 
+> divi-cli getnewaddress ""
+> divi-cli getnewaddress "myaccount"
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getnewaddress", "params": ["myaccount"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

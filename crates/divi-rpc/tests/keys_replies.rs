@@ -102,8 +102,14 @@ fn wrong_argument_counts_answer_with_the_help() {
     ] {
         let e = n.err(method, params.clone());
         assert_eq!(e.code, -1, "{method} {params:?}: {}", e.message);
+        // divid's bip38paperwallet text starts "bip38encrypt" (rpcdump.cpp:251-253)
+        let first = if method == "bip38paperwallet" {
+            "bip38encrypt"
+        } else {
+            method
+        };
         assert!(
-            e.message.starts_with(method) && e.message.contains('\n'),
+            e.message.starts_with(first) && e.message.contains('\n'),
             "{method} {params:?}: {}",
             e.message
         );

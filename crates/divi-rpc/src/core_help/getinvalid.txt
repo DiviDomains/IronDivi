@@ -1,0 +1,10 @@
+getinvalid 
+
+Get a summary of invalidated outpoints.
+
+Arguments:
+1. all   (string, optional) return a full list of outpoints even if they are spent
+
+Examples:
+> divi-cli getinvalid "all"
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getinvalid", "params": ["all"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

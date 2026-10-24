@@ -29,6 +29,11 @@ import urllib.request
 IRONDIVID, DIVID, PORT_BASE, WORK, SEED = (
     sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5]))
 KILLS = int(os.environ.get("UNCLEAN_KILLS", "5"))
+# The rows to run (default all): sync, wallet, reindex, relay, reorg
+ROWS = set(os.environ.get("UNCLEAN_ROWS", "sync,wallet,reindex,relay,reorg").split(","))
+# Row 4 at fixed delays after 'Building the transaction index' instead of the
+# seeded ones, e.g. "1,2,3,...,30": one kill point per delay
+REINDEX_DELAYS = [float(x) / 1000 for x in os.environ.get("UNCLEAN_REINDEX_DELAYS_MS", "").split(",") if x]
 # The chain the sync row downloads (row 1 asks for 300 or more)
 CHAIN = int(os.environ.get("UNCLEAN_BLOCKS", "320"))
 # Leave every irondivid on regtest with all three indexes, as row 4 needs them
@@ -673,12 +678,15 @@ def calibrate_reindex(node, template):
     shutil.rmtree(d, ignore_errors=True)
 
 
-def reindex_point(node, k, template):
+def reindex_point(node, k, template, fixed=None):
     d = copy_of(template, f"r4-{node.name}-{k}")
-    # Odd points: a random delay from the start; even ones: a few ms after the
-    # node says it builds the index
-    by_log = k % 2 == 0 and not node.core
-    delay = rng.uniform(0, 0.015) if by_log else rng.uniform(0.02, REINDEX_SECS[node] * 1.2)
+    # Odd points: a random delay from the start; even ones: up to 60 ms after
+    # the node says it builds the index, which covers the transaction index
+    # and then the address and spent indexes being built; `fixed`: that many
+    # seconds after it
+    by_log = (k % 2 == 0 or fixed is not None) and not node.core
+    delay = (fixed if fixed is not None else rng.uniform(0, 0.06) if by_log
+             else rng.uniform(0.02, REINDEX_SECS[node] * 1.2))
     conf = INDEX_CONF
 
     def run():
@@ -882,39 +890,47 @@ def compare(name, iron, core):
 
 # --- the run -----------------------------------------------------------------------
 
-note("row 1: kill -9 while syncing")
-r1 = [row1_point(V, k, INDEX_CONF) for k in range(1, KILLS + 1)]
-compare("sync-kill", r1, row1_point(K, 1, INDEX_CONF))
-r1b = [first_start_point(V, k, INDEX_CONF) for k in range(1, KILLS + 1)]
-compare("first-start-kill", r1b, first_start_point(K, 1, INDEX_CONF))
+if "sync" in ROWS:
+    note("row 1: kill -9 while syncing")
+    r1 = [row1_point(V, k, INDEX_CONF) for k in range(1, KILLS + 1)]
+    compare("sync-kill", r1, row1_point(K, 1, INDEX_CONF))
+    r1b = [first_start_point(V, k, INDEX_CONF) for k in range(1, KILLS + 1)]
+    compare("first-start-kill", r1b, first_start_point(K, 1, INDEX_CONF))
 
-note("row 3: kill -9 during encryptwallet and walletpassphrasechange")
-r3a = [wallet_point(V, k, "encrypt", TMPL) for k in range(1, KILLS + 1)]
-compare("encrypt-kill", r3a, wallet_point(K, 1, "encrypt", TMPL_C))
-r3b = [wallet_point(V, k, "change", TMPL_ENC) for k in range(1, KILLS + 1)]
-compare("change-kill", r3b, wallet_point(K, 1, "change", TMPL_C_ENC))
+if "wallet" in ROWS:
+    note("row 3: kill -9 during encryptwallet and walletpassphrasechange")
+    r3a = [wallet_point(V, k, "encrypt", TMPL) for k in range(1, KILLS + 1)]
+    compare("encrypt-kill", r3a, wallet_point(K, 1, "encrypt", TMPL_C))
+    r3b = [wallet_point(V, k, "change", TMPL_ENC) for k in range(1, KILLS + 1)]
+    compare("change-kill", r3b, wallet_point(K, 1, "change", TMPL_C_ENC))
 
-note("row 4: kill -9 during -reindex with -txindex -addressindex -spentindex")
-calibrate_reindex(V, TMPL)
-calibrate_reindex(K, TMPL_C)
-note(f"clean -reindex start: irondivid {REINDEX_SECS[V]:.2f}s, divid {REINDEX_SECS[K]:.2f}s")
-r4 = [reindex_point(V, k, TMPL) for k in range(1, KILLS + 1)]
-compare("reindex-kill", r4, reindex_point(K, 1, TMPL_C))
+if "reindex" in ROWS:
+    note("row 4: kill -9 during -reindex with -txindex -addressindex -spentindex")
+    calibrate_reindex(V, TMPL)
+    calibrate_reindex(K, TMPL_C)
+    note(f"clean -reindex start: irondivid {REINDEX_SECS[V]:.2f}s, divid {REINDEX_SECS[K]:.2f}s")
+    if REINDEX_DELAYS:
+        r4 = [reindex_point(V, k, TMPL, fixed=x) for k, x in enumerate(REINDEX_DELAYS, 1)]
+    else:
+        r4 = [reindex_point(V, k, TMPL) for k in range(1, KILLS + 1)]
+    compare("reindex-kill", r4, reindex_point(K, 1, TMPL_C))
 
-note("row 5: kill -9 after a spork call and after a -minrelaytxfee start")
-r5a = [relay_point(V, k, TMPL, "spork") for k in range(1, KILLS + 1)]
-compare("spork-kill", r5a, relay_point(K, 1, TMPL_C, "spork"))
-if V in SPORK_ANSWERS and K in SPORK_ANSWERS:
-    a, b = SPORK_ANSWERS[V], SPORK_ANSWERS[K]
-    same = a[0] == b[0] and (a[0] == "ok" or a[1] == b[1])
-    out("AS CORE" if same else "DIFFERS", "spork-change-answer",
-        f"irondivid {show_answer(a)}; divid {show_answer(b)}")
-r5b = [relay_point(V, k, TMPL, "relayfee") for k in range(1, KILLS + 1)]
-compare("relayfee-kill", r5b, relay_point(K, 1, TMPL_C, "relayfee"))
+if "relay" in ROWS:
+    note("row 5: kill -9 after a spork call and after a -minrelaytxfee start")
+    r5a = [relay_point(V, k, TMPL, "spork") for k in range(1, KILLS + 1)]
+    compare("spork-kill", r5a, relay_point(K, 1, TMPL_C, "spork"))
+    if V in SPORK_ANSWERS and K in SPORK_ANSWERS:
+        a, b = SPORK_ANSWERS[V], SPORK_ANSWERS[K]
+        same = a[0] == b[0] and (a[0] == "ok" or a[1] == b[1])
+        out("AS CORE" if same else "DIFFERS", "spork-change-answer",
+            f"irondivid {show_answer(a)}; divid {show_answer(b)}")
+    r5b = [relay_point(V, k, TMPL, "relayfee") for k in range(1, KILLS + 1)]
+    compare("relayfee-kill", r5b, relay_point(K, 1, TMPL_C, "relayfee"))
 
-note("row 2: kill -9 during a reorg between two Core miners")
-r2, r2c = reorg_rows()
-compare("reorg-kill", r2, r2c)
+if "reorg" in ROWS:
+    note("row 2: kill -9 during a reorg between two Core miners")
+    r2, r2c = reorg_rows()
+    compare("reorg-kill", r2, r2c)
 
 for n in (R, C1, C2):
     n.stop()

@@ -1,0 +1,26 @@
+listmasternodes ( "filter" )
+
+Get a ranked list of masternodes
+
+Arguments:
+1. "filter"    (string, optional) Filter search text. Partial match by txhash, status, or addr.
+
+Result:
+[
+  {
+    "rank": n,           (numeric) Masternode Rank (or 0 if not enabled)
+    "txhash": "hash",    (string) Collateral transaction hash
+    "outidx": n,         (numeric) Collateral transaction output index
+    "status": s,         (string) Status (ENABLED/EXPIRED/REMOVE/etc)
+    "addr": "addr",      (string) Masternode DIVI address
+    "version": v,        (numeric) Masternode protocol version
+    "lastseen": ttt,     (numeric) The time in seconds since epoch (Jan 1 1970 GMT) of the last seen
+    "activetime": ttt,   (numeric) The time in seconds since epoch (Jan 1 1970 GMT) masternode has been active
+    "lastpaid": ttt,     (numeric) The time in seconds since epoch (Jan 1 1970 GMT) masternode was last paid
+  }
+  ,...
+]
+
+Examples:
+> divi-cli masternodelist 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "masternodelist", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

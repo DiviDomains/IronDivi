@@ -1,0 +1,25 @@
+addmultisigaddress nrequired ["key",...] ( "account" )
+
+Add a nrequired-to-sign multisignature address to the wallet.
+Each key is a DIVI address or hex-encoded public key.
+If 'account' is specified, assign address to that account.
+
+Arguments:
+1. nrequired        (numeric, required) The number of required signatures out of the n keys or addresses.
+2. "keysobject"   (string, required) A json array of divi addresses or hex-encoded public keys
+     [
+       "address"  (string) divi address or hex-encoded public key
+       ...,
+     ]
+3. "account"      (string, optional) An account to assign the addresses to.
+
+Result:
+"diviaddress"  (string) A divi address associated with the keys.
+
+Examples:
+
+Add a multisig address from 2 addresses
+> divi-cli addmultisigaddress 2 "[\"diviaddress\",\"diviaddress\"]"
+
+As json rpc call
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "addmultisigaddress", "params": [2, "[\"diviaddress\",\"diviaddress\"]"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/
