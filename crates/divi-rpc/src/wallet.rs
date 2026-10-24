@@ -3662,105 +3662,38 @@ impl WalletRpc {
     }
 
     /// addmultisigaddress - Create a multisig address and add to wallet
+    ///
+    /// Divi Core rpcwallet.cpp:1736-1775: the redeem script as createmultisig
+    /// builds it, stored in the wallet, its address labelled with the account
     pub fn add_multisig_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let nrequired = params
-            .get_u64(0)
-            .ok_or_else(|| RpcError::invalid_params("nrequired parameter required"))?
-            as usize;
-
-        let keys_array = params
-            .get(1)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| RpcError::invalid_params("Keys array required"))?;
-
-        let _account = params.get_str(2).unwrap_or("");
-
-        if nrequired < 1 {
-            return Err(RpcError::invalid_params("nrequired must be at least 1").into());
-        }
-
-        if keys_array.is_empty() {
-            return Err(RpcError::invalid_params("Keys array cannot be empty").into());
-        }
-
-        if nrequired > keys_array.len() {
-            return Err(RpcError::invalid_params(format!(
-                "nrequired ({}) cannot be greater than number of keys ({})",
-                nrequired,
-                keys_array.len()
-            ))
+        if !(2..=3).contains(&params.len()) {
+            return Err(RpcError::new(
+                codes::MISC_ERROR,
+                "addmultisigaddress nrequired [\"key\",...] ( \"account\" )",
+            )
             .into());
         }
-
-        // Parse keys (addresses or public keys)
-        let mut pubkeys = Vec::new();
-        let wallet = self.get_wallet()?;
-
-        for key_val in keys_array {
-            let key_str = key_val.as_str().ok_or_else(|| {
-                RpcError::invalid_params("Keys must be strings (addresses or hex pubkeys)")
-            })?;
-
-            // Try to parse as address first
-            if let Ok(addr) = self.decode_address(key_str) {
-                // Get pubkey from wallet
-                if let Some(key_entry) = wallet.get_key_by_address(&addr) {
-                    pubkeys.push(key_entry.pubkey_bytes());
-                } else {
-                    return Err(RpcError::new(
-                        codes::INVALID_ADDRESS_OR_KEY,
-                        format!("Address not found in wallet: {}", key_str),
-                    )
-                    .into());
-                }
-            } else if let Ok(pubkey_bytes) = hex::decode(key_str) {
-                // Use hex-encoded public key directly
-                if pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65 {
-                    return Err(RpcError::invalid_params(format!(
-                        "Invalid public key length: {}",
-                        key_str
-                    ))
-                    .into());
-                }
-                pubkeys.push(pubkey_bytes);
-            } else {
+        // AccountFromValue(params[2]) (rpcwallet.cpp:1765)
+        let account = match params.get(2) {
+            None => String::new(),
+            Some(serde_json::Value::String(a)) if a == "*" => {
                 return Err(RpcError::new(
-                    codes::INVALID_ADDRESS_OR_KEY,
-                    format!("Invalid key: {}", key_str),
+                    codes::WALLET_INVALID_ACCOUNT_NAME,
+                    "Invalid account name",
                 )
-                .into());
+                .into())
             }
-        }
-
-        // Create multisig redeem script
-        use divi_script::opcodes::Opcode;
-        let mut script_bytes = Vec::new();
-
-        // OP_n (number required)
-        if (1..=16).contains(&nrequired) {
-            script_bytes.push(Opcode::OP_1 as u8 + (nrequired as u8 - 1));
-        } else {
-            return Err(RpcError::invalid_params("nrequired must be between 1 and 16").into());
-        }
-
-        // Add public keys
-        for pubkey in &pubkeys {
-            script_bytes.push(pubkey.len() as u8);
-            script_bytes.extend_from_slice(pubkey);
-        }
-
-        // OP_m (total keys)
-        let m = pubkeys.len();
-        if (1..=16).contains(&m) {
-            script_bytes.push(Opcode::OP_1 as u8 + (m as u8 - 1));
-        } else {
-            return Err(RpcError::invalid_params("Number of keys must be between 1 and 16").into());
-        }
-
-        // OP_CHECKMULTISIG
-        script_bytes.push(Opcode::OP_CHECKMULTISIG as u8);
-
-        let redeem_script = Script::from_bytes(script_bytes);
+            Some(serde_json::Value::String(a)) => a.clone(),
+            Some(v) => {
+                return Err(RpcError::new(
+                    codes::MISC_ERROR,
+                    format!("value is type {}, expected str", json_spirit_type(v)),
+                )
+                .into())
+            }
+        };
+        let wallet = self.get_wallet()?;
+        let redeem_script = self.multisig_redeem_script(params)?;
 
         // Create P2SH address from redeem script hash
         use divi_crypto::hash160;
@@ -3777,6 +3710,10 @@ impl WalletRpc {
                 codes::WALLET_ERROR,
                 format!("Failed to store redeem script: {}", e),
             )
+        })?;
+
+        wallet.set_label(&p2sh_addr, &account).map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
         })?;
 
         wallet.save().map_err(|e| {
@@ -4230,87 +4167,100 @@ impl WalletRpc {
         Ok(serde_json::Value::Bool(valid))
     }
 
-    /// createmultisig - Create a multisig address
-    pub fn create_multisig(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let nrequired = params.get_i64(0).ok_or_else(|| {
-            RpcError::invalid_params("nrequired (number of required signatures) required")
-        })?;
-
-        let keys_array = params
-            .get(1)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| RpcError::invalid_params("keys array required"))?;
-
+    /// The redeem script of createmultisig and addmultisigaddress, checked as
+    /// Divi Core's _createmultisig_redeemScript checks it (rpcmisc.cpp:388-445):
+    /// nrequired an int of at least 1, at most 16 keys and no fewer than
+    /// nrequired, each a wallet address with a full public key or a valid hex
+    /// public key, and the script within 520 bytes
+    fn multisig_redeem_script(&self, params: &Params) -> Result<Script, Error> {
+        let misc = |m: String| -> Error { RpcError::new(codes::MISC_ERROR, m).into() };
+        let type_error = |v: &serde_json::Value, want: &str| {
+            misc(format!(
+                "value is type {}, expected {want}",
+                json_spirit_type(v)
+            ))
+        };
+        let nrequired = match params.get(0) {
+            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
+                n.as_i64().unwrap_or(i64::MAX)
+            }
+            Some(v) => return Err(type_error(v, "int")),
+            None => return Err(type_error(&serde_json::Value::Null, "int")),
+        };
+        let keys = match params.get(1) {
+            Some(serde_json::Value::Array(keys)) => keys,
+            Some(v) => return Err(type_error(v, "array")),
+            None => return Err(type_error(&serde_json::Value::Null, "array")),
+        };
         if nrequired < 1 {
-            return Err(RpcError::invalid_params("nrequired must be at least 1").into());
+            return Err(misc(
+                "a multisignature address must require at least one key to redeem".into(),
+            ));
         }
-
-        if keys_array.is_empty() {
-            return Err(RpcError::invalid_params("keys array cannot be empty").into());
+        if (keys.len() as i64) < nrequired {
+            return Err(misc(format!(
+                "not enough keys supplied (got {} keys, but need at least {} to redeem)",
+                keys.len(),
+                nrequired
+            )));
         }
-
-        if nrequired as usize > keys_array.len() {
-            return Err(RpcError::invalid_params(
-                "nrequired cannot be greater than number of keys",
-            )
-            .into());
+        if keys.len() > 16 {
+            return Err(misc(
+                "Number of addresses involved in the multisignature address creation > 16\nReduce the number"
+                    .into(),
+            ));
         }
-
-        let mut pubkeys = Vec::new();
-
-        for key_val in keys_array {
-            let key_str = key_val.as_str().ok_or_else(|| {
-                RpcError::invalid_params("Each key must be a string (hex pubkey or address)")
-            })?;
-
-            // Serialized as given: an uncompressed key stays 65 bytes, as in Core
-            let pubkey = if key_str.len() == 66 || key_str.len() == 130 {
-                divi_crypto::keys::PublicKey::from_hex(key_str)
-                    .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid hex public key"))?;
-                hex::decode(key_str)
-                    .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid hex public key"))?
-            } else {
-                let address = self
-                    .decode_address(key_str)
-                    .map_err(|_| RpcError::new(codes::MISC_ERROR, "Invalid address"))?;
-
-                let wallet_guard = self.wallet.read();
-                if let Some(wallet) = wallet_guard.as_ref() {
-                    wallet
-                        .keystore()
-                        .get_key_by_address(&address)
-                        .map(|entry| entry.pubkey_bytes())
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                codes::MISC_ERROR,
-                                "Address not found in wallet - cannot extract pubkey",
-                            )
-                        })?
-                } else {
-                    return Err(RpcError::new(
-                        codes::WALLET_ERROR,
-                        "Wallet not available - addresses require pubkey lookup",
-                    )
-                    .into());
+        let wallet = self.wallet.read().clone();
+        let mut pubkeys = Vec::with_capacity(keys.len());
+        for key in keys {
+            let ks = key.as_str().ok_or_else(|| type_error(key, "str"))?;
+            let invalid = || misc(format!(" Invalid public key: {ks}"));
+            // A wallet address whose full public key the wallet has
+            if let (Some(wallet), Ok(address)) = (wallet.as_ref(), self.decode_address(ks)) {
+                if address.addr_type != divi_wallet::address::AddressType::P2PKH {
+                    return Err(misc(format!("{ks} does not refer to a key")));
                 }
-            };
-
-            pubkeys.push(pubkey);
+                let entry = wallet
+                    .get_key_by_address(&address)
+                    .ok_or_else(|| misc(format!("no full public key for address {ks}")))?;
+                pubkeys.push(entry.pubkey_bytes());
+                continue;
+            }
+            // A hex public key, valid as CPubKey::IsFullyValid takes it
+            let bytes = hex::decode(ks)
+                .ok()
+                .filter(|b| !b.is_empty())
+                .ok_or_else(invalid)?;
+            divi_crypto::keys::PublicKey::from_bytes(&bytes).map_err(|_| invalid())?;
+            pubkeys.push(bytes);
         }
-
-        let mut redeem_script = Vec::new();
-
-        redeem_script.push(0x50 + nrequired as u8);
-
-        for pubkey_bytes in &pubkeys {
-            redeem_script.push(pubkey_bytes.len() as u8);
-            redeem_script.extend_from_slice(pubkey_bytes);
+        let mut script = vec![0x50 + nrequired as u8];
+        for pubkey in &pubkeys {
+            script.push(pubkey.len() as u8);
+            script.extend_from_slice(pubkey);
         }
+        script.push(0x50 + pubkeys.len() as u8);
+        script.push(Opcode::OP_CHECKMULTISIG as u8);
+        // MAX_SCRIPT_ELEMENT_SIZE
+        if script.len() > 520 {
+            return Err(misc(format!(
+                "redeemScript exceeds size limit: {} > 520",
+                script.len()
+            )));
+        }
+        Ok(Script::from_bytes(script))
+    }
 
-        redeem_script.push(0x50 + pubkeys.len() as u8);
-        redeem_script.push(Opcode::OP_CHECKMULTISIG as u8);
-
-        let script_hash = divi_crypto::hash160(&redeem_script);
+    /// createmultisig - Create a multisig address (Divi Core rpcmisc.cpp:447-486)
+    pub fn create_multisig(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        if params.len() != 2 {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "createmultisig nrequired [\"key\",...]").into(),
+            );
+        }
+        let redeem_script = self.multisig_redeem_script(params)?;
+        let redeem_script = redeem_script.as_bytes();
+        let script_hash = divi_crypto::hash160(redeem_script);
 
         let network = self.address_network();
         let address = Address::p2sh(script_hash, network);
@@ -4318,7 +4268,7 @@ impl WalletRpc {
 
         Ok(serde_json::json!({
             "address": address_str,
-            "redeemScript": hex::encode(&redeem_script)
+            "redeemScript": hex::encode(redeem_script)
         }))
     }
 
