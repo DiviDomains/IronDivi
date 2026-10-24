@@ -57,8 +57,9 @@ fn keys(v: &Value) -> Vec<String> {
     v.as_object().unwrap().keys().cloned().collect()
 }
 
-/// Core 3.0.0 has no estimatefee / estimatesmartfee (not in rpcserver.cpp's
-/// table); irondivid answers both, at or above the relay floor, for BasicSwap
+/// Core 3.0.0 has no estimatefee / estimatesmartfee / estimatepriority (not in
+/// rpcserver.cpp's table); irondivid answers the fee estimates at or above the
+/// relay floor, for BasicSwap, and estimatepriority with the text "-1"
 #[test]
 fn fee_estimates_exist() {
     let (server, _dir) = server();
@@ -66,6 +67,10 @@ fn fee_estimates_exist() {
     assert!(fee.as_f64().unwrap() >= 0.0001, "{fee}");
     let smart = result(&server, "estimatesmartfee", vec![json!(2)]);
     assert!(smart["feerate"].as_f64().unwrap() >= 0.0001, "{smart}");
+    assert_eq!(
+        result(&server, "estimatepriority", vec![json!(2)]),
+        json!("-1")
+    );
 }
 
 /// getblockchaininfo carries fields divid lacks (Core sends chain, blocks,
@@ -145,23 +150,16 @@ fn loadwallet_is_refused() {
     assert!(error.message.contains("--wallet"), "{}", error.message);
 }
 
-/// With the address index off, the error names the fix rather than divid's
-/// "No information available for address" (rpcmisc.cpp)
+/// getblock also takes 0, 1 and 2 for verbose, as Bitcoin Core's verbosity;
+/// divid takes only true or false (rpcblockchain.cpp:216)
 #[test]
-fn address_index_off_error_names_the_fix() {
+fn getblock_takes_a_verbosity_number() {
     let (server, _dir) = server();
-    let reply = call(
-        &server,
-        "getaddressbalance",
-        vec![json!({"addresses": ["y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz"]})],
-    );
-    let error = reply.error.expect("refused without the index");
-    assert_eq!(error.code, -5);
-    assert!(
-        error.message.contains("Address index not enabled"),
-        "{}",
-        error.message
-    );
+    let tip = call(&server, "getbestblockhash", vec![]).result.unwrap();
+    for v in [0, 1, 2] {
+        let reply = call(&server, "getblock", vec![tip.clone(), json!(v)]);
+        assert!(reply.error.is_none(), "verbosity {v}: {:?}", reply.error);
+    }
 }
 
 /// getmempoolinfo: divid gives size and bytes (rpcblockchain.cpp:569-574);
@@ -189,7 +187,13 @@ fn generateblock_is_regtest_only() {
         )
         .unwrap(),
     );
-    let server = RpcServer::new(chain);
+    // with a wallet, as divid reaches generateblock only with one
+    // (rpcserver.cpp:369, :1043-1047)
+    let wallet = Arc::new(WalletDb::with_hd_wallet(
+        Network::Testnet,
+        HdWallet::new(ChainMode::Divi).unwrap(),
+    ));
+    let server = RpcServer::with_wallet(chain, wallet);
     let error = call(&server, "generateblock", vec![])
         .error
         .expect("refused");

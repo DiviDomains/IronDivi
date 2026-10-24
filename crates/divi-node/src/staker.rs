@@ -843,16 +843,18 @@ impl Staker {
     /// after it, as Divi Core does. The staking loop's pacing guards (rate
     /// limit, stale tip, minimum coin age, reserve balance) do not apply.
     pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, String> {
-        if self.wallet.is_locked() {
-            return Err("wallet is locked".to_string());
-        }
         let _producing = self.producing.lock();
         let mut hashes = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let tip = self.chain.tip().ok_or("no chain tip")?;
             let height = tip.height + 1;
+            // A work block pays a keypool key, which a locked wallet still
+            // hands out; only a stake block needs the wallet unlocked
+            // (CoinMinter.cpp:141-158)
             let block = if height <= divi_storage::chain::LAST_POW_BLOCK {
                 self.build_work_block(&tip)?
+            } else if self.wallet.is_locked() {
+                return Err("wallet is locked".to_string());
             } else {
                 self.build_generated_stake_block(&tip)?
             };
@@ -2792,6 +2794,46 @@ mod tests {
 
         // Staker starts in stopped state
         assert!(!staker.is_running());
+    }
+
+    /// setgenerate below the last PoW block mines on a locked wallet: the
+    /// coinbase pays a key from the keypool, which needs no unlock; only stake
+    /// blocks need the wallet unlocked (CoinMinter.cpp:141-158, wallet.cpp:2129-2136)
+    #[test]
+    fn setgenerate_mines_work_blocks_on_a_locked_wallet() {
+        use crate::config::MempoolConfig;
+        use divi_network::PeerManagerConfig;
+        use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType};
+        use divi_wallet::{HdWallet, Network};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(temp_dir.path().join("chain")).unwrap());
+        let params =
+            ChainParams::for_network(NetworkType::Regtest, divi_primitives::ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let wallet = Arc::new(
+            WalletDb::create_persistent(
+                &temp_dir.path().join("wallet"),
+                Network::Regtest,
+                HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+            )
+            .unwrap(),
+        );
+        wallet.encrypt_wallet("pw").unwrap();
+        wallet.lock();
+        assert!(wallet.is_locked());
+        let staker = Staker::new(
+            wallet.clone(),
+            chain.clone(),
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            PeerManager::new(PeerManagerConfig::default()),
+            StakingConfig::default(),
+        );
+        let hashes = staker
+            .generate_blocks(1)
+            .expect("a work block on a locked wallet");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(chain.height(), 1);
     }
 
     #[test]

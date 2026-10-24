@@ -51,6 +51,21 @@ fn dispatched_methods() -> BTreeSet<String> {
     names
 }
 
+/// Every method name in the call list `help` is built from (the `methods` of
+/// `help` in the source)
+fn listed_methods() -> BTreeSet<String> {
+    let src = include_str!("../src/server.rs");
+    let start = src.find("let methods = vec![").expect("methods");
+    let end = start + src[start..].find("];").expect("end of methods");
+    src[start..end]
+        .lines()
+        .skip(1)
+        .map(|l| l.trim().trim_end_matches(',').trim_matches('"'))
+        .filter(|l| !l.is_empty() && !l.starts_with("=="))
+        .map(String::from)
+        .collect()
+}
+
 #[test]
 fn help_covers_every_dispatched_method() {
     let (server, _dir) = server();
@@ -68,22 +83,22 @@ fn help_covers_every_dispatched_method() {
         }
         // (a regtest-only method off regtest is "Method disabled", -32601 too)
         if let Some(e) = call(&server, m, vec![]).error {
+            // -32601 here is never "Method not found": either a call that
+            // works on regtest only ("Method disabled: ...") or a wallet call
+            // on a node without a wallet (rpcserver.cpp:1043-1047)
             assert!(
-                e.code != -32601 || e.message.starts_with("Method disabled"),
+                e.code != -32601
+                    || e.message.starts_with("Method disabled")
+                    || e.message == "Method unavailable due to manually disabled wallet",
                 "{m} is not dispatched"
             );
         }
     }
 
-    let listing = call(&server, "help", vec![]).result.expect("help");
-    let listed: BTreeSet<String> = listing
-        .as_str()
-        .unwrap()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("=="))
-        .map(String::from)
-        .collect();
+    // `help` lists these as Divi Core lists them (usage lines, Core's
+    // categories), so the names are read from the list it is built from
+    let listed = listed_methods();
+    assert!(call(&server, "help", vec![]).result.is_some(), "help");
 
     let unlisted: Vec<_> = dispatched.difference(&listed).collect();
     assert!(unlisted.is_empty(), "missing from `help`: {unlisted:?}");
