@@ -131,28 +131,30 @@ fn divid_args(datadir: &Path, rpc_port: u16) -> Vec<String> {
     ]
 }
 
-/// Run `cmd` to its exit; panic if it is still running after 30 s
+/// Run `cmd` to its exit; panic if it is still running after 120 s (a slow,
+/// loaded host can take far longer than an idle one)
 fn output_within(cmd: &mut Command) -> Output {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn irondivid");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("irondivid did not exit within 30 s");
+            panic!("irondivid did not exit within 120 s");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     child.wait_with_output().unwrap()
 }
 
-/// Wait up to 20 s for `f` to be true
+/// Wait up to 120 s for `f` to be true, as long as `Daemon::start` waits for
+/// RPC: a node started on a loaded host can take far longer than 20 s
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         if f() {
             return true;
@@ -382,12 +384,16 @@ fn pid_file_and_wallet_are_in_the_data_directory() {
         .unwrap();
     assert!(status.success());
     let pid_file = dir.path().join("divid.pid");
-    let pid = eventually(|| pid_file.exists()).then(|| {
+    // The file can exist before the pid is written into it
+    let read_pid = || {
         std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap()
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+    };
+    let mut pid = None;
+    eventually(|| {
+        pid = read_pid();
+        pid.is_some()
     });
     let up = eventually(|| local(rpc_port, "getblockcount", json!([])).is_some());
     let wallet_dir = dir.path().join("w2").exists();
