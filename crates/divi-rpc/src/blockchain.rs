@@ -970,22 +970,30 @@ impl BlockchainRpc {
             None => Hash256::zero().to_string(),
         };
         let network = self.address_network();
+        // Divi Core keeps no OP_META output in its coins (CCoins::ClearUnspendable,
+        // coins.cpp:54-61), from a block or from the mempool, so gettxout gives null
         if let Some(utxo) = self.chain.get_utxo(&outpoint)? {
+            if utxo.script_pubkey.is_op_return() {
+                return Ok(Value::Null);
+            }
             let confirmations = self.chain.height().saturating_sub(utxo.height) + 1;
             return Ok(json!({
                 "bestblock": best_block_hash,
                 "confirmations": confirmations,
                 "value": utxo.value.as_divi_f64(),
                 "scriptPubKey": crate::wallet::script_pubkey_to_json(utxo.script_pubkey.as_bytes(), network, true),
-                // The UTXO set keeps no transaction version; standard transactions are 1
-                "version": 1,
+                "version": utxo.version,
                 "coinbase": utxo.is_coinbase,
                 "coinstake": utxo.is_coinstake,
             }));
         }
         let in_pool = mempool.and_then(|m| m.get_transaction(&txid));
         if let Some(tx) = in_pool {
-            if let Some(out) = tx.vout.get(outpoint.vout as usize) {
+            if let Some(out) = tx
+                .vout
+                .get(outpoint.vout as usize)
+                .filter(|o| !o.script_pubkey.is_op_return())
+            {
                 return Ok(json!({
                     "bestblock": best_block_hash,
                     "confirmations": 0,
