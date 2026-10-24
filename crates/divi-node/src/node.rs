@@ -165,6 +165,38 @@ pub struct Node {
 
     /// Shutdown signal
     shutdown_tx: broadcast::Sender<()>,
+
+    /// The loops `start` runs (peer events, sync, relay, peer upkeep):
+    /// stopped by `stop` before it flushes, so nothing writes after it
+    tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// How long `Node::stop` waits for the node's loops once told to stop
+const STOP_TASKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Log one shutdown step and how long it took
+pub fn shutdown_stage(what: &str, started: std::time::Instant) {
+    tracing::info!("Shutdown: {} in {} ms", what, started.elapsed().as_millis());
+}
+
+/// Abort `tasks` and wait for them, for `timeout` in all; how many did not
+/// finish (a task stops at its next await, so one inside a blocking call
+/// keeps running until the call returns)
+async fn stop_tasks(
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) -> usize {
+    for task in &tasks {
+        task.abort();
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stalled = 0;
+    for task in tasks {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            stalled += 1;
+        }
+    }
+    stalled
 }
 
 impl Node {
@@ -601,7 +633,13 @@ impl Node {
             masternode_handler,
             event_tx,
             shutdown_tx,
+            tasks: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Keep a loop `start` runs, for `stop`
+    fn keep(&self, task: tokio::task::JoinHandle<()>) {
+        self.tasks.lock().push(task);
     }
 
     /// Get node configuration
@@ -740,7 +778,7 @@ impl Node {
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
             let mut hash_continue: HashMap<u64, Hash256> = HashMap::new();
@@ -1118,44 +1156,44 @@ impl Node {
                     }
                 }
             }
-        });
+        }));
 
         // Start peer manager (non-blocking for regtest with no peers)
         let peer_manager = Arc::clone(&self.peer_manager);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             if let Err(e) = peer_manager.start().await {
                 tracing::error!("Peer manager error: {}", e);
             }
-        });
+        }));
 
         // Spawn peer maintenance loop (reconnects if peers drop)
         let pm_for_maintenance = Arc::clone(&self.peer_manager);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             pm_for_maintenance.run_maintenance().await;
-        });
+        }));
 
         // Start sync progress tracker
         let sync = Arc::clone(&self.block_sync);
         let event_sender = self.event_tx.clone();
         let mut sync_progress = sync.subscribe();
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             while let Ok(progress) = sync_progress.recv().await {
                 let _ = event_sender.send(NodeEvent::SyncProgress {
                     current: progress.current_height,
                     total: progress.target_height,
                 });
             }
-        });
+        }));
 
         // Start sync timeout checker
         let sync_for_timeout = Arc::clone(&self.block_sync);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 sync_for_timeout.check_timeouts().await;
             }
-        });
+        }));
 
         // Start transaction relay event handler (adds received txs to mempool)
         let tx_relay_for_mempool = Arc::clone(&self.tx_relay);
@@ -1166,7 +1204,7 @@ impl Node {
         let orphans_for_relay = Arc::clone(&self.orphans);
         let max_orphans = self.config.mempool.max_orphan_txs;
         let mut tx_events = tx_relay_for_mempool.subscribe();
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             while let Ok(event) = tx_events.recv().await {
                 match accept_relayed_transaction(
                     &chain_for_relay,
@@ -1199,22 +1237,22 @@ impl Node {
                     }
                 }
             }
-        });
+        }));
 
         // Start transaction relay timeout checker
         let tx_relay_for_timeout = Arc::clone(&self.tx_relay);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
                 tx_relay_for_timeout.check_timeouts().await;
             }
-        });
+        }));
 
         // Start block sync (wait for sporks to sync first, as required by Divi protocol)
         let sync_to_start = Arc::clone(&self.block_sync);
         let spork_for_sync = Arc::clone(&self.spork_manager);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             // Wait for initial peer connections
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -1239,7 +1277,7 @@ impl Node {
             }
 
             sync_to_start.start().await;
-        });
+        }));
 
         // Move to syncing state initially, then running when synced
         *self.status.write() = NodeStatus::Syncing;
@@ -1261,6 +1299,7 @@ impl Node {
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
+        let started = std::time::Instant::now();
         self.import_stop
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let handle = self.import_thread.lock().take();
@@ -1274,19 +1313,41 @@ impl Node {
             } else {
                 tracing::warn!("The block import did not stop within a minute; not waiting for it");
             }
+            shutdown_stage("block import stopped", started);
         }
 
+        // Stop the node's own loops (sync, relay, peer upkeep), so no block
+        // or transaction is taken and no peer dialled while the state below
+        // is written, as Divi Core's StopNode joins its threads before the
+        // flush (init.cpp Shutdown)
+        let started = std::time::Instant::now();
+        let tasks = std::mem::take(&mut *self.tasks.lock());
+        let stalled = stop_tasks(tasks, STOP_TASKS_TIMEOUT).await;
+        if stalled > 0 {
+            tracing::warn!(
+                "{} node task(s) did not stop within {} s; not waiting for them",
+                stalled,
+                STOP_TASKS_TIMEOUT.as_secs()
+            );
+        }
+        shutdown_stage("node loops stopped", started);
+
         // Disconnect all peers
+        let started = std::time::Instant::now();
         self.peer_manager.disconnect_all();
+        shutdown_stage("peers disconnected", started);
 
         // Persist masternode state before shutdown
+        let started = std::time::Instant::now();
         if let Err(e) = self.masternode_manager.save() {
             tracing::error!("Failed to persist masternode state on shutdown: {}", e);
         } else {
             tracing::info!("Masternode state persisted successfully");
         }
+        shutdown_stage("masternode state saved", started);
 
         // Flush UTXO cache to database before shutdown
+        let started = std::time::Instant::now();
         match self.chain.flush_utxo_cache() {
             Ok(count) => {
                 if count > 0 {
@@ -1297,6 +1358,7 @@ impl Node {
                 tracing::error!("Failed to flush UTXO cache on shutdown: {}", e);
             }
         }
+        shutdown_stage("UTXO cache flushed", started);
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());
@@ -2318,6 +2380,52 @@ mod tests {
 
         node.stop().await.unwrap();
         assert_eq!(node.status(), NodeStatus::Stopped);
+    }
+
+    /// stop ends the loops start runs: none still holds the node's parts
+    #[tokio::test]
+    async fn stop_ends_the_node_loops() {
+        let node = Node::new(test_config()).unwrap();
+        let idle = (
+            Arc::strong_count(&node.block_sync),
+            Arc::strong_count(&node.tx_relay),
+            Arc::strong_count(&node.peer_manager),
+        );
+        node.start().await.unwrap();
+        assert_ne!(Arc::strong_count(&node.block_sync), idle.0);
+        node.stop().await.unwrap();
+        // An aborted task lets go of what it holds once it has stopped
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let counts = || {
+            (
+                Arc::strong_count(&node.block_sync),
+                Arc::strong_count(&node.tx_relay),
+                Arc::strong_count(&node.peer_manager),
+            )
+        };
+        while counts() != idle && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(counts(), idle, "loops still running after stop");
+    }
+
+    /// A task inside a blocking call cannot be stopped; stop_tasks gives up on
+    /// it after its timeout
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_tasks_gives_up_after_the_timeout() {
+        let waiting = tokio::spawn(std::future::pending::<()>());
+        let blocked = tokio::spawn(async {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let stalled = stop_tasks(
+            vec![waiting, blocked],
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(stalled, 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]
