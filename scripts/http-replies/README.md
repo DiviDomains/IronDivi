@@ -65,10 +65,10 @@ HTTP reading) and `rpcserver.cpp` (`ServiceConnection`, `HTTPReq_JSONRPC`, `JSON
 Each KNOWN row checks irondivid's reply is exactly the one below; any other reply is a FAIL.
 
 - `401 replies: Connection header`: divid writes its 401 as an HTTP/1.0 reply with no Connection header and closes
-  the connection (`rpcprotocol.cpp:91-111`); irondivid's HTTP server (hyper) closes a connection only after a reply
+  the connection (`rpcprotocol.cpp:85-108`); irondivid's HTTP server (hyper) closes a connection only after a reply
   that says `Connection: close`, so it says it. Both close (the "wrong password, then a second request" rows).
 - `PUT`, `HEAD`, `PUT without credentials`: divid closes the connection without a reply to a method other than GET or
-  POST (`rpcprotocol.cpp:121-123`); irondivid's HTTP server answers every request: `405 Method Not Allowed`,
+  POST (`rpcprotocol.cpp:150-152`); irondivid's HTTP server answers every request: `405 Method Not Allowed`,
   `text/plain`, `Connection: close` (no body for HEAD).
 - `path /wallet/w1`: irondivid serves JSON-RPC on `/wallet/<name>` too, which `irondivi-cli -rpcwallet` uses
   (`bin/irondivi-cli/src/main.rs`); divid serves `/` only (`rpcserver.cpp:1019-1031`).

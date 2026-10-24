@@ -35,7 +35,7 @@ HOST = os.environ.get("HTTP_REPLIES_HOST", "127.0.0.1")
 OUTSIDE = os.environ.get("HTTP_REPLIES_OUTSIDE_IP", "")
 START_TIMEOUT = 120
 READ_TIMEOUT = 20
-# divid reads at most MAX_SIZE bytes of body (serialize.h:34, rpcprotocol.cpp:276-277)
+# divid reads at most MAX_SIZE bytes of body (serialize.h:34, rpcprotocol.cpp:218-220)
 MAX_SIZE = 0x02000000
 
 # Differences irondivid has on purpose, one per row name. Each is listed in
@@ -49,12 +49,12 @@ NOT_ALLOWED = {"status": "405 Method Not Allowed", "content-type": "text/plain",
 KNOWN = {
     "401 replies: Connection header": (
         "divid writes its 401 as an HTTP/1.0 reply with no Connection header and closes the connection "
-        "(rpcprotocol.cpp:91-111); irondivid's HTTP server closes a connection only after a reply that says "
+        "(rpcprotocol.cpp:85-108); irondivid's HTTP server closes a connection only after a reply that says "
         "Connection: close, so it says it. Both close (the 'closed after' rows).",
         {"connection": "close"}),
     "PUT": (
         "divid closes the connection without a reply to a method other than GET or POST "
-        "(rpcprotocol.cpp:121-123); irondivid's HTTP server answers every request: 405, then closes",
+        "(rpcprotocol.cpp:150-152); irondivid's HTTP server answers every request: 405, then closes",
         NOT_ALLOWED),
     "HEAD": ("as for PUT", dict(NOT_ALLOWED, body=("text", ""))),
     "PUT without credentials": ("as for PUT", NOT_ALLOWED),
@@ -388,7 +388,7 @@ for n in (C, I):
 close = {"Connection": "close"}
 good = rpc_body("getblockcount")
 
-# Credentials (rpcserver.cpp:936-956, rpcprotocol.cpp:91-111). The Connection
+# Credentials (rpcserver.cpp:936-956, rpcprotocol.cpp:85-108). The Connection
 # header of the 401 is compared once, on a row of its own
 NO_CONN = tuple(p for p in PARTS if p != "connection")
 c401, i401 = both("no Authorization header", lambda n: post(n, good, auth=None, headers=close), NO_CONN)
@@ -413,7 +413,7 @@ for name, make in (("wrong password: delay before the reply", lambda n: n.auth(p
     sort = lambda s: ">=0.2s" if s >= 0.2 else "<0.2s"
     row(name, f"{sort(c)} ({c * 1000:.0f}ms)", f"{sort(i)} ({i * 1000:.0f}ms)", sort(c) == sort(i))
 
-# HTTP methods and paths (rpcprotocol.cpp:113-138, rpcserver.cpp:1000-1033)
+# HTTP methods and paths (rpcprotocol.cpp:138-160, rpcserver.cpp:1000-1033)
 both("GET with a request body", lambda n: request(n, "GET", body=good, headers=close))
 both("PUT", lambda n: request(n, "PUT", body=good, headers=close))
 both("HEAD", lambda n: request(n, "HEAD", body="", headers=close))
@@ -475,7 +475,7 @@ for name, body in (
 ):
     both(name, lambda n, b=body: post(n, b, headers=close))
 
-# Keep-alive (rpcprotocol.cpp:291-297, rpcserver.cpp:1014-1017): HTTP/1.1 keeps the
+# Keep-alive (rpcprotocol.cpp:239-245, rpcserver.cpp:1014-1017): HTTP/1.1 keeps the
 # connection, HTTP/1.0 and "Connection: close" close it; an error reply closes it
 
 
