@@ -428,3 +428,33 @@ fn decoderawtransaction_members_are_in_cores_order() {
         ["txid", "baretxid", "version", "locktime", "vin", "vout"]
     );
 }
+
+/// getinfo: rpcmisc.cpp:138-157, the wallet's members after protocolversion;
+/// then irondivid's own
+#[test]
+fn getinfo_members_are_in_cores_order() {
+    let n = node();
+    n.mine(vec![], &nobody());
+    assert_eq!(
+        keys(&n.ok("getinfo", vec![])),
+        [
+            "version",
+            "protocolversion",
+            "walletversion",
+            "balance",
+            "blocks",
+            "timeoffset",
+            "connections",
+            "proxy",
+            "difficulty",
+            "testnet",
+            "moneysupply",
+            "relayfee",
+            "staking status",
+            "errors",
+            "keypoololdest",
+            "keypoolsize",
+            "paytxfee"
+        ]
+    );
+}
