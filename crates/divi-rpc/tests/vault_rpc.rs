@@ -1165,3 +1165,62 @@ fn coin_availability_lists_vault_txids_in_text_order() {
         ca
     );
 }
+
+/// fundvault's object form (rpcwallet.cpp:989-1036, :1059-1062): each encoding
+/// with an amount, or {"amount", "repetitions"} for that many outputs, in one
+/// transaction; the reply names every encoding. A value of another kind, or
+/// an amount or repetitions of the wrong kind, is refused with -8.
+#[test]
+fn fundvault_takes_an_object_of_encodings() {
+    let s = setup();
+    let rpc = s.net.rpc(&s.manager);
+    let code = |e: divi_rpc::Error| match e {
+        divi_rpc::Error::Rpc(r) => (r.code, r.message),
+        other => panic!("not an RPC error: {:?}", other),
+    };
+    let other_manager = s.owner.new_receiving_address().unwrap().to_string();
+    for (details, message) in [
+        (
+            json!({"amount": "x", "repetitions": 2}),
+            "Unable to parse amount for: ",
+        ),
+        (json!({"amount": 2}), "Unable to parse repetitions for: "),
+        (
+            json!({"amount": 2, "repetitions": 1.5}),
+            "Unable to parse repetitions for: ",
+        ),
+        (json!([1]), "Unknown json input. Unable to parse input for "),
+        (json!("2"), "Unknown json input. Unable to parse input for "),
+    ] {
+        let refused = rpc
+            .fund_vault(&p(vec![json!({ s.encoding.clone(): details })]))
+            .unwrap_err();
+        assert_eq!(code(refused), (-8, format!("{message}{}", s.encoding)));
+    }
+    assert!(s.net.submitted.lock().is_empty());
+
+    let funded = rpc
+        .fund_vault(&p(vec![json!({
+            s.encoding.clone(): 3,
+            other_manager.clone(): {"amount": 2, "repetitions": 2},
+        })]))
+        .unwrap_or_else(|e| panic!("fundvault failed: {}", error_message(e)));
+    let encodings = funded["vault"].as_array().unwrap();
+    assert_eq!(encodings.len(), 2);
+    assert_eq!(encodings[0]["encoding"], json!(s.encoding));
+    // Without an owner a new key of the wallet owns the vault
+    let second = encodings[1]["encoding"].as_str().unwrap();
+    let (new_owner, manager) = second.split_once(':').unwrap();
+    assert_eq!(manager, other_manager);
+    let new_owner: Address = new_owner.parse().unwrap();
+    assert!(s.manager.is_mine(&new_owner));
+
+    let tx = submitted_tx(&s);
+    assert_eq!(funded["txhash"], json!(tx.txid().to_string()));
+    assert_eq!(output_to(&tx, &s.vault), vec![3 * COIN]);
+    let other_manager: Address = other_manager.parse().unwrap();
+    assert_eq!(
+        output_to(&tx, &vault_script(&new_owner, &other_manager)),
+        vec![2 * COIN, 2 * COIN]
+    );
+}

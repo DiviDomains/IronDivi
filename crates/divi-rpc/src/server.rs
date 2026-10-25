@@ -552,6 +552,17 @@ impl RpcServer {
 
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
+        self.dispatch_with(method, params, None)
+    }
+
+    /// Dispatch a method call; `amounts` is sendmany's or fundvault's amounts
+    /// object with every pair as the request wrote it, when it came as JSON text
+    fn dispatch_with(
+        &self,
+        method: &str,
+        params: &Params,
+        amounts: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
         // Divi Core's dispatcher refuses a wallet call without a wallet before
         // the call runs (rpcserver.cpp:1043-1047)
         if WALLET_CALLS.contains(&method) && self.wallet.wallet_db().is_none() {
@@ -682,7 +693,7 @@ impl RpcServer {
             "listaccounts" => self.wallet.list_accounts(params),
             "getreceivedbyaccount" => self.wallet.get_received_by_account(params),
             "listreceivedbyaccount" => self.wallet.list_received_by_account(params),
-            "sendmany" => self.wallet.send_many(params),
+            "sendmany" => self.wallet.send_many_with(params, amounts),
             "sendfrom" => self.wallet.send_from(params),
             "walletpassphrasechange" => self.wallet.wallet_passphrase_change(params),
             "encryptwallet" => self.wallet.encrypt_wallet(params),
@@ -786,7 +797,7 @@ impl RpcServer {
             "addvault" => self.wallet.add_vault(params),
             "removevault" => self.wallet.remove_vault(params),
             "getcoinavailability" => self.wallet.get_coin_availability(params),
-            "fundvault" => self.wallet.fund_vault(params),
+            "fundvault" => self.wallet.fund_vault_with(params, amounts),
             "debitvaultbyname" => self.wallet.debit_vault_by_name(params),
             "reclaimvaultfunds" => self.wallet.reclaim_vault_funds(params),
 
@@ -1651,15 +1662,17 @@ impl RpcServer {
         // divi-cli's byte escapes of non-ASCII text, read as divid reads them
         let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
         let body = body.as_deref().unwrap_or(body_text);
-        // json_spirit's reading: of two equal keys the first counts
-        let request: Value = match crate::http::parse_json(body) {
+        // json_spirit's reading: of two equal keys the first counts, but an
+        // object keeps both (for sendmany's amounts)
+        let tree = match crate::http::parse_json_members(body) {
             Ok(v) => v,
             Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
         };
+        let request = tree.first_wins();
         match &request {
             Value::Object(_) => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
-                match self.execute_json_request(&request) {
+                match self.execute_json_request(&request, &tree) {
                     Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
                     Err(e) => error_reply(e, id),
                 }
@@ -1668,9 +1681,11 @@ impl RpcServer {
                 // JSONRPCExecBatch: every entry answered, the batch itself is 200
                 let replies: Vec<String> = requests
                     .iter()
-                    .map(|r| {
+                    .enumerate()
+                    .map(|(i, r)| {
                         let id = r.get("id").cloned().unwrap_or(Value::Null);
-                        reply_text(self.execute_json_request(r), &id)
+                        let tree = tree.element(i).expect("the batch's own entry");
+                        reply_text(self.execute_json_request(r, tree), &id)
                     })
                     .collect();
                 (StatusCode::OK, format!("[{}]\n", replies.join(",")))
@@ -1683,10 +1698,12 @@ impl RpcServer {
     }
 
     /// Check and run one request object (rpcserver.cpp JSONRequest::parse):
-    /// "method" must be a string, "params" an array or absent/null
+    /// "method" must be a string, "params" an array or absent/null. `tree` is
+    /// the same request with every member of its objects.
     fn execute_json_request(
         &self,
         request: &serde_json::Value,
+        tree: &crate::http::Json,
     ) -> Result<serde_json::Value, RpcError> {
         use serde_json::Value;
         let Value::Object(obj) = request else {
@@ -1702,7 +1719,20 @@ impl RpcServer {
             Some(Value::Array(a)) => Params::Array(a.clone()),
             Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
         };
-        match self.dispatch(method, &params) {
+        // sendmany and fundvault read each pair of their amounts object, equal
+        // keys included (rpcwallet.cpp parseMultiSendJson, parseFundVaultRPCParameters)
+        let amounts = match method.as_str() {
+            "sendmany" => tree
+                .member("params")
+                .and_then(|p| p.element(1))
+                .and_then(|a| a.members()),
+            "fundvault" => tree
+                .member("params")
+                .and_then(|p| p.element(0))
+                .and_then(|a| a.members()),
+            _ => None,
+        };
+        match self.dispatch_with(method, &params, amounts.as_deref()) {
             Ok(result) => Ok(result),
             Err(Error::Rpc(e)) => Err(e),
             Err(e) => Err(RpcError::internal_error(e.to_string())),
