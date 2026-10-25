@@ -2877,6 +2877,7 @@ dependencies = [
  "divi-primitives",
  "divi-script",
  "hex",
+ "libc",
  "moka",
  "parking_lot",
  "rocksdb",

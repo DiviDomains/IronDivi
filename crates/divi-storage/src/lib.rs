@@ -45,6 +45,7 @@ macro_rules! pause_point {
     };
 }
 
+pub mod abort;
 pub mod address_index;
 pub mod block_index;
 pub mod chain;
@@ -52,6 +53,7 @@ pub mod core_coins;
 pub mod database;
 pub mod datadir;
 pub mod difficulty;
+pub mod disk_space;
 pub mod error;
 pub mod export;
 #[cfg(test)]

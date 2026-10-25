@@ -14,7 +14,7 @@
 //! with, one vote per masternode (MasternodePaymentData, MasternodePayeeData).
 //! `getmasternodewinners` reads them.
 
-use crate::mn_list::{scoring_hash, MasternodeList};
+use crate::mn_list::{scoring_hash, MasternodeList, Refusal};
 use divi_masternode::cpp_wire::CppWinner;
 use divi_primitives::hash::Hash256;
 use divi_storage::{Chain, NetworkType};
@@ -46,6 +46,9 @@ pub struct MasternodeVotes {
     winners: RwLock<HashMap<[u8; 32], (CppWinner, Hash256)>>,
     /// The counts per scoring block
     blocks: RwLock<HashMap<Hash256, BlockPayees>>,
+    /// The masternode sync is not finished (CMasternodeSync::IsSynced false);
+    /// irondivid reports it finished, so this starts false
+    sync_unfinished: std::sync::atomic::AtomicBool,
 }
 
 impl MasternodeVotes {
@@ -53,8 +56,28 @@ impl MasternodeVotes {
         Self::default()
     }
 
+    /// Whether the node's masternode sync is finished, which decides whether a
+    /// vote's payee must be near the top of the queue and whether a bad
+    /// signature costs its sender (masternode-payments.cpp:241-245, :320-328)
+    pub fn set_sync_finished(&self, finished: bool) {
+        self.sync_unfinished
+            .store(!finished, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn sync_finished(&self) -> bool {
+        !self
+            .sync_unfinished
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn is_known(&self, hash: &[u8; 32]) -> bool {
         self.winners.read().contains_key(hash)
+    }
+
+    /// A vote taken, by hash, as an `mnw` payload (ShareMasternodeWinnerWithPeer,
+    /// MasternodeModule.cpp:329-338)
+    pub fn winner_bytes(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.winners.read().get(hash).map(|(w, _)| w.encode())
     }
 
     /// A vote from a peer, checked as Divi Core checks one
@@ -66,7 +89,7 @@ impl MasternodeVotes {
         chain: &Chain,
         list: &MasternodeList,
         payload: &[u8],
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Refusal> {
         let winner = CppWinner::decode(payload).map_err(|e| format!("{e:?}"))?;
         let hash = winner.hash();
         if self.is_known(&hash) {
@@ -75,10 +98,15 @@ impl MasternodeVotes {
         let tip = chain.height() as i64;
         let height = winner.height as i64;
         if height < tip - WINNER_DEPTH || height > tip + 20 {
-            return Err(format!("winner out of range: height {height}, tip {tip}"));
+            return Err(format!("winner out of range: height {height}, tip {tip}").into());
         }
         let scoring = scoring_hash(chain, height).ok_or("no scoring block for the height")?;
         list.check_collateral(chain);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // An unknown masternode is asked for (masternode-payments.cpp:223-228)
         let voter = list
             .entries()
             .into_iter()
@@ -86,14 +114,13 @@ impl MasternodeVotes {
                 e.mnb.vin.prevout_hash == winner.vin.prevout_hash
                     && e.mnb.vin.prevout_n == winner.vin.prevout_n
             })
-            .ok_or("unknown masternode")?;
+            .ok_or_else(|| Refusal {
+                ask: list.ask_entry(&winner.vin, now),
+                ..Refusal::from("unknown masternode")
+            })?;
         if voter.mnb.protocol_version < ACTIVE_PROTOCOL {
             return Err("masternode protocol too old".into());
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         if !voter.is_enabled(now) {
             return Err("masternode is not active".into());
         }
@@ -104,15 +131,16 @@ impl MasternodeVotes {
             2 * SIGNATURES_TOTAL,
         ) {
             Some(r) if r <= SIGNATURES_TOTAL => {}
-            _ => return Err(format!("masternode not in the top {SIGNATURES_TOTAL}")),
+            _ => return Err(format!("masternode not in the top {SIGNATURES_TOTAL}").into()),
         }
-        // A node whose masternode sync is finished (irondivid's always is)
-        // takes only a payee near the top of its own queue
-        let queue = list.payment_queue(chain, &scoring);
-        if !queue
-            .iter()
-            .take(2 * SIGNATURES_TOTAL)
-            .any(|p| *p == winner.payee)
+        // A node whose masternode sync is finished takes only a payee near
+        // the top of its own queue
+        if self.sync_finished()
+            && !list
+                .payment_queue(chain, &scoring)
+                .iter()
+                .take(2 * SIGNATURES_TOTAL)
+                .any(|p| *p == winner.payee)
         {
             return Err("payee not in the top of the payment queue".into());
         }
@@ -126,7 +154,17 @@ impl MasternodeVotes {
             return Err("masternode already voted".into());
         }
         if !winner.signature_is_valid(&voter.mnb.pubkey_masternode) {
-            return Err("invalid signature".into());
+            // It may be a masternode this node has not synced: asked for
+            // (masternode-payments.cpp:241-245)
+            // It costs its sender only on a node whose sync is finished
+            return Err(Refusal {
+                ask: list.ask_entry(&winner.vin, now),
+                ..Refusal::scored(
+                    if self.sync_finished() { 20 } else { 0 },
+                    "Invalid signature for mnwinner.",
+                    "invalid signature",
+                )
+            });
         }
         self.record(winner, hash, scoring, tip);
         Ok(true)
