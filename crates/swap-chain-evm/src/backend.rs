@@ -1376,6 +1376,179 @@ mod tests {
         assert_eq!(backend.confirmations(&first.txid).await.unwrap(), None);
     }
 
+    /// `geth --dev` on 127.0.0.1 for the geth devnet check: no discovery, no peers, no IPC,
+    /// HTTP on loopback only, the chain in `dir`. `period` 0 seals a block per transaction;
+    /// a long period leaves sent transactions in the pool.
+    fn spawn_geth_dev(dir: &std::path::Path, port: u16, period: u32) -> GethDev {
+        let child = std::process::Command::new("geth")
+            .args(["--dev", "--dev.period", &period.to_string(), "--datadir"])
+            .arg(dir)
+            .args([
+                "--nodiscover",
+                "--maxpeers",
+                "0",
+                "--ipcdisable",
+                "--port",
+                "0",
+            ])
+            .args([
+                "--http",
+                "--http.addr",
+                "127.0.0.1",
+                "--http.port",
+                &port.to_string(),
+            ])
+            .args(["--http.api", "eth,net,web3,txpool"])
+            .args(["--authrpc.addr", "127.0.0.1", "--authrpc.port", "0"])
+            .args(["--verbosity", "1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("geth on PATH");
+        GethDev(Some(child))
+    }
+
+    /// A running `geth --dev`, stopped with SIGTERM (so its chain is flushed to the datadir)
+    /// and, if it lingers, killed, when dropped.
+    struct GethDev(Option<std::process::Child>);
+
+    impl Drop for GethDev {
+        fn drop(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            let _ = std::process::Command::new("kill")
+                .arg(child.id().to_string())
+                .status();
+            for _ in 0..100 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Wait until the node at `backend` answers.
+    async fn wait_for_rpc(backend: &UsdcBackend) {
+        for _ in 0..100 {
+            if backend.client.provider().get_chain_id().await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("geth --dev never answered");
+    }
+
+    /// Devnet check of geth's replacement rule itself (`list.Add`, `--txpool.pricebump`
+    /// 10): an ephemeral `geth --dev` on 127.0.0.1 (no discovery, `--maxpeers 0`, no public
+    /// network), its chain in a temp datadir removed with the test. First run: seal a
+    /// block per transaction and fund dev key 0 from the dev account. Second run on the same
+    /// datadir: a one-hour block period, so the claim and its replacements meet in the pool.
+    /// A +1% same-nonce replacement is refused "replacement transaction underpriced" and the
+    /// claim stays; a +10% one is taken and evicts it. Ignored by default: needs `geth` on
+    /// `PATH`; run with
+    /// `PATH=$HOME/.geth/bin:$PATH cargo test -p swap-chain-evm --lib geth_ -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs geth on PATH"]
+    async fn geth_dev_txpool_refuses_a_one_percent_replacement_and_takes_ten_percent() {
+        use alloy::consensus::Transaction as _;
+        let dir = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let key: PrivateKeySigner =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .unwrap();
+        let backend = UsdcBackend::new(
+            &endpoint,
+            key,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap();
+        let provider = backend.client.provider();
+
+        {
+            let _geth = spawn_geth_dev(dir.path(), port, 0);
+            wait_for_rpc(&backend).await;
+            let dev: Vec<Address> = provider
+                .raw_request("eth_accounts".into(), ())
+                .await
+                .expect("eth_accounts");
+            let fund = TransactionRequest {
+                from: Some(dev[0]),
+                to: Some(backend.address().into()),
+                value: Some(U256::from(10u128.pow(18))),
+                ..Default::default()
+            };
+            let _: B256 = provider
+                .raw_request("eth_sendTransaction".into(), (fund,))
+                .await
+                .expect("fund dev key 0");
+            let mut funded = false;
+            for _ in 0..100 {
+                if provider.get_balance(backend.address()).await.unwrap() > U256::ZERO {
+                    funded = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(funded, "dev key 0 never funded");
+        }
+
+        let _geth = spawn_geth_dev(dir.path(), port, 3600);
+        wait_for_rpc(&backend).await;
+        assert!(provider.get_balance(backend.address()).await.unwrap() > U256::ZERO);
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(backend.broadcast(&first).await.unwrap(), first.txid);
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), Some(0));
+
+        let low = backend
+            .build_claim_replacement(&first, 3_030_000_000, 1)
+            .await
+            .unwrap()
+            .expect("1% clears a 1% bump");
+        assert_eq!(decoded(&low).nonce(), decoded(&first).nonce());
+        let err = backend.broadcast(&low).await.unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("replacement transaction underpriced"),
+            "{err}"
+        );
+        assert_eq!(backend.confirmations(&low.txid).await.unwrap(), None);
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), Some(0));
+
+        let next = backend
+            .build_claim_replacement(&first, 3_300_000_000, 10)
+            .await
+            .unwrap()
+            .expect("10% over");
+        assert_eq!(decoded(&next).nonce(), decoded(&first).nonce());
+        assert_eq!(backend.broadcast(&next).await.unwrap(), next.txid);
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(0));
+        assert_eq!(
+            backend.confirmations(&first.txid).await.unwrap(),
+            None,
+            "the replacement evicted the original"
+        );
+    }
+
     /// The replacement's fees: the max fee is the target, the tip rises with it, and both
     /// clear geth's price bump; a target under the bump is refused (`None`), not raised past
     /// what the caller allowed. The tip never exceeds the max fee.
