@@ -156,6 +156,13 @@ impl CppTxIn {
         }
     }
 
+    /// Serialize exactly like `CDataStream << CTxIn` (a `dseg` payload)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41 + self.script_sig.len());
+        self.encode(&mut out);
+        out
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.prevout_hash);
         out.extend_from_slice(&self.prevout_n.to_le_bytes());

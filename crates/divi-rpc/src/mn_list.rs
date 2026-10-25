@@ -16,7 +16,7 @@
 //! the datadir as Core saves mncache.dat, so it is there after a restart.
 
 use crate::mn_broadcast::{find_collateral, ping_signature_valid, tier_for_collateral};
-use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+use divi_masternode::cpp_wire::{CppBroadcast, CppPing, CppTxIn};
 use divi_primitives::hash::{Hash160, Hash256};
 use divi_primitives::transaction::OutPoint;
 use divi_storage::{Chain, NetworkType};
@@ -87,14 +87,18 @@ pub struct Refusal {
     pub dos: u32,
     pub cause: &'static str,
     pub reason: String,
+    /// A `dseg` payload to send the peer, asking it for the masternode
+    /// (CMasternodeSync::AskForMN, masternode-sync.cpp:456-462)
+    pub ask: Option<Vec<u8>>,
 }
 
 impl Refusal {
-    fn scored(dos: u32, cause: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn scored(dos: u32, cause: &'static str, reason: impl Into<String>) -> Self {
         Refusal {
             dos,
             cause,
             reason: reason.into(),
+            ask: None,
         }
     }
 }
@@ -136,6 +140,9 @@ pub struct MasternodeList {
     /// (mapSeenMasternodeBroadcast, mapSeenMasternodePing)
     seen_broadcasts: RwLock<HashMap<[u8; 32], CppBroadcast>>,
     seen_pings: RwLock<HashMap<[u8; 32], CppPing>>,
+    /// When each masternode may be asked for again
+    /// (mWeAskedForMasternodeListEntry, MasternodeNetworkMessageManager.cpp:191-205)
+    asked_entries: Mutex<HashMap<([u8; 32], u32), i64>>,
     /// Invs to relay, as CMasternodeBroadcast::Relay and CMasternodePing::Relay
     /// leave them for every peer (masternode.cpp:241-245, MasternodePing.cpp:17-21)
     relays: Mutex<Vec<(u32, [u8; 32])>>,
@@ -361,6 +368,20 @@ impl MasternodeList {
         }
     }
 
+    /// recordMasternodeEntryRequestAttempt: the `dseg` payload asking for the
+    /// masternode of `vin`, unless it was asked for in the last ten minutes
+    /// (MasternodeNetworkMessageManager.cpp:191-205)
+    pub fn ask_entry(&self, vin: &CppTxIn, now: i64) -> Option<Vec<u8>> {
+        let mut asked = self.asked_entries.lock();
+        let key = (vin.prevout_hash, vin.prevout_n);
+        if asked.get(&key).is_some_and(|t| now < *t) {
+            return None;
+        }
+        asked.retain(|_, t| now < *t);
+        asked.insert(key, now + MIN_MNP_SECONDS);
+        Some(vin.to_bytes())
+    }
+
     /// The invs left to relay since the last call
     pub fn take_relays(&self) -> Vec<(u32, [u8; 32])> {
         std::mem::take(&mut *self.relays.lock())
@@ -403,13 +424,22 @@ impl MasternodeList {
                 e.mnb.vin.prevout_hash == ping.vin.prevout_hash
                     && e.mnb.vin.prevout_n == ping.vin.prevout_n
             }) else {
-                return Ok(false);
+                // An unknown masternode is asked for (masternodeman.cpp:529-533)
+                return Err(Refusal {
+                    ask: self.ask_entry(&ping.vin, now),
+                    ..Refusal::from("unknown masternode")
+                });
             };
             if !e.is_enabled(now) {
                 return Ok(false);
             }
+            // A ping that costs its sender also asks it for the masternode
+            // (masternodeman.cpp:519-533)
             check_ping(chain, &e.mnb, Some(&e.mnb.last_ping), &ping, now).map_err(|r| Refusal {
                 cause: PING_FAILED,
+                ask: (r.dos > 0)
+                    .then(|| self.ask_entry(&ping.vin, now))
+                    .flatten(),
                 ..r
             })?;
             e.mnb.last_ping = ping;

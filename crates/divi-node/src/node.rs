@@ -1268,6 +1268,11 @@ impl Node {
                                     if e.dos > 0 {
                                         peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
                                     }
+                                    if let Some(vin) = e.ask {
+                                        let _ = peer_manager
+                                            .send_to_peer(peer_id, NetworkMessage::RequestMasternodeList(vin))
+                                            .await;
+                                    }
                                 }
                                 relay_masternode_items(
                                     &peer_manager,
@@ -1294,11 +1299,21 @@ impl Node {
                                         }
                                     }
                                     Ok(false) => {}
-                                    Err(e) => tracing::debug!(
-                                        "Masternode winner from peer {} not taken: {}",
-                                        peer_id,
-                                        e
-                                    ),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Masternode winner from peer {} not taken: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        if let Some(vin) = e.ask {
+                                            let _ = peer_manager
+                                                .send_to_peer(
+                                                    peer_id,
+                                                    NetworkMessage::RequestMasternodeList(vin),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                 }
                             }
                             // Divi Core reads no transaction from a dstx

@@ -625,3 +625,67 @@ fn taken_items_are_kept_and_left_to_relay() {
     let shared = CppBroadcast::decode(&n.list.seen_broadcast(&mnb.hash()).unwrap()).unwrap();
     assert_eq!(shared.last_ping, ping);
 }
+
+/// The sender of a ping for a masternode not in the list, of a ping that
+/// costs it, or of a vote of a masternode not in the list or badly signed is
+/// asked for that masternode with dseg, at most once in ten minutes per
+/// masternode; a ping only too early asks nothing (masternodeman.cpp:504-534,
+/// masternode-payments.cpp:223-245, masternode-sync.cpp:456-462)
+#[test]
+fn unknown_masternodes_are_asked_for_once() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing, CppTxIn, CppWinner};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now();
+    mnb.last_ping.sig_time = now() - 3000;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    let other = divi_crypto::SecretKey::new_random();
+    let ping = |vin: &CppTxIn, sig_time: i64, key: &divi_crypto::SecretKey| {
+        let mut p = CppPing {
+            vin: vin.clone(),
+            block_hash: recent,
+            sig_time,
+            signature: vec![],
+        };
+        p.sign(key).unwrap();
+        n.list.accept_ping(&n.chain, &p.to_bytes()).unwrap_err()
+    };
+    let stranger = CppTxIn::new([0xab; 32], 0);
+    assert_eq!(
+        ping(&stranger, now(), &mn_key).ask,
+        Some(stranger.to_bytes())
+    );
+    assert_eq!(ping(&stranger, now() + 1, &mn_key).ask, None);
+    let bad = ping(&mnb.vin, now(), &other);
+    assert_eq!((bad.dos, bad.ask), (33, Some(mnb.vin.to_bytes())));
+    assert_eq!(ping(&mnb.vin, now() + 1, &other).ask, None);
+
+    let vote = |vin: &CppTxIn, key: &divi_crypto::SecretKey| {
+        let mut w = CppWinner {
+            vin: vin.clone(),
+            height: n.chain.height() as i32 + 5,
+            payee: payee_script(&mnb),
+            signature: vec![],
+        };
+        w.sign(key).unwrap();
+        n.votes.accept(&n.chain, &n.list, &w.encode()).unwrap_err()
+    };
+    let unlisted = CppTxIn::new([0xbc; 32], 1);
+    assert_eq!(vote(&unlisted, &mn_key).ask, Some(unlisted.to_bytes()));
+    assert_eq!(vote(&unlisted, &mn_key).ask, None);
+}
