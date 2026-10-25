@@ -23,7 +23,7 @@ use crate::NetworkMessage;
 use divi_primitives::hash::Hash256;
 use divi_storage::ChainDatabase;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -117,10 +117,10 @@ pub struct SporkManager {
     /// Received sporks (keyed by hash)
     sporks: RwLock<HashMap<Hash256, SporkMessage>>,
 
-    /// Active sporks by ID, as Divi Core's `mapSporksActive`: the newest one
-    /// for a single-value spork, every signed entry in time order for a
-    /// multi-value spork
-    active_sporks: RwLock<HashMap<i32, Vec<SporkMessage>>>,
+    /// Active sporks by ID, as Divi Core's `mapSporksActive` (a `std::map`, so
+    /// in ID order): the newest one for a single-value spork, every signed
+    /// entry in time order for a multi-value spork
+    active_sporks: RwLock<BTreeMap<i32, Vec<SporkMessage>>>,
 
     /// Keeps the last spork added per id across restarts (Core's spork
     /// database); None keeps sporks in memory only
@@ -157,7 +157,7 @@ impl SporkManager {
             peer_manager,
             peer_states: RwLock::new(HashMap::new()),
             sporks: RwLock::new(HashMap::new()),
-            active_sporks: RwLock::new(HashMap::new()),
+            active_sporks: RwLock::new(BTreeMap::new()),
             db,
             progress_tx,
         };
@@ -394,7 +394,8 @@ impl SporkManager {
         self.active_sporks.read().values().map(Vec::len).sum()
     }
 
-    /// Every active spork, as `getsporks` serves them
+    /// Every active spork, as `getsporks` serves them: by ID, and by time
+    /// within a multi-value spork (Divi Core spork.cpp:261-267)
     pub fn active_sporks(&self) -> Vec<SporkMessage> {
         self.active_sporks
             .read()

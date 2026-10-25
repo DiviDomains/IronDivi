@@ -8,18 +8,9 @@
 
 mod common;
 use common::raw_peer::*;
-
-/// Read `n` inventory items from an `inv`, `getdata` or `notfound` payload
-fn inv_items(payload: &[u8]) -> Vec<(u32, [u8; 32])> {
-    let n = payload[0] as usize;
-    (0..n)
-        .map(|k| {
-            let at = 1 + 36 * k;
-            let kind = u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
-            (kind, payload[at + 4..at + 36].try_into().unwrap())
-        })
-        .collect()
-}
+use divi_network::SporkMessage;
+use divi_node::config::NodeConfig;
+use divi_storage::ChainDatabase;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_sporkcount_is_answered_with_getsporks() {
@@ -33,4 +24,55 @@ async fn every_sporkcount_is_answered_with_getsporks() {
             "no getsporks after sporkcount {count}"
         );
     }
+}
+
+/// A stored spork. Divi Core loads the sporks of its database without
+/// checking them again, so the signature here is only bytes (spork.cpp
+/// LoadSporksFromDB); a node can start with sporks no key here could sign.
+fn stored(id: i32, value: &str, time: i64) -> SporkMessage {
+    SporkMessage {
+        spork_id: id,
+        value: value.into(),
+        time_signed: time,
+        signature: vec![0x1f; 65],
+    }
+}
+
+/// Put sporks in the database a node is about to open
+fn seed(config: &mut NodeConfig, sporks: &[SporkMessage]) {
+    std::fs::create_dir_all(config.chainstate_path()).unwrap();
+    let db = ChainDatabase::open(config.chainstate_path()).unwrap();
+    for spork in sporks {
+        db.put_metadata(
+            format!("spork_{}", spork.spork_id).as_bytes(),
+            &spork.serialize(),
+        )
+        .unwrap();
+    }
+}
+
+fn spork_id(payload: &[u8]) -> i32 {
+    i32::from_le_bytes(payload[..4].try_into().unwrap())
+}
+
+/// Divi Core keeps its active sporks in a std::map and serves them in ID order
+/// (spork.cpp:261-267)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getsporks_serves_the_sporks_in_id_order() {
+    let ids = [
+        10015, 10001, 10012, 10007, 10013, 10002, 10011, 10009, 10004, 10008, 10014,
+    ];
+    let sporks: Vec<_> = ids.iter().map(|&id| stored(id, "1", 1000)).collect();
+    let t = TestNode::start_with(|c| seed(c, &sporks)).await;
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+    peer.send("getsporks", &[]).await;
+    let mut served = Vec::new();
+    for _ in ids {
+        let payload = peer.expect("spork", WAIT).await.expect("a spork");
+        served.push(spork_id(&payload));
+    }
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    assert_eq!(served, sorted);
 }
