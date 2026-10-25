@@ -2297,6 +2297,70 @@ impl WalletDb {
     }
 
     /// Get transaction history
+    /// Divi Core's -prunewalletconfs (wallet.cpp:900-920, :1162-1240): drop
+    /// from memory each confirmed wallet transaction whose outputs of ours
+    /// are all spent by a transaction with at least `min_confirmations`
+    /// confirmations, and none of whose inputs is an output of ours of a
+    /// transaction kept. The file keeps them, so the next start without the
+    /// option lists them again. `in_block` gives a confirmed transaction and
+    /// its place in its block; one it cannot give is kept. Transactions are
+    /// looked at after those they spend (divid goes in txid order once its
+    /// sort finds no coinbase, and may drop a spender whose funding it keeps:
+    /// docs/divid-differences.md W4). Returns the counts before and after.
+    pub fn prune_transactions(
+        &self,
+        min_confirmations: i64,
+        tip_height: u32,
+        in_block: impl Fn(&WalletTx) -> Option<(divi_primitives::transaction::Transaction, usize)>,
+    ) -> (usize, usize) {
+        let original = self.transactions.read().len()
+            + self.mempool_txs.read().len()
+            + self.detached_txs.read().len();
+        let mut confirmed: Vec<_> = self
+            .transactions
+            .read()
+            .values()
+            .filter_map(|t| {
+                let height = t.block_height?;
+                let (tx, index) = in_block(t)?;
+                Some((height, index, tx))
+            })
+            .collect();
+        confirmed.sort_by_key(|(height, index, _)| (*height, *index));
+        let pruned: HashSet<Hash256> = {
+            let utxos = self.utxos.read();
+            let spent = self.spent_utxo_data.read();
+            // Spent by a transaction with at least `min_confirmations`
+            let spent_deep = |op: &OutPoint| {
+                spent.get(op).is_some_and(|(_, height)| {
+                    i64::from(tip_height) - i64::from(*height) + 1 >= min_confirmations
+                })
+            };
+            let mut pruned = HashSet::new();
+            for (_, _, tx) in &confirmed {
+                let txid = tx.txid();
+                let outputs_gone = (0..tx.vout.len() as u32).all(|vout| {
+                    let op = OutPoint::new(txid, vout);
+                    !utxos.contains_key(&op) && (!spent.contains_key(&op) || spent_deep(&op))
+                });
+                // An input of ours from a transaction kept keeps this one
+                let from_kept = tx.vin.iter().any(|input| {
+                    spent.contains_key(&input.prevout)
+                        && self.transactions.read().contains_key(&input.prevout.txid)
+                        && !pruned.contains(&input.prevout.txid)
+                });
+                if outputs_gone && !from_kept {
+                    pruned.insert(txid);
+                }
+            }
+            pruned
+        };
+        self.transactions
+            .write()
+            .retain(|txid, _| !pruned.contains(txid));
+        (original, original - pruned.len())
+    }
+
     pub fn get_transactions(&self, count: Option<usize>) -> Vec<WalletTx> {
         let mut list: Vec<_> = self.transactions.read().values().cloned().collect();
         list.extend(self.mempool_txs.read().values().map(|e| e.record.clone()));

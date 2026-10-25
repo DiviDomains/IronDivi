@@ -352,3 +352,67 @@ fn hdseed_is_logged_as_divid_logs_it() {
     assert!(log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
     assert!(!log(dir.path()).contains(PREFER), "{}", log(dir.path()));
 }
+
+/// -prunewalletconfs leaves out of memory, at the start, a wallet transaction
+/// whose coins of ours are all spent by a transaction at least max(N, 20)
+/// blocks deep and none of whose inputs comes from one kept, and logs the
+/// counts; the wallet file keeps it, so a start without the option lists it
+/// again (wallet.cpp:900-920, :1162-1240; init.cpp:1574-1577)
+#[test]
+fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    ok(rpc, "setgenerate", json!([30]));
+    // The coinbase of block 1, swept alone to an address not ours
+    let hash = ok(rpc, "getblockhash", json!([1]));
+    let coinbase = ok(rpc, "getblock", json!([hash]))["tx"][0].clone();
+    let others: Vec<Value> = ok(rpc, "listunspent", json!([0]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["txid"] != coinbase)
+        .map(|u| json!({"txid": u["txid"], "vout": u["vout"]}))
+        .collect();
+    ok(rpc, "lockunspent", json!([false, others]));
+    let elsewhere = divi_wallet::Address::from_pubkey_hash(
+        divi_primitives::hash::Hash160::from_bytes([0x42; 20]),
+        divi_wallet::Network::Regtest,
+    );
+    let sweep = ok(
+        rpc,
+        "sendtoaddress",
+        json!([elsewhere.to_string(), 1, "sweep_funds"]),
+    );
+    ok(rpc, "setgenerate", json!([25]));
+    stop(node, rpc);
+
+    let known = |txid: &Value| {
+        try_rpc(
+            rpc,
+            "gettransaction",
+            &json!([txid]),
+            Duration::from_secs(60),
+        )
+        .unwrap()["error"]
+            .is_null()
+    };
+    let log = || std::fs::read_to_string(dir.path().join("debug.log")).unwrap_or_default();
+    let node = start(dir.path(), rpc, p2p, &["-prunewalletconfs=5"]);
+    assert!(!known(&coinbase), "the swept coinbase is still listed");
+    assert!(!known(&sweep), "its sweep is still listed");
+    let line = log()
+        .lines()
+        .rev()
+        .find(|l| l.contains("Pruned wallet transactions loaded to memory: Original "))
+        .map(str::to_string);
+    assert!(line.is_some(), "{}", log());
+    stop(node, rpc);
+
+    let node = start(dir.path(), rpc, p2p, &[]);
+    assert!(
+        known(&coinbase) && known(&sweep),
+        "a start without the option lists them again"
+    );
+    stop(node, rpc);
+}
