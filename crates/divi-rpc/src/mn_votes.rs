@@ -46,11 +46,28 @@ pub struct MasternodeVotes {
     winners: RwLock<HashMap<[u8; 32], (CppWinner, Hash256)>>,
     /// The counts per scoring block
     blocks: RwLock<HashMap<Hash256, BlockPayees>>,
+    /// The masternode sync is not finished (CMasternodeSync::IsSynced false);
+    /// irondivid reports it finished, so this starts false
+    sync_unfinished: std::sync::atomic::AtomicBool,
 }
 
 impl MasternodeVotes {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the node's masternode sync is finished, which decides whether a
+    /// vote's payee must be near the top of the queue and whether a bad
+    /// signature costs its sender (masternode-payments.cpp:241-245, :320-328)
+    pub fn set_sync_finished(&self, finished: bool) {
+        self.sync_unfinished
+            .store(!finished, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn sync_finished(&self) -> bool {
+        !self
+            .sync_unfinished
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn is_known(&self, hash: &[u8; 32]) -> bool {
@@ -116,13 +133,14 @@ impl MasternodeVotes {
             Some(r) if r <= SIGNATURES_TOTAL => {}
             _ => return Err(format!("masternode not in the top {SIGNATURES_TOTAL}").into()),
         }
-        // A node whose masternode sync is finished (irondivid's always is)
-        // takes only a payee near the top of its own queue
-        let queue = list.payment_queue(chain, &scoring);
-        if !queue
-            .iter()
-            .take(2 * SIGNATURES_TOTAL)
-            .any(|p| *p == winner.payee)
+        // A node whose masternode sync is finished takes only a payee near
+        // the top of its own queue
+        if self.sync_finished()
+            && !list
+                .payment_queue(chain, &scoring)
+                .iter()
+                .take(2 * SIGNATURES_TOTAL)
+                .any(|p| *p == winner.payee)
         {
             return Err("payee not in the top of the payment queue".into());
         }
@@ -138,9 +156,14 @@ impl MasternodeVotes {
         if !winner.signature_is_valid(&voter.mnb.pubkey_masternode) {
             // It may be a masternode this node has not synced: asked for
             // (masternode-payments.cpp:241-245)
+            // It costs its sender only on a node whose sync is finished
             return Err(Refusal {
                 ask: list.ask_entry(&winner.vin, now),
-                ..Refusal::from("invalid signature")
+                ..Refusal::scored(
+                    if self.sync_finished() { 20 } else { 0 },
+                    "Invalid signature for mnwinner.",
+                    "invalid signature",
+                )
             });
         }
         self.record(winner, hash, scoring, tip);

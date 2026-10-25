@@ -1305,6 +1305,9 @@ impl Node {
                                             peer_id,
                                             e
                                         );
+                                        if e.dos > 0 {
+                                            peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                        }
                                         if let Some(vin) = e.ask {
                                             let _ = peer_manager
                                                 .send_to_peer(

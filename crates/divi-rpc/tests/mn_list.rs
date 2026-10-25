@@ -689,3 +689,49 @@ fn unknown_masternodes_are_asked_for_once() {
     assert_eq!(vote(&unlisted, &mn_key).ask, Some(unlisted.to_bytes()));
     assert_eq!(vote(&unlisted, &mn_key).ask, None);
 }
+
+/// On a node whose masternode sync is finished a vote with a bad signature
+/// costs its sender 20 and a payee far from the top of the queue is refused;
+/// before the sync is finished neither (masternode-payments.cpp:241-245,
+/// :322-330)
+#[test]
+fn votes_follow_the_masternode_sync_as_divid() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppWinner};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    // Old enough to vote (25 minutes on regtest)
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now() - 1800;
+    mnb.last_ping.sig_time = now() - 600;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    let other = divi_crypto::SecretKey::new_random();
+    let vote = |ahead: i32, payee: Vec<u8>, key: &divi_crypto::SecretKey| {
+        let mut w = CppWinner {
+            vin: mnb.vin.clone(),
+            height: n.chain.height() as i32 + ahead,
+            payee,
+            signature: vec![],
+        };
+        w.sign(key).unwrap();
+        n.votes.accept(&n.chain, &n.list, &w.encode())
+    };
+    assert_eq!(vote(5, payee_script(&mnb), &other).unwrap_err().dos, 20);
+    assert!(vote(6, vec![0x51], &mn_key).is_err());
+    n.votes.set_sync_finished(false);
+    assert_eq!(vote(7, payee_script(&mnb), &other).unwrap_err().dos, 0);
+    assert_eq!(vote(8, vec![0x51], &mn_key), Ok(true));
+}
