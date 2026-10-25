@@ -1133,8 +1133,12 @@ impl Node {
                                         .await;
                                 }
                             }
-                            // Handle getblocks: respond with inv for blocks after locator
-                            NetworkMessage::GetBlocks(msg) => {
+                            // Handle getblocks: respond with inv for blocks after locator.
+                            // Divi Core answers getheaders the same way (main.cpp:624):
+                            // its headers answer is built only for a "headers" request
+                            // with headers-first syncing on, which no network has
+                            // (main.cpp:680-702, chainparams.cpp:251, :360, :440)
+                            NetworkMessage::GetBlocks(msg) | NetworkMessage::GetHeaders(msg) => {
                                 let (inv_items, continue_at) =
                                     getblocks_reply(&chain, &msg, GETBLOCKS_LIMIT);
                                 if let Some(hash) = continue_at {
