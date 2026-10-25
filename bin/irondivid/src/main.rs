@@ -848,14 +848,16 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             config.staking.block_version = Some(atoi(text) as i32);
         }
     }
-    // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    // Divi Core reads these with atoi64 into an unsigned int, never refusing
+    // one: a word or nothing is 0, a negative one wraps; the staker clamps
+    // them (BlockMemoryPoolTransactionCollector.cpp:18-42)
     for (key, slot) in [
         ("blockmaxsize", &mut config.staking.block_max_size),
         ("blockprioritysize", &mut config.staking.block_priority_size),
         ("blockminsize", &mut config.staking.block_min_size),
     ] {
-        if let Some(n) = number_option(&s, key, 0..=i64::from(u32::MAX)) {
-            *slot = n as usize;
+        if let Some(text) = s.get(key) {
+            *slot = atoi(text) as u32 as usize;
         }
     }
     for (key, slot) in [
@@ -4676,6 +4678,26 @@ mod divid_option_tests {
             .static_peers
             .contains(&"127.0.0.2:10".to_string()));
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
+    }
+
+    /// -blockmaxsize, -blockprioritysize and -blockminsize are read as divid
+    /// reads them, into an unsigned int with no warning: nothing or a word is
+    /// 0, a negative value wraps (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    #[test]
+    fn block_sizes_are_read_as_divid_reads_them() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &[
+                "-blockmaxsize",
+                "-blockminsize=-1",
+                "-blockprioritysize=abc",
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.staking.block_max_size, 0);
+        assert_eq!(c.staking.block_min_size, u32::MAX as usize);
+        assert_eq!(c.staking.block_priority_size, 0);
     }
 
     /// -dbcache is applied as divid splits it (init.cpp:1030, :1046-1056):
