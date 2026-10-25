@@ -43,6 +43,8 @@ REPLAY = os.environ.get("REPLAY", "")
 INJECT = os.environ.get("RANDOM_SEQUENCES_INJECT", "")
 # For looking into a difference: go on after a FAIL instead of ending the run
 GO_ON = os.environ.get("RANDOM_SEQUENCES_GO_ON", "") == "1"
+# For looking into a difference: a folder to copy the four debug.logs to on a FAIL
+LOGS = os.environ.get("RANDOM_SEQUENCES_LOGS", "")
 RPC_TIMEOUT = 120
 START_TIMEOUT = 180
 SETTLE_TIMEOUT = 45
@@ -179,14 +181,19 @@ class Pair:
         return self.nodes[2 - n]
 
     def settle(self):
-        """Both nodes on one tip, and each mempool still for a moment (or the
-        two equal)"""
+        """Both nodes connected to each other and on one tip, and each mempool
+        still for a moment (or the two equal). A transaction made while the
+        two are apart (just after a restart) reaches the other one only by the
+        random mempool rebroadcast, so the next step waits for the link."""
         a, b = self.nodes
         deadline = time.time() + SETTLE_TIMEOUT
         last = None
         steady = 0
         while time.time() < deadline:
             try:
+                if a.rpc("getconnectioncount") < 1 or b.rpc("getconnectioncount") < 1:
+                    time.sleep(0.5)
+                    continue
                 tips = (a.rpc("getbestblockhash"), b.rpc("getbestblockhash"))
                 pools = (sorted(a.rpc("getrawmempool")), sorted(b.rpc("getrawmempool")))
             except RuntimeError:
@@ -529,6 +536,11 @@ EXPLAINED = {
         "wallet to disk 2 s after the last change (ThreadFlushWalletDB, "
         "LegacyWalletDatabaseEndpointFactory.cpp:23-50), so a send made just before a kill -9 is lost; "
         "irondivid stores a send before the RPC that made it answers"),
+    "maturity window": (
+        "only the middle of the invalidate differs, by one or two coins of one value: the two sides had "
+        "spent different coins of that value (divid's choice among equal coins is by txid order), and with "
+        "the tip lowered one of them sits in the block between the mempool's coinbase maturity (20, "
+        "txmempool.cpp:151) and the wallet's (21, MerkleTxConfirmationNumberCalculator.cpp:54-59)"),
     "maturity after a reorg": (
         "after invalidateblock the dropped mempool transactions all spend a coinbase or coinstake "
         "output that is immature at the new height, which divid's removeCoinbaseSpends drops too "
@@ -600,8 +612,10 @@ def confirmed_sum(node):
 
 
 def balance_cache_explains():
-    """On some node divid's getbalance is not the sum of its confirmed coins,
-    irondivid's twin's is, and both have the same coins"""
+    """On some node both sides list the same confirmed coins, divid's
+    getbalance is below their sum (it counts as spent a coin that is not) and
+    irondivid's is not (getbalance also counts owned vault coins, which
+    listunspent leaves out, so it may be above)"""
     found = False
     for n in (1, 2):
         c, i = PAIRS[0].node(n), PAIRS[1].node(n)
@@ -609,12 +623,33 @@ def balance_cache_explains():
         cb, ib = c.call("getbalance"), i.call("getbalance")
         if None in (cs, is_) or cb[0] != "ok" or ib[0] != "ok":
             return False
-        if round(float(cb[1]), 8) == round(float(ib[1]), 8):
+        cb, ib = round(float(cb[1]), 8), round(float(ib[1]), 8)
+        if cb == ib:
             continue
-        if cs != is_ or round(float(ib[1]), 8) != is_ or round(float(cb[1]), 8) == cs:
+        if cs != is_ or not cb < cs or ib < is_:
             return False
         found = True
     return found
+
+
+def maturity_window_explains(c_mid, i_mid, diff):
+    """Only the middle of an invalidate differs, in balances and coins alone,
+    with mempools of one size, and the coins differ by one or two coins of
+    one value: one side spent a coin the other did not (divid's coin choice
+    among equal coins is by txid order), and in the middle that coin sits in
+    the block between the mempool's maturity (20, txmempool.cpp:151) and the
+    wallet's (21, MerkleTxConfirmationNumberCalculator.cpp:54-59)"""
+    allowed = {"after invalidateblock: " + k for k in ("getbalance * 0", "getbalance * 1", "listunspent 0 amounts")}
+    if not diff or any(k not in allowed for k in diff):
+        return False
+    if c_mid["mempool size"] != i_mid["mempool size"]:
+        return False
+    a, b = c_mid["listunspent 0 amounts"], i_mid["listunspent 0 amounts"]
+    if a[0] != "ok" or b[0] != "ok":
+        return False
+    from collections import Counter
+    extra = (Counter(a[1]) - Counter(b[1])) + (Counter(b[1]) - Counter(a[1]))
+    return len(extra) == 1 and sum(extra.values()) <= 2
 
 
 def rebroadcast_explains(n):
@@ -685,6 +720,9 @@ for step in steps:
                 and c_res[1]["height"][0] == i_res[1]["height"][0] == "ok" \
                 and maturity_explains(n, [c_res[1]["height"][1], i_res[1]["height"][1]]):
             explained = "maturity after a reorg"
+        elif step["kind"] == "invalidate" and c_res[1] and i_res[1] \
+                and maturity_window_explains(c_res[1], i_res[1], diff):
+            explained = "maturity window"
         elif step["kind"] == "kill" and PAIRS[0].note:
             explained = "divid reindex after a kill"
         elif step["kind"] == "kill" and counted(PAIRS[0].node(n).call("getrawmempool"))[1:] \
@@ -699,8 +737,10 @@ for step in steps:
     known = KNOWN.get(step["kind"])
     if diff and (explained or known):
         log(f"KNOWN  {line}  {explained or ''}  [{EXPLAINED[explained] if explained else known}]")
-        new_episode()
-        episode_steps = []
+        # the end states agree after a maturity window: the run goes on
+        if explained != "maturity window":
+            new_episode()
+            episode_steps = []
         continue
     if diff:
         fails += 1
@@ -752,6 +792,14 @@ for step in steps:
                     offered = node.call("sendrawtransaction", raw[1])
                     log(f"#   {p.name} node {m} lacks a transaction node {3 - m} holds; offered now: "
                         f"{outcome(offered)}; spends a coin immature at node {m}'s next height: {immature}")
+        if LOGS:
+            import shutil
+            os.makedirs(LOGS, exist_ok=True)
+            for p in PAIRS:
+                for node in p.nodes:
+                    for path in (os.path.join(node.dir, "regtest", "debug.log"), os.path.join(node.dir, "debug.log")):
+                        if os.path.exists(path):
+                            shutil.copy(path, os.path.join(LOGS, f"{node.name}-step{step['i']}.log"))
         # The steps of this episode: replayed with REPLAY on four fresh nodes,
         # they reach the same point
         log(f"#   episode steps: {json.dumps(episode_steps)}"[:30000])

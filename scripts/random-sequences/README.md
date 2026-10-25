@@ -96,13 +96,29 @@ episode) and the remaining steps, so every comparison stays exact:
   irondivid's agrees with the same coins. divid keeps each wallet transaction's balance in
   `CachedUtxoBalanceCalculator` (`CachedUtxoBalanceCalculator.cpp:13-30`), recomputed only when a wallet transaction
   spending it is added (`wallet.cpp:1242-1333`). So a spend that the mempool drops still counts as spending the coin.
+- **maturity window:** only the middle of an `invalidate` differs, by one or two coins of one value, with mempools
+  of one size, and the end states agree. The two sides had spent different coins of that value (divid's choice among
+  equal coins is by txid order, which shows only in the coins' depths). With the tip lowered, one of those coins sits
+  in the block between the mempool's coinbase maturity (20, `txmempool.cpp:151`) and the wallet's (21,
+  `MerkleTxConfirmationNumberCalculator.cpp:54-59`). The run goes on without a new episode.
+- **divid reindex after a kill:** see below. divid's reindex runs on a thread of its own (`init.cpp:1580`), while
+  its wallet's unconfirmed transactions are offered to the mempool at the end of the start (`init.cpp:1646`), before
+  the chain is rebuilt. So they are refused, and divid's wallet counts their inputs unspent.
+- **divid wallet after a kill:** after a kill, divid's restarted node holds fewer transactions than irondivid's.
+  divid writes its wallet to disk 2 s after the last change (`ThreadFlushWalletDB`,
+  `LegacyWalletDatabaseEndpointFactory.cpp:23-50`), so a send made just before a `kill -9` is lost. irondivid stores
+  a send before the RPC that made it answers.
 - **rebroadcast timing:** after a restart, only the restarted node's mempool, unconfirmed balance or unconfirmed coins
   differ, and each side's restarted node holds only transactions its peer holds too. divid sends some mempool
   transactions to its peers again at a random time within 30 minutes (`PeriodicallyRebroadcastMempoolTxs`,
   `main.cpp:1280-1294`; irondivid does the same since `fix/random-sequences`). Whether the restarted node has the
   peer's transactions back by then is chance.
 
-**divid after `kill -9`:** divid refuses to start ("Block database corruption detected! Failed to find best block in
+**Settling.** After each step, each pair waits until its two nodes are connected again (after a restart, the
+`-connect` node dials again within seconds) and on one tip, and until both mempools are equal or still for 8 s. A
+transaction made while the two are apart would reach the other node only through the random mempool rebroadcast.
+
+**divid after `kill -9`:** divid refuses to start (or aborts while loading its block index) ("Block database corruption detected! Failed to find best block in
 block index", `BlockIndexLoading.cpp:275`, `init.cpp:1082`) until it is started with `-reindex`. That is the recovery
 it asks for, so the script does it and notes it on the step; irondivid starts without it.
 
