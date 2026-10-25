@@ -373,3 +373,18 @@ fn an_unencrypted_wallet_is_warned_about_unless_allowed() {
         );
     }
 }
+
+/// -disablewallet: Divi Core logs "Wallet disabled!" where it would load the
+/// wallet (init.cpp:1546-1547)
+#[test]
+fn disablewallet_is_logged_as_divid_logs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let node = start(dir.path(), rpc_port, p2p_port, &["-disablewallet"]);
+    stop(node, rpc_port);
+    assert!(
+        log(dir.path()).contains("Wallet disabled!"),
+        "{}",
+        log_tail(dir.path())
+    );
+}

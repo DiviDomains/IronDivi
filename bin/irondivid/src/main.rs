@@ -2148,7 +2148,7 @@ async fn run_daemon(
 
     // Load or create wallet (unless disabled)
     let wallet = if disable_wallet {
-        info!("Wallet disabled");
+        info!("Wallet disabled!");
 
         // Still need mempool cleanup + fee estimation callback even without wallet
         let block_sync = node.block_sync();
