@@ -44,9 +44,6 @@ START_TIMEOUT = 180
 # Each is listed in README.md with divid's source line; a KNOWN row that starts to
 # match divid is a FAIL, so the list stays true.
 KNOWN = {
-    "member order of an object (setupmasternode)":
-        "irondivid writes a result's members in name order (serde_json without preserve_order; "
-        "docs/divid-differences.md R6); the members are otherwise compared as sets",
     "getmasternodecount: tier counts divid lacks":
         "copper, silver, gold, platinum, diamond, kept on purpose (divid rpcmasternode.cpp:327-358 has the 8 "
         "counts only; scripts/masternode-replies README)",
