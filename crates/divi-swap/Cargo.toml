@@ -23,6 +23,12 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 alloy = { version = "2.5.0", features = ["node-bindings"] }
+divi-crypto = { workspace = true }
+divi-primitives = { workspace = true }
+divi-wallet = { workspace = true }
 proptest = { workspace = true }
+secp256k1 = { workspace = true }
+swap-chain-divi.workspace = true
 swap-chain-evm.workspace = true
+swap-chain-zec.workspace = true
 tempfile = { workspace = true }
