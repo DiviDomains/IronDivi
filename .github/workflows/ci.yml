@@ -55,8 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo install cargo-audit
-      - run: cargo audit
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-deny cargo-audit
+      # The same gate a release build must pass (tools/release-check.sh)
+      - run: tools/release-check.sh
 
   mock-checks:
     # Swap-POC mock-backend acceptance (docs/plans/swap-poc/lanes/*.md), everything that
