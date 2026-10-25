@@ -22,6 +22,7 @@ members = [
     "crates/swap-adaptor",
     "crates/swap-chain-xmr",
     "crates/swap-keys",
+    "crates/swap-wasm",
     "bin/divi-swapd",
     "bin/divi-swap",
     "tests/integration-tests",

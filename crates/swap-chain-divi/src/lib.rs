@@ -188,6 +188,21 @@ impl DiviBackend {
         self.wallet.lock().apply_tx(&tx, &self.spk.to_hex())
     }
 
+    /// Sync the spendable coins with an address index's view (see [`Wallet::sync_coins`]).
+    pub fn sync_coins(&self, observed: &[Utxo]) -> Result<usize> {
+        self.wallet.lock().sync_coins(observed)
+    }
+
+    /// The wallet's persisted form (public data only).
+    pub fn wallet_json(&self) -> Result<String> {
+        self.wallet.lock().to_json()
+    }
+
+    /// Restore the wallet from [`wallet_json`](Self::wallet_json) output.
+    pub fn load_wallet_json(&self, text: &str) -> Result<()> {
+        self.wallet.lock().load_json(text)
+    }
+
     /// Next block height a scan should start at, as persisted with the wallet.
     pub fn scanned_height(&self) -> Option<u64> {
         self.wallet.lock().scanned_height

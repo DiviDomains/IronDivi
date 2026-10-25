@@ -816,3 +816,47 @@ async fn live_mainnet_sources_agree() {
     let now = divi_swap::rt::unix_now();
     assert!(now.abs_diff(mtp) < 3 * 3600, "mtp {mtp} now {now}");
 }
+
+#[test]
+fn sync_coins_never_re_adds_reserved_or_spent_coins() {
+    let mut w = Wallet::open(None).unwrap();
+    assert_eq!(
+        w.sync_coins(&[coin(1, 10), coin(2, 20), coin(3, 30)])
+            .unwrap(),
+        3
+    );
+    w.reserve(&[coin(1, 10)], txid_n(9)).unwrap();
+    w.record_broadcast(&[coin(2, 20).outpoint], &[]).unwrap();
+    // The index still lists 1 and 2 (unconfirmed spends) and has dropped 3 (spent by
+    // another wallet on the same key) and gained 4.
+    assert_eq!(
+        w.sync_coins(&[coin(1, 10), coin(2, 20), coin(4, 40)])
+            .unwrap(),
+        1
+    );
+    assert_eq!(w.available(), vec![coin(4, 40)]);
+    assert_eq!(w.reserved_count(), 1);
+}
+
+#[test]
+fn sync_coins_skips_excluded_txids() {
+    let mut w = Wallet::open(None).unwrap();
+    w.exclude_txid(txid_n(5)).unwrap();
+    assert_eq!(w.sync_coins(&[coin(5, 50), coin(6, 60)]).unwrap(), 1);
+    assert_eq!(w.available(), vec![coin(6, 60)]);
+}
+
+#[test]
+fn wallet_json_round_trips_reservations() {
+    let b = backend("http://127.0.0.1:1/", SecretKey::new_random());
+    b.sync_coins(&[coin(1, 10), coin(2, 20)]).unwrap();
+    b.wallet.lock().reserve(&[coin(1, 10)], txid_n(9)).unwrap();
+    let text = b.wallet_json().unwrap();
+    let c = backend("http://127.0.0.1:1/", SecretKey::new_random());
+    c.load_wallet_json(&text).unwrap();
+    assert_eq!(c.balance(), 20);
+    assert_eq!(c.wallet.lock().reserved_count(), 1);
+    // The restored reservation still blocks a re-add from the index.
+    assert_eq!(c.sync_coins(&[coin(1, 10), coin(2, 20)]).unwrap(), 0);
+    assert!(c.load_wallet_json("{not json").is_err());
+}

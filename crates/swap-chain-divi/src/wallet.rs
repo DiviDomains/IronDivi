@@ -177,6 +177,41 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// Replace the spendable set with what an address index reports (`observed`, e.g. the
+    /// extension's `getaddressutxos`), keeping every reservation and tombstone: a coin we
+    /// reserved or spent is never re-added, and a spendable coin the index no longer lists
+    /// (spent by another wallet on the same key) is dropped. Returns how many coins were
+    /// added.
+    pub fn sync_coins(&mut self, observed: &[Utxo]) -> Result<usize, SwapError> {
+        self.utxos
+            .retain(|u| observed.iter().any(|o| o.outpoint == u.outpoint));
+        let mut added = 0;
+        for u in observed {
+            if !self.excluded.contains(&u.outpoint.txid) {
+                added += usize::from(self.add(*u));
+            }
+        }
+        self.persist()?;
+        Ok(added)
+    }
+
+    /// The persisted form (public data only: coins, reservations, tombstones).
+    pub fn to_json(&self) -> Result<String, SwapError> {
+        serde_json::to_string(self)
+            .map_err(|e| SwapError::Storage(format!("serialize wallet: {e}")))
+    }
+
+    /// Restore from [`to_json`](Self::to_json) output, keeping this wallet's file path.
+    pub fn load_json(&mut self, text: &str) -> Result<(), SwapError> {
+        let mut w: Wallet = serde_json::from_str(text)
+            .map_err(|e| SwapError::Storage(format!("parse wallet: {e}")))?;
+        w.path = self.path.take();
+        *self = w;
+        self.persist()
+    }
+}
+
+impl Wallet {
     /// Record that a transaction we built was accepted by the chain: its inputs are spent
     /// for good and its outputs paying us (change, claim/refund proceeds) become coins.
     pub fn record_broadcast(
