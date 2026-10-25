@@ -1202,8 +1202,10 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         // Optional parameters
-        let min_conf = params.get_u64(0).unwrap_or(1) as u32;
-        let max_conf = params.get_u64(1).unwrap_or(9999999) as u32;
+        // C++ ints: a negative minconf takes every depth, a negative maxconf
+        // none (rpcrawtransaction.cpp:288-294, :318)
+        let min_conf = params.get_i64(0).unwrap_or(1);
+        let max_conf = params.get_i64(1).unwrap_or(9999999);
 
         // Optional ["address", ...] filter. As in Core, a bad address is -5
         // and a repeated one is -8.
@@ -1251,7 +1253,7 @@ impl WalletRpc {
         let result: Vec<_> = utxos
             .iter()
             .filter(|utxo| {
-                let confs = utxo.confirmations(height);
+                let confs = i64::from(utxo.confirmations(height));
                 confs >= min_conf && confs <= max_conf
             })
             .filter(|utxo| !wallet.is_coin_locked(&utxo.outpoint()))
@@ -3650,21 +3652,34 @@ impl WalletRpc {
             })?;
             let (amount, repetitions) = match amount_value.as_object() {
                 Some(details) => {
-                    let amount = details.get("amount").ok_or_else(|| {
+                    // RPCTypeCheck of {amount: real, repetitions: int}, nulls
+                    // allowed, in the map's name order (rpcwallet.cpp:1668)
+                    for (name, want) in [("amount", "real"), ("repetitions", "int")] {
+                        let got = details.get(name).map_or("null", json_spirit_type);
+                        if got != want && got != "null" {
+                            return Err(RpcError::new(
+                                codes::TYPE_ERROR,
+                                format!("Expected type {want} for {name}, got {got}"),
+                            )
+                            .into());
+                        }
+                    }
+                    let unparsed = |what: &str| -> Error {
                         RpcError::new(
                             codes::INVALID_PARAMETER,
-                            format!("Unable to parse amount for: {}", addr_str),
+                            format!("Unable to parse {what} for: {addr_str}"),
                         )
-                    })?;
+                        .into()
+                    };
+                    let amount = details
+                        .get("amount")
+                        .filter(|v| !v.is_null())
+                        .ok_or_else(|| unparsed("amount"))?;
                     let repetitions = details
                         .get("repetitions")
-                        .and_then(|r| r.as_i64())
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                codes::INVALID_PARAMETER,
-                                format!("Unable to parse repetitions for: {}", addr_str),
-                            )
-                        })?;
+                        .and_then(crate::protocol::json_spirit_int)
+                        .ok_or_else(|| unparsed("repetitions"))?;
+                    // std::max<int>(repetitions.get_int(), 1) (:1675)
                     (
                         amount_from_value(amount, false)?,
                         repetitions.max(1) as usize,
@@ -4242,7 +4257,8 @@ impl WalletRpc {
                 return Err(invalid("Invalid parameter, expected hex txid"));
             }
             let txid = uint256_set_hex(txid_str);
-            let vout = o["vout"].as_i64().unwrap_or(-1);
+            // get_int() (rpcwallet.cpp:2801)
+            let vout = crate::protocol::json_spirit_int(&o["vout"]).unwrap_or(-1);
             if vout < 0 {
                 return Err(invalid("Invalid parameter, vout must be positive"));
             }

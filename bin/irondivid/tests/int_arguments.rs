@@ -203,3 +203,66 @@ fn raw_transaction_calls_cut_indexes_to_an_int() {
         node.call("createmultisig", json!([1, [pubkey]]))
     );
 }
+
+/// The wallet calls' minconf, count, from and target, lockunspent's vout,
+/// getbalance "*" and sendmany's repeated outputs (rpcwallet.cpp:1576-1584,
+/// :1668-1675, :2276-2279, :2343, :2420-2422, :2801-2803;
+/// rpcrawtransaction.cpp:288-294, :318)
+#[test]
+fn wallet_calls_cut_counts_and_depths_to_an_int() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::mined(dir.path(), 25);
+    let (txid, _, _, address) = node.coin();
+
+    // maxconf -1: no depth is at most -1; minconf 2^32 is 0
+    assert_eq!(node.ok("listunspent", json!([1, -1])), json!([]));
+    assert_eq!(
+        node.call("listunspent", json!([TWO_32])),
+        node.call("listunspent", json!([0]))
+    );
+    let three = node.ok("listtransactions", json!(["*", TWO_32 + 3]));
+    assert_eq!(three.as_array().unwrap().len(), 3, "{three}");
+    assert_eq!(
+        node.call("listtransactions", json!(["*", TWO_31])),
+        Err((-8, "Negative count".to_string()))
+    );
+    let genesis = node.ok("getblockhash", json!([0]));
+    assert_eq!(
+        node.call("listsinceblock", json!([genesis, TWO_32])),
+        Err((-8, "Invalid parameter".to_string()))
+    );
+    assert_eq!(node.call("listaccounts", json!([null])), null_refused());
+    // For "*" divid answers before it reads minconf; for an account it reads it
+    assert_eq!(
+        node.call("getbalance", json!(["*", 1.5])),
+        node.call("getbalance", json!([]))
+    );
+    assert_eq!(node.call("getbalance", json!(["", null])), null_refused());
+    assert_eq!(
+        node.call(
+            "lockunspent",
+            json!([false, [{"txid": txid, "vout": TWO_31}]])
+        ),
+        Err((-8, "Invalid parameter, vout must be positive".to_string()))
+    );
+    // A repeated output's amount must be a real; -2^32 + 2 repetitions is 2
+    assert_eq!(
+        node.call(
+            "sendmany",
+            json!(["", {address.clone(): {"amount": 1, "repetitions": 1}}])
+        ),
+        Err((-3, "Expected type real for amount, got int".to_string()))
+    );
+    let sent = node.ok(
+        "sendmany",
+        json!(["", {address.clone(): {"amount": 1.5, "repetitions": 2 - TWO_32}}]),
+    );
+    let tx = node.ok("getrawtransaction", json!([sent, 1]));
+    let to_address = tx["vout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["scriptPubKey"]["addresses"] == json!([address]))
+        .count();
+    assert_eq!(to_address, 2, "{tx}");
+}
