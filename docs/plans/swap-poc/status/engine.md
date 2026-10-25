@@ -441,3 +441,4 @@
 - changed existing test: `xmr_token_guesses_are_throttled` (`e2e_xmr.rs`) asserted that after the XMR lockout a hashlock read of an unknown id is still 404 (separate budgets). Under ruling 4 it now asserts 429.
 - left: a legacy swap's bucket is keyed by (swap, IP), so with `trust_proxy_headers` off every client behind the proxy is still one address for it. The (swap, IP) limiter has the same 10,000-key cap as the others.
 - decisions: the legacy bucket has the route's size (the same constants as the per-swap one); no limit value, route path, schema or opt-in changed. Nothing pushed or deployed.
+- accepted (Manager, 2026-10-25): the legacy (swap, IP) proxy behaviour as documented. With `trust_proxy_headers` off (the default) every client behind a proxy shares one address in the legacy bucket. Legacy tokenless swaps are off by default, and `trust_proxy_headers` stays false until a deploy decides otherwise.
