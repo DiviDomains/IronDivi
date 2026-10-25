@@ -150,3 +150,20 @@ fn the_chain_check_logs_divid_s_verifying_line() {
         }
     }
 }
+
+/// -checkpoints is only in divid's help (LicenseAndInfo.cpp:165): taken
+/// without a line, as divid takes it
+#[test]
+fn checkpoints_is_taken_without_a_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_node, _) = start(
+        dir.path(),
+        &["-checkpoints=0".into(), "-bogusmarker=1".into()],
+    );
+    // the unknown option's line shows the warnings were written
+    assert!(log_has(dir.path(), "Unknown option -bogusmarker; ignored"));
+    assert!(
+        !debug_log(dir.path()).contains("-checkpoints"),
+        "a line for -checkpoints"
+    );
+}

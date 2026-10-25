@@ -313,13 +313,15 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
-/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205)
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
+/// -checkpoints :165)
 const UNUSED_BY_DIVID: &[&str] = &[
     "sendfreetransactions",
     "txconfirmtarget",
     "disablesystemnotifications",
     "mining",
     "genproclimit",
+    "checkpoints",
 ];
 
 /// Options apply_settings reads
