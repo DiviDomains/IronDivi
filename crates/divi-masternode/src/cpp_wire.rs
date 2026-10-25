@@ -180,7 +180,8 @@ impl CppTxIn {
     pub fn to_cpp_string(&self) -> String {
         let hash = hash_to_string(&self.prevout_hash);
         let null = self.prevout_hash == [0u8; 32] && self.prevout_n == u32::MAX;
-        let mut s = format!("CTxIn(COutPoint({}, {})", &hash[..10], self.prevout_n);
+        // COutPoint::ToString prints the whole hash in Divi Core (OutPoint.cpp:31)
+        let mut s = format!("CTxIn(COutPoint({}, {})", hash, self.prevout_n);
         if null {
             let hex: String = self
                 .script_sig
@@ -228,6 +229,16 @@ impl CppPing {
             sig_time: r.i64_le()?,
             signature: r.varbytes()?,
         })
+    }
+
+    /// Parse a ping (`mnp`); the whole input must be consumed
+    pub fn decode_bytes(data: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader { data, pos: 0 };
+        let ping = Self::decode(&mut r)?;
+        if r.pos != data.len() {
+            return Err(WireError::TrailingData);
+        }
+        Ok(ping)
     }
 
     /// C++ `CMasternodePing::getMessageToSign`: `vin.ToString() + blockHash.ToString() + sigTime`
@@ -474,8 +485,14 @@ mod tests {
             3,
         );
         let msg = String::from_utf8(p.message_to_sign()).unwrap();
+        // Divi Core prints the whole hash (OutPoint.cpp:31, its .substr(0,10)
+        // commented out), so a ping signed or checked over a shortened hash
+        // fails on divid ("Got bad Masternode address signature")
         assert!(
-            msg.starts_with("CTxIn(COutPoint(abcd000000, 3), scriptSig=)"),
+            msg.starts_with(&format!(
+                "CTxIn(COutPoint(abcd{}, 3), scriptSig=)",
+                "0".repeat(60)
+            )),
             "{}",
             msg
         );

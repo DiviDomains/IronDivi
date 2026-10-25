@@ -50,15 +50,17 @@
 
 pub mod auth_cookie;
 pub mod blockchain;
-mod core_help;
+pub mod core_help;
 pub mod error;
 pub mod http;
 pub mod json_spirit_text;
 pub mod lite_wallet;
 pub mod masternode;
 pub mod mn_broadcast;
+pub mod mn_list;
 pub mod network;
 pub mod protocol;
+pub mod rest;
 pub mod server;
 pub mod spork;
 pub mod staking;

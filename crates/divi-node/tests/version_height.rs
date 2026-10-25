@@ -77,3 +77,133 @@ async fn version_names_the_current_height() {
     let v = q.expect("version", WAIT).await.expect("version");
     assert_eq!(start_height(&v), 3, "the height now, not at start");
 }
+
+/// The block locator of a getblocks payload: its first hash (the sender's tip)
+fn locator_tip(p: &[u8]) -> [u8; 32] {
+    // version, then the compact count of hashes (one byte below 253)
+    p[5..37].try_into().unwrap()
+}
+
+/// A version payload without the start height (and relay) fields
+fn version_without_height() -> Vec<u8> {
+    let v = version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/");
+    v[..v.len() - 5].to_vec()
+}
+
+/// Wait (bounded) until the node has one peer whose stats show a start
+/// height, and return it as getpeerinfo would
+async fn starting_height(t: &TestNode) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let peers = t.node.peer_manager().get_peer_details();
+        if let Some((_, _, _, st, _)) = peers.first() {
+            if st.version.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                return Some(serde_json::json!(st
+                    .start_height
+                    .load(std::sync::atomic::Ordering::Relaxed)));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Divi Core's BeginSyncingWithPeer (main.cpp:1130-1142) sends getblocks
+/// from its tip to a full-node peer when the handshake is done, whatever height
+/// the peer named: a peer that names 0 still gets asked
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_peer_naming_a_lower_height_is_asked_for_blocks() {
+    let t = TestNode::start().await;
+    for _ in 0..3 {
+        mine(&t);
+    }
+    let tip = t.node.chain().tip().unwrap().hash;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.handshake().await;
+    let getblocks = p
+        .expect("getblocks", WAIT)
+        .await
+        .expect("getblocks after the handshake");
+    assert_eq!(
+        &locator_tip(&getblocks),
+        tip.as_bytes(),
+        "from the node's tip"
+    );
+}
+
+/// A fresh -connect node asks the peer it dials for blocks at once, though
+/// the peer names height 0 and announces no new block
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_node_asks_its_peer_for_blocks_without_a_new_block() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _t = TestNode::start_with(|c| {
+        c.p2p.connect = vec![format!("127.0.0.1:{port}")];
+    })
+    .await;
+    let (stream, addr) = tokio::time::timeout(WAIT, listener.accept())
+        .await
+        .expect("node dials in time")
+        .unwrap();
+    let mut seed = RawPeer {
+        stream,
+        ip: addr.ip(),
+    };
+    assert!(seed.expect("version", WAIT).await.is_some(), "node version");
+    seed.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    seed.send("verack", &[]).await;
+    assert!(
+        seed.expect("getblocks", WAIT).await.is_some(),
+        "getblocks to the -connect peer"
+    );
+}
+
+/// getpeerinfo startingheight is the height the peer named, -1 when its
+/// version names none (Divi Core nStartingHeight(-1), Node.cpp:561;
+/// rpcnet.cpp:135)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startingheight_is_minus_one_when_the_peer_names_none() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send("version", &version_without_height()).await;
+    assert!(p.expect("version", WAIT).await.is_some(), "node version");
+    p.send("verack", &[]).await;
+    assert_eq!(starting_height(&t).await, Some(serde_json::json!(-1)));
+}
+
+/// Two nodes: the fresh one dials one at height 3; each shows the other's
+/// start height as divid does (3 and 0), and the fresh one syncs the three
+/// blocks with no new block announced
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_node_syncs_from_its_connect_peer_and_both_show_start_heights() {
+    let a = TestNode::start().await;
+    for _ in 0..3 {
+        mine(&a);
+    }
+    let port = a.port;
+    let b = TestNode::start_with(|c| {
+        c.p2p.connect = vec![format!("127.0.0.1:{port}")];
+    })
+    .await;
+    assert_eq!(
+        starting_height(&b).await,
+        Some(serde_json::json!(3)),
+        "b sees a's height"
+    );
+    assert_eq!(
+        starting_height(&a).await,
+        Some(serde_json::json!(0)),
+        "a sees b's height"
+    );
+    let deadline = tokio::time::Instant::now() + WAIT * 3;
+    while b.node.chain().height() < 3 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(b.node.chain().height(), 3);
+}

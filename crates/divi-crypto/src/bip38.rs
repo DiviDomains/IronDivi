@@ -15,6 +15,11 @@
 //! This provides secure paper wallet storage with password protection.
 //!
 //! Specification: https://github.com/bitcoin/bips/blob/master/bip-0038.mediawiki
+//!
+//! The address hash is the double SHA-256 of the key's P2PKH address on the
+//! network the key is used on (`pubkey_version`), as in the specification and
+//! in Divi Core (bip38.cpp AddressToBip38Hash), so keys encrypted by divid's
+//! bip38paperwallet decrypt here and the other way round.
 
 use crate::error::CryptoError;
 use crate::hash::{double_sha256, hash160};
@@ -22,7 +27,6 @@ use crate::keys::{PublicKey, SecretKey};
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes256;
 use scrypt::{scrypt, Params as ScryptParams};
-use sha2::{Digest, Sha256};
 
 /// BIP38 magic bytes for non-EC-multiply encrypted keys
 const BIP38_MAGIC_NON_EC: [u8; 2] = [0x01, 0x42];
@@ -39,6 +43,7 @@ const BIP38_FLAG_UNCOMPRESSED: u8 = 0xC0;
 /// * `private_key` - 32-byte private key
 /// * `passphrase` - User-provided passphrase for encryption
 /// * `compressed` - Whether the corresponding public key should be compressed
+/// * `pubkey_version` - The P2PKH address version byte of the network
 ///
 /// # Returns
 /// Base58Check-encoded encrypted private key starting with "6P"
@@ -46,6 +51,7 @@ pub fn encrypt(
     private_key: &[u8; 32],
     passphrase: &str,
     compressed: bool,
+    pubkey_version: u8,
 ) -> Result<String, CryptoError> {
     // 1. Compute the public key and its address
     let secret = SecretKey::from_bytes(private_key)?;
@@ -53,10 +59,10 @@ pub fn encrypt(
 
     // Compute the Divi address from the public key
     // This uses the standard P2PKH address format
-    let address = compute_address(&pubkey, compressed);
+    let address = compute_address(&pubkey, compressed, pubkey_version);
 
-    // 2. Take SHA256 hash of the address string to get addresshash
-    let address_hash = Sha256::digest(address.as_bytes());
+    // 2. addresshash: the first 4 bytes of SHA256(SHA256(address))
+    let address_hash = double_sha256(address.as_bytes());
     let address_hash_prefix = &address_hash[0..4];
 
     // 3. Derive key material using scrypt
@@ -122,10 +128,16 @@ pub fn encrypt(
 /// # Arguments
 /// * `encrypted` - Base58Check-encoded encrypted key (starts with "6P")
 /// * `passphrase` - User-provided passphrase for decryption
+/// * `pubkey_version` - The P2PKH address version byte of the network, for the
+///   address hash check
 ///
 /// # Returns
 /// Tuple of (private_key, compressed) where compressed indicates key format
-pub fn decrypt(encrypted: &str, passphrase: &str) -> Result<([u8; 32], bool), CryptoError> {
+pub fn decrypt(
+    encrypted: &str,
+    passphrase: &str,
+    pubkey_version: u8,
+) -> Result<([u8; 32], bool), CryptoError> {
     // 1. Base58Check decode
     let data = bs58::decode(encrypted)
         .into_vec()
@@ -198,9 +210,9 @@ pub fn decrypt(encrypted: &str, passphrase: &str) -> Result<([u8; 32], bool), Cr
     // 8. Verify the decryption was successful by checking address hash
     let secret = SecretKey::from_bytes(&private_key)?;
     let pubkey = secret.public_key();
-    let address = compute_address(&pubkey, compressed);
+    let address = compute_address(&pubkey, compressed, pubkey_version);
 
-    let verification_hash = Sha256::digest(address.as_bytes());
+    let verification_hash = double_sha256(address.as_bytes());
     if verification_hash[0..4] != address_hash[0..4] {
         return Err(CryptoError::Custom(
             "Incorrect passphrase or corrupted data".into(),
@@ -210,11 +222,9 @@ pub fn decrypt(encrypted: &str, passphrase: &str) -> Result<([u8; 32], bool), Cr
     Ok((private_key, compressed))
 }
 
-/// Compute the Divi address string from a public key
-///
-/// This is used for BIP38's address hash verification.
-/// Uses Divi mainnet P2PKH address format.
-fn compute_address(pubkey: &PublicKey, compressed: bool) -> String {
+/// The P2PKH address string of a public key for the network whose address
+/// version byte is `pubkey_version`, as BIP38's address hash takes it
+fn compute_address(pubkey: &PublicKey, compressed: bool, pubkey_version: u8) -> String {
     // Get the appropriate public key format
     let pubkey_bytes = if compressed {
         pubkey.serialize_compressed().to_vec()
@@ -226,10 +236,7 @@ fn compute_address(pubkey: &PublicKey, compressed: bool) -> String {
     let pubkey_hash = hash160(&pubkey_bytes);
 
     // Build address: version_byte + hash160 + checksum
-    // Divi mainnet P2PKH version byte is 30 (produces addresses starting with 'D')
-    const DIVI_PUBKEY_VERSION: u8 = 30;
-
-    let mut addr_data = vec![DIVI_PUBKEY_VERSION];
+    let mut addr_data = vec![pubkey_version];
     addr_data.extend_from_slice(pubkey_hash.as_bytes());
 
     let checksum = double_sha256(&addr_data);
@@ -242,6 +249,9 @@ fn compute_address(pubkey: &PublicKey, compressed: bool) -> String {
 mod tests {
     use super::*;
 
+    /// Divi mainnet's P2PKH address version
+    const D: u8 = 30;
+
     #[test]
     fn test_bip38_roundtrip_compressed() {
         // Test with a known private key
@@ -253,11 +263,11 @@ mod tests {
         let passphrase = "test passphrase";
 
         // Encrypt
-        let encrypted = encrypt(&private_key, passphrase, true).unwrap();
+        let encrypted = encrypt(&private_key, passphrase, true, D).unwrap();
         assert!(encrypted.starts_with("6P"));
 
         // Decrypt
-        let (decrypted, compressed) = decrypt(&encrypted, passphrase).unwrap();
+        let (decrypted, compressed) = decrypt(&encrypted, passphrase, D).unwrap();
 
         assert_eq!(private_key, decrypted);
         assert!(compressed);
@@ -272,10 +282,10 @@ mod tests {
         ];
         let passphrase = "another test";
 
-        let encrypted = encrypt(&private_key, passphrase, false).unwrap();
+        let encrypted = encrypt(&private_key, passphrase, false, D).unwrap();
         assert!(encrypted.starts_with("6P"));
 
-        let (decrypted, compressed) = decrypt(&encrypted, passphrase).unwrap();
+        let (decrypted, compressed) = decrypt(&encrypted, passphrase, D).unwrap();
 
         assert_eq!(private_key, decrypted);
         assert!(!compressed);
@@ -286,70 +296,79 @@ mod tests {
         let private_key = [0x42; 32];
         let passphrase = "correct passphrase";
 
-        let encrypted = encrypt(&private_key, passphrase, true).unwrap();
+        let encrypted = encrypt(&private_key, passphrase, true, D).unwrap();
 
         // Try to decrypt with wrong passphrase
-        let result = decrypt(&encrypted, "wrong passphrase");
+        let result = decrypt(&encrypted, "wrong passphrase", D);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_bip38_invalid_format() {
         // Test with invalid base58
-        let result = decrypt("invalid", "passphrase");
+        let result = decrypt("invalid", "passphrase", D);
         assert!(result.is_err());
 
         // Test with wrong length
-        let result = decrypt("6PRV", "passphrase");
+        let result = decrypt("6PRV", "passphrase", D);
         assert!(result.is_err());
     }
 
-    // BIP38 test vector 1: No compression, no EC multiply
+    /// The test vectors of the BIP38 specification without EC multiply
+    /// (Bitcoin addresses, version 0): the exact ciphertexts, and back
     #[test]
-    fn test_bip38_vector_1() {
-        // Test vector from BIP38
-        // Private key: 5KN7MzqK5wt2TP1fQCYyHBtDrXdJuXbUzm4A9rKAteGu3Qi5CVR (uncompressed WIF)
-        // Passphrase: "TestingOneTwoThree"
-        // Expected: 6PRVWUbkzzsbcVac2qwfssoUJAN1Xhrg6bNk8J7Nzm5H7kxEbn2Nh2ZoGg
-
-        // This is the private key from the WIF (decoded)
-        let private_key =
-            hex::decode("CBF4B9F70470856BB4F40F80B87EDB90865997FFEE6DF315AB166D713AF433A5")
-                .unwrap();
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&private_key);
-
-        let passphrase = "TestingOneTwoThree";
-
-        let encrypted = encrypt(&key_bytes, passphrase, false).unwrap();
-
-        // The exact encrypted value depends on the address format
-        // We verify round-trip instead
-        let (decrypted, compressed) = decrypt(&encrypted, passphrase).unwrap();
-        assert_eq!(key_bytes, decrypted);
-        assert!(!compressed);
+    fn bip38_specification_vectors() {
+        let cbf4 = "CBF4B9F70470856BB4F40F80B87EDB90865997FFEE6DF315AB166D713AF433A5";
+        let c268 = "09C2686880095B1A4C249EE3AC4EEA8A014F11E6F986D0B5025AC1F39AFBD9AE";
+        for (key, passphrase, compressed, expected) in [
+            (
+                cbf4,
+                "TestingOneTwoThree",
+                false,
+                "6PRVWUbkzzsbcVac2qwfssoUJAN1Xhrg6bNk8J7Nzm5H7kxEbn2Nh2ZoGg",
+            ),
+            (
+                c268,
+                "Satoshi",
+                false,
+                "6PRNFFkZc2NZ6dJqFfhRoFNMR9Lnyj7dYGrzdgXXVMXcxoKTePPX1dWByq",
+            ),
+            (
+                cbf4,
+                "TestingOneTwoThree",
+                true,
+                "6PYNKZ1EAgYgmQfmNVamxyXVWHzK5s6DGhwP4J5o44cvXdoY7sRzhtpUeo",
+            ),
+            (
+                c268,
+                "Satoshi",
+                true,
+                "6PYLtMnXvfG3oJde97zRyLYFZCYizPU5T3LwgdYJz1fRhh16bU7u6PPmY7",
+            ),
+        ] {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&hex::decode(key).unwrap());
+            assert_eq!(
+                encrypt(&bytes, passphrase, compressed, 0).unwrap(),
+                expected,
+                "{passphrase} {compressed}"
+            );
+            assert_eq!(
+                decrypt(expected, passphrase, 0).unwrap(),
+                (bytes, compressed),
+                "{passphrase} {compressed}"
+            );
+        }
     }
 
-    // BIP38 test vector 2: Compression, no EC multiply
+    /// The address hash belongs to the network: a key encrypted for one does not
+    /// pass the check on another
     #[test]
-    fn test_bip38_vector_2() {
-        // Private key: L44B5gGEpqEDRS9vVPz7QT35jcBG2r3CZwSwQ4fCewXAhAhqGVpP (compressed WIF)
-        // Passphrase: "Satoshi"
-        // Expected: 6PYNKZ1EAgYgmQfmNVamxyXVWHzK5s6DGhwP4J5o44cvXdoY7sRzhtpUeo
-
-        let private_key =
-            hex::decode("09C2686880095B1A4C249EE3AC4EEA8A014F11E6F986D0B5025AC1F39AFBD9AE")
-                .unwrap();
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&private_key);
-
-        let passphrase = "Satoshi";
-
-        let encrypted = encrypt(&key_bytes, passphrase, true).unwrap();
-
-        let (decrypted, compressed) = decrypt(&encrypted, passphrase).unwrap();
-        assert_eq!(key_bytes, decrypted);
-        assert!(compressed);
+    fn address_hash_is_the_networks() {
+        let key = [0x42u8; 32];
+        let regtest = encrypt(&key, "pw", true, 139).unwrap();
+        assert_eq!(decrypt(&regtest, "pw", 139).unwrap(), (key, true));
+        assert!(decrypt(&regtest, "pw", D).is_err());
     }
 
     // --- Empty passphrase ---
@@ -360,13 +379,13 @@ mod tests {
         let private_key = [0x11u8; 32];
         let passphrase = "";
 
-        let encrypted = encrypt(&private_key, passphrase, true).unwrap();
+        let encrypted = encrypt(&private_key, passphrase, true, D).unwrap();
         assert!(
             encrypted.starts_with("6P"),
             "BIP38 ciphertext must start with '6P'"
         );
 
-        let (decrypted, compressed) = decrypt(&encrypted, passphrase).unwrap();
+        let (decrypted, compressed) = decrypt(&encrypted, passphrase, D).unwrap();
         assert_eq!(private_key, decrypted);
         assert!(compressed);
     }
@@ -376,8 +395,8 @@ mod tests {
         let private_key = [0x22u8; 32];
         let passphrase = "";
 
-        let encrypted = encrypt(&private_key, passphrase, false).unwrap();
-        let (decrypted, compressed) = decrypt(&encrypted, passphrase).unwrap();
+        let encrypted = encrypt(&private_key, passphrase, false, D).unwrap();
+        let (decrypted, compressed) = decrypt(&encrypted, passphrase, D).unwrap();
         assert_eq!(private_key, decrypted);
         assert!(!compressed);
     }
@@ -386,8 +405,8 @@ mod tests {
     fn test_bip38_empty_passphrase_wrong_passphrase_rejected() {
         // Encrypting with empty passphrase and decrypting with non-empty must fail
         let private_key = [0x33u8; 32];
-        let encrypted = encrypt(&private_key, "", true).unwrap();
-        let result = decrypt(&encrypted, "notEmpty");
+        let encrypted = encrypt(&private_key, "", true, D).unwrap();
+        let result = decrypt(&encrypted, "notEmpty", D);
         assert!(result.is_err());
     }
 
@@ -397,8 +416,8 @@ mod tests {
     fn test_bip38_output_prefix() {
         // BIP38 spec requires Base58Check output to start with "6P"
         let key = [0x55u8; 32];
-        assert!(encrypt(&key, "abc", true).unwrap().starts_with("6P"));
-        assert!(encrypt(&key, "abc", false).unwrap().starts_with("6P"));
+        assert!(encrypt(&key, "abc", true, D).unwrap().starts_with("6P"));
+        assert!(encrypt(&key, "abc", false, D).unwrap().starts_with("6P"));
     }
 
     // --- Different passphrases produce different ciphertexts ---
@@ -406,8 +425,8 @@ mod tests {
     #[test]
     fn test_bip38_different_passphrases_different_ciphertext() {
         let key = [0x77u8; 32];
-        let enc1 = encrypt(&key, "passA", true).unwrap();
-        let enc2 = encrypt(&key, "passB", true).unwrap();
+        let enc1 = encrypt(&key, "passA", true, D).unwrap();
+        let enc2 = encrypt(&key, "passB", true, D).unwrap();
         assert_ne!(enc1, enc2);
     }
 }

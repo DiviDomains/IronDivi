@@ -330,9 +330,15 @@ pub struct WalletDb {
     /// Divi Core's -vault: addvault and removevault change the wallet only
     /// when it is on (wallet.cpp:152, :693-716)
     vault_mode: std::sync::atomic::AtomicBool,
+    /// Divi Core's -spendzeroconfchange: a send may also use unconfirmed
+    /// outputs of our own transactions (wallet.cpp:1848)
+    spend_zero_conf_change: std::sync::atomic::AtomicBool,
     /// The relay fee rate the wallet pays, satoshis per 1000 bytes (Divi
     /// Core's -minrelaytxfee, which its wallet follows: rpcwallet.cpp:470-473)
     relay_fee_per_kb: std::sync::atomic::AtomicI64,
+    /// The highest fee a send may pay, satoshis (Divi Core's -maxtxfee:
+    /// MinimumFeeCoinSelectionAlgorithm.cpp:97, wallet.cpp:1559-1562)
+    max_tx_fee: std::sync::atomic::AtomicI64,
     /// The position each transaction was first seen at, and the next one
     /// (Divi Core's nOrderPos, the order listtransactions follows)
     tx_order: RwLock<(HashMap<Hash256, u64>, u64)>,
@@ -390,7 +396,9 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         }
@@ -426,7 +434,9 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         }
@@ -466,7 +476,9 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         };
@@ -769,7 +781,9 @@ impl WalletDb {
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
             vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
             tx_notes: RwLock::new(HashMap::new()),
         };
@@ -1969,16 +1983,24 @@ impl WalletDb {
     /// Coins a send may use, as Divi Core's `AvailableCoins` gives them to a
     /// send: confirmed (at least `min_confirmations`, never fewer than one),
     /// mature, unspent and not locked by `lockunspent`. Our own unconfirmed
-    /// change is not spent: Core spends it only with `-spendzeroconfchange`,
-    /// which is off by default (wallet.cpp:1843, AvailableUtxoCollector.cpp:33-43).
-    /// The send's coin selection orders them.
+    /// outputs are added only with `-spendzeroconfchange`, which is off by
+    /// default: those of wallet transactions whose inputs are all ours
+    /// (wallet.cpp:1848, AvailableUtxoCollector.cpp:33-43,
+    /// AvailableUtxoCalculator.cpp:84-85). The send's coin selection orders them.
     pub fn get_send_candidates(
         &self,
         current_height: u32,
         min_confirmations: u32,
     ) -> Vec<WalletUtxo> {
-        self.get_spendable_utxos(current_height, min_confirmations.max(1))
+        let zero_conf = self
+            .spend_zero_conf_change
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.get_spendable_utxos(current_height, 0)
             .into_iter()
+            .filter(|utxo| {
+                let confirmations = utxo.confirmations(current_height);
+                confirmations >= min_confirmations.max(1) || (zero_conf && confirmations == 0)
+            })
             .filter(|utxo| !self.is_coin_locked(&utxo.outpoint()))
             .collect()
     }
@@ -2809,15 +2831,16 @@ impl WalletDb {
                 None
             };
 
-            // Use block time for accurate transaction timestamps.
-            // During IBD scan, this preserves the actual block time rather than
-            // giving all historical transactions the same scan-time timestamp.
-            let timestamp = block_time.map(|t| t as u64).unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            });
+            // The block time, so a scan of old blocks keeps each transaction's
+            // own time, but never later than now: Divi Core's time of a wallet
+            // transaction is at most when the wallet received it (nTimeSmart,
+            // wallet.cpp:1052-1086), so one in a block dated ahead of the clock
+            // counts from its arrival
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let timestamp = block_time.map_or(now, |t| u64::from(t).min(now));
 
             let wallet_tx = WalletTx {
                 txid,
@@ -3574,19 +3597,32 @@ impl WalletDb {
             .store(per_kb, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the highest fee the wallet's sends may pay (-maxtxfee)
+    pub fn set_max_tx_fee(&self, sat: i64) {
+        self.max_tx_fee
+            .store(sat, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Fee rate and limit of the wallet's sends
     pub fn fee_policy(&self) -> crate::send::FeePolicy {
         crate::send::FeePolicy {
             per_kb: self
                 .relay_fee_per_kb
                 .load(std::sync::atomic::Ordering::Relaxed),
-            ..Default::default()
+            max_fee: Amount::from_sat(self.max_tx_fee.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }
 
     /// Turn Divi Core's -vault on or off
     pub fn set_vault_mode(&self, on: bool) {
         self.vault_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Let sends use unconfirmed outputs of our own transactions (Divi
+    /// Core's -spendzeroconfchange, off by default)
+    pub fn set_spend_zero_conf_change(&self, on: bool) {
+        self.spend_zero_conf_change
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3966,6 +4002,57 @@ mod tests {
     fn create_test_wallet() -> WalletDb {
         let wallet = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
         WalletDb::with_hd_wallet(Network::Mainnet, wallet)
+    }
+
+    /// Divi Core's time of a wallet transaction is at most when the wallet
+    /// received it (nTimeSmart, wallet.cpp:1052-1086): a block dated ahead of
+    /// the clock does not date its transactions in the future; an older block
+    /// keeps its own time
+    #[test]
+    fn transaction_time_is_never_ahead_of_its_arrival() {
+        use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        let wallet = create_test_wallet();
+        let ours = wallet.new_receiving_address().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let paying = |tag: u8| Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    txid: Hash256::from_bytes([tag; 32]),
+                    vout: 0,
+                },
+                script_sig: Script::default(),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: Script::new_p2pkh(ours.hash.as_bytes()),
+            }],
+            lock_time: 0,
+        };
+        let ahead = paying(7);
+        wallet.scan_transaction(
+            &ahead,
+            Some(Hash256::from_bytes([8; 32])),
+            Some(10),
+            Some((now + 3600) as u32),
+        );
+        let time = wallet.get_transaction(&ahead.txid()).unwrap().timestamp;
+        assert!(time <= now + 1, "{time} is ahead of {now}");
+        let old = paying(9);
+        wallet.scan_transaction(
+            &old,
+            Some(Hash256::from_bytes([10; 32])),
+            Some(11),
+            Some(1_000_000),
+        );
+        assert_eq!(
+            wallet.get_transaction(&old.txid()).unwrap().timestamp,
+            1_000_000
+        );
     }
 
     #[test]

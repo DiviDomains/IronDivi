@@ -37,7 +37,7 @@ use divi_wallet::{
 };
 use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -226,6 +226,92 @@ fn amount_from_value(value: &serde_json::Value, allow_zero: bool) -> Result<Amou
     Ok(amount)
 }
 
+/// The addresses a script pays and the signatures it needs, as Divi Core's
+/// ExtractDestinations (standard.cpp) gives them for decodescript and
+/// validateaddress: none for a script that is not standard
+fn script_destinations(
+    script_type: divi_script::ScriptType,
+    solutions: &[Vec<u8>],
+    network: Network,
+) -> (Vec<String>, Option<usize>) {
+    let mut addresses: Vec<String> = Vec::new();
+    let mut req_sigs: Option<usize> = None;
+
+    match script_type {
+        divi_script::ScriptType::PubKeyHash => {
+            if solutions.len() == 1 && solutions[0].len() == 20 {
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(&solutions[0]);
+                let addr = Address::from_pubkey_hash(Hash160(hash), network);
+                addresses.push(addr.to_string());
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::ScriptHash => {
+            if solutions.len() == 1 && solutions[0].len() == 20 {
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(&solutions[0]);
+                let addr = Address::p2sh(Hash160(hash), network);
+                addresses.push(addr.to_string());
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::PubKey => {
+            // P2PK: compute hash160 of pubkey to get address
+            if solutions.len() == 1 && (solutions[0].len() == 33 || solutions[0].len() == 65) {
+                let hash = divi_crypto::hash160(&solutions[0]);
+                let addr = Address::from_pubkey_hash(hash, network);
+                addresses.push(addr.to_string());
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::Multisig => {
+            // Multisig: first solution is m, last is n, middle are pubkeys
+            if solutions.len() >= 3 {
+                let m = solutions[0].first().copied().unwrap_or(0) as usize;
+                let _n = solutions
+                    .last()
+                    .and_then(|s| s.first().copied())
+                    .unwrap_or(0) as usize;
+                req_sigs = Some(m);
+
+                // Skip first (m) and last (n) elements
+                for pubkey in &solutions[1..solutions.len() - 1] {
+                    if pubkey.len() == 33 || pubkey.len() == 65 {
+                        let hash = divi_crypto::hash160(pubkey);
+                        let addr = Address::from_pubkey_hash(hash, network);
+                        addresses.push(addr.to_string());
+                    }
+                }
+            }
+        }
+        divi_script::ScriptType::Vault => {
+            // Vault scripts have owner and vault hashes
+            if solutions.len() == 2 {
+                // First is owner hash, second is vault hash
+                for sol in solutions.iter() {
+                    if sol.len() == 20 {
+                        let mut hash = [0u8; 20];
+                        hash.copy_from_slice(sol);
+                        let addr = Address::from_pubkey_hash(Hash160(hash), network);
+                        addresses.push(addr.to_string());
+                    }
+                }
+                req_sigs = Some(1);
+            }
+        }
+        divi_script::ScriptType::NullData => {
+            // OP_RETURN data scripts have no addresses
+            req_sigs = Some(0);
+        }
+        _ => {
+            // NonStandard, HTLC, etc. - no addresses extracted
+        }
+    }
+
+    (addresses, req_sigs)
+}
+
 /// The type name json_spirit gives a value in its "value is type X, expected Y"
 /// errors (json_spirit_value.h Value_type_name)
 pub(crate) fn json_spirit_type(value: &serde_json::Value) -> &'static str {
@@ -237,6 +323,44 @@ pub(crate) fn json_spirit_type(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Number(n) if n.is_f64() => "real",
         serde_json::Value::Number(_) => "int",
         serde_json::Value::Null => "null",
+    }
+}
+
+/// json_spirit's typed reads of positional argument `index` (json_spirit_value.h
+/// get_str, get_bool, get_int): the value as that type, else -1 "value is type
+/// <type>, expected <wanted>"
+fn spirit_type_error(value: Option<&serde_json::Value>, wanted: &str) -> Error {
+    RpcError::new(
+        codes::MISC_ERROR,
+        format!(
+            "value is type {}, expected {wanted}",
+            value.map_or("null", json_spirit_type)
+        ),
+    )
+    .into()
+}
+
+pub(crate) fn spirit_str(params: &Params, index: usize) -> Result<&str, Error> {
+    match params.get(index) {
+        Some(serde_json::Value::String(s)) => Ok(s),
+        other => Err(spirit_type_error(other, "str")),
+    }
+}
+
+pub(crate) fn spirit_bool(params: &Params, index: usize) -> Result<bool, Error> {
+    match params.get(index) {
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        other => Err(spirit_type_error(other, "bool")),
+    }
+}
+
+/// get_int: a JSON integer, taken as a C++ int
+pub(crate) fn spirit_int(params: &Params, index: usize) -> Result<i32, Error> {
+    match params.get(index) {
+        Some(serde_json::Value::Number(n)) if !n.is_f64() => {
+            Ok(n.as_i64().unwrap_or(i64::MAX) as i32)
+        }
+        other => Err(spirit_type_error(other, "int")),
     }
 }
 
@@ -293,6 +417,22 @@ pub(crate) fn script_pubkey_to_json(
         script_obj["addresses"] = json!(addresses);
     }
     script_obj
+}
+
+/// Where `address` comes in Divi Core's address book, a std::map keyed by
+/// CTxDestination: key hashes before script hashes (the variant's order), each
+/// by its uint160, which compares as a number stored from the last byte up
+/// (uint256.cpp:139-148)
+fn address_book_key(address: &str) -> (u8, Vec<u8>, String) {
+    match Address::from_base58(address) {
+        Ok(a) => {
+            let rank = u8::from(a.addr_type == divi_wallet::AddressType::P2SH);
+            let mut hash = a.hash.as_bytes().to_vec();
+            hash.reverse();
+            (rank, hash, String::new())
+        }
+        Err(_) => (2, Vec::new(), address.to_string()),
+    }
 }
 
 /// Divi Core's ParseHexV (rpcserver.cpp): a non-empty, even-length hex string,
@@ -353,6 +493,25 @@ pub(crate) fn parse_hash_v(
     }
     let digits = &text[text.len().saturating_sub(64)..];
     Ok(Hash256::from_hex(&format!("{digits:0>64}")).expect("64 hex digits"))
+}
+
+/// uint256::SetHex as Divi Core reads a hash from text (uint256.cpp:186-212):
+/// leading white space and a "0x" are skipped, then the hex digits up to the
+/// first other character are a number, of which the last 64 digits count (a
+/// shorter number has leading zeros). Text with no digits is the zero hash.
+pub(crate) fn uint256_set_hex(text: &str) -> Hash256 {
+    // C's isspace: space, \t, \n, \v, \f, \r
+    let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    let end = text
+        .bytes()
+        .position(|b| !b.is_ascii_hexdigit())
+        .unwrap_or(text.len());
+    let digits = &text[end.saturating_sub(64)..end];
+    Hash256::from_hex(&format!("{digits:0>64}")).expect("64 hex digits")
 }
 
 /// Decoded transaction as `getrawtransaction <txid> 1` shows it (without the block fields),
@@ -620,25 +779,6 @@ pub fn sync_wallet_with_chain(wallet: &WalletDb, chain: &Chain) -> Vec<u32> {
 }
 
 impl WalletRpc {
-    /// Amount received per address over all outputs the wallet received at
-    /// `min_conf` or more, spent or not, with the fewest confirmations among
-    /// them. Coinbase outputs are left out, as in Core's received-by RPCs.
-    fn received_by_address(&self, wallet: &WalletDb, min_conf: u32) -> HashMap<String, (i64, u32)> {
-        let height = self.current_height();
-        let mut by_addr: HashMap<String, (i64, u32)> = HashMap::new();
-        for output in wallet.received_outputs() {
-            let confs = output.confirmations(height);
-            // A bare multisig output has no address to tally under
-            if output.is_coinbase || confs < min_conf || output.address.is_empty() {
-                continue;
-            }
-            let entry = by_addr.entry(output.address).or_insert((0, u32::MAX));
-            entry.0 += output.value.as_sat();
-            entry.1 = entry.1.min(confs);
-        }
-        by_addr
-    }
-
     /// Bring the wallet up to the active chain after the chain moved without
     /// a block notification (invalidateblock, reconsiderblock)
     pub fn sync_with_chain(&self) {
@@ -818,8 +958,10 @@ impl WalletRpc {
         Ok(serde_json::json!(address.to_string()))
     }
 
-    /// getrawchangeaddress - Generate a new change address
-    pub fn get_raw_change_address(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    /// getrawchangeaddress - Generate a new change address; at most one
+    /// argument, which divid does not read (rpcwallet.cpp:558-578)
+    pub fn get_raw_change_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        crate::core_help::check_arguments("getrawchangeaddress", params, (0, 1), 0)?;
         let wallet = self.get_wallet()?;
 
         let address = wallet.new_change_address().map_err(new_key_error)?;
@@ -864,9 +1006,36 @@ impl WalletRpc {
                     result["isscript"] =
                         serde_json::json!(addr.addr_type == divi_wallet::AddressType::P2SH);
                 }
+                // A script address of the wallet: its redeem script as far as the
+                // wallet has it (empty when only the address is watched), the
+                // script's type, the addresses it pays and, for a multisig, how
+                // many sign (DescribeAddressVisitor, rpcmisc.cpp:249-270)
+                if let (true, true, Some(wallet)) = (
+                    known,
+                    addr.addr_type == divi_wallet::AddressType::P2SH,
+                    wallet_guard.as_ref(),
+                ) {
+                    let subscript = wallet
+                        .get_script(&addr.hash)
+                        .map(|s| s.as_bytes().to_vec())
+                        .unwrap_or_default();
+                    let (kind, solutions) = divi_script::extract_script_type(&subscript);
+                    let (addresses, req_sigs) =
+                        script_destinations(kind, &solutions, wallet.network());
+                    result["script"] = serde_json::json!(divi_script::get_script_type_name(kind));
+                    result["hex"] = serde_json::json!(hex::encode(&subscript));
+                    result["addresses"] = serde_json::json!(addresses);
+                    if kind == divi_script::ScriptType::Multisig {
+                        result["sigsrequired"] = serde_json::json!(req_sigs.unwrap_or(0));
+                    }
+                }
 
+                // Only an address of the address book has an account
+                // (rpcmisc.cpp:363); a change key has none
                 if let (true, Some(wallet)) = (known, wallet_guard.as_ref()) {
-                    result["account"] = serde_json::json!(wallet.get_account(&addr));
+                    if wallet.in_address_book(&addr) {
+                        result["account"] = serde_json::json!(wallet.get_account(&addr));
+                    }
                 }
                 if is_mine {
                     if let Some(wallet) = wallet_guard.as_ref() {
@@ -1330,17 +1499,15 @@ impl WalletRpc {
     pub fn dump_privkey(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_wallet::address::{encode_wif, Network};
 
-        let addr_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Address required"))?;
+        // As Divi Core: the wallet must be unlocked before the address is read
+        // (rpcdump.cpp:184-186)
+        let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
 
+        let addr_str = spirit_str(params, 0)?;
         let addr = self
             .decode_address(addr_str)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
-
-        let wallet = self.get_wallet()?;
-
-        ensure_fully_unlocked(&wallet)?;
 
         // rpcdump.cpp:186-193: a script address is -3, an unknown key -4
         if addr.addr_type == divi_wallet::address::AddressType::P2SH {
@@ -1373,18 +1540,22 @@ impl WalletRpc {
     }
 
     pub fn import_privkey(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let wif = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Private key required"))?;
-
-        // Optional label parameter
-        let label = params.get_str(1).map(|s| s.to_string());
-
-        let rescan = params.get_bool(2).unwrap_or(true);
-
+        // As Divi Core: the wallet must be unlocked before the arguments are
+        // read, each as json_spirit reads it (rpcdump.cpp:59-70)
         let wallet = self.get_wallet()?;
-
         ensure_fully_unlocked(&wallet)?;
+
+        let wif = spirit_str(params, 0)?;
+        let label = if params.len() > 1 {
+            Some(spirit_str(params, 1)?.to_string())
+        } else {
+            None
+        };
+        let rescan = if params.len() > 2 {
+            spirit_bool(params, 2)?
+        } else {
+            true
+        };
 
         // Decode the WIF private key
         // rpcdump.cpp:70-73
@@ -2103,26 +2274,32 @@ impl WalletRpc {
         &self,
         params: &Params,
     ) -> Result<serde_json::Value, Error> {
-        use divi_script::SigHashType;
-        if params.len() != 3 {
+        // Divi Core reads params[0..2] with no count check
+        // (rpcrawtransaction.cpp:566-572): more are ignored; fewer read past
+        // the list there, and are refused here
+        if params.len() < 3 {
             return Err(RpcError::new(
                 codes::MISC_ERROR,
                 "signtransactionwithaddresskey \"hexstring\" \"address\" inputindex",
             )
             .into());
         }
-        let hex_str = params.get_str(0).ok_or_else(|| {
-            RpcError::new(codes::INVALID_PARAMETER, "Invalid parameter, expected hex")
-        })?;
+        // ParseHexV (JsonParseHelpers.cpp:20-26): a non-empty even-length hex
+        // string; another type is read as ""
+        let hex_str = params.get_str(0).unwrap_or("");
+        let not_hex = || {
+            RpcError::new(
+                codes::INVALID_PARAMETER,
+                format!("Transaction hex data must be hexadecimal string (not '{hex_str}')"),
+            )
+        };
+        if hex_str.is_empty() {
+            return Err(not_hex().into());
+        }
+        let tx_bytes = hex::decode(hex_str).map_err(|_| not_hex())?;
         let input_index = params
             .get_i64(2)
             .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected type int for inputindex"))?;
-        let tx_bytes = hex::decode(hex_str).map_err(|_| {
-            RpcError::new(
-                codes::INVALID_PARAMETER,
-                "Transaction hex data must be hexadecimal",
-            )
-        })?;
         let mut tx: Transaction = deserialize(&tx_bytes)
             .map_err(|_| RpcError::new(codes::DESERIALIZATION_ERROR, "TX decode failed"))?;
         let address = self
@@ -2138,6 +2315,14 @@ impl WalletRpc {
                 RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
             })?;
         let unable = || RpcError::new(codes::WALLET_ERROR, "Unable to sign for input");
+        // A key of the HD chain is derived from the seed when it signs; with the
+        // wallet locked divid's GetKey throws (wallet.cpp:543-544), which the RPC
+        // layer answers as -1 with its text
+        if entry.hd_path.is_some() && !entry.is_watch_only && wallet.is_locked() {
+            return Err(
+                RpcError::new(codes::MISC_ERROR, "GetKey: DecryptHDChainSeed failed").into(),
+            );
+        }
         let secret = entry
             .secret
             .as_ref()
@@ -2152,14 +2337,19 @@ impl WalletRpc {
         dummy.extend_from_slice(&pk);
         dummy.push(0xac); // OP_CHECKSIG
         let script_code = Script::from_bytes(dummy);
-        let sig = divi_wallet::signer::sign_input(
+        // Core's SignatureHash, which for SIGHASH_SINGLE on an input without
+        // an output of its index hashes the value 1 (SignatureCheckers.cpp)
+        const SIGHASH_SINGLE: i32 = 3;
+        let hash = divi_script::checker::signature_hash(
+            &script_code,
             &tx,
             input_index as usize,
-            &script_code,
-            secret,
-            SigHashType::Single,
-        )
-        .map_err(|_| unable())?;
+            SIGHASH_SINGLE,
+        );
+        let mut sig = divi_crypto::sign_hash(secret, &hash)
+            .map_err(|_| unable())?
+            .to_der();
+        sig.push(SIGHASH_SINGLE as u8);
         let mut script_sig = vec![sig.len() as u8];
         script_sig.extend_from_slice(&sig);
         tx.vin[input_index as usize].script_sig = Script::from_bytes(script_sig);
@@ -2213,18 +2403,40 @@ impl WalletRpc {
                     )
                     .into());
                 }
+                // Then the fee total reads GetValueOut, which throws for a
+                // negative output or a sum past the int64 range
+                // (primitives/transaction.cpp:245-259): -1 with its message
+                let out_of_range = |what: &str| {
+                    RpcError::new(
+                        codes::MISC_ERROR,
+                        format!("CTransaction::GetValueOut() : value out of range : {what}"),
+                    )
+                };
+                let mut value_out: i64 = 0;
+                for o in &tx.vout {
+                    if o.value.as_sat() < 0 {
+                        return Err(out_of_range("less than 0").into());
+                    }
+                    value_out = value_out
+                        .checked_add(o.value.as_sat())
+                        .ok_or_else(|| out_of_range("wraps the int64_t boundary"))?;
+                }
             }
-            // Fee cap. Inputs still in the mempool are not visible here; such a
-            // transaction is checked by the mempool only.
+            // Fee cap, -maxtxfee: the inputs are read from the chain's coins and
+            // the mempool's outputs, as CCoinsViewMemPool reads them
+            // (rpcrawtransaction.cpp:810-826, :882). A transaction already in the
+            // mempool is relayed again without it (:875).
+            let max_fee = mempool.as_ref().map_or(MAX_TX_FEE, |m| m.max_tx_fee());
             let inputs: Option<Amount> = tx.vin.iter().try_fold(Amount::ZERO, |sum, i| match chain
                 .get_utxo(&i.prevout)
             {
                 Ok(Some(u)) => Some(sum + u.value),
-                _ => None,
+                _ => pooled(&i.prevout.txid)
+                    .and_then(|p| p.vout.get(i.prevout.vout as usize).map(|o| sum + o.value)),
             });
             if let Some(inputs) = inputs {
                 let outputs = tx.vout.iter().fold(Amount::ZERO, |a, o| a + o.value);
-                if !allow_high_fees && inputs - outputs > MAX_TX_FEE {
+                if !allow_high_fees && pooled(&txid).is_none() && inputs - outputs > max_fee {
                     return Err(RpcError::new(
                         codes::VERIFY_REJECTED,
                         "Fees being paid are in excess of maximum fee, but fee override is not provided",
@@ -2399,7 +2611,9 @@ impl WalletRpc {
         // address's flag, as Core assigns it)
         let mut accounts: std::collections::BTreeMap<String, (i64, i64, bool)> =
             std::collections::BTreeMap::new();
-        for (address, account) in wallet.address_book() {
+        let mut book = wallet.address_book();
+        book.sort_by_key(|(address, _)| address_book_key(address));
+        for (address, account) in book {
             let item = tally.get(&address);
             if item.is_none() && !include_empty {
                 continue;
@@ -2780,16 +2994,24 @@ impl WalletRpc {
 
         // C++ shape (AvailableUtxoCalculator): Vaulted = vaults we own,
         // Stakable = plain coins plus vaults we manage, Spendable = plain coins.
-        // The node has no coin-age filter here.
-        let owned_vaults = wallet.get_owned_vault_utxos(height, 1);
-        let plain = wallet.get_spendable_utxos(height, 1);
+        // The node has no coin-age filter here. A locked coin is in none of
+        // them, as AvailableCoins skips it for every type
+        // (AvailableUtxoCalculator.cpp:91).
+        let unlocked = |us: Vec<divi_wallet::wallet_db::WalletUtxo>| {
+            us.into_iter()
+                .filter(|u| !wallet.is_coin_locked(&u.outpoint()))
+                .collect::<Vec<_>>()
+        };
+        let owned_vaults = unlocked(wallet.get_owned_vault_utxos(height, 1));
+        let plain = unlocked(wallet.get_spendable_utxos(height, 1));
         let mut stakable = plain.clone();
-        stakable.extend(
+        stakable.extend(unlocked(
             wallet
                 .get_stakeable_vault_utxos(height, 1)
                 .into_iter()
-                .map(|(u, _)| u),
-        );
+                .map(|(u, _)| u)
+                .collect(),
+        ));
         let network = wallet.network();
         let sum = |us: &[divi_wallet::wallet_db::WalletUtxo]| -> f64 {
             us.iter()
@@ -3080,6 +3302,16 @@ impl WalletRpc {
         Ok(json!(txid.to_string()))
     }
 
+    /// The P2PKH address version of `network`, which BIP38's address hash uses
+    fn bip38_version(network: Network) -> u8 {
+        match network {
+            Network::Mainnet => divi_wallet::address::PUBKEY_ADDRESS_VERSION,
+            Network::Testnet | Network::Regtest => {
+                divi_wallet::address::PUBKEY_ADDRESS_VERSION_TESTNET
+            }
+        }
+    }
+
     /// BIP38 encrypt private key
     pub fn bip38_encrypt(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let addr_str = params
@@ -3120,25 +3352,29 @@ impl WalletRpc {
 
         // Encrypt using BIP38 in the key's own form (as PIVX's bip38encrypt, which this
         // RPC follows; Divi Core's own BIP38 RPCs keep the flag the same way)
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, key_entry.compressed)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("BIP38 encryption failed: {}", e),
-                )
-            })?;
+        let encrypted = divi_crypto::bip38_encrypt(
+            &key_array,
+            passphrase,
+            key_entry.compressed,
+            Self::bip38_version(wallet.network()),
+        )
+        .map_err(|e| {
+            RpcError::new(
+                codes::WALLET_ERROR,
+                format!("BIP38 encryption failed: {}", e),
+            )
+        })?;
 
         Ok(json!(encrypted))
     }
 
-    /// Generate a fresh key (not stored in the wallet) and return it BIP38-encrypted
+    /// bip38paperwallet as Divi Core (rpcdump.cpp:249-293): a fresh compressed
+    /// key, not kept in the wallet, and its BIP38 form. The wallet must be
+    /// unlocked first.
     pub fn bip38_paper_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let passphrase = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: password"))?;
-
         let wallet = self.get_wallet()?;
         ensure_fully_unlocked(&wallet)?;
+        let passphrase = spirit_str(params, 0)?;
         let network = wallet.network();
 
         let secret = divi_crypto::keys::SecretKey::new_random();
@@ -3146,52 +3382,74 @@ impl WalletRpc {
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(secret.as_bytes());
 
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, true).map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("BIP38 encryption failed: {}", e),
-            )
-        })?;
+        let encrypted =
+            divi_crypto::bip38_encrypt(&key_array, passphrase, true, Self::bip38_version(network))
+                .map_err(|e| {
+                    RpcError::new(
+                        codes::WALLET_ERROR,
+                        format!("BIP38 encryption failed: {}", e),
+                    )
+                })?;
 
         Ok(json!({ "Address": address, "Encrypted Key": encrypted }))
     }
 
-    /// BIP38 decrypt private key
+    /// bip38decrypt as Divi Core (rpcdump.cpp:295-347): with the wallet
+    /// unlocked, the key is decrypted, given the label "", refused if already
+    /// held, else added and the chain scanned for it; the answer is its address.
+    /// Unlike Core, a passphrase that does not give the key named by the address
+    /// hash is refused rather than adding whatever key comes out.
     pub fn bip38_decrypt(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let encrypted_key = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: bip38key"))?;
-        let passphrase = params
-            .get_str(1)
-            .ok_or_else(|| RpcError::invalid_params("Missing required parameter: passphrase"))?;
+        let wallet = self.get_wallet()?;
+        ensure_fully_unlocked(&wallet)?;
+        let encrypted_key = spirit_str(params, 0)?;
+        let passphrase = spirit_str(params, 1)?;
 
-        // Decrypt the BIP38 encrypted key
-        let (private_key, compressed) = divi_crypto::bip38_decrypt(encrypted_key, passphrase)
-            .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("BIP38 decryption failed: {}", e),
-                )
-            })?;
+        let failed = |text: &str| RpcError::new(codes::WALLET_ERROR, text);
+        let (private_key, compressed) = divi_crypto::bip38_decrypt(
+            encrypted_key,
+            passphrase,
+            Self::bip38_version(wallet.network()),
+        )
+        .map_err(|_| failed("Failed To Decrypt"))?;
+        let secret = divi_crypto::keys::SecretKey::from_bytes(&private_key)
+            .map_err(|_| failed("Private Key Not Valid"))?;
 
-        let network = self.address_network();
+        let address =
+            divi_wallet::KeyEntry::imported(secret.clone(), compressed).address(wallet.network());
+        wallet.set_label(&address, "").map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+        })?;
+        if wallet.is_mine(&address) && !wallet.is_watch_only(&address) {
+            return Err(failed("Key already held by wallet").into());
+        }
+        wallet.import_key_with_compression(secret, compressed, Some(String::new()));
+        info!("Imported BIP38 key for address: {}", address);
+        wallet.save().map_err(|e| {
+            RpcError::new(codes::WALLET_ERROR, format!("Failed to save wallet: {}", e))
+        })?;
+        self.rescan_after_import(&wallet)?;
 
-        // Encode as WIF
-        use divi_wallet::address::encode_wif;
-        let wif = encode_wif(&private_key, compressed, network);
-
-        Ok(json!(wif))
+        Ok(json!({ "Address": address.to_string() }))
     }
 
-    /// loadwallet "filename" — refused: the wallet cannot be swapped on a running node.
+    /// loadwallet "filename" — the loaded wallet's own name ("wallet.dat", the
+    /// name getwalletinfo gives it) answers null, as Divi Core does when the
+    /// name is the wallet it runs (init.cpp:263); any other is refused: the
+    /// wallet cannot be swapped on a running node.
     ///
     /// irondivid hands its one wallet to the block, mempool and reorg callbacks, the
     /// staker and the pruner at start, so replacing it here would leave them writing to
     /// the old one. The error says how to switch wallets today.
     pub fn load_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        // One string argument, else divid's help text (rpcwallet.cpp:526-532)
+        crate::core_help::check_arguments("loadwallet", params, (1, 1), 1)?;
         let filename = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Missing required parameter: filename"))?;
+        if filename == "wallet.dat" && self.wallet.read().is_some() {
+            return Ok(serde_json::Value::Null);
+        }
 
         let current = self
             .wallet
@@ -3236,7 +3494,7 @@ impl WalletRpc {
             .get_wallet()
             .map_err(|_| RpcError::new(codes::WALLET_ERROR, "Invalid masternode tier"))?;
         // Core takes the account address before it looks at the tier
-        let address = Self::account_address(&wallet, &format!("alloc->{}", arg(1)?), false)?;
+        let address = self.account_address(&wallet, &format!("alloc->{}", arg(1)?), false)?;
         use divi_masternode::MasternodeTier;
         let tier = match arg(2)?.to_lowercase().as_str() {
             "copper" => MasternodeTier::Copper,
@@ -3312,81 +3570,7 @@ impl WalletRpc {
 
         let network = self.address_network();
 
-        // Extract addresses based on script type
-        let mut addresses: Vec<String> = Vec::new();
-        let mut req_sigs: Option<usize> = None;
-
-        match script_type {
-            divi_script::ScriptType::PubKeyHash => {
-                if solutions.len() == 1 && solutions[0].len() == 20 {
-                    let mut hash = [0u8; 20];
-                    hash.copy_from_slice(&solutions[0]);
-                    let addr = Address::from_pubkey_hash(Hash160(hash), network);
-                    addresses.push(addr.to_string());
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::ScriptHash => {
-                if solutions.len() == 1 && solutions[0].len() == 20 {
-                    let mut hash = [0u8; 20];
-                    hash.copy_from_slice(&solutions[0]);
-                    let addr = Address::p2sh(Hash160(hash), network);
-                    addresses.push(addr.to_string());
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::PubKey => {
-                // P2PK: compute hash160 of pubkey to get address
-                if solutions.len() == 1 && (solutions[0].len() == 33 || solutions[0].len() == 65) {
-                    let hash = divi_crypto::hash160(&solutions[0]);
-                    let addr = Address::from_pubkey_hash(hash, network);
-                    addresses.push(addr.to_string());
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::Multisig => {
-                // Multisig: first solution is m, last is n, middle are pubkeys
-                if solutions.len() >= 3 {
-                    let m = solutions[0].first().copied().unwrap_or(0) as usize;
-                    let _n = solutions
-                        .last()
-                        .and_then(|s| s.first().copied())
-                        .unwrap_or(0) as usize;
-                    req_sigs = Some(m);
-
-                    // Skip first (m) and last (n) elements
-                    for pubkey in &solutions[1..solutions.len() - 1] {
-                        if pubkey.len() == 33 || pubkey.len() == 65 {
-                            let hash = divi_crypto::hash160(pubkey);
-                            let addr = Address::from_pubkey_hash(hash, network);
-                            addresses.push(addr.to_string());
-                        }
-                    }
-                }
-            }
-            divi_script::ScriptType::Vault => {
-                // Vault scripts have owner and vault hashes
-                if solutions.len() == 2 {
-                    // First is owner hash, second is vault hash
-                    for sol in solutions.iter() {
-                        if sol.len() == 20 {
-                            let mut hash = [0u8; 20];
-                            hash.copy_from_slice(sol);
-                            let addr = Address::from_pubkey_hash(Hash160(hash), network);
-                            addresses.push(addr.to_string());
-                        }
-                    }
-                    req_sigs = Some(1);
-                }
-            }
-            divi_script::ScriptType::NullData => {
-                // OP_RETURN data scripts have no addresses
-                req_sigs = Some(0);
-            }
-            _ => {
-                // NonStandard, HTLC, etc. - no addresses extracted
-            }
-        }
+        let (addresses, req_sigs) = script_destinations(script_type, &solutions, network);
 
         // Build response
         let mut result = serde_json::json!({
@@ -3630,20 +3814,22 @@ impl WalletRpc {
         })?;
 
         // As Divi Core 3.0.0 the node keeps running with the wallet reloaded,
-        // encrypted and locked (rpcwallet.cpp:2732-2733)
+        // encrypted and locked (rpcwallet.cpp:2732-2733). The reloaded wallet
+        // is a new one, so lockunspent's locks are gone, the masternode
+        // collateral's too: LoadAndSelectWallet does not lock it again
+        // (init.cpp:282-292, :1291-1318)
+        for outpoint in wallet.locked_coins() {
+            wallet.set_coin_locked(outpoint, false);
+        }
         Ok(serde_json::json!("Wallet reloaded!"))
     }
 
     /// getreceivedbyaddress - Get total amount received by an address
     pub fn get_received_by_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let addr_str = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Address required"))?;
-
-        let min_conf = params.get_u64(1).unwrap_or(1) as u32;
-
+        // rpcwallet.cpp:1450-1461: the address, then 0 for an address the
+        // wallet neither owns nor watches, and only then minconf
         let addr = self
-            .decode_address(addr_str)
+            .decode_address(spirit_str(params, 0)?)
             .map_err(|_| RpcError::new(codes::INVALID_ADDRESS_OR_KEY, "Invalid DIVI address"))?;
 
         let wallet = self.get_wallet()?;
@@ -3651,19 +3837,18 @@ impl WalletRpc {
         if !wallet.is_mine(&addr) {
             return Ok(serde_json::json!(0.0));
         }
+        let min_depth = if params.len() > 1 {
+            spirit_int(params, 1)?
+        } else {
+            1
+        };
 
         // Everything received at the address, including coins since spent:
         // outputs paying exactly its script, so a P2PK output to its key is not
         // counted (rpcwallet.cpp:1468-1480). Coinbase outputs are left out.
-        let height = self.current_height();
-        let script = addr.script_pubkey();
-        let total: i64 = wallet
-            .received_outputs()
-            .iter()
-            .filter(|o| !o.is_coinbase && o.script_pubkey == script)
-            .filter(|o| o.confirmations(height) >= min_conf)
-            .map(|o| o.value.as_sat())
-            .sum();
+        let total = self
+            .history(&wallet)
+            .received_by_script(&addr.script_pubkey(), min_depth as i64);
 
         let divi = total as f64 / 100_000_000.0;
         Ok(serde_json::json!(divi))
@@ -3671,13 +3856,9 @@ impl WalletRpc {
 
     /// importaddress - Import a watch-only address
     pub fn import_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let addr_or_script = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Address or script required"))?;
-
-        let label = params.get_str(1);
-        let rescan = params.get_bool(2).unwrap_or(true);
-        let _p2sh = params.get_bool(3).unwrap_or(false);
+        // As Divi Core (rpcdump.cpp:111-129): the address or script first, then
+        // the label and the rescan flag, each as json_spirit reads it
+        let addr_or_script = spirit_str(params, 0)?;
 
         let wallet = self.get_wallet()?;
 
@@ -3712,11 +3893,22 @@ impl WalletRpc {
                 .into());
             }
         };
+        let label = if params.len() > 1 {
+            Some(spirit_str(params, 1)?)
+        } else {
+            None
+        };
+        let rescan = if params.len() > 2 {
+            spirit_bool(params, 2)?
+        } else {
+            true
+        };
 
+        // rpcdump.cpp:142-143
         if wallet.is_mine(&addr) && !wallet.is_watch_only(&addr) {
             return Err(RpcError::new(
                 codes::WALLET_ERROR,
-                "The wallet already contains the private key for this address",
+                "The wallet already contains the private key for this address or script",
             )
             .into());
         }
@@ -3831,26 +4023,36 @@ impl WalletRpc {
     /// * `newsize` - Optional new keypool target size (default: 100)
     ///
     /// This pre-generates HD-derived keys for faster address generation.
+    /// keypoolrefill as Divi Core (rpcwallet.cpp:2552-2566): a size below 0 is
+    /// refused before the wallet is looked at, 0 (or none) is the default size,
+    /// and the pool must hold at least the size asked for afterwards
     pub fn keypool_refill(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let newsize = params.get_u64(0).map(|s| s as u32);
-
-        if let Some(size) = newsize {
-            if size == 0 {
-                return Err(RpcError::invalid_params("Keypool size must be at least 1").into());
-            }
+        let size = if !params.is_empty() {
+            spirit_int(params, 0)?
+        } else {
+            0
+        };
+        if size < 0 {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMETER,
+                "Invalid parameter, expected valid size.",
+            )
+            .into());
         }
 
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
 
-        // Actually refill the keypool
+        let newsize = (size > 0).then_some(size as u32);
         let generated = wallet
             .refill_keypool(newsize)
             .map_err(|e| RpcError::internal_error(format!("Failed to refill keypool: {}", e)))?;
-
         info!("Keypool refilled with {} new keys", generated);
 
+        if wallet.keypool_size() < size as u32 {
+            return Err(RpcError::new(codes::WALLET_ERROR, "Error refreshing keypool.").into());
+        }
         Ok(serde_json::Value::Null)
     }
 
@@ -3955,14 +4157,18 @@ impl WalletRpc {
         Ok(serde_json::json!(txid.to_string()))
     }
 
-    /// listlockunspent - Returns list of temporarily unspendable outputs
-    pub fn list_lock_unspent(&self, _params: &Params) -> Result<serde_json::Value, Error> {
+    /// listlockunspent - Returns list of temporarily unspendable outputs, in
+    /// the order of divid's std::set<COutPoint>: txid as a 256-bit number
+    /// (the hex as written), then output (rpcwallet.cpp:2816-2848)
+    pub fn list_lock_unspent(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        crate::core_help::check_arguments("listlockunspent", params, (0, 0), 0)?;
         let wallet_guard = self.wallet.read();
         let wallet = wallet_guard
             .as_ref()
             .ok_or_else(|| RpcError::new(codes::WALLET_ERROR, "Wallet not loaded"))?;
-        let result: Vec<_> = wallet
-            .locked_coins()
+        let mut locked = wallet.locked_coins();
+        locked.sort_by_key(|o| (o.txid.to_string(), o.vout));
+        let result: Vec<_> = locked
             .iter()
             .map(|outpoint| {
                 serde_json::json!({
@@ -4023,9 +4229,16 @@ impl WalletRpc {
                     .into());
                 }
             }
+            // IsHex (non-empty, even length, hex digits), then uint256(txid),
+            // which reads a shorter txid as a number (rpcwallet.cpp:2793-2802)
             let txid_str = o["txid"].as_str().unwrap_or_default();
-            let txid = Hash256::from_hex(txid_str)
-                .map_err(|_| invalid("Invalid parameter, expected hex txid"))?;
+            if txid_str.is_empty()
+                || !txid_str.len().is_multiple_of(2)
+                || !txid_str.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid("Invalid parameter, expected hex txid"));
+            }
+            let txid = uint256_set_hex(txid_str);
             let vout = o["vout"].as_i64().unwrap_or(-1);
             if vout < 0 {
                 return Err(invalid("Invalid parameter, vout must be positive"));
@@ -4092,9 +4305,7 @@ impl WalletRpc {
 
     /// backupwallet - write a consistent copy of the wallet to destination
     pub fn backup_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let destination = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Destination path required"))?;
+        let destination = spirit_str(params, 0)?;
 
         let wallet = self.get_wallet()?;
         wallet
@@ -4418,8 +4629,8 @@ impl WalletRpc {
         // account a new one (rpcwallet.cpp:609-615)
         if wallet.in_address_book(&address) {
             let old = wallet.get_account(&address);
-            if Self::account_address(&wallet, &old, false)? == address.to_string() {
-                Self::account_address(&wallet, &old, true)?;
+            if self.account_address(&wallet, &old, false)? == address.to_string() {
+                self.account_address(&wallet, &old, true)?;
             }
         }
         wallet.set_account(&address, account);
@@ -4439,18 +4650,27 @@ impl WalletRpc {
         )?;
 
         let wallet = self.get_wallet()?;
-        Ok(serde_json::json!(Self::account_address(
-            &wallet, account, false
-        )?))
+        Ok(serde_json::json!(
+            self.account_address(&wallet, account, false)?
+        ))
     }
 
     /// Divi Core's GetAccountAddress (rpcwallet.cpp:315-375): the account's
     /// last address, unless a wallet transaction already pays it or
     /// `force_new`; otherwise a new key from the pool labelled with the account
-    fn account_address(wallet: &WalletDb, account: &str, force_new: bool) -> Result<String, Error> {
+    fn account_address(
+        &self,
+        wallet: &WalletDb,
+        account: &str,
+        force_new: bool,
+    ) -> Result<String, Error> {
         let addresses = wallet.get_addresses_by_account(account);
         if let (Some(last), false) = (addresses.last(), force_new) {
-            let paid = wallet.received_outputs().iter().any(|o| &o.address == last);
+            // Any wallet transaction paying its script, a watched address's too
+            // (AccountShouldUseNewKey, rpcwallet.cpp:314-332)
+            let paid = Address::from_base58(last)
+                .map(|a| self.history(wallet).pays_script(&a.script_pubkey()))
+                .unwrap_or(false);
             if !paid {
                 return Ok(last.clone());
             }
@@ -4492,22 +4712,24 @@ impl WalletRpc {
     }
 
     pub fn get_received_by_account(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let min_conf = params.get_u64(1).unwrap_or(1) as u32;
-        // Read after minconf (rpcwallet.cpp:1517-1523)
-        let account = account_from_value(
-            params
-                .get_str(0)
-                .ok_or_else(|| RpcError::invalid_params("Account required"))?,
-        )?;
+        // minconf is read before the account (rpcwallet.cpp:1517-1523)
+        let min_depth = if params.len() > 1 {
+            spirit_int(params, 1)?
+        } else {
+            1
+        };
+        let account = account_from_value(spirit_str(params, 0)?)?;
 
+        // The outputs to the account's addresses the wallet owns or watches
+        // (rpcwallet.cpp:1531-1545)
         let wallet = self.get_wallet()?;
-        let received = self.received_by_address(&wallet, min_conf);
+        let received = self.history(&wallet).received_tally(min_depth as i64, true);
 
         let total: i64 = wallet
             .get_addresses_by_account(account)
             .iter()
             .filter_map(|addr| received.get(addr))
-            .map(|(amount, _)| amount)
+            .map(|t| t.amount)
             .sum();
 
         let divi = total as f64 / 100_000_000.0;
@@ -6223,7 +6445,7 @@ mod accounting_tests {
     }
 
     #[test]
-    fn send_does_not_spend_own_unconfirmed_change() {
+    fn send_spends_own_unconfirmed_change_only_with_spendzeroconfchange() {
         let f = fixture();
         // Our own tx spends every confirmed coin: 100 DIVI change comes back
         // unconfirmed (trusted, as all inputs are ours)
@@ -6269,6 +6491,15 @@ mod accounting_tests {
             .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
             .is_err());
         assert!(submitted.lock().is_none());
+
+        // With -spendzeroconfchange it may (wallet.cpp:1848)
+        f.wallet.set_spend_zero_conf_change(true);
+        assert!(f
+            .rpc
+            .send_to_address(&Params::Array(vec![json!(stranger_address()), json!(10)]))
+            .is_ok());
+        let sent = submitted.lock().clone().expect("a transaction was sent");
+        assert!(sent.vin.iter().any(|i| i.prevout.txid == own.txid()));
     }
 
     #[test]
@@ -6352,6 +6583,174 @@ mod accounting_tests {
         assert!(listed
             .iter()
             .all(|u| u["scriptPubKey"] != json!(hex::encode(vault.as_bytes()))));
+    }
+
+    fn rpc_code(e: Error) -> i32 {
+        match e {
+            Error::Rpc(r) => r.code,
+            other => panic!("expected an RPC error, got {:?}", other),
+        }
+    }
+
+    fn locks(rpc: &WalletRpc) -> serde_json::Value {
+        rpc.list_lock_unspent(&Params::None).unwrap()
+    }
+
+    fn lock(
+        rpc: &WalletRpc,
+        unlock: bool,
+        items: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        rpc.lock_unspent(&Params::Array(vec![json!(unlock), items]))
+    }
+
+    /// lockunspent takes any even-length hex as a txid and reads a short one
+    /// as a number, as uint256(txid) does (rpcwallet.cpp:2793-2802)
+    #[test]
+    fn lockunspent_reads_a_short_txid_as_a_number() {
+        let f = fixture();
+        assert_eq!(
+            lock(&f.rpc, false, json!([{"txid": "ab", "vout": 0}])).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            locks(&f.rpc),
+            json!([{"txid": format!("{:0>64}", "ab"), "vout": 0}])
+        );
+        for bad in ["abc", "", "zz"] {
+            let e = lock(&f.rpc, false, json!([{"txid": bad, "vout": 0}])).unwrap_err();
+            assert_eq!(rpc_code(e), codes::INVALID_PARAMETER, "{bad:?}");
+        }
+        // More than 64 digits: the last 64 count
+        let long = format!("ff{}", "1".repeat(64));
+        lock(&f.rpc, true, json!([{"txid": long, "vout": 0}])).unwrap();
+        lock(&f.rpc, false, json!([{"txid": long, "vout": 0}])).unwrap();
+        assert!(locks(&f.rpc)
+            .as_array()
+            .unwrap()
+            .contains(&json!({"txid": "1".repeat(64), "vout": 0})));
+    }
+
+    /// uint256::SetHex (uint256.cpp:186-212)
+    #[test]
+    fn uint256_set_hex_reads_text_as_divid() {
+        let h = |t: &str| uint256_set_hex(t).to_string();
+        let full = "0123456789abcdef".repeat(4);
+        assert_eq!(h(&full), full);
+        assert_eq!(h(&format!("0x{full}")), full);
+        assert_eq!(h(&format!("  0X{full}")), full);
+        assert_eq!(h(&full.to_uppercase()), full);
+        assert_eq!(h("ab"), format!("{:0>64}", "ab"));
+        assert_eq!(h("abc"), format!("{:0>64}", "abc"));
+        assert_eq!(h("12xyz"), format!("{:0>64}", "12"));
+        assert_eq!(h("xyz"), "0".repeat(64));
+        assert_eq!(h(""), "0".repeat(64));
+        assert_eq!(h(&format!("ff{full}")), full);
+    }
+
+    /// getcoinavailability leaves a locked coin out of all three sums, as
+    /// AvailableCoins does for every coin type (AvailableUtxoCalculator.cpp:91)
+    #[test]
+    fn getcoinavailability_leaves_locked_coins_out() {
+        let f = fixture();
+        let sums = |rpc: &WalletRpc| {
+            let r = rpc.get_coin_availability(&Params::None).unwrap();
+            (
+                r["Stakable"].as_f64().unwrap(),
+                r["Spendable"].as_f64().unwrap(),
+            )
+        };
+        let all = BALANCE as f64 / COIN as f64;
+        assert_eq!(sums(&f.rpc), (all, all));
+        let change = json!([{"txid": f.spend.txid().to_string(), "vout": 1}]);
+        lock(&f.rpc, false, change.clone()).unwrap();
+        let rest = (BALANCE - (250 * COIN - 1_000_000)) as f64 / COIN as f64;
+        assert_eq!(sums(&f.rpc), (rest, rest));
+        lock(&f.rpc, true, change).unwrap();
+        assert_eq!(sums(&f.rpc), (all, all));
+    }
+
+    /// encryptwallet reloads the wallet as a new one, which has no locks
+    /// (rpcwallet.cpp:2732, init.cpp:282-292)
+    #[test]
+    fn encryptwallet_leaves_no_coin_locked() {
+        let f = fixture_with(|dir| {
+            let hd = HdWallet::new(ChainMode::Divi).unwrap();
+            WalletDb::create_persistent(&dir.join("wallet"), Network::Regtest, hd).unwrap()
+        });
+        lock(
+            &f.rpc,
+            false,
+            json!([{"txid": f.spend.txid().to_string(), "vout": 1}]),
+        )
+        .unwrap();
+        assert_eq!(locks(&f.rpc).as_array().unwrap().len(), 1);
+        let reply = f
+            .rpc
+            .encrypt_wallet(&Params::Array(vec![json!("a test passphrase")]))
+            .unwrap();
+        assert_eq!(reply, json!("Wallet reloaded!"));
+        assert_eq!(locks(&f.rpc), json!([]));
+    }
+
+    /// loadwallet with the loaded wallet's name is null, as divid's
+    /// SwitchCoinMintingModuleToWallet answers true at once (init.cpp:263)
+    #[test]
+    fn loadwallet_of_the_loaded_wallet_is_null() {
+        let f = fixture();
+        let load = |name: &str| f.rpc.load_wallet(&Params::Array(vec![json!(name)]));
+        assert_eq!(load("wallet.dat").unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            rpc_code(load("other.dat").unwrap_err()),
+            codes::WALLET_ERROR
+        );
+    }
+
+    /// The transactions each call handed the reorg hook
+    fn listening_hook(
+        rpc: &crate::blockchain::BlockchainRpc,
+    ) -> Arc<parking_lot::Mutex<Vec<Vec<Hash256>>>> {
+        let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let t = told.clone();
+        rpc.set_reorg_hook(Arc::new(move |txs: Vec<Transaction>| {
+            t.lock().push(txs.iter().map(|tx| tx.txid()).collect())
+        }));
+        told
+    }
+
+    /// reverseblocktransactions reads the hash as uint256 reads it, "0x" and
+    /// leading space included (rpcblockchain.cpp:589), and hands the reorg
+    /// hook what it disconnected; for the genesis block it disconnects every
+    /// block above it and answers null (BlockInvalidationHelpers.cpp:134-143)
+    #[test]
+    fn reverseblocktransactions_reads_hashes_and_reverses_down_to_genesis() {
+        let f = fixture();
+        let rpc = crate::blockchain::BlockchainRpc::new(f.chain.clone());
+        let told = listening_hook(&rpc);
+        let tip = f.chain.tip().unwrap().hash.to_string();
+        let call = |method: &str, hash: String| {
+            rpc.invalidate_block_family(method, &Params::Array(vec![json!(hash)]))
+        };
+
+        call("reverseblocktransactions", format!("0x{tip}")).unwrap();
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT - 1);
+        assert_eq!(told.lock().last(), Some(&vec![f.spend.txid()]));
+        call("reconsiderblock", format!("  {tip}")).unwrap();
+        assert_eq!(f.chain.height(), FIXTURE_HEIGHT);
+
+        let genesis = f
+            .chain
+            .get_block_index_by_height(0)
+            .unwrap()
+            .unwrap()
+            .hash
+            .to_string();
+        assert_eq!(
+            call("reverseblocktransactions", genesis).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(f.chain.height(), 0);
+        assert_eq!(told.lock().last(), Some(&vec![f.spend.txid()]));
     }
 }
 

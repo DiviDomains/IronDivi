@@ -1,0 +1,16 @@
+getmasternodecount
+
+Get masternode count values
+
+Result:
+{
+  "total": n,        (numeric) Total masternodes
+  "stable": n,       (numeric) Stable count
+  "obfcompat": n,    (numeric) Obfuscation Compatible
+  "enabled": n,      (numeric) Enabled masternodes
+  "inqueue": n       (numeric) Masternodes in queue
+}
+
+Examples:
+> divi-cli getmasternodecount 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getmasternodecount", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

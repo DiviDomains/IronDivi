@@ -160,12 +160,51 @@ pub struct Node {
     /// Masternode P2P message handler
     masternode_handler: Arc<MasternodeHandler>,
 
+    /// The masternodes the network announced, as Divi Core keeps them
+    masternode_list: Arc<divi_rpc::mn_list::MasternodeList>,
+
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
 
     /// Shutdown signal
     shutdown_tx: broadcast::Sender<()>,
+
+    /// The loops `start` runs (peer events, sync, relay, peer upkeep):
+    /// stopped by `stop` before it flushes, so nothing writes after it
+    tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// How long `Node::stop` waits for the node's loops once told to stop
+const STOP_TASKS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Log one shutdown step and how long it took
+pub fn shutdown_stage(what: &str, started: std::time::Instant) {
+    tracing::info!("Shutdown: {} in {} ms", what, started.elapsed().as_millis());
+}
+
+/// Abort `tasks` and wait for them, for `timeout` in all; how many did not
+/// finish (a task stops at its next await, so one inside a blocking call
+/// keeps running until the call returns)
+async fn stop_tasks(
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) -> usize {
+    for task in &tasks {
+        task.abort();
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stalled = 0;
+    for task in tasks {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            stalled += 1;
+        }
+    }
+    stalled
+}
+
+/// Chain database metadata present while a -reindex is under way (Divi Core's
+/// DB_REINDEXINGFLAG, txdb.cpp:192-204)
+const REINDEXING_KEY: &[u8] = b"reindexing";
 
 impl Node {
     /// Create a new node with the given configuration
@@ -232,6 +271,22 @@ impl Node {
         // only on a new chain database or with -reindex, which builds every
         // index again (init.cpp:1103-1106, txdb.cpp:498-523,
         // ChainExtensionService.cpp:703-707)
+        // As Divi Core, a -reindex is recorded in the chain database before it
+        // starts and erased only once it is done, so one that was stopped
+        // (kill, power loss) is carried out again at the next start
+        // (init.cpp:1072-1073, :679; BlockIndexLoading.cpp:287-290;
+        // txdb.cpp:192-204)
+        let interrupted = db.get_metadata(REINDEXING_KEY).map_err(damaged)?.is_some();
+        if interrupted && !config.index.reindex {
+            tracing::warn!(
+                "A -reindex was stopped before it finished; the indexes are built again now"
+            );
+        }
+        let reindex = config.index.reindex || interrupted;
+        if reindex {
+            db.put_metadata_synced(REINDEXING_KEY, b"1")
+                .map_err(damaged)?;
+        }
         let requested = divi_storage::search_index::IndexFlags {
             txindex: config.index.txindex,
             addressindex: config.index.addressindex,
@@ -294,12 +349,12 @@ impl Node {
         // given, as Divi Core's -reindex writes the flags anew
         // (ChainExtensionService.cpp:703-707). Here the index is built from
         // the stored blocks; the chain state is kept.
-        let rebuild_tx_index = config.index.reindex && requested.txindex;
-        if config.index.reindex && flags.txindex != requested.txindex {
+        let rebuild_tx_index = reindex && requested.txindex;
+        if reindex && flags.txindex != requested.txindex {
             flags.txindex = requested.txindex;
         }
         // and the address and spent indexes with the options now given
-        if config.index.reindex {
+        if reindex {
             flags.addressindex = requested.addressindex;
             flags.spentindex = requested.spentindex;
         }
@@ -328,7 +383,7 @@ impl Node {
         }
 
         let txindex_path = config.data_dir.join("txindex");
-        if config.index.reindex && txindex_path.exists() {
+        if reindex && txindex_path.exists() {
             // Entries of an earlier index may name blocks no longer active
             std::fs::remove_dir_all(&txindex_path).map_err(|e| {
                 NodeError::Init(format!(
@@ -374,7 +429,7 @@ impl Node {
             }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
-        let build_search = config.index.reindex || build_unflagged_search;
+        let build_search = reindex || build_unflagged_search;
         if build_search && !(flags.addressindex || flags.spentindex) {
             // Switched off: remove the entries an earlier index left
             divi_storage::SearchIndex::new(db.clone(), false, false)
@@ -396,7 +451,7 @@ impl Node {
                         blocks,
                         started.elapsed().as_millis()
                     ),
-                    Err(e) if config.index.reindex => {
+                    Err(e) if reindex => {
                         return Err(NodeError::Init(format!(
                             "Failed to build the address and spent indexes: {}",
                             e
@@ -423,8 +478,11 @@ impl Node {
         }
 
         // The flags change only once the indexes they name are complete
-        if config.index.reindex || check_unflagged_index || build_unflagged_search {
+        if reindex || check_unflagged_index || build_unflagged_search {
             flags.store(&db).map_err(damaged)?;
+        }
+        if reindex {
+            db.delete_metadata(REINDEXING_KEY).map_err(damaged)?;
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the
@@ -456,10 +514,7 @@ impl Node {
                 peer_sources.listen
             );
         }
-        let proxy = config
-            .p2p
-            .proxy_addr()
-            .map_err(|e| NodeError::Init(format!("-proxy: {}", e)))?;
+        let proxy = config.p2p.proxy_addr().map_err(NodeError::Init)?;
         if let Some(proxy) = proxy {
             tracing::info!("Outbound P2P connections go through SOCKS5 proxy {}", proxy);
         }
@@ -522,6 +577,24 @@ impl Node {
             },
         };
         let peer_manager = PeerManager::new(peer_manager_config);
+        // The -addnode values are the first added nodes (net.cpp:1218)
+        for node in &config.p2p.addnode {
+            let addr = node.parse::<std::net::SocketAddr>().ok().or_else(|| {
+                node.parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(|ip| std::net::SocketAddr::new(ip, config.network.default_p2p_port()))
+            });
+            match addr {
+                Some(addr) => {
+                    peer_manager.add_node(addr);
+                }
+                None => {
+                    tracing::debug!("-addnode {} is not an address; dialled by name only", node)
+                }
+            }
+        }
+        // The addresses learnt before the last stop (Divi Core peers.dat, net.cpp:1431-1438)
+        peer_manager.address_book().open(&config.data_dir);
         // Divi Core -banscore / -bantime
         peer_manager.scoring().set_ban_policy(
             config.p2p.ban_score.min(i32::MAX as u32) as i32,
@@ -573,6 +646,9 @@ impl Node {
 
         // Create masternode P2P handler
         let masternode_handler = Arc::new(MasternodeHandler::new(Arc::clone(&masternode_manager)));
+        // Kept in the datadir as Divi Core keeps mncache.dat
+        let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
+        masternode_list.set_path(config.data_dir.join("masternodes.list"));
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -599,9 +675,16 @@ impl Node {
             spork_manager,
             masternode_manager,
             masternode_handler,
+            masternode_list,
             event_tx,
             shutdown_tx,
+            tasks: parking_lot::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Keep a loop `start` runs, for `stop`
+    fn keep(&self, task: tokio::task::JoinHandle<()>) {
+        self.tasks.lock().push(task);
     }
 
     /// Get node configuration
@@ -746,14 +829,33 @@ impl Node {
         let chain = Arc::clone(&self.chain);
         let mempool = Arc::clone(&self.mempool);
         let masternode_handler = Arc::clone(&self.masternode_handler);
+        let masternode_list = Arc::clone(&self.masternode_list);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
+        // Divi Core checks every masternode once a minute (MasternodeModule.cpp:524-529)
+        {
+            let list = Arc::clone(&self.masternode_list);
+            let chain = Arc::clone(&self.chain);
+            let mut shutdown = self.shutdown_tx.subscribe();
+            self.keep(tokio::spawn(async move {
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = every.tick() => list.check_collateral(&chain),
+                        _ = shutdown.recv() => break,
+                    }
+                }
+            }));
+        }
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
             let mut hash_continue: HashMap<u64, Hash256> = HashMap::new();
             let mut alerts_known: HashMap<u64, HashSet<[u8; 32]>> = HashMap::new();
+            // Masternode broadcasts and pings already asked for (Divi Core's
+            // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
+            let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
             while let Ok(event) = peer_events.recv().await {
                 match event {
                     PeerEvent::Connected {
@@ -766,9 +868,17 @@ impl Node {
 
                         // Update sync with peer's height
                         block_sync.update_peer_height(peer_id, version.start_height.max(0) as u32);
+                        block_sync
+                            .begin_syncing_with_peer(peer_id, version.services)
+                            .await;
 
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
+                        } else {
+                            // An outbound peer that answered (addrman Good, main.cpp:443)
+                            peer_manager
+                                .address_book()
+                                .connected(addr, version.services);
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
@@ -851,6 +961,30 @@ impl Node {
                                 }
                                 if !tx_items.is_empty() {
                                     tx_relay.handle_inv(peer_id, tx_items).await;
+                                }
+                                // Masternode broadcasts and pings are announced
+                                // by inv and fetched with getdata, as divid
+                                // relays them (CMasternodeBroadcast::Relay,
+                                // CMasternodePing::Relay)
+                                if masternode_items_asked.len() > 100_000 {
+                                    masternode_items_asked.clear();
+                                }
+                                let masternode_items: Vec<_> = items
+                                    .iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.inv_type,
+                                            divi_network::message::InvType::MasternodeAnnounce
+                                                | divi_network::message::InvType::MasternodePing
+                                        )
+                                    })
+                                    .filter(|i| masternode_items_asked.insert(i.hash))
+                                    .cloned()
+                                    .collect();
+                                if !masternode_items.is_empty() {
+                                    let _ = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
+                                        .await;
                                 }
                             }
                             NetworkMessage::NotFound(items) => {
@@ -1012,21 +1146,26 @@ impl Node {
                             NetworkMessage::RequestMasternodeList(_) => {
                                 tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
+                            // Broadcasts and pings in Divi Core's wire format, kept
+                            // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
-                                if let Err(e) =
-                                    masternode_handler.handle_broadcast(peer_id, &payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to handle masternode broadcast from peer {}: {}",
+                                match masternode_list.accept_broadcast(&chain, &payload) {
+                                    Ok(true) => tracing::info!(
+                                        "Masternode entry from peer {} added to the list",
+                                        peer_id
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => tracing::debug!(
+                                        "Masternode broadcast from peer {} not taken: {}",
                                         peer_id,
                                         e
-                                    );
+                                    ),
                                 }
                             }
                             NetworkMessage::MasternodePing(payload) => {
-                                if let Err(e) = masternode_handler.handle_ping(peer_id, &payload) {
-                                    tracing::warn!(
-                                        "Failed to handle masternode ping from peer {}: {}",
+                                if let Err(e) = masternode_list.accept_ping(&payload) {
+                                    tracing::debug!(
+                                        "Masternode ping from peer {} not taken: {}",
                                         peer_id,
                                         e
                                     );
@@ -1052,13 +1191,30 @@ impl Node {
                                 );
                             }
                             NetworkMessage::Addr(addrs) => {
-                                // IronDivi keeps no address book; only Divi Core's limit applies
+                                // Kept in the address book, as Divi Core's addrman
+                                // keeps them (main.cpp:521-558)
                                 if addrs.len() > 1000 {
                                     peer_manager.report_misbehavior_score(
                                         peer_id,
                                         20,
                                         "Requested too many addresses",
                                     );
+                                } else {
+                                    peer_manager.address_book().add(&addrs);
+                                }
+                            }
+                            // An inbound peer asking for addresses gets a share of
+                            // the book (main.cpp:863-869), at most 1000 per message
+                            NetworkMessage::GetAddr if peer_manager.is_inbound(peer_id) => {
+                                let sample = peer_manager.address_book().sample();
+                                for chunk in sample.chunks(1000) {
+                                    if let Err(e) = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::Addr(chunk.to_vec()))
+                                        .await
+                                    {
+                                        tracing::debug!("Failed to send addr to peer {}: {}", peer_id, e);
+                                        break;
+                                    }
                                 }
                             }
                             // IronDivi does not offer NODE_BLOOM, and Divi Core without
@@ -1127,63 +1283,81 @@ impl Node {
                     }
                 }
             }
-        });
+        }));
 
         // Start peer manager (non-blocking for regtest with no peers)
         let peer_manager = Arc::clone(&self.peer_manager);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             if let Err(e) = peer_manager.start().await {
                 tracing::error!("Peer manager error: {}", e);
             }
-        });
+        }));
+
+        // peers.dat every 15 minutes, as Divi Core's dumpaddr thread (net.cpp:83, :1060-1068)
+        let book = Arc::clone(self.peer_manager.address_book());
+        self.keep(tokio::spawn(async move {
+            let mut every = tokio::time::interval(divi_network::addrbook::DUMP_INTERVAL);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                if let Err(e) = book.save() {
+                    tracing::warn!("Failed to write peers.dat: {}", e);
+                }
+            }
+        }));
 
         // Spawn peer maintenance loop (reconnects if peers drop)
         let pm_for_maintenance = Arc::clone(&self.peer_manager);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             pm_for_maintenance.run_maintenance().await;
-        });
+        }));
 
         // Start sync progress tracker
         let sync = Arc::clone(&self.block_sync);
         let event_sender = self.event_tx.clone();
         let mut sync_progress = sync.subscribe();
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             while let Ok(progress) = sync_progress.recv().await {
                 let _ = event_sender.send(NodeEvent::SyncProgress {
                     current: progress.current_height,
                     total: progress.target_height,
                 });
             }
-        });
+        }));
 
         // Start sync timeout checker
         let sync_for_timeout = Arc::clone(&self.block_sync);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 sync_for_timeout.check_timeouts().await;
             }
-        });
+        }));
 
         // Start transaction relay event handler (adds received txs to mempool)
         let tx_relay_for_mempool = Arc::clone(&self.tx_relay);
         let mempool_for_relay = Arc::clone(&self.mempool);
-        let chain_for_relay = Arc::clone(&self.chain);
         let event_tx_for_relay = self.event_tx.clone();
         let peers_for_relay = Arc::clone(&self.peer_manager);
         let orphans_for_relay = Arc::clone(&self.orphans);
         let max_orphans = self.config.mempool.max_orphan_txs;
         let mut tx_events = tx_relay_for_mempool.subscribe();
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             while let Ok(event) = tx_events.recv().await {
-                match accept_relayed_transaction(
-                    &chain_for_relay,
-                    &mempool_for_relay,
-                    &peers_for_relay,
-                    &event,
-                ) {
+                let result = mempool_for_relay
+                    .add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
+                // The reject goes out before the peer is scored, so a peer
+                // the refusal bans still gets it (main.cpp:803-811)
+                if let Err(e) = &result {
+                    if let Some(msg) = relay_reject(e, &event.txid) {
+                        let _ = peers_for_relay.send_to_peer(event.from_peer, msg).await;
+                    }
+                    score_relayed_refusal(&peers_for_relay, &event, e);
+                }
+                match result {
                     Ok(txid) => {
+                        tracing::debug!("Added relayed tx {} to mempool", txid);
                         let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         for txid in accept_orphans(
                             &mempool_for_relay,
@@ -1208,22 +1382,22 @@ impl Node {
                     }
                 }
             }
-        });
+        }));
 
         // Start transaction relay timeout checker
         let tx_relay_for_timeout = Arc::clone(&self.tx_relay);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
                 tx_relay_for_timeout.check_timeouts().await;
             }
-        });
+        }));
 
         // Start block sync (wait for sporks to sync first, as required by Divi protocol)
         let sync_to_start = Arc::clone(&self.block_sync);
         let spork_for_sync = Arc::clone(&self.spork_manager);
-        tokio::spawn(async move {
+        self.keep(tokio::spawn(async move {
             // Wait for initial peer connections
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -1248,7 +1422,7 @@ impl Node {
             }
 
             sync_to_start.start().await;
-        });
+        }));
 
         // Move to syncing state initially, then running when synced
         *self.status.write() = NodeStatus::Syncing;
@@ -1270,6 +1444,7 @@ impl Node {
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
+        let started = std::time::Instant::now();
         self.import_stop
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let handle = self.import_thread.lock().take();
@@ -1283,19 +1458,48 @@ impl Node {
             } else {
                 tracing::warn!("The block import did not stop within a minute; not waiting for it");
             }
+            shutdown_stage("block import stopped", started);
         }
 
+        // Stop the node's own loops (sync, relay, peer upkeep), so no block
+        // or transaction is taken and no peer dialled while the state below
+        // is written, as Divi Core's StopNode joins its threads before the
+        // flush (init.cpp Shutdown)
+        let started = std::time::Instant::now();
+        let tasks = std::mem::take(&mut *self.tasks.lock());
+        let stalled = stop_tasks(tasks, STOP_TASKS_TIMEOUT).await;
+        if stalled > 0 {
+            tracing::warn!(
+                "{} node task(s) did not stop within {} s; not waiting for them",
+                stalled,
+                STOP_TASKS_TIMEOUT.as_secs()
+            );
+        }
+        shutdown_stage("node loops stopped", started);
+
         // Disconnect all peers
+        let started = std::time::Instant::now();
         self.peer_manager.disconnect_all();
+        shutdown_stage("peers disconnected", started);
+
+        // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
+        let started = std::time::Instant::now();
+        if let Err(e) = self.peer_manager.address_book().save() {
+            tracing::error!("Failed to write peers.dat: {}", e);
+        }
+        shutdown_stage("peers.dat written", started);
 
         // Persist masternode state before shutdown
+        let started = std::time::Instant::now();
         if let Err(e) = self.masternode_manager.save() {
             tracing::error!("Failed to persist masternode state on shutdown: {}", e);
         } else {
             tracing::info!("Masternode state persisted successfully");
         }
+        shutdown_stage("masternode state saved", started);
 
         // Flush UTXO cache to database before shutdown
+        let started = std::time::Instant::now();
         match self.chain.flush_utxo_cache() {
             Ok(count) => {
                 if count > 0 {
@@ -1306,6 +1510,7 @@ impl Node {
                 tracing::error!("Failed to flush UTXO cache on shutdown: {}", e);
             }
         }
+        shutdown_stage("UTXO cache flushed", started);
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());
@@ -1722,6 +1927,11 @@ impl Node {
     pub fn masternode_manager(&self) -> &Arc<MasternodeManager> {
         &self.masternode_manager
     }
+
+    /// The masternodes the network announced (listmasternodes)
+    pub fn masternode_list(&self) -> &Arc<divi_rpc::mn_list::MasternodeList> {
+        &self.masternode_list
+    }
 }
 
 /// Blockchain information
@@ -1789,15 +1999,48 @@ pub fn accept_relayed_transaction(
     let result = mempool.add_relayed(event.tx.clone(), divi_primitives::amount::Amount::ZERO);
     match &result {
         Ok(txid) => tracing::debug!("Added relayed tx {} to mempool", txid),
-        Err(e) => {
-            peers.report_misbehavior_score(
-                event.from_peer,
-                e.misbehaviour_score(),
-                &format!("tx {} rejected by the mempool: {}", event.txid, e),
-            );
-        }
+        Err(e) => score_relayed_refusal(peers, event, e),
     }
     result
+}
+
+/// The misbehaviour score of a refused relayed transaction, charged to the
+/// peer that sent it
+fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent, e: &NodeError) {
+    peers.report_misbehavior_score(
+        event.from_peer,
+        e.misbehaviour_score(),
+        &format!("tx {} rejected by the mempool: {}", event.txid, e),
+    );
+}
+
+/// The `reject` Divi Core sends the peer that relayed a transaction its
+/// mempool refused (main.cpp:803-809): only for a refusal with a reject
+/// state, with its code, its reason cut to MAX_REJECT_MESSAGE_LENGTH (111,
+/// defaultValues.h:94) and the txid. A missing input (an orphan), a coin a
+/// mempool transaction already spends and non-standard inputs leave no
+/// reject state (MempoolConsensus.cpp:296-313, :363-364), so no reject.
+pub fn relay_reject(e: &NodeError, txid: &Hash256) -> Option<divi_network::NetworkMessage> {
+    let (code, reason) = match e {
+        NodeError::TxRejected { reason, .. } if reason == "bad-txns-nonstandard-inputs" => {
+            return None
+        }
+        NodeError::TxRejected { code, reason, .. } => (*code, reason.as_str()),
+        NodeError::NonFinal => (crate::error::reject::NONSTANDARD, "non-final"),
+        _ => return None,
+    };
+    let mut cut = reason.len().min(111);
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(divi_network::NetworkMessage::Reject(
+        divi_network::RejectMessage {
+            message: "tx".to_string(),
+            code,
+            reason: reason[..cut].to_string(),
+            data: txid.as_bytes().to_vec(),
+        },
+    ))
 }
 
 /// Divi Core's orphan resolution after `txid` entered the mempool
@@ -2330,6 +2573,52 @@ mod tests {
 
         node.stop().await.unwrap();
         assert_eq!(node.status(), NodeStatus::Stopped);
+    }
+
+    /// stop ends the loops start runs: none still holds the node's parts
+    #[tokio::test]
+    async fn stop_ends_the_node_loops() {
+        let node = Node::new(test_config()).unwrap();
+        let idle = (
+            Arc::strong_count(&node.block_sync),
+            Arc::strong_count(&node.tx_relay),
+            Arc::strong_count(&node.peer_manager),
+        );
+        node.start().await.unwrap();
+        assert_ne!(Arc::strong_count(&node.block_sync), idle.0);
+        node.stop().await.unwrap();
+        // An aborted task lets go of what it holds once it has stopped
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let counts = || {
+            (
+                Arc::strong_count(&node.block_sync),
+                Arc::strong_count(&node.tx_relay),
+                Arc::strong_count(&node.peer_manager),
+            )
+        };
+        while counts() != idle && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(counts(), idle, "loops still running after stop");
+    }
+
+    /// A task inside a blocking call cannot be stopped; stop_tasks gives up on
+    /// it after its timeout
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_tasks_gives_up_after_the_timeout() {
+        let waiting = tokio::spawn(std::future::pending::<()>());
+        let blocked = tokio::spawn(async {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let stalled = stop_tasks(
+            vec![waiting, blocked],
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(stalled, 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

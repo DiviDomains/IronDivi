@@ -120,8 +120,11 @@ taken out here and in `KNOWN` in `check.py`.
     `preserve_order` in Cargo.toml; docs/divid-differences.md R6).
   - divid keeps the order given (`rpcrawtransaction.cpp:400-410`).
   - The array form (`[{"addr": n}, ...]`) keeps the order on irondivid, and that row passes.
-- `sendrawtransaction` of an unsigned spend (open: rpc-left, RPC-LEFT.md row 8): irondivid answers -25 `""`, divid
-  -26 `"16: mandatory-script-verify-flag-failed (...)"`.
+- `sendrawtransaction` of an unsigned spend: irondivid answers -25 `""`, divid -26
+  `"16: mandatory-script-verify-flag-failed (...)"`.
+  - **Cause:** divid runs here with `acceptnonstandard=1`, which skips its input standardness check
+    (`MempoolConsensus.cpp:274`, `:362-364`), so its script check answers. irondivid has no `-acceptnonstandard`.
+  - Without the option divid answers -25 `""` too (the `unsigned` row of `scripts/reject-replies`).
 
 ## Proving a difference is caught
 

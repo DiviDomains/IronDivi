@@ -1,0 +1,28 @@
+sendfrom "fromaccount" "todiviaddress" amount ( "comment" "comment-to" )
+
+Sent an amount from an account to a divi address.
+The amount is a real and is rounded to the nearest 0.00000001.
+
+Arguments:
+1. "fromaccount"       (string, required) The name of the account to send funds from. May be the default account using "".
+2. "todiviaddress"  (string, required) The divi address to send funds to.
+3. amount                (numeric, required) The amount in DIVI. (transaction fee is added on top).
+4. "comment"           (string, optional) A comment used to store what the transaction is for. 
+                                     This is not part of the transaction, just kept in your wallet.
+5. "comment-to"        (string, optional) An optional comment to store the name of the person or organization 
+                                     to which you're sending the transaction. This is not part of the transaction, 
+                                     it is just kept in your wallet.
+
+Result:
+"transactionid"        (string) The transaction id.
+
+Examples:
+
+Send 0.01 DIVI from the default account to the address, must have at least 1 confirmation
+> divi-cli sendfrom "" "diviaddress" 0.01
+
+Send 0.01 from the tabby account to the given address, funds must have at least 6 confirmations
+> divi-cli sendfrom "tabby" "diviaddress" 0.01 6 "donation" "seans outpost"
+
+As a json rpc call
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "sendfrom", "params": ["tabby", "diviaddress", 0.01, 6, "donation", "seans outpost"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

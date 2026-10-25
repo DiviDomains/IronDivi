@@ -28,9 +28,15 @@ A run takes about 35 seconds and is stopped after 10 minutes. However it ends, a
 directories deleted. Needs bash and python3 (standard library only). RPC passwords are made at random for each run
 and kept in each node's 0600 `divi.conf`.
 
+A node that exits while starting is reported with its exit code and the last 15 lines of its `debug.log` (or of its
+stderr when it wrote no log). If those lines say `Address already in use` or `Unable to bind`, the node is given two
+ports free at that moment (picked by the system) and started again, up to 5 times; the node that dials it follows, as
+each `divi.conf` is written from the nodes' current ports at every start.
+
 ## Nodes
 
-Node 1 of each kind listens; node 2 dials it (`connect=`). Node 1 mines 5 blocks and node 2 follows. All run with
+Node 1 of each kind listens; node 2 dials it (`connect=`). Node 1 mines 5 blocks and node 2 follows (2 more blocks
+later, for the start-height rows). All run with
 `staking=0` and `bantime=86400`. `addnode` and `setban` are given TEST-NET addresses (192.0.2.x, RFC 5737), where no
 node answers, so no other port is touched. The calls are made on node 1 of each kind (it has an inbound peer);
 `getpeerinfo` is compared on node 2 (an outbound peer) too.
@@ -46,6 +52,7 @@ node answers, so no other port is touched. The calls are made on node 1 of each 
 | masternode | `listmasternodes <filter>`, `mnsync <bad mode>` (help), `masternode status` (not a divid method) |
 | `setban`, `disconnectnode` | add, add again, a bad subnet, an absolute end time (and its `banned_until`), removing an address not banned; `disconnectnode` of an address not connected |
 | `ban` | an address with no peer, `outdated`, node 2's address; `getconnectioncount` and `listbanned` after it; the ban across the restart; `clearbanned` |
+| start height | node 2 stops, node 1 mines 2 blocks, node 2 starts again: `getpeerinfo` `startingheight` on node 1 (5, node 2's height) and node 2 (7, the height node 1 has now, reached after it started: Node.cpp:994-1005); node 2's `getblockcount` once it has caught up with no new block mined (divid asks a new peer for blocks whatever height it names, main.cpp:1130-1142) |
 
 How a row compares: the same outcome (a result, or an error with the same code and message; for divid's help texts
 the first line); for a result every field's name, JSON type (an integer and a number with a fraction differ) and value,
@@ -73,8 +80,6 @@ By design:
   `PeerBanningService.cpp:23-34`); irondivid gives an array of bans (`docs/rpc-parity-audit.md`).
 - `setban`, `disconnectnode`: not divid methods (`rpcserver.cpp:325-409`, divid answers `Method not found`); irondivid
   has them. The row checks irondivid's exact reply.
-- `ban outdated`: irondivid does not ban outdated peers and says so (`docs/rpc-parity-audit.md`; divid:
-  `net.cpp:357-393`).
 - `ban <ip>` of node 2's address: divid compares the address given with each peer's `ip:port` text, so it never finds
   a connected peer (`net.cpp:395-407`) and answers `Could not find matching node to ban`; irondivid bans node 2. So
   after it `getconnectioncount` is 1 on divid and 0 on irondivid, and irondivid's `listbanned` has the entry. Neither

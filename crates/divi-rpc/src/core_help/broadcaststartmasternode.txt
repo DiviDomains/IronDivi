@@ -1,0 +1,10 @@
+broadcaststartmasternode hex sig
+
+Verifies the escrowed funds for the masternode and returns the necessary info for your and its configuration files.
+
+Arguments:
+1. broadcast_hex			 (hex, required) hex representation of broadcast data.
+2. appendBroadcastSignature (hex, optional) hex representation of collateral signature.
+
+Result:
+"status"	(string) status of broadcast

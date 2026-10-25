@@ -1,0 +1,7 @@
+ban [outdated|<ip_address>]
+Bans outdated peers (using 'outdated') or specific 'ip address'.
+
+Result:
+{
+  "SuccessStatus": xxxxx, (bool) wether a node was able to be removed
+}

@@ -29,13 +29,13 @@ mod snapshot_sig;
 use anyhow::{Context, Result};
 use divi_crypto::compute_block_hash;
 use divi_node::config::{LogConfig, NetworkType, NodeConfig};
-use divi_node::{Node, Staker, StakingConfig};
+use divi_node::{shutdown_stage, Node, Staker, StakingConfig};
 use divi_primitives::amount::Amount;
 use divi_primitives::transaction::Transaction;
 use divi_primitives::ChainMode;
 use divi_rpc::{start_server_with_wallet_peer_and_staker, RpcConfig};
 use divi_wallet::{HdWallet, Network as WalletNetwork, WalletDb};
-use settings::Settings;
+use settings::{atoi, Settings};
 use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -95,7 +95,9 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n\
+-blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
+-zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
 -utxocachesize=<n> -expire=<age> -maxlogsize=<MB> -maxlogfiles=<n>\n  \
 --export-chain --export-start N --export-end N --export-output DIR\n  \
@@ -191,8 +193,10 @@ impl Args {
         };
         self.maxlogsize = positive("maxlogsize");
         self.maxlogfiles = positive("maxlogfiles").filter(|n| *n <= 100);
-        self.help = ["?", "help", "h"].iter().any(|k| self.cli.is_set(k));
-        self.version = ["version", "V"].iter().any(|k| self.cli.is_set(k));
+        // divid's AppInit takes -? and -help, and -version (divid.cpp:70-85);
+        // -h and -V are not its options
+        self.help = ["?", "help"].iter().any(|k| self.cli.is_set(k));
+        self.version = self.cli.is_set("version");
         if self.export_chain && (self.export_start.is_none() && self.cli.is_set("export-start")) {
             anyhow::bail!("invalid --export-start");
         }
@@ -242,7 +246,20 @@ fn config_path(args: &Args) -> PathBuf {
     }
 }
 
-/// Read the config file into the settings: irondivid's TOML, else divid's
+/// A config file divid's parser refuses, with boost's text
+#[derive(Debug)]
+struct ConfigFileError(String);
+
+impl std::fmt::Display for ConfigFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigFileError {}
+
+/// Read the config file into the settings: irondivid's TOML when the file is
+/// its own (`irondivi.conf` or `*.toml`) and parses as TOML, else divid's
 /// `name=value` format. Values the command line set are kept. Pins `conf` to
 /// the file read, so a network chosen by the file does not move it.
 fn resolve_args(mut args: Args) -> Result<Args> {
@@ -253,9 +270,16 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Error reading configuration file: {:?}", path))?;
+        // Only irondivid's own file may be TOML: a divi.conf that happens to
+        // parse as TOML still means what it means to divid
+        let own = path.file_name().is_some_and(|n| n == "irondivi.conf")
+            || path.extension().is_some_and(|e| e == "toml");
         match content.parse::<toml::Table>() {
-            Ok(table) => args.settings.read_toml(&table),
-            Err(_) => args.settings.read_config(&content),
+            Ok(table) if own => args.settings.read_toml(&table),
+            _ => args
+                .settings
+                .read_config(&content)
+                .map_err(ConfigFileError)?,
         }
     }
     args.refresh()?;
@@ -279,7 +303,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "forcednsseed",
     "forcestart",
     "genproclimit",
-    "keypool",
     "listenonion",
     "litemode",
     "logips",
@@ -289,7 +312,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "masternodeprivkey",
     "maxreceivebuffer",
     "maxsendbuffer",
-    "maxtxfee",
     "mining",
     "mnconf",
     "mnconflock",
@@ -300,27 +322,17 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
-    "rescan",
-    "rest",
     "resync",
-    "rpckeepalive",
     "rpcthreads",
-    "salvagewallet",
     "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
-    "spendzeroconfchange",
     "sysperms",
     "torcontrol",
     "torpassword",
     "txconfirmtarget",
-    "upgradewallet",
     "upnp",
     "vault_min",
-    "zmqpubhashblock",
-    "zmqpubhashtx",
-    "zmqpubrawblock",
-    "zmqpubrawtx",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -434,6 +446,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     // divid serves RPC unless -server=0 (divid.cpp:139)
     config.rpc.enabled = s.get_bool("server", true);
+    // The REST interface, off unless asked for (Divi Core -rest, rpcserver.cpp:1025)
+    config.rpc.rest = s.get_bool("rest", false);
     // The RPC server listens on the loopback unless -rpcallowip lets others
     // in; then on -rpcbind, else on every interface (rpcserver.cpp:633-706)
     let allowed = s.get_multi("rpcallowip").to_vec();
@@ -453,6 +467,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             warn!("option -rpcbind was ignored because -rpcallowip was not specified, refusing to allow everyone to connect");
         }
     } else if let Some(first) = rpcbind.first() {
+        // Each must be a numeric address, with a port or not (ParseEndpoint,
+        // rpcserver.cpp:623-629, :693-703)
+        for addr in rpcbind {
+            let (host, _) = host_and_port(addr);
+            if host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_err()
+            {
+                anyhow::bail!("Could not parse -rpcbind value {} as network address", addr);
+            }
+        }
         let (host, p) = host_and_port(first);
         config.rpc.listen_addr = host;
         if let Some(p) = p {
@@ -468,6 +494,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.rpc.listen_addr = "[::]".to_string();
     }
     config.rpc.allowed_ips = allowed;
+    // -rpckeepalive=0: each RPC connection is closed after its reply
+    // (rpcserver.cpp:1014-1017)
+    config.rpc.keep_alive = s.get_bool("rpckeepalive", true);
 
     if let Some(p) = port("port") {
         config.p2p.port = p;
@@ -503,6 +532,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.connect.extend(connect.iter().cloned());
         config.p2p.enable_discovery = false;
     }
+    config.p2p.addnode = s.get_multi("addnode").to_vec();
     config
         .network
         .static_peers
@@ -567,6 +597,35 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             anyhow::anyhow!("Invalid amount for -minrelaytxfee=<amount>: '{}'", text)
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
+    }
+    // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
+    // above 10 DIVI a warning (init.cpp:831-845)
+    if let Some(text) = s.get("maxtxfee") {
+        let invalid = || anyhow::anyhow!("Invalid amount for -maxtxfee=<amount>: '{}'", text);
+        let max_fee = parse_money(text).ok_or_else(invalid)?;
+        if max_fee > 10 * 100_000_000 {
+            warn!("Warning: -maxtxfee is set very high! Fees this large could be paid on a single transaction.");
+        }
+        let relay = config.mempool.min_relay_fee_per_kb;
+        if max_fee < relay {
+            anyhow::bail!(
+                "Invalid amount for -maxtxfee=<amount>: '{}' (must be at least the minrelay fee of {}.{:08} DIV/kB to prevent stuck transactions)",
+                text,
+                relay / 100_000_000,
+                relay % 100_000_000
+            );
+        }
+        config.mempool.max_tx_fee = max_fee;
+    }
+    // -onlynet: each one of Divi Core's network names (ParseNetwork,
+    // netbase.cpp:70-77; init.cpp:1734-1740)
+    for net in s.get_multi("onlynet") {
+        if !matches!(
+            net.to_lowercase().as_str(),
+            "ipv4" | "ipv6" | "tor" | "onion"
+        ) {
+            anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
+        }
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -633,16 +692,32 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("walletnotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    // Divi Core takes each -zmqpub* that is set, even empty (its bind then
+    // fails), as given (zmqnotificationinterface.cpp:38-50)
+    let zmq_address = |key: &str| s.get(key).map(String::from);
+    config.zmq = divi_node::zmq::ZmqConfig {
+        hashblock: zmq_address("zmqpubhashblock"),
+        hashtx: zmq_address("zmqpubhashtx"),
+        rawblock: zmq_address("zmqpubrawblock"),
+        rawtx: zmq_address("zmqpubrawtx"),
+    };
     config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
         "vault",
+        "rescan",
+        "salvagewallet",
+        "spendzeroconfchange",
+        "keypool",
+        "upgradewallet",
         "rpcuser",
         "rpcpassword",
         "rpcport",
         "server",
+        "rest",
         "rpcallowip",
         "rpcbind",
+        "rpckeepalive",
         "port",
         "bind",
         "listen",
@@ -664,6 +739,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "maxtxfee",
         "sporkkey",
         "staking",
         "stakeonstaletip",
@@ -679,6 +755,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "expire",
         "blocknotify",
         "walletnotify",
+        "zmqpubhashblock",
+        "zmqpubhashtx",
+        "zmqpubrawblock",
+        "zmqpubrawtx",
         "whitelist",
         "whitebind",
     ];
@@ -1030,19 +1110,6 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Initialize logging
-/// The file log's writer thread, kept until `flush_log`
-static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
-    std::sync::Mutex::new(None);
-
-/// Write out the lines the file log's writer thread still holds, before the
-/// process ends. Neither `std::process::exit` nor the end of `main` drops a
-/// static, so without this the last lines, a start-up error among them, are
-/// lost whenever the writer thread has not run yet (a loaded host).
-fn flush_log() {
-    flush_log_from(&LOG_GUARD);
-}
-
 /// Drop the writer's guard in `guard`: it hands the thread a shutdown behind
 /// the lines it holds and waits (up to about a second) until they are written
 fn flush_log_from(guard: &std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>) {
@@ -1090,6 +1157,7 @@ mod flush_log_tests {
     }
 }
 
+/// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -1150,7 +1218,8 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // Create a non-blocking writer to avoid blocking the async runtime
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-        // Keep the writer alive until `flush_log`
+        // Kept until the process exits, when `flush_log` writes out what it
+        // still holds
         *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
         // Set up file logging with timestamps
@@ -1167,6 +1236,23 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size, log_config.max_files
         );
     }
+}
+
+/// The writer thread of debug.log (non-blocking): dropping its guard writes
+/// out the lines it still holds
+static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
+    std::sync::Mutex::new(None);
+
+/// Write out the log lines not yet in debug.log (waits a second at most).
+/// Neither `std::process::exit` nor the end of `main` drops a static, so every
+/// way out of the process after logging starts calls this first: otherwise the
+/// last lines, a start-up error among them, are lost whenever the writer
+/// thread has not run yet (a loaded host).
+fn flush_log() {
+    flush_log_from(&LOG_GUARD);
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
 }
 
 /// Print startup banner
@@ -1214,12 +1300,53 @@ impl WalletSeed {
     }
 }
 
+/// Wallet start options
+#[derive(Debug, Clone, Copy, Default)]
+struct WalletOptions {
+    /// -rescan: scan the whole chain at the start; -salvagewallet sets it
+    /// unless it is given (init.cpp:763-766, :1242)
+    rescan: bool,
+    /// -spendzeroconfchange: sends may use unconfirmed outputs of our own
+    /// transactions (wallet.cpp:1848)
+    spend_zero_conf_change: bool,
+    /// -keypool: keys of each chain the keypool is topped up to, read as a
+    /// number and at least one (wallet.cpp:2071-2080)
+    keypool: Option<u32>,
+    /// -upgradewallet, read as a number: the highest wallet version a new
+    /// wallet may have (wallet.cpp:1963-1971)
+    upgrade_wallet: Option<i64>,
+}
+
+impl WalletOptions {
+    fn from_settings(settings: &Settings) -> Self {
+        WalletOptions {
+            rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
+            spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
+            keypool: settings
+                .get("keypool")
+                .map(|v| atoi(v).clamp(1, u32::MAX as i64) as u32),
+            upgrade_wallet: settings.get("upgradewallet").map(atoi),
+        }
+    }
+
+    /// Divi Core gives a new wallet the latest version only when
+    /// -upgradewallet is absent or is its client version; otherwise the
+    /// wallet keeps the base version, and a limit below that stops the load
+    /// (wallet.cpp:183, :1963-1971; init.cpp:1175)
+    fn refuses_new_wallet(&self) -> bool {
+        const CLIENT_VERSION: i64 = 3_000_000;
+        const FEATURE_BASE: i64 = 10_500;
+        matches!(self.upgrade_wallet, Some(v) if v != CLIENT_VERSION && v < FEATURE_BASE)
+    }
+}
+
 /// Load or create wallet
 fn load_or_create_wallet(
     wallet_path: &PathBuf,
     network: WalletNetwork,
     chain_mode: ChainMode,
     seed: WalletSeed,
+    options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
@@ -1239,6 +1366,7 @@ fn load_or_create_wallet(
         mnemonic,
         passphrase,
         hdseed,
+        options,
     )
 }
 
@@ -1271,6 +1399,7 @@ fn load_or_restore_wallet(
         restoring,
         passphrase,
         None,
+        &WalletOptions::default(),
     )
 }
 
@@ -1283,6 +1412,7 @@ fn load_or_restore_wallet_with_seed(
     restoring: Option<String>,
     passphrase: Option<String>,
     seed: Option<String>,
+    options: &WalletOptions,
 ) -> Result<Arc<WalletDb>> {
     // Try to open existing wallet
     if wallet_path.exists() {
@@ -1302,14 +1432,16 @@ fn load_or_restore_wallet_with_seed(
             .migrate_chain_mode(chain_mode)
             .with_context(|| "Failed to migrate wallet chain_mode")?;
 
+        if let Some(size) = options.keypool {
+            wallet.keystore().set_keypool_target(size);
+        }
         // Divi Core does not refill the keypool when it loads a wallet: it tops
         // up only before it takes a key (wallet.cpp:2122-2131), so a pool may
-        // sit one key short per chain. Only a pool below that, which divid
-        // never has (a wallet stored before its keypool was), is filled here,
-        // so payments to its next keys are still found. A locked wallet is
-        // topped up on unlock.
-        let at_rest = 2 * wallet.keypool_target().saturating_sub(1);
-        if !wallet.is_locked() && wallet.keypool_size() < at_rest {
+        // sit one key short per chain, or below a -keypool raised since. Only
+        // an empty pool, which divid never has (a wallet stored before its
+        // keypool was), is filled here, so payments to its next keys are
+        // still found. A locked wallet is topped up on unlock.
+        if !wallet.is_locked() && wallet.keypool_size() == 0 {
             if let Err(e) = wallet.top_up_keypool() {
                 warn!("Could not top up the keypool: {}", e);
             }
@@ -1339,6 +1471,11 @@ fn load_or_restore_wallet_with_seed(
     }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
+    // The version limit is checked before the seed is made
+    // (wallet.cpp:1963-1979), and before anything is written
+    if options.refuses_new_wallet() {
+        anyhow::bail!("Error loading wallet.dat: database load failure");
+    }
     // Checked only when words make the wallet, before anything is written
     // (wallet.cpp:2302-2305, reported by init.cpp:1203-1209)
     if passphrase.as_ref().is_some_and(|p| p.len() > 256) {
@@ -1385,6 +1522,9 @@ fn load_or_restore_wallet_with_seed(
 
     let wallet = WalletDb::create_persistent(wallet_path, network, hd_wallet)
         .with_context(|| "Failed to create wallet")?;
+    if let Some(size) = options.keypool {
+        wallet.keystore().set_keypool_target(size);
+    }
 
     // A new or restored wallet starts with a full keypool, as in Divi Core,
     // whose restore finds the coins of exactly these keys: the catch-up scan
@@ -1464,18 +1604,44 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
     );
 }
 
+/// Lock `<datadir>/.lock` as Divi Core does; a data directory another process
+/// holds stops the start with Divi Core's error
+fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(".lock"))
+        .with_context(|| format!("Failed to open {:?}", dir.join(".lock")))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
+            dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("Failed to lock {:?}", dir.join(".lock")))
+        }
+    }
+}
+
 /// Run the daemon
 async fn run_daemon(
     mut config: NodeConfig,
     wallet_path: Option<PathBuf>,
     wallet_seed: WalletSeed,
     disable_wallet: bool,
+    wallet_options: WalletOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
+    // One process per data directory, held until this one exits
+    // (TryLockDataDirectory, init.cpp:850-862)
+    let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // divid reads masternode.conf at every start and makes it when missing
+    core_files::ensure_masternode_conf(&config.data_dir);
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -1484,12 +1650,18 @@ async fn run_daemon(
 
     // Initialize the node
     info!("Initializing node...");
-    let node = Node::new(config.clone()).map_err(start_error)?;
+    // Never dropped: the process ends without running the destructors of the
+    // node's state (databases, caches, mempool), see `exit_after_stop`
+    let node = std::mem::ManuallyDrop::new(Node::new(config.clone()).map_err(start_error)?);
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
     }
+
+    // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
+    // Kept for the life of the node; none if an address cannot be bound.
+    let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
@@ -1548,11 +1720,14 @@ async fn run_daemon(
             wallet_network,
             config.network.chain_mode,
             wallet_seed,
+            &wallet_options,
         )?);
         if let Some(ref w) = wallet {
             core_files::lock_masternode_collateral(w, &config.data_dir);
             w.set_vault_mode(config.vault);
+            w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
+            w.set_max_tx_fee(config.mempool.max_tx_fee);
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
@@ -1610,7 +1785,7 @@ async fn run_daemon(
             {
                 let wallet_for_added = Arc::clone(wallet_arc);
                 node.mempool()
-                    .set_added_listener(Arc::new(move |tx: &Transaction| {
+                    .add_added_listener(Arc::new(move |tx: &Transaction| {
                         if wallet_for_added.add_mempool_tx(tx) {
                             info!("Wallet sees unconfirmed tx {}", tx.txid());
                         }
@@ -1664,8 +1839,15 @@ async fn run_daemon(
             // lock and its scan height, so neither side skips or reorders a block.
             // A chain lower than the scan height (rebuilt or reindexed) rolls the
             // wallet back to the tip; the sync that follows scans those blocks again.
-            let last_scan = wallet_arc.last_scan_height();
+            // -rescan: scan the whole active chain again, keeping what the
+            // wallet holds, as Divi Core's verifySyncToActiveChain from the
+            // genesis block (init.cpp:1242, wallet.cpp:279-313)
             let chain_height = node.chain().height();
+            if wallet_options.rescan {
+                info!("Rescanning... from height 0 to {}", chain_height);
+                wallet_arc.set_last_scan_height(0);
+            }
+            let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
                 info!(
                     "Wallet scanned to height {} but the chain is at {}; rescanning above it as the chain syncs",
@@ -1901,6 +2083,8 @@ async fn run_daemon(
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
+        keep_alive: config.rpc.keep_alive,
+        rest: config.rpc.rest,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -1935,6 +2119,7 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -1942,6 +2127,9 @@ async fn run_daemon(
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -1958,14 +2146,15 @@ async fn run_daemon(
                 move |rpc_server| {
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_reorg_hook(reorg_hook_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2088,11 +2277,15 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2108,14 +2301,15 @@ async fn run_daemon(
                 move |rpc_server| {
                     rpc_server.set_shutdown_callback(rpc_stop);
                     rpc_server.set_mempool(mempool_for_rpc);
+                    rpc_server.set_reorg_hook(reorg_hook_for_rpc);
                     rpc_server.set_block_fetcher(history_for_rpc);
                     rpc_server.set_block_sync(block_sync_for_rpc);
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2136,10 +2330,13 @@ async fn run_daemon(
 
     // Stop the node
     info!("Stopping node...");
+    let started = std::time::Instant::now();
     node.stop().await.with_context(|| "Failed to stop node")?;
+    shutdown_stage("node stopped", started);
 
     let mut clean = true;
     if let Some(wallet) = wallet_for_shutdown {
+        let started = std::time::Instant::now();
         match wallet.save() {
             Ok(()) => info!("Wallet saved"),
             Err(e) => {
@@ -2147,11 +2344,14 @@ async fn run_daemon(
                 clean = false;
             }
         }
+        shutdown_stage("wallet saved", started);
     }
     if clean {
+        let started = std::time::Instant::now();
         if let Err(e) = node.chain().end_run() {
             error!("Failed to record the clean stop: {}", e);
         }
+        shutdown_stage("databases synced and the clean stop recorded", started);
     }
 
     info!("Node stopped");
@@ -2181,7 +2381,7 @@ fn run_notify(cmd: &str, value: &str) {
 /// -blocknotify: run the command each time the best block changes, with the
 /// new tip's hash (divid's UpdatedBlockTip, init.cpp:113-117, :518-523)
 fn spawn_block_notify(chain: Arc<divi_storage::Chain>, cmd: String) {
-    chain.set_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
+    chain.add_tip_listener(Arc::new(move |tip| run_notify(&cmd, &tip.hash.to_string())));
 }
 
 /// The staker's settings. The minimum coin age is the network's (Divi Core
@@ -2259,6 +2459,7 @@ fn staking_info(
         // IronDivi keeps no masternode list sync of its own; Divi Core's
         // starts once the chain is synced
         mnsync: synced,
+        recently_attempted: status.recently_attempted,
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
@@ -2288,6 +2489,31 @@ fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::
         .flatten()
         .and_then(|index| chain.get_block_index_by_height(index.height).ok().flatten())
         .is_some_and(|index| index.hash == hash)
+}
+
+/// The mempool side of invalidateblock and its family: the disconnected
+/// blocks' transactions go back to the mempool and what the chain now spends
+/// leaves it, as after any reorganization. The wallet is brought to the tip
+/// first, as Divi Core's disconnectTip and connectTip tell it of every block
+/// that leaves or joins the chain (SyncTransactions, ChainTipManager.cpp:189,
+/// :150): blocks that left are rolled back, blocks that joined are scanned.
+/// Before the mempool, so a returned transaction reaches a wallet that no
+/// longer holds it as confirmed.
+fn mempool_reorg_hook(
+    node: &Node,
+    wallet: Option<Arc<WalletDb>>,
+) -> divi_rpc::blockchain::ReorgHook {
+    let chain = node.chain().clone();
+    let mempool = node.mempool().clone();
+    Arc::new(move |disconnected| {
+        if let Some(wallet) = &wallet {
+            sync_wallet_to_tip(wallet, &chain);
+            if let Err(e) = wallet.save_incremental() {
+                error!("Failed to save the wallet after the chain moved: {}", e);
+            }
+        }
+        divi_node::update_mempool_after_reorg(&chain, &mempool, disconnected)
+    })
 }
 
 /// The mempool side of a block handed over by the sync layer or the staker.
@@ -2525,7 +2751,11 @@ fn main() -> Result<()> {
     let args = match resolve_args(args) {
         Ok(args) => args,
         Err(e) => {
-            eprintln!("Error: {:#}", e);
+            // divid prints its config file errors under their own heading (divid.cpp:97-98)
+            match e.downcast_ref::<ConfigFileError>() {
+                Some(c) => eprintln!("Error reading configuration file: {}", c),
+                None => eprintln!("Error: {:#}", e),
+            }
             std::process::exit(1);
         }
     };
@@ -2612,13 +2842,38 @@ fn main() -> Result<()> {
     }
 
     // Now enter the tokio runtime (after daemonization)
-    let result = tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("Failed to build tokio runtime")?
-        .block_on(async_main(args, data_dir));
+        .context("Failed to build tokio runtime")?;
+    let result = runtime.block_on(async_main(args, data_dir));
+    exit_after_stop(runtime, result)
+}
+
+/// End the process once `async_main` has stopped the node and recorded the
+/// clean stop. The runtime is not dropped: that would wait, with no deadline,
+/// for every worker and blocking thread, and run the destructors of all the
+/// node's state still held by its tasks, among them the databases' close and
+/// the freeing of its caches, which reads back every page of them that is in
+/// swap. The next start needs none of it: `end_run` has synced the databases'
+/// logs. Divi Core likewise exits once its Shutdown() steps are done
+/// (init.cpp).
+fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
+    let started = std::time::Instant::now();
+    let code = match &result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            1
+        }
+    };
+    // Let the runtime's threads go without waiting for them
+    std::mem::forget(runtime);
+    shutdown_stage("exit", started);
     flush_log();
-    result
+    // _exit: no atexit handlers or C++ static destructors either (RocksDB's
+    // thread pools would be joined there)
+    unsafe { libc::_exit(code) }
 }
 
 async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
@@ -2718,6 +2973,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     });
 
     let wallet_seed = WalletSeed::from_settings(&args.settings);
+    let wallet_options = WalletOptions::from_settings(&args.settings);
 
     // Run the daemon
     if let Err(e) = run_daemon(
@@ -2725,6 +2981,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         args.wallet,
         wallet_seed,
         args.disablewallet,
+        wallet_options,
         shutdown_tx,
         shutdown_rx,
     )
@@ -2967,6 +3224,24 @@ mod config_format_tests {
         .unwrap();
         assert_eq!(a.maxlogsize, Some(2));
         assert_eq!(a.chain_mode(), ChainMode::Divi);
+    }
+
+    /// -rpckeepalive is read, on by default (rpcserver.cpp:1014-1017)
+    #[test]
+    fn rpckeepalive_is_read() {
+        assert!(cfg("regtest=1\n", &[]).unwrap().rpc.keep_alive);
+        assert!(
+            !cfg("regtest=1\nrpckeepalive=0\n", &[])
+                .unwrap()
+                .rpc
+                .keep_alive
+        );
+        assert!(
+            !cfg("regtest=1\n", &["--rpckeepalive=0"])
+                .unwrap()
+                .rpc
+                .keep_alive
+        );
     }
 
     /// -whitelist and -whitebind as divid reads them: a bad network or a
@@ -3358,6 +3633,7 @@ mod staking_status_tests {
             expected_time: None,
             last_stake_time: 0,
             blocks: 100,
+            recently_attempted: false,
         };
         let info = staking_info(&status, true, 0, 0, false, 5000.0);
         assert!(!info.wallet_unlocked, "locked wallet reported unlocked");
@@ -3674,6 +3950,7 @@ mod wallet_move_tests {
             WalletNetwork::Regtest,
             ChainMode::Divi,
             WalletSeed::default(),
+            &WalletOptions::default(),
         );
         std::env::remove_var("WALLET_HDSEED");
         std::env::remove_var("WALLET_MNEMONIC");
@@ -3741,6 +4018,46 @@ mod divid_option_tests {
         let c = cfg_in("divi.conf", "rpcuser=u\nrpcpassword=p\nrpcport=1234\n", &[]).unwrap();
         assert_eq!(c.rpc.port, 1234);
         assert_eq!(c.rpc.username.as_deref(), Some("u"));
+    }
+
+    /// A divi.conf that happens to be valid TOML still means what it means to
+    /// divid: a [section] line does not hide the keys after it
+    /// (Settings.cpp:159-184) and quotes stay in the value. Only irondivid's
+    /// own file, irondivi.conf or a .toml file, is read as TOML.
+    #[test]
+    fn divi_conf_is_read_as_divid_reads_it_even_when_it_is_toml() {
+        let conf = "rpcuser=1\nrpcpassword=2\nrpcport=1234\n[test]\nrpcport=5\ntimeout=7\n";
+        for file in ["divi.conf", "other.conf"] {
+            let extra = format!("--conf={file}");
+            let c = cfg_in(file, conf, &[&extra]).unwrap();
+            assert_eq!(c.rpc.port, 1234, "{file}: the first value wins");
+            assert_eq!(c.p2p.connect_timeout_ms, 7, "{file}: [test] keys apply");
+        }
+        let c = cfg_in("divi.conf", "rpcuser=\"u\"\nrpcpassword=2\n", &[]).unwrap();
+        assert_eq!(c.rpc.username.as_deref(), Some("\"u\""));
+
+        for file in ["irondivi.conf", "node.toml"] {
+            let extra = format!("--conf={file}");
+            let c = cfg_in(file, "rpcuser = \"u\"\nrpcport = 1236\n", &[&extra]).unwrap();
+            assert_eq!(c.rpc.username.as_deref(), Some("u"), "{file}");
+            assert_eq!(c.rpc.port, 1236, "{file}");
+        }
+    }
+
+    /// -addnode keeps every value, the command line's first, for the added
+    /// node list as well as the peers dialled
+    #[test]
+    fn addnode_values_in_order_command_line_first() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\naddnode=127.0.0.2:11\naddnode=127.0.0.2:12\n",
+            &["-addnode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.addnode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.2:12"]
+        );
     }
 
     /// -conf is relative to the data directory (Settings::GetConfigFile)
@@ -3929,5 +4246,141 @@ mod divid_option_tests {
         assert_eq!(NodeConfig::mainnet(ChainMode::Divi).rpc.port, 51473);
         assert_eq!(NodeConfig::testnet(ChainMode::Divi).rpc.port, 51475);
         assert_eq!(NodeConfig::regtest(ChainMode::Divi).rpc.port, 51475);
+    }
+}
+
+/// Starts divid refuses, refused with its text (init.cpp, divid.cpp, rpcserver.cpp)
+#[cfg(test)]
+mod start_errors {
+    use super::*;
+
+    fn start(conf: &str, argv: &[&str]) -> Result<NodeConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("divi.conf"), conf).unwrap();
+        let mut v = vec![
+            "irondivid".to_string(),
+            format!("-datadir={}", dir.path().display()),
+        ];
+        v.extend(argv.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(v))
+    }
+
+    fn refused(conf: &str, argv: &[&str]) -> String {
+        format!(
+            "{:#}",
+            start(conf, argv).expect_err("the start must be refused")
+        )
+    }
+
+    const CONF: &str = "regtest=1\nrpcuser=u\nrpcpassword=p\n";
+
+    /// -maxtxfee as init.cpp:831-845: ParseMoney, then at least the relay fee
+    #[test]
+    fn maxtxfee_is_refused_as_divid_refuses_it() {
+        for bad in ["abc", "-1", "99999999999", "1e3"] {
+            assert_eq!(
+                refused(CONF, &[&format!("-maxtxfee={bad}")]),
+                format!("Invalid amount for -maxtxfee=<amount>: '{bad}'")
+            );
+        }
+        assert_eq!(
+            refused(CONF, &["-maxtxfee=0.00001", "-minrelaytxfee=0.0001"]),
+            "Invalid amount for -maxtxfee=<amount>: '0.00001' (must be at least the minrelay \
+             fee of 0.00010000 DIV/kB to prevent stuck transactions)"
+        );
+        assert_eq!(
+            start(CONF, &["-maxtxfee=0.5"]).unwrap().mempool.max_tx_fee,
+            50_000_000
+        );
+        assert_eq!(
+            start(CONF, &[]).unwrap().mempool.max_tx_fee,
+            100 * 100_000_000
+        );
+        assert!(
+            start(CONF, &["-maxtxfee=100"]).is_ok(),
+            "very high is a warning only"
+        );
+    }
+
+    /// -onlynet takes ipv4, ipv6, tor or onion (netbase.cpp:70-77, init.cpp:1734-1740)
+    #[test]
+    fn onlynet_names_a_network_divid_knows() {
+        assert_eq!(
+            refused(CONF, &["-onlynet=bogus"]),
+            "Unknown network specified in -onlynet: 'bogus'"
+        );
+        for good in ["ipv4", "IPv6", "tor", "onion"] {
+            assert!(
+                start(CONF, &[&format!("-onlynet={good}")]).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    /// -rpcbind is a numeric address, read only with -rpcallowip
+    /// (rpcserver.cpp:623-629, :685-703)
+    #[test]
+    fn rpcbind_must_be_a_numeric_address() {
+        assert_eq!(
+            refused(CONF, &["-rpcallowip=127.0.0.1", "-rpcbind=garbage"]),
+            "Could not parse -rpcbind value garbage as network address"
+        );
+        assert_eq!(
+            refused(
+                CONF,
+                &[
+                    "-rpcallowip=127.0.0.1",
+                    "-rpcbind=127.0.0.1",
+                    "-rpcbind=localhost"
+                ]
+            ),
+            "Could not parse -rpcbind value localhost as network address"
+        );
+        assert!(
+            start(CONF, &["-rpcbind=garbage"]).is_ok(),
+            "ignored without -rpcallowip"
+        );
+        assert!(start(CONF, &["-rpcallowip=127.0.0.1", "-rpcbind=127.0.0.1:1234"]).is_ok());
+        assert!(start(CONF, &["-rpcallowip=::1", "-rpcbind=[::1]:1234"]).is_ok());
+    }
+
+    /// A divi.conf line with no "=" is boost's error (divid.cpp:95-99)
+    #[test]
+    fn config_line_without_a_value_stops_the_start() {
+        assert_eq!(
+            refused(&format!("{CONF}listen\n"), &[]),
+            "the options configuration file contains an invalid line 'listen'"
+        );
+    }
+
+    /// divid takes -? and -help, and -version; -h and -V are not its options
+    /// (divid.cpp:70-85)
+    #[test]
+    fn help_and_version_are_divid_s_options() {
+        let parse = |a: &str| Args::parse_from(["irondivid", a]);
+        assert!(parse("-?").help && parse("-help").help && parse("--help").help);
+        assert!(parse("-version").version);
+        assert!(!parse("-h").help && !parse("-h").version);
+        assert!(!parse("-V").version);
+    }
+
+    /// One process per data directory, with divid's text (init.cpp:850-862)
+    #[test]
+    fn a_held_data_directory_stops_a_second_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).unwrap();
+        let e = format!("{:#}", lock_data_dir(dir.path()).unwrap_err());
+        assert_eq!(
+            e,
+            format!(
+                "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
+                dir.path().display()
+            )
+        );
+        drop(first);
+        assert!(
+            lock_data_dir(dir.path()).is_ok(),
+            "free again once the first exits"
+        );
     }
 }

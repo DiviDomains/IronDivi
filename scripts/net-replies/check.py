@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -28,6 +29,8 @@ INJECT = os.environ.get("NET_REPLIES_INJECT", "")
 DUMP = os.environ.get("NET_REPLIES_DUMP", "")
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
+# A node that cannot bind its ports is started again on new ones, this often
+BIND_RETRIES = 5
 BANTIME = 86400
 
 # Differences listed in README.md with divid's source line, one per row name:
@@ -106,11 +109,6 @@ KNOWN = {
     "setban 192.0.2.11 add <absolute time>": iron_only("setban", ("ok", None)),
     "setban remove of an address not banned": iron_only("setban", ("err", -30, "IP not in ban list")),
     "disconnectnode of an address not connected": iron_only("disconnectnode", ("err", -29, "Node not connected")),
-    "ban outdated (none outdated)": (
-        "irondivid does not ban outdated peers (docs/rpc-parity-audit.md: ban outdated; divid: net.cpp:357-393) "
-        "[by design]",
-        pair(("ok", {"Banned": []}),
-             ("err", -1, "ban outdated is not supported: peer versions are not tracked"))),
     "ban 127.0.0.1 (node 2's address)": (
         "divid compares the address given with each peer's ip:port text, so it never finds a connected peer "
         "(net.cpp:395-407); irondivid bans node 2 [by design]",
@@ -148,39 +146,90 @@ def row(name, core, iron, same, raw=None):
     print(f"{word:<5}  {name}  divid={core}  irondivid={iron}{note}", flush=True)
 
 
+def free_port():
+    """A port nothing listens on now (the system picks it)"""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 class Node:
     def __init__(self, name, binary, index, extra):
+        """extra: divi.conf lines; a callable is evaluated at each start, so a
+        line naming another node's port follows that node to new ports"""
         self.name = name
         self.binary = binary
         self.dir = os.path.join(WORK, name)
         self.p2p = PORT_BASE + 2 * index
         self.rpcport = PORT_BASE + 2 * index + 1
-        password = secrets.token_hex(16)
-        self.auth = base64.b64encode(f"net{index}:{password}".encode()).decode()
-        self.lines = [
-            "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
-            f"rpcuser=net{index}", f"rpcpassword={password}",
-            "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
-            "bind=127.0.0.1", "dnsseed=0", "staking=0", f"bantime={BANTIME}",
-        ] + list(extra)
+        self.user = f"net{index}"
+        self.password = secrets.token_hex(16)
+        self.auth = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+        self.extra = list(extra)
         os.makedirs(self.dir)
-        fd = os.open(os.path.join(self.dir, "divi.conf"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write("\n".join(self.lines) + "\n")
         self.proc = None
         self.starts = 0
+        self.why = ""
 
-    def start(self):
+    def write_conf(self):
+        lines = [
+            "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
+            f"rpcuser={self.user}", f"rpcpassword={self.password}",
+            "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
+            "bind=127.0.0.1", "dnsseed=0", "staking=0", f"bantime={BANTIME}",
+        ] + [line() if callable(line) else line for line in self.extra]
+        path = os.path.join(self.dir, "divi.conf")
+        fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(path + ".new", path)
+
+    def launch(self):
         self.starts += 1
-        base = os.path.join(WORK, f"{self.name}.{self.starts}")
-        with open(base + ".out", "w") as o, open(base + ".err", "w") as e:
+        self.write_conf()
+        self.err = os.path.join(WORK, f"{self.name}.{self.starts}.err")
+        with open(os.path.join(WORK, f"{self.name}.{self.starts}.out"), "w") as o, open(self.err, "w") as e:
             self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir,
                                          stdout=o, stderr=e, start_new_session=True)
         with open(os.path.join(WORK, "pids"), "a") as f:
             f.write(f"{self.proc.pid}\n")
+
+    def log_tail(self, n=15):
+        """The last lines of the node's debug.log (divid keeps it in regtest/),
+        or of its stderr when there is none"""
+        for path in (os.path.join(self.dir, "regtest", "debug.log"), os.path.join(self.dir, "debug.log"), self.err):
+            try:
+                with open(path, errors="replace") as f:
+                    lines = f.read().splitlines()
+                if lines:
+                    return lines[-n:]
+            except OSError:
+                pass
+        return []
+
+    def start(self):
+        """True once RPC answers. A node that exits at once because a port is
+        taken is started again on new ports; otherwise `why` says how it ended:
+        its exit code and the last 15 lines of its debug.log"""
+        retries = BIND_RETRIES
+        self.launch()
         deadline = time.time() + START_TIMEOUT
         while time.time() < deadline:
-            if self.proc.poll() is not None:
+            code = self.proc.poll()
+            if code is not None:
+                tail = self.log_tail()
+                text = "\n".join(tail)
+                if retries and ("Address already in use" in text or "Unable to bind" in text):
+                    retries -= 1
+                    old = (self.p2p, self.rpcport)
+                    self.p2p, self.rpcport = free_port(), free_port()
+                    print(f"# {self.name}: ports {old[0]}/{old[1]} in use, starting again on "
+                          f"{self.p2p}/{self.rpcport}", flush=True)
+                    self.launch()
+                    continue
+                self.proc = None
+                self.why = f"exited with code {code}; last lines of its log:\n" + "\n".join(
+                    "#     " + line for line in tail)
                 return False
             try:
                 if self.call("getblockcount")[0] == "ok":
@@ -188,6 +237,8 @@ class Node:
             except Exception:
                 pass
             time.sleep(0.25)
+        self.why = f"no RPC answer within {START_TIMEOUT} s; last lines of its log:\n" + "\n".join(
+            "#     " + line for line in self.log_tail())
         return False
 
     def call(self, method, *params):
@@ -349,15 +400,15 @@ sys.excepthook = setup_failed
 # --- the four nodes -----------------------------------------------------------------
 
 C1 = Node("divid1", DIVID, 0, ["listen=1"])
-C2 = Node("divid2", DIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"])
+C2 = Node("divid2", DIVID, 1, ["listen=0", lambda: f"connect=127.0.0.1:{C1.p2p}"])
 I1 = Node("irondivid1", IRONDIVID, 2, ["listen=1"])
-I2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", f"connect=127.0.0.1:{PORT_BASE + 4}"])
+I2 = Node("irondivid2", IRONDIVID, 3, ["listen=0", lambda: f"connect=127.0.0.1:{I1.p2p}"])
 PAIRS = ((C1, C2), (I1, I2))
 
 
 def start_all():
     for n in (C1, C2, I1, I2):
-        need(n.start(), f"{n.name} did not start within {START_TIMEOUT} s")
+        need(n.start(), f"{n.name} did not start: {n.why}")
 
 
 def connected(n=1):
@@ -407,6 +458,26 @@ def replies(prefix):
 
 
 replies("")
+
+# A version names the height at the time it is sent (Node.cpp:994-1005), and a
+# node asks a new peer for blocks whatever height it names (main.cpp:1130-1142):
+# node 2 stops, node 1 mines two blocks, node 2 starts again and dials node 1,
+# which is at a height it reached after it started
+for _, b in PAIRS:
+    b.stop()
+for a, _ in PAIRS:
+    a.rpc("setgenerate", 2)
+for _, b in PAIRS:
+    need(b.start(), f"{b.name} did not start again: {b.why}")
+need(wait_for(connected, 90), "node 2 did not connect again")
+for on, what in ((1, "node 1 sees node 2"), (2, "node 2 sees node 1")):
+    c = [p.get("startingheight") for p in (C1 if on == 1 else C2).rpc("getpeerinfo")]
+    i = [p.get("startingheight") for p in (I1 if on == 1 else I2).rpc("getpeerinfo")]
+    compare(f"getpeerinfo startingheight after node 2 restarts ({what})", ("ok", c), ("ok", i))
+caught_up = lambda: all(b.rpc("getblockcount") == 7 for _, b in PAIRS)
+wait_for(caught_up, 60)
+compare("getblockcount on node 2 after it restarts (no new block)", ("ok", C2.rpc("getblockcount")),
+        ("ok", I2.rpc("getblockcount")))
 
 # addnode and getaddednodeinfo
 both("addnode add", "addnode", UNREACHABLE, "add")

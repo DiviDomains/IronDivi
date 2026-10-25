@@ -135,26 +135,851 @@ const LIST: &[(&str, &str, &str, bool)] = &[
     ("wallet", "walletpassphrasechange", "walletpassphrasechange \"oldpassphrase\" \"newpassphrase\"", true),
 ];
 
-/// The whole help text of a call as Divi Core writes it, for the calls given
-/// here. Core's examples name sample addresses; these say "diviaddress".
+/// One state's help text of a call: the same as with an unencrypted wallet,
+/// none (divid answers "help: unknown command: <call>"), or this text
+#[derive(Clone, Copy, Debug)]
+enum Help {
+    Same,
+    Unknown,
+    Text(&'static str),
+}
+
+/// Divi Core 3.0.0's help text of each of its calls, as divid 3.0.0 answers
+/// `help <call>`: with an unencrypted wallet, then with an encrypted one and
+/// without a wallet. The texts are taken from divid; sample addresses and
+/// hashes in their examples are written "diviaddress" and "hash".
+const TEXTS: &[(&str, Help, Help, Help)] = &[
+    (
+        "addmultisigaddress",
+        Help::Text(include_str!("core_help/addmultisigaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "addnode",
+        Help::Text(include_str!("core_help/addnode.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "addvault",
+        Help::Text(include_str!("core_help/addvault.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "allocatefunds",
+        Help::Text(include_str!("core_help/allocatefunds.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "backupwallet",
+        Help::Text(include_str!("core_help/backupwallet.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "ban",
+        Help::Text(include_str!("core_help/ban.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "bip38decrypt",
+        Help::Text(include_str!("core_help/bip38decrypt.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "bip38paperwallet",
+        Help::Text(include_str!("core_help/bip38paperwallet.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "broadcaststartmasternode",
+        Help::Text(include_str!("core_help/broadcaststartmasternode.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "clearbanned",
+        Help::Text(include_str!("core_help/clearbanned.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "createmultisig",
+        Help::Text(include_str!("core_help/createmultisig.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "createrawtransaction",
+        Help::Text(include_str!("core_help/createrawtransaction.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "debitvaultbyname",
+        Help::Text(include_str!("core_help/debitvaultbyname.txt")),
+        Help::Text(include_str!("core_help/debitvaultbyname.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "decoderawtransaction",
+        Help::Text(include_str!("core_help/decoderawtransaction.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "decodescript",
+        Help::Text(include_str!("core_help/decodescript.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "dumphdinfo",
+        Help::Text(include_str!("core_help/dumphdinfo.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "dumpprivkey",
+        Help::Text(include_str!("core_help/dumpprivkey.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "encryptwallet",
+        Help::Text(include_str!("core_help/encryptwallet.txt")),
+        Help::Unknown,
+        Help::Unknown,
+    ),
+    (
+        "fundvault",
+        Help::Text(include_str!("core_help/fundvault.txt")),
+        Help::Text(include_str!("core_help/fundvault.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "generateblock",
+        Help::Text(include_str!("core_help/generateblock.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getaccount",
+        Help::Text(include_str!("core_help/getaccount.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getaccountaddress",
+        Help::Text(include_str!("core_help/getaccountaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getaddednodeinfo",
+        Help::Text(include_str!("core_help/getaddednodeinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getaddressbalance",
+        Help::Text(include_str!("core_help/getaddressbalance.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getaddressdeltas",
+        Help::Text(include_str!("core_help/getaddressdeltas.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getaddressesbyaccount",
+        Help::Text(include_str!("core_help/getaddressesbyaccount.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getaddresstxids",
+        Help::Text(include_str!("core_help/getaddresstxids.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getaddressutxos",
+        Help::Text(include_str!("core_help/getaddressutxos.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getbalance",
+        Help::Text(include_str!("core_help/getbalance.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getbestblockhash",
+        Help::Text(include_str!("core_help/getbestblockhash.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getblock",
+        Help::Text(include_str!("core_help/getblock.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getblockchaininfo",
+        Help::Text(include_str!("core_help/getblockchaininfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getblockcount",
+        Help::Text(include_str!("core_help/getblockcount.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getblockhash",
+        Help::Text(include_str!("core_help/getblockhash.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getblockheader",
+        Help::Text(include_str!("core_help/getblockheader.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getchaintips",
+        Help::Text(include_str!("core_help/getchaintips.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getcoinavailability",
+        Help::Text(include_str!("core_help/getcoinavailability.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getconnectioncount",
+        Help::Text(include_str!("core_help/getconnectioncount.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getdifficulty",
+        Help::Text(include_str!("core_help/getdifficulty.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getinfo",
+        Help::Text(include_str!("core_help/getinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getinvalid",
+        Help::Text(include_str!("core_help/getinvalid.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getlotteryblockwinners",
+        Help::Text(include_str!("core_help/getlotteryblockwinners.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getmasternodecount",
+        Help::Text(include_str!("core_help/getmasternodecount.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getmasternodestatus",
+        Help::Text(include_str!("core_help/getmasternodestatus.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getmasternodewinners",
+        Help::Text(include_str!("core_help/getmasternodewinners.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getmempoolinfo",
+        Help::Text(include_str!("core_help/getmempoolinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getmininginfo",
+        Help::Text(include_str!("core_help/getmininginfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getnettotals",
+        Help::Text(include_str!("core_help/getnettotals.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getnetworkinfo",
+        Help::Text(include_str!("core_help/getnetworkinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getnewaddress",
+        Help::Text(include_str!("core_help/getnewaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getpeerinfo",
+        Help::Text(include_str!("core_help/getpeerinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getrawchangeaddress",
+        Help::Text(include_str!("core_help/getrawchangeaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getrawmempool",
+        Help::Text(include_str!("core_help/getrawmempool.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getrawtransaction",
+        Help::Text(include_str!("core_help/getrawtransaction.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getreceivedbyaccount",
+        Help::Text(include_str!("core_help/getreceivedbyaccount.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getreceivedbyaddress",
+        Help::Text(include_str!("core_help/getreceivedbyaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getspentinfo",
+        Help::Text(include_str!("core_help/getspentinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getstakingstatus",
+        Help::Text(include_str!("core_help/getstakingstatus.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "gettransaction",
+        Help::Text(include_str!("core_help/gettransaction.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "gettxout",
+        Help::Text(include_str!("core_help/gettxout.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "gettxoutsetinfo",
+        Help::Text(include_str!("core_help/gettxoutsetinfo.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "getunconfirmedbalance",
+        Help::Text(include_str!("core_help/getunconfirmedbalance.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "getwalletinfo",
+        Help::Text(include_str!("core_help/getwalletinfo.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "help",
+        Help::Text(include_str!("core_help/help.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "importaddress",
+        Help::Text(include_str!("core_help/importaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "importmnbroadcast",
+        Help::Text(include_str!("core_help/importmnbroadcast.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "importprivkey",
+        Help::Text(include_str!("core_help/importprivkey.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "invalidateblock",
+        Help::Text(include_str!("core_help/invalidateblock.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "keypoolrefill",
+        Help::Text(include_str!("core_help/keypoolrefill.txt")),
+        Help::Text(include_str!("core_help/keypoolrefill.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "listaccounts",
+        Help::Text(include_str!("core_help/listaccounts.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "listbanned",
+        Help::Text(include_str!("core_help/listbanned.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "listlockunspent",
+        Help::Text(include_str!("core_help/listlockunspent.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "listmasternodes",
+        Help::Text(include_str!("core_help/listmasternodes.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "listmnbroadcasts",
+        Help::Text(include_str!("core_help/listmnbroadcasts.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "listreceivedbyaccount",
+        Help::Text(include_str!("core_help/listreceivedbyaccount.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "listreceivedbyaddress",
+        Help::Text(include_str!("core_help/listreceivedbyaddress.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "listsinceblock",
+        Help::Text(include_str!("core_help/listsinceblock.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "listtransactions",
+        Help::Text(include_str!("core_help/listtransactions.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "listunspent",
+        Help::Text(include_str!("core_help/listunspent.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "loadwallet",
+        Help::Text(include_str!("core_help/loadwallet.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "lockunspent",
+        Help::Text(include_str!("core_help/lockunspent.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "mnsync",
+        Help::Text(include_str!("core_help/mnsync.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "ping",
+        Help::Text(include_str!("core_help/ping.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "prioritisetransaction",
+        Help::Text(include_str!("core_help/prioritisetransaction.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "reclaimvaultfunds",
+        Help::Text(include_str!("core_help/reclaimvaultfunds.txt")),
+        Help::Text(include_str!("core_help/reclaimvaultfunds.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "reconsiderblock",
+        Help::Text(include_str!("core_help/reconsiderblock.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "removevault",
+        Help::Text(include_str!("core_help/removevault.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "reverseblocktransactions",
+        Help::Text(include_str!("core_help/reverseblocktransactions.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "sendfrom",
+        Help::Text(include_str!("core_help/sendfrom.txt")),
+        Help::Text(include_str!("core_help/sendfrom.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "sendmany",
+        Help::Text(include_str!("core_help/sendmany.txt")),
+        Help::Text(include_str!("core_help/sendmany.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "sendrawtransaction",
+        Help::Text(include_str!("core_help/sendrawtransaction.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "sendtoaddress",
+        Help::Text(include_str!("core_help/sendtoaddress.txt")),
+        Help::Text(include_str!("core_help/sendtoaddress.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "setaccount",
+        Help::Text(include_str!("core_help/setaccount.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "setgenerate",
+        Help::Text(include_str!("core_help/setgenerate.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "setmocktime",
+        Help::Text(include_str!("core_help/setmocktime.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "setupmasternode",
+        Help::Text(include_str!("core_help/setupmasternode.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "signmessage",
+        Help::Text(include_str!("core_help/signmessage.txt")),
+        Help::Text(include_str!("core_help/signmessage.encrypted.txt")),
+        Help::Unknown,
+    ),
+    (
+        "signmnbroadcast",
+        Help::Text(include_str!("core_help/signmnbroadcast.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "signrawtransaction",
+        Help::Text(include_str!("core_help/signrawtransaction.txt")),
+        Help::Text(include_str!("core_help/signrawtransaction.encrypted.txt")),
+        Help::Same,
+    ),
+    (
+        "signtransactionwithaddresskey",
+        Help::Text(include_str!("core_help/signtransactionwithaddresskey.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "spork",
+        Help::Text(include_str!("core_help/spork.txt")),
+        Help::Text(include_str!("core_help/spork.encrypted.txt")),
+        Help::Same,
+    ),
+    (
+        "startmasternode",
+        Help::Text(include_str!("core_help/startmasternode.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "stop",
+        Help::Text(include_str!("core_help/stop.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "validateaddress",
+        Help::Text(include_str!("core_help/validateaddress.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "verifychain",
+        Help::Text(include_str!("core_help/verifychain.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "verifymasternodesetup",
+        Help::Text(include_str!("core_help/verifymasternodesetup.txt")),
+        Help::Same,
+        Help::Unknown,
+    ),
+    (
+        "verifymessage",
+        Help::Text(include_str!("core_help/verifymessage.txt")),
+        Help::Same,
+        Help::Same,
+    ),
+    (
+        "walletlock",
+        Help::Unknown,
+        Help::Text(include_str!("core_help/walletlock.encrypted.txt")),
+        Help::Same,
+    ),
+    (
+        "walletpassphrase",
+        Help::Unknown,
+        Help::Text(include_str!("core_help/walletpassphrase.encrypted.txt")),
+        Help::Same,
+    ),
+    (
+        "walletpassphrasechange",
+        Help::Unknown,
+        Help::Text(include_str!(
+            "core_help/walletpassphrasechange.encrypted.txt"
+        )),
+        Help::Same,
+    ),
+];
+
+/// Whether `method` is one of Divi Core's calls (rpcserver.cpp:324-467)
+pub fn is_core_call(method: &str) -> bool {
+    TEXTS.iter().any(|(name, ..)| *name == method)
+}
+
+/// The whole help text of a Divi Core call as divid 3.0.0 gives it with an
+/// unencrypted wallet
 pub fn text(method: &str) -> Option<&'static str> {
+    text_for(method, Some(false))
+}
+
+/// The whole help text of a Divi Core call in a wallet state: `encrypted` is
+/// None without a wallet. None: divid answers "help: unknown command" (a
+/// wallet call without a wallet, walletlock on an unencrypted wallet), or no
+/// Divi Core call has that name.
+pub fn text_for(method: &str, encrypted: Option<bool>) -> Option<&'static str> {
+    let (_, plain, crypted, none) = TEXTS.iter().find(|(name, ..)| *name == method)?;
+    let state = match encrypted {
+        Some(false) => plain,
+        Some(true) => crypted,
+        None => none,
+    };
+    match (state, plain) {
+        (Help::Text(t), _) | (Help::Same, Help::Text(t)) => Some(t),
+        _ => None,
+    }
+}
+
+/// Whether Divi Core answers `method` with these arguments by its help text
+/// (-1): each call's `if (fHelp || params.size() ...)` check
+/// (rpcblockchain.cpp, rpcmining.cpp, rpcmisc.cpp, rpcnet.cpp,
+/// rpcrawtransaction.cpp, rpcwallet.cpp, rpcdump.cpp, rpcmasternode.cpp,
+/// rpclottery.cpp). `encrypted` is None without a wallet. Named parameters
+/// are left to the call.
+pub fn usage_refused(method: &str, params: &Params, encrypted: Option<bool>) -> bool {
+    if matches!(params, Params::Object(_)) {
+        return false;
+    }
+    let n = params.len();
+    let word = |i: usize| params.get(i).and_then(|v| v.as_str());
+    let is_object = |i: usize| params.get(i).is_some_and(|v| v.is_object());
+    let (min, max) = match method {
+        // rpcnet.cpp:157-161: the command is read first (get_str), then checked
+        "addnode" => {
+            return n != 2 || word(1).is_some_and(|c| !matches!(c, "add" | "remove" | "onetry"))
+        }
+        // rpcmisc.cpp:166
+        "mnsync" => return n != 1 || word(0).is_some_and(|m| !matches!(m, "status" | "reset")),
+        // rpcmisc.cpp:277-312: anything but show, active or a name and a value
+        "spork" => return !(n == 2 || (n == 1 && matches!(word(0), Some("show" | "active")))),
+        // rpcmisc.cpp:881
+        "getspentinfo" => return n != 1 || !is_object(0),
+        // rpcwallet.cpp:1039
+        "fundvault" => return !(1..=2).contains(&n) || (n == 1 && !is_object(0)),
+        // rpcwallet.cpp:2669, :2575, :2630: counted only on an encrypted wallet
+        "walletlock" if encrypted == Some(true) => (0, 0),
+        "walletpassphrase" if encrypted == Some(true) => (2, 3),
+        "walletpassphrasechange" if encrypted == Some(true) => (2, 2),
+        "walletlock" | "walletpassphrase" | "walletpassphrasechange" => return false,
+        // rpcwallet.cpp:2694: counted only on an unencrypted wallet
+        "encryptwallet" if encrypted == Some(true) => return false,
+        // rpcwallet.cpp:1194 takes exactly one; irondivid still takes the second
+        // argument older IronDivi callers send (see scripts/vault-replies)
+        "removevault" => (1, 2),
+        // rpcwallet.cpp:2366, rpcrawtransaction.cpp:568: no count
+        "listsinceblock" | "signtransactionwithaddresskey" => return false,
+        _ => match argument_count(method) {
+            Some(range) => range,
+            None => return false,
+        },
+    };
+    !(min..=max).contains(&n)
+}
+
+/// The fewest and most arguments of the Divi Core calls whose check is a count
+fn argument_count(method: &str) -> Option<(usize, usize)> {
     Some(match method {
-        "getaccount" => "getaccount \"diviaddress\"\n\nReturns the account associated with the given address.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address for account lookup.\n\nResult:\n\"accountname\"        (string) the account address\n\nExamples:\n> divi-cli getaccount \"XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaccount\", \"params\": [\"XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getaccountaddress" => "getaccountaddress \"account\"\n\nReturns the current DIVI address for receiving payments to this account.\n\nArguments:\n1. \"account\"       (string, required) The account name for the address. It can also be set to the empty string \"\" to represent the default account. The account does not need to exist, it will be created and a new address created  if there is no account by the given name.\n\nResult:\n\"diviaddress\"   (string) The account divi address\n\nExamples:\n> divi-cli getaccountaddress \n> divi-cli getaccountaddress \"\"\n> divi-cli getaccountaddress \"myaccount\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaccountaddress\", \"params\": [\"myaccount\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getaddressesbyaccount" => "getaddressesbyaccount \"account\"\n\nReturns the list of addresses for the given account.\n\nArguments:\n1. \"account\"  (string, required) The account name.\n\nResult:\n[                     (json array of string)\n  \"diviaddress\"  (string) a divi address associated with the given account\n  ,...\n]\n\nExamples:\n> divi-cli getaddressesbyaccount \"tabby\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getaddressesbyaccount\", \"params\": [\"tabby\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getdifficulty" => "getdifficulty\n\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.\n\nResult:\nn.nnn       (numeric) the proof-of-work difficulty as a multiple of the minimum difficulty.\n\nExamples:\n> divi-cli getdifficulty \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getdifficulty\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getinfo" => "getinfo\nReturns an object containing various state info.\n\nResult:\n{\n  \"version\": xxxxx,           (numeric) the server version\n  \"protocolversion\": xxxxx,   (numeric) the protocol version\n  \"walletversion\": xxxxx,     (numeric) the wallet version\n  \"balance\": xxxxxxx,         (numeric) the total divi balance of the wallet\n  \"blocks\": xxxxxx,           (numeric) the current number of blocks processed in the server\n  \"timeoffset\": xxxxx,        (numeric) the time offset\n  \"connections\": xxxxx,       (numeric) the number of connections\n  \"proxy\": \"host:port\",     (string, optional) the proxy used by the server\n  \"difficulty\": xxxxxx,       (numeric) the current difficulty\n  \"testnet\": true|false,      (boolean) if the server is using testnet or not\n  \"moneysupply\" : \"supply\"       (numeric) The money supply when this block was added to the blockchain\n  \"keypoololdest\": xxxxxx,    (numeric) the timestamp (seconds since GMT epoch) of the oldest pre-generated key in the key pool\n  \"keypoolsize\": xxxx,        (numeric) how many new keys are pre-generated\n  \"unlocked_until\": ttt,      (numeric) the timestamp in seconds since epoch (midnight Jan 1 1970 GMT) that the wallet is unlocked for transfers, or 0 if the wallet is locked\n  \"paytxfee\": x.xxxx,         (numeric) the transaction fee set in divi/kb\n  \"relayfee\": x.xxxx,         (numeric) minimum relay fee for non-free transactions in divi/kb\n  \"staking status\": true|false,  (boolean) if the wallet is staking or not\n  \"errors\": \"...\"           (string) any error messages\n}\n\nExamples:\n> divi-cli getinfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getinfo\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getmininginfo" => "getmininginfo\n\nReturns a json object containing mining-related information.\nResult:\n{\n  \"blocks\": nnn,             (numeric) The current block\n  \"currentblocksize\": nnn,   (numeric) The last block size\n  \"difficulty\": xxx.xxxxx    (numeric) The current difficulty\n  \"errors\": \"...\"          (string) Current errors\n  \"pooledtx\": n              (numeric) The size of the mem pool\n  \"testnet\": true|false      (boolean) If using testnet or not\n  \"chain\": \"xxxx\",         (string) current network name as defined in BIP70 (main, test, regtest)\n}\n\nExamples:\n> divi-cli getmininginfo \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getmininginfo\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getnewaddress" => "getnewaddress ( \"account\" )\n\nReturns a new DIVI address for receiving payments.\nIf 'account' is specified (recommended), it is added to the address book \nso payments received with the address will be credited to 'account'.\n\nArguments:\n1. \"account\"        (string, optional) The account name for the address to be linked to. if not provided, the default account \"\" is used. It can also be set to the empty string \"\" to represent the default account. The account does not need to exist, it will be created if there is no account by the given name.\n\nResult:\n\"diviaddress\"    (string) The new divi address\n\nExamples:\n> divi-cli getnewaddress \n> divi-cli getnewaddress \"\"\n> divi-cli getnewaddress \"myaccount\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getnewaddress\", \"params\": [\"myaccount\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "getreceivedbyaccount" => "getreceivedbyaccount \"account\" ( minconf )\n\nReturns the total amount received by addresses with <account> in transactions with at least [minconf] confirmations.\n\nArguments:\n1. \"account\"      (string, required) The selected account, may be the default account using \"\".\n2. minconf          (numeric, optional, default=1) Only include transactions confirmed at least this many times.\n\nResult:\namount              (numeric) The total amount in DIVI received for this account.\n\nExamples:\n\nAmount received by the default account with at least 1 confirmation\n> divi-cli getreceivedbyaccount \"\"\n\nAmount received at the tabby account including unconfirmed amounts with zero confirmations\n> divi-cli getreceivedbyaccount \"tabby\" 0\n\nThe amount with at least 6 confirmation, very safe\n> divi-cli getreceivedbyaccount \"tabby\" 6\n\nAs a json rpc call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getreceivedbyaccount\", \"params\": [\"tabby\", 6] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "help" => "help ( \"command\" )\n\nList all commands, or get help for a specified command.\n\nArguments:\n1. \"command\"     (string, optional) The command to get help on\n\nResult:\n\"text\"     (string) The help text\n",
-        "listaccounts" => "listaccounts ( minconf includeWatchonly)\n\nReturns Object that has account names as keys, account balances as values.\n\nArguments:\n1. minconf          (numeric, optional, default=1) Only include transactions with at least this many confirmations\n2. includeWatchonly (bool, optional, default=false) Include balances in watchonly addresses (see 'importaddress')\n\nResult:\n{                      (json object where keys are account names, and values are numeric balances\n  \"account\": x.xxx,  (numeric) The property name is the account name, and the value is the total balance for the account.\n  ...\n}\n\nExamples:\n\nList account balances where there at least 1 confirmation\n> divi-cli listaccounts \n\nList account balances including zero confirmation transactions\n> divi-cli listaccounts 0\n\nList account balances for 6 or more confirmations\n> divi-cli listaccounts 6\n\nAs json rpc call\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"listaccounts\", \"params\": [6] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "listreceivedbyaccount" => "listreceivedbyaccount ( minconf includeempty includeWatchonly)\n\nList balances by account.\n\nArguments:\n1. minconf      (numeric, optional, default=1) The minimum number of confirmations before payments are included.\n2. includeempty (boolean, optional, default=false) Whether to include accounts that haven't received any payments.\n3. includeWatchonly (bool, optional, default=false) Whether to include watchonly addresses (see 'importaddress').\n\nResult:\n[\n  {\n    \"involvesWatchonly\" : \"true\",    (bool) Only returned if imported addresses were involved in transaction\n    \"account\" : \"accountname\",  (string) The account name of the receiving account\n    \"amount\" : x.xxx,             (numeric) The total amount received by addresses with this account\n    \"confirmations\" : n           (numeric) The number of confirmations of the most recent transaction included\n    \"bcconfirmations\" : n         (numeric) The number of blockchain confirmations of the most recent transaction included\n  }\n  ,...\n]\n\nExamples:\n> divi-cli listreceivedbyaccount \n> divi-cli listreceivedbyaccount 6 true\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"listreceivedbyaccount\", \"params\": [6, true, true] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "setaccount" => "setaccount \"diviaddress\" \"account\"\n\nSets the account associated with the given address.\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address to be associated with an account.\n2. \"account\"         (string, required) The account to assign the address to.\n\nExamples:\n> divi-cli setaccount \"XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg\" \"tabby\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"setaccount\", \"params\": [\"XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg\", \"tabby\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "signmessage" => "signmessage \"diviaddress\" \"message\" \"input_format\" \"output_format\"\n\nSign a message with the private key of an address\n\nArguments:\n1. \"diviaddress\"    (string, required) The divi address to use for the private key.\n2. \"message\"        (string, required) The message to create a signature of.\n3. \"input_format\"   (string, optional) ['hex'] Message encoding format. Default plaintext\n4. \"output_format\"  (string, optional) ['hex'] Message encoding format. Default base64\n\nResult:\n\"signature\"          (string) The signature of the message encoded in base 64\n\nExamples:\n\nUnlock the wallet for 30 seconds\n> divi-cli walletpassphrase \"mypassphrase\" 30\n\nCreate the signature\n> divi-cli signmessage \"diviaddress\" \"my message\"\n\nVerify the signature\n> divi-cli verifymessage \"diviaddress\" \"signature\" \"my message\"\n\nAs json rpc\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"signmessage\", \"params\": [\"diviaddress\", \"my message\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "validateaddress" => "validateaddress \"diviaddress\"\n\nReturn information about the given divi address.\n\nArguments:\n1. \"diviaddress\"     (string, required) The divi address to validate\n\nResult:\n{\n  \"isvalid\" : true|false,         (boolean) If the address is valid or not. If not, this is the only property returned.\n  \"address\" : \"diviaddress\", (string) The divi address validated\n  \"ismine\" : true|false,          (boolean) If the address is yours or not\n  \"isscript\" : true|false,        (boolean) If the key is a script\n  \"pubkey\" : \"publickeyhex\",    (string) The hex value of the raw public key\n  \"iscompressed\" : true|false,    (boolean) If the address is compressed\n  \"account\" : \"account\"         (string) The account associated with the address, \"\" is the default account\n}\n\nExamples:\n> divi-cli validateaddress \"diviaddress\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"validateaddress\", \"params\": [\"diviaddress\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "verifychain" => "verifychain ( numblocks )\n\nVerifies blockchain database.\n\nArguments:\n1. numblocks    (numeric, optional, default=288, 0=all) The number of blocks to check.\n\nResult:\ntrue|false       (boolean) Verified or not\n\nExamples:\n> divi-cli verifychain \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"verifychain\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
-        "verifymessage" => "verifymessage \"diviaddress\" \"signature\" \"message\"\n\nVerify a signed message\n\nArguments:\n1. \"diviaddress\"  (string, required) The divi address to use for the signature.\n2. \"signature\"       (string, required) The signature provided by the signer in base 64 encoding (see signmessage).\n3. \"message\"         (string, required) The message that was signed.\n\nResult:\ntrue|false   (boolean) If the signature is verified or not.\n\nExamples:\n\nUnlock the wallet for 30 seconds\n> divi-cli walletpassphrase \"mypassphrase\" 30\n\nCreate the signature\n> divi-cli signmessage \"diviaddress\" \"my message\"\n\nVerify the signature\n> divi-cli verifymessage \"diviaddress\" \"signature\" \"my message\"\n\nAs json rpc\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"verifymessage\", \"params\": [\"diviaddress\", \"signature\", \"my message\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n",
+        "getinfo"
+        | "getnetworkinfo"
+        | "getconnectioncount"
+        | "getnettotals"
+        | "getpeerinfo"
+        | "ping"
+        | "getblockchaininfo"
+        | "getbestblockhash"
+        | "getblockcount"
+        | "getchaintips"
+        | "getdifficulty"
+        | "getmempoolinfo"
+        | "gettxoutsetinfo"
+        | "getmininginfo"
+        | "getmasternodecount"
+        | "getmasternodestatus"
+        | "listmnbroadcasts"
+        | "dumphdinfo"
+        | "getstakingstatus"
+        | "getunconfirmedbalance"
+        | "getwalletinfo"
+        | "listlockunspent" => (0, 0),
+        "help"
+        | "stop"
+        | "getlotteryblockwinners"
+        | "getrawmempool"
+        | "getinvalid"
+        | "generateblock"
+        | "listmasternodes"
+        | "clearbanned"
+        | "listbanned"
+        | "getnewaddress"
+        | "getrawchangeaddress"
+        | "keypoolrefill"
+        | "getcoinavailability" => (0, 1),
+        "verifychain" | "listaccounts" => (0, 2),
+        "getmasternodewinners"
+        | "getbalance"
+        | "listreceivedbyaccount"
+        | "listreceivedbyaddress"
+        | "listunspent" => (0, 3),
+        "listtransactions" => (0, 4),
+        "getblockhash"
+        | "reverseblocktransactions"
+        | "invalidateblock"
+        | "reconsiderblock"
+        | "setgenerate"
+        | "decoderawtransaction"
+        | "decodescript"
+        | "validateaddress"
+        | "setmocktime"
+        | "signmnbroadcast"
+        | "importmnbroadcast"
+        | "ban"
+        | "backupwallet"
+        | "dumpprivkey"
+        | "bip38paperwallet"
+        | "encryptwallet"
+        | "getaccountaddress"
+        | "getaccount"
+        | "getaddressesbyaccount"
+        | "loadwallet" => (1, 1),
+        "getaddednodeinfo"
+        | "getblock"
+        | "getblockheader"
+        | "getrawtransaction"
+        | "sendrawtransaction"
+        | "broadcaststartmasternode"
+        | "startmasternode"
+        | "getreceivedbyaccount"
+        | "getreceivedbyaddress"
+        | "gettransaction"
+        | "lockunspent"
+        | "setaccount"
+        | "getaddressbalance"
+        | "getaddressdeltas"
+        | "getaddresstxids"
+        | "getaddressutxos" => (1, 2),
+        "importprivkey" | "importaddress" => (1, 3),
+        "signrawtransaction" => (1, 4),
+        "createrawtransaction" | "createmultisig" | "bip38decrypt" | "addvault" => (2, 2),
+        "addmultisigaddress" => (2, 3),
+        "sendmany" | "signmessage" => (2, 4),
+        "sendtoaddress" | "reclaimvaultfunds" => (2, 5),
+        "gettxout" => (2, 3),
+        "prioritisetransaction" | "verifymessage" | "allocatefunds" => (3, 3),
+        "sendfrom" => (3, 5),
+        "debitvaultbyname" => (3, 4),
+        "verifymasternodesetup" => (4, 4),
+        "setupmasternode" => (5, 6),
         _ => return None,
     })
 }
@@ -258,9 +1083,14 @@ mod tests {
 
     #[test]
     fn every_text_starts_with_its_list_line() {
-        for (_, name, line, _) in LIST {
+        for (category, name, line, _) in LIST {
+            // hidden calls are not listed, so they have no line
+            if *category == "hidden" {
+                continue;
+            }
             if let Some(text) = text(name) {
-                assert_eq!(text.lines().next(), Some(*line), "{name}");
+                // split, not lines: getcoinavailability's text is empty
+                assert_eq!(text.split('\n').next(), Some(*line), "{name}");
             }
         }
     }

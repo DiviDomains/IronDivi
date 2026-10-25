@@ -1,0 +1,6 @@
+loadwallet "walletFilename"
+
+Loads wallet into memory.
+
+Arguments:
+1. "walletFilename"       (string, required) The filename of the wallet.dat to be loaded.

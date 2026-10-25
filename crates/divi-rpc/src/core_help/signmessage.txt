@@ -1,0 +1,26 @@
+signmessage "diviaddress" "message" "input_format" "output_format"
+
+Sign a message with the private key of an address
+
+Arguments:
+1. "diviaddress"    (string, required) The divi address to use for the private key.
+2. "message"        (string, required) The message to create a signature of.
+3. "input_format"   (string, optional) ['hex'] Message encoding format. Default plaintext
+4. "output_format"  (string, optional) ['hex'] Message encoding format. Default base64
+
+Result:
+"signature"          (string) The signature of the message encoded in base 64
+
+Examples:
+
+Unlock the wallet for 30 seconds
+> divi-cli walletpassphrase "mypassphrase" 30
+
+Create the signature
+> divi-cli signmessage "diviaddress" "my message"
+
+Verify the signature
+> divi-cli verifymessage "diviaddress" "signature" "my message"
+
+As json rpc
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "signmessage", "params": ["diviaddress", "my message"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

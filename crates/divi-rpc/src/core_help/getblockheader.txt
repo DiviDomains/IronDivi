@@ -1,0 +1,25 @@
+getblockheader "hash" ( verbose )
+
+If verbose is false, returns a string that is serialized, hex-encoded data for block 'hash' header.
+If verbose is true, returns an Object with information about block <hash> header.
+
+Arguments:
+1. "hash"          (string, required) The block hash
+2. verbose           (boolean, optional, default=true) true for a json object, false for the hex encoded data
+
+Result (for verbose = true):
+{
+  "version" : n,         (numeric) The block version
+  "previousblockhash" : "hash",  (string) The hash of the previous block
+  "merkleroot" : "xxxx", (string) The merkle root
+  "time" : ttt,          (numeric) The block time in seconds since epoch (Jan 1 1970 GMT)
+  "bits" : "1d00ffff", (string) The bits
+  "nonce" : n,           (numeric) The nonce
+}
+
+Result (for verbose=false):
+"data"             (string) A string that is serialized, hex-encoded data for block 'hash' header.
+
+Examples:
+> divi-cli getblockheader "hash"
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getblockheader", "params": ["hash"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

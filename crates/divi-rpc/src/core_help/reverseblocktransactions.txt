@@ -1,0 +1,12 @@
+reverseblocktransactions "hash"
+
+Reverse the transactions in a block to mimic coin database corruption.
+
+Arguments:
+1. hash   (string, required) the hash of the block to mark as invalid
+
+Result:
+
+Examples:
+> divi-cli reverseblocktransactions "blockhash"
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "reverseblocktransactions", "params": ["blockhash"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

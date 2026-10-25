@@ -1,0 +1,20 @@
+generateblock ( options )
+
+Try to generate a single block with some extra options.
+This is intended for regtest mode and testing.
+
+Arguments:
+1. options          (object, optional) extra options for generating the block
+    {
+      "extratx" : ["hex", ...],   (array of strings, optional) transactions to include as hex
+      "coinstake" : "hex",        (string, optional) coinstake transaction to use as hex
+      "ignoreMempool" : true,       (bool, optional) if set, do not include mempool transactions
+      "blockBitsShift" : unsigned (integer, optional) if set, use custom block bits
+    }
+
+Result
+blockhash     (string) hash of the generated block
+
+Examples:
+> divi-cli generateblock 
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "generateblock", "params": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

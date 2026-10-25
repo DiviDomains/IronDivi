@@ -493,6 +493,109 @@ fn disconnected_blocks_are_reversed_as_core_reverses_them() {
     );
 }
 
+/// A height or index is read with json_spirit's get_int(), which cuts the
+/// number to a C++ int (rpcmisc.cpp:645-646, :735-736, :909)
+#[test]
+fn numbers_beyond_an_int_are_cut_as_core_cuts_them() {
+    let t = TestNode::new(&ALL);
+    let s = make_sends(&t);
+    let h = i64::from(s.first_height);
+    let payee = address(s.payee);
+    let query = |method: &str, start: i64, end: i64| {
+        t.call(
+            method,
+            json!([{"addresses": [payee], "start": start, "end": end}]),
+        )
+    };
+
+    // 2^32 + h is h
+    assert_eq!(
+        query("getaddressdeltas", (1 << 32) + h, h + 1),
+        query("getaddressdeltas", h, h + 1)
+    );
+    assert_eq!(
+        query("getaddresstxids", (1 << 32) + h + 1, h + 1),
+        query("getaddresstxids", h + 1, h + 1)
+    );
+    // 2^31 + h is negative: refused by getaddressdeltas, no range for getaddresstxids
+    assert_eq!(
+        query("getaddressdeltas", (1 << 31) + h, h + 1),
+        Err("Start and end is expected to be greater than zero".to_string())
+    );
+    assert_eq!(
+        query("getaddresstxids", (1 << 31) + h, h + 1),
+        Ok(json!([
+            s.first.txid().to_string(),
+            s.second.txid().to_string()
+        ]))
+    );
+    assert_eq!(
+        t.call(
+            "getspentinfo",
+            json!([{"txid": s.coin.txid.to_string(), "index": 1i64 << 32}])
+        ),
+        t.call(
+            "getspentinfo",
+            json!([{"txid": s.coin.txid.to_string(), "index": 0}])
+        )
+    );
+}
+
+/// A coin made and spent in the same block: disconnecting the block erases
+/// the spend as well as the receive. Core's DisconnectBlock reverses the
+/// spender while the block's own outputs are still in its view
+/// (BlockConnectionService.cpp:238-251, IndexDatabaseUpdateCollector.cpp:99-170)
+#[test]
+fn a_coin_made_and_spent_in_one_block_goes_with_the_block() {
+    let t = TestNode::new(&ALL);
+    let coin = t.mature_coin();
+    let payee_key = KeyPair::new_random();
+    let payee = hash160(&payee_key);
+    let first = spend(
+        &t.key,
+        coin,
+        1250 * COIN,
+        vec![TxOut::new(
+            Amount::from_sat(1250 * COIN - FEE),
+            Script::new_p2pkh(&payee),
+        )],
+    );
+    let second = spend(
+        &payee_key,
+        OutPoint::new(first.txid(), 0),
+        1250 * COIN - FEE,
+        vec![TxOut::new(
+            Amount::from_sat(1250 * COIN - 2 * FEE),
+            p2pkh(&t.key),
+        )],
+    );
+    let fork = t.tip();
+    t.mine(&[first.clone(), second]);
+    let payee = address(payee);
+    let in_block = t.ok("getaddressdeltas", json!([payee]));
+    assert_eq!(in_block.as_array().unwrap().len(), 2, "{in_block}");
+    assert_eq!(
+        t.ok("getaddressbalance", json!([payee])),
+        json!({"balance": 0, "received": 1250 * COIN - FEE})
+    );
+
+    t.branch(fork, 2, &[]);
+    assert_eq!(t.ok("getaddressdeltas", json!([payee])), json!([]));
+    assert_eq!(t.ok("getaddresstxids", json!([payee])), json!([]));
+    assert_eq!(
+        t.ok("getaddressbalance", json!([payee])),
+        json!({"balance": 0, "received": 0})
+    );
+    assert_eq!(t.ok("getaddressutxos", json!([payee])), json!([]));
+    assert_eq!(
+        t.call(
+            "getspentinfo",
+            json!([{"txid": first.txid().to_string(), "index": 0}])
+        ),
+        Err("Unable to get spent info".to_string())
+    );
+}
+
 /// Core erases spent entries on disconnect only when the address index is on
 /// (BlockConnectionService.cpp:187-192): with the spent index alone they stay
 #[test]

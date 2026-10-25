@@ -20,6 +20,17 @@ fn server() -> (RpcServer, tempfile::TempDir) {
     (RpcServer::new(chain), dir)
 }
 
+fn server_with_wallet() -> (RpcServer, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+    let chain = Arc::new(Chain::new(db, ChainParams::default()).unwrap());
+    let wallet = Arc::new(divi_wallet::WalletDb::with_hd_wallet(
+        divi_wallet::Network::Mainnet,
+        divi_wallet::HdWallet::new(divi_primitives::ChainMode::Divi).unwrap(),
+    ));
+    (RpcServer::with_wallet(chain, wallet), dir)
+}
+
 fn call(server: &RpcServer, method: &str, params: Vec<serde_json::Value>) -> Response {
     server.handle_request(Request {
         jsonrpc: "2.0".to_string(),
@@ -105,12 +116,28 @@ fn help_covers_every_dispatched_method() {
     let extra: Vec<_> = listed.difference(&dispatched).collect();
     assert!(extra.is_empty(), "`help` lists unknown methods: {extra:?}");
 
+    // With a wallet, as divid answers help of a wallet call only then: a Divi
+    // Core call has Divi Core's text, or Core's "unknown command" where divid
+    // gives none (walletlock and its kin on an unencrypted wallet); irondivid's
+    // own calls a text that starts with the call
+    let (server, _wallet_dir) = server_with_wallet();
     let mut no_text = Vec::new();
     for m in &dispatched {
         let r = call(&server, "help", vec![serde_json::json!(m)]);
-        match r.result.as_ref().and_then(|v| v.as_str()) {
-            Some(text) if text.starts_with(m.as_str()) => {}
-            _ => no_text.push(m.clone()),
+        let text = r
+            .result
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let fine = if divi_rpc::core_help::is_core_call(m) {
+            text == divi_rpc::core_help::text(m)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("help: unknown command: {m}"))
+        } else {
+            text.starts_with(m.as_str())
+        };
+        if !fine {
+            no_text.push(m.clone());
         }
     }
     assert!(
