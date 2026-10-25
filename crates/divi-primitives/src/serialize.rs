@@ -223,7 +223,7 @@ impl<T: Encodable> Encodable for Vec<T> {
 impl<T: Decodable> Decodable for Vec<T> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, Error> {
         let len = crate::compact::CompactSize::decode(reader)?.0 as usize;
-        let mut vec = Vec::with_capacity(len);
+        let mut vec = Vec::with_capacity(crate::compact::prealloc_len::<T>(len));
         for _ in 0..len {
             vec.push(T::decode(reader)?);
         }

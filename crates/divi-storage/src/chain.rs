@@ -18,7 +18,7 @@ use crate::block_index::{BlockIndex, BlockStatus};
 use crate::database::{BatchedUtxoWriter, ChainDatabase};
 use crate::difficulty::{get_next_work_required, DifficultyParams};
 use crate::error::StorageError;
-use crate::spent_index::SpentIndex;
+use crate::search_index::{self, SearchIndex};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::BlockUndo;
 use crate::utxo::Utxo;
@@ -30,6 +30,7 @@ use divi_primitives::transaction::{OutPoint, Transaction};
 use divi_primitives::ChainMode;
 use divi_script::{verify_input_with_flags, ScriptFlags};
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -133,6 +134,19 @@ pub struct ChainParams {
     pub network_type: NetworkType,
     /// Chain mode (Divi or PrivateDivi)
     pub chain_mode: ChainMode,
+    /// The network's max reorganization depth (Core `nMaxReorganizationDepth`).
+    /// `None` = no limit.
+    pub max_reorg_depth: Option<u32>,
+    /// `-maxreorg`: replaces `max_reorg_depth` when refusing a block that arrives
+    /// (block serving keeps the network's value, as Core does)
+    pub max_reorg_arg: Option<u32>,
+    /// Block hashes the chain must have at these heights
+    pub checkpoints: Vec<(u32, Hash256)>,
+    /// Seconds a coin must exist before it can stake (Core `nMinCoinAgeForStaking`)
+    pub min_stake_age: u32,
+    /// Check each block's difficulty bits, its proof of work and that PoW blocks
+    /// end and PoS blocks start after the last PoW block
+    pub check_block_work: bool,
 }
 
 impl Default for ChainParams {
@@ -144,9 +158,41 @@ impl Default for ChainParams {
             target_block_time: 60,
             network_type: NetworkType::Mainnet,
             chain_mode: ChainMode::Divi,
+            max_reorg_depth: None,
+            max_reorg_arg: None,
+            checkpoints: Vec::new(),
+            min_stake_age: 0,
+            check_block_work: false,
         }
     }
 }
+
+/// Last proof-of-work block on every Divi network (Divi Core chainparams.cpp:189, :405;
+/// regtest inherits testnet's)
+pub const LAST_POW_BLOCK: u32 = 100;
+
+/// Divi Core MaxFutureBlockDrift: a PoS block's time may be at most this many
+/// seconds ahead (Settings.cpp:215-218)
+const MAX_FUTURE_BLOCK_DRIFT_POS: u64 = 180;
+
+/// Divi Core MAX_BLOCK_SIZE_CURRENT (defaultValues.h:43)
+const MAX_BLOCK_SIZE: usize = 2_000_000;
+
+/// Divi Core MAX_STANDARD_TX_SIZE, which CheckTransaction applies to block
+/// transactions too (defaultValues.h:54, BlockCheckingHelpers.cpp:106-109)
+const MAX_TX_SIZE: usize = 100_000;
+
+/// Divi Core MAX_BLOCK_SIGOPS_LEGACY, the CheckBlock limit (defaultValues.h:57)
+const MAX_BLOCK_SIGOPS_LEGACY: u32 = 1_000_000 / 50;
+
+/// Divi Core MAX_BLOCK_SIGOPS_CURRENT, the ConnectBlock limit counting P2SH inputs
+/// (defaultValues.h:56)
+const MAX_BLOCK_SIGOPS: u32 = MAX_BLOCK_SIZE as u32 / 50;
+
+/// Divi mainnet checkpoint at height 100 (Divi Core chainparams.cpp:107-110). Height 0 is the
+/// genesis block, which `Chain::new` hard-codes.
+const DIVI_MAINNET_CHECKPOINT_100: &str =
+    "000000275b2b4a8af2c93ebdfd36ef8dd8c8ec710072bcc388ecbf5d0c8d3f9d";
 
 impl ChainParams {
     /// Create chain parameters for the specified network
@@ -177,10 +223,35 @@ impl ChainParams {
             }
         };
 
+        // Divi Core nMaturity: chainparams.cpp:184 (main), :400 (test), :479 (regtest)
         let coinbase_maturity = match network_type {
             NetworkType::Mainnet => 20,
             NetworkType::Testnet => 1,
-            NetworkType::Regtest => 1,
+            NetworkType::Regtest => 20,
+        };
+
+        // The rules below follow Divi Core's chainparams. PrivateDivi keeps its
+        // earlier behaviour until they are checked against PrivateDivi Core.
+        let divi = chain_mode == ChainMode::Divi;
+
+        // nMaxReorganizationDepth: chainparams.cpp:180 (main), :396 (test; regtest inherits)
+        let max_reorg_depth = divi.then_some(100);
+
+        // Testnet's and regtest's maps hold only height 0, which is never checked
+        // (ChainExtensionService.cpp:297-298), so only mainnet has a live checkpoint.
+        let checkpoints = if divi && network_type == NetworkType::Mainnet {
+            vec![(
+                100,
+                Hash256::from_hex(DIVI_MAINNET_CHECKPOINT_100).expect("checkpoint hash"),
+            )]
+        } else {
+            Vec::new()
+        };
+
+        // nMinCoinAgeForStaking: chainparams.cpp:195 (main; testnet inherits), :498 (regtest)
+        let min_stake_age = match (divi, network_type) {
+            (true, NetworkType::Mainnet | NetworkType::Testnet) => 60 * 60,
+            _ => 0,
         };
 
         ChainParams {
@@ -190,6 +261,11 @@ impl ChainParams {
             target_block_time: 60,
             network_type,
             chain_mode,
+            max_reorg_depth,
+            max_reorg_arg: None,
+            checkpoints,
+            min_stake_age,
+            check_block_work: divi,
         }
     }
 }
@@ -227,16 +303,39 @@ pub struct ChainTip {
     pub status: ChainTipStatus,
 }
 
+/// A listener for a new chain tip (see `Chain::add_tip_listener`)
+pub type TipListener = Arc<dyn Fn(&BlockIndex) + Send + Sync>;
+
+/// A block the active chain took or gave up (see `Chain::add_block_listener`)
+#[derive(Debug, Clone)]
+pub enum ChainEvent {
+    Connected(Block),
+    Disconnected(Block),
+}
+
+/// A listener for connected and disconnected blocks
+pub type BlockListener = Arc<dyn Fn(&ChainEvent) + Send + Sync>;
+
 /// Chain state
 pub struct Chain {
     /// Database for persistent storage
     db: Arc<ChainDatabase>,
     /// Transaction index for O(1) transaction lookups
     tx_index: Option<Arc<TxIndex>>,
-    /// Spent index for tracking spent outputs
-    spent_index: Option<Arc<SpentIndex>>,
+    /// Divi Core's address and spent indexes (`-addressindex`, `-spentindex`)
+    search_index: Option<Arc<SearchIndex>>,
     /// Current chain tip
     tip: RwLock<Option<BlockIndex>>,
+    /// Called with the new tip when a chain operation ends with another tip
+    /// than it started with (Divi Core's UpdatedBlockTip, for -blocknotify)
+    tip_listeners: RwLock<Vec<TipListener>>,
+    /// Called with each block connected or disconnected, in order, when the
+    /// chain operation ends and before the tip listeners
+    block_listeners: RwLock<Vec<BlockListener>>,
+    /// Blocks connected or disconnected by the running operation
+    pending_events: Mutex<Vec<ChainEvent>>,
+    /// Whether this start wrote the genesis block (a new data directory)
+    created_genesis: std::sync::atomic::AtomicBool,
     /// Best known block index (block with the highest chain work we've seen).
     /// Used by `activate_best_chain` to detect when a side-chain has accumulated
     /// more work than the current tip and a reorganization is needed.
@@ -250,12 +349,27 @@ pub struct Chain {
     /// When true, script verification is skipped for performance since
     /// the blockchain data is assumed valid during catch-up.
     ibd_mode: RwLock<bool>,
+    /// Blocks are being imported from block files (Divi Core's fImporting)
+    importing: std::sync::atomic::AtomicBool,
     /// What block script verification has checked, logged periodically
     script_stats: ScriptStats,
 }
 
 /// Metadata marker: the one-time height index repair has run on this datadir.
 const HEIGHT_INDEX_REPAIR_KEY: &[u8] = b"height_index_repair_v1";
+
+/// The block a reorganization is moving the chain to, kept until it is done,
+/// so a node stopped part-way through finishes it at the next start (Divi Core
+/// calls ActivateBestChain at start, init.cpp)
+const REORG_TARGET_KEY: &[u8] = b"reorg_target";
+
+/// "0" while a node runs on the database, "1" once it has stopped cleanly
+/// (Divi Core's "shutdown" flag, BlockIndexLoading.cpp:253-282)
+const CLEAN_STOP_KEY: &[u8] = b"clean_stop";
+
+/// Blocks indexed again at start when the transaction index cannot say how
+/// far it got (Divi's deepest reorganization is 100 blocks)
+const TX_INDEX_RECHECK: u32 = 100;
 
 /// Result of [`Chain::repair_height_index`].
 #[derive(Debug, Default, Clone)]
@@ -273,24 +387,56 @@ pub struct HeightIndexAudit {
 impl Chain {
     /// Create a new chain with the given database and parameters
     pub fn new(db: Arc<ChainDatabase>, params: ChainParams) -> Result<Self, StorageError> {
+        Self::load(db, params, true)
+    }
+
+    /// `Chain::new` for a chain that must already hold blocks: an empty
+    /// database is refused instead of being given a genesis block
+    pub fn open_existing(
+        db: Arc<ChainDatabase>,
+        params: ChainParams,
+    ) -> Result<Self, StorageError> {
+        Self::load(db, params, false)
+    }
+
+    fn load(
+        db: Arc<ChainDatabase>,
+        params: ChainParams,
+        init_if_empty: bool,
+    ) -> Result<Self, StorageError> {
         let mut chain = Chain {
             db,
             tx_index: None,
-            spent_index: None,
+            search_index: None,
             tip: RwLock::new(None),
+            tip_listeners: RwLock::new(Vec::new()),
+            block_listeners: RwLock::new(Vec::new()),
+            pending_events: Mutex::new(Vec::new()),
+            created_genesis: std::sync::atomic::AtomicBool::new(false),
             best_known_block: RwLock::new(None),
             params,
             chain_lock: Mutex::new(()),
             ibd_mode: RwLock::new(true),
+            importing: std::sync::atomic::AtomicBool::new(false),
             script_stats: ScriptStats::default(),
         };
+
+        crate::datadir::check_network(&chain.db, &chain.params)?;
 
         // Load tip from database
         chain.load_tip()?;
 
         // Initialize genesis block if chain is empty
         if chain.tip().is_none() {
+            if !init_if_empty {
+                return Err(StorageError::ChainState(
+                    "the chain database holds no blocks".to_string(),
+                ));
+            }
             chain.init_genesis()?;
+            chain
+                .created_genesis
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         } else if chain.db.get_metadata(HEIGHT_INDEX_REPAIR_KEY)?.is_none() {
             // One-time repair of height -> hash entries written for side-chain
@@ -303,18 +449,280 @@ impl Chain {
             );
             chain.db.put_metadata(HEIGHT_INDEX_REPAIR_KEY, b"1")?;
         }
+        chain.fill_tip_money_supply()?;
 
         Ok(chain)
     }
 
-    /// Enable transaction index for O(1) transaction lookups
+    /// Record the tip's money supply when the database has none for it (blocks
+    /// connected before the block index kept a supply). Divi Core's supply at a
+    /// block is the value of every output not yet spent, OP_META outputs
+    /// included, which is the sum of the UTXO set; blocks connected after this
+    /// carry it forward, and a disconnect works it back to the parent.
+    fn fill_tip_money_supply(&self) -> Result<(), StorageError> {
+        let Some(mut tip) = self.tip() else {
+            return Ok(());
+        };
+        if tip.height == 0 || tip.money_supply.is_some() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        tip.money_supply = Some(self.db.utxo_value_total()?);
+        self.db.store_block_index_entry(&tip)?;
+        info!(
+            "Recorded the money supply at height {} from the UTXO set in {} ms",
+            tip.height,
+            started.elapsed().as_millis()
+        );
+        *self.tip.write() = Some(tip);
+        Ok(())
+    }
+
+    /// Enable transaction index for O(1) transaction lookups. An index that
+    /// is behind the chain (the two databases recover separately after a
+    /// power loss) is first filled in from the stored blocks.
     pub fn enable_tx_index(&mut self, tx_index: Arc<TxIndex>) {
+        match self.catch_up_tx_index(&tx_index) {
+            Ok(0) => {}
+            Ok(n) => info!("Transaction index filled in for {} blocks", n),
+            Err(e) => error!("Transaction index could not be filled in: {}", e),
+        }
         self.tx_index = Some(tx_index);
     }
 
-    /// Enable spent index for tracking spent outputs
-    pub fn enable_spent_index(&mut self, spent_index: Arc<SpentIndex>) {
-        self.spent_index = Some(spent_index);
+    /// Build a transaction index for an existing chain: index every active
+    /// block from the stored blocks, then use it. Divi Core's -reindex builds
+    /// the index again from its block files (init.cpp:663-680); an index that
+    /// cannot cover every active block is refused, since a lookup would miss.
+    pub fn rebuild_tx_index(&mut self, tx_index: Arc<TxIndex>) -> Result<u32, StorageError> {
+        let indexed = self.index_tx_blocks(&tx_index, 1, true)?;
+        self.tx_index = Some(tx_index);
+        Ok(indexed)
+    }
+
+    /// Whether `tx_index` holds the first transaction of `samples` active
+    /// blocks spread from block 1 to the tip: an index kept since the chain
+    /// began does, one switched on later (or never built) does not
+    pub fn tx_index_covers_chain(
+        &self,
+        tx_index: &TxIndex,
+        samples: u32,
+    ) -> Result<bool, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(true);
+        };
+        let samples = samples.max(1);
+        for i in 0..samples {
+            let height = 1
+                + (u64::from(tip.height.saturating_sub(1)) * u64::from(i)
+                    / u64::from(samples.saturating_sub(1).max(1))) as u32;
+            let Some(hash) = self.db.get_height_mapping(height)? else {
+                return Ok(false);
+            };
+            let Some(block) = self.db.get_block(&hash)? else {
+                return Ok(false);
+            };
+            let Some(tx) = block.transactions.first() else {
+                continue;
+            };
+            if tx_index.get_location(&self.compute_txid(tx))?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Index the transactions of the active blocks above the newest block the
+    /// index recorded. When that block is not on the active chain, or the
+    /// index never recorded one, the last `TX_INDEX_RECHECK` blocks are
+    /// indexed again (rewriting an entry is harmless).
+    fn catch_up_tx_index(&self, tx_index: &TxIndex) -> Result<u32, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(0);
+        };
+        let from = match tx_index.indexed_tip()? {
+            Some((height, hash))
+                if height <= tip.height && self.db.get_height_mapping(height)? == Some(hash) =>
+            {
+                height + 1
+            }
+            _ => tip.height.saturating_sub(TX_INDEX_RECHECK),
+        };
+        self.index_tx_blocks(tx_index, from, false)
+    }
+
+    /// Index the transactions of the active blocks from `from` to the tip.
+    /// A block without a stored body is skipped, or with `every_block` an error.
+    fn index_tx_blocks(
+        &self,
+        tx_index: &TxIndex,
+        from: u32,
+        every_block: bool,
+    ) -> Result<u32, StorageError> {
+        let Some(tip) = self.tip() else {
+            return Ok(0);
+        };
+        let mut indexed = 0;
+        for height in from.max(1)..=tip.height {
+            let block = match self.db.get_height_mapping(height)? {
+                Some(hash) => self.db.get_block(&hash)?.map(|b| (hash, b)),
+                None => None,
+            };
+            let Some((hash, block)) = block else {
+                if every_block {
+                    return Err(StorageError::ChainState(format!(
+                        "block {} is not stored, so the transaction index cannot cover it",
+                        height
+                    )));
+                }
+                continue; // pruned or imported without bodies
+            };
+            let txids: Vec<Hash256> = block
+                .transactions
+                .iter()
+                .map(|tx| self.compute_txid(tx))
+                .collect();
+            let locations = Self::tx_locations(&block, &txids, &hash);
+            tx_index.put_block_tx_locations(&locations, height, &hash)?;
+            indexed += 1;
+        }
+        Ok(indexed)
+    }
+
+    /// A block's transactions under txid and bare txid
+    fn tx_locations(
+        block: &Block,
+        txids: &[Hash256],
+        block_hash: &Hash256,
+    ) -> Vec<(Hash256, Hash256, TxLocation)> {
+        txids
+            .iter()
+            .zip(&block.transactions)
+            .enumerate()
+            .map(|(i, (txid, tx))| {
+                (
+                    *txid,
+                    crate::txindex::bare_txid(tx),
+                    TxLocation::new(*block_hash, i as u32),
+                )
+            })
+            .collect()
+    }
+
+    /// Keep Divi Core's address and spent indexes as blocks are connected
+    /// and disconnected
+    pub fn enable_search_index(&mut self, search_index: Arc<SearchIndex>) {
+        self.search_index = Some(search_index);
+    }
+
+    /// Build the address and spent indexes for an existing chain: remove
+    /// their entries, then write each active block's from block 1 to the
+    /// tip, with the coins it spent taken from its undo data, as Divi Core's
+    /// -reindex writes them while it connects the blocks again
+    /// (init.cpp:663-680, BlockConnectionService.cpp:152-174). Refused when a
+    /// block or the undo data of a block that spends coins is not stored,
+    /// since the indexes would miss entries.
+    pub fn rebuild_search_index(&mut self, search: Arc<SearchIndex>) -> Result<u32, StorageError> {
+        search.clear()?;
+        let tip = self.height();
+        let mut built = 0;
+        for height in 1..=tip {
+            let missing = |what: &str| {
+                StorageError::ChainState(format!(
+                    "{} of block {} is not stored, so the address and spent indexes cannot cover it",
+                    what, height
+                ))
+            };
+            let hash = self
+                .db
+                .get_height_mapping(height)?
+                .ok_or_else(|| missing("the block"))?;
+            let block = self
+                .db
+                .get_block(&hash)?
+                .ok_or_else(|| missing("the block"))?;
+            let mut prevouts = HashMap::new();
+            if let Some(bytes) = self.db.get_undo_data(&hash)? {
+                if !bytes.is_empty() {
+                    for entry in BlockUndo::from_bytes(&bytes)?.entries {
+                        prevouts.insert(
+                            entry.outpoint,
+                            (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
+                        );
+                    }
+                }
+            }
+            let spends_unknown_coin = block
+                .transactions
+                .iter()
+                .filter(|tx| !tx.is_coinbase())
+                .flat_map(|tx| &tx.vin)
+                .any(|input| !input.prevout.is_null() && !prevouts.contains_key(&input.prevout));
+            if spends_unknown_coin {
+                return Err(missing("the undo data"));
+            }
+            let updates = search_index::collect_connect(
+                &block,
+                height,
+                &prevouts,
+                search.address_enabled(),
+                search.spent_enabled(),
+            );
+            search.apply_connect(&updates)?;
+            built += 1;
+        }
+        self.search_index = Some(search);
+        Ok(built)
+    }
+
+    /// The address and spent indexes, when enabled
+    pub fn search_index(&self) -> Option<&Arc<SearchIndex>> {
+        self.search_index.as_ref()
+    }
+
+    /// Write a connected block (UTXOs, undo data, tip) together with its
+    /// address and spent index entries, in one batch, as Divi Core's
+    /// ConnectBlock writes the indexes with the block's best-block hash
+    /// (BlockConnectionService.cpp:152-174)
+    fn commit_connected_block(
+        &self,
+        block: &Block,
+        utxo_batch: &BatchedUtxoWriter,
+        undo_bytes: &[u8],
+        index: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        let updates = match self.search_index {
+            Some(ref search) => {
+                let mut prevouts = HashMap::new();
+                if !undo_bytes.is_empty() {
+                    for entry in BlockUndo::from_bytes(undo_bytes)?.entries {
+                        prevouts.insert(
+                            entry.outpoint,
+                            (entry.prev_utxo.value, entry.prev_utxo.script_pubkey),
+                        );
+                    }
+                }
+                Some(search_index::collect_connect(
+                    block,
+                    index.height,
+                    &prevouts,
+                    search.address_enabled(),
+                    search.spent_enabled(),
+                ))
+            }
+            None => None,
+        };
+        self.db
+            .atomic_connect_block(utxo_batch, undo_bytes, &index.hash, index, &|wb| match (
+                &self.search_index,
+                &updates,
+            ) {
+                (Some(search), Some(updates)) => search.add_to_batch(wb, updates, false),
+                _ => Ok(()),
+            })?;
+        self.record_event(|| ChainEvent::Connected(block.clone()));
+        stop_point!("block connected");
+        Ok(())
     }
 
     /// Set IBD (Initial Block Download) mode.
@@ -329,6 +737,19 @@ impl Chain {
     /// Check whether the node is in IBD (Initial Block Download) mode.
     pub fn is_ibd(&self) -> bool {
         *self.ibd_mode.read()
+    }
+
+    /// Mark block files as being imported, or done (Divi Core's
+    /// CImportingNow, init.cpp:526-541)
+    pub fn set_importing(&self, importing: bool) {
+        self.importing
+            .store(importing, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether block files are being imported: blocks from peers are then
+    /// neither asked for nor taken (Divi Core main.cpp:581-587, :814)
+    pub fn is_importing(&self) -> bool {
+        self.importing.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Initialize the genesis block if chain is empty
@@ -641,10 +1062,13 @@ impl Chain {
         kernel_height: u32,
     ) -> Result<BlockIndex, StorageError> {
         if kernel_height > parent.height {
-            return Err(StorageError::InvalidBlock(format!(
-                "Kernel height {} above parent height {}",
-                kernel_height, parent.height
-            )));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Kernel height {} above parent height {}",
+                    kernel_height, parent.height
+                ),
+            ));
         }
         // Fast path only applies when `parent` is the active-chain block at its
         // height; a side-branch parent is resolved by walking its own ancestry.
@@ -688,11 +1112,14 @@ impl Chain {
         let mut cur = parent.clone();
         while cur.height > kernel_height {
             cur = self.db.get_block_index(&cur.prev_hash)?.ok_or_else(|| {
-                StorageError::InvalidBlock(format!(
-                    "Kernel lookup: missing ancestor {} at height {}",
-                    cur.prev_hash,
-                    cur.height.saturating_sub(1)
-                ))
+                StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "Kernel lookup: missing ancestor {} at height {}",
+                        cur.prev_hash,
+                        cur.height.saturating_sub(1)
+                    ),
+                )
             })?;
         }
         Ok(cur)
@@ -809,7 +1236,106 @@ impl Chain {
             above = Some(index);
             checked += 1;
         }
+        self.verify_utxo_set_at_tip(&tip, lowest.max(1))?;
         Ok(checked)
+    }
+
+    /// Undo the blocks from the tip down to `lowest` in memory, as Divi Core's
+    /// VerifyDB does at level 3 (verifyDb.cpp:110-127): every output a block
+    /// created must be in the UTXO set once the blocks above it are undone, and
+    /// every coin it spent must be absent until its undo data puts it back. A
+    /// UTXO set that does not belong to the tip fails here instead of being
+    /// built on. The walk stops at a block whose body or undo data is not kept
+    /// (pruned, imported from a snapshot, or connected before undo data existed).
+    fn verify_utxo_set_at_tip(&self, tip: &BlockIndex, lowest: u32) -> Result<(), StorageError> {
+        let damaged = |height: u32, what: String| {
+            StorageError::ChainState(format!(
+                "database is damaged at height {height}: the UTXO set does not match the chain ({what})"
+            ))
+        };
+        // What the undone blocks changed: Some = put back, None = removed
+        let mut view: HashMap<OutPoint, Option<Utxo>> = HashMap::new();
+        let mut height = tip.height;
+        while height >= lowest {
+            let hash = if height == tip.height {
+                tip.hash
+            } else {
+                match self.db.get_height_mapping(height)? {
+                    Some(hash) => hash,
+                    None => break,
+                }
+            };
+            let (Some(block), Some(undo)) =
+                (self.db.get_block(&hash)?, self.db.get_undo_data(&hash)?)
+            else {
+                break;
+            };
+            let mut undo: HashMap<OutPoint, Utxo> = if undo.is_empty() {
+                HashMap::new()
+            } else {
+                BlockUndo::from_bytes(&undo)?
+                    .entries
+                    .into_iter()
+                    .map(|e| (e.outpoint, e.prev_utxo))
+                    .collect()
+            };
+            for tx in block.transactions.iter().rev() {
+                let txid = self.compute_txid(tx);
+                for (vout, out) in tx.vout.iter().enumerate() {
+                    let outpoint = OutPoint::new(txid, vout as u32);
+                    let current = match view.get(&outpoint) {
+                        Some(entry) => entry.clone(),
+                        None => self.db.get_utxo(&outpoint)?,
+                    };
+                    match current {
+                        Some(u)
+                            if u.value == out.value
+                                && u.script_pubkey == out.script_pubkey
+                                && u.height == height => {}
+                        _ => {
+                            return Err(damaged(
+                                height,
+                                format!("output {txid}:{vout} of block {hash} is missing"),
+                            ))
+                        }
+                    }
+                    view.insert(outpoint, None);
+                }
+                if tx.is_coinbase() {
+                    continue;
+                }
+                for input in &tx.vin {
+                    if tx.is_coinstake() && input.prevout.is_null() {
+                        continue;
+                    }
+                    let prev = undo.remove(&input.prevout).ok_or_else(|| {
+                        damaged(
+                            height,
+                            format!(
+                                "undo data of block {hash} lacks the coin {}:{}",
+                                input.prevout.txid, input.prevout.vout
+                            ),
+                        )
+                    })?;
+                    let present = match view.get(&input.prevout) {
+                        Some(entry) => entry.is_some(),
+                        None => self.db.get_utxo(&input.prevout)?.is_some(),
+                    };
+                    if present {
+                        return Err(damaged(
+                            height,
+                            format!(
+                                "coin {}:{} spent by block {hash} is still unspent",
+                                input.prevout.txid, input.prevout.vout
+                            ),
+                        ));
+                    }
+                    view.insert(input.prevout, Some(prev));
+                }
+            }
+            height -= 1;
+        }
+        Ok(())
     }
 
     /// Get the current chain tip
@@ -872,6 +1398,11 @@ impl Chain {
     /// Height below which block-index lottery-winner lists have been cleared (0 = none).
     pub fn winners_strip_height(&self) -> u32 {
         self.db.winners_strip_height()
+    }
+
+    /// The chain parameters this chain was opened with
+    pub fn params(&self) -> &ChainParams {
+        &self.params
     }
 
     /// Tip this node was started from by `--import-snapshot`, if any.
@@ -940,16 +1471,33 @@ impl Chain {
     /// network-appropriate difficulty parameters. Used by the staker to
     /// compute the correct nBits for a new block.
     pub fn get_next_bits(&self, prev_block: &BlockIndex) -> Result<u32, StorageError> {
-        let diff_params = match self.params.network_type {
-            NetworkType::Mainnet => DifficultyParams::default(),
-            NetworkType::Testnet => DifficultyParams::testnet(),
-            NetworkType::Regtest => DifficultyParams::regtest(),
-        };
-        get_next_work_required(&self.db, prev_block, &diff_params)
+        get_next_work_required(&self.db, prev_block, &self.difficulty_params())
+    }
+
+    fn difficulty_params(&self) -> DifficultyParams {
+        match (self.params.chain_mode, self.params.network_type) {
+            (ChainMode::Divi, NetworkType::Mainnet) => DifficultyParams::default(),
+            (ChainMode::Divi, NetworkType::Testnet) => DifficultyParams::testnet(),
+            (ChainMode::Divi, NetworkType::Regtest) => DifficultyParams::regtest(),
+            (ChainMode::PrivateDivi, NetworkType::Mainnet) => {
+                DifficultyParams::privatedivi(56700, true)
+            }
+            (ChainMode::PrivateDivi, NetworkType::Testnet) => {
+                DifficultyParams::privatedivi(100, true)
+            }
+            (ChainMode::PrivateDivi, NetworkType::Regtest) => {
+                DifficultyParams::privatedivi(100, false)
+            }
+        }
     }
 
     pub fn get_utxo_stats(&self) -> Result<crate::database::UtxoStats, StorageError> {
         self.db.get_utxo_stats()
+    }
+
+    /// Value of every stored output, OP_META ones included: the tip's money supply
+    pub fn utxo_value_total(&self) -> Result<i64, StorageError> {
+        self.db.utxo_value_total()
     }
 
     /// Get a block by hash
@@ -958,6 +1506,35 @@ impl Chain {
     }
 
     /// Get a block index by hash
+    /// A stored block that may be sent to a peer that asks for it
+    ///
+    /// Divi Core main.cpp:223-239: any block on the active chain; a block off it only
+    /// if it was fully validated and lies less than the network's max reorganization
+    /// depth below the tip, so a peer cannot probe which stale blocks we hold.
+    pub fn get_block_for_peer(&self, hash: &Hash256) -> Result<Option<Block>, StorageError> {
+        let Some(index) = self.db.get_block_index(hash)? else {
+            return Ok(None);
+        };
+        if !index.is_on_main_chain() {
+            let best_header_height = self
+                .best_known_block
+                .read()
+                .as_ref()
+                .map(|b| b.height)
+                .unwrap_or(0);
+            let within_depth = self.params.max_reorg_depth.is_none_or(|depth| {
+                i64::from(self.height()) - i64::from(index.height) < i64::from(depth)
+            });
+            if !(index.status.contains(BlockStatus::VALID_SCRIPTS)
+                && best_header_height > 0
+                && within_depth)
+            {
+                return Ok(None);
+            }
+        }
+        self.db.get_block(hash)
+    }
+
     pub fn get_block_index(&self, hash: &Hash256) -> Result<Option<BlockIndex>, StorageError> {
         self.db.get_block_index(hash)
     }
@@ -1089,6 +1666,40 @@ impl Chain {
         Ok(None)
     }
 
+    /// A transaction outside the mempool, as Divi Core's GetTransaction finds
+    /// it (TransactionDiskAccessor.cpp:63-110): with the transaction index on,
+    /// only through the index; with it off, in the active block at the height
+    /// one of its unspent outputs records, by txid or bare txid. Without the
+    /// index a transaction whose outputs are all spent is not found.
+    pub fn locate_transaction(
+        &self,
+        txid: &Hash256,
+    ) -> Result<Option<(Transaction, TxLocation)>, StorageError> {
+        if self.tx_index.is_some() {
+            return self.get_transaction_with_location(txid);
+        }
+        // `nHeight > 0`: the genesis block's transactions are never found
+        let Some(height) = self.db.spendable_output_height_of(txid)?.filter(|&h| h > 0) else {
+            return Ok(None);
+        };
+        let Some(index) = self.get_block_index_by_height(height)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.get_block(&index.hash)? else {
+            return Ok(None);
+        };
+        Ok(block
+            .transactions
+            .iter()
+            .position(|tx| tx.txid() == *txid || crate::txindex::bare_txid(tx) == *txid)
+            .map(|i| {
+                (
+                    block.transactions[i].clone(),
+                    TxLocation::new(index.hash, i as u32),
+                )
+            }))
+    }
+
     /// Calculate the median time past for a block index
     ///
     /// Returns the median timestamp of the last 11 blocks (or fewer if near genesis).
@@ -1132,8 +1743,63 @@ impl Chain {
         Ok(timestamps[median_idx])
     }
 
+    /// Call `listener` with the new tip whenever an operation on the chain
+    /// ends with a different tip
+    pub fn add_tip_listener(&self, listener: TipListener) {
+        self.tip_listeners.write().push(listener);
+    }
+
+    /// Call `listener` with each block the active chain connects or
+    /// disconnects, in the order the chain did it, when the operation ends
+    pub fn add_block_listener(&self, listener: BlockListener) {
+        self.block_listeners.write().push(listener);
+    }
+
+    /// Whether this start wrote the genesis block, as on a new data directory
+    pub fn created_genesis(&self) -> bool {
+        self.created_genesis
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keep `event` for the block listeners, if there are any
+    fn record_event(&self, event: impl FnOnce() -> ChainEvent) {
+        if !self.block_listeners.read().is_empty() {
+            self.pending_events.lock().push(event());
+        }
+    }
+
+    /// Run `op`, then give the block listeners the blocks it connected and
+    /// disconnected, and tell the tip listeners if the tip moved
+    fn notifying_tip<T>(&self, op: impl FnOnce() -> T) -> T {
+        let before = self.tip.read().as_ref().map(|t| t.hash);
+        let result = op();
+        let events = std::mem::take(&mut *self.pending_events.lock());
+        if !events.is_empty() {
+            let listeners = self.block_listeners.read().clone();
+            for event in &events {
+                for listener in &listeners {
+                    listener(event);
+                }
+            }
+        }
+        let after = self.tip.read().clone();
+        if after.as_ref().map(|t| t.hash) != before {
+            if let Some(tip) = after {
+                let listeners = self.tip_listeners.read().clone();
+                for listener in &listeners {
+                    listener(&tip);
+                }
+            }
+        }
+        result
+    }
+
     /// Accept a new block into the chain
     pub fn accept_block(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
+        self.notifying_tip(|| self.accept_block_unnotified(block))
+    }
+
+    fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
         // Acquire exclusive lock for chain state modifications
         trace!("accept_block: Waiting for chain lock...");
         let _chain_guard = self.chain_lock.lock();
@@ -1155,10 +1821,10 @@ impl Chain {
             // Divi Core AcceptBlockHeader (ChainExtensionService.cpp): a known
             // block marked failed is rejected, never re-evaluated.
             if existing_index.failed() {
-                return Err(StorageError::InvalidBlock(format!(
-                    "block {} is marked invalid",
-                    hash
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!("block {} is marked invalid", hash),
+                ));
             }
             // We already have this block - update best_known_block in case
             // this was stored as a side-chain block and now participates in
@@ -1190,6 +1856,7 @@ impl Chain {
         // 3. Basic header validation
         debug!("  ├─ Header validation");
         self.check_block_header(&block)?;
+        check_block_transactions(&block, self.max_money())?;
         debug!("  ├─ Header validation: ✅ PASS");
 
         // 4. Check if this is the genesis block (prev_block is all zeros)
@@ -1219,6 +1886,15 @@ impl Chain {
             }
         }
 
+        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), then
+        // ContextualCheckBlockHeader's depth limit (ChainExtensionService.cpp:308-311).
+        // Both run for every block, whether it extends the tip or not.
+        if let Some(ref parent) = parent_index {
+            self.check_block_work(&block, &hash, parent)?;
+            self.check_reorg_depth(parent.height + 1)?;
+            Self::check_block_version_and_height(&block, parent.height + 1)?;
+        }
+
         // 6. Check contextual validity (skip for genesis)
         // Only perform full PoS/signature validation for blocks extending the current tip.
         // Side-chain blocks are stored with header-only validation and get full validation
@@ -1237,14 +1913,17 @@ impl Chain {
                 debug!("  ├─ Header-only context validation (side chain)");
                 // Minimal validation: timestamp and parent linkage only
                 if block.header.prev_block != parent.hash {
-                    return Err(StorageError::InvalidBlock("wrong parent".into()));
+                    return Err(StorageError::invalid_block_scored(0, "wrong parent".into()));
                 }
                 let mtp = self.get_median_time_past(parent)?;
                 if block.header.time <= mtp {
-                    return Err(StorageError::InvalidBlock(format!(
-                        "block timestamp {} is not greater than median time past {}",
-                        block.header.time, mtp
-                    )));
+                    return Err(StorageError::invalid_block_scored(
+                        0,
+                        format!(
+                            "block timestamp {} is not greater than median time past {}",
+                            block.header.time, mtp
+                        ),
+                    ));
                 }
                 debug!("  ├─ Header validation: ✅ PASS (full validation deferred to reorg)");
             }
@@ -1262,8 +1941,8 @@ impl Chain {
                     hash, height, expected_hash
                 );
                 return Err(StorageError::InvalidBlock(format!(
-                    "Block {} at height {} fails checkpoint: expected {}",
-                    hash, height, expected_hash
+                    "checkpoint mismatch: rejected by checkpoint lock-in at {} (block {}, expected {})",
+                    height, hash, expected_hash
                 )));
             }
             warn!(
@@ -1376,8 +2055,7 @@ impl Chain {
                     let accepted_height = index.height;
 
                     // Atomic write: UTXOs + undo data + tip update in single WriteBatch
-                    self.db
-                        .atomic_connect_block(&utxo_batch, &undo_bytes, &index.hash, &index)?;
+                    self.commit_connected_block(&block, &utxo_batch, &undo_bytes, &index)?;
                     *self.tip.write() = Some(index.clone());
 
                     // Keep best_known_block in sync with the new tip
@@ -1451,8 +2129,7 @@ impl Chain {
                 let accepted_height = index.height;
 
                 // Atomic write: UTXOs + undo data + tip update in single WriteBatch
-                self.db
-                    .atomic_connect_block(&utxo_batch, &undo_bytes, &index.hash, &index)?;
+                self.commit_connected_block(&block, &utxo_batch, &undo_bytes, &index)?;
                 *self.tip.write() = Some(index.clone());
 
                 // Keep best_known_block in sync with the new tip
@@ -1584,8 +2261,9 @@ impl Chain {
     /// Reorganize the chain to use a new best chain.
     /// Returns `(fork_height, orphaned_txs)` where `orphaned_txs` is the list of
     /// non-coinbase, non-coinstake transactions from disconnected blocks that are
-    /// not present in any of the newly-connected blocks.  Callers should re-insert
-    /// these into the mempool so they can be re-mined.
+    /// not present in any of the newly-connected blocks, parents before children:
+    /// the block nearest the fork first, each block's transactions in block order.
+    /// Callers should re-insert these into the mempool so they can be re-mined.
     fn reorganize_chain(
         &self,
         new_block: &Block,
@@ -1641,8 +2319,13 @@ impl Chain {
 
         // Collect candidate orphaned transactions from disconnected blocks.
         // Skip coinbase (index 0 in every block) and coinstake (index 1 in PoS blocks).
+        // blocks_to_disconnect runs from the old tip down; walk it from the fork
+        // up so a transaction comes after the ones it spends. Divi Core offers each
+        // block's transactions to the mempool as it disconnects it, while the
+        // blocks below are still connected (ChainTipManager.cpp:175-182), so a
+        // child is never refused there for a parent that is not back yet.
         let mut orphaned_txs: Vec<Transaction> = Vec::new();
-        for (block, _index) in &blocks_to_disconnect {
+        for (block, _index) in blocks_to_disconnect.iter().rev() {
             for tx in &block.transactions {
                 if tx.is_coinbase() || tx.is_coinstake() {
                     continue;
@@ -1675,6 +2358,9 @@ impl Chain {
             );
         }
 
+        self.db
+            .put_metadata(REORG_TARGET_KEY, new_index.hash.as_bytes())?;
+
         // Flush UTXO cache before reorg to ensure disconnect sees consistent state
         if self.db.has_utxo_cache() {
             match self.db.flush_utxo_cache() {
@@ -1702,8 +2388,15 @@ impl Chain {
             let mut index_mut = index.clone();
             if let Err(e) = self.disconnect_block(block, &mut index_mut) {
                 warn!("Failed to disconnect block {}: {}", index.hash, e);
+                // Each disconnect moved the tip on disk; follow it
+                if let Some(at) = self.db.get_best_block()? {
+                    if let Some(at) = self.db.get_block_index(&at)? {
+                        *self.tip.write() = Some(at);
+                    }
+                }
                 return Err(e);
             }
+            pause_point!("reorg disconnected");
         }
 
         // Connect blocks (in order from ancestor to new tip)
@@ -1716,16 +2409,19 @@ impl Chain {
                 index.height
             );
             let mut index_mut = index.clone();
-            let connected =
-                self.connect_block(block, &mut index_mut)
-                    .and_then(|(utxo_batch, undo_bytes)| {
-                        self.db.atomic_connect_block(
-                            &utxo_batch,
-                            &undo_bytes,
-                            &index_mut.hash,
-                            &index_mut,
-                        )
-                    });
+            // A side-chain block was stored without its proof of stake being
+            // checked (that needs the UTXO set at its parent, which is now in place)
+            let parent = if i == 0 {
+                &common_ancestor
+            } else {
+                &blocks_to_connect[i - 1].1
+            };
+            let connected = self
+                .check_block_proof_of_stake(block, parent)
+                .and_then(|()| self.connect_block(block, &mut index_mut))
+                .and_then(|(utxo_batch, undo_bytes)| {
+                    self.commit_connected_block(block, &utxo_batch, &undo_bytes, &index_mut)
+                });
             if let Err(e) = connected {
                 warn!("Failed to connect block {}: {}", index.hash, e);
                 // Divi Core ChainTipManager::connectTip -> InvalidBlockFound:
@@ -1750,9 +2446,13 @@ impl Chain {
                     &blocks_to_disconnect,
                     old_tip,
                 )?;
+                self.db.delete_metadata(REORG_TARGET_KEY)?;
                 return Err(e);
             }
         }
+
+        self.db.delete_metadata(REORG_TARGET_KEY)?;
+        pause_point!("reorg done");
 
         // Update in-memory tip (DB tip already written by last atomic_connect_block)
         info!(
@@ -1778,6 +2478,7 @@ impl Chain {
         matches!(
             err,
             StorageError::InvalidBlock(_)
+                | StorageError::InvalidBlockScored { .. }
                 | StorageError::UtxoNotFound(_)
                 | StorageError::DoubleSpend(_)
         )
@@ -1843,12 +2544,8 @@ impl Chain {
                     .get_block_index(&index.hash)?
                     .ok_or_else(|| StorageError::BlockNotFound(index.hash.to_string()))?;
                 let (utxo_batch, undo_bytes) = self.connect_block(block, &mut stored)?;
-                self.db
-                    .atomic_connect_block(&utxo_batch, &undo_bytes, &stored.hash, &stored)?;
+                self.commit_connected_block(block, &utxo_batch, &undo_bytes, &stored)?;
             }
-            // disconnect_block does not move the DB tip; when no old block was
-            // reconnected it would still name a rolled-back block.
-            self.db.set_best_block(&old_tip.hash)?;
             if self.db.has_utxo_cache() {
                 self.db.flush_utxo_cache()?;
             }
@@ -1885,19 +2582,35 @@ impl Chain {
     /// `invalidateblock` RPC does. If the block is on the active chain the tip
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
-    pub fn invalidate_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+    pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
+        self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
+    }
+
+    /// Mark the block failed and disconnect it and the blocks above it; with
+    /// `activate`, then move to the best valid chain left. Returns the
+    /// transactions of the disconnected blocks, coinbases and coinstakes left
+    /// out, from the lowest block up, for the mempool to take back as Divi
+    /// Core's disconnectTip does (ChainTipManager.cpp disconnectTip:
+    /// "Resurrect mempool transactions from the disconnected block").
+    fn invalidate_block_unnotified(
+        &self,
+        hash: &Hash256,
+        activate: bool,
+    ) -> Result<Vec<Transaction>, StorageError> {
         let _chain_guard = self.chain_lock.lock();
         let target = self
             .db
             .get_block_index(hash)?
             .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
         if target.height == 0 {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "cannot invalidate the genesis block".into(),
             ));
         }
         self.mark_block_failed(hash)?;
 
+        let mut disconnected: Vec<Vec<Transaction>> = Vec::new();
         if target.is_on_main_chain() {
             if self.db.has_utxo_cache() {
                 self.db.flush_utxo_cache()?;
@@ -1918,13 +2631,20 @@ impl Chain {
                     .unwrap_or_else(|| tip.clone());
                 self.disconnect_block(&block, &mut stored)?;
                 self.mark_block_failed(&tip.hash)?;
+                disconnected.push(
+                    block
+                        .transactions
+                        .iter()
+                        .filter(|tx| !tx.is_coinbase() && !tx.is_coinstake())
+                        .cloned()
+                        .collect(),
+                );
                 let parent = self
                     .db
                     .get_block_index(&block.header.prev_block)?
                     .ok_or_else(|| {
                         StorageError::BlockNotFound(block.header.prev_block.to_string())
                     })?;
-                self.db.set_best_block(&parent.hash)?;
                 if self.db.has_utxo_cache() {
                     self.db.flush_utxo_cache()?;
                 }
@@ -1935,13 +2655,125 @@ impl Chain {
                 }
             }
         }
-        self.activate_best_valid_chain()
+        if activate {
+            self.activate_best_valid_chain()?;
+        }
+        Ok(disconnected.into_iter().rev().flatten().collect())
+    }
+
+    /// Record that a node now runs on this database. Returns whether the run
+    /// before it stopped cleanly (a database written before this was kept
+    /// counts as clean).
+    pub fn begin_run(&self) -> Result<bool, StorageError> {
+        let clean = self.db.get_metadata(CLEAN_STOP_KEY)?.as_deref() != Some(b"0");
+        self.db.put_metadata_synced(CLEAN_STOP_KEY, b"0")?;
+        Ok(clean)
+    }
+
+    /// Record a clean stop: everything the node keeps has been written, and
+    /// the write-ahead logs of the chain database and the transaction index
+    /// are on disk, so the next start needs nothing from closing them
+    pub fn end_run(&self) -> Result<(), StorageError> {
+        self.db.flush()?;
+        if let Some(tx_index) = &self.tx_index {
+            tx_index.sync_wal()?;
+        }
+        self.db.sync_wal()?;
+        self.db.put_metadata_synced(CLEAN_STOP_KEY, b"1")
+    }
+
+    /// Finish a reorganization that a stop interrupted: the chain on disk is
+    /// whole at the block it had reached, and the blocks of the branch it was
+    /// moving to are stored, so connect them now, as Divi Core's
+    /// ActivateBestChain does at start. Returns whether the tip moved.
+    pub fn finish_interrupted_reorg(&self) -> Result<bool, StorageError> {
+        let Some(raw) = self.db.get_metadata(REORG_TARGET_KEY)? else {
+            return Ok(false);
+        };
+        let _chain_guard = self.chain_lock.lock();
+        let target = match <[u8; 32]>::try_from(raw.as_slice()) {
+            Ok(bytes) => self.db.get_block_index(&Hash256::from_bytes(bytes))?,
+            Err(_) => None,
+        };
+        let moved = match target {
+            Some(target) => {
+                info!(
+                    "A reorganization to block {} at height {} was interrupted; finishing it",
+                    target.hash, target.height
+                );
+                *self.best_known_block.write() = Some(target);
+                match self.activate_best_chain_inner() {
+                    Ok(result) => result.is_some(),
+                    Err(e) if Self::is_consensus_invalid(&e) => {
+                        warn!("The interrupted reorganization's branch is invalid: {}", e);
+                        false
+                    }
+                    Err(e) => {
+                        let tip = self.tip.read().clone();
+                        *self.best_known_block.write() = tip;
+                        return Err(e);
+                    }
+                }
+            }
+            None => false,
+        };
+        if !moved {
+            let tip = self.tip.read().clone();
+            *self.best_known_block.write() = tip;
+        }
+        self.db.delete_metadata(REORG_TARGET_KEY)?;
+        Ok(moved)
     }
 
     /// Clear the invalid flag on a block, its ancestors and its descendants
     /// (`reconsiderblock`), then activate the best valid chain.
     pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
+        self.notifying_tip(|| self.reconsider_block_unnotified(hash))
+    }
+
+    fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
         let _chain_guard = self.chain_lock.lock();
+        self.clear_failed_marks(hash)?;
+        self.activate_best_valid_chain()
+    }
+
+    /// Divi Core's reverseblocktransactions (rpcblockchain.cpp:577-603):
+    /// disconnect the block and those above it, as invalidateblock does, then
+    /// clear the invalid mark again without moving the tip, as Core's
+    /// reconsiderBlock (ChainExtensionService.cpp:662-689) does there. The
+    /// tip stays at the block's parent until another block is connected.
+    ///
+    /// For the genesis block Core disconnects every block above it, fails to
+    /// disconnect the genesis block itself and still answers null
+    /// (BlockInvalidationHelpers.cpp:134-143, rpcblockchain.cpp:605-609): the
+    /// tip is the genesis block, so here the reversal starts at block 1.
+    pub fn reverse_block_transactions(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Vec<Transaction>, StorageError> {
+        self.notifying_tip(|| {
+            let target = self
+                .db
+                .get_block_index(hash)?
+                .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
+            let first = if target.height == 0 {
+                match self.get_block_index_by_height(1)? {
+                    Some(block_1) => block_1.hash,
+                    None => return Ok(Vec::new()),
+                }
+            } else {
+                *hash
+            };
+            let disconnected = self.invalidate_block_unnotified(&first, false)?;
+            let _chain_guard = self.chain_lock.lock();
+            self.clear_failed_marks(&first)?;
+            Ok(disconnected)
+        })
+    }
+
+    /// Clear the failed mark of `hash`, its ancestors and its descendants.
+    /// Caller must hold `chain_lock`.
+    fn clear_failed_marks(&self, hash: &Hash256) -> Result<(), StorageError> {
         let target = self
             .db
             .get_block_index(hash)?
@@ -1979,7 +2811,7 @@ impl Chain {
                 }
             }
         }
-        self.activate_best_valid_chain()
+        Ok(())
     }
 
     /// Move the active chain to the most-work valid chain, trying candidates
@@ -2040,19 +2872,41 @@ impl Chain {
             }
         }
 
+        // Value the block's inputs spent, known when its undo data is
+        let mut undo_spent: Option<i64> = None;
+
         // Restore spent UTXOs from undo data
         if let Some(ref undo_bytes) = undo_data {
-            if !undo_bytes.is_empty() {
+            if undo_bytes.is_empty() {
+                // the block had no non-coinbase inputs, nothing to restore
+                undo_spent = Some(0);
+            } else {
                 let block_undo = BlockUndo::from_bytes(undo_bytes)?;
                 trace!(
                     "  ├─ Restoring {} spent UTXOs from undo data",
                     block_undo.entries.len()
                 );
+                // A coin created and spent in this block goes with the block:
+                // Divi Core undoes the spender (putting the coin back) and then
+                // the creator (taking it away again)
+                let created: std::collections::HashSet<Hash256> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| self.compute_txid(tx))
+                    .collect();
+                undo_spent = Some(
+                    block_undo
+                        .entries
+                        .iter()
+                        .map(|e| e.prev_utxo.value.as_sat())
+                        .sum(),
+                );
                 for entry in block_undo.entries {
-                    utxo_batch.add(entry.outpoint, entry.prev_utxo);
+                    if !created.contains(&entry.outpoint.txid) {
+                        utxo_batch.add(entry.outpoint, entry.prev_utxo);
+                    }
                 }
             }
-            // else: block had no non-coinbase inputs, nothing to restore
         } else {
             // Fallback for blocks connected before undo data was implemented:
             // Use the old brute-force search method
@@ -2080,7 +2934,8 @@ impl Chain {
                                     prev_height,
                                     prev_is_coinbase,
                                     prev_is_coinstake,
-                                );
+                                )
+                                .with_version(prev_tx.version);
                                 utxo_batch.add(input.prevout, utxo);
                             }
                         } else {
@@ -2094,40 +2949,87 @@ impl Chain {
             }
         }
 
-        // Flush all UTXO changes in a single atomic write
-        if !utxo_batch.is_empty() {
-            trace!(
-                "  ├─ Flushing disconnect UTXO batch: {} adds (restores), {} removes",
-                utxo_batch.add_count(),
-                utxo_batch.remove_count()
-            );
-            self.db.flush_utxo_batch(&utxo_batch)?;
-        }
+        // Divi Core DisconnectBlock: reverse the block's address and spent
+        // index entries from the outputs its inputs spent. A coin made and
+        // spent in the block is not restored, but Core's view still holds it
+        // when the spender is reversed, so its spend is erased too
+        let updates = match self.search_index {
+            Some(ref search) => {
+                let mut prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
+                    .adds
+                    .iter()
+                    .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
+                    .collect();
+                for tx in &block.transactions {
+                    let txid = self.compute_txid(tx);
+                    for (k, out) in tx.vout.iter().enumerate() {
+                        prevouts.insert(
+                            OutPoint::new(txid, k as u32),
+                            (out.value, out.script_pubkey.clone()),
+                        );
+                    }
+                }
+                Some(search_index::collect_disconnect(
+                    block,
+                    index.height,
+                    &prevouts,
+                    search.address_enabled(),
+                    search.spent_enabled(),
+                ))
+            }
+            None => None,
+        };
 
-        // Clean up undo data for this block
-        let _ = self.db.delete_undo_data(&index.hash);
+        let mut parent = self
+            .db
+            .get_block_index(&block.header.prev_block)?
+            .ok_or_else(|| StorageError::BlockNotFound(block.header.prev_block.to_string()))?;
+        // A parent connected before the block index kept a supply gets it from
+        // this block's: Divi Core's rule (TransactionInputChecker.cpp:79-80) run backwards
+        let parent_supply = match (parent.money_supply, index.money_supply, undo_spent) {
+            (None, Some(supply), Some(spent)) if parent.height > 0 => {
+                let created: i64 = block
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| tx.vout.iter())
+                    .map(|o| o.value.as_sat())
+                    .sum();
+                Some(supply - created + spent)
+            }
+            _ => None,
+        };
 
-        // Update block status
+        // UTXO changes, undo data removed, index entry off the main chain, height
+        // entry removed and the tip moved to the parent, in one write. The
+        // transaction index keeps the block's entries: Divi Core's
+        // DisconnectBlock leaves them, so getrawtransaction still finds a
+        // transaction of a disconnected block.
+        trace!(
+            "  ├─ Disconnect batch: {} adds (restores), {} removes",
+            utxo_batch.add_count(),
+            utxo_batch.remove_count()
+        );
         index.status.remove(BlockStatus::ON_MAIN_CHAIN);
-        self.db.store_block_index_entry(index)?;
+        self.db
+            .atomic_disconnect_block(&utxo_batch, index, &parent, &|wb| match (
+                &self.search_index,
+                &updates,
+            ) {
+                (Some(search), Some(updates)) => search.add_to_batch(wb, updates, true),
+                _ => Ok(()),
+            })?;
 
-        // Update height mapping to remove this block's height entry
-        // (the previous block at this height is on a different fork)
-        self.db.remove_height_mapping(index.height)?;
-
-        if let Some(ref tx_index) = self.tx_index {
-            let txids: Vec<Hash256> = block
-                .transactions
-                .iter()
-                .map(|tx| self.compute_txid(tx))
-                .collect();
-            tx_index.delete_locations_batch(&txids)?;
+        if let Some(supply) = parent_supply {
+            parent.money_supply = Some(supply);
+            self.db.store_block_index_entry(&parent)?;
         }
 
         info!(
             "Disconnected block {} at height {}",
             index.hash, index.height
         );
+        self.record_event(|| ChainEvent::Disconnected(block.clone()));
+        stop_point!("block disconnected");
         Ok(())
     }
 
@@ -2242,34 +3144,43 @@ impl Chain {
     }
 
     /// Get the expected block hash at a checkpoint height, if any.
-    /// Checkpoints prevent following minority forks during IBD.
+    ///
+    /// Divi Core ContextualCheckBlockHeader (ChainExtensionService.cpp:320-328). Its
+    /// second clause, "forked chain older than last checkpoint" (:330-347), keeps the
+    /// lowest checkpoint found (the genesis block) and so never refuses anything.
+    /// PrivateDivi has none: its relaunch map holds only the genesis (PrivateDivi
+    /// Core 21de13166, chainparams.cpp:107-109).
     fn get_checkpoint_hash(&self, height: u32) -> Option<Hash256> {
-        // Checkpoints are only for known fork points discovered during testing.
-        // None are pinned today.
-        //
-        // PrivateDivi mainnet used to pin height 47791 of the pre-relaunch
-        // chain. The 2026-04-20 relaunch replaced that chain, and Core's
-        // relaunch checkpoint map holds only the genesis (PrivateDivi Core
-        // 21de13166, chainparams.cpp:107-109), so there is none here.
-        let _ = height;
-        None
+        self.params
+            .checkpoints
+            .iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, hash)| *hash)
     }
 
     /// Check basic block header validity
     fn check_block_header(&self, block: &Block) -> Result<(), StorageError> {
         // Check version
         if block.header.version < 1 {
-            return Err(StorageError::InvalidBlock("invalid version".into()));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                "invalid version".into(),
+            ));
         }
 
-        // Check timestamp not too far in the future (2 hours)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| StorageError::ChainState(format!("System time error: {}", e)))?
-            .as_secs() as u32;
-        if block.header.time > now + 2 * 60 * 60 {
-            return Err(StorageError::InvalidBlock(
-                "timestamp too far in future".into(),
+        // Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): at most 180 s in the
+        // future for a PoS block (MaxFutureBlockDrift, Settings.cpp:215-218), 2 hours
+        // for a PoW block, past GetAdjustedTime (the clock setmocktime sets)
+        let now = divi_primitives::clock::now().max(0) as u64;
+        let max_drift = if block.is_proof_of_stake() {
+            MAX_FUTURE_BLOCK_DRIFT_POS
+        } else {
+            2 * 60 * 60
+        };
+        if u64::from(block.header.time) > now + max_drift {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                "time-too-new: block timestamp too far in the future".into(),
             ));
         }
 
@@ -2282,35 +3193,144 @@ impl Chain {
             )));
         }
 
+        // A transaction list repeated at the end of a level gives the same merkle
+        // root; Core refuses it as a duplicate (BlockCheckingHelpers.cpp:39-44)
+        let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        if merkle_tree_mutated(&txids) {
+            return Err(StorageError::InvalidBlock(
+                "bad-txns-duplicate: duplicate transaction".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Divi Core ContextualCheckBlockHeader's version rule and ContextualCheckBlock's
+    /// BIP34 rule (ChainExtensionService.cpp:350-353, :375-382), for every block
+    /// after the genesis block
+    fn check_block_version_and_height(block: &Block, height: u32) -> Result<(), StorageError> {
+        if block.header.version < 3 {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "bad-version: rejected nVersion={} block",
+                    block.header.version
+                ),
+            ));
+        }
+        let expect = bip34_height_script(height);
+        let script_sig = block.transactions[0].vin[0].script_sig.as_bytes();
+        if !script_sig.starts_with(&expect) {
+            return Err(StorageError::InvalidBlock(
+                "bad-cb-height: block height mismatch in coinbase".into(),
+            ));
+        }
         Ok(())
     }
 
     /// Check block context (relative to parent)
     fn check_block_context(&self, block: &Block, parent: &BlockIndex) -> Result<(), StorageError> {
         if block.header.prev_block != parent.hash {
-            return Err(StorageError::InvalidBlock("wrong parent".into()));
+            return Err(StorageError::invalid_block_scored(0, "wrong parent".into()));
         }
 
         let mtp = self.get_median_time_past(parent)?;
         if block.header.time <= mtp {
-            return Err(StorageError::InvalidBlock(format!(
-                "block timestamp {} is not greater than median time past {}",
-                block.header.time, mtp
-            )));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "block timestamp {} is not greater than median time past {}",
+                    block.header.time, mtp
+                ),
+            ));
         }
 
-        // Validate proof-of-stake if this is a PoS block
-        // Skip during IBD — the chain is trusted by accumulated work, and PoS validation
-        // depends on stake modifiers which can diverge at fork points during IBD.
-        // Once synced to tip, PoS validation is enabled for all new blocks.
-        if block.is_proof_of_stake() && !*self.ibd_mode.read() {
+        self.check_block_proof_of_stake(block, parent)
+    }
+
+    /// The proof of stake (kernel, stake modifier, target, coin age) and the block
+    /// signature. Divi Core checks the proof for every block it accepts, during
+    /// initial sync too (AcceptBlock -> CheckWork, BlockProofVerifier.cpp:149-155).
+    /// Here it needs the UTXO set at `parent`, so it runs when the block is
+    /// connected: on arrival for a block on the tip, during a reorg otherwise.
+    fn check_block_proof_of_stake(
+        &self,
+        block: &Block,
+        parent: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        if block.is_proof_of_stake() {
             self.validate_proof_of_stake(block, parent)?;
         }
+        self.verify_block_signature(block)
+    }
 
-        // Verify block signature
-        self.verify_block_signature(block)?;
-
+    /// Check the block's difficulty bits and, for a PoW block, its proof of work
+    ///
+    /// Divi Core CheckWork (BlockProofVerifier.cpp:136-155) and CheckProofOfWork
+    /// (:27-43). A failure there carries no misbehaviour score.
+    fn check_block_work(
+        &self,
+        block: &Block,
+        hash: &Hash256,
+        parent: &BlockIndex,
+    ) -> Result<(), StorageError> {
+        if !self.params.check_block_work {
+            return Ok(());
+        }
+        let required = self.get_next_bits(parent)?;
+        if block.header.bits != required {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "bad-diffbits: block bits 0x{:08x}, required 0x{:08x}",
+                    block.header.bits, required
+                ),
+            ));
+        }
+        if block.is_proof_of_work() {
+            let target = Hash256::from_compact(block.header.bits);
+            if target.is_zero() || target > self.difficulty_params().pow_limit {
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    "CheckProofOfWork() : nBits below minimum work".into(),
+                ));
+            }
+            if *hash > target {
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    "CheckProofOfWork() : hash doesn't match nBits".into(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Refuse a block more than the max reorganization depth below the active tip
+    ///
+    /// Divi Core ContextualCheckBlockHeader (ChainExtensionService.cpp:308-311).
+    fn check_reorg_depth(&self, height: u32) -> Result<(), StorageError> {
+        let Some(depth) = self.params.max_reorg_arg.or(self.params.max_reorg_depth) else {
+            return Ok(());
+        };
+        let tip_height = self.tip.read().as_ref().map(|t| t.height).unwrap_or(0);
+        if i64::from(tip_height) - i64::from(height) >= i64::from(depth) {
+            return Err(StorageError::invalid_block_scored(
+                1,
+                format!(
+                    "forked chain older than max reorganization depth (height {})",
+                    height
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Divi Core `MaxMoneyOut` (chainparams.cpp:186 main, :402 test; regtest inherits test)
+    pub fn max_money(&self) -> Amount {
+        match self.params.network_type {
+            NetworkType::Mainnet => Amount::from_divi(2_534_320_700),
+            NetworkType::Testnet | NetworkType::Regtest => Amount::from_divi(2_535_000_000),
+        }
     }
 
     /// Verify the block signature
@@ -2328,7 +3348,8 @@ impl Chain {
         // PoW blocks must have an empty signature
         if !block.is_proof_of_stake() {
             if !block.block_sig.is_empty() {
-                return Err(StorageError::InvalidBlock(
+                return Err(StorageError::invalid_block_scored(
+                    0,
                     "PoW block must have empty signature".into(),
                 ));
             }
@@ -2337,7 +3358,8 @@ impl Chain {
 
         // PoS blocks must have a non-empty signature
         if block.block_sig.is_empty() {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "PoS block must have a signature".into(),
             ));
         }
@@ -2347,7 +3369,8 @@ impl Chain {
 
         // Get coinstake's second output (vout[1]) — the staking output with the key
         if coinstake.vout.len() < 2 {
-            return Err(StorageError::InvalidBlock(
+            return Err(StorageError::invalid_block_scored(
+                0,
                 "coinstake must have at least 2 outputs for signature verification".into(),
             ));
         }
@@ -2365,37 +3388,38 @@ impl Chain {
                 // P2PKH: Use recoverable signature verification
                 // Recover pubkey from compact signature, check hash160 matches
                 if solutions.is_empty() || solutions[0].len() != 20 {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "invalid P2PKH script in coinstake output".into(),
                     ));
                 }
 
-                let expected_hash: [u8; 20] = solutions[0]
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StorageError::InvalidBlock("invalid pubkey hash length".into()))?;
+                let expected_hash: [u8; 20] = solutions[0].as_slice().try_into().map_err(|_| {
+                    StorageError::invalid_block_scored(0, "invalid pubkey hash length".into())
+                })?;
 
                 let recoverable_sig =
                     divi_crypto::RecoverableSig::from_compact_with_recovery(&block.block_sig)
                         .map_err(|e| {
-                            StorageError::InvalidBlock(format!(
-                                "invalid block signature format: {}",
-                                e
-                            ))
+                            StorageError::invalid_block_scored(
+                                0,
+                                format!("invalid block signature format: {}", e),
+                            )
                         })?;
 
                 let recovered_pubkey = recoverable_sig
                     .recover_from_hash(block_hash.as_bytes())
                     .map_err(|e| {
-                        StorageError::InvalidBlock(format!(
-                            "failed to recover pubkey from block signature: {}",
-                            e
-                        ))
+                        StorageError::invalid_block_scored(
+                            0,
+                            format!("failed to recover pubkey from block signature: {}", e),
+                        )
                     })?;
 
                 let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
                 if *recovered_hash.as_bytes() != expected_hash {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "block signature: recovered pubkey does not match coinstake P2PKH output"
                             .into(),
                     ));
@@ -2405,29 +3429,31 @@ impl Chain {
             divi_script::ScriptType::PubKey => {
                 // P2PK: Standard ECDSA verify with the pubkey from the script
                 if solutions.is_empty() {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "invalid P2PK script in coinstake output".into(),
                     ));
                 }
 
                 let pubkey = divi_crypto::PublicKey::from_bytes(&solutions[0]).map_err(|e| {
-                    StorageError::InvalidBlock(format!(
-                        "invalid pubkey in coinstake P2PK output: {}",
-                        e
-                    ))
+                    StorageError::invalid_block_scored(
+                        0,
+                        format!("invalid pubkey in coinstake P2PK output: {}", e),
+                    )
                 })?;
 
                 // For P2PK, the block_sig is a standard DER-encoded signature
                 let signature =
                     divi_crypto::Signature::from_der(&block.block_sig).map_err(|e| {
-                        StorageError::InvalidBlock(format!(
-                            "invalid DER block signature for P2PK: {}",
-                            e
-                        ))
+                        StorageError::invalid_block_scored(
+                            0,
+                            format!("invalid DER block signature for P2PK: {}", e),
+                        )
                     })?;
 
                 if !divi_crypto::verify_hash(&pubkey, &signature, block_hash.as_bytes()) {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "block signature: ECDSA verify failed for coinstake P2PK output".into(),
                     ));
                 }
@@ -2437,46 +3463,51 @@ impl Chain {
                 // Vault: Use recoverable signature with the vault manager's key hash
                 // solutions[1] is the vault pubkey hash (manager key)
                 if solutions.len() < 2 || solutions[1].len() != 20 {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "invalid vault script in coinstake output".into(),
                     ));
                 }
 
                 let vault_hash: [u8; 20] = solutions[1].as_slice().try_into().map_err(|_| {
-                    StorageError::InvalidBlock("invalid vault pubkey hash length".into())
+                    StorageError::invalid_block_scored(0, "invalid vault pubkey hash length".into())
                 })?;
 
                 let recoverable_sig =
                     divi_crypto::RecoverableSig::from_compact_with_recovery(&block.block_sig)
                         .map_err(|e| {
-                            StorageError::InvalidBlock(format!(
-                                "invalid block signature format for vault: {}",
-                                e
-                            ))
+                            StorageError::invalid_block_scored(
+                                0,
+                                format!("invalid block signature format for vault: {}", e),
+                            )
                         })?;
 
                 let recovered_pubkey = recoverable_sig
                     .recover_from_hash(block_hash.as_bytes())
                     .map_err(|e| {
-                        StorageError::InvalidBlock(format!(
-                            "failed to recover pubkey from vault block signature: {}",
-                            e
-                        ))
+                        StorageError::invalid_block_scored(
+                            0,
+                            format!("failed to recover pubkey from vault block signature: {}", e),
+                        )
                     })?;
 
                 let recovered_hash = divi_crypto::hash160(&recovered_pubkey.to_bytes());
                 if *recovered_hash.as_bytes() != vault_hash {
-                    return Err(StorageError::InvalidBlock(
+                    return Err(StorageError::invalid_block_scored(
+                        0,
                         "block signature: recovered pubkey does not match vault manager key".into(),
                     ));
                 }
             }
 
             _ => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "unsupported coinstake output script type for block signature: {:?}",
-                    script_type
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "unsupported coinstake output script type for block signature: {:?}",
+                        script_type
+                    ),
+                ));
             }
         }
 
@@ -2647,8 +3678,9 @@ impl Chain {
         }
 
         let coinstake = &block.transactions[1];
-        crate::pos_validation::validate_coinstake_transaction(coinstake)
-            .map_err(|e| StorageError::InvalidBlock(format!("Invalid coinstake: {}", e)))?;
+        crate::pos_validation::validate_coinstake_transaction(coinstake).map_err(|e| {
+            StorageError::invalid_block_scored(0, format!("Invalid coinstake: {}", e))
+        })?;
 
         // Validate all inputs pay to the same script
         let chain_ref = self;
@@ -2666,10 +3698,16 @@ impl Chain {
 
         crate::pos_validation::validate_coinstake_inputs_same_script(coinstake, &get_utxo)
             .map_err(|e| {
-                StorageError::InvalidBlock(format!("Coinstake inputs validation failed: {}", e))
+                StorageError::invalid_block_scored(
+                    0,
+                    format!("Coinstake inputs validation failed: {}", e),
+                )
             })?;
 
-        let expected_stake_reward = Self::stake_reward(&self.block_rewards(parent.height + 1));
+        let expected_stake_reward = coinstake_stake_reward(
+            &self.block_rewards(parent.height + 1),
+            self.masternodes_deprecated(parent)?,
+        );
         crate::pos_validation::validate_coinstake_vault_rules(
             coinstake,
             expected_stake_reward,
@@ -2687,10 +3725,13 @@ impl Chain {
 
         // Get UTXO being staked
         let kernel_utxo = self.db.get_utxo(&kernel_input.prevout)?.ok_or_else(|| {
-            StorageError::InvalidBlock(format!(
-                "Kernel UTXO not found: {}:{}",
-                kernel_input.prevout.txid, kernel_input.prevout.vout
-            ))
+            StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Kernel UTXO not found: {}:{}",
+                    kernel_input.prevout.txid, kernel_input.prevout.vout
+                ),
+            )
         })?;
 
         // Use the UTXO's height field directly instead of calling find_transaction,
@@ -2711,6 +3752,17 @@ impl Chain {
             utxo_value: kernel_utxo.value,
             block_hash_of_chain_tip: parent.hash,
         };
+
+        // Coin age before the stake modifier, as Divi Core's
+        // CreateProofOfStakeCalculator (ProofOfStakeGenerator.cpp:92-98)
+        crate::pos_validation::check_pos_time_requirements(
+            kernel_block_index.time,
+            block.header.time,
+            self.params.min_stake_age,
+        )
+        .map_err(|e| {
+            StorageError::invalid_block_scored(0, format!("PoS verification failed: {}", e))
+        })?;
 
         // Get stake modifier for this block using proper lookup algorithm
         // Reference: Divi/divi/src/PoSStakeModifierService.cpp
@@ -2737,7 +3789,9 @@ impl Chain {
             &staking_data,
             block.header.time,
         )
-        .map_err(|e| StorageError::InvalidBlock(format!("PoS verification failed: {}", e)))?;
+        .map_err(|e| {
+            StorageError::invalid_block_scored(0, format!("PoS verification failed: {}", e))
+        })?;
 
         debug!("  computed_hash: {}", hash_proof);
         debug!("  meets_target: {}", meets_target);
@@ -2748,10 +3802,13 @@ impl Chain {
             //    for correct Hash256 comparison (matching C++ uint256 semantics)
             // 2. PoS detection uses is_proof_of_stake flag (based on vtx[1].is_coinstake())
             // 3. Selection hash >> 32 shift corrected (right shift, not left)
-            return Err(StorageError::InvalidBlock(format!(
-                "Proof-of-stake hash does not meet target. Hash: {}, Target bits: {}",
-                hash_proof, block.header.bits
-            )));
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Proof-of-stake hash does not meet target. Hash: {}, Target bits: {}",
+                    hash_proof, block.header.bits
+                ),
+            ));
         }
 
         Ok(())
@@ -2836,8 +3893,10 @@ impl Chain {
     /// (e.g., the sync layer after processing orphan blocks). For the internal
     /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
     pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
-        let _chain_guard = self.chain_lock.lock();
-        self.activate_best_chain_inner()
+        self.notifying_tip(|| {
+            let _chain_guard = self.chain_lock.lock();
+            self.activate_best_chain_inner()
+        })
     }
 
     /// Inner implementation of activate_best_chain (caller must hold chain_lock).
@@ -2964,22 +4023,50 @@ impl Chain {
         // this block's height and time ("bad-txns-nonfinal").
         check_block_txs_final(block, height)?;
 
-        // IMPORTANT: Validate treasury payments BEFORE modifying any state
-        // This prevents UTXO corruption if validation fails
-        debug!(
-            "  ├─ Treasury validation check (network: {:?})",
-            self.network_type()
-        );
-        self.validate_treasury_payments(block, index)?;
-        debug!("  ├─ Treasury validation: ✅ PASS");
+        // Divi Core ConnectBlock checks the block again in case an earlier
+        // version stored a bad one (BlockConnectionService.cpp:300-302)
+        check_block_transactions(block, self.max_money())?;
 
-        debug!("  ├─ Block value + lottery validation check");
-        self.validate_block_value(block, index)?;
-        debug!("  ├─ Block value validation: ✅ PASS");
+        // Divi Core CheckEnforcedPoSBlocksAndBIP30 (BlockConnectionService.cpp:46-54)
+        if self.params.check_block_work && height > 0 {
+            if height <= LAST_POW_BLOCK && block.is_proof_of_stake() {
+                return Err(StorageError::InvalidBlock(format!(
+                    "PoS-early: PoS period not active (height {})",
+                    height
+                )));
+            }
+            if height > LAST_POW_BLOCK && block.is_proof_of_work() {
+                return Err(StorageError::InvalidBlock(format!(
+                    "PoW-ended: PoW period ended (height {})",
+                    height
+                )));
+            }
+        }
+
+        // Divi Core BIP30 (BlockConnectionService.cpp:56-62): a transaction may not
+        // reuse the id of one that still has unspent outputs
+        if height > 0 {
+            for tx in &block.transactions {
+                let txid = tx.txid();
+                if self.db.has_spendable_output_of(&txid)? {
+                    return Err(StorageError::InvalidBlock(format!(
+                        "bad-txns-BIP30: tried to overwrite transaction ({})",
+                        txid
+                    )));
+                }
+            }
+        }
 
         debug!("  ├─ Processing {} transactions", block.transactions.len());
         let mut total_inputs = 0;
         let mut total_outputs = 0;
+        // Divi Core nMint (coinbase and coinstake supply change) and the fees of
+        // all other transactions (TransactionInputChecker.cpp:79-81)
+        let mut mint = Amount::ZERO;
+        let mut fees = Amount::ZERO;
+        let max_money = self.max_money();
+        // Divi Core TotalSigOpsAreBelowMaximum (TransactionInputChecker.cpp:85-100)
+        let mut sig_ops = 0u32;
 
         // Use batched UTXO writer for better performance
         // Pre-calculate capacity: estimate ~2 inputs and ~3 outputs per tx
@@ -3039,6 +4126,31 @@ impl Chain {
 
             total_inputs += tx.vin.len();
             total_outputs += tx.vout.len();
+            let mut value_in = Amount::ZERO;
+
+            sig_ops += legacy_sig_op_count(tx);
+            if !is_coinbase {
+                // Pay-to-script-hash inputs add their redeem script's sigops, for the
+                // whole transaction before any of its scripts is run
+                for input in &tx.vin {
+                    let prev_script =
+                        match utxo_batch.adds.iter().find(|(op, _)| op == &input.prevout) {
+                            Some((_, u)) => Some(u.script_pubkey.clone()),
+                            None => self.db.get_utxo(&input.prevout)?.map(|u| u.script_pubkey),
+                        };
+                    if let Some(spk) = prev_script.filter(|spk| spk.is_p2sh()) {
+                        sig_ops += divi_script::p2sh_sig_op_count(
+                            spk.as_bytes(),
+                            input.script_sig.as_bytes(),
+                        );
+                    }
+                }
+            }
+            if sig_ops > MAX_BLOCK_SIGOPS {
+                return Err(StorageError::InvalidBlock(
+                    "bad-blk-sigops: too many sigops".into(),
+                ));
+            }
 
             // Remove spent UTXOs (except for coinbase which has no real inputs)
             if !is_coinbase {
@@ -3046,6 +4158,15 @@ impl Chain {
                     // Coinstake first input is empty marker, skip it
                     if is_coinstake && input.prevout.is_null() {
                         continue;
+                    }
+
+                    // A coin spent earlier in this block is gone (Divi Core CheckBlock,
+                    // BlockCheckingHelpers.cpp:131-136)
+                    if spent_in_block.contains(&input.prevout) {
+                        return Err(StorageError::InvalidBlock(format!(
+                            "bad-txns-inputs-duplicate: {}:{} in tx {}",
+                            input.prevout.txid, input.prevout.vout, txid
+                        )));
                     }
 
                     // Check if UTXO was created earlier in this same block
@@ -3078,6 +4199,26 @@ impl Chain {
                     };
 
                     if let Some(ref utxo) = prev_utxo {
+                        // Divi Core CheckInputs (UtxoCheckingAndUpdating.cpp:72-84): coinbase
+                        // and coinstake outputs mature after nMaturity blocks; input values
+                        // must be in range
+                        if utxo.is_coinbase || utxo.is_coinstake {
+                            let depth = i64::from(height) - i64::from(utxo.height);
+                            if depth < i64::from(self.params.coinbase_maturity) {
+                                return Err(StorageError::InvalidBlock(format!(
+                                    "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
+                                    depth, utxo.is_coinstake, txid
+                                )));
+                            }
+                        }
+                        value_in += utxo.value;
+                        if !money_range(utxo.value, max_money) || !money_range(value_in, max_money)
+                        {
+                            return Err(StorageError::InvalidBlock(format!(
+                                "bad-txns-inputvalues-outofrange in tx {}",
+                                txid
+                            )));
+                        }
                         block_undo.push(input.prevout, utxo.clone());
                     }
 
@@ -3126,11 +4267,14 @@ impl Chain {
                                 ScriptFlags::pos(),
                             )
                             .map_err(|e| {
-                                StorageError::InvalidBlock(format!(
-                                    "VerifySignature failed on coinstake {} ({})",
-                                    txid,
-                                    e.core_message()
-                                ))
+                                StorageError::invalid_block_scored(
+                                    0,
+                                    format!(
+                                        "VerifySignature failed on coinstake {} ({})",
+                                        txid,
+                                        e.core_message()
+                                    ),
+                                )
                             })?;
                         }
                     }
@@ -3139,6 +4283,21 @@ impl Chain {
                     spent_in_block.insert(input.prevout);
                     utxo_batch.remove(input.prevout);
                 }
+            }
+
+            // Divi Core CheckInputs (UtxoCheckingAndUpdating.cpp:86-99): an ordinary
+            // transaction may not spend more than its inputs; the difference is its fee
+            let value_out = tx.vout.iter().fold(Amount::ZERO, |acc, o| acc + o.value);
+            if is_coinbase || is_coinstake {
+                mint = mint + value_out - value_in;
+            } else {
+                if value_in < value_out {
+                    return Err(StorageError::InvalidBlock(format!(
+                        "bad-txns-in-belowout: tx {} value in ({}) < value out ({})",
+                        txid, value_in, value_out
+                    )));
+                }
+                fees += value_in - value_out;
             }
 
             // Add new UTXOs
@@ -3160,7 +4319,8 @@ impl Chain {
                     height,
                     is_coinbase,
                     is_coinstake,
-                );
+                )
+                .with_version(tx.version);
                 // Track UTXOs created in this block
                 created_in_block.insert(outpoint);
                 // Queue UTXO addition in batch
@@ -3181,6 +4341,10 @@ impl Chain {
                 debug!("  tx {}: created {} UTXOs", txid, utxos_created);
             }
         }
+
+        debug!("  ├─ Block value + lottery validation check");
+        self.validate_block_value(block, index, mint, fees)?;
+        debug!("  ├─ Block value validation: ✅ PASS");
 
         // Money supply: previous supply plus everything created minus everything consumed
         // (coinbase/coinstake rewards raise it, fees burned by plain transactions lower it)
@@ -3226,11 +4390,8 @@ impl Chain {
         );
 
         if let Some(ref tx_index) = self.tx_index {
-            let mut locations = Vec::with_capacity(block.transactions.len());
-            for (tx_idx, txid) in txids.iter().enumerate() {
-                locations.push((*txid, TxLocation::new(index.hash, tx_idx as u32)));
-            }
-            tx_index.put_locations_batch(&locations)?;
+            let locations = Self::tx_locations(block, &txids, &index.hash);
+            tx_index.put_block_tx_locations(&locations, index.height, &index.hash)?;
         }
 
         debug!("  ├─ Lottery winners update");
@@ -3305,11 +4466,9 @@ impl Chain {
             return Ok(());
         }
 
+        // Regtest pays testnet's treasury and charity addresses, as every
+        // network but mainnet does (BlockIncentivesPopulator.cpp:34-42)
         let is_mainnet = matches!(network_type, NetworkType::Mainnet);
-
-        if matches!(network_type, NetworkType::Regtest) {
-            return Ok(());
-        }
 
         let halving_interval = match network_type {
             NetworkType::Mainnet => 525_600u32,
@@ -3321,7 +4480,7 @@ impl Chain {
         let charity_script = treasury::get_charity_script(is_mainnet);
 
         let coinstake = block.transactions.get(1).ok_or_else(|| {
-            StorageError::InvalidBlock("Treasury block missing coinstake".to_string())
+            StorageError::invalid_block_scored(0, "Treasury block missing coinstake".to_string())
         })?;
 
         // Use transition-aware payment cycle (matches C++ GetTreasuryBlockPaymentCycle)
@@ -3334,48 +4493,31 @@ impl Chain {
                 halving_interval,
             );
 
-        let mut treasury_found = None;
-        let mut charity_found = None;
-
-        for output in &coinstake.vout {
-            if output.script_pubkey == treasury_script {
-                treasury_found = Some(output.value);
-            }
-            if output.script_pubkey == charity_script {
-                charity_found = Some(output.value);
-            }
+        // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
+        // an output of exactly the amount to exactly the script, for each
+        let pays = |script: &divi_primitives::script::Script, amount| {
+            coinstake
+                .vout
+                .iter()
+                .any(|o| o.script_pubkey == *script && o.value == amount)
+        };
+        if !pays(&treasury_script, expected_treasury) {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Treasury block {} does not pay the treasury {}",
+                    height, expected_treasury
+                ),
+            ));
         }
-
-        match treasury_found {
-            None => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} missing treasury payment",
-                    height
-                )));
-            }
-            Some(actual) if actual != expected_treasury => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} has incorrect treasury payment: expected {}, got {}",
-                    height, expected_treasury, actual
-                )));
-            }
-            Some(_) => {}
-        }
-
-        match charity_found {
-            None => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} missing charity payment",
-                    height
-                )));
-            }
-            Some(actual) if actual != expected_charity => {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Treasury block {} has incorrect charity payment: expected {}, got {}",
-                    height, expected_charity, actual
-                )));
-            }
-            Some(_) => {}
+        if !pays(&charity_script, expected_charity) {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Treasury block {} does not pay the charity {}",
+                    height, expected_charity
+                ),
+            ));
         }
 
         Ok(())
@@ -3391,33 +4533,81 @@ impl Chain {
     }
 
     /// Per-block rewards at `height`
-    fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
-        divi_consensus::block_subsidy::get_block_subsidy_for_chain(
+    /// Divi Core's CBlockRewards for a height (GetBlockSubsidity)
+    pub fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
+        let mut rewards = divi_consensus::block_subsidy::get_block_subsidy_for_chain(
             self.params.chain_mode,
             self.network_type() == NetworkType::Mainnet,
             height,
             self.halving_interval(),
-        )
+        );
+        // Divi regtest's premine is 1250 coins (Divi Core chainparams.cpp:470)
+        if height == 1
+            && self.params.chain_mode == ChainMode::Divi
+            && self.network_type() == NetworkType::Regtest
+        {
+            rewards.stake = Amount::from_divi(1_250);
+        }
+        rewards
     }
 
-    /// Core's `nStakeReward`: after DeprecateMasternodes (always active on
-    /// PrivateDivi) the masternode reward is folded into the stake. Shared by
-    /// the mint check and the vault rule so the two cannot disagree.
-    ///
-    /// C++ reference: BlockConnectionService.cpp lines 322-326
+    /// Whether DeprecateMasternodes is active for the block after `parent`: Divi
+    /// Core checks the parent's median time past against 2023-08-23
+    /// (BlockConnectionService.cpp:322, ForkActivation.cpp:19-31, :48-60). Always
+    /// active on PrivateDivi.
+    fn masternodes_deprecated(&self, parent: &BlockIndex) -> Result<bool, StorageError> {
+        if self.params.chain_mode == ChainMode::PrivateDivi {
+            return Ok(true);
+        }
+        let mtp = self.get_median_time_past(parent)? as i64;
+        Ok(masternodes_deprecated_after(parent, mtp))
+    }
+
+    /// The limit on what the coinbase and coinstake may create: stake plus
+    /// masternode reward, whether or not the masternode reward is still paid
+    /// separately (BlockIncentivesPopulator.cpp:202-220 sums both).
     fn stake_reward(rewards: &divi_consensus::block_subsidy::BlockRewards) -> Amount {
         rewards.stake + rewards.masternode
     }
 
+    /// What a proof-of-work coinbase at `height` may pay, before fees: the limit
+    /// `validate_block_value` checks it against
+    pub fn pow_block_reward(&self, height: u32) -> Amount {
+        Self::stake_reward(&self.block_rewards(height))
+    }
+
     /// Validate block value (total mint) doesn't exceed expected rewards.
     /// Matches C++ BlockIncentivesPopulator::IsBlockValueValid and HasValidPayees.
-    fn validate_block_value(&self, block: &Block, index: &BlockIndex) -> Result<(), StorageError> {
+    ///
+    /// `mint` is Core's `nMint`: what the coinbase and the coinstake create beyond
+    /// their inputs. `fees` is what the other transactions leave unspent; PoW blocks
+    /// may claim it, PoS blocks burn it (BlockConnectionService.cpp:67-96).
+    fn validate_block_value(
+        &self,
+        block: &Block,
+        index: &BlockIndex,
+        mint: Amount,
+        fees: Amount,
+    ) -> Result<(), StorageError> {
         use divi_consensus::{block_subsidy, lottery, treasury};
 
         let height = index.height;
 
-        // Skip PoW blocks and genesis
-        if height <= 100 {
+        if height == 0 {
+            return Ok(());
+        }
+        if height <= LAST_POW_BLOCK {
+            // PrivateDivi keeps its earlier behaviour (no PoW-era check)
+            if !self.params.check_block_work {
+                return Ok(());
+            }
+            let limit = Self::stake_reward(&self.block_rewards(height)) + fees;
+            if mint > limit {
+                return Err(StorageError::InvalidBlock(format!(
+                    "bad-cb-amount: reward pays too much (actual={} vs limit={})",
+                    mint, limit
+                )));
+            }
             return Ok(());
         }
 
@@ -3494,37 +4684,18 @@ impl Chain {
             base_expected
         };
 
-        // Compute actual mint from coinstake (tx[1])
-        let coinstake = block
-            .transactions
-            .get(1)
-            .ok_or_else(|| StorageError::InvalidBlock("PoS block missing coinstake".to_string()))?;
-
-        // Sum coinstake input values from UTXO set
-        let mut input_sum = Amount::ZERO;
-        for input in &coinstake.vin {
-            if input.prevout.is_null() {
-                continue; // Skip coinstake marker input
-            }
-            if let Some(utxo) = self.db.get_utxo(&input.prevout)? {
-                input_sum += utxo.value;
-            }
-            // If UTXO not found, it may have been created earlier in this block (edge case)
-            // The UTXO existence check in connect_block handles this
-        }
-
-        let output_sum = coinstake
-            .vout
-            .iter()
-            .fold(Amount::ZERO, |acc, o| acc + o.value);
-        let actual_mint = output_sum - input_sum;
-
-        if actual_mint > expected_mint {
+        if mint > expected_mint {
             return Err(StorageError::InvalidBlock(format!(
-                "Block {} mints too much: actual {} > expected {}",
-                height, actual_mint, expected_mint
+                "bad-cb-amount: reward pays too much (actual={} vs limit={}) at height {}",
+                mint, expected_mint, height
             )));
         }
+
+        // The payees after the amount, as Divi Core's
+        // CheckMintTotalsAndBlockPayees (BlockConnectionService.cpp:77-98): a
+        // block paying too much is refused with DoS 100 even when it also
+        // pays the wrong payee (DoS 0); the UTXO changes are not written yet
+        self.validate_treasury_payments(block, index)?;
 
         // Validate lottery payments on lottery blocks
         if is_lottery {
@@ -3583,10 +4754,13 @@ impl Chain {
                 .any(|out| out.script_pubkey == *expected_script && out.value == expected_reward);
 
             if !found {
-                return Err(StorageError::InvalidBlock(format!(
-                    "Lottery block {} missing payment for winner {}: expected {} to script",
-                    height, i, expected_reward
-                )));
+                return Err(StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "Lottery block {} missing payment for winner {}: expected {} to script",
+                        height, i, expected_reward
+                    ),
+                ));
             }
         }
 
@@ -3892,6 +5066,11 @@ impl Chain {
         self.db.get_utxo(outpoint)
     }
 
+    /// Whether any spendable output of `txid` is unspent (Core's `HaveCoins`)
+    pub fn has_spendable_output_of(&self, txid: &Hash256) -> Result<bool, StorageError> {
+        self.db.has_spendable_output_of(txid)
+    }
+
     /// Check if a UTXO exists
     pub fn has_utxo(&self, outpoint: &OutPoint) -> Result<bool, StorageError> {
         self.db.has_utxo(outpoint)
@@ -3917,9 +5096,13 @@ impl Chain {
         self.db.has_utxo_cache()
     }
 
-    /// Try to activate a stored block (potentially triggering a chain reorganization)
-    /// Returns true if a reorg was triggered, false if block was already on main chain
-    pub fn try_activate_block(&self, hash: &Hash256) -> Result<bool, StorageError> {
+    /// Try to activate a stored block (potentially triggering a chain reorganization).
+    /// When it does, returns the fork height and the transactions of the
+    /// disconnected blocks to return to the mempool, as `accept_block` reports them.
+    pub fn try_activate_block(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
         // Acquire exclusive lock for chain state modifications
         debug!("try_activate_block: Waiting for chain lock...");
         let _chain_guard = self.chain_lock.lock();
@@ -3930,20 +5113,20 @@ impl Chain {
             Some(idx) => idx,
             None => {
                 debug!("try_activate_block: Block {} not found in index", hash);
-                return Ok(false); // Block not found
+                return Ok(None); // Block not found
             }
         };
 
         // Already on main chain, nothing to do
         if existing_index.status.contains(BlockStatus::ON_MAIN_CHAIN) {
             debug!("try_activate_block: Block {} already on main chain", hash);
-            return Ok(false);
+            return Ok(None);
         }
 
         // Never activate a block that is, or descends from, an invalid block.
         if self.has_failed_ancestor(&existing_index)? {
             debug!("try_activate_block: Block {} is on an invalid chain", hash);
-            return Ok(false);
+            return Ok(None);
         }
 
         // Check if this block has more work than our tip
@@ -3953,7 +5136,7 @@ impl Chain {
                 "try_activate_block: No tip yet, cannot activate block {}",
                 hash
             );
-            return Ok(false); // No tip yet
+            return Ok(None); // No tip yet
         };
 
         debug!(
@@ -3966,7 +5149,7 @@ impl Chain {
                 "try_activate_block: Block {} should NOT update tip (insufficient work or doesn't extend)",
                 hash
             );
-            return Ok(false); // Not enough work to trigger reorg
+            return Ok(None); // Not enough work to trigger reorg
         }
 
         // Get the block data
@@ -3988,9 +5171,13 @@ impl Chain {
 
         let mut index = existing_index;
         match self.reorganize_chain(&block, &mut index, current_tip) {
-            Ok((_fork_height, _orphans)) => {
+            Ok(reorg) => {
                 info!("try_activate_block: Successfully activated block {}", hash);
-                Ok(true)
+                self.update_best_known_block(&index);
+                if self.db.has_utxo_cache() {
+                    self.db.flush_utxo_cache()?;
+                }
+                Ok(Some(reorg))
             }
             Err(e) => {
                 warn!(
@@ -4086,15 +5273,207 @@ impl divi_masternode::UtxoProvider for ChainDatabase {
     }
 }
 
+/// DeprecateMasternodes for the block after `parent`, from the parent's median
+/// time past (ForkActivation.cpp:31, :35-36, :56)
+fn masternodes_deprecated_after(parent: &BlockIndex, parent_mtp: i64) -> bool {
+    use crate::fork_activation::{ActivationState, Fork};
+    ActivationState::new_with_mtp(parent, parent_mtp).is_active(Fork::DeprecateMasternodes)
+}
+
+/// Divi Core's `nStakeReward` as ConnectBlock hands it to the vault coinstake rule
+/// (BlockConnectionService.cpp:321-326, BlockTransactionChecker.cpp:57-108): the
+/// stake share, plus the masternode share only once DeprecateMasternodes is active.
+/// Before that the masternode share is paid to another output.
+fn coinstake_stake_reward(
+    rewards: &divi_consensus::block_subsidy::BlockRewards,
+    masternodes_deprecated: bool,
+) -> Amount {
+    if masternodes_deprecated {
+        rewards.stake + rewards.masternode
+    } else {
+        rewards.stake
+    }
+}
+
+/// `CScript() << height` (Divi Core script.h:210-225): OP_1..OP_16 for 1-16,
+/// otherwise the minimal CScriptNum encoding pushed as data
+pub fn bip34_height_script(height: u32) -> Vec<u8> {
+    match height {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + height as u8],
+        _ => {
+            let mut num = Vec::new();
+            let mut v = height;
+            while v > 0 {
+                num.push((v & 0xff) as u8);
+                v >>= 8;
+            }
+            if num.last().is_some_and(|b| b & 0x80 != 0) {
+                num.push(0x00);
+            }
+            let mut out = vec![num.len() as u8];
+            out.extend_from_slice(&num);
+            out
+        }
+    }
+}
+
+/// Divi Core CBlock::BuildMerkleTree's `fMutated` (primitives/block.cpp:59-79): two
+/// identical hashes at the end of a level
+fn merkle_tree_mutated(txids: &[Hash256]) -> bool {
+    let mut level = txids.to_vec();
+    let mut mutated = false;
+    while level.len() > 1 {
+        let n = level.len();
+        let mut next = Vec::with_capacity(n.div_ceil(2));
+        for i in (0..n).step_by(2) {
+            let i2 = (i + 1).min(n - 1);
+            if i2 == i + 1 && i2 + 1 == n && level[i] == level[i2] {
+                mutated = true;
+            }
+            let mut pair = Vec::with_capacity(64);
+            pair.extend_from_slice(level[i].as_bytes());
+            pair.extend_from_slice(level[i2].as_bytes());
+            next.push(hash256(&pair));
+        }
+        level = next;
+    }
+    mutated
+}
+
+/// Divi Core `GetLegacySigOpCount` (TransactionOpCounting.cpp:6-16)
+fn legacy_sig_op_count(tx: &Transaction) -> u32 {
+    let ins: u32 = tx
+        .vin
+        .iter()
+        .map(|i| divi_script::sig_op_count(i.script_sig.as_bytes(), false))
+        .sum();
+    let outs: u32 = tx
+        .vout
+        .iter()
+        .map(|o| divi_script::sig_op_count(o.script_pubkey.as_bytes(), false))
+        .sum();
+    ins + outs
+}
+
+/// Divi Core `MoneyRange` against the network's `MaxMoneyOut`
+fn money_range(value: Amount, max_money: Amount) -> bool {
+    value >= Amount::ZERO && value <= max_money
+}
+
+/// The context-free transaction checks of Divi Core CheckBlock and
+/// CheckTransaction (BlockCheckingHelpers.cpp:24-147): one coinbase, first; a PoS
+/// block's coinbase pays nothing and its coinstake comes second; no transaction
+/// without inputs or outputs; output values in range; no coin spent twice.
+fn check_block_transactions(block: &Block, max_money: Amount) -> Result<(), StorageError> {
+    let invalid = |reason: String| Err(StorageError::InvalidBlock(reason));
+    use divi_primitives::serialize::Encodable;
+    if block.transactions.is_empty()
+        || block.transactions.len() > MAX_BLOCK_SIZE
+        || block.encoded_size() > MAX_BLOCK_SIZE
+    {
+        return invalid("bad-blk-length: size limits failed".into());
+    }
+    if !block.transactions[0].is_coinbase() {
+        return invalid("bad-cb-missing: first tx is not coinbase".into());
+    }
+    if block.transactions[1..].iter().any(|tx| tx.is_coinbase()) {
+        return invalid("bad-cb-multiple: more than one coinbase".into());
+    }
+    if block.is_proof_of_stake() {
+        let coinbase = &block.transactions[0];
+        if coinbase.vout.len() != 1 || !coinbase.vout[0].is_empty() {
+            return invalid("coinbase output not empty for proof-of-stake block".into());
+        }
+        if block.transactions[2..].iter().any(|tx| tx.is_coinstake()) {
+            return invalid("more than one coinstake".into());
+        }
+    }
+
+    let mut inputs = std::collections::HashSet::new();
+    for tx in &block.transactions {
+        check_transaction_with(tx, max_money, &mut inputs)?;
+    }
+    let sig_ops: u32 = block.transactions.iter().map(legacy_sig_op_count).sum();
+    if sig_ops > MAX_BLOCK_SIGOPS_LEGACY {
+        return invalid("bad-blk-sigops: out-of-bounds SigOpCount".into());
+    }
+    Ok(())
+}
+
+/// Divi Core `CheckTransaction` (BlockCheckingHelpers.cpp:99-147): the checks
+/// that need no context. `inputs` collects the outpoints spent so far; a block
+/// shares one set across its transactions, as Core's CheckBlock does.
+fn check_transaction_with(
+    tx: &Transaction,
+    max_money: Amount,
+    inputs: &mut std::collections::HashSet<OutPoint>,
+) -> Result<(), StorageError> {
+    use divi_primitives::serialize::Encodable;
+    let invalid = |reason: String| Err(StorageError::InvalidBlock(reason));
+    if tx.vin.is_empty() {
+        return Err(StorageError::invalid_block_scored(
+            10,
+            "bad-txns-vin-empty".into(),
+        ));
+    }
+    if tx.vout.is_empty() {
+        return Err(StorageError::invalid_block_scored(
+            10,
+            "bad-txns-vout-empty".into(),
+        ));
+    }
+    if tx.encoded_size() > MAX_TX_SIZE {
+        return invalid("bad-txns-oversize: size limits failed".into());
+    }
+    let mut value_out = Amount::ZERO;
+    for out in &tx.vout {
+        if out.is_empty() && !tx.is_coinbase() && !tx.is_coinstake() {
+            return invalid("txout empty for user transaction".into());
+        }
+        if !money_range(out.value, max_money) {
+            return invalid("bad-txns-vout-negative-or-toolarge".into());
+        }
+        value_out += out.value;
+        if !money_range(value_out, max_money) {
+            return invalid("bad-txns-txouttotal-toolarge".into());
+        }
+    }
+    for input in &tx.vin {
+        if !inputs.insert(input.prevout) {
+            return invalid(format!(
+                "bad-txns-inputs-duplicate: {}:{}",
+                input.prevout.txid, input.prevout.vout
+            ));
+        }
+    }
+    if tx.is_coinbase() {
+        let len = tx.vin[0].script_sig.len();
+        if !(2..=150).contains(&len) {
+            return invalid(format!("bad-cb-length: coinbase script size={}", len));
+        }
+    }
+    Ok(())
+}
+
+/// Divi Core `CheckTransaction` for a single transaction (the mempool's first
+/// check); the error carries Core's reason
+pub fn check_transaction(tx: &Transaction, max_money: Amount) -> Result<(), StorageError> {
+    check_transaction_with(tx, max_money, &mut std::collections::HashSet::new())
+}
+
 /// Divi Core `ContextualCheckBlock` finality rule: a block may only contain
 /// transactions that are final at its own height and timestamp.
 fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError> {
     for tx in &block.transactions {
         if !tx.is_final(height, block.header.time) {
-            return Err(StorageError::InvalidBlock(format!(
-                "bad-txns-nonfinal: block at height {} contains a non-final transaction",
-                height
-            )));
+            return Err(StorageError::invalid_block_scored(
+                10,
+                format!(
+                    "bad-txns-nonfinal: block at height {} contains a non-final transaction",
+                    height
+                ),
+            ));
         }
     }
     Ok(())
@@ -4102,6 +5481,8 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
 
 #[cfg(test)]
 mod tests {
+    mod crash;
+
     use super::*;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -4198,6 +5579,118 @@ mod tests {
     }
 
     /// Create a test chain with regtest network (genesis already initialized)
+    /// Real mainnet vault coinstakes, all accepted by Divi Core (read from a Core
+    /// 3.0.0 node): height, parent's median time past, vault input, vault outputs,
+    /// other outputs, all in satoshis. DeprecateMasternodes starts at 2,580,189,
+    /// the first block whose parent's MTP reaches 1692792000. 2,580,186 and
+    /// 2,580,187 have block times past that but parents' MTPs below it, so they are
+    /// still before the fork and pay the masternode share to another output.
+    #[allow(clippy::type_complexity)]
+    const MAINNET_VAULT_STAKES: &[(u32, i64, i64, &[i64], &[i64])] = &[
+        (
+            1_191_825,
+            1_610_308_802,
+            6_200_000_000_000,
+            &[3_120_900_000_000, 3_120_900_000_000],
+            &[49_500_000_000],
+        ),
+        (
+            2_400_002,
+            1_682_102_505,
+            1_569_559_351_563,
+            &[1_603_759_351_563],
+            &[40_500_000_000],
+        ),
+        (
+            2_400_005,
+            1_682_102_826,
+            740_515_029_326,
+            &[774_715_029_326],
+            &[40_500_000_000],
+        ),
+        (
+            2_580_186,
+            1_692_791_906,
+            1_969_562_500_000,
+            &[1_001_881_250_000, 1_001_881_250_000],
+            &[40_500_000_000],
+        ),
+        (
+            2_580_187,
+            1_692_791_913,
+            1_305_117_500_000,
+            &[1_339_317_500_000],
+            &[40_500_000_000],
+        ),
+        (
+            2_580_194,
+            1_692_792_561,
+            1_715_190_625_000,
+            &[1_789_890_625_000],
+            &[],
+        ),
+    ];
+
+    #[test]
+    fn test_vault_coinstakes_of_real_mainnet_blocks() {
+        let vault = divi_script::StakingVaultScript::new([0x36; 20], [0xa7; 20]).to_script();
+        let prev = OutPoint::new(Hash256::from_bytes([0x44; 32]), 1);
+        for &(height, parent_mtp, value_in, vault_outs, others) in MAINNET_VAULT_STAKES {
+            let parent = BlockIndex::from_header(
+                &divi_primitives::block::BlockHeader::default(),
+                height - 1,
+                None,
+            );
+            let deprecated = masternodes_deprecated_after(&parent, parent_mtp);
+            assert_eq!(deprecated, height >= 2_580_189, "fork state at {height}");
+
+            let mut vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+            vout.extend(
+                vault_outs
+                    .iter()
+                    .map(|&v| TxOut::new(Amount::from_sat(v), vault.clone())),
+            );
+            vout.extend(
+                others
+                    .iter()
+                    .map(|&v| TxOut::new(Amount::from_sat(v), Script::new_p2pkh(&[0xcd; 20]))),
+            );
+            let coinstake = Transaction {
+                version: 1,
+                vin: vec![TxIn::new(prev, Script::new(), 0xffff_ffff)],
+                vout,
+                lock_time: 0,
+            };
+            let input = TxOut::new(Amount::from_sat(value_in), vault.clone());
+            let get = |op: &OutPoint| (*op == prev).then(|| input.clone());
+            let check = |reward| {
+                crate::pos_validation::validate_coinstake_vault_rules(&coinstake, reward, &get)
+            };
+            let rewards = divi_consensus::block_subsidy::get_block_subsidy(height, 525_600);
+            assert!(
+                check(coinstake_stake_reward(&rewards, deprecated)).is_ok(),
+                "Core accepted block {height}"
+            );
+            if !deprecated {
+                // What IronDivi required before: the masternode share counted as the vault's
+                assert!(
+                    check(coinstake_stake_reward(&rewards, true)).is_err(),
+                    "block {height} pays the masternode share elsewhere"
+                );
+            }
+        }
+        // 1,191,825 in DIVI, as the refusal reported it
+        let rewards = divi_consensus::block_subsidy::get_block_subsidy(1_191_825, 525_600);
+        assert_eq!(
+            coinstake_stake_reward(&rewards, false),
+            Amount::from_divi(418)
+        );
+        assert_eq!(
+            coinstake_stake_reward(&rewards, true),
+            Amount::from_divi(913)
+        );
+    }
+
     fn create_test_chain() -> (Chain, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
@@ -4207,6 +5700,135 @@ mod tests {
         )
         .unwrap();
         (chain, dir)
+    }
+
+    /// A regtest treasury block pays exactly the treasury and the charity, as
+    /// Divi Core checks on every network (BlockIncentivesPopulator.cpp:66-90,
+    /// :180-185): at block 150 divid pays 9600 and 600 DIVI to testnet's
+    /// treasury and charity addresses
+    #[test]
+    fn regtest_treasury_payments_are_checked() {
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 150;
+        let treasury = divi_consensus::treasury::get_treasury_script(false);
+        let charity = divi_consensus::treasury::get_charity_script(false);
+        let block_paying = |outputs: Vec<TxOut>| {
+            let mut vout = vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(Amount::from_divi(1696), Script::new_p2pkh(&[7u8; 20])),
+            ];
+            vout.extend(outputs);
+            Block {
+                transactions: vec![
+                    Transaction::default(),
+                    Transaction {
+                        version: 1,
+                        vin: vec![TxIn::new(
+                            OutPoint::new(Hash256::from_bytes([3u8; 32]), 1),
+                            Script::new(),
+                            0xffff_ffff,
+                        )],
+                        vout,
+                        lock_time: 0,
+                    },
+                ],
+                ..Block::default()
+            }
+        };
+        let t = Amount::from_divi(9600);
+        let c = Amount::from_divi(600);
+        let pay = |script: &Script, amount: Amount| TxOut::new(amount, script.clone());
+        let less = Amount::from_sat(t.as_sat() - 1);
+        let other = Script::new_p2pkh(&[9u8; 20]);
+
+        let ok = block_paying(vec![pay(&treasury, t), pay(&charity, c)]);
+        assert!(chain.validate_treasury_payments(&ok, &index).is_ok());
+        // Another output to the treasury script beside the exact one is fine
+        let also = block_paying(vec![
+            pay(&treasury, less),
+            pay(&treasury, t),
+            pay(&charity, c),
+        ]);
+        assert!(chain.validate_treasury_payments(&also, &index).is_ok());
+        for (what, outputs) in [
+            (
+                "one satoshi less",
+                vec![pay(&treasury, less), pay(&charity, c)],
+            ),
+            (
+                "one satoshi more",
+                vec![
+                    pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+                    pay(&charity, c),
+                ],
+            ),
+            ("to another script", vec![pay(&other, t), pay(&charity, c)]),
+            ("no charity", vec![pay(&treasury, t)]),
+        ] {
+            let err = chain
+                .validate_treasury_payments(&block_paying(outputs), &index)
+                .expect_err(what);
+            assert_eq!(err.misbehaviour_score(), 0, "{what}: bad-cb-payee scores 0");
+        }
+
+        // In the block's value check: the payees are checked there, after the
+        // amount, so paying too much is bad-cb-amount (DoS 100) first
+        // (BlockConnectionService.cpp:84-97)
+        let limit = Chain::stake_reward(&chain.block_rewards(150)) + t + c;
+        let under = block_paying(vec![pay(&treasury, less), pay(&charity, c)]);
+        let err = chain
+            .validate_block_value(&under, &index, limit, Amount::ZERO)
+            .expect_err("a treasury paid one satoshi less");
+        assert_eq!(err.misbehaviour_score(), 0);
+        let over = block_paying(vec![
+            pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+            pay(&charity, c),
+        ]);
+        let err = chain
+            .validate_block_value(&over, &index, limit + Amount::from_sat(1), Amount::ZERO)
+            .expect_err("a treasury paid one satoshi more");
+        assert_eq!(err.misbehaviour_score(), 100, "{err}");
+        assert!(chain
+            .validate_block_value(&ok, &index, limit, Amount::ZERO)
+            .is_ok());
+    }
+
+    thread_local! {
+        /// Heights of the blocks `seal` produced in this test (a test runs on one thread)
+        static SEALED_HEIGHTS: std::cell::RefCell<std::collections::HashMap<Hash256, u32>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// Make a test block valid as Core requires: version 4, a coinbase that starts
+    /// with the block height (one more than its sealed parent's, 1 on genesis),
+    /// the merkle root, and a nonce that meets the block's bits
+    fn seal(block: &mut Block) {
+        let height = SEALED_HEIGHTS.with(|m| {
+            m.borrow()
+                .get(&block.header.prev_block)
+                .map_or(1, |h| h + 1)
+        });
+        if block.header.version < 3 {
+            block.header.version = 4;
+        }
+        if let Some(cb) = block.transactions.first_mut().filter(|tx| tx.is_coinbase()) {
+            let prefix = bip34_height_script(height);
+            if !cb.vin[0].script_sig.as_bytes().starts_with(&prefix) {
+                let mut sig = prefix;
+                sig.extend_from_slice(cb.vin[0].script_sig.as_bytes());
+                cb.vin[0].script_sig = Script::from_bytes(sig);
+            }
+        }
+        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        let hash = compute_block_hash(&block.header);
+        SEALED_HEIGHTS.with(|m| m.borrow_mut().insert(hash, height));
     }
 
     /// Get the existing genesis block info from the chain
@@ -4225,7 +5847,7 @@ mod tests {
         // Add coinbase transaction
         let coinbase = Transaction {
             version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x05]))],
             vout: vec![TxOut::new(
                 Amount::from_sat(1250_00000000),
                 Script::new_p2pkh(&[1u8; 20]),
@@ -4235,7 +5857,7 @@ mod tests {
         block.transactions.push(coinbase);
 
         // Compute merkle root
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
         block
     }
 
@@ -4280,7 +5902,7 @@ mod tests {
         let mut block1 = create_child_block(genesis_hash, genesis_time);
         block1.transactions[0].lock_time = 1; // height 1 is not below 1
         block1.transactions[0].vin[0].sequence = 0;
-        block1.header.merkle_root = compute_merkle_root(&block1.transactions);
+        seal(&mut block1);
 
         let result = chain.accept_block(block1);
         assert!(result.is_err(), "block with a non-final tx was accepted");
@@ -4296,7 +5918,7 @@ mod tests {
         // A time lock below the block's own timestamp is final
         block1.transactions[0].lock_time = genesis_time;
         block1.transactions[0].vin[0].sequence = 0;
-        block1.header.merkle_root = compute_merkle_root(&block1.transactions);
+        seal(&mut block1);
 
         chain.accept_block(block1).unwrap();
         assert_eq!(chain.height(), 1);
@@ -4386,7 +6008,7 @@ mod tests {
 
         let coinbase = Transaction {
             version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x05]))],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x05]))],
             vout: vec![TxOut::new(
                 Amount::from_sat(1250_00000000),
                 Script::new_p2pkh(&pubkey_hash),
@@ -4394,7 +6016,7 @@ mod tests {
             lock_time: 0,
         };
         block.transactions.push(coinbase);
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
         block
     }
 
@@ -4557,6 +6179,68 @@ mod tests {
         );
     }
 
+    /// The transactions of disconnected blocks come back parents first, so the
+    /// mempool can take a child after its parent. Divi Core offers each block's
+    /// transactions to the mempool while the blocks below it are still connected
+    /// (ChainTipManager.cpp:175-182), so both come back there.
+    #[test]
+    fn reorg_returns_disconnected_transactions_parents_first() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let anyone = Script::from_bytes(vec![0x51]);
+        let spend = |coin: OutPoint, value: i64| Transaction {
+            version: 1,
+            vin: vec![TxIn::new(coin, Script::new(), 0xffff_ffff)],
+            vout: vec![TxOut::new(Amount::from_sat(value), anyone.clone())],
+            lock_time: 0,
+        };
+
+        // 21 blocks, so the first one's coinbase is mature (regtest maturity 20)
+        let mut parent = (genesis_hash, genesis_time);
+        let mut coin = None;
+        for _ in 0..21 {
+            let mut block = create_child_block(parent.0, parent.1);
+            block.transactions[0].vout[0].script_pubkey = anyone.clone();
+            seal(&mut block);
+            let hash = chain.accept_block(block.clone()).unwrap().hash;
+            coin.get_or_insert(OutPoint::new(block.transactions[0].txid(), 0));
+            parent = (hash, block.header.time);
+        }
+        let fork = parent;
+
+        // A22 confirms T1, A23 confirms T2 spending T1
+        let t1 = spend(coin.unwrap(), 1249_00000000);
+        let t2 = spend(OutPoint::new(t1.txid(), 0), 1248_00000000);
+        let mut a22 = create_child_block(fork.0, fork.1);
+        a22.transactions.push(t1.clone());
+        seal(&mut a22);
+        let a22_hash = chain.accept_block(a22.clone()).unwrap().hash;
+        let mut a23 = create_child_block(a22_hash, a22.header.time);
+        a23.transactions.push(t2.clone());
+        seal(&mut a23);
+        chain.accept_block(a23).unwrap();
+        assert_eq!(chain.height(), 23);
+
+        // A branch from height 21 with more work disconnects both
+        let mut parent = (fork.0, fork.1 + 1);
+        let mut result = None;
+        for _ in 0..3 {
+            let block = create_child_block_with_pubkey(parent.0, parent.1, [0x2b; 20]);
+            let accepted = chain.accept_block(block.clone()).unwrap();
+            parent = (accepted.hash, block.header.time);
+            result = Some(accepted);
+        }
+        let result = result.unwrap();
+        assert_eq!(chain.height(), 24);
+        assert_eq!(result.reorg_fork_height, Some(21));
+        let returned: Vec<Hash256> = result
+            .orphaned_transactions
+            .iter()
+            .map(|tx| tx.txid())
+            .collect();
+        assert_eq!(returned, vec![t1.txid(), t2.txid()]);
+    }
+
     /// A side-chain block that fails to connect during a reorg must be marked
     /// invalid together with its descendants, the old chain must be restored,
     /// and later blocks must never make the node retry that chain.
@@ -4601,7 +6285,7 @@ mod tests {
             )],
             lock_time: 0,
         });
-        block_b2.header.merkle_root = compute_merkle_root(&block_b2.transactions);
+        seal(&mut block_b2);
         let hash_b2 = chain.accept_block(block_b2.clone()).unwrap().hash;
 
         // B3 gives the side chain more work and triggers the reorg, which fails at B2.
@@ -4656,7 +6340,7 @@ mod tests {
         assert_eq!(chain.tip().unwrap().hash, hash_a2);
 
         // Neither the explicit activation path nor activate_best_chain picks it again.
-        assert!(!chain.try_activate_block(&hash_b3).unwrap());
+        assert!(chain.try_activate_block(&hash_b3).unwrap().is_none());
         assert!(chain.activate_best_chain().unwrap().is_none());
         assert_eq!(chain.tip().unwrap().hash, hash_a2);
 
@@ -4839,7 +6523,7 @@ mod tests {
             lock_time: 0,
         };
         spending_block.transactions.push(spending_tx);
-        spending_block.header.merkle_root = compute_merkle_root(&spending_block.transactions);
+        seal(&mut spending_block);
 
         // This should fail because coinbase needs 100 confirmations
         // (maturity rule)
@@ -4911,7 +6595,7 @@ mod tests {
         empty_block.header.prev_block = genesis_hash;
         empty_block.header.time = genesis_time + 60;
         empty_block.header.bits = 0x207fffff;
-        empty_block.header.merkle_root = compute_merkle_root(&empty_block.transactions);
+        seal(&mut empty_block);
 
         let _result = chain.accept_block(empty_block);
         // Note: The current implementation may accept empty blocks (depending on validation)
@@ -4934,7 +6618,7 @@ mod tests {
         // Note: Divi allows timestamps > MTP, so this might be valid
         let mut old_block = create_child_block(genesis_hash, genesis_time);
         old_block.header.time = genesis_time.saturating_sub(1000); // Before genesis
-        old_block.header.merkle_root = compute_merkle_root(&old_block.transactions);
+        seal(&mut old_block);
 
         // Depending on implementation, may or may not be rejected
         let _result = chain.accept_block(old_block);
@@ -4955,7 +6639,7 @@ mod tests {
             .unwrap()
             .as_secs() as u32;
         future_block.header.time = future_time + 3 * 60 * 60; // 3 hours in future
-        future_block.header.merkle_root = compute_merkle_root(&future_block.transactions);
+        seal(&mut future_block);
 
         let result = chain.accept_block(future_block);
         assert!(
@@ -5044,34 +6728,25 @@ mod tests {
         block.header.time = genesis_time + 60;
         block.header.bits = 0x207fffff;
 
-        // Create coinbase (required)
-        let coinbase = Transaction {
-            version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
-            vout: vec![TxOut::new(Amount::ZERO, Script::new())], // Empty coinbase
-            lock_time: 0,
-        };
-
-        // Create coinstake transaction with empty first output
+        // A coinbase with an empty first output, like a coinstake's marker output.
+        // (Only a coinbase or a coinstake may carry an empty output, and a
+        // coinstake needs a real stake; the stored layout is the same.)
         let coinstake = Transaction {
             version: 1,
-            vin: vec![TxIn {
-                prevout: OutPoint::null(), // Coinstake marker
-                script_sig: Script::new(),
-                sequence: 0xffffffff,
-            }],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
             vout: vec![
-                // Output 0: Empty marker (coinstake marker output)
+                // Output 0: Empty marker
                 TxOut::new(Amount::ZERO, Script::new()),
-                // Output 1: Actual stake reward
-                TxOut::new(Amount::from_divi(9150), Script::new_p2pkh(&[0xaa; 20])),
+                // Output 1: Actual reward
+                TxOut::new(Amount::from_divi(1000), Script::new_p2pkh(&[0xaa; 20])),
             ],
             lock_time: 0,
         };
 
-        block.transactions.push(coinbase);
         block.transactions.push(coinstake.clone());
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
+        // seal puts the height in front of the coinbase script
+        let coinstake = block.transactions[0].clone();
 
         // Accept the block
         let block_hash = chain
@@ -5118,7 +6793,7 @@ mod tests {
             .expect("Output 1 should exist in UTXO set");
         assert_eq!(
             utxo_1.value,
-            Amount::from_divi(9150),
+            Amount::from_divi(1000),
             "Output 1 should have correct value"
         );
 
@@ -5147,7 +6822,7 @@ mod tests {
                 sequence: 0xffffffff,
             }],
             vout: vec![TxOut::new(
-                Amount::from_divi(9100),
+                Amount::from_divi(900),
                 Script::new_p2pkh(&[0xbb; 20]),
             )],
             lock_time: 0,
@@ -5155,7 +6830,7 @@ mod tests {
 
         spending_block.transactions.push(coinbase2);
         spending_block.transactions.push(spending_tx);
-        spending_block.header.merkle_root = compute_merkle_root(&spending_block.transactions);
+        seal(&mut spending_block);
 
         // This should succeed because output 1 exists at index 1
         let result = chain.accept_block(spending_block);
@@ -5201,7 +6876,7 @@ mod tests {
     //
     //         let coinbase = Transaction {
     //             version: 1,
-    //             vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01]))],
+    //             vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
     //             vout: vec![TxOut::new(Amount::ZERO, Script::new())],
     //             lock_time: 0,
     //         };
@@ -5278,22 +6953,12 @@ mod tests {
         block.header.time = genesis_time + 60;
         block.header.bits = 0x207fffff;
 
-        // Coinbase
-        let coinbase = Transaction {
-            version: 1,
-            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01]))],
-            vout: vec![TxOut::new(Amount::ZERO, Script::new())],
-            lock_time: 0,
-        };
-
-        // Transaction 1: empty output at index 0, real output at index 1
+        // Two coinbase-like transactions are not allowed in one block, so each
+        // layout goes in its own block's coinbase.
+        // tx1: empty output at index 0, real output at index 1
         let tx1 = Transaction {
             version: 1,
-            vin: vec![TxIn {
-                prevout: OutPoint::null(),
-                script_sig: Script::new(),
-                sequence: 0xffffffff,
-            }],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
             vout: vec![
                 TxOut::new(Amount::ZERO, Script::new()), // Index 0: empty
                 TxOut::new(Amount::from_divi(100), Script::new_p2pkh(&[0xaa; 20])), // Index 1
@@ -5301,14 +6966,10 @@ mod tests {
             lock_time: 0,
         };
 
-        // Transaction 2: empty outputs at 0 and 1, real output at index 2
+        // tx2: empty outputs at 0 and 1, real output at index 2
         let tx2 = Transaction {
             version: 1,
-            vin: vec![TxIn {
-                prevout: OutPoint::null(),
-                script_sig: Script::new(),
-                sequence: 0xffffffff,
-            }],
+            vin: vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x02]))],
             vout: vec![
                 TxOut::new(Amount::ZERO, Script::new()), // Index 0: empty
                 TxOut::new(Amount::ZERO, Script::new()), // Index 1: empty
@@ -5317,11 +6978,20 @@ mod tests {
             lock_time: 0,
         };
 
-        block.transactions.push(coinbase);
         block.transactions.push(tx1.clone());
-        block.transactions.push(tx2.clone());
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
+        // seal puts the height in front of the coinbase script
+        let tx1 = block.transactions[0].clone();
+        let first = chain.accept_block(block).unwrap().hash;
 
+        let mut block = Block::default();
+        block.header.version = 1;
+        block.header.prev_block = first;
+        block.header.time = genesis_time + 120;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(tx2.clone());
+        seal(&mut block);
+        let tx2 = block.transactions[0].clone();
         chain.accept_block(block).unwrap();
 
         let tx1_hash = chain.compute_txid(&tx1);
@@ -5742,7 +7412,7 @@ mod tests {
         };
 
         block.transactions.push(coinbase);
-        block.header.merkle_root = compute_merkle_root(&block.transactions);
+        seal(&mut block);
         block
     }
 
@@ -6096,6 +7766,7 @@ mod tests {
                     height: KERNEL_HEIGHT,
                     is_coinbase: false,
                     is_coinstake: true,
+                    version: 1,
                 },
             )
             .unwrap();

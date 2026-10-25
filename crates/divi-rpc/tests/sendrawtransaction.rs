@@ -10,13 +10,14 @@
 // licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
 
 //! sendrawtransaction checks done before the mempool, as Divi Core 3.0.0
-//! rpcrawtransaction.cpp: already confirmed (-27) and the fee cap (-26).
+//! rpcrawtransaction.cpp: already confirmed (-27) and the fee cap (-26),
+//! -maxtxfee, read over the chain's coins and the mempool's outputs.
 
 use divi_crypto::compute_merkle_root;
 use divi_primitives::{
     amount::Amount,
     block::Block,
-    hash::Hash160,
+    hash::{Hash160, Hash256},
     script::Script,
     serialize::serialize,
     transaction::{OutPoint, Transaction, TxIn, TxOut},
@@ -67,11 +68,12 @@ impl Net {
         let tip = self.chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;
-        let mut cb_sig = vec![0x04];
+        // BIP34: the coinbase starts with the height
+        let mut cb_sig = divi_storage::bip34_height_script(height);
         cb_sig.extend_from_slice(&height.to_le_bytes());
         let coinbase = Transaction {
             version: 1,
@@ -85,6 +87,11 @@ impl Net {
         block.transactions.push(coinbase.clone());
         block.transactions.extend(txs);
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         self.chain.accept_block(block).unwrap();
         assert_eq!(self.chain.height(), height);
         coinbase
@@ -93,12 +100,17 @@ impl Net {
 
 fn spend(net: &Net, coinbase: &Transaction, pay: i64) -> Transaction {
     let to = Address::from_pubkey_hash(Hash160::from_bytes([0x77; 20]), Network::Regtest);
+    spend_to(net, coinbase, pay, &to)
+}
+
+/// A spend of `prev`'s first output, paying `pay` to `to`
+fn spend_to(net: &Net, prev: &Transaction, pay: i64, to: &Address) -> Transaction {
     let (mut tx, prev) = TransactionBuilder::new()
         .add_input(
-            OutPoint::new(coinbase.txid(), 0),
-            coinbase.vout[0].script_pubkey.clone(),
+            OutPoint::new(prev.txid(), 0),
+            prev.vout[0].script_pubkey.clone(),
         )
-        .add_output_to_address(Amount::from_sat(pay), &to)
+        .add_output_to_address(Amount::from_sat(pay), to)
         .build();
     TransactionSigner::new(net.wallet.keystore())
         .sign_all_inputs(&mut tx, &prev)
@@ -122,6 +134,10 @@ fn confirmed_transaction_is_already_in_block_chain() {
     let net = Net::new();
     let me = net.wallet.new_receiving_address().unwrap();
     let cb = net.mine(vec![], &me);
+    // Regtest coinbases mature after 20 blocks
+    for _ in 0..20 {
+        net.mine(vec![], &me);
+    }
     let tx = spend(&net, &cb, 1249 * COIN);
     net.mine(vec![tx.clone()], &me);
     assert_eq!(
@@ -149,4 +165,90 @@ fn fee_above_100_divi_needs_allowhighfees() {
     let with_override = Params::Array(vec![json!(hex::encode(serialize(&tx))), json!(true)]);
     let txid = rpc.send_raw_transaction(&with_override).unwrap();
     assert_eq!(txid, json!(tx.txid().to_string()));
+}
+
+/// A mempool holding the given transactions
+struct Pool(Vec<Transaction>);
+
+impl divi_rpc::blockchain::MempoolProvider for Pool {
+    fn get_txids(&self) -> Vec<Hash256> {
+        self.0.iter().map(|t| t.txid()).collect()
+    }
+    fn get_transaction(&self, txid: &Hash256) -> Option<Transaction> {
+        self.0.iter().find(|t| t.txid() == *txid).cloned()
+    }
+    fn prioritise_transaction(&self, _: &Hash256, _: f64, _: i64) -> bool {
+        false
+    }
+}
+
+const EXCESS: &str =
+    "Fees being paid are in excess of maximum fee, but fee override is not provided";
+
+/// The inputs' value is read over the mempool too (CCoinsViewMemPool,
+/// rpcrawtransaction.cpp:810-826): a fee paid from a mempool output is held to
+/// the cap, and a transaction already in the mempool is relayed again (:875)
+#[test]
+fn fee_paid_from_a_mempool_output_is_held_to_the_cap() {
+    let net = Net::new();
+    let me = net.wallet.new_receiving_address().unwrap();
+    let cb = net.mine(vec![], &me);
+    let parent = spend_to(&net, &cb, 1249 * COIN, &me);
+    // 150 DIVI of fee, from the parent's output in the mempool only
+    let child = spend(&net, &parent, 1099 * COIN);
+    let rpc = net.rpc();
+    rpc.set_mempool(Arc::new(Pool(vec![parent.clone()])));
+    assert_eq!(
+        code(rpc.send_raw_transaction(&raw(&child))),
+        (-26, EXCESS.to_string())
+    );
+    let with_override = Params::Array(vec![json!(hex::encode(serialize(&child))), json!(true)]);
+    assert_eq!(
+        rpc.send_raw_transaction(&with_override).unwrap(),
+        json!(child.txid().to_string())
+    );
+    rpc.set_mempool(Arc::new(Pool(vec![parent, child.clone()])));
+    assert_eq!(
+        rpc.send_raw_transaction(&raw(&child)).unwrap(),
+        json!(child.txid().to_string()),
+        "in the mempool already: relayed, the fee not checked"
+    );
+}
+
+/// A mempool with no transactions whose -maxtxfee is `0`, in satoshis
+struct Capped(i64);
+
+impl divi_rpc::blockchain::MempoolProvider for Capped {
+    fn get_txids(&self) -> Vec<Hash256> {
+        Vec::new()
+    }
+    fn prioritise_transaction(&self, _: &Hash256, _: f64, _: i64) -> bool {
+        false
+    }
+    fn max_tx_fee(&self) -> Amount {
+        Amount::from_sat(self.0)
+    }
+}
+
+/// The cap is -maxtxfee (FeeAndPriorityCalculator::SetMaxFee, init.cpp:844;
+/// rpcrawtransaction.cpp:882), not always 100 DIVI
+#[test]
+fn fee_cap_is_maxtxfee() {
+    let net = Net::new();
+    let me = net.wallet.new_receiving_address().unwrap();
+    let cb = net.mine(vec![], &me);
+    // 0.001 DIVI of fee
+    let tx = spend(&net, &cb, 1250 * COIN - 100_000);
+    let rpc = net.rpc();
+    rpc.set_mempool(Arc::new(Capped(20_000)));
+    assert_eq!(
+        code(rpc.send_raw_transaction(&raw(&tx))),
+        (-26, EXCESS.to_string())
+    );
+    rpc.set_mempool(Arc::new(Capped(100_000)));
+    assert_eq!(
+        rpc.send_raw_transaction(&raw(&tx)).unwrap(),
+        json!(tx.txid().to_string()),
+        "a fee equal to the cap is taken"
+    );
 }

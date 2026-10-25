@@ -16,28 +16,27 @@
 
 use crate::error::NetworkError;
 use crate::peer::PeerId;
-use crate::NetworkMessage;
 use divi_masternode::{
     MasternodeBroadcast, MasternodeManager, MasternodePaymentWinner, MasternodePing,
-    MessageValidator, RelayManager, RequestMasternodeList, SyncStatus,
+    MessageValidator, RelayManager, SyncStatus,
 };
-use divi_primitives::serialize::{deserialize, Decodable};
+use divi_primitives::serialize::deserialize;
 use parking_lot::RwLock;
-use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Callback type for relaying messages to other peers
-type RelayCallback = Arc<RwLock<Option<Box<dyn Fn(NetworkMessage, PeerId) + Send + Sync>>>>;
-
-/// Handler for masternode P2P messages
+/// Handler for masternode P2P messages.
+///
+/// Divi Core passes a masternode message on, or announces an entry on
+/// `dseg`, only after checking its signatures, collateral and pings. IronDivi
+/// does not make those checks (and these types are not Divi Core's wire
+/// format), so it never relays what peers send it and does not answer `dseg`:
+/// a peer cannot make it spread unchecked entries to everyone it is connected to.
 pub struct MasternodeHandler {
     manager: Arc<MasternodeManager>,
     relay: Arc<RelayManager>,
     /// Masternode sync status tracker
     sync_status: Arc<RwLock<SyncStatus>>,
-    /// Callback for relaying messages to other peers
-    relay_callback: RelayCallback,
 }
 
 impl MasternodeHandler {
@@ -47,7 +46,6 @@ impl MasternodeHandler {
             manager,
             relay: Arc::new(RelayManager::new()),
             sync_status: Arc::new(RwLock::new(SyncStatus::new())),
-            relay_callback: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -89,73 +87,6 @@ impl MasternodeHandler {
         }
     }
 
-    /// Set the relay callback for broadcasting messages to other peers
-    pub fn set_relay_callback<F>(&self, callback: F)
-    where
-        F: Fn(NetworkMessage, PeerId) + Send + Sync + 'static,
-    {
-        *self.relay_callback.write() = Some(Box::new(callback));
-    }
-
-    /// Handle a masternode list request (dseg)
-    pub fn handle_list_request(
-        &self,
-        peer_id: PeerId,
-        payload: &[u8],
-    ) -> Result<Vec<NetworkMessage>, NetworkError> {
-        debug!("Received masternode list request from peer {}", peer_id);
-
-        // Parse the request
-        let mut cursor = Cursor::new(payload);
-        let request = RequestMasternodeList::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?;
-
-        let consumed = cursor.position() as usize;
-        if consumed != payload.len() {
-            warn!(
-                "dseg deserialization consumed {} bytes but payload has {} bytes ({} unconsumed)",
-                consumed,
-                payload.len(),
-                payload.len() - consumed
-            );
-        }
-
-        // Get masternodes from manager
-        let masternodes = if request.is_full_list() {
-            self.manager.get_all()
-        } else if let Some(vin) = request.vin {
-            // Request for specific masternode
-            self.manager.get(vin).map(|mn| vec![mn]).unwrap_or_default()
-        } else {
-            vec![]
-        };
-
-        info!(
-            "Sending {} masternodes to peer {} in response to list request",
-            masternodes.len(),
-            peer_id
-        );
-
-        // Convert masternodes to broadcast messages
-        let mut responses = Vec::new();
-        for mn in masternodes {
-            let mnb = MasternodeBroadcast::new(
-                mn.vin,
-                mn.addr,
-                mn.pubkey_collateral.clone(),
-                mn.pubkey_masternode.clone(),
-                mn.tier,
-                mn.protocol_version,
-                mn.sig_time,
-            );
-
-            let payload = divi_primitives::serialize::serialize(&mnb);
-            responses.push(NetworkMessage::MasternodeBroadcast(payload));
-        }
-
-        Ok(responses)
-    }
-
     /// Handle a masternode broadcast (mnb)
     pub fn handle_broadcast(&self, peer_id: PeerId, payload: &[u8]) -> Result<(), NetworkError> {
         debug!("Received masternode broadcast from peer {}", peer_id);
@@ -175,9 +106,6 @@ impl MasternodeHandler {
                 e
             )));
         }
-
-        // Check if we should relay
-        let should_relay = self.relay.should_relay_broadcast(&mnb);
 
         // Add to manager
         let is_new = if let Err(e) = self.manager.add(mnb.clone()) {
@@ -207,14 +135,7 @@ impl MasternodeHandler {
             }
         }
 
-        // Mark as seen and relay if needed
         self.relay.mark_broadcast_seen(&mnb);
-        if should_relay {
-            if let Some(ref callback) = *self.relay_callback.read() {
-                let payload = divi_primitives::serialize::serialize(&mnb);
-                callback(NetworkMessage::MasternodeBroadcast(payload), peer_id);
-            }
-        }
 
         Ok(())
     }
@@ -247,17 +168,7 @@ impl MasternodeHandler {
             // This is not a critical error - masternode might not exist yet
         }
 
-        // Check if we should relay
-        let should_relay = self.relay.should_relay_ping(&ping);
-
-        // Mark as seen and relay if needed
         self.relay.mark_ping_seen(&ping);
-        if should_relay {
-            if let Some(ref callback) = *self.relay_callback.read() {
-                let payload = divi_primitives::serialize::serialize(&ping);
-                callback(NetworkMessage::MasternodePing(payload), peer_id);
-            }
-        }
 
         Ok(())
     }
@@ -284,17 +195,7 @@ impl MasternodeHandler {
             winner.block_height, peer_id
         );
 
-        // Check if we should relay
-        let should_relay = self.relay.should_relay_payment_vote(&winner);
-
-        // Mark as seen and relay if needed
         self.relay.mark_payment_vote_seen(&winner);
-        if should_relay {
-            if let Some(ref callback) = *self.relay_callback.read() {
-                let payload = divi_primitives::serialize::serialize(&winner);
-                callback(NetworkMessage::MasternodeWinner(payload), peer_id);
-            }
-        }
 
         Ok(())
     }
@@ -309,7 +210,6 @@ mod tests {
     fn test_handler_creation() {
         let manager = Arc::new(MasternodeManager::new());
         let handler = MasternodeHandler::new(manager);
-        assert!(handler.relay_callback.read().is_none());
 
         // Verify initial sync state
         let sync_status = handler.get_sync_status();

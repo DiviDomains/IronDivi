@@ -11,11 +11,50 @@
 
 use crate::error::{codes, Error, RpcError};
 use crate::mn_broadcast::{self, BroadcastRelay, BroadcastStore, MnContext};
+use crate::mn_list::MasternodeList;
 use crate::protocol::Params;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
+use divi_storage::Chain;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// `params[i].get_str()` as Divi Core's json_spirit does it: None when there is
+/// no such argument, a -1 "value is type X, expected str" error when it is not a
+/// string
+pub(crate) fn str_arg(params: &Params, i: usize) -> Result<Option<&str>, Error> {
+    match params.get(i) {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(v) => Err(RpcError::new(
+            codes::MISC_ERROR,
+            format!(
+                "value is type {}, expected str",
+                crate::wallet::json_spirit_type(v)
+            ),
+        )
+        .into()),
+    }
+}
+
+/// C `atoi`, as getmasternodewinners reads its block count: leading spaces, a
+/// sign and digits, 0 when there are none
+fn atoi(s: &str) -> i32 {
+    let t = s.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let n = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0i64, |n, d| {
+            (n * 10 + i64::from(d - b'0')).min(i64::from(i32::MAX) + 1)
+        });
+    let n = if neg { -n } else { n };
+    n.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
 
 pub struct MasternodeRpc {
     manager: Arc<RwLock<Option<MasternodeManager>>>,
@@ -28,6 +67,8 @@ pub struct MasternodeRpc {
     datadir: RwLock<Option<std::path::PathBuf>>,
     /// Sends raw broadcast bytes to the P2P layer
     relay: RwLock<Option<BroadcastRelay>>,
+    /// The masternodes the network announced, in Divi Core's form
+    network_list: RwLock<Option<Arc<MasternodeList>>>,
 }
 
 impl MasternodeRpc {
@@ -38,7 +79,12 @@ impl MasternodeRpc {
             stored: BroadcastStore::default(),
             datadir: RwLock::new(None),
             relay: RwLock::new(None),
+            network_list: RwLock::new(None),
         }
+    }
+
+    pub fn set_network_list(&self, list: Arc<MasternodeList>) {
+        *self.network_list.write() = Some(list);
     }
 
     /// Set the datadir: broadcasts persist to `mnbroadcasts.json`, config is `masternode.conf`
@@ -68,7 +114,40 @@ impl MasternodeRpc {
     }
 
     /// Get masternode count values
-    pub fn get_masternode_count(&self, _params: &Params) -> Result<Value, Error> {
+    pub fn get_masternode_count(
+        &self,
+        params: &Params,
+        chain: &Arc<Chain>,
+    ) -> Result<Value, Error> {
+        // No arguments: anything else gets the help (rpcmasternode.cpp:329)
+        if !params.is_empty() {
+            return Err(Self::usage(GETMASTERNODECOUNT_USAGE));
+        }
+        if let Some(list) = self.network_list.read().clone() {
+            let c = list.counts(chain);
+            let mut value = json!({
+                "total": c.total,
+                "stable": c.stable,
+                "obfcompat": c.enabled,
+                "enabled": c.enabled,
+                "inqueue": c.inqueue,
+                "ipv4": c.ipv4,
+                "ipv6": c.ipv6,
+                "onion": c.onion,
+            });
+            // The count of each tier, which divid does not give
+            let entries = list.entries();
+            if let Some(obj) = value.as_object_mut() {
+                for (tier, name) in ["copper", "silver", "gold", "platinum", "diamond"]
+                    .iter()
+                    .enumerate()
+                {
+                    let n = entries.iter().filter(|e| e.mnb.tier == tier as i32).count();
+                    obj.insert(name.to_string(), json!(n));
+                }
+            }
+            return Ok(value);
+        }
         let rpc = self.get_rpc()?;
         let mut value = serde_json::to_value(rpc.count())?;
         // Fields C++ always reports; the Rust manager does not track network types yet
@@ -81,41 +160,60 @@ impl MasternodeRpc {
     }
 
     /// Print masternode status
-    pub fn get_masternode_status(&self, _params: &Params) -> Result<Value, Error> {
-        // This requires the node to be running as a masternode
-        // For now, return error indicating not running as masternode
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "This node is not configured as a masternode",
-        )
-        .into())
+    pub fn get_masternode_status(&self, params: &Params) -> Result<Value, Error> {
+        // No arguments: anything else gets the help (rpcmasternode.cpp:429)
+        if !params.is_empty() {
+            return Err(Self::usage(GETMASTERNODESTATUS_USAGE));
+        }
+        // irondivid never runs as a masternode: Divi Core's reply for a node
+        // that is not one (RpcMasternodeFeatures.cpp:219)
+        Err(RpcError::new(codes::MISC_ERROR, "This is not a masternode").into())
     }
 
     /// Print the masternode winners for the last n blocks.
     ///
     /// Payment votes are not yet received over the network, so every height reports the C++
     /// "Unknown" winner with zero votes; the shape matches C++ (`nHeight` / `winner`).
+    ///
+    /// As Divi Core (rpcmasternode.cpp:489-593): at most three arguments; the
+    /// block count is a string read with `atoi`; the filter is read only when
+    /// exactly two are given; height h is listed only when the block it is scored
+    /// with, at h - 101, is on the chain (GetBlockHashForScoring,
+    /// MasternodeHelpers.cpp:75-86).
     pub fn get_masternode_winners(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+        if params.len() > 3 {
+            return Err(Self::usage(GETMASTERNODEWINNERS_USAGE));
+        }
         self.get_rpc()?;
-        let blocks = match params.get(0) {
-            Some(Value::String(s)) => s.parse::<i32>().unwrap_or(0),
-            Some(v) => v.as_i64().unwrap_or(10) as i32,
-            None => 10,
+        let blocks = str_arg(params, 0)?.map(atoi).unwrap_or(10);
+        let filter = if params.len() == 2 {
+            str_arg(params, 1)?.unwrap_or("")
+        } else {
+            ""
         };
-        let filter = params.get_str(1).unwrap_or("");
         if !filter.is_empty() && !"Unknown".contains(filter) {
             return Ok(json!([]));
         }
-        let winners: Vec<Value> = (tip_height - blocks..tip_height + 20)
+        let first = tip_height.saturating_sub(blocks);
+        let winners: Vec<Value> = (first..tip_height.saturating_add(20))
+            .filter(|h| (0..=tip_height).contains(&h.saturating_sub(101)))
             .map(|h| json!({"nHeight": h, "winner": {"address": "Unknown", "nVotes": 0}}))
             .collect();
         Ok(Value::Array(winners))
     }
 
     /// Get a ranked list of masternodes
-    pub fn list_masternodes(&self, params: &Params) -> Result<Value, Error> {
+    pub fn list_masternodes(&self, params: &Params, chain: &Arc<Chain>) -> Result<Value, Error> {
+        // One string filter at most (rpcmasternode.cpp:263-275)
+        let filter = str_arg(params, 0)?;
+        if params.len() > 1 {
+            return Err(Self::usage(LISTMASTERNODES_USAGE));
+        }
+        if let Some(list) = self.network_list.read().clone() {
+            return Ok(list.list_json(chain, filter));
+        }
         let rpc = self.get_rpc()?;
-        let mode = params.get_str(0).map(|s| s.to_string());
+        let mode = filter.map(|s| s.to_string());
         let list = serde_json::to_value(rpc.list(mode))?;
         // C++ listmasternodes returns a bare array of entries
         Ok(match list.get("masternodes") {
@@ -166,6 +264,19 @@ impl MasternodeRpc {
         let alias = params
             .get_str(0)
             .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Expected string"))?;
+        // params[1].get_bool(): json_spirit takes only a boolean (rpcmasternode.cpp:407)
+        if let Some(v) = params.get(1) {
+            if !v.is_boolean() {
+                return Err(RpcError::new(
+                    codes::MISC_ERROR,
+                    format!(
+                        "value is type {}, expected bool",
+                        crate::wallet::json_spirit_type(v)
+                    ),
+                )
+                .into());
+            }
+        }
         match &ctx.wallet {
             Some(w) if !w.is_fully_unlocked() => {
                 return Err(RpcError::new(
@@ -208,8 +319,22 @@ impl MasternodeRpc {
             Some("update_ping") | None => None,
             Some(s) => Some(s),
         };
+        // Divi Core takes the broadcast into its own list, then relays it
+        // (RelayParsedMasternodeBroadcast, RpcMasternodeFeatures.cpp:80-121)
         let relay = self.relay.read().clone();
-        mn_broadcast::relay_broadcast(ctx, relay.as_ref(), hex_in, sig)
+        let list = self.network_list.read().clone();
+        let chain = Arc::clone(ctx.chain);
+        let relay: BroadcastRelay = Arc::new(move |bytes: Vec<u8>| {
+            if let Some(list) = &list {
+                if let Err(e) = list.accept_broadcast(&chain, &bytes) {
+                    tracing::debug!("own masternode broadcast not listed: {}", e);
+                }
+            }
+            if let Some(relay) = &relay {
+                relay(bytes);
+            }
+        });
+        mn_broadcast::relay_broadcast(ctx, Some(&relay), hex_in, sig)
     }
 
     /// `signmnbroadcast mnhex`
@@ -254,8 +379,9 @@ impl MasternodeRpc {
         default_port: u16,
     ) -> Result<Value, Error> {
         let bad = || -> Error {
+            // RPC_INVALID_PARAMS (rpcmasternode.cpp:156)
             RpcError::new(
-                codes::INVALID_PARAMETER,
+                codes::INVALID_PARAMS,
                 "Error parsing input arguments\n".to_string(),
             )
             .into()
@@ -290,11 +416,14 @@ impl MasternodeRpc {
 
     /// Masternode sync control
     pub fn mnsync(&self, params: &Params) -> Result<Value, Error> {
-        let command = params.get_str(0).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: command (status|reset)")
-        })?;
+        // Divi Core takes exactly one mode, "status" or "reset" as written, and
+        // answers anything else with its help (rpcmisc.cpp:160-197)
+        let command = match (params.len(), params.get_str(0)) {
+            (1, Some(c)) if c == "status" || c == "reset" => c,
+            _ => return Err(RpcError::new(codes::MISC_ERROR, MNSYNC_USAGE).into()),
+        };
 
-        match command.to_lowercase().as_str() {
+        match command {
             "status" => {
                 // Return basic sync status
                 Ok(json!({
@@ -311,16 +440,24 @@ impl MasternodeRpc {
                     "nominalNumberOfMasternodeWinnersReceived": 0
                 }))
             }
-            "reset" | "next" => {
-                Err(RpcError::new(
-                    codes::MISC_ERROR,
-                    "Masternode sync control requires full masternode subsystem. mnsync manages the synchronization of masternode lists, winners, and governance data across the P2P network. For masternode sync operations, please use the C++ Divi client."
-                ).into())
-            }
-            _ => Err(RpcError::invalid_params("Command must be 'status', 'reset', or 'next'").into()),
+            // Divi Core restarts its masternode sync and answers "success"
+            // (rpcmisc.cpp:217-220); irondivid keeps no sync stages to restart
+            "reset" => Ok(json!("success")),
+            _ => unreachable!("mode checked above"),
         }
     }
 }
+
+/// The help Divi Core answers a call with arguments it does not take (the first
+/// line is what the comparison scripts look at)
+const GETMASTERNODECOUNT_USAGE: &str = "getmasternodecount\n\nGet masternode count values\n";
+const GETMASTERNODESTATUS_USAGE: &str = "getmasternodestatus\n\nPrint masternode status\n";
+const GETMASTERNODEWINNERS_USAGE: &str = "getmasternodewinners ( blocks \"filter\" )\n\nPrint the masternode winners for the last n blocks\n";
+const LISTMASTERNODES_USAGE: &str =
+    "listmasternodes ( \"filter\" )\n\nGet a ranked list of masternodes\n";
+
+/// Divi Core's mnsync help, the error for a call it cannot take
+const MNSYNC_USAGE: &str = "mnsync \"status|reset\"\n\nReturns the sync status or resets sync.\n\nArguments:\n1. \"mode\"    (string, required) either 'status' or 'reset'\n\nResult ('status' mode):\n{\n  \"IsBlockchainSynced\": true|false,    (boolean) 'true' if blockchain is synced\n  \"timestampOfLastMasternodeListUpdate\": xxxx,        (numeric) Timestamp of last MN list message\n  \"timestampOfLastMasternodeWinnerUpdate\": xxxx,      (numeric) Timestamp of last MN winner message\n  \"lastBudgetItem\": xxxx,            (numeric) Timestamp of last MN budget message\n  \"timestampOfLastFailedSync\": xxxx,           (numeric) Timestamp of last failed sync\n  \"countOfFailedSyncAttempts\": n,           (numeric) Number of failed syncs (total)\n  \"nominalNumberOfMasternodeBroadcastsReceived\": n,        (numeric) Number of MN list messages (total)\n  \"nominalNumberOfMasternodeWinnersReceived\": n,      (numeric) Number of MN winner messages (total)\n  \"sumBudgetItemProp\": n,        (numeric) Number of MN budget messages (total)\n  \"sumBudgetItemFin\": n,         (numeric) Number of MN budget finalization messages (total)\n  \"fulfilledMasternodeListSyncRequests\": n,      (numeric) Number of MN list messages (local)\n  \"fulfilledMasternodeWinnerSyncRequests\": n,    (numeric) Number of MN winner messages (local)\n  \"countBudgetItemProp\": n,      (numeric) Number of MN budget messages (local)\n  \"countBudgetItemFin\": n,       (numeric) Number of MN budget finalization messages (local)\n  \"currentMasternodeSyncStatus\": n, (numeric) Status code of last sync phase\n  \"totalSuccessivePeerSyncRequests\": n, (numeric) Status code of last sync attempt\n}\n\nResult ('reset' mode):\n\"status\"     (string) 'success'\n\nExamples:\n> divi-cli mnsync \"status\"\n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"mnsync\", \"params\": [\"status\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n";
 
 impl Default for MasternodeRpc {
     fn default() -> Self {
@@ -333,12 +470,204 @@ mod tests {
     use super::*;
     use crate::protocol::Params;
 
+    fn rpc_err(r: Result<Value, Error>) -> (i32, String) {
+        match r {
+            Err(Error::Rpc(e)) => (e.code, e.message),
+            other => panic!("expected an RPC error, got {other:?}"),
+        }
+    }
+
+    /// Divi Core's reply on a node that is not a masternode
+    /// (RpcMasternodeFeatures.cpp:219)
+    #[test]
+    fn getmasternodestatus_on_a_node_that_is_not_a_masternode() {
+        assert_eq!(
+            rpc_err(MasternodeRpc::new().get_masternode_status(&Params::None)),
+            (-1, "This is not a masternode".to_string())
+        );
+    }
+
+    /// mnsync takes one mode, "status" or "reset" as written; anything else is
+    /// Divi Core's help (rpcmisc.cpp:160-197)
+    #[test]
+    fn mnsync_answers_a_call_it_cannot_take_with_divid_s_help() {
+        let rpc = MasternodeRpc::new();
+        let call = |args: &[&str]| {
+            rpc.mnsync(&Params::Array(
+                args.iter().map(|a| serde_json::json!(a)).collect(),
+            ))
+        };
+        assert!(call(&["status"]).is_ok());
+        for bad in [&[][..], &["bad"], &["next"], &["Status"], &["status", "x"]] {
+            let (code, message) = rpc_err(call(bad));
+            assert_eq!(code, -1, "{bad:?}");
+            assert!(
+                message.starts_with("mnsync \"status|reset\"\n\nReturns the sync status")
+                    && message.ends_with("\"params\": [\"status\"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/\n"),
+                "{bad:?}: {message}"
+            );
+        }
+    }
+
+    fn with_manager() -> MasternodeRpc {
+        let rpc = MasternodeRpc::new();
+        rpc.set_manager(divi_masternode::MasternodeManager::new());
+        rpc
+    }
+
+    fn args(values: &[Value]) -> Params {
+        Params::Array(values.to_vec())
+    }
+
+    fn first_line((code, message): (i32, String)) -> (i32, String) {
+        (code, message.lines().next().unwrap_or("").to_string())
+    }
+
+    /// An empty regtest chain, for the calls that read one
+    fn test_chain() -> (tempfile::TempDir, Arc<divi_storage::Chain>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = divi_storage::ChainDatabase::open(dir.path()).unwrap();
+        let chain = Arc::new(
+            divi_storage::Chain::new(
+                Arc::new(db),
+                divi_storage::ChainParams::for_network(
+                    divi_storage::chain::NetworkType::Regtest,
+                    divi_primitives::ChainMode::Divi,
+                ),
+            )
+            .unwrap(),
+        );
+        (dir, chain)
+    }
+
+    /// Argument counts and types as Divi Core checks them: more arguments than
+    /// a call takes is its help (-1), and a parameter read with get_str/get_bool
+    /// that is another JSON type is json_spirit's -1 type error
+    /// (rpcmasternode.cpp:263-275, :327-331, :393-407, :427-431, :489-494)
+    #[test]
+    fn masternode_calls_check_argument_counts_and_types_as_divid() {
+        let rpc = with_manager();
+        let (_dir, chain) = test_chain();
+        let s = |v: &str| json!(v);
+        let help = |r| first_line(rpc_err(r));
+        assert_eq!(
+            help(rpc.get_masternode_count(&args(&[s("x")]), &chain)),
+            (-1, "getmasternodecount".into())
+        );
+        assert_eq!(
+            help(rpc.get_masternode_status(&args(&[s("x")]))),
+            (-1, "getmasternodestatus".into())
+        );
+        assert_eq!(
+            help(rpc.list_masternodes(&args(&[s("a"), s("b")]), &chain)),
+            (-1, "listmasternodes ( \"filter\" )".into())
+        );
+        assert_eq!(
+            help(rpc.list_masternodes(&args(&[json!(5)]), &chain)),
+            (-1, "value is type int, expected str".into())
+        );
+        assert_eq!(
+            help(rpc.get_masternode_winners(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
+            (-1, "getmasternodewinners ( blocks \"filter\" )".into())
+        );
+        assert_eq!(
+            help(rpc.get_masternode_winners(&args(&[json!(5)]), 200)),
+            (-1, "value is type int, expected str".into())
+        );
+        // Three arguments are taken; the filter is read only when there are two
+        let three = rpc
+            .get_masternode_winners(&args(&[s("5"), s("nomatch"), s("x")]), 200)
+            .unwrap();
+        assert_eq!(three.as_array().unwrap().len(), 25);
+    }
+
+    /// The block count is read with atoi, and height h is listed only when the
+    /// block it is scored with, h - 101, is on the chain (rpcmasternode.cpp:543-590,
+    /// MasternodeHelpers.cpp:75-86)
+    #[test]
+    fn masternode_winners_list_only_heights_with_a_scoring_block() {
+        let rpc = with_manager();
+        let heights = |a: &[&str], tip: i32| -> Vec<i64> {
+            rpc.get_masternode_winners(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["nHeight"].as_i64().unwrap())
+                .collect()
+        };
+        assert!(heights(&[], 32).is_empty());
+        assert_eq!(heights(&[], 90), (101..110).collect::<Vec<_>>());
+        assert_eq!(heights(&[], 200), (190..220).collect::<Vec<_>>());
+        assert_eq!(heights(&["5blocks"], 200), (195..220).collect::<Vec<_>>());
+        assert_eq!(heights(&["abc"], 200), (200..220).collect::<Vec<_>>());
+        assert_eq!(heights(&["-3"], 200), (203..220).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn atoi_reads_a_number_as_c_does() {
+        assert_eq!(atoi("  +12x"), 12);
+        assert_eq!(atoi("-7"), -7);
+        assert_eq!(atoi("x1"), 0);
+        assert_eq!(atoi("99999999999"), i32::MAX);
+    }
+
+    /// startmasternode reads its second argument with get_bool (rpcmasternode.cpp:407)
+    #[test]
+    fn startmasternode_defer_relay_must_be_a_boolean() {
+        let rpc = MasternodeRpc::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = divi_storage::ChainDatabase::open(dir.path()).unwrap();
+        let chain = std::sync::Arc::new(
+            divi_storage::Chain::new(
+                std::sync::Arc::new(db),
+                divi_storage::ChainParams::for_network(
+                    divi_storage::chain::NetworkType::Regtest,
+                    divi_primitives::ChainMode::Divi,
+                ),
+            )
+            .unwrap(),
+        );
+        let ctx = MnContext {
+            chain: &chain,
+            wallet: None,
+        };
+        assert_eq!(
+            rpc_err(rpc.start_masternode(&args(&[json!("mn1"), json!("yes")]), &ctx)),
+            (-1, "value is type str, expected bool".to_string())
+        );
+    }
+
+    /// mnsync reset answers "success" as Divi Core (rpcmisc.cpp:217-220)
+    #[test]
+    fn mnsync_reset_answers_success() {
+        assert_eq!(
+            MasternodeRpc::new()
+                .mnsync(&args(&[json!("reset")]))
+                .unwrap(),
+            json!("success")
+        );
+    }
+
+    /// A sigtime that is not a number is RPC_INVALID_PARAMS (rpcmasternode.cpp:156)
+    #[test]
+    fn verifymasternodesetup_bad_input_is_invalid_params() {
+        assert_eq!(
+            rpc_err(MasternodeRpc::new().verify_masternode_setup(
+                &args(&[json!("127.0.0.1"), json!("abc"), json!("02"), json!("03")]),
+                51476
+            )),
+            (-32602, "Error parsing input arguments\n".to_string())
+        );
+    }
+
     #[test]
     fn test_masternode_rpc_without_manager() {
         let rpc = MasternodeRpc::new();
+        let (_dir, chain) = test_chain();
 
         // Should return error when manager is not set
-        let result = rpc.get_masternode_count(&Params::None);
+        let result = rpc.get_masternode_count(&Params::None, &chain);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not initialized"));
     }
@@ -350,7 +679,8 @@ mod tests {
         rpc.set_manager(manager);
 
         // Should now work and return empty counts
-        let result = rpc.get_masternode_count(&Params::None);
+        let (_dir, chain) = test_chain();
+        let result = rpc.get_masternode_count(&Params::None, &chain);
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -365,7 +695,8 @@ mod tests {
         rpc.set_manager(manager);
 
         // Should return empty list
-        let result = rpc.list_masternodes(&Params::None);
+        let (_dir, chain) = test_chain();
+        let result = rpc.list_masternodes(&Params::None, &chain);
         assert!(result.is_ok());
 
         let value = result.unwrap();

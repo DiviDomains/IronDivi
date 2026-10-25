@@ -16,6 +16,7 @@
 
 pub mod amount;
 pub mod block;
+pub mod clock;
 pub mod compact;
 pub mod error;
 pub mod hash;

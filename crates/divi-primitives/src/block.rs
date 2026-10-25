@@ -271,7 +271,9 @@ impl Decodable for Block {
         let tx_count_size = CompactSize(tx_count as u64).encoded_size();
 
         // Read each transaction
-        let mut transactions = Vec::with_capacity(tx_count);
+        let mut transactions = Vec::with_capacity(crate::compact::prealloc_len::<
+            crate::transaction::Transaction,
+        >(tx_count));
         let mut txs_total_size = 0usize;
         for _i in 0..tx_count {
             let tx = crate::transaction::Transaction::decode(reader)?;

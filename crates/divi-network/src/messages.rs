@@ -13,17 +13,17 @@
 //!
 //! This module defines all the P2P protocol messages.
 
-use crate::constants::Magic;
+use crate::constants::{Magic, MAX_HEADERS_RESULTS};
 use crate::error::NetworkError;
 use crate::message::{InvItem, MessageHeader, NetAddr};
 use crate::version::VersionMessage;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use crate::wire::Reader;
+use byteorder::{LittleEndian, WriteBytesExt};
 use divi_primitives::block::{Block, BlockHeader};
 use divi_primitives::compact::CompactSize;
 use divi_primitives::hash::Hash256;
-use divi_primitives::serialize::{deserialize, serialize, Decodable, Encodable};
+use divi_primitives::serialize::{serialize, Encodable};
 use divi_primitives::transaction::Transaction;
-use std::io::Cursor;
 
 /// All network message types
 #[derive(Debug, Clone)]
@@ -123,7 +123,7 @@ pub enum NetworkMessage {
 
 impl NetworkMessage {
     /// Get the command name for this message
-    pub fn command(&self) -> &'static str {
+    pub fn command(&self) -> &str {
         match self {
             NetworkMessage::Version(_) => "version",
             NetworkMessage::Verack => "verack",
@@ -155,11 +155,7 @@ impl NetworkMessage {
             NetworkMessage::MasternodeBroadcast(_) => "mnb",
             NetworkMessage::MasternodePing(_) => "mnp",
             NetworkMessage::MasternodeWinner(_) => "mnw",
-            NetworkMessage::Unknown(cmd, _) => {
-                // Note: This is a bit awkward since we return &'static str
-                // but command is dynamic. This should only be used for logging.
-                Box::leak(cmd.clone().into_boxed_str())
-            }
+            NetworkMessage::Unknown(cmd, _) => cmd,
         }
     }
 
@@ -253,284 +249,104 @@ impl NetworkMessage {
 
     /// Deserialize from command and payload
     pub fn deserialize(command: &str, payload: &[u8]) -> Result<Self, NetworkError> {
-        match command {
-            "version" => Ok(NetworkMessage::Version(VersionMessage::deserialize(
-                payload,
-            )?)),
-            "verack" => Ok(NetworkMessage::Verack),
-            "getaddr" => Ok(NetworkMessage::GetAddr),
-            "mempool" => Ok(NetworkMessage::Mempool),
-            "filterclear" => Ok(NetworkMessage::FilterClear),
-            "sendheaders" => Ok(NetworkMessage::SendHeaders),
+        let mut r = Reader::new(payload);
+        let msg = match command {
+            "version" => NetworkMessage::Version(VersionMessage::deserialize(payload)?),
+            "verack" => NetworkMessage::Verack,
+            "getaddr" => NetworkMessage::GetAddr,
+            "mempool" => NetworkMessage::Mempool,
+            "filterclear" => NetworkMessage::FilterClear,
+            "sendheaders" => NetworkMessage::SendHeaders,
 
             "addr" => {
-                let mut cursor = Cursor::new(payload);
-                let count = CompactSize::decode(&mut cursor)
-                    .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-                    .value() as usize;
-
-                let mut addrs = Vec::with_capacity(count);
+                let count = r.size()?;
+                let mut addrs = Vec::with_capacity(r.capacity(count, 30));
                 for _ in 0..count {
-                    let time = cursor.read_u32::<LittleEndian>()?;
-                    let pos = cursor.position() as usize;
-                    let addr = NetAddr::deserialize(&payload[pos..pos + 26])?;
-                    cursor.set_position((pos + 26) as u64);
-                    addrs.push((time, addr));
+                    let time = r.u32()?;
+                    addrs.push((time, NetAddr::read(&mut r)?));
                 }
-                Ok(NetworkMessage::Addr(addrs))
+                NetworkMessage::Addr(addrs)
             }
 
             "inv" | "getdata" | "notfound" => {
-                let mut cursor = Cursor::new(payload);
-                let count = CompactSize::decode(&mut cursor)
-                    .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-                    .value() as usize;
-
-                let mut items = Vec::with_capacity(count);
+                let count = r.size()?;
+                let mut items = Vec::with_capacity(r.capacity(count, 36));
                 for _ in 0..count {
-                    let pos = cursor.position() as usize;
-                    let item = InvItem::deserialize(&payload[pos..pos + 36])?;
-                    cursor.set_position((pos + 36) as u64);
-                    items.push(item);
+                    items.push(InvItem::read(&mut r)?);
                 }
-
-                // Check for unconsumed bytes
-                let consumed = cursor.position() as usize;
-                if consumed != payload.len() {
-                    tracing::error!(
-                        "{} deserialization consumed {} bytes but payload has {} bytes ({} unconsumed)",
-                        command, consumed, payload.len(), payload.len() - consumed
-                    );
-                }
-
-                Ok(match command {
+                match command {
                     "inv" => NetworkMessage::Inv(items),
                     "getdata" => NetworkMessage::GetData(items),
                     _ => NetworkMessage::NotFound(items),
-                })
+                }
             }
 
-            "getblocks" => Ok(NetworkMessage::GetBlocks(GetBlocksMessage::deserialize(
-                payload,
-            )?)),
-            "getheaders" => Ok(NetworkMessage::GetHeaders(GetHeadersMessage::deserialize(
-                payload,
-            )?)),
+            "getblocks" => NetworkMessage::GetBlocks(GetBlocksMessage::deserialize(payload)?),
+            "getheaders" => NetworkMessage::GetHeaders(GetHeadersMessage::deserialize(payload)?),
 
             "headers" => {
-                let mut cursor = Cursor::new(payload);
-                let count = CompactSize::decode(&mut cursor)
-                    .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-                    .value() as usize;
-
-                let mut headers = Vec::with_capacity(count);
+                let count = r.size()?;
+                // No node sends more than MAX_HEADERS_RESULTS headers at once
+                // (Divi Core main.cpp:696), so a larger count is refused
+                // before any header is read
+                if count > MAX_HEADERS_RESULTS {
+                    return Err(NetworkError::Deserialization(format!(
+                        "headers count {} above {}",
+                        count, MAX_HEADERS_RESULTS
+                    )));
+                }
+                let mut headers = Vec::with_capacity(r.capacity(count, 81));
                 for _ in 0..count {
-                    let pos = cursor.position() as usize;
                     // Block headers are 80 bytes (v3) or 112 bytes (v4)
-                    let header: BlockHeader = deserialize(&payload[pos..])
-                        .map_err(|e| NetworkError::Deserialization(e.to_string()))?;
-                    let header_size = header.encoded_size();
-                    cursor.set_position((pos + header_size) as u64);
-
-                    // Skip tx count (CompactSize, typically 0)
-                    let _ = CompactSize::decode(&mut cursor)
-                        .map_err(|e| NetworkError::Deserialization(e.to_string()))?;
-
+                    let header: BlockHeader = r.decode()?;
+                    // Each header is followed by a transaction count (0)
+                    r.size()?;
                     headers.push(header);
                 }
-
-                // Check for unconsumed bytes
-                let consumed = cursor.position() as usize;
-                if consumed != payload.len() {
-                    tracing::error!(
-                        "headers deserialization consumed {} bytes but payload has {} bytes ({} unconsumed)",
-                        consumed, payload.len(), payload.len() - consumed
-                    );
-                }
-
-                Ok(NetworkMessage::Headers(headers))
+                NetworkMessage::Headers(headers)
             }
 
-            "block" => {
-                // Save larger blocks for analysis (blocks with multiple txs might show the issue)
-                static BLOCK_SAVE_COUNT: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let save_count =
-                    BLOCK_SAVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if save_count < 5 && payload.len() > 1000 {
-                    let filename = format!("/tmp/block_payload_{}.bin", save_count);
-                    if let Ok(mut f) = std::fs::File::create(&filename) {
-                        use std::io::Write;
-                        let _ = f.write_all(payload);
-                        tracing::info!("Saved block payload to {}", filename);
-                    }
-                }
+            "block" => NetworkMessage::Block(r.decode::<Block>()?),
+            "tx" => NetworkMessage::Tx(r.decode::<Transaction>()?),
+            "ping" => NetworkMessage::Ping(r.u64()?),
+            "pong" => NetworkMessage::Pong(r.u64()?),
 
-                // Log payload info for debugging
-                tracing::debug!(
-                    "BLOCK_DEBUG: Received block payload, {} bytes, first 32: {:02x?}",
-                    payload.len(),
-                    &payload[..payload.len().min(32)]
-                );
-
-                // Use a cursor to track how many bytes are consumed
-                let mut cursor = std::io::Cursor::new(payload);
-                let block: Block = Block::decode(&mut cursor)
-                    .map_err(|e| NetworkError::Deserialization(e.to_string()))?;
-
-                let consumed = cursor.position() as usize;
-                let total = payload.len();
-
-                // Always log block parsing results for debugging
-                let is_pos = block.is_proof_of_stake();
-
-                // Verify: re-serialize and compare size
-                let reserialized = divi_primitives::serialize::serialize(&block);
-                let reser_size = reserialized.len();
-                if reser_size != total {
-                    tracing::error!(
-                        "MISMATCH: payload={} bytes, reserialized={} bytes, diff={}, is_pos={}, tx_count={}, sig_len={}",
-                        total, reser_size, reser_size as i64 - total as i64, is_pos, block.transactions.len(), block.block_sig.len()
-                    );
-                    // This means we're NOT parsing the same data the C++ serialized
-                }
-
-                tracing::debug!(
-                    "BLOCK_DEBUG: Parsed block: consumed={}, total={}, reserialized={}, is_pos={}, tx_count={}, sig_len={}, header_version={}",
-                    consumed, total, reser_size, is_pos, block.transactions.len(), block.block_sig.len(), block.header.version
-                );
-
-                if consumed != total {
-                    let is_pos = block.is_proof_of_stake();
-                    let tx_count = block.transactions.len();
-                    let tx1_info = if tx_count > 1 {
-                        let tx1 = &block.transactions[1];
-                        let vin_ok = !tx1.vin.is_empty();
-                        let prevout_ok = vin_ok && !tx1.vin[0].prevout.is_null();
-                        let vout_count = tx1.vout.len();
-                        let vout0_empty = vout_count >= 2 && tx1.vout[0].is_empty();
-                        let vout0_value = if !tx1.vout.is_empty() {
-                            tx1.vout[0].value.0
-                        } else {
-                            -1
-                        };
-                        let vout0_script_len = if !tx1.vout.is_empty() {
-                            tx1.vout[0].script_pubkey.len()
-                        } else {
-                            0
-                        };
-                        format!(
-                            "tx1: vin_ok={}, prevout_ok={}, vout_count={}, vout0_empty={}, vout0_value={}, vout0_script_len={}",
-                            vin_ok, prevout_ok, vout_count, vout0_empty, vout0_value, vout0_script_len
-                        )
-                    } else {
-                        format!("tx_count={}", tx_count)
-                    };
-                    let unconsumed_preview: Vec<u8> =
-                        payload[consumed..].iter().take(32).cloned().collect();
-                    tracing::error!(
-                        "Block deserialization: consumed={}, total={}, unconsumed={}, is_pos={}, {}, unconsumed_bytes={:02x?}",
-                        consumed, total, total - consumed, is_pos, tx1_info, unconsumed_preview
-                    );
-                }
-
-                Ok(NetworkMessage::Block(block))
+            "reject" => NetworkMessage::Reject(RejectMessage::deserialize(payload)?),
+            "alert" => {
+                crate::alert::Alert::parse(payload)?;
+                NetworkMessage::Alert(payload.to_vec())
             }
+            "filterload" => NetworkMessage::FilterLoad(payload.to_vec()),
+            "filteradd" => NetworkMessage::FilterAdd(payload.to_vec()),
 
-            "tx" => {
-                // Use a cursor to track how many bytes are consumed
-                let mut cursor = std::io::Cursor::new(payload);
-                let tx: Transaction = Transaction::decode(&mut cursor)
-                    .map_err(|e| NetworkError::Deserialization(e.to_string()))?;
+            "sporkcount" => NetworkMessage::SporkCount(r.u32()?),
+            "getsporks" => NetworkMessage::GetSporks,
+            "spork" => NetworkMessage::Spork(SporkMessage::deserialize(payload)?),
 
-                let consumed = cursor.position() as usize;
-                let total = payload.len();
-                if consumed != total {
-                    tracing::error!(
-                        "TX deserialization consumed {} bytes but payload has {} bytes ({} unconsumed)",
-                        consumed, total, total - consumed
-                    );
-                    tracing::error!(
-                        "Unconsumed bytes: {:02x?}",
-                        &payload[consumed..total.min(consumed + 64)]
-                    );
-                }
+            "ssc" => NetworkMessage::SyncStatusCount {
+                item_id: r.i32()?,
+                count: r.i32()?,
+            },
+            "govsync" => NetworkMessage::GetSyncStatus,
 
-                Ok(NetworkMessage::Tx(tx))
-            }
+            "dseg" => NetworkMessage::RequestMasternodeList(payload.to_vec()),
+            "mnb" => NetworkMessage::MasternodeBroadcast(payload.to_vec()),
+            "mnp" => NetworkMessage::MasternodePing(payload.to_vec()),
+            "mnw" => NetworkMessage::MasternodeWinner(payload.to_vec()),
 
-            "ping" => {
-                let mut cursor = Cursor::new(payload);
-                let nonce = cursor.read_u64::<LittleEndian>()?;
-                Ok(NetworkMessage::Ping(nonce))
-            }
-
-            "pong" => {
-                let mut cursor = Cursor::new(payload);
-                let nonce = cursor.read_u64::<LittleEndian>()?;
-                Ok(NetworkMessage::Pong(nonce))
-            }
-
-            "reject" => Ok(NetworkMessage::Reject(RejectMessage::deserialize(payload)?)),
-            "alert" => Ok(NetworkMessage::Alert(payload.to_vec())),
-            "filterload" => Ok(NetworkMessage::FilterLoad(payload.to_vec())),
-            "filteradd" => Ok(NetworkMessage::FilterAdd(payload.to_vec())),
-
-            // Spork messages
-            "sporkcount" => {
-                tracing::debug!(
-                    "sporkcount payload ({} bytes): {:02x?}",
-                    payload.len(),
-                    payload
-                );
-                let mut cursor = Cursor::new(payload);
-                let count = cursor.read_u32::<LittleEndian>()?;
-                tracing::debug!("Parsed sporkcount: {}", count);
-
-                // Check for unconsumed bytes
-                let consumed = cursor.position() as usize;
-                if consumed != payload.len() {
-                    tracing::error!(
-                        "sporkcount deserialization consumed {} bytes but payload has {} bytes ({} unconsumed)",
-                        consumed, payload.len(), payload.len() - consumed
-                    );
-                    tracing::error!(
-                        "Unconsumed sporkcount bytes: {:02x?}",
-                        &payload[consumed..payload.len().min(consumed + 64)]
-                    );
-                }
-
-                Ok(NetworkMessage::SporkCount(count))
-            }
-            "getsporks" => Ok(NetworkMessage::GetSporks),
-            "spork" => Ok(NetworkMessage::Spork(SporkMessage::deserialize(payload)?)),
-
-            // Masternode sync messages
-            "ssc" => {
-                tracing::info!("ssc payload ({} bytes): {:02x?}", payload.len(), payload);
-                let mut cursor = Cursor::new(payload);
-                let item_id = cursor.read_i32::<LittleEndian>()?;
-                let count = cursor.read_i32::<LittleEndian>()?;
-                tracing::info!("Parsed ssc: item_id={}, count={}", item_id, count);
-                Ok(NetworkMessage::SyncStatusCount { item_id, count })
-            }
-            "govsync" => Ok(NetworkMessage::GetSyncStatus),
-
-            // Masternode messages
-            "dseg" => Ok(NetworkMessage::RequestMasternodeList(payload.to_vec())),
-            "mnb" => Ok(NetworkMessage::MasternodeBroadcast(payload.to_vec())),
-            "mnp" => Ok(NetworkMessage::MasternodePing(payload.to_vec())),
-            "mnw" => Ok(NetworkMessage::MasternodeWinner(payload.to_vec())),
-
-            // Unknown commands are captured for potential future handling
-            _ => Ok(NetworkMessage::Unknown(
-                command.to_string(),
-                payload.to_vec(),
-            )),
+            _ => NetworkMessage::Unknown(command.to_string(), payload.to_vec()),
+        };
+        // Like Divi Core, bytes after a complete message are ignored
+        if !r.is_empty() {
+            tracing::trace!(
+                "{}: {} bytes after the message ignored",
+                command,
+                r.remaining()
+            );
         }
+        Ok(msg)
     }
 
-    /// Create a full message with header
     pub fn to_bytes(&self, magic: Magic) -> Result<Vec<u8>, NetworkError> {
         let payload = self.serialize_payload()?;
         let header = MessageHeader::new(magic, self.command(), &payload);
@@ -557,7 +373,7 @@ impl GetBlocksMessage {
     /// Create a new GetBlocks message
     pub fn new(locator_hashes: Vec<Hash256>, stop_hash: Hash256) -> Self {
         GetBlocksMessage {
-            version: crate::constants::PROTOCOL_VERSION,
+            version: crate::constants::protocol_version(),
             locator_hashes,
             stop_hash,
         }
@@ -593,26 +409,14 @@ impl GetBlocksMessage {
 
     /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        let mut cursor = Cursor::new(data);
-        let version = cursor.read_i32::<LittleEndian>()?;
-
-        let count = CompactSize::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-            .value() as usize;
-
-        let mut locator_hashes = Vec::with_capacity(count);
+        let mut r = Reader::new(data);
+        let version = r.i32()?;
+        let count = r.size()?;
+        let mut locator_hashes = Vec::with_capacity(r.capacity(count, 32));
         for _ in 0..count {
-            let pos = cursor.position() as usize;
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes.copy_from_slice(&data[pos..pos + 32]);
-            locator_hashes.push(Hash256::from_bytes(hash_bytes));
-            cursor.set_position((pos + 32) as u64);
+            locator_hashes.push(r.hash()?);
         }
-
-        let pos = cursor.position() as usize;
-        let mut stop_bytes = [0u8; 32];
-        stop_bytes.copy_from_slice(&data[pos..pos + 32]);
-        let stop_hash = Hash256::from_bytes(stop_bytes);
+        let stop_hash = r.hash()?;
 
         Ok(GetBlocksMessage {
             version,
@@ -624,6 +428,14 @@ impl GetBlocksMessage {
 
 /// GetHeaders message (same format as GetBlocks)
 pub type GetHeadersMessage = GetBlocksMessage;
+
+/// Longest command a reject names (Divi Core
+/// `LIMITED_STRING(strMsg, CMessageHeader::COMMAND_SIZE)`, main.cpp:946)
+pub const MAX_REJECT_COMMAND_LENGTH: usize = crate::message::COMMAND_SIZE;
+
+/// Longest reason a reject gives (Divi Core `MAX_REJECT_MESSAGE_LENGTH`,
+/// defaultValues.h:94)
+pub const MAX_REJECT_MESSAGE_LENGTH: usize = 111;
 
 /// Reject message
 #[derive(Debug, Clone)]
@@ -661,26 +473,11 @@ impl RejectMessage {
 
     /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        let mut cursor = Cursor::new(data);
-
-        let msg_len = CompactSize::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-            .value() as usize;
-        let pos = cursor.position() as usize;
-        let message = String::from_utf8_lossy(&data[pos..pos + msg_len]).to_string();
-        cursor.set_position((pos + msg_len) as u64);
-
-        let code = cursor.read_u8()?;
-
-        let reason_len = CompactSize::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-            .value() as usize;
-        let pos = cursor.position() as usize;
-        let reason = String::from_utf8_lossy(&data[pos..pos + reason_len]).to_string();
-        cursor.set_position((pos + reason_len) as u64);
-
-        let pos = cursor.position() as usize;
-        let extra_data = data[pos..].to_vec();
+        let mut r = Reader::new(data);
+        let message = r.limited_string(MAX_REJECT_COMMAND_LENGTH)?;
+        let code = r.u8()?;
+        let reason = r.limited_string(MAX_REJECT_MESSAGE_LENGTH)?;
+        let extra_data = r.take(r.remaining())?.to_vec();
 
         Ok(RejectMessage {
             message,
@@ -749,23 +546,11 @@ impl SporkMessage {
 
     /// Deserialize from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, NetworkError> {
-        let mut cursor = Cursor::new(data);
-        let spork_id = cursor.read_i32::<LittleEndian>()?;
-
-        let value_len = CompactSize::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-            .value() as usize;
-        let pos = cursor.position() as usize;
-        let value = String::from_utf8_lossy(&data[pos..pos + value_len]).to_string();
-        cursor.set_position((pos + value_len) as u64);
-
-        let time_signed = cursor.read_i64::<LittleEndian>()?;
-
-        let sig_len = CompactSize::decode(&mut cursor)
-            .map_err(|e| NetworkError::Deserialization(e.to_string()))?
-            .value() as usize;
-        let pos = cursor.position() as usize;
-        let signature = data[pos..pos + sig_len].to_vec();
+        let mut r = Reader::new(data);
+        let spork_id = r.i32()?;
+        let value = String::from_utf8_lossy(r.var_bytes()?).into_owned();
+        let time_signed = r.i64()?;
+        let signature = r.var_bytes()?.to_vec();
 
         Ok(SporkMessage {
             spork_id,
@@ -820,6 +605,13 @@ mod tests {
         } else {
             panic!("Expected Ping message");
         }
+    }
+
+    /// Divi Core main.cpp:946 and defaultValues.h:94
+    #[test]
+    fn reject_limits_are_cores() {
+        assert_eq!(MAX_REJECT_COMMAND_LENGTH, 12);
+        assert_eq!(MAX_REJECT_MESSAGE_LENGTH, 111);
     }
 
     #[test]

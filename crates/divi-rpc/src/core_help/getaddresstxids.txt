@@ -1,0 +1,21 @@
+getaddresstxids <address>|<addresses> (only_vaults)
+
+Returns the txids for an address(es) (requires addressindex to be enabled).
+
+Arguments:
+address: (string) The base58check encoded address
+"addresses": (optional JSON object) An object with fields:
+               (1) '"addresses"' (required) array of base58check encoded addresses
+               (2) '"start"' (optional field) integer block height to start at
+               (3) '"end"' (optional field) integer block height to stop at
+"only_vaults" (boolean, optional) Only return utxos spendable by the specified addresses
+
+Result:
+[
+  "transactionid"  (string) The transaction id
+  ,...
+]
+
+Examples:
+> divi-cli getaddresstxids '{"addresses": ["diviaddress"]}'
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddresstxids", "params": [{"addresses": ["diviaddress"]}] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

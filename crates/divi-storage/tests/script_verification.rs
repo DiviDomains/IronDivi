@@ -91,7 +91,8 @@ impl TestChain {
     }
 
     fn coinbase(&self, height: u32, payee: Script) -> Transaction {
-        let mut sig = vec![4u8];
+        // BIP34: the coinbase starts with the height
+        let mut sig = divi_storage::bip34_height_script(height);
         sig.extend_from_slice(&height.to_le_bytes());
         Transaction {
             version: 1,
@@ -104,12 +105,16 @@ impl TestChain {
     fn block(&self, txs: Vec<Transaction>) -> Block {
         let tip = self.chain.tip().unwrap();
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;
         block.transactions = txs;
         block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         block
     }
 
@@ -123,15 +128,24 @@ impl TestChain {
         self.chain.accept_block(block).is_ok() && self.chain.height() == height
     }
 
-    /// Fund `script` with a 1250 DIVI coinbase and let it mature
+    /// Fund `script` with a 1250 DIVI coinbase and let it mature (20 blocks on regtest)
     fn fund(&self, script: Script) -> (OutPoint, i64) {
         let height = self.chain.height() + 1;
         let cb = self.coinbase(height, script);
         let outpoint = OutPoint::new(cb.txid(), 0);
         let block = self.block(vec![cb]);
         self.chain.accept_block(block).unwrap();
-        assert!(self.mine(p2pkh(&self.miner), vec![]));
+        for _ in 0..20 {
+            assert!(self.mine(p2pkh(&self.miner), vec![]));
+        }
         (outpoint, 1250 * COIN)
+    }
+
+    /// Mine PoW blocks up to the last PoW block, so the next block may be PoS
+    fn mine_to_last_pow_block(&self) {
+        while self.chain.height() < 100 {
+            assert!(self.mine(p2pkh(&self.miner), vec![]));
+        }
     }
 }
 
@@ -284,16 +298,37 @@ fn vault_stake_block(
     vault_spk: &Script,
     signer: &KeyPair,
 ) -> Block {
+    // Paying the vault the stake and masternode shares satisfies the rule both
+    // before and after DeprecateMasternodes
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(t.chain.height() + 1, 100);
+    let back = Amount::from_sat(value) + reward.stake + reward.masternode;
+    vault_stake_block_paying(t, coin, value, vault_spk, signer, vec![back], vec![])
+}
+
+/// A vault stake block whose coinstake pays `vault_outs` back to the vault, then `others`
+fn vault_stake_block_paying(
+    t: &TestChain,
+    coin: OutPoint,
+    value: i64,
+    vault_spk: &Script,
+    signer: &KeyPair,
+    vault_outs: Vec<Amount>,
+    others: Vec<TxOut>,
+) -> Block {
     let height = t.chain.height() + 1;
     let mut coinbase = t.coinbase(height, Script::new());
     coinbase.vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+    let mut vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+    vout.extend(
+        vault_outs
+            .into_iter()
+            .map(|v| TxOut::new(v, vault_spk.clone())),
+    );
+    vout.extend(others);
     let mut stake = Transaction {
         version: 1,
         vin: vec![TxIn::new(coin, Script::new(), 0xffffffff)],
-        vout: vec![
-            TxOut::new(Amount::ZERO, Script::new()),
-            TxOut::new(Amount::from_sat(value), vault_spk.clone()),
-        ],
+        vout,
         lock_time: 0,
     };
     let sig = sign(&stake, 0, vault_spk, value, signer);
@@ -305,6 +340,70 @@ fn vault_stake_block(
     block
 }
 
+/// Before DeprecateMasternodes (median time past 2023-08-23; these regtest blocks
+/// carry 2018 times) the vault gets its input plus the stake share only, and the
+/// masternode share goes to another payee. Mainnet block 1,191,825 has this shape:
+/// in 62000 (vault), out 31209 + 31209 (vault, split), 495 to a pubkey hash.
+#[test]
+fn vault_stake_paying_the_masternode_elsewhere_is_accepted() {
+    let t = TestChain::new();
+    let owner = KeyPair::new_random();
+    let manager = KeyPair::new_random();
+    let vault_spk = vault(&owner, &manager);
+    let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
+    let height = t.chain.height();
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(height + 1, 100);
+    assert!(reward.masternode > Amount::ZERO);
+    // Split in two halves would need 10,000 DIVI each; this vault holds 1250, so
+    // the stake share goes into the one vault output
+    let back = Amount::from_sat(value) + reward.stake;
+    let masternode = TxOut::new(reward.masternode, p2pkh(&KeyPair::new_random()));
+    let block = vault_stake_block_paying(
+        &t,
+        coin,
+        value,
+        &vault_spk,
+        &manager,
+        vec![back],
+        vec![masternode],
+    );
+    t.chain
+        .accept_block(block)
+        .expect("vault keeps the stake share, the masternode share is paid elsewhere");
+    assert_eq!(t.chain.height(), height + 1);
+}
+
+/// A vault coinstake that pays itself less than its input plus the stake share is refused
+#[test]
+fn vault_stake_paying_itself_too_little_is_refused() {
+    let t = TestChain::new();
+    let owner = KeyPair::new_random();
+    let manager = KeyPair::new_random();
+    let vault_spk = vault(&owner, &manager);
+    let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
+    let height = t.chain.height();
+    let reward = divi_consensus::block_subsidy::get_block_subsidy(height + 1, 100);
+    let back = Amount::from_sat(value) + reward.stake - Amount::from_sat(1);
+    let elsewhere = TxOut::new(
+        reward.masternode + Amount::from_sat(1),
+        p2pkh(&KeyPair::new_random()),
+    );
+    let block = vault_stake_block_paying(
+        &t,
+        coin,
+        value,
+        &vault_spk,
+        &manager,
+        vec![back],
+        vec![elsewhere],
+    );
+    let err = t.chain.accept_block(block).unwrap_err().to_string();
+    assert!(err.contains("Vault output value"), "{err}");
+    assert_eq!(t.chain.height(), height);
+}
+
 #[test]
 fn vault_manager_stake_is_accepted() {
     let t = TestChain::new();
@@ -312,6 +411,7 @@ fn vault_manager_stake_is_accepted() {
     let manager = KeyPair::new_random();
     let vault_spk = vault(&owner, &manager);
     let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
     let height = t.chain.height();
 
     let block = vault_stake_block(&t, coin, value, &vault_spk, &manager);
@@ -328,6 +428,7 @@ fn vault_stake_signed_by_wrong_key_is_refused() {
     let manager = KeyPair::new_random();
     let vault_spk = vault(&owner, &manager);
     let (coin, value) = t.fund(vault_spk.clone());
+    t.mine_to_last_pow_block();
     let height = t.chain.height();
 
     // The coinstake input is signed by a key that is not the manager's; the

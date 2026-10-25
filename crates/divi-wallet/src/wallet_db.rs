@@ -125,6 +125,21 @@ pub enum VaultRole {
     Managed,
 }
 
+/// How the wallet owns an output script (Divi Core's isminetype)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// Not the wallet's
+    No,
+    /// Watched only: never recorded as a coin
+    WatchOnly,
+    /// The wallet can sign for it
+    Spendable,
+    /// A vault whose owner key the wallet holds
+    OwnedVault,
+    /// A registered vault whose manager key the wallet holds
+    ManagedVault,
+}
+
 /// Tracks which categories of wallet data have been modified since last save
 #[derive(Default, Clone)]
 struct DirtyFlags {
@@ -222,6 +237,19 @@ impl CoinSource {
     }
 }
 
+/// A wallet transaction that left the chain or the mempool without
+/// confirming: conflicted by another spend, evicted, or in a block that was
+/// disconnected. Divi Core keeps such transactions in the wallet, at depth -1
+/// (MerkleTxConfirmationNumberCalculator.cpp:43-47).
+#[derive(Debug, Clone)]
+pub struct DetachedTx {
+    /// When the wallet first saw it
+    pub timestamp: u64,
+    /// The transaction, when the wallet had it (a disconnected block's
+    /// transactions are left to the chain's transaction index)
+    pub tx: Option<divi_primitives::transaction::Transaction>,
+}
+
 #[derive(Debug, Clone)]
 struct MempoolWalletTx {
     /// Every outpoint the transaction spends (ours or not), for conflict checks
@@ -239,6 +267,12 @@ struct MempoolWalletTx {
 }
 
 /// Wallet database
+/// Called with the txid of a wallet transaction each time the wallet adds or
+/// updates it, as Divi Core's NotifyTransactionChanged NEW or UPDATED
+/// (wallet.cpp:1283): committed by a send, seen in the mempool, in a block
+/// connected or disconnected, or found by a scan.
+pub type TxListener = std::sync::Arc<dyn Fn(&Hash256) + Send + Sync>;
+
 pub struct WalletDb {
     /// Key store
     keystore: KeyStore,
@@ -268,6 +302,9 @@ pub struct WalletDb {
     scripts: RwLock<HashMap<Hash160, Script>>,
     /// Vault metadata storage
     vaults: RwLock<HashMap<Vec<u8>, VaultMetadata>>,
+    /// Coins `lockunspent` set aside. In memory only, as Divi Core's
+    /// `setLockedCoins`; neither staked nor spent while locked.
+    locked_coins: RwLock<HashSet<OutPoint>>,
     /// How the wallet is unlocked: timer and staking-only flag
     unlock: RwLock<UnlockState>,
     /// Decrypted master key (in memory only when unlocked). Unlock and
@@ -280,10 +317,15 @@ pub struct WalletDb {
     spent_utxo_data: RwLock<HashMap<OutPoint, (WalletUtxo, u32)>>,
     /// Wallet transactions in the mempool (stored on disk as raw transactions)
     mempool_txs: RwLock<HashMap<Hash256, MempoolWalletTx>>,
+    /// Wallet transactions that left the chain or the mempool unconfirmed
+    /// (stored on disk), listed at depth -1 as Divi Core lists them
+    detached_txs: RwLock<HashMap<Hash256, DetachedTx>>,
     /// Serializes block scanning: live block notifications, the startup
     /// catch-up, reorg rollback and rescans must not interleave, or a spend
     /// can be scanned before the coin it spends and be lost
     scan_lock: Mutex<()>,
+    /// Told each wallet transaction added or seen again (-walletnotify)
+    tx_listener: RwLock<Option<TxListener>>,
     /// Rows removed from memory that must also be deleted from disk on the
     /// next save (a save only writes what is in memory)
     pending_deletes: RwLock<PendingDeletes>,
@@ -291,6 +333,24 @@ pub struct WalletDb {
     /// sync notices a chain switch it was not told about (invalidateblock,
     /// a missed reorg notification) and rolls back to the fork first
     scanned_hashes: RwLock<BTreeMap<u32, Hash256>>,
+    /// Divi Core's -vault: addvault and removevault change the wallet only
+    /// when it is on (wallet.cpp:152, :693-716)
+    vault_mode: std::sync::atomic::AtomicBool,
+    /// Divi Core's -spendzeroconfchange: a send may also use unconfirmed
+    /// outputs of our own transactions (wallet.cpp:1848)
+    spend_zero_conf_change: std::sync::atomic::AtomicBool,
+    /// The relay fee rate the wallet pays, satoshis per 1000 bytes (Divi
+    /// Core's -minrelaytxfee, which its wallet follows: rpcwallet.cpp:470-473)
+    relay_fee_per_kb: std::sync::atomic::AtomicI64,
+    /// The highest fee a send may pay, satoshis (Divi Core's -maxtxfee:
+    /// MinimumFeeCoinSelectionAlgorithm.cpp:97, wallet.cpp:1559-1562)
+    max_tx_fee: std::sync::atomic::AtomicI64,
+    /// The position each transaction was first seen at, and the next one
+    /// (Divi Core's nOrderPos, the order listtransactions follows)
+    tx_order: RwLock<(HashMap<Hash256, u64>, u64)>,
+    /// Notes kept with a transaction by the call that sent it (Divi Core's
+    /// mapValue: comment, to, FromAccount), in key order as Core's std::map
+    tx_notes: RwLock<HashMap<Hash256, BTreeMap<String, String>>>,
 }
 
 /// Unlock state of an encrypted wallet (Divi Core `walletStakingOnly` plus the
@@ -307,6 +367,10 @@ struct UnlockState {
 
 /// How many recently scanned block hashes the wallet remembers
 const SCANNED_HASHES_KEPT: usize = 10_000;
+
+/// How many of them are saved with the scan height (more than Divi's deepest
+/// reorganization of 100 blocks)
+const SCANNED_HASHES_SAVED: usize = 128;
 
 impl WalletDb {
     /// Create a new in-memory wallet
@@ -326,19 +390,29 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         }
     }
 
     /// Create wallet with HD wallet
     pub fn with_hd_wallet(network: Network, wallet: HdWallet) -> Self {
+        let wallet = with_core_coin_type(wallet, network);
         WalletDb {
             keystore: KeyStore::with_hd_wallet(network, wallet),
             network,
@@ -354,14 +428,23 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -387,14 +470,23 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults,
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         };
 
         // Load wallet data from database
@@ -410,6 +502,7 @@ impl WalletDb {
         }
         // Needs keys, UTXOs, spent set, history and vaults loaded first
         wallet.restore_unconfirmed_txs(&db)?;
+        wallet.restore_detached_txs(&db)?;
         debug!("Restored {} vaults", wallet.vaults.read().len());
 
         // Wallets written before removevault dropped its outputs still hold them
@@ -452,6 +545,7 @@ impl WalletDb {
                 if !confirmed {
                     // Its outputs never existed, so whatever spends them is void too
                     dropped.insert(txid);
+                    self.detach(txid, timestamp, Some(tx.clone()));
                 }
             } else {
                 restored += 1;
@@ -461,6 +555,126 @@ impl WalletDb {
             info!("Restored {} unconfirmed wallet transaction(s)", restored);
         }
         Ok(())
+    }
+
+    /// Load the detached transactions stored on disk, forgetting those the
+    /// wallet has since recorded from a block or holds in the mempool overlay
+    fn restore_detached_txs(&self, db: &WalletDatabase) -> Result<(), WalletError> {
+        for (txid, timestamp, raw) in db.load_detached_txs()? {
+            if self.is_recorded(&txid) {
+                db.remove_detached_tx(&txid)?;
+                continue;
+            }
+            let tx = if raw.is_empty() {
+                None
+            } else {
+                match divi_primitives::deserialize(&raw) {
+                    Ok(tx) => Some(tx),
+                    Err(e) => {
+                        tracing::warn!("Skipping unreadable detached wallet tx {}: {}", txid, e);
+                        continue;
+                    }
+                }
+            };
+            self.detached_txs
+                .write()
+                .insert(txid, DetachedTx { timestamp, tx });
+        }
+        Ok(())
+    }
+
+    /// Recorded from a block, or in the mempool overlay
+    fn is_recorded(&self, txid: &Hash256) -> bool {
+        matches!(self.transactions.read().get(txid), Some(t) if t.block_height.is_some())
+            || self.mempool_txs.read().contains_key(txid)
+    }
+
+    /// Keep a wallet transaction that left the chain or the mempool unconfirmed
+    fn detach(
+        &self,
+        txid: Hash256,
+        timestamp: u64,
+        tx: Option<divi_primitives::transaction::Transaction>,
+    ) {
+        if self.is_recorded(&txid) {
+            return;
+        }
+        let raw = tx
+            .as_ref()
+            .map(divi_primitives::serialize)
+            .unwrap_or_default();
+        {
+            let mut detached = self.detached_txs.write();
+            if let Some(known) = detached.get(&txid) {
+                if known.tx.is_some() || tx.is_none() {
+                    return;
+                }
+            }
+            detached.insert(txid, DetachedTx { timestamp, tx });
+        }
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.store_detached_tx(&txid, timestamp, &raw) {
+                tracing::warn!("Failed to store detached wallet tx {}: {}", txid, e);
+            }
+        }
+    }
+
+    /// A detached transaction is in a block or the mempool again
+    fn reattach(&self, txid: &Hash256) {
+        if self.detached_txs.write().remove(txid).is_some() {
+            if let Some(ref db) = self.db {
+                if let Err(e) = db.remove_detached_tx(txid) {
+                    tracing::warn!("Failed to forget detached wallet tx {}: {}", txid, e);
+                }
+            }
+        }
+    }
+
+    /// Wallet transactions that left the chain or the mempool unconfirmed
+    pub fn detached_transactions(&self) -> Vec<(Hash256, DetachedTx)> {
+        self.detached_txs
+            .read()
+            .iter()
+            .map(|(id, d)| (*id, d.clone()))
+            .collect()
+    }
+
+    /// Every wallet transaction as Divi Core's wallet keeps them: recorded,
+    /// in the mempool, and detached (block fields empty)
+    pub fn history_records(&self) -> Vec<WalletTx> {
+        let mut list = self.get_transactions(None);
+        let known: HashSet<Hash256> = list.iter().map(|t| t.txid).collect();
+        list.extend(
+            self.detached_txs
+                .read()
+                .iter()
+                .filter(|(id, _)| !known.contains(id))
+                .map(|(id, d)| Self::detached_record(*id, d)),
+        );
+        list
+    }
+
+    /// One wallet transaction, detached ones included
+    pub fn history_record(&self, txid: &Hash256) -> Option<WalletTx> {
+        self.get_transaction(txid).or_else(|| {
+            self.detached_txs
+                .read()
+                .get(txid)
+                .map(|d| Self::detached_record(*txid, d))
+        })
+    }
+
+    fn detached_record(txid: Hash256, d: &DetachedTx) -> WalletTx {
+        WalletTx {
+            txid,
+            block_hash: None,
+            block_height: None,
+            timestamp: d.timestamp,
+            amount: 0,
+            fee: None,
+            category: String::new(),
+            confirmations: 0,
+        }
     }
 
     /// Unconfirmed wallet transactions, parents before children, to resubmit
@@ -491,7 +705,27 @@ impl WalletDb {
         }
 
         if let Some(mnemonic) = db.load_mnemonic()? {
-            let hd_wallet = HdWallet::from_mnemonic(&mnemonic, None, new_mode)?;
+            let passphrase = db.load_mnemonic_passphrase()?;
+            let mut hd_wallet =
+                HdWallet::from_mnemonic(&mnemonic, passphrase.as_deref(), new_mode)?;
+            // A Divi wallet keeps a testnet coin type it was made with
+            if let (ChainMode::Divi, Some(coin_type)) = (new_mode, db.load_hd_coin_type()?) {
+                if coin_type != crate::hd::PRIVATEDIVI_COIN_TYPE {
+                    hd_wallet = hd_wallet.with_coin_type(coin_type);
+                }
+            }
+            db.store_hd_coin_type(hd_wallet.coin_type())?;
+            self.keystore.set_hd_wallet(hd_wallet);
+            db.store_chain_mode(new_mode)?;
+            info!("Migrated wallet chain_mode to {:?}", new_mode);
+        } else if let Some(seed) = db.load_hd_seed()? {
+            let mut hd_wallet = HdWallet::from_seed(&seed, new_mode)?;
+            if let (ChainMode::Divi, Some(coin_type)) = (new_mode, db.load_hd_coin_type()?) {
+                if coin_type != crate::hd::PRIVATEDIVI_COIN_TYPE {
+                    hd_wallet = hd_wallet.with_coin_type(coin_type);
+                }
+            }
+            db.store_hd_coin_type(hd_wallet.coin_type())?;
             self.keystore.set_hd_wallet(hd_wallet);
             db.store_chain_mode(new_mode)?;
             info!("Migrated wallet chain_mode to {:?}", new_mode);
@@ -509,19 +743,22 @@ impl WalletDb {
         let db = WalletDatabase::open(path)?;
         let db = Arc::new(db);
 
-        // Store mnemonic, network, and chain mode
+        // Store mnemonic, network, chain mode and coin type
+        let wallet = with_core_coin_type(wallet, network);
         if let Some(mnemonic) = wallet.mnemonic() {
             db.store_mnemonic(mnemonic)?;
         }
+        if let Some(passphrase) = wallet.mnemonic_passphrase() {
+            db.store_mnemonic_passphrase(passphrase)?;
+        }
+        if let Some(seed) = wallet.seed() {
+            db.store_hd_seed(seed)?;
+        }
         db.store_network(network)?;
 
-        // Store chain mode for correct HD derivation on future loads
-        let chain_mode = if wallet.coin_type() == 801 {
-            ChainMode::PrivateDivi
-        } else {
-            ChainMode::Divi
-        };
-        db.store_chain_mode(chain_mode)?;
+        // Store chain mode and coin type for the same HD derivation on future loads
+        db.store_chain_mode(wallet.chain_mode())?;
+        db.store_hd_coin_type(wallet.coin_type())?;
 
         let wallet_db = WalletDb {
             keystore: KeyStore::with_hd_wallet(network, wallet),
@@ -538,14 +775,23 @@ impl WalletDb {
             address_accounts: RwLock::new(HashMap::new()),
             scripts: RwLock::new(HashMap::new()),
             vaults: RwLock::new(HashMap::new()),
+            locked_coins: RwLock::new(HashSet::new()),
             unlock: RwLock::new(UnlockState::default()),
             decrypted_master_key: RwLock::new(None),
             dirty: RwLock::new(DirtyFlags::default()),
             spent_utxo_data: RwLock::new(HashMap::new()),
             mempool_txs: RwLock::new(HashMap::new()),
+            detached_txs: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            tx_listener: RwLock::new(None),
             pending_deletes: RwLock::new(PendingDeletes::default()),
             scanned_hashes: RwLock::new(BTreeMap::new()),
+            vault_mode: std::sync::atomic::AtomicBool::new(false),
+            spend_zero_conf_change: std::sync::atomic::AtomicBool::new(false),
+            relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
+            max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
+            tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_notes: RwLock::new(HashMap::new()),
         };
 
         Ok(wallet_db)
@@ -571,17 +817,34 @@ impl WalletDb {
             }
         }
 
+        {
+            let mut order = self.tx_order.write();
+            for (txid, position) in db.load_tx_order()? {
+                order.0.insert(txid, position);
+                order.1 = order.1.max(position + 1);
+            }
+        }
+        for (txid, raw) in db.load_tx_notes()? {
+            match serde_json::from_slice::<BTreeMap<String, String>>(&raw) {
+                Ok(notes) => {
+                    self.tx_notes.write().insert(txid, notes);
+                }
+                Err(e) => debug!("Skipping unreadable notes of {}: {}", txid, e),
+            }
+        }
+
         // Load mnemonic and restore HD wallet
         if let Some(mnemonic) = db.load_mnemonic()? {
-            // Use stored chain_mode, defaulting to Divi for backward compat
-            // (all existing wallets used Divi's coin type due to the old hardcode)
-            let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
-            let hd_wallet = HdWallet::from_mnemonic(&mnemonic, None, chain_mode)?;
-            self.keystore.set_hd_wallet(hd_wallet);
+            let passphrase = db.load_mnemonic_passphrase()?;
+            let hd_wallet = stored_hd_wallet(db, &mnemonic, passphrase.as_deref())?;
             debug!(
-                "Restored HD wallet from mnemonic (chain_mode={:?})",
-                chain_mode
+                "Restored HD wallet from mnemonic (chain_mode={:?}, coin type {})",
+                hd_wallet.chain_mode(),
+                hd_wallet.coin_type()
             );
+            self.keystore.set_hd_wallet(hd_wallet);
+        } else if let Some(seed) = db.load_hd_seed()? {
+            self.keystore.set_hd_wallet(stored_seed_wallet(db, &seed)?);
         } else if let Some(ids) = db.load_hd_public_ids()? {
             // Encrypted wallet: the seed stays locked, its public ids do not
             self.keystore.set_hd_public_ids(ids);
@@ -667,12 +930,21 @@ impl WalletDb {
 
         // Load last scan height
         *self.last_scan_height.write() = db.load_last_scan_height()?;
+        self.scanned_hashes
+            .write()
+            .extend(db.load_scanned_hashes()?);
 
         // Load accounts
         let accounts = db.load_accounts()?;
         {
             let mut accounts_map = self.accounts.write();
-            for (account, addresses) in accounts {
+            for (account, mut addresses) in accounts {
+                // Divi Core reads its "name" records in key order (the address
+                // string after its length) and an account's current address is
+                // the last one read (walletdb.cpp:242-251,
+                // AddressBookManager.cpp:17-22), so after a restart it is the
+                // greatest address, not the last one handed out
+                addresses.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
                 accounts_map.insert(account, addresses);
             }
         }
@@ -814,6 +1086,9 @@ impl WalletDb {
             if let Some(mnemonic) = self.keystore.mnemonic() {
                 batch.put_cf(db.cf_metadata(), b"mnemonic", mnemonic.as_bytes());
             }
+            if let Some(seed) = self.keystore.hd_seed() {
+                batch.put_cf(db.cf_metadata(), crate::persistence::KEY_HD_SEED, &seed[..]);
+            }
         }
 
         // Save network
@@ -838,15 +1113,11 @@ impl WalletDb {
             self.put_key(&mut batch, db, &hash, &entry);
         }
 
-        // Delete rows dropped from memory (reorg, rescan) before writing the
-        // current state, so they do not come back on the next load
+        // Delete rows dropped from memory (reorg, rescan) so they do not come
+        // back on the next load; the rows written below come after them in the
+        // batch and win over them
         let pending = self.pending_deletes_snapshot();
-        if !pending.is_empty() {
-            let mut batch = db.create_batch();
-            Self::put_pending_deletes(&mut batch, db, &pending);
-            db.write_batch(batch)?;
-            self.clear_pending_deletes(&pending);
-        }
+        Self::put_pending_deletes(&mut batch, db, &pending);
 
         // Save UTXOs and remove spent ones from the UTXO table.
         // First, delete any spent outpoints from the UTXO column family so they
@@ -879,12 +1150,7 @@ impl WalletDb {
             [*self.encrypted.read() as u8],
         );
 
-        // Save last scan height
-        batch.put_cf(
-            db.cf_metadata(),
-            b"last_scan_height",
-            self.last_scan_height.read().to_le_bytes(),
-        );
+        self.put_scan_state(&mut batch, db);
 
         // Save accounts
         for (account, addresses) in self.accounts.read().iter() {
@@ -906,6 +1172,8 @@ impl WalletDb {
 
         // Synced, so it is on disk when this returns; no memtable flush needed
         db.write_batch_sync(batch)?;
+        self.clear_pending_deletes(&pending);
+        stop_point!("wallet deletes written");
 
         // Clear dirty flags since everything was just written
         self.dirty.write().clear();
@@ -951,9 +1219,34 @@ impl WalletDb {
     /// Save only the last scan height to database (lightweight, no flush)
     pub fn save_scan_height(&self) -> Result<(), WalletError> {
         if let Some(db) = &self.db {
-            db.store_last_scan_height(*self.last_scan_height.read())?;
+            let mut batch = db.create_batch();
+            self.put_scan_state(&mut batch, db);
+            db.write_batch(batch)?;
         }
         Ok(())
+    }
+
+    /// The scan height and the hashes of the blocks scanned up to it, so a
+    /// restart on a chain where those blocks were replaced rolls them back, as
+    /// Divi Core's wallet starts from the fork of its best-block locator
+    /// (wallet.cpp:258-293). Enough heights are kept to cover the deepest
+    /// reorganization.
+    fn put_scan_state(&self, batch: &mut rocksdb::WriteBatch, db: &WalletDatabase) {
+        let last = *self.last_scan_height.read();
+        batch.put_cf(db.cf_metadata(), b"last_scan_height", last.to_le_bytes());
+        let recent: Vec<(u32, Hash256)> = self
+            .scanned_hashes
+            .read()
+            .range(..=last)
+            .rev()
+            .take(SCANNED_HASHES_SAVED)
+            .map(|(h, hash)| (*h, *hash))
+            .collect();
+        batch.put_cf(
+            db.cf_metadata(),
+            crate::persistence::KEY_SCANNED_HASHES,
+            crate::persistence::encode_scanned_hashes(&recent),
+        );
     }
 
     /// Incrementally save only dirty wallet data using an atomic WriteBatch.
@@ -979,11 +1272,7 @@ impl WalletDb {
         Self::put_pending_deletes(&mut batch, db, &pending);
 
         // Always update scan height
-        batch.put_cf(
-            db.cf_metadata(),
-            b"last_scan_height",
-            self.last_scan_height.read().to_le_bytes(),
-        );
+        self.put_scan_state(&mut batch, db);
 
         if flags.utxos || flags.spent {
             // Remove spent outpoints from UTXO CF and add to spent CF
@@ -1041,6 +1330,9 @@ impl WalletDb {
                 if let Some(mnemonic) = self.keystore.mnemonic() {
                     batch.put_cf(db.cf_metadata(), b"mnemonic", mnemonic.as_bytes());
                 }
+                if let Some(seed) = self.keystore.hd_seed() {
+                    batch.put_cf(db.cf_metadata(), crate::persistence::KEY_HD_SEED, &seed[..]);
+                }
             }
             let network_val = match self.network {
                 Network::Mainnet => b"mainnet".as_slice(),
@@ -1088,21 +1380,110 @@ impl WalletDb {
         &self.keystore
     }
 
+    /// Write a backup of the wallet to `destination`, as `backupwallet`: a
+    /// consistent copy of the open database (a checkpoint, then copied, so the
+    /// backup shares no file with the wallet). An existing folder that is not
+    /// itself a wallet backup gets the copy inside it under the wallet's name,
+    /// as Divi Core appends wallet.dat to a directory (walletdb.cpp:609-610);
+    /// an earlier backup at the destination is replaced. Returns where it went.
+    ///
+    /// Only a backup this method wrote (it carries [`BACKUP_MARKER`]) is ever
+    /// replaced: any other database (the live wallet, the chain, another
+    /// program's store) or folder at the destination is refused, never removed.
+    pub fn backup_to(&self, destination: &Path) -> Result<std::path::PathBuf, WalletError> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| WalletError::Storage("wallet has no database to back up".into()))?;
+        let is_db = |p: &Path| p.join("CURRENT").exists();
+        let is_backup = |p: &Path| is_db(p) && p.join(BACKUP_MARKER).is_file();
+        if destination.is_dir() && is_db(destination) && !is_backup(destination) {
+            return Err(WalletError::Storage(format!(
+                "{} holds a database that is not a wallet backup; refusing to replace it",
+                destination.display()
+            )));
+        }
+        let name = db
+            .path()
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| "wallet".into());
+        let target = if destination.is_dir() && !is_backup(destination) {
+            destination.join(&name)
+        } else {
+            destination.to_path_buf()
+        };
+        if target.is_file() {
+            return Err(WalletError::Storage(format!(
+                "{} is a file; give a folder name for the wallet backup",
+                target.display()
+            )));
+        }
+        if target.exists() && !is_backup(&target) {
+            return Err(WalletError::Storage(format!(
+                "{} exists and is not a wallet backup",
+                target.display()
+            )));
+        }
+        // Never the live wallet, nor a folder that holds it, even when it was
+        // itself restored from a backup and so carries the marker
+        if let (Ok(t), Ok(live)) = (target.canonicalize(), db.path().canonicalize()) {
+            if live.starts_with(&t) {
+                return Err(WalletError::Storage(format!(
+                    "{} is the open wallet; give another place for the backup",
+                    target.display()
+                )));
+            }
+        }
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| WalletError::Storage(e.to_string()))?;
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut checkpoint_name = std::ffi::OsString::from(".");
+        checkpoint_name.push(&name);
+        checkpoint_name.push(format!(".checkpoint-{stamp}"));
+        let checkpoint = db
+            .path()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(checkpoint_name);
+        let mut staging = target.clone().into_os_string();
+        staging.push(format!(".partial-{stamp}"));
+        let staging = std::path::PathBuf::from(staging);
+
+        let result = (|| {
+            db.checkpoint_to(&checkpoint)?;
+            crate::backup::copy_dir(&checkpoint, &staging)
+                .map_err(|e| WalletError::Storage(format!("Failed to copy backup: {e}")))?;
+            write_backup_marker(&staging.join(BACKUP_MARKER))?;
+            if target.exists() {
+                std::fs::remove_dir_all(&target)
+                    .map_err(|e| WalletError::Storage(e.to_string()))?;
+            }
+            std::fs::rename(&staging, &target).map_err(|e| WalletError::Storage(e.to_string()))
+        })();
+        let _ = std::fs::remove_dir_all(&checkpoint);
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        result?;
+        info!("Wallet backed up to {}", target.display());
+        Ok(target)
+    }
+
     pub fn database_path(&self) -> std::path::PathBuf {
         match &self.db {
             Some(db) => db.path().to_path_buf(),
             None => std::path::PathBuf::from("wallet.dat"),
-        }
-    }
-
-    /// Write a consistent, owner-only copy of the wallet database to `dst`,
-    /// which must not exist yet
-    pub fn backup_to(&self, dst: &Path) -> Result<(), WalletError> {
-        match &self.db {
-            Some(db) => db.checkpoint_to(dst),
-            None => Err(WalletError::Storage(
-                "the wallet is not stored on disk".into(),
-            )),
         }
     }
 
@@ -1111,12 +1492,13 @@ impl WalletDb {
         self.network
     }
 
-    /// Get coinbase maturity for this network (mainnet=20, testnet/regtest=1)
+    /// Get coinbase maturity for this network (Divi Core nMaturity: mainnet 20,
+    /// testnet 1, regtest 20; chainparams.cpp:184, :400, :479)
     pub fn coinbase_maturity(&self) -> u32 {
         match self.network {
             Network::Mainnet => 20,
             Network::Testnet => 1,
-            Network::Regtest => 1,
+            Network::Regtest => 20,
         }
     }
 
@@ -1145,13 +1527,14 @@ impl WalletDb {
         let addr = if *locked {
             self.keystore.take_from_keypool(is_change)?
         } else {
-            let addr = if is_change {
+            // Divi Core tops the keypool up, then takes its oldest key
+            // (wallet.cpp:2122-2156), so the pool is one short afterwards
+            store = self.keystore.top_up_keypool(None).unwrap_or_default();
+            if is_change {
                 self.keystore.new_change_address()?
             } else {
                 self.keystore.new_receiving_address()?
-            };
-            store = self.keystore.top_up_keypool(None).unwrap_or_default();
-            addr
+            }
         };
         self.dirty.write().keys = true;
         self.dirty.write().metadata = true; // receiving/change index changed
@@ -1171,14 +1554,15 @@ impl WalletDb {
         self.keystore.get_addresses()
     }
 
-    /// Check if an address belongs to this wallet
+    /// Whether the wallet knows an address at all, spendable or watched
+    /// (Divi Core's IsMine of its script is not ISMINE_NO)
     pub fn is_mine(&self, address: &Address) -> bool {
-        self.keystore.have_key(&address.hash)
+        self.ownership(&address.script_pubkey()) != Ownership::No
     }
 
-    /// Check if an address is watch-only
+    /// Whether an address is watched only (Divi Core's ISMINE_WATCH_ONLY)
     pub fn is_watch_only(&self, address: &Address) -> bool {
-        self.keystore.is_watch_only(&address.hash)
+        self.ownership(&address.script_pubkey()) == Ownership::WatchOnly
     }
 
     /// Import a watch-only public key
@@ -1257,17 +1641,85 @@ impl WalletDb {
             .unwrap_or_default()
     }
 
-    /// Check if a script belongs to this wallet
+    /// Whether the wallet records an output paying `script`: Divi Core keeps a
+    /// transaction only when it pays or spends a spendable or vault output
+    /// (wallet.cpp:1300-1305), so watched scripts never bring coins in.
     pub fn is_mine_script(&self, script: &Script) -> bool {
-        // Try P2PKH first (most common)
-        if let Some(hash_bytes) = script.extract_p2pkh_hash() {
-            let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
-            if self.keystore.have_key(&hash) {
-                return true;
-            }
-        }
+        matches!(
+            self.ownership(script),
+            Ownership::Spendable | Ownership::OwnedVault | Ownership::ManagedVault
+        )
+    }
 
-        self.vault_role(script).is_some()
+    /// How the wallet owns `script`, as Divi Core's IsMine
+    /// (wallet_ismine.cpp:37-113): P2PKH and P2PK of a wallet key, a bare
+    /// multisig of wallet keys only, and P2SH by what its stored redeem script
+    /// is are spendable; a vault is owned through its owner key or managed
+    /// through its manager key once registered. Watched P2PKH and P2SH
+    /// addresses, and redeem scripts stored without every key, are watch-only.
+    pub fn ownership(&self, script: &Script) -> Ownership {
+        use divi_script::standard::{extract_script_type, ScriptType};
+
+        if self.is_watched_script(script) {
+            return Ownership::WatchOnly;
+        }
+        let (kind, solutions) = extract_script_type(script.as_bytes());
+        let has_signing_key = |hash: Hash160| {
+            self.keystore
+                .get_key(&hash)
+                .is_some_and(|entry| !entry.is_watch_only)
+        };
+        match kind {
+            ScriptType::PubKey => {
+                if has_signing_key(divi_crypto::hash160(&solutions[0])) {
+                    return Ownership::Spendable;
+                }
+            }
+            ScriptType::PubKeyHash => {
+                if has_signing_key(hash160_from(&solutions[0])) {
+                    return Ownership::Spendable;
+                }
+            }
+            ScriptType::ScriptHash => {
+                if let Some(redeem) = self.get_script(&hash160_from(&solutions[0])) {
+                    return match self.ownership(&redeem) {
+                        // addmultisigaddress watches a redeem script it
+                        // cannot spend (rpcwallet.cpp:1770-1771)
+                        Ownership::No => Ownership::WatchOnly,
+                        mine => mine,
+                    };
+                }
+            }
+            ScriptType::Vault => match self.vault_role(script) {
+                Some(VaultRole::Owned) => return Ownership::OwnedVault,
+                Some(VaultRole::Managed) => return Ownership::ManagedVault,
+                None => {}
+            },
+            ScriptType::Multisig => {
+                let keys = &solutions[1..solutions.len() - 1];
+                if keys
+                    .iter()
+                    .all(|key| has_signing_key(divi_crypto::hash160(key)))
+                {
+                    return Ownership::Spendable;
+                }
+            }
+            _ => {}
+        }
+        Ownership::No
+    }
+
+    /// A P2PKH or P2SH script imported with importaddress (Divi Core's
+    /// HaveWatchOnly; IronDivi keeps the watched hash as a key entry)
+    fn is_watched_script(&self, script: &Script) -> bool {
+        let hash = match script.extract_p2pkh_hash() {
+            Some(hash) => hash,
+            None => match script.extract_p2sh_hash() {
+                Some(hash) => hash,
+                None => return false,
+            },
+        };
+        self.keystore.is_watch_only(&Hash160::from_bytes(hash))
     }
 
     /// Our role for a vault script, as Divi Core's IsMine: the owner key makes
@@ -1408,6 +1860,26 @@ impl WalletDb {
         out
     }
 
+    /// Lock (`lock` true) or unlock a coin, as `lockunspent` does
+    pub fn set_coin_locked(&self, outpoint: OutPoint, lock: bool) {
+        let mut locked = self.locked_coins.write();
+        if lock {
+            locked.insert(outpoint);
+        } else {
+            locked.remove(&outpoint);
+        }
+    }
+
+    /// Whether `lockunspent` locked this coin
+    pub fn is_coin_locked(&self, outpoint: &OutPoint) -> bool {
+        self.locked_coins.read().contains(outpoint)
+    }
+
+    /// Every coin `lockunspent` locked
+    pub fn locked_coins(&self) -> Vec<OutPoint> {
+        self.locked_coins.read().iter().copied().collect()
+    }
+
     /// Outpoints spent by wallet transactions in the mempool
     fn mempool_spent(&self) -> HashSet<OutPoint> {
         self.mempool_txs
@@ -1435,38 +1907,42 @@ impl WalletDb {
             .into_iter()
             .filter(|(_, source)| source.is_trusted())
             .map(|(utxo, _)| utxo)
-            .filter(|utxo| !divi_script::is_staking_vault_script(&utxo.script_pubkey))
+            .filter(|utxo| self.ownership(&utxo.script_pubkey) == Ownership::Spendable)
             .filter(|utxo| {
-                let confs = utxo.confirmations(current_height);
-                let mature = utxo.is_mature(current_height, self.coinbase_maturity());
-
-                // Check if this is a watch-only address
-                let is_watch_only = if let Ok(addr) = Address::from_base58(&utxo.address) {
-                    self.is_watch_only(&addr)
-                } else {
-                    false
-                };
-
-                // Only include UTXOs that are confirmed, mature, and not watch-only
-                confs >= min_confirmations && mature && !is_watch_only
+                utxo.confirmations(current_height) >= min_confirmations
+                    && utxo.is_mature(current_height, self.coinbase_maturity())
             })
             .collect()
     }
 
     /// Reconcile wallet UTXOs against the chain's UTXO set.
-    /// Removes any wallet UTXOs that don't exist in the chain (phantom UTXOs).
+    /// Removes wallet UTXOs that the chain does not have (phantom UTXOs).
     ///
     /// This handles the case where IronDivi stakes a block that later gets orphaned,
     /// and the coinstake outputs remain as phantom UTXOs in the wallet after restart
     /// (because `spent_utxo_data` was in-memory only prior to persistence fix).
     ///
+    /// Only coins at or below both `chain_height` and the wallet's scan height
+    /// are checked: a coin in a block the chain has not reached yet (a chain
+    /// being rebuilt) is not missing. A removed coin is forgotten rather than
+    /// marked spent, so a later scan of its block brings it back if the chain
+    /// does have it.
+    ///
     /// The `chain_has_utxo` closure should return true if the outpoint exists in the
     /// chain UTXO database.
-    pub fn reconcile_utxos<F>(&self, chain_has_utxo: F) -> u32
+    pub fn reconcile_utxos<F>(&self, chain_height: u32, chain_has_utxo: F) -> u32
     where
         F: Fn(&OutPoint) -> bool,
     {
-        let outpoints: Vec<OutPoint> = self.utxos.read().keys().cloned().collect();
+        let _scan = self.scan_lock.lock();
+        let checked_to = chain_height.min(self.last_scan_height());
+        let outpoints: Vec<OutPoint> = self
+            .utxos
+            .read()
+            .iter()
+            .filter(|(_, u)| u.height.is_some_and(|h| h <= checked_to))
+            .map(|(op, _)| *op)
+            .collect();
         let mut removed = 0u32;
         for outpoint in &outpoints {
             if !chain_has_utxo(outpoint) {
@@ -1475,15 +1951,13 @@ impl WalletDb {
                         "Reconciliation: removed phantom UTXO {}:{} ({} sat, addr={})",
                         outpoint.txid, outpoint.vout, utxo.value, utxo.address
                     );
-                    self.spent.write().insert(*outpoint);
+                    self.pending_deletes.write().utxos.insert(*outpoint);
                     removed += 1;
                 }
             }
         }
         if removed > 0 {
-            let mut dirty = self.dirty.write();
-            dirty.utxos = true;
-            dirty.spent = true;
+            self.dirty.write().utxos = true;
             info!(
                 "UTXO reconciliation complete: removed {} phantom UTXOs, {} remaining",
                 removed,
@@ -1491,8 +1965,9 @@ impl WalletDb {
             );
         } else {
             info!(
-                "UTXO reconciliation complete: all {} wallet UTXOs verified against chain",
-                outpoints.len()
+                "UTXO reconciliation complete: all {} wallet UTXOs up to height {} verified against chain",
+                outpoints.len(),
+                checked_to
             );
         }
         removed
@@ -1533,70 +2008,72 @@ impl WalletDb {
         select::select_minimum(&available_utxos, target, fee_rate, num_outputs)
     }
 
-    /// Our coins for balance purposes: everything except vaults we only
-    /// manage (Core's balances count ISMINE_SPENDABLE and ISMINE_OWNED_VAULT,
-    /// never ISMINE_MANAGED_VAULT)
-    fn balance_utxos(&self) -> Vec<(WalletUtxo, CoinSource)> {
-        self.effective_utxos()
-            .into_iter()
-            .filter(|(u, _)| self.vault_role(&u.script_pubkey) != Some(VaultRole::Managed))
-            .collect()
-    }
-
-    /// Whether a coin can be spent at all once selected: mature and not
-    /// watch-only. Balances count only such coins, like Core's
-    /// GetAvailableCredit (immature rewards are getimmaturebalance's).
-    fn is_spendable_coin(&self, utxo: &WalletUtxo, current_height: u32) -> bool {
-        let watch_only = Address::from_base58(&utxo.address)
-            .map(|addr| self.is_watch_only(&addr))
-            .unwrap_or(false);
-        utxo.is_mature(current_height, self.coinbase_maturity()) && !watch_only
-    }
-
-    /// Coins a send may use, in the order it should try them: coins with at
-    /// least `min_confirmations` (largest first), then, when `min_confirmations`
-    /// is 0 or 1, our own unconfirmed change (largest first). This is Core's
-    /// CreateTransaction with spendzeroconfchange: confirmed coins first, then
-    /// trusted 0-conf coins, which getbalance already counts.
+    /// Coins a send may use, as Divi Core's `AvailableCoins` gives them to a
+    /// send: confirmed (at least `min_confirmations`, never fewer than one),
+    /// mature, unspent and not locked by `lockunspent`. Our own unconfirmed
+    /// outputs are added only with `-spendzeroconfchange`, which is off by
+    /// default: those of wallet transactions whose inputs are all ours
+    /// (wallet.cpp:1848, AvailableUtxoCollector.cpp:33-43,
+    /// AvailableUtxoCalculator.cpp:84-85). The send's coin selection orders them.
     pub fn get_send_candidates(
         &self,
         current_height: u32,
         min_confirmations: u32,
     ) -> Vec<WalletUtxo> {
-        let mut confirmed = self.get_spendable_utxos(current_height, min_confirmations.max(1));
-        confirmed.sort_by_key(|u| std::cmp::Reverse(u.value));
-        if min_confirmations <= 1 {
-            let mut change: Vec<_> = self
-                .get_spendable_utxos(current_height, 0)
-                .into_iter()
-                .filter(|u| u.confirmations(current_height) == 0)
-                .collect();
-            change.sort_by_key(|u| std::cmp::Reverse(u.value));
-            confirmed.extend(change);
-        }
-        confirmed
-    }
-
-    /// Get total balance: Core's GetBalance, i.e. trusted coins only
-    /// (confirmed, plus our own unconfirmed change), mature and not watch-only
-    pub fn get_balance(&self) -> Amount {
-        let height = self.last_scan_height();
-        self.balance_utxos()
+        let zero_conf = self
+            .spend_zero_conf_change
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.get_spendable_utxos(current_height, 0)
             .into_iter()
-            .filter(|(u, source)| source.is_trusted() && self.is_spendable_coin(u, height))
-            .map(|(u, _)| u.value)
-            .fold(Amount::ZERO, |a, b| a + b)
+            .filter(|utxo| {
+                let confirmations = utxo.confirmations(current_height);
+                confirmations >= min_confirmations.max(1) || (zero_conf && confirmations == 0)
+            })
+            .filter(|utxo| !self.is_coin_locked(&utxo.outpoint()))
+            .collect()
     }
 
-    /// Get confirmed balance
-    ///
-    /// Matches Core's getbalance "*" minconf: coins spent by a mempool
+    /// Unspent coins of the given ownership, confirmed or not, with where
+    /// they come from. Coins spent by a wallet transaction in the mempool are
+    /// left out, as Divi Core's IsSpent counts those spends.
+    fn owned_coins(&self, wanted: &[Ownership]) -> Vec<(WalletUtxo, CoinSource)> {
+        self.effective_utxos()
+            .into_iter()
+            .filter(|(u, _)| wanted.contains(&self.ownership(&u.script_pubkey)))
+            .collect()
+    }
+
+    /// Confirmed, mature coins of the given ownership (Divi Core's
+    /// CONFIRMED_AND_MATURE filter)
+    fn confirmed_mature(&self, wanted: &[Ownership], current_height: u32) -> Amount {
+        self.owned_coins(wanted)
+            .into_iter()
+            .filter(|(u, source)| {
+                matches!(source, CoinSource::Block)
+                    && u.height.is_some()
+                    && u.is_mature(current_height, self.coinbase_maturity())
+            })
+            .fold(Amount::ZERO, |a, (u, _)| a + u.value)
+    }
+
+    /// Core's GetBalance (getbalance, getbalance "*"): confirmed, mature
+    /// spendable coins and coins in vaults we own. Unconfirmed coins, our own
+    /// change included, are getunconfirmedbalance's (wallet.cpp:1395-1402,
+    /// FilteredTransactionsCalculator.h:62-78).
+    pub fn get_balance(&self) -> Amount {
+        self.confirmed_mature(
+            &[Ownership::Spendable, Ownership::OwnedVault],
+            self.last_scan_height(),
+        )
+    }
+
+    /// Balance of `getbalance <account> minconf`: coins spent by a mempool
     /// transaction no longer count, our own unconfirmed change counts at any
     /// minconf, and unconfirmed coins from others count only at minconf 0.
     pub fn get_confirmed_balance(&self, current_height: u32, min_confirmations: u32) -> Amount {
-        self.balance_utxos()
+        self.owned_coins(&[Ownership::Spendable, Ownership::OwnedVault])
             .into_iter()
-            .filter(|(utxo, _)| self.is_spendable_coin(utxo, current_height))
+            .filter(|(utxo, _)| utxo.is_mature(current_height, self.coinbase_maturity()))
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.confirmations(current_height) >= min_confirmations,
                 CoinSource::Mempool { trusted } => *trusted || min_confirmations == 0,
@@ -1605,35 +2082,44 @@ impl WalletDb {
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
-    /// Get unconfirmed balance: Core's GetUnconfirmedBalance, i.e. unconfirmed
-    /// coins that are not trusted (incoming from others)
+    /// Core's GetUnconfirmedBalance: unconfirmed spendable coins, our own
+    /// change as well as payments from others (wallet.cpp:1404-1412)
     pub fn get_unconfirmed_balance(&self) -> Amount {
-        self.balance_utxos()
+        self.owned_coins(&[Ownership::Spendable])
             .into_iter()
             .filter(|(utxo, source)| match source {
                 CoinSource::Block => utxo.height.is_none(),
-                CoinSource::Mempool { trusted } => !*trusted,
+                CoinSource::Mempool { .. } => true,
             })
             .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
     }
 
-    /// Get immature balance (coinbase/coinstake not yet mature)
+    /// Core's GetImmatureBalance: confirmed, immature spendable coins. A reward
+    /// paid to a vault we own is in no balance until it matures
+    /// (wallet.cpp:1414-1422).
     pub fn get_immature_balance(&self, current_height: u32, maturity: u32) -> Amount {
-        let immature: Vec<WalletUtxo> = self
-            .utxos
-            .read()
-            .values()
-            .filter(|utxo| {
-                (utxo.is_coinbase || utxo.is_coinstake) && !utxo.is_mature(current_height, maturity)
+        self.owned_coins(&[Ownership::Spendable])
+            .into_iter()
+            .filter(|(utxo, source)| {
+                matches!(source, CoinSource::Block)
+                    && utxo.height.is_some()
+                    && !utxo.is_mature(current_height, maturity)
             })
-            .cloned()
-            .collect();
-        immature
-            .iter()
-            .filter(|u| self.vault_role(&u.script_pubkey) != Some(VaultRole::Managed))
-            .map(|u| u.value)
+            .map(|(u, _)| u.value)
             .fold(Amount::ZERO, |a, b| a + b)
+    }
+
+    /// Core's GetSpendableBalance (getwalletinfo spendable_balance):
+    /// confirmed, mature spendable coins plus unconfirmed spendable outputs of
+    /// transactions that spend only our spendable coins (WalletBalanceCalculator.cpp:73-81)
+    pub fn get_spendable_balance(&self, current_height: u32) -> Amount {
+        let unconfirmed = self
+            .owned_coins(&[Ownership::Spendable])
+            .into_iter()
+            .filter(|(_, source)| matches!(source, CoinSource::Mempool { trusted: true }))
+            .fold(Amount::ZERO, |a, (u, _)| a + u.value);
+        self.confirmed_mature(&[Ownership::Spendable], current_height) + unconfirmed
     }
 
     /// Clear all wallet transactions, UTXOs, and spent tracking
@@ -1671,8 +2157,13 @@ impl WalletDb {
     /// Add a transaction to history
     pub fn add_transaction(&self, tx: WalletTx) {
         debug!("Adding transaction {} to history", tx.txid);
+        let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
+        self.note_first_seen(&txid);
         self.transactions.write().insert(tx.txid, tx);
         self.dirty.write().transactions = true;
+        if confirmed {
+            self.reattach(&txid);
+        }
     }
 
     /// Get transaction history
@@ -1773,6 +2264,11 @@ impl WalletDb {
             return Err(WalletError::InvalidPassphrase);
         }
 
+        // Settle an earlier timed unlock that has run out before anything is
+        // restored: if is_locked first noticed it further down, it would lock
+        // the wallet and strip the keys and HD seed this unlock brings back
+        let was_staking_only = self.is_unlocked_for_staking_only();
+
         // Load encryption metadata from database
         let db = self.db.as_ref().ok_or_else(|| {
             WalletError::Storage("Cannot unlock wallet without database".to_string())
@@ -1784,18 +2280,26 @@ impl WalletDb {
         let mut master = open_master(db, passphrase)?;
 
         // Decrypt everything first so a corrupt wallet is not left half-unlocked
-        let (mnemonic, secrets) = decrypt_records(db, &master)?;
-        let hd_wallet = match &mnemonic {
+        let records = decrypt_records(db, &master)?;
+        let hd_wallet = match &records.mnemonic {
             Some(mnemonic) => {
                 let mnemonic = std::str::from_utf8(mnemonic)
                     .map_err(|_| WalletError::Storage("corrupt encrypted mnemonic".into()))?;
-                let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
-                Some(HdWallet::from_mnemonic(mnemonic, None, chain_mode)?)
+                let passphrase = match &records.mnemonic_passphrase {
+                    Some(bytes) => Some(std::str::from_utf8(bytes).map_err(|_| {
+                        WalletError::Storage("corrupt encrypted passphrase".into())
+                    })?),
+                    None => None,
+                };
+                Some(stored_hd_wallet(db, mnemonic, passphrase)?)
             }
-            None => None,
+            None => match &records.hd_seed {
+                Some(seed) => Some(stored_seed_wallet(db, seed)?),
+                None => None,
+            },
         };
         // A secret stored for another address would sign for the wrong key
-        for (hash, secret) in &secrets {
+        for (hash, secret) in &records.secrets {
             if let Some(entry) = self.keystore.get_key(hash) {
                 if secret.public_key() != entry.public {
                     return Err(WalletError::Storage(format!(
@@ -1808,13 +2312,7 @@ impl WalletDb {
 
         // Wallets from older builds move to Argon2id and authenticated records
         if !master.aead {
-            match migrate_legacy(
-                db,
-                passphrase,
-                &master.key,
-                mnemonic.as_ref().map(|m| m.as_slice()),
-                &secrets,
-            ) {
+            match migrate_legacy(db, passphrase, &master.key, &records) {
                 Ok(()) => {
                     master.aead = true;
                     info!("Wallet encryption upgraded to Argon2id and XChaCha20-Poly1305");
@@ -1828,13 +2326,20 @@ impl WalletDb {
         // Keep the decrypted master key in memory so new keys can be stored encrypted
         *master_slot = Some(master);
         drop(master_slot);
-        drop(mnemonic);
+        let OpenedRecords {
+            mnemonic,
+            mnemonic_passphrase,
+            hd_seed,
+            secrets,
+        } = records;
+        drop((mnemonic, mnemonic_passphrase, hd_seed));
 
         if let Some(hd) = hd_wallet {
             self.keystore.set_hd_wallet(hd);
-            // Wallets encrypted before the ids were stored get them on first unlock
-            if db.load_hd_public_ids()?.is_none() {
-                if let Some(ids) = self.keystore.hd_public_ids() {
+            // Wallets encrypted before the ids were stored, or stored with an
+            // older chain id, get them on unlock
+            if let Some(ids) = self.keystore.hd_public_ids() {
+                if db.load_hd_public_ids()? != Some(ids) {
                     db.store_hd_public_ids(&ids)?;
                 }
             }
@@ -1873,7 +2378,6 @@ impl WalletDb {
         } else {
             None // Unlimited
         };
-        let was_staking_only = self.is_unlocked_for_staking_only();
         *self.unlock.write() = UnlockState {
             until: expiration,
             staking_only,
@@ -2077,6 +2581,29 @@ impl WalletDb {
             );
             batch.delete_cf(db.cf_metadata(), b"mnemonic");
         }
+        if let Some(seed) = self.keystore.hd_seed() {
+            batch.put_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_ENCRYPTED_HD_SEED,
+                master.seal_record(crate::persistence::KEY_ENCRYPTED_HD_SEED, &seed),
+            );
+            batch.delete_cf(db.cf_metadata(), crate::persistence::KEY_HD_SEED);
+        }
+        if let Some(passphrase) = self.keystore.mnemonic_passphrase() {
+            let passphrase = Zeroizing::new(passphrase);
+            batch.put_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_ENCRYPTED_MNEMONIC_PASSPHRASE,
+                master.seal_record(
+                    crate::persistence::KEY_ENCRYPTED_MNEMONIC_PASSPHRASE,
+                    passphrase.as_bytes(),
+                ),
+            );
+            batch.delete_cf(
+                db.cf_metadata(),
+                crate::persistence::KEY_MNEMONIC_PASSPHRASE,
+            );
+        }
         let (receiving, change) = self.keystore.get_indices();
         batch.put_cf(
             db.cf_metadata(),
@@ -2131,19 +2658,16 @@ impl WalletDb {
         } else {
             // An older wallet: every record moves to the new format with the new
             // passphrase, so the old one can open nothing afterwards
-            let (mnemonic, secrets) = decrypt_records(db, &master)?;
-            migrate_legacy(
-                db,
-                new_pass,
-                &master.key,
-                mnemonic.as_ref().map(|m| m.as_slice()),
-                &secrets,
-            )?;
+            let records = decrypt_records(db, &master)?;
+            migrate_legacy(db, new_pass, &master.key, &records)?;
             if let Some(unlocked) = master_slot.as_mut() {
                 unlocked.aead = true;
             }
         }
         drop(master_slot);
+        // The new salt and sealed master key went in as one synced write: a stop
+        // here leaves the wallet opening with the new passphrase
+        stop_point!("passphrase salt written");
 
         info!("Wallet passphrase changed successfully");
         Ok(())
@@ -2188,6 +2712,27 @@ impl WalletDb {
         self.keystore.mnemonic()
     }
 
+    /// The seed of a wallet made from a seed (no words); None while locked
+    pub fn hd_seed(&self) -> Option<Zeroizing<Vec<u8>>> {
+        if *self.locked.read() {
+            return None;
+        }
+        self.keystore.hd_seed()
+    }
+
+    /// Path of the account the wallet's HD keys derive from, m/44'/coin'/0'
+    pub fn hd_account_path(&self) -> Option<String> {
+        self.keystore.hd_account_path()
+    }
+
+    /// BIP39 passphrase of the HD seed (if one was given and unlocked)
+    pub fn mnemonic_passphrase(&self) -> Option<String> {
+        if *self.locked.read() {
+            return None;
+        }
+        self.keystore.mnemonic_passphrase()
+    }
+
     /// Get key entry by address
     pub fn get_key_by_address(&self, address: &Address) -> Option<crate::keystore::KeyEntry> {
         self.keystore.get_key_by_address(address)
@@ -2201,6 +2746,11 @@ impl WalletDb {
     /// Get the current keypool size (number of pre-generated unused keys)
     pub fn keypool_size(&self) -> u32 {
         self.keystore.keypool_size()
+    }
+
+    /// How many keys of each chain the keypool is filled to (-keypool)
+    pub fn keypool_target(&self) -> u32 {
+        self.keystore.keypool_target()
     }
 
     /// Get the timestamp of the oldest key in the keypool
@@ -2278,7 +2828,9 @@ impl WalletDb {
                 if !self.spent.read().contains(&utxo.outpoint()) {
                     self.add_utxo(utxo);
                 }
-                self.mark_address_used(&address);
+                if !address.is_empty() {
+                    self.mark_address_used(&address);
+                }
 
                 trace!("Received {} to {} in tx {}", output.value, address, txid);
             }
@@ -2350,15 +2902,16 @@ impl WalletDb {
                 None
             };
 
-            // Use block time for accurate transaction timestamps.
-            // During IBD scan, this preserves the actual block time rather than
-            // giving all historical transactions the same scan-time timestamp.
-            let timestamp = block_time.map(|t| t as u64).unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            });
+            // The block time, so a scan of old blocks keeps each transaction's
+            // own time, but never later than now: Divi Core's time of a wallet
+            // transaction is at most when the wallet received it (nTimeSmart,
+            // wallet.cpp:1052-1086), so one in a block dated ahead of the clock
+            // counts from its arrival
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let timestamp = block_time.map_or(now, |t| u64::from(t).min(now));
 
             let wallet_tx = WalletTx {
                 txid,
@@ -2373,6 +2926,7 @@ impl WalletDb {
 
             self.add_transaction(wallet_tx);
             debug!("Wallet tx {} {} {} sats", category, txid, net_amount.abs());
+            self.tx_changed(&txid);
         }
 
         if block_hash.is_some() {
@@ -2380,11 +2934,21 @@ impl WalletDb {
         }
     }
 
-    /// Label for an output we own: its P2PKH address, or "vault:<manager>"
+    /// Label for an output we own: its address as Divi Core's
+    /// ExtractDestination gives it (a P2PK output shows its key's P2PKH
+    /// address, a bare multisig none), or "vault:<manager>"
     fn output_address(&self, script_pubkey: &Script) -> String {
         if let Some(hash_bytes) = script_pubkey.extract_p2pkh_hash() {
             let hash = divi_primitives::hash::Hash160::from_bytes(hash_bytes);
             Address::from_pubkey_hash(hash, self.network).to_string()
+        } else if let Some(hash_bytes) = script_pubkey.extract_p2sh_hash() {
+            Address::p2sh(Hash160::from_bytes(hash_bytes), self.network).to_string()
+        } else if divi_script::standard::is_p2pk(script_pubkey.as_bytes()) {
+            let pubkey_len = script_pubkey.as_bytes()[0] as usize;
+            let hash = divi_crypto::hash160(&script_pubkey.as_bytes()[1..1 + pubkey_len]);
+            Address::from_pubkey_hash(hash, self.network).to_string()
+        } else if divi_script::standard::is_multisig(script_pubkey.as_bytes()).is_some() {
+            String::new()
         } else if let Some(vault) = divi_script::StakingVaultScript::from_script(script_pubkey) {
             // For vault UTXOs, use vault: prefix with manager address
             let manager_hash = Hash160::from_bytes(vault.vault_pubkey_hash);
@@ -2404,7 +2968,30 @@ impl WalletDb {
     /// made it answers; the confirmed state is left to the block scan, which
     /// records the transaction once it confirms.
     pub fn add_mempool_tx(&self, tx: &divi_primitives::transaction::Transaction) -> bool {
-        self.track_mempool_tx(tx, None)
+        let added = self.track_mempool_tx(tx, None);
+        if added {
+            self.tx_changed(&tx.txid());
+        }
+        added
+    }
+
+    /// Tell the listener about every later change of a wallet transaction
+    pub fn set_tx_listener(&self, listener: TxListener) {
+        *self.tx_listener.write() = Some(listener);
+    }
+
+    /// A send was signed and is handed to the node: Divi Core's
+    /// CommitTransaction adds it to the wallet before the mempool sees it
+    /// (wallet.cpp:1878), one notification of its own
+    pub fn note_committed(&self, txid: &Hash256) {
+        self.tx_changed(txid);
+    }
+
+    fn tx_changed(&self, txid: &Hash256) {
+        let listener = self.tx_listener.read().clone();
+        if let Some(listener) = listener {
+            listener(txid);
+        }
     }
 
     /// Add a transaction to the mempool overlay. `restored_time` is set when it
@@ -2449,6 +3036,7 @@ impl WalletDb {
         let mut inputs = Vec::new();
         let mut spends = Vec::new();
         let mut sent = Amount::ZERO;
+        let mut spends_vault = false;
         {
             let utxos = self.utxos.read();
             for input in &tx.vin {
@@ -2457,17 +3045,15 @@ impl WalletDb {
                 }
                 let outpoint = OutPoint::new(input.prevout.txid, input.prevout.vout);
                 inputs.push(outpoint);
-                let value = utxos.get(&outpoint).map(|u| u.value).or_else(|| {
-                    overlay.get(&outpoint.txid).and_then(|e| {
-                        e.outputs
-                            .iter()
-                            .find(|u| u.vout == outpoint.vout)
-                            .map(|u| u.value)
-                    })
+                let coin = utxos.get(&outpoint).cloned().or_else(|| {
+                    overlay
+                        .get(&outpoint.txid)
+                        .and_then(|e| e.outputs.iter().find(|u| u.vout == outpoint.vout).cloned())
                 });
-                if let Some(v) = value {
+                if let Some(coin) = coin {
                     spends.push(outpoint);
-                    sent += v;
+                    sent += coin.value;
+                    spends_vault |= divi_script::is_staking_vault_script(&coin.script_pubkey);
                 }
             }
         }
@@ -2505,7 +3091,10 @@ impl WalletDb {
             confirmations: 0,
         };
 
-        let trusted = spends.len() == inputs.len();
+        // Core trusts an unconfirmed transaction whose every input is a
+        // spendable coin of ours (AvailableUtxoCalculator.cpp:33-43); a vault
+        // coin is not spendable in that sense
+        let trusted = spends.len() == inputs.len() && !spends_vault;
         info!(
             "Mempool wallet tx {} {} {} sats ({})",
             category,
@@ -2536,7 +3125,58 @@ impl WalletDb {
                 }
             }
         }
+        self.note_first_seen(&txid);
+        self.reattach(&txid);
         true
+    }
+
+    /// Give `txid` the next position if the wallet has not seen it before
+    fn note_first_seen(&self, txid: &Hash256) {
+        let position = {
+            let mut order = self.tx_order.write();
+            if order.0.contains_key(txid) {
+                return;
+            }
+            let position = order.1;
+            order.0.insert(*txid, position);
+            order.1 += 1;
+            position
+        };
+        if let Some(db) = &self.db {
+            if let Err(e) = db.store_tx_order(txid, position) {
+                tracing::warn!("Failed to store the position of {}: {}", txid, e);
+            }
+        }
+    }
+
+    /// The position at which the wallet first saw `txid` (None for a
+    /// transaction recorded before positions were kept)
+    pub fn order_position(&self, txid: &Hash256) -> Option<u64> {
+        self.tx_order.read().0.get(txid).copied()
+    }
+
+    /// Keep `notes` with a transaction the wallet sent (Divi Core's mapValue;
+    /// comment, to, FromAccount). Stored at once, synced.
+    pub fn set_tx_notes(&self, txid: &Hash256, notes: BTreeMap<String, String>) {
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(db) = &self.db {
+            match serde_json::to_vec(&notes) {
+                Ok(raw) => {
+                    if let Err(e) = db.store_tx_notes(txid, &raw) {
+                        tracing::error!("Failed to store the notes of {}: {}", txid, e);
+                    }
+                }
+                Err(e) => tracing::error!("Failed to encode the notes of {}: {}", txid, e),
+            }
+        }
+        self.tx_notes.write().insert(*txid, notes);
+    }
+
+    /// The notes kept with `txid`, in key order
+    pub fn tx_notes(&self, txid: &Hash256) -> BTreeMap<String, String> {
+        self.tx_notes.read().get(txid).cloned().unwrap_or_default()
     }
 
     /// Delete stored unconfirmed transactions that left the overlay
@@ -2555,11 +3195,13 @@ impl WalletDb {
     /// The wallet mirrors the mempool, so only this entry is dropped; any
     /// child still in the mempool gets its own removal notice.
     pub fn remove_mempool_tx(&self, txid: &Hash256) -> bool {
-        let removed = self.mempool_txs.write().remove(txid).is_some();
-        if removed {
+        let removed = self.mempool_txs.write().remove(txid);
+        if let Some(entry) = &removed {
             self.forget_stored_unconfirmed(&[*txid]);
+            // Evicted unconfirmed: kept, at depth -1, as Divi Core keeps it
+            self.detach(*txid, entry.record.timestamp, Some(entry.tx.clone()));
         }
-        removed
+        removed.is_some()
     }
 
     /// Number of wallet transactions currently tracked in the mempool
@@ -2592,9 +3234,11 @@ impl WalletDb {
             .filter(|(_, e)| e.inputs.iter().any(|op| confirmed_inputs.contains(op)))
             .map(|(id, _)| *id)
             .collect();
+        let mut conflicted = Vec::new();
         while let Some(id) = doomed.pop() {
-            if overlay.remove(&id).is_some() {
+            if let Some(entry) = overlay.remove(&id) {
                 forgotten.push(id);
+                conflicted.push((id, entry.record.timestamp, entry.tx));
                 info!("Dropped mempool wallet tx {} (conflicts with {})", id, txid);
                 doomed.extend(
                     overlay
@@ -2606,6 +3250,9 @@ impl WalletDb {
         }
         drop(overlay);
         self.forget_stored_unconfirmed(&forgotten);
+        for (id, timestamp, tx) in conflicted {
+            self.detach(id, timestamp, Some(tx));
+        }
     }
 
     /// Update confirmation counts for all transactions
@@ -2653,6 +3300,7 @@ impl WalletDb {
             gone.len()
         };
 
+        let mut disconnected = Vec::new();
         let removed_txs = {
             let mut txs = self.transactions.write();
             let gone: Vec<Hash256> = txs
@@ -2661,7 +3309,9 @@ impl WalletDb {
                 .map(|(txid, _)| *txid)
                 .collect();
             for txid in &gone {
-                txs.remove(txid);
+                if let Some(record) = txs.remove(txid) {
+                    disconnected.push((*txid, record.timestamp));
+                }
                 pending.transactions.insert(*txid);
             }
             gone.len()
@@ -2712,10 +3362,19 @@ impl WalletDb {
             start, stop, removed_utxos, removed_txs, restored
         );
 
-        let mut dirty = self.dirty.write();
-        dirty.utxos = true;
-        dirty.transactions = true;
-        dirty.spent = true;
+        {
+            let mut dirty = self.dirty.write();
+            dirty.utxos = true;
+            dirty.transactions = true;
+            dirty.spent = true;
+        }
+        drop(pending);
+        // Kept, at depth -1, until a block or the mempool has them again;
+        // Divi Core updates each one as its block is disconnected
+        for (txid, timestamp) in disconnected {
+            self.detach(txid, timestamp, None);
+            self.tx_changed(&txid);
+        }
     }
 
     /// Scan the active chain's blocks above the last scanned height, in
@@ -2727,8 +3386,11 @@ impl WalletDb {
     /// block is never skipped (e.g. the middle blocks of a reorg) and a spend
     /// is never scanned before the coin it spends. If the blocks last scanned
     /// are no longer in the active chain, what they recorded is rolled back
-    /// first. Returns the heights whose block could not be read; they are
-    /// skipped.
+    /// first. The same holds when the chain is lower than the wallet's scan
+    /// height (a rebuilt or reindexed chain): heights above the tip are rolled
+    /// back and scanned again as the chain grows, as Divi Core restarts its
+    /// wallet scan from the fork with the active chain. Returns the heights
+    /// whose block could not be read; they are skipped.
     pub fn sync_to_tip<H, F>(&self, tip_height: u32, hash_at: H, mut get_block: F) -> Vec<u32>
     where
         H: Fn(u32) -> Option<Hash256>,
@@ -2737,7 +3399,11 @@ impl WalletDb {
         let _scan = self.scan_lock.lock();
 
         let last = self.last_scan_height();
-        if let Some(fork) = self.find_fork(last, &hash_at) {
+        let top = last.min(tip_height);
+        let fork = self
+            .find_fork(top, &hash_at)
+            .or_else(|| (top < last).then_some(top));
+        if let Some(fork) = fork {
             info!(
                 "Wallet scanned blocks above {} that left the active chain; rolling back",
                 fork
@@ -2808,6 +3474,27 @@ impl WalletDb {
             self.rollback_heights(start, stop);
         }
 
+        // A coin marked spent without a recorded spending block (dropped as
+        // missing from the chain, or evicted by the staker) hides its output
+        // from every scan. A scan up to the tip sees the coin's spend if
+        // there is one, so such marks are lifted for it; those whose output
+        // the scan does not meet are put back afterwards.
+        let lifted: Vec<OutPoint> = if !full && stop >= tip_height {
+            let data = self.spent_utxo_data.read();
+            let mut spent = self.spent.write();
+            let lifted: Vec<OutPoint> = spent
+                .iter()
+                .filter(|op| !data.contains_key(op))
+                .copied()
+                .collect();
+            for op in &lifted {
+                spent.remove(op);
+            }
+            lifted
+        } else {
+            Vec::new()
+        };
+
         let mut scanned = 0u32;
         let mut unreadable = None;
         for height in start..=stop {
@@ -2820,6 +3507,35 @@ impl WalletDb {
                     unreadable = Some(height);
                     break;
                 }
+            }
+        }
+
+        if !lifted.is_empty() {
+            // Same lock order as rollback_heights
+            let mut pending = self.pending_deletes.write();
+            let data = self.spent_utxo_data.read();
+            let mut spent = self.spent.write();
+            let utxos = self.utxos.read();
+            let mut found = 0usize;
+            for op in lifted {
+                if utxos.contains_key(&op) || data.contains_key(&op) {
+                    // Seen again: held now, or spent at a known height
+                    if !spent.contains(&op) {
+                        pending.spent.insert(op);
+                    }
+                    found += 1;
+                } else {
+                    spent.insert(op);
+                }
+            }
+            if found > 0 {
+                info!(
+                    "Rescan found {} coin(s) marked spent without a spending block",
+                    found
+                );
+                let mut dirty = self.dirty.write();
+                dirty.utxos = true;
+                dirty.spent = true;
             }
         }
 
@@ -2886,6 +3602,26 @@ impl WalletDb {
         db.write_batch_sync(batch)
     }
 
+    /// The address book: every address with its name (Divi Core's
+    /// mapAddressBook; addresses the wallet handed out or was told about)
+    pub fn address_book(&self) -> Vec<(String, String)> {
+        let mut book: Vec<(String, String)> = self
+            .address_accounts
+            .read()
+            .iter()
+            .map(|(a, n)| (a.clone(), n.clone()))
+            .collect();
+        book.sort();
+        book
+    }
+
+    /// Whether `address` has an address-book entry (its name may be "")
+    pub fn in_address_book(&self, address: &Address) -> bool {
+        self.address_accounts
+            .read()
+            .contains_key(&address.to_string())
+    }
+
     pub fn get_account(&self, address: &Address) -> String {
         let addr_str = address.to_string();
         self.address_accounts
@@ -2924,6 +3660,46 @@ impl WalletDb {
 
     pub fn get_script(&self, script_hash: &Hash160) -> Option<Script> {
         self.scripts.read().get(script_hash).cloned()
+    }
+
+    /// Set the relay fee rate the wallet's sends pay (-minrelaytxfee)
+    pub fn set_relay_fee_per_kb(&self, per_kb: i64) {
+        self.relay_fee_per_kb
+            .store(per_kb, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the highest fee the wallet's sends may pay (-maxtxfee)
+    pub fn set_max_tx_fee(&self, sat: i64) {
+        self.max_tx_fee
+            .store(sat, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fee rate and limit of the wallet's sends
+    pub fn fee_policy(&self) -> crate::send::FeePolicy {
+        crate::send::FeePolicy {
+            per_kb: self
+                .relay_fee_per_kb
+                .load(std::sync::atomic::Ordering::Relaxed),
+            max_fee: Amount::from_sat(self.max_tx_fee.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+
+    /// Turn Divi Core's -vault on or off
+    pub fn set_vault_mode(&self, on: bool) {
+        self.vault_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Let sends use unconfirmed outputs of our own transactions (Divi
+    /// Core's -spendzeroconfchange, off by default)
+    pub fn set_spend_zero_conf_change(&self, on: bool) {
+        self.spend_zero_conf_change
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether vaults may be added or removed (Divi Core's -vault)
+    pub fn vault_mode(&self) -> bool {
+        self.vault_mode.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Store vault metadata
@@ -3070,14 +3846,10 @@ impl WalletDb {
             .collect()
     }
 
-    /// Core's GetVaultedBalance: trusted coins in vaults we own. A vault we
-    /// only manage is not vaulted for us (Core counts it as stakable).
+    /// Core's GetVaultedBalance: confirmed, mature coins in vaults we own. A
+    /// vault we only manage is not vaulted for us (Core counts it as stakable).
     pub fn get_vaulted_balance(&self) -> Amount {
-        self.effective_utxos()
-            .into_iter()
-            .filter(|(_, source)| source.is_trusted())
-            .filter(|(u, _)| self.vault_role(&u.script_pubkey) == Some(VaultRole::Owned))
-            .fold(Amount::ZERO, |a, (u, _)| a + u.value)
+        self.confirmed_mature(&[Ownership::OwnedVault], self.last_scan_height())
     }
 
     /// Vault outputs we own (owner key held), confirmed and mature, not spent
@@ -3101,8 +3873,9 @@ impl WalletDb {
 
     /// Get vault UTXOs suitable for staking, with their parsed vault script
     ///
-    /// Returns (utxo, vault_script_parsed) pairs where the vault is registered
-    /// and we have the manager key (an owner-only wallet cannot stake it).
+    /// Returns (utxo, vault_script_parsed) pairs where the vault is registered,
+    /// we have the manager key and not the owner key: a vault we own is not
+    /// staked, as in Divi Core.
     pub fn get_stakeable_vault_utxos(
         &self,
         current_height: u32,
@@ -3139,13 +3912,69 @@ impl WalletDb {
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .filter(|(_, vault)| {
-                self.keystore
-                    .get_key(&Hash160::from_bytes(vault.vault_pubkey_hash))
-                    .is_some_and(|entry| !entry.is_watch_only)
-            })
+            // Divi Core stakes managed vault coins only: a vault whose owner
+            // key is in the wallet is owned, even when the manager key is too
+            // (AvailableUtxoCalculator.cpp:28-31)
+            .filter(|(utxo, _)| self.vault_role(&utxo.script_pubkey) == Some(VaultRole::Managed))
             .collect()
     }
+}
+
+/// The wallet's HD seed from its mnemonic, with the stored chain mode and coin
+/// type (wallets made before the coin type was stored keep the chain mode's)
+fn stored_hd_wallet(
+    db: &WalletDatabase,
+    mnemonic: &str,
+    passphrase: Option<&str>,
+) -> Result<HdWallet, WalletError> {
+    let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
+    let hd_wallet = HdWallet::from_mnemonic(mnemonic, passphrase, chain_mode)?;
+    Ok(match db.load_hd_coin_type()? {
+        Some(coin_type) => hd_wallet.with_coin_type(coin_type),
+        None => hd_wallet,
+    })
+}
+
+/// The HD wallet of a wallet made from a seed, with the stored chain mode and
+/// coin type
+fn stored_seed_wallet(db: &WalletDatabase, seed: &[u8]) -> Result<HdWallet, WalletError> {
+    let chain_mode = db.load_chain_mode()?.unwrap_or(ChainMode::Divi);
+    let hd_wallet = HdWallet::from_seed(seed, chain_mode)?;
+    Ok(match db.load_hd_coin_type()? {
+        Some(coin_type) => hd_wallet.with_coin_type(coin_type),
+        None => hd_wallet,
+    })
+}
+
+/// A new wallet derives with Divi Core's coin type for its network
+fn with_core_coin_type(wallet: HdWallet, network: Network) -> HdWallet {
+    let coin_type = crate::hd::core_coin_type(wallet.chain_mode(), network == Network::Mainnet);
+    wallet.with_coin_type(coin_type)
+}
+
+/// File `backup_to` puts in every backup it writes: only a folder holding it
+/// may be replaced by a later backup (an earlier backup, never another database)
+pub const BACKUP_MARKER: &str = "IRONDIVI_WALLET_BACKUP";
+
+fn write_backup_marker(path: &Path) -> Result<(), WalletError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    opts.open(path)
+        .and_then(|mut f| f.write_all(b"irondivid wallet backup\n"))
+        .map_err(|e| WalletError::Storage(format!("Failed to mark backup: {e}")))
+}
+
+/// A 20-byte hash taken from a script solution
+fn hash160_from(bytes: &[u8]) -> Hash160 {
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&bytes[..20]);
+    Hash160::from_bytes(hash)
 }
 
 /// The database key of a private key's encrypted record: `hash160 || 0x01`
@@ -3175,22 +4004,44 @@ fn open_master(db: &WalletDatabase, passphrase: &str) -> Result<MasterKey, Walle
     }
 }
 
-/// Decrypt the mnemonic and every private key stored encrypted
-#[allow(clippy::type_complexity)]
-fn decrypt_records(
-    db: &WalletDatabase,
+/// Every record an encrypted wallet keeps under its master key, opened
+struct OpenedRecords {
+    mnemonic: Option<Zeroizing<Vec<u8>>>,
+    /// BIP39 passphrase of the mnemonic, when one was given
+    mnemonic_passphrase: Option<Zeroizing<Vec<u8>>>,
+    /// Seed of a wallet made from a seed, no words (Divi Core's -hdseed)
+    hd_seed: Option<Zeroizing<Vec<u8>>>,
+    secrets: Vec<(Hash160, divi_crypto::keys::SecretKey)>,
+}
+
+/// Open a metadata record sealed under its own key name, if it is stored
+fn open_metadata_record(
     master: &MasterKey,
-) -> Result<
-    (
-        Option<Zeroizing<Vec<u8>>>,
-        Vec<(Hash160, divi_crypto::keys::SecretKey)>,
-    ),
-    WalletError,
-> {
-    let mnemonic = match db.load_encrypted_mnemonic()? {
-        Some(blob) => Some(master.open_record(KEY_ENCRYPTED_MNEMONIC, &blob)?),
-        None => None,
-    };
+    record_key: &[u8],
+    blob: Option<Vec<u8>>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, WalletError> {
+    match blob {
+        Some(blob) => Ok(Some(master.open_record(record_key, &blob)?)),
+        None => Ok(None),
+    }
+}
+
+/// Decrypt the mnemonic, its passphrase, the HD seed and every private key
+/// stored encrypted
+fn decrypt_records(db: &WalletDatabase, master: &MasterKey) -> Result<OpenedRecords, WalletError> {
+    use crate::persistence::{KEY_ENCRYPTED_HD_SEED, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE};
+    let mnemonic = open_metadata_record(
+        master,
+        KEY_ENCRYPTED_MNEMONIC,
+        db.load_encrypted_mnemonic()?,
+    )?;
+    let mnemonic_passphrase = open_metadata_record(
+        master,
+        KEY_ENCRYPTED_MNEMONIC_PASSPHRASE,
+        db.load_encrypted_mnemonic_passphrase()?,
+    )?;
+    let hd_seed =
+        open_metadata_record(master, KEY_ENCRYPTED_HD_SEED, db.load_encrypted_hd_seed()?)?;
     let mut secrets = Vec::new();
     for (hash, blob) in db.load_encrypted_secrets()? {
         let bytes = master.open_record(&secret_record_key(&hash), &blob)?;
@@ -3202,7 +4053,12 @@ fn decrypt_records(
             .map_err(|e| WalletError::Storage(format!("corrupt private key: {}", e)))?;
         secrets.push((hash, secret));
     }
-    Ok((mnemonic, secrets))
+    Ok(OpenedRecords {
+        mnemonic,
+        mnemonic_passphrase,
+        hd_seed,
+        secrets,
+    })
 }
 
 /// Add the master key, sealed under `passphrase` with a fresh salt at the
@@ -3231,23 +4087,33 @@ fn migrate_legacy(
     db: &WalletDatabase,
     passphrase: &str,
     master_key: &[u8],
-    mnemonic: Option<&[u8]>,
-    secrets: &[(Hash160, divi_crypto::keys::SecretKey)],
+    records: &OpenedRecords,
 ) -> Result<(), WalletError> {
+    use crate::persistence::{KEY_ENCRYPTED_HD_SEED, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE};
     let master = MasterKey {
         key: Zeroizing::new(master_key.to_vec()),
         aead: true,
     };
     let mut batch = db.create_batch();
     put_sealed_master(&mut batch, db, master_key, passphrase)?;
-    if let Some(mnemonic) = mnemonic {
-        batch.put_cf(
-            db.cf_metadata(),
-            KEY_ENCRYPTED_MNEMONIC,
-            master.seal_record(KEY_ENCRYPTED_MNEMONIC, mnemonic),
-        );
+    let metadata = [
+        (KEY_ENCRYPTED_MNEMONIC, &records.mnemonic),
+        (
+            KEY_ENCRYPTED_MNEMONIC_PASSPHRASE,
+            &records.mnemonic_passphrase,
+        ),
+        (KEY_ENCRYPTED_HD_SEED, &records.hd_seed),
+    ];
+    for (record_key, plain) in metadata {
+        if let Some(plain) = plain {
+            batch.put_cf(
+                db.cf_metadata(),
+                record_key,
+                master.seal_record(record_key, plain),
+            );
+        }
     }
-    for (hash, secret) in secrets {
+    for (hash, secret) in &records.secrets {
         let record_key = secret_record_key(hash);
         let blob = master.seal_record(&record_key, secret.as_bytes());
         batch.put_cf(db.cf_keys(), &record_key, blob);
@@ -3291,6 +4157,57 @@ mod tests {
         WalletDb::with_hd_wallet(Network::Mainnet, wallet)
     }
 
+    /// Divi Core's time of a wallet transaction is at most when the wallet
+    /// received it (nTimeSmart, wallet.cpp:1052-1086): a block dated ahead of
+    /// the clock does not date its transactions in the future; an older block
+    /// keeps its own time
+    #[test]
+    fn transaction_time_is_never_ahead_of_its_arrival() {
+        use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        let wallet = create_test_wallet();
+        let ours = wallet.new_receiving_address().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let paying = |tag: u8| Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    txid: Hash256::from_bytes([tag; 32]),
+                    vout: 0,
+                },
+                script_sig: Script::default(),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: Script::new_p2pkh(ours.hash.as_bytes()),
+            }],
+            lock_time: 0,
+        };
+        let ahead = paying(7);
+        wallet.scan_transaction(
+            &ahead,
+            Some(Hash256::from_bytes([8; 32])),
+            Some(10),
+            Some((now + 3600) as u32),
+        );
+        let time = wallet.get_transaction(&ahead.txid()).unwrap().timestamp;
+        assert!(time <= now + 1, "{time} is ahead of {now}");
+        let old = paying(9);
+        wallet.scan_transaction(
+            &old,
+            Some(Hash256::from_bytes([10; 32])),
+            Some(11),
+            Some(1_000_000),
+        );
+        assert_eq!(
+            wallet.get_transaction(&old.txid()).unwrap().timestamp,
+            1_000_000
+        );
+    }
+
     #[test]
     fn test_wallet_creation() {
         let wallet = WalletDb::new(Network::Mainnet);
@@ -3309,13 +4226,14 @@ mod tests {
         let wallet = create_test_wallet();
         let addr = wallet.new_receiving_address().unwrap();
 
-        let utxo = WalletUtxo::new(
+        let mut utxo = WalletUtxo::new(
             Hash256::from_bytes([1u8; 32]),
             0,
             Amount::from_sat(100_000_000),
             Script::new_p2pkh(addr.hash.as_bytes()),
             addr.to_string(),
         );
+        utxo.height = Some(1);
 
         wallet.add_utxo(utxo.clone());
 
@@ -3328,7 +4246,7 @@ mod tests {
         let wallet = create_test_wallet();
         let addr = wallet.new_receiving_address().unwrap();
 
-        let utxo = WalletUtxo::new(
+        let mut utxo = WalletUtxo::new(
             Hash256::from_bytes([1u8; 32]),
             0,
             Amount::from_sat(100_000_000),
@@ -3336,6 +4254,7 @@ mod tests {
             addr.to_string(),
         );
         let outpoint = utxo.outpoint();
+        utxo.height = Some(1);
 
         wallet.add_utxo(utxo);
         assert_eq!(wallet.get_balance(), Amount::from_sat(100_000_000));
@@ -4001,13 +4920,21 @@ mod tests {
             assert_eq!(spendable[0].txid, tx.txid());
             assert!(wallet.get_spendable_utxos(100, 1).is_empty());
 
-            // Core: change is trusted, so it is in getbalance, not getunconfirmedbalance.
-            assert_eq!(wallet.get_balance().as_sat(), 70 * COIN - 1_000_000);
+            // Core: getbalance counts confirmed coins only; the change is in
+            // getunconfirmedbalance and spendable_balance until it confirms.
+            assert_eq!(wallet.get_balance().as_sat(), 0);
             assert_eq!(
                 wallet.get_confirmed_balance(100, 1).as_sat(),
                 70 * COIN - 1_000_000
             );
-            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), 0);
+            assert_eq!(
+                wallet.get_unconfirmed_balance().as_sat(),
+                70 * COIN - 1_000_000
+            );
+            assert_eq!(
+                wallet.get_spendable_balance(100).as_sat(),
+                70 * COIN - 1_000_000
+            );
 
             let rec = wallet.get_transaction(&tx.txid()).unwrap();
             assert_eq!(rec.category, "send");
@@ -4204,6 +5131,8 @@ mod tests {
 
     /// Confirmed-state accounting: blocks scanned twice, reorgs, restarts
     mod chain_accounting {
+        mod crash;
+
         use super::*;
         use divi_primitives::block::Block;
         use divi_primitives::transaction::{OutPoint as TxOutPoint, Transaction, TxIn, TxOut};
@@ -4331,31 +5260,43 @@ mod tests {
         }
 
         #[test]
-        fn send_candidates_take_confirmed_coins_before_own_change() {
+        fn send_candidates_are_confirmed_unlocked_coins() {
             let wallet = create_test_wallet();
             let (fund, send) = fixture(&wallet);
             let small = tx(
                 &[(Hash256::from_bytes([7u8; 32]), 0)],
                 vec![(COIN, mine(&wallet.new_receiving_address().unwrap()))],
             );
-            scan(&wallet, 1, &[fund, small.clone()]);
+            let other = tx(
+                &[(Hash256::from_bytes([8u8; 32]), 0)],
+                vec![(2 * COIN, mine(&wallet.new_receiving_address().unwrap()))],
+            );
+            scan(&wallet, 1, &[fund, small.clone(), other.clone()]);
             assert!(wallet.add_mempool_tx(&send));
 
-            let order: Vec<OutPoint> = wallet
-                .get_send_candidates(1, 1)
-                .iter()
-                .map(|u| u.outpoint())
-                .collect();
-            assert_eq!(
-                order,
-                vec![
-                    OutPoint::new(small.txid(), 0),
-                    OutPoint::new(send.txid(), 1)
-                ]
-            );
-            // An explicit higher minconf does not fall back to 0-conf change
+            let coins = |wallet: &WalletDb, minconf| -> HashSet<OutPoint> {
+                wallet
+                    .get_send_candidates(1, minconf)
+                    .iter()
+                    .map(|u| u.outpoint())
+                    .collect()
+            };
+            // Our unconfirmed change is not spent (Divi Core without
+            // -spendzeroconfchange), nor counted by getbalance
+            let expected: HashSet<OutPoint> = [
+                OutPoint::new(small.txid(), 0),
+                OutPoint::new(other.txid(), 0),
+            ]
+            .into();
+            assert_eq!(coins(&wallet, 1), expected);
+            assert_eq!(coins(&wallet, 0), expected);
+            assert_eq!(wallet.get_balance().as_sat(), 3 * COIN);
+            assert_eq!(wallet.get_unconfirmed_balance().as_sat(), CHANGE);
+            // A locked coin is not spent
+            wallet.set_coin_locked(OutPoint::new(other.txid(), 0), true);
+            assert_eq!(coins(&wallet, 1), [OutPoint::new(small.txid(), 0)].into());
+            // An explicit higher minconf
             assert!(wallet.get_send_candidates(1, 2).is_empty());
-            assert_eq!(wallet.get_balance().as_sat(), COIN + CHANGE);
         }
 
         #[test]
@@ -4369,7 +5310,10 @@ mod tests {
                 vec![(5 * COIN, Script::new_p2pkh(watched.hash.as_bytes()))],
             );
             scan(&wallet, 1, std::slice::from_ref(&pay));
-            assert_eq!(wallet.get_utxos().len(), 1);
+            // Divi Core records no coin paid only to a watched script
+            // (wallet.cpp:1292-1311)
+            assert!(wallet.get_utxos().is_empty());
+            assert!(wallet.get_transactions(None).is_empty());
             assert_eq!(wallet.get_balance().as_sat(), 0);
             assert_eq!(wallet.get_confirmed_balance(1, 1).as_sat(), 0);
             assert!(wallet.get_send_candidates(1, 1).is_empty());
@@ -4395,6 +5339,35 @@ mod tests {
             );
             assert_eq!(wallet.get_balance().as_sat(), 100 * COIN);
             assert!(wallet.get_transaction(&send.txid()).is_none());
+        }
+
+        /// -walletnotify's points, Divi Core's addToWallet (wallet.cpp:1283):
+        /// a send committed, then seen in the mempool, its block, the block
+        /// disconnected, and the mempool again
+        #[test]
+        fn tx_listener_hears_each_wallet_change() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = std::sync::Arc::clone(&heard);
+            wallet.set_tx_listener(std::sync::Arc::new(move |txid: &Hash256| {
+                into.lock().unwrap().push(*txid)
+            }));
+            let count =
+                |txid: Hash256| heard.lock().unwrap().iter().filter(|t| **t == txid).count();
+
+            scan(&wallet, 1, std::slice::from_ref(&fund));
+            assert_eq!(count(fund.txid()), 1, "received in a block");
+            wallet.note_committed(&send.txid());
+            assert!(wallet.add_mempool_tx(&send));
+            assert_eq!(count(send.txid()), 2, "committed, then in the mempool");
+            scan(&wallet, 2, std::slice::from_ref(&send));
+            assert_eq!(count(send.txid()), 3, "in a block");
+            wallet.handle_reorg(1);
+            assert_eq!(count(send.txid()), 4, "its block disconnected");
+            assert!(wallet.add_mempool_tx(&send));
+            assert_eq!(count(send.txid()), 5, "back in the mempool");
+            assert_eq!(count(fund.txid()), 1, "below the fork, untouched");
         }
 
         #[test]
@@ -4594,6 +5567,153 @@ mod tests {
             assert_eq!(missing, vec![2]);
             assert_eq!(wallet.last_scan_height(), 3);
         }
+
+        #[test]
+        fn chain_rebuild_restores_coins_after_sync() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("rebuild.dat");
+            let (fund, send);
+            let chain;
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                (fund, send) = fixture(&wallet);
+                chain = TestChain::new(
+                    0,
+                    &[
+                        std::slice::from_ref(&fund),
+                        std::slice::from_ref(&send),
+                        &[],
+                    ],
+                );
+                chain.sync(&wallet);
+                wallet.save().unwrap();
+                assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+            }
+
+            // Restart on an empty chain (chainstate deleted): the startup sync,
+            // then reconciliation against a UTXO set that has nothing yet
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            TestChain::new(0, &[]).sync(&wallet);
+            wallet.reconcile_utxos(0, |_| false);
+            wallet.save_incremental().unwrap();
+
+            // The chain syncs again; the wallet follows it block by block
+            chain.sync(&wallet);
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(send.txid(), 1)])
+            );
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+            assert!(wallet.get_transaction(&fund.txid()).is_some());
+            assert_eq!(wallet.last_scan_height(), 3);
+        }
+
+        #[test]
+        fn reconcile_keeps_coins_above_the_chain_tip() {
+            let wallet = create_test_wallet();
+            let addr = wallet.new_receiving_address().unwrap();
+            let low = tx(
+                &[(Hash256::from_bytes([1u8; 32]), 0)],
+                vec![(5 * COIN, mine(&addr))],
+            );
+            let high = tx(
+                &[(Hash256::from_bytes([2u8; 32]), 0)],
+                vec![(7 * COIN, mine(&addr))],
+            );
+            let chain = TestChain::new(
+                0,
+                &[std::slice::from_ref(&low), std::slice::from_ref(&high)],
+            );
+            chain.sync(&wallet);
+
+            // The chain is back at height 1 and has neither coin
+            assert_eq!(wallet.reconcile_utxos(1, |_| false), 1);
+            assert_eq!(
+                outpoints(&wallet),
+                HashSet::from([OutPoint::new(high.txid(), 0)])
+            );
+
+            // The dropped coin is not marked spent: a scan of its block finds it
+            wallet.rescan(1, 1, 2, |h| chain.block_at(h));
+            assert_eq!(wallet.get_balance().as_sat(), 12 * COIN);
+        }
+
+        #[test]
+        fn partial_rescan_finds_coin_marked_spent_without_a_block() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let chain = TestChain::new(
+                0,
+                &[
+                    std::slice::from_ref(&fund),
+                    std::slice::from_ref(&send),
+                    &[],
+                ],
+            );
+            chain.sync(&wallet);
+            // Dropped earlier as missing from the chain, with no spending block
+            let change = OutPoint::new(send.txid(), 1);
+            wallet.spend_utxo(&change);
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+
+            // rescanblockchain from the coin's block
+            let (scanned, unreadable) = wallet.rescan(2, 3, 3, |h| chain.block_at(h));
+            assert_eq!((scanned, unreadable), (2, None));
+            assert_eq!(outpoints(&wallet), HashSet::from([change]));
+            assert_eq!(wallet.get_balance().as_sat(), CHANGE);
+
+            // and from below it
+            wallet.spend_utxo(&change);
+            wallet.rescan(1, 3, 3, |h| chain.block_at(h));
+            assert_eq!(outpoints(&wallet), HashSet::from([change]));
+        }
+
+        #[test]
+        fn partial_rescan_keeps_marked_coin_spent_in_range() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let spend_change = tx(&[(send.txid(), 1)], vec![(CHANGE - 1_000_000, stranger())]);
+            let chain = TestChain::new(
+                0,
+                &[
+                    std::slice::from_ref(&fund),
+                    std::slice::from_ref(&send),
+                    &[],
+                    std::slice::from_ref(&spend_change),
+                ],
+            );
+            // The wallet missed block 4 and dropped the change coin
+            wallet.sync_to_tip(3, |h| chain.hash_at(h), |h| chain.block_at(h));
+            let change = OutPoint::new(send.txid(), 1);
+            wallet.spend_utxo(&change);
+
+            wallet.rescan(2, 4, 4, |h| chain.block_at(h));
+            assert!(outpoints(&wallet).is_empty());
+            assert_eq!(wallet.get_balance().as_sat(), 0);
+            assert!(wallet.get_transaction(&spend_change.txid()).is_some());
+        }
+
+        #[test]
+        fn rescan_stopping_below_tip_keeps_spent_mark() {
+            let wallet = create_test_wallet();
+            let (fund, send) = fixture(&wallet);
+            let chain = TestChain::new(
+                0,
+                &[
+                    std::slice::from_ref(&fund),
+                    std::slice::from_ref(&send),
+                    &[],
+                ],
+            );
+            chain.sync(&wallet);
+            // The spend may lie above the range, so the mark stays
+            wallet.spend_utxo(&OutPoint::new(send.txid(), 1));
+            wallet.rescan(2, 2, 3, |h| chain.block_at(h));
+            assert!(outpoints(&wallet).is_empty());
+        }
     }
 
     mod vaults {
@@ -4746,6 +5866,50 @@ mod tests {
             assert!(wallet.db.as_ref().unwrap().load_utxos().unwrap().is_empty());
         }
 
+        /// A registered vault whose owner and manager keys are both in the
+        /// wallet is owned, and Divi Core does not stake owned vault coins
+        /// (AvailableUtxoCalculator.cpp:28-31): only a vault managed for
+        /// someone else is staked.
+        #[test]
+        fn vault_with_owner_and_manager_keys_is_not_staked() {
+            let wallet = create_test_wallet();
+            let owner = wallet.new_receiving_address().unwrap();
+            let manager = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new(hash20(&owner), hash20(&manager)).to_script();
+            register(&wallet, hash20(&owner), &manager, &vault);
+            let tx = pay(vec![(300 * COIN, vault.clone())]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([6; 32])), Some(10), None);
+
+            assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Owned));
+            assert!(wallet.get_stakeable_vault_utxos(20, 1).is_empty());
+
+            // The same vault managed for someone else is staked
+            let other = wallet.new_receiving_address().unwrap();
+            let managed =
+                divi_script::StakingVaultScript::new([0x55; 20], hash20(&other)).to_script();
+            register(&wallet, [0x55; 20], &other, &managed);
+            let tx = pay(vec![(300 * COIN, managed.clone())]);
+            wallet.scan_transaction(&tx, Some(Hash256::from_bytes([7; 32])), Some(10), None);
+            let stakeable = wallet.get_stakeable_vault_utxos(20, 1);
+            assert_eq!(stakeable.len(), 1);
+            assert_eq!(stakeable[0].0.script_pubkey, managed);
+        }
+
+        /// `lockunspent` locks a coin for the whole wallet, in memory
+        #[test]
+        fn locked_coin_is_recorded_until_unlocked() {
+            let wallet = create_test_wallet();
+            let coin = TxOutPoint::new(Hash256::from_bytes([8; 32]), 1);
+            assert!(!wallet.is_coin_locked(&coin));
+            wallet.set_coin_locked(coin, true);
+            assert!(wallet.is_coin_locked(&coin));
+            assert_eq!(wallet.locked_coins(), vec![coin]);
+            wallet.set_coin_locked(coin, false);
+            assert!(!wallet.is_coin_locked(&coin));
+            assert!(wallet.locked_coins().is_empty());
+        }
+
         /// the owner key alone makes a vault output ours (registered
         /// or not), outside the plain spendable set and not stakeable.
         #[test]
@@ -4775,6 +5939,32 @@ mod tests {
             // and removevault does not drop the owner's coins
             assert!(wallet.remove_vault(vault.as_bytes()));
             assert_eq!(wallet.get_owned_vault_utxos(20, 1).len(), 1);
+        }
+
+        /// A stake reward paid to a vault we own is in no balance until it
+        /// matures: Divi Core's getimmaturebalance counts spendable coins
+        /// only, getbalance mature ones (wallet.cpp:1395-1422)
+        #[test]
+        fn owned_vault_reward_is_not_immature_balance() {
+            let wallet = create_test_wallet();
+            let owner = wallet.new_receiving_address().unwrap();
+            let vault =
+                divi_script::StakingVaultScript::new(hash20(&owner), [0x44; 20]).to_script();
+            let mut coinstake = pay(vec![(0, Script::default()), (300 * COIN, vault)]);
+            coinstake.vout[0].value = Amount::ZERO;
+            assert!(coinstake.is_coinstake());
+            wallet.scan_transaction(
+                &coinstake,
+                Some(Hash256::from_bytes([4; 32])),
+                Some(10),
+                None,
+            );
+            wallet.set_last_scan_height(15);
+
+            assert_eq!(wallet.get_immature_balance(15, 20), Amount::ZERO);
+            assert_eq!(wallet.get_balance(), Amount::ZERO);
+            wallet.set_last_scan_height(30);
+            assert_eq!(wallet.get_balance(), Amount::from_sat(300 * COIN));
         }
 
         /// The manager key counts only for a registered vault.
@@ -5194,5 +6384,218 @@ mod tests {
         assert!(wallet.is_locked());
         // Nothing was migrated from the bad records
         assert_eq!(wallet.db.as_ref().unwrap().load_kdf_params().unwrap(), None);
+    }
+
+    // Seed-only and mnemonic+passphrase wallets at rest (NODE-7, NODE-9)
+
+    const SEED_ONLY: [u8; 32] = [
+        0x3c, 0x91, 0x07, 0xe4, 0x5a, 0xd2, 0x68, 0x1f, 0xb3, 0x2e, 0x84, 0xc6, 0x7d, 0x09, 0xf5,
+        0x40, 0x9b, 0x13, 0xae, 0x62, 0xd8, 0x37, 0x5c, 0xe1, 0x0a, 0x76, 0xbf, 0x24, 0x8d, 0x59,
+        0xc3, 0x6e,
+    ];
+    const BIP39_PASSPHRASE: &str = "an extra bip39 passphrase";
+
+    /// Public keys of the first receiving keys `hd` derives as a new wallet
+    fn reference_pubkeys(hd: HdWallet) -> Vec<divi_crypto::keys::PublicKey> {
+        let hd = with_core_coin_type(hd, Network::Testnet);
+        (0..60)
+            .map(|i| {
+                hd.derive_receiving(0, i)
+                    .unwrap()
+                    .secret_key()
+                    .unwrap()
+                    .public_key()
+            })
+            .collect()
+    }
+
+    fn assert_derived_from(
+        wallet: &WalletDb,
+        addresses: &[Address],
+        reference: &[divi_crypto::keys::PublicKey],
+    ) {
+        for address in addresses {
+            let entry = wallet.get_key_by_address(address).expect("address kept");
+            assert!(
+                reference.contains(&entry.public),
+                "{address} not from the seed"
+            );
+            assert!(entry.secret.is_some(), "{address} has its secret");
+        }
+    }
+
+    /// Rewrite an encrypted wallet's records in the format of builds before
+    /// Argon2id (PBKDF2 and AES-256-CBC), as an older wallet on disk would be
+    fn downgrade_to_legacy(wallet: &WalletDb, passphrase: &str) {
+        use crate::persistence::{KEY_ENCRYPTED_HD_SEED, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE};
+        let db = wallet.db.as_ref().unwrap();
+        let master = open_master(db, passphrase).unwrap();
+        assert!(master.aead);
+        let records = decrypt_records(db, &master).unwrap();
+        let legacy = MasterKey {
+            key: master.key.clone(),
+            aead: false,
+        };
+        let salt = [0x5au8; 16];
+        let key = at_rest::legacy::derive_key_from_passphrase(passphrase, &salt);
+        let mut batch = db.create_batch();
+        batch.delete_cf(db.cf_metadata(), KEY_KDF_PARAMS);
+        batch.put_cf(db.cf_metadata(), KEY_ENCRYPTION_SALT, salt);
+        batch.put_cf(
+            db.cf_metadata(),
+            KEY_ENCRYPTED_MASTER_KEY,
+            at_rest::legacy::seal_master_key(&master.key, &key),
+        );
+        for (record_key, plain) in [
+            (KEY_ENCRYPTED_MNEMONIC, &records.mnemonic),
+            (
+                KEY_ENCRYPTED_MNEMONIC_PASSPHRASE,
+                &records.mnemonic_passphrase,
+            ),
+            (KEY_ENCRYPTED_HD_SEED, &records.hd_seed),
+        ] {
+            if let Some(plain) = plain {
+                batch.put_cf(
+                    db.cf_metadata(),
+                    record_key,
+                    legacy.seal_record(record_key, plain),
+                );
+            }
+        }
+        for (hash, secret) in &records.secrets {
+            let record_key = secret_record_key(hash);
+            batch.put_cf(
+                db.cf_keys(),
+                &record_key,
+                legacy.seal_record(&record_key, secret.as_bytes()),
+            );
+        }
+        db.write_batch_sync(batch).unwrap();
+        assert_eq!(db.load_kdf_params().unwrap(), None);
+    }
+
+    /// No plaintext record and no file of the wallet holds any of `secrets`
+    fn assert_no_plaintext(wallet: WalletDb, path: &std::path::Path, secrets: &[&[u8]]) {
+        let db = wallet.db.as_ref().unwrap();
+        assert_eq!(db.load_mnemonic().unwrap(), None);
+        assert_eq!(db.load_mnemonic_passphrase().unwrap(), None);
+        assert!(db.load_hd_seed().unwrap().is_none());
+        drop(wallet);
+        for secret in secrets {
+            assert_eq!(
+                files_containing(path, secret),
+                Vec::<std::path::PathBuf>::new()
+            );
+        }
+    }
+
+    /// Encrypt, lock, unlock, change the passphrase and reopen a wallet; then
+    /// move it from the older format; every step keeps the keys the seed derives
+    fn at_rest_round_trip(
+        hd: HdWallet,
+        reference: HdWallet,
+        secrets: &[&[u8]],
+    ) -> (tempfile::TempDir, WalletDb) {
+        let reference = reference_pubkeys(reference);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let wallet = WalletDb::create_persistent(&path, Network::Testnet, hd).unwrap();
+        let mut addresses = vec![
+            wallet.new_receiving_address().unwrap(),
+            wallet.new_receiving_address().unwrap(),
+        ];
+        wallet.save().unwrap();
+        assert_derived_from(&wallet, &addresses, &reference);
+        for secret in secrets {
+            assert!(!files_containing(&path, secret).is_empty());
+        }
+
+        wallet.encrypt_wallet("pw").unwrap();
+        assert!(wallet.is_locked());
+        assert!(wallet.hd_seed().is_none() && wallet.mnemonic_passphrase().is_none());
+        wallet.unlock("pw", 0).unwrap();
+        addresses.push(wallet.new_receiving_address().unwrap());
+        assert_derived_from(&wallet, &addresses, &reference);
+        wallet.lock();
+        wallet.change_passphrase("pw", "pw2").unwrap();
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        let wallet = {
+            drop(wallet);
+            WalletDb::open(&path, Network::Testnet).unwrap()
+        };
+        wallet.unlock("pw2", 0).unwrap();
+        addresses.push(wallet.new_receiving_address().unwrap());
+        assert_derived_from(&wallet, &addresses, &reference);
+        let seed = wallet.hd_seed();
+        let passphrase = wallet.mnemonic_passphrase();
+        wallet.lock();
+
+        // The same wallet written by an older build moves to the new format
+        downgrade_to_legacy(&wallet, "pw2");
+        let wallet = {
+            drop(wallet);
+            WalletDb::open(&path, Network::Testnet).unwrap()
+        };
+        assert!(matches!(
+            wallet.unlock("pw", 0),
+            Err(WalletError::WrongPassphrase)
+        ));
+        wallet.unlock("pw2", 0).unwrap();
+        let db = wallet.db.as_ref().unwrap();
+        assert_eq!(db.load_kdf_params().unwrap(), Some(KdfParams::DEFAULT));
+        assert_derived_from(&wallet, &addresses, &reference);
+        assert_eq!(wallet.hd_seed(), seed);
+        assert_eq!(wallet.mnemonic_passphrase(), passphrase);
+        addresses.push(wallet.new_receiving_address().unwrap());
+        assert_derived_from(&wallet, &addresses, &reference);
+        wallet.lock();
+        let wallet = {
+            drop(wallet);
+            WalletDb::open(&path, Network::Testnet).unwrap()
+        };
+        wallet.unlock("pw2", 0).unwrap();
+        assert_derived_from(&wallet, &addresses, &reference);
+        wallet.lock();
+        assert_no_plaintext(wallet, &path, secrets);
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        (dir, wallet)
+    }
+
+    #[test]
+    fn node09_seed_only_wallet_round_trips_encrypted() {
+        let hd = || HdWallet::from_seed(&SEED_ONLY, ChainMode::Divi).unwrap();
+        let (_dir, wallet) = at_rest_round_trip(hd(), hd(), &[&SEED_ONLY]);
+        wallet.unlock("pw2", 0).unwrap();
+        assert_eq!(
+            wallet.hd_seed().as_deref().map(|s| &s[..]),
+            Some(&SEED_ONLY[..])
+        );
+        assert!(wallet.mnemonic().is_none());
+    }
+
+    #[test]
+    fn node09_mnemonic_with_passphrase_round_trips_encrypted() {
+        let hd = || {
+            HdWallet::from_mnemonic(TEST_MNEMONIC, Some(BIP39_PASSPHRASE), ChainMode::Divi).unwrap()
+        };
+        // Without its passphrase the mnemonic derives other keys
+        let plain = reference_pubkeys(
+            HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap(),
+        );
+        assert!(!reference_pubkeys(hd()).iter().any(|k| plain.contains(k)));
+        let (_dir, wallet) = at_rest_round_trip(
+            hd(),
+            hd(),
+            &[TEST_MNEMONIC.as_bytes(), BIP39_PASSPHRASE.as_bytes()],
+        );
+        wallet.unlock("pw2", 0).unwrap();
+        assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+        assert_eq!(
+            wallet.mnemonic_passphrase().as_deref(),
+            Some(BIP39_PASSPHRASE)
+        );
     }
 }

@@ -44,27 +44,31 @@
 //!
 //! // Get network info
 //! let net_info = node.get_network_info();
-//! assert_eq!(net_info.protocol_version, 70920);
+//! assert_eq!(net_info.protocol_version, 70915);
 //!
 //! // Clean up
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+pub mod block_import;
 pub mod config;
 pub mod error;
 pub mod fee_estimator;
 pub mod history_fetch;
 pub mod mempool;
 pub mod node;
+pub mod orphans;
 pub mod staker;
+pub mod zmq;
 
 pub use config::{NetworkConfig, NetworkType, NodeConfig, P2pConfig, RpcConfig};
 pub use error::NodeError;
 pub use fee_estimator::{FeeEstimator, FeeEstimatorStats};
-pub use mempool::MempoolValidator;
+pub use mempool::{Admission, MempoolValidator};
 pub use mempool::{Mempool, MempoolEntry, MempoolStats};
 pub use node::{
-    check_mempool_transaction, BlockchainInfo, MempoolInfo, NetworkInfo, Node, NodeEvent,
-    NodeStatus,
+    accept_orphans, accept_relayed_transaction, check_mempool_transaction, getblocks_reply,
+    relay_reject, shutdown_stage, update_mempool_after_reorg, BlockchainInfo, MempoolInfo,
+    NetworkInfo, Node, NodeEvent, NodeStatus, GETBLOCKS_LIMIT,
 };
 pub use staker::{StakeResult, Staker, StakerEvent, StakingConfig, StakingStatus};

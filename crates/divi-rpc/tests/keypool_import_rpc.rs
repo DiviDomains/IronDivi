@@ -60,6 +60,36 @@ fn encrypted_rpc(path: &Path) -> (WalletRpc, Arc<WalletDb>) {
     (rpc, db)
 }
 
+/// As Core: unlocked_until is sent only for an encrypted wallet, so BasicSwap
+/// (which reads its presence as "encrypted") sees a plain wallet as unlocked
+#[test]
+fn getwalletinfo_sends_unlocked_until_only_when_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = WalletRpc::with_wallet(Arc::new(
+        WalletDb::create_persistent(
+            &dir.path().join("plain"),
+            Network::Regtest,
+            HdWallet::new(ChainMode::Divi).unwrap(),
+        )
+        .unwrap(),
+    ));
+    let info = plain.get_wallet_info(&Params::None).unwrap();
+    assert_eq!(info["encryption_status"], "unencrypted");
+    assert!(info.get("unlocked_until").is_none());
+
+    let (rpc, _db) = encrypted_rpc(&dir.path().join("enc"));
+    assert_eq!(
+        rpc.get_wallet_info(&Params::None).unwrap()["unlocked_until"],
+        0
+    );
+    rpc.wallet_passphrase(&p(vec![json!(PASS), json!(60)]))
+        .unwrap();
+    let until = rpc.get_wallet_info(&Params::None).unwrap()["unlocked_until"]
+        .as_u64()
+        .unwrap();
+    assert!(until > 0);
+}
+
 #[test]
 fn getnewaddress_while_locked_keeps_label_and_key_across_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -187,11 +217,12 @@ impl Net {
         let tip = self.chain.tip().unwrap();
         let height = tip.height + 1;
         let mut block = Block::default();
-        block.header.version = 1;
+        block.header.version = 4;
         block.header.prev_block = tip.hash;
         block.header.time = tip.time + 60;
         block.header.bits = 0x207fffff;
-        let mut cb_sig = vec![0x04];
+        // BIP34: the coinbase starts with the height
+        let mut cb_sig = divi_storage::bip34_height_script(height);
         cb_sig.extend_from_slice(&height.to_le_bytes());
         block.transactions.push(Transaction {
             version: 1,
@@ -203,6 +234,11 @@ impl Net {
             lock_time: 0,
         });
         block.header.merkle_root = compute_merkle_root(&block.transactions);
+        // Proof of work for the block's bits
+        let target = divi_primitives::hash::Hash256::from_compact(block.header.bits);
+        while divi_crypto::compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
         let time = block.header.time;
         let txs = block.transactions.clone();
         let hash = self.chain.accept_block(block).unwrap().hash;
@@ -285,19 +321,18 @@ fn importprivkey_rescan_false_waits_for_rescanblockchain() {
     assert_eq!(net.coins_at(&addr), 25 * COIN);
 }
 
+/// Divi Core watches the address but records only transactions that pay or
+/// spend a spendable output (wallet.cpp:1292-1311), so even after the rescan
+/// the coin paid to the watched address is not the wallet's
 #[test]
-fn importaddress_rescan_true_shows_past_coins_watch_only() {
+fn importaddress_rescan_true_watches_without_recording_coins() {
     let net = Net::new();
     let (_key, addr) = funded_foreign_key(&net);
 
     net.rpc
         .import_address(&p(vec![json!(addr.to_string()), json!(""), json!(true)]))
         .unwrap();
-    assert_eq!(
-        net.coins_at(&addr),
-        25 * COIN,
-        "rescan did not find the coin"
-    );
+    assert_eq!(net.coins_at(&addr), 0, "a watched coin was recorded");
     let info = net
         .rpc
         .validate_address(&p(vec![json!(addr.to_string())]))
@@ -308,14 +343,14 @@ fn importaddress_rescan_true_shows_past_coins_watch_only() {
 }
 
 #[test]
-fn importaddress_rescan_false_waits_for_rescanblockchain() {
+fn importaddress_rescan_false_labels_the_address() {
     let net = Net::new();
     let (_key, addr) = funded_foreign_key(&net);
 
     net.rpc
         .import_address(&p(vec![json!(addr.to_string()), json!("w"), json!(false)]))
         .unwrap();
-    assert_eq!(net.coins_at(&addr), 0, "rescan=false must not scan");
+    assert_eq!(net.coins_at(&addr), 0);
     assert_eq!(
         net.rpc
             .get_account(&p(vec![json!(addr.to_string())]))
@@ -324,5 +359,5 @@ fn importaddress_rescan_false_waits_for_rescanblockchain() {
     );
 
     net.rpc.rescan_blockchain(&Params::None).unwrap();
-    assert_eq!(net.coins_at(&addr), 25 * COIN);
+    assert_eq!(net.coins_at(&addr), 0, "a watched coin was recorded");
 }

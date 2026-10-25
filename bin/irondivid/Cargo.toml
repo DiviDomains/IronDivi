@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal crates
 divi-node = { workspace = true }
+divi-network = { workspace = true }
 divi-rpc = { workspace = true }
 divi-storage = { workspace = true }
 divi-primitives = { workspace = true }
@@ -44,5 +45,9 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 toml = "0.8"
 
+[features]
+fault-injection = ["divi-storage/fault-injection"]
+
 [dev-dependencies]
+divi-test-support = { workspace = true }
 tempfile = { workspace = true }

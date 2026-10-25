@@ -138,11 +138,7 @@ impl LiteWalletRpc {
         let coinbase_maturity = self
             .chain
             .as_ref()
-            .map(|c| match c.network_type() {
-                NetworkType::Mainnet => 20u32,
-                NetworkType::Testnet => 1,
-                NetworkType::Regtest => 1,
-            })
+            .map(|c| c.params().coinbase_maturity)
             .unwrap_or(20);
         let balance = index
             .get_balance(&script, min_conf, height, coinbase_maturity)
@@ -288,7 +284,7 @@ impl LiteWalletRpc {
         let fee_rate = if let Some(ref mempool) = self.mempool {
             mempool.estimate_fee(conf_target)
         } else {
-            0.00001 // Default minimum fee rate
+            0.0001 // Divi Core's default relay floor, 10000 sat/kB
         };
 
         Ok(serde_json::json!(fee_rate))
@@ -307,14 +303,14 @@ impl LiteWalletRpc {
             }))
         } else {
             Ok(serde_json::json!({
-                "feerate": 0.00001,
+                "feerate": 0.0001,
                 "blocks": conf_target,
             }))
         }
     }
 
     pub fn estimate_priority(&self, _params: &Params) -> Result<serde_json::Value, Error> {
-        // Deprecated command - return "-1" as string (matches C++ Divi)
+        // Not in Divi Core 3.0.0 (docs/divid-differences.md R1); "-1" as text
         Ok(serde_json::Value::String("-1".to_string()))
     }
 
@@ -336,7 +332,7 @@ impl LiteWalletRpc {
                 "bytes": 0,
                 "usage": 0,
                 "maxmempool": 300000000,
-                "mempoolminfee": 0.00001,
+                "mempoolminfee": 0.0001,
             }))
         }
     }

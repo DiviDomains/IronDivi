@@ -17,10 +17,12 @@ divi-masternode = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "sync", "rt-multi-thread", "signal"] }
 parking_lot = { workspace = true }
+rand = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+divi-test-support = { workspace = true }
 tempfile = { workspace = true }

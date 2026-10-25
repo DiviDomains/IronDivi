@@ -1,0 +1,10 @@
+startmasternode alias
+
+Verifies the escrowed funds for the masternode and returns the necessary info for your and its configuration files.
+
+Arguments:
+1. alias			(string, required) helpful identifier to recognize this allocation later.
+2. deferRelay  (bool, optional) returns broadcast data to delegate signaling masternode start.
+
+Result:
+"status"	(string) status of masternode

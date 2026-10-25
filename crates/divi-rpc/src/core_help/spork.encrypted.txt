@@ -1,0 +1,3 @@
+spork <name> [<value>]
+<name> is the corresponding spork name, or 'show' to show all current spork settings, active to show which sporks are active<value> is a epoch datetime to enable or disable spork
+Requires wallet passphrase to be set with walletpassphrase call.

@@ -29,17 +29,15 @@ use std::io::Write;
 /// Reference: ProofOfStakeCalculator.cpp:8
 const MAXIMUM_COIN_AGE_WEIGHT_FOR_STAKING: u64 = 60 * 60 * 24 * 7 - 60 * 60;
 
-/// Minimum coin age required for staking (60 seconds)
-/// Reference: ProofOfStakeGenerator.cpp and Settings
-const MINIMUM_COIN_AGE_FOR_STAKING: u64 = 60;
-
 /// Hash drift allowance for proof-of-stake (45 seconds)
 /// Reference: I_ProofOfStakeGenerator.h:30
 pub const HASH_DRIFT: u32 = 45;
 
-/// Maximum number of inputs that can be combined in a coinstake transaction
-/// Reference: BlockProofVerifier.cpp:54
-const MAX_COMBINABLE_INPUTS: usize = 30;
+/// Maximum number of inputs in a coinstake transaction, kernel included.
+/// A fixed 20 in Divi Core (`MAX_KERNEL_COMBINED_INPUTS`, Settings.cpp:210-214),
+/// checked for every proof-of-stake block (BlockProofVerifier.cpp:54-61) and
+/// used by its staker when combining coins (PoSTransactionCreator.cpp:178, :199).
+pub const MAX_COMBINABLE_INPUTS: usize = 20;
 
 /// Staking data required for proof-of-stake validation
 /// Reference: StakingData.h
@@ -214,10 +212,13 @@ pub fn compute_and_verify_proof_of_stake(
 
 /// Check if proof-of-stake time requirements are met
 ///
+/// `min_coin_age` is the network's `nMinCoinAgeForStaking` (chainparams.cpp:195, :498).
+///
 /// Reference: ProofOfStakeGenerator.cpp:75-90
 pub fn check_pos_time_requirements(
     coinstake_start_time: u32,
     hashproof_timestamp: u32,
+    min_coin_age: u32,
 ) -> Result<(), String> {
     // Transaction timestamp violation
     // Reference: ProofOfStakeGenerator.cpp:79-82
@@ -230,10 +231,10 @@ pub fn check_pos_time_requirements(
 
     // Minimum age requirement
     // Reference: ProofOfStakeGenerator.cpp:84-88
-    if coinstake_start_time + MINIMUM_COIN_AGE_FOR_STAKING as u32 > hashproof_timestamp {
+    if u64::from(coinstake_start_time) + u64::from(min_coin_age) > u64::from(hashproof_timestamp) {
         return Err(format!(
             "min age violation: coinstake_start_time ({}) + min_age ({}) > hashproof_timestamp ({})",
-            coinstake_start_time, MINIMUM_COIN_AGE_FOR_STAKING, hashproof_timestamp
+            coinstake_start_time, min_coin_age, hashproof_timestamp
         ));
     }
 
@@ -429,20 +430,21 @@ mod tests {
     #[test]
     fn test_pos_time_requirements_valid() {
         let coinstake_start = 1000000;
-        let hashproof = coinstake_start + 60; // Exactly minimum age
+        let hashproof = coinstake_start + 3600; // Exactly the mainnet minimum age
 
-        assert!(check_pos_time_requirements(coinstake_start, hashproof).is_ok());
+        assert!(check_pos_time_requirements(coinstake_start, hashproof, 3600).is_ok());
 
-        let hashproof2 = coinstake_start + 3600; // 1 hour later
-        assert!(check_pos_time_requirements(coinstake_start, hashproof2).is_ok());
+        // Regtest has no minimum age
+        assert!(check_pos_time_requirements(coinstake_start, coinstake_start, 0).is_ok());
     }
 
     #[test]
     fn test_pos_time_requirements_too_young() {
         let coinstake_start = 1000000;
-        let hashproof = coinstake_start + 59; // 1 second too young
+        let hashproof = coinstake_start + 3599; // 1 second too young
 
-        assert!(check_pos_time_requirements(coinstake_start, hashproof).is_err());
+        let result = check_pos_time_requirements(coinstake_start, hashproof, 3600);
+        assert!(result.unwrap_err().contains("min age violation"));
     }
 
     #[test]
@@ -450,7 +452,7 @@ mod tests {
         let coinstake_start = 1000000;
         let hashproof = 999999; // Before coinstake start
 
-        let result = check_pos_time_requirements(coinstake_start, hashproof);
+        let result = check_pos_time_requirements(coinstake_start, hashproof, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("nTime violation"));
     }
@@ -492,6 +494,43 @@ mod tests {
 
         let result = validate_coinstake_transaction(&tx);
         assert!(result.is_err());
+    }
+
+    /// A coinstake with `n` inputs and valid marker and stake outputs
+    fn coinstake_with_inputs(n: usize) -> Transaction {
+        use divi_primitives::{Script, TxIn, TxOut};
+        Transaction {
+            version: 1,
+            vin: (0..n)
+                .map(|i| TxIn {
+                    prevout: OutPoint {
+                        txid: Hash256::from_slice(&[i as u8 + 1; 32]),
+                        vout: 0,
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xFFFFFFFF,
+                })
+                .collect(),
+            vout: vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: Script::new(),
+                },
+                TxOut {
+                    value: Amount::from_divi(100),
+                    script_pubkey: Script::new_p2pkh(&[7; 20]),
+                },
+            ],
+            lock_time: 0,
+        }
+    }
+
+    /// Divi Core refuses a coinstake with more than 20 inputs
+    #[test]
+    fn coinstake_input_limit_is_twenty() {
+        assert!(validate_coinstake_transaction(&coinstake_with_inputs(20)).is_ok());
+        let err = validate_coinstake_transaction(&coinstake_with_inputs(21)).unwrap_err();
+        assert!(err.contains("too many inputs: 21 > 20"), "{err}");
     }
 
     #[test]

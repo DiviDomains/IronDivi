@@ -268,3 +268,23 @@ fn unlock_timeout_relocks_and_wipes() {
     assert!(wallet.is_locked());
     assert!(wallet.get_key_by_address(&addr).unwrap().secret.is_none());
 }
+
+/// An earlier timed unlock that has run out, with nothing having checked the
+/// lock since, must not leave the next unlock without its keys
+#[test]
+fn unlock_after_an_unnoticed_timeout_keeps_keys() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wallet");
+    let wallet = new_wallet(&path);
+    let addr = wallet.new_receiving_address().unwrap();
+    wallet.save().unwrap();
+    wallet.encrypt_wallet("pw").unwrap();
+    wallet.unlock("pw", 1).unwrap();
+    // Let the 1-second unlock run out without calling is_locked
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    wallet.unlock("pw", 60).unwrap();
+    assert!(!wallet.is_locked());
+    assert!(wallet.get_key_by_address(&addr).unwrap().secret.is_some());
+    // A send derives its change key from the HD seed
+    wallet.new_change_address().unwrap();
+}

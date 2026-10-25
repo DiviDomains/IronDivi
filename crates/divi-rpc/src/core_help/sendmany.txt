@@ -1,0 +1,27 @@
+sendmany "fromaccount" {"address":amount,...} ( "comment" )
+
+Send multiple times. Amounts are double-precision floating point numbers.
+
+Arguments:
+1. "fromaccount"         (string, required) The account to send the funds from, can be "" for the default account
+2. "amounts"             (string, required) A json object with addresses and amounts
+    {
+      "address":amount   (numeric) The divi address is the key, the numeric amount in DIVI is the value
+      ,...
+    }
+3. "comment"             (string, optional) A comment
+
+Result:
+"transactionid"          (string) The transaction id for the send. Only 1 transaction is created regardless of 
+                                    the number of addresses.
+
+Examples:
+
+Send two amounts to two different addresses:
+> divi-cli sendmany "tabby" "{\"diviaddress\":0.01,\"diviaddress\":0.02}"
+
+Send two amounts to two different addresses setting the confirmation and comment:
+> divi-cli sendmany "tabby" "{\"diviaddress\":0.01,\"diviaddress\":0.02}" 6 "testing"
+
+As a json rpc call
+> curl --user myusername --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "sendmany", "params": ["tabby", "{\"diviaddress\":0.01,\"diviaddress\":0.02}", 6, "testing"] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/

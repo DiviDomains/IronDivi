@@ -138,18 +138,16 @@ pub struct KeyStore {
 pub struct HdPublicIds {
     /// hash160 of the master public key (`hdmasterkeyid`)
     pub master_key_id: [u8; 20],
-    /// sha256 of the master public key (`hdchainid`)
+    /// Double SHA-256 of the seed (`hdchainid`, shown byte-reversed as
+    /// Divi Core's uint256)
     pub chain_id: [u8; 32],
 }
 
 impl HdPublicIds {
     /// Derive the ids from an HD wallet
     pub fn of(wallet: &HdWallet) -> Option<Self> {
-        use sha2::{Digest, Sha256};
-
         let master_key_id = wallet.master_key_id().ok()?;
-        let master_pubkey = wallet.get_master_pubkey().ok()?;
-        let chain_id: [u8; 32] = Sha256::digest(master_pubkey.to_bytes()).into();
+        let chain_id = wallet.seed_hash()?;
         Some(HdPublicIds {
             master_key_id,
             chain_id,
@@ -157,8 +155,9 @@ impl HdPublicIds {
     }
 }
 
-/// Default keypool target size (matches C++ Divi DEFAULT_KEYPOOL_SIZE)
-pub const DEFAULT_KEYPOOL_SIZE: u32 = 100;
+/// Default keypool size of each chain, receiving and change (Divi Core's
+/// DEFAULT_KEYPOOL_SIZE, wallet.cpp:2059)
+pub const DEFAULT_KEYPOOL_SIZE: u32 = 1000;
 
 impl KeyStore {
     /// Create a new empty keystore
@@ -271,7 +270,10 @@ impl KeyStore {
         } else {
             wallet.derive_receiving(0, *index)?
         };
-        let entry = KeyEntry::with_hd_path(key.secret_key()?, hd_key_path(is_change, *index));
+        let entry = KeyEntry::with_hd_path(
+            key.secret_key()?,
+            hd_key_path(wallet.coin_type(), is_change, *index),
+        );
         let address = entry.address(self.network);
         self.add_key(entry);
 
@@ -320,12 +322,34 @@ impl KeyStore {
         self.keys.read().len()
     }
 
+    /// The seed of an HD wallet made from a seed rather than words
+    pub fn hd_seed(&self) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        self.hd_wallet
+            .read()
+            .as_ref()
+            .and_then(|w| w.seed().map(|s| zeroize::Zeroizing::new(s.to_vec())))
+    }
+
+    /// Account path the HD keys derive from (if HD wallet configured)
+    pub fn hd_account_path(&self) -> Option<String> {
+        self.hd_wallet.read().as_ref().map(|w| w.account_path())
+    }
+
     /// Get mnemonic (if HD wallet configured)
     pub fn mnemonic(&self) -> Option<String> {
         self.hd_wallet
             .read()
             .as_ref()
             .and_then(|w| w.mnemonic())
+            .map(|s| s.to_string())
+    }
+
+    /// BIP39 passphrase of the HD seed, if one was given
+    pub fn mnemonic_passphrase(&self) -> Option<String> {
+        self.hd_wallet
+            .read()
+            .as_ref()
+            .and_then(|w| w.mnemonic_passphrase())
             .map(|s| s.to_string())
     }
 
@@ -438,19 +462,12 @@ impl KeyStore {
             .collect()
     }
 
-    /// Get HD chain ID (SHA256 hash of master pubkey)
+    /// HD chain id as Divi Core shows it (CHDChain::GetID().GetHex(): the
+    /// seed hash, byte-reversed)
     pub fn get_hd_chain_id(&self) -> Option<String> {
-        use sha2::{Digest, Sha256};
-
-        let wallet = self.hd_wallet.read();
-        let Some(wallet) = wallet.as_ref() else {
-            return self.hd_public_ids().map(|ids| hex::encode(ids.chain_id));
-        };
-
-        let master_pubkey = wallet.get_master_pubkey().ok()?;
-        let pubkey_bytes = master_pubkey.to_bytes();
-        let hash = Sha256::digest(&pubkey_bytes);
-        Some(hex::encode(hash))
+        let mut id = self.hd_public_ids()?.chain_id;
+        id.reverse();
+        Some(hex::encode(id))
     }
 
     /// Get the current keypool size (number of pre-generated unused keys)
@@ -496,19 +513,21 @@ impl KeyStore {
         Ok(self.top_up_keypool(new_size)?.len() as u32)
     }
 
-    /// Derive the keypool keys still missing: target/2 receiving and target/2
-    /// change keys past the next index of each chain. Keys already derived are
-    /// left alone. Returns the hashes of the keys added.
-    pub fn top_up_keypool(&self, new_size: Option<u32>) -> Result<Vec<Hash160>, WalletError> {
+    /// Derive the keypool keys still missing, as Divi Core's TopUpKeyPool
+    /// (wallet.cpp:2057-2120): `size` (the keypool target when None or 0, at
+    /// least 1) receiving and as many change keys past the next index of each
+    /// chain. Keys already derived are left alone. Returns the hashes of the
+    /// keys added.
+    pub fn top_up_keypool(&self, size: Option<u32>) -> Result<Vec<Hash160>, WalletError> {
         let wallet = self.hd_wallet.read();
         let wallet = wallet
             .as_ref()
             .ok_or(WalletError::KeyNotFound("No HD wallet configured".into()))?;
 
-        if let Some(new) = new_size {
-            *self.keypool_target.write() = new;
-        }
-        let target = *self.keypool_target.read();
+        let target = size
+            .filter(|&n| n > 0)
+            .unwrap_or(*self.keypool_target.read())
+            .max(1);
 
         let held: std::collections::HashSet<(bool, u32)> = self
             .keys
@@ -520,10 +539,7 @@ impl KeyStore {
         let (receiving, change) = self.get_indices();
 
         let mut added = Vec::new();
-        for (is_change, start, count) in [
-            (false, receiving, target.div_ceil(2)),
-            (true, change, target / 2),
-        ] {
+        for (is_change, start, count) in [(false, receiving, target), (true, change, target)] {
             for i in start..start.saturating_add(count) {
                 if held.contains(&(is_change, i)) {
                     continue;
@@ -533,7 +549,10 @@ impl KeyStore {
                 } else {
                     wallet.derive_receiving(0, i)?
                 };
-                let entry = KeyEntry::with_hd_path(key.secret_key()?, hd_key_path(is_change, i));
+                let entry = KeyEntry::with_hd_path(
+                    key.secret_key()?,
+                    hd_key_path(wallet.coin_type(), is_change, i),
+                );
                 added.push(entry.pubkey_hash());
                 self.add_key(entry);
             }
@@ -577,8 +596,8 @@ impl KeyStore {
 }
 
 /// Path of the HD key at `index` of the receiving or change chain
-fn hd_key_path(is_change: bool, index: u32) -> String {
-    format!("m/44'/301'/0'/{}/{}", u8::from(is_change), index)
+fn hd_key_path(coin_type: u32, is_change: bool, index: u32) -> String {
+    format!("m/44'/{}'/0'/{}/{}", coin_type, u8::from(is_change), index)
 }
 
 /// Chain (true for change) and index of an HD key path `…/0/i` or `…/1/i`
@@ -598,6 +617,27 @@ mod tests {
     use divi_primitives::ChainMode;
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// divid -regtest -mnemonic=<TEST_MNEMONIC>: validateaddress shows this
+    /// hdchainid (Hash of the BIP39 seed, hdchain.cpp:116-119, as GetHex)
+    #[test]
+    fn hd_chain_id_is_cores() {
+        const CORE_ID: &str = "98093d2dca56fdc3b2934a7a394890f5f735991b6bc7fdf9166e49f75d99d21b";
+        let words = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let store = KeyStore::with_hd_wallet(Network::Regtest, words);
+        assert_eq!(store.get_hd_chain_id().as_deref(), Some(CORE_ID));
+
+        // The same seed given as bytes (-hdseed) has the same id
+        let seed = bip39::Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
+        let bytes = HdWallet::from_seed(&seed, ChainMode::Divi).unwrap();
+        let store = KeyStore::with_hd_wallet(Network::Regtest, bytes);
+        assert_eq!(store.get_hd_chain_id().as_deref(), Some(CORE_ID));
+
+        // A passphrase makes another seed, so another id
+        let other = HdWallet::from_mnemonic(TEST_MNEMONIC, Some("pw"), ChainMode::Divi).unwrap();
+        let store = KeyStore::with_hd_wallet(Network::Regtest, other);
+        assert_ne!(store.get_hd_chain_id().as_deref(), Some(CORE_ID));
+    }
 
     #[test]
     fn node20_concurrent_new_addresses_are_all_different() {
@@ -762,7 +802,7 @@ mod tests {
         assert!(store.keypool_oldest() > 0); // Should have a timestamp
 
         // Refill keypool with 10 keys
-        let generated = store.refill_keypool(Some(10)).unwrap();
+        let generated = store.refill_keypool(Some(5)).unwrap();
         assert_eq!(generated, 10); // 5 receiving + 5 change
 
         // Now we have 10 keys in the keypool
@@ -793,7 +833,7 @@ mod tests {
         assert_eq!(store.keypool_size(), 7);
 
         // Refill again should generate more keys
-        let generated2 = store.refill_keypool(Some(20)).unwrap();
+        let generated2 = store.refill_keypool(Some(10)).unwrap();
         // Should generate enough to reach target of 20
         // Currently: receiving_index=2, change_index=1
         // Target: 10 receiving (2..12), 10 change (1..11)
@@ -821,8 +861,8 @@ mod tests {
         let wallet = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
         let store = KeyStore::with_hd_wallet(Network::Mainnet, wallet);
 
-        // Refill keypool with 10 HD keys
-        let generated = store.refill_keypool(Some(10)).unwrap();
+        // Refill keypool with 10 HD keys (5 per chain)
+        let generated = store.refill_keypool(Some(5)).unwrap();
         assert_eq!(generated, 10);
         assert_eq!(store.keypool_size(), 10);
         assert_eq!(store.key_count(), 10);

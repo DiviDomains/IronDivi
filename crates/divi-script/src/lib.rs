@@ -37,6 +37,7 @@ pub mod checker;
 pub mod error;
 pub mod interpreter;
 pub mod opcodes;
+pub mod policy;
 pub mod stack;
 pub mod standard;
 pub mod vault;
@@ -45,8 +46,8 @@ pub use asm::{to_asm, Script as AsmScript, ScriptItem, ScriptIterator};
 pub use checker::{verify_input, verify_input_with_flags, TransactionSignatureChecker};
 pub use error::{ScriptError, ScriptFlags, SigHashType};
 pub use interpreter::{
-    get_op, is_push_only, verify_script, verify_script_with_amount, NullChecker, ScriptInterpreter,
-    SignatureChecker,
+    get_op, is_push_only, p2sh_sig_op_count, sig_op_count, verify_script,
+    verify_script_with_amount, NullChecker, ScriptInterpreter, SignatureChecker,
 };
 pub use opcodes::Opcode;
 pub use stack::{ScriptNum, Stack};

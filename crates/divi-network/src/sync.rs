@@ -22,7 +22,7 @@ use divi_crypto::compute_block_hash;
 use divi_primitives::block::{Block, BlockHeader};
 use divi_primitives::hash::Hash256;
 use divi_primitives::transaction::Transaction;
-use divi_storage::Chain;
+use divi_storage::{Chain, StorageError};
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -35,8 +35,13 @@ use tracing::{debug, error, info, trace, warn};
 /// Maximum headers to request at once
 const MAX_HEADERS_REQUEST: usize = 2000;
 
-/// Maximum blocks to have in flight at once
-const MAX_BLOCKS_IN_FLIGHT: usize = 128;
+/// Blocks in flight from one peer at most (Divi Core MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+/// defaultValues.h:80, applied in main.cpp:1211-1217)
+const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+
+/// How far past the first missing block downloads may run (Divi Core
+/// BLOCK_DOWNLOAD_WINDOW, defaultValues.h:90; NodeStateRegistry.cpp:182-186)
+const BLOCK_DOWNLOAD_WINDOW: usize = 1024;
 
 /// Timeout for block downloads
 const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -297,6 +302,10 @@ fn order_retry_peers(
     fresh
 }
 
+/// Cap on remembered block sources (blocks downloaded but not yet accepted
+/// or refused); past it the map starts over
+const MAX_TRACKED_BLOCK_SOURCES: usize = 10_000;
+
 /// Orphan block tracking
 struct OrphanBlock {
     /// The orphan block
@@ -311,9 +320,10 @@ pub type BlockConnectedCallback = Arc<dyn Fn(&Block, u32) + Send + Sync>;
 /// Callback for when a chain reorganization occurs (parameter is fork height)
 pub type ReorgCallback = Arc<dyn Fn(u32) + Send + Sync>;
 
-/// Callback invoked after a reorg with the transactions that were in disconnected
-/// blocks but are not present in any of the newly-connected blocks.  The node
-/// should re-insert these into the mempool so they can be re-mined.
+/// Callback invoked after every reorg with the transactions that were in
+/// disconnected blocks but are not present in any of the newly-connected blocks
+/// (possibly none). The node should re-insert these into the mempool so they
+/// can be re-mined, and drop what the new chain made unspendable.
 pub type OrphanedTxCallback = Arc<dyn Fn(Vec<Transaction>) + Send + Sync>;
 
 /// Number of block hashes a getblocks answer carries when more follow (C++ limit).
@@ -337,6 +347,9 @@ pub struct BlockSync {
     blocks_in_flight: RwLock<HashMap<Hash256, BlockRequest>>,
     /// Blocks that have been downloaded but not yet connected
     downloaded_blocks: RwLock<HashMap<Hash256, Block>>,
+    /// Which peer sent each downloaded block not yet accepted or refused,
+    /// so a refused block can be scored against it
+    block_sources: RwLock<HashMap<Hash256, PeerId>>,
     /// Orphan blocks (blocks whose parent we don't have yet)
     orphan_blocks: RwLock<HashMap<Hash256, OrphanBlock>>,
     /// Blocks we've requested from each peer
@@ -367,11 +380,17 @@ pub struct BlockSync {
     /// A growing side chain counts as progress: while a deep fork is fetched the
     /// main-chain height stays put for many rounds.
     stall_counter: RwLock<((u32, u32), u32)>,
+    /// Sync peers that stalled since the chain last moved: the next sync peer
+    /// is one not in here, until every peer has had its turn
+    stalled_sync_peers: RwLock<HashSet<PeerId>>,
     /// Highest fully stored block we know of that is NOT on the main chain
     /// (hash, height). A fork deeper than one getblocks batch (500 hashes) is
     /// fetched across several rounds; this lets each round resume from where
     /// the side chain ends instead of from the fork point.
     side_chain_tip: RwLock<Option<(Hash256, u32)>>,
+    /// Peers sent the getblocks that starts a sync when they connected
+    /// (Divi Core CNodeState::Syncing, NodeState.cpp)
+    sync_started_peers: RwLock<HashSet<PeerId>>,
 }
 
 /// Sync statistics
@@ -397,6 +416,7 @@ impl BlockSync {
             pending_headers: RwLock::new(VecDeque::new()),
             blocks_in_flight: RwLock::new(HashMap::new()),
             downloaded_blocks: RwLock::new(HashMap::new()),
+            block_sources: RwLock::new(HashMap::new()),
             orphan_blocks: RwLock::new(HashMap::new()),
             peer_block_requests: RwLock::new(HashMap::new()),
             pending_block_requests: RwLock::new(VecDeque::new()),
@@ -410,7 +430,9 @@ impl BlockSync {
             reorg_callback: RwLock::new(None),
             orphaned_tx_callback: RwLock::new(None),
             stall_counter: RwLock::new(((0, 0), 0)),
+            stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
+            sync_started_peers: RwLock::new(HashSet::new()),
         })
     }
 
@@ -426,22 +448,22 @@ impl BlockSync {
 
     /// Set callback for orphaned transactions after a chain reorganization.
     /// The callback receives transactions from disconnected blocks that were not
-    /// included in the new chain and should be re-added to the mempool.
+    /// included in the new chain and should be re-added to the mempool. It runs
+    /// after every reorganization, with an empty list too: the mempool must also
+    /// drop what the new chain confirmed or made unspendable.
     pub fn set_orphaned_tx_callback(&self, callback: OrphanedTxCallback) {
         *self.orphaned_tx_callback.write() = Some(callback);
     }
 
-    /// Fire reorg callbacks: notifies the reorg callback with `fork_height` and,
-    /// if there are orphaned transactions, invokes the orphaned-tx callback so
-    /// they can be re-added to the mempool.
+    /// Fire reorg callbacks: notifies the reorg callback with `fork_height`,
+    /// then the orphaned-tx callback, which returns the disconnected blocks'
+    /// transactions to the mempool and updates it for the new chain.
     fn fire_reorg_callbacks(&self, fork_height: u32, orphaned_txs: Vec<Transaction>) {
         if let Some(callback) = self.reorg_callback.read().as_ref() {
             callback(fork_height);
         }
-        if !orphaned_txs.is_empty() {
-            if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
-                callback(orphaned_txs);
-            }
+        if let Some(callback) = self.orphaned_tx_callback.read().as_ref() {
+            callback(orphaned_txs);
         }
     }
 
@@ -453,6 +475,13 @@ impl BlockSync {
     /// Get current sync state
     pub fn state(&self) -> SyncState {
         *self.state.read()
+    }
+
+    /// Height of the best header this node holds: the chain tip plus the
+    /// headers waiting for their blocks, which follow on from it (Divi Core's
+    /// pindexBestHeader)
+    pub fn best_header_height(&self) -> u32 {
+        self.chain.height() + self.pending_headers.read().len() as u32
     }
 
     /// Get current sync progress
@@ -526,6 +555,49 @@ impl BlockSync {
         }
     }
 
+    /// A peer finished its handshake (`services` from its version): ask it
+    /// for blocks from our tip, as
+    /// Divi Core's BeginSyncingWithPeer does (main.cpp:1130-1142) whatever
+    /// height the peer named. Core asks a full-node peer (not fClient), once,
+    /// when no peer has been asked yet or its best block is less than six
+    /// hours old; so a node learns of a peer's blocks even when the peer named
+    /// a lower height than it has. Nothing is asked while importing (the
+    /// answer would be ignored, main.cpp:581-587).
+    pub async fn begin_syncing_with_peer(&self, peer_id: PeerId, services: u64) {
+        if self.chain.is_importing() {
+            return;
+        }
+        if services & crate::constants::services::NODE_NETWORK == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let recent = self
+            .chain
+            .tip()
+            .is_some_and(|tip| u64::from(tip.time) + 6 * 60 * 60 > now);
+        {
+            let mut started = self.sync_started_peers.write();
+            if started.contains(&peer_id) || !(started.is_empty() || recent) {
+                return;
+            }
+            started.insert(peer_id);
+        }
+        let locator = self.build_block_locator();
+        let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
+        info!(
+            "Sending getblocks to peer {} from height {} (start of sync)",
+            peer_id,
+            self.chain.height()
+        );
+        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+            warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
+            self.sync_started_peers.write().remove(&peer_id);
+        }
+    }
+
     /// Get a peer's known height (for testing and diagnostics)
     pub fn get_peer_height(&self, peer_id: PeerId) -> Option<u32> {
         self.peer_heights.read().get(&peer_id).copied()
@@ -536,6 +608,7 @@ impl BlockSync {
 
     /// Remove peer from tracking
     pub fn remove_peer(&self, peer_id: PeerId) {
+        self.sync_started_peers.write().remove(&peer_id);
         let removed_height = self.peer_heights.write().remove(&peer_id);
         let remaining_peers = self.peer_heights.read().len();
 
@@ -685,9 +758,21 @@ impl BlockSync {
         }
     }
 
-    /// Select the best peer for syncing
+    /// Select the best peer for syncing.
+    ///
+    /// Only a peer that advertises NODE_NETWORK can be chosen: Divi Core starts
+    /// a sync only with a peer that is not fClient (main.cpp:1133, fClient set
+    /// at main.cpp:410), and with none such it syncs with nobody. Among them
+    /// irondivid prefers a peer at the best known height, else the highest.
     fn select_sync_peer(&self) -> Option<PeerId> {
-        let heights = self.peer_heights.read();
+        let full: HashSet<PeerId> = self.peer_manager.full_history_peers().into_iter().collect();
+        let heights: HashMap<PeerId, u32> = self
+            .peer_heights
+            .read()
+            .iter()
+            .filter(|(id, _)| full.contains(id))
+            .map(|(&id, &h)| (id, h))
+            .collect();
         let best_height = *self.best_peer_height.read();
 
         // Debug: log peer_heights state
@@ -701,12 +786,25 @@ impl BlockSync {
             best_height
         );
 
-        // Find a peer at the best height
-        let peer = heights
+        // A peer at the best height that has not stalled since the chain last
+        // moved, the lowest id first so the order is the same each time; when
+        // every one has stalled, start over. (The first entry of the map was
+        // the same peer at every rotation, so a first peer that serves no
+        // blocks stopped the sync for good.)
+        let mut at_best: Vec<PeerId> = heights
             .iter()
             .filter(|(_, &h)| h >= best_height)
             .map(|(&id, _)| id)
-            .next();
+            .collect();
+        at_best.sort_unstable();
+        let peer = {
+            let mut stalled = self.stalled_sync_peers.write();
+            let fresh = at_best.iter().copied().find(|id| !stalled.contains(id));
+            if fresh.is_none() && !at_best.is_empty() {
+                stalled.clear();
+            }
+            fresh.or_else(|| at_best.first().copied())
+        };
 
         if peer.is_none() && !heights.is_empty() {
             // No peer at best height - find the peer with highest height instead
@@ -725,7 +823,7 @@ impl BlockSync {
 
         if peer.is_none() && heights.is_empty() {
             warn!(
-                "select_sync_peer: peer_heights is EMPTY! best_peer_height={}",
+                "select_sync_peer: no connected peer with NODE_NETWORK (best_peer_height={})",
                 best_height
             );
         }
@@ -807,9 +905,9 @@ impl BlockSync {
     /// out-works our tip and `accept_block` reorgs onto it. A peer that does
     /// not know the hint skips it and matches on the main-chain entries.
     ///
-    /// There is no max-reorg-depth rule in this codebase (nor in C++ Divi's
-    /// getblocks sync); the only fork-choice limit is the hard-coded
-    /// checkpoint table in `Chain::get_checkpoint_hash`.
+    /// `Chain::accept_block` refuses a block 100 or more blocks below the tip
+    /// (Divi Core's max reorganization depth, `-maxreorg`) and one that misses a
+    /// checkpoint, so a fork that diverges deeper than that stops growing here.
     fn build_block_locator(&self) -> Vec<Hash256> {
         let mut locator = Vec::new();
         if let Some((side_hash, side_height)) = self.valid_side_chain_tip() {
@@ -963,15 +1061,53 @@ impl BlockSync {
         let _ = self.progress_tx.send(self.progress());
     }
 
-    /// Request blocks from peers
+    /// Blocks in flight from each peer
+    fn in_flight_per_peer(&self) -> HashMap<PeerId, usize> {
+        let mut per = HashMap::new();
+        for req in self.blocks_in_flight.read().values() {
+            *per.entry(req.peer_id).or_default() += 1;
+        }
+        per
+    }
+
+    /// Request the next blocks from peers. As Divi Core's SendMessages does for
+    /// each peer (main.cpp:1205-1224, FindNextBlocksToDownload in
+    /// NodeStateRegistry.cpp:146-234): a peer with fewer than
+    /// MAX_BLOCKS_IN_TRANSIT_PER_PEER blocks in flight gets the next blocks in
+    /// chain order that are neither downloaded nor in flight, within
+    /// BLOCK_DOWNLOAD_WINDOW of the first missing one.
+    ///
+    /// Only peers that advertise NODE_NETWORK are asked (Divi Core skips
+    /// fClient peers, main.cpp:1211), and each peer's blocks go in one getdata
+    /// (main.cpp:1205-1224 collects vGetData and sends it once).
     async fn request_blocks(&self) {
-        let in_flight_count = self.blocks_in_flight.read().len();
-        if in_flight_count >= MAX_BLOCKS_IN_FLIGHT {
-            trace!("Already have {} blocks in flight", in_flight_count);
+        if self.chain.is_importing() {
+            return;
+        }
+        let peer_ids = self.peer_manager.full_history_peers();
+        if peer_ids.is_empty() {
+            debug!("No connected peer with NODE_NETWORK available for block download");
+            return;
+        }
+        let per_peer = self.in_flight_per_peer();
+        let free: Vec<(PeerId, usize)> = peer_ids
+            .iter()
+            .map(|p| {
+                let used = per_peer.get(p).copied().unwrap_or(0);
+                (*p, MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(used))
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let slots: usize = free.iter().map(|(_, n)| n).sum();
+        if slots == 0 {
+            trace!(
+                "Every peer has {} blocks in flight",
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            );
             return;
         }
 
-        // Get block hashes to request
+        // Block hashes to request, in chain order
         let mut hashes_to_request = Vec::new();
         {
             let pending = self.pending_headers.read();
@@ -979,12 +1115,14 @@ impl BlockSync {
             let downloaded = self.downloaded_blocks.read();
             let retry = self.block_retry.read();
 
-            for header in pending.iter() {
+            for header in pending.iter().take(BLOCK_DOWNLOAD_WINDOW) {
+                if hashes_to_request.len() == slots {
+                    break;
+                }
                 let hash = compute_block_hash(header);
                 if !in_flight.contains_key(&hash)
                     && !downloaded.contains_key(&hash)
                     && retry.get(&hash).is_none_or(|r| r.gave_up_at.is_none())
-                    && hashes_to_request.len() < MAX_BLOCKS_IN_FLIGHT - in_flight_count
                 {
                     hashes_to_request.push(hash);
                 }
@@ -997,48 +1135,92 @@ impl BlockSync {
             return;
         }
 
-        // Request blocks from actually-connected peers (not stale peer_heights)
-        let peer_ids = self.peer_manager.connected_peers();
-        if peer_ids.is_empty() {
-            debug!("No connected peers available for block download");
-            return;
-        }
-
-        // Distribute requests across peers
-        for (i, hash) in hashes_to_request.iter().enumerate() {
-            let peer_id = peer_ids[i % peer_ids.len()];
-
-            let inv = vec![InvItem::new(InvType::Block, *hash)];
-            let msg = NetworkMessage::GetData(inv);
-
-            debug!("Requesting block {} from peer {}", hash, peer_id);
-
-            if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-                warn!("Failed to request block from peer {}: {}", peer_id, e);
-                continue;
+        // Each peer takes the next blocks up to its free slots, in one getdata
+        let mut next = hashes_to_request.into_iter();
+        for (peer_id, n) in free {
+            let batch: Vec<Hash256> = next.by_ref().take(n).collect();
+            if batch.is_empty() {
+                break;
             }
-
-            // Track the request
-            self.blocks_in_flight.write().insert(
-                *hash,
-                BlockRequest {
-                    peer_id,
-                    _hash: *hash,
-                    requested_at: Instant::now(),
-                },
-            );
-
-            self.peer_block_requests
-                .write()
-                .entry(peer_id)
-                .or_default()
-                .insert(*hash);
+            if self.send_block_getdata(peer_id, &batch).await {
+                self.peer_block_requests
+                    .write()
+                    .entry(peer_id)
+                    .or_default()
+                    .extend(batch);
+            }
         }
+    }
+
+    /// Ask `peer_id` for `hashes` in one getdata (split at MAX_INV_SIZE items)
+    /// and track each block on its own, so each times out and is re-requested
+    /// alone. False if the peer could not be sent to.
+    async fn send_block_getdata(&self, peer_id: PeerId, hashes: &[Hash256]) -> bool {
+        for chunk in hashes.chunks(crate::constants::MAX_INV_SIZE) {
+            let items = chunk
+                .iter()
+                .map(|h| InvItem::new(InvType::Block, *h))
+                .collect();
+            if let Err(e) = self
+                .peer_manager
+                .send_to_peer(peer_id, NetworkMessage::GetData(items))
+                .await
+            {
+                warn!("Failed to request blocks from peer {}: {}", peer_id, e);
+                return false;
+            }
+            debug!("Requested {} blocks from peer {}", chunk.len(), peer_id);
+            let now = Instant::now();
+            let mut in_flight = self.blocks_in_flight.write();
+            for hash in chunk {
+                in_flight.insert(
+                    *hash,
+                    BlockRequest {
+                        peer_id,
+                        _hash: *hash,
+                        requested_at: now,
+                    },
+                );
+            }
+        }
+        true
+    }
+
+    /// A block was accepted: it no longer needs its source
+    fn note_block_accepted(&self, hash: &Hash256) {
+        self.block_sources.write().remove(hash);
+    }
+
+    /// A block was refused. As Divi Core's ProcessMessage ("Bad block
+    /// processed"), the peer that sent it gets the refusal's misbehaviour score.
+    /// Returns true when the block is invalid (scored), so callers drop it
+    /// instead of retrying; an orphan or a local error scores 0 and is kept.
+    fn note_block_rejected(&self, hash: &Hash256, err: &StorageError) -> bool {
+        let score = err.misbehaviour_score();
+        if score == 0 {
+            return false;
+        }
+        if let Some(peer_id) = self.block_sources.write().remove(hash) {
+            self.peer_manager.report_misbehavior_score(
+                peer_id,
+                score,
+                &format!("bad block {}: {}", hash, err),
+            );
+        }
+        true
     }
 
     /// Handle received block
     pub async fn handle_block(&self, peer_id: PeerId, block: Block) {
         let hash = compute_block_hash(&block.header);
+        // Divi Core ignores blocks received while importing (main.cpp:814)
+        if self.chain.is_importing() {
+            debug!(
+                "Ignoring block {} from peer {} while importing",
+                hash, peer_id
+            );
+            return;
+        }
         debug!("Received block {} from peer {}", hash, peer_id);
 
         // Track chain height before processing to detect newly connected blocks
@@ -1052,6 +1234,13 @@ impl BlockSync {
         self.block_retry.write().remove(&hash);
 
         // Store in downloaded blocks
+        {
+            let mut sources = self.block_sources.write();
+            if sources.len() >= MAX_TRACKED_BLOCK_SOURCES {
+                sources.clear();
+            }
+            sources.insert(hash, peer_id);
+        }
         self.downloaded_blocks.write().insert(hash, block);
         self.stats.write().blocks_downloaded += 1;
 
@@ -1111,6 +1300,7 @@ impl BlockSync {
                         self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                     }
                     let height = self.chain.height();
+                    self.note_block_accepted(&hash);
                     // Remove from pending headers
                     self.pending_headers.write().pop_front();
                     debug!("Connected block {} at height {}", hash, height);
@@ -1122,6 +1312,7 @@ impl BlockSync {
                 }
                 Err(e) => {
                     error!("Failed to connect block {}: {}", hash, e);
+                    self.note_block_rejected(&hash, &e);
                     break;
                 }
             }
@@ -1229,6 +1420,7 @@ impl BlockSync {
                         self.fire_reorg_callbacks(fork_height, result.orphaned_transactions);
                     }
                     let height = self.chain.height();
+                    self.note_block_accepted(&hash);
                     debug!("Connected block {} at height {}", hash, height);
                     self.stats.write().blocks_connected += 1;
 
@@ -1239,6 +1431,7 @@ impl BlockSync {
                 }
                 Err(e) => {
                     error!("Failed to connect block {}: {}", hash, e);
+                    self.note_block_rejected(&hash, &e);
                     break;
                 }
             }
@@ -1275,6 +1468,7 @@ impl BlockSync {
                         }
                         // Remove from downloaded if it was accepted
                         self.downloaded_blocks.write().remove(&hash);
+                        self.note_block_accepted(&hash);
                         made_progress = true;
 
                         // Check if our height changed (reorg happened)
@@ -1292,9 +1486,14 @@ impl BlockSync {
                         }
                     }
                     Err(e) => {
-                        // Block couldn't be accepted (orphan or invalid)
-                        // Keep it for now, might be usable after we get more blocks
-                        debug!("Block {} not accepted yet: {}", hash, e);
+                        // An invalid block is scored and dropped; an orphan is
+                        // kept, it might be usable after we get more blocks
+                        if self.note_block_rejected(&hash, &e) {
+                            self.downloaded_blocks.write().remove(&hash);
+                            warn!("Dropped invalid block {}: {}", hash, e);
+                        } else {
+                            debug!("Block {} not accepted yet: {}", hash, e);
+                        }
                     }
                 }
             }
@@ -1404,15 +1603,23 @@ impl BlockSync {
                     false
                 }
             } else {
+                if stall.0 != progress {
+                    // The chain moved: every peer may be tried again
+                    self.stalled_sync_peers.write().clear();
+                }
                 stall.0 = progress;
                 stall.1 = 0;
                 false
             }
         }; // RwLock guard dropped here
         if is_stalled {
-            *self.sync_peer.write() = None;
+            // The next sync peer is another one (select_sync_peer)
+            if let Some(peer) = self.sync_peer.write().take() {
+                self.stalled_sync_peers.write().insert(peer);
+            }
             self.downloaded_blocks.write().clear();
             self.orphan_blocks.write().clear();
+            self.block_sources.write().clear();
             self.request_headers().await;
             return;
         }
@@ -1514,6 +1721,7 @@ impl BlockSync {
 
                 // Clear downloaded blocks now that we've saved them as orphans
                 self.downloaded_blocks.write().clear();
+                self.block_sources.write().clear();
 
                 // Try to request missing blocks to fill the gap
                 self.request_missing_blocks_for_orphans().await;
@@ -1564,6 +1772,11 @@ impl BlockSync {
 
     /// Handle inventory announcement
     pub async fn handle_inv(&self, peer_id: PeerId, items: Vec<InvItem>) {
+        // Divi Core asks for nothing announced while importing (main.cpp:581-587)
+        if self.chain.is_importing() {
+            trace!("Ignoring inv from peer {} while importing", peer_id);
+            return;
+        }
         // Count block items
         let block_count = items
             .iter()
@@ -1671,13 +1884,14 @@ impl BlockSync {
                             // We have the full block but it's not on main chain
                             // Try to activate it (reorg if it has more work)
                             match self.chain.try_activate_block(&hash) {
-                                Ok(true) => {
+                                Ok(Some((fork_height, orphaned))) => {
                                     info!("Reorg triggered by block {} from inv", hash);
+                                    self.fire_reorg_callbacks(fork_height, orphaned);
                                     reorg_triggered = true;
                                     already_have += 1;
                                     continue;
                                 }
-                                Ok(false) => {
+                                Ok(None) => {
                                     // Stored on a side chain with less work than our
                                     // tip. We already hold it: count it as known. Re-
                                     // queueing it was the deep-fork loop: the queue
@@ -1817,56 +2031,50 @@ impl BlockSync {
         }
     }
 
-    /// Request blocks from the pending queue, respecting MAX_BLOCKS_IN_FLIGHT.
+    /// Request blocks from the pending queue, at most MAX_BLOCKS_IN_TRANSIT_PER_PEER
+    /// in flight per peer: a block goes to the first of its preferred peers
+    /// with a free slot, and waits while every peer is full. The blocks given to
+    /// one peer in a pass go in one getdata, in queue order (Divi Core asks for
+    /// an inv's wanted blocks in one getdata, main.cpp:584-610).
+    ///
+    /// Only peers that advertise NODE_NETWORK are chosen (Divi Core's fClient,
+    /// main.cpp:410, :1133, :1211). With no such peer connected, a block is asked
+    /// of the peer that announced it, as Divi Core answers any inv with a
+    /// getdata to its sender; a block nobody connected announced waits.
     ///
     /// Uses only actually-connected peers (via `peer_manager`) rather than the
-    /// potentially-stale `peer_heights` map. Includes a circuit breaker: if we
-    /// encounter 3 consecutive failures (no connected peers or all sends fail),
-    /// we stop processing the queue to avoid a tight spin loop. Unassigned or
-    /// dead-peer blocks will be retried the next time this method is called
-    /// (e.g., from `check_timeouts` or when a new block arrives).
+    /// potentially-stale `peer_heights` map. Blocks that cannot be sent stay
+    /// queued and are retried the next time this method is called (e.g., from
+    /// `check_timeouts` or when a new block arrives).
     async fn request_queued_blocks(&self) {
-        let mut consecutive_failures: u32 = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        if self.chain.is_importing() {
+            return;
+        }
+        let connected = self.peer_manager.connected_peers();
+        if connected.is_empty() {
+            return;
+        }
+        let full: HashSet<PeerId> = self.peer_manager.full_history_peers().into_iter().collect();
+        let mut per_peer = self.in_flight_per_peer();
+        // Peers in the order they were first given a block, and their blocks
+        let mut order: Vec<PeerId> = Vec::new();
+        let mut batches: HashMap<PeerId, Vec<Hash256>> = HashMap::new();
+        let mut assigned: HashSet<Hash256> = HashSet::new();
+        // Blocks whose peers are all full for now, kept in queue order
+        let mut waiting: Vec<(Hash256, PeerId)> = Vec::new();
 
         loop {
-            // Circuit breaker: stop after too many consecutive failures
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                let queued = self.pending_block_requests.read().len();
-                if queued > 0 {
-                    debug!(
-                        "Circuit breaker: {} consecutive send failures, {} blocks still queued — will retry later",
-                        consecutive_failures, queued
-                    );
-                }
-                break;
-            }
-
-            // Check how many slots are available
-            let in_flight_count = self.blocks_in_flight.read().len();
-            if in_flight_count >= MAX_BLOCKS_IN_FLIGHT {
-                trace!("At max blocks in flight ({}), waiting", in_flight_count);
-                break;
-            }
-
-            // Get next block to request
-            let next = {
-                let mut pending = self.pending_block_requests.write();
-                pending.pop_front()
-            };
-
+            let next = self.pending_block_requests.write().pop_front();
             let Some((hash, assigned_peer)) = next else {
                 break; // Queue empty
             };
 
-            // Double-check we don't already have it
+            // Already have it, already asked for it, or given up on it
             if self.chain.has_block(&hash).unwrap_or(false) {
                 self.block_retry.write().remove(&hash);
-                consecutive_failures = 0;
                 continue;
             }
-            if self.blocks_in_flight.read().contains_key(&hash) {
-                consecutive_failures = 0;
+            if self.blocks_in_flight.read().contains_key(&hash) || assigned.contains(&hash) {
                 continue;
             }
             if self
@@ -1875,64 +2083,90 @@ impl BlockSync {
                 .get(&hash)
                 .is_some_and(|r| r.gave_up_at.is_some())
             {
-                consecutive_failures = 0;
                 continue;
             }
 
-            let connected = self.peer_manager.connected_peers();
-            if connected.is_empty() {
-                // No connected peers at all — put the block back as unassigned
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, Self::UNASSIGNED_PEER));
-                consecutive_failures += 1;
-                continue;
-            }
-
-            let peers_to_try = self.order_peers_for_block(&hash, assigned_peer, connected);
-
-            // Try each peer until one succeeds
-            let item = InvItem {
-                inv_type: InvType::Block,
-                hash,
+            // A block announced by a peer that is still connected, may be
+            // asked (a full peer, or any peer when none is full) and has not
+            // failed it is asked of that peer only. Divi Core answers an inv
+            // with a getdata to its sender (main.cpp:584-610) and otherwise
+            // asks a peer only for blocks it has shown it has
+            // (FindNextBlocksToDownload, main.cpp:1211-1214); a peer that has
+            // not announced the block may not have it and would hold it until
+            // the request times out. With the announcer's slots full the block
+            // waits for one of them.
+            let announcer = self.block_retry.read().get(&hash).and_then(|r| {
+                r.announced_by.filter(|a| {
+                    connected.contains(a)
+                        && (full.is_empty() || full.contains(a))
+                        && !r.failed_peers.contains(a)
+                })
+            });
+            let candidates: Vec<PeerId> = if let Some(announcer) = announcer {
+                vec![announcer]
+            } else if full.is_empty() {
+                // No full peer: only the announcer, as Divi Core's inv reply
+                let announcer = self
+                    .block_retry
+                    .read()
+                    .get(&hash)
+                    .and_then(|r| r.announced_by)
+                    .unwrap_or(assigned_peer);
+                connected
+                    .iter()
+                    .copied()
+                    .filter(|p| *p == announcer && *p != Self::UNASSIGNED_PEER)
+                    .collect()
+            } else {
+                self.order_peers_for_block(&hash, assigned_peer, connected.clone())
+                    .into_iter()
+                    .filter(|p| full.contains(p))
+                    .collect()
             };
-            let mut sent = false;
-
-            for &try_peer in &peers_to_try {
-                let msg = NetworkMessage::GetData(vec![item.clone()]);
-                match self.peer_manager.send_to_peer(try_peer, msg).await {
-                    Ok(()) => {
-                        debug!("Requested block {} from peer {}", hash, try_peer);
-                        self.blocks_in_flight.write().insert(
-                            hash,
-                            BlockRequest {
-                                peer_id: try_peer,
-                                _hash: hash,
-                                requested_at: Instant::now(),
-                            },
-                        );
-                        sent = true;
-                        consecutive_failures = 0;
-                        break;
-                    }
-                    Err(_) => {
-                        // This peer failed, try the next one
-                        continue;
-                    }
-                }
-            }
-
-            if !sent {
-                // All peers failed — put block back as unassigned for later retry
-                debug!(
-                    "All {} peers failed for block {}, re-queuing as unassigned",
-                    peers_to_try.len(),
-                    hash
+            let chosen = candidates
+                .into_iter()
+                .find(|p| per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER);
+            let Some(peer) = chosen else {
+                // Every peer this block may be asked of is full, or none is
+                // connected: it waits. Blocks behind it are still placed while
+                // some connected peer has a free slot (one announced by another
+                // peer, or one any peer may be asked for)
+                trace!(
+                    "No peer with a free slot for block {}; {} queued",
+                    hash,
+                    self.pending_block_requests.read().len() + 1
                 );
-                self.pending_block_requests
-                    .write()
-                    .push_back((hash, Self::UNASSIGNED_PEER));
-                consecutive_failures += 1;
+                waiting.push((hash, assigned_peer));
+                let any_free = connected.iter().any(|p| {
+                    per_peer.get(p).copied().unwrap_or(0) < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                });
+                if any_free {
+                    continue;
+                }
+                break;
+            };
+            *per_peer.entry(peer).or_default() += 1;
+            assigned.insert(hash);
+            if !batches.contains_key(&peer) {
+                order.push(peer);
+            }
+            batches.entry(peer).or_default().push(hash);
+        }
+        {
+            let mut pending = self.pending_block_requests.write();
+            for entry in waiting.into_iter().rev() {
+                pending.push_front(entry);
+            }
+        }
+
+        for peer in order {
+            let hashes = batches.remove(&peer).unwrap_or_default();
+            if !self.send_block_getdata(peer, &hashes).await {
+                // The peer went away: queue its blocks again for any peer
+                let mut pending = self.pending_block_requests.write();
+                for hash in hashes {
+                    pending.push_back((hash, Self::UNASSIGNED_PEER));
+                }
             }
         }
     }
@@ -2105,6 +2339,7 @@ impl BlockSync {
 
                         // Remove from orphans
                         self.orphan_blocks.write().remove(&hash);
+                        self.note_block_accepted(&hash);
 
                         // Update stats
                         self.stats.write().blocks_connected += 1;
@@ -2117,7 +2352,12 @@ impl BlockSync {
                         connected_any = true;
                     }
                     Err(e) => {
-                        debug!("Failed to connect orphan block {}: {}", hash, e);
+                        if self.note_block_rejected(&hash, &e) {
+                            self.orphan_blocks.write().remove(&hash);
+                            warn!("Dropped invalid orphan block {}: {}", hash, e);
+                        } else {
+                            debug!("Failed to connect orphan block {}: {}", hash, e);
+                        }
                     }
                 }
             }
@@ -2160,12 +2400,14 @@ impl BlockSync {
         let current_sync = *self.sync_peer.read();
         *self.sync_peer.write() = None;
 
-        // Try to find a peer that's NOT the current sync peer
+        // Try to find a peer that's NOT the current sync peer, with NODE_NETWORK
         let alt_peer = {
+            let full: HashSet<PeerId> =
+                self.peer_manager.full_history_peers().into_iter().collect();
             let peer_heights = self.peer_heights.read();
             peer_heights
                 .iter()
-                .filter(|(&id, _)| Some(id) != current_sync)
+                .filter(|(&id, _)| Some(id) != current_sync && full.contains(&id))
                 .max_by_key(|(_, &h)| h)
                 .map(|(&id, _)| id)
         };
@@ -2287,7 +2529,8 @@ mod tests {
         // height peer when no peer has height >= best_peer_height.
         // This can happen when best_peer_height is updated from inv announcements
         // but peer_heights only has the initial heights from version messages.
-        let (sync, _dir) = create_test_sync();
+        // Peers with NODE_NETWORK, the only ones divid syncs from
+        let (sync, _rxs, _dir) = sync_with_peers(3);
 
         // Add peers with initial heights
         sync.update_peer_height(1, 1000);
@@ -2313,7 +2556,8 @@ mod tests {
 
     #[test]
     fn test_select_sync_peer_exact_match() {
-        let (sync, _dir) = create_test_sync();
+        // Peers with NODE_NETWORK, the only ones divid syncs from
+        let (sync, _rxs, _dir) = sync_with_peers(3);
 
         sync.update_peer_height(1, 1000);
         sync.update_peer_height(2, 1500);
@@ -2466,7 +2710,8 @@ mod tests {
 
     #[test]
     fn test_select_sync_peer_prefers_higher() {
-        let (sync, _dir) = create_test_sync();
+        // Peers with NODE_NETWORK, the only ones divid syncs from
+        let (sync, _rxs, _dir) = sync_with_peers(3);
 
         sync.update_peer_height(1, 500);
         sync.update_peer_height(2, 1000);
@@ -2722,45 +2967,62 @@ mod tests {
 
     /// Build `len` consensus-valid regtest blocks on top of genesis.
     ///
-    /// Heights 1..=100 are PoW; above that each block is PoS, built the way
-    /// `divi-node`'s staker builds one (coinbase marker, coinstake re-staking
-    /// the previous stake output, lottery and treasury payees, recoverable
-    /// block signature). The chain is built in its own scratch `Chain`, where
-    /// it is the main chain, so lottery winners come from the real chain code.
-    /// Stake-kernel checks are skipped in IBD mode, which a fresh `Chain` is in.
+    /// Heights 1..=100 are PoW (1250 DIVI coinbases, with a real proof of work
+    /// for regtest's bits); above that each block is PoS, built the way
+    /// `divi-node`'s staker builds one (coinbase marker, coinstake, lottery and
+    /// treasury payees, recoverable block signature). Each coinstake stakes the
+    /// largest coin at least 20 blocks deep (regtest's maturity). The chain is
+    /// built in its own scratch `Chain`, where it is the main chain, so lottery
+    /// winners come from the real chain code.
     fn build_regtest_chain(len: u32, seed: u8, time_offset: u32) -> Vec<Block> {
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
         let chain = Chain::new(db, regtest_params()).unwrap();
-        extend_regtest_chain(&chain, len, seed, time_offset, 1250_00000000)
+        extend_regtest_chain(&chain, len, seed, time_offset, false)
     }
 
     /// Extend `chain` from genesis to height `len` (see `build_regtest_chain`).
-    /// `pow_value_sat` is the value of each PoW coinbase; the stake re-staked
-    /// from height 101 on starts from the height-100 coinbase.
+    /// With `big_stake`, height 40 joins the coinbases of heights 1-10 into one
+    /// coin of about 12,500 DIVI, above the lottery's ticket minimum.
     fn extend_regtest_chain(
         chain: &Chain,
         len: u32,
         seed: u8,
         time_offset: u32,
-        pow_value_sat: i64,
+        big_stake: bool,
     ) -> Vec<Block> {
         use divi_consensus::block_subsidy;
         use divi_primitives::amount::Amount;
         use divi_primitives::script::Script;
         use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
 
+        const MATURITY: u32 = 20;
         let key = divi_crypto::SecretKey::from_bytes(&[seed; 32]).unwrap();
         let pay = Script::new_p2pkh(key.public_key().pubkey_hash().as_bytes());
+        let sign_input = |tx: &mut Transaction, i: usize, value: Amount| {
+            let sighash =
+                divi_script::TransactionSignatureChecker::new(tx, i, value).signature_hash(&pay, 1);
+            let mut sig = divi_crypto::sign_hash(&key, &sighash).unwrap().to_der();
+            sig.push(1);
+            let pubkey = key.public_key().to_bytes();
+            let mut script_sig = vec![sig.len() as u8];
+            script_sig.extend_from_slice(&sig);
+            script_sig.push(pubkey.len() as u8);
+            script_sig.extend_from_slice(&pubkey);
+            tx.vin[i].script_sig = Script::from_bytes(script_sig);
+        };
         let genesis = chain.tip().unwrap();
         let (mut prev, mut t) = (genesis.hash, genesis.time + time_offset);
-        let mut stake: Option<(OutPoint, Amount)> = None;
+        // Spendable coins of `pay`: (outpoint, value, height)
+        let mut coins: Vec<(OutPoint, Amount, u32)> = Vec::new();
         let mut blocks = Vec::with_capacity(len as usize);
 
         for h in 1..=len {
             t += 60;
-            // Height + seed keep every coinbase txid unique across both chains.
-            let mut tag = vec![0x05];
+            // BIP34 height, then height + seed to keep every coinbase txid unique
+            // across both chains.
+            let mut tag = divi_storage::bip34_height_script(h);
+            tag.push(0x05);
             tag.extend_from_slice(&h.to_le_bytes());
             tag.push(seed);
 
@@ -2770,21 +3032,48 @@ mod tests {
             block.header.bits = 0x207fffff; // regtest never retargets
 
             if h <= 100 {
-                block.header.version = 1;
+                block.header.version = 4;
                 let coinbase = Transaction {
                     version: 1,
                     vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
-                    vout: vec![TxOut::new(Amount::from_sat(pow_value_sat), pay.clone())],
+                    vout: vec![TxOut::new(Amount::from_sat(1250_00000000), pay.clone())],
                     lock_time: 0,
                 };
-                if h == 100 {
-                    stake = Some((OutPoint::new(coinbase.txid(), 0), coinbase.vout[0].value));
-                }
+                coins.push((OutPoint::new(coinbase.txid(), 0), coinbase.vout[0].value, h));
                 block.transactions.push(coinbase);
+                if big_stake && h == 40 {
+                    let joined: Vec<_> = coins.drain(..10).collect();
+                    let total = joined.iter().fold(Amount::ZERO, |acc, (_, v, _)| acc + *v);
+                    let mut join = Transaction {
+                        version: 1,
+                        vin: joined
+                            .iter()
+                            .map(|(op, _, _)| TxIn::new(*op, Script::default(), 0xffffffff))
+                            .collect(),
+                        vout: vec![TxOut::new(
+                            total - Amount::from_sat(1_00000000),
+                            pay.clone(),
+                        )],
+                        lock_time: 0,
+                    };
+                    for (i, (_, v, _)) in joined.iter().enumerate() {
+                        sign_input(&mut join, i, *v);
+                    }
+                    coins.push((OutPoint::new(join.txid(), 0), join.vout[0].value, h));
+                    block.transactions.push(join);
+                }
             } else {
                 block.header.version = 4;
                 let parent = chain.get_block_index(&prev).unwrap().unwrap();
-                let (prevout, value) = stake.take().unwrap();
+                // The largest mature coin (the earliest of equal ones)
+                let pick = coins
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, ch))| h - ch >= MATURITY)
+                    .max_by(|(ia, (_, va, _)), (ib, (_, vb, _))| va.cmp(vb).then(ib.cmp(ia)))
+                    .map(|(i, _)| i)
+                    .expect("a mature coin to stake");
+                let (prevout, value, _) = coins.remove(pick);
                 let rewards = block_subsidy::get_block_subsidy(h, 100);
                 let mut vout = vec![
                     TxOut::new(Amount::ZERO, Script::default()),
@@ -2802,17 +3091,12 @@ mod tests {
                     lock_time: 0,
                 };
                 // Blocks are script-verified: sign the stake input
-                let sighash = divi_script::TransactionSignatureChecker::new(&coinstake, 0, value)
-                    .signature_hash(&pay, 1);
-                let mut sig = divi_crypto::sign_hash(&key, &sighash).unwrap().to_der();
-                sig.push(1);
-                let pubkey = key.public_key().to_bytes();
-                let mut script_sig = vec![sig.len() as u8];
-                script_sig.extend_from_slice(&sig);
-                script_sig.push(pubkey.len() as u8);
-                script_sig.extend_from_slice(&pubkey);
-                coinstake.vin[0].script_sig = Script::from_bytes(script_sig);
-                stake = Some((OutPoint::new(coinstake.txid(), 1), coinstake.vout[1].value));
+                sign_input(&mut coinstake, 0, value);
+                coins.push((
+                    OutPoint::new(coinstake.txid(), 1),
+                    coinstake.vout[1].value,
+                    h,
+                ));
                 let marker = Transaction {
                     version: 2,
                     vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
@@ -2830,6 +3114,11 @@ mod tests {
                     .unwrap()
                     .to_compact_with_recovery()
                     .to_vec();
+            } else {
+                let target = Hash256::from_compact(block.header.bits);
+                while compute_block_hash(&block.header) > target {
+                    block.header.nonce += 1;
+                }
             }
             prev = chain
                 .accept_block(block.clone())
@@ -2901,8 +3190,8 @@ mod tests {
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
         let chain = Chain::new(db, regtest_params()).unwrap();
 
-        // 20,000 DIVI PoW coinbases: every coinstake from 101 on is a ticket.
-        let blocks = extend_regtest_chain(&chain, 150, 0x7C, 0, 2_000_000_000_000);
+        // One stake above the ticket minimum, staked every 20 blocks (101, 121, 141).
+        let blocks = extend_regtest_chain(&chain, 150, 0x7C, 0, true);
 
         assert!(treasury::is_treasury_block_with_lottery(
             150,
@@ -2939,6 +3228,115 @@ mod tests {
         assert_eq!(coinstake.vout.len(), 4, "no lottery payees at 150");
     }
 
+    /// A stalled sync is retried with another peer each time, and every peer
+    /// at the best height gets its turn before one is tried again: picking the
+    /// first peer of a hash map picked the same peer at every rotation, so a
+    /// node whose first peer serves no blocks never synced (mainnet replay at
+    /// 2,472,145)
+    #[tokio::test]
+    async fn stalled_sync_rotates_through_every_peer() {
+        use crate::peer::PeerHandle;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let pm = PeerManager::new(Default::default());
+        let sync = BlockSync::new(chain, pm.clone());
+        let peers: Vec<PeerId> = vec![3, 8, 11, 20, 42];
+        let mut receivers = Vec::new();
+        for &id in &peers {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            receivers.push(rx);
+            // Peers that serve every block (NODE_NETWORK), the only ones a
+            // sync peer is chosen from
+            let stats: Arc<crate::peer::LivePeerStats> = Default::default();
+            stats
+                .services
+                .store(crate::constants::services::NODE_NETWORK, Ordering::Relaxed);
+            pm.insert_test_peer(PeerHandle {
+                id,
+                addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
+                tx,
+                inbound: false,
+                stats,
+            });
+            sync.update_peer_height(id, 500);
+        }
+
+        // Downloading blocks, as the replay was, with no block coming in
+        *sync.state.write() = SyncState::BlockDownload;
+
+        // Each stall (three checks without progress) moves to another peer
+        let mut chosen = Vec::new();
+        for _ in 0..peers.len() {
+            for _ in 0..3 {
+                sync.check_timeouts().await;
+            }
+            chosen.push(sync.sync_peer.read().expect("a sync peer is chosen"));
+        }
+        let mut distinct = chosen.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct, peers, "every peer gets a turn: {chosen:?}");
+    }
+
+    /// Both rules together: a stalled sync rotates over the NODE_NETWORK peers
+    /// and never to one without it, even at the best height
+    #[tokio::test]
+    async fn stalled_sync_rotates_only_over_peers_with_node_network() {
+        let (sync, _rxs, _dir) = sync_with_peers(4);
+        make_pruned(&sync, 2);
+        for id in 1..=4 {
+            sync.update_peer_height(id, 500);
+        }
+        *sync.state.write() = SyncState::BlockDownload;
+        let mut chosen = Vec::new();
+        for _ in 0..6 {
+            for _ in 0..3 {
+                sync.check_timeouts().await;
+            }
+            chosen.push(sync.sync_peer.read().expect("a sync peer is chosen"));
+        }
+        assert!(
+            !chosen.contains(&2),
+            "never the client-only peer: {chosen:?}"
+        );
+        let mut distinct = chosen.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            vec![1, 3, 4],
+            "every full peer gets a turn: {chosen:?}"
+        );
+    }
+
+    /// While block files are imported a block from a peer is not taken, as
+    /// Divi Core ignores "block" messages then (main.cpp:814); afterwards it is
+    #[tokio::test]
+    async fn blocks_from_peers_are_ignored_while_importing() {
+        let blocks = build_regtest_chain(1, 0xC3, 0);
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        let sync = BlockSync::new(chain.clone(), PeerManager::new(Default::default()));
+
+        chain.set_importing(true);
+        sync.handle_block(7, blocks[0].clone()).await;
+        assert_eq!(
+            chain.height(),
+            0,
+            "a peer's block was taken while importing"
+        );
+
+        chain.set_importing(false);
+        sync.handle_block(7, blocks[0].clone()).await;
+        assert_eq!(
+            chain.height(),
+            1,
+            "a peer's block was not taken after the import"
+        );
+    }
+
     #[tokio::test]
     async fn test_deep_side_chain_reorg_across_inv_batches() {
         use crate::peer::PeerHandle;
@@ -2952,7 +3350,11 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
-        let chain = Arc::new(Chain::new(db, regtest_params()).unwrap());
+        // This test is about fetching a long fork across inv batches; lift the
+        // 100-block reorganization limit, which would refuse a fork this deep
+        let mut params = regtest_params();
+        params.max_reorg_depth = None;
+        let chain = Arc::new(Chain::new(db, params).unwrap());
         let pm = PeerManager::new(Default::default());
         let sync = BlockSync::new(chain.clone(), pm.clone());
 
@@ -3087,12 +3489,17 @@ mod tests {
         let mut rxs = HashMap::new();
         for id in 1..=n {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
+            // Test peers serve every block (NODE_NETWORK), as Divi Core peers do
+            let stats: Arc<crate::peer::LivePeerStats> = Default::default();
+            stats
+                .services
+                .store(crate::constants::services::NODE_NETWORK, Ordering::Relaxed);
             sync.peer_manager.insert_test_peer(PeerHandle {
                 id,
                 addr: format!("127.0.0.1:{}", 1000 + id).parse().unwrap(),
                 tx,
                 inbound: false,
-                stats: Default::default(),
+                stats,
             });
             rxs.insert(id, rx);
         }
@@ -3167,6 +3574,346 @@ mod tests {
             order_retry_peers(vec![2, 1], &all, &HashSet::new(), None, 0, 0).len(),
             2
         );
+    }
+
+    /// Blocks in flight per peer
+    fn in_flight_per_peer(sync: &BlockSync) -> HashMap<PeerId, usize> {
+        let mut per = HashMap::new();
+        for req in sync.blocks_in_flight.read().values() {
+            *per.entry(req.peer_id).or_default() += 1;
+        }
+        per
+    }
+
+    /// `n` distinct headers, as if received from a getheaders reply
+    fn queue_headers(sync: &BlockSync, n: u32) -> Vec<Hash256> {
+        let mut pending = sync.pending_headers.write();
+        (0..n)
+            .map(|i| {
+                let header = BlockHeader {
+                    nonce: 1000 + i,
+                    ..Default::default()
+                };
+                pending.push_back(header.clone());
+                compute_block_hash(&header)
+            })
+            .collect()
+    }
+
+    /// Divi Core requests at most MAX_BLOCKS_IN_TRANSIT_PER_PEER (16) blocks
+    /// from one peer (defaultValues.h:80, main.cpp:1211-1217)
+    #[tokio::test]
+    async fn no_peer_gets_more_than_16_blocks_in_flight() {
+        let (sync, _rxs, _dir) = sync_with_peers(2);
+        queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert!(per.values().all(|&n| n <= 16), "{per:?}");
+        assert_eq!(per.values().sum::<usize>(), 32, "{per:?}");
+
+        // Announced blocks are held to the same cap
+        let (sync, _rxs, _dir) = sync_with_peers(2);
+        for i in 0..40u8 {
+            sync.pending_block_requests
+                .write()
+                .push_back((Hash256::from_bytes([i + 1; 32]), 1));
+        }
+        sync.request_queued_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert!(per.values().all(|&n| n <= 16), "{per:?}");
+        assert_eq!(
+            sync.pending_block_requests.read().len(),
+            8,
+            "the rest wait for a free slot"
+        );
+    }
+
+    /// Blocks a peer announced are asked of that peer, not of another peer
+    /// that has not shown it has them: with the announcer's 16 slots full the
+    /// rest wait for its slots (Divi Core main.cpp:584-610, :1211-1214).
+    /// Spread over a peer that lacked them, they stayed in flight there until
+    /// the request timed out.
+    #[tokio::test]
+    async fn announced_blocks_are_asked_of_the_announcer_only() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes: Vec<Hash256> = (0..28u8)
+            .map(|i| Hash256::from_bytes([i + 1; 32]))
+            .collect();
+        sync.handle_inv(
+            1,
+            hashes
+                .iter()
+                .map(|h| InvItem::new(InvType::Block, *h))
+                .collect(),
+        )
+        .await;
+        let asked = block_getdatas(&mut rxs);
+        assert!(!asked.contains_key(&2), "peer 2 was asked: {asked:?}");
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), None, "{per:?}");
+        assert_eq!(sync.pending_block_requests.read().len(), 12);
+
+        // A block from the announcer frees a slot there for the next one
+        let first = *sync
+            .blocks_in_flight
+            .read()
+            .keys()
+            .next()
+            .expect("a block in flight");
+        sync.blocks_in_flight.write().remove(&first);
+        sync.request_queued_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), None, "{per:?}");
+        assert_eq!(sync.pending_block_requests.read().len(), 11);
+
+        // Once the announcer fails a block, another peer may be asked for it
+        let stuck = *sync.blocks_in_flight.read().keys().next().unwrap();
+        expire_request(&sync, &stuck);
+        sync.check_timeouts().await;
+        assert_eq!(in_flight_peer(&sync, &stuck), Some(2));
+    }
+
+    /// Divi Core fills each peer's free slots with the next blocks in chain
+    /// order (FindNextBlocksToDownload, NodeStateRegistry.cpp:146-234), so
+    /// requests spread over the peers rather than one peer taking them all
+    #[tokio::test]
+    async fn requests_spread_over_two_peers() {
+        let (sync, _rxs, _dir) = sync_with_peers(2);
+        let hashes = queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let per = in_flight_per_peer(&sync);
+        assert_eq!(per.get(&1), Some(&16), "{per:?}");
+        assert_eq!(per.get(&2), Some(&16), "{per:?}");
+        // the first 32 blocks, nothing beyond them
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(in_flight_peer(&sync, hash).is_some(), i < 32, "block {i}");
+        }
+        // a block that arrives frees its peer's slot for the next block
+        let first = hashes[0];
+        let peer = in_flight_peer(&sync, &first).unwrap();
+        sync.blocks_in_flight.write().remove(&first);
+        sync.pending_headers.write().pop_front(); // connected
+        sync.request_blocks().await;
+        assert_eq!(in_flight_peer(&sync, &hashes[32]), Some(peer));
+        assert!(in_flight_peer(&sync, &hashes[33]).is_none());
+    }
+
+    /// Every block getdata each peer received since the last drain, as hash lists
+    fn block_getdatas(
+        rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+    ) -> HashMap<PeerId, Vec<Vec<Hash256>>> {
+        let mut got: HashMap<PeerId, Vec<Vec<Hash256>>> = HashMap::new();
+        for (&id, rx) in rxs.iter_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                if let NetworkMessage::GetData(items) = msg {
+                    let blocks: Vec<Hash256> = items
+                        .iter()
+                        .filter(|i| i.inv_type == InvType::Block)
+                        .map(|i| i.hash)
+                        .collect();
+                    if !blocks.is_empty() {
+                        got.entry(id).or_default().push(blocks);
+                    }
+                }
+            }
+        }
+        got
+    }
+
+    /// A peer that keeps only recent blocks (no NODE_NETWORK), as a pruning node
+    fn make_pruned(sync: &BlockSync, peer: PeerId) {
+        let stats = sync.peer_manager.test_peer_stats(peer).unwrap();
+        stats.services.store(
+            crate::constants::services::NODE_NETWORK_LIMITED,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Divi Core asks for every wanted block of a pass in one getdata
+    /// (main.cpp:584-610 for an inv; main.cpp:1205-1224 collects vGetData and
+    /// sends it once), in chain order
+    #[tokio::test]
+    async fn blocks_for_one_peer_go_in_one_getdata() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes = queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        for peer in [1, 2] {
+            let msgs = &got[&peer];
+            assert_eq!(msgs.len(), 1, "peer {peer}: {} getdata", msgs.len());
+            assert_eq!(msgs[0].len(), 16, "peer {peer}");
+            // consecutive blocks in chain order
+            let start = hashes.iter().position(|h| *h == msgs[0][0]).unwrap();
+            assert_eq!(msgs[0], hashes[start..start + 16].to_vec(), "peer {peer}");
+        }
+
+        // Announced blocks: one getdata per peer as well
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let announced: Vec<Hash256> = (0..40u8)
+            .map(|i| Hash256::from_bytes([i + 1; 32]))
+            .collect();
+        for h in &announced {
+            sync.pending_block_requests.write().push_back((*h, 1));
+        }
+        sync.request_queued_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        assert_eq!(got[&1], vec![announced[..16].to_vec()]);
+        assert_eq!(got[&2], vec![announced[16..32].to_vec()]);
+    }
+
+    /// Divi Core does not download from a peer without NODE_NETWORK (fClient,
+    /// main.cpp:410 and :1211), nor start a sync with one (main.cpp:1133)
+    #[tokio::test]
+    async fn peers_without_node_network_get_no_block_requests() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        make_pruned(&sync, 3);
+        queue_headers(&sync, 40);
+        sync.request_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        assert!(!got.contains_key(&3), "{:?}", got.keys());
+        assert_eq!(in_flight_per_peer(&sync).values().sum::<usize>(), 32);
+
+        // Blocks the pruned peer announced go to the full peers
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        make_pruned(&sync, 3);
+        for i in 0..10u8 {
+            sync.pending_block_requests
+                .write()
+                .push_back((Hash256::from_bytes([i + 1; 32]), 3));
+        }
+        sync.request_queued_blocks().await;
+        let got = block_getdatas(&mut rxs);
+        assert!(!got.contains_key(&3), "{:?}", got.keys());
+        assert_eq!(in_flight_per_peer(&sync).values().sum::<usize>(), 10);
+    }
+
+    /// With no full peer at all, a block is still asked of the peer that
+    /// announced it, as Divi Core answers any inv (main.cpp:584-610)
+    #[tokio::test]
+    async fn announcer_without_node_network_is_asked_when_no_full_peer_is_connected() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        make_pruned(&sync, 1);
+        make_pruned(&sync, 2);
+        let hash = Hash256::from_bytes([0x42; 32]);
+        sync.pending_block_requests.write().push_back((hash, 2));
+        sync.request_queued_blocks().await;
+        assert_eq!(block_getdatas(&mut rxs).get(&2), Some(&vec![vec![hash]]));
+        // and a block nobody announced waits
+        let other = Hash256::from_bytes([0x43; 32]);
+        sync.pending_block_requests
+            .write()
+            .push_back((other, BlockSync::UNASSIGNED_PEER));
+        sync.request_queued_blocks().await;
+        assert!(in_flight_peer(&sync, &other).is_none());
+    }
+
+    /// A batched getdata answered in part: each missing block times out and is
+    /// re-requested on its own
+    #[tokio::test]
+    async fn a_partly_answered_batch_is_re_requested_per_block() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let hashes = queue_headers(&sync, 4);
+        sync.request_blocks().await;
+        let first = block_getdatas(&mut rxs);
+        let (peer, batch) = first
+            .iter()
+            .next()
+            .map(|(p, m)| (*p, m[0].clone()))
+            .unwrap();
+        assert_eq!(batch.len(), 4);
+        // two of the four arrive; the other two time out
+        for h in &hashes[..2] {
+            sync.blocks_in_flight.write().remove(h);
+            sync.pending_headers.write().pop_front();
+        }
+        for h in &hashes[2..] {
+            expire_request(&sync, h);
+        }
+        sync.check_timeouts().await;
+        for h in &hashes[2..] {
+            let now = in_flight_peer(&sync, h).expect("re-requested");
+            assert_ne!(now, peer, "not from the peer that failed it");
+            assert_eq!(sync.block_retry.read()[h].attempts, 1);
+        }
+        for h in &hashes[..2] {
+            assert!(in_flight_peer(&sync, h).is_none());
+        }
+    }
+
+    /// getblocks sent to each peer since the last drain
+    fn getblocks_recipients(
+        rxs: &mut HashMap<PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>>,
+    ) -> Vec<PeerId> {
+        let mut got = Vec::new();
+        for (&id, rx) in rxs.iter_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                if matches!(
+                    msg,
+                    NetworkMessage::GetBlocks(_) | NetworkMessage::GetHeaders(_)
+                ) {
+                    got.push(id);
+                }
+            }
+        }
+        got.sort_unstable();
+        got
+    }
+
+    /// Divi Core starts a sync (getblocks) only with a peer that advertises
+    /// NODE_NETWORK (main.cpp:1133, fClient set at main.cpp:410)
+    #[tokio::test]
+    async fn sync_peer_is_never_a_peer_without_node_network() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        make_pruned(&sync, 1);
+        sync.update_peer_height(1, 500);
+        sync.update_peer_height(2, 400);
+        assert_eq!(sync.select_sync_peer(), Some(2));
+        sync.request_headers().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![2]);
+        assert_eq!(*sync.sync_peer.read(), Some(2));
+    }
+
+    /// With no NODE_NETWORK peer there is no sync peer and nothing is sent
+    #[tokio::test]
+    async fn no_sync_peer_when_no_peer_has_node_network() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        make_pruned(&sync, 1);
+        make_pruned(&sync, 2);
+        sync.update_peer_height(1, 500);
+        sync.update_peer_height(2, 400);
+        assert_eq!(sync.select_sync_peer(), None);
+        sync.request_headers().await;
+        assert!(getblocks_recipients(&mut rxs).is_empty());
+        assert_eq!(*sync.sync_peer.read(), None);
+    }
+
+    /// When the sync peer disconnects, the next sync goes to another
+    /// NODE_NETWORK peer (Divi Core: CNodeState::Finalize drops it from the
+    /// syncing count, NodeState.cpp:34-36, so main.cpp:1133-1141 starts anew),
+    /// never to a client-only one
+    #[tokio::test]
+    async fn after_the_sync_peer_disconnects_only_a_full_peer_takes_over() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        make_pruned(&sync, 3);
+        sync.update_peer_height(1, 500);
+        sync.update_peer_height(2, 450);
+        sync.update_peer_height(3, 900);
+        sync.request_headers().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+        sync.remove_peer(1);
+        sync.peer_manager.remove_test_peer(1);
+        sync.request_headers().await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![2]);
+        sync.remove_peer(2);
+        sync.peer_manager.remove_test_peer(2);
+        sync.request_headers().await;
+        assert!(
+            getblocks_recipients(&mut rxs).is_empty(),
+            "only the client-only peer is left"
+        );
+        assert_eq!(*sync.sync_peer.read(), None);
     }
 
     #[tokio::test]
@@ -3251,5 +3998,113 @@ mod tests {
         assert_eq!(getdata_recipients(&mut rxs, hash), vec![2]);
         assert_eq!(in_flight_peer(&sync, &hash), Some(2));
         assert_eq!(sync.block_retry.read()[&hash].attempts, 1);
+    }
+
+    /// A regtest chain at genesis, its BlockSync, and a peer at a
+    /// non-loopback address registered with the peer manager
+    fn sync_with_peer() -> (Arc<BlockSync>, tempfile::TempDir, PeerId, std::net::IpAddr) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(
+            divi_storage::NetworkType::Regtest,
+            divi_primitives::ChainMode::Divi,
+        );
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let peer_manager = PeerManager::new(Default::default());
+        let ip: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let peer_id: PeerId = 7;
+        peer_manager.scoring().register_peer(peer_id, ip);
+        (BlockSync::new(chain, peer_manager), dir, peer_id, ip)
+    }
+
+    /// A PoW block on `chain`'s tip with a coinbase only
+    fn next_block(chain: &Chain) -> Block {
+        use divi_primitives::amount::Amount;
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let tip = chain.tip().unwrap();
+        let mut tag = divi_storage::bip34_height_script(tip.height + 1);
+        tag.extend_from_slice(&(tip.height + 1).to_le_bytes());
+        let mut block = Block::default();
+        block.header.version = 4;
+        block.header.prev_block = tip.hash;
+        block.header.time = tip.time + 60;
+        block.header.bits = 0x207fffff;
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn::coinbase(Script::from_bytes(tag))],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1250 * 100_000_000),
+                Script::new_p2pkh(&[3u8; 20]),
+            )],
+            lock_time: 0,
+        });
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        let target = Hash256::from_compact(block.header.bits);
+        while compute_block_hash(&block.header) > target {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    fn score(sync: &BlockSync, peer_id: PeerId) -> i32 {
+        sync.peer_manager
+            .scoring()
+            .get_stats(peer_id)
+            .map_or(0, |s| s.misbehavior_score)
+    }
+
+    #[tokio::test]
+    async fn peer_relaying_an_invalid_block_is_banned() {
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        let mut block = next_block(&sync.chain);
+        // Merkle root that does not match the transactions: Divi Core scores 100
+        block.header.merkle_root = Hash256::from_bytes([9u8; 32]);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 0);
+        assert!(sync.peer_manager.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn valid_block_does_not_score_its_peer() {
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        assert!(sync.chain.is_ibd());
+        let block = next_block(&sync.chain);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 1);
+        assert_eq!(score(&sync, peer_id), 0);
+        assert!(!sync.peer_manager.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn orphan_block_does_not_score_its_peer() {
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        let mut block = next_block(&sync.chain);
+        block.header.prev_block = Hash256::from_bytes([5u8; 32]);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 0);
+        assert_eq!(score(&sync, peer_id), 0);
+        assert!(!sync.peer_manager.is_banned(&ip));
+    }
+
+    #[tokio::test]
+    async fn block_from_the_future_does_not_score_its_peer() {
+        // Divi Core records a too-far-future timestamp as state.Invalid (score 0)
+        let (sync, _dir, peer_id, ip) = sync_with_peer();
+        let mut block = next_block(&sync.chain);
+        block.header.time = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 24 * 3600) as u32;
+        block.header.merkle_root = divi_crypto::compute_merkle_root(&block.transactions);
+        sync.handle_block(peer_id, block).await;
+
+        assert_eq!(sync.chain.height(), 0);
+        assert_eq!(score(&sync, peer_id), 0);
+        assert!(!sync.peer_manager.is_banned(&ip));
     }
 }

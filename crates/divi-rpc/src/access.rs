@@ -337,9 +337,8 @@ impl RpcAccess {
     pub fn authenticate(&self, authorization: Option<&str>) -> Option<String> {
         use base64::Engine;
 
-        let encoded = authorization?
-            .strip_prefix("Basic ")
-            .or_else(|| authorization?.strip_prefix("basic "))?;
+        // The scheme as Divi Core takes it: "Basic " exactly (rpcserver.cpp:492)
+        let encoded = authorization?.strip_prefix("Basic ")?;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
             .ok()?;

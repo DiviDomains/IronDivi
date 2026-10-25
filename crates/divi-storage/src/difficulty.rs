@@ -36,39 +36,70 @@ pub struct DifficultyParams {
     pub last_pow_block: u32,
     /// Whether to retarget difficulty (false for regtest)
     pub retarget_difficulty: bool,
+    /// Easiest target the PoS retarget may reach
+    pub pos_target_limit: Hash256,
+    /// Spacing below which the PoS retarget counts a block as 1 second apart
+    /// (Divi Core: a negative spacing becomes 1, a zero spacing stays 0)
+    pub pos_spacing_floor: i64,
+}
+
+/// `~uint256(0) >> shift`
+pub fn target_limit(shift: u32) -> Hash256 {
+    let mut arr = [0xffu8; 32];
+    let mut remaining = shift;
+    for byte in arr.iter_mut().rev() {
+        if remaining >= 8 {
+            *byte = 0;
+            remaining -= 8;
+        } else {
+            *byte >>= remaining;
+            break;
+        }
+    }
+    Hash256::from_bytes(arr)
 }
 
 impl Default for DifficultyParams {
     fn default() -> Self {
-        // Mainnet parameters (from chainparams.cpp:303)
+        // Divi mainnet: bnProofOfWorkLimit ~uint256(0) >> 20, nLastPOWBlock 100
+        // (chainparams.cpp:178, :189); PoS limit ~uint256(0) >> 24 and spacing
+        // floor from DifficultyAdjuster.cpp:27, :35-36
         DifficultyParams {
-            // ProofOfWorkLimit: ~uint256(0) >> 24
-            pow_limit: Hash256::from_compact(0x1e0fffff),
+            pow_limit: target_limit(20),
             target_spacing: 60,
-            last_pow_block: 56700,
+            last_pow_block: 100,
             retarget_difficulty: true,
+            pos_target_limit: target_limit(24),
+            pos_spacing_floor: 0,
         }
     }
 }
 
 impl DifficultyParams {
-    /// Create regtest parameters
+    /// Divi regtest: PoW limit ~uint256(0) >> 1, no retarget (chainparams.cpp:485, :516)
     pub fn regtest() -> Self {
         DifficultyParams {
-            pow_limit: Hash256::from_compact(0x1e0fffff),
-            target_spacing: 60,
-            last_pow_block: 100,
+            pow_limit: target_limit(1),
             retarget_difficulty: false,
+            ..Self::default()
         }
     }
 
-    /// Create testnet parameters
+    /// Divi testnet: as mainnet (chainparams.cpp:394, :405)
     pub fn testnet() -> Self {
+        Self::default()
+    }
+
+    /// The values IronDivi has always used for PrivateDivi, kept until they are
+    /// checked against PrivateDivi Core
+    pub fn privatedivi(network_last_pow_block: u32, retarget_difficulty: bool) -> Self {
         DifficultyParams {
             pow_limit: Hash256::from_compact(0x1e0fffff),
             target_spacing: 60,
-            last_pow_block: 100,
-            retarget_difficulty: true,
+            last_pow_block: network_last_pow_block,
+            retarget_difficulty,
+            pos_target_limit: Hash256::from_compact(0x1e0fffff),
+            pos_spacing_floor: 1,
         }
     }
 }
@@ -160,11 +191,11 @@ pub fn get_next_work_required(
 fn compute_pos_difficulty(
     db: &Arc<ChainDatabase>,
     prev_block: &BlockIndex,
-    _params: &DifficultyParams,
+    params: &DifficultyParams,
 ) -> Result<u32, StorageError> {
     // PoS target limit: ~uint256(0) >> 24
     // Reference: DifficultyAdjuster.cpp:27
-    let target_limit = Hash256::from_compact(0x1e0fffff);
+    let target_limit = params.pos_target_limit;
 
     // Target timespan: 60 * 40 = 2400 seconds (40 minutes)
     // Reference: DifficultyAdjuster.cpp:28-29
@@ -183,9 +214,8 @@ fn compute_pos_difficulty(
         actual_spacing = (prev_block.time as i64) - (pprev.time as i64);
     }
 
-    // Clamp to minimum 1 second
-    // Reference: DifficultyAdjuster.cpp:35-36
-    if actual_spacing < 1 {
+    // Reference: DifficultyAdjuster.cpp:35-36 (a negative spacing counts as 1)
+    if actual_spacing < params.pos_spacing_floor {
         actual_spacing = 1;
     }
 
@@ -452,9 +482,9 @@ mod tests {
         let params = DifficultyParams::default();
 
         // Create blocks with 120s spacing (too slow)
-        let pprev = create_block_index(56700, 1000, 0x1e0fffff, Hash256::zero());
+        let pprev = create_block_index(56700, 1000, 0x1c0fffff, Hash256::zero());
         let pprev_hash = pprev.hash;
-        let prev = create_block_index(56701, 1120, 0x1e0fffff, pprev_hash);
+        let prev = create_block_index(56701, 1120, 0x1c0fffff, pprev_hash);
 
         db.store_block_index(&pprev).unwrap();
 
@@ -463,7 +493,7 @@ mod tests {
         // Slow blocks should decrease difficulty (increase target/bits)
         // Actual spacing = 120, formula: target *= (2340 + 240) / 2460 > 1.0
         assert!(
-            result >= 0x1e0fffff,
+            Hash256::from_compact(result) > Hash256::from_compact(0x1c0fffff),
             "Slow blocks should decrease difficulty"
         );
     }
@@ -482,8 +512,8 @@ mod tests {
 
         let result = get_next_work_required(&db, &prev, &params).unwrap();
 
-        // Should clamp to target limit
-        assert_eq!(result, 0x1e0fffff, "Should clamp to PoS limit");
+        // Should clamp to the PoS target limit, ~uint256(0) >> 24
+        assert_eq!(result, 0x1e00ffff, "Should clamp to PoS limit");
     }
 
     #[test]
@@ -586,5 +616,62 @@ mod tests {
             input_mantissa,
             diff,
         );
+    }
+
+    /// Two stored blocks `spacing` seconds apart at `height - 1` and `height`
+    fn pair(db: &Arc<ChainDatabase>, height: u32, bits: u32, spacing: u32) -> BlockIndex {
+        let pprev = create_block_index(height - 1, 1_000_000, bits, Hash256::zero());
+        db.store_block_index(&pprev).unwrap();
+        create_block_index(height, 1_000_000 + spacing, bits, pprev.hash)
+    }
+
+    /// Divi Core's PoS retarget, DifficultyAdjuster.cpp:38-45
+    fn core_pos_retarget(bits: u32, spacing: i64) -> Hash256 {
+        let n = Hash256::from_u128_le((39 * 60 + 2 * spacing) as u128);
+        Hash256::from_compact(bits)
+            .multiply_by(&n)
+            .unwrap()
+            .divide_by_u64(41 * 60)
+    }
+
+    /// Mainnet's last PoW block is 100 (chainparams.cpp:189): block 102 onwards
+    /// uses the PoS retarget, not DarkGravity
+    #[test]
+    fn mainnet_retargets_as_pos_after_block_100() {
+        let db = create_test_db();
+        let prev = pair(&db, 200, 0x1c0fffff, 60);
+        let result = get_next_work_required(&db, &prev, &DifficultyParams::default()).unwrap();
+        assert_eq!(result, to_compact(&core_pos_retarget(0x1c0fffff, 60)));
+    }
+
+    /// Divi Core counts a zero spacing as zero; only a negative one becomes 1
+    #[test]
+    fn pos_retarget_keeps_zero_spacing() {
+        let db = create_test_db();
+        let prev = pair(&db, 200_000, 0x1c0fffff, 0);
+        let result = get_next_work_required(&db, &prev, &DifficultyParams::default()).unwrap();
+        assert_eq!(result, to_compact(&core_pos_retarget(0x1c0fffff, 0)));
+        assert_ne!(result, to_compact(&core_pos_retarget(0x1c0fffff, 1)));
+    }
+
+    /// The easiest PoS target is ~uint256(0) >> 24 (DifficultyAdjuster.cpp:27)
+    #[test]
+    fn pos_retarget_clamps_to_uint256_shr_24() {
+        let db = create_test_db();
+        let prev = pair(&db, 200_000, 0x1e00ffff, 600);
+        let result = get_next_work_required(&db, &prev, &DifficultyParams::default()).unwrap();
+        assert_eq!(result, 0x1e00ffff);
+        assert_eq!(to_compact(&target_limit(24)), 0x1e00ffff);
+    }
+
+    /// PoW limits: ~uint256(0) >> 20 on mainnet/testnet, >> 1 on regtest
+    #[test]
+    fn pow_limits_follow_chainparams() {
+        let db = create_test_db();
+        let genesis = create_block_index(0, 1000, 0, Hash256::zero());
+        let req = |p: &DifficultyParams| get_next_work_required(&db, &genesis, p).unwrap();
+        assert_eq!(req(&DifficultyParams::default()), 0x1e0fffff);
+        assert_eq!(req(&DifficultyParams::testnet()), 0x1e0fffff);
+        assert_eq!(req(&DifficultyParams::regtest()), 0x207fffff);
     }
 }

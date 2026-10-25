@@ -209,10 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_refused_target_is_an_error() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let closed = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let (proxy, _) = stub::start().await;
         let err = connect(proxy, closed).await.unwrap_err().to_string();
         assert!(err.contains("connection refused"), "{err}");
@@ -220,10 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unreachable_proxy_is_an_error() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let closed = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
         let target: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let err = connect(closed, target).await.unwrap_err().to_string();
         assert!(err.contains("cannot reach proxy"), "{err}");

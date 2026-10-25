@@ -42,8 +42,23 @@ pub const PRIVATEDIVI_REGTEST_MAGIC: Magic = [0x70, 0xd1, 0x76, 0x13];
 /// Initial protocol version (used in handshake before negotiation)
 pub const INIT_PROTO_VERSION: i32 = 209;
 
-/// Current protocol version
-pub const PROTOCOL_VERSION: i32 = 70920;
+/// Divi Core's protocol version: 70915 on every network (version.h:21,
+/// version-util.cpp:5-6)
+pub const PROTOCOL_VERSION: i32 = 70915;
+
+static PROTOCOL_VERSION_IN_USE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(PROTOCOL_VERSION);
+
+/// The protocol version this node sends and reports: [`PROTOCOL_VERSION`]
+/// unless -protocolversion set another (Divi Core init.cpp:1450-1452)
+pub fn protocol_version() -> i32 {
+    PROTOCOL_VERSION_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Divi Core's SetProtocolVersion (version-util.cpp:8-12), for -protocolversion
+pub fn set_protocol_version(version: i32) {
+    PROTOCOL_VERSION_IN_USE.store(version, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Minimum peer protocol version after enforcement
 pub const MIN_PEER_PROTO_VERSION: i32 = 70915;
@@ -57,8 +72,9 @@ pub const BIP0031_VERSION: i32 = 60000;
 /// Version when getheaders was introduced
 pub const GETHEADERS_VERSION: i32 = 70077;
 
-/// Maximum message payload size (32 MB)
-pub const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
+/// Largest payload accepted from a peer; a larger one ends the connection
+/// (Divi Core `MAX_PROTOCOL_MESSAGE_LENGTH`, Node.cpp)
+pub const MAX_MESSAGE_SIZE: u32 = 2 * 1024 * 1024;
 
 /// Maximum number of headers in a single headers message
 pub const MAX_HEADERS_RESULTS: usize = 2000;
@@ -85,10 +101,10 @@ pub const DEFAULT_PORT_PRIVATEDIVI_TESTNET: u16 = 52474;
 pub const DEFAULT_PORT_PRIVATEDIVI_REGTEST: u16 = 52476;
 
 /// Default RPC port for Divi mainnet
-pub const DEFAULT_RPC_PORT_MAINNET: u16 = 51471;
+pub const DEFAULT_RPC_PORT_MAINNET: u16 = 51473;
 
 /// Default RPC port for Divi testnet
-pub const DEFAULT_RPC_PORT_TESTNET: u16 = 51473;
+pub const DEFAULT_RPC_PORT_TESTNET: u16 = 51475;
 
 /// Default RPC port for Divi regtest
 pub const DEFAULT_RPC_PORT_REGTEST: u16 = 51475;
@@ -102,8 +118,10 @@ pub const DEFAULT_RPC_PORT_PRIVATEDIVI_TESTNET: u16 = 52473;
 /// Default RPC port for PrivateDivi regtest
 pub const DEFAULT_RPC_PORT_PRIVATEDIVI_REGTEST: u16 = 52475;
 
-/// User agent string
-pub const USER_AGENT: &str = "/IronDivi:0.1.0/";
+/// User agent sent in the version message, built from the crate version so
+/// it always names the running release (also used as getnetworkinfo's
+/// "subversion")
+pub const USER_AGENT: &str = concat!("/IronDivi:", env!("CARGO_PKG_VERSION"), "/");
 
 /// Service flags
 pub mod services {
@@ -145,5 +163,18 @@ mod advertised_services_tests {
     #[test]
     fn full_node_sets_network_bit_only() {
         assert_eq!(advertised_services(false), services::NODE_NETWORK);
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::USER_AGENT;
+
+    #[test]
+    fn user_agent_names_the_crate_version() {
+        assert_eq!(
+            USER_AGENT,
+            format!("/IronDivi:{}/", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

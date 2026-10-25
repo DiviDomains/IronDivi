@@ -73,7 +73,15 @@ pub(crate) const KEY_ENCRYPTED_MASTER_KEY: &[u8] = b"encrypted_master_key";
 pub(crate) const KEY_KDF_PARAMS: &[u8] = b"kdf_params";
 const KEY_CHAIN_MODE: &[u8] = b"chain_mode";
 pub(crate) const KEY_ENCRYPTED_MNEMONIC: &[u8] = b"encrypted_mnemonic";
+/// The seed of a wallet made from a seed, no words (Divi Core's -hdseed)
+pub(crate) const KEY_HD_SEED: &[u8] = b"hd_seed";
+pub(crate) const KEY_ENCRYPTED_HD_SEED: &[u8] = b"encrypted_hd_seed";
+const KEY_HD_COIN_TYPE: &[u8] = b"hd_coin_type";
+pub(crate) const KEY_MNEMONIC_PASSPHRASE: &[u8] = b"mnemonic_passphrase";
+pub(crate) const KEY_ENCRYPTED_MNEMONIC_PASSPHRASE: &[u8] = b"encrypted_mnemonic_passphrase";
 pub(crate) const KEY_HD_PUBLIC_IDS: &[u8] = b"hd_public_ids";
+/// Hashes of the most recently scanned blocks, written with the scan height
+pub(crate) const KEY_SCANNED_HASHES: &[u8] = b"scanned_hashes";
 
 /// Suffix byte on a 20-byte key hash marking an encrypted private-key blob in the keys CF
 pub(crate) const ENCRYPTED_SECRET_SUFFIX: u8 = 0x01;
@@ -84,6 +92,29 @@ pub(crate) fn encode_hd_public_ids(ids: &HdPublicIds) -> Vec<u8> {
     data.extend_from_slice(&ids.master_key_id);
     data.extend_from_slice(&ids.chain_id);
     data
+}
+
+/// Scanned blocks as height (4 bytes LE) and hash (32 bytes) each
+pub(crate) fn encode_scanned_hashes(hashes: &[(u32, Hash256)]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(hashes.len() * 36);
+    for (height, hash) in hashes {
+        data.extend_from_slice(&height.to_le_bytes());
+        data.extend_from_slice(hash.as_bytes());
+    }
+    data
+}
+
+fn decode_scanned_hashes(data: &[u8]) -> Vec<(u32, Hash256)> {
+    data.as_chunks::<36>()
+        .0
+        .iter()
+        .map(|c| {
+            let height = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&c[4..]);
+            (height, Hash256::from_bytes(hash))
+        })
+        .collect()
 }
 
 /// Salt and encrypted master key pair
@@ -128,6 +159,25 @@ impl WalletDatabase {
         self.db.path()
     }
 
+    /// Write a consistent copy of the open database into `dir`, which must not
+    /// exist: a RocksDB checkpoint after the memtables are flushed, so writes
+    /// running meanwhile are either all in it or not at all. The copy is
+    /// readable by the owner only (0700 folder, 0600 files).
+    pub fn checkpoint_to(&self, dir: &Path) -> Result<(), WalletError> {
+        if dir.exists() {
+            return Err(WalletError::Storage(format!(
+                "{} already exists",
+                dir.display()
+            )));
+        }
+        let storage = |e: rocksdb::Error| WalletError::Storage(e.to_string());
+        self.db.flush().map_err(storage)?;
+        rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .and_then(|c| c.create_checkpoint(dir))
+            .map_err(storage)?;
+        restrict_to_owner(dir).map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     // ========== Metadata ==========
 
     /// Store the mnemonic (should be encrypted in production)
@@ -157,7 +207,91 @@ impl WalletDatabase {
         }
     }
 
+    /// Store the BIP39 passphrase of an unencrypted wallet's seed
+    pub fn store_mnemonic_passphrase(&self, passphrase: &str) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_MNEMONIC_PASSPHRASE, passphrase.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load the BIP39 passphrase of an unencrypted wallet's seed
+    pub fn load_mnemonic_passphrase(&self) -> Result<Option<String>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        match self
+            .db
+            .get_cf(cf, KEY_MNEMONIC_PASSPHRASE)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(data) => String::from_utf8(data)
+                .map(Some)
+                .map_err(|e| WalletError::Storage(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// The encrypted BIP39 passphrase blob of an encrypted wallet
+    pub fn load_encrypted_mnemonic_passphrase(&self) -> Result<Option<Vec<u8>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_ENCRYPTED_MNEMONIC_PASSPHRASE)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Store the BIP44 coin type the wallet derives with
+    pub fn store_hd_coin_type(&self, coin_type: u32) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_HD_COIN_TYPE, coin_type.to_le_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// The stored BIP44 coin type; None for wallets made before it was stored
+    pub fn load_hd_coin_type(&self) -> Result<Option<u32>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        match self
+            .db
+            .get_cf(cf, KEY_HD_COIN_TYPE)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(data) => {
+                let bytes: [u8; 4] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| WalletError::Storage("Invalid coin type".into()))?;
+                Ok(Some(u32::from_le_bytes(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Accessors for the encrypted mnemonic blob (`[IV][AES-256-CBC ciphertext]`)
+    /// Store the seed of a wallet made from a seed
+    pub fn store_hd_seed(&self, seed: &[u8]) -> Result<(), WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .put_cf(cf, KEY_HD_SEED, seed)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load the seed of a wallet made from a seed (None for a mnemonic wallet)
+    pub fn load_hd_seed(&self) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        Ok(self
+            .db
+            .get_cf(cf, KEY_HD_SEED)
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+            .map(zeroize::Zeroizing::new))
+    }
+
+    /// Load the encrypted seed of an encrypted wallet made from a seed
+    pub fn load_encrypted_hd_seed(&self) -> Result<Option<Vec<u8>>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        self.db
+            .get_cf(cf, KEY_ENCRYPTED_HD_SEED)
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     pub fn load_encrypted_mnemonic(&self) -> Result<Option<Vec<u8>>, WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
         self.db
@@ -326,20 +460,20 @@ impl WalletDatabase {
         }
     }
 
-    /// Store encryption metadata (salt and encrypted master key)
+    /// Store encryption metadata (salt and encrypted master key) in one synced
+    /// write: the salt is only of use with the master key sealed under it, so
+    /// the two are never on disk apart (Divi Core keeps both in one `mkey`
+    /// record, walletdb.cpp:135-139)
     pub fn store_encryption_metadata(
         &self,
         salt: &[u8],
         encrypted_master_key: &[u8],
     ) -> Result<(), WalletError> {
         let cf = self.db.cf_handle(CF_METADATA).unwrap();
-        self.db
-            .put_cf(cf, KEY_ENCRYPTION_SALT, salt)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
-        self.db
-            .put_cf(cf, KEY_ENCRYPTED_MASTER_KEY, encrypted_master_key)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
-        Ok(())
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf, KEY_ENCRYPTION_SALT, salt);
+        batch.put_cf(cf, KEY_ENCRYPTED_MASTER_KEY, encrypted_master_key);
+        self.write_batch_sync(batch)
     }
 
     /// The Argon2id cost of the passphrase key, or None for an older wallet
@@ -425,6 +559,16 @@ impl WalletDatabase {
             .put_cf(cf, KEY_LAST_SCAN_HEIGHT, height.to_le_bytes())
             .map_err(|e| WalletError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Load the hashes of the most recently scanned blocks by height
+    pub fn load_scanned_hashes(&self) -> Result<Vec<(u32, Hash256)>, WalletError> {
+        let cf = self.db.cf_handle(CF_METADATA).unwrap();
+        let raw = self
+            .db
+            .get_cf(cf, KEY_SCANNED_HASHES)
+            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        Ok(raw.map(|v| decode_scanned_hashes(&v)).unwrap_or_default())
     }
 
     /// Load last scan height
@@ -761,23 +905,6 @@ impl WalletDatabase {
         Ok(())
     }
 
-    /// Write a consistent copy of the database to `dst`, which must not exist
-    /// yet, readable by the owner only
-    pub fn checkpoint_to(&self, dst: &Path) -> Result<(), WalletError> {
-        if dst.exists() {
-            return Err(WalletError::Storage(format!(
-                "{} already exists",
-                dst.display()
-            )));
-        }
-        let storage = |e: rocksdb::Error| WalletError::Storage(e.to_string());
-        rocksdb::checkpoint::Checkpoint::new(&self.db)
-            .map_err(storage)?
-            .create_checkpoint(dst)
-            .map_err(storage)?;
-        restrict_to_owner(dst).map_err(|e| WalletError::Storage(e.to_string()))
-    }
-
     pub fn flush(&self) -> Result<(), WalletError> {
         self.db
             .flush()
@@ -948,6 +1075,75 @@ impl WalletDatabase {
     // written by this version still opens with an older one (RocksDB refuses
     // to open a database with an unknown column family).
 
+    /// Key prefix of the position a wallet transaction was first seen at
+    /// (Divi Core's nOrderPos)
+    const TX_ORDER_PREFIX: &'static [u8] = b"tx_order_";
+    /// Key prefix of a wallet transaction's notes (Divi Core's mapValue:
+    /// comment, to, FromAccount)
+    const TX_NOTES_PREFIX: &'static [u8] = b"tx_notes_";
+
+    fn prefixed_txid_key(prefix: &[u8], txid: &Hash256) -> Vec<u8> {
+        let mut key = prefix.to_vec();
+        key.extend_from_slice(txid.as_bytes());
+        key
+    }
+
+    /// Every row under `prefix` as (txid, value)
+    fn load_prefixed(&self, prefix: &[u8]) -> Result<Vec<(Hash256, Vec<u8>)>, WalletError> {
+        let iter = self.db.iterator_cf(
+            self.cf(CF_DEFAULT),
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
+        let mut rows = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let Ok(txid) = <[u8; 32]>::try_from(&key[prefix.len()..]) else {
+                continue;
+            };
+            rows.push((Hash256::from_bytes(txid), value.to_vec()));
+        }
+        Ok(rows)
+    }
+
+    /// Store the position at which the wallet first saw a transaction
+    pub fn store_tx_order(&self, txid: &Hash256, position: u64) -> Result<(), WalletError> {
+        self.db
+            .put_cf(
+                self.cf(CF_DEFAULT),
+                Self::prefixed_txid_key(Self::TX_ORDER_PREFIX, txid),
+                position.to_le_bytes(),
+            )
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Every stored transaction position
+    pub fn load_tx_order(&self) -> Result<Vec<(Hash256, u64)>, WalletError> {
+        Ok(self
+            .load_prefixed(Self::TX_ORDER_PREFIX)?
+            .into_iter()
+            .filter_map(|(txid, v)| Some((txid, u64::from_le_bytes(v.try_into().ok()?))))
+            .collect())
+    }
+
+    /// Store a transaction's notes (JSON object of strings), synced
+    pub fn store_tx_notes(&self, txid: &Hash256, notes: &[u8]) -> Result<(), WalletError> {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf(CF_DEFAULT),
+            Self::prefixed_txid_key(Self::TX_NOTES_PREFIX, txid),
+            notes,
+        );
+        self.write_batch_sync(batch)
+    }
+
+    /// Every stored transaction's notes
+    pub fn load_tx_notes(&self) -> Result<Vec<(Hash256, Vec<u8>)>, WalletError> {
+        self.load_prefixed(Self::TX_NOTES_PREFIX)
+    }
+
     /// Key prefix of unconfirmed wallet transactions
     const UNCONFIRMED_TX_PREFIX: &'static [u8] = b"unconfirmed_tx_";
 
@@ -979,6 +1175,69 @@ impl WalletDatabase {
         self.db
             .delete_cf(self.cf(CF_DEFAULT), Self::unconfirmed_tx_key(txid))
             .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Key prefix of wallet transactions that left the chain or the mempool
+    /// without confirming
+    const DETACHED_TX_PREFIX: &'static [u8] = b"detached_tx_";
+
+    fn detached_tx_key(txid: &Hash256) -> Vec<u8> {
+        let mut key = Self::DETACHED_TX_PREFIX.to_vec();
+        key.extend_from_slice(txid.as_bytes());
+        key
+    }
+
+    /// Store a detached wallet transaction: the time the wallet first saw it
+    /// and the raw transaction (empty when only the chain has it)
+    pub fn store_detached_tx(
+        &self,
+        txid: &Hash256,
+        timestamp: u64,
+        raw_tx: &[u8],
+    ) -> Result<(), WalletError> {
+        let mut value = Vec::with_capacity(8 + raw_tx.len());
+        value.extend_from_slice(&timestamp.to_le_bytes());
+        value.extend_from_slice(raw_tx);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(self.cf(CF_DEFAULT), Self::detached_tx_key(txid), &value);
+        self.write_batch_sync(batch)
+    }
+
+    /// Forget a detached wallet transaction (seen again in a block or the mempool)
+    pub fn remove_detached_tx(&self, txid: &Hash256) -> Result<(), WalletError> {
+        self.db
+            .delete_cf(self.cf(CF_DEFAULT), Self::detached_tx_key(txid))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load every detached wallet transaction as (txid, timestamp, raw tx)
+    pub fn load_detached_txs(&self) -> Result<Vec<(Hash256, u64, Vec<u8>)>, WalletError> {
+        let iter = self.db.iterator_cf(
+            self.cf(CF_DEFAULT),
+            rocksdb::IteratorMode::From(Self::DETACHED_TX_PREFIX, rocksdb::Direction::Forward),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| WalletError::Storage(e.to_string()))?;
+            if !key.starts_with(Self::DETACHED_TX_PREFIX) {
+                break;
+            }
+            let id = &key[Self::DETACHED_TX_PREFIX.len()..];
+            if value.len() < 8 || id.len() != 32 {
+                debug!("Skipping corrupt detached tx entry");
+                continue;
+            }
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(id);
+            let mut ts = [0u8; 8];
+            ts.copy_from_slice(&value[..8]);
+            results.push((
+                Hash256::from_bytes(txid),
+                u64::from_le_bytes(ts),
+                value[8..].to_vec(),
+            ));
+        }
+        Ok(results)
     }
 
     /// Load every stored unconfirmed wallet transaction as (timestamp, raw tx)

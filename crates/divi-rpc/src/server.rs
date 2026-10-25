@@ -29,7 +29,7 @@ use divi_wallet::WalletDb;
 use crate::access::{AccessConfig, Denial, MethodGrant, RpcAccess};
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Request as HttpRequest, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Version},
     middleware::{self, Next},
     response::IntoResponse,
     routing::post,
@@ -51,7 +51,12 @@ pub struct RpcConfig {
     pub username: Option<String>,
     /// RPC password (optional)
     pub password: Option<String>,
-    /// Peer, host, origin, rpcauth and whitelist settings
+    /// Keep a connection open after a reply when the request asks for it
+    /// (Divi Core's -rpckeepalive, default on)
+    pub keep_alive: bool,
+    /// Serve the REST interface (Divi Core's -rest, default off)
+    pub rest: bool,
+    /// Peer (-rpcallowip), host, origin, rpcauth and whitelist settings
     pub access: AccessConfig,
     /// Largest request body accepted, in bytes; a bigger one gets HTTP 413
     pub max_request_size: usize,
@@ -75,10 +80,34 @@ impl Default for RpcConfig {
             bind_address: "127.0.0.1:9998".parse().unwrap(),
             username: None,
             password: None,
+            keep_alive: true,
+            rest: false,
             access: AccessConfig::default(),
             max_request_size: DEFAULT_MAX_REQUEST_SIZE,
         }
     }
+}
+
+/// A network an RPC client may connect from (-rpcallowip), as Divi Core's
+/// CSubNet reads it
+pub use divi_network::Subnet;
+
+/// Check the bind address against the access configuration, then serve
+/// `app` with the peer address available to the access checks of
+/// [`build_router`] (connections from outside the local host and the
+/// -rpcallowip networks get HTTP 403, as Divi Core)
+async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
+    rpc_access(config)?
+        .check_bind(config.bind_address)
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    info!("Starting RPC server on {}", config.bind_address);
+    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Log configuration for RPC queries
@@ -208,10 +237,20 @@ impl RpcServer {
         self.lite_wallet.write().set_mempool(mempool);
     }
 
+    /// Set what invalidateblock and its family do to the mempool
+    pub fn set_reorg_hook(&self, hook: crate::blockchain::ReorgHook) {
+        self.blockchain.set_reorg_hook(hook);
+    }
+
     /// Let `getblock` fetch pruned blocks from full-history peers
     pub fn set_block_fetcher(&self, fetcher: Arc<dyn crate::blockchain::BlockFetcher>) {
         self.wallet.set_block_fetcher(fetcher.clone());
         self.blockchain.set_block_fetcher(fetcher);
+    }
+
+    /// Let `getblockchaininfo` report real headers and sync progress
+    pub fn set_block_sync(&self, sync: Arc<divi_network::BlockSync>) {
+        self.blockchain.set_block_sync(sync);
     }
 
     /// Set the spork manager that backs the `spork` RPC
@@ -220,6 +259,12 @@ impl RpcServer {
     }
 
     /// Set the masternode manager
+    /// The masternodes the network announced (Core's list), read by
+    /// listmasternodes and getmasternodecount
+    pub fn set_masternode_list(&self, list: Arc<crate::mn_list::MasternodeList>) {
+        self.masternode.set_network_list(list);
+    }
+
     pub fn set_masternode_manager(&self, manager: divi_masternode::MasternodeManager) {
         self.masternode.set_manager(manager);
     }
@@ -298,7 +343,6 @@ impl RpcServer {
     /// this method composes data from blockchain, network, wallet, and staking.
     fn get_info(&self, _params: &Params) -> Result<serde_json::Value, Error> {
         use divi_consensus::bits_to_difficulty;
-        use divi_network::constants::PROTOCOL_VERSION;
         use divi_storage::chain::NetworkType;
 
         let chain = self.blockchain.chain();
@@ -319,30 +363,21 @@ impl RpcServer {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        // Wallet data (balance, keypoololdest, keypoolsize)
-        let (balance, keypoololdest, keypoolsize) = match self.wallet.get_wallet_info(&Params::None)
-        {
-            Ok(info) => (
-                info["balance"].as_f64().unwrap_or(0.0),
-                info["keypoololdest"].as_u64().unwrap_or(0),
-                info["keypoolsize"].as_u64().unwrap_or(0),
-            ),
-            Err(_) => (0.0, 0, 0),
-        };
+        // Wallet data, none without a wallet
+        let wallet_info = self.wallet.get_wallet_info(&Params::None).ok();
 
         // Staking status from staking subsystem
+        // Divi Core: "Staking Active" when the node tried to stake lately
+        // (rpcmisc.cpp:154-155), the bool getstakingstatus reports
         let staking_status_text = match self.staking.get_staking_status(&Params::None) {
-            Ok(info) => info["staking status"]
-                .as_str()
-                .unwrap_or("Staking Not Active")
-                .to_string(),
-            Err(_) => "Staking Not Active".to_string(),
-        };
+            Ok(info) if info["staking status"] == serde_json::Value::Bool(true) => "Staking Active",
+            _ => "Staking Not Active",
+        }
+        .to_string();
 
-        Ok(serde_json::json!({
+        let mut info = serde_json::json!({
             "version": "3.0.0.0",
-            "protocolversion": PROTOCOL_VERSION,
-            "walletversion": 120200,
+            "protocolversion": divi_network::constants::protocol_version(),
             "blocks": height,
             "timeoffset": 0,
             "connections": connections,
@@ -350,23 +385,39 @@ impl RpcServer {
             "difficulty": difficulty,
             "testnet": matches!(network_type, NetworkType::Testnet),
             "moneysupply": self.blockchain.money_supply(),
-            "keypoololdest": keypoololdest,
-            "keypoolsize": keypoolsize,
-            "balance": balance,
-            "paytxfee": 0.0,
-            "relayfee": 0.0001,
+            "relayfee": self.blockchain.relay_fee(),
             "staking status": staking_status_text,
             "errors": ""
-        }))
+        });
+        // Divi Core has the wallet members only with a wallet
+        // (rpcmisc.cpp:139-144)
+        if let (Some(wallet), Some(map)) = (wallet_info, info.as_object_mut()) {
+            map.insert("walletversion".into(), serde_json::json!(120200));
+            map.insert(
+                "balance".into(),
+                serde_json::json!(wallet["balance"].as_f64().unwrap_or(0.0)),
+            );
+            map.insert(
+                "keypoololdest".into(),
+                serde_json::json!(wallet["keypoololdest"].as_u64().unwrap_or(0)),
+            );
+            map.insert(
+                "keypoolsize".into(),
+                serde_json::json!(wallet["keypoolsize"].as_u64().unwrap_or(0)),
+            );
+            map.insert("paytxfee".into(), serde_json::json!(0.0));
+        }
+        Ok(info)
     }
 
-    /// setmocktime - C++ only honours this on regtest; this node has no mock clock at all.
+    /// setmocktime - sets the node's clock on regtest; 0 goes back to the
+    /// system time (Divi Core rpcmisc.cpp:526-541, utiltime.cpp)
     fn set_mock_time(&self, params: &Params) -> Result<serde_json::Value, Error> {
         use divi_storage::chain::NetworkType;
 
-        if params.get_i64(0).is_none() {
-            return Err(RpcError::invalid_params("setmocktime timestamp").into());
-        }
+        let time = params
+            .get_i64(0)
+            .ok_or_else(|| RpcError::invalid_params("setmocktime timestamp"))?;
         if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
             return Err(RpcError::new(
                 codes::MISC_ERROR,
@@ -374,11 +425,38 @@ impl RpcServer {
             )
             .into());
         }
-        Err(RpcError::new(
-            codes::MISC_ERROR,
-            "setmocktime is not supported by this node",
-        )
-        .into())
+        divi_primitives::clock::set_mock_time(time);
+        Ok(serde_json::Value::Null)
+    }
+
+    /// setgenerate - mines blocks to the wallet at once (Divi Core
+    /// rpcmining.cpp:52-118): exactly one argument, regtest only
+    fn set_generate(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_storage::chain::NetworkType;
+
+        if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method disabled: invalid networks setting (regtest only)",
+            )
+            .into());
+        }
+        self.staking.set_generate(params)
+    }
+
+    /// generateblock - one block with Divi Core's test options
+    /// (rpcmining.cpp:121-210); regtest only, as setgenerate
+    fn generate_block(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        use divi_storage::chain::NetworkType;
+
+        if !matches!(self.blockchain.chain().network_type(), NetworkType::Regtest) {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method disabled: invalid networks setting (regtest only)",
+            )
+            .into());
+        }
+        self.staking.generate_block(params)
     }
 
     /// Handle a single RPC request
@@ -394,6 +472,34 @@ impl RpcServer {
 
     /// Dispatch a method call
     fn dispatch(&self, method: &str, params: &Params) -> Result<serde_json::Value, Error> {
+        // Divi Core's dispatcher refuses a wallet call without a wallet before
+        // the call runs (rpcserver.cpp:1043-1047)
+        if WALLET_CALLS.contains(&method) && self.wallet.wallet_db().is_none() {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                "Method unavailable due to manually disabled wallet",
+            )
+            .into());
+        }
+        // Then the call's own `if (fHelp || params.size() ...)`: a wrong
+        // argument count answers -1 with the call's help text
+        let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+        if crate::core_help::usage_refused(method, params, encrypted) {
+            let help = self.help(&Params::Array(vec![serde_json::json!(method)]))?;
+            return Err(RpcError::new(codes::MISC_ERROR, help.as_str().unwrap_or_default()).into());
+        }
+        rpc_type_check(method, params)?;
+        // The wallet passphrase calls check the encryption state before they
+        // read an argument (rpcwallet.cpp:2596, :2642, :2715)
+        let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+        let state_first = match method {
+            "walletpassphrase" | "walletpassphrasechange" => encrypted == Some(false),
+            "encryptwallet" => encrypted == Some(true),
+            _ => false,
+        };
+        if !state_first {
+            json_spirit_getter_check(method, params)?;
+        }
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
@@ -423,13 +529,22 @@ impl RpcServer {
             "getaddressdeltas" => self.blockchain.get_address_deltas(params),
             "getaddresstxids" => self.blockchain.get_address_txids(params),
             "getspentinfo" => self.blockchain.get_spent_info(params),
+            "getaddressbalance" => self.blockchain.get_address_balance(params),
+            "getaddressutxos" => self.blockchain.get_address_utxos(params),
 
             // Mining/generation methods
-            "generateblock" => self.blockchain.generate_block(params),
-            "setgenerate" => self.blockchain.set_generate(params),
+            "generateblock" => self.generate_block(params),
+            "setgenerate" => self.set_generate(params),
 
             // Network methods
-            "getnetworkinfo" => self.network.read().get_network_info(params),
+            "getnetworkinfo" => self
+                .network
+                .read()
+                .get_network_info(params)
+                .map(|mut info| {
+                    info["relayfee"] = serde_json::json!(self.blockchain.relay_fee());
+                    info
+                }),
             "getpeerinfo" => self.network.read().get_peer_info(params),
             "getconnectioncount" => self.network.read().get_connection_count(params),
             "ping" => self.network.read().ping(params),
@@ -439,13 +554,7 @@ impl RpcServer {
             "setban" => self.network.read().set_ban(params),
             "ban" => self.network.read().ban(params),
             "setmocktime" => self.set_mock_time(params),
-            "getinvalid" => Ok(serde_json::json!([{
-                // C++ 3.0.0 builds these from empty maps, so the report is always empty
-                "addresses_with_invalid": {},
-                "total_unspent": "0.00",
-                "total_minted": "0.00",
-                "total_valid_used": "0.00",
-            }])),
+            "getinvalid" => self.blockchain.get_invalid(params),
             "listbanned" => self.network.read().list_banned(params),
             "clearbanned" => self.network.read().clear_banned(params),
             "disconnectnode" => self.network.read().disconnect_node(params),
@@ -522,8 +631,6 @@ impl RpcServer {
             "setstakesplitthreshold" => self.staking.set_stake_split_threshold(params),
 
             // Lite wallet methods (external address queries)
-            "getaddressbalance" => self.lite_wallet.read().get_address_balance(params),
-            "getaddressutxos" => self.lite_wallet.read().get_address_utxos(params),
             "getaddresshistory" => self.lite_wallet.read().get_address_history(params),
             "gettxindex" => self.lite_wallet.read().get_tx_index(params),
             "estimatefee" => self.lite_wallet.read().estimate_fee(params),
@@ -534,12 +641,16 @@ impl RpcServer {
             "getlitewalletinfo" => self.lite_wallet.read().get_lite_wallet_info(params),
 
             // Masternode methods
-            "getmasternodecount" => self.masternode.get_masternode_count(params),
+            "getmasternodecount" => self
+                .masternode
+                .get_masternode_count(params, self.blockchain.chain()),
             "getmasternodestatus" => self.masternode.get_masternode_status(params),
             "getmasternodewinners" => self
                 .masternode
                 .get_masternode_winners(params, self.blockchain.tip_height()),
-            "listmasternodes" => self.masternode.list_masternodes(params),
+            "listmasternodes" => self
+                .masternode
+                .list_masternodes(params, self.blockchain.chain()),
             "setupmasternode"
             | "startmasternode"
             | "broadcaststartmasternode"
@@ -606,9 +717,22 @@ impl RpcServer {
 
     /// Help method - list available methods
     fn help(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let method = params.get_str(0);
+        // Divi Core's help: more than one argument answers its own help text,
+        // and the command must be a string (rpcserver.cpp:291-304)
+        crate::core_help::check_arguments("help", params, (0, 1), 1)?;
+        // An empty command lists them all, as no command does
+        let method = params.get_str(0).filter(|m| !m.is_empty());
 
         if let Some(method) = method {
+            // A Divi Core call: its text in this wallet state, or Core's "unknown
+            // command" where divid gives none (rpcserver.cpp:256-258, :283-285)
+            if crate::core_help::is_core_call(method) {
+                let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+                let text = crate::core_help::text_for(method, encrypted)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("help: unknown command: {method}"));
+                return Ok(serde_json::Value::String(text));
+            }
             // Return help for specific method
             let help = match method {
                 // Blockchain
@@ -621,11 +745,11 @@ impl RpcServer {
                 "getchaintips" => "getchaintips\n\nReturn information about all known tips in the block tree.",
                 "getdifficulty" => "getdifficulty\n\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.",
                 "gettxoutsetinfo" => "gettxoutsetinfo\n\nReturns statistics about the unspent transaction output set.",
-                "getrawmempool" => "getrawmempool\n\nReturns all transaction ids in memory pool.",
+                "getrawmempool" => "getrawmempool ( verbose )\n\nReturns all transaction ids in memory pool.\n\nArguments:\n1. verbose  (boolean, optional, default=false) true for a json object, false for array of transaction ids",
                 "prioritisetransaction" => "prioritisetransaction <txid> <priority delta> <fee delta>\n\nAccepts the transaction into mined blocks at a higher (or lower) priority.",
                 "gettxout" => "gettxout \"txid\" n ( include_mempool )\n\nReturns details about an unspent transaction output.",
-                "generateblock" => "generateblock ( options )\n\nTry to generate a single block with extra options (regtest only - not yet implemented).",
-                "setgenerate" => "setgenerate numberofblocks\n\nGenerate blocks immediately (regtest only - not yet implemented).",
+                "generateblock" => "generateblock ( options )\n\nTry to generate a single block with some extra options (-regtest only).\n\nArguments:\n1. options          (object, optional) extra options for generating the block\n    {\n      \"extratx\" : [\"hex\", ...],   (array of strings, optional) transactions to include as hex\n      \"coinstake\" : \"hex\",        (string, optional) coinstake transaction to use as hex\n      \"ignoreMempool\" : true,       (bool, optional) if set, do not include mempool transactions\n      \"blockBitsShift\" : unsigned (integer, optional) if set, use custom block bits\n    }\n\nResult\nblockhash     (string) hash of the generated block",
+                "setgenerate" => "setgenerate numberofblocks\n\nMine blocks to this wallet immediately (-regtest only): proof-of-work up to block 100, proof-of-stake after it.\n\nArguments:\n1. numberofblocks  (numeric, required) How many blocks to mine; below 1 mines none\n\nResult:\n[ \"blockhash\", ... ]  (array) Hashes of the mined blocks",
                 "getinfo" => "getinfo\n\nReturns an object containing various state info (version, blocks, connections, difficulty, balance, staking status).",
                 "getinvalid" => "getinvalid ( \"all\" )\n\nGet a summary of invalidated outpoints.\n\nArguments:\n1. all   (string, optional) return a full list of outpoints even if they are spent",
                 "invalidateblock" => "invalidateblock \"hash\"\n\nPermanently marks a block as invalid, as if it violated a consensus rule.\n\nArguments:\n1. hash   (string, required) the hash of the block to mark as invalid",
@@ -643,8 +767,8 @@ impl RpcServer {
                 "listbanned" => "listbanned\n\nList all banned IPs/subnets.",
                 "clearbanned" => "clearbanned\n\nClear all banned IPs.",
                 "disconnectnode" => "disconnectnode \"address\"\n\nDisconnects a peer by address.\n\nArguments:\n1. \"address\"  (string, required) The IP address:port of the node",
-                "ban" => "ban \"ip_address\"\n\nBans the connected peer with this IP address.\n('outdated' is refused: peer versions are not recorded after the handshake.)\n\nArguments:\n1. \"ip_address\"  (string, required) The IP address of a connected peer",
-                "setmocktime" => "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only).\nThis node has no mock clock, so the call always returns an error.\n\nArguments:\n1. timestamp  (integer, required) Unix seconds-since-epoch timestamp",
+                "ban" => "ban [outdated|<ip_address>]\n\nBans the connected peers older than Divi Core 3.0.0.0 ('outdated') or the connected peer with this IP address.\n\nArguments:\n1. \"outdated\" or \"ip_address\"  (string, required) The IP address of a connected peer",
+                "setmocktime" => "setmocktime timestamp\n\nSet the local time to given timestamp (-regtest only).\n\nArguments:\n1. timestamp  (integer, required) Unix seconds-since-epoch timestamp",
                 "getpeerscores" => "getpeerscores\n\nReturns peer scoring and reliability information for debugging.",
                 // Wallet
                 "getnewaddress" => "getnewaddress ( \"label\" )\n\nReturns a new Divi address for receiving payments.",
@@ -685,7 +809,7 @@ impl RpcServer {
                 "walletpassphrasechange" => "walletpassphrasechange \"oldpassphrase\" \"newpassphrase\"\n\nChanges the wallet passphrase from 'oldpassphrase' to 'newpassphrase'.\n\nArguments:\n1. \"oldpassphrase\"  (string) The current passphrase\n2. \"newpassphrase\"  (string) The new passphrase",
                 "getreceivedbyaddress" => "getreceivedbyaddress \"address\" ( minconf )\n\nReturns the total amount received by the given address in transactions with at least minconf confirmations.\n\nArguments:\n1. \"address\"  (string, required) The divi address for transactions\n2. minconf     (numeric, optional, default=1) Only include transactions confirmed at least this many times\n\nResult:\namount         (numeric) The total amount in DIVI received at this address.",
                 "importaddress" => "importaddress \"address\" ( \"label\" rescan p2sh )\n\nAdds an address or script (in hex) that can be watched as if it were in your wallet but cannot be used to spend.\n\nArguments:\n1. \"address\"  (string, required) The address\n2. \"label\"    (string, optional, default=\"\") An optional label\n3. rescan      (boolean, optional, default=true) Rescan the wallet for transactions\n4. p2sh        (boolean, optional, default=false) Add as P2SH address\n\nNote: This call can take minutes to complete if rescan is true.",
-                "addmultisigaddress" => "addmultisigaddress nrequired [\"key\",...] ( \"account\" )\n\nAdd a nrequired-to-sign multisignature address to the wallet.\nEach key is a DIVI address or hex-encoded public key.\nIf 'account' is specified, assign address to that account.\n\nArguments:\n1. nrequired      (numeric, required) The number of required signatures out of the n keys\n2. \"keys\"        (array, required) A json array of divi addresses or hex-encoded public keys\n     [\n       \"address\"  (string) divi address or hex-encoded public key\n       ...,\n     ]\n3. \"account\"     (string, optional) An account to assign the addresses to\n\nResult:\n{\n  \"address\":\"multisigaddress\",    (string) The value of the new multisig address\n  \"redeemScript\":\"script\"         (string) The string value of the hex-encoded redemption script\n}",
+                "addmultisigaddress" => "addmultisigaddress nrequired [\"key\",...] ( \"account\" )\n\nAdd a nrequired-to-sign multisignature address to the wallet.\nEach key is a DIVI address or hex-encoded public key.\nIf 'account' is specified, assign address to that account.\n\nArguments:\n1. nrequired      (numeric, required) The number of required signatures out of the n keys\n2. \"keys\"        (array, required) A json array of divi addresses or hex-encoded public keys\n     [\n       \"address\"  (string) divi address or hex-encoded public key\n       ...,\n     ]\n3. \"account\"     (string, optional) An account to assign the addresses to\n\nResult:\n\"diviaddress\"  (string) A divi address associated with the keys.",
                 "keypoolrefill" => "keypoolrefill ( newsize )\n\nFills the keypool.\n\nArguments:\n1. newsize  (numeric, optional, default=100) The new keypool size",
                 "getkeypoolsize" => "getkeypoolsize\n\nReturns the number of keys in the keypool.\n\nResult:\n  n    (numeric) The number of pre-generated but unused keys in the keypool",
                 "decodescript" => "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. \"hexstring\"  (string) the hex encoded script\n\nResult:\n{\n  \"asm\":\"asm\",      (string) Script public key\n  \"hex\":\"hex\",      (string) hex encoded public key\n  \"type\":\"type\",    (string) The output type\n  \"reqSigs\": n,      (numeric) The required signatures\n  \"addresses\": [     (json array of string)\n     \"address\"       (string) divi address\n     ,...\n  ],\n  \"p2sh\":\"address\"   (string) address of P2SH script wrapping this redeem script\n}",
@@ -712,7 +836,7 @@ impl RpcServer {
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
                 "getaddressbalance" => "getaddressbalance \"address\" ( minconf )\n\nReturns the balance for an external address.\nDoes not require a local wallet.",
-                "getaddressutxos" => "getaddressutxos \"address\" ( minconf maxconf skip limit )\n\nReturns UTXOs for an external address, at most limit (default and most 1000) after skipping skip of them.\nDoes not require a local wallet.",
+                "getaddressutxos" => "getaddressutxos \"address\"|{\"addresses\":[\"address\",...],\"skip\":n,\"limit\":n} ( only_vaults )\n\nReturns the unspent outputs of addresses from the address index, oldest first: at most limit (default and most 1000) after skipping skip of them.",
                 "getaddresshistory" => "getaddresshistory \"address\" ( skip limit )\n\nReturns transaction history for an external address.\nDoes not require a local wallet.",
                 "gettxindex" => "gettxindex \"txid\"\n\nReturns block location info for a transaction.",
                 "estimatefee" => "estimatefee ( nblocks )\n\nEstimates the fee per kilobyte needed for confirmation in nblocks.",
@@ -758,7 +882,12 @@ impl RpcServer {
                 // Control
                 "help" => "help ( \"command\" )\n\nList all commands, or get help for a specified command.",
                 "stop" => "stop\n\nStop Divi server.",
-                _ => return Err(RpcError::method_not_found(method).into()),
+                // Divi Core answers an unknown command with text, not an error (rpcserver.cpp:283-285)
+                _ => {
+                    return Ok(serde_json::Value::String(format!(
+                        "help: unknown command: {method}"
+                    )))
+                }
             };
             Ok(serde_json::Value::String(help.to_string()))
         } else {
@@ -926,7 +1055,20 @@ impl RpcServer {
                 "help",
                 "stop",
             ];
-            Ok(serde_json::Value::String(methods.join("\n")))
+            // (category, name) of each call above
+            let mut category = "";
+            let mut calls = Vec::new();
+            for line in methods {
+                if let Some(title) = line.strip_prefix("== ").and_then(|l| l.strip_suffix(" ==")) {
+                    category = title;
+                } else if !line.is_empty() {
+                    calls.push((category, line));
+                }
+            }
+            let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
+            Ok(serde_json::Value::String(crate::core_help::list(
+                &calls, encrypted,
+            )))
         }
     }
 
@@ -940,111 +1082,289 @@ impl RpcServer {
         };
         info!("RPC stop received, shutting down");
         shutdown();
+        // rpcserver.cpp:317
         Ok(serde_json::Value::String(
-            "Divi server stopping".to_string(),
+            "DIVI server stopping".to_string(),
         ))
     }
 }
 
-/// Run one JSON-RPC body (a single call or a batch) for a caller that may call
-/// the methods in `grant`. A batch containing any method the caller may not
-/// call is refused whole with HTTP 403, as Bitcoin Core does.
-fn process_body(server: &RpcServer, grant: &MethodGrant, body: &str) -> axum::response::Response {
-    let json_response = |json: String| {
-        (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json,
-        )
-            .into_response()
-    };
-    let forbidden = |method: &str| {
-        warn!("RPC method {method:?} refused by rpcwhitelist");
-        StatusCode::FORBIDDEN.into_response()
-    };
+/// The calls Divi Core's table marks as needing a wallet (requiresWalletLock or
+/// requiresWalletInstance, rpcserver.cpp:329-465); without one they answer
+/// -32601 before they run (rpcserver.cpp:1043-1047)
+const WALLET_CALLS: &[&str] = &[
+    "addmultisigaddress",
+    "addvault",
+    "allocatefunds",
+    "backupwallet",
+    "bip38decrypt",
+    "bip38paperwallet",
+    "debitvaultbyname",
+    "dumphdinfo",
+    "dumpprivkey",
+    "encryptwallet",
+    "fundvault",
+    "generateblock",
+    "getaccount",
+    "getaccountaddress",
+    "getaddressesbyaccount",
+    "getbalance",
+    "getcoinavailability",
+    "getnewaddress",
+    "getrawchangeaddress",
+    "getreceivedbyaccount",
+    "getreceivedbyaddress",
+    "getstakingstatus",
+    "gettransaction",
+    "getunconfirmedbalance",
+    "getwalletinfo",
+    "importaddress",
+    "importprivkey",
+    "keypoolrefill",
+    "listaccounts",
+    "listlockunspent",
+    "listreceivedbyaccount",
+    "listreceivedbyaddress",
+    "listsinceblock",
+    "listtransactions",
+    "listunspent",
+    "loadwallet",
+    "lockunspent",
+    "reclaimvaultfunds",
+    "removevault",
+    "sendfrom",
+    "sendmany",
+    "sendtoaddress",
+    "setaccount",
+    "setgenerate",
+    "setupmasternode",
+    "signmessage",
+    "signmnbroadcast",
+    "signtransactionwithaddresskey",
+    "startmasternode",
+    "verifymasternodesetup",
+    "walletlock",
+    "walletpassphrase",
+    "walletpassphrasechange",
+];
 
-    // Never log a body or a result: they carry passphrases, private keys and
-    // seeds (walletpassphrase, dumpprivkey, dumphdinfo, importprivkey...).
-    // The method, the id and the sizes are enough to follow the traffic.
-    match serde_json::from_str::<Request>(body) {
-        Ok(request) => {
-            if !grant.allows(&request.method) {
-                return forbidden(&request.method);
-            }
-            let method = request.method.clone();
-            let id = request.id.clone();
-            let response = server.handle_request(request);
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            debug!(
-                "RPC {method} id={id:?}: {} byte request, {} byte response",
-                body.len(),
-                json.len()
-            );
-            json_response(json)
+/// The arguments Divi Core reads with json_spirit's get_str/get_int/get_bool/
+/// get_array/get_obj, by position (an argument read as more than one type, or
+/// whose type the call checks itself, is left out): a given argument of another JSON type makes the getter throw,
+/// -1 "value is type X, expected Y" (json_spirit_value.h:339-349,
+/// rpcserver.cpp:1107-1108)
+fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
+    match method {
+        // rpcwallet.cpp:1736
+        "addmultisigaddress" => &[(2, "str")],
+        // rpcnet.cpp:156
+        "addnode" => &[(0, "str"), (1, "str")],
+        // rpcwallet.cpp:1231
+        "addvault" => &[(0, "str"), (1, "str")],
+        // rpcmasternode.cpp:63
+        "allocatefunds" => &[(0, "str"), (1, "str"), (2, "str")],
+        // rpcwallet.cpp:2525
+        "backupwallet" => &[(0, "str")],
+        // rpcmisc.cpp:65
+        "ban" => &[(0, "str")],
+        // bip38decrypt, bip38paperwallet, dumpprivkey and importprivkey check
+        // that the wallet is unlocked before they read an argument
+        // (rpcdump.cpp:59, :184, :262, :309), so they check their own types
+        // rpcmasternode.cpp:361
+        "broadcaststartmasternode" => &[(0, "str"), (1, "str")],
+        // rpcrawtransaction.cpp:361
+        "createrawtransaction" => &[(0, "array")],
+        // rpcwallet.cpp:1080
+        "debitvaultbyname" => &[(0, "str"), (1, "str"), (3, "str")],
+        // rpcrawtransaction.cpp:464
+        "decoderawtransaction" => &[(0, "str")],
+        // rpcrawtransaction.cpp:527
+        "decodescript" => &[(0, "str")],
+        // rpcwallet.cpp:2692
+        "encryptwallet" => &[(0, "str")],
+        // rpcmining.cpp:120
+        "generateblock" => &[(0, "obj")],
+        // rpcwallet.cpp:624
+        "getaccount" => &[(0, "str")],
+        // rpcwallet.cpp:538
+        "getaccountaddress" => &[(0, "str")],
+        // rpcnet.cpp:188
+        "getaddednodeinfo" => &[(0, "bool"), (1, "str")],
+        // rpcwallet.cpp:650
+        "getaddressesbyaccount" => &[(0, "str")],
+        // rpcwallet.cpp:1554
+        "getbalance" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcblockchain.cpp:176
+        // verbose: IronDivi also takes 0, 1 and 2 (verbosity 2 decodes the
+        // transactions), so a number is not refused here
+        "getblock" => &[(0, "str")],
+        // rpcblockchain.cpp:153
+        "getblockhash" => &[(0, "int")],
+        // rpcblockchain.cpp:240
+        "getblockheader" => &[(0, "str"), (1, "bool")],
+        // rpcwallet.cpp:818
+        "getcoinavailability" => &[(0, "bool")],
+        // rpcwallet.cpp:281
+        "getnewaddress" => &[(0, "str")],
+        // rpcblockchain.cpp:80
+        "getrawmempool" => &[(0, "bool")],
+        // rpcrawtransaction.cpp:139
+        "getrawtransaction" => &[(1, "int")],
+        // getreceivedbyaccount reads minconf before the account, and
+        // getreceivedbyaddress minconf only for an address of the wallet: both
+        // read their arguments themselves
+        // rpcwallet.cpp:2452
+        "gettransaction" => &[(0, "str"), (1, "bool")],
+        // rpcblockchain.cpp:330
+        "gettxout" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcserver.cpp:289
+        "help" => &[(0, "str")],
+        // rpcdump.cpp:105
+        "importaddress" => &[(0, "str"), (1, "str"), (2, "bool")],
+        // rpcmasternode.cpp:595
+        "importmnbroadcast" => &[(0, "str")],
+        // rpcblockchain.cpp:612
+        "invalidateblock" => &[(0, "str")],
+        // rpcwallet.cpp:2544
+        "keypoolrefill" => &[(0, "int")],
+        // rpcwallet.cpp:2320
+        "listaccounts" => &[(0, "int"), (1, "bool")],
+        // rpcwallet.cpp:1798-1808
+        "listreceivedbyaccount" | "listreceivedbyaddress" => {
+            &[(0, "int"), (1, "bool"), (2, "bool")]
         }
-        Err(e) => {
-            if let Ok(requests) = serde_json::from_str::<Vec<Request>>(body) {
-                if requests.len() > MAX_BATCH_CALLS {
-                    warn!(
-                        "RPC batch of {} calls refused (limit {MAX_BATCH_CALLS})",
-                        requests.len()
-                    );
-                    return json_response(
-                        serde_json::to_string(&Response::error_only(RpcError::invalid_request(
-                            format!(
-                                "Batch of {} calls is over the limit of {MAX_BATCH_CALLS}",
-                                requests.len()
-                            ),
-                        )))
-                        .unwrap_or_default(),
-                    );
-                }
-                if let Some(denied) = requests.iter().find(|r| !grant.allows(&r.method)) {
-                    return forbidden(&denied.method);
-                }
-                debug!(
-                    "RPC batch of {} calls, {} bytes",
-                    requests.len(),
-                    body.len()
-                );
-                let responses: Vec<Response> = requests
-                    .into_iter()
-                    .map(|req| server.handle_request(req))
-                    .collect();
-                return json_response(serde_json::to_string(&responses).unwrap_or_default());
-            }
-            // The parse error can quote a value from the body: log only where
-            error!(
-                "Failed to parse RPC request ({:?} at line {} column {})",
-                e.classify(),
-                e.line(),
-                e.column()
-            );
-            json_response(
-                serde_json::to_string(&Response::error_only(RpcError::parse_error()))
-                    .unwrap_or_default(),
-            )
-        }
+        // rpcmasternode.cpp:263
+        "listmasternodes" => &[(0, "str")],
+        // rpcwallet.cpp:2364
+        "listsinceblock" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcwallet.cpp:2215
+        "listtransactions" => &[(0, "str"), (1, "int"), (2, "int"), (3, "bool")],
+        // rpcrawtransaction.cpp:251
+        "listunspent" => &[(0, "int"), (1, "int"), (2, "array")],
+        // rpcwallet.cpp:524
+        "loadwallet" => &[(0, "str")],
+        // rpcwallet.cpp:2742
+        "lockunspent" => &[(0, "bool"), (1, "array")],
+        // rpcmisc.cpp:160
+        "mnsync" => &[(0, "str")],
+        // rpcmining.cpp:251
+        "prioritisetransaction" => &[(0, "str"), (2, "int")],
+        // rpcwallet.cpp:1139
+        "reclaimvaultfunds" => &[(0, "str"), (2, "str"), (3, "str"), (4, "str")],
+        // rpcblockchain.cpp:649
+        "reconsiderblock" => &[(0, "str")],
+        // rpcwallet.cpp:1192
+        "removevault" => &[(0, "str")],
+        // rpcblockchain.cpp:577
+        "reverseblocktransactions" => &[(0, "str")],
+        // rpcwallet.cpp:1606
+        "sendfrom" => &[(0, "str"), (1, "str"), (3, "str"), (4, "str")],
+        // rpcwallet.cpp:1694
+        "sendmany" => &[(0, "str"), (1, "obj"), (2, "str")],
+        // rpcrawtransaction.cpp:828
+        "sendrawtransaction" => &[(0, "str"), (1, "bool")],
+        // rpcwallet.cpp:1306
+        "sendtoaddress" => &[(0, "str"), (2, "str"), (3, "str"), (4, "str")],
+        // rpcwallet.cpp:586
+        "setaccount" => &[(0, "str"), (1, "str")],
+        // rpcmining.cpp:52
+        "setgenerate" => &[(0, "int")],
+        // rpcmisc.cpp:526
+        "setmocktime" => &[(0, "int")],
+        // rpcmasternode.cpp:183
+        "setupmasternode" => &[(0, "str"), (1, "str"), (2, "str"), (3, "str"), (4, "str")],
+        // rpcwallet.cpp:1364
+        "signmessage" => &[(0, "str"), (1, "str"), (2, "str"), (3, "str")],
+        // rpcmasternode.cpp:161
+        "signmnbroadcast" => &[(0, "str")],
+        // rpcrawtransaction.cpp:602
+        "signrawtransaction" => &[(1, "array"), (2, "array"), (3, "str")],
+        // rpcrawtransaction.cpp:566
+        "signtransactionwithaddresskey" => &[(1, "str"), (2, "int")],
+        // rpcmisc.cpp:277
+        "spork" => &[(0, "str"), (1, "str")],
+        // rpcmasternode.cpp:393
+        "startmasternode" => &[(0, "str"), (1, "bool")],
+        // rpcmisc.cpp:318
+        "validateaddress" => &[(0, "str")],
+        // rpcblockchain.cpp:404
+        "verifychain" => &[(1, "int")],
+        // rpcmisc.cpp:485
+        "verifymessage" => &[(0, "str"), (1, "str"), (2, "str")],
+        // rpcwallet.cpp:2573
+        "walletpassphrase" => &[(0, "str"), (1, "int"), (2, "bool")],
+        // rpcwallet.cpp:2628
+        "walletpassphrasechange" => &[(0, "str"), (1, "str")],
+        _ => &[],
     }
 }
 
-/// Run [`process_body`] on the blocking pool once one of the
-/// [`MAX_CONCURRENT_REQUESTS`] slots is free.
-async fn process_body_blocking(
-    server: Arc<RpcServer>,
-    slots: Arc<Semaphore>,
-    grant: MethodGrant,
-    body: String,
-) -> axum::response::Response {
-    let Ok(_slot) = slots.acquire_owned().await else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+/// The calls whose arguments of `core_argument_types` Divi Core reads with no
+/// test for null first, so a null makes the getter throw too
+/// (rpcwallet.cpp:550, :1752, :1798-1808)
+fn getter_reads_null(method: &str) -> bool {
+    matches!(
+        method,
+        "addmultisigaddress"
+            | "getaccountaddress"
+            | "listreceivedbyaccount"
+            | "listreceivedbyaddress"
+    )
+}
+
+/// Refuse an argument of the wrong JSON type as json_spirit's getter does. A
+/// null is left to the call, as Divi Core mostly reads optional arguments only
+/// when they are not null, except for the calls of `getter_reads_null`.
+fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcError> {
+    let Params::Array(values) = params else {
+        return Ok(());
     };
-    tokio::task::spawn_blocking(move || process_body(&server, &grant, &body))
-        .await
-        .unwrap_or_else(|e| {
-            error!("RPC handler failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })
+    for (index, want) in core_argument_types(method) {
+        let Some(value) = values.get(*index) else {
+            continue;
+        };
+        let got = crate::wallet::json_spirit_type(value);
+        if (value.is_null() && !getter_reads_null(method)) || got == *want {
+            continue;
+        }
+        return Err(RpcError::new(
+            codes::MISC_ERROR,
+            format!("value is type {got}, expected {want}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Divi Core's RPCTypeCheck on positional arguments (rpcserver.cpp:195-212)
+/// for the calls that run it: each given argument must have the listed type
+/// (null too where Core allows it), else -3 "Expected type X, got Y"
+fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
+    let (expected, allow_null): (&[&str], bool) = match method {
+        "setmocktime" => (&["int"], false),
+        "listunspent" => (&["int", "int", "array"], false),
+        "createrawtransaction" => (&["array"], false),
+        "decoderawtransaction" | "decodescript" => (&["str"], false),
+        "signrawtransaction" | "signrawtransactionwithwallet" => {
+            (&["str", "array", "array", "str"], true)
+        }
+        "sendrawtransaction" => (&["str", "bool"], false),
+        "lockunspent" => (&["bool", "array"], false),
+        "generateblock" => (&["obj"], true),
+        _ => return Ok(()),
+    };
+    let Params::Array(values) = params else {
+        return Ok(());
+    };
+    for (value, want) in values.iter().zip(expected) {
+        let got = crate::wallet::json_spirit_type(value);
+        if got != *want && !(allow_null && value.is_null()) {
+            return Err(RpcError::new(
+                codes::TYPE_ERROR,
+                format!("Expected type {want}, got {got}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// HTTP handler for JSON-RPC requests
@@ -1052,9 +1372,84 @@ async fn handle_rpc(
     State(server): State<Arc<RpcServer>>,
     Extension(slots): Extension<Arc<Semaphore>>,
     Extension(grant): Extension<MethodGrant>,
+    version: Version,
+    headers: HeaderMap,
     body: String,
 ) -> axum::response::Response {
-    process_body_blocking(server, slots, grant, body).await
+    rpc_reply(server, slots, grant, body, &version, &headers).await
+}
+
+/// Run a request and write its reply. Never logs a body or a result: they
+/// carry passphrases, private keys and seeds (walletpassphrase, dumpprivkey,
+/// dumphdinfo, importprivkey...); the sizes are enough to follow the traffic.
+async fn rpc_reply(
+    server: Arc<RpcServer>,
+    slots: Arc<Semaphore>,
+    grant: MethodGrant,
+    body: String,
+    version: &Version,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let request_len = body.len();
+    let Ok(_slot) = slots.acquire_owned().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (status, reply) = handle_body(server, grant, body).await;
+    debug!(
+        "RPC request: {request_len} bytes, reply {} bytes, status {status}",
+        reply.len()
+    );
+    if status == StatusCode::FORBIDDEN {
+        return crate::http::error_page(StatusCode::FORBIDDEN);
+    }
+    json_reply(status, reply, version, headers)
+}
+
+/// Run a request's calls on the runtime's blocking threads. The calls are
+/// synchronous; on a worker thread a long one (keypoolrefill, verifychain)
+/// would keep that worker from serving other connections until it ends.
+/// Divi Core serves other connections from its other RPC threads meanwhile
+/// (rpcserver.cpp:755-757). At most [`MAX_CONCURRENT_REQUESTS`] run at once.
+async fn handle_body(
+    server: Arc<RpcServer>,
+    grant: MethodGrant,
+    body: String,
+) -> (StatusCode, String) {
+    match tokio::task::spawn_blocking(move || server.handle_http_body_for(&grant, &body)).await {
+        Ok(reply) => reply,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Cancelled: the runtime is shutting down
+        Err(_) => error_reply(
+            RpcError::internal_error("RPC server stopping"),
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+/// A JSON-RPC reply with Divi Core's headers: application/json, and the
+/// connection kept only after a 200 to a request that keeps it
+fn json_reply(
+    status: StatusCode,
+    reply: String,
+    version: &Version,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let keep = crate::http::keep_alive(*version, headers);
+    (
+        status,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CONNECTION,
+                crate::http::connection_header(status, keep),
+            ),
+        ],
+        reply,
+    )
+        .into_response()
 }
 
 /// HTTP handler for wallet-specific JSON-RPC requests. The wallet name is not
@@ -1065,9 +1460,167 @@ async fn handle_wallet_rpc(
     Path(_wallet_name): Path<String>,
     Extension(slots): Extension<Arc<Semaphore>>,
     Extension(grant): Extension<MethodGrant>,
+    version: Version,
+    headers: HeaderMap,
     body: String,
 ) -> axum::response::Response {
-    process_body_blocking(server, slots, grant, body).await
+    rpc_reply(server, slots, grant, body, &version, &headers).await
+}
+
+/// A reply object as Divi Core writes it (rpcprotocol.cpp JSONRPCReplyObj):
+/// "result" (null on error), "error" (null on success), "id", in that order
+fn reply_text(outcome: Result<serde_json::Value, RpcError>, id: &serde_json::Value) -> String {
+    use crate::protocol::write_core_json;
+    let (result, error) = match outcome {
+        Ok(result) => (write_core_json(&result), "null".to_string()),
+        Err(e) => (
+            "null".to_string(),
+            write_core_json(&serde_json::json!({"code": e.code, "message": e.message})),
+        ),
+    };
+    format!(
+        "{{\"result\":{result},\"error\":{error},\"id\":{}}}",
+        write_core_json(id)
+    )
+}
+
+/// An error reply with Divi Core's HTTP status (rpcserver.cpp ErrorReply):
+/// 400 for an invalid request, 404 for an unknown method, else 500
+fn error_reply(error: RpcError, id: serde_json::Value) -> (StatusCode, String) {
+    let status = match error.code {
+        codes::INVALID_REQUEST => StatusCode::BAD_REQUEST,
+        codes::METHOD_NOT_FOUND => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, reply_text(Err(error), &id) + "\n")
+}
+
+impl RpcServer {
+    /// Serve one HTTP JSON-RPC body as Divi Core does (rpcserver.cpp
+    /// HTTPReq_JSONRPC): a request object or a batch array; returns the HTTP
+    /// status and the reply text.
+    pub fn handle_http_body(&self, body_text: &str) -> (StatusCode, String) {
+        self.handle_http_body_for(&MethodGrant::All, body_text)
+    }
+
+    /// [`Self::handle_http_body`] for a caller limited to `grant`
+    /// (-rpcwhitelist): a request or a batch naming a method outside it gets
+    /// HTTP 403 with no reply text, and nothing of it runs. A batch over
+    /// [`MAX_BATCH_CALLS`] is refused whole as an invalid request.
+    pub fn handle_http_body_for(
+        &self,
+        grant: &MethodGrant,
+        body_text: &str,
+    ) -> (StatusCode, String) {
+        use serde_json::Value;
+        let denied = |r: &Value| match r.get("method") {
+            Some(Value::String(m)) if !grant.allows(m) => Some(m.clone()),
+            _ => None,
+        };
+        let forbidden = |method: String| {
+            warn!("RPC method {method:?} refused by rpcwhitelist");
+            (StatusCode::FORBIDDEN, String::new())
+        };
+        // divi-cli's byte escapes of non-ASCII text, read as divid reads them
+        let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
+        let body = body.as_deref().unwrap_or(body_text);
+        // json_spirit's reading: of two equal keys the first counts
+        let request: Value = match crate::http::parse_json(body) {
+            Ok(v) => v,
+            Err(_) => {
+                // The body is not logged: it can carry a passphrase
+                debug!("RPC request that is not JSON, {} bytes", body.len());
+                return error_reply(RpcError::parse_error(), Value::Null);
+            }
+        };
+        match &request {
+            Value::Object(_) => {
+                if let Some(method) = denied(&request) {
+                    return forbidden(method);
+                }
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                // Never log a body or a result: they carry passphrases, private
+                // keys and seeds. The method name and the sizes are enough.
+                let method = match request.get("method") {
+                    Some(Value::String(m)) => m.as_str(),
+                    _ => "(no method name)",
+                };
+                let reply = match self.execute_json_request(&request) {
+                    Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
+                    Err(e) => error_reply(e, id),
+                };
+                debug!(
+                    "RPC {method}: {} byte request, {} byte response",
+                    body.len(),
+                    reply.1.len()
+                );
+                reply
+            }
+            Value::Array(requests) => {
+                if requests.len() > MAX_BATCH_CALLS {
+                    warn!(
+                        "RPC batch of {} calls refused (limit {MAX_BATCH_CALLS})",
+                        requests.len()
+                    );
+                    return error_reply(
+                        RpcError::invalid_request(format!(
+                            "Batch of {} calls is over the limit of {MAX_BATCH_CALLS}",
+                            requests.len()
+                        )),
+                        Value::Null,
+                    );
+                }
+                if let Some(method) = requests.iter().find_map(denied) {
+                    return forbidden(method);
+                }
+                debug!(
+                    "RPC batch of {} calls, {} bytes",
+                    requests.len(),
+                    body.len()
+                );
+                // JSONRPCExecBatch: every entry answered, the batch itself is 200
+                let replies: Vec<String> = requests
+                    .iter()
+                    .map(|r| {
+                        let id = r.get("id").cloned().unwrap_or(Value::Null);
+                        reply_text(self.execute_json_request(r), &id)
+                    })
+                    .collect();
+                (StatusCode::OK, format!("[{}]\n", replies.join(",")))
+            }
+            _ => error_reply(
+                RpcError::new(codes::PARSE_ERROR, "Top-level object parse error"),
+                Value::Null,
+            ),
+        }
+    }
+
+    /// Check and run one request object (rpcserver.cpp JSONRequest::parse):
+    /// "method" must be a string, "params" an array or absent/null
+    fn execute_json_request(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        use serde_json::Value;
+        let Value::Object(obj) = request else {
+            return Err(RpcError::invalid_request("Invalid Request object"));
+        };
+        let method = match obj.get("method") {
+            None | Some(Value::Null) => return Err(RpcError::invalid_request("Missing method")),
+            Some(Value::String(m)) => m,
+            Some(_) => return Err(RpcError::invalid_request("Method must be a string")),
+        };
+        let params = match obj.get("params") {
+            None | Some(Value::Null) => Params::Array(Vec::new()),
+            Some(Value::Array(a)) => Params::Array(a.clone()),
+            Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
+        };
+        match self.dispatch(method, &params) {
+            Ok(result) => Ok(result),
+            Err(Error::Rpc(e)) => Err(e),
+            Err(e) => Err(RpcError::internal_error(e.to_string())),
+        }
+    }
 }
 
 /// Build the access-control state for `config`. A malformed `rpcauth`,
@@ -1082,12 +1635,13 @@ pub fn rpc_access(config: &RpcConfig) -> Result<RpcAccess, Error> {
 }
 
 /// Create the axum router for RPC, enforcing the checks of [`crate::access`]:
-/// peer address, `Host` header, `Origin` and HTTP Basic authentication, then
-/// the caller's method whitelist. Without credentials every request is
-/// refused: the RPC is never served open (irondivid fills in cookie
-/// credentials when none are configured, see [`crate::auth_cookie`]). The
-/// router must be served with [`ConnectInfo`] (see [`serve`]); without the
-/// peer address every request is refused.
+/// peer address (-rpcallowip), `Host` header, `Origin`, then HTTP Basic
+/// authentication (rpcuser/rpcpassword or rpcauth) and the caller's method
+/// whitelist. Without credentials every request is refused: the RPC is never
+/// served open (irondivid fills in cookie credentials when none are
+/// configured, see [`crate::auth_cookie`]). The router must be served with
+/// [`ConnectInfo`] (see [`serve`]); without the peer address every request is
+/// refused.
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
     let access = match rpc_access(config) {
         Ok(access) => access,
@@ -1096,62 +1650,158 @@ pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Ro
             RpcAccess::new(None, None, &AccessConfig::default()).expect("empty config is valid")
         }
     };
-    if !access.has_credentials() {
+    if access.has_credentials() {
+        info!("RPC authentication enabled");
+    } else {
         error!("RPC has no credentials: every request will be refused");
     }
-    build_router(server, Arc::new(access), config.max_request_size)
+    let router = build_router(
+        server,
+        Arc::new(access),
+        config.rest,
+        config.max_request_size,
+    );
+    if config.keep_alive {
+        return router;
+    }
+    // -rpckeepalive=0: every reply closes its connection, as Divi Core ends
+    // the connection's loop after it (rpcserver.cpp:1014-1017)
+    router.layer(middleware::map_response(
+        |mut res: axum::response::Response| async move {
+            res.headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            res
+        },
+    ))
 }
 
-fn build_router(server: Arc<RpcServer>, access: Arc<RpcAccess>, max_request_size: usize) -> Router {
+fn build_router(
+    server: Arc<RpcServer>,
+    access: Arc<RpcAccess>,
+    rest: bool,
+    max_request_size: usize,
+) -> Router {
+    // /rest/ paths: REST when on, without credentials, as divid
+    let rest_paths = crate::rest::router(server.clone(), rest);
     let origins: Vec<HeaderValue> = access
         .allowed_origins()
         .iter()
         .filter_map(|o| HeaderValue::from_str(o).ok())
         .collect();
-
+    // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:150-152);
+    // bodies up to -rpcmaxrequestsize (HTTP 413 above it), never above
+    // Divi Core's MAX_SIZE
     let router = Router::new()
-        .route("/", post(handle_rpc))
-        .route("/wallet/:wallet_name", post(handle_wallet_rpc))
+        .route("/", post(handle_rpc).get(handle_rpc))
+        .route(
+            "/wallet/:wallet_name",
+            post(handle_wallet_rpc).get(handle_wallet_rpc),
+        )
+        .with_state(server)
         .layer(Extension(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
-        .layer(DefaultBodyLimit::max(max_request_size))
-        .with_state(server);
+        .layer(DefaultBodyLimit::max(
+            max_request_size.min(crate::http::MAX_BODY),
+        ));
 
+    // A declared body above MAX_SIZE is not read: Divi Core parses an empty
+    // request, a parse error (rpcprotocol.cpp:218-220, rpcserver.cpp:960-961)
     let router = router.layer(middleware::from_fn(
-        move |connect: Option<ConnectInfo<SocketAddr>>, mut req: HttpRequest, next: Next| {
-            let access = access.clone();
+        |req: HttpRequest, next: Next| async move {
+            if crate::http::body_too_large(req.headers()) {
+                let (status, reply) = error_reply(RpcError::parse_error(), serde_json::Value::Null);
+                return json_reply(status, reply, &req.version(), req.headers());
+            }
+            next.run(req).await
+        },
+    ));
+
+    // No credentials means no request can authenticate, never an open server.
+    // Wrong credentials are refused after Divi Core's delay (rpcserver.cpp:940-956).
+    // The authenticated user's -rpcwhitelist grant goes to the handler.
+    let auth = access.clone();
+    let router = router.layer(middleware::from_fn(
+        move |mut req: HttpRequest, next: Next| {
+            let access = auth.clone();
             async move {
                 // The header borrows end here: the body is not Sync, so a
                 // borrow of the request held across an await is not Send.
+                let (user, presented) = {
+                    let authorization = req
+                        .headers()
+                        .get(header::AUTHORIZATION)
+                        .map(|v| v.to_str().unwrap_or(""));
+                    (access.authenticate(authorization), authorization.is_some())
+                };
+                match user {
+                    Some(user) => {
+                        req.extensions_mut().insert(access.grant_for(&user));
+                        next.run(req).await
+                    }
+                    None => {
+                        if presented {
+                            tokio::time::sleep(crate::http::WRONG_CREDENTIALS_DELAY).await;
+                        }
+                        crate::http::unauthorized()
+                    }
+                }
+            }
+        },
+    ));
+
+    // REST outside the credentials
+    let router = router.merge(rest_paths);
+
+    // Before the credentials, as Divi Core: GET and POST only, and the JSON-RPC
+    // paths only, the query included, or /rest/ when REST is on
+    // (rpcserver.cpp:1019-1031)
+    let router = router.layer(middleware::from_fn(
+        move |req: HttpRequest, next: Next| async move {
+            if !crate::http::method_served(req.method()) {
+                return crate::http::error_page(StatusCode::METHOD_NOT_ALLOWED);
+            }
+            let uri = req.uri();
+            let path = uri.path();
+            let rpc_path = path == "/"
+                || path
+                    .strip_prefix("/wallet/")
+                    .is_some_and(|w| !w.is_empty() && !w.contains('/'));
+            if rest && path.starts_with("/rest/") {
+                return next.run(req).await;
+            }
+            if uri.query().is_some() || !rpc_path {
+                return crate::http::error_page(StatusCode::NOT_FOUND);
+            }
+            next.run(req).await
+        },
+    ));
+
+    // First of all, REST included: the peer must be the local host or in
+    // -rpcallowip (Divi Core's ClientAllowed, rpcserver.cpp:906-912), and the
+    // Host and Origin headers must name allowed ones (DNS rebinding and
+    // cross-site requests from a browser). Without the peer address
+    // (no ConnectInfo) every request is refused.
+    let router = router.layer(middleware::from_fn(
+        move |connect: Option<ConnectInfo<SocketAddr>>, req: HttpRequest, next: Next| {
+            let access = access.clone();
+            async move {
                 let checked = {
                     let headers = req.headers();
                     let hdr = |name| headers.get(name).and_then(|v| v.to_str().ok());
-                    access.check(
-                        connect.map(|ConnectInfo(addr)| addr.ip()),
-                        hdr(header::HOST),
-                        hdr(header::ORIGIN),
-                        hdr(header::AUTHORIZATION),
-                    )
+                    if !connect.is_some_and(|ConnectInfo(addr)| access.peer_allowed(addr.ip())) {
+                        Err(Denial::Peer)
+                    } else if !access.host_allowed(hdr(header::HOST)) {
+                        Err(Denial::Host)
+                    } else if !access.origin_allowed(hdr(header::ORIGIN)) {
+                        Err(Denial::Origin)
+                    } else {
+                        Ok(())
+                    }
                 };
                 match checked {
-                    Ok(grant) => {
-                        req.extensions_mut().insert(grant);
-                        next.run(req).await
-                    }
-                    Err(Denial::Unauthorized) => {
-                        // Slow down password guessing, as Bitcoin Core does.
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        (
-                            StatusCode::UNAUTHORIZED,
-                            [(
-                                header::WWW_AUTHENTICATE,
-                                HeaderValue::from_static("Basic realm=\"jsonrpc\""),
-                            )],
-                        )
-                            .into_response()
-                    }
+                    Ok(()) => next.run(req).await,
                     Err(denial) => {
                         warn!("RPC request refused: {denial:?}");
-                        StatusCode::FORBIDDEN.into_response()
+                        crate::http::error_page(StatusCode::FORBIDDEN)
                     }
                 }
             }
@@ -1159,7 +1809,8 @@ fn build_router(server: Arc<RpcServer>, access: Arc<RpcAccess>, max_request_size
     ));
 
     // Browsers get CORS headers only for the origins configured with
-    // rpcalloworigin; with none configured there is no CORS layer at all.
+    // -rpcalloworigin; with none there is no CORS layer, and RPC replies carry
+    // no cross-origin headers, as Divi Core sends none
     if origins.is_empty() {
         router
     } else {
@@ -1172,30 +1823,11 @@ fn build_router(server: Arc<RpcServer>, access: Arc<RpcAccess>, max_request_size
     }
 }
 
-/// Check the bind address against the access configuration, bind and serve
-/// `server` with the peer address available to the access checks.
-async fn serve(config: &RpcConfig, server: Arc<RpcServer>) -> Result<(), Error> {
-    let access = rpc_access(config)?;
-    access
-        .check_bind(config.bind_address)
-        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let app = build_router(server, Arc::new(access), config.max_request_size);
-
-    info!("Starting RPC server on {}", config.bind_address);
-
-    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
-}
-
 /// Start the RPC server
 pub async fn start_server(config: RpcConfig, chain: Arc<Chain>) -> Result<(), Error> {
     let server = Arc::new(RpcServer::new(chain));
-    serve(&config, server).await
+    let app = create_router_with_auth(server, &config);
+    serve(&config, app).await
 }
 
 /// Start the RPC server with peer manager
@@ -1220,7 +1852,8 @@ where
 
     setup_callbacks(&server);
 
-    serve(&config, server).await
+    let app = create_router_with_auth(server, &config);
+    serve(&config, app).await
 }
 
 /// Start the RPC server with wallet, peer manager, and optional staker
@@ -1243,7 +1876,8 @@ where
     // Allow caller to set up callbacks
     setup_callbacks(&server);
 
-    serve(&config, server).await
+    let app = create_router_with_auth(server, &config);
+    serve(&config, app).await
 }
 
 /// Start the RPC server with wallet and peer manager
@@ -1262,6 +1896,27 @@ mod tests {
     use crate::protocol::RequestId;
     use divi_storage::{ChainDatabase, ChainParams};
     use tempfile::tempdir;
+
+    /// -rpcallowip values as Divi Core's CSubNet reads them
+    #[test]
+    fn rpcallowip_subnets_are_divi_core_s() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let one = Subnet::parse("1.2.3.4").unwrap();
+        assert!(one.contains(ip("1.2.3.4")) && !one.contains(ip("1.2.3.5")));
+        let cidr = Subnet::parse("10.0.0.0/8").unwrap();
+        assert!(cidr.contains(ip("10.9.8.7")) && !cidr.contains(ip("11.0.0.1")));
+        let mask = Subnet::parse("192.168.1.0/255.255.255.0").unwrap();
+        assert!(mask.contains(ip("192.168.1.200")) && !mask.contains(ip("192.168.2.1")));
+        // An IPv4 client reaching a dual-stack socket comes as ::ffff:a.b.c.d
+        assert!(cidr.contains(ip("::ffff:10.1.1.1")));
+        let v6 = Subnet::parse("fe80::/10").unwrap();
+        assert!(v6.contains(ip("fe80::1")) && !v6.contains(ip("10.0.0.1")));
+        for bad in ["", "1.2.3", "1.2.3.4/33", "1.2.3.4/x", "host.example"] {
+            assert!(Subnet::parse(bad).is_none(), "{bad}");
+        }
+        let [lo4, lo6] = Subnet::loopback();
+        assert!(lo4.contains(ip("127.0.0.53")) && lo6.contains(ip("::1")));
+    }
 
     fn create_test_server() -> (Arc<RpcServer>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -1311,7 +1966,7 @@ mod tests {
                 format!(r#"{{"jsonrpc":"2.0","id":1,"method":["{secret}"]}}"#),
                 format!(r#"{{"method":"walletpassphrase","params":["{secret}"#),
             ] {
-                let _ = process_body(&server, &MethodGrant::All, &body);
+                let _ = server.handle_http_body_for(&MethodGrant::All, &body);
             }
         });
         assert!(logs.contains("RPC"), "the calls are still logged: {logs}");
@@ -1380,7 +2035,7 @@ mod tests {
         let response = server.handle_request(request);
         assert!(response.result.is_some());
         let help = response.result.unwrap();
-        assert!(help.as_str().unwrap().contains("longest blockchain"));
+        assert_eq!(help.as_str(), crate::core_help::text("getblockcount"));
     }
 
     #[test]
@@ -1489,7 +2144,7 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         let r = call(&server, "stop", Params::None);
-        assert_eq!(r.result, Some(serde_json::json!("Divi server stopping")));
+        assert_eq!(r.result, Some(serde_json::json!("DIVI server stopping")));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1499,7 +2154,8 @@ mod tests {
         let r = call(&server, "getinfo", Params::None).result.unwrap();
         assert!(r["version"].is_string());
         assert!(r["moneysupply"].is_number());
-        assert_eq!(r["walletversion"], serde_json::json!(120200));
+        // No wallet on this server: no wallet members (rpcmisc.cpp:139-144)
+        assert!(r.get("walletversion").is_none());
     }
 
     #[test]
@@ -1510,14 +2166,29 @@ mod tests {
     }
 
     #[test]
-    fn test_setmocktime_is_an_honest_error() {
+    fn test_setmocktime_is_regtest_only() {
         let (server, _dir) = create_test_server();
         let resp = call(
             &server,
             "setmocktime",
             Params::Array(vec![serde_json::json!(1)]),
         );
-        assert!(resp.error.is_some());
+        assert_eq!(
+            resp.error.unwrap().message,
+            "setmocktime for regression testing (-regtest mode) only"
+        );
+        assert_eq!(divi_primitives::clock::mock_time(), 0);
+    }
+
+    #[test]
+    fn test_setgenerate_is_regtest_only() {
+        let (server, _dir) = create_test_server();
+        let resp = call(
+            &server,
+            "setgenerate",
+            Params::Array(vec![serde_json::json!(1)]),
+        );
+        assert_eq!(resp.error.unwrap().code, -32601);
     }
 
     #[test]
@@ -1578,7 +2249,12 @@ mod tests {
         // Without a staking callback registered, the method returns an error
         // but it IS a registered method (not -32601 method-not-found)
         if let Some(err) = response.error {
-            assert_ne!(err.code, -32601, "Should not be method-not-found");
+            // Without a wallet Divi Core answers -32601 "Method unavailable
+            // due to manually disabled wallet", not "Method not found"
+            assert_ne!(
+                err.message, "Method not found",
+                "Should not be method-not-found"
+            );
         }
         // It either succeeded (if a default is available) or errored with a non-method-not-found code
     }
@@ -1606,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_help_unknown_method_returns_error() {
+    fn test_help_unknown_method_answers_like_core() {
         let (server, _dir) = create_test_server();
         let request = Request {
             jsonrpc: "2.0".to_string(),
@@ -1616,8 +2292,14 @@ mod tests {
         };
 
         let response = server.handle_request(request);
-        // Help for an unknown method should return an error
-        assert!(response.error.is_some());
+        // Divi Core answers with text, not an error
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!(
+                "help: unknown command: nonexistentmethod"
+            ))
+        );
     }
 
     #[test]
@@ -1684,7 +2366,8 @@ mod tests {
 
         let err = RpcError::method_not_found("testmethod");
         assert_eq!(err.code, codes::METHOD_NOT_FOUND);
-        assert!(err.message.contains("testmethod"));
+        // worded as Divi Core: the method name is not repeated
+        assert_eq!(err.message, "Method not found");
 
         let err = RpcError::invalid_params("bad param");
         assert_eq!(err.code, codes::MISC_ERROR);
@@ -1777,6 +2460,117 @@ mod tests {
         }
     }
 
+    /// Serve `router` on a loopback port, send `request` as is and return the
+    /// whole HTTP response.
+    async fn raw_response(router: Router, request: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(request.replace("{addr}", &addr.to_string()).as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    /// Without -rpcalloworigin a cross-origin request is refused (403) and
+    /// no reply carries a cross-origin header
+    #[tokio::test]
+    async fn rpc_replies_carry_no_cross_origin_headers() {
+        let (server, _dir) = create_test_server();
+        let config = RpcConfig {
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..RpcConfig::default()
+        };
+        let router = create_router_with_auth(server, &config);
+        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+        let preflight = "OPTIONS / HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://example.com\r\n\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: authorization,content-type\r\n\
+             Connection: close\r\n\r\n"
+            .to_string();
+        let post = format!(
+            "POST / HTTP/1.1\r\nHost: {{addr}}\r\nOrigin: https://example.com\r\n\
+             Content-Type: application/json\r\nAuthorization: {}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            basic("alice", "s3cret"),
+            body.len()
+        );
+        for request in [preflight, post] {
+            let response = raw_response(router.clone(), request).await;
+            assert!(
+                !response.to_ascii_lowercase().contains("access-control-"),
+                "unexpected cross-origin header in {response:?}"
+            );
+        }
+        // The authorized POST itself still works
+        assert_eq!(
+            status_of(router, Some(basic("alice", "s3cret"))).await,
+            StatusCode::OK
+        );
+    }
+
+    /// The request exactly as Divi Core 3.0.0's divi-cli sends it: JSON-RPC
+    /// 1.0 with no "jsonrpc" member, which divid accepts
+    #[tokio::test]
+    async fn requests_from_divi_cli_are_answered() {
+        let (server, _dir) = create_test_server();
+        let config = RpcConfig {
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..RpcConfig::default()
+        };
+        let router = create_router_with_auth(server, &config);
+        for (path, body) in [
+            (
+                "/",
+                "{\"method\":\"getblockcount\",\"params\":[],\"id\":1}\n",
+            ),
+            (
+                "/wallet/w",
+                "{\"method\":\"getblockcount\",\"params\":[],\"id\":1}\n",
+            ),
+            (
+                "/",
+                "[{\"method\":\"getblockcount\",\"params\":[],\"id\":1}]",
+            ),
+        ] {
+            let post = format!(
+                "POST {path} HTTP/1.1\r\nUser-Agent: divi-json-rpc/v3.0.0\r\nHost: {{addr}}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\
+                 Accept: application/json\r\nAuthorization: {}\r\n\r\n{body}",
+                body.len(),
+                basic("alice", "s3cret"),
+            );
+            let response = raw_response(router.clone(), post).await;
+            let reply = &response[response.find("\r\n\r\n").unwrap() + 4..];
+            let reply: serde_json::Value = serde_json::from_str(reply).unwrap();
+            let reply = if reply.is_array() {
+                reply[0].clone()
+            } else {
+                reply
+            };
+            assert!(reply["error"].is_null(), "{path} {body}: {reply}");
+            assert_eq!(
+                reply["result"],
+                serde_json::json!(0),
+                "{path} {body}: {reply}"
+            );
+            assert_eq!(reply["id"], serde_json::json!(1), "{path} {body}: {reply}");
+        }
+    }
+
     #[tokio::test]
     async fn cookie_credentials_authenticate() {
         let (server, dir) = create_test_server();
@@ -1802,6 +2596,7 @@ mod tests {
         let (u, p) = contents.split_once(':').unwrap();
         assert_eq!(status_of(router, Some(basic(u, p))).await, StatusCode::OK);
     }
+
     fn alice_config(access: AccessConfig) -> RpcConfig {
         RpcConfig {
             username: Some("alice".into()),
@@ -1944,7 +2739,9 @@ mod tests {
         let (server, _dir) = create_test_server();
         let mut config = alice_config(AccessConfig::default());
         config.bind_address = "0.0.0.0:0".parse().unwrap();
-        let err = serve(&config, server).await.unwrap_err();
+        let err = serve(&config, create_router_with_auth(server, &config))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("rpcallowip"), "{err}");
     }
 
@@ -1970,7 +2767,8 @@ mod tests {
 
         let batch = format!("[{}]", vec![GETBLOCKCOUNT; MAX_BATCH_CALLS + 1].join(","));
         let (status, response) = exchange(router, "POST", None, &auth, &batch).await;
-        assert_eq!(status, StatusCode::OK);
+        // An invalid request, with Divi Core's HTTP status for one
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         let reply = body_json(&response);
         assert!(
             reply.is_object(),
