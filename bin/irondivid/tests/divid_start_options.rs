@@ -523,7 +523,8 @@ fn blocknotify_and_walletnotify_run_their_commands() {
 /// -rescan scans the wallet from the first block when it loads
 /// (init.cpp:1242, wallet.cpp:279-313), and -salvagewallet sets -rescan
 /// (init.cpp:763-766): a key imported without a rescan shows its coins after
-/// such a start, and not after a plain one
+/// such a start, and not after a plain one (a coin in the last block is the
+/// exception: every start scans that block again)
 #[test]
 fn rescan_and_salvagewallet_find_the_coins_of_a_key_imported_without_rescan() {
     let dir = tempfile::tempdir().unwrap();
@@ -543,7 +544,9 @@ fn rescan_and_salvagewallet_find_the_coins_of_a_key_imported_without_rescan() {
         );
         let to = daemon.rpc("getnewaddress", json!([]));
         daemon.rpc("sendtoaddress", json!([to, 3]));
-        daemon.rpc("setgenerate", json!([1]));
+        // Two blocks: a start scans the last block again (wallet.cpp:258-269),
+        // so the payment must not be in the last one
+        daemon.rpc("setgenerate", json!([2]));
         daemon.rpc("dumpprivkey", json!([to]))
     };
     let start = |wallet: &str, extra: &[&str]| {

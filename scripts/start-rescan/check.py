@@ -816,13 +816,6 @@ print(f"# the reorg replaces block {CO.rpc('getblockcount')}", flush=True)
 views("last block, before the reorg")
 CO.rpc("invalidateblock", t0)
 mine(2)
-for n, path in ((CM, os.path.join(CM.dir, "regtest", "debug.log")), (IM, os.path.join(IM.dir, "debug.log"))):
-    try:
-        with open(path, errors="replace") as f:
-            lines = [l.strip()[:170] for l in f if p_txid[:12] in l]
-        print(f"#   {n.name} log lines of the payment: " + " || ".join(lines[-8:]), flush=True)
-    except OSError:
-        pass
 notify_rows("reorg, wallets running")
 views("reorg, wallets running")
 cycle("restart after the reorg")
