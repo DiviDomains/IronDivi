@@ -342,6 +342,9 @@ pub struct WalletDb {
     /// The position each transaction was first seen at, and the next one
     /// (Divi Core's nOrderPos, the order listtransactions follows)
     tx_order: RwLock<(HashMap<Hash256, u64>, u64)>,
+    /// When the wallet first heard of each transaction and its smart time
+    /// (Divi Core nTimeReceived, nTimeSmart), set once, at that moment
+    tx_times: RwLock<HashMap<Hash256, (u64, u64)>>,
     /// Notes kept with a transaction by the call that sent it (Divi Core's
     /// mapValue: comment, to, FromAccount), in key order as Core's std::map
     tx_notes: RwLock<HashMap<Hash256, BTreeMap<String, String>>>,
@@ -400,6 +403,7 @@ impl WalletDb {
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_times: RwLock::new(HashMap::new()),
             tx_notes: RwLock::new(HashMap::new()),
         }
     }
@@ -438,6 +442,7 @@ impl WalletDb {
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_times: RwLock::new(HashMap::new()),
             tx_notes: RwLock::new(HashMap::new()),
         }
     }
@@ -480,6 +485,7 @@ impl WalletDb {
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_times: RwLock::new(HashMap::new()),
             tx_notes: RwLock::new(HashMap::new()),
         };
 
@@ -785,6 +791,7 @@ impl WalletDb {
             relay_fee_per_kb: std::sync::atomic::AtomicI64::new(crate::send::MIN_RELAY_FEE_PER_KB),
             max_tx_fee: std::sync::atomic::AtomicI64::new(crate::send::DEFAULT_MAX_TX_FEE.as_sat()),
             tx_order: RwLock::new((HashMap::new(), 0)),
+            tx_times: RwLock::new(HashMap::new()),
             tx_notes: RwLock::new(HashMap::new()),
         };
 
@@ -816,6 +823,14 @@ impl WalletDb {
             for (txid, position) in db.load_tx_order()? {
                 order.0.insert(txid, position);
                 order.1 = order.1.max(position + 1);
+            }
+        }
+        // A wallet written before these were kept has none: its records'
+        // own timestamps stand in for both (tx_times)
+        {
+            let mut times = self.tx_times.write();
+            for (txid, received, smart) in db.load_tx_times()? {
+                times.insert(txid, (received, smart));
             }
         }
         for (txid, raw) in db.load_tx_notes()? {
@@ -2130,7 +2145,8 @@ impl WalletDb {
     pub fn add_transaction(&self, tx: WalletTx) {
         debug!("Adding transaction {} to history", tx.txid);
         let (txid, confirmed) = (tx.txid, tx.block_height.is_some());
-        self.note_first_seen(&txid);
+        // A confirmed record's timestamp is its block time, at most now
+        self.note_first_seen(&txid, tx.block_hash.map(|_| tx.timestamp));
         self.transactions.write().insert(tx.txid, tx);
         self.dirty.write().transactions = true;
         if confirmed {
@@ -3054,13 +3070,14 @@ impl WalletDb {
                 }
             }
         }
-        self.note_first_seen(&txid);
+        self.note_first_seen(&txid, None);
         self.reattach(&txid);
         true
     }
 
-    /// Give `txid` the next position if the wallet has not seen it before
-    fn note_first_seen(&self, txid: &Hash256) {
+    /// Give `txid` the next position if the wallet has not seen it before,
+    /// and its received and smart times; `block_time` when it came in a block
+    fn note_first_seen(&self, txid: &Hash256, block_time: Option<u64>) {
         let position = {
             let mut order = self.tx_order.write();
             if order.0.contains_key(txid) {
@@ -3076,6 +3093,68 @@ impl WalletDb {
                 tracing::warn!("Failed to store the position of {}: {}", txid, e);
             }
         }
+        self.note_times(txid, block_time);
+    }
+
+    /// Set `txid`'s received time to now and its smart time as Divi Core's
+    /// smartWalletTxTimestampEstimation (wallet.cpp:1052-1086): the received
+    /// time when it is not in a block; else its block time, but no later than
+    /// the received time (or a later entry of the wallet up to five minutes
+    /// ahead) and no earlier than the latest earlier entry of the wallet
+    fn note_times(&self, txid: &Hash256, block_time: Option<u64>) {
+        let received = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let smart = match block_time {
+            None => received,
+            Some(block_time) => {
+                let tolerated = received + 300;
+                let mut others: Vec<(u64, Hash256)> = self
+                    .tx_order
+                    .read()
+                    .0
+                    .iter()
+                    .filter(|(other, _)| *other != txid)
+                    .map(|(other, position)| (*position, *other))
+                    .collect();
+                others.sort_unstable_by(|a, b| b.cmp(a));
+                let mut latest_now = received;
+                let mut latest_entry = 0;
+                for (_, other) in others {
+                    let (other_received, other_smart) = self.tx_times(&other);
+                    let other_time = if other_smart != 0 {
+                        other_smart
+                    } else {
+                        other_received
+                    };
+                    if other_time <= tolerated {
+                        latest_entry = other_time;
+                        latest_now = latest_now.max(other_time);
+                        break;
+                    }
+                }
+                latest_entry.max(block_time.min(latest_now))
+            }
+        };
+        self.tx_times.write().insert(*txid, (received, smart));
+        if let Some(db) = &self.db {
+            if let Err(e) = db.store_tx_times(txid, received, smart) {
+                tracing::warn!("Failed to store the times of {}: {}", txid, e);
+            }
+        }
+    }
+
+    /// When the wallet first heard of `txid` and its smart time (Divi Core
+    /// nTimeReceived and GetTxTime); for a transaction recorded before these
+    /// were kept, its record's timestamp for both
+    pub fn tx_times(&self, txid: &Hash256) -> (u64, u64) {
+        if let Some(times) = self.tx_times.read().get(txid) {
+            return *times;
+        }
+        self.history_record(txid)
+            .map(|r| (r.timestamp, r.timestamp))
+            .unwrap_or((0, 0))
     }
 
     /// The position at which the wallet first saw `txid` (None for a
@@ -4002,6 +4081,106 @@ mod tests {
     fn create_test_wallet() -> WalletDb {
         let wallet = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
         WalletDb::with_hd_wallet(Network::Mainnet, wallet)
+    }
+
+    /// A transaction paying `to`, its input made up from `tag`
+    fn paying_tx(to: &Address, tag: u8) -> divi_primitives::transaction::Transaction {
+        use divi_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint {
+                    txid: Hash256::from_bytes([tag; 32]),
+                    vout: 0,
+                },
+                script_sig: Script::default(),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut {
+                value: Amount::from_sat(100_000_000),
+                script_pubkey: Script::new_p2pkh(to.hash.as_bytes()),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Divi Core smartWalletTxTimestampEstimation (wallet.cpp:1052-1086): a
+    /// transaction first seen in an old block is dated by the block, received
+    /// now; one in a block dated before the wallet's latest entry is dated by
+    /// that entry; a transaction keeps both times once set
+    #[test]
+    fn smart_time_as_divid() {
+        let wallet = create_test_wallet();
+        let ours = wallet.new_receiving_address().unwrap();
+        let now = unix_now();
+
+        let old = paying_tx(&ours, 1);
+        wallet.scan_transaction(
+            &old,
+            Some(Hash256::from_bytes([2; 32])),
+            Some(5),
+            Some(1_000_000),
+        );
+        let (received, smart) = wallet.tx_times(&old.txid());
+        assert_eq!(smart, 1_000_000, "dated by its block");
+        assert!(received >= now && received <= unix_now(), "received now");
+
+        // The wallet's latest entry: an unconfirmed receive, dated now
+        let latest = paying_tx(&ours, 3);
+        wallet.scan_transaction(&latest, None, None, None);
+        let (_, latest_time) = wallet.tx_times(&latest.txid());
+        assert!(latest_time >= now);
+
+        // A block dated well before that entry: dated by the entry
+        let behind = paying_tx(&ours, 4);
+        wallet.scan_transaction(
+            &behind,
+            Some(Hash256::from_bytes([5; 32])),
+            Some(6),
+            Some(2_000_000),
+        );
+        assert_eq!(wallet.tx_times(&behind.txid()).1, latest_time);
+
+        // The unconfirmed receive mined later: its times stay
+        let before = wallet.tx_times(&latest.txid());
+        wallet.scan_transaction(
+            &latest,
+            Some(Hash256::from_bytes([6; 32])),
+            Some(7),
+            Some((now + 50) as u32),
+        );
+        assert_eq!(wallet.tx_times(&latest.txid()), before);
+    }
+
+    /// Received and smart times are kept in the wallet file
+    #[test]
+    fn transaction_times_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let (txid, times) = {
+            let wallet = WalletDb::create_persistent(&path, Network::Regtest, hd).unwrap();
+            let ours = wallet.new_receiving_address().unwrap();
+            let tx = paying_tx(&ours, 9);
+            wallet.scan_transaction(
+                &tx,
+                Some(Hash256::from_bytes([8; 32])),
+                Some(3),
+                Some(1_500_000),
+            );
+            wallet.save().unwrap();
+            (tx.txid(), wallet.tx_times(&tx.txid()))
+        };
+        let wallet = WalletDb::open(&path, Network::Regtest).unwrap();
+        assert_eq!(wallet.tx_times(&txid), times);
+        assert_eq!(times.1, 1_500_000);
     }
 
     /// Divi Core's time of a wallet transaction is at most when the wallet
