@@ -1172,9 +1172,9 @@ impl WalletRpc {
             )
         })?;
         let key_bytes = secret.as_bytes();
-        let mut key_array = [0u8; 32];
+        let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(key_bytes);
-        let wif = encode_wif(&key_array, key_entry.compressed, network);
+        let wif = encode_wif(&*key_array, key_entry.compressed, network);
 
         Ok(serde_json::json!(wif))
     }
@@ -2947,18 +2947,18 @@ impl WalletRpc {
             )
         })?;
         let key_bytes = secret.as_bytes();
-        let mut key_array = [0u8; 32];
+        let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(key_bytes);
 
         // Encrypt using BIP38 in the key's own form (as PIVX's bip38encrypt, which this
         // RPC follows; Divi Core's own BIP38 RPCs keep the flag the same way)
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, key_entry.compressed)
+        let encrypted = divi_crypto::bip38_encrypt(&*key_array, passphrase, key_entry.compressed)
             .map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("BIP38 encryption failed: {}", e),
-                )
-            })?;
+            RpcError::new(
+                codes::WALLET_ERROR,
+                format!("BIP38 encryption failed: {}", e),
+            )
+        })?;
 
         Ok(json!(encrypted))
     }
@@ -2975,10 +2975,10 @@ impl WalletRpc {
 
         let secret = divi_crypto::keys::SecretKey::new_random();
         let address = Address::p2pkh(&secret.public_key(), network).to_base58();
-        let mut key_array = [0u8; 32];
+        let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(secret.as_bytes());
 
-        let encrypted = divi_crypto::bip38_encrypt(&key_array, passphrase, true).map_err(|e| {
+        let encrypted = divi_crypto::bip38_encrypt(&*key_array, passphrase, true).map_err(|e| {
             RpcError::new(
                 codes::WALLET_ERROR,
                 format!("BIP38 encryption failed: {}", e),
@@ -3010,6 +3010,7 @@ impl WalletRpc {
 
         // Encode as WIF
         use divi_wallet::address::encode_wif;
+        let private_key = zeroize::Zeroizing::new(private_key);
         let wif = encode_wif(&private_key, compressed, network);
 
         Ok(json!(wif))

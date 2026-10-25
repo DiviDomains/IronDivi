@@ -2214,6 +2214,10 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
 fn main() -> Result<()> {
     // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
     private_files::restrict_umask();
+    // A core dump would hold unlocked wallet keys (NODE-10)
+    if let Err(e) = private_files::disable_core_dumps() {
+        eprintln!("Warning: could not disable core dumps: {}", e);
+    }
 
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match resolve_args(Args::parse()) {

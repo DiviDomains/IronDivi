@@ -26,6 +26,7 @@ use bip39::Mnemonic;
 use divi_crypto::keys::{PublicKey, SecretKey};
 use divi_primitives::ChainMode;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 /// Divi coin type for BIP44 derivation
 pub const DIVI_COIN_TYPE: u32 = 301;
@@ -123,7 +124,7 @@ pub struct HdWallet {
     /// Master private key
     master: ExtendedPrivateKey,
     /// Mnemonic words (if available)
-    mnemonic: Option<String>,
+    mnemonic: Option<Zeroizing<String>>,
     /// Chain mode affects BIP44 coin type
     chain_mode: ChainMode,
 }
@@ -132,12 +133,13 @@ impl HdWallet {
     /// Create a new HD wallet with random 24-word mnemonic
     pub fn new(chain_mode: ChainMode) -> Result<Self, WalletError> {
         // Generate 32 bytes (256 bits) of entropy for 24 words
-        let mut entropy = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut entropy);
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(&mut entropy[..]);
 
-        let mnemonic = Mnemonic::from_entropy(&entropy)
+        let mnemonic = Mnemonic::from_entropy(&entropy[..])
             .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
-        Self::from_mnemonic(&mnemonic.to_string(), None, chain_mode)
+        let phrase = Zeroizing::new(mnemonic.to_string());
+        Self::from_mnemonic(&phrase, None, chain_mode)
     }
 
     /// Create from mnemonic phrase
@@ -150,12 +152,12 @@ impl HdWallet {
             .parse()
             .map_err(|e: bip39::Error| WalletError::InvalidMnemonic(e.to_string()))?;
 
-        let seed = mnemonic.to_seed(passphrase.unwrap_or(""));
-        let master = ExtendedPrivateKey::from_seed(&seed)?;
+        let seed = Zeroizing::new(mnemonic.to_seed(passphrase.unwrap_or("")));
+        let master = ExtendedPrivateKey::from_seed(&seed[..])?;
 
         Ok(HdWallet {
             master,
-            mnemonic: Some(phrase.to_string()),
+            mnemonic: Some(Zeroizing::new(phrase.to_string())),
             chain_mode,
         })
     }
@@ -172,7 +174,7 @@ impl HdWallet {
 
     /// Get the mnemonic phrase (if available)
     pub fn mnemonic(&self) -> Option<&str> {
-        self.mnemonic.as_deref()
+        self.mnemonic.as_ref().map(|m| m.as_str())
     }
 
     /// Get the HD master key ID (hash160 of master public key)

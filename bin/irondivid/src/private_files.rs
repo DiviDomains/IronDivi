@@ -26,6 +26,23 @@ pub fn restrict_umask() {
     }
 }
 
+/// Stop the process from writing core dumps, which would hold unlocked wallet keys
+/// (NODE-10). Call first, before the wallet is opened.
+pub fn disable_core_dumps() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit reads the struct passed by reference and changes only this process.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Create `dir` with mode 0700 if it is missing. If it exists and other users can read or
 /// enter it, warn, and with `tighten` set it to 0700. Returns whether it was loose.
 pub fn ensure_private_dir(dir: &Path, tighten: bool) -> io::Result<bool> {
@@ -136,6 +153,20 @@ mod tests {
         std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
         restrict_file(&log);
         assert_eq!(mode(&log), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node10_core_dumps_are_disabled() {
+        disable_core_dumps().unwrap();
+        let mut lim = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        // SAFETY: getrlimit writes into the struct passed by reference.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) }, 0);
+        assert_eq!(lim.rlim_cur, 0);
+        assert_eq!(lim.rlim_max, 0);
     }
 
     #[test]
