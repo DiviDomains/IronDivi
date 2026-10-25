@@ -1111,9 +1111,14 @@ impl Node {
                                                 let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
                                             }
                                         }
-                                        divi_network::InvType::Tx => match mempool.get(&item.hash) {
-                                            Some(entry) => {
-                                                let msg = NetworkMessage::Tx(entry.tx);
+                                        // From what was relayed in the last 15
+                                        // minutes, then the mempool (main.cpp:324)
+                                        divi_network::InvType::Tx => match tx_relay
+                                            .relayed_tx(&item.hash)
+                                            .or_else(|| mempool.get(&item.hash).map(|e| e.tx))
+                                        {
+                                            Some(tx) => {
+                                                let msg = NetworkMessage::Tx(tx);
                                                 let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
                                             }
                                             None => not_found.push(item),
@@ -1424,6 +1429,7 @@ impl Node {
                         tracing::debug!("Added relayed tx {} to mempool", txid);
                         // Relayed once the mempool took it, and so is each
                         // orphan it lets in (Divi Core main.cpp:734, :763)
+                        tx_relay_for_mempool.keep_relayed(event.tx.clone());
                         tx_relay_for_mempool
                             .relay_accepted(txid, Some(event.from_peer))
                             .await;
@@ -1434,6 +1440,9 @@ impl Node {
                             &orphans_for_relay,
                             txid,
                         ) {
+                            if let Some(entry) = mempool_for_relay.get(&txid) {
+                                tx_relay_for_mempool.keep_relayed(entry.tx);
+                            }
                             tx_relay_for_mempool.relay_accepted(txid, None).await;
                             let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         }
@@ -1854,11 +1863,13 @@ impl Node {
             fee
         };
 
+        let relayed = tx.clone();
         let txid = self.mempool.add(tx, actual_fee)?;
         let _ = self.event_tx.send(NodeEvent::TransactionAccepted(txid));
 
-        // Mark as seen and announce to peers
+        // Mark as seen and announce to peers, and keep it for their getdata
         self.tx_relay.mark_seen(txid);
+        self.tx_relay.keep_relayed(relayed);
         let relay = Arc::clone(&self.tx_relay);
         tokio::spawn(async move {
             relay.announce_tx(txid).await;
