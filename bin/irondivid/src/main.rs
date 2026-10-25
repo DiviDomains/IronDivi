@@ -1798,9 +1798,6 @@ fn load_or_restore_wallet_with_seed(
         );
     }
 
-    info!("Creating new wallet at {:?}", wallet_path);
-    std::fs::create_dir_all(wallet_path)
-        .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
     let hd_wallet = if let Some(ref seed) = seed {
         info!("Restoring wallet from -hdseed");
         HdWallet::from_seed(seed, chain_mode)
@@ -1820,14 +1817,26 @@ fn load_or_restore_wallet_with_seed(
             "Restoring wallet from -mnemonic (chain_mode={:?})",
             restore_chain_mode
         );
-        HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode)
-            .with_context(|| "Failed to restore HD wallet from mnemonic")?
+        // Words of an unknown count, outside the word list or failing their
+        // checksum: CMnemonic::Check refuses them, before the wallet is made
+        // (hdchain.cpp:63-65, init.cpp:1203-1209)
+        HdWallet::from_mnemonic(mnemonic, passphrase.as_deref(), restore_chain_mode).map_err(
+            |_| {
+                anyhow::anyhow!(
+                    "Error loading or creating wallet.dat, SetMnemonic: invalid mnemonic: please check your words`"
+                )
+            },
+        )?
     } else {
         // No mnemonic: new words, with the passphrase if one is given
         // (hdchain.cpp:56-67)
         HdWallet::generate(passphrase.as_deref(), chain_mode)
             .with_context(|| "Failed to generate HD wallet")?
     };
+
+    info!("Creating new wallet at {:?}", wallet_path);
+    std::fs::create_dir_all(wallet_path)
+        .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
 
     // Never log the mnemonic: logs go to journald and log files, which are
     // neither encrypted nor access-controlled like the wallet. Point the
@@ -3975,6 +3984,40 @@ mod wallet_log_tests {
             back.mnemonic() == old,
             "the moved wallet is not the old one"
         );
+    }
+
+    /// As hdchain.cpp:63-65 and init.cpp:1203-1209: words that fail their
+    /// checksum stop the start with divid's text, after the wallet there was
+    /// moved, and leave no new wallet
+    #[test]
+    fn invalid_mnemonic_words_stop_the_start() {
+        // "abandon" twelve times: every word is in the list, the checksum fails
+        let words = ["abandon"; 12].join(" ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        drop(
+            load_or_create_wallet_from(&path, WalletNetwork::Regtest, ChainMode::Divi, None)
+                .unwrap(),
+        );
+        let refused = load_or_create_wallet(
+            &path,
+            WalletNetwork::Regtest,
+            ChainMode::Divi,
+            WalletSeed {
+                mnemonic: Some(words),
+                restore: true,
+                ..WalletSeed::default()
+            },
+            &WalletOptions::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(
+            format!("{refused:#}"),
+            "Error loading or creating wallet.dat, SetMnemonic: invalid mnemonic: please check your words`"
+        );
+        assert_eq!(moved_wallets(dir.path()).len(), 1);
+        assert!(!path.exists(), "a wallet was left at {path:?}");
     }
 
     #[test]
