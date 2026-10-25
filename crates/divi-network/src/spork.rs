@@ -16,6 +16,7 @@
 //! indicating how many sporks it has. We respond with `getsporks` to request
 //! them all, then receive individual `spork` messages.
 
+use crate::message::{InvItem, InvType};
 use crate::messages::SporkMessage;
 use crate::peer::PeerId;
 use crate::peer_manager::PeerManager;
@@ -377,6 +378,31 @@ impl SporkManager {
             let _ = self
                 .peer_manager
                 .send_to_peer(peer_id, NetworkMessage::Spork(spork))
+                .await;
+        }
+    }
+
+    /// Handle a `getdata` that asks for sporks: send each one held, and tell the
+    /// peer which are not (Divi Core main.cpp:270-346, `ShareSporkDataWithPeer`
+    /// and the `notfound` that follows)
+    pub async fn handle_getdata(&self, peer_id: PeerId, items: &[InvItem]) {
+        let mut missing = Vec::new();
+        for item in items.iter().filter(|i| i.inv_type == InvType::Spork) {
+            let held = self.sporks.read().get(&item.hash).cloned();
+            match held {
+                Some(spork) => {
+                    let _ = self
+                        .peer_manager
+                        .send_to_peer(peer_id, NetworkMessage::Spork(spork))
+                        .await;
+                }
+                None => missing.push(item.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            let _ = self
+                .peer_manager
+                .send_to_peer(peer_id, NetworkMessage::NotFound(missing))
                 .await;
         }
     }

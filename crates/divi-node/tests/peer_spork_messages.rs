@@ -12,6 +12,18 @@ use divi_network::SporkMessage;
 use divi_node::config::NodeConfig;
 use divi_storage::ChainDatabase;
 
+/// Read `n` inventory items from an `inv`, `getdata` or `notfound` payload
+fn inv_items(payload: &[u8]) -> Vec<(u32, [u8; 32])> {
+    let n = payload[0] as usize;
+    (0..n)
+        .map(|k| {
+            let at = 1 + 36 * k;
+            let kind = u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
+            (kind, payload[at + 4..at + 36].try_into().unwrap())
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_sporkcount_is_answered_with_getsporks() {
     let t = TestNode::start().await;
@@ -98,4 +110,33 @@ async fn stored_sporks_of_unnamed_ids_are_not_loaded() {
     let served = peer.expect("spork", WAIT).await.expect("a spork");
     assert_eq!(spork_id(&served), 10007);
     assert_eq!(peer.expect("spork", QUIET).await, None);
+}
+
+/// Divi Core serves a spork it holds to a peer that asks for it by its hash and
+/// answers `notfound` for one it does not (main.cpp:187-189, :337-346)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getdata_of_a_spork_is_served_or_not_found() {
+    let held = stored(10007, "1537971708", 1000);
+    let t = TestNode::start_with(|c| seed(c, std::slice::from_ref(&held))).await;
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+
+    let mut ask = vec![1u8];
+    ask.extend_from_slice(&6u32.to_le_bytes());
+    ask.extend_from_slice(held.hash().as_bytes());
+    peer.send("getdata", &ask).await;
+    let served = peer.expect("spork", WAIT).await.expect("the spork");
+    assert_eq!(served, held.serialize());
+
+    let unknown = [0x42u8; 32];
+    let mut ask = vec![2u8];
+    ask.extend_from_slice(&6u32.to_le_bytes());
+    ask.extend_from_slice(&unknown);
+    ask.extend_from_slice(&6u32.to_le_bytes());
+    ask.extend_from_slice(held.hash().as_bytes());
+    peer.send("getdata", &ask).await;
+    let first = peer.expect("spork", WAIT).await.expect("the spork again");
+    assert_eq!(first, held.serialize());
+    let missing = peer.expect("notfound", WAIT).await.expect("notfound");
+    assert_eq!(inv_items(&missing), vec![(6, unknown)]);
 }

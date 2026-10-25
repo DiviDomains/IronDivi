@@ -1123,6 +1123,8 @@ impl Node {
                                     }
                                 }
 
+                                spork_manager.handle_getdata(peer_id, &items).await;
+
                                 // Handle tx getdata requests
                                 if !tx_items.is_empty() {
                                     let mempool_ref = &mempool;
