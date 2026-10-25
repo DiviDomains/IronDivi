@@ -51,8 +51,6 @@ ABORT = ("same error line; divid then aborts (SIGABRT) in the shutdown after thi
 AIDS = ("a divid test aid for a part irondivid has but does not let an option change (bin/irondivid/src/main.rs "
         "UNSUPPORTED_OPTIONS): divid takes it without a word, irondivid names it as not supported "
         "(docs/divid-differences.md S2)")
-NOT_HERE = ("divid uses it for a part irondivid does not have (name lookups of -addnode and -connect names, UPnP "
-            "port mapping): irondivid names it as not supported (docs/divid-differences.md S2)")
 PRUNED = ("divid's -prunewalletconfs rebuilds the wallet's transactions in memory without the fully spent ones of at "
          "least that many confirmations and logs the counts (wallet.cpp:1162-1239); irondivid's wallet keeps them "
          "all, and it names the option as not supported (UNSUPPORTED_OPTIONS)")
@@ -417,8 +415,6 @@ for _option, _typical, _forms, _during, _after in OPTIONS:
         if _option in ("accountlabels", "activeversion", "manual_fork", "override_mnpayee", "prunewalletconfs",
                        "stakeupdatetime", "whitelisted_vault"):
             KNOWN[f"{_label}: log lines naming -{_option}"] = (AIDS, unsupported(_option))
-        if _option in ("dns", "upnp"):
-            KNOWN[f"{_label}: log lines naming -{_option}"] = (NOT_HERE, unsupported(_option))
         if _option == "prunewalletconfs":
             KNOWN[f"{_label}: log lines"] = (PRUNED, pruned)
         if _option == "socks" or (_option == "tor" and _label not in ("-tor=0", "-tor=abc")):
