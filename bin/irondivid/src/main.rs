@@ -319,7 +319,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "onion",
     "onlynet",
     "par",
-    "peerbloomfilters",
     "permitbaremultisig",
     "proxyrandomize",
     "resync",
@@ -560,6 +559,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.proxy = Some(proxy.to_string());
     }
     config.p2p.discover = s.get_bool("discover", true);
+    config.p2p.peer_bloom_filters = s.get_bool("peerbloomfilters", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
     for raw in s.get_multi("externalip") {
@@ -740,6 +740,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "peerbloomfilters",
         "acceptnonstandard",
         "maxtxfee",
         "sporkkey",

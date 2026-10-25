@@ -813,8 +813,15 @@ impl Node {
         // A pruning node must not advertise NODE_NETWORK (full history). Key it off the
         // database too, so a node that pruned earlier stays honest if expire is later off.
         let prunes = self.config.expire.is_enabled() || self.chain.prune_height() > 0;
+        // NODE_BLOOM while bloom filters are served (Divi Core EnableBloomFilters,
+        // net.cpp:1722-1723, NetworkLocalAddressHelpers.cpp:224-227)
+        let bloom = if self.config.p2p.peer_bloom_filters {
+            divi_network::constants::services::NODE_BLOOM
+        } else {
+            0
+        };
         self.peer_manager
-            .set_services(divi_network::constants::advertised_services(prunes));
+            .set_services(divi_network::constants::advertised_services(prunes) | bloom);
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
         self.peer_manager
             .set_local_addresses(self.local_addresses());
