@@ -604,3 +604,215 @@ async fn scan_cursor_persists_with_wallet() {
     // A fresh process sees the saved cursor.
     assert_eq!(open().scanned_height(), Some(102));
 }
+
+// --- G2: two DIVI sources -------------------------------------------------------------
+
+/// A cryptoid stand-in: `tx.raw.dws` answers `tx` (or "unknown"), `block.raw.dws` gives
+/// block `h` the time `h * 60`, and `api.dws?q=getblockcount` says `tip`.
+#[derive(Clone)]
+struct Cryptoid {
+    tx: Arc<Mutex<Option<Value>>>,
+    status: Arc<Mutex<u16>>,
+    tip: u64,
+}
+
+impl Respond for Cryptoid {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let status = *self.status.lock();
+        if status != 200 {
+            return ResponseTemplate::new(status).set_body_string("busy");
+        }
+        let q: HashMap<String, String> = req.url.query_pairs().into_owned().collect();
+        match req.url.path() {
+            "/explorer/tx.raw.dws" => match &*self.tx.lock() {
+                Some(tx) => ResponseTemplate::new(200).set_body_json(tx),
+                None => ResponseTemplate::new(200).set_body_string("\"unknown\""),
+            },
+            "/explorer/block.raw.dws" => {
+                let h: u64 = q["height"].parse().unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({"height": h, "time": h * 60}))
+            }
+            "/divi/api.dws" if q["q"] == "getblockcount" => {
+                ResponseTemplate::new(200).set_body_string(self.tip.to_string())
+            }
+            _ => ResponseTemplate::new(404).set_body_string("not found"),
+        }
+    }
+}
+
+async fn cryptoid(tx: Option<Value>) -> (MockServer, Cryptoid) {
+    let server = MockServer::start().await;
+    let c = Cryptoid {
+        tx: Arc::new(Mutex::new(tx)),
+        status: Arc::new(Mutex::new(200)),
+        tip: 100,
+    };
+    Mock::given(method("GET"))
+        .respond_with(c.clone())
+        .mount(&server)
+        .await;
+    (server, c)
+}
+
+/// The maker's lock as both sources print it: `sat` to the HTLC, in block `block`.
+fn lock_json(h: &HtlcParams, sat: u64, confs: u32, block: Option<&str>) -> Value {
+    let mut tx = tx_json(
+        &txid_n(7),
+        &[],
+        &[(&htlc_script_pubkey(h).to_hex(), sat)],
+        confs,
+    );
+    if let Some(b) = block {
+        tx["blockhash"] = json!(b);
+    }
+    tx
+}
+
+const LOCK_AT: Outpoint = Outpoint {
+    txid: Txid([7; 32]),
+    vout: 0,
+};
+
+async fn two_source(
+    rpc_tx: Value,
+    cid_tx: Option<Value>,
+) -> (
+    TwoSource<DiviBackend>,
+    HtlcParams,
+    MockServer,
+    MockServer,
+    Cryptoid,
+) {
+    let (rpc, node) = mock().await;
+    let b = backend(&rpc.uri(), SecretKey::new_random());
+    let h = htlc_for(&b, [5; 32]);
+    let rpc_tx = if rpc_tx.is_null() {
+        lock_json(&h, 5_000, 12, Some("aa"))
+    } else {
+        rpc_tx
+    };
+    node.result("getrawtransaction", rpc_tx);
+    let (cs, c) = cryptoid(cid_tx).await;
+    let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));
+    (t, h, rpc, cs, c)
+}
+
+#[tokio::test]
+async fn two_sources_that_agree_give_the_lower_count() {
+    let (rpc, node) = mock().await;
+    let b = backend(&rpc.uri(), SecretKey::new_random());
+    let h = htlc_for(&b, [5; 32]);
+    node.result("getrawtransaction", lock_json(&h, 5_000, 12, Some("aa")));
+    let (cs, _c) = cryptoid(Some(lock_json(&h, 5_000, 10, Some("aa")))).await;
+    let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));
+    let lo = t.htlc_output(&h, &LOCK_AT).await.unwrap().unwrap();
+    assert_eq!((lo.amount, lo.confirmations), (Amount(5_000), 10));
+    assert_eq!(t.confirmations(&LOCK_AT.txid).await.unwrap(), Some(10));
+}
+
+#[tokio::test]
+async fn a_lock_cryptoid_does_not_know_is_no_lock() {
+    let (t, h, _r, _c, _) = two_source(Value::Null, None).await;
+    assert_eq!(t.htlc_output(&h, &LOCK_AT).await.unwrap(), None);
+    assert_eq!(t.confirmations(&LOCK_AT.txid).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_lock_paying_another_script_on_cryptoid_is_no_lock() {
+    let (rpc, node) = mock().await;
+    let b = backend(&rpc.uri(), SecretKey::new_random());
+    let h = htlc_for(&b, [5; 32]);
+    node.result("getrawtransaction", lock_json(&h, 5_000, 12, Some("aa")));
+    let other = htlc_for(&b, [6; 32]);
+    let (cs, _c) = cryptoid(Some(lock_json(&other, 5_000, 12, Some("aa")))).await;
+    let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));
+    assert_eq!(t.htlc_output(&h, &LOCK_AT).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn sources_reporting_different_amounts_are_refused() {
+    let (rpc, node) = mock().await;
+    let b = backend(&rpc.uri(), SecretKey::new_random());
+    let h = htlc_for(&b, [5; 32]);
+    node.result("getrawtransaction", lock_json(&h, 9_000, 12, Some("aa")));
+    let (cs, _c) = cryptoid(Some(lock_json(&h, 5_000, 12, Some("aa")))).await;
+    let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));
+    let e = t.htlc_output(&h, &LOCK_AT).await.unwrap_err();
+    assert!(
+        matches!(e, SwapError::Other(m) if m.contains("rpc says") && m.contains("cryptoid says"))
+    );
+}
+
+#[tokio::test]
+async fn sources_reporting_different_blocks_wait() {
+    let (rpc, node) = mock().await;
+    let b = backend(&rpc.uri(), SecretKey::new_random());
+    let h = htlc_for(&b, [5; 32]);
+    node.result("getrawtransaction", lock_json(&h, 5_000, 12, Some("aa")));
+    let (cs, _c) = cryptoid(Some(lock_json(&h, 5_000, 12, Some("bb")))).await;
+    let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));
+    let e = t.htlc_output(&h, &LOCK_AT).await.unwrap_err();
+    assert!(matches!(e, SwapError::Transient(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn cryptoid_down_is_transient() {
+    let (t, h, _r, _cs, c) = two_source(Value::Null, None).await;
+    *c.status.lock() = 503;
+    let e = t.htlc_output(&h, &LOCK_AT).await.unwrap_err();
+    assert!(matches!(e, SwapError::Transient(_)), "{e:?}");
+    *c.status.lock() = 429;
+    let e = t.confirmations(&LOCK_AT.txid).await.unwrap_err();
+    assert!(matches!(e, SwapError::Transient(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn cryptoid_mtp_is_the_median_of_the_last_11_and_is_cached() {
+    let (cs, _c) = cryptoid(None).await;
+    let o = CryptoidObserver::new(&cs.uri(), "divi");
+    // Tip 100: blocks 90..=100, times h * 60, median block 95.
+    assert_eq!(o.median_time_past().await.unwrap(), 95 * 60);
+    let calls = cs.received_requests().await.unwrap().len();
+    assert_eq!(calls, 12);
+    // Cached: no second Query API call, which would also have to wait out the 10 s gap.
+    assert_eq!(o.median_time_past().await.unwrap(), 95 * 60);
+    assert_eq!(cs.received_requests().await.unwrap().len(), calls);
+}
+
+#[tokio::test]
+async fn two_source_mtp_is_the_later_one() {
+    let (rpc, node) = mock().await;
+    let b = backend(&rpc.uri(), SecretKey::new_random());
+    node.result("getblockcount", json!(5))
+        .result("getblockhash", json!("h"))
+        .result("getblock", json!({"time": 1_000_000}));
+    let (cs, _c) = cryptoid(None).await;
+    let t = b.with_second_source(Arc::new(CryptoidObserver::new(&cs.uri(), "divi")));
+    assert_eq!(t.median_time_past().await.unwrap(), 1_000_000);
+}
+
+/// Live: the mainnet proxy and cryptoid agree on a real mainnet tx and on the clock.
+/// Run with `--ignored live_mainnet_sources_agree`.
+#[tokio::test]
+#[ignore = "network: services.divi.domains and chainz.cryptoid.info"]
+async fn live_mainnet_sources_agree() {
+    let b = DiviBackend::new(
+        MAINNET_RPC,
+        SecretKey::new_random(),
+        Network::Mainnet,
+        FeePolicy::default(),
+        None,
+    )
+    .unwrap();
+    let t = b.with_second_source(Arc::new(CryptoidObserver::mainnet()));
+    // First tx of block 3,000,000.
+    let txid =
+        Txid::from_rpc_hex("85ffd9b4719ae59a1285c4b9bf60b0c20d0ac174932e556513fce69156cb4e99")
+            .unwrap();
+    let confs = t.confirmations(&txid).await.unwrap().unwrap();
+    assert!(confs > 1_000_000, "{confs}");
+    assert_eq!(t.confirmations(&txid_n(9)).await.unwrap(), None);
+    let mtp = t.median_time_past().await.unwrap() as u64;
+    let now = divi_swap::rt::unix_now();
+    assert!(now.abs_diff(mtp) < 3 * 3600, "mtp {mtp} now {now}");
+}
