@@ -346,7 +346,9 @@ pub fn verify_htlc_spend(
 /// Build and sign a CPFP child: spend output 0 of `parent` (paid to the key's own P2WPKH,
 /// worth `parent_value`) back to the same address, paying enough that the package it joins
 /// (`package_vsize` vbytes that paid `package_fee` in all) and the child together pay
-/// `sat_per_vb`, and never less than 1 litoshi/vB for the child itself.
+/// `sat_per_vb`, and never less than 1 litoshi/vB for the child itself. The child signals
+/// BIP125, so a node run with `-mempoolreplacement=1` takes a richer child of the same
+/// parent in its place (the next bump), keeping the package two deep.
 pub fn build_cpfp_tx(
     secp: &Secp256k1<All>,
     sk: &SecretKey,
@@ -367,7 +369,7 @@ pub fn build_cpfp_tx(
     let mut tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
-        input: vec![input(at, Sequence::MAX)],
+        input: vec![input(at, Sequence::ENABLE_RBF_NO_LOCKTIME)],
         output: vec![TxOut {
             value: Amount::from_sat(parent_value),
             script_pubkey: my_spk.clone(),
