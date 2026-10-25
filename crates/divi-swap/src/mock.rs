@@ -91,6 +91,9 @@ struct ChainState {
     fail_broadcasts: Option<SwapError>,
     /// Every txid this chain ever accepted, kept when the tx later leaves the mempool.
     accepted: HashMap<Txid, TxKind>,
+    /// Every `broadcast()` call that reached the node, by kind, whatever its answer
+    /// (accepted, already known, premature or rejected).
+    attempts: HashMap<TxKind, usize>,
 }
 
 /// The kind of a mock transaction.
@@ -233,6 +236,12 @@ impl MockChain {
     pub fn accepted(&self) -> Vec<(Txid, TxKind)> {
         let s = self.state.lock();
         s.accepted.iter().map(|(id, k)| (*id, *k)).collect()
+    }
+
+    /// How many `broadcast()` calls of `kind` reached this chain's node (online), whatever
+    /// the node answered: a premature refund the node refused counts too.
+    pub fn attempts(&self, kind: TxKind) -> usize {
+        self.state.lock().attempts.get(&kind).copied().unwrap_or(0)
     }
 
     /// The chain has `txid`, in the mempool or mined.
@@ -402,14 +411,57 @@ impl MockBackend {
     }
 }
 
+/// Bitcoin Core's `IsFinalTx` for a one-input tx mined into the block after a tip at
+/// `tip_height` with median time past `tip_mtp` (BIP113): a height nLockTime is final once
+/// it is below the next block's height, a time nLockTime once it is below the tip's MTP; a
+/// zero nLockTime or a final input always is.
+fn is_final_tx(lock_time: u32, sequence: u32, tip_height: u64, tip_mtp: u32) -> bool {
+    if lock_time == 0 || sequence == SEQUENCE_FINAL {
+        return true;
+    }
+    let cutoff = if lock_time < LOCKTIME_THRESHOLD {
+        tip_height as i64 + 1
+    } else {
+        tip_mtp as i64
+    };
+    (lock_time as i64) < cutoff
+}
+
+/// Bitcoin Core's `CalculateSequenceLocks` + `EvaluateSequenceLocks` (BIP68) for the input
+/// of a version-2 tx spending a coin mined at `coin_height` (a mempool coin counts as the
+/// next block's), into the block after the tip at `tip_height`. `mtp_of(h)` is the MTP of
+/// the block at height `h`. A relative lock of `n` blocks gives
+/// `min_height = coin_height + n - 1`; of `n` 512 s units gives
+/// `min_time = MTP(block before the coin's) + n * 512 - 1`. Final when
+/// `min_height < tip_height + 1` and `min_time < MTP(tip)`; the disable bit turns it off.
+fn sequence_lock_final(
+    sequence: u32,
+    coin_height: u64,
+    tip_height: u64,
+    mtp_of: impl Fn(u64) -> u32,
+) -> bool {
+    if sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+        return true;
+    }
+    let n = (sequence & SEQUENCE_LOCKTIME_MASK) as i64;
+    let mut min_height: i64 = -1;
+    let mut min_time: i64 = -1;
+    if sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+        let coin_time = mtp_of(coin_height.saturating_sub(1)) as i64;
+        min_time = min_time.max(coin_time + (n << SEQUENCE_LOCKTIME_GRANULARITY) - 1);
+    } else {
+        min_height = min_height.max(coin_height as i64 + n - 1);
+    }
+    let next_height = tip_height as i64 + 1;
+    !(min_height >= next_height || min_time >= mtp_of(tip_height) as i64)
+}
+
 /// Why a node refuses `tx` spending the HTLC at `at` into the next block, if it does: the
-/// checks and reject strings of Bitcoin Core's mempool, in its order. `IsFinalTx` (BIP113:
-/// a time nLockTime must be *below* the tip's MTP, a height one below the next height;
-/// skipped when the input is final), then BIP68 relative locks (only when the sequence's
-/// disable bit is clear; a mempool parent counts as mined in the next block), then the
-/// script's `OP_CHECKLOCKTIMEVERIFY` (nLockTime of the HTLC's type and at least its
-/// locktime, input not final). The BTC backend maps all three to `SwapError::Premature`
-/// (`classify_broadcast_error`), and so does the mock.
+/// checks and reject strings of Bitcoin Core's mempool, in its order. [`is_final_tx`]
+/// (BIP113), then BIP68 relative locks ([`sequence_lock_final`]; a mempool parent counts
+/// as mined in the next block), then the script's `OP_CHECKLOCKTIMEVERIFY` (nLockTime of
+/// the HTLC's type and at least its locktime, input not final). The BTC backend maps all
+/// three to `SwapError::Premature` (`classify_broadcast_error`), and so does the mock.
 fn refund_premature(
     s: &ChainState,
     htlc: &HtlcParams,
@@ -418,33 +470,17 @@ fn refund_premature(
     sequence: u32,
 ) -> Option<String> {
     let next = s.height + 1;
-    if sequence != SEQUENCE_FINAL && lock_time != 0 {
-        let (cutoff, now) = if lock_time < LOCKTIME_THRESHOLD {
-            (lock_time as u64, next)
-        } else {
-            (lock_time as u64, s.mtp as u64)
-        };
-        if cutoff >= now {
-            return Some(format!(
-                "non-final (nLockTime {lock_time}, tip mtp {}, next height {next})",
-                s.mtp
-            ));
-        }
+    if !is_final_tx(lock_time, sequence, s.height, s.mtp) {
+        return Some(format!(
+            "non-final (nLockTime {lock_time}, tip mtp {}, next height {next})",
+            s.mtp
+        ));
     }
-    if sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0 {
-        let parent = s.txs.get(&at.txid).and_then(|(_, h)| *h).unwrap_or(next);
-        let n = sequence & SEQUENCE_LOCKTIME_MASK;
-        let ok = if sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
-            let base = s.mtp_hist[parent.saturating_sub(1) as usize] as u64;
-            base + ((n as u64) << SEQUENCE_LOCKTIME_GRANULARITY) <= s.mtp as u64
-        } else {
-            parent + n as u64 <= next
-        };
-        if !ok {
-            return Some(format!(
-                "non-BIP68-final (sequence {sequence:#x}, parent height {parent})"
-            ));
-        }
+    let parent = s.txs.get(&at.txid).and_then(|(_, h)| *h).unwrap_or(next);
+    if !sequence_lock_final(sequence, parent, s.height, |h| s.mtp_hist[h as usize]) {
+        return Some(format!(
+            "non-BIP68-final (sequence {sequence:#x}, parent height {parent})"
+        ));
     }
     let same_type = (lock_time < LOCKTIME_THRESHOLD) == (htlc.locktime < LOCKTIME_THRESHOLD);
     if sequence == SEQUENCE_FINAL || !same_type || lock_time < htlc.locktime {
@@ -564,6 +600,7 @@ impl ChainBackend for MockBackend {
         let parsed: MockTx = serde_json::from_slice(&tx.raw)
             .map_err(|e| SwapError::Rejected(format!("decode: {e}")))?;
         let mut s = self.chain.state.lock();
+        *s.attempts.entry(parsed.kind()).or_default() += 1;
         if let Some(e) = &s.fail_broadcasts {
             return Err(e.clone());
         }
@@ -792,6 +829,92 @@ mod tests {
         taker.broadcast(&r).await.unwrap();
         let spend = taker.find_spend(&f.outpoint, 0).await.unwrap().unwrap();
         assert_eq!(spend.extract_preimage(&hash), None);
+    }
+
+    /// Core's finality on all four lock kinds, each at edge-1, at the edge (both not final)
+    /// and at the first final point. Only the absolute time lock is an HTLC refund's; the
+    /// other three are pinned here so the mock cannot drift from Core on them.
+    #[test]
+    fn core_finality_edges_all_four_kinds() {
+        // Absolute time L (BIP113): final once MTP(tip) > L.
+        let l = 1_800_000_000;
+        for (mtp, fin) in [(l - 1, false), (l, false), (l + 1, true)] {
+            assert_eq!(
+                is_final_tx(l, REFUND_SEQUENCE, 7, mtp),
+                fin,
+                "time, mtp {mtp}"
+            );
+        }
+        // Absolute height H: final once H < tip_height + 1, i.e. tip_height >= H.
+        let hl = 500u32;
+        for (tip, fin) in [(498, false), (499, false), (500, true)] {
+            assert_eq!(
+                is_final_tx(hl, REFUND_SEQUENCE, tip, 0),
+                fin,
+                "height, tip {tip}"
+            );
+        }
+        // A final input or a zero nLockTime is final whatever the tip.
+        assert!(is_final_tx(l, SEQUENCE_FINAL, 0, 0));
+        assert!(is_final_tx(0, REFUND_SEQUENCE, 0, 0));
+        // Relative height n on a coin at height c: min_height = c + n - 1 < tip + 1.
+        let (c, n) = (10u64, 3u32);
+        let flat = |_: u64| 0u32;
+        for (tip, fin) in [(10, false), (11, false), (12, true)] {
+            assert_eq!(
+                sequence_lock_final(n, c, tip, flat),
+                fin,
+                "csv height, tip {tip}"
+            );
+        }
+        // Relative time n units: min_time = MTP(block c-1) + n*512 - 1 < MTP(tip). The
+        // coin's own block time does not count: MTP(c) is far above MTP(c-1) here.
+        let base = 1_800_000_000u32;
+        let seq = SEQUENCE_LOCKTIME_TYPE_FLAG | n;
+        let edge = base + n * 512 - 1;
+        for (tip_mtp, fin) in [(edge - 1, false), (edge, false), (edge + 1, true)] {
+            let mtp_of = |h: u64| match h {
+                9 => base,
+                10 => base + 1_000_000,
+                _ => tip_mtp,
+            };
+            assert_eq!(
+                sequence_lock_final(seq, c, 20, mtp_of),
+                fin,
+                "csv time, tip mtp {tip_mtp}"
+            );
+        }
+        // The disable bit turns either relative lock off.
+        assert!(sequence_lock_final(
+            SEQUENCE_LOCKTIME_DISABLE_FLAG | n,
+            c,
+            0,
+            flat
+        ));
+        assert!(sequence_lock_final(REFUND_SEQUENCE, c, 0, flat));
+    }
+
+    /// `attempts` counts every broadcast that reached the node, a refused premature refund
+    /// and an already-known resend included; `tx_counts` only the accepted txids.
+    #[tokio::test]
+    async fn attempts_count_refused_and_repeated_broadcasts() {
+        let chain = MockChain::new(Chain::Btc, 1_800_000_000, 600);
+        let taker = chain.backend(3, Amount(1_000_000));
+        let (_, hash) = new_preimage();
+        let h = htlc([2; 33], taker.pubkey(), hash, 1_800_000_600);
+        let f = taker.build_funding(&h, Amount(100_000)).await.unwrap();
+        taker.broadcast(&f.tx).await.unwrap();
+        let r = taker.build_refund(&h, &f.outpoint, f.amount).await.unwrap();
+        premature(taker.broadcast(&r).await);
+        assert_eq!(chain.attempts(TxKind::Refund), 1);
+        assert_eq!(chain.tx_counts().refunds, 0);
+        chain.mine(1);
+        chain.advance_time(1); // MTP = L+1
+        taker.broadcast(&r).await.unwrap();
+        taker.broadcast(&r).await.unwrap(); // already known
+        assert_eq!(chain.attempts(TxKind::Refund), 3);
+        assert_eq!(chain.attempts(TxKind::Fund), 1);
+        assert_eq!(chain.tx_counts().refunds, 1);
     }
 
     /// The script's CLTV: an nLockTime below the HTLC's, of the other type, or a final

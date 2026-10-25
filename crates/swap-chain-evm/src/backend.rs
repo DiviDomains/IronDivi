@@ -321,6 +321,13 @@ impl ChainBackend for UsdcBackend {
         Ok(block.header.timestamp as u32)
     }
 
+    /// `Erc20Htlc.refund` checks `block.timestamp >= timelock` in the block that includes
+    /// it, which comes after the latest block: a refund is good once the latest block's
+    /// timestamp reaches the timelock, so EVM keeps `>=` where Bitcoin Core needs `>`.
+    fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
+        mtp >= locktime
+    }
+
     /// This key's `token` balance, with no allowance or gas taken off. Below the lock-gas
     /// floor ([`UsdcBackend::with_min_lock_gas_wei`]) the USDC cannot be locked at all, so
     /// that is refused outright rather than reported as a balance.
@@ -677,6 +684,23 @@ mod tests {
             eth_address_from_pubkey(&maker_pubkey).unwrap().to_string(),
             "0x995669a244d511542ca314e4068c754E3F555bd2"
         );
+    }
+
+    /// The refund gate keeps the contract's own `block.timestamp >= timelock`: final at a
+    /// latest-block timestamp equal to the timelock (the default, Core's `>`, would wait).
+    #[test]
+    fn refund_final_matches_contract_timelock_check() {
+        let backend = UsdcBackend::new(
+            "http://127.0.0.1:1",
+            PrivateKeySigner::random(),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap();
+        let l = 1_800_000_000;
+        assert!(!backend.refund_final(l - 1, l));
+        assert!(backend.refund_final(l, l));
+        assert!(backend.refund_final(l + 1, l));
     }
 
     /// `broadcast`'s idempotency check (geth's wording for a tx already in its own

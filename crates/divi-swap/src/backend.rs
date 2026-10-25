@@ -57,6 +57,19 @@ pub trait ChainBackend: Send + Sync {
     /// Median time past of the tip (what CLTV unix-time locktimes are compared against).
     async fn median_time_past(&self) -> Result<u32>;
 
+    /// Whether a refund whose absolute locktime is `locktime` is final at a tip with median
+    /// time past `mtp`, by this chain's own rule: the engines' refund gate, so neither side
+    /// broadcasts a refund the node must refuse.
+    ///
+    /// Default: Bitcoin Core's `IsFinalTx` for a unix-time nLockTime (BIP113), which needs
+    /// `nLockTime < MTP(tip)`: final only once the tip's MTP is *past* the locktime. Every
+    /// HTLC locktime is a unix time (`HtlcParams::validate`), and the refund's nSequence
+    /// disables BIP68, so this is the only lock a refund has. (A height nLockTime `H` would
+    /// instead be final at `tip_height >= H`.)
+    fn refund_final(&self, mtp: u32, locktime: u32) -> bool {
+        mtp > locktime
+    }
+
     /// Select coins and build + sign a transaction paying `amount` to the HTLC (P2SH on
     /// DIVI, P2WSH on BTC), change back to this key. **Does not broadcast.**
     ///
@@ -121,5 +134,21 @@ pub trait ChainBackend: Send + Sync {
     /// `None` means this backend cannot tell cheaply; a caller must not refuse on it.
     async fn spendable(&self) -> Result<Option<Amount>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::MockChain;
+
+    /// The default gate is Core's: at MTP == locktime the refund is still non-final.
+    #[test]
+    fn refund_final_default_is_core_time_lock() {
+        let b = MockChain::new(Chain::Btc, 0, 600).backend(1, Amount(0));
+        let l = 1_800_000_000;
+        assert!(!b.refund_final(l - 1, l));
+        assert!(!b.refund_final(l, l));
+        assert!(b.refund_final(l + 1, l));
     }
 }

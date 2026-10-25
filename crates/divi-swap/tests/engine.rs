@@ -1650,14 +1650,15 @@ async fn refund_on_claimed_does_nothing_body(dir: Direction) {
     );
 }
 
-/// A refund before its timelock is refused the way a node refuses it, and the engine does
-/// not count a refused refund as done. Each leg's refund (nLockTime = that HTLC's locktime
-/// L) is sent at MTP L-1 and at MTP L, where BIP113 (`IsFinalTx`: nLockTime must be below
-/// the tip's MTP) makes it non-final, then at L+1, where it is accepted. While refused, the
-/// side stays refunding (maker `MakerRefundable`, taker `Refunded`), the chain has no refund
-/// and the refunder's balance is unchanged; accepted and mined, both end `Done` with the
-/// lock paid back. MTP moves with `advance_time` only, never a block, so
-/// each point is exact.
+/// The engines' refund gate is the node's own finality rule. Each leg's refund has
+/// nLockTime = that HTLC's locktime L (a unix time) and a BIP68-disabled sequence, so Core's
+/// `IsFinalTx` (BIP113) is the only lock: final once the tip's MTP is *past* L. At MTP L-1
+/// and at MTP L the node refuses the refund (sent here directly to show it), and the engine
+/// step holds: the side stays put (maker `MakerLockConfirmed` with no refund built, taker
+/// `Locked`) and makes no refund broadcast attempt at all. At L+1 the step sends the refund
+/// exactly once, the node accepts it, and once mined both end `Done` with the lock paid
+/// back and exactly one refund on the chain. MTP moves with `advance_time` only, never a
+/// block, so each point is exact.
 async fn refund_at_timelock_boundary_body(dir: Direction) {
     let mut h = H::with(dir);
     h.accept(None).await;
@@ -1670,12 +1671,6 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
         h.mine_all(1);
     }
     assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed, "setup");
-    let refunds = |c: &MockChain| {
-        c.accepted()
-            .into_iter()
-            .filter(|(_, k)| *k == TxKind::Refund)
-            .count()
-    };
 
     // Maker leg.
     let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
@@ -1690,38 +1685,44 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
         .build_refund(&htlc, &f.outpoint, f.amount)
         .await
         .unwrap();
-    // At L-1 the engine has not timed out (its gate is MTP >= L) and sends nothing; at L
-    // it sends the refund (the same bytes as `own`) and the node refuses it.
-    let points = [
-        (l - 1, SwapState::MakerLockConfirmed, None),
-        (l, SwapState::MakerRefundable, Some(own.txid)),
-    ];
-    for (at, want, sent) in points {
+    for at in [l - 1, l] {
         assert_eq!(ml.mtp(), at);
         match h.m_ml().broadcast(&own).await {
             Err(SwapError::Premature(m)) => assert!(m.starts_with("non-final"), "{at}: {m}"),
             other => panic!("maker refund at mtp {at}: {other:?}"),
         }
+        let before = ml.attempts(TxKind::Refund);
         let state = h.maker.step(&h.maker_id).await.unwrap();
-        assert_eq!(state, want, "maker at mtp {at}");
-        let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
         assert_eq!(
-            rec.maker_leg_refund.map(|t| t.txid),
-            sent,
-            "maker at mtp {at}"
+            ml.attempts(TxKind::Refund) - before,
+            0,
+            "maker engine broadcast its refund at mtp {at} (locktime {l}): not final yet"
         );
-        assert_eq!(refunds(&ml), 0, "maker refund accepted at mtp {at}");
+        assert_eq!(state, SwapState::MakerLockConfirmed, "maker at mtp {at}");
+        let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+        assert!(rec.maker_leg_refund.is_none(), "maker at mtp {at}");
+        assert_eq!(
+            ml.tx_counts().refunds,
+            0,
+            "maker refund accepted at mtp {at}"
+        );
         assert_eq!(ml.balance(&h.m_ml().pubkey()), bal, "maker at mtp {at}");
         ml.advance_time(1);
     }
+    assert_eq!(ml.mtp(), l + 1);
+    let before = ml.attempts(TxKind::Refund);
     assert_eq!(
         h.maker.step(&h.maker_id).await.unwrap(),
         SwapState::MakerRefundable
     );
+    assert_eq!(ml.attempts(TxKind::Refund) - before, 1, "maker at mtp L+1");
+    let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
+    assert_eq!(rec.maker_leg_refund.map(|t| t.txid), Some(own.txid));
     assert_eq!(ml.mempool(), vec![(own.txid, TxKind::Refund)]);
     ml.mine(1);
     // One step: MakerRefundable → MakerRefunded (refund confirmed) → Done.
     assert_eq!(h.maker.step(&h.maker_id).await.unwrap(), SwapState::Done);
+    assert_eq!(ml.tx_counts().refunds, 1);
     assert_eq!(
         ml.balance(&h.m_ml().pubkey()).0,
         bal.0 + f.amount.0 - MOCK_FEE.0
@@ -1741,30 +1742,46 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
         .build_refund(&htlc, &f.outpoint, f.amount)
         .await
         .unwrap();
-    for (at, want) in [(l - 1, TakerState::Locked), (l, TakerState::Refunded)] {
+    for at in [l - 1, l] {
         assert_eq!(tl.mtp(), at);
         match h.t_tl().broadcast(&own).await {
             Err(SwapError::Premature(m)) => assert!(m.starts_with("non-final"), "{at}: {m}"),
             other => panic!("taker refund at mtp {at}: {other:?}"),
         }
+        let before = tl.attempts(TxKind::Refund);
         let state = h.taker.step(&h.taker_id, None).await.unwrap();
-        assert_eq!(state, want, "taker at mtp {at}");
-        assert_eq!(refunds(&tl), 0, "taker refund accepted at mtp {at}");
+        assert_eq!(
+            tl.attempts(TxKind::Refund) - before,
+            0,
+            "taker engine broadcast its refund at mtp {at} (locktime {l}): not final yet"
+        );
+        assert_eq!(state, TakerState::Locked, "taker at mtp {at}");
+        let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+        assert!(rec.taker_leg_refund.is_none(), "taker at mtp {at}");
+        assert_eq!(
+            tl.tx_counts().refunds,
+            0,
+            "taker refund accepted at mtp {at}"
+        );
         assert_eq!(tl.balance(&h.t_tl().pubkey()), bal, "taker at mtp {at}");
         tl.advance_time(1);
     }
-    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
-    assert_eq!(rec.taker_leg_refund.map(|t| t.txid), Some(own.txid));
+    assert_eq!(tl.mtp(), l + 1);
+    let before = tl.attempts(TxKind::Refund);
     assert_eq!(
         h.taker.step(&h.taker_id, None).await.unwrap(),
         TakerState::Refunded
     );
+    assert_eq!(tl.attempts(TxKind::Refund) - before, 1, "taker at mtp L+1");
+    let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(rec.taker_leg_refund.map(|t| t.txid), Some(own.txid));
     assert_eq!(tl.mempool(), vec![(own.txid, TxKind::Refund)]);
     tl.mine(1);
     assert_eq!(
         h.taker.step(&h.taker_id, None).await.unwrap(),
         TakerState::Done
     );
+    assert_eq!(tl.tx_counts().refunds, 1);
     assert_eq!(
         tl.balance(&h.t_tl().pubkey()).0,
         bal.0 + f.amount.0 - MOCK_FEE.0
@@ -2457,6 +2474,43 @@ both!(
     late_reorg_refunds_early_body
 );
 
+/// The early `MakerRefundable` of a late lock (a reorg near the locktime) still waits for
+/// the refund to be final: no refund broadcast attempt while MTP is at most the locktime L
+/// (at L - claim_margin/2, at L-1 and at L), exactly one at L+1, accepted and mined.
+async fn late_lock_refund_waits_for_final_body(dir: Direction) {
+    let mut h = H::with(dir);
+    let lock = to_maker_lock_confirmed(&mut h).await;
+    let l = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    h.ml_chain().unconfirm(&lock);
+    let ml = h.ml_chain().clone();
+    ml.advance_time(l - h.cfg.claim_margin_secs / 2 - ml.mtp());
+    let before = ml.attempts(TxKind::Refund);
+    for at in [l - h.cfg.claim_margin_secs / 2, l - 1, l] {
+        ml.advance_time(at - ml.mtp());
+        h.maker.tick().await.unwrap();
+        assert_eq!(
+            ml.attempts(TxKind::Refund) - before,
+            0,
+            "maker engine broadcast its refund at mtp {at} (locktime {l}): not final yet"
+        );
+        let rec = h.maker_rec();
+        assert_eq!(rec.state, SwapState::MakerRefundable, "mtp {at}");
+        assert!(rec.maker_leg_refund.is_none(), "mtp {at}");
+    }
+    ml.advance_time(1);
+    h.maker.tick().await.unwrap();
+    assert_eq!(ml.attempts(TxKind::Refund) - before, 1, "mtp L+1");
+    ml.mine(1);
+    h.maker.tick().await.unwrap();
+    assert_eq!(h.maker_state(), SwapState::Done);
+    assert_eq!(ml.tx_counts().refunds, 1);
+}
+both!(
+    late_lock_refund_waits_for_final,
+    rev_late_lock_refund_waits_for_final,
+    late_lock_refund_waits_for_final_body
+);
+
 /// A lock that is confirmed is never abandoned early, however close the locktime is.
 async fn confirmed_lock_not_refunded_early_body(dir: Direction) {
     let mut h = H::with(dir);
@@ -2476,8 +2530,8 @@ both!(
     confirmed_lock_not_refunded_early_body
 );
 
-/// The lock is gone and never returns: at the locktime the maker is `MakerRefundable` and
-/// reports a stable error, not a growing one.
+/// The lock is gone and never returns: once its refund is final (MTP past the locktime) the
+/// maker is `MakerRefundable` and reports a stable error, not a growing one.
 async fn lost_lock_past_locktime_body(dir: Direction) {
     let mut h = H::with(dir);
     let lock = to_maker_lock_confirmed(&mut h).await;
@@ -2486,7 +2540,7 @@ async fn lost_lock_past_locktime_body(dir: Direction) {
     h.ml_chain().reject_next_broadcast();
     h.maker.tick().await.unwrap(); // lock dropped, flagged
     let ml = h.ml_chain().clone();
-    ml.advance_time(locktime - ml.mtp());
+    ml.advance_time(locktime + 1 - ml.mtp());
     assert!(h.maker.tick().await.is_ok()); // tick records errors, never returns them
     let first = h.maker_rec();
     assert_eq!(first.state, SwapState::MakerRefundable);

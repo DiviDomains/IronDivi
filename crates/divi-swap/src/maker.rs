@@ -776,6 +776,11 @@ impl Maker {
             r.preimage = Some(p);
             return self.enter(r, SwapState::TakerClaimed);
         }
+        // Entered early (a late lock, `watch_maker_lock`) or not: never send a refund the
+        // node must refuse as non-final.
+        if !self.maker_leg_timed_out(r).await? {
+            return Ok(Flow::Idle);
+        }
         let (htlc, funding) = self.maker_leg(r)?;
         let refund = match r.maker_leg_refund.clone() {
             Some(tx) => tx,
@@ -893,7 +898,8 @@ impl Maker {
 
     async fn maker_leg_timed_out(&self, r: &MakerRecord) -> Result<bool> {
         let (htlc, _) = self.maker_leg(r)?;
-        Ok(self.mk(r)?.median_time_past().await? >= htlc.locktime)
+        let mk = self.mk(r)?;
+        Ok(mk.refund_final(mk.median_time_past().await?, htlc.locktime))
     }
 
     /// The preimage, if a transaction other than our own refund spent the maker-leg lock.

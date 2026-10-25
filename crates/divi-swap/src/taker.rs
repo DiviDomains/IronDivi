@@ -392,7 +392,11 @@ impl Taker {
     }
 
     async fn taker_leg_refundable(&self, r: &TakerRecord) -> Result<bool> {
-        Ok(self.tk(r)?.median_time_past().await? >= self.taker_leg_htlc(r)?.locktime)
+        let tk = self.tk(r)?;
+        Ok(tk.refund_final(
+            tk.median_time_past().await?,
+            self.taker_leg_htlc(r)?.locktime,
+        ))
     }
 
     async fn on_locked(&self, r: &mut TakerRecord, maker: Option<&SwapView>) -> Result<Flow> {
