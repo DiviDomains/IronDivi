@@ -1447,6 +1447,14 @@ impl Chain {
                             format!("block {hash} transactions do not match its merkle root"),
                         ));
                     }
+                    // divid's VerifyDB checks each block as CheckBlock does,
+                    // its time against the clock among it (verifyDb.cpp:95-97)
+                    if time_too_new(&block) {
+                        return Err(damaged(
+                            height,
+                            format!("block {hash} timestamp too far in the future"),
+                        ));
+                    }
                 }
                 None if height <= bodies_optional_to => {}
                 None => return Err(damaged(height, format!("block {hash} data is missing"))),
@@ -3438,17 +3446,7 @@ impl Chain {
             ));
         }
 
-        // Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): at most 180 s in the
-        // future for a PoS block (MaxFutureBlockDrift, Settings.cpp:215-218), 2 hours
-        // for a PoW block, past GetAdjustedTime: the clock setmocktime sets plus
-        // the network time offset (timedata.cpp:35-38)
-        let now = divi_primitives::clock::adjusted_now().max(0) as u64;
-        let max_drift = if block.is_proof_of_stake() {
-            MAX_FUTURE_BLOCK_DRIFT_POS
-        } else {
-            2 * 60 * 60
-        };
-        if u64::from(block.header.time) > now + max_drift {
+        if time_too_new(block) {
             return Err(StorageError::invalid_block_scored(
                 0,
                 "time-too-new: block timestamp too far in the future".into(),
@@ -5745,6 +5743,21 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
 
 /// The depth Divi Core's VerifyDB checks for a requested `depth` on a chain of
 /// `height` (verifyDb.cpp:73-76)
+/// Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): whether a block is
+/// more than 180 s in the future for a PoS block (MaxFutureBlockDrift,
+/// Settings.cpp:215-218), 2 hours for a PoW block, past GetAdjustedTime: the
+/// clock setmocktime or -mocktime sets plus the network time offset
+/// (timedata.cpp:35-38)
+fn time_too_new(block: &Block) -> bool {
+    let now = divi_primitives::clock::adjusted_now().max(0) as u64;
+    let max_drift = if block.is_proof_of_stake() {
+        MAX_FUTURE_BLOCK_DRIFT_POS
+    } else {
+        2 * 60 * 60
+    };
+    u64::from(block.header.time) > now + max_drift
+}
+
 pub fn check_depth(depth: i64, height: u32) -> u32 {
     if depth <= 0 || depth > i64::from(height) {
         height

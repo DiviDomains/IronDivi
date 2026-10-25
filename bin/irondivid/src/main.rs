@@ -298,13 +298,33 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     Ok(args)
 }
 
-/// Options divid takes that irondivid has nothing for: accepted, with a warning
-const UNSUPPORTED_OPTIONS: &[&str] = &["checklevel", "par", "peerbloomfilters"];
+/// Options divid takes that irondivid has nothing for: accepted, with a warning.
+/// Among them divid's test aids for parts irondivid has but does not let an
+/// option change: -accountlabels (the default account's coins in every send,
+/// rpcwallet.cpp:445-467, :715), -activeversion (the masternode protocol,
+/// version.cpp:11-17), -manual_fork (two fork times, ForkActivation.cpp:50-55),
+/// -override_mnpayee (BlockIncentivesPopulator.cpp:224), -prunewalletconfs
+/// (the wallet's transactions in memory, wallet.cpp:1162-1239),
+/// -stakeupdatetime (PoSTransactionCreator.cpp:116) and -whitelisted_vault
+/// (init.cpp:1182-1191)
+const UNSUPPORTED_OPTIONS: &[&str] = &[
+    "accountlabels",
+    "activeversion",
+    "manual_fork",
+    "override_mnpayee",
+    "prunewalletconfs",
+    "stakeupdatetime",
+    "whitelisted_vault",
+    "checklevel",
+    "par",
+    "peerbloomfilters",
+];
 
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
 /// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205;
-/// -checkpoints :165, -printpriority :201)
+/// -checkpoints :165, -printpriority :201; -windowtitle :150,
+/// -printstakemodifier and -printcoinstake :215-216)
 const UNUSED_BY_DIVID: &[&str] = &[
     "sendfreetransactions",
     "txconfirmtarget",
@@ -313,6 +333,9 @@ const UNUSED_BY_DIVID: &[&str] = &[
     "genproclimit",
     "checkpoints",
     "printpriority",
+    "windowtitle",
+    "printstakemodifier",
+    "printcoinstake",
 ];
 
 /// Options divid reads for checks and test aids of its own that irondivid has
@@ -321,7 +344,13 @@ const UNUSED_BY_DIVID: &[&str] = &[
 /// init.cpp:795), its wallet flush thread (init.cpp:1281) and signature cache
 /// size (script/sigcache.cpp:51), none of which shows outside, and its message
 /// fault injection (-dropmessagestest main.cpp:473, Node.cpp:479;
-/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do
+/// -fuzzmessagestest Node.cpp:484-485), which irondivid does not do; its
+/// Berkeley DB wallet environment (-dblogsize db.cpp:101, -privdb
+/// dbenv.cpp:68); the debug section of its -help (-help-debug
+/// LicenseAndInfo.cpp:140-231); and the shutdown flag of its block index with
+/// the recovery after a stop that was not prepared (-safe_shutdown, -recoverblockdb
+/// BlockIndexLoading.cpp:258-283), a check irondivid does not make (see
+/// -forcestart)
 const NO_COUNTERPART: &[&str] = &[
     "checkblockindex",
     "checkmempool",
@@ -329,6 +358,11 @@ const NO_COUNTERPART: &[&str] = &[
     "maxsigcachesize",
     "dropmessagestest",
     "fuzzmessagestest",
+    "dblogsize",
+    "privdb",
+    "help-debug",
+    "safe_shutdown",
+    "recoverblockdb",
 ];
 
 /// Options apply_settings reads
@@ -353,6 +387,7 @@ const APPLIED: &[&str] = &[
     "litemode",
     "budgetvotemode",
     "rescan",
+    "force_rescan",
     "salvagewallet",
     "dbloadfailexit",
     "allowunencryptedwallet",
@@ -388,6 +423,11 @@ const APPLIED: &[&str] = &[
     "torcontrol",
     "torpassword",
     "upnp",
+    // read by retired_options
+    "socks",
+    "tor",
+    "debugnet",
+    "benchmark",
     "discover",
     "externalip",
     "onlynet",
@@ -417,6 +457,7 @@ const APPLIED: &[&str] = &[
     "staking",
     "stakeonstaletip",
     "stakesplitthreshold",
+    "blockversion",
     "blockmaxsize",
     "blockprioritysize",
     "blockminsize",
@@ -468,6 +509,10 @@ const READ_ELSEWHERE: &[&str] = &[
     "snapshot-signer",
     "maxlogsize",
     "maxlogfiles",
+    // read by main before the runtime starts
+    "mocktime",
+    "testsafemode",
+    "disablesafemode",
     "?",
     "help",
     "h",
@@ -876,14 +921,23 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             _ => warn!("Invalid stakesplitthreshold value, expected DIVI"),
         }
     }
-    // Divi Core reads these as unsigned int (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    // -blockversion: the version of the blocks made, on regtest only, read
+    // as a number into the header's int (BlockFactory.cpp:90-95)
+    if regtest {
+        if let Some(text) = s.get("blockversion") {
+            config.staking.block_version = Some(atoi(text) as i32);
+        }
+    }
+    // Divi Core reads these with atoi64 into an unsigned int, never refusing
+    // one: a word or nothing is 0, a negative one wraps; the staker clamps
+    // them (BlockMemoryPoolTransactionCollector.cpp:18-42)
     for (key, slot) in [
         ("blockmaxsize", &mut config.staking.block_max_size),
         ("blockprioritysize", &mut config.staking.block_priority_size),
         ("blockminsize", &mut config.staking.block_min_size),
     ] {
-        if let Some(n) = number_option(&s, key, 0..=i64::from(u32::MAX)) {
-            *slot = n as usize;
+        if let Some(text) = s.get(key) {
+            *slot = atoi(text) as u32 as usize;
         }
     }
     for (key, slot) in [
@@ -946,22 +1000,46 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     config.p2p.alerts = s.get_bool("alerts", true);
 
+    retired_options(settings)?;
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
     for key in keys {
         let k = key.as_str();
-        if k == "checklevel" {
-            // divid refuses any -checklevel: it always checks at level 4
-            // (init.cpp:782-784)
-            anyhow::bail!(
-                "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
-            );
-        }
         if let Some(text) = option_warning(settings, k) {
             warn!("{}", text);
         }
     }
     Ok(())
+}
+
+/// divid's check of the options it no longer takes, in its order
+/// (CheckCriticalUnsupportedFeaturesAreNotUsed, init.cpp:770-790): a true
+/// -debugnet or -benchmark draws a warning; -socks given at all and a true
+/// -tor stop the start, as any -checklevel does (it always checks at level 4)
+fn retired_options(s: &Settings) -> Result<()> {
+    if s.get_bool("debugnet", false) {
+        init_warning("Warning: Unsupported argument -debugnet ignored, use -debug=net.");
+    }
+    if s.is_set("socks") {
+        anyhow::bail!("Error: Unsupported argument -socks found. Setting SOCKS version isn't possible anymore, only SOCKS5 proxies are supported.");
+    }
+    if s.get_bool("tor", false) {
+        anyhow::bail!("Error: Unsupported argument -tor found, use -onion.");
+    }
+    if s.is_set("checklevel") {
+        anyhow::bail!("Error: Unsupported argument -checklevel found. Checklevel must be level 4.");
+    }
+    if s.get_bool("benchmark", false) {
+        init_warning("Warning: Unsupported argument -benchmark ignored, use -debug=bench.");
+    }
+    Ok(())
+}
+
+/// divid's InitWarning: "Warning: " and the text, in debug.log and on stderr
+/// (init.cpp:303-307, noui.cpp:38-40)
+fn init_warning(text: &str) {
+    info!("Warning: {}", text);
+    eprintln!("Warning: {}", text);
 }
 
 /// The warning an option read nowhere gets: one divid takes and irondivid
@@ -1643,6 +1721,9 @@ struct WalletOptions {
     /// Whether -rescan is given: a transaction record that cannot be read
     /// asks for a rescan only when it is not (SoftSetBoolArg, walletdb.cpp:508)
     rescan_given: bool,
+    /// -force_rescan: the start's scan from the genesis block, as divid's
+    /// seed restore asks for it (wallet.cpp:261, :2327)
+    force_rescan: bool,
     /// -dbloadfailexit, read as a number: a wallet that loads with a warning
     /// stops the start (init.cpp:1307-1309)
     db_load_fail_exit: bool,
@@ -1683,6 +1764,7 @@ impl WalletOptions {
         WalletOptions {
             rescan: settings.get_bool("rescan", settings.get_bool("salvagewallet", false)),
             rescan_given: settings.get("rescan").is_some(),
+            force_rescan: settings.get_bool("force_rescan", false),
             db_load_fail_exit: settings.get("dbloadfailexit").is_some_and(|v| atoi(v) != 0),
             allow_unencrypted: settings.get_bool("allowunencryptedwallet", false),
             spend_zero_conf_change: settings.get_bool("spendzeroconfchange", false),
@@ -2336,11 +2418,25 @@ async fn run_daemon(
             if rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
+            } else if wallet_options.force_rescan {
+                // -force_rescan scans from the genesis block too, under the
+                // word for a scan that was not asked for (wallet.cpp:261-262, :292)
+                info!("Scanning... from height 0 to {}", chain_height);
+                wallet_arc.set_last_scan_height(0);
             } else {
                 // Divi Core scans from the wallet's stored best block, itself
                 // included (wallet.cpp:258-269, :279-313): the last block is
-                // scanned again at every start
+                // scanned again at every start. A wallet that never scanned
+                // starts at the genesis block. Its line names both ends
+                // (wallet.cpp:292-294)
+                let scanned = wallet_arc.last_scan_height();
                 divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
+                let from = if scanned == 0 {
+                    0
+                } else {
+                    wallet_arc.last_scan_height() + 1
+                };
+                info!("Scanning... from height {} to {}", from, chain_height);
             }
             let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
@@ -3002,6 +3098,7 @@ fn staking_config(config: &NodeConfig, chain: &divi_storage::ChainParams) -> Sta
         max_block_size: config.staking.block_max_size,
         block_priority_size: config.staking.block_priority_size,
         block_min_size: config.staking.block_min_size,
+        block_version: config.staking.block_version,
         ..StakingConfig::default()
     }
 }
@@ -3427,6 +3524,18 @@ fn main() -> Result<()> {
         eprintln!("Warning: Daemon mode is only supported on Unix systems, running in foreground");
     }
 
+    // -mocktime: the node's clock from here on, set as divid sets it after
+    // daemonizing (divid.cpp:140-143); read as a number, 0 is the real clock
+    if let Some(text) = args.settings.get("mocktime") {
+        divi_primitives::clock::set_mock_time(atoi(text));
+    }
+    // -testsafemode puts the RPC server in safe mode, -disablesafemode lets
+    // it run every call all the same (rpcserver.cpp:185, :1052)
+    divi_rpc::warnings::set_safe_mode(
+        args.settings.get_bool("testsafemode", false),
+        args.settings.get_bool("disablesafemode", false),
+    );
+
     // Now enter the tokio runtime (after daemonization)
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3449,7 +3558,10 @@ fn exit_after_stop(runtime: tokio::runtime::Runtime, result: Result<()>) -> ! {
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
+            // divid's InitError: the line on stderr and in debug.log
+            // (noui.cpp:38-40)
             eprintln!("Error: {:#}", e);
+            info!("Error: {:#}", e);
             1
         }
     };
@@ -4799,6 +4911,26 @@ mod divid_option_tests {
             .static_peers
             .contains(&"127.0.0.2:10".to_string()));
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
+    }
+
+    /// -blockmaxsize, -blockprioritysize and -blockminsize are read as divid
+    /// reads them, into an unsigned int with no warning: nothing or a word is
+    /// 0, a negative value wraps (BlockMemoryPoolTransactionCollector.cpp:18-42)
+    #[test]
+    fn block_sizes_are_read_as_divid_reads_them() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &[
+                "-blockmaxsize",
+                "-blockminsize=-1",
+                "-blockprioritysize=abc",
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.staking.block_max_size, 0);
+        assert_eq!(c.staking.block_min_size, u32::MAX as usize);
+        assert_eq!(c.staking.block_priority_size, 0);
     }
 
     /// -dbcache is applied as divid splits it (init.cpp:1030, :1046-1056):

@@ -27,6 +27,7 @@ pub mod codes {
 
     // Bitcoin/Divi specific errors (from Bitcoin Core)
     pub const MISC_ERROR: i32 = -1;
+    pub const FORBIDDEN_BY_SAFE_MODE: i32 = -2;
     pub const TYPE_ERROR: i32 = -3;
     pub const INVALID_ADDRESS_OR_KEY: i32 = -5;
     pub const OUT_OF_MEMORY: i32 = -7;

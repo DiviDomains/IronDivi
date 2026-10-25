@@ -572,6 +572,13 @@ impl RpcServer {
             )
             .into());
         }
+        // Then safe mode, for the calls Divi Core's table does not mark
+        // okSafeMode (rpcserver.cpp:329-465, :1049-1054)
+        if NOT_IN_SAFE_MODE.contains(&method) {
+            if let Some(refusal) = crate::warnings::safe_mode_refusal() {
+                return Err(RpcError::new(codes::FORBIDDEN_BY_SAFE_MODE, refusal).into());
+            }
+        }
         // Then the call's own `if (fHelp || params.size() ...)`: a wrong
         // argument count answers -1 with the call's help text
         let encrypted = self.wallet.wallet_db().map(|w| w.is_encrypted());
@@ -1185,6 +1192,38 @@ impl RpcServer {
         ))
     }
 }
+
+/// The calls Divi Core's table does not mark okSafeMode: refused while a
+/// warning puts the server in safe mode (rpcserver.cpp:329-465)
+const NOT_IN_SAFE_MODE: &[&str] = &[
+    "getblockheader",
+    "sendrawtransaction",
+    "signtransactionwithaddresskey",
+    "signrawtransaction",
+    "getbalance",
+    "getreceivedbyaccount",
+    "getreceivedbyaddress",
+    "getstakingstatus",
+    "gettransaction",
+    "getunconfirmedbalance",
+    "getwalletinfo",
+    "listaccounts",
+    "listlockunspent",
+    "listreceivedbyaccount",
+    "listreceivedbyaddress",
+    "listsinceblock",
+    "listtransactions",
+    "listunspent",
+    "sendfrom",
+    "sendmany",
+    "sendtoaddress",
+    "fundvault",
+    "reclaimvaultfunds",
+    "debitvaultbyname",
+    "removevault",
+    "addvault",
+    "getcoinavailability",
+];
 
 /// The calls Divi Core's table marks as needing a wallet (requiresWalletLock or
 /// requiresWalletInstance, rpcserver.cpp:329-465); without one they answer

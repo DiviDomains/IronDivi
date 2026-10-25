@@ -92,6 +92,9 @@ pub struct StakingConfig {
     /// Size below which transactions under the fee floor still go in, Divi
     /// Core `-blockminsize`
     pub block_min_size: usize,
+    /// The version of the blocks made, Divi Core `-blockversion` on regtest
+    /// (BlockFactory.cpp:90-95); 4 when not given
+    pub block_version: Option<i32>,
     /// Maximum block weight
     pub max_block_weight: usize,
     /// Staking loop interval (milliseconds)
@@ -259,6 +262,7 @@ impl Default for StakingConfig {
             max_block_size: DEFAULT_BLOCK_MAX_SIZE,
             block_priority_size: DEFAULT_BLOCK_PRIORITY_SIZE,
             block_min_size: DEFAULT_BLOCK_MIN_SIZE,
+            block_version: None,
             max_block_weight: 4_000_000,
             loop_interval_ms: 500, // Try every 500ms
             max_tip_age_secs: DEFAULT_MAX_TIP_AGE_SECS,
@@ -1041,7 +1045,7 @@ impl Staker {
         }];
         transactions.extend(self.mempool_block_txs(height, time));
         let mut header = BlockHeader {
-            version: 4,
+            version: self.config.read().block_version.unwrap_or(4),
             prev_block: tip.hash,
             merkle_root: compute_merkle_root(&transactions),
             time,
@@ -1874,7 +1878,7 @@ impl Staker {
 
         // Create block header
         let header = BlockHeader {
-            version: 4, // PoS blocks use version 4+
+            version: self.config.read().block_version.unwrap_or(4),
             prev_block: tip.hash,
             merkle_root,
             time: timestamp,
