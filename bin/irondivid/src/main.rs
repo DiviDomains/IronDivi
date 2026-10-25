@@ -4274,6 +4274,30 @@ mod divid_option_tests {
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
     }
 
+    /// Each option is in one list only: read by apply_settings, read
+    /// elsewhere, one divid does not use, or one irondivid does not support
+    #[test]
+    fn every_option_is_in_one_list() {
+        let lists: [(&str, &[&str]); 4] = [
+            ("APPLIED", APPLIED),
+            ("READ_ELSEWHERE", READ_ELSEWHERE),
+            ("UNUSED_BY_DIVID", UNUSED_BY_DIVID),
+            ("UNSUPPORTED_OPTIONS", UNSUPPORTED_OPTIONS),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, list) in lists {
+            for key in list {
+                if let Some(first) = seen.insert(*key, name) {
+                    panic!("-{key} is in {first} and in {name}");
+                }
+            }
+        }
+        for key in ["forcestart", "rpcthreads", "alerts", "alertnotify"] {
+            assert_eq!(seen.get(key), Some(&"APPLIED"), "-{key}");
+        }
+        assert_eq!(seen.get("sysperms"), Some(&"READ_ELSEWHERE"));
+    }
+
     /// -conf is relative to the data directory (Settings::GetConfigFile)
     #[test]
     fn conf_is_relative_to_the_data_directory() {
