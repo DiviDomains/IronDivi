@@ -47,6 +47,7 @@ macro_rules! stop_point {
 }
 
 pub mod address;
+mod at_rest;
 pub mod backup;
 pub mod coin_selection;
 pub mod coinstake;
@@ -68,4 +69,6 @@ pub use hd::{core_coin_type, ExtendedPrivateKey, ExtendedPublicKey, HdWallet, DI
 pub use keystore::{HdPublicIds, KeyEntry, KeyStore};
 pub use persistence::WalletDatabase;
 pub use signer::{sighash, sign_input, TransactionBuilder, TransactionSigner};
-pub use wallet_db::{DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo};
+pub use wallet_db::{
+    DetachedTx, Ownership, TxListener, WalletDb, WalletTx, WalletUtxo, BACKUP_MARKER,
+};

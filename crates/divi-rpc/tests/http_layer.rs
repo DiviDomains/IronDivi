@@ -43,7 +43,13 @@ fn served() -> Served {
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    runtime.spawn(async move { axum::serve(listener, router).await });
+    runtime.spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     Served {
         addr,
         _runtime: runtime,
@@ -71,7 +77,7 @@ fn request(method: &str, path: &str, auth: Option<&str>, body: &str, extra: &str
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
     format!(
-        "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{auth}{extra}\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{auth}{extra}\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
@@ -250,7 +256,7 @@ fn bodies_up_to_divid_s_max_size() {
     assert!(r.status_line.contains(" 200 "), "{}", r.status_line);
 
     let too_big = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: {AUTH}\r\nContent-Length: {}\r\n\
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: {AUTH}\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n",
         0x0200_0000 + 1
     );

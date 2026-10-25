@@ -446,3 +446,143 @@ fn vault_stake_signed_by_wrong_key_is_refused() {
     assert!(t.chain.accept_block(block).is_err() || t.chain.height() == height);
     assert_eq!(t.chain.height(), height);
 }
+
+// NODE-2: signatures that Divi Core's SignatureHash and EvalScript accept
+// under the mandatory flags must be accepted in a block too. The sighash
+// here is computed independently of divi-script, the way C++ does it.
+
+/// C++ `SignatureHash` for a hash type whose base is neither NONE nor SINGLE,
+/// ANYONECANPAY clear: other scriptSigs blanked, the scriptCode without its
+/// OP_CODESEPARATORs in the signed input, and the full 32-bit type appended
+fn cpp_sighash_all(tx: &Transaction, i: usize, script_code: &[u8], hash_type: u32) -> [u8; 32] {
+    let mut c = tx.clone();
+    for input in c.vin.iter_mut() {
+        input.script_sig = Script::new();
+    }
+    // Direct pushes and single-byte opcodes only
+    let mut code = Vec::new();
+    let mut pc = 0;
+    while pc < script_code.len() {
+        let op = script_code[pc];
+        if (1..=75).contains(&op) {
+            code.extend_from_slice(&script_code[pc..pc + 1 + op as usize]);
+            pc += 1 + op as usize;
+        } else {
+            if op != 0xab {
+                code.push(op);
+            }
+            pc += 1;
+        }
+    }
+    c.vin[i].script_sig = Script::from_bytes(code);
+    let mut data = divi_primitives::serialize::serialize(&c);
+    data.extend_from_slice(&hash_type.to_le_bytes());
+    divi_crypto::double_sha256(&data)
+}
+
+/// n - s on the secp256k1 group order, big-endian
+fn negate_s(s: &[u8]) -> [u8; 32] {
+    const N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36,
+        0x41, 0x41,
+    ];
+    let mut out = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let mut d = N[i] as i16 - s[i] as i16 - borrow;
+        borrow = if d < 0 {
+            d += 256;
+            1
+        } else {
+            0
+        };
+        out[i] = d as u8;
+    }
+    out
+}
+
+/// Fund `<pk> CHECKSIG` (with `prefix` opcodes before the push), spend it
+/// with a signature of `hash_type`, and report whether the block was accepted
+fn mine_pubkey_spend(prefix: &[u8], hash_type: u8, high_s: bool) -> bool {
+    let t = TestChain::new();
+    let owner = KeyPair::new_random();
+    let mut spk = prefix.to_vec();
+    push(&mut spk, &owner.public_key().to_bytes());
+    spk.push(0xac);
+    let spk = Script::from_bytes(spk);
+    let (coin, value) = t.fund(spk.clone());
+
+    let mut tx = spend(coin, value, p2pkh(&KeyPair::new_random()));
+    let h = cpp_sighash_all(&tx, 0, spk.as_bytes(), hash_type as u32);
+    let low = divi_crypto::sign_hash(owner.secret_key(), &h).unwrap();
+    let mut sig = if high_s {
+        let mut c = low.to_compact();
+        let s = negate_s(&c[32..]);
+        c[32..].copy_from_slice(&s);
+        divi_crypto::signature::Signature::from_compact(&c)
+            .unwrap()
+            .to_der()
+    } else {
+        low.to_der()
+    };
+    sig.push(hash_type);
+    let mut ss = Vec::new();
+    push(&mut ss, &sig);
+    tx.vin[0].script_sig = Script::from_bytes(ss);
+    let accepted = t.mine(p2pkh(&t.miner), vec![tx]);
+    assert_eq!(accepted, t.chain.get_utxo(&coin).unwrap().is_none());
+    accepted
+}
+
+#[test]
+fn node02_sighash_all_control_is_accepted() {
+    assert!(mine_pubkey_spend(&[], 0x01, false));
+}
+
+#[test]
+fn node02_undefined_hashtypes_are_accepted_as_in_core() {
+    // 0x41, 0x00 and 0x04 all hash as ALL with the raw type appended
+    for hash_type in [0x41, 0x00, 0x04] {
+        assert!(
+            mine_pubkey_spend(&[], hash_type, false),
+            "hash type {hash_type:#04x}"
+        );
+    }
+}
+
+#[test]
+fn node02_high_s_signature_is_accepted_as_in_core() {
+    // LOW_S is policy, not a mandatory flag
+    assert!(mine_pubkey_spend(&[], 0x01, true));
+}
+
+#[test]
+fn node02_codeseparator_is_dropped_from_script_code() {
+    assert!(mine_pubkey_spend(&[0xab], 0x01, false));
+}
+
+#[test]
+fn node02_p2sh_spend_with_non_push_script_sig_is_refused() {
+    // A valid 2-of-3 spend, but the scriptSig holds an opcode (OP_NOP) before
+    // the pushes; Core's P2SH rule needs a push-only scriptSig
+    let t = TestChain::new();
+    let keys = [
+        KeyPair::new_random(),
+        KeyPair::new_random(),
+        KeyPair::new_random(),
+    ];
+    let (redeem, p2sh) = multisig(&keys);
+    let (coin, value) = t.fund(p2sh);
+    let mut tx = spend(coin, value, p2pkh(&KeyPair::new_random()));
+    let s0 = sign(&tx, 0, &redeem, value, &keys[0]);
+    let s2 = sign(&tx, 0, &redeem, value, &keys[2]);
+    let mut ss = vec![0x61, 0x00];
+    push(&mut ss, &s0);
+    push(&mut ss, &s2);
+    ss.extend_from_slice(&[0x4c, redeem.as_bytes().len() as u8]);
+    ss.extend_from_slice(redeem.as_bytes());
+    tx.vin[0].script_sig = Script::from_bytes(ss);
+    assert!(!t.mine(p2pkh(&t.miner), vec![tx]));
+    assert!(t.chain.get_utxo(&coin).unwrap().is_some());
+}

@@ -81,7 +81,7 @@ rocksdb = "0.22"
 # Web API
 axum = "0.7"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1.1"
 
 # Utilities
@@ -119,3 +119,11 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 1
+
+# The wallet's passphrase key costs 64 MiB of Argon2id; unoptimised it takes
+# seconds, and the tests unlock wallets many times
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

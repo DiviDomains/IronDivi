@@ -43,7 +43,13 @@ fn served(keep_alive: bool) -> Served {
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    runtime.spawn(async move { axum::serve(listener, router).await });
+    runtime.spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     Served {
         addr,
         _runtime: runtime,
@@ -63,7 +69,7 @@ fn call(addr: SocketAddr, extra: &str) -> (String, bool) {
     stream
         .write_all(
             format!(
-                "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
+                "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
                  Content-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
                 body.len()
             )

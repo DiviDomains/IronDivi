@@ -48,6 +48,7 @@
 //! let _ = std::fs::remove_dir_all(&temp_dir);
 //! ```
 
+pub mod access;
 pub mod auth_cookie;
 pub mod blockchain;
 pub mod core_help;
@@ -68,6 +69,7 @@ pub mod wallet;
 mod wallet_history;
 pub mod websocket;
 
+pub use access::{AccessConfig, RpcAccess};
 pub use auth_cookie::{resolve_rpc_auth, AuthCookie, COOKIE_AUTH_USER};
 pub use blockchain::{BlockFetcher, BlockchainRpc};
 pub use error::{Error, RpcError};
@@ -76,7 +78,7 @@ pub use masternode::MasternodeRpc;
 pub use network::NetworkRpc;
 pub use protocol::{Params, Request, RequestId, Response};
 pub use server::{
-    create_router_with_auth, start_server, start_server_with_peer_manager,
+    create_router_with_auth, rpc_access, start_server, start_server_with_peer_manager,
     start_server_with_peer_manager_and_setup, start_server_with_wallet_and_peer_manager,
     start_server_with_wallet_peer_and_staker, LogConfigInfo, RpcConfig, RpcServer,
     ShutdownCallback, Subnet,

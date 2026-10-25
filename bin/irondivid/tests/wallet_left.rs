@@ -26,7 +26,7 @@ fn rpc(port: u16, method: &str, params: Value) -> Option<Value> {
     let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
     // "dGVzdDp0ZXN0" is base64 of test:test
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );

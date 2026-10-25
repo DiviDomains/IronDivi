@@ -44,7 +44,7 @@ fn call(port: u16) -> Option<(String, bool)> {
         .ok()?;
     // test:test
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );

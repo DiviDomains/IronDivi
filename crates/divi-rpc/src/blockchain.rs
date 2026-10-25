@@ -14,6 +14,7 @@
 //! Methods for querying blockchain state: blocks, transactions, chain info.
 
 use crate::error::{codes, Error, RpcError};
+use crate::lite_wallet::MAX_PAGE;
 use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
 use divi_primitives::hash::{Hash160, Hash256};
@@ -1271,6 +1272,18 @@ impl BlockchainRpc {
             .and_then(|obj| obj.get("chainInfo"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // A page of the outputs, oldest first: "skip" and "limit" in the
+        // object form, at most MAX_PAGE (the default) per call
+        let page = |key: &str| {
+            params
+                .get(0)
+                .and_then(|p| p.as_object())
+                .and_then(|obj| obj.get(key))
+                .and_then(json_spirit_int)
+                .map(|n| n.max(0) as usize)
+        };
+        let skip = page("skip").unwrap_or(0);
+        let limit = page("limit").map_or(MAX_PAGE, |l| l.min(MAX_PAGE));
         let keys = self.index_keys(params)?;
         let index = self.address_index()?;
         let mut unspent = Vec::new();
@@ -1280,6 +1293,8 @@ impl BlockchainRpc {
         unspent.sort_by_key(|(_, value)| value.height);
         let utxos: Vec<Value> = unspent
             .iter()
+            .skip(skip)
+            .take(limit)
             .map(|(key, value)| {
                 json!({
                     "address": self.index_address(key.address_type, &key.hash),

@@ -27,6 +27,7 @@ use crate::keys::{PublicKey, SecretKey};
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes256;
 use scrypt::{scrypt, Params as ScryptParams};
+use zeroize::Zeroizing;
 
 /// BIP38 magic bytes for non-EC-multiply encrypted keys
 const BIP38_MAGIC_NON_EC: [u8; 2] = [0x01, 0x42];
@@ -70,12 +71,12 @@ pub fn encrypt(
     let params = ScryptParams::new(14, 8, 8, 64)
         .map_err(|e| CryptoError::Custom(format!("Invalid scrypt params: {}", e)))?;
 
-    let mut derived = [0u8; 64];
+    let mut derived = Zeroizing::new([0u8; 64]);
     scrypt(
         passphrase.as_bytes(),
         address_hash_prefix,
         &params,
-        &mut derived,
+        &mut derived[..],
     )
     .map_err(|e| CryptoError::Custom(format!("scrypt failed: {}", e)))?;
 
@@ -183,9 +184,14 @@ pub fn decrypt(
     let params = ScryptParams::new(14, 8, 8, 64)
         .map_err(|e| CryptoError::Custom(format!("Invalid scrypt params: {}", e)))?;
 
-    let mut derived = [0u8; 64];
-    scrypt(passphrase.as_bytes(), address_hash, &params, &mut derived)
-        .map_err(|e| CryptoError::Custom(format!("scrypt failed: {}", e)))?;
+    let mut derived = Zeroizing::new([0u8; 64]);
+    scrypt(
+        passphrase.as_bytes(),
+        address_hash,
+        &params,
+        &mut derived[..],
+    )
+    .map_err(|e| CryptoError::Custom(format!("scrypt failed: {}", e)))?;
 
     let derivedhalf1 = &derived[0..32];
     let derivedhalf2 = &derived[32..64];

@@ -26,18 +26,21 @@ use divi_network::PeerManager;
 use divi_storage::{AddressIndex, Chain};
 use divi_wallet::WalletDb;
 
+use crate::access::{AccessConfig, Denial, MethodGrant, RpcAccess};
 use axum::{
-    extract::{DefaultBodyLimit, Path, Request as HttpRequest, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode, Version},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request as HttpRequest, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Version},
     middleware::{self, Next},
     response::IntoResponse,
     routing::post,
-    Router,
+    Extension, Router,
 };
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tokio::sync::Semaphore;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::{debug, error, info, warn};
 
 /// RPC server configuration
 #[derive(Debug, Clone)]
@@ -48,14 +51,28 @@ pub struct RpcConfig {
     pub username: Option<String>,
     /// RPC password (optional)
     pub password: Option<String>,
-    /// Who may connect besides the local host (Divi Core's -rpcallowip)
-    pub allowed: Vec<Subnet>,
     /// Keep a connection open after a reply when the request asks for it
     /// (Divi Core's -rpckeepalive, default on)
     pub keep_alive: bool,
     /// Serve the REST interface (Divi Core's -rest, default off)
     pub rest: bool,
+    /// Peer (-rpcallowip), host, origin, rpcauth and whitelist settings
+    pub access: AccessConfig,
+    /// Largest request body accepted, in bytes; a bigger one gets HTTP 413
+    pub max_request_size: usize,
 }
+
+/// Default for [`RpcConfig::max_request_size`]: room for submitblock with a
+/// full 2 MB block in hex
+pub const DEFAULT_MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
+/// Most calls one batch may hold; a bigger batch is refused whole
+pub const MAX_BATCH_CALLS: usize = 100;
+
+/// Most requests run at once. Handlers block (RocksDB, signing, scans), so
+/// they run on the blocking pool, and a flood of requests waits here instead
+/// of starving the runtime that drives P2P, staking and masternode pings.
+const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 impl Default for RpcConfig {
     fn default() -> Self {
@@ -63,9 +80,10 @@ impl Default for RpcConfig {
             bind_address: "127.0.0.1:9998".parse().unwrap(),
             username: None,
             password: None,
-            allowed: Vec::new(),
             keep_alive: true,
             rest: false,
+            access: AccessConfig::default(),
+            max_request_size: DEFAULT_MAX_REQUEST_SIZE,
         }
     }
 }
@@ -74,26 +92,15 @@ impl Default for RpcConfig {
 /// CSubNet reads it
 pub use divi_network::Subnet;
 
-/// Serve `app` on the configured address, refusing (HTTP 403, as Divi Core)
-/// connections from outside the local host and the allowed subnets
+/// Check the bind address against the access configuration, then serve
+/// `app` with the peer address available to the access checks of
+/// [`build_router`] (connections from outside the local host and the
+/// -rpcallowip networks get HTTP 403, as Divi Core)
 async fn serve(config: &RpcConfig, app: Router) -> Result<(), Error> {
-    let mut allowed: Vec<Subnet> = Subnet::loopback().to_vec();
-    allowed.extend(config.allowed.iter().copied());
-    let app = app.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
-        let allowed = allowed.clone();
-        async move {
-            let peer = req
-                .extensions()
-                .get::<axum::extract::ConnectInfo<SocketAddr>>()
-                .map(|c| c.0.ip());
-            match peer {
-                Some(ip) if !allowed.iter().any(|s| s.contains(ip)) => {
-                    crate::http::error_page(StatusCode::FORBIDDEN)
-                }
-                _ => next.run(req).await,
-            }
-        }
-    }));
+    rpc_access(config)?
+        .check_bind(config.bind_address)
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    info!("Starting RPC server on {}", config.bind_address);
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
     axum::serve(
         listener,
@@ -829,14 +836,14 @@ impl RpcServer {
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
                 "getaddressbalance" => "getaddressbalance \"address\" ( minconf )\n\nReturns the balance for an external address.\nDoes not require a local wallet.",
-                "getaddressutxos" => "getaddressutxos \"address\" ( minconf maxconf )\n\nReturns UTXOs for an external address.\nDoes not require a local wallet.",
+                "getaddressutxos" => "getaddressutxos \"address\"|{\"addresses\":[\"address\",...],\"skip\":n,\"limit\":n} ( only_vaults )\n\nReturns the unspent outputs of addresses from the address index, oldest first: at most limit (default and most 1000) after skipping skip of them.",
                 "getaddresshistory" => "getaddresshistory \"address\" ( skip limit )\n\nReturns transaction history for an external address.\nDoes not require a local wallet.",
                 "gettxindex" => "gettxindex \"txid\"\n\nReturns block location info for a transaction.",
                 "estimatefee" => "estimatefee ( nblocks )\n\nEstimates the fee per kilobyte needed for confirmation in nblocks.",
                 "estimatepriority" => "estimatepriority nblocks\n\nDeprecated. Always returns -1.",
                 "estimatesmartfee" => "estimatesmartfee ( nblocks )\n\nEstimates the smart fee per kilobyte needed for confirmation.",
                 "getmempoolinfo" => "getmempoolinfo\n\nReturns details on the active state of the mempool.",
-                "validateaddresses" => "validateaddresses [\"address\",...]\n\nValidates multiple addresses at once.",
+                "validateaddresses" => "validateaddresses [\"address\",...]\n\nValidates up to 1000 addresses at once.",
                 "getlitewalletinfo" => "getlitewalletinfo\n\nReturns info about lite wallet service availability.",
                 // Masternode
                 "getmasternodecount" => "getmasternodecount\n\nGet masternode count values\n\nResult:\n{\n  \"total\": n,        (numeric) Total masternodes\n  \"stable\": n,       (numeric) Stable count\n  \"obfcompat\": n,    (numeric) Obfuscation Compatible\n  \"enabled\": n,      (numeric) Enabled masternodes\n  \"inqueue\": n       (numeric) Masternodes in queue\n}\n\nExamples:\n> divi-cli getmasternodecount \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getmasternodecount\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/",
@@ -1363,23 +1370,52 @@ fn rpc_type_check(method: &str, params: &Params) -> Result<(), RpcError> {
 /// HTTP handler for JSON-RPC requests
 async fn handle_rpc(
     State(server): State<Arc<RpcServer>>,
+    Extension(slots): Extension<Arc<Semaphore>>,
+    Extension(grant): Extension<MethodGrant>,
     version: Version,
     headers: HeaderMap,
     body: String,
-) -> impl IntoResponse {
-    debug!("RPC request: {}", body);
-    let (status, reply) = handle_body(server, body).await;
-    debug!("RPC response: {}", reply);
-    json_reply(status, reply, &version, &headers)
+) -> axum::response::Response {
+    rpc_reply(server, slots, grant, body, &version, &headers).await
+}
+
+/// Run a request and write its reply. Never logs a body or a result: they
+/// carry passphrases, private keys and seeds (walletpassphrase, dumpprivkey,
+/// dumphdinfo, importprivkey...); the sizes are enough to follow the traffic.
+async fn rpc_reply(
+    server: Arc<RpcServer>,
+    slots: Arc<Semaphore>,
+    grant: MethodGrant,
+    body: String,
+    version: &Version,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let request_len = body.len();
+    let Ok(_slot) = slots.acquire_owned().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (status, reply) = handle_body(server, grant, body).await;
+    debug!(
+        "RPC request: {request_len} bytes, reply {} bytes, status {status}",
+        reply.len()
+    );
+    if status == StatusCode::FORBIDDEN {
+        return crate::http::error_page(StatusCode::FORBIDDEN);
+    }
+    json_reply(status, reply, version, headers)
 }
 
 /// Run a request's calls on the runtime's blocking threads. The calls are
 /// synchronous; on a worker thread a long one (keypoolrefill, verifychain)
 /// would keep that worker from serving other connections until it ends.
 /// Divi Core serves other connections from its other RPC threads meanwhile
-/// (rpcserver.cpp:755-757).
-async fn handle_body(server: Arc<RpcServer>, body: String) -> (StatusCode, String) {
-    match tokio::task::spawn_blocking(move || server.handle_http_body(&body)).await {
+/// (rpcserver.cpp:755-757). At most [`MAX_CONCURRENT_REQUESTS`] run at once.
+async fn handle_body(
+    server: Arc<RpcServer>,
+    grant: MethodGrant,
+    body: String,
+) -> (StatusCode, String) {
+    match tokio::task::spawn_blocking(move || server.handle_http_body_for(&grant, &body)).await {
         Ok(reply) => reply,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         // Cancelled: the runtime is shutting down
@@ -1416,22 +1452,19 @@ fn json_reply(
         .into_response()
 }
 
-/// HTTP handler for wallet-specific JSON-RPC requests
+/// HTTP handler for wallet-specific JSON-RPC requests. The wallet name is not
+/// used for routing yet: the server has one wallet, and this path lets
+/// multi-wallet clients talk to it.
 async fn handle_wallet_rpc(
     State(server): State<Arc<RpcServer>>,
-    Path(wallet_name): Path<String>,
+    Path(_wallet_name): Path<String>,
+    Extension(slots): Extension<Arc<Semaphore>>,
+    Extension(grant): Extension<MethodGrant>,
     version: Version,
     headers: HeaderMap,
     body: String,
-) -> impl IntoResponse {
-    debug!("RPC request for wallet '{}': {}", wallet_name, body);
-
-    // TODO: In the future, we could use wallet_name to route to specific wallet instances
-    // For now, we just log it and pass through to the default wallet
-    // This enables multi-wallet CLI support even if server only has one wallet loaded
-    let (status, reply) = handle_body(server, body).await;
-    debug!("RPC response for wallet '{}': {}", wallet_name, reply);
-    json_reply(status, reply, &version, &headers)
+) -> axum::response::Response {
+    rpc_reply(server, slots, grant, body, &version, &headers).await
 }
 
 /// A reply object as Divi Core writes it (rpcprotocol.cpp JSONRPCReplyObj):
@@ -1467,24 +1500,84 @@ impl RpcServer {
     /// HTTPReq_JSONRPC): a request object or a batch array; returns the HTTP
     /// status and the reply text.
     pub fn handle_http_body(&self, body_text: &str) -> (StatusCode, String) {
+        self.handle_http_body_for(&MethodGrant::All, body_text)
+    }
+
+    /// [`Self::handle_http_body`] for a caller limited to `grant`
+    /// (-rpcwhitelist): a request or a batch naming a method outside it gets
+    /// HTTP 403 with no reply text, and nothing of it runs. A batch over
+    /// [`MAX_BATCH_CALLS`] is refused whole as an invalid request.
+    pub fn handle_http_body_for(
+        &self,
+        grant: &MethodGrant,
+        body_text: &str,
+    ) -> (StatusCode, String) {
         use serde_json::Value;
+        let denied = |r: &Value| match r.get("method") {
+            Some(Value::String(m)) if !grant.allows(m) => Some(m.clone()),
+            _ => None,
+        };
+        let forbidden = |method: String| {
+            warn!("RPC method {method:?} refused by rpcwhitelist");
+            (StatusCode::FORBIDDEN, String::new())
+        };
         // divi-cli's byte escapes of non-ASCII text, read as divid reads them
         let body = crate::json_spirit_text::byte_escapes_as_divid(body_text);
         let body = body.as_deref().unwrap_or(body_text);
         // json_spirit's reading: of two equal keys the first counts
         let request: Value = match crate::http::parse_json(body) {
             Ok(v) => v,
-            Err(_) => return error_reply(RpcError::parse_error(), Value::Null),
+            Err(_) => {
+                // The body is not logged: it can carry a passphrase
+                debug!("RPC request that is not JSON, {} bytes", body.len());
+                return error_reply(RpcError::parse_error(), Value::Null);
+            }
         };
         match &request {
             Value::Object(_) => {
+                if let Some(method) = denied(&request) {
+                    return forbidden(method);
+                }
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
-                match self.execute_json_request(&request) {
+                // Never log a body or a result: they carry passphrases, private
+                // keys and seeds. The method name and the sizes are enough.
+                let method = match request.get("method") {
+                    Some(Value::String(m)) => m.as_str(),
+                    _ => "(no method name)",
+                };
+                let reply = match self.execute_json_request(&request) {
                     Ok(result) => (StatusCode::OK, reply_text(Ok(result), &id) + "\n"),
                     Err(e) => error_reply(e, id),
-                }
+                };
+                debug!(
+                    "RPC {method}: {} byte request, {} byte response",
+                    body.len(),
+                    reply.1.len()
+                );
+                reply
             }
             Value::Array(requests) => {
+                if requests.len() > MAX_BATCH_CALLS {
+                    warn!(
+                        "RPC batch of {} calls refused (limit {MAX_BATCH_CALLS})",
+                        requests.len()
+                    );
+                    return error_reply(
+                        RpcError::invalid_request(format!(
+                            "Batch of {} calls is over the limit of {MAX_BATCH_CALLS}",
+                            requests.len()
+                        )),
+                        Value::Null,
+                    );
+                }
+                if let Some(method) = requests.iter().find_map(denied) {
+                    return forbidden(method);
+                }
+                debug!(
+                    "RPC batch of {} calls, {} bytes",
+                    requests.len(),
+                    body.len()
+                );
                 // JSONRPCExecBatch: every entry answered, the batch itself is 200
                 let replies: Vec<String> = requests
                     .iter()
@@ -1530,12 +1623,44 @@ impl RpcServer {
     }
 }
 
-/// Create the axum router for RPC, enforcing HTTP Basic authentication.
-/// Without both a username and a password every request is refused: the RPC
-/// is never served open (irondivid fills in cookie credentials when none are
-/// configured, see [`crate::auth_cookie`]).
+/// Build the access-control state for `config`. A malformed `rpcauth`,
+/// `rpcwhitelist` or `rpcallowip` entry is an error.
+pub fn rpc_access(config: &RpcConfig) -> Result<RpcAccess, Error> {
+    RpcAccess::new(
+        config.username.as_deref(),
+        config.password.as_deref(),
+        &config.access,
+    )
+    .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))
+}
+
+/// Create the axum router for RPC, enforcing the checks of [`crate::access`]:
+/// peer address (-rpcallowip), `Host` header, `Origin`, then HTTP Basic
+/// authentication (rpcuser/rpcpassword or rpcauth) and the caller's method
+/// whitelist. Without credentials every request is refused: the RPC is never
+/// served open (irondivid fills in cookie credentials when none are
+/// configured, see [`crate::auth_cookie`]). The router must be served with
+/// [`ConnectInfo`] (see [`serve`]); without the peer address every request is
+/// refused.
 pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Router {
-    let router = build_router(server, rpc_credentials(config), config.rest);
+    let access = match rpc_access(config) {
+        Ok(access) => access,
+        Err(e) => {
+            error!("Invalid RPC access configuration ({e}): every request will be refused");
+            RpcAccess::new(None, None, &AccessConfig::default()).expect("empty config is valid")
+        }
+    };
+    if access.has_credentials() {
+        info!("RPC authentication enabled");
+    } else {
+        error!("RPC has no credentials: every request will be refused");
+    }
+    let router = build_router(
+        server,
+        Arc::new(access),
+        config.rest,
+        config.max_request_size,
+    );
     if config.keep_alive {
         return router;
     }
@@ -1552,13 +1677,20 @@ pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Ro
 
 fn build_router(
     server: Arc<RpcServer>,
-    credentials: Option<Arc<(String, String)>>,
+    access: Arc<RpcAccess>,
     rest: bool,
+    max_request_size: usize,
 ) -> Router {
     // /rest/ paths: REST when on, without credentials, as divid
     let rest_paths = crate::rest::router(server.clone(), rest);
+    let origins: Vec<HeaderValue> = access
+        .allowed_origins()
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
     // GET is served as POST, as Divi Core reads either (rpcprotocol.cpp:150-152);
-    // bodies up to Divi Core's MAX_SIZE
+    // bodies up to -rpcmaxrequestsize (HTTP 413 above it), never above
+    // Divi Core's MAX_SIZE
     let router = Router::new()
         .route("/", post(handle_rpc).get(handle_rpc))
         .route(
@@ -1566,7 +1698,10 @@ fn build_router(
             post(handle_wallet_rpc).get(handle_wallet_rpc),
         )
         .with_state(server)
-        .layer(DefaultBodyLimit::max(crate::http::MAX_BODY));
+        .layer(Extension(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
+        .layer(DefaultBodyLimit::max(
+            max_request_size.min(crate::http::MAX_BODY),
+        ));
 
     // A declared body above MAX_SIZE is not read: Divi Core parses an empty
     // request, a parse error (rpcprotocol.cpp:218-220, rpcserver.cpp:960-961)
@@ -1582,26 +1717,36 @@ fn build_router(
 
     // No credentials means no request can authenticate, never an open server.
     // Wrong credentials are refused after Divi Core's delay (rpcserver.cpp:940-956).
-    let router = router.layer(middleware::from_fn(move |req: HttpRequest, next: Next| {
-        let creds = credentials.clone();
-        async move {
-            let authorization = req
-                .headers()
-                .get(header::AUTHORIZATION)
-                .map(|v| v.to_str().unwrap_or(""));
-            let authorized = creds
-                .as_ref()
-                .is_some_and(|c| basic_auth_matches(authorization, &c.0, &c.1));
-            if authorized {
-                next.run(req).await
-            } else {
-                if authorization.is_some() {
-                    tokio::time::sleep(crate::http::WRONG_CREDENTIALS_DELAY).await;
+    // The authenticated user's -rpcwhitelist grant goes to the handler.
+    let auth = access.clone();
+    let router = router.layer(middleware::from_fn(
+        move |mut req: HttpRequest, next: Next| {
+            let access = auth.clone();
+            async move {
+                // The header borrows end here: the body is not Sync, so a
+                // borrow of the request held across an await is not Send.
+                let (user, presented) = {
+                    let authorization = req
+                        .headers()
+                        .get(header::AUTHORIZATION)
+                        .map(|v| v.to_str().unwrap_or(""));
+                    (access.authenticate(authorization), authorization.is_some())
+                };
+                match user {
+                    Some(user) => {
+                        req.extensions_mut().insert(access.grant_for(&user));
+                        next.run(req).await
+                    }
+                    None => {
+                        if presented {
+                            tokio::time::sleep(crate::http::WRONG_CREDENTIALS_DELAY).await;
+                        }
+                        crate::http::unauthorized()
+                    }
                 }
-                crate::http::unauthorized()
             }
-        }
-    }));
+        },
+    ));
 
     // REST outside the credentials
     let router = router.merge(rest_paths);
@@ -1630,51 +1775,58 @@ fn build_router(
         },
     ));
 
-    // No cross-origin headers on RPC replies, as Divi Core sends none
-    router
-}
+    // First of all, REST included: the peer must be the local host or in
+    // -rpcallowip (Divi Core's ClientAllowed, rpcserver.cpp:906-912), and the
+    // Host and Origin headers must name allowed ones (DNS rebinding and
+    // cross-site requests from a browser). Without the peer address
+    // (no ConnectInfo) every request is refused.
+    let router = router.layer(middleware::from_fn(
+        move |connect: Option<ConnectInfo<SocketAddr>>, req: HttpRequest, next: Next| {
+            let access = access.clone();
+            async move {
+                let checked = {
+                    let headers = req.headers();
+                    let hdr = |name| headers.get(name).and_then(|v| v.to_str().ok());
+                    if !connect.is_some_and(|ConnectInfo(addr)| access.peer_allowed(addr.ip())) {
+                        Err(Denial::Peer)
+                    } else if !access.host_allowed(hdr(header::HOST)) {
+                        Err(Denial::Host)
+                    } else if !access.origin_allowed(hdr(header::ORIGIN)) {
+                        Err(Denial::Origin)
+                    } else {
+                        Ok(())
+                    }
+                };
+                match checked {
+                    Ok(()) => next.run(req).await,
+                    Err(denial) => {
+                        warn!("RPC request refused: {denial:?}");
+                        crate::http::error_page(StatusCode::FORBIDDEN)
+                    }
+                }
+            }
+        },
+    ));
 
-/// The credentials to enforce: both must be set. `None` means no request can
-/// authenticate.
-fn rpc_credentials(config: &RpcConfig) -> Option<Arc<(String, String)>> {
-    match (&config.username, &config.password) {
-        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
-            info!("RPC authentication enabled");
-            Some(Arc::new((u.clone(), p.clone())))
-        }
-        _ => {
-            error!("RPC has no complete rpcuser/rpcpassword: every request will be refused");
-            None
-        }
+    // Browsers get CORS headers only for the origins configured with
+    // -rpcalloworigin; with none there is no CORS layer, and RPC replies carry
+    // no cross-origin headers, as Divi Core sends none
+    if origins.is_empty() {
+        router
+    } else {
+        router.layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods([Method::POST])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+        )
     }
-}
-
-/// Check an `Authorization` header against the expected Basic credentials.
-fn basic_auth_matches(authorization: Option<&str>, user: &str, password: &str) -> bool {
-    use base64::Engine;
-
-    // The scheme as Divi Core takes it: "Basic " exactly (rpcserver.cpp:492)
-    let Some(encoded) = authorization.and_then(|h| h.strip_prefix("Basic ")) else {
-        return false;
-    };
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-        return false;
-    };
-    let expected = format!("{user}:{password}");
-    constant_time_eq(&decoded, expected.as_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Start the RPC server
 pub async fn start_server(config: RpcConfig, chain: Arc<Chain>) -> Result<(), Error> {
     let server = Arc::new(RpcServer::new(chain));
     let app = create_router_with_auth(server, &config);
-
-    info!("Starting RPC server on {}", config.bind_address);
-
     serve(&config, app).await
 }
 
@@ -1701,9 +1853,6 @@ where
     setup_callbacks(&server);
 
     let app = create_router_with_auth(server, &config);
-
-    info!("Starting RPC server on {}", config.bind_address);
-
     serve(&config, app).await
 }
 
@@ -1728,9 +1877,6 @@ where
     setup_callbacks(&server);
 
     let app = create_router_with_auth(server, &config);
-
-    info!("Starting RPC server on {}", config.bind_address);
-
     serve(&config, app).await
 }
 
@@ -1778,6 +1924,53 @@ mod tests {
         let chain = Arc::new(Chain::new(db, ChainParams::default()).unwrap());
         let server = Arc::new(RpcServer::new(chain));
         (server, dir)
+    }
+
+    /// Run `f` with every log event, at any level, written to the returned buffer.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn node04_rpc_bodies_and_results_are_never_logged() {
+        let (server, _dir) = create_test_server();
+        let secret = "correct-horse-battery-staple-4f2a";
+        let logs = capture_logs(|| {
+            // A call, a batch, and bodies that fail to parse, all carrying the secret
+            for body in [
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"walletpassphrase","params":["{secret}",60]}}"#
+                ),
+                format!(
+                    r#"[{{"jsonrpc":"2.0","id":1,"method":"encryptwallet","params":["{secret}"]}}]"#
+                ),
+                format!(r#"{{"jsonrpc":"2.0","id":1,"method":["{secret}"]}}"#),
+                format!(r#"{{"method":"walletpassphrase","params":["{secret}"#),
+            ] {
+                let _ = server.handle_http_body_for(&MethodGrant::All, &body);
+            }
+        });
+        assert!(logs.contains("RPC"), "the calls are still logged: {logs}");
+        assert!(!logs.contains(secret), "a secret reached the log: {logs}");
     }
 
     #[test]
@@ -2190,65 +2383,39 @@ mod tests {
         assert_eq!(err.code, -32700);
     }
 
-    #[test]
-    fn basic_auth_accepts_only_the_configured_credentials() {
-        use base64::Engine;
-        let enc = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
-        let basic = |s: &str| format!("Basic {}", enc(s));
-        assert!(basic_auth_matches(
-            Some(&basic("alice:s3cret")),
-            "alice",
-            "s3cret"
-        ));
-        assert!(!basic_auth_matches(None, "alice", "s3cret"));
-        assert!(!basic_auth_matches(
-            Some(&basic("alice:wrong")),
-            "alice",
-            "s3cret"
-        ));
-        assert!(!basic_auth_matches(
-            Some(&basic("bob:s3cret")),
-            "alice",
-            "s3cret"
-        ));
-        assert!(!basic_auth_matches(
-            Some(&basic("alice:s3cretX")),
-            "alice",
-            "s3cret"
-        ));
-        let bearer = format!("Bearer {}", enc("alice:s3cret"));
-        assert!(!basic_auth_matches(Some(&bearer), "alice", "s3cret"));
-        assert!(!basic_auth_matches(
-            Some("Basic !!notbase64"),
-            "alice",
-            "s3cret"
-        ));
-    }
-
-    #[test]
-    fn credentials_need_both_user_and_password() {
-        let mut config = RpcConfig::default();
-        assert!(rpc_credentials(&config).is_none());
-        config.username = Some("alice".into());
-        assert!(rpc_credentials(&config).is_none());
-        config.password = Some("s3cret".into());
-        assert!(rpc_credentials(&config).is_some());
-    }
-
     /// Serve `router` on a loopback port and POST one getblockcount to it.
     async fn status_of(router: Router, authorization: Option<String>) -> StatusCode {
+        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+        let auth = authorization
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        exchange(router, "POST", None, &auth, body).await.0
+    }
+
+    /// Serve `router` with connect info on a loopback port and send one
+    /// request. `host` replaces the real `Host` header; `extra` holds further
+    /// header lines, each ending in CRLF. Returns the status and raw response.
+    async fn exchange(
+        router: Router,
+        method: &str,
+        host: Option<&str>,
+        extra: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router).await });
-
-        let body = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
-        let auth_line = authorization
-            .map(|a| format!("Authorization: {a}\r\n"))
-            .unwrap_or_default();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let host = host.map(String::from).unwrap_or_else(|| addr.to_string());
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\n{auth_line}Connection: close\r\n\r\n{body}",
+            "{method} / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
             body.len()
         );
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -2260,7 +2427,7 @@ mod tests {
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap_or_else(|| panic!("bad HTTP response: {response:?}"));
-        StatusCode::from_u16(code).unwrap()
+        (StatusCode::from_u16(code).unwrap(), response)
     }
 
     fn basic(user: &str, password: &str) -> String {
@@ -2277,7 +2444,6 @@ mod tests {
         for (user, pass) in [(None, None), (Some("alice"), None), (Some(""), Some(""))] {
             let (server, _dir) = create_test_server();
             let config = RpcConfig {
-                allowed: Vec::new(),
                 username: user.map(String::from),
                 password: pass.map(String::from),
                 ..RpcConfig::default()
@@ -2300,7 +2466,13 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router).await });
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(request.replace("{addr}", &addr.to_string()).as_bytes())
@@ -2311,11 +2483,12 @@ mod tests {
         response
     }
 
+    /// Without -rpcalloworigin a cross-origin request is refused (403) and
+    /// no reply carries a cross-origin header
     #[tokio::test]
     async fn rpc_replies_carry_no_cross_origin_headers() {
         let (server, _dir) = create_test_server();
         let config = RpcConfig {
-            allowed: Vec::new(),
             username: Some("alice".into()),
             password: Some("s3cret".into()),
             ..RpcConfig::default()
@@ -2354,7 +2527,6 @@ mod tests {
     async fn requests_from_divi_cli_are_answered() {
         let (server, _dir) = create_test_server();
         let config = RpcConfig {
-            allowed: Vec::new(),
             username: Some("alice".into()),
             password: Some("s3cret".into()),
             ..RpcConfig::default()
@@ -2406,7 +2578,6 @@ mod tests {
             crate::auth_cookie::resolve_rpc_auth(None, None, dir.path()).unwrap();
         assert!(cookie.is_some());
         let config = RpcConfig {
-            allowed: Vec::new(),
             username: Some(user.clone()),
             password: Some(password.clone()),
             ..RpcConfig::default()
@@ -2424,5 +2595,207 @@ mod tests {
         let contents = std::fs::read_to_string(cookie.as_ref().unwrap().path()).unwrap();
         let (u, p) = contents.split_once(':').unwrap();
         assert_eq!(status_of(router, Some(basic(u, p))).await, StatusCode::OK);
+    }
+
+    fn alice_config(access: AccessConfig) -> RpcConfig {
+        RpcConfig {
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            access,
+            ..RpcConfig::default()
+        }
+    }
+
+    const GETBLOCKCOUNT: &str = r#"{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}"#;
+
+    #[tokio::test]
+    async fn node01_cors_preflight_has_no_wildcard() {
+        let preflight = "Origin: http://evil.example\r\nAccess-Control-Request-Method: POST\r\n";
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(AccessConfig::default()));
+        let (_, response) = exchange(router, "OPTIONS", None, preflight, "").await;
+        assert!(
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "{response}"
+        );
+
+        // A configured origin is echoed exactly; any other gets nothing
+        let access = AccessConfig {
+            allow_origins: vec!["http://wallet.example".into()],
+            ..AccessConfig::default()
+        };
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(access));
+        let (_, response) = exchange(router.clone(), "OPTIONS", None, preflight, "").await;
+        assert!(!response.contains("*"), "{response}");
+        assert!(!response.contains("evil.example"), "{response}");
+        let good = "Origin: http://wallet.example\r\nAccess-Control-Request-Method: POST\r\n";
+        let (_, response) = exchange(router, "OPTIONS", None, good, "").await;
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin: http://wallet.example"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node01_foreign_host_and_origin_are_forbidden() {
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(AccessConfig::default()));
+        let auth = format!("Authorization: {}\r\n", basic("alice", "s3cret"));
+        // DNS rebinding: the browser sends the attacker's hostname
+        let (status, _) = exchange(
+            router.clone(),
+            "POST",
+            Some("evil.example:9998"),
+            &auth,
+            GETBLOCKCOUNT,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A page on another site posting with the user's credentials
+        let with_origin = format!("{auth}Origin: http://evil.example\r\n");
+        let (status, _) = exchange(router.clone(), "POST", None, &with_origin, GETBLOCKCOUNT).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = exchange(router, "POST", None, &auth, GETBLOCKCOUNT).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn node01_router_without_connect_info_refuses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(AccessConfig::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{GETBLOCKCOUNT}",
+            basic("alice", "s3cret"),
+            GETBLOCKCOUNT.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn node12_rpcauth_authenticates_end_to_end() {
+        use hmac::{Hmac, Mac};
+        let salt = "00112233445566778899aabbccddeeff";
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(salt.as_bytes()).unwrap();
+        mac.update(b"b0b-pass");
+        let line = format!("bob:{salt}${}", hex::encode(mac.finalize().into_bytes()));
+        let access = AccessConfig {
+            rpcauth: vec![line],
+            ..AccessConfig::default()
+        };
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(access));
+        assert_eq!(
+            status_of(router.clone(), Some(basic("bob", "b0b-pass"))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(router.clone(), Some(basic("bob", "wrong"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(router, Some(basic("alice", "s3cret"))).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn node12_whitelist_denies_method_and_batch() {
+        let access = AccessConfig {
+            whitelist: vec!["alice:getblockcount,getbestblockhash".into()],
+            ..AccessConfig::default()
+        };
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(access));
+        let auth = format!("Authorization: {}\r\n", basic("alice", "s3cret"));
+        let (status, _) = exchange(router.clone(), "POST", None, &auth, GETBLOCKCOUNT).await;
+        assert_eq!(status, StatusCode::OK);
+        let stop = r#"{"jsonrpc":"1.0","id":1,"method":"stop","params":[]}"#;
+        let (status, _) = exchange(router.clone(), "POST", None, &auth, stop).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let batch = format!("[{GETBLOCKCOUNT},{stop}]");
+        let (status, _) = exchange(router.clone(), "POST", None, &auth, &batch).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let batch = format!("[{GETBLOCKCOUNT},{GETBLOCKCOUNT}]");
+        let (status, _) = exchange(router, "POST", None, &auth, &batch).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn node12_serve_refuses_unsafe_bind() {
+        let (server, _dir) = create_test_server();
+        let mut config = alice_config(AccessConfig::default());
+        config.bind_address = "0.0.0.0:0".parse().unwrap();
+        let err = serve(&config, create_router_with_auth(server, &config))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rpcallowip"), "{err}");
+    }
+
+    /// The JSON body of a raw HTTP response
+    fn body_json(response: &str) -> serde_json::Value {
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body:?}"))
+    }
+
+    #[tokio::test]
+    async fn node13_batch_over_the_limit_is_refused() {
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(AccessConfig::default()));
+        let auth = format!("Authorization: {}\r\n", basic("alice", "s3cret"));
+
+        let batch = format!("[{}]", vec![GETBLOCKCOUNT; MAX_BATCH_CALLS].join(","));
+        let (status, response) = exchange(router.clone(), "POST", None, &auth, &batch).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body_json(&response).as_array().unwrap().len(),
+            MAX_BATCH_CALLS
+        );
+
+        let batch = format!("[{}]", vec![GETBLOCKCOUNT; MAX_BATCH_CALLS + 1].join(","));
+        let (status, response) = exchange(router, "POST", None, &auth, &batch).await;
+        // An invalid request, with Divi Core's HTTP status for one
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let reply = body_json(&response);
+        assert!(
+            reply.is_object(),
+            "one error, not a batch of results: {reply}"
+        );
+        assert_eq!(reply["error"]["code"], -32600, "{reply}");
+    }
+
+    #[tokio::test]
+    async fn node13_body_over_max_request_size_gets_413() {
+        let (server, _dir) = create_test_server();
+        let mut config = alice_config(AccessConfig::default());
+        config.max_request_size = 1024;
+        let router = create_router_with_auth(server, &config);
+        let auth = format!("Authorization: {}\r\n", basic("alice", "s3cret"));
+
+        let (status, _) = exchange(router.clone(), "POST", None, &auth, GETBLOCKCOUNT).await;
+        assert_eq!(status, StatusCode::OK);
+        let padding = " ".repeat(2000);
+        let big = format!("{GETBLOCKCOUNT}{padding}");
+        let (status, _) = exchange(router, "POST", None, &auth, &big).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn node13_default_body_limit_holds_a_full_block() {
+        // submitblock sends a 2 MB block as 4 MB of hex
+        assert!(RpcConfig::default().max_request_size >= 4 * 1024 * 1024 + 1024);
     }
 }

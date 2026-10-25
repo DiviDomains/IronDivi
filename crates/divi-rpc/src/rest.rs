@@ -356,7 +356,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router.clone();
-        tokio::spawn(async move { axum::serve(listener, app).await });
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+        });
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{extra}\r\n{body}",

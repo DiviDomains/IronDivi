@@ -27,9 +27,11 @@ pub const MONTHLY_BACKUPS: usize = 12;
 /// (timeIntervalConstants.h: 30 days)
 pub const MONTH: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Copy a folder and everything in it
+/// Copy a folder and everything in it. The copy holds wallet secrets, so it is
+/// readable by its owner only (0700 folders, 0600 files), whatever the umask.
 pub fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
+    owner_only(dst, 0o700)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let target = dst.join(entry.file_name());
@@ -37,8 +39,20 @@ pub fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
             copy_dir(&entry.path(), &target)?;
         } else {
             std::fs::copy(entry.path(), &target)?;
+            owner_only(&target, 0o600)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn owner_only(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn owner_only(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 

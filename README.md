@@ -137,6 +137,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
 ```
 
+### Releasing
+
+Run `tools/release-check.sh` in the tree being released before building any tarball. It fails on a known vulnerability (`cargo deny`, `cargo audit`) or a disallowed license or source, and a failing tree is not released.
+
 ## RPC Compatibility
 
 IronDivi implements a subset of the Divi Core JSON-RPC interface. Supported commands include `getblockchaininfo`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getbalance`, `listunspent`, `getnewaddress`, `signmessage`, `verifymessage`, and more. The goal is wire-level compatibility so that existing tools and scripts work without modification.

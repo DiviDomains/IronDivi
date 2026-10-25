@@ -26,6 +26,7 @@ use bip39::Mnemonic;
 use divi_crypto::keys::{PublicKey, SecretKey};
 use divi_primitives::ChainMode;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 /// Divi coin type for BIP44 derivation
 pub const DIVI_COIN_TYPE: u32 = 301;
@@ -126,9 +127,9 @@ pub struct HdWallet {
     /// Master private key
     master: ExtendedPrivateKey,
     /// Mnemonic words (if available)
-    mnemonic: Option<String>,
+    mnemonic: Option<Zeroizing<String>>,
     /// BIP39 passphrase the seed was made with (Divi Core's -mnemonicpassphrase)
-    passphrase: Option<String>,
+    passphrase: Option<Zeroizing<String>>,
     /// Chain mode affects BIP44 coin type
     chain_mode: ChainMode,
     /// BIP44 coin type of the derivation path
@@ -149,12 +150,13 @@ impl HdWallet {
     /// without -mnemonic (hdchain.cpp:56-67)
     pub fn generate(passphrase: Option<&str>, chain_mode: ChainMode) -> Result<Self, WalletError> {
         // Generate 32 bytes (256 bits) of entropy for 24 words
-        let mut entropy = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut entropy);
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(&mut entropy[..]);
 
-        let mnemonic = Mnemonic::from_entropy(&entropy)
+        let mnemonic = Mnemonic::from_entropy(&entropy[..])
             .map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
-        Self::from_mnemonic(&mnemonic.to_string(), passphrase, chain_mode)
+        let phrase = Zeroizing::new(mnemonic.to_string());
+        Self::from_mnemonic(&phrase, passphrase, chain_mode)
     }
 
     /// Create from mnemonic phrase
@@ -167,13 +169,15 @@ impl HdWallet {
             .parse()
             .map_err(|e: bip39::Error| WalletError::InvalidMnemonic(e.to_string()))?;
 
-        let seed = mnemonic.to_seed(passphrase.unwrap_or(""));
-        let master = ExtendedPrivateKey::from_seed(&seed)?;
+        let seed = Zeroizing::new(mnemonic.to_seed(passphrase.unwrap_or("")));
+        let master = ExtendedPrivateKey::from_seed(&seed[..])?;
 
         Ok(HdWallet {
             master,
-            mnemonic: Some(phrase.to_string()),
-            passphrase: passphrase.filter(|p| !p.is_empty()).map(str::to_string),
+            mnemonic: Some(Zeroizing::new(phrase.to_string())),
+            passphrase: passphrase
+                .filter(|p| !p.is_empty())
+                .map(|p| Zeroizing::new(p.to_string())),
             chain_mode,
             coin_type: legacy_coin_type(chain_mode),
             seed: None,
@@ -201,7 +205,7 @@ impl HdWallet {
 
     /// Get the mnemonic phrase (if available)
     pub fn mnemonic(&self) -> Option<&str> {
-        self.mnemonic.as_deref()
+        self.mnemonic.as_ref().map(|m| m.as_str())
     }
 
     /// The seed of a wallet made from a seed (no words)
@@ -217,7 +221,7 @@ impl HdWallet {
         }
         let mnemonic: Mnemonic = self.mnemonic.as_deref()?.parse().ok()?;
         let seed =
-            zeroize::Zeroizing::new(mnemonic.to_seed(self.passphrase.as_deref().unwrap_or("")));
+            zeroize::Zeroizing::new(mnemonic.to_seed(self.mnemonic_passphrase().unwrap_or("")));
         Some(divi_crypto::double_sha256(seed.as_slice()))
     }
 
@@ -229,7 +233,7 @@ impl HdWallet {
 
     /// The BIP39 passphrase of the seed, if one was given
     pub fn mnemonic_passphrase(&self) -> Option<&str> {
-        self.passphrase.as_deref()
+        self.passphrase.as_ref().map(|p| p.as_str())
     }
 
     /// The chain mode the wallet was made for

@@ -590,10 +590,31 @@ pub struct RpcConfig {
     /// Request timeout (seconds)
     pub timeout: u64,
 
+    /// `rpcauth` entries: `user:salt$hex(HMAC-SHA256(salt, password))`
+    #[serde(default)]
+    pub rpcauth: Vec<String>,
+
+    /// `rpcwhitelist` entries: `user:method,method,...`
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+
+    /// `rpcwhitelistdefault`: whether users without a whitelist entry are
+    /// refused every method (defaults to true once any whitelist is set)
+    #[serde(default)]
+    pub whitelist_default: Option<bool>,
+
     /// Subnets allowed to connect besides the local host (Divi Core's
     /// -rpcallowip); with none, the server listens on the loopback only
     #[serde(default)]
-    pub allowed_ips: Vec<String>,
+    pub allow_ips: Vec<String>,
+
+    /// `rpcalloworigin` entries: browser origins allowed to call the RPC
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
+
+    /// `rpcallowhost` entries: host names accepted in the `Host` header
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
 
     /// Keep a connection open after a reply when the request asks for it
     /// (Divi Core's -rpckeepalive, default on)
@@ -619,7 +640,12 @@ impl Default for RpcConfig {
             password: None,
             max_request_size: 10 * 1024 * 1024, // 10 MB
             timeout: 30,
-            allowed_ips: Vec::new(),
+            rpcauth: Vec::new(),
+            whitelist: Vec::new(),
+            whitelist_default: None,
+            allow_ips: Vec::new(),
+            allow_origins: Vec::new(),
+            allow_hosts: Vec::new(),
             keep_alive: true,
             rest: false,
         }
@@ -632,6 +658,18 @@ impl RpcConfig {
         format!("{}:{}", self.listen_addr, self.port)
             .parse()
             .expect("Invalid RPC listen address")
+    }
+
+    /// The access-control settings for the RPC server
+    pub fn access(&self) -> divi_rpc::AccessConfig {
+        divi_rpc::AccessConfig {
+            rpcauth: self.rpcauth.clone(),
+            whitelist: self.whitelist.clone(),
+            whitelist_default: self.whitelist_default,
+            allow_ips: self.allow_ips.clone(),
+            allow_origins: self.allow_origins.clone(),
+            allow_hosts: self.allow_hosts.clone(),
+        }
     }
 }
 

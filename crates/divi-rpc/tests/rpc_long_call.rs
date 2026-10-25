@@ -29,7 +29,7 @@ fn call(addr: SocketAddr, body: &str) -> String {
     stream
         .write_all(
             format!(
-                "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
+                "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dGVzdDp0ZXN0\r\n\
                  Connection: close\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
@@ -77,7 +77,13 @@ fn a_short_call_is_answered_while_a_long_call_runs() {
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    runtime.spawn(async move { axum::serve(listener, router).await });
+    runtime.spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
 
     let long = std::thread::spawn(move || {
         let status = call(addr, r#"{"method":"keypoolrefill","params":[3000],"id":1}"#);

@@ -169,9 +169,10 @@ fn two_inputs() -> String {
     hex::encode(divi_primitives::serialize(&tx))
 }
 
-/// signtransactionwithaddresskey signs with SIGHASH_SINGLE; for an input
-/// without an output of its index Core's SignatureHash is the value 1
-/// (SignatureCheckers.cpp), and the signature is over that
+/// signtransactionwithaddresskey signs with SIGHASH_SINGLE over Core's
+/// SignatureHash. For an input without an output of its index that hash is
+/// the value 1 (SignatureCheckers.cpp), a signature that would spend any coin
+/// of the key: Divi Core signs it, IronDivi refuses it with -8 (NODE-5)
 #[test]
 fn signtransactionwithaddresskey_signs_core_s_hash() {
     let (server, wallet, _dir) = server();
@@ -180,29 +181,29 @@ fn signtransactionwithaddresskey_signs_core_s_hash() {
         .get_key_by_address(&divi_wallet::Address::from_base58(address.as_str().unwrap()).unwrap())
         .unwrap();
     let raw = two_inputs();
-    for index in [0usize, 1] {
-        let asm = ok(
-            &server,
-            "signtransactionwithaddresskey",
-            vec![json!(raw), address.clone(), json!(index)],
-        );
-        let mut sig = hex::decode(asm.as_str().unwrap()).unwrap();
-        assert_eq!(sig.pop(), Some(3), "SIGHASH_SINGLE");
-        let tx: Transaction = divi_primitives::deserialize(&hex::decode(&raw).unwrap()).unwrap();
-        let mut code = vec![key.pubkey_bytes().len() as u8];
-        code.extend_from_slice(&key.pubkey_bytes());
-        code.push(0xac);
-        let hash = divi_script::checker::signature_hash(&Script::from_bytes(code), &tx, index, 3);
-        if index == 1 {
-            let mut one = [0u8; 32];
-            one[0] = 1;
-            assert_eq!(hash, one);
-        }
-        assert!(
-            divi_script::checker::verify_ecdsa_lax(&key.pubkey_bytes(), &sig, &hash),
-            "input {index}: not a signature over Core's hash"
-        );
-    }
+    let asm = ok(
+        &server,
+        "signtransactionwithaddresskey",
+        vec![json!(raw), address.clone(), json!(0)],
+    );
+    let mut sig = hex::decode(asm.as_str().unwrap()).unwrap();
+    assert_eq!(sig.pop(), Some(3), "SIGHASH_SINGLE");
+    let tx: Transaction = divi_primitives::deserialize(&hex::decode(&raw).unwrap()).unwrap();
+    let mut code = vec![key.pubkey_bytes().len() as u8];
+    code.extend_from_slice(&key.pubkey_bytes());
+    code.push(0xac);
+    let hash = divi_script::checker::signature_hash(&Script::from_bytes(code), &tx, 0, 3);
+    assert!(
+        divi_script::checker::verify_ecdsa_lax(&key.pubkey_bytes(), &sig, &hash),
+        "not a signature over Core's hash"
+    );
+    // Input 1 has no output 1: the hash-one signature is refused
+    let (code, _) = err(
+        &server,
+        "signtransactionwithaddresskey",
+        vec![json!(raw), address.clone(), json!(1)],
+    );
+    assert_eq!(code, -8);
     // A fourth argument is not read (no count check, rpcrawtransaction.cpp:566-572)
     ok(
         &server,

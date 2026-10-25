@@ -242,3 +242,27 @@ fn only_vaults_returns_vaults_by_owner() {
         .unwrap_err();
     assert!(err.contains("Invalid address"), "{:?}", err);
 }
+
+/// The object form takes a page: "skip" and "limit", oldest first
+#[test]
+fn object_form_pages_with_skip_and_limit() {
+    let (chain, _dir, a, b) = setup();
+    let rpc = Rpc::for_chain(chain);
+    let heights = |extra: Value| -> Vec<u64> {
+        let mut req = json!({ "addresses": [a.to_base58(), b.to_base58()] });
+        for (k, v) in extra.as_object().unwrap() {
+            req[k] = v.clone();
+        }
+        rpc.get_address_utxos(vec![req])
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["height"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(heights(json!({ "skip": 1 })), vec![2, 3]);
+    assert_eq!(heights(json!({ "limit": 2 })), vec![1, 2]);
+    assert_eq!(heights(json!({ "skip": 1, "limit": 1 })), vec![2]);
+    assert_eq!(heights(json!({ "skip": 5 })), Vec::<u64>::new());
+}

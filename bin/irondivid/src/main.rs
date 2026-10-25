@@ -23,6 +23,7 @@
 
 mod core_files;
 mod interfaces;
+mod private_files;
 mod settings;
 mod snapshot_sig;
 
@@ -92,7 +93,9 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -port=<port> -bind=<addr> -listen -connect=<ip> -addnode=<ip> -dnsseed\n  \
 -maxconnections=<n> -proxy=<ip:port> -banscore=<n> -bantime=<n> -timeout=<ms>\n  \
 -server -rpcbind=<addr> -rpcallowip=<ip> -rpcport=<port> -rpcuser=<user>\n  \
--rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
+-rpcpassword=<pw> -rpcauth=<user:salt$hash> -rpcwhitelist=<user:methods>\n  \
+-rpcwhitelistdefault -rpcalloworigin=<origin> -rpcallowhost=<host>\n  \
+-txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
 -blocknotify=<cmd> -walletnotify=<cmd>\n  \
@@ -493,10 +496,20 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     } else {
         config.rpc.listen_addr = "[::]".to_string();
     }
-    config.rpc.allowed_ips = allowed;
+    config.rpc.allow_ips = allowed;
     // -rpckeepalive=0: each RPC connection is closed after its reply
     // (rpcserver.cpp:1014-1017)
     config.rpc.keep_alive = s.get_bool("rpckeepalive", true);
+    // RPC access control, each repeatable but -rpcwhitelistdefault: hashed
+    // credentials (`user:salt$hash`), the methods a user may call
+    // (`user:method,method`), browser origins and Host names to accept
+    config.rpc.rpcauth = s.get_multi("rpcauth").to_vec();
+    config.rpc.whitelist = s.get_multi("rpcwhitelist").to_vec();
+    if s.is_set("rpcwhitelistdefault") {
+        config.rpc.whitelist_default = Some(s.get_bool("rpcwhitelistdefault", true));
+    }
+    config.rpc.allow_origins = s.get_multi("rpcalloworigin").to_vec();
+    config.rpc.allow_hosts = s.get_multi("rpcallowhost").to_vec();
 
     if let Some(p) = port("port") {
         config.p2p.port = p;
@@ -718,6 +731,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "rpcallowip",
         "rpcbind",
         "rpckeepalive",
+        "rpcauth",
+        "rpcwhitelist",
+        "rpcwhitelistdefault",
+        "rpcalloworigin",
+        "rpcallowhost",
         "port",
         "bind",
         "listen",
@@ -888,6 +906,24 @@ fn parse_money(text: &str) -> Option<i64> {
     Some(whole * 100_000_000 + frac)
 }
 
+/// Warn when a config file holding RPC credentials can be read by other users
+fn warn_if_conf_exposed(path: &std::path::Path, has_secret: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if has_secret && meta.permissions().mode() & 0o077 != 0 {
+                warn!(
+                    "{:?} holds RPC credentials and is readable by other users; run chmod 600 on it",
+                    path
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, has_secret);
+}
+
 /// Build node configuration from CLI args and config file
 fn build_config(args: &Args) -> Result<NodeConfig> {
     build_config_with_env(args, std::env::var("IRONDIVI_EXPIRE").ok())
@@ -911,7 +947,18 @@ fn build_config_with_env(args: &Args, env_expire: Option<String>) -> Result<Node
     if let Some(conf) = &args.conf {
         if conf.exists() {
             info!("Loaded config from {:?}", conf);
+            // The file holds RPC credentials when it sets what the command
+            // line did not
+            let from_file =
+                |key: &str| args.settings.get_multi(key).len() > args.cli.get_multi(key).len();
+            warn_if_conf_exposed(conf, from_file("rpcpassword") || from_file("rpcauth"));
         }
+    }
+    if args.cli.is_set("rpcpassword") {
+        warn!(
+            "-rpcpassword on the command line is visible to every user of this machine \
+             (ps, /proc); put it in the config file or use rpcauth instead"
+        );
     }
 
     // Everything from the command line and the file, the command line first;
@@ -1133,7 +1180,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     } else {
         // Log to file (debug.log in data directory) like C++ divid
         // Create data directory if it doesn't exist
-        if let Err(e) = std::fs::create_dir_all(data_dir) {
+        if let Err(e) = private_files::ensure_private_dir(data_dir, false) {
             eprintln!(
                 "Warning: Could not create data directory {:?}: {}",
                 data_dir, e
@@ -1144,6 +1191,12 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
                 .with(filter)
                 .init();
             return;
+        }
+
+        // Logs written before the umask was set may be readable by others (NODE-4)
+        private_files::restrict_file(&data_dir.join("debug.log"));
+        for i in 1..log_config.max_files {
+            private_files::restrict_file(&data_dir.join(format!("debug.log.{}", i)));
         }
 
         // debug.log, rotated by size like C++ divid
@@ -1374,6 +1427,10 @@ fn load_or_restore_wallet_with_seed(
             }
         }
         info!("Loading wallet from {:?}", wallet_path);
+        // Only this user may read the wallet (NODE-3)
+        if let Err(e) = private_files::ensure_private_dir(wallet_path, true) {
+            warn!("Could not check the wallet directory permissions: {}", e);
+        }
         let wallet = WalletDb::open(wallet_path, network)
             .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
 
@@ -1397,6 +1454,7 @@ fn load_or_restore_wallet_with_seed(
             }
         }
 
+        warn_if_unencrypted(&wallet);
         info!("Wallet loaded successfully");
         return Ok(Arc::new(wallet));
     }
@@ -1435,7 +1493,7 @@ fn load_or_restore_wallet_with_seed(
     }
 
     info!("Creating new wallet at {:?}", wallet_path);
-    std::fs::create_dir_all(wallet_path)
+    private_files::ensure_private_dir(wallet_path, true)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
     let hd_wallet = if let Some(ref seed) = seed {
         info!("Restoring wallet from -hdseed");
@@ -1500,8 +1558,42 @@ fn load_or_restore_wallet_with_seed(
     // Save immediately
     wallet.save().with_context(|| "Failed to save wallet")?;
 
+    warn_if_unencrypted(&wallet);
     info!("New wallet created successfully");
     Ok(Arc::new(wallet))
+}
+
+/// Say loudly that the seed and keys are stored in the clear (NODE-3). Staking keeps working
+/// on an encrypted wallet: `walletpassphrase <passphrase> 0 true` unlocks it for staking only.
+fn warn_if_unencrypted(wallet: &WalletDb) {
+    if !wallet.is_encrypted() {
+        warn!(
+            "The wallet is NOT encrypted: its seed and private keys are stored in the clear. \
+             Run encryptwallet, then walletpassphrase <passphrase> 0 true to keep staking."
+        );
+        eprintln!(
+            "WARNING: the wallet is not encrypted; anyone who can read its files can spend \
+             its coins. Run the encryptwallet RPC."
+        );
+    }
+}
+
+/// Put one wallet transaction back in the mempool with its real fee (inputs -
+/// outputs), as a local RPC send does, so the relay fee check applies to it.
+fn resubmit_tx(
+    tx: Transaction,
+    chain: &Arc<divi_storage::Chain>,
+    mempool: &Arc<divi_node::Mempool>,
+) -> std::result::Result<divi_primitives::hash::Hash256, String> {
+    let inputs_available = tx.vin.iter().all(|input| {
+        mempool.contains(&input.prevout.txid)
+            || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
+    });
+    if !inputs_available {
+        return Err("inputs no longer available".to_string());
+    }
+    let fee = Node::calculate_transaction_fee(&tx, chain, mempool).map_err(|e| e.to_string())?;
+    mempool.add(tx, fee).map_err(|e| e.to_string())
 }
 
 /// Put the wallet's unconfirmed transactions back into the mempool after a
@@ -1516,22 +1608,10 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
     if txs.is_empty() {
         return;
     }
-    let chain = node.chain();
-    let mempool = node.mempool();
     let mut resubmitted = 0;
     for tx in txs {
         let txid = tx.txid();
-        let inputs_available = tx.vin.iter().all(|input| {
-            mempool.contains(&input.prevout.txid)
-                || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
-        });
-        // The mempool works out the fee itself (Node's validator)
-        let result = if inputs_available {
-            mempool.add(tx, Amount::ZERO).map_err(|e| e.to_string())
-        } else {
-            Err("inputs no longer available".to_string())
-        };
-        match result {
+        match resubmit_tx(tx, node.chain(), node.mempool()) {
             Ok(_) => {
                 resubmitted += 1;
                 let relay = node.tx_relay().clone();
@@ -1585,7 +1665,7 @@ async fn run_daemon(
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
-    std::fs::create_dir_all(&config.data_dir)
+    private_files::ensure_private_dir(&config.data_dir, false)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
@@ -1673,6 +1753,8 @@ async fn run_daemon(
             &wallet_options,
         )?);
         if let Some(ref w) = wallet {
+            // Timed unlocks drop their keys when they run out (NODE-6)
+            WalletDb::start_auto_lock(w);
             core_files::lock_masternode_collateral(w, &config.data_dir);
             w.set_vault_mode(config.vault);
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
@@ -2024,18 +2106,23 @@ async fn run_daemon(
         None => info!("RPC authentication: rpcuser/rpcpassword"),
     }
     let rpc_config = RpcConfig {
-        allowed: config
-            .rpc
-            .allowed_ips
-            .iter()
-            .filter_map(|a| divi_rpc::Subnet::parse(a))
-            .collect(),
         bind_address: config.rpc.socket_addr(),
         username: Some(rpc_user),
         password: Some(rpc_password),
         keep_alive: config.rpc.keep_alive,
         rest: config.rpc.rest,
+        access: config.rpc.access(),
+        max_request_size: config.rpc.max_request_size,
     };
+    // Fail at startup, not on the first request, on a bad rpcauth/rpcwhitelist/
+    // rpcallowip entry or a non-loopback bind without rpcallowip.
+    divi_rpc::rpc_access(&rpc_config)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| {
+            a.check_bind(rpc_config.bind_address)
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .context("Invalid RPC configuration")?;
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
 
@@ -2671,6 +2758,13 @@ fn remove_pid_file(pid_file: &std::path::Path) {
 }
 
 fn main() -> Result<()> {
+    // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
+    private_files::restrict_umask();
+    // A core dump would hold unlocked wallet keys (NODE-10)
+    if let Err(e) = private_files::disable_core_dumps() {
+        eprintln!("Warning: could not disable core dumps: {}", e);
+    }
+
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match Args::try_parse_from(std::env::args()) {
         Ok(args) => args,
@@ -2730,7 +2824,7 @@ fn main() -> Result<()> {
         use std::os::unix::io::AsRawFd;
 
         // Ensure data directory exists before daemonizing
-        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        if let Err(e) = private_files::ensure_private_dir(&data_dir, false) {
             eprintln!("Failed to create data directory {:?}: {}", data_dir, e);
             std::process::exit(1);
         }
@@ -2769,9 +2863,12 @@ fn main() -> Result<()> {
         let _ = std::env::set_current_dir(&data_dir);
 
         // Redirect stdout/stderr to log file
+        use std::os::unix::fs::OpenOptionsExt;
+        private_files::restrict_file(&log_file);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&log_file)
             .unwrap_or_else(|e| {
                 eprintln!("Failed to open log file: {}", e);
@@ -2870,8 +2967,13 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
 
     // Set up shutdown channel
     // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
+    // All at once, so a reader never sees a partial pid (NODE-23)
     #[cfg(unix)]
-    let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
+    if let Err(e) =
+        private_files::write_private_atomic(&pid_file, std::process::id().to_string().as_bytes())
+    {
+        warn!("Failed to write PID file {:?}: {}", pid_file, e);
+    }
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
@@ -3061,6 +3163,53 @@ mod config_format_tests {
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
         build_config(&Args::parse_from(argv))
+    }
+
+    #[test]
+    fn node12_rpc_access_keys_from_file_and_cli() {
+        let c = cfg(
+            "rpcauth=bob:00ff$abcd\nrpcauth=carol:11ee$beef\nrpcwhitelist=bob:getinfo\n\
+             rpcwhitelistdefault=0\nrpcallowip=10.0.0.0/8\nrpcalloworigin=https://w.example\n\
+             rpcallowhost=node.lan\n",
+            &[
+                "--rpcallowip=192.168.1.5",
+                "-rpcwhitelist=carol:getblockcount",
+            ],
+        )
+        .unwrap();
+        // Repeated options keep every value, the command line's first
+        assert_eq!(c.rpc.rpcauth, ["bob:00ff$abcd", "carol:11ee$beef"]);
+        assert_eq!(c.rpc.whitelist, ["carol:getblockcount", "bob:getinfo"]);
+        assert_eq!(c.rpc.whitelist_default, Some(false));
+        assert_eq!(c.rpc.allow_ips, ["192.168.1.5", "10.0.0.0/8"]);
+        assert_eq!(c.rpc.allow_origins, ["https://w.example"]);
+        assert_eq!(c.rpc.allow_hosts, ["node.lan"]);
+        let access = c.rpc.access();
+        assert_eq!(access.allow_ips, c.rpc.allow_ips);
+
+        // Each in divid's -name=value form alone, and -rpcwhitelistdefault
+        // as a bare flag; none of them set means the defaults
+        let c = cfg(
+            "",
+            &[
+                "-rpcauth=dave:22dd$cafe",
+                "-rpcwhitelist=dave:getinfo",
+                "-rpcwhitelistdefault",
+                "-rpcalloworigin=https://x.example",
+                "-rpcallowhost=box.lan",
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.rpc.rpcauth, ["dave:22dd$cafe"]);
+        assert_eq!(c.rpc.whitelist, ["dave:getinfo"]);
+        assert_eq!(c.rpc.whitelist_default, Some(true));
+        assert_eq!(c.rpc.allow_origins, ["https://x.example"]);
+        assert_eq!(c.rpc.allow_hosts, ["box.lan"]);
+        let c = cfg("rpcuser=u\nrpcpassword=p\n", &[]).unwrap();
+        assert!(c.rpc.rpcauth.is_empty() && c.rpc.whitelist.is_empty());
+        assert_eq!(c.rpc.whitelist_default, None);
+        assert!(c.rpc.allow_ips.is_empty() && c.rpc.allow_hosts.is_empty());
+        assert_eq!(c.rpc.listen_addr, "127.0.0.1");
     }
 
     /// A Divi Core divi.conf used to stop irondivid ("Failed to parse config file"):
@@ -4330,6 +4479,62 @@ mod start_errors {
         assert!(
             lock_data_dir(dir.path()).is_ok(),
             "free again once the first exits"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resubmit_tests {
+    use super::*;
+    use divi_primitives::hash::Hash256;
+    use divi_primitives::script::Script;
+    use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
+    use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType as StorageNetwork};
+
+    fn spend(prev: Hash256, value: i64) -> Transaction {
+        let mut tx = Transaction::new();
+        tx.vin.push(TxIn::new(
+            OutPoint::new(prev, 0),
+            Script::from_bytes(vec![0x51]),
+            0xffff_ffff,
+        ));
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(value),
+            Script::new_p2pkh(&[9u8; 20]),
+        ));
+        tx
+    }
+
+    /// A wallet transaction put back after a restart used to be charged a
+    /// made-up fee of 10,000 sat per byte, so one paying less than the relay
+    /// fee got past the mempool's fee check. It now pays what it really pays.
+    #[test]
+    fn node21_resubmit_uses_the_real_fee() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(StorageNetwork::Regtest, ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let mempool = Arc::new(divi_node::Mempool::new(Default::default()));
+
+        let parent = spend(Hash256::from_bytes([7u8; 32]), 5_000_000);
+        let parent_id = parent.txid();
+        mempool.add(parent, Amount::from_sat(1_000_000)).unwrap();
+
+        // 100 sat for a ~85 byte transaction is under 10 sat/byte
+        let cheap = spend(parent_id, 5_000_000 - 100);
+        let cheap_id = cheap.txid();
+        assert!(resubmit_tx(cheap, &chain, &mempool).is_err());
+        assert!(!mempool.contains(&cheap_id));
+
+        let paid = spend(parent_id, 5_000_000 - 100_000);
+        let paid_id = paid.txid();
+        assert_eq!(resubmit_tx(paid, &chain, &mempool), Ok(paid_id));
+
+        // Inputs that exist nowhere are reported, not added
+        let orphan = spend(Hash256::from_bytes([8u8; 32]), 1_000);
+        assert_eq!(
+            resubmit_tx(orphan, &chain, &mempool),
+            Err("inputs no longer available".to_string())
         );
     }
 }
