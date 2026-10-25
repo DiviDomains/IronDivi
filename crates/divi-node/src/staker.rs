@@ -1724,12 +1724,14 @@ impl Staker {
                 treasury_cycle,
                 treasury_lottery_cycle,
             );
-            let (treasury_payment, charity_payment) =
-                divi_consensus::block_subsidy::calculate_weighted_treasury_payment(
+            let (treasury_payment, charity_payment) = self.chain.with_sporks(|sporks| {
+                divi_consensus::block_subsidy::calculate_weighted_treasury_payment_with(
                     height,
                     payment_cycle,
                     halving_interval,
-                );
+                    sporks,
+                )
+            });
 
             info!(
                 "Treasury block {} payments: {} DIVI treasury, {} DIVI charity",
@@ -2157,13 +2159,8 @@ impl Staker {
     /// what would have gone to masternodes), but this is handled at the
     /// block validation level, not here.
     fn calculate_stake_reward(&self, height: u32) -> Amount {
-        // Use the proper block subsidy calculation from divi-consensus
-        let halving_interval = match self.chain.network_type() {
-            divi_storage::NetworkType::Mainnet => 525_600u32,
-            divi_storage::NetworkType::Testnet => 1_000u32,
-            divi_storage::NetworkType::Regtest => 100u32,
-        };
-        let rewards = divi_consensus::block_subsidy::get_block_subsidy(height, halving_interval);
+        // The chain's rewards, which the network's sporks 13 and 15 can change
+        let rewards = self.chain.block_rewards(height);
 
         // After DeprecateMasternodes fork (MTP >= Aug 23 2023), the masternode
         // reward is folded into the staker reward. Since PrivateDivi started in

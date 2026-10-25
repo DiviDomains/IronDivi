@@ -1845,6 +1845,16 @@ async fn run_daemon(
             w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             w.set_max_tx_fee(config.mempool.max_tx_fee);
+            // A spork 14 entry sets the fees the wallet's sends pay and may pay
+            {
+                let (w, chain) = (Arc::clone(w), node.chain().clone());
+                node.spork_manager().on_tx_fee_spork(Arc::new(move || {
+                    if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                        w.set_relay_fee_per_kb(fee.min_fee_per_kb as i64);
+                        w.set_max_tx_fee(fee.max_fee as i64);
+                    }
+                }));
+            }
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
