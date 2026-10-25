@@ -102,6 +102,10 @@ impl Default for FeePolicy {
 /// Blocks scanned per `find_spend` call when falling back to block scanning.
 const MAX_SCAN_BLOCKS: u64 = 200;
 
+/// Litecoin's target block spacing in seconds, the same on mainnet and testnet: Litecoin
+/// Core's `consensus.nPowTargetSpacing = 2.5 * 60` in `src/kernel/chainparams.cpp`.
+pub const TARGET_BLOCK_SECS: u32 = 150;
+
 /// Litecoin [`ChainBackend`] (testnet by default; see [`LtcBackend::new_on`]).
 pub struct LtcBackend {
     esplora: EsploraClient,
@@ -502,6 +506,21 @@ impl ChainBackend for LtcBackend {
 
     async fn tip_hash(&self) -> Result<String> {
         divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)
+    }
+
+    async fn tip_time(&self) -> Result<u32> {
+        let hash = self.tip_hash_raw().await?;
+        let block = self.get_json(&format!("/block/{}", hash.trim())).await?;
+        block["timestamp"]
+            .as_u64()
+            .map(|t| t as u32)
+            .ok_or_else(|| {
+                SwapError::Transient("block JSON lacks timestamp (still indexing?)".into())
+            })
+    }
+
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(TARGET_BLOCK_SECS)
     }
 
     async fn median_time_past(&self) -> Result<u32> {

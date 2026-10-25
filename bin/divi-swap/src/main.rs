@@ -670,14 +670,23 @@ fn live_counter(
     })
 }
 
+/// The wall clock in unix seconds, for the expiry sweep's freshness check.
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().min(u32::MAX as u64) as u32)
+}
+
 /// Live BTC, LTC or ZEC taker: release the lock inputs of every finished swap in `--db`
-/// ([`divi_swap_cli::reservations::release_finished`]), then those of every lock `counter`
-/// finds in no mempool and no block once its swap's deadline has passed
-/// ([`InputReservations::release_expired_swaps`]). Run before each taker command (a swap
-/// that finished, or a lock that expired, since the last one) and after each command that
-/// can finish a swap, whether or not that command succeeded. A failure only warns: an
+/// ([`divi_swap_cli::reservations::release_finished`]), then those of every lock past its
+/// swap's deadline that `counter`, fresh at wall-clock `now`, has found in no mempool and no
+/// block on two checks [`divi_swap::reservation::EXPIRY_ABSENT_BLOCKS`] blocks apart
+/// ([`InputReservations::release_expired_swaps`]; the first check's height is kept in
+/// `--db`, so the second can come from a later command). Run before each taker command (a
+/// swap that finished, or a lock that expired, since the last one) and after each command
+/// that can finish a swap, whether or not that command succeeded. A failure only warns: an
 /// unreleased input stays out of coin selection, never spent twice.
-async fn sweep_locks(cli: &Cli, counter: &dyn ChainBackend) {
+async fn sweep_locks(cli: &Cli, counter: &dyn ChainBackend, now: u32) {
     if !matches!(cli.backend, BackendArg::Live)
         || !matches!(cli.counter_chain, Chain::Btc | Chain::Ltc | Chain::Zec)
     {
@@ -695,7 +704,7 @@ async fn sweep_locks(cli: &Cli, counter: &dyn ChainBackend) {
         Ok(n) => tracing::info!(n, "released the lock inputs of finished taker swaps"),
         Err(e) => tracing::warn!(error = %e, "could not release finished taker lock inputs"),
     }
-    match res.release_expired_swaps(&store, counter).await {
+    match res.release_expired_swaps(&store, counter, now).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(
             n,
@@ -1037,7 +1046,7 @@ async fn ready_backends(cli: &Cli) -> Result<Backends> {
     let b = backends(cli)?;
     ltc_preflight(cli, &b).await?;
     sync_divi(cli, &b).await?;
-    sweep_locks(cli, b.btc.as_ref()).await;
+    sweep_locks(cli, b.btc.as_ref(), unix_now()).await;
     Ok(b)
 }
 
@@ -1048,11 +1057,11 @@ async fn taker(cli: &Cli) -> Result<Taker> {
 
 /// `claim`, `refund` and `run` on the prepared backends `b`, then [`sweep_locks`] whether
 /// the command succeeded or not (refunding a dropped lock fails, and that is when its inputs
-/// may be due for release). Returns the line the command prints.
-async fn finishing(cli: &Cli, sessions: &Sessions, b: Backends) -> Result<String> {
+/// may be due for release), with the wall clock at `now`. Returns the line the command prints.
+async fn finishing(cli: &Cli, sessions: &Sessions, b: Backends, now: u32) -> Result<String> {
     let counter = b.btc.clone();
     let out = finish(cli, sessions, b).await;
-    sweep_locks(cli, counter.as_ref()).await;
+    sweep_locks(cli, counter.as_ref(), now).await;
     out
 }
 
@@ -1159,7 +1168,7 @@ async fn main() -> Result<()> {
         Cmd::Claim { .. } | Cmd::Refund { .. } | Cmd::Run { .. } => {
             println!(
                 "{}",
-                finishing(&cli, &sessions, ready_backends(&cli).await?).await?
+                finishing(&cli, &sessions, ready_backends(&cli).await?, unix_now()).await?
             );
         }
         Cmd::Tip { .. } => unreachable!("handled before the match"),
@@ -2333,7 +2342,7 @@ mod tests {
         let mut refunding = taker_swap("b", TakerState::Refunded, counter, &b);
         refunding.taker_leg_refund = Some(b.tx.clone());
         store.put_taker_swap(&refunding).unwrap();
-        refund_command(&db, chain, "a", three.clone())
+        refund_command(&db, chain, "a", three.clone(), unix_now())
             .await
             .unwrap();
         assert_eq!(held(&db), vec![(counter, b.tx.txid)]);
@@ -2343,7 +2352,7 @@ mod tests {
         // Refund: `b` finishes; released once, and a restart releases nothing twice.
         refunding.state = TakerState::Done;
         store.put_taker_swap(&refunding).unwrap();
-        refund_command(&db, chain, "b", three.clone())
+        refund_command(&db, chain, "b", three.clone(), unix_now())
             .await
             .unwrap();
         assert_eq!(held(&db), vec![(counter, next.tx.txid)]);
@@ -2502,7 +2511,7 @@ mod tests {
         let mut c = live_cli("btc", &db);
         c.backend = BackendArg::Mock;
         let counter = MockChain::new(Chain::Btc, T0, 600).backend(4, Amount(Amount::COIN));
-        sweep_locks(&c, &counter).await;
+        sweep_locks(&c, &counter, T0).await;
         assert!(!db.exists(), "a mock run never opens --db for reservations");
     }
 
@@ -2536,12 +2545,14 @@ mod tests {
         }
     }
 
-    /// `divi-swap refund <swap>` on `counter` (DIVI is a fresh mock: a refund never uses it).
+    /// `divi-swap refund <swap>` on `counter` with the wall clock at `now` (DIVI is a fresh
+    /// mock: a refund never uses it).
     async fn refund_command(
         db: &std::path::Path,
         chain: &str,
         swap: &str,
         counter: Arc<dyn ChainBackend>,
+        now: u32,
     ) -> Result<String> {
         let cli = command(db, chain, &["refund", "--swap", swap]);
         let divi = MockChain::new(Chain::Divi, T0, 60).backend(3, Amount(Amount::COIN));
@@ -2549,6 +2560,7 @@ mod tests {
             &cli,
             &Sessions::beside(db),
             prepared(Arc::new(divi), counter),
+            now,
         )
         .await
     }
@@ -2600,7 +2612,7 @@ mod tests {
         let (c, b) = btc_chain();
         let s = locked_swap(&db, b.as_ref(), "r", TakerState::Locked, 1).await;
         c.mine(1);
-        let refund = || refund_command(&db, "btc", "r", b.clone());
+        let refund = || refund_command(&db, "btc", "r", b.clone(), c.mtp());
 
         assert_eq!(refund().await.unwrap(), "Locked", "before the deadline");
         assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
@@ -2619,7 +2631,8 @@ mod tests {
         let (c, b) = btc_chain();
         let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
         c.forget(&lock_of(&s)); // in no mempool and no block
-        let refund = || refund_command(&db, "btc", "dropped", b.clone());
+        let refund_at = |now: u32| refund_command(&db, "btc", "dropped", b.clone(), now);
+        let refund = || refund_at(c.mtp());
 
         assert_eq!(refund().await.unwrap(), "Locked");
         assert_eq!(
@@ -2628,9 +2641,28 @@ mod tests {
             "deadline not passed"
         );
         c.advance_time(3_600);
-        let err = refund().await.unwrap_err();
-        assert!(err.to_string().contains("missing inputs"), "{err:#}");
-        assert_eq!(held(&db), vec![], "past the deadline and nowhere: released");
+        for _ in 0..2 {
+            let err = refund().await.unwrap_err();
+            assert!(err.to_string().contains("missing inputs"), "{err:#}");
+            assert_eq!(
+                held(&db),
+                vec![(Chain::Btc, lock_of(&s))],
+                "absent past the deadline, but only at one height"
+            );
+        }
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(refund_at(c.mtp() + 2 * 600 + 1).await.is_err());
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Btc, lock_of(&s))],
+            "a stale backend releases nothing"
+        );
+        assert!(refund().await.is_err());
+        assert_eq!(
+            held(&db),
+            vec![],
+            "absent past the deadline six blocks apart: released"
+        );
     }
 
     #[tokio::test]
@@ -2640,7 +2672,9 @@ mod tests {
         let (c, b) = btc_chain();
         let s = locked_swap(&db, b.as_ref(), "slow", TakerState::Locked, 1).await;
         c.advance_time(3_600); // the lock never confirmed, but it is still in the mempool
-        let out = refund_command(&db, "btc", "slow", b.clone()).await.unwrap();
+        let out = refund_command(&db, "btc", "slow", b.clone(), c.mtp())
+            .await
+            .unwrap();
         assert_eq!(out, "Refunded", "the refund spends the pending lock");
         assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
     }
@@ -2682,7 +2716,14 @@ mod tests {
             .unwrap();
         let cli = command(&db, "btc", &["claim", "--swap", "c"]);
         let taker_divi: Arc<dyn ChainBackend> = Arc::new(divi.backend(3, Amount(Amount::COIN)));
-        let claim = || finishing(&cli, &sessions, prepared(taker_divi.clone(), b.clone()));
+        let claim = || {
+            finishing(
+                &cli,
+                &sessions,
+                prepared(taker_divi.clone(), b.clone()),
+                btc.mtp(),
+            )
+        };
 
         assert_eq!(claim().await.unwrap(), "Claimed", "claim broadcast");
         assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&s))]);
@@ -2714,16 +2755,22 @@ mod tests {
                 "5000",
             ],
         );
-        let divi = MockChain::new(Chain::Divi, T0, 60).backend(3, Amount(Amount::COIN));
-        let run = finishing(
-            &cli,
-            &Sessions::beside(&db),
-            prepared(Arc::new(divi), b.clone()),
-        )
-        .await;
-        assert!(run.is_err(), "no maker answers the quote");
-        // The finished swap's lock and the dropped one past its deadline are released; the
-        // lock still in the mempool keeps its input.
+        let divi: Arc<dyn ChainBackend> =
+            Arc::new(MockChain::new(Chain::Divi, T0, 60).backend(3, Amount(Amount::COIN)));
+        let sessions = Sessions::beside(&db);
+        let run = || finishing(&cli, &sessions, prepared(divi.clone(), b.clone()), c.mtp());
+        assert!(run().await.is_err(), "no maker answers the quote");
+        // The finished swap's lock is released; the dropped one has had one absent check.
+        let mut want = vec![
+            (Chain::Btc, lock_of(&dropped)),
+            (Chain::Btc, lock_of(&live)),
+        ];
+        want.sort_by_key(|(_, t)| t.0);
+        assert_eq!(held(&db), want);
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(run().await.is_err());
+        // Six blocks later the dropped lock is released too; the lock still in the mempool
+        // (now mined) keeps its input.
         assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&live))]);
     }
 }

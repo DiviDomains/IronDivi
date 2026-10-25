@@ -41,7 +41,30 @@ CREATE TABLE IF NOT EXISTS input_reservation (
     PRIMARY KEY (chain, in_txid, in_vout)
 );
 CREATE INDEX IF NOT EXISTS input_reservation_by_tx ON input_reservation (chain, reserved_by);
+CREATE TABLE IF NOT EXISTS lock_absence (
+    chain               TEXT    NOT NULL,
+    lock_txid           TEXT    NOT NULL,
+    first_absent_height INTEGER NOT NULL,
+    PRIMARY KEY (chain, lock_txid)
+);
+CREATE TABLE IF NOT EXISTS expiry_tip (
+    chain  TEXT    NOT NULL PRIMARY KEY,
+    height INTEGER NOT NULL
+);
 ";
+
+/// Blocks between the first and the releasing absent check of a lock past its deadline.
+pub const EXPIRY_ABSENT_BLOCKS: u64 = 6;
+
+/// How far behind the wall clock a backend's tip may be, in target block spacings, for the
+/// expiry sweep to trust it.
+pub const EXPIRY_MAX_TIP_LAG_BLOCKS: u32 = 2;
+
+/// A backend whose tip time is more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target spacings
+/// behind `now` (or which does not say its spacing) is stale.
+fn tip_is_fresh(tip_time: u32, spacing: Option<u32>, now: u32) -> bool {
+    spacing.is_some_and(|s| now.saturating_sub(tip_time) <= EXPIRY_MAX_TIP_LAG_BLOCKS * s)
+}
 
 fn storage<E: std::fmt::Display>(e: E) -> SwapError {
     SwapError::Storage(e.to_string())
@@ -254,18 +277,30 @@ impl InputReservations {
 
     /// Release the inputs of each lock in `locks` (its txid and its HTLC locktime, the
     /// swap's deadline) that holds a reservation on `backend`'s chain, once `backend`'s
-    /// median time past has reached the deadline and `backend` finds the lock neither in
-    /// the mempool nor on chain. Such a lock was dropped; if it ever came back it would be
+    /// median time past has reached the deadline and `backend` has found the lock neither in
+    /// the mempool nor on chain on two checks at least [`EXPIRY_ABSENT_BLOCKS`] blocks
+    /// apart by its tip height. Such a lock was dropped; if it ever came back it would be
     /// refundable at once, so its inputs can fund the next swap without risking funds, and
-    /// a rebroadcast of it after they are reused is refused by [`Self::reserve`]. A lock in
+    /// a rebroadcast of it after they are reused is refused by [`Self::reserve`].
+    ///
+    /// The first absent check past the deadline records its tip height in `lock_absence`
+    /// (so a restart keeps it); a check that finds the lock clears the record. A lock in
     /// the mempool or on chain, or before its deadline, keeps its inputs; so does every
     /// reservation `locks` does not name (`divi-swapd --release-reservation` is the
-    /// override for those). A backend error stops the sweep with the error and releases
+    /// override for those). The checks run only while `backend` is fresh, in this order:
+    /// - a tip more than [`EXPIRY_MAX_TIP_LAG_BLOCKS`] target spacings behind `now` (unix
+    ///   seconds), or a backend that reports no spacing, is stale: nothing is checked,
+    ///   recorded or released, so a lagging endpoint can neither release nor reset a count;
+    /// - a tip height below the last fresh one (`expiry_tip`) is a reorg: every absence
+    ///   record on the chain is cleared, the new height is recorded, and nothing is released.
+    ///
+    /// Either case is logged. A backend error stops the sweep with the error and releases
     /// nothing more. Returns how many inputs were released.
     pub async fn release_expired(
         &self,
         backend: &dyn ChainBackend,
         locks: &[(Txid, u32)],
+        now: u32,
     ) -> Result<usize> {
         let chain = backend.chain();
         let held: HashSet<Txid> = self
@@ -274,15 +309,53 @@ impl InputReservations {
             .filter(|r| r.chain == chain)
             .map(|r| r.reserved_by)
             .collect();
+        self.forget_absences(chain, |t| !held.contains(t))?;
         let due: Vec<_> = locks.iter().filter(|(t, _)| held.contains(t)).collect();
         if due.is_empty() {
+            return Ok(0);
+        }
+        let height = backend.tip_height().await?;
+        let tip_time = backend.tip_time().await?;
+        if !tip_is_fresh(tip_time, backend.target_block_secs(), now) {
+            tracing::warn!(
+                %chain,
+                height,
+                tip_time,
+                now,
+                spacing = ?backend.target_block_secs(),
+                "backend tip is stale; not releasing expired locks"
+            );
+            return Ok(0);
+        }
+        let last = self.last_tip(chain)?;
+        self.record_tip(chain, height)?;
+        if let Some(last) = last.filter(|l| height < *l) {
+            self.forget_absences(chain, |_| true)?;
+            tracing::warn!(
+                %chain,
+                height,
+                last,
+                "backend tip height went backwards; cleared lock absence records, not releasing"
+            );
             return Ok(0);
         }
         let mtp = backend.median_time_past().await?;
         let mut released = 0;
         for (txid, deadline) in due {
-            if mtp >= *deadline && backend.confirmations(txid).await?.is_none() {
-                released += self.release_tx(chain, txid)?;
+            if mtp < *deadline {
+                continue;
+            }
+            if backend.confirmations(txid).await?.is_some() {
+                self.forget_absences(chain, |t| t == txid)?;
+                continue;
+            }
+            match self.first_absent_height(chain, txid)? {
+                None => self.record_absence(chain, txid, height)?,
+                Some(first) if height >= first + EXPIRY_ABSENT_BLOCKS => {
+                    released += self.release_tx(chain, txid)?;
+                    self.forget_absences(chain, |t| t == txid)?;
+                }
+                Some(_) => {}
             }
         }
         Ok(released)
@@ -294,9 +367,91 @@ impl InputReservations {
         &self,
         store: &Store,
         backend: &dyn ChainBackend,
+        now: u32,
     ) -> Result<usize> {
-        self.release_expired(backend, &swap_locks(store, backend.chain())?)
+        self.release_expired(backend, &swap_locks(store, backend.chain())?, now)
             .await
+    }
+
+    /// The tip height at which the expiry sweep first found `lock` absent past its
+    /// deadline, if that record stands.
+    pub fn first_absent_height(&self, chain: Chain, lock: &Txid) -> Result<Option<u64>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT first_absent_height FROM lock_absence WHERE chain = ?1 AND lock_txid = ?2",
+                params![chain.to_string(), lock.to_rpc_hex()],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|h| Some(h as u64))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .map_err(storage)
+    }
+
+    fn record_absence(&self, chain: Chain, lock: &Txid, height: u64) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO lock_absence (chain, lock_txid, first_absent_height) \
+                 VALUES (?1, ?2, ?3)",
+                params![chain.to_string(), lock.to_rpc_hex(), height as i64],
+            )
+            .map(|_| ())
+            .map_err(storage)
+    }
+
+    /// Delete the absence records on `chain` whose lock `which` selects.
+    fn forget_absences(&self, chain: Chain, which: impl Fn(&Txid) -> bool) -> Result<()> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT lock_txid FROM lock_absence WHERE chain = ?1")
+            .map_err(storage)?;
+        let ids = stmt
+            .query_map(params![chain.to_string()], |r| r.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        for id in ids {
+            if which(&Txid::from_rpc_hex(&id)?) {
+                conn.execute(
+                    "DELETE FROM lock_absence WHERE chain = ?1 AND lock_txid = ?2",
+                    params![chain.to_string(), id],
+                )
+                .map_err(storage)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn last_tip(&self, chain: Chain) -> Result<Option<u64>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT height FROM expiry_tip WHERE chain = ?1",
+                params![chain.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|h| Some(h as u64))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .map_err(storage)
+    }
+
+    fn record_tip(&self, chain: Chain, height: u64) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO expiry_tip (chain, height) VALUES (?1, ?2) \
+                 ON CONFLICT (chain) DO UPDATE SET height = excluded.height",
+                params![chain.to_string(), height as i64],
+            )
+            .map(|_| ())
+            .map_err(storage)
     }
 }
 
@@ -330,7 +485,7 @@ mod tests {
     use super::*;
     use crate::htlc::HtlcParams;
     use crate::mock::{MockBackend, MockChain};
-    use crate::types::Amount;
+    use crate::types::{Amount, SignedTx};
 
     const T0: u32 = 1_700_000_000;
     const DEADLINE: u32 = T0 + 3_600;
@@ -345,6 +500,11 @@ mod tests {
     /// Broadcast a lock (hash `[n; 32]`, deadline [`DEADLINE`]) and reserve input `[n; 32]:0`
     /// for it, as a live backend does.
     async fn lock(r: &InputReservations, b: &MockBackend, n: u8) -> Txid {
+        lock_tx(r, b, n).await.txid
+    }
+
+    /// [`lock`], keeping the signed bytes for a rebroadcast.
+    async fn lock_tx(r: &InputReservations, b: &MockBackend, n: u8) -> SignedTx {
         let htlc = HtlcParams {
             hash: [n; 32],
             claim_pubkey: [2; 33],
@@ -355,7 +515,7 @@ mod tests {
         let f = b.build_funding(&htlc, Amount(1_000)).await.unwrap();
         b.broadcast(&f.tx).await.unwrap();
         r.reserve(Chain::Btc, &f.tx.txid, &[op(n, 0)]).unwrap();
-        f.tx.txid
+        f.tx
     }
 
     fn held_by(r: &InputReservations) -> HashSet<Txid> {
@@ -366,8 +526,18 @@ mod tests {
             .collect()
     }
 
+    /// One sweep with the wall clock at the mock's own clock: a fresh backend.
+    async fn sweep(
+        r: &InputReservations,
+        c: &MockChain,
+        b: &MockBackend,
+        locks: &[(Txid, u32)],
+    ) -> usize {
+        r.release_expired(b, locks, c.mtp()).await.unwrap()
+    }
+
     #[tokio::test]
-    async fn a_dropped_lock_past_its_deadline_releases_its_inputs() {
+    async fn a_dropped_lock_past_its_deadline_releases_after_two_absent_checks_six_blocks_apart() {
         let (c, b) = chain();
         let r = InputReservations::in_memory().unwrap();
         let t = lock(&r, &b, 1).await;
@@ -375,16 +545,160 @@ mod tests {
         let locks = [(t, DEADLINE)];
 
         c.advance_time(DEADLINE - T0 - 1);
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
-        assert_eq!(held_by(&r), HashSet::from([t]), "one second early: kept");
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        assert_eq!(
+            r.first_absent_height(Chain::Btc, &t).unwrap(),
+            None,
+            "before the deadline nothing counts"
+        );
 
         c.advance_time(1);
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 1);
+        let first = c.height();
+        assert_eq!(
+            sweep(&r, &c, &b, &locks).await,
+            0,
+            "one absent check is not enough"
+        );
+        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), Some(first));
+        assert_eq!(
+            sweep(&r, &c, &b, &locks).await,
+            0,
+            "a second check at the same height is not a new one"
+        );
+        c.mine(EXPIRY_ABSENT_BLOCKS - 1);
+        assert_eq!(
+            sweep(&r, &c, &b, &locks).await,
+            0,
+            "five blocks apart: kept"
+        );
+        assert_eq!(held_by(&r), HashSet::from([t]));
+
+        c.mine(1);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 1);
         assert!(r.reserved(Chain::Btc).unwrap().is_empty());
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), None);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
         // The freed input can fund the next lock.
         r.reserve(Chain::Btc, &Txid([0x77; 32]), &[op(1, 0)])
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_absent_height_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swap.db");
+        let (c, b) = chain();
+        let t = {
+            let r = InputReservations::open(&db).unwrap();
+            let t = lock(&r, &b, 1).await;
+            c.forget(&t);
+            c.advance_time(2 * 3_600);
+            assert_eq!(sweep(&r, &c, &b, &[(t, DEADLINE)]).await, 0);
+            t
+        };
+        c.mine(EXPIRY_ABSENT_BLOCKS);
+        let r = InputReservations::open(&db).unwrap();
+        assert!(r.first_absent_height(Chain::Btc, &t).unwrap().is_some());
+        assert_eq!(
+            sweep(&r, &c, &b, &[(t, DEADLINE)]).await,
+            1,
+            "the restart did not reset the count"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lagging_backend_releases_nothing_and_records_nothing() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        c.advance_time(2 * 3_600);
+        let locks = [(t, DEADLINE)];
+        let limit = EXPIRY_MAX_TIP_LAG_BLOCKS * 600;
+
+        // Its tip is one second past two target spacings behind the wall clock.
+        let stale = |c: &MockChain| c.mtp() + limit + 1;
+        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
+        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), None);
+        c.mine(EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
+        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), None);
+
+        // A fresh view with an absent record in place: a stale one does not release it either.
+        assert_eq!(
+            r.release_expired(&b, &locks, c.mtp() + limit)
+                .await
+                .unwrap(),
+            0
+        );
+        c.mine(EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(r.release_expired(&b, &locks, stale(&c)).await.unwrap(), 0);
+        assert_eq!(held_by(&r), HashSet::from([t]));
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_lock_seen_absent_then_present_keeps_its_inputs_and_clears_the_record() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let f = lock_tx(&r, &b, 1).await;
+        let t = f.txid;
+        c.forget(&t);
+        c.advance_time(2 * 3_600);
+        let locks = [(t, DEADLINE)];
+
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        assert!(r.first_absent_height(Chain::Btc, &t).unwrap().is_some());
+        b.broadcast(&f).await.unwrap(); // back in the mempool
+        c.mine(EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        assert_eq!(
+            r.first_absent_height(Chain::Btc, &t).unwrap(),
+            None,
+            "seen present: cleared"
+        );
+
+        // Gone again: the count starts over from this height.
+        c.forget(&t);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        assert_eq!(
+            r.first_absent_height(Chain::Btc, &t).unwrap(),
+            Some(c.height())
+        );
+        assert_eq!(held_by(&r), HashSet::from([t]));
+    }
+
+    #[tokio::test]
+    async fn a_reorg_around_the_deadline_releases_nothing_until_two_fresh_checks_six_blocks_apart()
+    {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        c.advance_time(DEADLINE - T0);
+        c.mine(10);
+        let locks = [(t, DEADLINE)];
+
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        c.mine(EXPIRY_ABSENT_BLOCKS - 1);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        // A reorg to a shorter chain, one block above the first check.
+        c.rewind(EXPIRY_ABSENT_BLOCKS - 2);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0, "height went backwards");
+        assert_eq!(
+            r.first_absent_height(Chain::Btc, &t).unwrap(),
+            None,
+            "every record cleared"
+        );
+        // Six blocks past the old record: kept, since the reorg cleared it.
+        c.mine(EXPIRY_ABSENT_BLOCKS - 1);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        assert_eq!(held_by(&r), HashSet::from([t]));
+
+        // Fresh checks on the new chain: the first records, six blocks later releases.
+        let first = r.first_absent_height(Chain::Btc, &t).unwrap().unwrap();
+        c.mine(first + EXPIRY_ABSENT_BLOCKS - c.height());
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 1);
     }
 
     #[tokio::test]
@@ -396,10 +710,15 @@ mod tests {
         let pending = lock(&r, &b, 2).await;
         c.advance_time(2 * 3_600);
         let locks = [(mined, DEADLINE), (pending, DEADLINE)];
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        for _ in 0..2 {
+            assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+            c.mine(EXPIRY_ABSENT_BLOCKS);
+            c.unconfirm(&pending);
+        }
         c.unconfirm(&mined); // reorged back into the mempool
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
         assert_eq!(held_by(&r), HashSet::from([mined, pending]));
+        assert_eq!(r.first_absent_height(Chain::Btc, &mined).unwrap(), None);
     }
 
     #[tokio::test]
@@ -416,11 +735,13 @@ mod tests {
         let locks = [(named, DEADLINE)];
 
         c.set_offline(true);
-        assert!(r.release_expired(&b, &locks).await.is_err());
+        assert!(r.release_expired(&b, &locks, c.mtp()).await.is_err());
         assert_eq!(r.list_all().unwrap().len(), 3, "an error releases nothing");
 
         c.set_offline(false);
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 1);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 0);
+        c.mine(EXPIRY_ABSENT_BLOCKS);
+        assert_eq!(sweep(&r, &c, &b, &locks).await, 1);
         let left: Vec<_> = r
             .list_all()
             .unwrap()
@@ -428,6 +749,21 @@ mod tests {
             .map(|r| (r.chain, r.reserved_by))
             .collect();
         assert_eq!(left, vec![(Chain::Btc, orphan), (Chain::Ltc, named)]);
+        assert_eq!(r.first_absent_height(Chain::Btc, &orphan).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_released_reservation_drops_its_absence_record() {
+        let (c, b) = chain();
+        let r = InputReservations::in_memory().unwrap();
+        let t = lock(&r, &b, 1).await;
+        c.forget(&t);
+        c.advance_time(2 * 3_600);
+        assert_eq!(sweep(&r, &c, &b, &[(t, DEADLINE)]).await, 0);
+        assert!(r.first_absent_height(Chain::Btc, &t).unwrap().is_some());
+        r.release_tx(Chain::Btc, &t).unwrap(); // the operator override
+        assert_eq!(sweep(&r, &c, &b, &[]).await, 0);
+        assert_eq!(r.first_absent_height(Chain::Btc, &t).unwrap(), None);
     }
 
     #[tokio::test]
@@ -436,7 +772,18 @@ mod tests {
         let r = InputReservations::in_memory().unwrap();
         c.set_offline(true);
         let locks = [(Txid([1; 32]), DEADLINE)];
-        assert_eq!(r.release_expired(&b, &locks).await.unwrap(), 0);
+        assert_eq!(r.release_expired(&b, &locks, 0).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn a_backend_without_a_spacing_is_never_fresh() {
+        assert!(tip_is_fresh(100, Some(600), 1_300));
+        assert!(!tip_is_fresh(100, Some(600), 1_301));
+        assert!(
+            tip_is_fresh(100, Some(600), 50),
+            "a tip ahead of the clock is not stale"
+        );
+        assert!(!tip_is_fresh(100, None, 100));
     }
 
     fn op(n: u8, vout: u32) -> Outpoint {

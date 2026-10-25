@@ -103,6 +103,7 @@ pub struct BtcBackend {
     key: SecretKey,
     pubkey: CompressedPublicKey,
     address: Address,
+    network: Network,
     fees: FeePolicy,
     reservations: Option<InputReservations>,
 }
@@ -220,6 +221,7 @@ impl BtcBackend {
             key,
             pubkey,
             address,
+            network,
             fees,
             reservations: None,
         })
@@ -427,6 +429,24 @@ impl ChainBackend for BtcBackend {
 
     async fn tip_hash(&self) -> Result<String> {
         divi_swap::backend::normalize_block_hash(&self.tip_hash_raw().await?)
+    }
+
+    async fn tip_time(&self) -> Result<u32> {
+        let hash = self.tip_hash_raw().await?;
+        let block = self.get_json(&format!("/block/{}", hash.trim())).await?;
+        block["timestamp"]
+            .as_u64()
+            .map(|t| t as u32)
+            .ok_or_else(|| {
+                SwapError::Transient("block JSON lacks timestamp (still indexing?)".into())
+            })
+    }
+
+    /// `pow_target_spacing` of rust-bitcoin's consensus parameters for this network
+    /// (`bitcoin::params::Params`, 600 s on every network; Bitcoin Core's
+    /// `consensus.nPowTargetSpacing = 10 * 60` in `src/kernel/chainparams.cpp`).
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(bitcoin::params::Params::new(self.network).pow_target_spacing as u32)
     }
 
     async fn median_time_past(&self) -> Result<u32> {

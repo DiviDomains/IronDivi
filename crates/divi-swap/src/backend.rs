@@ -57,6 +57,22 @@ pub trait ChainBackend: Send + Sync {
     /// Median time past of the tip (what CLTV unix-time locktimes are compared against).
     async fn median_time_past(&self) -> Result<u32>;
 
+    /// Header time of the current best block (unix seconds), so a caller can tell a backend
+    /// that has stopped following the chain. A backend that cannot report it fails with
+    /// `Transient` (the default), and a caller that needs a fresh view acts on nothing.
+    async fn tip_time(&self) -> Result<u32> {
+        Err(crate::error::SwapError::Transient(format!(
+            "the {} backend does not report its tip time",
+            self.chain()
+        )))
+    }
+
+    /// The chain's target block spacing in seconds, from its consensus parameters; `None`
+    /// (the default) if this backend does not say.
+    fn target_block_secs(&self) -> Option<u32> {
+        None
+    }
+
     /// Select coins and build + sign a transaction paying `amount` to the HTLC (P2SH on
     /// DIVI, P2WSH on BTC), change back to this key. **Does not broadcast.**
     ///

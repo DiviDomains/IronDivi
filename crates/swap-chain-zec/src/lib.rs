@@ -112,6 +112,10 @@ pub fn lightwalletd_endpoints(network: &str) -> Result<Vec<String>> {
 /// no "find the spend of this outpoint" index on this API, only block scanning.
 const MAX_SCAN_BLOCKS: u64 = 200;
 
+/// Zcash's target block spacing in seconds since Blossom (ZIP 208), on mainnet and
+/// testnet: zcashd's `POST_BLOSSOM_POW_TARGET_SPACING = 75` in `src/consensus/params.h`.
+pub const TARGET_BLOCK_SECS: u32 = 75;
+
 /// How the zat/byte rate is chosen.
 #[derive(Debug, Clone, Copy)]
 pub enum FeePolicy {
@@ -425,6 +429,22 @@ impl ChainBackend for ZecBackend {
     async fn tip_hash(&self) -> Result<String> {
         let tip = self.client.latest_block().await.map_err(SwapError::from)?;
         display_block_hash(&tip.hash)
+    }
+
+    async fn tip_time(&self) -> Result<u32> {
+        let tip = self.tip_height().await?;
+        let blocks = self
+            .client
+            .block_range(tip, tip)
+            .await
+            .map_err(SwapError::from)?;
+        blocks.last().map(|b| b.time).ok_or_else(|| {
+            SwapError::Transient(format!("lightwalletd returned no block at tip {tip}"))
+        })
+    }
+
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(TARGET_BLOCK_SECS)
     }
 
     async fn median_time_past(&self) -> Result<u32> {

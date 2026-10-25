@@ -119,6 +119,19 @@ impl MockChain {
         }
     }
 
+    /// Reorg to a shorter chain: the tip goes back `n` blocks and every tx mined above the
+    /// new tip returns to the mempool. MTP stays. Test-only.
+    pub fn rewind(&self, n: u64) {
+        let mut s = self.state.lock();
+        let h = s.height.saturating_sub(n);
+        s.height = h;
+        for (_, mined) in s.txs.values_mut() {
+            if mined.is_some_and(|m| m > h) {
+                *mined = None;
+            }
+        }
+    }
+
     /// Reorg: `txid` (and every tx that spends its outputs) is gone from chain and mempool,
     /// and a dropped funding tx gives its inputs back, so rebroadcasting it works again.
     /// Test-only; unknown ids are ignored.
@@ -299,6 +312,16 @@ impl ChainBackend for MockBackend {
     async fn median_time_past(&self) -> Result<u32> {
         self.check_online()?;
         Ok(self.chain.mtp())
+    }
+
+    /// The mock has one clock: its tip is as recent as its MTP.
+    async fn tip_time(&self) -> Result<u32> {
+        self.check_online()?;
+        Ok(self.chain.mtp())
+    }
+
+    fn target_block_secs(&self) -> Option<u32> {
+        Some(self.chain.block_secs)
     }
 
     async fn build_funding(&self, htlc: &HtlcParams, amount: Amount) -> Result<Funding> {
