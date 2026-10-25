@@ -1313,7 +1313,9 @@ impl Chain {
     /// one below, and each stored block body reads back (RocksDB checks its CRC on read),
     /// hashes to its index entry and matches its merkle root; stored undo data must decode.
     /// Bodies may be absent only where pruning or a snapshot import removed them.
-    /// `depth` 0 checks the whole chain (C++ treats `-checkblocks=0` the same way).
+    /// As VerifyDB, the heights from the tip down to tip - `depth` are checked, the
+    /// genesis block never (verifyDb.cpp:69-88); `depth` 0, or one past the height,
+    /// checks every block above genesis (C++ treats `-checkblocks=0` the same way).
     ///
     /// Returns the number of heights checked.
     pub fn verify_recent_blocks(&self, depth: u32) -> Result<u32, StorageError> {
@@ -1324,9 +1326,12 @@ impl Chain {
             .db
             .prune_height()
             .max(self.db.snapshot_base().map(|(h, _)| h).unwrap_or(0));
+        if tip.height == 0 {
+            return Ok(0);
+        }
         let lowest = match depth {
-            0 => 0,
-            n => tip.height.saturating_sub(n - 1),
+            0 => 1,
+            n => tip.height.saturating_sub(n).max(1),
         };
         let damaged = |height: u32, what: String| {
             StorageError::ChainState(format!("database is damaged at height {height}: {what}"))
@@ -7528,22 +7533,35 @@ mod tests {
             hash = chain.accept_block(b.clone()).unwrap().hash;
             blocks.push((hash, b));
         }
-        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 6, "0 = whole chain");
-        assert_eq!(chain.verify_recent_blocks(3).unwrap(), 3);
+        // As VerifyDB: tip - depth up to the tip, genesis never (verifyDb.cpp:69-88)
+        assert_eq!(
+            chain.verify_recent_blocks(0).unwrap(),
+            5,
+            "0 = every block above genesis"
+        );
+        assert_eq!(
+            chain.verify_recent_blocks(3).unwrap(),
+            4,
+            "tip - 3 up to the tip"
+        );
         assert_eq!(
             chain.verify_recent_blocks(100).unwrap(),
-            6,
-            "tip down to genesis"
+            5,
+            "tip down to height 1"
         );
         // Store block 2's body under block 4's hash: wrong data for that key
         chain.db.store_block(&blocks[3].0, &blocks[1].1).unwrap();
         let err = chain.verify_recent_blocks(100).unwrap_err().to_string();
         assert!(err.contains("damaged at height 4"), "{err}");
-        assert_eq!(
-            chain.verify_recent_blocks(1).unwrap(),
-            1,
-            "height 4 not in range"
+        assert!(
+            chain.verify_recent_blocks(1).is_err(),
+            "depth 1 checks the tip and the block below it"
         );
+        // A damaged genesis block is not looked at
+        let genesis = chain.db.get_height_mapping(0).unwrap().unwrap();
+        chain.db.store_block(&blocks[3].0, &blocks[3].1).unwrap();
+        chain.db.store_block(&genesis, &blocks[0].1).unwrap();
+        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 5);
     }
 
     /// getchaintips must report side branches, not just the active tip.

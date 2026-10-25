@@ -12,6 +12,7 @@
 use crate::error::{codes, Error, RpcError};
 use crate::mn_broadcast::{self, BroadcastRelay, BroadcastStore, MnContext};
 use crate::mn_list::MasternodeList;
+use crate::mn_votes::MasternodeVotes;
 use crate::protocol::Params;
 use divi_masternode::{MasternodeManager, MasternodeRpc as MasternodeRpcImpl, PaymentVoteTracker};
 use divi_storage::Chain;
@@ -63,12 +64,16 @@ pub struct MasternodeRpc {
     vote_tracker: Arc<RwLock<PaymentVoteTracker>>,
     /// Pre-signed broadcasts (`importmnbroadcast` / `listmnbroadcasts`)
     stored: BroadcastStore,
-    /// Datadir holding `masternode.conf`
+    /// Datadir holding `mnbroadcasts.json`
     datadir: RwLock<Option<std::path::PathBuf>>,
+    /// masternode.conf (-mnconf; `<datadir>/masternode.conf` by default)
+    conf_path: RwLock<Option<std::path::PathBuf>>,
     /// Sends raw broadcast bytes to the P2P layer
     relay: RwLock<Option<BroadcastRelay>>,
     /// The masternodes the network announced, in Divi Core's form
     network_list: RwLock<Option<Arc<MasternodeList>>>,
+    /// The masternodes' payment votes
+    votes: RwLock<Option<Arc<MasternodeVotes>>>,
 }
 
 impl MasternodeRpc {
@@ -78,9 +83,15 @@ impl MasternodeRpc {
             vote_tracker: Arc::new(RwLock::new(PaymentVoteTracker::new(10, 3))),
             stored: BroadcastStore::default(),
             datadir: RwLock::new(None),
+            conf_path: RwLock::new(None),
             relay: RwLock::new(None),
             network_list: RwLock::new(None),
+            votes: RwLock::new(None),
         }
+    }
+
+    pub fn set_votes(&self, votes: Arc<MasternodeVotes>) {
+        *self.votes.write() = Some(votes);
     }
 
     pub fn set_network_list(&self, list: Arc<MasternodeList>) {
@@ -90,7 +101,15 @@ impl MasternodeRpc {
     /// Set the datadir: broadcasts persist to `mnbroadcasts.json`, config is `masternode.conf`
     pub fn set_datadir(&self, dir: std::path::PathBuf) {
         self.stored.set_path(dir.join("mnbroadcasts.json"));
+        if self.conf_path.read().is_none() {
+            *self.conf_path.write() = Some(dir.join("masternode.conf"));
+        }
         *self.datadir.write() = Some(dir);
+    }
+
+    /// The masternode.conf -mnconf names (masternodeconfig.cpp:33-38)
+    pub fn set_conf_path(&self, path: std::path::PathBuf) {
+        *self.conf_path.write() = Some(path);
     }
 
     pub fn set_broadcast_relay(&self, relay: BroadcastRelay) {
@@ -180,17 +199,37 @@ impl MasternodeRpc {
     /// exactly two are given; height h is listed only when the block it is scored
     /// with, at h - 101, is on the chain (GetBlockHashForScoring,
     /// MasternodeHelpers.cpp:75-86).
-    pub fn get_masternode_winners(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+    pub fn get_masternode_winners(
+        &self,
+        params: &Params,
+        chain: &Arc<Chain>,
+    ) -> Result<Value, Error> {
+        if let Some(votes) = self.votes.read().clone() {
+            let (blocks, filter) = Self::winners_args(params)?;
+            return Ok(votes.winners_json(chain, blocks as i64, filter));
+        }
+        self.winners_at(params, chain.height() as i32)
+    }
+
+    /// `blocks` (read with atoi, default 10) and the filter, read only when
+    /// there are exactly two arguments (rpcmasternode.cpp:489-552)
+    fn winners_args(params: &Params) -> Result<(i32, &str), Error> {
         if params.len() > 3 {
             return Err(Self::usage(GETMASTERNODEWINNERS_USAGE));
         }
-        self.get_rpc()?;
         let blocks = str_arg(params, 0)?.map(atoi).unwrap_or(10);
         let filter = if params.len() == 2 {
             str_arg(params, 1)?.unwrap_or("")
         } else {
             ""
         };
+        Ok((blocks, filter))
+    }
+
+    /// The winners with no vote known: every listed height "Unknown"
+    fn winners_at(&self, params: &Params, tip_height: i32) -> Result<Value, Error> {
+        let (blocks, filter) = Self::winners_args(params)?;
+        self.get_rpc()?;
         if !filter.is_empty() && !"Unknown".contains(filter) {
             return Ok(json!([]));
         }
@@ -289,10 +328,10 @@ impl MasternodeRpc {
             _ => {}
         }
         let conf = self
-            .datadir
+            .conf_path
             .read()
             .as_ref()
-            .map(|d| mn_broadcast::read_conf(&d.join("masternode.conf")))
+            .map(|p| mn_broadcast::read_conf(p))
             .unwrap_or_default();
         // This node never runs as the masternode itself, as on a C++ controller wallet
         Ok(mn_broadcast::start_masternode(
@@ -425,19 +464,19 @@ impl MasternodeRpc {
 
         match command {
             "status" => {
-                // Return basic sync status
+                // Return basic sync status, in Divi Core's order (rpcmisc.cpp:203-213)
                 Ok(json!({
                     "IsBlockchainSynced": true,
                     "timestampOfLastMasternodeListUpdate": 0,
                     "timestampOfLastMasternodeWinnerUpdate": 0,
-                    "currentMasternodeSyncStatus": 999,
-                    "countOfFailedSyncAttempts": 0,
-                    "totalSuccessivePeerSyncRequests": 0,
                     "timestampOfLastFailedSync": 0,
+                    "countOfFailedSyncAttempts": 0,
+                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
+                    "nominalNumberOfMasternodeWinnersReceived": 0,
                     "fulfilledMasternodeListSyncRequests": 0,
                     "fulfilledMasternodeWinnerSyncRequests": 0,
-                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
-                    "nominalNumberOfMasternodeWinnersReceived": 0
+                    "currentMasternodeSyncStatus": 999,
+                    "totalSuccessivePeerSyncRequests": 0
                 }))
             }
             // Divi Core restarts its masternode sync and answers "success"
@@ -567,16 +606,16 @@ mod tests {
             (-1, "value is type int, expected str".into())
         );
         assert_eq!(
-            help(rpc.get_masternode_winners(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
+            help(rpc.winners_at(&args(&[s("5"), s("a"), s("b"), s("c")]), 200)),
             (-1, "getmasternodewinners ( blocks \"filter\" )".into())
         );
         assert_eq!(
-            help(rpc.get_masternode_winners(&args(&[json!(5)]), 200)),
+            help(rpc.winners_at(&args(&[json!(5)]), 200)),
             (-1, "value is type int, expected str".into())
         );
         // Three arguments are taken; the filter is read only when there are two
         let three = rpc
-            .get_masternode_winners(&args(&[s("5"), s("nomatch"), s("x")]), 200)
+            .winners_at(&args(&[s("5"), s("nomatch"), s("x")]), 200)
             .unwrap();
         assert_eq!(three.as_array().unwrap().len(), 25);
     }
@@ -588,7 +627,7 @@ mod tests {
     fn masternode_winners_list_only_heights_with_a_scoring_block() {
         let rpc = with_manager();
         let heights = |a: &[&str], tip: i32| -> Vec<i64> {
-            rpc.get_masternode_winners(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
+            rpc.winners_at(&args(&a.iter().map(|v| json!(v)).collect::<Vec<_>>()), tip)
                 .unwrap()
                 .as_array()
                 .unwrap()

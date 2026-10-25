@@ -19,7 +19,8 @@ use divi_primitives::{
     transaction::{OutPoint, Transaction, TxIn, TxOut},
     ChainMode,
 };
-use divi_rpc::mn_list::MasternodeList;
+use divi_rpc::mn_list::{payee_script, MasternodeList};
+use divi_rpc::mn_votes::MasternodeVotes;
 use divi_rpc::{Params, Request, RequestId, RpcServer};
 use divi_storage::{txindex::TxIndex, Chain, ChainDatabase, ChainParams, NetworkType};
 use divi_wallet::{HdWallet, Network, TransactionBuilder, TransactionSigner, WalletDb};
@@ -33,6 +34,8 @@ struct Node {
     chain: Arc<Chain>,
     wallet: Arc<WalletDb>,
     server: RpcServer,
+    list: Arc<MasternodeList>,
+    votes: Arc<MasternodeVotes>,
     sent: Arc<Mutex<Vec<Transaction>>>,
     dir: tempfile::TempDir,
 }
@@ -55,6 +58,8 @@ fn node() -> Node {
     let list = Arc::new(MasternodeList::new());
     list.set_path(dir.path().join("masternodes.list"));
     server.set_masternode_list(list.clone());
+    let votes = Arc::new(MasternodeVotes::new());
+    server.set_masternode_votes(votes.clone());
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sink = sent.clone();
     server
@@ -68,6 +73,8 @@ fn node() -> Node {
         chain,
         wallet,
         server,
+        list,
+        votes,
         sent,
         dir,
     }
@@ -160,12 +167,24 @@ fn set_up(n: &Node, alias: &str, confirmations: usize) -> (String, u32, String, 
         ],
     );
     let signed = n.ok("signmnbroadcast", vec![setup["broadcast_data"].clone()]);
+    *n_key(n).lock() = setup["config_line"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .map(String::from);
     (
         txhash,
         vout,
         address,
         signed["broadcast_data"].as_str().unwrap().to_string(),
     )
+}
+
+/// The masternode key of the last set_up, from its config line (WIF)
+fn n_key(_n: &Node) -> &'static Mutex<Option<String>> {
+    static KEY: Mutex<Option<String>> = parking_lot::const_mutex(None);
+    &KEY
 }
 
 fn funded() -> Node {
@@ -275,4 +294,59 @@ fn spent_collateral_shows_after_a_check() {
         n.ok("listmasternodes", vec![])[0]["status"],
         json!("VIN_SPENT")
     );
+}
+
+/// A payment vote (mnw) of a ranked masternode for the payee at the top of
+/// the queue is counted and shown by getmasternodewinners; the same vote
+/// again is not new, a second payee from the same masternode for the height
+/// is refused, and so is a vote with a bad signature (masternode-payments.cpp
+/// :203-267, MasternodePayeeData.cpp:44-66, rpcmasternode.cpp:489-578)
+#[test]
+fn payment_votes_are_counted_as_divid_counts_them() {
+    let n = funded();
+    let (txhash, vout, address, signed) = set_up(&n, "mn1", 16);
+    let wif = n_key(&n).lock().clone().unwrap();
+    n.ok("broadcaststartmasternode", vec![json!(signed)]);
+    // A height is scored with the block 101 below it, and votes are taken up
+    // to 20 above the tip: with proof of work up to 100, height 110
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let height = 110;
+    let key = divi_crypto::SecretKey::from_bytes(&divi_wallet::decode_wif(&wif).unwrap().key_bytes)
+        .unwrap();
+    let mnb = n.list.entries()[0].mnb.clone();
+    let mut vote = divi_masternode::cpp_wire::CppWinner {
+        vin: mnb.vin.clone(),
+        height,
+        payee: payee_script(&mnb),
+        signature: vec![],
+    };
+    vote.sign(&key).unwrap();
+    assert_eq!(n.votes.accept(&n.chain, &n.list, &vote.encode()), Ok(true));
+    assert_eq!(n.votes.accept(&n.chain, &n.list, &vote.encode()), Ok(false));
+    let winners = n.ok("getmasternodewinners", vec![json!("1")]);
+    let at = winners
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["nHeight"] == json!(height))
+        .unwrap();
+    assert_eq!(at["winner"], json!({"address": address, "nVotes": 1}));
+    let other = winners
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["nHeight"] == json!(height + 1))
+        .unwrap();
+    assert_eq!(other["winner"], json!({"address": "Unknown", "nVotes": 0}));
+
+    let mut twice = vote.clone();
+    twice.payee = vec![0x51];
+    twice.sign(&key).unwrap();
+    assert!(n.votes.accept(&n.chain, &n.list, &twice.encode()).is_err());
+    let mut forged = vote.clone();
+    forged.height = height + 1;
+    assert!(n.votes.accept(&n.chain, &n.list, &forged.encode()).is_err());
+    let _ = (txhash, vout);
 }
