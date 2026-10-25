@@ -956,6 +956,32 @@ impl Node {
         crate::masternode_sync::load(&masternode_sync, &config.data_dir);
         // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
         masternode_votes.follow_sync(Arc::clone(&masternode_sync));
+        // The payment votes of the last run, read when there are masternodes,
+        // as LoadMasternodeDataFromDisk does (MasternodeModule.cpp:269-280); a
+        // file that is not a votes file of this network stops the start
+        if !masternode_list.entries().is_empty() {
+            use divi_rpc::mn_votes::{PaymentsFile, PAYMENTS_FILE};
+            let path = config.data_dir.join(PAYMENTS_FILE);
+            match masternode_votes.load(&path, config.network.magic, chain.height() as i64) {
+                PaymentsFile::Loaded(n) => {
+                    tracing::info!("Loaded {} masternode payment votes from {}", n, PAYMENTS_FILE)
+                }
+                PaymentsFile::Missing => {
+                    tracing::info!("Missing file {}, will try to recreate", PAYMENTS_FILE)
+                }
+                PaymentsFile::BadFormat => tracing::warn!(
+                    "Error reading {}: Magic is ok but data has invalid format, will try to recreate",
+                    PAYMENTS_FILE
+                ),
+                PaymentsFile::Invalid(why) => {
+                    tracing::error!("Error reading {}: {}", PAYMENTS_FILE, why);
+                    return Err(NodeError::Init(format!(
+                        "Failed to load masternode payments cache from\n{}",
+                        config.data_dir.display()
+                    )));
+                }
+            }
+        }
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -2151,6 +2177,24 @@ impl Node {
         let started = std::time::Instant::now();
         crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
         shutdown_stage("netfulfilled.dat written", started);
+
+        // The payment votes beside it, as SaveMasternodeDataToDisk writes
+        // mnpayments.dat (MasternodeModule.cpp:284-297)
+        let started = std::time::Instant::now();
+        let path = self.config.data_dir.join(divi_rpc::mn_votes::PAYMENTS_FILE);
+        match self.masternode_votes.save(&path, self.config.network.magic) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "Error reading {}: File format is unknown or invalid, please fix it manually",
+                divi_rpc::mn_votes::PAYMENTS_FILE
+            ),
+            Err(e) => tracing::error!(
+                "Failed to write {}: {}",
+                divi_rpc::mn_votes::PAYMENTS_FILE,
+                e
+            ),
+        }
+        shutdown_stage("mnpayments.dat written", started);
 
         // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
         let started = std::time::Instant::now();
