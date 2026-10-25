@@ -2021,3 +2021,68 @@ both!(
     rev_unseen_lock_is_not_released,
     unseen_lock_is_not_released_body
 );
+
+/// Found by `swap_model.rs`: the taker persists its claim and goes down before broadcasting
+/// it, and stays down past the maker-leg locktime, so the maker refunds its leg. The stored
+/// claim is now refused for good, and re-signing it gives the same refused bytes: the taker
+/// sat in `Claimed` forever and never refunded its own, still-locked leg. It must notice the
+/// maker leg is gone and refund instead — through `step` and through `refund` alike.
+async fn claimed_after_maker_refund_body(dir: Direction, refund_only: bool) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await; // signed and stored, not broadcast
+    h.restart();
+
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    h.clock.fetch_add(22_000, Ordering::SeqCst);
+    for _ in 0..8 {
+        let _ = h.maker.tick().await;
+        h.mine_all(1);
+    }
+    assert_eq!(
+        h.maker_state(),
+        SwapState::Done,
+        "the maker refunds its leg"
+    );
+
+    h.tl_chain().advance_time(22_000); // past the taker's own timeout
+    for _ in 0..8 {
+        let _ = if refund_only {
+            h.taker.refund(&h.taker_id).await
+        } else {
+            let view = h.maker.view(&h.maker_id).unwrap();
+            h.taker.step(&h.taker_id, view.as_ref()).await
+        };
+        h.mine_all(1);
+    }
+    let taker = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(
+        taker.state,
+        TakerState::Done,
+        "the taker leg must be refunded"
+    );
+    let at = taker.taker_leg_funding.unwrap().outpoint;
+    let counts = h.tl_chain().tx_counts(&at);
+    assert_eq!((counts.claims, counts.refunds), (0, 1), "{counts:?}");
+}
+
+async fn claimed_after_maker_refund_steps_body(dir: Direction) {
+    claimed_after_maker_refund_body(dir, false).await
+}
+both!(
+    claimed_after_maker_refund_steps,
+    rev_claimed_after_maker_refund_steps,
+    claimed_after_maker_refund_steps_body
+);
+
+async fn claimed_after_maker_refund_refund_only_body(dir: Direction) {
+    claimed_after_maker_refund_body(dir, true).await
+}
+both!(
+    claimed_after_maker_refund_refund_only,
+    rev_claimed_after_maker_refund_refund_only,
+    claimed_after_maker_refund_refund_only_body
+);

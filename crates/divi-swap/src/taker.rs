@@ -68,7 +68,7 @@ impl TakerState {
     ///   `MakerLockConfirmed` or `Refunded`.
     /// - `MakerLockConfirmed`: not terminal. Moves to `Claimed` or `Refunded`.
     /// - `Claimed`: not terminal. The maker-leg claim is still being broadcast until it
-    ///   confirms (`Done`).
+    ///   confirms (`Done`), unless the maker refunded its leg first (`Refunded`).
     /// - `Refunded`: not terminal. The refund is only built and broadcast from here, and
     ///   still owed until it confirms (`Done`); the taker leg stays funded and spendable
     ///   by the refund.
@@ -321,8 +321,9 @@ impl Taker {
 
     /// [`Taker::refund`]'s state machine: `Locked`/`MakerLockConfirmed` only ever move to
     /// `Refunded` (never `Claimed`), and only once the taker leg is actually refundable;
-    /// `Refunded` drives the refund to `Done` the same way [`Taker::advance`] does; every
-    /// other state (including `Claimed`) is left exactly as it is.
+    /// `Refunded` drives the refund to `Done` the same way [`Taker::advance`] does;
+    /// `Claimed` moves to `Refunded` only once the maker has refunded its leg (nothing is
+    /// left to claim); every other state is left exactly as it is.
     async fn advance_refund_only(&self, r: &mut TakerRecord) -> Result<Flow> {
         match r.state {
             TakerState::Locked | TakerState::MakerLockConfirmed => {
@@ -331,6 +332,10 @@ impl Taker {
                 } else {
                     Ok(Flow::Idle)
                 }
+            }
+            TakerState::Claimed if self.maker_leg_refunded(r).await? => {
+                r.maker_leg_claim = None;
+                self.enter(r, TakerState::Refunded)
             }
             TakerState::Refunded => self.on_refunded(r).await,
             TakerState::Prepared
@@ -389,6 +394,26 @@ impl Taker {
             TakerState::Claimed => self.on_claimed(r).await,
             TakerState::Refunded => self.on_refunded(r).await,
         }
+    }
+
+    /// Whether a block holds a spend of the maker-leg lock that carries no preimage: the
+    /// maker's refund won, because we were down or offline from signing our claim until
+    /// past its locktime. Nothing is left to claim and the preimage never went out with a
+    /// spend of it, so our own leg comes back by refund.
+    async fn maker_leg_refunded(&self, r: &TakerRecord) -> Result<bool> {
+        let Some(op) = r.maker_leg_outpoint else {
+            return Ok(false);
+        };
+        let mb = self.mk(r)?;
+        // No spend predates the lock's own block.
+        let Some(confs) = mb.confirmations(&op.txid).await?.filter(|&c| c >= 1) else {
+            return Ok(false);
+        };
+        let from = (mb.tip_height().await? + 1).saturating_sub(confs as u64);
+        let Some(spend) = mb.find_spend(&op, from).await? else {
+            return Ok(false);
+        };
+        Ok(spend.height.is_some() && spend.extract_preimage(&r.hash).is_none())
     }
 
     async fn taker_leg_refundable(&self, r: &TakerRecord) -> Result<bool> {
@@ -537,6 +562,9 @@ impl Taker {
                 // next step re-signs from the persisted preimage, same as the maker/taker
                 // claim/refund paths.
                 r.maker_leg_claim = None;
+                if self.maker_leg_refunded(r).await? {
+                    return self.enter(r, TakerState::Refunded);
+                }
                 self.store.put_taker_swap(r)?;
             }
             return Err(e);
