@@ -299,7 +299,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "forcednsseed",
     "forcestart",
     "genproclimit",
-    "listenonion",
     "logips",
     "logtimestamps",
     "maxreceivebuffer",
@@ -311,8 +310,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "rpcthreads",
     "shrinkdebugfile",
     "sysperms",
-    "torcontrol",
-    "torpassword",
     "upnp",
 ];
 
@@ -363,6 +360,9 @@ const APPLIED: &[&str] = &[
     "proxyrandomize",
     "onion",
     "dns",
+    "listenonion",
+    "torcontrol",
+    "torpassword",
     "discover",
     "externalip",
     "protocolversion",
@@ -494,6 +494,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // given (net.cpp:1690-1716)
     if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
         s.soft_set_bool("discover", false);
+    }
+    // -listen=0 turns -listenonion off unless it is given (net.cpp:1706-1711)
+    if !s.get_bool("listen", true) {
+        s.soft_set_bool("listenonion", false);
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
@@ -637,6 +641,13 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // GetBoolArg("-dns", DEFAULT_NAME_LOOKUP): host names are looked up only
     // with it (net.cpp:1759)
     config.p2p.name_lookup = s.get_bool("dns", true);
+    // The Tor controller (init.cpp:1621, torcontrol.cpp:640, :744)
+    config.p2p.listen_onion = s.get_bool("listenonion", true);
+    config.p2p.tor_control = s
+        .get("torcontrol")
+        .unwrap_or(divi_network::torcontrol::DEFAULT_TOR_CONTROL)
+        .to_string();
+    config.p2p.tor_password = s.get("torpassword").unwrap_or("").to_string();
     config.p2p.discover = s.get_bool("discover", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)

@@ -96,13 +96,10 @@ fn start(datadir: &Path, extra: &[&str]) -> Started {
         .arg(datadir)
         .args(["--rpcport", &port.to_string()])
         .args(["--port", &p2p_port.to_string()])
-        .args([
-            "--bind",
-            "127.0.0.1",
-            "--staking=false",
-            "-discover=0",
-            "-listenonion=0",
-        ])
+        .args(["--bind", "127.0.0.1", "--staking=false", "-discover=0"])
+        // No Tor controller (it would try 127.0.0.1:9051) unless the test
+        // names its own control port
+        .args((!extra.iter().any(|a| a.starts_with("-torcontrol"))).then_some("-listenonion=0"))
         .args(["--connect", "127.0.0.1:1"])
         .args(["--rpcuser", "test", "--rpcpassword", "test"])
         .args(extra)
@@ -400,5 +397,148 @@ fn proxy_gets_a_peer_host_name() {
                 .all(|(_, atyp, d)| *atyp == 3 && d == "localhost"),
             "{dns}: {got:?}"
         );
+    }
+}
+
+/// What a fake Tor control port on 127.0.0.1 was sent, one line each
+type ControlSeen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A fake Tor control port on 127.0.0.1 that offers `methods`, takes any
+/// AUTHENTICATE and gives the onion service SERVICE_ID
+fn tor_control_stand_in(methods: &'static str) -> (u16, ControlSeen) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: ControlSeen = Default::default();
+    let record = seen.clone();
+    std::thread::spawn(move || {
+        for c in listener.incoming().flatten() {
+            let record = record.clone();
+            std::thread::spawn(move || {
+                let mut w = c.try_clone().unwrap();
+                for line in std::io::BufRead::lines(std::io::BufReader::new(c)) {
+                    let Ok(line) = line else { break };
+                    let out = if line == "PROTOCOLINFO 1" {
+                        format!("250-PROTOCOLINFO 1\r\n250-AUTH METHODS={methods}\r\n250 OK\r\n")
+                    } else if line.starts_with("AUTHENTICATE") {
+                        "250 OK\r\n".to_string()
+                    } else if line.starts_with("ADD_ONION ") {
+                        format!("250-ServiceID={SERVICE_ID}\r\n250-PrivateKey=RSA1024:not-a-real-key\r\n250 OK\r\n")
+                    } else {
+                        "510 Unrecognized command\r\n".to_string()
+                    };
+                    record.lock().unwrap().push(line);
+                    if w.write_all(out.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, seen)
+}
+
+const SERVICE_ID: &str = "abcdefghij234567";
+
+fn wait_until(mut done: impl FnMut() -> bool, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    done()
+}
+
+/// With -listenonion the node asks the control port for a hidden service on
+/// its listen port and advertises it: a local address with LOCAL_MANUAL,
+/// onion reachable through 127.0.0.1:9050, the key kept in the datadir
+/// (torcontrol.cpp:491-548)
+#[test]
+fn tor_controller_advertises_the_onion_service() {
+    let (control, seen) = tor_control_stand_in("NULL");
+    let dir = tempfile::tempdir().unwrap();
+    let torcontrol = format!("-torcontrol=127.0.0.1:{control}");
+    let node = up(dir.path(), &["-listenonion=1", torcontrol.as_str()]);
+    let name = format!("{SERVICE_ID}.onion");
+    let mut local = Value::Null;
+    assert!(
+        wait_until(
+            || {
+                local = node.rpc("getnetworkinfo", json!([]))["localaddresses"].clone();
+                local
+                    .as_array()
+                    .is_some_and(|l| l.iter().any(|a| a["address"] == name))
+            },
+            30
+        ),
+        "{local}"
+    );
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got[..2], ["PROTOCOLINFO 1", "AUTHENTICATE"]);
+    let port = got[2]
+        .strip_prefix("ADD_ONION NEW:RSA1024 Port=")
+        .and_then(|r| r.split_once(','))
+        .map(|(p, to)| (p.to_string(), to.to_string()))
+        .unwrap_or_else(|| panic!("{got:?}"));
+    assert_eq!(port.1, format!("127.0.0.1:{}", port.0));
+    assert_eq!(
+        local,
+        json!([{"address": name, "port": port.0, "score": "4"}])
+    );
+    let onion = node.network("onion");
+    assert_eq!(onion["reachable"], true, "{onion}");
+    assert_eq!(onion["proxy"], "127.0.0.1:9050", "{onion}");
+    assert_eq!(onion["proxy_randomize_credentials"], false, "{onion}");
+    drop(node);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("onion_private_key")).unwrap(),
+        "RSA1024:not-a-real-key"
+    );
+}
+
+/// -torpassword goes to the control port quoted, with HASHEDPASSWORD
+/// (torcontrol.cpp:650-659); the value here is a fixed fake
+#[test]
+fn torpassword_is_sent_for_hashedpassword() {
+    let (control, seen) = tor_control_stand_in("HASHEDPASSWORD");
+    let dir = tempfile::tempdir().unwrap();
+    let torcontrol = format!("-torcontrol=127.0.0.1:{control}");
+    let node = up(
+        dir.path(),
+        &[
+            "-listenonion=1",
+            torcontrol.as_str(),
+            "-torpassword=dummy-not-a-password",
+        ],
+    );
+    assert!(wait_until(|| seen.lock().unwrap().len() >= 3, 30));
+    drop(node);
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got[1], r#"AUTHENTICATE "dummy-not-a-password""#);
+}
+
+/// -listenonion is on by default but off under -listen=0 unless given
+/// (DEFAULT_LISTEN_ONION, net.cpp:1706-1711); -bind makes -listen=1
+#[test]
+fn listenonion_default_and_listen_off() {
+    for (extra, contacted) in [
+        (&[][..], true),
+        (&["-listen=0"][..], false),
+        (&["-listen=0", "-listenonion=1"][..], true),
+        (&["-listenonion=0"][..], false),
+    ] {
+        let (control, seen) = tor_control_stand_in("NULL");
+        let dir = tempfile::tempdir().unwrap();
+        let torcontrol = format!("-torcontrol=127.0.0.1:{control}");
+        let mut args = vec![torcontrol.as_str()];
+        args.extend(extra);
+        let node = up(dir.path(), &args);
+        let got = wait_until(
+            || !seen.lock().unwrap().is_empty(),
+            if contacted { 30 } else { 5 },
+        );
+        drop(node);
+        assert_eq!(got, contacted, "{extra:?}");
     }
 }

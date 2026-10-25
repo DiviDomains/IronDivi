@@ -443,6 +443,21 @@ pub struct P2pConfig {
     #[serde(default = "default_name_lookup")]
     pub name_lookup: bool,
 
+    /// Ask Tor for a hidden service at start (Divi Core's `-listenonion`, on
+    /// by default, off under -listen=0 unless given; init.cpp:1621,
+    /// net.cpp:1706-1711)
+    #[serde(default = "default_listen_onion")]
+    pub listen_onion: bool,
+
+    /// The Tor control port, a numeric `ip:port` (Divi Core's `-torcontrol`)
+    #[serde(default = "default_tor_control")]
+    pub tor_control: String,
+
+    /// The Tor control password (Divi Core's `-torpassword`), empty for none.
+    /// Never written out.
+    #[serde(default, skip_serializing)]
+    pub tor_password: String,
+
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -548,6 +563,14 @@ fn default_name_lookup() -> bool {
     true
 }
 
+fn default_listen_onion() -> bool {
+    true
+}
+
+fn default_tor_control() -> String {
+    divi_network::torcontrol::DEFAULT_TOR_CONTROL.to_string()
+}
+
 fn default_proxy_randomize() -> bool {
     true
 }
@@ -590,6 +613,9 @@ impl Default for P2pConfig {
             proxy_randomize: default_proxy_randomize(),
             onion: None,
             name_lookup: default_name_lookup(),
+            listen_onion: default_listen_onion(),
+            tor_control: default_tor_control(),
+            tor_password: String::new(),
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),

@@ -288,6 +288,11 @@ impl LocalAddresses {
         true
     }
 
+    /// Forget a local address (Divi Core RemoveLocal, :109-115)
+    pub fn remove(&self, addr: &SocketAddr) {
+        self.map.write().remove(&bytes(&addr.ip()));
+    }
+
     /// An inbound peer saw us at `addr` (Divi Core SeenLocal, :143-152)
     pub fn seen(&self, addr: &SocketAddr) -> bool {
         match self.map.write().get_mut(&bytes(&addr.ip())) {

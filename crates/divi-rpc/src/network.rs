@@ -115,7 +115,9 @@ impl NetworkRpc {
             "localaddresses": local
                 .into_iter()
                 .map(|a| serde_json::json!({
-                    "address": a.address.to_string(),
+                    // An onion address as its name (CNetAddr::ToStringIP)
+                    "address": divi_network::local::onion_name(&a.address)
+                        .unwrap_or_else(|| a.address.to_string()),
                     "port": a.port.to_string(),
                     "score": a.score.to_string(),
                 }))

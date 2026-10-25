@@ -925,6 +925,19 @@ impl Node {
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
         self.peer_manager
             .set_local_addresses(self.local_addresses());
+        // -listenonion: the Tor controller, for the life of the node
+        // (init.cpp:1621-1622)
+        if self.config.p2p.listen_onion {
+            divi_network::torcontrol::spawn(
+                divi_network::torcontrol::TorControl {
+                    target: self.config.p2p.tor_control.clone(),
+                    password: self.config.p2p.tor_password.clone(),
+                    private_key_file: self.config.data_dir.join("onion_private_key"),
+                    set_onion_proxy: self.config.p2p.onion.as_deref().unwrap_or("").is_empty(),
+                },
+                Arc::clone(&self.peer_manager),
+            );
+        }
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
