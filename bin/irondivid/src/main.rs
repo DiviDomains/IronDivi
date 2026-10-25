@@ -293,7 +293,6 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
     "alerts",
-    "budgetvotemode",
     "checklevel",
     "createwalletbackups",
     "dbcache",
@@ -303,7 +302,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "forcestart",
     "genproclimit",
     "listenonion",
-    "litemode",
     "logips",
     "logtimestamps",
     "maxreceivebuffer",
@@ -324,6 +322,85 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "txconfirmtarget",
     "upnp",
     "vault_min",
+];
+
+/// Options apply_settings reads
+const APPLIED: &[&str] = &[
+    "vault",
+    // read by masternode_options
+    "masternode",
+    "masternodeaddr",
+    "masternodeprivkey",
+    "mnconf",
+    "mnconflock",
+    // only in divid's help: no code of divid reads them, and it says
+    // nothing about them (LicenseAndInfo.cpp:209, :226)
+    "litemode",
+    "budgetvotemode",
+    "rescan",
+    "salvagewallet",
+    "spendzeroconfchange",
+    "keypool",
+    "upgradewallet",
+    "rpcuser",
+    "rpcpassword",
+    "rpcport",
+    "server",
+    "rest",
+    "rpcallowip",
+    "rpcbind",
+    "rpckeepalive",
+    "port",
+    "bind",
+    "listen",
+    "connect",
+    "addnode",
+    "seednode",
+    "fullnode",
+    "dnsseed",
+    "maxconnections",
+    "timeout",
+    "proxy",
+    "discover",
+    "externalip",
+    "protocolversion",
+    "banscore",
+    "bantime",
+    "checkblocks",
+    "resync",
+    "loadblock",
+    "stopafterblockimport",
+    "maxreorg",
+    "maxorphantx",
+    "minrelaytxfee",
+    "acceptnonstandard",
+    "permitbaremultisig",
+    "datacarrier",
+    "datacarriersize",
+    "relaypriority",
+    "limitfreerelay",
+    "maxtxfee",
+    "sporkkey",
+    "staking",
+    "stakeonstaletip",
+    "stakesplitthreshold",
+    "blockmaxsize",
+    "blockprioritysize",
+    "blockminsize",
+    "txindex",
+    "spentindex",
+    "addressindex",
+    "reindex",
+    "utxocachesize",
+    "expire",
+    "blocknotify",
+    "walletnotify",
+    "zmqpubhashblock",
+    "zmqpubhashtx",
+    "zmqpubrawblock",
+    "zmqpubrawtx",
+    "whitelist",
+    "whitebind",
 ];
 
 /// Options read elsewhere (before the node config is built, or by a command)
@@ -717,104 +794,38 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     };
     config.vault = s.get_bool("vault", false);
 
-    const APPLIED: &[&str] = &[
-        "vault",
-        // read by masternode_options
-        "masternode",
-        "masternodeaddr",
-        "masternodeprivkey",
-        "mnconf",
-        "mnconflock",
-        "rescan",
-        "salvagewallet",
-        "spendzeroconfchange",
-        "keypool",
-        "upgradewallet",
-        "rpcuser",
-        "rpcpassword",
-        "rpcport",
-        "server",
-        "rest",
-        "rpcallowip",
-        "rpcbind",
-        "rpckeepalive",
-        "port",
-        "bind",
-        "listen",
-        "connect",
-        "addnode",
-        "seednode",
-        "fullnode",
-        "dnsseed",
-        "maxconnections",
-        "timeout",
-        "proxy",
-        "discover",
-        "externalip",
-        "protocolversion",
-        "banscore",
-        "bantime",
-        "checkblocks",
-        "resync",
-        "loadblock",
-        "stopafterblockimport",
-        "maxreorg",
-        "maxorphantx",
-        "minrelaytxfee",
-        "acceptnonstandard",
-        "permitbaremultisig",
-        "datacarrier",
-        "datacarriersize",
-        "relaypriority",
-        "limitfreerelay",
-        "maxtxfee",
-        "sporkkey",
-        "staking",
-        "stakeonstaletip",
-        "stakesplitthreshold",
-        "blockmaxsize",
-        "blockprioritysize",
-        "blockminsize",
-        "txindex",
-        "spentindex",
-        "addressindex",
-        "reindex",
-        "utxocachesize",
-        "expire",
-        "blocknotify",
-        "walletnotify",
-        "zmqpubhashblock",
-        "zmqpubhashtx",
-        "zmqpubrawblock",
-        "zmqpubrawtx",
-        "whitelist",
-        "whitebind",
-    ];
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
     for key in keys {
         let k = key.as_str();
-        if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) {
-            continue;
+        if k == "checklevel" {
+            // divid refuses any -checklevel: it always checks at level 4
+            // (init.cpp:782-784)
+            anyhow::bail!(
+                "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
+            );
         }
-        if UNSUPPORTED_OPTIONS.contains(&k) {
-            if k == "checklevel" {
-                // divid refuses any -checklevel: it always checks at level 4
-                // (init.cpp:782-784)
-                anyhow::bail!(
-                    "Error: Unsupported argument -checklevel found. Checklevel must be level 4."
-                );
-            } else {
-                warn!(
-                    "Option -{} is not supported by irondivid; ignored",
-                    settings.written_name(k)
-                );
-            }
-        } else {
-            warn!("Unknown option -{}; ignored", settings.written_name(k));
+        if let Some(text) = option_warning(settings, k) {
+            warn!("{}", text);
         }
     }
     Ok(())
+}
+
+/// The warning an option read nowhere gets: one divid takes and irondivid
+/// has nothing for, or one neither knows; none for an option that is read
+fn option_warning(settings: &Settings, k: &str) -> Option<String> {
+    if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) {
+        return None;
+    }
+    Some(if UNSUPPORTED_OPTIONS.contains(&k) {
+        format!(
+            "Option -{} is not supported by irondivid; ignored",
+            settings.written_name(k)
+        )
+    } else {
+        format!("Unknown option -{}; ignored", settings.written_name(k))
+    })
 }
 
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:
@@ -4296,6 +4307,24 @@ mod divid_option_tests {
         assert!(c.staking.enabled);
         assert!(!cfg("rpcuser=x\ndisablewallet=1\n").staking.enabled);
         assert!(cfg("rpcuser=x\n").staking.enabled);
+    }
+
+    /// -litemode and -budgetvotemode appear only in divid's help
+    /// (LicenseAndInfo.cpp:209, :226): no code of divid reads them and it says
+    /// nothing about them, so irondivid does not call them unsupported; an
+    /// option of divid that irondivid has nothing for still gets the warning
+    #[test]
+    fn help_only_options_draw_no_warning() {
+        let s = Settings::default();
+        assert_eq!(option_warning(&s, "litemode"), None);
+        assert_eq!(option_warning(&s, "budgetvotemode"), None);
+        assert_eq!(option_warning(&s, "masternode"), None);
+        assert!(option_warning(&s, "dbcache")
+            .unwrap()
+            .contains("not supported"));
+        assert!(option_warning(&s, "nosuchoption")
+            .unwrap()
+            .starts_with("Unknown option"));
     }
 
     /// The masternode options are read when the node starts, after
