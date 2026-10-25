@@ -58,6 +58,7 @@ pub mod history_fetch;
 pub mod mempool;
 pub mod node;
 pub mod orphans;
+pub mod rebroadcast;
 pub mod staker;
 pub mod zmq;
 
