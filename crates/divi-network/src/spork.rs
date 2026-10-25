@@ -21,8 +21,9 @@ use crate::messages::SporkMessage;
 use crate::peer::PeerId;
 use crate::peer_manager::PeerManager;
 use crate::NetworkMessage;
+use divi_consensus::spork_values::SporkEntry;
 use divi_primitives::hash::Hash256;
-use divi_storage::ChainDatabase;
+use divi_storage::{ChainDatabase, SharedSporks};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -148,6 +149,10 @@ pub struct SporkManager {
     /// database); None keeps sporks in memory only
     db: Option<Arc<ChainDatabase>>,
 
+    /// Where the entries of sporks 13 to 16 are kept for the chain, which reads
+    /// them to value and pay blocks
+    consensus: SharedSporks,
+
     /// When each spork inventory item was asked for, so it is asked for once
     /// (Divi Core `AskFor` waits two minutes before asking again)
     asked: Mutex<HashMap<Hash256, Instant>>,
@@ -170,12 +175,42 @@ impl SporkManager {
         Self::with_key(peer_manager, key, Some(db))
     }
 
+    /// [`SporkManager::with_db`], keeping the entries of sporks 13 to 16 in
+    /// `consensus` (the chain's), loaded ones included
+    pub fn with_chain(
+        peer_manager: Arc<PeerManager>,
+        db: Arc<ChainDatabase>,
+        consensus: SharedSporks,
+    ) -> Arc<Self> {
+        let key = spork_key(&peer_manager.magic());
+        Self::build(peer_manager, key, Some(db), consensus)
+    }
+
     /// Create a spork manager that checks sporks against `spork_key` (None:
     /// not checked), optionally kept in `db`
     pub fn with_key(
         peer_manager: Arc<PeerManager>,
         spork_key: Option<Vec<u8>>,
         db: Option<Arc<ChainDatabase>>,
+    ) -> Arc<Self> {
+        Self::build(peer_manager, spork_key, db, Default::default())
+    }
+
+    /// [`SporkManager::with_key`] keeping sporks 13 to 16 in `consensus`
+    pub fn with_key_and_chain(
+        peer_manager: Arc<PeerManager>,
+        spork_key: Option<Vec<u8>>,
+        db: Option<Arc<ChainDatabase>>,
+        consensus: SharedSporks,
+    ) -> Arc<Self> {
+        Self::build(peer_manager, spork_key, db, consensus)
+    }
+
+    fn build(
+        peer_manager: Arc<PeerManager>,
+        spork_key: Option<Vec<u8>>,
+        db: Option<Arc<ChainDatabase>>,
+        consensus: SharedSporks,
     ) -> Arc<Self> {
         let (progress_tx, _) = broadcast::channel(16);
         let manager = SporkManager {
@@ -185,6 +220,7 @@ impl SporkManager {
             sporks: RwLock::new(HashMap::new()),
             active_sporks: RwLock::new(BTreeMap::new()),
             db,
+            consensus,
             asked: Mutex::new(HashMap::new()),
             progress_tx,
         };
@@ -221,18 +257,27 @@ impl SporkManager {
     /// that entry is already held; any other spork replaces the active one.
     /// True when the spork was added.
     fn add_active(&self, spork: SporkMessage) -> bool {
-        let mut active = self.active_sporks.write();
-        let list = active.entry(spork.spork_id).or_default();
-        if is_multi_value(spork.spork_id) {
-            let hash = spork.hash();
-            if list.iter().any(|held| held.hash() == hash) {
-                return false;
+        let id = spork.spork_id;
+        let entries: Vec<SporkEntry> = {
+            let mut active = self.active_sporks.write();
+            let list = active.entry(id).or_default();
+            if is_multi_value(id) {
+                let hash = spork.hash();
+                if list.iter().any(|held| held.hash() == hash) {
+                    return false;
+                }
+                list.push(spork);
+                list.sort_by_key(|held| held.time_signed);
+            } else {
+                *list = vec![spork];
+                return true;
             }
-            list.push(spork);
-            list.sort_by_key(|held| held.time_signed);
-        } else {
-            *list = vec![spork];
-        }
+            list.iter()
+                .map(|held| SporkEntry::new(held.value.clone(), held.time_signed))
+                .collect()
+        };
+        // Consensus reads the entries of the multi-value sporks from here
+        self.consensus.write().set(id, entries);
         true
     }
 
@@ -339,7 +384,8 @@ impl SporkManager {
         self.sporks.write().insert(hash, spork.clone());
 
         // Divi Core writes the spork to its database when it was added
-        if self.add_active(spork.clone()) {
+        let added = self.add_active(spork.clone());
+        if added {
             if let Some(db) = &self.db {
                 if let Err(e) = db.put_metadata(&db_key(spork.spork_id), &spork.serialize()) {
                     tracing::warn!("Could not store spork {}: {}", spork.spork_id, e);
@@ -645,6 +691,52 @@ mod tests {
         sporks.handle_spork(1, forged).await;
         assert!(announced(&mut other).is_empty());
         assert!(announced(&mut third).is_empty());
+    }
+
+    /// The entries of sporks 13 to 16 are handed to the chain as they are added,
+    /// and again when a restart loads them (spork.cpp:144-168, :192-211)
+    #[tokio::test]
+    async fn multi_value_sporks_reach_the_chain_and_survive_a_restart() {
+        use divi_storage::SharedSporks;
+        let kp = divi_crypto::KeyPair::new_random();
+        let key = kp.public_key().to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let handed = SharedSporks::default();
+        {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let sporks = SporkManager::with_key_and_chain(
+                quiet_peers(),
+                Some(key.clone()),
+                Some(db),
+                handed.clone(),
+            );
+            sporks
+                .handle_spork(1, signed(&kp, 10015, "5000;100", 1000))
+                .await;
+            sporks
+                .handle_spork(1, signed(&kp, 10015, "3000;200", 2000))
+                .await;
+            // a single-value spork is not one of them
+            sporks
+                .handle_spork(1, signed(&kp, 10007, "1600000000", 2000))
+                .await;
+        }
+        let entries = |s: &SharedSporks| s.read().entries(10015).to_vec();
+        assert_eq!(
+            entries(&handed),
+            vec![
+                SporkEntry::new("5000;100", 1000),
+                SporkEntry::new("3000;200", 2000)
+            ]
+        );
+        assert!(handed.read().entries(10007).is_empty());
+
+        // a restart holds the last entry added to each spork, as divid's database does
+        let restarted = SharedSporks::default();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let _ =
+            SporkManager::with_key_and_chain(quiet_peers(), Some(key), Some(db), restarted.clone());
+        assert_eq!(entries(&restarted), vec![SporkEntry::new("3000;200", 2000)]);
     }
 
     /// Divi Core AddActiveSpork and GetActiveSporkCount (spork.cpp:144-168,
