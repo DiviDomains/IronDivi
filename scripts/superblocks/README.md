@@ -31,6 +31,25 @@ A run takes 4 to 6 minutes and is stopped after 10 minutes. However it ends, eve
 deleted. Needs bash and python3 (standard library only). RPC passwords are made for the run and written only to
 each node's mode-600 `divi.conf`.
 
+## Long mode: the switch at 500
+
+`SB_LONG=1 scripts/superblocks/run.sh …` runs everything above, then stakes on to 565 and compares heights 490 to
+560 the same way. It is left out of the default run and of the gate, as it takes longer: it is stopped after 30
+minutes instead of 10.
+
+From 500 the superblock rules change (`SuperblockHeightValidator.cpp:6-11`): a lottery block every 10 blocks from
+500, and a treasury block the block after each. The treasury block 501 pays for 51 blocks, the later ones for 10
+instead of 50 (`SuperblockHeightValidator.cpp:47-51`). So 490 is still a legacy lottery block, 500 is a lottery block (and not a
+treasury block, as 450 was), and treasury blocks are 501, 511, … 561.
+
+The long rows, each prefixed `long:`:
+- `getlotteryblockwinners` after every block to 565;
+- every lottery and treasury superblock from 490 to 560, and each cycle's winners, as in the rows above;
+- `getlotteryblockwinners` at every height from 490 to 560;
+- the first lottery superblock from 520 with three or more winners, offered by a raw peer with the first winner paid
+  one satoshi less and with the last winner left out; and the treasury block after it, with the treasury paid one
+  satoshi less and with the charity left out; each then as made.
+
 To find out more about a FAIL, two environment variables help:
 - `SUPERBLOCKS_DUMP=<dir>` writes both replies of every differing row there;
 - `SUPERBLOCKS_TRACE=1` prints each block's maker, its winner count and its coinstake outputs.
