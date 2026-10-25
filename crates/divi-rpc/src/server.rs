@@ -947,16 +947,23 @@ fn process_body(server: &RpcServer, grant: &MethodGrant, body: &str) -> axum::re
         StatusCode::FORBIDDEN.into_response()
     };
 
-    debug!("RPC request: {}", body);
-
+    // Never log a body or a result: they carry passphrases, private keys and
+    // seeds (walletpassphrase, dumpprivkey, dumphdinfo, importprivkey...).
+    // The method, the id and the sizes are enough to follow the traffic.
     match serde_json::from_str::<Request>(body) {
         Ok(request) => {
             if !grant.allows(&request.method) {
                 return forbidden(&request.method);
             }
+            let method = request.method.clone();
+            let id = request.id.clone();
             let response = server.handle_request(request);
             let json = serde_json::to_string(&response).unwrap_or_default();
-            debug!("RPC response: {}", json);
+            debug!(
+                "RPC {method} id={id:?}: {} byte request, {} byte response",
+                body.len(),
+                json.len()
+            );
             json_response(json)
         }
         Err(e) => {
@@ -964,13 +971,24 @@ fn process_body(server: &RpcServer, grant: &MethodGrant, body: &str) -> axum::re
                 if let Some(denied) = requests.iter().find(|r| !grant.allows(&r.method)) {
                     return forbidden(&denied.method);
                 }
+                debug!(
+                    "RPC batch of {} calls, {} bytes",
+                    requests.len(),
+                    body.len()
+                );
                 let responses: Vec<Response> = requests
                     .into_iter()
                     .map(|req| server.handle_request(req))
                     .collect();
                 return json_response(serde_json::to_string(&responses).unwrap_or_default());
             }
-            error!("Failed to parse RPC request: {}", e);
+            // The parse error can quote a value from the body: log only where
+            error!(
+                "Failed to parse RPC request ({:?} at line {} column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            );
             json_response(
                 serde_json::to_string(&Response::error_only(RpcError::parse_error()))
                     .unwrap_or_default(),
@@ -1197,6 +1215,53 @@ mod tests {
         let chain = Arc::new(Chain::new(db, ChainParams::default()).unwrap());
         let server = Arc::new(RpcServer::new(chain));
         (server, dir)
+    }
+
+    /// Run `f` with every log event, at any level, written to the returned buffer.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn node04_rpc_bodies_and_results_are_never_logged() {
+        let (server, _dir) = create_test_server();
+        let secret = "correct-horse-battery-staple-4f2a";
+        let logs = capture_logs(|| {
+            // A call, a batch, and bodies that fail to parse, all carrying the secret
+            for body in [
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"walletpassphrase","params":["{secret}",60]}}"#
+                ),
+                format!(
+                    r#"[{{"jsonrpc":"2.0","id":1,"method":"encryptwallet","params":["{secret}"]}}]"#
+                ),
+                format!(r#"{{"jsonrpc":"2.0","id":1,"method":["{secret}"]}}"#),
+                format!(r#"{{"method":"walletpassphrase","params":["{secret}"#),
+            ] {
+                let _ = process_body(&server, &MethodGrant::All, &body);
+            }
+        });
+        assert!(logs.contains("RPC"), "the calls are still logged: {logs}");
+        assert!(!logs.contains(secret), "a secret reached the log: {logs}");
     }
 
     #[test]
