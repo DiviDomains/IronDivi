@@ -70,7 +70,8 @@ Two **partitions** at 30% and 70% of the run:
 - a snapshot follows 60 s after the rejoin.
 
 A **new node** of a drawn kind joins from nothing at 50% of the run, connected to two running nodes, and must reach
-the tip.
+the tip. It connects out to them, and keeps doing so on any later start, so a restart of
+either end links them again.
 
 Before a restart, an unclean stop or a partition, blocks are mined until every mempool is empty. divid keeps no
 mempool across a restart, so a transaction lost there would otherwise read as a disagreement.
@@ -84,7 +85,8 @@ and ban scores. The best hash must then agree in each connected part.
   fails with `Error: Error loading block database : Block database corruption detected! Failed to find best block in
   block index`. As in `scripts/unclean-stop`, a node that refuses to start after a kill and names a damaged database
   or `-reindex` is started with `-reindex`. The summary counts this per kind (`started with -reindex after a kill`);
-  it is not a disagreement. Seen on divid in the first campaign (seeds 1 and 3).
+  it is not a disagreement. In the campaigns on 41e8496 and on the fix it happened 2–10 times per seed, always on
+  divid and never on irondivid.
 
 ## Not covered
 
