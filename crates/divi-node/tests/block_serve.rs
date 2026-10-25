@@ -177,3 +177,24 @@ async fn getdata_answers_in_order_and_names_only_missing_transactions() {
         ]
     );
 }
+
+/// A getdata of the known types the node holds nothing for (tx lock, scan
+/// error, budget, quorum) is answered with a notfound naming them, in order:
+/// Divi Core finds them neither in its relay map nor in PushKnownInventory
+/// (main.cpp:168-211, :321-327, :337-345)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getdata_of_items_held_by_no_store_is_not_found() {
+    let t = TestNode::start().await;
+    let asked: Vec<(u32, Hash256)> = [4u32, 5, 8, 9, 10, 11, 12, 13]
+        .iter()
+        .map(|&k| (k, Hash256::from_bytes([k as u8; 32])))
+        .collect();
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send("getdata", &getdata(&asked)).await;
+    let got: Vec<(String, Vec<(u32, Hash256)>)> = replies(&mut p)
+        .await
+        .iter()
+        .map(|(c, m)| (c.clone(), items(m)))
+        .collect();
+    assert_eq!(got, vec![("notfound".to_string(), asked)]);
+}

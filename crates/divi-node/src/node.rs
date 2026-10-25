@@ -208,7 +208,17 @@ pub fn serve_getdata(
                 }
                 queue.pop_front();
             }
+            // A type outside 1..15 is not known and gets nothing; neither does
+            // a filtered block, taken as a block request (main.cpp:300-321,
+            // protocol.cpp:146-149)
+            divi_network::InvType::Unknown | divi_network::InvType::FilteredBlock => {
+                queue.pop_front();
+            }
+            // The other known types: Divi Core holds nothing to send for them,
+            // neither in its relay map nor in PushKnownInventory, so they are
+            // not found (main.cpp:168-211, :321-327, net.cpp:1565-1575)
             _ => {
+                not_found.push(item);
                 queue.pop_front();
             }
         }
