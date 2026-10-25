@@ -1631,6 +1631,35 @@ mod tests {
     }
 
     #[test]
+    fn a_divi_leg_taker_lock_is_named_by_its_swap_and_refused_until_it_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        // `TakerPaysDivi` against BTC: the taker's lock is on DIVI.
+        let mut s = taker_lock_swap("tdivi", divi_swap::TakerState::Locked, 0x55);
+        assert_eq!(s.quote.taker_chain(), Chain::Divi);
+        store.put_taker_swap(&s).unwrap();
+        InputReservations::open(&db)
+            .unwrap()
+            .reserve(Chain::Divi, &divi_swap::Txid([0x55; 32]), &[op(9, 0)])
+            .unwrap();
+        let cfg = inflight_cfg(&db, false);
+        let out = reservations_report(&cfg).unwrap();
+        assert!(out.contains("\ttdivi\t"), "{out}");
+        for yes in [false, true] {
+            let err = release_reservation(&cfg, Chain::Divi, &hex_of(0x55), yes)
+                .err()
+                .expect("a live DIVI lock is not an orphan");
+            assert!(err.to_string().contains("not terminal"), "{err}");
+        }
+        s.state = divi_swap::TakerState::Done;
+        store.put_taker_swap(&s).unwrap();
+        let out = release_reservation(&cfg, Chain::Divi, &hex_of(0x55), true).unwrap();
+        assert!(out.released);
+        assert!(out.text.contains("swap tdivi (done, terminal)"), "{}", out.text);
+    }
+
+    #[test]
     fn release_is_accepted_for_a_terminal_taker_swap() {
         let dir = tempfile::tempdir().unwrap();
         let db = taker_reserved_db(dir.path());

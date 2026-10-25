@@ -35,8 +35,8 @@ use divi_swap::htlc::{
     claim_script_sig, push_data, refund_script_sig, HtlcParams, REFUND_SEQUENCE,
 };
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, LockedOutput, Outpoint, Result, SignedTx, SpendInfo,
-    SwapError, Txid,
+    Amount, Chain, ChainBackend, Funding, InputReservations, LockedOutput, Outpoint, Result,
+    SignedTx, SpendInfo, SwapError, Txid,
 };
 use divi_wallet::address::{Address, Network};
 use divi_wallet::signer::sighash;
@@ -118,6 +118,7 @@ pub struct DiviBackend {
     network: Network,
     fee: FeePolicy,
     wallet: Mutex<Wallet>,
+    reservations: Option<InputReservations>,
 }
 
 fn to_hash(txid: &Txid) -> Hash256 {
@@ -182,7 +183,14 @@ impl DiviBackend {
             network,
             fee,
             wallet: Mutex::new(Wallet::open(wallet_path)?),
+            reservations: None,
         })
+    }
+
+    /// Share lock-input reservations with every other process on the same swap database.
+    pub fn with_input_reservations(mut self, reservations: InputReservations) -> Self {
+        self.reservations = Some(reservations);
+        self
     }
 
     /// Add a second, independent endpoint. Every swap-relevant read (confirmations, HTLC

@@ -829,3 +829,275 @@ async fn released_state_survives_a_restart() {
         "nothing left to release"
     );
 }
+
+// ---- lock-input reservations: the shared `input_reservation` table ----
+
+/// A backend on `url` holding coins `coins` and sharing `res` with other processes.
+fn reserving(url: &str, key: SecretKey, res: &InputReservations, coins: &[Utxo]) -> DiviBackend {
+    let b = backend(url, key).with_input_reservations(res.clone());
+    b.wallet.lock().record_broadcast(&[], coins).unwrap();
+    b
+}
+
+/// `sendrawtransaction` calls the node received.
+async fn sends(server: &MockServer) -> usize {
+    let reqs = server.received_requests().await.unwrap();
+    reqs.iter()
+        .filter(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["method"] == "sendrawtransaction"
+        })
+        .count()
+}
+
+/// Every reservation on DIVI, as (input, reserving tx).
+fn divi_rows(res: &InputReservations) -> Vec<(Outpoint, Txid)> {
+    res.list_all()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.chain == Chain::Divi)
+        .map(|r| (r.input, r.reserved_by))
+        .collect()
+}
+
+fn new_htlc(b: &DiviBackend) -> HtlcParams {
+    htlc_for(b, new_preimage().1)
+}
+
+#[tokio::test]
+async fn funding_skips_coins_another_process_reserved() {
+    let res = InputReservations::in_memory().unwrap();
+    let b = reserving(
+        "http://127.0.0.1:1/",
+        SecretKey::new_random(),
+        &res,
+        &[coin(1, COIN_SAT), coin(2, 2 * COIN_SAT)],
+    );
+    // Another taker's lock holds coin 1, the one selection would otherwise pick.
+    res.reserve(Chain::Divi, &txid_n(0x77), &[coin(1, 0).outpoint])
+        .unwrap();
+    assert_eq!(
+        b.spendable().await.unwrap(),
+        Some(Amount(2 * COIN_SAT)),
+        "a reserved coin is not spendable"
+    );
+    let f = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap();
+    let t = parse(&f.tx);
+    assert_eq!(t.vin.len(), 1);
+    assert_eq!(t.vin[0].prevout.txid, to_hash(&txid_n(2)));
+    // With coin 2 taken by this build too, nothing is left.
+    let err = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_lock_reserves_its_inputs_before_it_is_sent() {
+    let (server, node) = mock().await;
+    let res = InputReservations::in_memory().unwrap();
+    let key = SecretKey::new_random();
+    let a = reserving(&server.uri(), key.clone(), &res, &[coin(1, COIN_SAT)]);
+    let f = a.build_funding(&new_htlc(&a), AMOUNT).await.unwrap();
+    assert!(divi_rows(&res).is_empty(), "built, not sent: nothing reserved");
+    node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
+    a.broadcast(&f.tx).await.unwrap();
+    assert_eq!(divi_rows(&res), vec![(coin(1, 0).outpoint, f.tx.txid)]);
+    // A re-broadcast of the same bytes (a restart) keeps the one reservation.
+    a.broadcast(&f.tx).await.unwrap();
+    assert_eq!(divi_rows(&res).len(), 1);
+
+    // A second process on the same wallet that never saw the lock cannot select its coin.
+    let b = reserving(&server.uri(), key, &res, &[coin(1, COIN_SAT)]);
+    let err = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap_err();
+    assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_lock_whose_input_another_lock_holds_is_never_sent() {
+    let (server, node) = mock().await;
+    let res = InputReservations::in_memory().unwrap();
+    let b = reserving(
+        &server.uri(),
+        SecretKey::new_random(),
+        &res,
+        &[coin(1, COIN_SAT)],
+    );
+    let f = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap();
+    node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
+    // The other taker reserved coin 1 between this build and this broadcast.
+    res.reserve(Chain::Divi, &txid_n(0x77), &[coin(1, 0).outpoint])
+        .unwrap();
+    let err = b.broadcast(&f.tx).await.unwrap_err();
+    assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+    assert_eq!(sends(&server).await, 0, "never sent");
+    assert_eq!(divi_rows(&res), vec![(coin(1, 0).outpoint, txid_n(0x77))]);
+    assert_eq!(
+        b.wallet.lock().reserved_count(),
+        0,
+        "the wallet file drops its own hold on the coin"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_reservation_write_blocks_the_broadcast() {
+    let (server, node) = mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("swaps.db");
+    InputReservations::open(&db).unwrap();
+    let res = InputReservations::open_read_only(&db).unwrap();
+    let b = reserving(
+        &server.uri(),
+        SecretKey::new_random(),
+        &res,
+        &[coin(1, COIN_SAT)],
+    );
+    let f = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap();
+    node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
+    assert!(b.broadcast(&f.tx).await.is_err());
+    assert_eq!(sends(&server).await, 0, "never sent");
+}
+
+#[tokio::test]
+async fn claims_and_refunds_reserve_nothing() {
+    let (server, node) = mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("swaps.db");
+    InputReservations::open(&db).unwrap();
+    // Read-only: a reservation attempt would fail the broadcast.
+    let res = InputReservations::open_read_only(&db).unwrap();
+    let b = reserving(&server.uri(), SecretKey::new_random(), &res, &[]);
+    let (pre, hash) = new_preimage();
+    let h = htlc_for(&b, hash);
+    let claim = b
+        .build_claim(&h, &Outpoint { txid: txid_n(7), vout: 0 }, AMOUNT, &pre)
+        .await
+        .unwrap();
+    let refund = b
+        .build_refund(&h, &Outpoint { txid: txid_n(8), vout: 0 }, AMOUNT)
+        .await
+        .unwrap();
+    node.result("sendrawtransaction", json!("00"));
+    b.broadcast(&claim).await.unwrap();
+    b.broadcast(&refund).await.unwrap();
+    assert!(divi_rows(&res).is_empty());
+}
+
+#[tokio::test]
+async fn a_confirmed_lock_releases_its_reservation() {
+    let (server, node) = mock().await;
+    let res = InputReservations::in_memory().unwrap();
+    let b = reserving(
+        &server.uri(),
+        SecretKey::new_random(),
+        &res,
+        &[coin(1, COIN_SAT)],
+    );
+    let f = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap();
+    node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
+    b.broadcast(&f.tx).await.unwrap();
+    node.result("getrawtransaction", json!({"txid": f.tx.txid.to_rpc_hex(), "confirmations": 0}));
+    assert_eq!(b.confirmations(&f.tx.txid).await.unwrap(), Some(0));
+    assert_eq!(divi_rows(&res).len(), 1, "in the mempool: kept");
+    node.result("getrawtransaction", json!({"txid": f.tx.txid.to_rpc_hex(), "confirmations": 1}));
+    assert_eq!(b.confirmations(&f.tx.txid).await.unwrap(), Some(1));
+    assert!(divi_rows(&res).is_empty(), "confirmed: released");
+    // The wallet keeps the input tombstoned: it is spent on chain.
+    assert!(!b
+        .wallet
+        .lock()
+        .available()
+        .iter()
+        .any(|u| u.outpoint == coin(1, 0).outpoint));
+}
+
+#[tokio::test]
+async fn a_dead_lock_releases_its_reservation_with_its_wallet_booking() {
+    let (server, node) = mock().await;
+    let res = InputReservations::in_memory().unwrap();
+    let b = backend(&server.uri(), SecretKey::new_random()).with_input_reservations(res.clone());
+    let f = broadcast_lock(&b, &node).await;
+    assert_eq!(divi_rows(&res).len(), 1);
+    // No proof (the input is spent): both stay held.
+    node.result("gettxout", Value::Null);
+    assert!(!b.release_dead_lock(&f.tx).await.unwrap());
+    assert_eq!(divi_rows(&res).len(), 1);
+    node.result("gettxout", txout_json(&b, COIN_SAT));
+    assert!(b.release_dead_lock(&f.tx).await.unwrap());
+    assert!(divi_rows(&res).is_empty());
+    assert_eq!(b.spendable().await.unwrap(), Some(Amount(COIN_SAT)));
+}
+
+const TIP: &str = "00000000000000000000000000000000000000000000000000000000000000ab";
+
+#[tokio::test]
+async fn the_tip_header_comes_from_the_best_block() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getbestblockhash", json!(TIP));
+    node.result(
+        "getblock",
+        json!({"hash": TIP, "height": 1234, "time": 1_800_000_000u32}),
+    );
+    assert_eq!(
+        b.tip_header().await.unwrap(),
+        divi_swap::backend::TipHeader {
+            height: 1234,
+            hash: TIP.into(),
+            time: 1_800_000_000,
+        }
+    );
+    // A block that is not the one asked for (the tip moved, a lagging node) is transient.
+    node.result(
+        "getblock",
+        json!({"hash": "00".repeat(32), "height": 1234, "time": 1_800_000_000u32}),
+    );
+    assert!(matches!(
+        b.tip_header().await,
+        Err(SwapError::Transient(_))
+    ));
+    node.result("getblock", json!({"hash": TIP, "height": 1234}));
+    assert!(matches!(
+        b.tip_header().await,
+        Err(SwapError::Transient(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_block_is_in_the_best_chain_when_its_height_still_names_it() {
+    let (server, node) = mock().await;
+    let b = backend(&server.uri(), SecretKey::new_random());
+    node.result("getblockhash", json!(TIP));
+    assert!(b.in_best_chain(1234, TIP).await.unwrap());
+    assert!(b
+        .in_best_chain(1234, &TIP.to_ascii_uppercase())
+        .await
+        .unwrap());
+    assert!(!b.in_best_chain(1234, &"00".repeat(32)).await.unwrap());
+    assert_eq!(b.target_block_secs(), Some(60));
+}
+
+#[tokio::test]
+async fn with_a_fallback_the_tip_header_and_best_chain_must_agree() {
+    let (primary, p) = mock().await;
+    let (fallback, f) = mock().await;
+    let b = backend(&primary.uri(), SecretKey::new_random()).with_fallback_rpc(&fallback.uri());
+    for n in [&p, &f] {
+        n.result("getbestblockhash", json!(TIP));
+        n.result("getblock", json!({"hash": TIP, "height": 9, "time": 1_800_000_000u32}));
+        n.result("getblockhash", json!(TIP));
+    }
+    assert_eq!(b.tip_header().await.unwrap().height, 9);
+    assert!(b.in_best_chain(9, TIP).await.unwrap());
+    f.result("getblockhash", json!("00".repeat(32)));
+    assert!(matches!(
+        b.in_best_chain(9, TIP).await,
+        Err(SwapError::Transient(_))
+    ));
+    f.result("getbestblockhash", json!("00".repeat(32)));
+    f.result(
+        "getblock",
+        json!({"hash": "00".repeat(32), "height": 9, "time": 1_800_000_000u32}),
+    );
+    assert!(matches!(
+        b.tip_header().await,
+        Err(SwapError::Transient(_))
+    ));
+}

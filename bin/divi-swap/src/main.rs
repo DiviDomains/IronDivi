@@ -602,16 +602,14 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         .as_deref()
         .map(divi_swap_cli::wallet::prepare_wallet_path)
         .transpose()?;
-    let divi = Arc::new(with_divi_fallback(
+    let (_, reservations) = divi_swap_cli::reservations::open(&cli.db)?;
+    let divi = Arc::new(live_divi(
         cli,
+        swap_chain_divi::default_rpc(divi_network),
+        dkey,
         divi_network,
-        DiviBackend::new(
-            swap_chain_divi::default_rpc(divi_network),
-            dkey,
-            divi_network,
-            swap_chain_divi::FeePolicy::default(),
-            wallet,
-        )?,
+        wallet,
+        &reservations,
     )?);
 
     if cli.counter_chain == Chain::Usdc {
@@ -636,7 +634,6 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         ),
         other => bail!("no live {other} backend in this build yet; use --backend mock"),
     };
-    let (_, reservations) = divi_swap_cli::reservations::open(&cli.db)?;
     let (btc, counter) = live_counter(cli, key, endpoints, &reservations)?;
 
     Ok(Backends {
@@ -644,6 +641,30 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
         btc,
         live: Some((divi, counter)),
     })
+}
+
+/// The live DIVI backend for `key` on `url` (the network's default in production), its
+/// coin set in `wallet`, with `--divi-fallback-rpc-url` applied.
+fn live_divi(
+    cli: &Cli,
+    url: &str,
+    key: divi_crypto::keys::SecretKey,
+    network: divi_wallet::address::Network,
+    wallet: Option<std::path::PathBuf>,
+    reservations: &InputReservations,
+) -> Result<DiviBackend> {
+    let _ = reservations;
+    with_divi_fallback(
+        cli,
+        network,
+        DiviBackend::new(
+            url,
+            key,
+            network,
+            swap_chain_divi::FeePolicy::default(),
+            wallet,
+        )?,
+    )
 }
 
 /// The live `--counter-chain` backend for `key` on `endpoints` (the network's defaults in
@@ -715,7 +736,8 @@ fn unix_now() -> u32 {
 /// swap that finished, or a lock that expired, since the last one) and after each command
 /// that can finish a swap, whether or not that command succeeded. A failure only warns: an
 /// unreleased input stays out of coin selection, never spent twice.
-async fn sweep_locks(cli: &Cli, counter: &dyn ChainBackend, now: u32) {
+async fn sweep_locks(cli: &Cli, divi: &dyn ChainBackend, counter: &dyn ChainBackend, now: u32) {
+    let _ = divi;
     if !matches!(cli.backend, BackendArg::Live)
         || !matches!(cli.counter_chain, Chain::Btc | Chain::Ltc | Chain::Zec)
     {
@@ -1075,7 +1097,7 @@ async fn ready_backends(cli: &Cli) -> Result<Backends> {
     let b = backends(cli)?;
     ltc_preflight(cli, &b).await?;
     sync_divi(cli, &b).await?;
-    sweep_locks(cli, b.btc.as_ref(), unix_now()).await;
+    sweep_locks(cli, b.divi.as_ref(), b.btc.as_ref(), unix_now()).await;
     Ok(b)
 }
 
@@ -1091,9 +1113,9 @@ async fn taker(cli: &Cli) -> Result<Taker> {
 /// the command succeeded or not (refunding a dropped lock fails, and that is when its inputs
 /// may be due for release), with the wall clock at `now`. Returns the line the command prints.
 async fn finishing(cli: &Cli, sessions: &Sessions, b: Backends, now: u32) -> Result<String> {
-    let counter = b.btc.clone();
+    let (divi, counter) = (b.divi.clone(), b.btc.clone());
     let out = finish(cli, sessions, b).await;
-    sweep_locks(cli, counter.as_ref(), now).await;
+    sweep_locks(cli, divi.as_ref(), counter.as_ref(), now).await;
     out
 }
 
@@ -2326,10 +2348,15 @@ mod tests {
     /// its own, so two locks are never the same tx); a broadcast refused because the other
     /// taker reserved the same coin first is retried once with a fresh selection.
     async fn fund(b: &dyn ChainBackend, hash: u8) -> anyhow::Result<Funding> {
+        fund_amount(b, hash, Amount::from_sat(5_000)).await
+    }
+
+    /// [`fund`] for a lock of `amount`.
+    async fn fund_amount(b: &dyn ChainBackend, hash: u8, amount: Amount) -> anyhow::Result<Funding> {
         let h = lock_htlc(hash);
         let mut last = None;
         for _ in 0..2 {
-            let f = b.build_funding(&h, Amount::from_sat(5_000)).await?;
+            let f = b.build_funding(&h, amount).await?;
             match b.broadcast(&f.tx).await {
                 Ok(_) => return Ok(f),
                 Err(e) => last = Some(e),
@@ -2366,13 +2393,24 @@ mod tests {
 
     /// The taker swap `id` on `chain` whose taker-leg lock is `lock`.
     fn taker_swap(id: &str, state: TakerState, chain: Chain, lock: &Funding) -> TakerRecord {
+        taker_swap_paying(id, state, chain, Direction::TakerPaysBtc, lock)
+    }
+
+    /// [`taker_swap`] in `direction`: `TakerPaysDivi` puts the lock on DIVI.
+    fn taker_swap_paying(
+        id: &str,
+        state: TakerState,
+        chain: Chain,
+        direction: Direction,
+        lock: &Funding,
+    ) -> TakerRecord {
         TakerRecord {
             id: id.into(),
             state,
             quote: Quote {
                 id: format!("q-{id}"),
                 offer_id: "o".into(),
-                direction: Direction::TakerPaysBtc,
+                direction,
                 counter_chain: chain,
                 btc_amount: Amount::from_sat(5_000),
                 divi_amount: Amount(2),
@@ -2609,6 +2647,161 @@ mod tests {
         assert_eq!(held(&db).len(), 2);
     }
 
+    /// The DIVI wallet key of the two-taker DIVI tests.
+    fn divi_key() -> divi_crypto::keys::SecretKey {
+        divi_crypto::keys::SecretKey::from_bytes(&[0x33; 32]).unwrap()
+    }
+
+    /// A DIVI lock of [`DIVI_LOCK`] from coin `[1; 32]:0` or `[2; 32]:0` leaves change under
+    /// the dust limit, so no lock creates a coin a third one could spend.
+    const DIVI_LOCK: Amount = Amount(500_000_000);
+    const DIVI_COINS: [(u8, u64); 2] = [(1, 500_226_000), (2, 500_230_000)];
+
+    /// A DIVI wallet file holding [`DIVI_COINS`], as a scan leaves it.
+    fn divi_wallet(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("divi-wallet.json");
+        let utxos: Vec<_> = DIVI_COINS
+            .iter()
+            .map(|(n, value)| {
+                serde_json::json!({
+                    "outpoint": {"txid": divi_swap::Txid([*n; 32]).to_rpc_hex(), "vout": 0},
+                    "value": value,
+                })
+            })
+            .collect();
+        let wallet = serde_json::json!({
+            "utxos": utxos, "reserved": [], "spent": [], "excluded": [], "scanned_height": 1,
+        });
+        std::fs::write(&path, wallet.to_string()).unwrap();
+        path
+    }
+
+    /// A DIVI node that accepts every `sendrawtransaction` and counts it.
+    struct DiviNode(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl wiremock::Respond for DiviNode {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let ok = |v| {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": v, "error": null, "id": 1}))
+            };
+            match body["method"].as_str().unwrap_or_default() {
+                "sendrawtransaction" => {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ok(serde_json::json!("00"))
+                }
+                other => panic!("DIVI node stub: no {other} answer"),
+            }
+        }
+    }
+
+    /// The prevout txids of a legacy-format DIVI transaction (fewer than 253 inputs, each
+    /// scriptSig shorter than 253 bytes).
+    fn divi_spent(f: &Funding) -> Vec<[u8; 32]> {
+        let raw = &f.tx.raw;
+        let mut at = 5;
+        (0..raw[4])
+            .map(|_| {
+                let txid: [u8; 32] = raw[at..at + 32].try_into().unwrap();
+                at += 36;
+                at += 1 + raw[at] as usize + 4;
+                txid
+            })
+            .collect()
+    }
+
+    /// The DIVI case of [`two_takers_never_share_a_lock_input`]: two DIVI-leg takers, each
+    /// its own `divi-swap` process on one wallet file and one `--db`, lock different coins; a
+    /// third, with nothing unreserved left, aborts before broadcasting and reserves nothing; a
+    /// rebroadcast after a restart keeps its one reservation; a completed swap and a refunded
+    /// one release theirs, once.
+    #[tokio::test]
+    async fn two_divi_takers_never_share_a_lock_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let wallet = divi_wallet(dir.path());
+        let cli = live_cli("btc", &db);
+        let server = MockServer::start().await;
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(DiviNode(posts.clone()))
+            .mount(&server)
+            .await;
+        let sent = || posts.load(std::sync::atomic::Ordering::SeqCst);
+        let taker = || -> Arc<dyn ChainBackend> {
+            let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+            Arc::new(
+                live_divi(
+                    &cli,
+                    &server.uri(),
+                    divi_key(),
+                    divi_wallet::address::Network::Testnet,
+                    Some(wallet.clone()),
+                    &res,
+                )
+                .unwrap(),
+            )
+        };
+
+        let (one, two) = (taker(), taker());
+        let (a, b) = tokio::join!(
+            fund_amount(one.as_ref(), 1, DIVI_LOCK),
+            fund_amount(two.as_ref(), 2, DIVI_LOCK)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (ia, ib) = (divi_spent(&a), divi_spent(&b));
+        assert!(!ia.is_empty() && !ib.is_empty());
+        let shared = ia.iter().filter(|i| ib.contains(i)).count();
+        assert_eq!(shared, 0, "both locks spend {ia:?} / {ib:?}");
+        assert_eq!(sent(), 2);
+        assert_eq!(held(&db).len(), 2, "{:?}", held(&db));
+        assert!(held(&db).iter().all(|(c, _)| *c == Chain::Divi));
+
+        // Abort: no unreserved coin covers a third lock; nothing sent, nothing reserved.
+        let three = taker();
+        assert!(fund_amount(three.as_ref(), 3, DIVI_LOCK).await.is_err());
+        assert_eq!(sent(), 2, "the third lock is never sent");
+        assert_eq!(held(&db).len(), 2);
+
+        // Restart: a new process rebroadcasts lock `a`; it keeps its one reservation.
+        taker().broadcast(&a.tx).await.unwrap();
+        assert_eq!(held(&db).len(), 2);
+
+        // Completion and refund: each finished swap releases its lock, and only it, once.
+        let store = Store::open(&db).unwrap();
+        let swap = |id, state, lock| {
+            taker_swap_paying(id, state, Chain::Btc, Direction::TakerPaysDivi, lock)
+        };
+        store
+            .put_taker_swap(&swap("a", TakerState::Done, &a))
+            .unwrap();
+        let mut refunding = swap("b", TakerState::Refunded, &b);
+        refunding.taker_leg_refund = Some(b.tx.clone());
+        store.put_taker_swap(&refunding).unwrap();
+        let counter: Arc<dyn ChainBackend> =
+            Arc::new(MockChain::new(Chain::Btc, T0, 600).backend(4, Amount(Amount::COIN)));
+        refund_command_on(&db, "btc", "a", three.clone(), counter.clone(), unix_now())
+            .await
+            .unwrap();
+        assert_eq!(held(&db), vec![(Chain::Divi, b.tx.txid)]);
+        refunding.state = TakerState::Done;
+        store.put_taker_swap(&refunding).unwrap();
+        refund_command_on(&db, "btc", "b", three.clone(), counter, unix_now())
+            .await
+            .unwrap();
+        assert_eq!(held(&db), vec![]);
+        let (_, after_restart) = divi_swap_cli::reservations::open(&db).unwrap();
+        assert_eq!(
+            divi_swap_cli::reservations::release_finished(&store, &after_restart).unwrap(),
+            0
+        );
+        // The released inputs are spent on chain: the wallet file never offers them again.
+        assert!(fund_amount(three.as_ref(), 6, DIVI_LOCK).await.is_err());
+        assert!(fund_amount(taker().as_ref(), 7, DIVI_LOCK).await.is_err());
+        assert_eq!(sent(), 3, "two locks and the rebroadcast");
+    }
+
     #[tokio::test]
     async fn the_sweep_is_live_counter_chain_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -2616,7 +2809,7 @@ mod tests {
         let mut c = live_cli("btc", &db);
         c.backend = BackendArg::Mock;
         let counter = MockChain::new(Chain::Btc, T0, 600).backend(4, Amount(Amount::COIN));
-        sweep_locks(&c, &counter, T0).await;
+        sweep_locks(&c, &counter, &counter, T0).await;
         assert!(!db.exists(), "a mock run never opens --db for reservations");
     }
 
@@ -2659,15 +2852,21 @@ mod tests {
         counter: Arc<dyn ChainBackend>,
         now: u32,
     ) -> Result<String> {
-        let cli = command(db, chain, &["refund", "--swap", swap]);
         let divi = MockChain::new(Chain::Divi, T0, 60).backend(3, Amount(Amount::COIN));
-        finishing(
-            &cli,
-            &Sessions::beside(db),
-            prepared(Arc::new(divi), counter),
-            now,
-        )
-        .await
+        refund_command_on(db, chain, swap, Arc::new(divi), counter, now).await
+    }
+
+    /// [`refund_command`] with `divi` as the DIVI backend (the taker leg of a DIVI-leg swap).
+    async fn refund_command_on(
+        db: &std::path::Path,
+        chain: &str,
+        swap: &str,
+        divi: Arc<dyn ChainBackend>,
+        counter: Arc<dyn ChainBackend>,
+        now: u32,
+    ) -> Result<String> {
+        let cli = command(db, chain, &["refund", "--swap", swap]);
+        finishing(&cli, &Sessions::beside(db), prepared(divi, counter), now).await
     }
 
     /// A BTC mock chain at [`T0`] and the taker's wallet on it.
@@ -2677,8 +2876,9 @@ mod tests {
         (c, Arc::new(b))
     }
 
-    /// Fund and broadcast the taker-leg lock of swap `id` (HTLC [`lock_htlc`]`(7)`), store the
-    /// swap in `state` and reserve input `[n; 32]:0` for the lock, as the live backend does.
+    /// Fund and broadcast the taker-leg lock of swap `id` (HTLC [`lock_htlc`]`(7)`) on `b`'s
+    /// chain (a DIVI lock is a `TakerPaysDivi` swap against BTC), store the swap in `state`
+    /// and reserve input `[n; 32]:0` for the lock, as the live backend does.
     async fn locked_swap(
         db: &std::path::Path,
         b: &dyn ChainBackend,
@@ -2693,7 +2893,7 @@ mod tests {
         b.broadcast(&f.tx).await.unwrap();
         let (store, res) = divi_swap_cli::reservations::open(db).unwrap();
         res.reserve(
-            Chain::Btc,
+            b.chain(),
             &f.tx.txid,
             &[divi_swap::Outpoint {
                 txid: divi_swap::Txid([n; 32]),
@@ -2701,7 +2901,11 @@ mod tests {
             }],
         )
         .unwrap();
-        let s = taker_swap(id, state, Chain::Btc, &f);
+        let direction = match b.chain() {
+            Chain::Divi => Direction::TakerPaysDivi,
+            _ => Direction::TakerPaysBtc,
+        };
+        let s = taker_swap_paying(id, state, Chain::Btc, direction, &f);
         store.put_taker_swap(&s).unwrap();
         s
     }
@@ -2877,5 +3081,156 @@ mod tests {
         // Six blocks later the dropped lock is released too; the lock still in the mempool
         // (now mined) keeps its input.
         assert_eq!(held(&db), vec![(Chain::Btc, lock_of(&live))]);
+    }
+
+    // ---- the sweep, for a DIVI-leg lock ----
+
+    /// A DIVI mock chain at [`T0`] and the taker's wallet on it.
+    fn divi_chain() -> (MockChain, Arc<divi_swap::mock::MockBackend>) {
+        let c = MockChain::new(Chain::Divi, T0, 60);
+        let b = c.backend(4, Amount(10 * Amount::COIN));
+        (c, Arc::new(b))
+    }
+
+    /// A fresh BTC counter backend: a DIVI-leg refund never uses it.
+    fn idle_btc() -> Arc<dyn ChainBackend> {
+        btc_chain().1
+    }
+
+    #[tokio::test]
+    async fn the_refund_command_releases_a_divi_lock_once_its_refund_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let s = locked_swap(&db, b.as_ref(), "r", TakerState::Locked, 1).await;
+        c.mine(1);
+        let refund = || refund_command_on(&db, "btc", "r", b.clone(), idle_btc(), c.mtp());
+
+        assert_eq!(refund().await.unwrap(), "Locked", "before the deadline");
+        assert_eq!(held(&db), vec![(Chain::Divi, lock_of(&s))]);
+        c.advance_time(3_600);
+        assert_eq!(refund().await.unwrap(), "Refunded", "refund broadcast");
+        assert_eq!(held(&db), vec![(Chain::Divi, lock_of(&s))], "lock on chain");
+        c.mine(1);
+        assert_eq!(refund().await.unwrap(), "Done");
+        assert_eq!(held(&db), vec![], "the finished swap released its lock");
+        assert!(b.released_locks().is_empty(), "a lock on chain is never given back");
+    }
+
+    #[tokio::test]
+    async fn refunding_a_dropped_divi_lock_releases_its_inputs_after_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let s = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 1).await;
+        c.forget(&lock_of(&s)); // in no mempool and no block
+        let refund_at = |now: u32| refund_command_on(&db, "btc", "dropped", b.clone(), idle_btc(), now);
+        let refund = || refund_at(c.mtp());
+
+        assert_eq!(refund().await.unwrap(), "Locked");
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Divi, lock_of(&s))],
+            "deadline not passed"
+        );
+        c.advance_time(3_601); // MTP past the locktime: the refund is final
+        for _ in 0..2 {
+            assert!(refund().await.is_err(), "the refund spends a lock nobody has");
+            assert_eq!(
+                held(&db),
+                vec![(Chain::Divi, lock_of(&s))],
+                "absent past the deadline, but only at one height"
+            );
+        }
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(refund_at(c.mtp() + 2 * 60 + 1).await.is_err());
+        assert_eq!(
+            held(&db),
+            vec![(Chain::Divi, lock_of(&s))],
+            "a stale backend releases nothing"
+        );
+        assert!(b.released_locks().is_empty());
+        assert!(refund().await.is_err());
+        assert_eq!(
+            held(&db),
+            vec![],
+            "absent past the deadline six blocks apart: released"
+        );
+        assert_eq!(
+            b.released_locks(),
+            vec![lock_of(&s)],
+            "the wallet file gets the lock's inputs back too"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refund_command_keeps_a_divi_lock_still_in_the_mempool_past_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let s = locked_swap(&db, b.as_ref(), "slow", TakerState::Locked, 1).await;
+        c.advance_time(3_601); // past the locktime; the lock never confirmed but is in the mempool
+        for _ in 0..2 {
+            let out = refund_command_on(&db, "btc", "slow", b.clone(), idle_btc(), c.mtp())
+                .await
+                .unwrap();
+            assert_eq!(out, "Refunded", "the refund spends the pending lock");
+            assert_eq!(held(&db), vec![(Chain::Divi, lock_of(&s))]);
+        }
+        assert!(b.released_locks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_run_command_sweeps_divi_locks_and_keeps_those_on_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let (c, b) = divi_chain();
+        let mined = locked_swap(&db, b.as_ref(), "mined", TakerState::Locked, 4).await;
+        c.mine(1);
+        locked_swap(&db, b.as_ref(), "done", TakerState::Done, 1).await;
+        let dropped = locked_swap(&db, b.as_ref(), "dropped", TakerState::Locked, 2).await;
+        let live = locked_swap(&db, b.as_ref(), "live", TakerState::Locked, 3).await;
+        c.forget(&lock_of(&dropped));
+        c.advance_time(3_600);
+        let cli = command(
+            &db,
+            "btc",
+            &[
+                "run",
+                "--maker",
+                "http://127.0.0.1:1",
+                "--offer",
+                "o",
+                "--btc-sats",
+                "5000",
+            ],
+        );
+        let sessions = Sessions::beside(&db);
+        let run = || finishing(&cli, &sessions, prepared(b.clone(), idle_btc()), c.mtp());
+        assert!(run().await.is_err(), "no maker answers the quote");
+        let sorted = |mut v: Vec<(Chain, divi_swap::Txid)>| {
+            v.sort_by_key(|(_, t)| t.0);
+            v
+        };
+        // The finished swap's lock is released; the dropped one has had one absent check.
+        assert_eq!(
+            held(&db),
+            sorted(vec![
+                (Chain::Divi, lock_of(&mined)),
+                (Chain::Divi, lock_of(&dropped)),
+                (Chain::Divi, lock_of(&live)),
+            ])
+        );
+        c.mine(divi_swap::reservation::EXPIRY_ABSENT_BLOCKS);
+        assert!(run().await.is_err());
+        // Six blocks later the dropped lock is released too; the locks on chain keep theirs.
+        assert_eq!(
+            held(&db),
+            sorted(vec![
+                (Chain::Divi, lock_of(&mined)),
+                (Chain::Divi, lock_of(&live)),
+            ])
+        );
+        assert_eq!(b.released_locks(), vec![lock_of(&dropped)]);
     }
 }
