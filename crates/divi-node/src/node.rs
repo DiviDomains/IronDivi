@@ -624,6 +624,13 @@ impl Node {
 
         // Create transaction relay manager
         let tx_relay = TxRelay::new(Arc::clone(&peer_manager));
+        let orphans = Arc::new(crate::orphans::OrphanPool::new());
+        {
+            let (mempool, orphans) = (Arc::clone(&mempool), Arc::clone(&orphans));
+            tx_relay.set_have_check(Arc::new(move |txid| {
+                (mempool.contains(txid), orphans.contains(txid))
+            }));
+        }
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
@@ -671,7 +678,7 @@ impl Node {
             peer_manager,
             block_sync,
             tx_relay,
-            orphans: Arc::new(crate::orphans::OrphanPool::new()),
+            orphans,
             spork_manager,
             masternode_manager,
             masternode_handler,
