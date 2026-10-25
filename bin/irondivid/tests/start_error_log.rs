@@ -13,6 +13,7 @@
 
 #![cfg(target_os = "linux")]
 
+use divi_test_support::free_port;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +70,11 @@ fn a_refused_start_on_a_busy_cpu_leaves_its_reason_in_debug_log() {
         .collect();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
+    // No P2P listener (it is bound before the wallet is made) and an RPC
+    // port nobody uses: the start must fail for its passphrase only
     cmd.arg(format!("-datadir={}", dir.path().display()))
+        .arg("-listen=0")
+        .arg(format!("-rpcport={}", free_port()))
         .args(["-rpcuser=test", "-rpcpassword=test"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
