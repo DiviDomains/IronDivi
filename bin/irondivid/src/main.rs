@@ -1706,6 +1706,13 @@ async fn run_daemon(
     // Kept for the life of the node; none if an address cannot be bound.
     let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
+    // Divi Core's last check before it starts the node: 50 MB free on the
+    // data directory's filesystem (init.cpp:1604-1605)
+    if !divi_storage::disk_space::check_disk_space(&config.data_dir, 0) {
+        divi_storage::abort::abort_node("Disk space is low!");
+        anyhow::bail!("Disk space is low!");
+    }
+
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
 

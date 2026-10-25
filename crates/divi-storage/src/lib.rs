@@ -53,6 +53,7 @@ pub mod core_coins;
 pub mod database;
 pub mod datadir;
 pub mod difficulty;
+pub mod disk_space;
 pub mod error;
 pub mod export;
 #[cfg(test)]

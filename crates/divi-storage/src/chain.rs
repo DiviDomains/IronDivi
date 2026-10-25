@@ -2189,7 +2189,12 @@ impl Chain {
             }
         }
 
-        // 8. Store block and index
+        // 8. Store block and index. Divi Core first checks that 50 MB stay
+        // free beyond what the block adds (BlockFileHelpers.cpp:132-142).
+        let size = divi_primitives::serialize::serialize(&block).len() as u64;
+        if !crate::disk_space::check_disk_space(self.db.path(), size) {
+            return Err(crate::disk_space::disk_space_low());
+        }
         debug!("  ├─ Storing block data and index");
         self.db.store_block(&hash, &block)?;
         // Index entry only: the height -> hash mapping is written solely when the
@@ -5117,7 +5122,13 @@ impl Chain {
     /// Should be called periodically during sync for durability.
     /// Returns the number of entries flushed, or 0 if cache is not enabled.
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
-        // Divi Core FlushStateToDisk: "Failed to write to coin database" (FlushChainState.cpp:49-50)
+        // Divi Core FlushStateToDisk: room for each coin, 100 bytes written
+        // twice with a safety factor of 2 (FlushChainState.cpp:31-40), then
+        // "Failed to write to coin database" (:49-50)
+        let room = 100 * 2 * 2 * self.db.utxo_dirty_count() as u64;
+        if !crate::disk_space::check_disk_space(self.db.path(), room) {
+            return Err(crate::disk_space::disk_space_low());
+        }
         abort_on_write_failure(self.db.flush_utxo_cache())
     }
 
@@ -5539,6 +5550,7 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
 #[cfg(test)]
 mod tests {
     mod crash;
+    mod disk_space;
 
     use super::*;
     use divi_primitives::amount::Amount;
