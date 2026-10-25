@@ -318,6 +318,25 @@ fn a_usdc_maker_claim_one_bump_short_of_the_cap_still_reaches_it() {
     );
 }
 
+/// Found by the property at 5000 cases: the maker's USDC claim first priced at 1 gwei
+/// (fixed cap 50) under a 371 gwei block floor and a 128 gwei mempool floor, climbing to
+/// `cap_feerate` only at the locktime, was short of the floor when the refund came.
+#[test]
+fn a_usdc_maker_claim_reaches_cap_feerate_blocks_before_the_locktime() {
+    let o = run(&Market {
+        chain: Chain::Usdc,
+        estimate: 1,
+        reveal: 101,
+        floors: vec![(371, 128)],
+        refund_feerate: 2000,
+    });
+    assert_eq!(
+        (o.maker, o.claimed, o.refunded.is_none()),
+        (SwapState::Done, true, true),
+        "{o:?}"
+    );
+}
+
 /// Revealed at the deadline, a first claim at 2, and from the reveal on a block floor of
 /// `block_floor` and a mempool floor of `mempool_floor`.
 fn floor_at(chain: Chain, block_floor: u64, mempool_floor: u64) -> Market {

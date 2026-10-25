@@ -387,6 +387,26 @@ fn a_usdc_claim_one_bump_short_of_the_cap_still_reaches_it() {
 }
 
 #[test]
+fn a_usdc_claim_reaches_cap_feerate_blocks_before_the_locktime() {
+    // Found by the USDC property at 5000 cases: a first claim at 1 gwei (fixed cap 50),
+    // the block floor at 370 and the mempool floor at 94. Climbing to `cap_feerate` only
+    // at the locktime, the claim was at 369 one block before it and lost to the refund.
+    let m = Market {
+        chain: Chain::Usdc,
+        estimate: 1,
+        delay_secs: 2545,
+        floors: vec![(740, 188)],
+        refund_feerate: 2000,
+    };
+    let o = run(&m, true);
+    assert_eq!(
+        (o.taker, o.claimed, o.leaked),
+        (TakerState::Done, true, true),
+        "{o:?}"
+    );
+}
+
+#[test]
 fn a_congested_btc_market_is_won_with_escalation_and_lost_without() {
     let on = run(&congested(Chain::Btc), true);
     assert_eq!((on.taker, on.claimed), (TakerState::Done, true), "{on:?}");
