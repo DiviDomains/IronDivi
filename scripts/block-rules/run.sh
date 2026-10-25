@@ -8,7 +8,7 @@
 #   run.sh <irondivid-bin-dir> <core-bin-dir> <port-base> [root]
 #
 # <irondivid-bin-dir> holds irondivid, <core-bin-dir> divid. Ports
-# <port-base> .. <port-base>+5 are used, on 127.0.0.2. A fresh directory is made
+# <port-base> .. <port-base>+9 are used, on 127.0.0.2. A fresh directory is made
 # under [root] (default $TMPDIR or /tmp) and deleted, with every node stopped,
 # however the run ends.
 set -u
@@ -49,7 +49,7 @@ trap cleanup EXIT
 trap 'exit 255' INT TERM HUP
 
 LIMIT=1500
-echo "# block-rules: ports $BASE..$((BASE + 5)) on 127.0.0.2, work directory $WORK"
+echo "# block-rules: ports $BASE..$((BASE + 9)) on 127.0.0.2, work directory $WORK"
 # In the background, so a signal to this script runs the trap at once
 timeout $LIMIT python3 -I "$HERE/check.py" "$IRD" "$DIVID" "$BASE" "$WORK" &
 CHILD=$!
