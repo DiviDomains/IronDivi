@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 static MOCK_TIME: AtomicI64 = AtomicI64::new(0);
+static TIME_OFFSET: AtomicI64 = AtomicI64::new(0);
 
 /// Set the clock to `time`; 0 goes back to the system time (Core SetMockTime)
 pub fn set_mock_time(time: i64) {
@@ -32,6 +33,24 @@ pub fn now() -> i64 {
         0 => system_now(),
         mock => mock,
     }
+}
+
+/// The network time offset in seconds: the median of the peers' clocks less
+/// ours, as the version messages sampled it (Core GetTimeOffset,
+/// timedata.cpp:29-33); 0 until enough peers agree
+pub fn time_offset() -> i64 {
+    TIME_OFFSET.load(Ordering::Relaxed)
+}
+
+/// Set the network time offset (Core's nTimeOffset, set by AddTimeData)
+pub fn set_time_offset(offset: i64) {
+    TIME_OFFSET.store(offset, Ordering::Relaxed);
+}
+
+/// Now on the network-adjusted clock: the node's clock plus the network time
+/// offset (Core GetAdjustedTime, timedata.cpp:35-38)
+pub fn adjusted_now() -> i64 {
+    now() + time_offset()
 }
 
 /// Now in Unix seconds from the system clock, whatever the mocked time

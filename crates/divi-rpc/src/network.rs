@@ -122,23 +122,11 @@ impl NetworkRpc {
         }))
     }
 
-    /// Network-adjusted time offset in seconds: the median of the connected peers'
-    /// clock offsets, used once at least 5 peers are known (C++ `GetTimeOffset`)
+    /// The network time offset in seconds (GetTimeOffset, rpcnet.cpp:374): the
+    /// median of every peer's version time since the start, one per address
+    /// (divi_network::timedata)
     fn time_offset(&self) -> i64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some(pm) = &self.peer_manager else {
-            return 0;
-        };
-        let mut offsets: Vec<i64> = pm
-            .get_peer_details()
-            .iter()
-            .map(|(_, _, _, st, _)| st.time_offset.load(Relaxed))
-            .collect();
-        if offsets.len() < 5 {
-            return 0;
-        }
-        offsets.sort_unstable();
-        offsets[offsets.len() / 2]
+        divi_primitives::clock::time_offset()
     }
 
     /// Get peer info

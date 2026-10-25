@@ -32,6 +32,10 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+/// How long Divi Core's DNS seed thread waits for peers before it asks the
+/// seeds, when the address book has addresses (net.cpp:1020)
+const DNS_SEED_DELAY: Duration = Duration::from_secs(11);
+
 /// Reads the node's current chain height
 pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
 
@@ -78,6 +82,11 @@ pub struct PeerManagerConfig {
     /// after its answer, `-connect` or not (Divi Core AddOneShot,
     /// net.cpp:1071-1084, :1096, :1112, :1842-1843)
     pub seed_nodes: Vec<String>,
+    /// Query the DNS seeds at start (Divi Core -dnsseed, after -connect
+    /// soft-set it off; net.cpp:1448-1450, :1683-1685)
+    pub dns_seed: bool,
+    /// Query them even when the address book has addresses (-forcednsseed)
+    pub force_dns_seed: bool,
 }
 
 /// The check Divi Core makes before a dial (net.cpp OpenNetworkConnection,
@@ -156,6 +165,8 @@ impl Default for PeerManagerConfig {
             whitelist: Vec::new(),
             white_listen: Vec::new(),
             seed_nodes: Vec::new(),
+            dns_seed: true,
+            force_dns_seed: false,
         }
     }
 }
@@ -207,6 +218,9 @@ pub struct PeerManager {
     static_peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
     /// Reads the current chain height for version messages (set by the node)
     height_source: RwLock<Option<HeightSource>>,
+    /// The node's active spork count, which an inbound peer is told after its
+    /// version (main.cpp:417-419)
+    spork_count_source: RwLock<Option<HeightSource>>,
     /// Listeners bound before the node starts (bind_listeners): address,
     /// whether its peers are whitelisted, socket. None until bound.
     prebound: parking_lot::Mutex<Option<Vec<(SocketAddr, bool, TcpListener)>>>,
@@ -246,6 +260,7 @@ impl PeerManager {
             total_bytes_recv: Arc::new(AtomicU64::new(0)),
             static_peer_backoff: RwLock::new(HashMap::new()),
             height_source: RwLock::new(None),
+            spork_count_source: RwLock::new(None),
             prebound: parking_lot::Mutex::new(None),
             inbound_handshaking: AtomicUsize::new(0),
             address_book: Arc::new(crate::addrbook::AddressBook::new(config_magic)),
@@ -279,10 +294,8 @@ impl PeerManager {
         if self.config.connect_only {
             return;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // GetAdjustedTime (net.cpp:1147)
+        let now = divi_primitives::clock::adjusted_now();
         let local = self.local_addresses();
         let mut slots = self.config.max_outbound;
         while slots > 0 && self.can_connect_outbound() {
@@ -485,6 +498,11 @@ impl PeerManager {
     /// Divi Core reads its chain height in each PushVersion (Node.cpp:994)
     pub fn set_height_source(&self, source: HeightSource) {
         *self.height_source.write() = Some(source);
+    }
+
+    /// Read the spork count an inbound peer is told from `source`
+    pub fn set_spork_count_source(&self, source: HeightSource) {
+        *self.spork_count_source.write() = Some(source);
     }
 
     /// The height a new version message names
@@ -800,7 +818,11 @@ impl PeerManager {
 
         // Then addresses learnt from peers, then DNS seeds
         self.dial_learnt();
-        Arc::clone(&self).discover_peers().await;
+        if self.config.dns_seed {
+            tokio::spawn(Arc::clone(&self).seed_from_dns());
+        } else {
+            info!("DNS seeding disabled");
+        }
 
         // Wait for the listeners (if started)
         for handle in listener_handles {
@@ -815,11 +837,29 @@ impl PeerManager {
         self.config.proxy
     }
 
-    /// Discover peers from DNS seeds
-    async fn discover_peers(self: Arc<Self>) {
+    /// Divi Core's DNS seed thread (net.cpp:1015-1060): the seeds are asked
+    /// only when addresses are needed, that is with an empty address book,
+    /// with -forcednsseed, or when fewer than two peers are connected 11 s
+    /// after the start
+    async fn seed_from_dns(self: Arc<Self>) {
+        if !self.address_book.is_empty() && !self.config.force_dns_seed {
+            tokio::time::sleep(DNS_SEED_DELAY).await;
+            if self.peer_count() >= 2 {
+                info!("P2P peers available. Skipped DNS seeding.");
+                return;
+            }
+        }
+        info!("Loading addresses from DNS seeds (could take a while)");
+        let found = Arc::clone(&self).discover_peers().await;
+        info!("{} addresses found from DNS seeds", found);
+    }
+
+    /// Look up the DNS seeds: their addresses go into the address book and,
+    /// unless -connect, are dialled into free outbound slots. How many were found.
+    async fn discover_peers(self: Arc<Self>) -> usize {
         if self.config.dns_seeds.is_empty() {
             debug!("No DNS seeds configured; skipping DNS peer discovery");
-            return;
+            return 0;
         }
         if let Some(proxy) = self.config.proxy {
             // A local lookup would reveal the node outside the proxy
@@ -827,12 +867,9 @@ impl PeerManager {
                 "Proxy {} set: not resolving DNS seeds locally; using configured peers only",
                 proxy
             );
-            return;
+            return 0;
         }
-        info!(
-            "Discovering peers from DNS seeds ({} configured)",
-            self.config.dns_seeds.len()
-        );
+        let mut found = 0;
 
         for seed in &self.config.dns_seeds {
             debug!("Resolving DNS seed: {}", seed);
@@ -841,9 +878,13 @@ impl PeerManager {
                 Ok(addrs) => {
                     // Into the book, as divid adds what a seed gives (net.cpp ThreadDNSAddressSeed)
                     let addrs: Vec<SocketAddr> = addrs.collect();
+                    found += addrs.len();
                     self.address_book.add_seeds(&addrs);
                     let local = self.local_addresses();
                     for addr in addrs {
+                        if self.config.connect_only {
+                            break;
+                        }
                         if self.can_connect_outbound() {
                             // A seed address dialled at once: as from the
                             // book, not in a network -onlynet left out
@@ -870,6 +911,7 @@ impl PeerManager {
                 }
             }
         }
+        found
     }
 
     /// Run the inbound connection listener
@@ -1028,7 +1070,10 @@ impl PeerManager {
         .await;
 
         let (conn, handle) = match result {
-            Ok(r) => r,
+            Ok((conn, handle)) => (
+                conn.with_spork_count(self.spork_count_source.read().clone()),
+                handle,
+            ),
             Err(e) => {
                 self.connecting_addrs.write().remove(&addr);
                 return Err(e);
@@ -1110,6 +1155,7 @@ impl PeerManager {
             self.local_addresses(),
         )
         .await?;
+        let conn = conn.with_spork_count(self.spork_count_source.read().clone());
 
         let peer_id = handle.id;
         let addr = handle.addr;
@@ -1517,7 +1563,11 @@ impl PeerManager {
             self.dial_learnt();
 
             // 4. Re-query DNS seeds as last resort
-            if self.can_connect_outbound() && !self.config.dns_seeds.is_empty() {
+            if self.can_connect_outbound()
+                && self.config.dns_seed
+                && !self.config.connect_only
+                && !self.config.dns_seeds.is_empty()
+            {
                 info!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;
             }
@@ -1731,6 +1781,59 @@ mod tests {
             "empty seed list still logged discovery: {:?}",
             logs
         );
+    }
+
+    /// The log of `f` run on a current-thread runtime
+    async fn logs_of<F: std::future::Future<Output = ()>>(f: F) -> String {
+        let buf = LogBuf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        let logs = String::from_utf8(buf.0.lock().clone()).unwrap();
+        logs
+    }
+
+    /// Divi Core's DNS seed thread asks the seeds at once with an empty
+    /// address book or -forcednsseed, and logs it in its words (net.cpp:1034, :1059)
+    #[tokio::test]
+    async fn dns_seeds_are_asked_at_once_with_an_empty_book_or_forced() {
+        let pm = regtest_peer_manager(None);
+        assert!(pm.address_book.is_empty());
+        let logs = logs_of(Arc::clone(&pm).seed_from_dns()).await;
+        assert!(
+            logs.contains("Loading addresses from DNS seeds (could take a while)")
+                && logs.contains("0 addresses found from DNS seeds"),
+            "{logs}"
+        );
+
+        let forced = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            dns_seeds: vec![],
+            force_dns_seed: true,
+            ..Default::default()
+        });
+        let public = crate::message::NetAddr::from_ipv4([11, 2, 7, 9], 51476, 1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        forced
+            .address_book
+            .add(&[(now, public)], "127.0.0.12".parse().unwrap());
+        assert_eq!(forced.address_book.len(), 1);
+        // No 11 s wait: well within the timeout
+        let logs = logs_of(async {
+            tokio::time::timeout(Duration::from_secs(5), Arc::clone(&forced).seed_from_dns())
+                .await
+                .expect("asked at once");
+        })
+        .await;
+        assert!(logs.contains("Loading addresses from DNS seeds"), "{logs}");
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub enum NetworkMessage {
     MasternodePing(Vec<u8>),
     /// Masternode payment winner (mnw)
     MasternodeWinner(Vec<u8>),
+    /// Request the payment winners of the last blocks (mnget, the count asked)
+    MasternodeWinnersRequest(i32),
 
     // Unknown/unhandled messages
     /// Unknown message type (command, payload)
@@ -160,6 +162,7 @@ impl NetworkMessage {
             NetworkMessage::MasternodeBroadcast(_) => "mnb",
             NetworkMessage::MasternodePing(_) => "mnp",
             NetworkMessage::MasternodeWinner(_) => "mnw",
+            NetworkMessage::MasternodeWinnersRequest(_) => "mnget",
             NetworkMessage::Unknown(cmd, _) => cmd,
         }
     }
@@ -249,6 +252,7 @@ impl NetworkMessage {
                 Ok(buf)
             }
             NetworkMessage::GetSyncStatus => Ok(vec![]),
+            NetworkMessage::MasternodeWinnersRequest(count) => Ok(count.to_le_bytes().to_vec()),
         }
     }
 
@@ -338,6 +342,7 @@ impl NetworkMessage {
             "mnb" => NetworkMessage::MasternodeBroadcast(payload.to_vec()),
             "mnp" => NetworkMessage::MasternodePing(payload.to_vec()),
             "mnw" => NetworkMessage::MasternodeWinner(payload.to_vec()),
+            "mnget" => NetworkMessage::MasternodeWinnersRequest(r.i32()?),
 
             _ => NetworkMessage::Unknown(command.to_string(), payload.to_vec()),
         };

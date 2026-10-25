@@ -46,6 +46,7 @@ mod constants;
 pub mod cpp_wire;
 mod manager;
 mod masternode;
+pub mod mnsync;
 mod payments;
 mod relay;
 mod rpc;
