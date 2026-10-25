@@ -206,6 +206,9 @@ pub struct Node {
     /// The masternodes' payment votes (mnw)
     masternode_votes: Arc<divi_rpc::mn_votes::MasternodeVotes>,
 
+    /// Divi Core's masternode sync and IsBlockchainSynced
+    masternode_sync: divi_masternode::mnsync::SharedMasternodeSync,
+
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
 
@@ -808,6 +811,14 @@ impl Node {
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
         masternode_list.set_path(config.data_dir.join("masternodes.list"));
         let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
+        // The masternode sync, with the requests kept from the last run
+        let masternode_sync = divi_masternode::mnsync::shared(
+            divi_primitives::clock::now(),
+            chain.network_type() == divi_storage::chain::NetworkType::Mainnet,
+        );
+        crate::masternode_sync::load(&masternode_sync, &config.data_dir);
+        // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
+        masternode_votes.follow_sync(Arc::clone(&masternode_sync));
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -835,6 +846,7 @@ impl Node {
             masternode_manager,
             masternode_list,
             masternode_votes,
+            masternode_sync,
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -1036,6 +1048,37 @@ impl Node {
                 }
             }));
         }
+        // The masternode sync thread: a step a second, the request cache
+        // cleared of expired entries and kept on disk once a minute
+        // (MasternodeModule.cpp:472-531)
+        {
+            let sync = Arc::clone(&self.masternode_sync);
+            let chain = Arc::clone(&self.chain);
+            let peers = Arc::clone(&self.peer_manager);
+            let sporks = Arc::clone(&self.spork_manager);
+            let data_dir = self.config.data_dir.clone();
+            let mut shutdown = self.shutdown_tx.subscribe();
+            self.keep(tokio::spawn(async move {
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut last_cleanup = divi_primitives::clock::now();
+                loop {
+                    tokio::select! {
+                        _ = every.tick() => {}
+                        _ = shutdown.recv() => break,
+                    }
+                    let now = divi_primitives::clock::now();
+                    if !crate::masternode_sync::tick(&sync, &chain, &peers, &sporks, now).await {
+                        continue;
+                    }
+                    if now >= last_cleanup + 60 {
+                        last_cleanup = now;
+                        sync.lock().sync.requests.check_and_remove(now);
+                        crate::masternode_sync::save(&sync, &data_dir);
+                    }
+                }
+            }));
+        }
+        let masternode_sync = Arc::clone(&self.masternode_sync);
         // With -alerts=0 an alert message is not read at all (main.cpp:870)
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic)
             .filter(|_| self.config.p2p.alerts);
@@ -1167,6 +1210,25 @@ impl Node {
                                 // CMasternodePing::Relay)
                                 if masternode_items_asked.len() > 100_000 {
                                     masternode_items_asked.clear();
+                                }
+                                // Announced items the node has count for the
+                                // sync's list and winner stages (MasternodeIsKnown,
+                                // MasternodeWinnerIsKnown, MasternodeModule.cpp:346-370)
+                                for i in items.iter() {
+                                    use divi_network::message::InvType;
+                                    let now = divi_primitives::clock::now();
+                                    match i.inv_type {
+                                        InvType::MasternodeAnnounce
+                                            if masternode_list
+                                                .has(divi_rpc::mn_list::INV_BROADCAST, &i.hash.0) =>
+                                        {
+                                            masternode_sync.lock().sync.record_list_update(i.hash.0, true, now)
+                                        }
+                                        InvType::MasternodeWinner if masternode_votes.is_known(&i.hash.0) => {
+                                            masternode_sync.lock().sync.record_winner_update(i.hash.0, true, now)
+                                        }
+                                        _ => {}
+                                    }
                                 }
                                 let masternode_items: Vec<_> = items
                                     .iter()
@@ -1335,21 +1397,51 @@ impl Node {
                                 spork_manager.handle_spork(peer_id, spork).await;
                             }
                             // Masternode sync messages
+                            // A peer's count for what the masternode sync asked
                             NetworkMessage::SyncStatusCount { item_id, count } => {
-                                tracing::info!(
-                                    "Received sync status count from peer {}: item_id={}, count={}",
+                                tracing::debug!(
+                                    "Sync status count from peer {}: item_id={}, count={}",
                                     peer_id,
                                     item_id,
                                     count
+                                );
+                                crate::masternode_sync::sync_status_count(
+                                    &masternode_sync,
+                                    &chain,
+                                    peer_manager.peer_addr(peer_id),
+                                    item_id,
+                                    count,
+                                    divi_primitives::clock::now(),
                                 );
                             }
                             NetworkMessage::GetSyncStatus => {
                                 tracing::debug!("Received govsync request from peer {}", peer_id);
                             }
-                            // Masternode P2P messages
-                            // dseg is not answered (a peer's masternode list sync)
-                            NetworkMessage::RequestMasternodeList(_) => {
-                                tracing::debug!("dseg from peer {} not answered", peer_id);
+                            // Masternode P2P messages: a peer's masternode
+                            // sync asks for the list and the winners
+                            NetworkMessage::RequestMasternodeList(payload) => {
+                                crate::masternode_sync::answer_list_request(
+                                    &masternode_sync,
+                                    &chain,
+                                    &masternode_list,
+                                    &peer_manager,
+                                    peer_id,
+                                    &payload,
+                                    divi_primitives::clock::now(),
+                                )
+                                .await;
+                            }
+                            NetworkMessage::MasternodeWinnersRequest(count) => {
+                                crate::masternode_sync::answer_winners_request(
+                                    &masternode_sync,
+                                    &chain,
+                                    &masternode_votes,
+                                    &peer_manager,
+                                    peer_id,
+                                    count,
+                                    divi_primitives::clock::now(),
+                                )
+                                .await;
                             }
                             // Masternode messages are read once the chain is
                             // synced (ProcessMasternodeMessages,
@@ -1357,7 +1449,11 @@ impl Node {
                             NetworkMessage::MasternodeBroadcast(_)
                             | NetworkMessage::MasternodePing(_)
                             | NetworkMessage::MasternodeWinner(_)
-                                if !masternode_list.blockchain_synced(&chain) =>
+                                if !crate::masternode_sync::blockchain_synced(
+                                    &masternode_sync,
+                                    &chain,
+                                    divi_primitives::clock::now(),
+                                ) =>
                             {
                                 tracing::debug!(
                                     "Masternode message from peer {} not read: the chain is not synced",
@@ -1367,7 +1463,23 @@ impl Node {
                             // Broadcasts and pings in Divi Core's wire format, kept
                             // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
-                                match masternode_list.accept_broadcast(&chain, &payload) {
+                                // A broadcast seen again or newly taken counts for
+                                // the sync's list stage (masternodeman.cpp:416-419, :474)
+                                let hash = divi_masternode::cpp_wire::CppBroadcast::decode(&payload)
+                                    .ok()
+                                    .map(|b| b.hash());
+                                let known = hash.is_some_and(|h| {
+                                    masternode_list.has(divi_rpc::mn_list::INV_BROADCAST, &h)
+                                });
+                                let result = masternode_list.accept_broadcast(&chain, &payload);
+                                if let (Some(hash), true) = (hash, known || result.is_ok()) {
+                                    masternode_sync.lock().sync.record_list_update(
+                                        hash,
+                                        known,
+                                        divi_primitives::clock::now(),
+                                    );
+                                }
+                                match result {
                                     Ok(true) => tracing::info!(
                                         "Masternode entry from peer {} added to the list",
                                         peer_id
@@ -1418,11 +1530,23 @@ impl Node {
                             // checks and then announced, as ProcessMasternodeWinners
                             // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
-                                match masternode_votes.accept(&chain, &masternode_list, &payload) {
+                                // A vote seen again or newly taken counts for the
+                                // sync's winner stage (masternode-payments.cpp:205-209, :262-265)
+                                let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
+                                    .ok()
+                                    .map(|w| w.hash());
+                                let known = hash.is_some_and(|h| masternode_votes.is_known(&h));
+                                let result = masternode_votes.accept(&chain, &masternode_list, &payload);
+                                if let (Some(hash), true) = (hash, known || matches!(result, Ok(true))) {
+                                    masternode_sync.lock().sync.record_winner_update(
+                                        hash,
+                                        true,
+                                        divi_primitives::clock::now(),
+                                    );
+                                }
+                                match result {
                                     Ok(true) => {
-                                        let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
-                                            .map(|w| w.hash());
-                                        if let Ok(hash) = hash {
+                                        if let Some(hash) = hash {
                                             relay_masternode_items(
                                                 &peer_manager,
                                                 &mut masternode_items_known,
@@ -1490,15 +1614,17 @@ impl Node {
                                         "Requested too many addresses",
                                     );
                                 } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as u32)
-                                        .unwrap_or(0);
+                                    // Addresses are dated on the network-adjusted
+                                    // clock (main.cpp:536), the day's peers picked
+                                    // on the node's own (net.cpp:1508)
+                                    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
+                                    let day_now = divi_primitives::clock::now().max(0) as u32;
                                     let got = peer_manager.gossip().received(
                                         peer_id,
                                         &addrs,
                                         &peer_manager.connected_peers(),
                                         now,
+                                        day_now,
                                     );
                                     if let Some(from) = peer_manager.peer_addr(peer_id) {
                                         peer_manager.address_book().add(&got.keep, from.ip());
@@ -1807,6 +1933,8 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
+        // netfulfilled.dat is written at shutdown (MasternodeModule.cpp:290-296)
+        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
@@ -2317,6 +2445,11 @@ impl Node {
     pub fn masternode_votes(&self) -> &Arc<divi_rpc::mn_votes::MasternodeVotes> {
         &self.masternode_votes
     }
+
+    /// The masternode sync (mnsync, getstakingstatus)
+    pub fn masternode_sync(&self) -> &divi_masternode::mnsync::SharedMasternodeSync {
+        &self.masternode_sync
+    }
 }
 
 /// Blockchain information
@@ -2740,10 +2873,10 @@ pub fn check_mempool_transaction(
         return Err(NodeError::rejected(reject::INVALID, "coinstake"));
     }
     let tip_height = chain.height();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // IsStandardTx reads a time lock on GetAdjustedTime: the node's clock
+    // (setmocktime sets it) plus the network time offset
+    // (MempoolConsensus.cpp:61, TransactionFinalityHelpers.cpp:16-17)
+    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
     // Divi Core checks IsStandardTx and AreInputsStandard only without
     // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
     let require_standard = mempool.requires_standard();

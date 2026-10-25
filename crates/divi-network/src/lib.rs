@@ -78,6 +78,7 @@ pub mod socks5;
 pub mod spork;
 pub mod subnet;
 pub mod sync;
+pub mod timedata;
 pub mod torcontrol;
 pub mod upnp;
 

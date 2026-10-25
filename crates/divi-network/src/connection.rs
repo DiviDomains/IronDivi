@@ -410,6 +410,7 @@ impl Connection {
 
         // Store their version info
         self.info.time_offset = their_version.timestamp - divi_primitives::clock::now();
+        let their_time = their_version.timestamp;
         // An inbound peer names the address it reached us at (Divi Core
         // main.cpp:402-404 SeenLocal)
         if self.info.direction == PeerDirection::Inbound {
@@ -433,6 +434,10 @@ impl Connection {
 
         // Send verack
         self.send_message(NetworkMessage::Verack).await?;
+        // A sample of the network's time, last of the version message's work, so
+        // the version we sent an inbound peer has the offset as it was before
+        // (Divi Core AddTimeData after PushVersion and verack, main.cpp:407-465)
+        crate::timedata::add_time_data(self.info.addr.ip(), their_time);
 
         // Then, as Divi Core's version handler: an inbound peer is told the
         // spork count, an outbound one asked for addresses (main.cpp:417-442)
@@ -481,8 +486,13 @@ impl Connection {
         let version = VersionMessage {
             version: crate::constants::protocol_version(),
             services: self.our_services,
-            // GetTime or GetAdjustedTime, both from the mocked clock (Node.cpp PushVersion)
-            timestamp: divi_primitives::clock::now(),
+            // GetAdjustedTime to an inbound peer, GetTime to one we dialled, both on
+            // the clock setmocktime sets (Node.cpp:995-996)
+            timestamp: if self.info.direction == PeerDirection::Inbound {
+                divi_primitives::clock::adjusted_now()
+            } else {
+                divi_primitives::clock::now()
+            },
             addr_recv,
             addr_from: self
                 .local
