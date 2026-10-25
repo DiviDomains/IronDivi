@@ -298,3 +298,55 @@ fn externalip_that_is_not_an_address_stops_the_start() {
         "{text}"
     );
 }
+
+/// -onlynet limits every network it does not name (net.cpp:1734-1746):
+/// getnetworkinfo shows it limited and not reachable (rpcnet.cpp:323-324), and
+/// an -externalip of a limited network is not one of our addresses
+/// (AddLocal, NetworkLocalAddressHelpers.cpp:90)
+#[test]
+fn onlynet_limits_the_other_networks() {
+    let net = |info: &Value, name: &str| {
+        info["networks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("network {name}"))
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let node = Daemon::start(
+        dir.path(),
+        &[
+            "-onlynet=IPv6",
+            "-externalip=1.2.3.4",
+            "-externalip=[2a00:1450:4001:80b::200e]",
+        ],
+    );
+    let info = node.rpc("getnetworkinfo");
+    assert_eq!(net(&info, "ipv4")["limited"], true, "{info}");
+    assert_eq!(net(&info, "ipv4")["reachable"], false, "{info}");
+    assert_eq!(net(&info, "ipv6")["limited"], false, "{info}");
+    assert_eq!(net(&info, "ipv6")["reachable"], true, "{info}");
+    let local: Vec<&str> = info["localaddresses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(local, ["2a00:1450:4001:80b::200e"], "{info}");
+    drop(node);
+    // An option irondivid acts on: no "not supported" or "Unknown option" line
+    let log = std::fs::read_to_string(dir.path().join("regtest").join("debug.log"))
+        .or_else(|_| std::fs::read_to_string(dir.path().join("debug.log")))
+        .unwrap_or_default();
+    assert!(!log.contains("-onlynet"), "{log}");
+
+    // Without -onlynet nothing is limited, and both addresses are ours
+    let dir = tempfile::tempdir().unwrap();
+    let node = Daemon::start(dir.path(), &["-externalip=1.2.3.4"]);
+    let info = node.rpc("getnetworkinfo");
+    assert_eq!(net(&info, "ipv4")["limited"], false, "{info}");
+    assert_eq!(net(&info, "ipv6")["limited"], false, "{info}");
+    assert_eq!(info["localaddresses"][0]["address"], "1.2.3.4", "{info}");
+}

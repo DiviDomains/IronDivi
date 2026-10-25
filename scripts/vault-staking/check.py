@@ -49,23 +49,15 @@ KNOWN = {
     "*getstakingstatus: fields divid lacks":
         "\"staking status text\", the string irondivid gave before the field became a bool, kept for older "
         "callers (docs/rpc-parity-audit.md: getstakingstatus; divid: rpcmisc.cpp:1059-1076)",
-    "*getstakingstatus mnsync (divid's masternode sync not finished)":
-        "open: true, as irondivid has no masternode sync and counts it finished; divid gives false on a "
-        "regtest node with no masternodes (rpcmisc.cpp:1068; the same gap as mnsync status in scripts/net-replies)",
+    "*owner getstakingstatus mnsync (the owners' peers differ)":
+        "the topology, not a difference: divid's owner has three inbound peers (both managers and irondivid's "
+        "owner dial it), so its masternode sync can finish (mnsync true, IsSynced, rpcmisc.cpp:1069); "
+        "irondivid's owner has one peer and stays at SPORKS (masternode-sync.cpp:437-440)",
     "*: manager listtransactions * 100 0 true (a removed vault's records)":
-        "open: after removevault divid still lists the records of the removed vault's coins until it restarts "
-        "(removevault drops the script from memory only, wallet.cpp:707-716; the transactions stay in mapWallet); "
-        "irondivid drops them at once; as in scripts/vault-replies",
-    "after the managers *: removevault vault [12] again (divid manages it again)":
-        "open: divid's removevault drops the vault script from memory only (wallet.cpp:707-716), and a "
-        "restart or -reindex reads it back from the wallet file, so divid manages the vault again and "
-        "removes it again (true); irondivid removed it for good (false); as in scripts/vault-replies",
-    "locked manager: setgenerate":
-        "divid's locked wallet throws from key derivation (CWallet::GetKey, wallet.cpp:544) and the RPC layer "
-        "returns that text as -1; irondivid answers -25 \"failed to generate a valid block\", as divid does "
-        "when no stake is found (rpcmining.cpp:110)",
-    "*getstakingstatus: member order":
-        "members in name order, not in divid's insertion order (docs/divid-differences.md R6)",
+        "by design: after removevault divid still lists the removed vault's transactions, with their amounts, "
+        "until its next start: it keeps each transaction's credit and debit in a cache "
+        "(CachedTransactionDeltasCalculator.cpp:108-118) that removevault never clears (wallet.cpp:707-716); "
+        "irondivid works the entries out from the wallet as it is; as in scripts/vault-replies",
 }
 
 EXTRA = {
@@ -400,8 +392,8 @@ NAMES = {MGR: "<manager>", DEST: "<dest>"}
 for k, o in enumerate(OWNERS):
     NAMES[o] = f"<owner {k + 1}>"
 FUNDS = {}      # funding txid -> "vault k coin c"
-# Set once a vault the managers held coin records of is removed (divid keeps
-# those records, irondivid drops them)
+# Set once a vault the managers held coin records of is removed, until the next
+# start (divid lists those records from its cache until then, irondivid does not)
 REMOVED_WITH_RECORDS = False
 
 
@@ -489,7 +481,7 @@ def status(when):
         compare(f"{p}{side} getstakingstatus", cs, is_, drop={"mnsync", "staking status"}, extra="getstakingstatus")
         if cs[0] == is_[0] == "ok":
             a, b = cs[1].get("mnsync"), is_[1].get("mnsync")
-            name = f"{p}{side} getstakingstatus mnsync" + ("" if a == b else " (divid's masternode sync not finished)")
+            name = f"{p}{side} getstakingstatus mnsync" + ("" if a == b else " (the owners' peers differ)")
             row(name, a, b, a == b)
         order_c = list(c.raw_call("getstakingstatus")["result"])
         order_i = [k for k in i.raw_call("getstakingstatus")["result"] if k in order_c]
@@ -662,30 +654,27 @@ mine(25)
 views("vault 3 funded and mature", since=mark)
 
 def remove_again(when):
-    # divid shows a removed vault's records until it restarts; once the vault
-    # is removed again after the restart, both show none
-    global REMOVED_WITH_RECORDS
-    REMOVED_WITH_RECORDS = False
+    # divid's removevault leaves the vault in its wallet file, and so does
+    # irondivid's: a start manages the vault again on both, so the managers
+    # remove the vaults again to go on from the same state
     for k in (0, 1):
-        c, i = CM.call("removevault", VAULTS[k]), IM.call("removevault", VAULTS[k])
-        name = f"{when}: removevault vault {k + 1} again"
-        if c != i:
-            name += " (divid manages it again)"
-        compare(name, c, i)
+        compare(f"{when}: removevault vault {k + 1} again", CM.call("removevault", VAULTS[k]),
+                IM.call("removevault", VAULTS[k]))
 
 
 for n in (CM, IM):
     n.restart()
 if not synced():
     raise RuntimeError("the managers did not reconnect after the restart")
-remove_again("after the managers restarted")
+REMOVED_WITH_RECORDS = False    # a start gives the same on both: the vaults are registered again
 views("after the managers restarted")
+remove_again("after the managers restarted")
 for n in (CM, IM):
     n.restart("-reindex")
 if not wait_for(lambda: len(set(tips())) == 1, 300):
     raise RuntimeError("the managers did not finish -reindex")
-remove_again("after the managers -reindex")
 views("after the managers -reindex")
+remove_again("after the managers -reindex")
 
 # Locked: both managers encrypted with one throwaway passphrase
 passphrase = secrets.token_hex(16)

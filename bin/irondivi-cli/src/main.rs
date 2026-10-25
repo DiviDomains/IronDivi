@@ -816,10 +816,12 @@ fn parse_argument(arg: &str) -> serde_json::Value {
 }
 
 /// The result as divi-cli prints it: nothing for null, a string as it is,
-/// anything else as indented JSON (divi-cli.cpp:174-180, 202-203)
+/// anything else as indented JSON; nothing at all, not even the newline, when
+/// that text is empty (divi-cli.cpp:174-180, 202-203)
 fn format_result(result: &json_spirit::Value) -> Option<Vec<u8>> {
     match result {
         json_spirit::Value::Null => None,
+        json_spirit::Value::Str(s) if s.is_empty() => None,
         json_spirit::Value::Str(s) => Some(s.clone()),
         other => Some(json_spirit::write(other, true)),
     }
@@ -1332,6 +1334,23 @@ mod endpoint_tests {
         assert_eq!(unquote("alice"), "alice");
         assert_eq!(unquote("\""), "\"");
         assert_eq!(unquote("51491"), "51491");
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    /// divi-cli prints a result only when its text is not empty
+    /// (divi-cli.cpp:202-203): an empty string prints nothing, not a newline
+    #[test]
+    fn an_empty_string_result_prints_nothing() {
+        assert_eq!(format_result(&json_spirit::Value::Str(Vec::new())), None);
+        assert_eq!(format_result(&json_spirit::Value::Null), None);
+        assert_eq!(
+            format_result(&json_spirit::Value::Str(b" ".to_vec())),
+            Some(b" ".to_vec())
+        );
     }
 }
 

@@ -240,10 +240,13 @@ fn wrong_argument_types_are_refused_as_json_spirit_refuses_them() {
         n.err("getblockheader", vec![tip, json!(1)]),
         (-1, "value is type int, expected bool".to_string())
     );
+    // minconf is read for an account; for "*" divid answers before it reads
+    // it (rpcwallet.cpp:1576-1582)
     assert_eq!(
-        n.err("getbalance", vec![json!("*"), json!("1")]),
+        n.err("getbalance", vec![json!(""), json!("1")]),
         (-1, "value is type str, expected int".to_string())
     );
+    assert!(n.call("getbalance", vec![json!("*"), json!("1")]).is_ok());
 }
 
 /// Calls that need a wallet answer -32601 on a node without one

@@ -66,20 +66,23 @@ pub mod error;
 pub mod lottery;
 pub mod pos_calculator;
 pub mod pos_generator;
+pub mod spork_values;
 pub mod stake_modifier;
 pub mod staking_data;
 pub mod target;
 pub mod treasury;
 
 pub use block_subsidy::{
-    calculate_weighted_treasury_payment, get_block_subsidy, get_block_subsidy_for_chain,
-    premine_for_chain, BlockRewards, PRIVATEDIVI_MAINNET_PREMINE, SUBSIDY_HALVING_INTERVAL,
+    calculate_weighted_treasury_payment, calculate_weighted_treasury_payment_with,
+    get_block_subsidy, get_block_subsidy_for_chain, get_block_subsidy_for_chain_with,
+    get_block_subsidy_with, premine_for_chain, BlockRewards, SporkView,
+    PRIVATEDIVI_MAINNET_PREMINE, SUBSIDY_HALVING_INTERVAL,
 };
 pub use error::ConsensusError;
 pub use lottery::{
     calculate_lottery_payments, calculate_lottery_score, get_last_lottery_height,
-    is_coinstake_valid_for_lottery, is_lottery_block, update_lottery_winners,
-    LOTTERY_TICKET_MINIMUM, LOTTERY_WINNER_COUNT,
+    is_coinstake_valid_for_lottery, is_coinstake_valid_for_lottery_with_minimum, is_lottery_block,
+    update_lottery_winners, LOTTERY_TICKET_MINIMUM, LOTTERY_WINNER_COUNT,
 };
 pub use pos_calculator::{
     compute_stake_hash, create_hashproof, stake_target_hit, HashproofResult,

@@ -24,6 +24,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 RPC_TIMEOUT = 60
 START_TIMEOUT = 120
@@ -35,7 +38,6 @@ IRONDIVID_ONLY = {
     "bip38encrypt": "divid has bip38paperwallet only (rpcdump.cpp:249-293)",
     "setstakesplitthreshold": "divid takes -stakesplitthreshold at start only",
     "getstakesplitthreshold": "divid takes -stakesplitthreshold at start only",
-    "reservebalance": "divid has no reservebalance call in 3.0.0",
 }
 
 # Differences irondivid has on purpose, by row name. Each is listed in README.md
@@ -48,13 +50,13 @@ KNOWN = {
 }
 
 fails = 0
-counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0}
+counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0, "ORDER": 0}
 
 
 def row(word, name, core, iron, note=""):
     global fails
     counts[word] += 1
-    if word == "FAIL":
+    if word in ("FAIL", "ORDER"):
         fails += 1
     line = f"{word:<5}  {name}  divid={core}  irondivid={iron}{note}".replace("\n", "\\n")
     print(line[:400], flush=True)
@@ -206,9 +208,14 @@ def compare(name, core, iron, hide=False, norm=None):
         if norm:
             a, b = norm(a), norm(b)
         d = first_difference(a, b)
+        moved = member_order.difference(a, b)
         if d and hide:
             d = "results differ (hidden)"
         same, shown = d is None, d or short(iron, hide)
+        if moved:
+            # The same members or items in another order than divid's: a FAIL of its own kind
+            row("ORDER", name, short(core, hide), shown, "  [" + ("order differs (hidden)" if hide else moved) + "]")
+            return
     if name in KNOWN:
         word = "FAIL" if same else "KNOWN"
         note = "  [listed as KNOWN but now matches divid: update README.md]" if same \
@@ -404,7 +411,7 @@ def unlocked():
     both("bip38encrypt <own address> <passphrase>", "bip38encrypt", X, PASS1, hide=True)
     both("bip38encrypt (no argument)", "bip38encrypt", hide=True)
 
-    # Stake split threshold and reserve balance: irondivid only
+    # Stake split threshold: irondivid only. reservebalance: neither node has it
     both("getstakesplitthreshold", "getstakesplitthreshold")
     both("setstakesplitthreshold 30000", "setstakesplitthreshold", 30000)
     both("setstakesplitthreshold -1", "setstakesplitthreshold", -1)
@@ -460,6 +467,7 @@ del WALLET_PASS
 
 for n in (C, I):
     n.stop()
-print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
+print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL, {counts['ORDER']} ORDER",
+      flush=True)
 print(f"FAILS {fails}", flush=True)
 sys.exit(min(fails, 254))

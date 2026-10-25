@@ -23,8 +23,8 @@ use divi_crypto::compute_block_hash;
 use divi_masternode::MasternodeManager;
 use divi_network::constants::MAX_INV_SIZE;
 use divi_network::{
-    BlockSync, MasternodeHandler, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
-    SporkManager, SyncState, TxRelay,
+    BlockSync, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig, SporkManager, SyncState,
+    TxRelay,
 };
 use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
@@ -75,6 +75,182 @@ pub fn getblocks_reply(
         height += 1;
     }
     (items, None)
+}
+
+/// What getdata items are served from
+pub struct GetDataStores<'a> {
+    pub chain: &'a Chain,
+    pub tx_relay: &'a TxRelay,
+    pub mempool: &'a Mempool,
+    pub spork_manager: &'a SporkManager,
+    pub masternode_list: &'a divi_rpc::mn_list::MasternodeList,
+    pub masternode_votes: &'a divi_rpc::mn_votes::MasternodeVotes,
+}
+
+/// Answer a peer's waiting getdata as Divi Core's ProcessGetData
+/// (main.cpp:283-347), in the order asked, while the bytes queued for the
+/// peer are under -maxsendbuffer (main.cpp:291-293); what is left waits for
+/// the next pass, so a peer that does not read holds up no other.
+///
+/// A block is sent only if the node has it and may send it
+/// (GetBlockIndexOfRequestedBlock, main.cpp:213-247), else nothing; after the
+/// last block of a full getblocks answer an inv of the tip follows, so the peer
+/// asks for more. A transaction comes from what was relayed in the last 15
+/// minutes, then the mempool (main.cpp:324), else it is named in a notfound,
+/// which goes out after the next block, or at the end of the pass. A spork,
+/// masternode broadcast, ping or vote held is sent, else named in the same
+/// notfound (main.cpp:187-198, :337-346).
+pub fn serve_getdata(
+    stores: &GetDataStores<'_>,
+    peer_manager: &PeerManager,
+    hash_continue: &mut HashMap<divi_network::PeerId, Hash256>,
+    queue: &mut std::collections::VecDeque<divi_network::InvItem>,
+    peer_id: divi_network::PeerId,
+) {
+    use divi_network::TrySend;
+    let GetDataStores {
+        chain,
+        tx_relay,
+        mempool,
+        spork_manager,
+        masternode_list,
+        masternode_votes,
+    } = stores;
+    let mut not_found = Vec::new();
+    while let Some(item) = queue.front().cloned() {
+        match peer_manager.send_queued(peer_id) {
+            None => return queue.clear(),
+            Some(queued) if queued >= divi_network::buffers::max_send_buffer() => break,
+            Some(_) => {}
+        }
+        match item.inv_type {
+            // A filtered block is found and followed as a block is
+            // (main.cpp:300-318), sent as a merkleblock under the peer's
+            // filter (which matching updates), then each matched transaction
+            // the peer is not known to have (main.cpp:249-278); served whatever
+            // -peerbloomfilters says, as every peer has a filter (Node.cpp:556)
+            divi_network::InvType::Block | divi_network::InvType::FilteredBlock => {
+                match chain.get_block_for_peer(&item.hash) {
+                    Ok(Some(block)) => {
+                        let messages = if item.inv_type == divi_network::InvType::Block {
+                            vec![NetworkMessage::Block(block)]
+                        } else {
+                            let Some(stats) = peer_manager.peer_stats(peer_id) else {
+                                return queue.clear();
+                            };
+                            let (payload, matched) = {
+                                let mut filter = stats.bloom.filter();
+                                divi_network::bloom::merkle_block(&block, &mut filter)
+                            };
+                            let mut messages = vec![NetworkMessage::MerkleBlock(payload)];
+                            for (i, txid) in matched {
+                                if !tx_relay.peer_knows(peer_id, &txid) {
+                                    messages
+                                        .push(NetworkMessage::Tx(block.transactions[i].clone()));
+                                }
+                            }
+                            messages
+                        };
+                        // A full queue keeps the item for the next pass; the
+                        // transactions after a merkleblock follow it at once,
+                        // as divid pushes them together
+                        let mut messages = messages.into_iter();
+                        if let Some(first) = messages.next() {
+                            match peer_manager.try_send_to_peer(peer_id, first) {
+                                TrySend::Sent => {}
+                                TrySend::Full => break,
+                                TrySend::Gone => return queue.clear(),
+                            }
+                        }
+                        for msg in messages {
+                            if let TrySend::Gone = peer_manager.try_send_to_peer(peer_id, msg) {
+                                return queue.clear();
+                            }
+                        }
+                        tracing::debug!("Served block {} to peer {} (getdata)", item.hash, peer_id);
+                        if hash_continue.get(&peer_id) == Some(&item.hash) {
+                            hash_continue.remove(&peer_id);
+                            if let Some(tip) = chain.tip() {
+                                let inv = NetworkMessage::Inv(vec![divi_network::InvItem::new(
+                                    divi_network::InvType::Block,
+                                    tip.hash,
+                                )]);
+                                let _ = peer_manager.try_send_to_peer(peer_id, inv);
+                            }
+                        }
+                    }
+                    Ok(None) => tracing::debug!(
+                        "Block {} not found for getdata from peer {}",
+                        item.hash,
+                        peer_id
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Error looking up block {} for peer {}: {}",
+                        item.hash,
+                        peer_id,
+                        e
+                    ),
+                }
+                queue.pop_front();
+                // The pass's notfound goes out after the block
+                if !not_found.is_empty() {
+                    let msg = NetworkMessage::NotFound(std::mem::take(&mut not_found));
+                    let _ = peer_manager.try_send_to_peer(peer_id, msg);
+                }
+            }
+            divi_network::InvType::Tx => {
+                match tx_relay
+                    .relayed_tx(&item.hash)
+                    .or_else(|| mempool.get(&item.hash).map(|e| e.tx))
+                {
+                    Some(tx) => {
+                        match peer_manager.try_send_to_peer(peer_id, NetworkMessage::Tx(tx)) {
+                            TrySend::Sent => {}
+                            TrySend::Full => break,
+                            TrySend::Gone => return queue.clear(),
+                        }
+                    }
+                    None => not_found.push(item),
+                }
+                queue.pop_front();
+            }
+            divi_network::InvType::Spork
+            | divi_network::InvType::MasternodeAnnounce
+            | divi_network::InvType::MasternodePing
+            | divi_network::InvType::MasternodeWinner => {
+                let hash = item.hash.as_bytes();
+                let held = match item.inv_type {
+                    divi_network::InvType::Spork => spork_manager
+                        .spork_by_hash(&item.hash)
+                        .map(NetworkMessage::Spork),
+                    divi_network::InvType::MasternodeAnnounce => masternode_list
+                        .seen_broadcast(hash)
+                        .map(NetworkMessage::MasternodeBroadcast),
+                    divi_network::InvType::MasternodePing => masternode_list
+                        .seen_ping(hash)
+                        .map(NetworkMessage::MasternodePing),
+                    _ => masternode_votes
+                        .winner_bytes(hash)
+                        .map(NetworkMessage::MasternodeWinner),
+                };
+                match held {
+                    Some(msg) => match peer_manager.try_send_to_peer(peer_id, msg) {
+                        TrySend::Sent => {}
+                        TrySend::Full => break,
+                        TrySend::Gone => return queue.clear(),
+                    },
+                    None => not_found.push(item),
+                }
+                queue.pop_front();
+            }
+            _ => {
+                queue.pop_front();
+            }
+        }
+    }
+    if !not_found.is_empty() {
+        let _ = peer_manager.try_send_to_peer(peer_id, NetworkMessage::NotFound(not_found));
+    }
 }
 
 /// Node status
@@ -157,11 +333,14 @@ pub struct Node {
     /// Masternode manager
     masternode_manager: Arc<MasternodeManager>,
 
-    /// Masternode P2P message handler
-    masternode_handler: Arc<MasternodeHandler>,
-
     /// The masternodes the network announced, as Divi Core keeps them
     masternode_list: Arc<divi_rpc::mn_list::MasternodeList>,
+
+    /// The masternodes' payment votes (mnw)
+    masternode_votes: Arc<divi_rpc::mn_votes::MasternodeVotes>,
+
+    /// Divi Core's masternode sync and IsBlockchainSynced
+    masternode_sync: divi_masternode::mnsync::SharedMasternodeSync,
 
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
@@ -222,9 +401,25 @@ impl Node {
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| NodeError::Init(format!("Failed to create data directory: {}", e)))?;
+        if config.resync {
+            clear_folders_for_resync(&config);
+        }
 
         // Initialize database, optionally with UTXO cache
-        let db = Arc::new(if config.utxo_cache_size > 0 {
+        let db = Arc::new(if let Some(block_cache) = config.block_cache_size {
+            // -dbcache: divid's split of it (init.cpp:1046-1056)
+            tracing::info!(
+                "Cache configuration: block cache {} MiB, UTXO cache {} entries",
+                block_cache >> 20,
+                config.utxo_cache_size
+            );
+            ChainDatabase::open_with_caches(
+                config.chainstate_path(),
+                block_cache,
+                config.utxo_cache_size,
+            )
+            .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
+        } else if config.utxo_cache_size > 0 {
             tracing::info!("UTXO cache enabled: {} entries", config.utxo_cache_size);
             ChainDatabase::open_with_utxo_cache(config.chainstate_path(), config.utxo_cache_size)
                 .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
@@ -257,9 +452,20 @@ impl Node {
         // C++ checks the newest blocks at every start (-checkblocks); a damaged
         // database otherwise goes unnoticed until the bad record is read.
         let started = std::time::Instant::now();
+        // A failed check stops the start with Divi Core's InitError text
+        // (init.cpp:1116-1119) on the first line; what was found, and how to
+        // recover, after it and in the log
         let checked = chain
-            .verify_recent_blocks(config.check_blocks)
-            .map_err(damaged)?;
+            .verify_db(i64::from(config.check_blocks))
+            .map_err(|e| {
+                tracing::error!("VerifyDB() : *** {}", e);
+                match damaged(e) {
+                    NodeError::Init(detail) => {
+                        NodeError::Init(format!("Corrupted block database detected\n{detail}"))
+                    }
+                    other => other,
+                }
+            })?;
         tracing::info!(
             "Verified the last {} blocks in {} ms",
             checked,
@@ -483,6 +689,8 @@ impl Node {
         }
         if reindex {
             db.delete_metadata(REINDEXING_KEY).map_err(damaged)?;
+            // divid's line once its -reindex is done (init.cpp:681)
+            tracing::info!("Reindexing finished");
         }
 
         // Divi Core notes an unclean stop at start and brings the chain to the
@@ -575,6 +783,12 @@ impl Node {
             } else {
                 Vec::new()
             },
+            seed_nodes: config.p2p.seednode.clone(),
+            dns_seed: config
+                .p2p
+                .dns_seed
+                .unwrap_or(config.p2p.connect.is_empty()),
+            force_dns_seed: config.p2p.force_dns_seed,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
@@ -613,8 +827,8 @@ impl Node {
         {
             let chain_for_scripts = Arc::clone(&chain);
             mempool.set_validator(Arc::new(
-                move |pool: &Mempool, tx: &Transaction, limit_free: bool| {
-                    check_mempool_transaction(&chain_for_scripts, pool, tx, limit_free)
+                move |pool: &Mempool, tx: &Transaction, origin: crate::mempool::Origin| {
+                    check_mempool_transaction(&chain_for_scripts, pool, tx, origin)
                 },
             ));
         }
@@ -624,6 +838,13 @@ impl Node {
 
         // Create transaction relay manager
         let tx_relay = TxRelay::new(Arc::clone(&peer_manager));
+        let orphans = Arc::new(crate::orphans::OrphanPool::new());
+        {
+            let (mempool, orphans) = (Arc::clone(&mempool), Arc::clone(&orphans));
+            tx_relay.set_have_check(Arc::new(move |txid| {
+                (mempool.contains(txid), orphans.contains(txid))
+            }));
+        }
         let mempool_for_filters = Arc::clone(&mempool);
         tx_relay.set_tx_source(Arc::new(move |txid| {
             mempool_for_filters.get(txid).map(|entry| entry.tx.clone())
@@ -631,7 +852,21 @@ impl Node {
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
-        let spork_manager = SporkManager::with_db(Arc::clone(&peer_manager), Arc::clone(&db));
+        let spork_manager = SporkManager::with_chain(
+            Arc::clone(&peer_manager),
+            Arc::clone(&db),
+            chain.consensus_sporks(),
+        );
+
+        // A spork 14 entry sets the relay fee and the highest fee the mempool uses
+        {
+            let (chain, mempool) = (Arc::clone(&chain), Arc::clone(&mempool));
+            spork_manager.on_tx_fee_spork(Arc::new(move || {
+                if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                    mempool.set_spork_fees(fee.min_fee_per_kb as i64, fee.max_fee as i64);
+                }
+            }));
+        }
 
         // Initialize masternode manager with database persistence
         let masternode_manager = match MasternodeManager::with_db(db.db_arc()) {
@@ -648,11 +883,19 @@ impl Node {
             }
         };
 
-        // Create masternode P2P handler
-        let masternode_handler = Arc::new(MasternodeHandler::new(Arc::clone(&masternode_manager)));
-        // Kept in the datadir as Divi Core keeps mncache.dat
+        // The network's masternodes, kept in the datadir as Divi Core keeps
+        // mncache.dat, and their payment votes
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
         masternode_list.set_path(config.data_dir.join("masternodes.list"));
+        let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
+        // The masternode sync, with the requests kept from the last run
+        let masternode_sync = divi_masternode::mnsync::shared(
+            divi_primitives::clock::now(),
+            chain.network_type() == divi_storage::chain::NetworkType::Mainnet,
+        );
+        crate::masternode_sync::load(&masternode_sync, &config.data_dir);
+        // Votes are checked against the sync's stage (masternode-payments.cpp:241-245, :320)
+        masternode_votes.follow_sync(Arc::clone(&masternode_sync));
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -675,11 +918,12 @@ impl Node {
             peer_manager,
             block_sync,
             tx_relay,
-            orphans: Arc::new(crate::orphans::OrphanPool::new()),
+            orphans,
             spork_manager,
             masternode_manager,
-            masternode_handler,
             masternode_list,
+            masternode_votes,
+            masternode_sync,
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -809,6 +1053,10 @@ impl Node {
 
         // Set peer manager height
         self.peer_manager.set_height(self.chain.height());
+        // An inbound peer is told the active spork count after its version
+        let sporks_for_count = Arc::clone(&self.spork_manager);
+        self.peer_manager
+            .set_spork_count_source(Arc::new(move || sporks_for_count.spork_count() as u32));
         // Version messages name the height at the time they are sent
         let chain_for_height = Arc::clone(&self.chain);
         self.peer_manager
@@ -829,6 +1077,8 @@ impl Node {
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
         self.peer_manager
             .set_local_addresses(self.local_addresses());
+        divi_network::buffers::set_max_receive_buffer(self.config.p2p.max_receive_buffer);
+        divi_network::buffers::set_max_send_buffer(self.config.p2p.max_send_buffer);
 
         // Start peer event handler
         let event_tx = self.event_tx.clone();
@@ -839,8 +1089,8 @@ impl Node {
         let spork_manager = Arc::clone(&self.spork_manager);
         let chain = Arc::clone(&self.chain);
         let mempool = Arc::clone(&self.mempool);
-        let masternode_handler = Arc::clone(&self.masternode_handler);
         let masternode_list = Arc::clone(&self.masternode_list);
+        let masternode_votes = Arc::clone(&self.masternode_votes);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
         // Divi Core checks every masternode once a minute (MasternodeModule.cpp:524-529)
@@ -858,7 +1108,40 @@ impl Node {
                 }
             }));
         }
-        let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
+        // The masternode sync thread: a step a second, the request cache
+        // cleared of expired entries and kept on disk once a minute
+        // (MasternodeModule.cpp:472-531)
+        {
+            let sync = Arc::clone(&self.masternode_sync);
+            let chain = Arc::clone(&self.chain);
+            let peers = Arc::clone(&self.peer_manager);
+            let sporks = Arc::clone(&self.spork_manager);
+            let data_dir = self.config.data_dir.clone();
+            let mut shutdown = self.shutdown_tx.subscribe();
+            self.keep(tokio::spawn(async move {
+                let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut last_cleanup = divi_primitives::clock::now();
+                loop {
+                    tokio::select! {
+                        _ = every.tick() => {}
+                        _ = shutdown.recv() => break,
+                    }
+                    let now = divi_primitives::clock::now();
+                    if !crate::masternode_sync::tick(&sync, &chain, &peers, &sporks, now).await {
+                        continue;
+                    }
+                    if now >= last_cleanup + 60 {
+                        last_cleanup = now;
+                        sync.lock().sync.requests.check_and_remove(now);
+                        crate::masternode_sync::save(&sync, &data_dir);
+                    }
+                }
+            }));
+        }
+        let masternode_sync = Arc::clone(&self.masternode_sync);
+        // With -alerts=0 an alert message is not read at all (main.cpp:870)
+        let alert_key = divi_network::alert::alert_key(&self.config.network.magic)
+            .filter(|_| self.config.p2p.alerts);
         let peer_bloom_filters = self.config.p2p.peer_bloom_filters;
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
@@ -868,14 +1151,66 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
-            while let Ok(event) = peer_events.recv().await {
+            // The peers known to have each masternode item: it came from them
+            // in an inv, or went to them in one (CNode::setInventoryKnown)
+            let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
+            // Per peer: block getdata not answered yet (its send buffer was
+            // full), answered again when a peer's buffer has room, or on the
+            // `resume` tick
+            let mut pending_getdata: HashMap<u64, std::collections::VecDeque<divi_network::InvItem>> =
+                HashMap::new();
+            let stores = GetDataStores {
+                chain: &chain,
+                tx_relay: &tx_relay,
+                mempool: &mempool,
+                spork_manager: &spork_manager,
+                masternode_list: &masternode_list,
+                masternode_votes: &masternode_votes,
+            };
+            let mut resume = tokio::time::interval(std::time::Duration::from_millis(50));
+            resume.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // A message is taken off the queue here; falling behind the
+                // queue drops messages, and the loop goes on
+                let received = tokio::select! {
+                    received = peer_events.recv() => received,
+                    _ = divi_network::buffers::send_space().notified(), if !pending_getdata.is_empty() => {
+                        pending_getdata.retain(|peer_id, queue| {
+                            serve_getdata(&stores, &peer_manager, &mut hash_continue, queue, *peer_id);
+                            !queue.is_empty()
+                        });
+                        continue;
+                    }
+                    _ = resume.tick(), if !pending_getdata.is_empty() => {
+                        pending_getdata.retain(|peer_id, queue| {
+                            serve_getdata(&stores, &peer_manager, &mut hash_continue, queue, *peer_id);
+                            !queue.is_empty()
+                        });
+                        continue;
+                    }
+                };
+                let event = match received {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!("Peer messages came faster than they were handled: {} missed", missed);
+                        peer_manager.clear_receive_queues();
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if let PeerEvent::Message { peer_id, size, .. } = &event {
+                    peer_manager.message_taken(*peer_id, *size);
+                }
                 match event {
                     PeerEvent::Connected {
                         peer_id,
                         addr,
                         version,
                     } => {
-                        tracing::info!("Peer connected: {}", addr);
+                        tracing::info!(
+                            "Peer connected: {}",
+                            divi_network::peer_log::peer(peer_id, addr)
+                        );
                         let _ = event_tx.send(NodeEvent::PeerConnected(addr.to_string()));
 
                         // Update sync with peer's height
@@ -884,17 +1219,22 @@ impl Node {
                             .begin_syncing_with_peer(peer_id, version.services)
                             .await;
 
+                        peer_manager
+                            .gossip()
+                            .connected(peer_id, peer_manager.is_one_shot(peer_id));
                         if peer_manager.is_inbound(peer_id) {
                             spork_manager.inbound_peer_connected(peer_id).await;
                         } else {
-                            // An outbound peer that answered (addrman Good, main.cpp:443)
-                            peer_manager
-                                .address_book()
-                                .connected(addr, version.services);
+                            // An outbound peer was asked for addresses with its
+                            // verack (main.cpp:438-442), and counts as good
+                            // (addrman Good, main.cpp:443)
+                            peer_manager.gossip().asked(peer_id);
+                            peer_manager.address_book().good(addr);
                         }
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
                         tracing::warn!("Peer {} disconnected: {}", peer_id, reason);
+                        pending_getdata.remove(&peer_id);
                         block_sync.remove_peer(peer_id);
                         tx_relay.remove_peer(peer_id);
                         // Divi Core FinalizeNode: EraseOrphansFor (NodeState.cpp:41)
@@ -902,8 +1242,11 @@ impl Node {
                         spork_manager.remove_peer(peer_id);
                         hash_continue.remove(&peer_id);
                         alerts_known.remove(&peer_id);
+                        peer_manager.gossip().disconnected(peer_id);
                     }
-                    PeerEvent::Message { peer_id, message } => {
+                    PeerEvent::Message {
+                        peer_id, message, ..
+                    } => {
                         // Log all message types at INFO for debugging sync issues
                         let cmd = message.command();
                         if cmd == "block" || cmd == "notfound" {
@@ -981,14 +1324,36 @@ impl Node {
                                 if masternode_items_asked.len() > 100_000 {
                                     masternode_items_asked.clear();
                                 }
+                                // Announced items the node has count for the
+                                // sync's list and winner stages (MasternodeIsKnown,
+                                // MasternodeWinnerIsKnown, MasternodeModule.cpp:346-370)
+                                for i in items.iter() {
+                                    use divi_network::message::InvType;
+                                    let now = divi_primitives::clock::now();
+                                    match i.inv_type {
+                                        InvType::MasternodeAnnounce
+                                            if masternode_list
+                                                .has(divi_rpc::mn_list::INV_BROADCAST, &i.hash.0) =>
+                                        {
+                                            masternode_sync.lock().sync.record_list_update(i.hash.0, true, now)
+                                        }
+                                        InvType::MasternodeWinner if masternode_votes.is_known(&i.hash.0) => {
+                                            masternode_sync.lock().sync.record_winner_update(i.hash.0, true, now)
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 let masternode_items: Vec<_> = items
                                     .iter()
+                                    .filter(|i| masternode_inv_kind(i.inv_type).is_some())
                                     .filter(|i| {
-                                        matches!(
-                                            i.inv_type,
-                                            divi_network::message::InvType::MasternodeAnnounce
-                                                | divi_network::message::InvType::MasternodePing
-                                        )
+                                        masternode_items_known
+                                            .entry(*i.hash.as_bytes())
+                                            .or_default()
+                                            .insert(peer_id);
+                                        let kind = masternode_inv_kind(i.inv_type).unwrap();
+                                        !masternode_list.has(kind, i.hash.as_bytes())
+                                            && !masternode_votes.is_known(i.hash.as_bytes())
                                     })
                                     .filter(|i| masternode_items_asked.insert(i.hash))
                                     .cloned()
@@ -998,6 +1363,8 @@ impl Node {
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
                                         .await;
                                 }
+                                // Sporks are announced by inv as well
+                                spork_manager.handle_inv(peer_id, &items).await;
                             }
                             NetworkMessage::NotFound(items) => {
                                 let items: Vec<_> = items
@@ -1020,128 +1387,29 @@ impl Node {
                                     );
                                     continue;
                                 }
-                                // A filtered block: a merkleblock under the peer's
-                                // filter (which matching updates), then each matched
-                                // transaction the peer is not known to have; served
-                                // whatever -peerbloomfilters says, as every peer has a
-                                // filter (main.cpp:249-278, Node.cpp:556). A block not
-                                // had gets no answer (main.cpp:300-318).
-                                for item in items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::FilteredBlock)
-                                {
-                                    let (Ok(Some(block)), Some(stats)) =
-                                        (chain.get_block_for_peer(&item.hash), peer_manager.peer_stats(peer_id))
-                                    else {
-                                        continue;
-                                    };
-                                    let (payload, matched) = {
-                                        let mut filter = stats.bloom.filter();
-                                        divi_network::bloom::merkle_block(&block, &mut filter)
-                                    };
-                                    let _ = peer_manager
-                                        .send_block_to_peer(peer_id, NetworkMessage::MerkleBlock(payload))
-                                        .await;
-                                    for (i, txid) in matched {
-                                        if !tx_relay.peer_knows(peer_id, &txid) {
-                                            let tx = NetworkMessage::Tx(block.transactions[i].clone());
-                                            let _ = peer_manager.send_block_to_peer(peer_id, tx).await;
-                                        }
+                                // Queued for the peer, answered in order as its
+                                // send buffer allows
+                                if !items.is_empty() {
+                                    let queue = pending_getdata.entry(peer_id).or_default();
+                                    queue.extend(items);
+                                    serve_getdata(
+                                        &stores,
+                                        &peer_manager,
+                                        &mut hash_continue,
+                                        queue,
+                                        peer_id,
+                                    );
+                                    if queue.is_empty() {
+                                        pending_getdata.remove(&peer_id);
                                     }
-                                }
-                                // Split block and tx getdata items
-                                let block_items: Vec<_> = items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::Block)
-                                    .cloned()
-                                    .collect();
-                                let tx_items: Vec<_> = items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::Tx)
-                                    .cloned()
-                                    .collect();
-
-                                // Handle block getdata: serve blocks from our chain
-                                for item in block_items {
-                                    match chain.get_block_for_peer(&item.hash) {
-                                        Ok(Some(block)) => {
-                                            let msg = NetworkMessage::Block(block);
-                                            if let Err(e) =
-                                                peer_manager.send_block_to_peer(peer_id, msg).await
-                                            {
-                                                tracing::warn!(
-                                                    "Failed to send block {} to peer {}: {}",
-                                                    item.hash,
-                                                    peer_id,
-                                                    e
-                                                );
-                                            } else {
-                                                tracing::debug!(
-                                                    "Served block {} to peer {} (getdata)",
-                                                    item.hash,
-                                                    peer_id
-                                                );
-                                                // The last block of a full getblocks
-                                                // answer: announce our tip so the peer
-                                                // asks for the next batch
-                                                if hash_continue.get(&peer_id) == Some(&item.hash) {
-                                                    hash_continue.remove(&peer_id);
-                                                    if let Some(tip) = chain.tip() {
-                                                        let inv = NetworkMessage::Inv(vec![
-                                                            divi_network::InvItem::new(
-                                                                divi_network::InvType::Block,
-                                                                tip.hash,
-                                                            ),
-                                                        ]);
-                                                        let _ = peer_manager
-                                                            .send_block_to_peer(peer_id, inv)
-                                                            .await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            tracing::debug!(
-                                                "Block {} not found for getdata from peer {}",
-                                                item.hash,
-                                                peer_id
-                                            );
-                                            // Tell the peer so it can ask elsewhere (pruned or unknown).
-                                            let msg = NetworkMessage::NotFound(vec![item.clone()]);
-                                            if let Err(e) =
-                                                peer_manager.send_block_to_peer(peer_id, msg).await
-                                            {
-                                                tracing::debug!(
-                                                    "Failed to send notfound for {} to peer {}: {}",
-                                                    item.hash,
-                                                    peer_id,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Error looking up block {} for peer {}: {}",
-                                                item.hash,
-                                                peer_id,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Handle tx getdata requests
-                                if !tx_items.is_empty() {
-                                    let mempool_ref = &mempool;
-                                    tx_relay
-                                        .handle_getdata(peer_id, tx_items, |txid| {
-                                            mempool_ref.get(txid).map(|e| e.tx)
-                                        })
-                                        .await;
                                 }
                             }
-                            // Handle getblocks: respond with inv for blocks after locator
-                            NetworkMessage::GetBlocks(msg) => {
+                            // Handle getblocks: respond with inv for blocks after locator.
+                            // Divi Core answers getheaders the same way (main.cpp:624):
+                            // its headers answer is built only for a "headers" request
+                            // with headers-first syncing on, which no network has
+                            // (main.cpp:680-702, chainparams.cpp:251, :360, :440)
+                            NetworkMessage::GetBlocks(msg) | NetworkMessage::GetHeaders(msg) => {
                                 let (inv_items, continue_at) =
                                     getblocks_reply(&chain, &msg, GETBLOCKS_LIMIT);
                                 if let Some(hash) = continue_at {
@@ -1170,57 +1438,202 @@ impl Node {
                                 spork_manager.handle_spork(peer_id, spork).await;
                             }
                             // Masternode sync messages
+                            // A peer's count for what the masternode sync asked
                             NetworkMessage::SyncStatusCount { item_id, count } => {
-                                tracing::info!(
-                                    "Received sync status count from peer {}: item_id={}, count={}",
+                                tracing::debug!(
+                                    "Sync status count from peer {}: item_id={}, count={}",
                                     peer_id,
                                     item_id,
                                     count
+                                );
+                                crate::masternode_sync::sync_status_count(
+                                    &masternode_sync,
+                                    &chain,
+                                    peer_manager.peer_addr(peer_id),
+                                    item_id,
+                                    count,
+                                    divi_primitives::clock::now(),
                                 );
                             }
                             NetworkMessage::GetSyncStatus => {
                                 tracing::debug!("Received govsync request from peer {}", peer_id);
                             }
-                            // Masternode P2P messages
-                            // Not answered: IronDivi cannot vouch for masternode
-                            // entries as Divi Core does (see MasternodeHandler)
-                            NetworkMessage::RequestMasternodeList(_) => {
-                                tracing::debug!("dseg from peer {} not answered", peer_id);
+                            // Masternode P2P messages: a peer's masternode
+                            // sync asks for the list and the winners
+                            NetworkMessage::RequestMasternodeList(payload) => {
+                                crate::masternode_sync::answer_list_request(
+                                    &masternode_sync,
+                                    &chain,
+                                    &masternode_list,
+                                    &peer_manager,
+                                    peer_id,
+                                    &payload,
+                                    divi_primitives::clock::now(),
+                                )
+                                .await;
+                            }
+                            NetworkMessage::MasternodeWinnersRequest(count) => {
+                                crate::masternode_sync::answer_winners_request(
+                                    &masternode_sync,
+                                    &chain,
+                                    &masternode_votes,
+                                    &peer_manager,
+                                    peer_id,
+                                    count,
+                                    divi_primitives::clock::now(),
+                                )
+                                .await;
+                            }
+                            // Masternode messages are read once the chain is
+                            // synced (ProcessMasternodeMessages,
+                            // MasternodeModule.cpp:371-382)
+                            NetworkMessage::MasternodeBroadcast(_)
+                            | NetworkMessage::MasternodePing(_)
+                            | NetworkMessage::MasternodeWinner(_)
+                                if !crate::masternode_sync::blockchain_synced(
+                                    &masternode_sync,
+                                    &chain,
+                                    divi_primitives::clock::now(),
+                                ) =>
+                            {
+                                tracing::debug!(
+                                    "Masternode message from peer {} not read: the chain is not synced",
+                                    peer_id
+                                );
                             }
                             // Broadcasts and pings in Divi Core's wire format, kept
                             // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
-                                match masternode_list.accept_broadcast(&chain, &payload) {
+                                // A broadcast seen again or newly taken counts for
+                                // the sync's list stage (masternodeman.cpp:416-419, :474)
+                                let hash = divi_masternode::cpp_wire::CppBroadcast::decode(&payload)
+                                    .ok()
+                                    .map(|b| b.hash());
+                                let known = hash.is_some_and(|h| {
+                                    masternode_list.has(divi_rpc::mn_list::INV_BROADCAST, &h)
+                                });
+                                let result = masternode_list.accept_broadcast(&chain, &payload);
+                                if let (Some(hash), true) = (hash, known || result.is_ok()) {
+                                    masternode_sync.lock().sync.record_list_update(
+                                        hash,
+                                        known,
+                                        divi_primitives::clock::now(),
+                                    );
+                                }
+                                match result {
                                     Ok(true) => tracing::info!(
                                         "Masternode entry from peer {} added to the list",
                                         peer_id
                                     ),
                                     Ok(false) => {}
-                                    Err(e) => tracing::debug!(
-                                        "Masternode broadcast from peer {} not taken: {}",
-                                        peer_id,
-                                        e
-                                    ),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Masternode broadcast from peer {} not taken: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        if e.dos > 0 {
+                                            peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                        }
+                                    }
                                 }
+                                relay_masternode_items(
+                                    &peer_manager,
+                                    &mut masternode_items_known,
+                                    masternode_list.take_relays(),
+                                )
+                                .await;
                             }
                             NetworkMessage::MasternodePing(payload) => {
-                                if let Err(e) = masternode_list.accept_ping(&payload) {
+                                if let Err(e) = masternode_list.accept_ping(&chain, &payload) {
                                     tracing::debug!(
                                         "Masternode ping from peer {} not taken: {}",
                                         peer_id,
                                         e
                                     );
+                                    if e.dos > 0 {
+                                        peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                    }
+                                    if let Some(vin) = e.ask {
+                                        let _ = peer_manager
+                                            .send_to_peer(peer_id, NetworkMessage::RequestMasternodeList(vin))
+                                            .await;
+                                    }
                                 }
+                                relay_masternode_items(
+                                    &peer_manager,
+                                    &mut masternode_items_known,
+                                    masternode_list.take_relays(),
+                                )
+                                .await;
                             }
+                            // A payment vote, counted when it passes Divi Core's
+                            // checks and then announced, as ProcessMasternodeWinners
+                            // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
-                                if let Err(e) = masternode_handler.handle_winner(peer_id, &payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to handle masternode winner from peer {}: {}",
-                                        peer_id,
-                                        e
+                                // A vote seen again or newly taken counts for the
+                                // sync's winner stage (masternode-payments.cpp:205-209, :262-265)
+                                let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
+                                    .ok()
+                                    .map(|w| w.hash());
+                                let known = hash.is_some_and(|h| masternode_votes.is_known(&h));
+                                let result = masternode_votes.accept(&chain, &masternode_list, &payload);
+                                if let (Some(hash), true) = (hash, known || matches!(result, Ok(true))) {
+                                    masternode_sync.lock().sync.record_winner_update(
+                                        hash,
+                                        true,
+                                        divi_primitives::clock::now(),
                                     );
                                 }
+                                match result {
+                                    Ok(true) => {
+                                        if let Some(hash) = hash {
+                                            relay_masternode_items(
+                                                &peer_manager,
+                                                &mut masternode_items_known,
+                                                vec![(divi_rpc::mn_list::INV_WINNER, hash)],
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Masternode winner from peer {} not taken: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        if e.dos > 0 {
+                                            peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                        }
+                                        if let Some(vin) = e.ask {
+                                            let _ = peer_manager
+                                                .send_to_peer(
+                                                    peer_id,
+                                                    NetworkMessage::RequestMasternodeList(vin),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            // Divi Core reads no transaction from a dstx
+                            // (main.cpp:705-718) and checks an empty one, which
+                            // fails CheckTransaction (DoS 10,
+                            // BlockCheckingHelpers.cpp:101-103) and then bad-tx
+                            // (DoS 100, MempoolConsensus.cpp:276-277): a reject
+                            // and a score of 110 (main.cpp:803-812)
+                            NetworkMessage::Unknown(cmd, _) if cmd == "dstx" => {
+                                if let Err(e) =
+                                    peer_manager.send_to_peer(peer_id, dstx_reject()).await
+                                {
+                                    tracing::debug!("Failed to send reject to peer {}: {}", peer_id, e);
+                                }
+                                peer_manager.report_misbehavior_score(
+                                    peer_id,
+                                    DSTX_SCORE,
+                                    "Transaction from peer rejected by memory pool",
+                                );
                             }
                             NetworkMessage::Unknown(cmd, payload) => {
                                 // Unknown messages are logged with payload details for debugging
@@ -1233,28 +1646,56 @@ impl Node {
                             }
                             NetworkMessage::Addr(addrs) => {
                                 // Kept in the address book, as Divi Core's addrman
-                                // keeps them (main.cpp:521-558)
-                                if addrs.len() > 1000 {
+                                // keeps them, and a short fresh one relayed
+                                // (main.cpp:521-558)
+                                if addrs.len() > divi_network::gossip::MAX_ADDR_MESSAGE {
                                     peer_manager.report_misbehavior_score(
                                         peer_id,
                                         20,
                                         "Requested too many addresses",
                                     );
                                 } else {
-                                    peer_manager.address_book().add(&addrs);
+                                    // Addresses are dated on the network-adjusted
+                                    // clock (main.cpp:536), the day's peers picked
+                                    // on the node's own (net.cpp:1508)
+                                    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
+                                    let day_now = divi_primitives::clock::now().max(0) as u32;
+                                    let got = peer_manager.gossip().received(
+                                        peer_id,
+                                        &addrs,
+                                        &peer_manager.connected_peers(),
+                                        now,
+                                        day_now,
+                                    );
+                                    if let Some(from) = peer_manager.peer_addr(peer_id) {
+                                        peer_manager.address_book().add(&got.keep, from.ip());
+                                    }
+                                    for (to, relayed) in got.relay {
+                                        if let Err(e) = peer_manager
+                                            .send_to_peer(to, NetworkMessage::Addr(relayed))
+                                            .await
+                                        {
+                                            tracing::debug!("Failed to relay addr to peer {}: {}", to, e);
+                                        }
+                                    }
+                                    // A -seednode peer goes once it has answered (main.cpp:556-557)
+                                    if got.disconnect {
+                                        peer_manager.disconnect(peer_id);
+                                    }
                                 }
                             }
                             // An inbound peer asking for addresses gets a share of
-                            // the book (main.cpp:863-869), at most 1000 per message
+                            // the book it does not have yet, at most 1000
+                            // (main.cpp:863-869, :1087-1104)
                             NetworkMessage::GetAddr if peer_manager.is_inbound(peer_id) => {
                                 let sample = peer_manager.address_book().sample();
-                                for chunk in sample.chunks(1000) {
+                                let answer = peer_manager.gossip().answer(peer_id, sample);
+                                if !answer.is_empty() {
                                     if let Err(e) = peer_manager
-                                        .send_to_peer(peer_id, NetworkMessage::Addr(chunk.to_vec()))
+                                        .send_to_peer(peer_id, NetworkMessage::Addr(answer))
                                         .await
                                     {
                                         tracing::debug!("Failed to send addr to peer {}: {}", peer_id, e);
-                                        break;
                                     }
                                 }
                             }
@@ -1406,6 +1847,11 @@ impl Node {
         self.keep(tokio::spawn(async move {
             pm_for_maintenance.run_maintenance().await;
         }));
+        // -connect peers are dialled again every few seconds, as Divi Core does
+        let pm_for_connect = Arc::clone(&self.peer_manager);
+        self.keep(tokio::spawn(async move {
+            pm_for_connect.run_connect_loop().await;
+        }));
 
         // Start sync progress tracker
         let sync = Arc::clone(&self.block_sync);
@@ -1455,6 +1901,7 @@ impl Node {
                         tracing::debug!("Added relayed tx {} to mempool", txid);
                         // Relayed once the mempool took it, and so is each
                         // orphan it lets in (Divi Core main.cpp:734, :763)
+                        tx_relay_for_mempool.keep_relayed(event.tx.clone());
                         tx_relay_for_mempool
                             .relay_accepted(txid, Some(event.from_peer))
                             .await;
@@ -1465,6 +1912,9 @@ impl Node {
                             &orphans_for_relay,
                             txid,
                         ) {
+                            if let Some(entry) = mempool_for_relay.get(&txid) {
+                                tx_relay_for_mempool.keep_relayed(entry.tx);
+                            }
                             tx_relay_for_mempool.relay_accepted(txid, None).await;
                             let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         }
@@ -1480,6 +1930,42 @@ impl Node {
                     }
                     Err(e) => {
                         tracing::debug!("Rejected relayed tx {}: {}", event.txid, e);
+                    }
+                }
+            }
+        }));
+
+        // Rebroadcast some mempool transactions at a random time within 30
+        // minutes when the tip has moved since the last time, as Divi Core's
+        // SendMessages does (PeriodicallyRebroadcastMempoolTxs, main.cpp:1280-1294)
+        let tx_relay_for_rebroadcast = Arc::clone(&self.tx_relay);
+        let mempool_for_rebroadcast = Arc::clone(&self.mempool);
+        let chain_for_rebroadcast = Arc::clone(&self.chain);
+        self.keep(tokio::spawn(async move {
+            use crate::rebroadcast::{rebroadcast_candidates, RebroadcastTimer, MAX_WAIT_SECS};
+            use rand::Rng;
+            let mut timer = RebroadcastTimer::new();
+            let mut tip = chain_for_rebroadcast.tip().map(|t| t.hash);
+            let mut last_tip_update = 0i64;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let current = chain_for_rebroadcast.tip().map(|t| t.hash);
+                if current != tip {
+                    tip = current;
+                    last_tip_update = now;
+                }
+                if timer.due(now, last_tip_update, || {
+                    rand::thread_rng().gen_range(0..MAX_WAIT_SECS)
+                }) {
+                    let txids = rebroadcast_candidates(&mempool_for_rebroadcast);
+                    if !txids.is_empty() {
+                        tracing::info!("Rebroadcasting {} mempool transaction(s)", txids.len());
+                        tx_relay_for_rebroadcast.rebroadcast(&txids).await;
                     }
                 }
             }
@@ -1542,6 +2028,8 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
+        // netfulfilled.dat is written at shutdown (MasternodeModule.cpp:290-296)
+        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
@@ -1885,11 +2373,13 @@ impl Node {
             fee
         };
 
+        let relayed = tx.clone();
         let txid = self.mempool.add(tx, actual_fee)?;
         let _ = self.event_tx.send(NodeEvent::TransactionAccepted(txid));
 
-        // Mark as seen and announce to peers
+        // Mark as seen and announce to peers, and keep it for their getdata
         self.tx_relay.mark_seen(txid);
+        self.tx_relay.keep_relayed(relayed);
         let relay = Arc::clone(&self.tx_relay);
         tokio::spawn(async move {
             relay.announce_tx(txid).await;
@@ -1952,6 +2442,14 @@ impl Node {
         let p2p = &self.config.p2p;
         let listen = self.config.peer_sources().listen;
         let local = LocalAddresses::new(listen, p2p.discover, p2p.port);
+        // -onlynet first: an address of a left-out network is not ours
+        // (AddLocal, NetworkLocalAddressHelpers.cpp:90)
+        let only: Vec<_> = p2p
+            .only_nets
+            .iter()
+            .filter_map(|n| divi_network::local::Network::parse(n))
+            .collect();
+        local.limit_to(&only);
         let bound = p2p
             .listen_addr
             .trim_matches(['[', ']'])
@@ -1983,7 +2481,7 @@ impl Node {
             protocol_version: self.config.network.protocol_version,
             connections: self.peer_manager.peer_count(),
             networks: vec!["ipv4".to_string(), "ipv6".to_string()],
-            relay_fee: self.config.mempool.min_relay_fee_per_kb as f64 / 100_000_000.0,
+            relay_fee: self.mempool.min_relay_fee_per_kb() as f64 / 100_000_000.0,
         }
     }
 
@@ -2032,6 +2530,16 @@ impl Node {
     /// The masternodes the network announced (listmasternodes)
     pub fn masternode_list(&self) -> &Arc<divi_rpc::mn_list::MasternodeList> {
         &self.masternode_list
+    }
+
+    /// The masternodes' payment votes (getmasternodewinners)
+    pub fn masternode_votes(&self) -> &Arc<divi_rpc::mn_votes::MasternodeVotes> {
+        &self.masternode_votes
+    }
+
+    /// The masternode sync (mnsync, getstakingstatus)
+    pub fn masternode_sync(&self) -> &divi_masternode::mnsync::SharedMasternodeSync {
+        &self.masternode_sync
     }
 }
 
@@ -2105,6 +2613,44 @@ pub fn accept_relayed_transaction(
     result
 }
 
+/// The masternode inv kinds (mn_list's INV_*) of an inv type
+fn masternode_inv_kind(inv_type: divi_network::InvType) -> Option<u32> {
+    match inv_type {
+        divi_network::InvType::MasternodeWinner => Some(divi_rpc::mn_list::INV_WINNER),
+        divi_network::InvType::MasternodeAnnounce => Some(divi_rpc::mn_list::INV_BROADCAST),
+        divi_network::InvType::MasternodePing => Some(divi_rpc::mn_list::INV_PING),
+        _ => None,
+    }
+}
+
+/// Announce masternode items as RelayInv does: an inv to every peer that does
+/// not know the item yet, the peer that sent it included unless it announced
+/// it (net.cpp:1617-1624, CNode::PushInventory)
+async fn relay_masternode_items(
+    peers: &PeerManager,
+    known: &mut HashMap<[u8; 32], HashSet<u64>>,
+    items: Vec<(u32, [u8; 32])>,
+) {
+    if known.len() > 100_000 {
+        known.clear();
+    }
+    for (kind, hash) in items {
+        let inv_type = match kind {
+            divi_rpc::mn_list::INV_WINNER => divi_network::InvType::MasternodeWinner,
+            divi_rpc::mn_list::INV_BROADCAST => divi_network::InvType::MasternodeAnnounce,
+            _ => divi_network::InvType::MasternodePing,
+        };
+        let knows = known.entry(hash).or_default();
+        for peer in peers.connected_peers() {
+            if knows.insert(peer) {
+                let inv =
+                    NetworkMessage::Inv(vec![divi_network::InvItem::new(inv_type, Hash256(hash))]);
+                let _ = peers.send_to_peer(peer, inv).await;
+            }
+        }
+    }
+}
+
 /// The misbehaviour score of a refused relayed transaction, charged to the
 /// peer that sent it
 fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent, e: &NodeError) {
@@ -2113,6 +2659,46 @@ fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent
         e.misbehaviour_score(),
         &format!("tx {} rejected by the mempool: {}", event.txid, e),
     );
+}
+
+/// Divi Core's -resync (ClearFoldersForResync, init.cpp:901-930): the chain's
+/// folders are deleted before it is loaded, one by one so a missing one does not
+/// stop the rest, and a failure is logged, not fatal. irondivid's chain database
+/// holds its blocks, undo data, sporks and the address and spent indexes; the
+/// transaction index has its own folder. The wallet, the configuration and the
+/// peer and masternode files stay.
+fn clear_folders_for_resync(config: &NodeConfig) {
+    tracing::info!("Deleting blockchain folders blocks, chainstate and sporks");
+    for dir in [
+        config.blocks_path(),
+        config.chainstate_path(),
+        config.data_dir.join("txindex"),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!("-resync: folder deleted: {}", dir.display()),
+            Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
+        }
+    }
+}
+
+/// The score a `dstx` costs its sender: Divi Core checks the empty
+/// transaction it never read, 10 for CheckTransaction and 100 for bad-tx
+/// (BlockCheckingHelpers.cpp:101-103, MempoolConsensus.cpp:276-277)
+pub const DSTX_SCORE: u32 = 110;
+
+/// The `reject` Divi Core sends for a `dstx` (main.cpp:803-809): bad-tx, with
+/// the hash of the empty transaction, which is all zeros since a transaction
+/// that was never read has no hash computed
+pub fn dstx_reject() -> divi_network::NetworkMessage {
+    divi_network::NetworkMessage::Reject(divi_network::RejectMessage {
+        message: "dstx".to_string(),
+        code: crate::error::reject::INVALID,
+        reason: "bad-tx".to_string(),
+        data: vec![0u8; 32],
+    })
 }
 
 /// The `reject` Divi Core sends the peer that relayed a transaction its
@@ -2222,10 +2808,11 @@ fn spendable_in_next_block(chain: &Chain, outpoint: &OutPoint) -> Result<bool, N
 /// each connected block confirms and those conflicting with it
 /// (ChainTipManager.cpp:139-141, :175-183). Here the chain has already moved:
 /// `disconnected` (parents before children, as `Chain::accept_block` returns
-/// them) is offered first, through `Mempool::add`, which works out the fee and
-/// applies Core's AcceptToMemoryPool with `fLimitFree` false as disconnectTip
-/// does; then every transaction the new chain made unspendable goes, with its
-/// descendants.
+/// them) is offered first, through `Mempool::add_from_disconnected_block`,
+/// which works out the fee and applies Core's AcceptToMemoryPool with
+/// `fLimitFree` false and the height lock checked at the transaction's block,
+/// as disconnectTip does; then every transaction the new chain made
+/// unspendable goes, with its descendants.
 pub fn update_mempool_after_reorg(
     chain: &Arc<Chain>,
     mempool: &Arc<Mempool>,
@@ -2235,7 +2822,7 @@ pub fn update_mempool_after_reorg(
     let mut returned = 0;
     for tx in disconnected {
         let txid = tx.txid();
-        match mempool.add(tx, divi_primitives::amount::Amount::ZERO) {
+        match mempool.add_from_disconnected_block(tx) {
             Ok(_) => returned += 1,
             Err(e) => tracing::debug!(
                 "Transaction {} of a disconnected block not returned to the mempool: {}",
@@ -2244,10 +2831,10 @@ pub fn update_mempool_after_reorg(
             ),
         }
     }
+    // A transaction a lower tip makes non-final stays, as in Core: only the
+    // staker waits for its lock
     let dropped = mempool
         .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
-    // The tip may now be lower: drop what can no longer be mined
-    mempool.remove_non_final();
     tracing::info!(
         "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
         returned,
@@ -2262,18 +2849,22 @@ const MAX_STANDARD_TX_SIZE: usize = 100_000;
 /// Divi Core `MAX_TX_SIGOPS_CURRENT` (defaultValues.h:61): 40,000 / 5
 const MAX_TX_SIGOPS: u32 = 8_000;
 
-/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121) with
-/// its defaults (`-permitbaremultisig` on, `-datacarriersize` 603): the reason
-/// a transaction is not relayed, if it is not. Applies on every network, as
-/// `-acceptnonstandard` is off by default.
+/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121): the
+/// reason a transaction is not relayed, if it is not. Applies on every network,
+/// as `-acceptnonstandard` is off by default. Without `permit_bare_multisig`
+/// (`-permitbaremultisig=0`) a bare multisig output is not standard; an OP_META
+/// output script is standard up to `max_datacarrier_bytes` (`-datacarriersize`,
+/// 603 by default; 0 with `-datacarrier=0`).
 pub fn check_standard_tx(
     tx: &Transaction,
     tip_height: u32,
     now: u32,
     relay_fee_per_kb: i64,
+    permit_bare_multisig: bool,
+    max_datacarrier_bytes: usize,
 ) -> Result<(), NodeError> {
     use crate::error::reject;
-    use divi_script::policy::{standard_output_type, MAX_OP_META_RELAY};
+    use divi_script::policy::standard_output_type;
     use divi_script::ScriptType;
 
     let nonstandard = |reason: &str| Err(NodeError::rejected(reject::NONSTANDARD, reason));
@@ -2297,9 +2888,12 @@ pub fn check_standard_tx(
     }
     let mut data_outputs = 0;
     for out in &tx.vout {
-        match standard_output_type(out.script_pubkey.as_bytes(), MAX_OP_META_RELAY) {
+        match standard_output_type(out.script_pubkey.as_bytes(), max_datacarrier_bytes) {
             None => return nonstandard("scriptpubkey"),
             Some(ScriptType::NullData) => data_outputs += 1,
+            Some(ScriptType::Multisig) if !permit_bare_multisig => {
+                return nonstandard("bare-multisig");
+            }
             Some(_) => {
                 if out.value < out.min_non_dust_value(relay_fee_per_kb) {
                     return nonstandard("dust");
@@ -2321,14 +2915,15 @@ pub fn check_standard_tx(
 /// CheckInputs (maturity, input values, value in at least value out) and every
 /// input script under the standard flags (and, to pick the reject reason, the
 /// mandatory ones). Returns the fee. Each refusal carries Core's reject code,
-/// reason and misbehaviour score. `limit_free` is Core's `fLimitFree` (true for
-/// relayed transactions).
+/// reason and misbehaviour score. `origin` gives Core's `fLimitFree` (true for
+/// relayed transactions) and the tip a height lock is checked against.
 pub fn check_mempool_transaction(
     chain: &Chain,
     mempool: &Mempool,
     tx: &Transaction,
-    limit_free: bool,
+    origin: crate::mempool::Origin,
 ) -> Result<crate::mempool::Admission, NodeError> {
+    let limit_free = origin.limit_free();
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -2357,15 +2952,22 @@ pub fn check_mempool_transaction(
         return Err(NodeError::rejected(reject::INVALID, "coinstake"));
     }
     let tip_height = chain.height();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // IsStandardTx reads a time lock on GetAdjustedTime: the node's clock
+    // (setmocktime sets it) plus the network time offset
+    // (MempoolConsensus.cpp:61, TransactionFinalityHelpers.cpp:16-17)
+    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
     // Divi Core checks IsStandardTx and AreInputsStandard only without
     // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
     let require_standard = mempool.requires_standard();
     if require_standard {
-        check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+        check_standard_tx(
+            tx,
+            origin.lock_tip(tip_height),
+            now,
+            mempool.min_relay_fee_per_kb(),
+            mempool.permits_bare_multisig(),
+            mempool.max_datacarrier_bytes(),
+        )?;
     }
     mempool.check_conflicts(tx)?;
 
@@ -2652,8 +3254,15 @@ mod tests {
 
         let err = match Node::new(config.clone()) {
             Ok(_) => panic!("node started on a damaged chain database"),
-            Err(e) => e.to_string(),
+            Err(NodeError::Init(reason)) => reason,
+            Err(e) => panic!("not a start refusal: {e}"),
         };
+        // Divi Core's InitError text first (init.cpp:1116-1119), then the detail
+        assert_eq!(
+            err.lines().next(),
+            Some("Corrupted block database detected"),
+            "{err}"
+        );
         assert!(err.contains("damaged at height"), "{err}");
         assert!(err.contains("move that directory aside"), "{err}");
 

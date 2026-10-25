@@ -65,7 +65,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const PING_CHECK: Duration = Duration::from_secs(1);
 
 /// Channel buffer size for outgoing messages
-const OUTBOUND_BUFFER: usize = 100;
+/// Messages that may wait for a peer's connection; what getdata answers put
+/// there is bounded in bytes by -maxsendbuffer (crate::buffers)
+const OUTBOUND_BUFFER: usize = 10_000;
 
 /// Connection handler for a single peer
 pub struct Connection {
@@ -99,6 +101,8 @@ pub struct Connection {
     sent_nonce: Option<NonceGuard>,
     /// The node's own addresses (our address in the version message)
     local: Arc<crate::local::LocalAddresses>,
+    /// The node's active spork count, told to an inbound peer
+    spork_count: Option<crate::peer_manager::HeightSource>,
 }
 
 /// Nonces in the version messages a node has sent on its open connections:
@@ -138,13 +142,17 @@ impl Connection {
         // connection when the proxy fails
         let stream = match proxy {
             Some(proxy) => {
-                info!("Connecting to peer {} via proxy {}", addr, proxy);
+                info!(
+                    "Connecting to {} via proxy {}",
+                    crate::peer_log::address(addr),
+                    proxy
+                );
                 timeout(connect_timeout(), crate::socks5::connect(proxy, addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)??
             }
             None => {
-                info!("Connecting to peer {}", addr);
+                info!("Connecting to {}", crate::peer_log::address(addr));
                 timeout(connect_timeout(), TcpStream::connect(addr))
                     .await
                     .map_err(|_| NetworkError::Timeout)?
@@ -185,6 +193,7 @@ impl Connection {
             local_nonces,
             sent_nonce: None,
             local,
+            spork_count: None,
         };
 
         Ok((conn, handle))
@@ -205,7 +214,10 @@ impl Connection {
         local: Arc<crate::local::LocalAddresses>,
     ) -> Result<(Self, PeerHandle), NetworkError> {
         let addr = stream.peer_addr()?;
-        info!("Accepting connection from {}", addr);
+        info!(
+            "Accepting connection from {}",
+            crate::peer_log::address(addr)
+        );
 
         stream.set_nodelay(true)?;
 
@@ -239,16 +251,27 @@ impl Connection {
             local_nonces,
             sent_nonce: None,
             local,
+            spork_count: None,
         };
 
         Ok((conn, handle))
+    }
+
+    /// Tell an inbound peer the spork count `source` gives
+    pub fn with_spork_count(mut self, source: Option<crate::peer_manager::HeightSource>) -> Self {
+        self.spork_count = source;
+        self
     }
 
     /// Run the connection handler
     pub async fn run(mut self) -> Result<(), NetworkError> {
         // Perform handshake
         if let Err(e) = self.handshake().await {
-            error!("Handshake failed with {}: {}", self.info.addr, e);
+            error!(
+                "Handshake failed with {}: {}",
+                crate::peer_log::peer(self.peer_id, self.info.addr),
+                e
+            );
             let _ = self.event_tx.send(PeerEvent::Disconnected {
                 peer_id: self.peer_id,
                 reason: e.to_string(),
@@ -256,17 +279,18 @@ impl Connection {
             return Err(e);
         }
 
+        // Divi Core's "receive version message" line (main.cpp:456-461)
         info!(
-            "Handshake complete with {} ({}), height {}",
-            self.info.addr,
+            "receive version message: {}: version {}, blocks={}, us={}, {}",
             self.info.user_agent().unwrap_or("unknown"),
-            self.info.start_height
+            self.info.version.as_ref().map_or(0, |v| v.version),
+            self.info.start_height,
+            self.info
+                .version
+                .as_ref()
+                .map_or_else(String::new, |v| v.addr_recv.socket_addr().to_string()),
+            crate::peer_log::peer(self.peer_id, self.info.addr)
         );
-
-        // Send BIP 130 sendheaders message
-        if let Err(e) = self.send_message(NetworkMessage::SendHeaders).await {
-            debug!("Failed to send sendheaders to {}: {}", self.info.addr, e);
-        }
 
         // The peer's services are readable before anyone hears of it: block
         // download picks peers by NODE_NETWORK
@@ -287,6 +311,10 @@ impl Connection {
 
     /// Perform version handshake
     async fn handshake(&mut self) -> Result<(), NetworkError> {
+        // getpeerinfo lists a peer from its connection on, with start height
+        // -1 until a version names one (Divi Core nStartingHeight, Node.cpp:561)
+        self.info.publish(&self.stats);
+
         // For outbound connections, we send version first
         // For inbound, we wait for their version first
         if self.info.direction == PeerDirection::Outbound {
@@ -322,12 +350,16 @@ impl Connection {
 
         // Divi Core IsSelfConnection: our own version came back
         if self.local_nonces.lock().contains(&their_version.nonce) {
-            info!("Connected to self at {}, disconnecting", self.info.addr);
+            info!(
+                "Connected to self at {}, disconnecting",
+                crate::peer_log::peer(self.peer_id, self.info.addr)
+            );
             return Err(NetworkError::Connection("connected to self".into()));
         }
 
         // Store their version info
         self.info.time_offset = their_version.timestamp - divi_primitives::clock::now();
+        let their_time = their_version.timestamp;
         // An inbound peer names the address it reached us at (Divi Core
         // main.cpp:402-404 SeenLocal)
         if self.info.direction == PeerDirection::Inbound {
@@ -343,6 +375,9 @@ impl Connection {
         self.stats.bloom.set_relay(their_version.relay);
         self.info.version = Some(their_version);
         self.info.state = PeerState::VersionReceived;
+        // Divi Core keeps the version's fields as it reads them (main.cpp:372-391),
+        // so getpeerinfo shows them before the verack
+        self.info.publish(&self.stats);
 
         // If inbound, now send our version
         if self.info.direction == PeerDirection::Inbound {
@@ -351,12 +386,25 @@ impl Connection {
 
         // Send verack
         self.send_message(NetworkMessage::Verack).await?;
+        // A sample of the network's time, last of the version message's work, so
+        // the version we sent an inbound peer has the offset as it was before
+        // (Divi Core AddTimeData after PushVersion and verack, main.cpp:407-465)
+        crate::timedata::add_time_data(self.info.addr.ip(), their_time);
 
-        // Wait for their verack
-        timeout(HANDSHAKE_TIMEOUT, self.recv_verack())
-            .await
-            .map_err(|_| NetworkError::Timeout)??;
+        // Then, as Divi Core's version handler: an inbound peer is told the
+        // spork count, an outbound one asked for addresses (main.cpp:417-442)
+        if self.info.direction == PeerDirection::Inbound {
+            let count = self.spork_count.as_ref().map_or(0, |source| source());
+            self.send_message(NetworkMessage::SporkCount(count)).await?;
+        } else {
+            self.send_message(NetworkMessage::GetAddr).await?;
+        }
 
+        // Divi Core counts the peer as connected once its version is handled
+        // (RecordSuccessfullConnection, main.cpp:454): what goes out to a peer
+        // with a version (sporkcount, ping, getblocks, getaddr) goes now, and
+        // what the peer sends is handled as it comes, its verack included
+        // (main.cpp:484-514 checks only for the version)
         self.info.state = PeerState::Connected;
         Ok(())
     }
@@ -390,8 +438,13 @@ impl Connection {
         let version = VersionMessage {
             version: crate::constants::protocol_version(),
             services: self.our_services,
-            // GetTime or GetAdjustedTime, both from the mocked clock (Node.cpp PushVersion)
-            timestamp: divi_primitives::clock::now(),
+            // GetAdjustedTime to an inbound peer, GetTime to one we dialled, both on
+            // the clock setmocktime sets (Node.cpp:995-996)
+            timestamp: if self.info.direction == PeerDirection::Inbound {
+                divi_primitives::clock::adjusted_now()
+            } else {
+                divi_primitives::clock::now()
+            },
             addr_recv,
             addr_from: self
                 .local
@@ -429,30 +482,6 @@ impl Connection {
             score: 1,
             reason: "Version message has not arrived before other handshake steps".into(),
         });
-    }
-
-    /// Wait for verack message (during handshake - uses blocking read, ok because no select!)
-    async fn recv_verack(&mut self) -> Result<(), NetworkError> {
-        loop {
-            match self.read_message_handshake().await? {
-                Some(Decoded::Message(NetworkMessage::Verack)) => return Ok(()),
-                Some(Decoded::Message(NetworkMessage::Version(_))) => {
-                    self.send_message(duplicate_version_reject()).await?;
-                    let _ = self.event_tx.send(duplicate_version(self.peer_id));
-                }
-                Some(Decoded::Malformed { command, .. }) if command == "version" => {
-                    self.send_message(duplicate_version_reject()).await?;
-                    let _ = self.event_tx.send(duplicate_version(self.peer_id));
-                }
-                Some(Decoded::Message(msg)) => {
-                    debug!("Ignoring {} during handshake", msg.command());
-                }
-                Some(Decoded::Malformed { command, error }) => {
-                    self.reject_malformed(&command, &error).await?;
-                }
-                None => {}
-            }
-        }
     }
 
     /// Divi Core's answer to a message that does not parse
@@ -538,6 +567,7 @@ impl Connection {
             stats,
             local_nonces: _,
             local: _,
+            spork_count: _,
             // Kept until the loop ends: the nonce leaves the node's set then
             sent_nonce: _nonce_guard,
         } = self;
@@ -549,20 +579,42 @@ impl Connection {
         let codec = DiviCodec::new(magic);
         let mut framed = FramedRead::new(reader, codec);
 
-        // Keepalive pings as Divi Core's MaybeSendPing: the first check comes at
-        // once, so a ping goes out right after the handshake, then one each
-        // PING_INTERVAL after the last ping sent (a `ping` call included)
+        // Keepalive pings as Divi Core's MaybeSendPing: the first goes out now,
+        // after what the version handler sent and before anything else, as the
+        // message handler sends it before SendMessages (net.cpp:871-893); then
+        // one each PING_INTERVAL after the last ping sent (a `ping` call included)
         let mut ping_timer = tokio::time::interval(PING_CHECK);
-        let mut last_ping_sent: Option<std::time::Instant> = None;
+        let first_ping = rand::random();
+        info.ping_nonce = Some(first_ping);
+        info.ping_time = Some(std::time::Instant::now());
+        let mut last_ping_sent = info.ping_time;
+        if let Err(e) = Self::write_message(
+            &mut writer,
+            &mut info,
+            magic,
+            &total_bytes_sent,
+            NetworkMessage::Ping(first_ping),
+        )
+        .await
+        {
+            error!(
+                "Failed to send keepalive ping to {}: {}",
+                crate::peer_log::peer(peer_id, info.addr),
+                e
+            );
+        }
 
         loop {
             info.publish(&stats);
+            // Not read while its messages the node has not taken pass the
+            // limits (Divi Core IsAvailableToReceive, Node.cpp:335-339)
+            let can_receive = stats.can_receive();
             tokio::select! {
                 biased;
 
                 // Check for shutdown signal (highest priority)
                 _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received, disconnecting from {}", info.addr);
+                    info!("Shutdown signal received, disconnecting from {}", crate::peer_log::peer(peer_id, info.addr));
                     break;
                 }
 
@@ -570,9 +622,11 @@ impl Connection {
                 // manager drops this peer (disconnect, ban): end the connection.
                 msg = outbound_rx.recv() => {
                     let Some(msg) = msg else {
-                        info!("Disconnecting from {} (dropped by the peer manager)", info.addr);
+                        info!("Disconnecting from {} (dropped by the peer manager)", crate::peer_log::peer(peer_id, info.addr));
                         break;
                     };
+                    // Counted until written, as Divi Core's nSendSize
+                    let queued = msg.wire_size();
                     // A queued ping (the `ping` RPC) gets a fresh nonce and is timed like the
                     // keep-alive, so its pong updates pingtime (C++ fPingQueued)
                     let msg = match msg {
@@ -585,8 +639,10 @@ impl Connection {
                         }
                         other => other,
                     };
-                    if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await {
-                        error!("Failed to send message to {}: {}", info.addr, e);
+                    let written = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await;
+                    stats.send_written(queued);
+                    if let Err(e) = written {
+                        error!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                         break;
                     }
                 }
@@ -594,7 +650,7 @@ impl Connection {
                 // Proactive keepalive ping
                 _ = ping_timer.tick() => {
                     if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
-                        info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
+                        info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                         break;
                     }
                     let now = std::time::Instant::now();
@@ -604,21 +660,24 @@ impl Connection {
                         info.ping_time = Some(now);
                         last_ping_sent = Some(now);
                         if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, NetworkMessage::Ping(nonce)).await {
-                            error!("Failed to send keepalive ping to {}: {}", info.addr, e);
+                            error!("Failed to send keepalive ping to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             break;
                         }
                     }
                 }
 
+                // The node took a message: read again if there is room
+                _ = stats.recv_space.notified(), if !can_receive => {}
+
                 // Handle incoming messages - framed.next() IS CANCELLATION SAFE!
-                result = timeout(READ_TIMEOUT, framed.next()) => {
+                result = timeout(READ_TIMEOUT, framed.next()), if can_receive => {
                     match result {
                         Ok(Some(Ok(Decoded::Malformed { command, .. }))) if command == "version" => {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, duplicate_version_reject()).await {
-                                error!("Failed to send reject to {}: {}", info.addr, e);
+                                error!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                                 break;
                             }
                             let _ = event_tx.send(duplicate_version(peer_id));
@@ -630,9 +689,16 @@ impl Connection {
                             info.last_recv_unix = crate::peer::unix_now();
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
+                            if command == "pong" {
+                                // Divi Core reads a pong without throwing: under 8
+                                // bytes ends the ping untimed ("Short payload",
+                                // Node.cpp:790-794)
+                                info.ping_nonce = None;
+                                info.ping_time = None;
+                            }
                             if let Some(answer) = malformed_reject(&command) {
                                 if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, answer).await {
-                                    error!("Failed to send reject to {}: {}", info.addr, e);
+                                    error!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                                     break;
                                 }
                             }
@@ -651,25 +717,25 @@ impl Connection {
                             trace!("Received {} from {}", msg.command(), info.addr);
 
                             if let Err(e) = Self::handle_message(
-                                &mut writer, &mut info, magic, &total_bytes_sent, peer_id, &event_tx, msg
+                                &mut writer, &mut info, magic, &total_bytes_sent, peer_id, &event_tx, &stats, msg, bytes_received
                             ).await {
-                                warn!("Error handling message from {}: {}", info.addr, e);
+                                warn!("Error handling message from {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             }
                         }
                         Ok(Some(Err(e))) => {
-                            error!("Error reading from {}: {}", info.addr, e);
+                            error!("Error reading from {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             break;
                         }
                         Ok(None) => {
                             // Stream ended (connection closed)
-                            info!("Connection closed by {}", info.addr);
+                            info!("Connection closed by {}", crate::peer_log::peer(peer_id, info.addr));
                             break;
                         }
                         Err(_) => {
                             // A quiet peer gets no extra ping: the keepalive above
                             // runs on its own interval, as in Divi Core
                             if inactivity_exceeded(info.last_recv, info.ping_time, std::time::Instant::now()) {
-                                info!("{} inactive for {:?}, disconnecting", info.addr, TIMEOUT_INTERVAL);
+                                info!("{} inactive for {:?}, disconnecting", crate::peer_log::peer(peer_id, info.addr), TIMEOUT_INTERVAL);
                                 break;
                             }
                         }
@@ -688,6 +754,7 @@ impl Connection {
     }
 
     /// Handle a received message
+    #[allow(clippy::too_many_arguments)]
     async fn handle_message<W: AsyncWriteExt + Unpin>(
         writer: &mut W,
         info: &mut PeerInfo,
@@ -695,9 +762,13 @@ impl Connection {
         total_bytes_sent: &Arc<AtomicU64>,
         peer_id: PeerId,
         event_tx: &broadcast::Sender<PeerEvent>,
+        stats: &LivePeerStats,
         msg: NetworkMessage,
+        size: u64,
     ) -> Result<(), NetworkError> {
         match &msg {
+            // The peer's verack: nothing waits for it (main.cpp:498-507)
+            NetworkMessage::Verack => {}
             // Divi Core: one version per connection
             NetworkMessage::Version(_) => {
                 Self::write_message(
@@ -722,7 +793,10 @@ impl Connection {
                 .await?;
             }
             NetworkMessage::Pong(nonce) => {
-                // Check if this matches our ping
+                // Divi Core ProcessReceivedPong (Node.cpp:754-808): our nonce
+                // ends the ping and times it; nonce 0 ends it untimed (a bug
+                // in the other implementation); another nonce leaves it
+                // outstanding (pings may overlap)
                 if let Some(sent_nonce) = info.ping_nonce {
                     if sent_nonce == *nonce {
                         if let Some(ping_time) = info.ping_time {
@@ -732,6 +806,10 @@ impl Connection {
                         }
                         info.ping_nonce = None;
                         info.ping_time = None;
+                    } else if *nonce == 0 {
+                        debug!("Pong with nonce 0 from {}: ping cancelled", info.addr);
+                        info.ping_nonce = None;
+                        info.ping_time = None;
                     }
                 }
             }
@@ -739,10 +817,13 @@ impl Connection {
                 // Log all messages for debugging
                 trace!("Received {} message from peer {}", msg.command(), peer_id);
 
-                // Forward to event handler for processing
+                // Forward to event handler for processing; counted until
+                // the node takes it
+                stats.message_queued(size);
                 let _ = event_tx.send(PeerEvent::Message {
                     peer_id,
                     message: msg,
+                    size,
                 });
             }
         }
@@ -810,13 +891,14 @@ fn reject(command: &str, code: u8, reason: &str) -> NetworkMessage {
 
 /// The `reject` Divi Core sends for a message that does not parse
 /// (main.cpp:1054). None for a `reject`, which Divi Core reads only with
-/// -debug and whose parse errors it swallows (main.cpp:940-962), and for
+/// -debug and whose parse errors it swallows (main.cpp:940-962), for
 /// `headers`, which it never reads (main.cpp:669, HeadersFirstSyncingActive
 /// is false on every network): answering those could only start an
-/// exchange of rejects.
+/// exchange of rejects; and for a short `pong`, which Divi Core reads by
+/// the bytes it has (Node.cpp:759-794).
 fn malformed_reject(command: &str) -> Option<NetworkMessage> {
     match command {
-        "reject" | "headers" => None,
+        "reject" | "headers" | "pong" => None,
         _ => Some(reject(command, REJECT_MALFORMED, "error parsing message")),
     }
 }

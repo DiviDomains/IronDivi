@@ -67,6 +67,14 @@ impl NetworkRpc {
         // :163-167)
         let ipv6_reachable = local.iter().any(|a| a.address.is_ipv6());
         let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
+        // -onlynet: the networks it left out are limited, and a limited
+        // network is not reachable (rpcnet.cpp:323-324,
+        // NetworkLocalAddressHelpers.cpp:163-167)
+        let limited = |net| pm.is_some_and(|pm| pm.local_addresses().is_net_limited(net));
+        let (ipv4_limited, ipv6_limited) = (
+            limited(divi_network::local::Network::Ipv4),
+            limited(divi_network::local::Network::Ipv6),
+        );
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
@@ -80,15 +88,15 @@ impl NetworkRpc {
             "networks": [
                 {
                     "name": "ipv4",
-                    "limited": false,
-                    "reachable": ipv4_reachable,
+                    "limited": ipv4_limited,
+                    "reachable": ipv4_reachable && !ipv4_limited,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
-                    "limited": false,
-                    "reachable": ipv6_reachable,
+                    "limited": ipv6_limited,
+                    "reachable": ipv6_reachable && !ipv6_limited,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
@@ -114,23 +122,11 @@ impl NetworkRpc {
         }))
     }
 
-    /// Network-adjusted time offset in seconds: the median of the connected peers'
-    /// clock offsets, used once at least 5 peers are known (C++ `GetTimeOffset`)
+    /// The network time offset in seconds (GetTimeOffset, rpcnet.cpp:374): the
+    /// median of every peer's version time since the start, one per address
+    /// (divi_network::timedata)
     fn time_offset(&self) -> i64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some(pm) = &self.peer_manager else {
-            return 0;
-        };
-        let mut offsets: Vec<i64> = pm
-            .get_peer_details()
-            .iter()
-            .map(|(_, _, _, st, _)| st.time_offset.load(Relaxed))
-            .collect();
-        if offsets.len() < 5 {
-            return 0;
-        }
-        offsets.sort_unstable();
-        offsets[offsets.len() / 2]
+        divi_primitives::clock::time_offset()
     }
 
     /// Get peer info
@@ -148,6 +144,7 @@ impl NetworkRpc {
                 let ping_us = st.ping_us.load(Relaxed);
                 let ping_sent_us = st.ping_sent_us.load(Relaxed);
                 let subver = st.subver.lock().clone();
+                // Divi Core's members in its order (rpcnet.cpp:116-148)
                 let mut info = serde_json::json!({
                     "id": id,
                     "addr": addr.to_string(),
@@ -158,21 +155,21 @@ impl NetworkRpc {
                     "bytesrecv": st.bytes_recv.load(Relaxed),
                     "conntime": st.conn_time.load(Relaxed),
                     "pingtime": ping_us as f64 / 1_000_000.0,
-                    "version": st.version.load(Relaxed),
-                    "subver": subver,
-                    "inbound": *inbound,
-                    "startingheight": st.start_height.load(Relaxed),
-                    "banscore": banscore,
-                    "inflight": [],
-                    "whitelisted": peer_manager.is_whitelisted(*id),
-                    "synced_headers": -1,
-                    "synced_blocks": -1
                 });
                 // Like C++, pingwait is only present while a ping is unanswered
                 if ping_sent_us != 0 {
                     let wait_us = divi_network::peer::unix_now_us().saturating_sub(ping_sent_us);
                     info["pingwait"] = serde_json::json!(wait_us as f64 / 1_000_000.0);
                 }
+                info["version"] = serde_json::json!(st.version.load(Relaxed));
+                info["subver"] = serde_json::json!(subver);
+                info["inbound"] = serde_json::json!(*inbound);
+                info["startingheight"] = serde_json::json!(st.start_height.load(Relaxed));
+                info["banscore"] = serde_json::json!(banscore);
+                info["synced_headers"] = serde_json::json!(-1);
+                info["synced_blocks"] = serde_json::json!(-1);
+                info["inflight"] = serde_json::json!([]);
+                info["whitelisted"] = serde_json::json!(peer_manager.is_whitelisted(*id));
                 info
             })
             .collect();
@@ -1041,5 +1038,79 @@ mod tests {
         let rpc = NetworkRpc::new();
         let result = rpc.get_peer_info(&Params::None).unwrap();
         assert_eq!(result, serde_json::json!([]));
+    }
+
+    /// A peer's members as Divi Core pushes them (rpcnet.cpp:116-148);
+    /// pingwait comes only while a ping is unanswered
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_peer_info_members_are_in_cores_order() {
+        use std::time::Duration;
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", divi_test_support::free_port())
+            .parse()
+            .unwrap();
+        let server = PeerManager::new(divi_network::PeerManagerConfig {
+            listen_addr: Some(listen),
+            ..quiet_config()
+        });
+        tokio::spawn(Arc::clone(&server).start());
+        let client = PeerManager::new(quiet_config());
+        let mut connected = false;
+        for _ in 0..50 {
+            if Arc::clone(&client).connect_to_peer(listen).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "client could not reach the local listener");
+        let rpc = NetworkRpc::with_peer_manager(Arc::clone(&client));
+        let mut peers = serde_json::json!([]);
+        for _ in 0..50 {
+            peers = rpc.get_peer_info(&Params::None).unwrap();
+            if peers.as_array().is_some_and(|a| !a.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let keys: Vec<&str> = peers[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "pingwait")
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "id",
+                "addr",
+                "services",
+                "lastsend",
+                "lastrecv",
+                "bytessent",
+                "bytesrecv",
+                "conntime",
+                "pingtime",
+                "version",
+                "subver",
+                "inbound",
+                "startingheight",
+                "banscore",
+                "synced_headers",
+                "synced_blocks",
+                "inflight",
+                "whitelisted"
+            ]
+        );
+        if let Some(n) = peers[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .position(|k| k == "pingwait")
+        {
+            assert_eq!(n, 9, "pingwait after pingtime: {}", peers[0]);
+        }
+        client.disconnect_all();
+        server.disconnect_all();
     }
 }

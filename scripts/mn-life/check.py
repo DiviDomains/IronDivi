@@ -26,6 +26,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import mnsync_stages  # noqa: E402  (scripts/lib: the sync stages of nodes over time)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
 # changed before it is compared
@@ -44,9 +47,6 @@ START_TIMEOUT = 180
 # Each is listed in README.md with divid's source line; a KNOWN row that starts to
 # match divid is a FAIL, so the list stays true.
 KNOWN = {
-    "member order of an object (setupmasternode)":
-        "irondivid writes a result's members in name order (serde_json without preserve_order; "
-        "docs/divid-differences.md R6); the members are otherwise compared as sets",
     "getmasternodecount: tier counts divid lacks":
         "copper, silver, gold, platinum, diamond, kept on purpose (divid rpcmasternode.cpp:327-358 has the 8 "
         "counts only; scripts/masternode-replies README)",
@@ -252,22 +252,19 @@ def compare(name, c, i, by_shape=False, mask=None):
     return c, i
 
 
-STAGES = ("irondivid has no masternode sync stages and reports 999 (finished); divid moves through its stages "
-          "with three spork-synced peers (masternode-sync.cpp:425-455) and was still in one here "
-          "(scripts/masternode-replies README)")
-
-
 def compare_mnsync(name, c, i):
-    """mnsync status; a divid still in a sync stage against irondivid's 999 is the
-    known difference, anything else is compared as usual"""
+    """mnsync status: whether the chain is synced, the stage, and the shape of
+    the node's own counters and times"""
     cv = mnsync_view(c[1]) if c[0] == "ok" else c
     iv = mnsync_view(i[1]) if i[0] == "ok" else i
     a, b = json.dumps(cv, sort_keys=True), json.dumps(iv, sort_keys=True)
-    staged = (c[0] == i[0] == "ok" and cv.get("currentMasternodeSyncStatus") != 999
-              and iv.get("currentMasternodeSyncStatus") == 999
-              and {k: x for k, x in cv.items() if k != "currentMasternodeSyncStatus"}
-              == {k: x for k, x in iv.items() if k != "currentMasternodeSyncStatus"})
-    row(name, a, b, a == b, reason=STAGES if staged else None)
+    row(name, a, b, a == b)
+
+
+def stage_rows(name, seqs):
+    """The stages C and I went through, compared as sequences"""
+    a, b = seqs[C.name], seqs[I.name]
+    row(name, mnsync_stages.text(a), mnsync_stages.text(b), a == b)
 
 
 def sorted_list(v):
@@ -325,6 +322,7 @@ NODES = [C, I, M1, M2, M3, M4]
 # 1. The two controllers, one chain, coins on both
 for n in (C, I):
     n.start()
+poller = mnsync_stages.StagePoller([C, I]).start()
 mesh()
 print(f"# divid {C.rpc('getinfo').get('version')}, irondivid {I.rpc('getinfo').get('version')}", flush=True)
 mine(C, 30)
@@ -437,10 +435,12 @@ def sync_state(node):
     return out[1].get("currentMasternodeSyncStatus") if out[0] == "ok" else out
 
 
-# divid's masternode sync moves through its stages with three spork-synced peers
+# The masternode sync moves through its stages with three peers it may ask
+# (inbound or spork-synced), on each controller as on the masternode nodes
 t0 = time.time()
-finished = wait_for(lambda: all(sync_state(n) == 999 for n in (C, M1, M2)), 240, step=2)
-info(f"divid nodes' masternode sync finished: {finished} after {time.time() - t0:.0f} s")
+finished = wait_for(lambda: all(sync_state(n) == 999 for n in (C, M1, M2, I)), 240, step=2)
+info(f"the nodes' masternode sync finished: {finished} after {time.time() - t0:.0f} s")
+stage_rows("mnsync stages from start to the network up", poller.stop())
 compare_mnsync("mnsync status, the network up", C.call("mnsync", "status"), I.call("mnsync", "status"))
 compare("getmasternodestatus on a masternode node before its start (M1 for C, M2 for I)",
         M1.call("getmasternodestatus"), M2.call("getmasternodestatus"))
@@ -520,8 +520,11 @@ for n in (C, I):
     n.stop()
 for n in (C, I):
     n.start()
+poller = mnsync_stages.StagePoller([C, I]).start()
 mesh()
 need(synced(secs=180), "the controllers did not come back to the tip")
+wait_for(lambda: all(sync_state(n) == 999 for n in (C, I)), 240, step=2)
+stage_rows("mnsync stages after the controllers restarted", poller.stop())
 time.sleep(5)
 views("after the controllers restarted")
 for n in (M1, M2):
@@ -571,6 +574,13 @@ views("after the copper collateral was spent")
 # 8. Payments (MN_LIFE_PAYMENTS=1): ranked 25 minutes after the broadcast was
 # signed; then each block is mined in turn by C and by I
 if PAYMENTS:
+    # I stakes ten blocks below. A stake combines the wallet's coins paying the
+    # kernel's script, and a coinstake output needs 20 confirmations before it
+    # stakes again (wallet.cpp:1452-1457), so I gets twelve coins of its own,
+    # each to a new address, well before they are needed
+    for _ in range(12):
+        C.rpc("sendtoaddress", I.rpc("getnewaddress"), 200)
+    mine(C, 1)
     ready = max(starts.values()) + 25 * 60 + 60
     info(f"waiting {max(0, ready - time.time()):.0f} s for the masternodes to be ranked")
     while time.time() < ready:
@@ -581,25 +591,54 @@ if PAYMENTS:
     while C.rpc("getblockcount") < 110:
         mine(C, 1)
     collateral_addresses = {mn[a]["address"]: a for a in mn}
-    paid = {C.name: [], I.name: []}
+
+    def coinstake_view(height):
+        """The masternode payments in the block (outputs to a masternode's
+        collateral address that is not one of the coinstake's own inputs, so a
+        staked collateral is not a payment) and what it minted"""
+        block = C.rpc("getblock", C.rpc("getblockhash", height))
+        tx = C.rpc("getrawtransaction", block["tx"][1], 1)
+        inputs, spent = set(), 0.0
+        for i in tx["vin"]:
+            prev = C.rpc("getrawtransaction", i["txid"], 1)["vout"][i["vout"]]
+            spent += float(prev["value"])
+            inputs.update(prev.get("scriptPubKey", {}).get("addresses", []))
+        payments, made = [], 0.0
+        for o in tx["vout"]:
+            made += float(o["value"])
+            for addr in o.get("scriptPubKey", {}).get("addresses", []):
+                if addr in collateral_addresses and addr not in inputs:
+                    payments.append((collateral_addresses[addr], o["value"]))
+        return payments, round(made - spent, 8)
+
+    # Divi Core pays no masternode once DeprecateMasternodes is active (median
+    # time past from 2023-08-23, ForkActivation.cpp:31; BlockIncentivesPopulator
+    # .cpp:142-152), so each block's masternode payments are compared, and what
+    # it minted; the votes still flow and are compared after each block
+    views_by = {C.name: [], I.name: []}
     for k in range(20):
         miner = (C, I)[k % 2]
         height = miner.rpc("getblockcount") + 1
-        winners = [n.call("getmasternodewinners", "1") for n in (C, I)]
-        mine(miner, 1)
-        block = C.rpc("getblock", C.rpc("getblockhash", height))
-        payees = []
-        for txid in block["tx"][:2]:
-            tx = C.rpc("getrawtransaction", txid, 1)
-            for o in tx["vout"]:
-                for addr in o.get("scriptPubKey", {}).get("addresses", []):
-                    if addr in collateral_addresses:
-                        payees.append((collateral_addresses[addr], o["value"]))
-        paid[miner.name].append(bool(payees))
-        info(f"height {height} mined by {miner.name}: masternode payment {payees}")
-        compare(f"payments: getmasternodewinners before height {height}", *winners)
-    row("payments: blocks that pay a masternode, of 10 mined by each", sum(paid[C.name]), sum(paid[I.name]),
-        sum(paid[C.name]) == sum(paid[I.name]))
+        out = miner.call("setgenerate", 1)
+        if out[0] != "ok":
+            row(f"payments: setgenerate by {miner.name} at height {height}", "ok", show(out), False)
+            break
+        need(synced(), f"the nodes did not follow {miner.name}'s block")
+        payments, minted = coinstake_view(height)
+        views_by[miner.name].append((payments, minted))
+        info(f"height {height} mined by {miner.name}: masternode payments {payments}, minted {minted}")
+        same = lambda: C.call("getmasternodewinners", "20") == I.call("getmasternodewinners", "20")
+        wait_for(same, 30)
+        compare(f"payments: getmasternodewinners 20 after height {height}",
+                C.call("getmasternodewinners", "20"), I.call("getmasternodewinners", "20"))
+    voted = C.call("getmasternodewinners", "20")
+    row("payments: divid's winners carry votes", any(
+        (w["winner"].get("nVotes", 0) if isinstance(w["winner"], dict) else 1) for w in voted[1])
+        if voted[0] == "ok" else voted, True, True)
+    pays = {n: sum(1 for p, _ in v if p) for n, v in views_by.items()}
+    row("payments: blocks that pay a masternode", pays[C.name], pays[I.name], pays[C.name] == pays[I.name])
+    minted = {n: sorted({m for _, m in v}) for n, v in views_by.items()}
+    row("payments: what a block mints", minted[C.name], minted[I.name], minted[C.name] == minted[I.name])
 
 for n in NODES:
     n.stop()

@@ -16,9 +16,11 @@ scripts/mining-replies/run.sh <irondivid-bin-dir> <divid-bin-dir> <port-base> [<
 Each call prints one row:
 - `SAME`: the replies agree.
 - `DIFFERS`: the row is followed by what differs and both replies. A difference kept on purpose names its row of `docs/divid-differences.md`.
+- `ORDER`: the replies hold the same members or list items, in another order than divid's; the row is followed
+  by the first object or list that differs and both orders (`scripts/lib/member_order.py`), then what else differs.
 - `ABSENT`: divid answers and irondivid does not have the method.
 
-The run ends with the counts. The exit code is the number of rows that are neither `SAME` nor a kept difference. 255 means a usage error, or that the run went over 15 minutes. A trap stops both nodes and deletes the datadirs on every exit, including Ctrl-C. A run takes about two minutes.
+The run ends with the counts. The exit code is the number of rows that are neither `SAME` nor a kept difference (`ORDER` rows count). 255 means a usage error, or that the run went over 15 minutes. A trap stops both nodes and deletes the datadirs on every exit, including Ctrl-C. A run takes about two minutes.
 
 It needs bash and python3 (standard library only).
 
@@ -28,7 +30,7 @@ It needs bash and python3 (standard library only).
   - the `time` a transaction entered the pool;
   - block hashes, since each node mines its own block;
   - the order of the txid list in `getrawmempool`, since divid's map order means nothing.
-- **Member order.** irondivid writes members in name order (difference R6), so it is not compared.
+- **Member order.** Not compared here (scripts/coin-view compares it for the coin-view calls).
 - **Help text.** A wrong argument count is answered with the method's help in both. The two help texts are worded differently, so such replies count as `SAME` when the code and the first (usage) line agree.
 
 ## What runs

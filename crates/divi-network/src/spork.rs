@@ -16,15 +16,18 @@
 //! indicating how many sporks it has. We respond with `getsporks` to request
 //! them all, then receive individual `spork` messages.
 
+use crate::message::{InvItem, InvType};
 use crate::messages::SporkMessage;
 use crate::peer::PeerId;
 use crate::peer_manager::PeerManager;
 use crate::NetworkMessage;
+use divi_consensus::spork_values::SporkEntry;
 use divi_primitives::hash::Hash256;
-use divi_storage::ChainDatabase;
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use divi_storage::{ChainDatabase, SharedSporks};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// Spork synchronization state per peer
@@ -56,6 +59,9 @@ const MAINNET_SPORK_KEY: &str =
 const TESTNET_SPORK_KEY: &str =
     "034ffa41e5cffdd009f3b34a3e1482ec82b514bb218b7648948b5858cc5c035adb";
 
+/// How long before an inventory item is asked for again (net.cpp `AskFor`)
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(120);
+
 /// Points Divi Core adds for a spork with a bad signature (spork.cpp)
 pub const BAD_SPORK_SCORE: u32 = 100;
 
@@ -72,8 +78,25 @@ pub fn spork_key(magic: &crate::constants::Magic) -> Option<Vec<u8>> {
     hex::decode(key).ok()
 }
 
-/// Divi Core `SPORK_START` and `SPORK_END` (spork.h): the ids it loads at start
-const SPORK_IDS: std::ops::RangeInclusive<i32> = 10001..=10015;
+/// The ids Divi Core loads at start: those from `SPORK_START` to `SPORK_END`
+/// (spork.h) that have a name (spork.cpp:196-197, `GetSporkNameByID`). It stores
+/// a spork of any id it is sent, but loads only these.
+const SPORK_IDS: [i32; 11] = {
+    use crate::messages::spork_ids::*;
+    [
+        SPORK_2_SWIFTTX_ENABLED,
+        SPORK_3_SWIFTTX_BLOCK_FILTERING,
+        SPORK_5_INSTANTSEND_MAX_VALUE,
+        SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT,
+        SPORK_9_SUPERBLOCKS_ENABLED,
+        SPORK_10_MASTERNODE_PAY_UPDATED_NODES,
+        SPORK_12_RECONSIDER_BLOCKS,
+        SPORK_13_BLOCK_PAYMENTS,
+        SPORK_14_TX_FEE,
+        SPORK_15_BLOCK_VALUE,
+        SPORK_16_LOTTERY_TICKET_MIN_VALUE,
+    ]
+};
 
 /// Where a spork id is kept in the chain database's metadata
 fn db_key(spork_id: i32) -> Vec<u8> {
@@ -117,14 +140,26 @@ pub struct SporkManager {
     /// Received sporks (keyed by hash)
     sporks: RwLock<HashMap<Hash256, SporkMessage>>,
 
-    /// Active sporks by ID, as Divi Core's `mapSporksActive`: the newest one
-    /// for a single-value spork, every signed entry in time order for a
-    /// multi-value spork
-    active_sporks: RwLock<HashMap<i32, Vec<SporkMessage>>>,
+    /// Active sporks by ID, as Divi Core's `mapSporksActive` (a `std::map`, so
+    /// in ID order): the newest one for a single-value spork, every signed
+    /// entry in time order for a multi-value spork
+    active_sporks: RwLock<BTreeMap<i32, Vec<SporkMessage>>>,
 
     /// Keeps the last spork added per id across restarts (Core's spork
     /// database); None keeps sporks in memory only
     db: Option<Arc<ChainDatabase>>,
+
+    /// Where the entries of sporks 13 to 16 are kept for the chain, which reads
+    /// them to value and pay blocks
+    consensus: SharedSporks,
+
+    /// Called when a spork 14 entry arrives (Divi Core `ExecuteSpork`,
+    /// spork.cpp:256, :278-302); not at start, as it does not load sporks that way
+    fee_listeners: RwLock<Vec<Arc<dyn Fn() + Send + Sync>>>,
+
+    /// When each spork inventory item was asked for, so it is asked for once
+    /// (Divi Core `AskFor` waits two minutes before asking again)
+    asked: Mutex<HashMap<Hash256, Instant>>,
 
     /// Progress event broadcaster
     progress_tx: broadcast::Sender<SporkSyncProgress>,
@@ -144,6 +179,17 @@ impl SporkManager {
         Self::with_key(peer_manager, key, Some(db))
     }
 
+    /// [`SporkManager::with_db`], keeping the entries of sporks 13 to 16 in
+    /// `consensus` (the chain's), loaded ones included
+    pub fn with_chain(
+        peer_manager: Arc<PeerManager>,
+        db: Arc<ChainDatabase>,
+        consensus: SharedSporks,
+    ) -> Arc<Self> {
+        let key = spork_key(&peer_manager.magic());
+        Self::build(peer_manager, key, Some(db), consensus)
+    }
+
     /// Create a spork manager that checks sporks against `spork_key` (None:
     /// not checked), optionally kept in `db`
     pub fn with_key(
@@ -151,14 +197,36 @@ impl SporkManager {
         spork_key: Option<Vec<u8>>,
         db: Option<Arc<ChainDatabase>>,
     ) -> Arc<Self> {
+        Self::build(peer_manager, spork_key, db, Default::default())
+    }
+
+    /// [`SporkManager::with_key`] keeping sporks 13 to 16 in `consensus`
+    pub fn with_key_and_chain(
+        peer_manager: Arc<PeerManager>,
+        spork_key: Option<Vec<u8>>,
+        db: Option<Arc<ChainDatabase>>,
+        consensus: SharedSporks,
+    ) -> Arc<Self> {
+        Self::build(peer_manager, spork_key, db, consensus)
+    }
+
+    fn build(
+        peer_manager: Arc<PeerManager>,
+        spork_key: Option<Vec<u8>>,
+        db: Option<Arc<ChainDatabase>>,
+        consensus: SharedSporks,
+    ) -> Arc<Self> {
         let (progress_tx, _) = broadcast::channel(16);
         let manager = SporkManager {
             spork_key,
             peer_manager,
             peer_states: RwLock::new(HashMap::new()),
             sporks: RwLock::new(HashMap::new()),
-            active_sporks: RwLock::new(HashMap::new()),
+            active_sporks: RwLock::new(BTreeMap::new()),
             db,
+            consensus,
+            fee_listeners: RwLock::new(Vec::new()),
+            asked: Mutex::new(HashMap::new()),
             progress_tx,
         };
         manager.load_stored();
@@ -194,19 +262,33 @@ impl SporkManager {
     /// that entry is already held; any other spork replaces the active one.
     /// True when the spork was added.
     fn add_active(&self, spork: SporkMessage) -> bool {
-        let mut active = self.active_sporks.write();
-        let list = active.entry(spork.spork_id).or_default();
-        if is_multi_value(spork.spork_id) {
-            let hash = spork.hash();
-            if list.iter().any(|held| held.hash() == hash) {
-                return false;
+        let id = spork.spork_id;
+        let entries: Vec<SporkEntry> = {
+            let mut active = self.active_sporks.write();
+            let list = active.entry(id).or_default();
+            if is_multi_value(id) {
+                let hash = spork.hash();
+                if list.iter().any(|held| held.hash() == hash) {
+                    return false;
+                }
+                list.push(spork);
+                list.sort_by_key(|held| held.time_signed);
+            } else {
+                *list = vec![spork];
+                return true;
             }
-            list.push(spork);
-            list.sort_by_key(|held| held.time_signed);
-        } else {
-            *list = vec![spork];
-        }
+            list.iter()
+                .map(|held| SporkEntry::new(held.value.clone(), held.time_signed))
+                .collect()
+        };
+        // Consensus reads the entries of the multi-value sporks from here
+        self.consensus.write().set(id, entries);
         true
+    }
+
+    /// Call `listener` when a spork 14 entry arrives, to take its fee settings
+    pub fn on_tx_fee_spork(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        self.fee_listeners.write().push(listener);
     }
 
     /// Subscribe to progress events
@@ -238,8 +320,12 @@ impl SporkManager {
             .unwrap_or(SporkSyncState::Pending)
     }
 
-    /// Handle sporkcount message from a peer
+    /// Handle sporkcount message from a peer. Divi Core takes a count of none
+    /// or less as nothing to wait for (Node.cpp SetSporkCount) and answers
+    /// every sporkcount with getsporks (spork.cpp ProcessSpork)
     pub async fn handle_sporkcount(&self, peer_id: PeerId, count: u32) {
+        // The count is a signed 32-bit integer on the wire
+        let count = if count > i32::MAX as u32 { 0 } else { count };
         tracing::info!("Peer {} has {} sporks", peer_id, count);
 
         // Update peer state
@@ -258,14 +344,11 @@ impl SporkManager {
             }
         }
 
-        // If peer has sporks, request them
-        if count > 0 {
-            tracing::debug!("Requesting sporks from peer {}", peer_id);
-            let _ = self
-                .peer_manager
-                .send_to_peer(peer_id, NetworkMessage::GetSporks)
-                .await;
-        }
+        tracing::debug!("Requesting sporks from peer {}", peer_id);
+        let _ = self
+            .peer_manager
+            .send_to_peer(peer_id, NetworkMessage::GetSporks)
+            .await;
 
         self.emit_progress();
     }
@@ -311,13 +394,27 @@ impl SporkManager {
         self.sporks.write().insert(hash, spork.clone());
 
         // Divi Core writes the spork to its database when it was added
-        if self.add_active(spork.clone()) {
+        let added = self.add_active(spork.clone());
+        if added {
             if let Some(db) = &self.db {
                 if let Err(e) = db.put_metadata(&db_key(spork.spork_id), &spork.serialize()) {
                     tracing::warn!("Could not store spork {}: {}", spork.spork_id, e);
                 }
             }
         }
+
+        if spork.spork_id == divi_consensus::spork_values::ids::TX_FEE && added {
+            for listener in self.fee_listeners.read().iter() {
+                listener();
+            }
+        }
+
+        // Divi Core announces every spork it accepted to its other peers
+        // (spork.cpp:259, `CSporkMessage::Relay`); they fetch it by getdata
+        self.peer_manager.broadcast_except(
+            NetworkMessage::Inv(vec![InvItem::new(InvType::Spork, hash)]),
+            peer_id,
+        );
 
         self.emit_progress();
     }
@@ -363,21 +460,47 @@ impl SporkManager {
         }
     }
 
-    /// A peer that dialled us. Divi Core tells it how many sporks it holds
-    /// (main.cpp SetPeerVersionAndServices) and waits for no sporks from it
-    /// (Node.cpp CanSendMessagesToPeer, net.cpp GetSporkSyncedOrInboundNodes);
-    /// the peer itself sends nothing else to us until it has that many sporks,
-    /// so the count must match what `getsporks` serves.
+    /// Handle an `inv` that announces sporks: ask for the ones this node does
+    /// not hold, once (Divi Core main.cpp:559-612, `AlreadyHave` then `AskFor`)
+    pub async fn handle_inv(&self, peer_id: PeerId, items: &[InvItem]) {
+        let wanted: Vec<InvItem> = {
+            let held = self.sporks.read();
+            let mut asked = self.asked.lock();
+            let now = Instant::now();
+            asked.retain(|_, when| now.duration_since(*when) < ASK_AGAIN_AFTER);
+            items
+                .iter()
+                .filter(|item| item.inv_type == InvType::Spork)
+                .filter(|item| !held.contains_key(&item.hash))
+                .filter(|item| asked.insert(item.hash, now).is_none())
+                .cloned()
+                .collect()
+        };
+        if !wanted.is_empty() {
+            let _ = self
+                .peer_manager
+                .send_to_peer(peer_id, NetworkMessage::GetData(wanted))
+                .await;
+        }
+    }
+
+    /// A spork this node holds, by its hash: what a `getdata` for it is answered
+    /// with (Divi Core `ShareSporkDataWithPeer`, spork.cpp:41-50)
+    pub fn spork_by_hash(&self, hash: &Hash256) -> Option<SporkMessage> {
+        self.sporks.read().get(hash).cloned()
+    }
+
+    /// A peer that dialled us. Divi Core waits for no sporks from it
+    /// (Node.cpp CanSendMessagesToPeer, net.cpp GetSporkSyncedOrInboundNodes).
+    /// Its connection told it how many sporks this node holds, with its verack
+    /// (main.cpp SetPeerVersionAndServices, `spork_count`); the peer itself
+    /// sends nothing else to us until it has that many sporks, so the count
+    /// must match what `getsporks` serves.
     pub async fn inbound_peer_connected(&self, peer_id: PeerId) {
         self.peer_states
             .write()
             .entry(peer_id)
             .or_insert(SporkSyncState::Synced);
-        let count = self.spork_count() as u32;
-        let _ = self
-            .peer_manager
-            .send_to_peer(peer_id, NetworkMessage::SporkCount(count))
-            .await;
         self.emit_progress();
     }
 
@@ -393,7 +516,8 @@ impl SporkManager {
         self.active_sporks.read().values().map(Vec::len).sum()
     }
 
-    /// Every active spork, as `getsporks` serves them
+    /// Every active spork, as `getsporks` serves them: by ID, and by time
+    /// within a multi-value spork (Divi Core spork.cpp:261-267)
     pub fn active_sporks(&self) -> Vec<SporkMessage> {
         self.active_sporks
             .read()
@@ -486,6 +610,177 @@ mod tests {
             listen_addr: None,
             ..Default::default()
         })
+    }
+
+    /// A peer registered with `peers`, and the receiver of what is sent to it
+    fn test_peer(
+        peers: &Arc<PeerManager>,
+        id: PeerId,
+    ) -> tokio::sync::mpsc::Receiver<NetworkMessage> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        peers.insert_test_peer(crate::peer::PeerHandle {
+            id,
+            addr: format!("127.0.0.1:{}", 2000 + id).parse().unwrap(),
+            tx,
+            inbound: true,
+            stats: Default::default(),
+        });
+        rx
+    }
+
+    fn received(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<NetworkMessage> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(msg);
+        }
+        got
+    }
+
+    /// Divi Core answers every sporkcount with getsporks, a count of none
+    /// included (spork.cpp:269-274), and takes a count of none or less as
+    /// "nothing to wait for" (Node.cpp:1008-1016)
+    #[tokio::test]
+    async fn every_sporkcount_is_answered_with_getsporks() {
+        let peers = quiet_peers();
+        let sporks = SporkManager::with_key(Arc::clone(&peers), None, None);
+        let mut rx = test_peer(&peers, 1);
+
+        sporks.handle_sporkcount(1, 0).await;
+        assert!(matches!(received(&mut rx)[..], [NetworkMessage::GetSporks]));
+        assert!(sporks.is_peer_synced(1));
+
+        // a count that is negative as a 32-bit integer
+        sporks.handle_sporkcount(1, u32::MAX).await;
+        assert!(matches!(received(&mut rx)[..], [NetworkMessage::GetSporks]));
+        assert!(sporks.is_peer_synced(1));
+
+        sporks.handle_sporkcount(1, 3).await;
+        assert!(matches!(received(&mut rx)[..], [NetworkMessage::GetSporks]));
+        assert_eq!(
+            sporks.peer_state(1),
+            SporkSyncState::Syncing {
+                expected: 3,
+                received: 0
+            }
+        );
+    }
+
+    /// Divi Core relays a spork it accepted as an inv to its peers
+    /// (spork.cpp:259); a spork it refused, or one no newer than the active
+    /// one, is not relayed
+    #[tokio::test]
+    async fn an_accepted_spork_is_announced_to_the_other_peers() {
+        let kp = divi_crypto::KeyPair::new_random();
+        let peers = quiet_peers();
+        let sporks =
+            SporkManager::with_key(Arc::clone(&peers), Some(kp.public_key().to_bytes()), None);
+        let mut sender = test_peer(&peers, 1);
+        let mut other = test_peer(&peers, 2);
+        let mut third = test_peer(&peers, 3);
+
+        let spork = signed(&kp, 10007, "1600000000", 2000);
+        sporks.handle_spork(1, spork.clone()).await;
+        let announced = |rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>| {
+            received(rx)
+                .into_iter()
+                .filter_map(|m| match m {
+                    NetworkMessage::Inv(items) => Some(items),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![InvItem::new(InvType::Spork, spork.hash())];
+        assert_eq!(announced(&mut other), expected);
+        assert_eq!(announced(&mut third), expected);
+        assert!(announced(&mut sender).is_empty());
+
+        // older than the active one: counted, not relayed
+        sporks.handle_spork(1, signed(&kp, 10007, "1", 1000)).await;
+        // refused
+        let mut forged = signed(&kp, 10007, "2", 3000);
+        forged.signature[10] ^= 1;
+        sporks.handle_spork(1, forged).await;
+        assert!(announced(&mut other).is_empty());
+        assert!(announced(&mut third).is_empty());
+    }
+
+    /// The entries of sporks 13 to 16 are handed to the chain as they are added,
+    /// and again when a restart loads them (spork.cpp:144-168, :192-211)
+    #[tokio::test]
+    async fn multi_value_sporks_reach_the_chain_and_survive_a_restart() {
+        use divi_storage::SharedSporks;
+        let kp = divi_crypto::KeyPair::new_random();
+        let key = kp.public_key().to_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let handed = SharedSporks::default();
+        {
+            let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+            let sporks = SporkManager::with_key_and_chain(
+                quiet_peers(),
+                Some(key.clone()),
+                Some(db),
+                handed.clone(),
+            );
+            sporks
+                .handle_spork(1, signed(&kp, 10015, "5000;100", 1000))
+                .await;
+            sporks
+                .handle_spork(1, signed(&kp, 10015, "3000;200", 2000))
+                .await;
+            // a single-value spork is not one of them
+            sporks
+                .handle_spork(1, signed(&kp, 10007, "1600000000", 2000))
+                .await;
+        }
+        let entries = |s: &SharedSporks| s.read().entries(10015).to_vec();
+        assert_eq!(
+            entries(&handed),
+            vec![
+                SporkEntry::new("5000;100", 1000),
+                SporkEntry::new("3000;200", 2000)
+            ]
+        );
+        assert!(handed.read().entries(10007).is_empty());
+
+        // a restart holds the last entry added to each spork, as divid's database does
+        let restarted = SharedSporks::default();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let _ =
+            SporkManager::with_key_and_chain(quiet_peers(), Some(key), Some(db), restarted.clone());
+        assert_eq!(entries(&restarted), vec![SporkEntry::new("3000;200", 2000)]);
+    }
+
+    /// A spork 14 entry that is added tells the node to take its fees; a copy of
+    /// it, another spork and a refused one do not (spork.cpp:253-257)
+    #[tokio::test]
+    async fn only_a_new_tx_fee_entry_runs_the_fee_listener() {
+        let kp = divi_crypto::KeyPair::new_random();
+        let sporks = SporkManager::with_key(quiet_peers(), Some(kp.public_key().to_bytes()), None);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        sporks.on_tx_fee_spork(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let count = || runs.load(std::sync::atomic::Ordering::SeqCst);
+
+        let fee = signed(&kp, 10013, "10000;300;100000;20000;50;0", 1000);
+        sporks.handle_spork(1, fee.clone()).await;
+        assert_eq!(count(), 1);
+        sporks.handle_spork(2, fee).await;
+        assert_eq!(count(), 1, "the same entry again");
+        sporks
+            .handle_spork(1, signed(&kp, 10015, "5000;100", 1000))
+            .await;
+        assert_eq!(count(), 1, "another spork");
+        let mut forged = signed(&kp, 10013, "1;1;1;1;1;0", 3000);
+        forged.signature[10] ^= 1;
+        sporks.handle_spork(1, forged).await;
+        assert_eq!(count(), 1, "a refused entry");
+        sporks
+            .handle_spork(1, signed(&kp, 10013, "10000;300;100000;30000;60;0", 2000))
+            .await;
+        assert_eq!(count(), 2);
     }
 
     /// Divi Core AddActiveSpork and GetActiveSporkCount (spork.cpp:144-168,

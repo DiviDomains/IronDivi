@@ -83,8 +83,10 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         |rpc_port, p2p_port| {
             let mut a = args(dir.path(), rpc_port, p2p_port);
             a.push("-bogusflag=1".into());
+            a.push("-par=2".into());
+            // Applied (-dbcache) or only in divid's help (-mining): no line
             a.push("-dbcache=100".into());
-            a.push("-alertnotify=echo %s".into());
+            a.push("-mining=1".into());
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
             cmd.args(&a).stdout(Stdio::null()).stderr(Stdio::null());
             cmd
@@ -98,24 +100,23 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         "no line for the unknown option"
     );
     assert!(
-        log.contains("Option -dbcache is not supported by irondivid; ignored"),
+        log.contains("Option -par is not supported by irondivid; ignored"),
         "no line for the unsupported option"
     );
-    assert!(
-        log.contains("Option -alertnotify is not supported by irondivid; ignored"),
-        "no line for -alertnotify"
-    );
+    assert!(!log.contains("-dbcache"), "a line for -dbcache: {log}");
+    assert!(!log.contains("-mining"), "a line for -mining: {log}");
+    // -alertnotify is taken: irondivid runs it for its own warning
+    // (start_rpc_options.rs), so it is not named as unsupported
 }
 
-/// divid runs as the masternode named by -masternode=<alias> from
-/// masternode.conf (MasternodeModule.cpp:163-190); irondivid does not run as
-/// a masternode and refuses to start, naming the line to remove
-#[test]
-fn masternode_option_is_refused() {
+/// Start irondivid with `extra` and masternode.conf `conf`; its exit status
+/// and what it printed (stderr, stdout, log)
+fn start_and_stop(extra: &[&str], conf: &str) -> (std::process::ExitStatus, String) {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("masternode.conf"), conf).unwrap();
     let (rpc_port, p2p_port) = (free_port(), free_port());
     let mut a = args(dir.path(), rpc_port, p2p_port);
-    a.push("-masternode=mn1".into());
+    a.extend(extra.iter().map(|s| s.to_string()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
         .args(&a)
         .stdout(Stdio::piped())
@@ -129,11 +130,10 @@ fn masternode_option_is_refused() {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("irondivid kept running with -masternode");
+            panic!("irondivid kept running with {extra:?}");
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert!(!status.success());
     let mut text = String::new();
     child
         .stderr
@@ -148,6 +148,31 @@ fn masternode_option_is_refused() {
         .read_to_string(&mut text)
         .unwrap();
     text.push_str(&debug_log(dir.path()));
+    (status, text)
+}
+
+/// -masternode=<alias> goes through divid's checks first
+/// (MasternodeModule.cpp:163-240): with no masternode.conf entry for the alias
+/// irondivid stops with divid's text. With a valid entry divid runs as that
+/// masternode; irondivid does not run as one and refuses to start, naming
+/// the line to remove.
+#[test]
+fn masternode_option_is_refused() {
+    let (status, text) = start_and_stop(&["-masternode=mn1"], "");
+    assert!(!status.success());
+    assert!(
+        text.contains("Unknown masternode configuration for masternode=<alias>."),
+        "{text}"
+    );
+
+    // A throwaway regtest key made for this test only (test fixture)
+    let key = divi_crypto::keys::SecretKey::new_random();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(key.as_bytes());
+    let wif = divi_wallet::encode_wif(&bytes, true, divi_wallet::Network::Regtest);
+    let conf = format!("mn1 127.0.0.1:1 {wif} {} 0\n", "11".repeat(32));
+    let (status, text) = start_and_stop(&["-masternode=mn1"], &conf);
+    assert!(!status.success());
     assert!(
         text.contains("irondivid does not run as a masternode"),
         "{text}"

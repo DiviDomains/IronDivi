@@ -16,7 +16,7 @@
 use crate::message::{InvItem, InvType};
 use crate::peer::PeerId;
 use crate::peer_manager::PeerManager;
-use crate::{GetHeadersMessage, NetworkMessage};
+use crate::{GetHeadersMessage, NetworkMessage, RejectMessage};
 
 use divi_crypto::compute_block_hash;
 use divi_primitives::block::{Block, BlockHeader};
@@ -1196,6 +1196,21 @@ impl BlockSync {
     /// Returns true when the block is invalid (scored), so callers drop it
     /// instead of retrying; an orphan or a local error scores 0 and is kept.
     fn note_block_rejected(&self, hash: &Hash256, err: &StorageError) -> bool {
+        // Divi Core tells the peer why (main.cpp:840-843), score or none
+        if let Some((code, reason)) = err.block_reject() {
+            let source = self.block_sources.read().get(hash).copied();
+            if let Some(peer_id) = source {
+                self.peer_manager.try_send_to_peer(
+                    peer_id,
+                    NetworkMessage::Reject(RejectMessage {
+                        message: "block".to_string(),
+                        code,
+                        reason,
+                        data: hash.as_bytes().to_vec(),
+                    }),
+                );
+            }
+        }
         let score = err.misbehaviour_score();
         if score == 0 {
             return false;

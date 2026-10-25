@@ -8,6 +8,8 @@ JSON types, values in divid's units, and error codes and texts. Each row prints 
 - `PASS`: same as divid;
 - `KNOWN`: differs, and the difference is listed below with the reason;
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date).
+- `ORDER`: the same members or list items as divid's, in another order (a FAIL, counted in `FAILS`). The line
+  names the first object or list that differs and both orders (`scripts/lib/member_order.py`).
 
 The run ends with `FAILS <n>`. The exit code is the number of FAILs. It is 255 for a usage error, an interrupted
 run, or a run over 10 minutes.
@@ -82,9 +84,8 @@ By design (the same rows as in `scripts/chain-replies`):
   `JsonTxHelpers.cpp:66`).
 - `decodescript`: irondivid adds `hex`, the script given (divid: `rpcrawtransaction.cpp:556-563`).
 
-**Outputs in name order.** `createrawtransaction` with outputs given as an object keeps them in the order given on
-divid, and sorted by address on irondivid. That is an open row in `scripts/chain-replies`. Here the outputs are given
-in name order, so the transactions this script builds are the same on both.
+**Outputs in name order.** The outputs of `createrawtransaction` are given here in name order. Both nodes keep the
+order given (`rpcrawtransaction.cpp:400-410`; `scripts/chain-replies` compares an object not in name order).
 
 ## Proving a difference is caught
 

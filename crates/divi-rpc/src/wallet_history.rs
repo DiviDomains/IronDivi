@@ -363,8 +363,13 @@ impl<'a> History<'a> {
             json!(crate::wallet::bare_txid(&loaded.tx).to_string()),
         );
         entry.insert("walletconflicts".into(), json!(self.conflicts(&loaded.tx)));
-        entry.insert("time".into(), json!(record.timestamp));
-        entry.insert("timereceived".into(), json!(record.timestamp));
+        // GetTxTime (the smart time) and nTimeReceived (rpcwallet.cpp:267-268)
+        let (received, smart) = self.wallet.tx_times(&record.txid);
+        entry.insert(
+            "time".into(),
+            json!(if smart != 0 { smart } else { received }),
+        );
+        entry.insert("timereceived".into(), json!(received));
         // The notes the send kept with the transaction (mapValue,
         // rpcwallet.cpp:268-269)
         for (key, value) in self.wallet.tx_notes(&record.txid) {
@@ -420,8 +425,11 @@ impl<'a> History<'a> {
         };
         let tx = &loaded.tx;
         let all_accounts = account == "*";
-        // wtx.strFromAccount: IronDivi keeps no "from" account
-        let sent_account = "";
+        // wtx.strFromAccount: the account sendfrom and sendmany were given,
+        // kept with the send's notes (wallet.cpp:1918-1921, WalletTx.h:49, :75);
+        // "" for any other send
+        let notes = self.wallet.tx_notes(&record.txid);
+        let sent_account = notes.get("FromAccount").map_or("", String::as_str);
         let push = |mut entry: Map<String, Value>, out: &mut Vec<Value>| {
             if long {
                 self.tx_fields(record, &loaded, &mut entry);

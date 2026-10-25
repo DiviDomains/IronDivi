@@ -22,6 +22,7 @@ use crate::search_index::{self, SearchIndex};
 use crate::txindex::{TxIndex, TxLocation};
 use crate::undo::BlockUndo;
 use crate::utxo::Utxo;
+use divi_consensus::spork_values::ConsensusSporks;
 use divi_crypto::{compute_block_hash, compute_merkle_root, hash256};
 use divi_primitives::amount::Amount;
 use divi_primitives::block::Block;
@@ -316,6 +317,190 @@ pub enum ChainEvent {
 /// A listener for connected and disconnected blocks
 pub type BlockListener = Arc<dyn Fn(&ChainEvent) + Send + Sync>;
 
+/// The two payments a treasury block owes: the treasury's and the charity's
+/// script and amount
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreasuryDue {
+    pub treasury: (divi_primitives::script::Script, Amount),
+    pub charity: (divi_primitives::script::Script, Amount),
+}
+
+/// What the treasury block at `height` must pay, or None when `height` is
+/// not a treasury block (Divi Core SuperblockHeightValidator,
+/// BlockSubsidyProvider::updateTreasuryReward, BlockIncentivesPopulator.cpp:31-42:
+/// every network but mainnet pays testnet's addresses)
+pub fn treasury_payments_due(network_type: NetworkType, height: u32) -> Option<TreasuryDue> {
+    treasury_payments_due_with(network_type, height, None)
+}
+
+/// [`treasury_payments_due`] with the network's sporks, which set the per-block
+/// rewards the payment adds up
+pub fn treasury_payments_due_with(
+    network_type: NetworkType,
+    height: u32,
+    sporks: Option<&divi_consensus::SporkView>,
+) -> Option<TreasuryDue> {
+    use divi_consensus::treasury;
+    let (treasury_cycle, treasury_start, lottery_cycle, halving_interval) = match network_type {
+        NetworkType::Mainnet => (
+            treasury::mainnet::TREASURY_CYCLE,
+            treasury::mainnet::TREASURY_START_BLOCK,
+            treasury::mainnet::LOTTERY_CYCLE,
+            525_600u32,
+        ),
+        NetworkType::Testnet => (
+            treasury::testnet::TREASURY_CYCLE,
+            treasury::testnet::TREASURY_START_BLOCK,
+            treasury::testnet::LOTTERY_CYCLE,
+            1_000u32,
+        ),
+        NetworkType::Regtest => (
+            treasury::regtest::TREASURY_CYCLE,
+            treasury::regtest::TREASURY_START_BLOCK,
+            treasury::regtest::LOTTERY_CYCLE,
+            100u32,
+        ),
+    };
+    if !treasury::is_treasury_block_with_lottery(
+        height,
+        treasury_start,
+        treasury_cycle,
+        lottery_cycle,
+    ) {
+        return None;
+    }
+    let is_mainnet = matches!(network_type, NetworkType::Mainnet);
+    let payment_cycle = treasury::get_treasury_payment_cycle(height, treasury_cycle, lottery_cycle);
+    let (treasury_amount, charity_amount) =
+        divi_consensus::calculate_weighted_treasury_payment_with(
+            height,
+            payment_cycle,
+            halving_interval,
+            sporks,
+        );
+    Some(TreasuryDue {
+        treasury: (treasury::get_treasury_script(is_mainnet), treasury_amount),
+        charity: (treasury::get_charity_script(is_mainnet), charity_amount),
+    })
+}
+
+/// Check that the treasury block at `height` pays the treasury and the
+/// charity what is due: some output of exactly the amount to exactly the
+/// script, for each (Divi Core IsValidTreasuryPayment,
+/// BlockIncentivesPopulator.cpp:66-90). Any other height passes.
+pub fn check_treasury_payments(
+    network_type: NetworkType,
+    block: &Block,
+    height: u32,
+) -> Result<(), StorageError> {
+    check_treasury_payments_with(network_type, block, height, None)
+}
+
+/// [`check_treasury_payments`] with the network's sporks
+pub fn check_treasury_payments_with(
+    network_type: NetworkType,
+    block: &Block,
+    height: u32,
+    sporks: Option<&divi_consensus::SporkView>,
+) -> Result<(), StorageError> {
+    let Some(due) = treasury_payments_due_with(network_type, height, sporks) else {
+        // Not a treasury block - nothing to validate
+        return Ok(());
+    };
+    let (treasury_script, expected_treasury) = (&due.treasury.0, due.treasury.1);
+    let (charity_script, expected_charity) = (&due.charity.0, due.charity.1);
+
+    let coinstake = block.transactions.get(1).ok_or_else(|| {
+        StorageError::invalid_block_scored(0, "Treasury block missing coinstake".to_string())
+    })?;
+
+    // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
+    // an output of exactly the amount to exactly the script, for each
+    let pays = |script: &divi_primitives::script::Script, amount| {
+        coinstake
+            .vout
+            .iter()
+            .any(|o| o.script_pubkey == *script && o.value == amount)
+    };
+    if !pays(treasury_script, expected_treasury) {
+        return Err(StorageError::invalid_block_scored(
+            0,
+            format!(
+                "Treasury block {} does not pay the treasury {}",
+                height, expected_treasury
+            ),
+        ));
+    }
+    if !pays(charity_script, expected_charity) {
+        return Err(StorageError::invalid_block_scored(
+            0,
+            format!(
+                "Treasury block {} does not pay the charity {}",
+                height, expected_charity
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check that the lottery block at `height` pays each of `winners` (the
+/// winners of the block before it): the first half of the cycle's lottery
+/// pool, each other a tenth of that half (Divi Core
+/// BlockIncentivesPopulator.cpp:48-64, IsValidLotteryBlockPayee)
+pub fn check_lottery_payments(
+    block: &Block,
+    height: u32,
+    winners: &divi_primitives::LotteryWinners,
+    lottery_cycle: u32,
+    halving_interval: u32,
+) -> Result<(), StorageError> {
+    use divi_consensus::block_subsidy;
+
+    // If no winners, lottery payments are optional (C++ returns true for empty winners)
+    if winners.coinstakes.is_empty() {
+        return Ok(());
+    }
+
+    // Calculate lottery pool: 50 DIVI per block × cycle = total
+    // (lottery per-block reward is always 50 DIVI, independent of halving)
+    let per_block_lottery = block_subsidy::get_block_subsidy(height, halving_interval).lottery;
+    let total_pool = Amount::from_sat(per_block_lottery.as_sat() * lottery_cycle as i64);
+
+    // Big reward (1st place): 50% of pool
+    let big_reward = Amount::from_sat(total_pool.as_sat() / 2);
+    // Small reward (2nd-11th): 5% of pool each
+    let small_reward = Amount::from_sat(big_reward.as_sat() / 10);
+
+    let coinstake = block
+        .transactions
+        .get(1)
+        .ok_or_else(|| StorageError::InvalidBlock("Lottery block missing coinstake".to_string()))?;
+
+    // Verify each winner's payment exists in coinstake outputs
+    for (i, winner) in winners.coinstakes.iter().enumerate() {
+        let expected_reward = if i == 0 { big_reward } else { small_reward };
+        let expected_script = &winner.script_pubkey;
+
+        let found = coinstake
+            .vout
+            .iter()
+            .any(|out| out.script_pubkey == *expected_script && out.value == expected_reward);
+
+        if !found {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Lottery block {} missing payment for winner {}: expected {} to script",
+                    height, i, expected_reward
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Chain state
 pub struct Chain {
     /// Database for persistent storage
@@ -353,6 +538,19 @@ pub struct Chain {
     importing: std::sync::atomic::AtomicBool,
     /// What block script verification has checked, logged periodically
     script_stats: ScriptStats,
+    /// Sporks 13 to 16, which set block values, payments and the lottery ticket
+    consensus_sporks: SharedSporks,
+}
+
+/// The entries of sporks 13 to 16, shared between the spork manager that holds
+/// them and the chain that reads them
+pub type SharedSporks = Arc<RwLock<ConsensusSporks>>;
+
+/// An output a coinstake spends, as proof of stake reads it
+struct StakePrevout {
+    value: Amount,
+    script_pubkey: divi_primitives::script::Script,
+    height: u32,
 }
 
 /// Metadata marker: the one-time height index repair has run on this datadir.
@@ -419,6 +617,7 @@ impl Chain {
             ibd_mode: RwLock::new(true),
             importing: std::sync::atomic::AtomicBool::new(false),
             script_stats: ScriptStats::default(),
+            consensus_sporks: Arc::new(RwLock::new(ConsensusSporks::default())),
         };
 
         crate::datadir::check_network(&chain.db, &chain.params)?;
@@ -1146,12 +1345,30 @@ impl Chain {
         Ok(())
     }
 
+    /// Divi Core's VerifyDB at its one level, 4, over the last `depth` blocks
+    /// (`-checkblocks` at start, init.cpp:1116; `verifychain`,
+    /// rpcblockchain.cpp:417-422), with its log line: 0 or below is every
+    /// block, more than the height is the height (verifyDb.cpp:73-78). Nothing
+    /// is checked or logged below height 1 (verifyDb.cpp:68-69). Returns the
+    /// number of heights checked.
+    pub fn verify_db(&self, depth: i64) -> Result<u32, StorageError> {
+        let height = self.height();
+        if self.tip().is_none() || height == 0 {
+            return Ok(0);
+        }
+        let depth = check_depth(depth, height);
+        info!("Verifying last {} blocks at level 4", depth);
+        self.verify_recent_blocks(depth)
+    }
+
     /// Check the last `depth` blocks of the active chain, as C++ `-checkblocks` does at
     /// start (CVerifyDB::VerifyDB): each height maps to an index entry that links to the
     /// one below, and each stored block body reads back (RocksDB checks its CRC on read),
     /// hashes to its index entry and matches its merkle root; stored undo data must decode.
     /// Bodies may be absent only where pruning or a snapshot import removed them.
-    /// `depth` 0 checks the whole chain (C++ treats `-checkblocks=0` the same way).
+    /// As VerifyDB, the heights from the tip down to tip - `depth` are checked, the
+    /// genesis block never (verifyDb.cpp:69-88); `depth` 0, or one past the height,
+    /// checks every block above genesis (C++ treats `-checkblocks=0` the same way).
     ///
     /// Returns the number of heights checked.
     pub fn verify_recent_blocks(&self, depth: u32) -> Result<u32, StorageError> {
@@ -1162,9 +1379,12 @@ impl Chain {
             .db
             .prune_height()
             .max(self.db.snapshot_base().map(|(h, _)| h).unwrap_or(0));
+        if tip.height == 0 {
+            return Ok(0);
+        }
         let lowest = match depth {
-            0 => 0,
-            n => tip.height.saturating_sub(n - 1),
+            0 => 1,
+            n => tip.height.saturating_sub(n).max(1),
         };
         let damaged = |height: u32, what: String| {
             StorageError::ChainState(format!("database is damaged at height {height}: {what}"))
@@ -1796,7 +2016,7 @@ impl Chain {
 
     /// Accept a new block into the chain
     pub fn accept_block(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
-        self.notifying_tip(|| self.accept_block_unnotified(block))
+        abort_on_write_failure(self.notifying_tip(|| self.accept_block_unnotified(block)))
     }
 
     fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
@@ -1886,11 +2106,25 @@ impl Chain {
             }
         }
 
-        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), then
-        // ContextualCheckBlockHeader's depth limit (ChainExtensionService.cpp:308-311).
-        // Both run for every block, whether it extends the tip or not.
+        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), which
+        // includes the proof of stake, then ContextualCheckBlockHeader's depth limit,
+        // time and version (ChainExtensionService.cpp:292-353). A block that fails the
+        // proof is refused before its time or version is looked at, so it draws no
+        // reject. The bits and the work run for every block; the proof of stake needs the
+        // UTXO set at the parent, so it runs here for a block on the tip and during a
+        // reorg for any other.
+        let extends_tip = parent_index.as_ref().is_some_and(|parent| {
+            self.tip
+                .read()
+                .as_ref()
+                .map(|t| t.hash == parent.hash)
+                .unwrap_or(true)
+        });
         if let Some(ref parent) = parent_index {
             self.check_block_work(&block, &hash, parent)?;
+            if extends_tip {
+                self.check_block_proof_of_stake(&block, parent)?;
+            }
             self.check_reorg_depth(parent.height + 1)?;
             Self::check_block_version_and_height(&block, parent.height + 1)?;
         }
@@ -1901,10 +2135,6 @@ impl Chain {
         // during reorg (connect_block). This matches C++ Divi's AcceptBlock vs ConnectTip
         // separation and allows storing competing chain blocks for proper fork selection.
         if let Some(ref parent) = parent_index {
-            let extends_tip = {
-                let tip = self.tip.read();
-                tip.as_ref().map(|t| t.hash == parent.hash).unwrap_or(true)
-            };
             if extends_tip {
                 debug!("  ├─ Full context validation (extends tip)");
                 self.check_block_context(&block, parent)?;
@@ -1920,7 +2150,7 @@ impl Chain {
                     return Err(StorageError::invalid_block_scored(
                         0,
                         format!(
-                            "block timestamp {} is not greater than median time past {}",
+                            "time-too-old: block's timestamp {} is not greater than the median time past {}",
                             block.header.time, mtp
                         ),
                     ));
@@ -2022,7 +2252,12 @@ impl Chain {
             }
         }
 
-        // 8. Store block and index
+        // 8. Store block and index. Divi Core first checks that 50 MB stay
+        // free beyond what the block adds (BlockFileHelpers.cpp:132-142).
+        let size = divi_primitives::serialize::serialize(&block).len() as u64;
+        if !crate::disk_space::check_disk_space(self.db.path(), size) {
+            return Err(crate::disk_space::disk_space_low());
+        }
         debug!("  ├─ Storing block data and index");
         self.db.store_block(&hash, &block)?;
         // Index entry only: the height -> hash mapping is written solely when the
@@ -2583,7 +2818,7 @@ impl Chain {
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
     pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
-        self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
+        abort_on_write_failure(self.notifying_tip(|| self.invalidate_block_unnotified(hash, true)))
     }
 
     /// Mark the block failed and disconnect it and the blocks above it; with
@@ -2728,7 +2963,7 @@ impl Chain {
     /// Clear the invalid flag on a block, its ancestors and its descendants
     /// (`reconsiderblock`), then activate the best valid chain.
     pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
-        self.notifying_tip(|| self.reconsider_block_unnotified(hash))
+        abort_on_write_failure(self.notifying_tip(|| self.reconsider_block_unnotified(hash)))
     }
 
     fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
@@ -3033,6 +3268,27 @@ impl Chain {
         Ok(())
     }
 
+    /// The output a proof of stake spends: the unspent output, else the output
+    /// of the transaction in the chain (Divi Core reads the transaction itself,
+    /// BlockProofVerifier.cpp:58-77)
+    fn stake_prevout(&self, outpoint: &OutPoint) -> Result<Option<StakePrevout>, StorageError> {
+        if let Some(utxo) = self.db.get_utxo(outpoint)? {
+            return Ok(Some(StakePrevout {
+                value: utxo.value,
+                script_pubkey: utxo.script_pubkey.clone(),
+                height: utxo.height,
+            }));
+        }
+        let Some((tx, height, _, _)) = self.find_transaction(&outpoint.txid)? else {
+            return Ok(None);
+        };
+        Ok(tx.vout.get(outpoint.vout as usize).map(|out| StakePrevout {
+            value: out.value,
+            script_pubkey: out.script_pubkey.clone(),
+            height,
+        }))
+    }
+
     /// Find a transaction by its hash and return (tx, height, is_coinbase, is_coinstake)
     #[allow(dead_code)]
     fn find_transaction(
@@ -3170,8 +3426,9 @@ impl Chain {
 
         // Divi Core CheckBlock (BlockCheckingHelpers.cpp:29-31): at most 180 s in the
         // future for a PoS block (MaxFutureBlockDrift, Settings.cpp:215-218), 2 hours
-        // for a PoW block, past GetAdjustedTime (the clock setmocktime sets)
-        let now = divi_primitives::clock::now().max(0) as u64;
+        // for a PoW block, past GetAdjustedTime: the clock setmocktime sets plus
+        // the network time offset (timedata.cpp:35-38)
+        let now = divi_primitives::clock::adjusted_now().max(0) as u64;
         let max_drift = if block.is_proof_of_stake() {
             MAX_FUTURE_BLOCK_DRIFT_POS
         } else {
@@ -3188,7 +3445,7 @@ impl Chain {
         let computed_merkle_root = compute_merkle_root(&block.transactions);
         if block.header.merkle_root != computed_merkle_root {
             return Err(StorageError::InvalidBlock(format!(
-                "merkle root mismatch: header has {}, computed {}",
+                "bad-txnmrklroot: merkle root mismatch: header has {}, computed {}",
                 block.header.merkle_root, computed_merkle_root
             )));
         }
@@ -3239,13 +3496,13 @@ impl Chain {
             return Err(StorageError::invalid_block_scored(
                 0,
                 format!(
-                    "block timestamp {} is not greater than median time past {}",
+                    "time-too-old: block's timestamp {} is not greater than the median time past {}",
                     block.header.time, mtp
                 ),
             ));
         }
 
-        self.check_block_proof_of_stake(block, parent)
+        Ok(())
     }
 
     /// The proof of stake (kernel, stake modifier, target, coin age) and the block
@@ -3682,17 +3939,19 @@ impl Chain {
             StorageError::invalid_block_scored(0, format!("Invalid coinstake: {}", e))
         })?;
 
-        // Validate all inputs pay to the same script
+        // Validate all inputs pay to the same script. As Divi Core's
+        // CheckProofOfStake reads the transaction of each input (GetTransaction,
+        // BlockProofVerifier.cpp:58-77), a coin already spent is found too; it is
+        // connecting the block that finds it spent
         let chain_ref = self;
         let get_utxo = |outpoint: &divi_primitives::OutPoint| -> Option<divi_primitives::TxOut> {
             chain_ref
-                .db
-                .get_utxo(outpoint)
+                .stake_prevout(outpoint)
                 .ok()
                 .flatten()
-                .map(|utxo| divi_primitives::TxOut {
-                    value: utxo.value,
-                    script_pubkey: utxo.script_pubkey.clone(),
+                .map(|prevout| divi_primitives::TxOut {
+                    value: prevout.value,
+                    script_pubkey: prevout.script_pubkey,
                 })
         };
 
@@ -3703,6 +3962,29 @@ impl Chain {
                     format!("Coinstake inputs validation failed: {}", e),
                 )
             })?;
+
+        // Divi Core verifies the kernel's signature under POS_SCRIPT_VERIFY_FLAGS
+        // before the kernel itself, and a failure scores nothing
+        // (BlockProofVerifier.cpp:76-77)
+        if let Some(kernel) = self.stake_prevout(&coinstake.vin[0].prevout)? {
+            verify_input_with_flags(
+                coinstake,
+                0,
+                &kernel.script_pubkey,
+                kernel.value,
+                ScriptFlags::pos(),
+            )
+            .map_err(|e| {
+                StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "VerifySignature failed on coinstake {} ({})",
+                        self.compute_txid(coinstake),
+                        e.core_message()
+                    ),
+                )
+            })?;
+        }
 
         let expected_stake_reward = coinstake_stake_reward(
             &self.block_rewards(parent.height + 1),
@@ -3724,7 +4006,7 @@ impl Chain {
         let kernel_input = &coinstake.vin[0];
 
         // Get UTXO being staked
-        let kernel_utxo = self.db.get_utxo(&kernel_input.prevout)?.ok_or_else(|| {
+        let kernel_utxo = self.stake_prevout(&kernel_input.prevout)?.ok_or_else(|| {
             StorageError::invalid_block_scored(
                 0,
                 format!(
@@ -3893,10 +4175,10 @@ impl Chain {
     /// (e.g., the sync layer after processing orphan blocks). For the internal
     /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
     pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
-        self.notifying_tip(|| {
+        abort_on_write_failure(self.notifying_tip(|| {
             let _chain_guard = self.chain_lock.lock();
             self.activate_best_chain_inner()
-        })
+        }))
     }
 
     /// Inner implementation of activate_best_chain (caller must hold chain_lock).
@@ -4205,10 +4487,15 @@ impl Chain {
                         if utxo.is_coinbase || utxo.is_coinstake {
                             let depth = i64::from(height) - i64::from(utxo.height);
                             if depth < i64::from(self.params.coinbase_maturity) {
-                                return Err(StorageError::InvalidBlock(format!(
-                                    "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
-                                    depth, utxo.is_coinstake, txid
-                                )));
+                                // Divi Core refuses it with state.Invalid, which scores
+                                // nothing (UtxoCheckingAndUpdating.cpp:75-83)
+                                return Err(StorageError::invalid_block_scored(
+                                    0,
+                                    format!(
+                                        "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
+                                        depth, utxo.is_coinstake, txid
+                                    ),
+                                ));
                             }
                         }
                         value_in += utxo.value;
@@ -4429,98 +4716,65 @@ impl Chain {
         block: &Block,
         index: &BlockIndex,
     ) -> Result<(), StorageError> {
-        use divi_consensus::treasury;
+        self.with_sporks(|sporks| {
+            check_treasury_payments_with(self.network_type(), block, index.height, sporks)
+        })
+    }
 
-        let height = index.height;
-        let network_type = self.network_type();
+    /// The entries of sporks 13 to 16, to be filled by the spork manager
+    pub fn consensus_sporks(&self) -> SharedSporks {
+        Arc::clone(&self.consensus_sporks)
+    }
 
-        // Get network-specific treasury parameters
-        let (treasury_cycle, treasury_start, lottery_cycle) = match network_type {
-            NetworkType::Mainnet => (
-                treasury::mainnet::TREASURY_CYCLE,
-                treasury::mainnet::TREASURY_START_BLOCK,
-                treasury::mainnet::LOTTERY_CYCLE,
-            ),
-            NetworkType::Testnet => (
-                treasury::testnet::TREASURY_CYCLE,
-                treasury::testnet::TREASURY_START_BLOCK,
-                treasury::testnet::LOTTERY_CYCLE,
-            ),
-            NetworkType::Regtest => (
-                treasury::regtest::TREASURY_CYCLE,
-                treasury::regtest::TREASURY_START_BLOCK,
-                treasury::regtest::LOTTERY_CYCLE,
-            ),
-        };
-
-        // Use transition-aware treasury block check (matches C++ SuperblockHeightValidator)
-        let is_treasury_block = treasury::is_treasury_block_with_lottery(
-            height,
-            treasury_start,
-            treasury_cycle,
-            lottery_cycle,
-        );
-
-        if !is_treasury_block {
-            // Not a treasury block - nothing to validate
-            return Ok(());
+    /// The time of the block at `height` as sporks read it: that of the block in
+    /// the active chain, else the time now (Divi Core `GetBlockTime`,
+    /// spork.cpp:84-88; a block being connected is not in the active chain yet)
+    fn spork_block_time(&self, height: u32) -> i64 {
+        if height <= self.height() {
+            if let Ok(Some(index)) = self.db.get_block_index_by_height(height) {
+                return index.time as i64;
+            }
         }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
 
-        // Regtest pays testnet's treasury and charity addresses, as every
-        // network but mainnet does (BlockIncentivesPopulator.cpp:34-42)
-        let is_mainnet = matches!(network_type, NetworkType::Mainnet);
-
-        let halving_interval = match network_type {
-            NetworkType::Mainnet => 525_600u32,
-            NetworkType::Testnet => 1_000u32,
-            NetworkType::Regtest => 100u32,
+    /// Run `f` with the sporks consensus reads
+    pub fn with_sporks<R>(&self, f: impl FnOnce(Option<&divi_consensus::SporkView>) -> R) -> R {
+        let sporks = self.consensus_sporks.read();
+        let time = |height: u32| self.spork_block_time(height);
+        let view = divi_consensus::SporkView {
+            sporks: &sporks,
+            block_time: &time,
         };
+        f(Some(&view))
+    }
 
-        let treasury_script = treasury::get_treasury_script(is_mainnet);
-        let charity_script = treasury::get_charity_script(is_mainnet);
+    /// What the lottery asks a coinstake to pay at `height` to hold a ticket, in
+    /// satoshis: spork 16's value in force there, else 10,000 DIVI
+    pub fn lottery_ticket_minimum(&self, height: u32) -> i64 {
+        let time = self.spork_block_time(height);
+        self.consensus_sporks
+            .read()
+            .lottery_ticket_minimum(height, time)
+            .map(|a| a.as_sat())
+            .unwrap_or(divi_consensus::LOTTERY_TICKET_MINIMUM)
+    }
 
-        let coinstake = block.transactions.get(1).ok_or_else(|| {
-            StorageError::invalid_block_scored(0, "Treasury block missing coinstake".to_string())
-        })?;
+    /// The fee settings spork 14 has in force at the tip, as Divi Core reads
+    /// them when the spork arrives (`ExecuteMultiValueSpork`, spork.cpp:286-302)
+    pub fn tx_fee_spork_at_tip(&self) -> Option<divi_consensus::spork_values::TxFeeValue> {
+        let tip = self.tip()?;
+        self.consensus_sporks
+            .read()
+            .tx_fee(tip.height, tip.time as i64)
+    }
 
-        // Use transition-aware payment cycle (matches C++ GetTreasuryBlockPaymentCycle)
-        let payment_cycle =
-            treasury::get_treasury_payment_cycle(height, treasury_cycle, lottery_cycle);
-        let (expected_treasury, expected_charity) =
-            divi_consensus::calculate_weighted_treasury_payment(
-                height,
-                payment_cycle,
-                halving_interval,
-            );
-
-        // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
-        // an output of exactly the amount to exactly the script, for each
-        let pays = |script: &divi_primitives::script::Script, amount| {
-            coinstake
-                .vout
-                .iter()
-                .any(|o| o.script_pubkey == *script && o.value == amount)
-        };
-        if !pays(&treasury_script, expected_treasury) {
-            return Err(StorageError::invalid_block_scored(
-                0,
-                format!(
-                    "Treasury block {} does not pay the treasury {}",
-                    height, expected_treasury
-                ),
-            ));
-        }
-        if !pays(&charity_script, expected_charity) {
-            return Err(StorageError::invalid_block_scored(
-                0,
-                format!(
-                    "Treasury block {} does not pay the charity {}",
-                    height, expected_charity
-                ),
-            ));
-        }
-
-        Ok(())
+    /// Treasury and charity payments due at `height` (None: not a treasury block)
+    pub fn treasury_payments_due(&self, height: u32) -> Option<TreasuryDue> {
+        self.with_sporks(|sporks| treasury_payments_due_with(self.network_type(), height, sporks))
     }
 
     /// Subsidy halving interval for this network
@@ -4535,12 +4789,15 @@ impl Chain {
     /// Per-block rewards at `height`
     /// Divi Core's CBlockRewards for a height (GetBlockSubsidity)
     pub fn block_rewards(&self, height: u32) -> divi_consensus::block_subsidy::BlockRewards {
-        let mut rewards = divi_consensus::block_subsidy::get_block_subsidy_for_chain(
-            self.params.chain_mode,
-            self.network_type() == NetworkType::Mainnet,
-            height,
-            self.halving_interval(),
-        );
+        let mut rewards = self.with_sporks(|sporks| {
+            divi_consensus::block_subsidy::get_block_subsidy_for_chain_with(
+                self.params.chain_mode,
+                self.network_type() == NetworkType::Mainnet,
+                height,
+                self.halving_interval(),
+                sporks,
+            )
+        });
         // Divi regtest's premine is 1250 coins (Divi Core chainparams.cpp:470)
         if height == 1
             && self.params.chain_mode == ChainMode::Divi
@@ -4670,11 +4927,14 @@ impl Chain {
                 treasury_cycle,
                 treasury_lottery_cycle,
             );
-            let (treasury_amt, charity_amt) = block_subsidy::calculate_weighted_treasury_payment(
-                height,
-                payment_cycle,
-                halving_interval,
-            );
+            let (treasury_amt, charity_amt) = self.with_sporks(|sporks| {
+                block_subsidy::calculate_weighted_treasury_payment_with(
+                    height,
+                    payment_cycle,
+                    halving_interval,
+                    sporks,
+                )
+            });
             base_expected + treasury_amt + charity_amt
         } else if is_lottery {
             // Lottery reward = 50 DIVI per block × cycle_length (always 50, independent of halving)
@@ -4706,7 +4966,6 @@ impl Chain {
     }
 
     /// Validate lottery winner payments on lottery blocks.
-    /// Matches C++ IsValidLotteryPayment in BlockIncentivesPopulator.cpp.
     fn validate_lottery_payments(
         &self,
         block: &Block,
@@ -4714,57 +4973,18 @@ impl Chain {
         lottery_cycle: u32,
         halving_interval: u32,
     ) -> Result<(), StorageError> {
-        use divi_consensus::block_subsidy;
-
         // Get previous block's lottery winners
         let prev_index = self
             .db
             .get_block_index(&block.header.prev_block)?
             .ok_or_else(|| StorageError::BlockNotFound(block.header.prev_block.to_string()))?;
-
-        let winners = &prev_index.lottery_winners;
-
-        // If no winners, lottery payments are optional (C++ returns true for empty winners)
-        if winners.coinstakes.is_empty() {
-            return Ok(());
-        }
-
-        // Calculate lottery pool: 50 DIVI per block × cycle = total
-        // (lottery per-block reward is always 50 DIVI, independent of halving)
-        let per_block_lottery = block_subsidy::get_block_subsidy(height, halving_interval).lottery;
-        let total_pool = Amount::from_sat(per_block_lottery.as_sat() * lottery_cycle as i64);
-
-        // Big reward (1st place): 50% of pool
-        let big_reward = Amount::from_sat(total_pool.as_sat() / 2);
-        // Small reward (2nd-11th): 5% of pool each
-        let small_reward = Amount::from_sat(big_reward.as_sat() / 10);
-
-        let coinstake = block.transactions.get(1).ok_or_else(|| {
-            StorageError::InvalidBlock("Lottery block missing coinstake".to_string())
-        })?;
-
-        // Verify each winner's payment exists in coinstake outputs
-        for (i, winner) in winners.coinstakes.iter().enumerate() {
-            let expected_reward = if i == 0 { big_reward } else { small_reward };
-            let expected_script = &winner.script_pubkey;
-
-            let found = coinstake
-                .vout
-                .iter()
-                .any(|out| out.script_pubkey == *expected_script && out.value == expected_reward);
-
-            if !found {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!(
-                        "Lottery block {} missing payment for winner {}: expected {} to script",
-                        height, i, expected_reward
-                    ),
-                ));
-            }
-        }
-
-        Ok(())
+        check_lottery_payments(
+            block,
+            height,
+            &prev_index.lottery_winners,
+            lottery_cycle,
+            halving_interval,
+        )
     }
 
     /// Update lottery winners when connecting a block.
@@ -4828,7 +5048,10 @@ impl Chain {
 
         let coinstake = &block.transactions[1];
 
-        if !lottery::is_coinstake_valid_for_lottery(coinstake) {
+        if !lottery::is_coinstake_valid_for_lottery_with_minimum(
+            coinstake,
+            self.lottery_ticket_minimum(height),
+        ) {
             index.lottery_winners = prev_winners;
             return Ok(());
         }
@@ -5081,7 +5304,14 @@ impl Chain {
     /// Should be called periodically during sync for durability.
     /// Returns the number of entries flushed, or 0 if cache is not enabled.
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
-        self.db.flush_utxo_cache()
+        // Divi Core FlushStateToDisk: room for each coin, 100 bytes written
+        // twice with a safety factor of 2 (FlushChainState.cpp:31-40), then
+        // "Failed to write to coin database" (:49-50)
+        let room = 100 * 2 * 2 * self.db.utxo_dirty_count() as u64;
+        if !crate::disk_space::check_disk_space(self.db.path(), room) {
+            return Err(crate::disk_space::disk_space_low());
+        }
+        abort_on_write_failure(self.db.flush_utxo_cache())
     }
 
     /// Get UTXO cache statistics (if cache is enabled)
@@ -5100,6 +5330,13 @@ impl Chain {
     /// When it does, returns the fork height and the transactions of the
     /// disconnected blocks to return to the mempool, as `accept_block` reports them.
     pub fn try_activate_block(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
+        abort_on_write_failure(self.try_activate_block_unchecked(hash))
+    }
+
+    fn try_activate_block_unchecked(
         &self,
         hash: &Hash256,
     ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
@@ -5295,6 +5532,19 @@ fn coinstake_stake_reward(
     }
 }
 
+/// A chain change that failed to write the node's own data stops the node, as
+/// Divi Core's state.Abort does (ChainExtensionService.cpp:513-518,
+/// BlockConnectionService.cpp:111-192, FlushChainState.cpp:37-58); the error is
+/// returned as it was
+fn abort_on_write_failure<T>(result: Result<T, StorageError>) -> Result<T, StorageError> {
+    if let Err(e) = &result {
+        if e.is_write_failure() {
+            crate::abort::abort_node(&format!("System error: {e}"));
+        }
+    }
+    result
+}
+
 /// `CScript() << height` (Divi Core script.h:210-225): OP_1..OP_16 for 1-16,
 /// otherwise the minimal CScriptNum encoding pushed as data
 pub fn bip34_height_script(height: u32) -> Vec<u8> {
@@ -5479,11 +5729,35 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
     Ok(())
 }
 
+/// The depth Divi Core's VerifyDB checks for a requested `depth` on a chain of
+/// `height` (verifyDb.cpp:73-76)
+pub fn check_depth(depth: i64, height: u32) -> u32 {
+    if depth <= 0 || depth > i64::from(height) {
+        height
+    } else {
+        depth as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod crash;
+    mod disk_space;
 
     use super::*;
+
+    /// Divi Core's VerifyDB depth: 0 or below is every block, more than the
+    /// height is the height (verifyDb.cpp:73-76)
+    #[test]
+    fn verify_depth_is_divid_s() {
+        assert_eq!(check_depth(0, 30), 30);
+        assert_eq!(check_depth(-1, 30), 30);
+        assert_eq!(check_depth(1, 30), 1);
+        assert_eq!(check_depth(30, 30), 30);
+        assert_eq!(check_depth(31, 30), 30);
+        assert_eq!(check_depth(288, 30), 30);
+        assert_eq!(check_depth(100, 300), 100);
+    }
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
     use divi_primitives::transaction::{TxIn, TxOut};
@@ -5700,6 +5974,178 @@ mod tests {
         )
         .unwrap();
         (chain, dir)
+    }
+
+    /// Put signed entries of a multi-value spork where the chain reads them
+    fn set_spork(chain: &Chain, id: i32, entries: &[(&str, i64)]) {
+        chain.consensus_sporks().write().set(
+            id,
+            entries
+                .iter()
+                .map(|(v, t)| divi_consensus::spork_values::SporkEntry::new(*v, *t))
+                .collect(),
+        );
+    }
+
+    /// A block with a coinbase and a coinstake that pays `staked` DIVI back to one
+    /// script, as the lottery counts it
+    fn block_staking(staked: i64) -> Block {
+        let coinstake = Transaction {
+            version: 1,
+            vin: vec![TxIn::new(
+                OutPoint::new(Hash256::from_bytes([9u8; 32]), 0),
+                Script::new(),
+                0xffff_ffff,
+            )],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(Amount::from_divi(staked), Script::new_p2pkh(&[5u8; 20])),
+            ],
+            lock_time: 0,
+        };
+        Block {
+            transactions: vec![Transaction::default(), coinstake],
+            ..Block::default()
+        }
+    }
+
+    /// The lottery asks a coinstake for a ticket to pay more than spork 16 sets at
+    /// the block's height, else 10,000 DIVI (Divi Core
+    /// LotteryWinnersCalculator.cpp:27-37, spork.cpp:127-141)
+    #[test]
+    fn lottery_ticket_minimum_follows_spork_16() {
+        let (chain, _dir) = create_test_chain();
+        // the lottery blocks the cycle looks back to
+        for (n, height) in [101u32, 110].into_iter().enumerate() {
+            let mut lottery_block = chain.tip().unwrap();
+            lottery_block.height = height;
+            lottery_block.hash = Hash256::from_bytes([0x40 + n as u8; 32]);
+            chain.db.store_block_index_entry(&lottery_block).unwrap();
+            chain
+                .db
+                .set_height_mapping(height, &lottery_block.hash)
+                .unwrap();
+        }
+        let tickets_at = |chain: &Chain, staked: i64, height: u32| {
+            let mut block = block_staking(staked);
+            block.header.prev_block = chain.tip().unwrap().hash;
+            let mut index = chain.tip().unwrap();
+            index.height = height;
+            chain.update_lottery_winners(&block, &mut index).unwrap();
+            index.lottery_winners.coinstakes.len()
+        };
+        // no entry: 10,000 DIVI
+        assert_eq!(tickets_at(&chain, 6000, 112), 0);
+        assert_eq!(tickets_at(&chain, 10_001, 112), 1);
+        assert_eq!(chain.lottery_ticket_minimum(112), 10_000 * 100_000_000);
+
+        // an entry from height 115 on, signed a long time ago
+        set_spork(&chain, 10015, &[("5000;115", 1_000)]);
+        assert_eq!(tickets_at(&chain, 6000, 112), 0, "before its height");
+        assert_eq!(tickets_at(&chain, 6000, 115), 1);
+        assert_eq!(tickets_at(&chain, 5000, 115), 0, "the stake must be more");
+        assert_eq!(tickets_at(&chain, 5001, 117), 1);
+        assert_eq!(chain.lottery_ticket_minimum(117), 5_000 * 100_000_000);
+
+        // an entry signed in the future is not in force yet
+        set_spork(&chain, 10015, &[("5000;115", i64::MAX / 2)]);
+        assert_eq!(tickets_at(&chain, 6000, 117), 0);
+    }
+
+    /// The block value comes from spork 15 where its entry is in force
+    /// (LegacyBlockSubsidies.cpp:30-42, spork.cpp:90-107)
+    #[test]
+    fn block_value_follows_spork_15() {
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 135;
+        let mut block = Block::default();
+        block.header.prev_block = index.hash;
+        let accepts = |mint: i64| {
+            chain
+                .validate_block_value(&block, &index, Amount::from_divi(mint), Amount::ZERO)
+                .is_ok()
+        };
+        // 1250 DIVI: 50 for the lottery and 83% of the rest for stake and masternode
+        assert!(accepts(996));
+        assert!(!accepts(1000));
+
+        set_spork(&chain, 10014, &[("2000;100", 1_000)]);
+        assert_eq!(chain.block_rewards(135).stake, Amount::from_divi(741));
+        assert!(accepts(1000));
+        assert!(accepts(1618));
+        assert!(!accepts(1619));
+        // not before its height; a proof-of-work block takes the whole value
+        assert_eq!(chain.block_rewards(99).stake, Amount::from_divi(1250));
+        assert_eq!(chain.block_rewards(100).stake, Amount::from_divi(2000));
+        // a height that is not on the halving interval is not used
+        set_spork(&chain, 10014, &[("2000;150", 1_000)]);
+        assert!(!accepts(1000));
+    }
+
+    /// The split of the block value comes from spork 13 where its entry is in force
+    /// (LegacyBlockSubsidies.cpp:72-89, spork.cpp:109-125)
+    #[test]
+    fn block_payments_follow_spork_13() {
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 135;
+        let mut block = Block::default();
+        block.header.prev_block = index.hash;
+        let accepts = |mint: i64| {
+            chain
+                .validate_block_value(&block, &index, Amount::from_divi(mint), Amount::ZERO)
+                .is_ok()
+        };
+        assert!(accepts(990));
+
+        // stake 50, masternode 30: the staker side is 80% of 1200 DIVI
+        set_spork(&chain, 10012, &[("50;30;10;5;5;100", 1_000)]);
+        let rewards = chain.block_rewards(135);
+        assert_eq!(rewards.stake, Amount::from_divi(600));
+        assert_eq!(rewards.masternode, Amount::from_divi(360));
+        assert_eq!(rewards.treasury, Amount::from_divi(120));
+        assert_eq!(rewards.proposals, Amount::from_divi(60));
+        assert_eq!(rewards.charity, Amount::from_divi(60));
+        assert!(accepts(960));
+        assert!(!accepts(990));
+
+        // 90% to the staker side
+        set_spork(&chain, 10012, &[("40;50;5;0;5;100", 1_000)]);
+        assert!(accepts(1080));
+        assert!(!accepts(1081));
+
+        // the five must add up to 100
+        set_spork(&chain, 10012, &[("40;50;5;0;6;100", 1_000)]);
+        assert!(accepts(990));
+        assert!(!accepts(1000));
+    }
+
+    /// A treasury block is paid from the rewards of the network's sporks, at both
+    /// ends of its cycle (BlockSubsidyProvider.cpp:19-37)
+    #[test]
+    fn treasury_payments_follow_sporks_13_and_15() {
+        let (chain, _dir) = create_test_chain();
+        let due = |chain: &Chain| {
+            let due = chain.treasury_payments_due(150).unwrap();
+            (due.treasury.1, due.charity.1)
+        };
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(9600), Amount::from_divi(600))
+        );
+        set_spork(&chain, 10012, &[("50;30;10;5;5;100", 1_000)]);
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(6000), Amount::from_divi(3000))
+        );
+        set_spork(&chain, 10012, &[]);
+        set_spork(&chain, 10014, &[("2000;100", 1_000)]);
+        // 16% and 1% of 1950 DIVI, for 50 blocks
+        assert_eq!(
+            due(&chain),
+            (Amount::from_divi(15_600), Amount::from_divi(975))
+        );
     }
 
     /// A regtest treasury block pays exactly the treasury and the charity, as
@@ -6485,6 +6931,142 @@ mod tests {
         assert!(utxo.is_coinbase);
         assert_eq!(utxo.height, 1);
         assert_eq!(utxo.value.as_sat(), 1250_00000000);
+    }
+
+    /// Spending a coinbase or a coinstake output before it matures refuses the
+    /// block, and scores the peer nothing: Divi Core gives it state.Invalid, not
+    /// state.DoS (UtxoCheckingAndUpdating.cpp:75-83)
+    #[test]
+    fn spending_an_immature_coinbase_refuses_the_block_without_a_score() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+
+        let mut spending_block = create_child_block(hash1, block1.header.time);
+        spending_block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1249_00000000),
+                Script::new_p2pkh(&[0x99; 20]),
+            )],
+            lock_time: 0,
+        });
+        seal(&mut spending_block);
+        let err = chain.accept_block(spending_block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bad-txns-premature-spend-of-coinbase"),
+            "{err}"
+        );
+        assert_eq!(err.misbehaviour_score(), 0);
+    }
+
+    /// A coinstake whose first input has a signature that does not check is
+    /// refused before the kernel is looked at, with no score: Divi Core's
+    /// CheckProofOfStake verifies the script first (BlockProofVerifier.cpp:76-77).
+    /// Connecting the block would have scored it 100.
+    #[test]
+    fn a_coinstake_with_a_damaged_kernel_signature_scores_nothing() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        let mut block = create_child_block(hash1, block1.header.time);
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        assert!(block.is_proof_of_stake());
+        let parent = chain.tip().unwrap();
+        let err = chain.validate_proof_of_stake(&block, &parent).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
+        assert_eq!(err.misbehaviour_score(), 0);
+    }
+
+    /// A coinstake may stake a coin the chain no longer holds unspent: Divi Core
+    /// reads the transaction of the kernel (GetTransaction,
+    /// BlockProofVerifier.cpp:58-77), so such a block gets as far as connecting,
+    /// where it fails for the missing input and scores 100. It was refused while
+    /// its proof was checked, as an unknown kernel, with no score.
+    #[test]
+    fn a_proof_of_stake_reads_a_coin_that_is_spent() {
+        let (chain, _dir) = create_test_chain();
+        let genesis = chain
+            .get_block(&chain.tip().unwrap().hash)
+            .unwrap()
+            .unwrap();
+        // The genesis coinbase is in a block but not in the UTXO set
+        let outpoint = OutPoint::new(chain.compute_txid(&genesis.transactions[0]), 0);
+        assert!(!chain.has_utxo(&outpoint).unwrap());
+        let found = chain
+            .stake_prevout(&outpoint)
+            .unwrap()
+            .expect("the output is found");
+        assert_eq!(found.value, genesis.transactions[0].vout[0].value);
+        assert_eq!(found.height, 0);
+        assert!(chain
+            .stake_prevout(&OutPoint::new(Hash256::from_bytes([7; 32]), 0))
+            .unwrap()
+            .is_none());
+    }
+
+    /// Divi Core checks the proof of a block (bits, work or stake) before the
+    /// block's version and time (AcceptBlock, ChainExtensionService.cpp:441-493:
+    /// CheckWork first, then ContextualCheckBlockHeader), and a proof that fails
+    /// draws no reject. A block that fails both is therefore refused for its proof.
+    #[test]
+    fn a_block_failing_its_proof_is_refused_before_its_version_is_looked_at() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        let mut block = create_child_block(hash1, block1.header.time);
+        block.transactions[0].vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        seal(&mut block);
+        block.header.version = 2;
+        let err = chain.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
+        assert_eq!(err.block_reject(), None);
     }
 
     #[test]
@@ -7497,22 +8079,35 @@ mod tests {
             hash = chain.accept_block(b.clone()).unwrap().hash;
             blocks.push((hash, b));
         }
-        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 6, "0 = whole chain");
-        assert_eq!(chain.verify_recent_blocks(3).unwrap(), 3);
+        // As VerifyDB: tip - depth up to the tip, genesis never (verifyDb.cpp:69-88)
+        assert_eq!(
+            chain.verify_recent_blocks(0).unwrap(),
+            5,
+            "0 = every block above genesis"
+        );
+        assert_eq!(
+            chain.verify_recent_blocks(3).unwrap(),
+            4,
+            "tip - 3 up to the tip"
+        );
         assert_eq!(
             chain.verify_recent_blocks(100).unwrap(),
-            6,
-            "tip down to genesis"
+            5,
+            "tip down to height 1"
         );
         // Store block 2's body under block 4's hash: wrong data for that key
         chain.db.store_block(&blocks[3].0, &blocks[1].1).unwrap();
         let err = chain.verify_recent_blocks(100).unwrap_err().to_string();
         assert!(err.contains("damaged at height 4"), "{err}");
-        assert_eq!(
-            chain.verify_recent_blocks(1).unwrap(),
-            1,
-            "height 4 not in range"
+        assert!(
+            chain.verify_recent_blocks(1).is_err(),
+            "depth 1 checks the tip and the block below it"
         );
+        // A damaged genesis block is not looked at
+        let genesis = chain.db.get_height_mapping(0).unwrap().unwrap();
+        chain.db.store_block(&blocks[3].0, &blocks[3].1).unwrap();
+        chain.db.store_block(&genesis, &blocks[0].1).unwrap();
+        assert_eq!(chain.verify_recent_blocks(0).unwrap(), 5);
     }
 
     /// getchaintips must report side branches, not just the active tip.

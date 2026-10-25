@@ -7,6 +7,8 @@ and after a restart of both nodes. Each row prints one line:
 - `PASS`: same as divid;
 - `KNOWN`: differs, and the difference is listed below with the reason;
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date).
+- `ORDER`: the same members or list items as divid's, in another order (a FAIL, counted in `FAILS`). The line
+  names the first object or list that differs and both orders (`scripts/lib/member_order.py`).
 
 The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or over 10 minutes).
 
@@ -19,7 +21,7 @@ scripts/wallet-replies/run.sh target/release ~/divi-3.0.0/bin 53950 /var/tmp
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.1 (divid p2p and RPC, then irondivid's).
+- `<port-base>`: ports `<port-base>` to `<port-base>+3` on 127.0.0.2 (divid p2p and RPC, then irondivid's).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 A run takes about 30 seconds and is stopped after 10 minutes. However it ends, both nodes are stopped and their
