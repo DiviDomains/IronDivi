@@ -50,7 +50,8 @@ rng = random.Random(SEED)
 started_at = time.time()
 end_at = started_at + HOURS * 3600
 stats = {"seed": SEED, "hours": HOURS, "steps": 0, "blocks": 0, "transactions": 0, "reorgs": [],
-         "restarts": 0, "unclean stops": 0, "joined": None, "partitions": 0, "send errors": {}}
+         "restarts": 0, "unclean stops": 0, "joined": None, "partitions": 0, "send errors": {},
+         "started with -reindex after a kill": {"divid": 0, "irondivid": 0}}
 step_log = []  # (step number, what)
 events = open(os.path.join(OUT, f"seed{SEED}.jsonl"), "w")
 
@@ -91,9 +92,9 @@ class Node:
         self.proc = None
         self.peers = []  # nodes this one connects out to
 
-    def write_conf(self, connect_to):
+    def write_conf(self, connect_to, extra=()):
         tmp = os.path.join(self.dir, "divi.conf.new")
-        lines = self.base + [f"connect={NODE_IP}:{n.p2p}" for n in connect_to]
+        lines = self.base + list(extra) + [f"connect={NODE_IP}:{n.p2p}" for n in connect_to]
         if not connect_to:
             lines.append(f"connect={NODE_IP}:1")  # none: -connect with no reachable peer
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -101,8 +102,8 @@ class Node:
             f.write("\n".join(lines) + "\n")
         os.replace(tmp, os.path.join(self.dir, "divi.conf"))
 
-    def start(self, connect_to):
-        self.write_conf(connect_to)
+    def start(self, connect_to, extra=()):
+        self.write_conf(connect_to, extra)
         log = open(os.path.join(self.dir, "stdout.log"), "a")
         self.proc = subprocess.Popen([self.binary, f"-datadir={self.dir}"], cwd=self.dir, stdout=log, stderr=log,
                                      start_new_session=True)
@@ -624,11 +625,24 @@ def step_unclean():
     lists = connect_lists(NODES, ACTIVE_EDGES)
     n.kill()
     time.sleep(2)
-    n.start(lists[n.index])
+    reindexed = ""
+    try:
+        n.start(lists[n.index])
+    except RuntimeError as e:
+        # A node that refuses to start after a kill and says what it needs (a damaged
+        # block database, -reindex) is started with -reindex, as scripts/unclean-stop
+        # does; divid 3.0.0 can lose its best block this way (KNOWN in README.md)
+        if not any(w in str(e).lower() for w in ("corrupt", "reindex", "damaged", "cannot be used")):
+            raise
+        note("start refused after a kill", node=n.name, error=str(e)[-300:])
+        n.start(lists[n.index], extra=["reindex=1"])
+        n.write_conf(lists[n.index])  # read at that start; a later one does not reindex
+        stats["started with -reindex after a kill"][n.kind] += 1
+        reindexed = f"; it refused to start ({str(e)[-120:]}), started with -reindex"
     stats["unclean stops"] += 1
     wait_links(NODES, ACTIVE_EDGES)
     wait_chain(everyone(), f"{n.name} killed and started again")
-    return f"{n.name} killed (SIGKILL) and started again"
+    return f"{n.name} killed (SIGKILL) and started again{reindexed}"
 
 
 def step_partition():

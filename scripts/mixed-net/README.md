@@ -78,6 +78,14 @@ mempool across a restart, so a transaction lost there would otherwise read as a 
 Every 30 s (between steps) a snapshot of every node is written: height, best hash, mempool txids, chain tips, peers
 and ban scores. The best hash must then agree in each connected part.
 
+## KNOWN
+
+- **A divid that will not start after SIGKILL.** divid 3.0.0 can lose its best block when killed: the next start
+  fails with `Error: Error loading block database : Block database corruption detected! Failed to find best block in
+  block index`. As in `scripts/unclean-stop`, a node that refuses to start after a kill and names a damaged database
+  or `-reindex` is started with `-reindex`. The summary counts this per kind (`started with -reindex after a kill`);
+  it is not a disagreement. Seen on divid in the first campaign (seeds 1 and 3).
+
 ## Not covered
 
 - Masternodes: none is set up, so no masternode list is compared.
