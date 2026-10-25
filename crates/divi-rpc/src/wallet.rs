@@ -3991,7 +3991,9 @@ impl WalletRpc {
         let wallet = self.get_wallet()?;
 
         // Try to parse as address first
-        let addr = if let Ok(address) = self.decode_address(addr_or_script) {
+        let parsed = self.decode_address(addr_or_script).ok();
+        let from_address = parsed.is_some();
+        let addr = if let Some(address) = parsed {
             address
         } else {
             // Try as hex script
@@ -4026,6 +4028,9 @@ impl WalletRpc {
         } else {
             None
         };
+        // Only an address is labelled; a script in hex is watched without
+        // an address book entry (rpcdump.cpp:150-151)
+        let label = label.filter(|_| from_address);
         let rescan = if params.len() > 2 {
             spirit_bool(params, 2)?
         } else {
@@ -4043,9 +4048,11 @@ impl WalletRpc {
         // As Core: an address already watched only gets its label
         // (rpcdump.cpp:150-156)
         if wallet.is_watch_only(&addr) {
-            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
-                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-            })?;
+            if from_address {
+                wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                })?;
+            }
             return Ok(serde_json::Value::Null);
         }
 
@@ -4060,9 +4067,11 @@ impl WalletRpc {
             })?;
 
         info!("Imported watch-only address: {}", addr);
-        wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
-            RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-        })?;
+        if from_address {
+            wallet.set_label(&addr, label.unwrap_or("")).map_err(|e| {
+                RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+            })?;
+        }
 
         // Save wallet
         wallet.save().map_err(|e| {
