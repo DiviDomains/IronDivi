@@ -525,6 +525,49 @@ async fn live_backends(
     Ok((backends, job, offers))
 }
 
+/// One pass of the lock-expiry sweep over `counters`: a maker lock in no mempool and no block
+/// once its deadline has passed gives its inputs back to the wallet. A chain that cannot be
+/// asked keeps its reservations this pass (`--release-reservation` stays the manual override).
+async fn expiry_sweep_once(
+    res: &InputReservations,
+    store: &Store,
+    counters: &[Arc<dyn ChainBackend>],
+) -> usize {
+    let mut released = 0;
+    for b in counters {
+        match res.release_expired_swaps(store, b.as_ref()).await {
+            Ok(n) => released += n,
+            Err(e) => {
+                tracing::warn!(chain = %b.chain(), error = %e, "could not check locks for expiry")
+            }
+        }
+    }
+    if released > 0 {
+        tracing::info!(
+            released,
+            "released the inputs of dropped locks past their deadline"
+        );
+    }
+    released
+}
+
+/// The live daemon's lock-expiry sweep: [`expiry_sweep_once`] every `every`.
+fn spawn_expiry_sweep(
+    cfg: &DaemonConfig,
+    store: Store,
+    counters: Vec<Arc<dyn ChainBackend>>,
+    every: Duration,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let res = InputReservations::open(&cfg.db_path).context("opening input reservations")?;
+    Ok(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            expiry_sweep_once(&res, &store, &counters).await;
+        }
+    }))
+}
+
 /// `--xmr-inflight`: the in-flight XMR swaps in `db_path`, as the lines documented on `Args`.
 /// The store must already exist: a wrong path is an error, never an empty store.
 /// With `lock_txids`, each swap line gets a third field: the reported XMR lock txid, or `-`.
@@ -804,7 +847,16 @@ async fn main() -> Result<()> {
     let hashlock_auth = HashlockAuth::new(store.clone())
         .with_operator_token(cfg.operator_token()?)
         .allow_tokenless(cfg.allow_tokenless_swaps);
-    let counters = std::iter::once(btc.clone()).chain(others).collect();
+    let counters: Vec<Arc<dyn ChainBackend>> = std::iter::once(btc.clone()).chain(others).collect();
+    let _expiry = match kind {
+        BackendKind::Mock => None,
+        BackendKind::Live => Some(spawn_expiry_sweep(
+            &cfg,
+            store.clone(),
+            counters.clone(),
+            Duration::from_secs(cfg.tick_secs),
+        )?),
+    };
     let mut maker =
         Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?;
     if let Some(x) = &xmr {
@@ -1254,6 +1306,67 @@ mod tests {
 
     fn hex_of(n: u8) -> String {
         divi_swap::Txid([n; 32]).to_rpc_hex()
+    }
+
+    #[tokio::test]
+    async fn the_expiry_sweep_releases_a_dropped_lock_past_its_deadline_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        let store = Store::open(&db).unwrap();
+        let deadline = lock_swap("x", divi_swap::SwapState::MakerLocked, 0)
+            .maker_leg_htlc
+            .unwrap()
+            .locktime;
+        let chain = MockChain::new(Chain::Btc, deadline - 1, 600);
+        let wallet = chain.backend(9, Amount(Amount::COIN));
+        // `dropped`'s lock (0x11) is in no mempool and no block; `pending`'s is broadcast.
+        let dropped = lock_swap("dropped", divi_swap::SwapState::MakerLocked, 0x11);
+        let mut pending = lock_swap("pending", divi_swap::SwapState::MakerLocked, 0x22);
+        let f = wallet
+            .build_funding(pending.maker_leg_htlc.as_ref().unwrap(), Amount(5_000))
+            .await
+            .unwrap();
+        wallet.broadcast(&f.tx).await.unwrap();
+        let pending_lock = f.tx.txid;
+        pending.maker_leg_funding = Some(f);
+        store.put_maker_swap(&dropped).unwrap();
+        store.put_maker_swap(&pending).unwrap();
+        let res = InputReservations::open(&db).unwrap();
+        res.reserve(Chain::Btc, &divi_swap::Txid([0x11; 32]), &[op(1, 0)])
+            .unwrap();
+        res.reserve(Chain::Btc, &pending_lock, &[op(2, 0)]).unwrap();
+        let held = || {
+            let mut by: Vec<_> = res
+                .list_all()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.reserved_by)
+                .collect();
+            by.sort_by_key(|t| t.0);
+            by
+        };
+        let mut both = vec![divi_swap::Txid([0x11; 32]), pending_lock];
+        both.sort_by_key(|t| t.0);
+        let counters: Vec<Arc<dyn ChainBackend>> = vec![Arc::new(wallet)];
+
+        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 0);
+        assert_eq!(held(), both, "one second before the deadline");
+        chain.set_offline(true);
+        chain.advance_time(1);
+        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 0);
+        assert_eq!(
+            held(),
+            both,
+            "a chain that cannot be asked keeps everything"
+        );
+        chain.set_offline(false);
+        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 1);
+        assert_eq!(
+            held(),
+            vec![pending_lock],
+            "the pending lock keeps its input"
+        );
+        assert_eq!(expiry_sweep_once(&res, &store, &counters).await, 0);
     }
 
     #[test]
