@@ -76,3 +76,26 @@ async fn getsporks_serves_the_sporks_in_id_order() {
     sorted.sort();
     assert_eq!(served, sorted);
 }
+
+/// Divi Core loads only the ids it has a name for (spork.cpp:196-197): a stored
+/// spork of any other id is not active after a restart, is not counted and is
+/// not served
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stored_sporks_of_unnamed_ids_are_not_loaded() {
+    let sporks = [
+        stored(10007, "1", 1000),
+        stored(10003, "1", 1000),
+        stored(10005, "1", 1000),
+        stored(10010, "1", 1000),
+        stored(10099, "1", 1000),
+    ];
+    let t = TestNode::start_with(|c| seed(c, &sporks)).await;
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+    let count = peer.expect("sporkcount", WAIT).await.expect("sporkcount");
+    assert_eq!(i32::from_le_bytes(count[..4].try_into().unwrap()), 1);
+    peer.send("getsporks", &[]).await;
+    let served = peer.expect("spork", WAIT).await.expect("a spork");
+    assert_eq!(spork_id(&served), 10007);
+    assert_eq!(peer.expect("spork", QUIET).await, None);
+}

@@ -72,8 +72,25 @@ pub fn spork_key(magic: &crate::constants::Magic) -> Option<Vec<u8>> {
     hex::decode(key).ok()
 }
 
-/// Divi Core `SPORK_START` and `SPORK_END` (spork.h): the ids it loads at start
-const SPORK_IDS: std::ops::RangeInclusive<i32> = 10001..=10015;
+/// The ids Divi Core loads at start: those from `SPORK_START` to `SPORK_END`
+/// (spork.h) that have a name (spork.cpp:196-197, `GetSporkNameByID`). It stores
+/// a spork of any id it is sent, but loads only these.
+const SPORK_IDS: [i32; 11] = {
+    use crate::messages::spork_ids::*;
+    [
+        SPORK_2_SWIFTTX_ENABLED,
+        SPORK_3_SWIFTTX_BLOCK_FILTERING,
+        SPORK_5_INSTANTSEND_MAX_VALUE,
+        SPORK_8_MASTERNODE_PAYMENT_ENFORCEMENT,
+        SPORK_9_SUPERBLOCKS_ENABLED,
+        SPORK_10_MASTERNODE_PAY_UPDATED_NODES,
+        SPORK_12_RECONSIDER_BLOCKS,
+        SPORK_13_BLOCK_PAYMENTS,
+        SPORK_14_TX_FEE,
+        SPORK_15_BLOCK_VALUE,
+        SPORK_16_LOTTERY_TICKET_MIN_VALUE,
+    ]
+};
 
 /// Where a spork id is kept in the chain database's metadata
 fn db_key(spork_id: i32) -> Vec<u8> {
