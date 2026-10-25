@@ -356,11 +356,9 @@ pub(crate) fn spirit_bool(params: &Params, index: usize) -> Result<bool, Error> 
 
 /// get_int: a JSON integer, taken as a C++ int
 pub(crate) fn spirit_int(params: &Params, index: usize) -> Result<i32, Error> {
-    match params.get(index) {
-        Some(serde_json::Value::Number(n)) if !n.is_f64() => {
-            Ok(n.as_i64().unwrap_or(i64::MAX) as i32)
-        }
-        other => Err(spirit_type_error(other, "int")),
+    match params.get(index).and_then(crate::protocol::json_spirit_int) {
+        Some(n) => Ok(n as i32),
+        None => Err(spirit_type_error(params.get(index), "int")),
     }
 }
 

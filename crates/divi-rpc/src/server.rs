@@ -493,6 +493,8 @@ impl RpcServer {
         if !state_first {
             json_spirit_getter_check(method, params)?;
         }
+        let cut = cut_int_arguments(method, params);
+        let params = cut.as_ref().unwrap_or(params);
         match method {
             // Blockchain methods
             "getblockcount" => self.blockchain.get_block_count(params),
@@ -1294,15 +1296,53 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
 
 /// The calls whose arguments of `core_argument_types` Divi Core reads with no
 /// test for null first, so a null makes the getter throw too
-/// (rpcwallet.cpp:550, :1752, :1798-1808)
+/// (rpcwallet.cpp:550, :1752, :1798-1808;
+/// rpcrawtransaction.cpp:206-207; rpcblockchain.cpp:418-420)
 fn getter_reads_null(method: &str) -> bool {
     matches!(
         method,
         "addmultisigaddress"
             | "getaccountaddress"
+            | "getrawtransaction"
             | "listreceivedbyaccount"
             | "listreceivedbyaddress"
+            | "verifychain"
     )
+}
+
+/// The positional arguments Divi Core reads with json_spirit's get_int(), which
+/// cuts an integer to a C++ int (json_spirit_value.h:385-390). Those read with
+/// get_int64() (prioritisetransaction, setmocktime, walletpassphrase) are not cut.
+fn core_int_arguments(method: &str) -> &'static [usize] {
+    match method {
+        // Chain calls (rpcblockchain.cpp:168, :369, :418-420; rpclottery.cpp:50;
+        // rpcrawtransaction.cpp:207); verifychain's one argument too
+        "getblockhash" | "getlotteryblockwinners" => &[0],
+        "gettxout" | "getrawtransaction" => &[1],
+        "verifychain" => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// The arguments as Divi Core's handler reads them: each integer of
+/// `core_int_arguments` cut to a C++ int. None when nothing changes.
+fn cut_int_arguments(method: &str, params: &Params) -> Option<Params> {
+    let Params::Array(values) = params else {
+        return None;
+    };
+    let mut cut = values.clone();
+    let mut changed = false;
+    for &index in core_int_arguments(method) {
+        if let Some(v) = cut.get_mut(index) {
+            if let Some(n) = crate::protocol::json_spirit_int(v) {
+                if v.as_i64() != Some(n) {
+                    *v = serde_json::json!(n);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed.then_some(Params::Array(cut))
 }
 
 /// Refuse an argument of the wrong JSON type as json_spirit's getter does. A

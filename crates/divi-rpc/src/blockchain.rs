@@ -14,6 +14,7 @@
 //! Methods for querying blockchain state: blocks, transactions, chain info.
 
 use crate::error::{codes, Error, RpcError};
+use crate::protocol::json_spirit_int;
 use crate::protocol::Params;
 use divi_consensus::bits_to_difficulty;
 use divi_primitives::hash::{Hash160, Hash256};
@@ -1444,8 +1445,11 @@ impl BlockchainRpc {
     /// Verify blockchain database
     /// verifychain ( numblocks )
     pub fn verifychain(&self, params: &Params) -> Result<Value, Error> {
-        // Parse optional numblocks parameter (default 288)
-        let numblocks = params.get_i64(0).unwrap_or(288).max(0) as u64;
+        // numblocks, default 288. Divi Core reads params[1] whenever an argument
+        // is given (rpcblockchain.cpp:418-420); with only one it reads past the
+        // list, so that one is taken here
+        let at = if params.len() > 1 { 1 } else { 0 };
+        let numblocks = params.get_i64(at).unwrap_or(288).max(0) as u64;
 
         let best_height = self.chain.height() as u64;
 
@@ -1545,21 +1549,6 @@ fn core_parse_hash_str(s: &str, name: &str) -> Result<Hash256, RpcError> {
     }
     let tail = &s[s.len().saturating_sub(64)..];
     Hash256::from_hex(&format!("{tail:0>64}")).map_err(|_| not_hex())
-}
-
-/// json_spirit's `get_int()` of an integer: its 64 bits cut to a C++ `int`
-/// (json_spirit_value.h, `static_cast<int>`), so 2^32 + 5 reads as 5; None for
-/// anything but an integer
-fn json_spirit_int(v: &Value) -> Option<i64> {
-    match v {
-        Value::Number(n) if n.is_i64() || n.is_u64() => {
-            let wide = n
-                .as_i64()
-                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64);
-            Some(i64::from(wide as i32))
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

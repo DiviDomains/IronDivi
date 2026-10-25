@@ -47,6 +47,21 @@ pub struct Request {
     pub params: Params,
 }
 
+/// json_spirit's `get_int()` of an integer (json_spirit_value.h:385-390): its
+/// 64 bits cut to a C++ `int` by `static_cast<int>`, so 2^32 + 5 reads as 5
+/// and 2^31 as -2^31. None for anything but an integer, where get_int() throws.
+pub(crate) fn json_spirit_int(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+            let wide = n
+                .as_i64()
+                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64);
+            Some(i64::from(wide as i32))
+        }
+        _ => None,
+    }
+}
+
 /// Method parameters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(untagged)]
