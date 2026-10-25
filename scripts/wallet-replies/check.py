@@ -106,7 +106,7 @@ class Node:
             "regtest=1", f"port={self.p2p}", f"rpcport={self.rpcport}",
             f"rpcuser=replies{index}", f"rpcpassword={password}",
             "daemon=0", "printtoconsole=0", "server=1", "discover=0", "listenonion=0",
-            "bind=127.0.0.1", "dnsseed=0", "staking=0",
+            "bind=127.0.0.2", "rpcbind=127.0.0.2", "rpcallowip=127.0.0.0/8", "dnsseed=0", "staking=0",
         ] + list(extra_conf)
         fd = os.open(os.path.join(self.dir, "divi.conf"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -125,7 +125,7 @@ class Node:
     def call(self, method, *params):
         """('ok', result) or ('err', code, message)"""
         body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(f"http://127.0.0.1:{self.rpcport}/", data=body,
+        req = urllib.request.Request(f"http://127.0.0.2:{self.rpcport}/", data=body,
                                      headers={"Authorization": "Basic " + self.auth, "Content-Type": "text/plain"})
         try:
             with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
@@ -329,7 +329,7 @@ if not C.wait_ready():
     print(f"FAIL   start: divid did not answer within {START_TIMEOUT} s", flush=True)
     sys.exit(1)
 phrase = C.rpc("dumphdinfo")["mnemonic"]
-I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.1:{PORT_BASE}"],
+I = Node("irondivid", IRONDIVID, 1, ["listen=0", f"connect=127.0.0.2:{PORT_BASE}"],
          env={"WALLET_MNEMONIC": phrase})
 del phrase
 if not I.wait_ready():

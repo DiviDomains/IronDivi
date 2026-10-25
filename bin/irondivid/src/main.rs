@@ -2406,9 +2406,19 @@ async fn run_daemon(
                         rpc_server
                             .staking()
                             .set_generate_control(Arc::new(move |n| {
+                                use divi_node::staker::GenerateBlockError;
+                                use divi_rpc::staking::GenerateBlockFailure;
                                 staker_for_generate
                                     .generate_blocks(n)
                                     .map(|hashes| hashes.iter().map(|h| h.to_string()).collect())
+                                    .map_err(|e| match e {
+                                        GenerateBlockError::Refused(m) => {
+                                            GenerateBlockFailure::Refused(m)
+                                        }
+                                        GenerateBlockError::Failed(m) => {
+                                            GenerateBlockFailure::Failed(m)
+                                        }
+                                    })
                             }));
                         let staker_for_block = Arc::clone(staker_arc);
                         rpc_server
