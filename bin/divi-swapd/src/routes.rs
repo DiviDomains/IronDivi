@@ -51,15 +51,17 @@ use tower_http::trace::TraceLayer;
 /// is set (see [`client_ip`]).
 pub const RATE_LIMIT_PER_WINDOW: u32 = 20;
 /// Requests one IP may make per [`RATE_WINDOW`] to the swap-state-changing routes
-/// (`POST /swaps` accept, `POST /swaps/:id/lock`). A taker makes one of each per swap (a
-/// retry or two on a transient error); 20 leaves room for several swaps a minute from one
-/// NAT address. A separate limiter from the quote/setup one so a swap's negotiation calls
-/// do not eat into each other.
+/// (`POST /swaps` accept, and `POST /swaps/:id/lock` refused by its token gate). A taker
+/// makes one of each per swap (a retry or two on a transient error); 20 leaves room for
+/// several swaps a minute from one NAT address. A lock with the right token counts in its
+/// swap's own bucket of the same size instead (a legacy swap's, per swap and IP). A separate
+/// limiter from the quote/setup one so a swap's negotiation calls do not eat into each other.
 pub const WRITE_LIMIT_PER_WINDOW: u32 = 20;
-/// Requests one IP may make per [`RATE_WINDOW`] to `GET /swaps` and `GET /swaps/:id`. A live
-/// taker polls `GET /swaps/:id` once per `--poll-secs` (default 10 s = 6 a minute; 1 s = 60).
-/// 300 is 5x the 1 s case, and a separate limiter keeps status polling from exhausting the
-/// accept/lock budget.
+/// Requests one IP may make per [`RATE_WINDOW`] to `GET /swaps`, and to `GET /swaps/:id`
+/// refused by its token gate; one swap may get as many with its right token, in its own
+/// bucket (a legacy swap as many per IP). A live taker polls `GET /swaps/:id` once per
+/// `--poll-secs` (default 10 s = 6 a minute; 1 s = 60). 300 is 5x the 1 s case, and a
+/// separate limiter keeps status polling from exhausting the accept/lock budget.
 pub const READ_LIMIT_PER_WINDOW: u32 = 300;
 /// Requests one IP may make per [`RATE_WINDOW`] to the public reads `GET /healthz` and
 /// `GET /offers`, in one bucket of their own. A health monitor polls every 10-60 s (1-6 a
@@ -73,18 +75,22 @@ pub const PUBLIC_READ_LIMIT_PER_WINDOW: u32 = 600;
 /// (`GET /xmr/swaps/:id`, `POST .../j`, `/sigs`, `/xmr-lock`) with its right token, counted
 /// per swap id rather than per IP: clients sharing an address (behind a proxy with
 /// `trust_proxy_headers` off) cannot spend each other's budget. Requests without the right
-/// token count in a per-IP bucket of the same size instead. An honest taker's busiest minute is the setup: at most `MAX_J_EXCHANGES` (64,
-/// about ten in practice) `/j` calls and one `/sigs`, then one `GET` per poll and at most one
-/// `/xmr-lock` beside it: 64 + 1 + 2 * 60 = 185 at `--poll-secs 1`, 77 at the default 10 s.
+/// token count only as misses ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]): these routes have no
+/// per-IP bucket, as one this size could never refuse before the miss limit. An honest
+/// taker's busiest minute is the setup: at most `MAX_J_EXCHANGES` (64, about ten in practice)
+/// `/j` calls and one `/sigs`, then one `GET` per poll and at most one `/xmr-lock` beside it:
+/// 64 + 1 + 2 * 60 = 185 at `--poll-secs 1`, 77 at the default 10 s.
 pub const XMR_SWAP_LIMIT_PER_WINDOW: u32 = 300;
 /// Token misses (a wrong, missing or other-swap token, or an unknown id) one IP may make per
-/// [`RATE_WINDOW`] on the XMR `:id` routes. Past it every request from that IP without the
-/// right token is a 429 for the rest of the window; a request with the right token still
-/// passes, so a prober sharing an address cannot lock a taker out. The 429-versus-200 split
-/// does tell a locked-out prober which guess is right, so the limit slows guessing only up to
-/// the lockout; what stops guessing is the token's 256 bits ([`new_swap_token`]). An honest
-/// taker reads its token from its own session file and never misses; 20 leaves room for an
-/// operator's typos.
+/// [`RATE_WINDOW`] on the XMR `:id` routes and the hashlock ones (`GET /swaps/:id`,
+/// `POST /swaps/:id/lock`) together: one budget, so a prober gets 20 misses in all, not 20 on
+/// each. Past it every request from that IP to those routes without the right token is a 429
+/// for the rest of the window; a request with the right token still passes, so a prober
+/// sharing an address cannot lock a taker out.
+/// The 429-versus-200 split does tell a locked-out prober which guess is right, so the limit
+/// slows guessing only up to the lockout; what stops guessing is the token's 256 bits
+/// ([`new_swap_token`]). An honest taker reads its token from its own session file and never
+/// misses; 20 leaves room for an operator's typos.
 pub const XMR_TOKEN_MISS_LIMIT_PER_WINDOW: u32 = 20;
 /// Length of the fixed window [`RATE_LIMIT_PER_WINDOW`] counts in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -200,9 +206,8 @@ struct XmrGate {
     maker: Arc<XmrMaker>,
     /// Requests with the right token, per swap id ([`XMR_SWAP_LIMIT_PER_WINDOW`]).
     per_swap: Arc<RateLimiter<String>>,
-    /// Requests without it, per IP (the same size).
-    per_ip: Arc<RateLimiter>,
-    /// Token misses per IP ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]).
+    /// Requests without it, as token misses per IP ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]),
+    /// shared with the hashlock `:id` routes. No per-IP bucket: the misses bind first.
     misses: Arc<RateLimiter>,
     trust_proxy_headers: bool,
 }
@@ -211,8 +216,8 @@ struct XmrGate {
 /// body would otherwise tell a prober the id exists). A request with the right token counts
 /// in its swap's bucket only, so nothing another client on the same address does can use it
 /// up. Any other request (missing, wrong or another swap's token, or an unknown id; the same
-/// 404) counts in the address's bucket and as one of its misses, and is a 429 once either
-/// is used up. A wrong token for a real id never touches that id's bucket.
+/// 404) counts as one of the address's misses (shared with the hashlock `:id` routes) and is
+/// a 429 once they are used up. A wrong token for a real id never touches that id's bucket.
 async fn xmr_swap_gate(
     State(g): State<XmrGate>,
     Path(params): Path<HashMap<String, String>>,
@@ -234,11 +239,25 @@ async fn xmr_swap_gate(
         };
     }
     let ip = request_ip(&req, g.trust_proxy_headers);
-    if g.misses.exhausted(&ip, now) || !g.per_ip.allow(ip, now) {
+    refuse(None, &g.misses, ip, now, || {
+        ApiError(StatusCode::NOT_FOUND, format!("no xmr swap {id}")).into_response()
+    })
+}
+
+/// A request a token gate turned away: a 429 once `ip` has used up its misses or its bucket
+/// (`per_ip`, on a route that has one), else one more miss and `refusal`.
+fn refuse(
+    per_ip: Option<&RateLimiter>,
+    misses: &RateLimiter,
+    ip: IpAddr,
+    now: Instant,
+    refusal: impl FnOnce() -> Response,
+) -> Response {
+    if misses.exhausted(&ip, now) || per_ip.is_some_and(|b| !b.allow(ip, now)) {
         return too_many();
     }
-    g.misses.allow(ip, now);
-    ApiError(StatusCode::NOT_FOUND, format!("no xmr swap {id}")).into_response()
+    misses.allow(ip, now);
+    refusal()
 }
 
 /// `docs` kind holding a hashlock swap's token, keyed by the maker's swap id. A swap with no
@@ -293,11 +312,27 @@ fn no_swap(id: &str) -> Response {
 struct SwapGate {
     auth: HashlockAuth,
     maker: Arc<Maker>,
+    /// Requests the gate lets through with the right token, per swap id (the route's size).
+    per_swap: Arc<RateLimiter<String>>,
+    /// Requests to a legacy swap, per (swap id, IP) (the same size): anyone may call one by
+    /// its id, so one address cannot spend another's budget on it.
+    legacy: Arc<RateLimiter<(String, IpAddr)>>,
+    /// Requests it refuses, per IP: the route's bucket, shared with `GET /swaps` (reads) or
+    /// `POST /swaps` (writes).
+    per_ip: Arc<RateLimiter>,
+    /// Token misses per IP on both hashlock `:id` routes ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]),
+    /// shared with the XMR ones.
+    misses: Arc<RateLimiter>,
+    trust_proxy_headers: bool,
 }
 
 /// Gate for `GET /swaps/:id` and `POST /swaps/:id/lock`, run before the body is parsed. A swap
 /// with a token needs it in `X-Swap-Token`; a legacy swap (no token document) is open, as it
-/// was; an unknown id is refused. All refusals are the one 404 of [`no_swap`].
+/// was; an unknown id is refused. All refusals are the one 404 of [`no_swap`]. As on the XMR
+/// routes, a request with the right token counts in its swap's bucket only, and a refused one
+/// in the address's bucket and as one of its misses (shared with the XMR routes), a 429 once
+/// either is used up; a wrong token for a real id never touches that id's bucket. A legacy
+/// swap counts per swap and address.
 async fn hashlock_token_gate(
     State(g): State<SwapGate>,
     Path(params): Path<HashMap<String, String>>,
@@ -310,15 +345,19 @@ async fn hashlock_token_gate(
         .get(HASHLOCK_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let ok = match g.auth.store.get_doc::<TokenDoc>(TOKEN_KIND, id) {
-        Ok(Some(d)) => token_matches(&d.token, given),
-        Ok(None) => matches!(g.maker.view(id), Ok(Some(_))),
-        Err(_) => false,
+    let now = Instant::now();
+    let ip = request_ip(&req, g.trust_proxy_headers);
+    let allowed = match g.auth.store.get_doc::<TokenDoc>(TOKEN_KIND, id) {
+        Ok(Some(d)) if token_matches(&d.token, given) => g.per_swap.allow(id.to_owned(), now),
+        Ok(None) if matches!(g.maker.view(id), Ok(Some(_))) => {
+            g.legacy.allow((id.to_owned(), ip), now)
+        }
+        _ => return refuse(Some(&g.per_ip), &g.misses, ip, now, || no_swap(id)),
     };
-    if ok {
+    if allowed {
         next.run(req).await
     } else {
-        no_swap(id)
+        too_many()
     }
 }
 
@@ -401,11 +440,22 @@ pub fn router_with_auth(
     trust_proxy_headers: bool,
     auth: HashlockAuth,
 ) -> Router {
-    let gate = || {
+    let write_ips = Arc::new(RateLimiter::new(WRITE_LIMIT_PER_WINDOW, RATE_WINDOW));
+    let read_ips = Arc::new(RateLimiter::new(READ_LIMIT_PER_WINDOW, RATE_WINDOW));
+    let misses = Arc::new(RateLimiter::new(
+        XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
+        RATE_WINDOW,
+    ));
+    let gate = |max: u32, per_ip: &Arc<RateLimiter>| {
         middleware::from_fn_with_state(
             SwapGate {
                 auth: auth.clone(),
                 maker: state.maker.clone(),
+                per_swap: Arc::new(RateLimiter::new(max, RATE_WINDOW)),
+                legacy: Arc::new(RateLimiter::new(max, RATE_WINDOW)),
+                per_ip: per_ip.clone(),
+                misses: misses.clone(),
+                trust_proxy_headers,
             },
             hashlock_token_gate,
         )
@@ -416,37 +466,38 @@ pub fn router_with_auth(
         trust_proxy_headers,
     };
     let limited = || middleware::from_fn_with_state(rate.clone(), rate_limit);
-    let bucket = |max: u32| {
+    let on = |limiter: Arc<RateLimiter>| {
         middleware::from_fn_with_state(
             RateState {
-                limiter: Arc::new(RateLimiter::new(max, RATE_WINDOW)),
+                limiter,
                 trust_proxy_headers,
             },
             rate_limit,
         )
     };
-    let writes = bucket(WRITE_LIMIT_PER_WINDOW);
-    let reads = bucket(READ_LIMIT_PER_WINDOW);
-    let public = bucket(PUBLIC_READ_LIMIT_PER_WINDOW);
+    let writes = on(write_ips.clone());
+    let reads = on(read_ips.clone());
+    let public = on(Arc::new(RateLimiter::new(
+        PUBLIC_READ_LIMIT_PER_WINDOW,
+        RATE_WINDOW,
+    )));
     let mut api = Router::new()
         .route("/healthz", get(healthz).route_layer(public.clone()))
         .route("/offers", get(offers).route_layer(public))
         .route("/offers/:id/quote", get(quote).route_layer(limited()))
         .route(
             "/swaps",
-            post(accept).route_layer(writes.clone()).merge(
-                get(list_swaps)
-                    .route_layer(operator)
-                    .route_layer(reads.clone()),
-            ),
+            post(accept)
+                .route_layer(writes)
+                .merge(get(list_swaps).route_layer(operator).route_layer(reads)),
         )
         .route(
             "/swaps/:id",
-            get(get_swap).route_layer(gate()).route_layer(reads),
+            get(get_swap).route_layer(gate(READ_LIMIT_PER_WINDOW, &read_ips)),
         )
         .route(
             "/swaps/:id/lock",
-            post(lock).route_layer(gate()).route_layer(writes),
+            post(lock).route_layer(gate(WRITE_LIMIT_PER_WINDOW, &write_ips)),
         )
         .layer(Extension(auth.clone()))
         .with_state(state);
@@ -467,14 +518,7 @@ pub fn router_with_auth(
                                     XMR_SWAP_LIMIT_PER_WINDOW,
                                     RATE_WINDOW,
                                 )),
-                                per_ip: Arc::new(RateLimiter::new(
-                                    XMR_SWAP_LIMIT_PER_WINDOW,
-                                    RATE_WINDOW,
-                                )),
-                                misses: Arc::new(RateLimiter::new(
-                                    XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
-                                    RATE_WINDOW,
-                                )),
+                                misses: misses.clone(),
                                 trust_proxy_headers,
                             },
                             xmr_swap_gate,

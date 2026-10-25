@@ -64,15 +64,21 @@ With an `[xmr]` section the daemon asks the configured `monerod` for its `nettyp
 ### Rate limit behind a reverse proxy
 
 The quote and XMR setup routes are limited to 20 requests a minute per client address; accept
-and lock (`POST /swaps`, `POST /swaps/:id/lock`) to 20 a minute in their own bucket; and
-`GET /swaps` and `GET /swaps/:id` to 300 a minute in a third, so a taker's status polling cannot
-use up its accept/lock budget. `/healthz` and `GET /offers` share a public bucket of 600 a minute.
-On the XMR `:id` routes (`GET /xmr/swaps/:id`, `/j`, `/sigs`, `/xmr-lock`) a request with the
-swap's right token counts in that swap's own bucket of 300 a minute, so clients sharing an
-address cannot use up each other's; any other request (no, wrong or another swap's token, or an
-unknown id) counts in the address's bucket of 300 and as one of its 20 token misses a minute:
-past either, every such request from the address is a 429 until the window ends, while the right
-token still passes. A wrong token for a real swap id never touches that swap's bucket. Once an
+(`POST /swaps`) to 20 a minute in its own bucket; and `GET /swaps` to 300 a minute in a third,
+so a taker's status polling cannot use up its accept/lock budget. `/healthz` and `GET /offers`
+share a public bucket of 600 a minute.
+On the token-gated `:id` routes a request with the swap's right token counts in that swap's own
+bucket, so clients sharing an address cannot use up each other's: 20 a minute for
+`POST /swaps/:id/lock`, 300 for `GET /swaps/:id`, 300 across the XMR routes
+(`GET /xmr/swaps/:id`, `/j`, `/sigs`, `/xmr-lock`). A request for a legacy swap (no token)
+counts in a bucket of the same size per swap and address, so one address cannot use up
+another's on that id. Any other request (no, wrong or another swap's token, or an unknown id) is
+a token miss: an address gets 20 a minute in all, across the hashlock and XMR `:id` routes
+together. On the hashlock routes a miss also counts in the address's bucket for that route (the
+accept bucket for a lock, the `GET /swaps` bucket for a read); the XMR routes have no
+per-address bucket, as the 20 misses always run out first. Past the misses (or that bucket)
+every such request from the address is a 429 until the window ends, while the right token still
+passes. A wrong token for a real swap id never touches that swap's bucket. Once an
 address is locked out, a 429 for a wrong token beside a 200 for the right one tells a guesser
 which guess was right; what stops guessing is the token's 256 bits from the OS-seeded CSPRNG, not
 the miss limit. The token compare is constant-time (`subtle`). `nginx-swap.conf` carries a commented `limit_req` example. By default the
@@ -117,7 +123,8 @@ divi-swapd --config /etc/divi-swapd/divi-swapd.toml --release-reservation <txid>
 
 * `POST /swaps` (accept) answers a taker that sent `X-Swap-Token-Support: 1` with the usual swap view plus
   `swap_token`. `GET /swaps/:id` and `POST /swaps/:id/lock` then need that value in `X-Swap-Token`; a missing,
-  wrong or another swap's token is the same 404 as an unknown id. The CLI stores the token in its sidecar
+  wrong or another swap's token is the same 404 as an unknown id, and a 429 once the address has used up its
+  20 misses a minute (see the rate limits above). The CLI stores the token in its sidecar
   `<db>.sessions.json` and sends it itself.
 * An old taker (no support header) gets 426 "upgrade the taker" and no quote is spent, unless the maker sets
   `allow_tokenless_swaps = true`. A swap made before this version has no token and stays open by id.

@@ -26,9 +26,11 @@ use std::time::{Duration, Instant};
 use divi_swap::mock::MockChain;
 use divi_swap::{Amount, Chain, Maker, Profile, Store, SwapConfig};
 use divi_swap_cli::{xmr_flow, MakerClient, RunOpts, Sessions};
+use divi_swap_xmr::api::{JRoundRequest, SigsRequest, XmrLockNotice};
 use divi_swap_xmr::mock::{
     MockDiviChain, MockDiviWallet, MockMoneroChain, MockMoneroWallet, MOCK_DIVI_FEE, MOCK_XMR_FEE,
 };
+use divi_swap_xmr::taker::JNext;
 use divi_swap_xmr::{XmrConfig, XmrMaker, XmrMakerState, XmrTaker, XmrTakerState};
 use divi_swapd::{
     mock_xmr_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus,
@@ -567,11 +569,71 @@ async fn xmr_token_guesses_are_throttled() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 429, "every :id route");
-    // Hashlock reads are a different bucket.
+    // One miss budget per address: the hashlock `:id` routes are locked out too.
     let r = reqwest::get(format!("{}/swaps/nope", d.base))
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 404);
+    assert_eq!(r.status().as_u16(), 429, "hashlock misses share the budget");
+}
+
+/// One miss budget per address across the hashlock and XMR `:id` routes: a prober mixing them
+/// gets [`divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW`] misses in all, not twice that. Fails
+/// on 4310796 (two budgets: the 21st miss is a 404).
+#[tokio::test]
+async fn hashlock_and_xmr_misses_share_one_budget() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let http = reqwest::Client::new();
+    let hashlock = format!("{}/swaps/nope", d.base);
+    let xmr = format!("{}/xmr/swaps/nope", d.base);
+    let get = |url: &str| {
+        let r = http.get(url).header("X-Swap-Token", "0".repeat(64)).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        let url = if i % 2 == 0 { &hashlock } else { &xmr };
+        assert_eq!(get(url).await, 404, "miss {i} on {url}");
+    }
+    assert_eq!(get(&xmr).await, 429, "the next miss, on the XMR route");
+    assert_eq!(get(&hashlock).await, 429, "and on the hashlock route");
+}
+
+/// The XMR `:id` routes have no per-address bucket: right-token traffic counts only in its
+/// swap's bucket, never per address, so after its swap's whole bucket the address still has
+/// every miss, and the next one is the 429. Passes on 4310796 as well: the per-address bucket
+/// there (as large as the swap's) counted only misses, so the miss limit always bound first.
+#[tokio::test]
+async fn xmr_right_tokens_are_not_counted_per_address() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let (id, token) = begun(&w, tmp.path(), &d.base).await;
+    let url = format!("{}/xmr/swaps/{id}", d.base);
+    let http = reqwest::Client::new();
+    let get = |token: &str| {
+        let r = http.get(&url).header("X-Swap-Token", token).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    // Spend the swap's whole bucket (`begin` already used some of it).
+    let mut ok = 0;
+    loop {
+        match get(&token).await {
+            200 => ok += 1,
+            429 => break,
+            other => panic!("status {other}"),
+        }
+        assert!(
+            ok <= divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW,
+            "no 429 after {ok}"
+        );
+    }
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        assert_eq!(get(&format!("{i:064x}")).await, 404, "miss {i}");
+    }
+    assert_eq!(get(&format!("{misses:064x}")).await, 429, "the next miss");
 }
 
 /// With `trust_proxy_headers`, a prober rotating the first `X-Forwarded-For` entry keeps the
@@ -744,4 +806,172 @@ async fn wrong_tokens_never_spend_the_swaps_bucket() {
     }
     // `begin` used about ten `/j` and one `/sigs` of the bucket (at most 66).
     assert!(ok >= limit - 66, "the taker got {ok} of {limit}");
+}
+
+/// A swap on `w`'s daemon at `base`, keyed up to its last `/j` exchange; `/sigs` not sent.
+struct Keyed {
+    taker: XmrTaker,
+    local: String,
+    id: String,
+    token: String,
+    /// The last `/j` request: the maker answers a replay with its cached reply (200).
+    last_j: JRoundRequest,
+    sigs: SigsRequest,
+    /// Right-token requests made so far on the `:id` routes (each counts in the swap's bucket).
+    spent: u32,
+}
+
+async fn keyed(w: &World, tmp: &std::path::Path, base: &str) -> Keyed {
+    let taker = w.taker(&tmp.join("t.db"));
+    let client = MakerClient::new(base);
+    client.wait_ready().await.unwrap();
+    taker.warm_primes().await.unwrap();
+    let quote = client
+        .quote_retrying("divi-xmr-stagenet", XMR_UNITS)
+        .await
+        .unwrap();
+    let (local, req) = taker.prepare(&quote).await.unwrap();
+    let mut reply = client.xmr_setup(&req).await.unwrap();
+    let (id, token) = (reply.swap_id.clone(), reply.swap_token.clone());
+    let (mut last_j, mut spent) = (None, 0);
+    let sigs = loop {
+        match taker.j_step(&local, reply).await.unwrap() {
+            JNext::Sigs(s) => break s,
+            JNext::Send(req) => {
+                reply = client.xmr_j(&id, &token, &req).await.unwrap();
+                spent += 1;
+                last_j = Some(req);
+            }
+        }
+    };
+    Keyed {
+        taker,
+        local,
+        id,
+        token,
+        last_j: last_j.expect("at least one /j exchange"),
+        sigs,
+        spent,
+    }
+}
+
+/// Sends `/sigs`, then steps the taker (one right-token `GET` per step) until it has locked
+/// its XMR; returns the lock notice, not yet sent.
+async fn to_xmr_lock(w: &World, k: &mut Keyed, base: &str) -> XmrLockNotice {
+    let client = MakerClient::new(base);
+    client.xmr_sigs(&k.id, &k.token, &k.sigs).await.unwrap();
+    k.spent += 1;
+    let deadline = Instant::now() + LOADED_HOST_WAIT;
+    loop {
+        w.mine();
+        let view = client.xmr_swap(&k.id, &k.token).await.unwrap();
+        k.spent += 1;
+        k.taker.step(&k.local, Some(&view)).await.unwrap();
+        if let Some(n) = k.taker.lock_notice(&k.local).unwrap() {
+            return n;
+        }
+        assert!(Instant::now() < deadline, "the taker never locked its XMR");
+        // Long enough for the scheduler to act on each block: every step spends a request.
+        tokio::time::sleep(TICK * 10).await;
+    }
+}
+
+async fn post(http: &reqwest::Client, url: &str, token: &str, body: &impl serde::Serialize) -> u16 {
+    let r = http.post(url).header("X-Swap-Token", token).json(body);
+    r.send().await.unwrap().status().as_u16()
+}
+
+/// The POST `:id` routes' limits, each route on a daemon of its own: wrong-token requests
+/// to the real id are 404 up to `XMR_TOKEN_MISS_LIMIT_PER_WINDOW`, then 429 through request
+/// `XMR_SWAP_LIMIT_PER_WINDOW + 1` (the miss lockout binds before the per-IP bucket of 300
+/// could), and the right token with a valid body is still a 200. Passes on 5a35a3e: a guard.
+#[tokio::test]
+async fn xmr_posts_without_the_token_lock_out_at_the_miss_limit() {
+    let limit = divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW;
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW as usize;
+    for tail in ["j", "sigs", "xmr-lock"] {
+        let w = World::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let d = serve(&w, &tmp.path().join("m.db")).await;
+        let mut k = keyed(&w, tmp.path(), &d.base).await;
+        let body = match tail {
+            "j" => serde_json::to_value(&k.last_j).unwrap(),
+            "sigs" => serde_json::to_value(&k.sigs).unwrap(),
+            _ => serde_json::to_value(to_xmr_lock(&w, &mut k, &d.base).await).unwrap(),
+        };
+        let url = format!("{}/xmr/swaps/{}/{tail}", d.base, k.id);
+        let http = reqwest::Client::new();
+        let mut codes = Vec::new();
+        for i in 0..=limit {
+            codes.push(post(&http, &url, &format!("{i:064x}"), &body).await);
+        }
+        assert!(
+            codes[..misses].iter().all(|c| *c == 404),
+            "{tail}: {codes:?}"
+        );
+        assert!(
+            codes[misses..].iter().all(|c| *c == 429),
+            "{tail}: {codes:?}"
+        );
+        assert_eq!(codes[limit as usize], 429, "{tail}: request {}", limit + 1);
+        assert_eq!(
+            post(&http, &url, &k.token, &body).await,
+            200,
+            "{tail} with the token"
+        );
+    }
+}
+
+/// A prober on the taker's address floods every POST `:id` route with wrong and missing
+/// tokens, twice the swap limit. The taker still gets a 200 on each with a valid body, and
+/// its right-token requests before and after add up to exactly the swap's bucket: none of
+/// the prober's were counted in it. Passes on 5a35a3e (c282392's per-swap buckets): a guard.
+#[tokio::test]
+async fn a_prober_cannot_drain_a_swaps_bucket_on_the_post_routes() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let mut k = keyed(&w, tmp.path(), &d.base).await;
+    let url = format!("{}/xmr/swaps/{}", d.base, k.id);
+    let http = reqwest::Client::new();
+    let limit = divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW;
+    let junk = serde_json::json!({});
+    for i in 0..2 * limit {
+        let tail = ["j", "sigs", "xmr-lock"][i as usize % 3];
+        let token = if i % 2 == 0 {
+            format!("{i:064x}")
+        } else {
+            String::new()
+        };
+        post(&http, &format!("{url}/{tail}"), &token, &junk).await;
+    }
+    assert_eq!(
+        post(&http, &format!("{url}/j"), &k.token, &k.last_j).await,
+        200,
+        "/j"
+    );
+    k.spent += 1;
+    let notice = to_xmr_lock(&w, &mut k, &d.base).await; // sends `/sigs`: a 200 or it panics
+    assert_eq!(
+        post(&http, &format!("{url}/sigs"), &k.token, &k.sigs).await,
+        200,
+        "/sigs"
+    );
+    k.spent += 1;
+    let lock = format!("{url}/xmr-lock");
+    let mut ok = 0;
+    loop {
+        match post(&http, &lock, &k.token, &notice).await {
+            200 => ok += 1,
+            429 => break,
+            other => panic!("/xmr-lock: status {other}"),
+        }
+        assert!(ok <= limit, "no 429 after {ok}");
+    }
+    assert!(ok > 0, "/xmr-lock with the token");
+    assert_eq!(
+        k.spent + ok,
+        limit,
+        "the taker's requests fill the bucket exactly"
+    );
 }

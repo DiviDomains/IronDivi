@@ -26,7 +26,10 @@ use common::*;
 use divi_swap::api::{AcceptRequest, SwapView};
 use divi_swap::{Store, SwapState};
 use divi_swap_cli::{flow, MakerClient, Sessions};
-use divi_swapd::{router_with_auth, AppState, HashlockAuth, ScanStatus};
+use divi_swapd::{
+    router_with_auth, AppState, HashlockAuth, ScanStatus, READ_LIMIT_PER_WINDOW,
+    WRITE_LIMIT_PER_WINDOW, XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
+};
 use serde_json::{json, Value};
 
 const SUPPORT: &str = "x-swap-token-support";
@@ -40,6 +43,17 @@ struct Served {
 
 /// A daemon over a fresh world with the given operator credential and tokenless policy.
 async fn serve_with(w: &World, operator: Option<&str>, tokenless: bool) -> Served {
+    serve_opts(w, operator, tokenless, false).await
+}
+
+/// [`serve_with`], and `trust_proxy_headers` (a test picks its address with
+/// `X-Forwarded-For`).
+async fn serve_opts(
+    w: &World,
+    operator: Option<&str>,
+    tokenless: bool,
+    trust_proxy_headers: bool,
+) -> Served {
     let state = AppState {
         maker: w.maker(Store::in_memory().unwrap()),
         divi: Arc::new(w.maker_divi.clone()),
@@ -49,7 +63,7 @@ async fn serve_with(w: &World, operator: Option<&str>, tokenless: bool) -> Serve
     let auth = HashlockAuth::new(Store::in_memory().unwrap())
         .with_operator_token(operator.map(str::to_string))
         .allow_tokenless(tokenless);
-    let app = router_with_auth(state, None, "/swap", false, auth);
+    let app = router_with_auth(state, None, "/swap", trust_proxy_headers, auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move {
@@ -297,6 +311,57 @@ async fn legacy_swap_stays_readable_and_lockable_by_id_but_never_listed() {
     s.handle.abort();
 }
 
+/// A legacy (tokenless) swap is throttled per (swap, address), not per swap: a second address
+/// spending the read and lock limits on a legacy id leaves the first address's budget on that
+/// id whole. Fails on 4310796 (one bucket per swap: the first address gets 429).
+#[tokio::test]
+async fn a_second_address_cannot_spend_a_legacy_swaps_budget() {
+    let w = World::new();
+    let s = serve_opts(&w, Some("op"), true, true).await;
+    let (code, v) = take(&w, &s.base, false).await;
+    assert_eq!(code, 201, "tokenless allowed by config: {v}");
+    let url = format!("{}/swaps/{}", s.base, v["id"].as_str().unwrap());
+    let lock = format!("{url}/lock");
+    let c = reqwest::Client::new();
+    let send = |get: bool, ip: &str| {
+        let req = if get {
+            c.get(&url)
+        } else {
+            c.post(&lock).json(&json!({}))
+        };
+        let r = req.header("x-forwarded-for", ip).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    let (first, second) = ("198.51.100.1", "198.51.100.2");
+    for i in 0..READ_LIMIT_PER_WINDOW {
+        assert_eq!(send(true, second).await, 200, "read {i}");
+    }
+    assert_eq!(
+        send(true, second).await,
+        429,
+        "the second address's next read"
+    );
+    for i in 0..WRITE_LIMIT_PER_WINDOW {
+        assert_ne!(send(false, second).await, 429, "lock {i}");
+    }
+    assert_eq!(
+        send(false, second).await,
+        429,
+        "the second address's next lock"
+    );
+    assert_eq!(
+        send(true, first).await,
+        200,
+        "the first address still reads"
+    );
+    assert_ne!(
+        send(false, first).await,
+        429,
+        "the first address still locks"
+    );
+    s.handle.abort();
+}
+
 /// With tokenless off (the default) a tokenless taker cannot create a legacy swap at all.
 #[tokio::test]
 async fn tokenless_swaps_are_off_by_default() {
@@ -479,5 +544,99 @@ async fn accept_reply_debug_redacts_the_token() {
     let reply: divi_swap::api::AcceptReply = serde_json::from_value(v).unwrap();
     assert!(!format!("{reply:?}").contains(&token));
     assert!(!format!("{reply:#?}").contains(&token));
+    s.handle.abort();
+}
+
+/// Token guesses on the hashlock `:id` routes: past `XMR_TOKEN_MISS_LIMIT_PER_WINDOW` misses
+/// (the XMR routes' limit) an address gets 429 on `GET /swaps/:id` and `POST .../lock`
+/// without the right token, while the right token still passes. Fails on 5a35a3e (every
+/// guess a 404).
+#[tokio::test]
+async fn hashlock_token_guesses_are_throttled() {
+    let w = World::new();
+    let s = serve_with(&w, None, false).await;
+    let (id, token) = open_swap(&w, &s.base).await;
+    let url = format!("{}/swaps/{id}", s.base);
+    let misses = XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        let guess = format!("{i:064x}");
+        assert_eq!(
+            call("GET", &url, Some((SWAP_TOKEN, &guess))).await.0,
+            404,
+            "guess {i}"
+        );
+    }
+    let guess = format!("{misses:064x}");
+    assert_eq!(
+        call("GET", &url, Some((SWAP_TOKEN, &guess))).await.0,
+        429,
+        "the next guess"
+    );
+    let lock = format!("{url}/lock");
+    assert_eq!(
+        call("POST", &lock, Some((SWAP_TOKEN, &guess))).await.0,
+        429,
+        "lock"
+    );
+    let unknown = format!("{}/swaps/no-such-id", s.base);
+    assert_eq!(call("GET", &unknown, None).await.0, 429, "unknown id");
+    assert_eq!(
+        call("GET", &url, Some((SWAP_TOKEN, &token))).await.0,
+        200,
+        "the right token still passes"
+    );
+    let (code, _) = call("POST", &lock, Some((SWAP_TOKEN, &token))).await;
+    assert!(
+        code == 400 || code == 422,
+        "lock reaches the handler: {code}"
+    );
+    s.handle.abort();
+}
+
+/// The shared-bucket DoS on the hashlock routes: a prober on the client's address floods both
+/// `:id` routes with wrong and missing tokens, past the read and write buckets. The client
+/// holding the right token still reaches its lock and has its swap's whole read bucket: a
+/// wrong token for the real id never touches that swap's bucket. Fails on 5a35a3e (the
+/// flood spends the address's write bucket: the lock is a 429).
+#[tokio::test]
+async fn a_prober_cannot_lock_a_valid_token_hashlock_client_out() {
+    let w = World::new();
+    let s = serve_with(&w, None, false).await;
+    let (id, token) = open_swap(&w, &s.base).await;
+    let url = format!("{}/swaps/{id}", s.base);
+    let c = reqwest::Client::new();
+    for i in 0..2 * READ_LIMIT_PER_WINDOW {
+        c.get(&url)
+            .header(SWAP_TOKEN, format!("{i:064x}"))
+            .send()
+            .await
+            .unwrap();
+        c.get(format!("{}/swaps/no-such-id", s.base))
+            .send()
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 * WRITE_LIMIT_PER_WINDOW {
+        c.post(format!("{url}/lock"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let (code, _) = call("POST", &format!("{url}/lock"), Some((SWAP_TOKEN, &token))).await;
+    assert!(
+        code == 400 || code == 422,
+        "lock with the right token: {code}"
+    );
+    let mut ok = 0;
+    loop {
+        match call("GET", &url, Some((SWAP_TOKEN, &token))).await.0 {
+            200 => ok += 1,
+            429 => break,
+            other => panic!("status {other}"),
+        }
+        assert!(ok <= READ_LIMIT_PER_WINDOW, "no 429 after {ok} reads");
+    }
+    assert_eq!(ok, READ_LIMIT_PER_WINDOW, "the taker's whole read bucket");
     s.handle.abort();
 }

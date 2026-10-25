@@ -83,20 +83,20 @@ async fn first_429(
 async fn accept_and_lock_are_limited_together_and_reads_do_not_block_them() {
     let (base, h) = serve_proxy(false).await;
     let c = reqwest::Client::new();
-    // Exhaust the read bucket.
+    // Exhaust the read bucket with the listing (an unknown id would hit the miss limit first).
     let n = first_429(
         &c,
         "GET",
-        &format!("{base}/swaps/nope"),
+        &format!("{base}/swaps"),
         READ_LIMIT_PER_WINDOW,
         |_| None,
     )
     .await;
     assert_eq!(n, Some(READ_LIMIT_PER_WINDOW + 1), "read bucket size");
     assert_eq!(
-        hit(&c, "GET", &format!("{base}/swaps"), None).await,
+        hit(&c, "GET", &format!("{base}/swaps/nope"), None).await,
         429,
-        "GET /swaps shares it"
+        "a refused GET /swaps/:id shares it"
     );
     // Writes are untouched by the exhausted reads: a full write budget still passes.
     for i in 0..WRITE_LIMIT_PER_WINDOW {
@@ -132,10 +132,11 @@ async fn accept_and_lock_are_limited_together_and_reads_do_not_block_them() {
 async fn writes_exhausting_their_bucket_do_not_block_status_reads() {
     let (base, h) = serve_proxy(false).await;
     let c = reqwest::Client::new();
+    // Accept, not a lock: refused locks would also use up the misses `GET /swaps/:id` shares.
     let n = first_429(
         &c,
         "POST",
-        &format!("{base}/swaps/nope/lock"),
+        &format!("{base}/swaps"),
         WRITE_LIMIT_PER_WINDOW,
         |_| None,
     )
@@ -153,7 +154,7 @@ async fn writes_exhausting_their_bucket_do_not_block_status_reads() {
 async fn a_spoofed_forwarded_for_cannot_get_a_fresh_bucket_under_trust_proxy_headers() {
     let (base, h) = serve_proxy(true).await;
     let c = reqwest::Client::new();
-    let url = format!("{base}/swaps/nope/lock");
+    let url = format!("{base}/swaps");
     // nginx's old `$proxy_add_x_forwarded_for` shape: the client's own entries, then the
     // address nginx saw. The first entry changes every request; the last does not.
     let n = first_429(&c, "POST", &url, WRITE_LIMIT_PER_WINDOW, |i| {
@@ -179,7 +180,7 @@ async fn a_spoofed_forwarded_for_cannot_get_a_fresh_bucket_under_trust_proxy_hea
 async fn forwarded_for_is_ignored_without_trust_proxy_headers() {
     let (base, h) = serve_proxy(false).await;
     let c = reqwest::Client::new();
-    let url = format!("{base}/swaps/nope/lock");
+    let url = format!("{base}/swaps");
     let n = first_429(&c, "POST", &url, WRITE_LIMIT_PER_WINDOW, |i| {
         Some(format!("198.51.100.{i}"))
     })
