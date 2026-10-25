@@ -11,11 +11,11 @@
 use async_trait::async_trait;
 use divi_swap::api::{AcceptRequest, Direction, LockNotice, Offer, Quote};
 use divi_swap::htlc::ScriptVersion;
-use divi_swap::mock::{MockBackend, MockChain, TxCounts};
+use divi_swap::mock::{MockBackend, MockChain, TxCounts, TxKind};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Maker, Outpoint, Profile,
-    Result, SignedTx, SpendInfo, Store, SwapConfig, SwapState, Taker, TakerState, Txid,
+    Result, SignedTx, SpendInfo, Store, SwapConfig, SwapError, SwapState, Taker, TakerState, Txid,
 };
 use proptest::prelude::*;
 use std::path::PathBuf;
@@ -79,6 +79,37 @@ struct H {
     restarts: u32,
     /// Restart at every checkpoint instead of once at an armed crash state.
     restart_every: bool,
+    /// Armed for the crash restart: the leg whose chain then fails, with what, and whether
+    /// only broadcasts fail. Starts at the restart, or at the first round if the restart
+    /// came earlier; lasts `FAULT_ROUNDS` rounds.
+    fault: Option<(Leg, SwapError, bool)>,
+    fault_left: usize,
+    /// Fault rounds after which either side had an error recorded.
+    fault_errors: usize,
+    in_rounds: bool,
+    round_no: usize,
+    /// The first round each state was seen in (sampled after each engine pass).
+    first_maker: Vec<(SwapState, usize)>,
+    first_taker: Vec<(TakerState, usize)>,
+    drop: Option<DropPlan>,
+}
+
+/// One leg of the swap: the taker's lock and its spend, or the maker's.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Leg {
+    Taker,
+    Maker,
+}
+
+/// Evict the first `kind` tx seen unconfirmed on `leg`'s chain, `times` times (each time
+/// after it came back), optionally restarting both engines right after each eviction.
+struct DropPlan {
+    leg: Leg,
+    kind: TxKind,
+    times: usize,
+    restart: bool,
+    /// (txid, round dropped, round it was on the chain again)
+    drops: Vec<(Txid, usize, Option<usize>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -162,6 +193,14 @@ impl H {
             taker_id: String::new(),
             restarts: 0,
             restart_every: false,
+            fault: None,
+            fault_left: 0,
+            fault_errors: 0,
+            in_rounds: false,
+            round_no: 0,
+            first_maker: Vec::new(),
+            first_taker: Vec::new(),
+            drop: None,
         };
         h.maker = build_maker(&h, store.clone());
         h.taker = Taker::new(
@@ -225,6 +264,88 @@ impl H {
         };
         if hit {
             self.restart();
+            if self.in_rounds {
+                self.start_fault();
+            }
+        }
+    }
+
+    fn leg_chain(&self, leg: Leg) -> &MockChain {
+        match leg {
+            Leg::Taker => self.tl_chain(),
+            Leg::Maker => self.ml_chain(),
+        }
+    }
+
+    fn start_fault(&mut self) {
+        let Some((leg, err, send_only)) = self.fault.take() else {
+            return;
+        };
+        let chain = self.leg_chain(leg);
+        if send_only {
+            chain.fail_broadcasts_with(Some(err));
+        } else {
+            chain.fail_with(Some(err));
+        }
+        self.fault_left = FAULT_ROUNDS;
+    }
+
+    fn heal(&mut self) {
+        for chain in [&self.btc, &self.divi] {
+            chain.fail_with(None);
+            chain.fail_broadcasts_with(None);
+        }
+        self.fault_left = 0;
+    }
+
+    fn end_fault_round(&mut self) {
+        if self.fault_left == 0 {
+            return;
+        }
+        let m = self.store.get_maker_swap(&self.maker_id).unwrap().unwrap();
+        let t = self.store.get_taker_swap(&self.taker_id).unwrap().unwrap();
+        if m.last_error.is_some() || t.last_error.is_some() {
+            self.fault_errors += 1;
+        }
+        self.fault_left -= 1;
+        if self.fault_left == 0 {
+            self.heal();
+        }
+    }
+
+    fn note_states(&mut self) {
+        let (m, t, at) = (self.maker_state(), self.taker_state(), self.round_no);
+        if !self.first_maker.iter().any(|(s, _)| *s == m) {
+            self.first_maker.push((m, at));
+        }
+        if !self.first_taker.iter().any(|(s, _)| *s == t) {
+            self.first_taker.push((t, at));
+        }
+    }
+
+    /// Before the round's blocks: note a dropped tx that is back, then evict the next one.
+    fn drop_tick(&mut self) {
+        let Some(mut p) = self.drop.take() else {
+            return;
+        };
+        let chain = self.leg_chain(p.leg).clone();
+        if let Some(last) = p.drops.last_mut() {
+            if last.2.is_none() && chain.contains(&last.0) {
+                last.2 = Some(self.round_no);
+            }
+        }
+        let ready = p.drops.last().is_none_or(|d| d.2.is_some());
+        let mut restart = false;
+        if ready && p.drops.len() < p.times {
+            if let Some((id, _)) = chain.mempool().into_iter().find(|(_, k)| *k == p.kind) {
+                assert!(chain.drop_from_mempool(&id));
+                p.drops.push((id, self.round_no, None));
+                restart = p.restart;
+            }
+        }
+        self.drop = Some(p);
+        if restart {
+            self.restart();
         }
     }
 
@@ -264,10 +385,15 @@ impl H {
     }
 
     async fn round(&mut self, scn: Scn, crash: Option<Crash>, timed_out: &mut bool, offline: bool) {
+        self.in_rounds = true;
+        if self.restarts > 0 {
+            self.start_fault();
+        }
         self.btc.set_offline(offline);
         self.divi.set_offline(offline);
         let _ = self.maker.tick().await;
         self.maybe_crash(crash);
+        self.note_states();
         if scn == Scn::Refund && !*timed_out && self.maker_state() == SwapState::MakerLockConfirmed
         {
             self.expire_both();
@@ -278,10 +404,14 @@ impl H {
             let _ = self.taker.step(&self.taker_id, view.as_ref()).await;
             self.maybe_crash(crash);
         }
+        self.note_states();
         self.btc.set_offline(false);
         self.divi.set_offline(false);
+        self.end_fault_round();
+        self.drop_tick();
         self.btc.mine(1);
         self.divi.mine(1);
+        self.round_no += 1;
     }
 
     fn finished(&self) -> bool {
@@ -640,6 +770,8 @@ struct Outcome {
     taker_leg_txs: TxCounts,
     maker_leg_txs: TxCounts,
     coin_selections: (u64, u64),
+    /// Maker locks handed back to the wallet as lost.
+    released: usize,
 }
 
 impl H {
@@ -656,6 +788,10 @@ impl H {
             taker_leg_txs: self.tl_chain().tx_counts(),
             maker_leg_txs: self.ml_chain().tx_counts(),
             coin_selections: (self.m_ml().funding_calls(), self.t_tl().funding_calls()),
+            released: [&self.mdivi, &self.mbtc, &self.tdivi, &self.tbtc]
+                .iter()
+                .map(|b| b.released_locks().len())
+                .sum(),
         }
     }
 
@@ -802,6 +938,238 @@ both!(
     restart_matrix_same_outcome,
     rev_restart_matrix_same_outcome,
     restart_matrix_body
+);
+
+/// How long an injected backend fault lasts, in rounds (one block on each chain per round).
+const FAULT_ROUNDS: usize = 5;
+
+/// The ways a chain backend fails, as (name, error, only broadcasts fail). The engine
+/// treats Transient/Premature as retryable, Rejected as "these bytes are dead" (forget and
+/// re-sign a spend, flag a dropped maker lock) and anything else as a plain step error.
+fn faults() -> [(&'static str, SwapError, bool); 7] {
+    [
+        (
+            "down",
+            SwapError::Transient("mock: node down (test)".into()),
+            false,
+        ),
+        (
+            "premature",
+            SwapError::Premature("mock: premature (test)".into()),
+            false,
+        ),
+        (
+            "rejected",
+            SwapError::Rejected("mock: rejected (test)".into()),
+            false,
+        ),
+        (
+            "other",
+            SwapError::Other("mock: internal error (test)".into()),
+            false,
+        ),
+        (
+            "send-transient",
+            SwapError::Transient("mock: send failed (test)".into()),
+            true,
+        ),
+        (
+            "send-premature",
+            SwapError::Premature("mock: send premature (test)".into()),
+            true,
+        ),
+        (
+            "send-rejected",
+            SwapError::Rejected("mock: send rejected (test)".into()),
+            true,
+        ),
+    ]
+}
+
+/// No state was first reached in an earlier round than in the undisturbed run `base`: a
+/// fault or an eviction may only delay the swap, never hurry it into a timeout.
+fn assert_not_earlier(h: &H, base: &H, what: &str) {
+    for (s, at) in &h.first_maker {
+        if let Some((_, b)) = base.first_maker.iter().find(|(x, _)| x == s) {
+            assert!(
+                at >= b,
+                "{what}: maker {s:?} in round {at}, undisturbed in round {b}"
+            );
+        }
+    }
+    for (s, at) in &h.first_taker {
+        if let Some((_, b)) = base.first_taker.iter().find(|(x, _)| x == s) {
+            assert!(
+                at >= b,
+                "{what}: taker {s:?} in round {at}, undisturbed in round {b}"
+            );
+        }
+    }
+}
+
+/// Neither side was ever seen in a state off the scenario's path: no abort or refund in
+/// the happy swap, no abort or claim in the refund swap.
+fn assert_on_path(h: &H, scn: Scn, what: &str) {
+    use SwapState as M;
+    use TakerState as T;
+    let (bad_m, bad_t): (&[SwapState], &[TakerState]) = match scn {
+        Scn::Happy => (
+            &[M::Aborted, M::MakerRefundable, M::MakerRefunded],
+            &[T::Refunded],
+        ),
+        Scn::Refund => (
+            &[M::Aborted, M::TakerClaimed, M::MakerClaimed],
+            &[T::Claimed],
+        ),
+    };
+    for (s, at) in &h.first_maker {
+        assert!(!bad_m.contains(s), "{what}: maker {s:?} in round {at}");
+    }
+    for (s, at) in &h.first_taker {
+        assert!(!bad_t.contains(s), "{what}: taker {s:?} in round {at}");
+    }
+}
+
+/// The undisturbed run: its outcome is what every disturbed run must end with.
+async fn undisturbed(dir: Direction, scn: Scn) -> (H, Outcome) {
+    let mut base = H::with(dir);
+    base.run(scn, None, &[]).await;
+    assert_atomic(&base, scn);
+    assert_on_path(&base, scn, "undisturbed");
+    base.restart_and_settle().await;
+    let want = base.outcome();
+    assert_eq!(want.coin_selections, (1, 1), "{scn:?}");
+    assert_eq!(want.released, 0, "{scn:?}");
+    (base, want)
+}
+
+/// Restart while a chain backend is down or erroring: for the happy and the refund
+/// scenario, each leg's chain, each fault kind and each restart point, restart both engines
+/// and make that chain fail for `FAULT_ROUNDS` rounds. Meanwhile the engines keep retrying
+/// (a step error is recorded), nothing reaches a state earlier than undisturbed and nothing
+/// leaves the scenario's path (no abort, no refund of a happy swap). Healed, every run ends
+/// like the undisturbed one: same states, balances, tx counts, coin selections.
+async fn outage_matrix_body(dir: Direction) {
+    let crashes: Vec<Crash> = MAKER_RESTART_POINTS
+        .iter()
+        .map(|s| Crash::Maker(*s))
+        .chain(TAKER_RESTART_POINTS.iter().map(|s| Crash::Taker(*s)))
+        .collect();
+    for scn in [Scn::Happy, Scn::Refund] {
+        let (base, want) = undisturbed(dir, scn).await;
+        let mut runs = 0;
+        for leg in [Leg::Taker, Leg::Maker] {
+            for (name, err, send_only) in faults() {
+                let mut errored = 0;
+                for crash in &crashes {
+                    let mut h = H::with(dir);
+                    h.fault = Some((leg, err.clone(), send_only));
+                    h.run(scn, Some(*crash), &[]).await;
+                    if h.restarts == 0 {
+                        continue;
+                    }
+                    let what = format!(
+                        "{dir:?} {scn:?}: {leg:?}-leg chain {name} from restart after {crash:?}"
+                    );
+                    assert!(h.fault.is_none(), "{what}: the fault never started");
+                    assert_on_path(&h, scn, &what);
+                    assert_not_earlier(&h, &base, &what);
+                    assert_atomic(&h, scn);
+                    errored += h.fault_errors;
+                    h.heal();
+                    h.restart_and_settle().await;
+                    assert_eq!(h.outcome(), want, "{what}");
+                    runs += 1;
+                }
+                assert!(
+                    errored > 0,
+                    "{dir:?} {scn:?} {leg:?} {name}: no step ever hit the fault"
+                );
+            }
+        }
+        eprintln!("DF-MATRIX outage {dir:?} {scn:?}: {runs} runs");
+    }
+}
+both!(
+    outage_matrix_same_outcome,
+    rev_outage_matrix_same_outcome,
+    outage_matrix_body
+);
+
+/// Mempool eviction: for the happy and the refund scenario, each leg and each tx the
+/// scenario sends on it (funding, then the claim or the refund), evict it while
+/// unconfirmed, once or three times, with or without a restart right after. The engine
+/// must send the same tx again by the next round (same txid; it never re-signs or selects
+/// coins anew, so the chain only ever sees one tx of that kind on that leg) and the swap
+/// must end like the undisturbed run: the refund still lands and pays the same.
+async fn mempool_drop_matrix_body(dir: Direction) {
+    for scn in [Scn::Happy, Scn::Refund] {
+        let (base, want) = undisturbed(dir, scn).await;
+        let spend = match scn {
+            Scn::Happy => TxKind::Claim,
+            Scn::Refund => TxKind::Refund,
+        };
+        let mut runs = 0;
+        for leg in [Leg::Taker, Leg::Maker] {
+            for kind in [TxKind::Fund, spend] {
+                if scn == Scn::Refund && leg == Leg::Taker && kind == TxKind::Fund {
+                    // The silent taker is the only party holding its funding tx: evicted,
+                    // it is never sent again and the maker aborts. Not a resend question.
+                    continue;
+                }
+                for times in [1, 3] {
+                    for restart in [false, true] {
+                        let what = format!(
+                            "{dir:?} {scn:?}: {leg:?}-leg {kind:?} evicted {times}x, restart {restart}"
+                        );
+                        let mut h = H::with(dir);
+                        h.drop = Some(DropPlan {
+                            leg,
+                            kind,
+                            times,
+                            restart,
+                            drops: Vec::new(),
+                        });
+                        h.run(scn, None, &[]).await;
+                        let p = h.drop.take().unwrap();
+                        assert_eq!(p.drops.len(), times, "{what}: {:?}", p.drops);
+                        let id = p.drops[0].0;
+                        for (d, at, back) in &p.drops {
+                            assert_eq!(*d, id, "{what}: another {kind:?} was sent");
+                            let back = back.unwrap_or_else(|| {
+                                panic!("{what}: never sent again after round {at}")
+                            });
+                            assert!(
+                                back <= at + 1,
+                                "{what}: evicted in round {at}, back in {back}"
+                            );
+                        }
+                        assert!(h.leg_chain(leg).contains(&id), "{what}: not on chain");
+                        let ids: Vec<Txid> = h
+                            .leg_chain(leg)
+                            .accepted()
+                            .into_iter()
+                            .filter(|(_, k)| *k == kind)
+                            .map(|(t, _)| t)
+                            .collect();
+                        assert_eq!(ids, vec![id], "{what}: a second {kind:?} txid");
+                        assert_on_path(&h, scn, &what);
+                        assert_not_earlier(&h, &base, &what);
+                        assert_atomic(&h, scn);
+                        h.restart_and_settle().await;
+                        assert_eq!(h.outcome(), want, "{what}");
+                        runs += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("DF-MATRIX mempool-drop {dir:?} {scn:?}: {runs} runs");
+    }
+}
+both!(
+    mempool_drop_matrix_same_txid,
+    rev_mempool_drop_matrix_same_txid,
+    mempool_drop_matrix_body
 );
 
 const MAKER_STATES: [SwapState; 9] = [

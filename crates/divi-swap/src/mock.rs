@@ -68,6 +68,30 @@ struct ChainState {
     /// Txids the node cannot look up (no txindex): `confirmations`/`htlc_output` say `None`
     /// although the tx stays in the chain and `broadcast` still answers already-known.
     blind: HashSet<Txid>,
+    /// While set, every backend call fails with this error (an erroring node).
+    fail: Option<SwapError>,
+    /// While set, every `broadcast()` fails with this error; reads still work.
+    fail_broadcasts: Option<SwapError>,
+    /// Every txid this chain ever accepted, kept when the tx later leaves the mempool.
+    accepted: HashMap<Txid, TxKind>,
+}
+
+/// The kind of a mock transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TxKind {
+    Fund,
+    Claim,
+    Refund,
+}
+
+impl MockTx {
+    fn kind(&self) -> TxKind {
+        match self {
+            MockTx::Fund { .. } => TxKind::Fund,
+            MockTx::Claim { .. } => TxKind::Claim,
+            MockTx::Refund { .. } => TxKind::Refund,
+        }
+    }
 }
 
 /// How many funding, claim and refund txs a [`MockChain`] has accepted (mempool or mined).
@@ -143,6 +167,59 @@ impl MockChain {
         }
     }
 
+    /// Mempool eviction: an unconfirmed `txid` (and every unconfirmed tx spending it) is
+    /// gone as if it was never sent: a funding gives its inputs back and a claim or refund
+    /// takes its credit back, so rebroadcasting the same bytes is accepted again. Returns
+    /// false (and changes nothing) for a mined or unknown txid. Test-only.
+    pub fn drop_from_mempool(&self, txid: &Txid) -> bool {
+        let mut s = self.state.lock();
+        if !matches!(s.txs.get(txid), Some((_, None))) {
+            return false;
+        }
+        for id in Self::with_dependents(&s, txid) {
+            if !matches!(s.txs.get(&id), Some((_, None))) {
+                continue;
+            }
+            let Some((tx, _)) = s.txs.remove(&id) else {
+                continue;
+            };
+            s.spends.retain(|_, spender| *spender != id);
+            match tx {
+                MockTx::Fund { from, amount, .. } => {
+                    *s.balances.entry(from).or_default() += amount.0 + MOCK_FEE.0;
+                }
+                MockTx::Claim { to, amount, .. } | MockTx::Refund { to, amount, .. } => {
+                    let bal = s.balances.entry(to).or_default();
+                    *bal = bal
+                        .checked_sub(amount.0 - MOCK_FEE.0)
+                        .expect("dropped spend's credit is still there");
+                }
+            }
+        }
+        true
+    }
+
+    /// Unconfirmed txs, by kind.
+    pub fn mempool(&self) -> Vec<(Txid, TxKind)> {
+        let s = self.state.lock();
+        s.txs
+            .iter()
+            .filter(|(_, (_, mined))| mined.is_none())
+            .map(|(id, (tx, _))| (*id, tx.kind()))
+            .collect()
+    }
+
+    /// Every txid this chain ever accepted, by kind, including ones since dropped.
+    pub fn accepted(&self) -> Vec<(Txid, TxKind)> {
+        let s = self.state.lock();
+        s.accepted.iter().map(|(id, k)| (*id, *k)).collect()
+    }
+
+    /// The chain has `txid`, in the mempool or mined.
+    pub fn contains(&self, txid: &Txid) -> bool {
+        self.state.lock().txs.contains_key(txid)
+    }
+
     /// The node cannot look `txid` up (a backend without txindex), though it is in the chain.
     /// Test-only.
     pub fn blind(&self, txid: &Txid) {
@@ -179,6 +256,18 @@ impl MockChain {
         self.state.lock().reject_next_broadcast = true;
     }
 
+    /// While `Some`, every backend call on this chain fails with `err`: a node that is up
+    /// but erroring, or down (`Transient`). `None` heals it.
+    pub fn fail_with(&self, err: Option<SwapError>) {
+        self.state.lock().fail = err;
+    }
+
+    /// While `Some`, every `broadcast()` on this chain fails with `err` before touching
+    /// any state; reads still answer. `None` heals it.
+    pub fn fail_broadcasts_with(&self, err: Option<SwapError>) {
+        self.state.lock().fail_broadcasts = err;
+    }
+
     /// Current MTP.
     pub fn mtp(&self) -> u32 {
         self.state.lock().mtp
@@ -195,15 +284,16 @@ impl MockChain {
         self.state.lock().height
     }
 
-    /// Every tx this chain has accepted, by kind. A rebroadcast of a known tx is not counted
-    /// twice, so a second funding or a claim plus a refund shows up here.
+    /// Every tx this chain has ever accepted, by kind, including one since dropped from the
+    /// mempool. A rebroadcast of the same txid is not counted twice, so a second funding,
+    /// a re-signed spend or a claim plus a refund shows up here.
     pub fn tx_counts(&self) -> TxCounts {
         let mut c = TxCounts::default();
-        for (tx, _) in self.state.lock().txs.values() {
-            match tx {
-                MockTx::Fund { .. } => c.funds += 1,
-                MockTx::Claim { .. } => c.claims += 1,
-                MockTx::Refund { .. } => c.refunds += 1,
+        for kind in self.state.lock().accepted.values() {
+            match kind {
+                TxKind::Fund => c.funds += 1,
+                TxKind::Claim => c.claims += 1,
+                TxKind::Refund => c.refunds += 1,
             }
         }
         c
@@ -270,8 +360,11 @@ impl MockBackend {
     }
 
     fn check_online(&self) -> Result<()> {
-        if self.chain.state.lock().offline {
+        let s = self.chain.state.lock();
+        if s.offline {
             Err(SwapError::Transient("mock chain offline".into()))
+        } else if let Some(e) = &s.fail {
+            Err(e.clone())
         } else {
             Ok(())
         }
@@ -391,6 +484,9 @@ impl ChainBackend for MockBackend {
         let parsed: MockTx = serde_json::from_slice(&tx.raw)
             .map_err(|e| SwapError::Rejected(format!("decode: {e}")))?;
         let mut s = self.chain.state.lock();
+        if let Some(e) = &s.fail_broadcasts {
+            return Err(e.clone());
+        }
         if s.reject_next_broadcast {
             s.reject_next_broadcast = false;
             return Err(SwapError::Rejected("mock: forced rejection (test)".into()));
@@ -451,6 +547,7 @@ impl ChainBackend for MockBackend {
                 *s.balances.entry(to.clone()).or_default() += amount.0 - MOCK_FEE.0;
             }
         }
+        s.accepted.insert(tx.txid, parsed.kind());
         s.txs.insert(tx.txid, (parsed, None));
         Ok(tx.txid)
     }
