@@ -44,6 +44,116 @@ fn late_claim_lead_must_exceed_the_safety_margin() {
     assert!(ClaimPolicy::Never.validate().is_ok());
 }
 
+/// A late BTC taker (reverse offer: the maker leg is on BTC, testnet profile) with a lead
+/// between the 1800 s floor and BTC's 3600 s claim margin would lock, wait, and then have the
+/// engine decline the claim. The CLI must refuse it before anything is locked, reading the
+/// same margin the taker enforces (`Taker::claim_deadline`).
+#[tokio::test]
+async fn late_btc_claim_inside_the_btc_margin_is_refused_before_locking() {
+    let w = World::new();
+    let dir = tempfile::tempdir().unwrap();
+    let d = serve(
+        &w,
+        w.maker(Store::open(&dir.path().join("m.db")).unwrap()),
+        Some(TICK),
+    )
+    .await;
+    let tdb = dir.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let margin = taker.claim_deadline(divi_swap::Chain::Btc).margin_secs();
+    assert_eq!(margin, 3600);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let gate = ClaimGate {
+        policy: ClaimPolicy::NotBefore {
+            secs_before_timeout: 2400,
+        },
+        store: Store::open(&tdb).unwrap(),
+        divi: Arc::new(w.taker_divi.clone()),
+        btc: Arc::new(w.taker_btc.clone()),
+    };
+    let opts = RunOpts {
+        timeout: Duration::from_secs(20),
+        poll: Duration::from_millis(15),
+    };
+    let res = flow::run_swap_gated(
+        &taker,
+        &client,
+        &sessions,
+        REV_OFFER_ID,
+        BTC_SATS,
+        &opts,
+        &mut || {
+            w.divi.mine(1);
+            w.divi.advance_time(300);
+            w.btc.mine(1);
+            w.btc.advance_time(300);
+        },
+        Some(&gate),
+    )
+    .await;
+    let err = res.expect_err("a 2400 s lead on a BTC maker leg must be refused");
+    assert!(
+        err.to_string().contains("3600"),
+        "the error should name the BTC margin: {err}"
+    );
+    let swaps = Store::open(&tdb).unwrap().list_taker_swaps().unwrap();
+    assert!(
+        swaps.iter().all(|r| r.taker_leg_funding.is_none()),
+        "nothing may be locked"
+    );
+    d.stop();
+}
+
+/// The same reverse BTC taker with a lead above the BTC margin is held, then claims.
+#[tokio::test]
+async fn late_btc_claim_above_the_btc_margin_goes_through() {
+    let w = World::new();
+    let dir = tempfile::tempdir().unwrap();
+    let d = serve(
+        &w,
+        w.maker(Store::open(&dir.path().join("m.db")).unwrap()),
+        Some(TICK),
+    )
+    .await;
+    let tdb = dir.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let lead = 4800;
+    let gate = ClaimGate {
+        policy: ClaimPolicy::NotBefore {
+            secs_before_timeout: lead,
+        },
+        store: Store::open(&tdb).unwrap(),
+        divi: Arc::new(w.taker_divi.clone()),
+        btc: Arc::new(w.taker_btc.clone()),
+    };
+    let (local, state) = flow::run_swap_gated(
+        &taker,
+        &client,
+        &sessions,
+        REV_OFFER_ID,
+        BTC_SATS,
+        &fast(),
+        &mut || {
+            w.divi.mine(1);
+            w.btc.mine(1);
+        },
+        Some(&gate),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state, TakerState::Done);
+    let rec = Store::open(&tdb)
+        .unwrap()
+        .get_taker_swap(&local)
+        .unwrap()
+        .unwrap();
+    assert!(rec.maker_leg_claim.is_some());
+    d.stop();
+}
+
 /// Case D: the claim is held until the DIVI MTP is `lead` seconds before the maker's
 /// locktime, then goes through; the maker still claims the BTC.
 #[tokio::test]

@@ -48,23 +48,36 @@ pub enum ClaimPolicy {
     /// As soon as the lock is verified and confirmed (the normal flow).
     Asap,
     /// Hold the claim until the DIVI median time is within this many seconds of the maker's
-    /// refund locktime (case D, "late claim"). Must exceed the taker's safety margin.
+    /// refund locktime (case D, "late claim"). Must exceed the maker-leg chain's claim margin
+    /// ([`Taker::claim_deadline`]), or the engine declines the claim when it is released.
     NotBefore { secs_before_timeout: u32 },
     /// Never claim; wait out the BTC timelock and refund (case C).
     Never,
 }
 
 impl ClaimPolicy {
-    /// Reject a late-claim lead the engine would itself refuse to claim with.
+    /// Reject a late-claim lead the engine would refuse to claim with on any chain (the
+    /// least margin, [`TAKER_SAFETY_MARGIN_SECS`]). Checked before the quote, when the
+    /// maker-leg chain is not known yet; [`ClaimPolicy::validate_for`] then checks that chain.
     pub fn validate(&self) -> Result<()> {
+        self.check(TAKER_SAFETY_MARGIN_SECS, "the taker safety margin")
+    }
+
+    /// Reject a late-claim lead the engine would refuse to claim with on `maker_chain`,
+    /// reading the margin from `taker` itself so the two cannot drift.
+    pub fn validate_for(&self, taker: &Taker, maker_chain: Chain) -> Result<()> {
+        let margin = taker.claim_deadline(maker_chain).margin_secs();
+        self.check(margin, &format!("the {maker_chain} maker-leg claim margin"))
+    }
+
+    fn check(&self, margin: u32, what: &str) -> Result<()> {
         if let ClaimPolicy::NotBefore {
             secs_before_timeout,
         } = self
         {
-            if *secs_before_timeout <= TAKER_SAFETY_MARGIN_SECS {
+            if *secs_before_timeout <= margin {
                 bail!(
-                    "--claim-not-before must exceed the taker safety margin ({TAKER_SAFETY_MARGIN_SECS}s), \
-                     or the engine refuses to claim"
+                    "--claim-not-before must exceed {what} ({margin}s), or the engine refuses to claim"
                 );
             }
         }
@@ -120,7 +133,15 @@ pub async fn run_swap_gated(
         g.policy.validate()?;
         taker.halt_after(Some(TakerState::MakerLockConfirmed));
     }
-    let local = begin(taker, client, sessions, offer_id, btc_sats).await?;
+    let local = begin_checked(
+        taker,
+        client,
+        sessions,
+        offer_id,
+        btc_sats,
+        gate.map(|g| g.policy),
+    )
+    .await?;
     lock(taker, client, sessions, &local).await?;
     let started = Instant::now();
     let mut held = false;
@@ -186,6 +207,20 @@ pub async fn begin(
     offer_id: &str,
     btc_sats: u64,
 ) -> Result<String> {
+    begin_checked(taker, client, sessions, offer_id, btc_sats, None).await
+}
+
+/// [`begin`], refusing a `policy` whose late-claim lead the maker-leg chain's claim margin
+/// would turn into a declined claim. Checked once the quote names that chain, before anything
+/// is accepted or locked.
+async fn begin_checked(
+    taker: &Taker,
+    client: &MakerClient,
+    sessions: &Sessions,
+    offer_id: &str,
+    btc_sats: u64,
+    policy: Option<ClaimPolicy>,
+) -> Result<String> {
     let quote = client.quote(offer_id, btc_sats).await?;
     let c = quote.counter_chain;
     if !taker.counter_chains().contains(&c) {
@@ -193,6 +228,9 @@ pub async fn begin(
             "offer {offer_id} swaps DIVI against {c}; rerun with --counter-chain {c} \
              (and --{c}-key for the live backend)"
         );
+    }
+    if let Some(p) = policy {
+        p.validate_for(taker, quote.maker_chain())?;
     }
     let (local, req) = taker.prepare(&quote).await?;
     let view = client.accept(&req).await?;
