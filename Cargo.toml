@@ -27,6 +27,7 @@ members = [
     "tests/integration-tests",
     "tools/cpp-test-extractor",
     "tools/block-comparator",
+    "tools/spork-seed",
 ]
 
 [workspace.package]

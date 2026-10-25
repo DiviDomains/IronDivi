@@ -69,29 +69,20 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f7
 
 ## What irondivid does with `-rpcthreads` and `-rpckeepalive`
 
-- **`-rpcthreads`:** irondivid accepts it, logs `Option -rpcthreads is not supported by irondivid; ignored`
-  (bin/irondivid/src/main.rs, `UNSUPPORTED_OPTIONS`), and does not use it.
-  - irondivid's RPC server serves each connection on a task of its own and runs calls side by side, with no limit
-    on how many.
-  - divid starts `-rpcthreads` threads (default 4, rpcserver.cpp:755-757). Each thread serves one connection from
-    accept to close, keep-alive included (rpcserver.cpp:578-622, ServiceConnection :1000-1033).
+- **`-rpcthreads`:** as in divid, irondivid serves that many connections at once (default 4), each to its end,
+  keep-alive included; a connection past them waits until one closes (rpcserver.cpp:578-622, :755-757,
+  ServiceConnection :1000-1033). So with `rpcthreads=1` a short call on a second connection comes after the long
+  one, on both.
 - **`-rpckeepalive`:** irondivid reads it. With `rpckeepalive=0` every reply carries `Connection: close` and the
   connection is closed after it, as in divid, where the connection's loop ends after the reply
   (rpcserver.cpp:1014-1017).
 
 ## KNOWN differences
 
-- **`rpcthreads=1`: a call while another client holds its connection open; `rpcthreads=2`: while two clients hold
-  theirs.** divid's threads are all taken by the held keep-alive connections, so a new client is not answered until
-  one closes (rpcserver.cpp:578-622, :755-757, :1000-1033). irondivid serves each connection on its own task and does
-  not use `-rpcthreads`, so the call is answered. Both answer once the holders close. With `rpcthreads=2` and one
-  holder, both answer.
 - **A short call while a long call runs.** divid runs a call its table does not mark thread-safe only while it holds
   cs_main, which it tries for every 50 ms (rpcserver.cpp:1072-1096). `keypoolrefill` (rpcserver.cpp:442) holds
   cs_main while it makes the keys, so `getblockcount` (rpcserver.cpp:345) comes back only after the long call.
   irondivid runs calls side by side, and its chain reads take no wallet lock, so the short call comes first.
-- **`rpcthreads=1`: a short call while a long call runs.** Both reasons above: divid's one thread serves the long
-  call's connection, and the short call also waits for cs_main. irondivid answers the short call first.
 
 No other row differs from divid.
 

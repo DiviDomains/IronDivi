@@ -1,0 +1,10 @@
+[package]
+license = "AGPL-3.0-only"
+name = "spork-seed"
+version = "0.1.0"
+edition = "2021"
+description = "Put a spork in an irondivid chain database, for regtest checks"
+
+[dependencies]
+divi-network = { path = "../../crates/divi-network" }
+divi-storage = { path = "../../crates/divi-storage" }

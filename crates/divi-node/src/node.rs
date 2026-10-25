@@ -692,7 +692,21 @@ impl Node {
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
-        let spork_manager = SporkManager::with_db(Arc::clone(&peer_manager), Arc::clone(&db));
+        let spork_manager = SporkManager::with_chain(
+            Arc::clone(&peer_manager),
+            Arc::clone(&db),
+            chain.consensus_sporks(),
+        );
+
+        // A spork 14 entry sets the relay fee and the highest fee the mempool uses
+        {
+            let (chain, mempool) = (Arc::clone(&chain), Arc::clone(&mempool));
+            spork_manager.on_tx_fee_spork(Arc::new(move || {
+                if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                    mempool.set_spork_fees(fee.min_fee_per_kb as i64, fee.max_fee as i64);
+                }
+            }));
+        }
 
         // Initialize masternode manager with database persistence
         let masternode_manager = match MasternodeManager::with_db(db.db_arc()) {
@@ -912,7 +926,9 @@ impl Node {
                 }
             }));
         }
-        let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
+        // With -alerts=0 an alert message is not read at all (main.cpp:870)
+        let alert_key = divi_network::alert::alert_key(&self.config.network.magic)
+            .filter(|_| self.config.p2p.alerts);
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
@@ -2130,7 +2146,7 @@ impl Node {
             protocol_version: self.config.network.protocol_version,
             connections: self.peer_manager.peer_count(),
             networks: vec!["ipv4".to_string(), "ipv6".to_string()],
-            relay_fee: self.config.mempool.min_relay_fee_per_kb as f64 / 100_000_000.0,
+            relay_fee: self.mempool.min_relay_fee_per_kb() as f64 / 100_000_000.0,
         }
     }
 

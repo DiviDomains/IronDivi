@@ -32,7 +32,7 @@ are stopped and their directories deleted. Needs bash and python3 (standard libr
 random for each run and kept in each node's 0600 `divi.conf`.
 
 Run with divid in both places (a directory whose `irondivid` is a link to `divid`), every row gives the same answer
-on both: each compares something divid itself does the same way each time. The 11 KNOWN rows then print FAIL
+on both: each compares something divid itself does the same way each time. The 10 KNOWN rows then print FAIL
 ("listed as KNOWN, but now the same as divid"), and nothing else does.
 
 ## Nodes and peers
@@ -89,8 +89,6 @@ Each KNOWN row checks that the difference is exactly the one below; any other ou
   the peer's version (`main.cpp:418-420`; SendMessages runs for any peer with a version, `Node.cpp:1043-1069`,
   `main.cpp:1130-1142`); irondivid sends them once the peer's verack is in. The same messages follow the verack,
   which every node sends at once.
-- `handshake: commands in the first 6 s, as a set`: irondivid also sends `sendheaders` (BIP 130) after the
-  handshake; divid has no handler for it and ignores it, unscored (`main.cpp:963-966`).
 - `handshake: version: services`, `addr_from`, and the `filteradd before filterload` and `filterclear` rows:
   irondivid offers no bloom filters, so it does not set NODE_BLOOM (4) and scores a filter message 100, as divid run
   with `-peerbloomfilters=0` does (`net.cpp:1722`, `main.cpp:892-898`). By design.

@@ -60,6 +60,7 @@ struct Args {
     debug: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
+    sysperms: bool,
     pid: Option<PathBuf>,
     export_chain: bool,
     export_start: Option<u32>,
@@ -96,7 +97,7 @@ the data directory) for whatever the command line left unset. Among them:\n  \
 -rpcpassword=<pw> -txindex -addressindex -spentindex -checkblocks=<n>\n  \
 -maxreorg=<n> -maxorphantx=<n> -minrelaytxfee=<amt> -staking\n  \
 -blockmaxsize=<n> -blockprioritysize=<n> -blockminsize=<n>\n  \
--blocknotify=<cmd> -walletnotify=<cmd>\n  \
+-blocknotify=<cmd> -walletnotify=<cmd> -alertnotify=<cmd>\n  \
 -zmqpubhashblock=<address> -zmqpubhashtx=<address>\n  \
 -zmqpubrawblock=<address> -zmqpubrawtx=<address>\n\
 IronDivi's own: -fullnode=<ip> -stakeonstaletip -stakesplitthreshold=<n>\n  \
@@ -174,6 +175,7 @@ impl Args {
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
+        self.sysperms = s.get_bool("sysperms", false);
         self.pid = path("pid");
         self.export_chain = self.cli.get_bool("export-chain", false);
         self.export_start = number("export-start")?;
@@ -291,14 +293,11 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
-    "alertnotify",
-    "alerts",
     "checklevel",
     "dbcache",
     "disablesystemnotifications",
     "dns",
     "forcednsseed",
-    "forcestart",
     "genproclimit",
     "listenonion",
     "logips",
@@ -311,9 +310,7 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "par",
     "peerbloomfilters",
     "proxyrandomize",
-    "rpcthreads",
     "shrinkdebugfile",
-    "sysperms",
     "torcontrol",
     "torpassword",
     "upnp",
@@ -325,6 +322,14 @@ const UNUSED_BY_DIVID: &[&str] = &["sendfreetransactions", "txconfirmtarget"];
 
 /// Options apply_settings reads
 const APPLIED: &[&str] = &[
+    // divid's -forcestart skips the checks it makes after a stop that was
+    // not prepared: its best block in the block index, its coin database
+    // at that block (BlockIndexLoading.cpp:267-285). irondivid writes each
+    // block's chain state in one batch, so after a kill it is at its last
+    // whole block and has no such check to skip: the option is taken as is
+    "forcestart",
+    "rpcthreads",
+    "alerts",
     "vault",
     // read by masternode_options
     "masternode",
@@ -396,6 +401,7 @@ const APPLIED: &[&str] = &[
     "utxocachesize",
     "expire",
     "blocknotify",
+    "alertnotify",
     "walletnotify",
     "zmqpubhashblock",
     "zmqpubhashtx",
@@ -420,6 +426,7 @@ const READ_ELSEWHERE: &[&str] = &[
     "debug",
     "wallet",
     "disablewallet",
+    "sysperms",
     "pid",
     "export-chain",
     "export-start",
@@ -781,6 +788,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         .get("blocknotify")
         .filter(|c| !c.is_empty())
         .map(String::from);
+    config.alertnotify = s
+        .get("alertnotify")
+        .filter(|c| !c.is_empty())
+        .map(String::from);
     config.walletnotify = s
         .get("walletnotify")
         .filter(|c| !c.is_empty())
@@ -795,6 +806,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         rawtx: zmq_address("zmqpubrawtx"),
     };
     config.vault = s.get_bool("vault", false);
+    // GetArg("-rpcthreads", 4), an atoi64 of the text (rpcserver.cpp:756)
+    if let Some(n) = s.get("rpcthreads") {
+        config.rpc.threads = settings::atoi(n);
+    }
+    config.p2p.alerts = s.get_bool("alerts", true);
 
     let mut keys: Vec<&String> = settings.keys().collect();
     keys.sort();
@@ -1747,6 +1763,7 @@ async fn run_daemon(
     if let Some(cmd) = config.blocknotify.clone() {
         spawn_block_notify(node.chain().clone(), cmd);
     }
+    spawn_version_warning(node.chain().clone(), config.alertnotify.clone());
 
     // The ZMQ notifiers, before the chain takes blocks (init.cpp:1495-1500).
     // Kept for the life of the node; none if an address cannot be bound.
@@ -1828,6 +1845,16 @@ async fn run_daemon(
             w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
             w.set_max_tx_fee(config.mempool.max_tx_fee);
+            // A spork 14 entry sets the fees the wallet's sends pay and may pay
+            {
+                let (w, chain) = (Arc::clone(w), node.chain().clone());
+                node.spork_manager().on_tx_fee_spork(Arc::new(move || {
+                    if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                        w.set_relay_fee_per_kb(fee.min_fee_per_kb as i64);
+                        w.set_max_tx_fee(fee.max_fee as i64);
+                    }
+                }));
+            }
             // -walletnotify, before the wallet catches up with the chain
             // (init.cpp:1199, before the rescan at :1242)
             if let Some(cmd) = config.walletnotify.clone() {
@@ -1946,6 +1973,11 @@ async fn run_daemon(
             if wallet_options.rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
+            } else {
+                // Divi Core scans from the wallet's stored best block, itself
+                // included (wallet.cpp:258-269, :279-313): the last block is
+                // scanned again at every start
+                divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
             }
             let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
@@ -2195,6 +2227,7 @@ async fn run_daemon(
         password: Some(rpc_password),
         keep_alive: config.rpc.keep_alive,
         rest: config.rpc.rest,
+        threads: config.rpc.threads,
     };
 
     info!("Starting RPC server on {}...", rpc_config.bind_address);
@@ -2506,6 +2539,59 @@ fn run_notify(cmd: &str, value: &str) {
             Err(e) => warn!("runCommand error: {} ({})", cmd, e),
         }
     });
+}
+
+/// -alertnotify: run the command with the warning's text, kept to Divi Core's
+/// safe characters and put in single quotes (CAlert::Notify, alert.cpp:218-235)
+fn alert_notify(cmd: &str, message: &str) {
+    const SAFE: &str =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890 .,;_-/:?@()";
+    let safe: String = message.chars().filter(|c| SAFE.contains(*c)).collect();
+    run_notify(cmd, &format!("'{safe}'"));
+}
+
+/// Divi Core's warning when most of the last 100 blocks are of a newer
+/// version than it makes (ChainTipManager.cpp:43-60): once out of initial
+/// download, with more than 50 of them above version 4 (block.h:26), the
+/// miscellaneous warning is set and -alertnotify run, once. Initial download
+/// ends, for good, at a tip less than 6 hours old (ChainSyncHelpers.cpp:42-49)
+fn spawn_version_warning(chain: Arc<divi_storage::Chain>, alertnotify: Option<String>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const CURRENT_VERSION: i32 = 4;
+    let warned = AtomicBool::new(false);
+    let synced = AtomicBool::new(false);
+    let blocks = chain.clone();
+    chain.add_tip_listener(Arc::new(move |tip| {
+        if warned.load(Ordering::SeqCst) {
+            return;
+        }
+        if !synced.load(Ordering::SeqCst) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            if blocks.is_importing() || i64::from(tip.time) < now - 6 * 60 * 60 {
+                return;
+            }
+            synced.store(true, Ordering::SeqCst);
+        }
+        let upgraded = (0..100u32)
+            .map_while(|back| tip.height.checked_sub(back))
+            .filter_map(|height| blocks.get_block_index_by_height(height).ok().flatten())
+            .filter(|index| index.version > CURRENT_VERSION)
+            .count();
+        if upgraded > 100 / 2 {
+            let message = "Warning: This version is obsolete, upgrade required!";
+            warn!(
+                "{} of last 100 blocks above version {}",
+                upgraded, CURRENT_VERSION
+            );
+            divi_rpc::warnings::set_misc_warning(message);
+            if let Some(cmd) = &alertnotify {
+                alert_notify(cmd, message);
+            }
+            warned.store(true, Ordering::SeqCst);
+        }
+    }));
 }
 
 /// -blocknotify: run the command each time the best block changes, with the
@@ -2905,6 +2991,20 @@ fn main() -> Result<()> {
     // ... and so are -testnet and -regtest together
     if args.testnet && args.regtest {
         eprintln!("Error: Invalid combination of -regtest and -testnet.");
+        std::process::exit(1);
+    }
+
+    // divid creates its files 0600 and its directories 0700 (umask 077), or
+    // with the system's umask under -sysperms, which it refuses with the
+    // wallet on (init.cpp:1378-1385)
+    #[cfg(unix)]
+    if !args.sysperms {
+        // SAFETY: umask(2) only sets this process's file-creation mask
+        unsafe { libc::umask(0o077) };
+    } else if !args.disablewallet {
+        eprintln!(
+            "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
+        );
         std::process::exit(1);
     }
 
@@ -4240,6 +4340,30 @@ mod divid_option_tests {
             .static_peers
             .contains(&"127.0.0.2:10".to_string()));
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
+    }
+
+    /// Each option is in one list only: read by apply_settings, read
+    /// elsewhere, one divid does not use, or one irondivid does not support
+    #[test]
+    fn every_option_is_in_one_list() {
+        let lists: [(&str, &[&str]); 4] = [
+            ("APPLIED", APPLIED),
+            ("READ_ELSEWHERE", READ_ELSEWHERE),
+            ("UNUSED_BY_DIVID", UNUSED_BY_DIVID),
+            ("UNSUPPORTED_OPTIONS", UNSUPPORTED_OPTIONS),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, list) in lists {
+            for key in list {
+                if let Some(first) = seen.insert(*key, name) {
+                    panic!("-{key} is in {first} and in {name}");
+                }
+            }
+        }
+        for key in ["forcestart", "rpcthreads", "alerts", "alertnotify"] {
+            assert_eq!(seen.get(key), Some(&"APPLIED"), "-{key}");
+        }
+        assert_eq!(seen.get("sysperms"), Some(&"READ_ELSEWHERE"));
     }
 
     /// -conf is relative to the data directory (Settings::GetConfigFile)

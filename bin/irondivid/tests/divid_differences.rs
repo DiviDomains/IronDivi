@@ -84,7 +84,6 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
             let mut a = args(dir.path(), rpc_port, p2p_port);
             a.push("-bogusflag=1".into());
             a.push("-dbcache=100".into());
-            a.push("-alertnotify=echo %s".into());
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_irondivid"));
             cmd.args(&a).stdout(Stdio::null()).stderr(Stdio::null());
             cmd
@@ -101,10 +100,8 @@ fn unknown_and_unsupported_options_start_with_a_log_line() {
         log.contains("Option -dbcache is not supported by irondivid; ignored"),
         "no line for the unsupported option"
     );
-    assert!(
-        log.contains("Option -alertnotify is not supported by irondivid; ignored"),
-        "no line for -alertnotify"
-    );
+    // -alertnotify is taken: irondivid runs it for its own warning
+    // (start_rpc_options.rs), so it is not named as unsupported
 }
 
 /// Start irondivid with `extra` and masternode.conf `conf`; its exit status
