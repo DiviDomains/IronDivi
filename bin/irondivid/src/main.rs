@@ -298,8 +298,23 @@ fn resolve_args(mut args: Args) -> Result<Args> {
     Ok(args)
 }
 
-/// Options divid takes that irondivid has nothing for: accepted, with a warning
+/// Options divid takes that irondivid has nothing for: accepted, with a warning.
+/// Among them divid's test aids for parts irondivid has but does not let an
+/// option change: -accountlabels (the default account's coins in every send,
+/// rpcwallet.cpp:445-467, :715), -activeversion (the masternode protocol,
+/// version.cpp:11-17), -manual_fork (two fork times, ForkActivation.cpp:50-55),
+/// -override_mnpayee (BlockIncentivesPopulator.cpp:224), -prunewalletconfs
+/// (the wallet's transactions in memory, wallet.cpp:1162-1239),
+/// -stakeupdatetime (PoSTransactionCreator.cpp:116) and -whitelisted_vault
+/// (init.cpp:1182-1191)
 const UNSUPPORTED_OPTIONS: &[&str] = &[
+    "accountlabels",
+    "activeversion",
+    "manual_fork",
+    "override_mnpayee",
+    "prunewalletconfs",
+    "stakeupdatetime",
+    "whitelisted_vault",
     "checklevel",
     "dns",
     "listenonion",

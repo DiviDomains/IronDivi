@@ -212,3 +212,27 @@ fn divid_s_silent_options_start_without_a_line() {
         assert!(!log.contains(&format!("-{o}")), "a line for -{o}: {log}");
     }
 }
+
+/// divid's test aids for parts irondivid does not let an option change are
+/// named as not supported, not as unknown (docs/divid-differences.md S2)
+#[test]
+fn divid_s_test_aids_are_named_as_not_supported() {
+    let options = [
+        "accountlabels",
+        "activeversion",
+        "manual_fork",
+        "override_mnpayee",
+        "prunewalletconfs",
+        "stakeupdatetime",
+        "whitelisted_vault",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let args: Vec<String> = options.iter().map(|o| format!("-{o}=1")).collect();
+    let (node, _) = start(dir.path(), &args);
+    drop(node);
+    let log = debug_log(dir.path());
+    for o in options {
+        let line = format!("Option -{o} is not supported by irondivid; ignored");
+        assert!(log.contains(&line), "no {line:?}: {log}");
+    }
+}
