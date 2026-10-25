@@ -23,6 +23,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const TWO_32: i64 = 1 << 32;
+const TWO_31: i64 = 1 << 31;
 
 /// POST one JSON-RPC call: the result, or the error's code and message; None
 /// while the server is not up yet
@@ -148,4 +149,57 @@ fn chain_calls_cut_heights_and_indexes_to_an_int() {
     // verifychain reads its second argument whenever it has one
     assert_eq!(node.call("verifychain", json!([4, null])), null_refused());
     assert_eq!(node.ok("verifychain", json!([4, 1])), json!(true));
+}
+
+/// createrawtransaction and signrawtransaction vouts, signtransactionwithaddresskey's
+/// input index and createmultisig's nrequired (rpcrawtransaction.cpp:420-426, :572,
+/// :726-728; rpcmisc.cpp:390)
+#[test]
+fn raw_transaction_calls_cut_indexes_to_an_int() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::mined(dir.path(), 25);
+    let (txid, vout, script, address) = node.coin();
+
+    // 2^31 is negative
+    assert_eq!(
+        node.call(
+            "createrawtransaction",
+            json!([[{"txid": txid, "vout": TWO_31}], {address.clone(): 1}])
+        ),
+        Err((-8, "Invalid parameter, vout must be positive".to_string()))
+    );
+    // 2^32 + vout is vout
+    assert_eq!(
+        node.call(
+            "createrawtransaction",
+            json!([[{"txid": txid, "vout": TWO_32 + vout}], {address.clone(): 1}])
+        ),
+        node.call(
+            "createrawtransaction",
+            json!([[{"txid": txid, "vout": vout}], {address.clone(): 1}])
+        )
+    );
+    let raw = node.ok(
+        "createrawtransaction",
+        json!([[{"txid": txid, "vout": vout}], {address.clone(): 1}]),
+    );
+    assert_eq!(
+        node.call(
+            "signrawtransaction",
+            json!([raw, [{"txid": txid, "vout": TWO_31, "scriptPubKey": script}]])
+        ),
+        Err((-22, "vout must be positive".to_string()))
+    );
+    assert_eq!(
+        node.call(
+            "signtransactionwithaddresskey",
+            json!([raw, address.clone(), null])
+        ),
+        null_refused()
+    );
+    let pubkey = node.ok("validateaddress", json!([address]))["pubkey"].clone();
+    assert_eq!(
+        node.call("createmultisig", json!([TWO_32 + 1, [pubkey.clone()]])),
+        node.call("createmultisig", json!([1, [pubkey]]))
+    );
 }

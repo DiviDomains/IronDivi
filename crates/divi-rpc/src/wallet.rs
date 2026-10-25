@@ -1981,12 +1981,16 @@ impl WalletRpc {
             }
             let txid = parse_hash_v(input.get("txid"), "txid")?;
 
-            let vout = input.get("vout").and_then(|v| v.as_i64()).ok_or_else(|| {
-                RpcError::new(
-                    codes::INVALID_PARAMETER,
-                    "Invalid parameter, missing vout key",
-                )
-            })?;
+            // vout_v.get_int() (rpcrawtransaction.cpp:420-422)
+            let vout = input
+                .get("vout")
+                .and_then(crate::protocol::json_spirit_int)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        codes::INVALID_PARAMETER,
+                        "Invalid parameter, missing vout key",
+                    )
+                })?;
             if vout < 0 {
                 return Err(RpcError::new(
                     codes::INVALID_PARAMETER,
@@ -2134,7 +2138,8 @@ impl WalletRpc {
                     &[("scriptPubKey", "str"), ("txid", "str"), ("vout", "int")],
                 )?;
                 let txid = parse_hash_v(prevtx.get("txid"), "txid")?;
-                let vout = prevtx["vout"].as_i64().unwrap_or(i64::MAX);
+                // get_int() (rpcrawtransaction.cpp:726)
+                let vout = crate::protocol::json_spirit_int(&prevtx["vout"]).unwrap_or(i64::MAX);
                 if vout < 0 {
                     return Err(RpcError::new(
                         codes::DESERIALIZATION_ERROR,

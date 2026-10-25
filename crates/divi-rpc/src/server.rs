@@ -1275,7 +1275,8 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
         // rpcrawtransaction.cpp:602
         "signrawtransaction" => &[(1, "array"), (2, "array"), (3, "str")],
         // rpcrawtransaction.cpp:566
-        "signtransactionwithaddresskey" => &[(1, "str"), (2, "int")],
+        // (the input index is read before the address, :572 then :586)
+        "signtransactionwithaddresskey" => &[(2, "int"), (1, "str")],
         // rpcmisc.cpp:277
         "spork" => &[(0, "str"), (1, "str")],
         // rpcmasternode.cpp:393
@@ -1297,7 +1298,7 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
 /// The calls whose arguments of `core_argument_types` Divi Core reads with no
 /// test for null first, so a null makes the getter throw too
 /// (rpcwallet.cpp:550, :1752, :1798-1808;
-/// rpcrawtransaction.cpp:206-207; rpcblockchain.cpp:418-420)
+/// rpcrawtransaction.cpp:206-207, :571-572; rpcblockchain.cpp:418-420)
 fn getter_reads_null(method: &str) -> bool {
     matches!(
         method,
@@ -1306,6 +1307,7 @@ fn getter_reads_null(method: &str) -> bool {
             | "getrawtransaction"
             | "listreceivedbyaccount"
             | "listreceivedbyaddress"
+            | "signtransactionwithaddresskey"
             | "verifychain"
     )
 }
@@ -1320,6 +1322,10 @@ fn core_int_arguments(method: &str) -> &'static [usize] {
         "getblockhash" | "getlotteryblockwinners" => &[0],
         "gettxout" | "getrawtransaction" => &[1],
         "verifychain" => &[0, 1],
+        // Raw transaction calls (rpcrawtransaction.cpp:572; rpcmisc.cpp:390,
+        // _createmultisig_redeemScript)
+        "signtransactionwithaddresskey" => &[2],
+        "createmultisig" | "addmultisigaddress" => &[0],
         _ => &[],
     }
 }
