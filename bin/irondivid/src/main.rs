@@ -1752,6 +1752,13 @@ async fn run_daemon(
     // Kept for the life of the node; none if an address cannot be bound.
     let _zmq = divi_node::zmq::ZmqNotifier::start(&config.zmq, node.chain(), node.mempool());
 
+    // Divi Core's last check before it starts the node: 50 MB free on the
+    // data directory's filesystem (init.cpp:1604-1605)
+    if !divi_storage::disk_space::check_disk_space(&config.data_dir, 0) {
+        divi_storage::abort::abort_node("Disk space is low!");
+        anyhow::bail!("Disk space is low!");
+    }
+
     // Start the node
     node.start().await.with_context(|| "Failed to start node")?;
 
@@ -3036,6 +3043,18 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+    // Divi Core AbortNode (ValidationState.cpp:17-27): a write the node cannot
+    // make tells the user to look at debug.log and starts the shutdown
+    let abort_tx = shutdown_tx.clone();
+    divi_storage::abort::set_handler(Box::new(move |_| {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "Error: Error: A fatal internal error occured, see debug.log for details"
+        );
+        let _ = abort_tx.send(());
+    }));
 
     // SIGHUP reopens debug.log and the node keeps running, as Divi Core does
     // (init.cpp:513-516), so a logrotate postrotate line does not stop it
