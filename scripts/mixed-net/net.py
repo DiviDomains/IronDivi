@@ -36,6 +36,9 @@ import urllib.request
 IRONDIVID, DIVID, PORT_BASE, WORK, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 SEED = int(os.environ.get("SEED", "1"))
 HOURS = float(os.environ.get("HOURS", "1"))
+# BURST=1: the 100 work blocks are mined in rotation with no wait between them, the
+# nodes racing each other, then one agreement check; the run stops there
+BURST = os.environ.get("BURST") == "1"
 NODE_IP = "127.0.0.2"
 RPC_TIMEOUT = 120
 START_TIMEOUT = 180
@@ -757,7 +760,12 @@ wait_links(NODES, EDGES)
 # 100 work blocks, spread over every node so each wallet holds coins to stake with
 for k in range(100):
     mine(NODES[k % len(NODES)])
-    wait_chain(NODES, f"work block {k + 1}")
+    if not BURST:
+        wait_chain(NODES, f"work block {k + 1}")
+if BURST:
+    wait_chain(NODES, "100 work blocks mined in rotation with no wait")
+    say(f"burst: every node agreed at height {NODES[0].rpc('getblockcount')}")
+    finish(0)
 # stake blocks past the coinbase maturity
 for k in range(25):
     mine(rng.choice(NODES))

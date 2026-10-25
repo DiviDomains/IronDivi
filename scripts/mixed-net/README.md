@@ -13,7 +13,9 @@ SEED=7 HOURS=1 OUT=/var/tmp/mn-results scripts/mixed-net/run.sh <irondivid-bin-d
   one that joins.
 - `[root]`: a fresh directory is made under it for the datadirs (default `$TMPDIR`, else `/tmp`) and deleted at the
   end.
-- `SEED` (default 1) draws every random choice; `HOURS` (default 1) is how long the traffic runs.
+- `SEED` (default 1) draws every random choice; `HOURS` (default 1) is how long the traffic runs. `BURST=1` instead
+  mines the 100 work blocks in rotation with no wait between them, the nodes racing each other, checks agreement
+  once and stops (the shortest run that showed a tip not announced; see the status of this script's first run).
 - `OUT` (default `[root]/mixed-net-results`) keeps what the run found:
   - `seed<N>.jsonl`: every step, send and snapshot;
   - `seed<N>-summary.json`: steps, blocks, transactions, reorg depths, restarts;
