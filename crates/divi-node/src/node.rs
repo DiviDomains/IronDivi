@@ -237,6 +237,19 @@ pub fn serve_getdata(
     }
 }
 
+/// A peer's message the node is handling, marked taken when dropped
+struct Taken<'a> {
+    peer_manager: &'a PeerManager,
+    peer_id: divi_network::PeerId,
+    size: u64,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.peer_manager.message_taken(self.peer_id, self.size);
+    }
+}
+
 /// Node status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -1172,9 +1185,19 @@ impl Node {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if let PeerEvent::Message { peer_id, size, .. } = &event {
-                    peer_manager.message_taken(*peer_id, *size);
-                }
+                // Taken once handled, at the end of this turn of the loop: until
+                // then it counts against the peer's receive limits, and the
+                // connection's own answers to later messages wait for it (Divi
+                // Core erases a message from vRecvMsg after ProcessMessage,
+                // main.cpp:1072-1077)
+                let _taken = match &event {
+                    PeerEvent::Message { peer_id, size, .. } => Some(Taken {
+                        peer_manager: &peer_manager,
+                        peer_id: *peer_id,
+                        size: *size,
+                    }),
+                    _ => None,
+                };
                 match event {
                     PeerEvent::Connected {
                         peer_id,
