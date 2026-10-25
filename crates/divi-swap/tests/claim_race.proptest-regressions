@@ -4,6 +4,9 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 97a46c089086481e828472017cdb7a8f278b67df285a11b80cd22073ea90aaee # shrinks to m = Market { chain: Btc, estimate: 1, delay_secs: 0, floors: [(1020, 0)], refund_feerate: 1000 }
-cc 701c1fe3623381b586bec0f4f389f72b4d130e86ece7d6e46c68a8fec7a5f999 # shrinks to m = Market { chain: Ltc, estimate: 10, delay_secs: 294, floors: [(1472, 0)], refund_feerate: 1000 }
-cc 6d92e0593dfa06cfe58ebe3416e16a92f5536f77e52a9c7643db0f27ee343844 # shrinks to m = Market { chain: Btc, estimate: 19, delay_secs: 6601, floors: [(1128, 0)], refund_feerate: 1000 }
+#
+# All three were recorded while `market()` drew refund_feerate from 1000 and shrank to a
+# 1000/vB refund. Under the 2000.. draw a seed replays as a different market, given after it.
+cc 97a46c089086481e828472017cdb7a8f278b67df285a11b80cd22073ea90aaee # recorded as Btc, estimate 1, delay 0, floors [(1020, 0)], refund 1000; replays as Market { chain: Btc, estimate: 55, delay_secs: 6675, floors: [(190, 191), (1141, 964)], refund_feerate: 2066 }
+cc 701c1fe3623381b586bec0f4f389f72b4d130e86ece7d6e46c68a8fec7a5f999 # recorded as Ltc, estimate 10, delay 294, floors [(1472, 0)], refund 1000; replays as Market { chain: Ltc, estimate: 20, delay_secs: 789, floors: 32 entries from (1558, 1304) to (1672, 50), refund_feerate: 17303 }
+cc 6d92e0593dfa06cfe58ebe3416e16a92f5536f77e52a9c7643db0f27ee343844 # recorded as Btc, estimate 19, delay 6601, floors [(1128, 0)], refund 1000; replays as Market { chain: Ltc, estimate: 6, delay_secs: 5889, floors: [(1110, 1455), (1430, 845)], refund_feerate: 19076 }
