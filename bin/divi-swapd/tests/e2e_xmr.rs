@@ -483,3 +483,128 @@ async fn garbage_forwarded_for_falls_back_to_the_socket() {
     let codes = setup_posts(&d, |i| Some(format!("not-an-ip-{i}")), n).await;
     assert_eq!(codes.last(), Some(&429), "garbage shares the socket bucket");
 }
+
+/// One honest swap's setup (`begin`: the `/j` exchanges and `/sigs`), then a status read with
+/// its own token per request: the XMR `:id` routes share one per-IP bucket, counted before the
+/// token check, and the setup leaves most of it. Fails on 7361ae6 (no limit: never 429).
+#[tokio::test]
+async fn xmr_swap_routes_share_a_per_ip_bucket() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let tdb = tmp.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+        .await
+        .unwrap();
+    let session = sessions.get(&local).unwrap();
+    let url = format!("{}/xmr/swaps/{}", d.base, session.maker_swap_id);
+    let http = reqwest::Client::new();
+    let limit = divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW;
+    let mut ok = 0;
+    let first_429 = loop {
+        let r = http
+            .get(&url)
+            .header("X-Swap-Token", &session.swap_token)
+            .send()
+            .await
+            .unwrap();
+        match r.status().as_u16() {
+            200 => ok += 1,
+            429 => break ok + 1,
+            other => panic!("status {other}"),
+        }
+        assert!(ok <= limit, "no 429 after {ok} reads");
+    };
+    // `begin` used some of the bucket (about ten `/j` and one `/sigs`); reads use the rest.
+    let used_by_setup = limit + 1 - first_429;
+    assert!(
+        (2..=66).contains(&used_by_setup),
+        "setup used {used_by_setup} of {limit}"
+    );
+}
+
+/// Token guesses: past `XMR_TOKEN_MISS_LIMIT_PER_WINDOW` misses an IP gets 429 on every XMR
+/// `:id` route, even with the right token, so it cannot keep testing tokens. Fails on 7361ae6
+/// (every guess a 404).
+#[tokio::test]
+async fn xmr_token_guesses_are_throttled() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let tdb = tmp.path().join("t.db");
+    let taker = w.taker(&tdb);
+    let client = MakerClient::new(&d.base);
+    let sessions = Sessions::beside(&tdb);
+    let local = xmr_flow::begin(&taker, &client, &sessions, "divi-xmr-stagenet", XMR_UNITS)
+        .await
+        .unwrap();
+    let session = sessions.get(&local).unwrap();
+    let url = format!("{}/xmr/swaps/{}", d.base, session.maker_swap_id);
+    let http = reqwest::Client::new();
+    let get = |token: String| {
+        let r = http.get(&url).header("X-Swap-Token", token).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    assert_eq!(get(session.swap_token.clone()).await, 200, "no miss yet");
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        assert_eq!(get(format!("{i:064x}")).await, 404, "guess {i}");
+    }
+    assert_eq!(get(format!("{misses:064x}")).await, 429, "the next guess");
+    assert_eq!(
+        get(session.swap_token.clone()).await,
+        429,
+        "even the right token, for the rest of the window"
+    );
+    let r = http
+        .post(format!("{url}/sigs"))
+        .header("X-Swap-Token", &session.swap_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 429, "every :id route");
+    // Hashlock reads are a different bucket.
+    let r = reqwest::get(format!("{}/swaps/nope", d.base))
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+}
+
+/// With `trust_proxy_headers`, a prober rotating the first `X-Forwarded-For` entry keeps the
+/// miss count of the last one.
+#[tokio::test]
+async fn spoofed_forwarded_for_cannot_reset_token_misses() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve_with(&w, &tmp.path().join("m.db"), true).await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/xmr/swaps/nope", d.base);
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    let mut codes = Vec::new();
+    for i in 0..=misses {
+        let r = http
+            .get(&url)
+            .header("x-forwarded-for", format!("203.0.113.{i}, 198.51.100.9"))
+            .header("X-Swap-Token", "0".repeat(64))
+            .send()
+            .await
+            .unwrap();
+        codes.push(r.status().as_u16());
+    }
+    assert!(
+        codes[..misses as usize].iter().all(|c| *c == 404),
+        "{codes:?}"
+    );
+    assert_eq!(codes.last(), Some(&429), "{codes:?}");
+    let r = http
+        .get(&url)
+        .header("x-forwarded-for", "198.51.100.10")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404, "another client is not throttled");
+}

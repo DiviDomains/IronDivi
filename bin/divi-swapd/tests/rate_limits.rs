@@ -23,7 +23,8 @@ use std::sync::Arc;
 use common::*;
 use divi_swap::Store;
 use divi_swapd::{
-    router_with_proxy, AppState, ScanStatus, READ_LIMIT_PER_WINDOW, WRITE_LIMIT_PER_WINDOW,
+    router_with_proxy, AppState, ScanStatus, PUBLIC_READ_LIMIT_PER_WINDOW, READ_LIMIT_PER_WINDOW,
+    WRITE_LIMIT_PER_WINDOW,
 };
 
 async fn serve_proxy(trust: bool) -> (String, tokio::task::JoinHandle<()>) {
@@ -121,7 +122,7 @@ async fn accept_and_lock_are_limited_together_and_reads_do_not_block_them() {
         429,
         "lock"
     );
-    // Unlimited routes stay open.
+    // The public reads have a bucket of their own.
     assert_eq!(hit(&c, "GET", &format!("{base}/healthz"), None).await, 200);
     assert_eq!(hit(&c, "GET", &format!("{base}/offers"), None).await, 200);
     h.abort();
@@ -187,6 +188,58 @@ async fn forwarded_for_is_ignored_without_trust_proxy_headers() {
         n,
         Some(WRITE_LIMIT_PER_WINDOW + 1),
         "one socket bucket whatever the header says"
+    );
+    h.abort();
+}
+
+/// `/healthz` and `GET /offers` share one generous public bucket, apart from the swap reads.
+/// Fails on 7361ae6, where both were unlimited.
+#[tokio::test]
+async fn healthz_and_offers_share_a_public_bucket() {
+    let (base, h) = serve_proxy(false).await;
+    let c = reqwest::Client::new();
+    let n = first_429(
+        &c,
+        "GET",
+        &format!("{base}/healthz"),
+        PUBLIC_READ_LIMIT_PER_WINDOW,
+        |_| None,
+    )
+    .await;
+    assert_eq!(
+        n,
+        Some(PUBLIC_READ_LIMIT_PER_WINDOW + 1),
+        "public bucket size"
+    );
+    assert_eq!(
+        hit(&c, "GET", &format!("{base}/offers"), None).await,
+        429,
+        "GET /offers shares it"
+    );
+    // Swap status reads are not in it.
+    assert_ne!(
+        hit(&c, "GET", &format!("{base}/swaps/nope"), None).await,
+        429
+    );
+    h.abort();
+}
+
+/// Under `trust_proxy_headers` a client changing the first `X-Forwarded-For` entry keeps the
+/// public bucket of the last one (the address the proxy wrote).
+#[tokio::test]
+async fn a_spoofed_forwarded_for_cannot_get_a_fresh_public_bucket() {
+    let (base, h) = serve_proxy(true).await;
+    let c = reqwest::Client::new();
+    let url = format!("{base}/offers");
+    let n = first_429(&c, "GET", &url, PUBLIC_READ_LIMIT_PER_WINDOW, |i| {
+        Some(format!("203.0.113.{}, 198.51.100.9", i % 250))
+    })
+    .await;
+    assert_eq!(n, Some(PUBLIC_READ_LIMIT_PER_WINDOW + 1));
+    assert_ne!(
+        hit(&c, "GET", &url, Some("203.0.113.1, 198.51.100.10")).await,
+        429,
+        "another real client has its own bucket"
     );
     h.abort();
 }

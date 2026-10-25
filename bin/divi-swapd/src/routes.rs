@@ -60,6 +60,26 @@ pub const WRITE_LIMIT_PER_WINDOW: u32 = 20;
 /// 300 is 5x the 1 s case, and a separate limiter keeps status polling from exhausting the
 /// accept/lock budget.
 pub const READ_LIMIT_PER_WINDOW: u32 = 300;
+/// Requests one IP may make per [`RATE_WINDOW`] to the public reads `GET /healthz` and
+/// `GET /offers`, in one bucket of their own. A health monitor polls every 10-60 s (1-6 a
+/// minute; `swap-watch` and a taker's `wait_ready` are in that range), the landing page makes
+/// one of each per view, and a taker one `/healthz` per poll while the scan runs. 600 is ten a
+/// second: 10x a monitor polling every second, with room for a shared proxy bucket while
+/// `trust_proxy_headers` is off. Enough to stop a flood from turning every request into chain
+/// RPCs (`/healthz` asks each chain for its tip).
+pub const PUBLIC_READ_LIMIT_PER_WINDOW: u32 = 600;
+/// Requests one IP may make per [`RATE_WINDOW`] to the token-gated XMR routes
+/// (`GET /xmr/swaps/:id`, `POST .../j`, `/sigs`, `/xmr-lock`), counted before the token is
+/// checked. An honest taker's busiest minute is the setup: at most `MAX_J_EXCHANGES` (64,
+/// about ten in practice) `/j` calls and one `/sigs`, then one `GET` per poll and at most one
+/// `/xmr-lock` beside it: 64 + 1 + 2 * 60 = 185 at `--poll-secs 1`, 77 at the default 10 s.
+pub const XMR_SWAP_LIMIT_PER_WINDOW: u32 = 300;
+/// Token misses (the 404 of a wrong, missing or other-swap token, or an unknown id) one IP may
+/// make per [`RATE_WINDOW`] on the XMR `:id` routes. Past it every XMR `:id` request from that
+/// IP is a 429 for the rest of the window, right token or not, so a prober cannot keep
+/// testing tokens. An honest taker reads its token from its own session file and never
+/// misses; 20 leaves room for an operator's typos.
+pub const XMR_TOKEN_MISS_LIMIT_PER_WINDOW: u32 = 20;
 /// Length of the fixed window [`RATE_LIMIT_PER_WINDOW`] counts in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Most distinct IPs the limiter tracks; at this many, expired windows are swept first and,
@@ -100,6 +120,14 @@ impl RateLimiter {
         e.1 += 1;
         e.1 <= self.max
     }
+
+    /// Whether `ip` has used its whole budget in the current window, without counting a request.
+    pub fn exhausted(&self, ip: IpAddr, now: Instant) -> bool {
+        self.hits
+            .lock()
+            .get(&ip)
+            .is_some_and(|(start, n)| now.duration_since(*start) < self.window && *n >= self.max)
+    }
 }
 
 /// The limiter and whether its key may come from proxy headers.
@@ -136,18 +164,42 @@ fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy_headers: boo
         .unwrap_or(peer)
 }
 
-/// 429 past the limit.
-async fn rate_limit(State(l): State<RateState>, req: Request, next: Next) -> Response {
+/// [`client_ip`] of a request, its peer taken from `ConnectInfo`.
+fn request_ip(req: &Request, trust_proxy_headers: bool) -> IpAddr {
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip());
-    let ip = client_ip(req.headers(), peer, l.trust_proxy_headers);
+    client_ip(req.headers(), peer, trust_proxy_headers)
+}
+
+fn too_many() -> Response {
+    ApiError(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()).into_response()
+}
+
+/// 429 past the limit.
+async fn rate_limit(State(l): State<RateState>, req: Request, next: Next) -> Response {
+    let ip = request_ip(&req, l.trust_proxy_headers);
     if l.limiter.allow(ip, Instant::now()) {
         next.run(req).await
     } else {
-        ApiError(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()).into_response()
+        too_many()
     }
+}
+
+/// Counts the 404s of the route it wraps per IP ([`XMR_TOKEN_MISS_LIMIT_PER_WINDOW`]); once an
+/// IP has used its misses, every request from it is a 429 until the window ends, before the
+/// token is looked at.
+async fn token_miss_limit(State(l): State<RateState>, req: Request, next: Next) -> Response {
+    let ip = request_ip(&req, l.trust_proxy_headers);
+    if l.limiter.exhausted(ip, Instant::now()) {
+        return too_many();
+    }
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::NOT_FOUND {
+        l.limiter.allow(ip, Instant::now());
+    }
+    resp
 }
 
 /// Gate for every `/xmr/swaps/:id...` route, run before the body is parsed (a 422 for a bad
@@ -358,9 +410,10 @@ pub fn router_with_auth(
     };
     let writes = bucket(WRITE_LIMIT_PER_WINDOW);
     let reads = bucket(READ_LIMIT_PER_WINDOW);
+    let public = bucket(PUBLIC_READ_LIMIT_PER_WINDOW);
     let mut api = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/offers", get(offers))
+        .route("/healthz", get(healthz).route_layer(public.clone()))
+        .route("/offers", get(offers).route_layer(public))
         .route("/offers/:id/quote", get(quote).route_layer(limited()))
         .route(
             "/swaps",
@@ -390,7 +443,18 @@ pub fn router_with_auth(
                         .route("/xmr/swaps/:id/j", post(xmr_j))
                         .route("/xmr/swaps/:id/sigs", post(xmr_sigs))
                         .route("/xmr/swaps/:id/xmr-lock", post(xmr_lock))
-                        .route_layer(middleware::from_fn_with_state(x.clone(), swap_token_gate)),
+                        .route_layer(middleware::from_fn_with_state(x.clone(), swap_token_gate))
+                        .route_layer(middleware::from_fn_with_state(
+                            RateState {
+                                limiter: Arc::new(RateLimiter::new(
+                                    XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
+                                    RATE_WINDOW,
+                                )),
+                                trust_proxy_headers,
+                            },
+                            token_miss_limit,
+                        ))
+                        .route_layer(bucket(XMR_SWAP_LIMIT_PER_WINDOW)),
                 )
                 .with_state(x),
         );
