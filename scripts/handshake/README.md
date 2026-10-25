@@ -31,8 +31,9 @@ A run takes about 3 minutes (the cases run on both nodes at once) and is stopped
 are stopped and their directories deleted. Needs bash and python3 (standard library only). RPC passwords are made at
 random for each run and kept in each node's 0600 `divi.conf`.
 
-Run with divid in both places (a directory whose `irondivid` is a link to `divid`), the script gives 0 FAIL: every
-row compares something divid itself does the same way each time.
+Run with divid in both places (a directory whose `irondivid` is a link to `divid`), every row gives the same answer
+on both: each compares something divid itself does the same way each time. The 11 KNOWN rows then print FAIL
+("listed as KNOWN, but now the same as divid"), and nothing else does.
 
 ## Nodes and peers
 
