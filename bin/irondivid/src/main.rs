@@ -294,7 +294,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alerts",
     "budgetvotemode",
     "checklevel",
-    "createwalletbackups",
     "datacarrier",
     "datacarriersize",
     "dbcache",
@@ -713,6 +712,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "spendzeroconfchange",
         "keypool",
         "upgradewallet",
+        "createwalletbackups",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1255,7 +1255,7 @@ impl WalletSeed {
 }
 
 /// Wallet start options
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
@@ -1269,6 +1269,17 @@ struct WalletOptions {
     /// -upgradewallet, read as a number: the highest wallet version a new
     /// wallet may have (wallet.cpp:1963-1971)
     upgrade_wallet: Option<i64>,
+    /// -createwalletbackups: backups kept in backups/ and monthlyBackups/ by
+    /// the backup at start, 20 by default, a negative count as 0
+    /// (init.cpp:124, :938; WalletBackupCreator.cpp:21)
+    wallet_backups: usize,
+}
+
+/// divid's defaults: the options as when none is given
+impl Default for WalletOptions {
+    fn default() -> Self {
+        WalletOptions::from_settings(&Settings::default())
+    }
 }
 
 impl WalletOptions {
@@ -1280,6 +1291,11 @@ impl WalletOptions {
                 .get("keypool")
                 .map(|v| atoi(v).clamp(1, u32::MAX as i64) as u32),
             upgrade_wallet: settings.get("upgradewallet").map(atoi),
+            wallet_backups: settings
+                .get("createwalletbackups")
+                .map_or(divi_wallet::backup::STARTUP_BACKUPS, |v| {
+                    atoi(v).max(0) as usize
+                }),
         }
     }
 
@@ -1373,7 +1389,9 @@ fn load_or_restore_wallet_with_seed(
         // Divi Core copies the wallet into backups/ (and monthlyBackups/) at
         // every start, before it opens it (init.cpp:1479)
         if let Some(data_dir) = wallet_path.parent() {
-            if let Err(e) = divi_wallet::backup::backup_at_start(wallet_path, data_dir) {
+            if let Err(e) =
+                divi_wallet::backup::backup_at_start(wallet_path, data_dir, options.wallet_backups)
+            {
                 warn!("Failed to create backup: {}", e);
             }
         }
@@ -1860,7 +1878,11 @@ async fn run_daemon(
                         let wallet = Arc::clone(&wallet_for_backup);
                         let root = root.clone();
                         let made = tokio::task::spawn_blocking(move || {
-                            divi_wallet::backup::monthly_backup(&wallet, &root)
+                            divi_wallet::backup::monthly_backup(
+                                &wallet,
+                                &root,
+                                divi_wallet::backup::MONTHLY_BACKUPS,
+                            )
                         })
                         .await;
                         match made {
