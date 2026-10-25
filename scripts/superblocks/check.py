@@ -44,8 +44,6 @@ LAST_POW = 100
 LOTTERY = [h for h in range(110, 500, 10)]
 TREASURY = [h for h in range(150, 500, 50)]
 
-ORDER = ("irondivid writes the members of a result in name order, divid in the order it adds them "
-         "(json_spirit Object); docs/divid-differences.md R6")
 KNOWN = {}
 # The field order of each reply kind: compared once, in its own row at the end
 order_seen = {}
@@ -249,7 +247,7 @@ def both(name, method, *params, core=None):
     return compare(name, method, core.call(method, *params), I.call(method, *params))
 
 
-# Reply kinds whose field order irondivid does not keep (R6), each with a row
+# Reply kinds whose field order has a row even when no difference was seen
 ORDER_KINDS = ["getlotteryblockwinners", "getblock", "getrawtransaction"]
 
 
@@ -804,6 +802,8 @@ def superblock_rows(tag=""):
             if out[0] == "ok":
                 for extra in GETBLOCK_EXTRA:
                     out[1].pop(extra, None)
+                if " order" in out[1]:
+                    out[1][" order"] = [k for k in out[1][" order"] if k not in GETBLOCK_EXTRA]
         compare(f"{p}: getblock", "getblock", core, iron)
         stake_txid = A.rpc("getblock", bh[0])["tx"][1]
         both(f"{p}: the coinstake (getrawtransaction verbose)", "getrawtransaction", stake_txid, 1)
@@ -895,7 +895,6 @@ winners_at(CHECK_HEIGHTS, "after -reindex")
 superblock_rows("after -reindex: ")
 for kind in sorted(set(order_seen) | set(ORDER_KINDS)):
     name = f"{kind}: field order"
-    KNOWN[name] = ORDER
     seen = order_seen.get(kind)
     row(name, seen[1] if seen else "same", seen[2] if seen else "same", seen is None)
 

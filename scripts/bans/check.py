@@ -77,12 +77,6 @@ KNOWN = {
     "raw peer from 127.0.0.11 again": (BAN_IP, pair(("ok", "up"), ("ok", "refused"))),
     "ban outdated with a '/IronDivi:0.2.6/' peer": (STOI, pair(("err", -1, "stoi"), ("ok", {"Banned": []}))),
     "ban outdated with a '/bans:1.2.3.4/' peer": (STOI, pair(("err", -1, "stoi"), ("ok", {"Banned": []}))),
-    "getinvalid key order": (
-        "irondivid writes every JSON object's keys in name order (serde_json without preserve_order, "
-        "Cargo.toml:67); divid in the order rpcblockchain.cpp:716-719 adds them. JSON objects are unordered "
-        "(RFC 8259 section 4)",
-        pair(("ok", ["addresses_with_invalid", "total_unspent", "total_minted", "total_valid_used"]),
-             ("ok", ["addresses_with_invalid", "total_minted", "total_unspent", "total_valid_used"]))),
 }
 
 fails = 0
@@ -643,7 +637,8 @@ facts("a ban list file in the datadir after a restart",
                                                 else n.dir) if "ban" in f.lower()))
 connect_row("raw peer from 127.0.0.40 after a restart", "127.0.0.40")
 
-# --- getinvalid (rpcblockchain.cpp:687-725): one summary, always zero ------------------
+# --- getinvalid (rpcblockchain.cpp:687-725): one summary, always zero; its keys in the
+# order rpcblockchain.cpp:716-719 adds them --------------------------------------------
 c, i = both("getinvalid", "getinvalid")
 compare("getinvalid key order", ("ok", list(c[1][0])) if c[0] == "ok" else c,
         ("ok", list(i[1][0])) if i[0] == "ok" else i)
