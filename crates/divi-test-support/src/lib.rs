@@ -46,7 +46,7 @@ pub fn free_port() -> u16 {
 
 /// The node's debug.log in `datadir` (regtest writes it there, other networks
 /// in the network's folder); empty if there is none yet
-fn read_log(datadir: &Path) -> String {
+pub fn read_log(datadir: &Path) -> String {
     std::fs::read_to_string(datadir.join("debug.log"))
         .or_else(|_| std::fs::read_to_string(datadir.join("regtest").join("debug.log")))
         .unwrap_or_default()

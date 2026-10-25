@@ -546,6 +546,13 @@ pub struct Chain {
 /// them and the chain that reads them
 pub type SharedSporks = Arc<RwLock<ConsensusSporks>>;
 
+/// An output a coinstake spends, as proof of stake reads it
+struct StakePrevout {
+    value: Amount,
+    script_pubkey: divi_primitives::script::Script,
+    height: u32,
+}
+
 /// Metadata marker: the one-time height index repair has run on this datadir.
 const HEIGHT_INDEX_REPAIR_KEY: &[u8] = b"height_index_repair_v1";
 
@@ -2083,11 +2090,25 @@ impl Chain {
             }
         }
 
-        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), then
-        // ContextualCheckBlockHeader's depth limit (ChainExtensionService.cpp:308-311).
-        // Both run for every block, whether it extends the tip or not.
+        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), which
+        // includes the proof of stake, then ContextualCheckBlockHeader's depth limit,
+        // time and version (ChainExtensionService.cpp:292-353). A block that fails the
+        // proof is refused before its time or version is looked at, so it draws no
+        // reject. The bits and the work run for every block; the proof of stake needs the
+        // UTXO set at the parent, so it runs here for a block on the tip and during a
+        // reorg for any other.
+        let extends_tip = parent_index.as_ref().is_some_and(|parent| {
+            self.tip
+                .read()
+                .as_ref()
+                .map(|t| t.hash == parent.hash)
+                .unwrap_or(true)
+        });
         if let Some(ref parent) = parent_index {
             self.check_block_work(&block, &hash, parent)?;
+            if extends_tip {
+                self.check_block_proof_of_stake(&block, parent)?;
+            }
             self.check_reorg_depth(parent.height + 1)?;
             Self::check_block_version_and_height(&block, parent.height + 1)?;
         }
@@ -2098,10 +2119,6 @@ impl Chain {
         // during reorg (connect_block). This matches C++ Divi's AcceptBlock vs ConnectTip
         // separation and allows storing competing chain blocks for proper fork selection.
         if let Some(ref parent) = parent_index {
-            let extends_tip = {
-                let tip = self.tip.read();
-                tip.as_ref().map(|t| t.hash == parent.hash).unwrap_or(true)
-            };
             if extends_tip {
                 debug!("  ├─ Full context validation (extends tip)");
                 self.check_block_context(&block, parent)?;
@@ -2117,7 +2134,7 @@ impl Chain {
                     return Err(StorageError::invalid_block_scored(
                         0,
                         format!(
-                            "block timestamp {} is not greater than median time past {}",
+                            "time-too-old: block's timestamp {} is not greater than the median time past {}",
                             block.header.time, mtp
                         ),
                     ));
@@ -3235,6 +3252,27 @@ impl Chain {
         Ok(())
     }
 
+    /// The output a proof of stake spends: the unspent output, else the output
+    /// of the transaction in the chain (Divi Core reads the transaction itself,
+    /// BlockProofVerifier.cpp:58-77)
+    fn stake_prevout(&self, outpoint: &OutPoint) -> Result<Option<StakePrevout>, StorageError> {
+        if let Some(utxo) = self.db.get_utxo(outpoint)? {
+            return Ok(Some(StakePrevout {
+                value: utxo.value,
+                script_pubkey: utxo.script_pubkey.clone(),
+                height: utxo.height,
+            }));
+        }
+        let Some((tx, height, _, _)) = self.find_transaction(&outpoint.txid)? else {
+            return Ok(None);
+        };
+        Ok(tx.vout.get(outpoint.vout as usize).map(|out| StakePrevout {
+            value: out.value,
+            script_pubkey: out.script_pubkey.clone(),
+            height,
+        }))
+    }
+
     /// Find a transaction by its hash and return (tx, height, is_coinbase, is_coinstake)
     #[allow(dead_code)]
     fn find_transaction(
@@ -3391,7 +3429,7 @@ impl Chain {
         let computed_merkle_root = compute_merkle_root(&block.transactions);
         if block.header.merkle_root != computed_merkle_root {
             return Err(StorageError::InvalidBlock(format!(
-                "merkle root mismatch: header has {}, computed {}",
+                "bad-txnmrklroot: merkle root mismatch: header has {}, computed {}",
                 block.header.merkle_root, computed_merkle_root
             )));
         }
@@ -3442,13 +3480,13 @@ impl Chain {
             return Err(StorageError::invalid_block_scored(
                 0,
                 format!(
-                    "block timestamp {} is not greater than median time past {}",
+                    "time-too-old: block's timestamp {} is not greater than the median time past {}",
                     block.header.time, mtp
                 ),
             ));
         }
 
-        self.check_block_proof_of_stake(block, parent)
+        Ok(())
     }
 
     /// The proof of stake (kernel, stake modifier, target, coin age) and the block
@@ -3885,17 +3923,19 @@ impl Chain {
             StorageError::invalid_block_scored(0, format!("Invalid coinstake: {}", e))
         })?;
 
-        // Validate all inputs pay to the same script
+        // Validate all inputs pay to the same script. As Divi Core's
+        // CheckProofOfStake reads the transaction of each input (GetTransaction,
+        // BlockProofVerifier.cpp:58-77), a coin already spent is found too; it is
+        // connecting the block that finds it spent
         let chain_ref = self;
         let get_utxo = |outpoint: &divi_primitives::OutPoint| -> Option<divi_primitives::TxOut> {
             chain_ref
-                .db
-                .get_utxo(outpoint)
+                .stake_prevout(outpoint)
                 .ok()
                 .flatten()
-                .map(|utxo| divi_primitives::TxOut {
-                    value: utxo.value,
-                    script_pubkey: utxo.script_pubkey.clone(),
+                .map(|prevout| divi_primitives::TxOut {
+                    value: prevout.value,
+                    script_pubkey: prevout.script_pubkey,
                 })
         };
 
@@ -3906,6 +3946,29 @@ impl Chain {
                     format!("Coinstake inputs validation failed: {}", e),
                 )
             })?;
+
+        // Divi Core verifies the kernel's signature under POS_SCRIPT_VERIFY_FLAGS
+        // before the kernel itself, and a failure scores nothing
+        // (BlockProofVerifier.cpp:76-77)
+        if let Some(kernel) = self.stake_prevout(&coinstake.vin[0].prevout)? {
+            verify_input_with_flags(
+                coinstake,
+                0,
+                &kernel.script_pubkey,
+                kernel.value,
+                ScriptFlags::pos(),
+            )
+            .map_err(|e| {
+                StorageError::invalid_block_scored(
+                    0,
+                    format!(
+                        "VerifySignature failed on coinstake {} ({})",
+                        self.compute_txid(coinstake),
+                        e.core_message()
+                    ),
+                )
+            })?;
+        }
 
         let expected_stake_reward = coinstake_stake_reward(
             &self.block_rewards(parent.height + 1),
@@ -3927,7 +3990,7 @@ impl Chain {
         let kernel_input = &coinstake.vin[0];
 
         // Get UTXO being staked
-        let kernel_utxo = self.db.get_utxo(&kernel_input.prevout)?.ok_or_else(|| {
+        let kernel_utxo = self.stake_prevout(&kernel_input.prevout)?.ok_or_else(|| {
             StorageError::invalid_block_scored(
                 0,
                 format!(
@@ -4408,10 +4471,15 @@ impl Chain {
                         if utxo.is_coinbase || utxo.is_coinstake {
                             let depth = i64::from(height) - i64::from(utxo.height);
                             if depth < i64::from(self.params.coinbase_maturity) {
-                                return Err(StorageError::InvalidBlock(format!(
-                                    "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
-                                    depth, utxo.is_coinstake, txid
-                                )));
+                                // Divi Core refuses it with state.Invalid, which scores
+                                // nothing (UtxoCheckingAndUpdating.cpp:75-83)
+                                return Err(StorageError::invalid_block_scored(
+                                    0,
+                                    format!(
+                                        "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}, coinstake={} (tx {})",
+                                        depth, utxo.is_coinstake, txid
+                                    ),
+                                ));
                             }
                         }
                         value_in += utxo.value;
@@ -6824,6 +6892,142 @@ mod tests {
         assert!(utxo.is_coinbase);
         assert_eq!(utxo.height, 1);
         assert_eq!(utxo.value.as_sat(), 1250_00000000);
+    }
+
+    /// Spending a coinbase or a coinstake output before it matures refuses the
+    /// block, and scores the peer nothing: Divi Core gives it state.Invalid, not
+    /// state.DoS (UtxoCheckingAndUpdating.cpp:75-83)
+    #[test]
+    fn spending_an_immature_coinbase_refuses_the_block_without_a_score() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+
+        let mut spending_block = create_child_block(hash1, block1.header.time);
+        spending_block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![TxOut::new(
+                Amount::from_sat(1249_00000000),
+                Script::new_p2pkh(&[0x99; 20]),
+            )],
+            lock_time: 0,
+        });
+        seal(&mut spending_block);
+        let err = chain.accept_block(spending_block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bad-txns-premature-spend-of-coinbase"),
+            "{err}"
+        );
+        assert_eq!(err.misbehaviour_score(), 0);
+    }
+
+    /// A coinstake whose first input has a signature that does not check is
+    /// refused before the kernel is looked at, with no score: Divi Core's
+    /// CheckProofOfStake verifies the script first (BlockProofVerifier.cpp:76-77).
+    /// Connecting the block would have scored it 100.
+    #[test]
+    fn a_coinstake_with_a_damaged_kernel_signature_scores_nothing() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        let mut block = create_child_block(hash1, block1.header.time);
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        assert!(block.is_proof_of_stake());
+        let parent = chain.tip().unwrap();
+        let err = chain.validate_proof_of_stake(&block, &parent).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
+        assert_eq!(err.misbehaviour_score(), 0);
+    }
+
+    /// A coinstake may stake a coin the chain no longer holds unspent: Divi Core
+    /// reads the transaction of the kernel (GetTransaction,
+    /// BlockProofVerifier.cpp:58-77), so such a block gets as far as connecting,
+    /// where it fails for the missing input and scores 100. It was refused while
+    /// its proof was checked, as an unknown kernel, with no score.
+    #[test]
+    fn a_proof_of_stake_reads_a_coin_that_is_spent() {
+        let (chain, _dir) = create_test_chain();
+        let genesis = chain
+            .get_block(&chain.tip().unwrap().hash)
+            .unwrap()
+            .unwrap();
+        // The genesis coinbase is in a block but not in the UTXO set
+        let outpoint = OutPoint::new(chain.compute_txid(&genesis.transactions[0]), 0);
+        assert!(!chain.has_utxo(&outpoint).unwrap());
+        let found = chain
+            .stake_prevout(&outpoint)
+            .unwrap()
+            .expect("the output is found");
+        assert_eq!(found.value, genesis.transactions[0].vout[0].value);
+        assert_eq!(found.height, 0);
+        assert!(chain
+            .stake_prevout(&OutPoint::new(Hash256::from_bytes([7; 32]), 0))
+            .unwrap()
+            .is_none());
+    }
+
+    /// Divi Core checks the proof of a block (bits, work or stake) before the
+    /// block's version and time (AcceptBlock, ChainExtensionService.cpp:441-493:
+    /// CheckWork first, then ContextualCheckBlockHeader), and a proof that fails
+    /// draws no reject. A block that fails both is therefore refused for its proof.
+    #[test]
+    fn a_block_failing_its_proof_is_refused_before_its_version_is_looked_at() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        let mut block = create_child_block(hash1, block1.header.time);
+        block.transactions[0].vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        seal(&mut block);
+        block.header.version = 2;
+        let err = chain.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
+        assert_eq!(err.block_reject(), None);
     }
 
     #[test]

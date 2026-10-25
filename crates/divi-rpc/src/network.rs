@@ -67,6 +67,14 @@ impl NetworkRpc {
         // :163-167)
         let ipv6_reachable = local.iter().any(|a| a.address.is_ipv6());
         let ipv4_reachable = ipv6_reachable || local.iter().any(|a| a.address.is_ipv4());
+        // -onlynet: the networks it left out are limited, and a limited
+        // network is not reachable (rpcnet.cpp:323-324,
+        // NetworkLocalAddressHelpers.cpp:163-167)
+        let limited = |net| pm.is_some_and(|pm| pm.local_addresses().is_net_limited(net));
+        let (ipv4_limited, ipv6_limited) = (
+            limited(divi_network::local::Network::Ipv4),
+            limited(divi_network::local::Network::Ipv6),
+        );
 
         Ok(serde_json::json!({
             "version": format!("{}.0", env!("CARGO_PKG_VERSION")),
@@ -80,15 +88,15 @@ impl NetworkRpc {
             "networks": [
                 {
                     "name": "ipv4",
-                    "limited": false,
-                    "reachable": ipv4_reachable,
+                    "limited": ipv4_limited,
+                    "reachable": ipv4_reachable && !ipv4_limited,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
                 {
                     "name": "ipv6",
-                    "limited": false,
-                    "reachable": ipv6_reachable,
+                    "limited": ipv6_limited,
+                    "reachable": ipv6_reachable && !ipv6_limited,
                     "proxy": proxy,
                     "proxy_randomize_credentials": false
                 },
