@@ -90,6 +90,24 @@ impl Daemon {
     fn rpc_with(&self, method: &str, params: Value) -> Value {
         try_rpc(self.rpc_port, method, params).unwrap_or_else(|| panic!("{method}"))
     }
+
+    /// The whole reply, an error included
+    fn reply(&self, method: &str, params: Value) -> Value {
+        let mut s = TcpStream::connect(("127.0.0.1", self.rpc_port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+        let body =
+            json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAuthorization: Basic dGVzdDp0ZXN0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        let start = resp.find("\r\n\r\n").expect("reply") + 4;
+        serde_json::from_str(&resp[start..]).expect("JSON reply")
+    }
 }
 
 impl Drop for Daemon {
@@ -361,4 +379,32 @@ fn the_wallet_receives_on_the_adjusted_clock() {
         (before + 1795..=unix_now() + 1805).contains(&received),
         "timereceived {received}, clock {before}"
     );
+}
+
+/// The mempool takes a transaction locked to a time once the adjusted clock is
+/// past it (IsFinalTx with GetAdjustedTime, MempoolConsensus.cpp:61,
+/// TransactionFinalityHelpers.cpp:16-17)
+#[test]
+fn the_mempool_reads_lock_times_on_the_adjusted_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers = ahead(&d, 60, 1800);
+    d.rpc_with("setgenerate", json!([101]));
+    let coin = d.rpc_with("listunspent", json!([]))[0].clone();
+    let to = d.rpc("getnewaddress");
+    let amount = (coin["amount"].as_f64().unwrap() * 1e8).round() as i64 - 100_000;
+    let raw = d.rpc_with(
+        "createrawtransaction",
+        json!([[{"txid": coin["txid"], "vout": coin["vout"]}], {to.as_str().unwrap(): amount as f64 / 1e8}]),
+    );
+    let raw = raw.as_str().unwrap();
+    // A non-final input (sequence 0) and a lock time 10 minutes ahead of the clock
+    let (body, _) = raw.split_at(raw.len() - 8);
+    let body = body.replacen("00ffffffff", "0000000000", 1);
+    let lock = u32::try_from(unix_now() + 600).unwrap();
+    let raw = format!("{body}{}", hex::encode(lock.to_le_bytes()));
+    let signed = d.rpc_with("signrawtransaction", json!([raw]));
+    assert_eq!(signed["complete"], json!(true), "{signed}");
+    let reply = d.reply("sendrawtransaction", json!([signed["hex"]]));
+    assert!(reply["error"].is_null(), "{reply}");
 }
