@@ -672,7 +672,26 @@ impl Node {
             } else {
                 Vec::new()
             },
-            seed_nodes: config.p2p.seednode.clone(),
+            // A -seednode host name is looked up only with -dns, as a
+            // -connect one (ProcessOneShot, net.cpp:1071-1084, dials it by
+            // name: ConnectSocketByName, netbase.cpp:631-660)
+            seed_nodes: config
+                .p2p
+                .seednode
+                .iter()
+                .filter(|s| {
+                    let numeric = s.parse::<std::net::SocketAddr>().is_ok()
+                        || s.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok();
+                    if !numeric && proxy.is_none() && !config.p2p.name_lookup {
+                        tracing::info!("Peer {} is a host name and -dns=0: not resolved", s);
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect(),
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)

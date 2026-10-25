@@ -373,6 +373,31 @@ fn dns_off_does_not_dial_a_peer_host_name() {
     }
 }
 
+/// Whether a -seednode peer named by host name is dialled: with -dns it is
+/// resolved and dialled, with -dns=0 not (ProcessOneShot, net.cpp:1071-1084;
+/// ConnectSocketByName, netbase.cpp:631-660)
+#[test]
+fn dns_off_does_not_dial_a_seednode_host_name() {
+    for (dns, dialled) in [("-dns=1", true), ("-dns=0", false)] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let seednode = format!(
+            "-seednode=localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let node = up(dir.path(), &[dns, seednode.as_str()]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut got = false;
+        while !got && Instant::now() < deadline {
+            got = listener.accept().is_ok();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        drop(node);
+        assert_eq!(got, dialled, "{dns}");
+    }
+}
+
 /// With a proxy a peer host name goes to the proxy unresolved, whatever -dns
 /// says (net.cpp:1221-1236, netbase.cpp:654-660)
 #[test]
