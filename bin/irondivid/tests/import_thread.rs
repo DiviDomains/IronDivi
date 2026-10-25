@@ -152,21 +152,26 @@ fn rpc_answers_while_a_block_file_is_imported() {
     // The RPC server must answer while the file is still unwritten: a node
     // that does not is stopped by `start`, which fails with its log
     let node = Daemon::start(&datadir, &[format!("-loadblock={}", fifo.display())]);
-
-    let writer = std::thread::spawn(move || {
-        let mut pipe = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        pipe.write_all(&file).unwrap();
-    });
+    // Asked before the writer starts: once the file is written a fast import
+    // could already be done, so this is the only moment the height says
+    // anything about the order
     assert_eq!(
         node.rpc("getblockcount", json!([])),
         0,
         "imported before the file was written"
     );
-    writer.join().unwrap();
+
+    let writer = std::thread::spawn(move || {
+        let mut pipe = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        pipe.write_all(&file).unwrap();
+    });
     assert!(
         node.height_reaches(15, 60),
         "the block file was not imported"
     );
+    // Joined only once the node has read the file: a writer still waiting for
+    // a reader would never return
+    writer.join().unwrap();
     node.stop();
 }
 
