@@ -322,3 +322,83 @@ fn onion_peer_goes_through_the_onion_proxy() {
         seen.lock().unwrap()
     );
 }
+
+fn exit_text(datadir: &Path, extra: &[&str]) -> String {
+    match start(datadir, extra) {
+        Started::Exited(code, text) => {
+            assert_ne!(code, 0, "{extra:?}");
+            text
+        }
+        Started::Up(_) => panic!("{extra:?}: started"),
+    }
+}
+
+/// With -dns=0 a host name is not looked up: a -proxy or -externalip host
+/// name stops the start (net.cpp:1759, :1767-1771, :1834-1839)
+#[test]
+fn dns_off_refuses_host_names_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = exit_text(dir.path(), &["-dns=0", "-proxy=localhost:9"]);
+    assert!(
+        text.contains("Invalid -proxy address or hostname: 'localhost:9'"),
+        "{text}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let text = exit_text(dir.path(), &["-dns=0", "-externalip=localhost"]);
+    assert!(
+        text.contains("Cannot resolve -externalip address: 'localhost'"),
+        "{text}"
+    );
+}
+
+/// Whether a -connect peer named by host name is dialled: with -dns it is
+/// resolved and dialled, with -dns=0 not (ConnectSocketByName,
+/// netbase.cpp:640-652)
+#[test]
+fn dns_off_does_not_dial_a_peer_host_name() {
+    for (dns, dialled) in [("-dns=1", true), ("-dns=0", false)] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let connect = format!(
+            "-connect=localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let node = up(dir.path(), &[dns, connect.as_str()]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut got = false;
+        while !got && Instant::now() < deadline {
+            got = listener.accept().is_ok();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        drop(node);
+        assert_eq!(got, dialled, "{dns}");
+    }
+}
+
+/// With a proxy a peer host name goes to the proxy unresolved, whatever -dns
+/// says (net.cpp:1221-1236, netbase.cpp:654-660)
+#[test]
+fn proxy_gets_a_peer_host_name() {
+    for dns in ["-dns=1", "-dns=0"] {
+        let (socks, seen) = socks5_stand_in();
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = format!("-proxy=127.0.0.1:{socks}");
+        let node = up(
+            dir.path(),
+            &[dns, proxy.as_str(), "-connect=localhost:51476"],
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        drop(node);
+        let got = seen.lock().unwrap().clone();
+        assert!(!got.is_empty(), "{dns}: nothing reached the proxy");
+        assert!(
+            got.iter()
+                .all(|(_, atyp, d)| *atyp == 3 && d == "localhost"),
+            "{dns}: {got:?}"
+        );
+    }
+}

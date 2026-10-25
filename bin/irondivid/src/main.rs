@@ -296,7 +296,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "checklevel",
     "dbcache",
     "disablesystemnotifications",
-    "dns",
     "forcednsseed",
     "forcestart",
     "genproclimit",
@@ -363,6 +362,7 @@ const APPLIED: &[&str] = &[
     "proxy",
     "proxyrandomize",
     "onion",
+    "dns",
     "discover",
     "externalip",
     "protocolversion",
@@ -634,11 +634,14 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.p2p.proxy_randomize = s.get_bool("proxyrandomize", true);
     // -onion=<ip:port>, -onion=0 / -noonion (net.cpp:1785-1800)
     config.p2p.onion = s.get("onion").map(str::to_string);
+    // GetBoolArg("-dns", DEFAULT_NAME_LOOKUP): host names are looked up only
+    // with it (net.cpp:1759)
+    config.p2p.name_lookup = s.get_bool("dns", true);
     config.p2p.discover = s.get_bool("discover", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
     for raw in s.get_multi("externalip") {
-        let addr = resolve_service(raw, config.p2p.port)
+        let addr = resolve_service(raw, config.p2p.port, config.p2p.name_lookup)
             .filter(|a| divi_network::local::is_valid(&a.ip()))
             .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
         config.p2p.external_ips.push(addr);
@@ -888,7 +891,11 @@ fn is_spork_key(wif: &str, mainnet: bool, spork: &[u8]) -> bool {
 
 /// A host with an optional port, as Divi Core's CService reads it: `ip`,
 /// `ip:port`, `[ipv6]:port`, or a name, with `default_port` when none is given
-fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+fn resolve_service(
+    text: &str,
+    default_port: u16,
+    name_lookup: bool,
+) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
     let text = text.trim();
     if let Ok(addr) = text.parse::<SocketAddr>() {
@@ -896,6 +903,10 @@ fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr
     }
     if let Ok(ip) = text.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Some(SocketAddr::new(ip, default_port));
+    }
+    // A host name only with -dns (CService(strAddr, port, fNameLookup))
+    if !name_lookup {
+        return None;
     }
     let (host, port) = match text.rsplit_once(':') {
         Some((h, p)) if !h.contains(':') => (h, p.parse().ok()?),

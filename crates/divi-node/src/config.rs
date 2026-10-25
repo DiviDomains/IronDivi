@@ -437,6 +437,12 @@ pub struct P2pConfig {
     #[serde(default)]
     pub onion: Option<String>,
 
+    /// Resolve host names given for -proxy, -onion, -externalip, -addnode and
+    /// -connect (Divi Core's `-dns`, on by default; net.cpp:1759). Off, only
+    /// addresses are read; a peer name still goes to the proxy, if one is set.
+    #[serde(default = "default_name_lookup")]
+    pub name_lookup: bool,
+
     /// Connection timeout in milliseconds (Divi Core's -timeout)
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
@@ -484,7 +490,7 @@ impl P2pConfig {
         else {
             return Ok(None);
         };
-        lookup_proxy(raw, "proxy").map(Some)
+        lookup_proxy(raw, "proxy", self.name_lookup).map(Some)
     }
 
     /// The `onion` setting: unset or empty (onion peers go through `-proxy`, if
@@ -494,7 +500,7 @@ impl P2pConfig {
         match self.onion.as_deref().map(str::trim) {
             None | Some("") => Ok(OnionSetting::Unset),
             Some("0") => Ok(OnionSetting::Off),
-            Some(raw) => lookup_proxy(raw, "onion").map(OnionSetting::Proxy),
+            Some(raw) => lookup_proxy(raw, "onion", self.name_lookup).map(OnionSetting::Proxy),
         }
     }
 }
@@ -511,15 +517,19 @@ pub enum OnionSetting {
 }
 
 /// A `-proxy` or `-onion` value as divid's Lookup reads it: `ip:port`,
-/// `host:port`, or a bare IP or host with the Tor port 9050; else "Invalid
-/// -<option> address or hostname: '<value>'" (net.cpp:1767-1771, :1790-1794)
-fn lookup_proxy(raw: &str, option: &str) -> Result<SocketAddr, String> {
+/// `host:port`, or a bare IP or host with the Tor port 9050, a host only with
+/// `name_lookup`; else "Invalid -<option> address or hostname: '<value>'"
+/// (net.cpp:1767-1771, :1790-1794)
+fn lookup_proxy(raw: &str, option: &str, name_lookup: bool) -> Result<SocketAddr, String> {
     let invalid = || format!("Invalid -{option} address or hostname: '{raw}'");
     if let Ok(addr) = raw.parse::<SocketAddr>() {
         return Ok(addr);
     }
     if let Ok(ip) = raw.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, 9050));
+    }
+    if !name_lookup {
+        return Err(invalid());
     }
     use std::net::ToSocketAddrs;
     let with_port = if raw.contains(':') {
@@ -532,6 +542,10 @@ fn lookup_proxy(raw: &str, option: &str) -> Result<SocketAddr, String> {
         .ok()
         .and_then(|mut a| a.next())
         .ok_or_else(invalid)
+}
+
+fn default_name_lookup() -> bool {
+    true
 }
 
 fn default_proxy_randomize() -> bool {
@@ -575,6 +589,7 @@ impl Default for P2pConfig {
             proxy: None,
             proxy_randomize: default_proxy_randomize(),
             onion: None,
+            name_lookup: default_name_lookup(),
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),

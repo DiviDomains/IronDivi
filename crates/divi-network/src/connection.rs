@@ -162,6 +162,79 @@ impl Connection {
             }
         };
 
+        Self::outbound(
+            addr,
+            stream,
+            magic,
+            our_height,
+            our_services,
+            event_tx,
+            shutdown_rx,
+            total_bytes_sent,
+            total_bytes_recv,
+            local_nonces,
+            local,
+        )
+    }
+
+    /// Connect to `host:port` through `proxy`, the proxy resolving `host` (Divi
+    /// Core's ConnectSocketByName with a name proxy, netbase.cpp:631-660). The
+    /// peer's address is 0.0.0.0:0, as divid has none for it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_named(
+        host: &str,
+        port: u16,
+        proxy: crate::socks5::Proxy,
+        magic: Magic,
+        our_height: u32,
+        our_services: u64,
+        event_tx: broadcast::Sender<PeerEvent>,
+        shutdown_rx: broadcast::Receiver<()>,
+        total_bytes_sent: Arc<AtomicU64>,
+        total_bytes_recv: Arc<AtomicU64>,
+        local_nonces: LocalNonces,
+        local: Arc<crate::local::LocalAddresses>,
+    ) -> Result<(Self, PeerHandle), NetworkError> {
+        info!(
+            "Connecting to peer {}:{} via proxy {}",
+            host, port, proxy.addr
+        );
+        let stream = timeout(
+            connect_timeout(),
+            crate::socks5::connect_to_name(proxy, host, port),
+        )
+        .await
+        .map_err(|_| NetworkError::Timeout)??;
+        Self::outbound(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            stream,
+            magic,
+            our_height,
+            our_services,
+            event_tx,
+            shutdown_rx,
+            total_bytes_sent,
+            total_bytes_recv,
+            local_nonces,
+            local,
+        )
+    }
+
+    /// The connection on an open outbound stream to `addr`
+    #[allow(clippy::too_many_arguments)]
+    fn outbound(
+        addr: SocketAddr,
+        stream: TcpStream,
+        magic: Magic,
+        our_height: u32,
+        our_services: u64,
+        event_tx: broadcast::Sender<PeerEvent>,
+        shutdown_rx: broadcast::Receiver<()>,
+        total_bytes_sent: Arc<AtomicU64>,
+        total_bytes_recv: Arc<AtomicU64>,
+        local_nonces: LocalNonces,
+        local: Arc<crate::local::LocalAddresses>,
+    ) -> Result<(Self, PeerHandle), NetworkError> {
         // Set TCP options
         stream.set_nodelay(true)?;
 

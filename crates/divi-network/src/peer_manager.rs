@@ -48,6 +48,10 @@ pub struct PeerManagerConfig {
     pub dns_seeds: Vec<String>,
     /// Static peers to connect to
     pub static_peers: Vec<SocketAddr>,
+    /// `-connect` and `-addnode` peers given by host name while a proxy is set:
+    /// dialled through `proxy` by name, the proxy resolving them (Divi Core
+    /// ConnectSocketByName with a name proxy, netbase.cpp:631-660; net.cpp:1221-1236)
+    pub named_peers: Vec<(String, u16)>,
     /// Listen address for inbound connections
     pub listen_addr: Option<SocketAddr>,
     /// Default P2P port for DNS seed resolution
@@ -146,6 +150,7 @@ impl Default for PeerManagerConfig {
                 "178.62.221.33:51472".parse().unwrap(),
                 "178.128.251.20:51472".parse().unwrap(),
             ],
+            named_peers: Vec::new(),
             listen_addr: None,
             default_port: 51472, // Mainnet P2P port
             proxy: None,
@@ -193,6 +198,9 @@ pub struct PeerManager {
     /// The onion network's proxy and whether onion is reachable, which the Tor
     /// controller changes once it has authenticated (torcontrol.cpp:533-541)
     tor: RwLock<(Option<crate::socks5::Proxy>, bool)>,
+    /// Named peers connected (the peer each one is) and being dialled
+    named_connected: RwLock<HashMap<String, PeerId>>,
+    named_dialling: RwLock<HashSet<String>>,
     /// Added nodes, in the order they were added: -addnode, then the addnode
     /// RPC (Divi Core's vAddedNodes list, net.cpp:1218)
     added_nodes: RwLock<Vec<SocketAddr>>,
@@ -244,6 +252,8 @@ impl PeerManager {
             local_nonces: Default::default(),
             local_addresses: RwLock::new(Arc::new(Default::default())),
             tor: RwLock::new(tor),
+            named_connected: RwLock::new(HashMap::new()),
+            named_dialling: RwLock::new(HashSet::new()),
             added_nodes: RwLock::new(Vec::new()),
             connecting_addrs: RwLock::new(HashSet::new()),
             total_bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -792,6 +802,7 @@ impl PeerManager {
         for handle in static_handles {
             let _ = handle.await;
         }
+        self.dial_named();
 
         // Then addresses learnt from peers, then DNS seeds
         self.dial_learnt();
@@ -1084,6 +1095,82 @@ impl PeerManager {
             self_clone.scoring.unregister_peer(peer_id);
         });
 
+        Ok(peer_id)
+    }
+
+    /// Dial each named peer that is neither connected nor being dialled,
+    /// through the proxy by name
+    fn dial_named(self: &Arc<Self>) {
+        let Some(proxy) = self.config.proxy else {
+            return;
+        };
+        for (host, port) in self.config.named_peers.clone() {
+            if !self.can_connect_outbound() {
+                break;
+            }
+            let key = format!("{host}:{port}");
+            let connected = self
+                .named_connected
+                .read()
+                .get(&key)
+                .is_some_and(|id| self.peers.read().contains_key(id));
+            if connected || !self.named_dialling.write().insert(key.clone()) {
+                continue;
+            }
+            let self_clone = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(e) = Arc::clone(&self_clone)
+                    .connect_to_named(&host, port, proxy)
+                    .await
+                {
+                    debug!(
+                        "Failed to connect to {}:{} via the proxy: {}",
+                        host, port, e
+                    );
+                }
+                self_clone.named_dialling.write().remove(&key);
+            });
+        }
+    }
+
+    /// Dial `host:port` through `proxy` by name
+    async fn connect_to_named(
+        self: Arc<Self>,
+        host: &str,
+        port: u16,
+        proxy: crate::socks5::Proxy,
+    ) -> Result<PeerId, NetworkError> {
+        let (conn, handle) = Connection::connect_named(
+            host,
+            port,
+            proxy,
+            self.config.magic,
+            self.current_height(),
+            self.services(),
+            self.event_tx.clone(),
+            self.shutdown_tx.subscribe(),
+            self.bytes_sent_counter(),
+            self.bytes_recv_counter(),
+            Arc::clone(&self.local_nonces),
+            self.local_addresses(),
+        )
+        .await?;
+        let peer_id = handle.id;
+        let addr = handle.addr;
+        self.scoring.register_peer(peer_id, addr.ip());
+        self.scoring.reset_connection_failures(peer_id);
+        self.peers.write().insert(peer_id, handle);
+        self.named_connected
+            .write()
+            .insert(format!("{host}:{port}"), peer_id);
+        let self_clone = Arc::clone(&self);
+        tokio::spawn(async move {
+            if let Err(e) = conn.run().await {
+                debug!("Connection to {} ended: {}", addr, e);
+            }
+            self_clone.peers.write().remove(&peer_id);
+            self_clone.scoring.unregister_peer(peer_id);
+        });
         Ok(peer_id)
     }
 
@@ -1520,10 +1607,13 @@ impl PeerManager {
                 }
             }
 
-            // 3. Addresses learnt from peers
+            // 3. Peers named by host name, through the proxy
+            self.dial_named();
+
+            // 4. Addresses learnt from peers
             self.dial_learnt();
 
-            // 4. Re-query DNS seeds as last resort
+            // 5. Re-query DNS seeds as last resort
             if self.can_connect_outbound() && !self.config.dns_seeds.is_empty() {
                 info!("Re-querying DNS seeds for peers");
                 Arc::clone(&self).discover_peers().await;

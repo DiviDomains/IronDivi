@@ -598,6 +598,8 @@ impl Node {
             };
         // -timeout for outbound connections
         divi_network::set_connect_timeout_ms(config.p2p.connect_timeout_ms);
+        // -connect and -addnode host names that go to the proxy by name
+        let mut named_peers: Vec<(String, u16)> = Vec::new();
         let peer_manager_config = PeerManagerConfig {
             max_outbound: config.p2p.max_outbound,
             max_inbound: config.p2p.max_inbound,
@@ -617,12 +619,16 @@ impl Node {
                     {
                         return Some(addr);
                     }
-                    // If that fails, try to resolve as hostname:port
+                    // A host name: given to the proxy, which resolves it, when
+                    // one is set; resolved here only with -dns
+                    // (ConnectSocketByName, netbase.cpp:631-660)
                     if proxy.is_some() {
-                        tracing::warn!(
-                            "Resolving peer {} with local DNS, outside the proxy; give an IP address to avoid this",
-                            s
-                        );
+                        named_peers.push(host_and_port(s, config.network.default_p2p_port()));
+                        return None;
+                    }
+                    if !config.p2p.name_lookup {
+                        tracing::info!("Peer {} is a host name and -dns=0: not resolved", s);
+                        return None;
                     }
                     use std::net::ToSocketAddrs;
                     match s.to_socket_addrs() {
@@ -649,6 +655,7 @@ impl Node {
             proxy,
             tor_proxy,
             tor_reachable,
+            named_peers,
             connect_only: !config.p2p.connect.is_empty(),
             whitelist: config
                 .p2p
@@ -2519,6 +2526,18 @@ pub fn update_mempool_after_reorg(
         offered,
         dropped
     );
+}
+
+/// A `host[:port]` peer as its host and port, `default_port` when none is
+/// given (SplitHostPort)
+fn host_and_port(text: &str, default_port: u16) -> (String, u16) {
+    match text.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => match port.parse() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (text.to_string(), default_port),
+        },
+        _ => (text.to_string(), default_port),
+    }
 }
 
 /// Divi Core `MAX_STANDARD_TX_SIZE` (defaultValues.h:54)
