@@ -268,10 +268,8 @@ impl PeerManager {
         if self.config.connect_only {
             return;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // GetAdjustedTime (net.cpp:1147)
+        let now = divi_primitives::clock::adjusted_now();
         let mut slots = self.config.max_outbound;
         while slots > 0 && self.can_connect_outbound() {
             slots -= 1;

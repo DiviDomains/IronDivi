@@ -429,3 +429,63 @@ fn the_version_to_an_inbound_peer_is_on_the_adjusted_clock() {
         "version time {time}, clock {before}"
     );
 }
+
+/// Addresses dated 20 minutes ahead of the clock are no more than 10 minutes
+/// ahead of the adjusted clock, so they keep their time; on the local clock
+/// they would be taken as five days old (main.cpp:536-542). Kept less the two
+/// hours' penalty of an address another peer names (addrman.cpp)
+#[test]
+fn addr_times_are_read_on_the_adjusted_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers = ahead(&d, 90, 1800);
+    let mut s = peer(&d, 95, 1800);
+    // Ten addresses: a getaddr answer is 23% of the book (addrman GetAddr_)
+    let time = u32::try_from(unix_now() + 1200).unwrap();
+    let ips: Vec<[u8; 16]> = (1..=10u8)
+        .map(|k| Ipv4Addr::new(8, 8, k, 4).to_ipv6_mapped().octets())
+        .collect();
+    let mut addr = vec![ips.len() as u8];
+    for ip in &ips {
+        addr.extend_from_slice(&time.to_le_bytes());
+        addr.extend_from_slice(&1u64.to_le_bytes());
+        addr.extend_from_slice(ip);
+        addr.extend_from_slice(&51476u16.to_be_bytes());
+    }
+    s.write_all(&frame("addr", &addr)).unwrap();
+    // Asked from another connection, the node gives some back with their times
+    let deadline = Instant::now() + WAIT;
+    let mut n = 96;
+    loop {
+        let mut q = peer(&d, n, 1800);
+        n += 1;
+        q.write_all(&frame("getaddr", &[])).unwrap();
+        q.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut header = [0u8; 24];
+        let mut got = None;
+        while got.is_none() && q.read_exact(&mut header).is_ok() {
+            let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            q.read_exact(&mut payload).unwrap();
+            if &header[4..8] == b"addr" {
+                got = Some(payload);
+            }
+        }
+        if let Some(reply) = got {
+            let kept: Vec<u32> = (0..reply[0] as usize)
+                .map(|k| &reply[1 + 30 * k..1 + 30 * (k + 1)])
+                .filter(|e| ips.iter().any(|ip| e[12..28] == ip[..]))
+                .map(|e| u32::from_le_bytes(e[..4].try_into().unwrap()))
+                .collect();
+            if !kept.is_empty() {
+                let day = 24 * 60 * 60;
+                assert!(
+                    kept.iter().all(|&k| i64::from(k) > unix_now() - day),
+                    "kept as {kept:?}, sent as {time}"
+                );
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "no address given back");
+    }
+}

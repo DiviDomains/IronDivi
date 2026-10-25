@@ -1372,15 +1372,17 @@ impl Node {
                                         "Requested too many addresses",
                                     );
                                 } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as u32)
-                                        .unwrap_or(0);
+                                    // Addresses are dated on the network-adjusted
+                                    // clock (main.cpp:536), the day's peers picked
+                                    // on the node's own (net.cpp:1508)
+                                    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
+                                    let day_now = divi_primitives::clock::now().max(0) as u32;
                                     let got = peer_manager.gossip().received(
                                         peer_id,
                                         &addrs,
                                         &peer_manager.connected_peers(),
                                         now,
+                                        day_now,
                                     );
                                     if let Some(from) = peer_manager.peer_addr(peer_id) {
                                         peer_manager.address_book().add(&got.keep, from.ip());
