@@ -82,6 +82,32 @@ fn change_script_template() -> Script {
 /// Smallest change output worth creating. Less than this would be dust, which
 /// no node relays, so it goes to the fee instead, as in Divi Core. Change always
 /// pays a P2PKH address.
+/// Adds the change output, taking a change key only when there is change
+/// worth an output; smaller change goes to the fee, as in Core.
+fn add_change_output(
+    builder: TransactionBuilder,
+    wallet: &WalletDb,
+    change_amount: Amount,
+    min_output: Amount,
+) -> Result<TransactionBuilder, Error> {
+    if change_amount < min_output {
+        if change_amount > Amount::ZERO {
+            debug!(
+                "change of {} sat is below the dust limit and goes to the fee",
+                change_amount.as_sat()
+            );
+        }
+        return Ok(builder);
+    }
+    let change_addr = wallet.new_change_address().map_err(|e| {
+        RpcError::new(
+            codes::WALLET_ERROR,
+            format!("Failed to generate change address: {}", e),
+        )
+    })?;
+    Ok(builder.add_output_to_address(change_amount, &change_addr))
+}
+
 fn min_change_value() -> Amount {
     TxOut::new(Amount::ZERO, Script::new_p2pkh(&[0; 20]))
         .min_non_dust_value(DEFAULT_MIN_RELAY_FEE_PER_KB)
@@ -1453,9 +1479,7 @@ impl WalletRpc {
 
         // Add change output if significant
         let change_amount = total_input - send_amount - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
+        builder = add_change_output(builder, &wallet, change_amount, min_output)?;
 
         let (mut tx, prev_scripts) = builder.build();
 
@@ -2535,14 +2559,6 @@ impl WalletRpc {
             .into());
         }
 
-        // Get change address
-        let change_addr = wallet.new_change_address().map_err(|e| {
-            RpcError::new(
-                codes::WALLET_ERROR,
-                format!("Failed to generate change address: {}", e),
-            )
-        })?;
-
         // Build the transaction
         let mut builder = TransactionBuilder::new();
 
@@ -2557,9 +2573,7 @@ impl WalletRpc {
 
         // Add change output if significant
         let change_amount = total_input - send_amount - fee;
-        if change_amount >= min_output {
-            builder = builder.add_output_to_address(change_amount, &change_addr);
-        }
+        builder = add_change_output(builder, &wallet, change_amount, min_output)?;
 
         let (mut tx, prev_scripts) = builder.build();
 
@@ -3236,7 +3250,10 @@ impl WalletRpc {
             })?;
 
             outputs.push((addr, amount));
-            total_send += amount;
+            total_send = total_send
+                .checked_add(amount)
+                .filter(|t| *t <= MAX_MONEY)
+                .ok_or_else(|| RpcError::new(codes::TYPE_ERROR, "Invalid amount"))?;
         }
 
         if outputs.is_empty() {
@@ -5708,6 +5725,41 @@ mod send_unlock_regression {
             err(rpc.wallet_passphrase_change(&p(vec![json!("not it"), json!("new")]))),
             incorrect
         );
+    }
+
+    #[test]
+    fn node18_send_without_change_takes_no_change_key() {
+        let to = address(8, Network::Testnet);
+        // Exactly the coin less the 3000 sat fee, and 3000 sat of dust change
+        for left in [3000i64, 6000] {
+            let (rpc, db, sent) = funded_rpc();
+            let (_, before) = db.keystore().get_indices();
+            let amount = (1_000_000_000i64 - left) as f64 / 100_000_000.0;
+            rpc.send_to_address(&p(vec![json!(to), json!(amount)]))
+                .unwrap();
+            assert_eq!(sent.lock()[0].vout.len(), 1);
+            assert_eq!(db.keystore().get_indices().1, before, "left {}", left);
+        }
+        // With real change a change key is still taken
+        let (rpc, db, sent) = funded_rpc();
+        let (_, before) = db.keystore().get_indices();
+        rpc.send_to_address(&p(vec![json!(to), json!(1.0)]))
+            .unwrap();
+        assert_eq!(sent.lock()[0].vout.len(), 2);
+        assert_eq!(db.keystore().get_indices().1, before + 1);
+    }
+
+    #[test]
+    fn node17_sendmany_total_above_max_money_is_refused() {
+        let (rpc, _, sent) = funded_rpc();
+        let mut outputs = serde_json::Map::new();
+        outputs.insert(address(8, Network::Testnet), json!(MAX_MONEY.as_divi()));
+        outputs.insert(address(9, Network::Testnet), json!(MAX_MONEY.as_divi()));
+        assert_eq!(
+            err(rpc.send_many(&p(vec![json!(""), serde_json::Value::Object(outputs)]))),
+            (codes::TYPE_ERROR, "Invalid amount".to_string())
+        );
+        assert!(sent.lock().is_empty());
     }
 
     #[test]
