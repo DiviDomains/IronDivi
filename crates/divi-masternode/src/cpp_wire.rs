@@ -231,6 +231,14 @@ impl CppPing {
         })
     }
 
+    /// `GetHash`: the input and the time, double SHA-256 (MasternodePing.cpp:23-29)
+    pub fn hash(&self) -> [u8; 32] {
+        let mut data = Vec::with_capacity(60);
+        self.vin.encode(&mut data);
+        data.extend_from_slice(&self.sig_time.to_le_bytes());
+        double_sha256(&data)
+    }
+
     /// Serialize exactly like `CDataStream << CMasternodePing` (an `mnp` payload)
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(150);
@@ -298,6 +306,15 @@ impl CppBroadcast {
         self.last_ping.encode(&mut out);
         out.extend_from_slice(&self.tier.to_le_bytes());
         out
+    }
+
+    /// `GetHash`: the time and the collateral key, double SHA-256
+    /// (masternode.cpp:255-261)
+    pub fn hash(&self) -> [u8; 32] {
+        let mut data = Vec::with_capacity(42);
+        data.extend_from_slice(&self.sig_time.to_le_bytes());
+        write_varbytes(&mut data, &self.pubkey_collateral);
+        double_sha256(&data)
     }
 
     /// Parse a broadcast; the whole input must be consumed

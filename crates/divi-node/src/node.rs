@@ -921,6 +921,9 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
+            // The peers known to have each masternode item: it came from them
+            // in an inv, or went to them in one (CNode::setInventoryKnown)
+            let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
             while let Ok(event) = peer_events.recv().await {
                 match event {
                     PeerEvent::Connected {
@@ -1047,13 +1050,15 @@ impl Node {
                                 }
                                 let masternode_items: Vec<_> = items
                                     .iter()
+                                    .filter(|i| masternode_inv_kind(i.inv_type).is_some())
                                     .filter(|i| {
-                                        matches!(
-                                            i.inv_type,
-                                            divi_network::message::InvType::MasternodeAnnounce
-                                                | divi_network::message::InvType::MasternodePing
-                                                | divi_network::message::InvType::MasternodeWinner
-                                        )
+                                        masternode_items_known
+                                            .entry(*i.hash.as_bytes())
+                                            .or_default()
+                                            .insert(peer_id);
+                                        let kind = masternode_inv_kind(i.inv_type).unwrap();
+                                        !masternode_list.has(kind, i.hash.as_bytes())
+                                            && !masternode_votes.is_known(i.hash.as_bytes())
                                     })
                                     .filter(|i| masternode_items_asked.insert(i.hash))
                                     .cloned()
@@ -1131,6 +1136,35 @@ impl Node {
                                             match spork_manager.spork_by_hash(&item.hash) {
                                                 Some(spork) => {
                                                     let msg = NetworkMessage::Spork(spork);
+                                                    let _ = peer_manager
+                                                        .send_block_to_peer(peer_id, msg)
+                                                        .await;
+                                                }
+                                                None => not_found.push(item),
+                                            }
+                                        }
+                                        // A masternode broadcast, ping or vote taken
+                                        // is sent, else named in the notfound
+                                        // (main.cpp:190-198)
+                                        divi_network::InvType::MasternodeAnnounce
+                                        | divi_network::InvType::MasternodePing
+                                        | divi_network::InvType::MasternodeWinner => {
+                                            let hash = item.hash.as_bytes();
+                                            let msg = match item.inv_type {
+                                                divi_network::InvType::MasternodeAnnounce => {
+                                                    masternode_list
+                                                        .seen_broadcast(hash)
+                                                        .map(NetworkMessage::MasternodeBroadcast)
+                                                }
+                                                divi_network::InvType::MasternodePing => masternode_list
+                                                    .seen_ping(hash)
+                                                    .map(NetworkMessage::MasternodePing),
+                                                _ => masternode_votes
+                                                    .winner_bytes(hash)
+                                                    .map(NetworkMessage::MasternodeWinner),
+                                            };
+                                            match msg {
+                                                Some(msg) => {
                                                     let _ = peer_manager
                                                         .send_block_to_peer(peer_id, msg)
                                                         .await;
@@ -1217,6 +1251,12 @@ impl Node {
                                         }
                                     }
                                 }
+                                relay_masternode_items(
+                                    &peer_manager,
+                                    &mut masternode_items_known,
+                                    masternode_list.take_relays(),
+                                )
+                                .await;
                             }
                             NetworkMessage::MasternodePing(payload) => {
                                 if let Err(e) = masternode_list.accept_ping(&chain, &payload) {
@@ -1229,16 +1269,30 @@ impl Node {
                                         peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
                                     }
                                 }
+                                relay_masternode_items(
+                                    &peer_manager,
+                                    &mut masternode_items_known,
+                                    masternode_list.take_relays(),
+                                )
+                                .await;
                             }
                             // A payment vote, counted when it passes Divi Core's
-                            // checks and then passed on, as ProcessMasternodeWinners
+                            // checks and then announced, as ProcessMasternodeWinners
                             // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
                                 match masternode_votes.accept(&chain, &masternode_list, &payload) {
-                                    Ok(true) => peer_manager.broadcast_except(
-                                        NetworkMessage::MasternodeWinner(payload),
-                                        peer_id,
-                                    ),
+                                    Ok(true) => {
+                                        let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
+                                            .map(|w| w.hash());
+                                        if let Ok(hash) = hash {
+                                            relay_masternode_items(
+                                                &peer_manager,
+                                                &mut masternode_items_known,
+                                                vec![(divi_rpc::mn_list::INV_WINNER, hash)],
+                                            )
+                                            .await;
+                                        }
+                                    }
                                     Ok(false) => {}
                                     Err(e) => tracing::debug!(
                                         "Masternode winner from peer {} not taken: {}",
@@ -2129,6 +2183,44 @@ pub fn accept_relayed_transaction(
         Err(e) => score_relayed_refusal(peers, event, e),
     }
     result
+}
+
+/// The masternode inv kinds (mn_list's INV_*) of an inv type
+fn masternode_inv_kind(inv_type: divi_network::InvType) -> Option<u32> {
+    match inv_type {
+        divi_network::InvType::MasternodeWinner => Some(divi_rpc::mn_list::INV_WINNER),
+        divi_network::InvType::MasternodeAnnounce => Some(divi_rpc::mn_list::INV_BROADCAST),
+        divi_network::InvType::MasternodePing => Some(divi_rpc::mn_list::INV_PING),
+        _ => None,
+    }
+}
+
+/// Announce masternode items as RelayInv does: an inv to every peer that does
+/// not know the item yet, the peer that sent it included unless it announced
+/// it (net.cpp:1617-1624, CNode::PushInventory)
+async fn relay_masternode_items(
+    peers: &PeerManager,
+    known: &mut HashMap<[u8; 32], HashSet<u64>>,
+    items: Vec<(u32, [u8; 32])>,
+) {
+    if known.len() > 100_000 {
+        known.clear();
+    }
+    for (kind, hash) in items {
+        let inv_type = match kind {
+            divi_rpc::mn_list::INV_WINNER => divi_network::InvType::MasternodeWinner,
+            divi_rpc::mn_list::INV_BROADCAST => divi_network::InvType::MasternodeAnnounce,
+            _ => divi_network::InvType::MasternodePing,
+        };
+        let knows = known.entry(hash).or_default();
+        for peer in peers.connected_peers() {
+            if knows.insert(peer) {
+                let inv =
+                    NetworkMessage::Inv(vec![divi_network::InvItem::new(inv_type, Hash256(hash))]);
+                let _ = peers.send_to_peer(peer, inv).await;
+            }
+        }
+    }
 }
 
 /// The misbehaviour score of a refused relayed transaction, charged to the

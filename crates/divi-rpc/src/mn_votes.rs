@@ -57,6 +57,12 @@ impl MasternodeVotes {
         self.winners.read().contains_key(hash)
     }
 
+    /// A vote taken, by hash, as an `mnw` payload (ShareMasternodeWinnerWithPeer,
+    /// MasternodeModule.cpp:329-338)
+    pub fn winner_bytes(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.winners.read().get(hash).map(|(w, _)| w.encode())
+    }
+
     /// A vote from a peer, checked as Divi Core checks one
     /// (CheckMasternodeWinnerCandidate, CheckMasternodeWinnerValidity,
     /// masternode-payments.cpp:203-331), then counted. Ok(true) when it was

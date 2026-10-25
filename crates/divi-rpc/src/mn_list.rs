@@ -22,7 +22,8 @@ use divi_primitives::transaction::OutPoint;
 use divi_storage::{Chain, NetworkType};
 use divi_wallet::address::Address;
 use divi_wallet::Network;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// MASTERNODE_MIN_CONFIRMATIONS (masternode.h:16)
@@ -122,10 +123,22 @@ const MISMATCHED_VIN: &str = "Mismatched pubkey and vin for masternode";
 const INVALID_PING: &str = "Invalid masternode ping";
 const PING_FAILED: &str = "Ping update failed";
 
+/// The inv types of masternode messages (protocol.h:136-144)
+pub const INV_WINNER: u32 = 7;
+pub const INV_BROADCAST: u32 = 14;
+pub const INV_PING: u32 = 15;
+
 #[derive(Default)]
 pub struct MasternodeList {
     entries: RwLock<Vec<NetworkMasternode>>,
     path: RwLock<Option<PathBuf>>,
+    /// The broadcasts and pings taken, by hash, which a peer may ask for
+    /// (mapSeenMasternodeBroadcast, mapSeenMasternodePing)
+    seen_broadcasts: RwLock<HashMap<[u8; 32], CppBroadcast>>,
+    seen_pings: RwLock<HashMap<[u8; 32], CppPing>>,
+    /// Invs to relay, as CMasternodeBroadcast::Relay and CMasternodePing::Relay
+    /// leave them for every peer (masternode.cpp:241-245, MasternodePing.cpp:17-21)
+    relays: Mutex<Vec<(u32, [u8; 32])>>,
 }
 
 fn now() -> i64 {
@@ -196,6 +209,9 @@ impl MasternodeList {
     }
 
     fn accept_decoded(&self, chain: &Chain, mnb: CppBroadcast, now: i64) -> Result<bool, Refusal> {
+        if self.seen_broadcasts.read().contains_key(&mnb.hash()) {
+            return Ok(false);
+        }
         // CheckMasternodeBroadcastContext (masternodeman.cpp:232-265)
         if mnb.sig_time > now + 3600 {
             return Err(Refusal::scored(
@@ -251,6 +267,13 @@ impl MasternodeList {
                             && check_ping(chain, &e.mnb, Some(&last_ping), &ping, now).is_ok()
                         {
                             e.mnb.last_ping = ping;
+                            self.record_ping(&e.mnb);
+                            self.relays.lock().push((INV_PING, e.mnb.last_ping.hash()));
+                        }
+                        // Relayed when enabled, but not kept as seen
+                        // (masternodeman.cpp:296-303)
+                        if e.is_enabled(now) {
+                            self.relays.lock().push((INV_BROADCAST, mnb.hash()));
                         }
                         changed = true;
                     }
@@ -308,6 +331,13 @@ impl MasternodeList {
         if existing_enabled {
             return Ok(changed);
         }
+        self.seen_broadcasts.write().insert(mnb.hash(), mnb.clone());
+        self.record_ping(&mnb);
+        // Relayed unless its address is private or local, on regtest always
+        // (masternodeman.cpp:495-499)
+        if chain.network_type() == NetworkType::Regtest || !is_private_or_local(&mnb.ip) {
+            self.relays.lock().push((INV_BROADCAST, mnb.hash()));
+        }
         {
             let mut entries = self.entries.write();
             entries.retain(|e| e.outpoint() != outpoint);
@@ -320,6 +350,42 @@ impl MasternodeList {
         Ok(true)
     }
 
+    /// recordLastPing: the masternode's last ping is seen, and so is the
+    /// broadcast it belongs to with that ping (MasternodeNetworkMessageManager.cpp:246-256)
+    fn record_ping(&self, mnb: &CppBroadcast) {
+        self.seen_pings
+            .write()
+            .insert(mnb.last_ping.hash(), mnb.last_ping.clone());
+        if let Some(seen) = self.seen_broadcasts.write().get_mut(&mnb.hash()) {
+            seen.last_ping = mnb.last_ping.clone();
+        }
+    }
+
+    /// The invs left to relay since the last call
+    pub fn take_relays(&self) -> Vec<(u32, [u8; 32])> {
+        std::mem::take(&mut *self.relays.lock())
+    }
+
+    /// A broadcast taken, by hash, as an `mnb` payload (ShareMasternodeBroadcastWithPeer)
+    pub fn seen_broadcast(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.seen_broadcasts.read().get(hash).map(|m| m.encode())
+    }
+
+    /// A ping taken, by hash, as an `mnp` payload (ShareMasternodePingWithPeer)
+    pub fn seen_ping(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.seen_pings.read().get(hash).map(|p| p.to_bytes())
+    }
+
+    /// Whether a broadcast or ping of this inv type and hash was taken
+    /// (AlreadyHave, main.cpp:157-162)
+    pub fn has(&self, inv_type: u32, hash: &[u8; 32]) -> bool {
+        match inv_type {
+            INV_BROADCAST => self.seen_broadcasts.read().contains_key(hash),
+            INV_PING => self.seen_pings.read().contains_key(hash),
+            _ => false,
+        }
+    }
+
     /// A ping from a peer: taken for an enabled masternode in the list when
     /// it passes CheckAndUpdatePing: its time, not too early after the last
     /// ping, signed by the masternode key, naming a known block at most 24
@@ -327,6 +393,9 @@ impl MasternodeList {
     /// ping was taken.
     pub fn accept_ping(&self, chain: &Chain, payload: &[u8]) -> Result<bool, Refusal> {
         let ping = CppPing::decode_bytes(payload).map_err(|e| format!("{e:?}"))?;
+        if self.seen_pings.read().contains_key(&ping.hash()) {
+            return Ok(false);
+        }
         let now = now();
         {
             let mut entries = self.entries.write();
@@ -344,6 +413,8 @@ impl MasternodeList {
                 ..r
             })?;
             e.mnb.last_ping = ping;
+            self.record_ping(&e.mnb);
+            self.relays.lock().push((INV_PING, e.mnb.last_ping.hash()));
         }
         self.save();
         Ok(true)
@@ -541,6 +612,16 @@ impl MasternodeList {
             .take(check_num)
             .position(|(_, h)| h == vin_hash)
             .map(|i| i + 1)
+    }
+}
+
+/// CNetAddr::IsRFC1918() || IsLocal() for a masternode's address
+/// (netbase.cpp): 10/8, 172.16/12, 192.168/16, 127/8, 0/8 and ::1
+fn is_private_or_local(ip: &[u8; 16]) -> bool {
+    let v6 = std::net::Ipv6Addr::from(*ip);
+    match v6.to_ipv4_mapped() {
+        Some(v4) => v4.is_private() || v4.is_loopback() || v4.octets()[0] == 0,
+        None => v6.is_loopback(),
     }
 }
 

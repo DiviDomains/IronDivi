@@ -575,3 +575,53 @@ fn refusals_carry_divids_misbehaviour_scores() {
     assert_eq!(ping(now(), &mn_key), Ok(true));
     assert_eq!(ping(now() + 60, &mn_key).unwrap_err().dos, 0);
 }
+
+/// A broadcast or ping taken is kept by hash for peers that ask for it and
+/// left to relay by inv, once; a broadcast seen before is not taken again
+/// (masternodeman.cpp:420-426, :486-499, :504-517;
+/// MasternodeNetworkMessageManager.cpp:236-266)
+#[test]
+fn taken_items_are_kept_and_left_to_relay() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+    use divi_rpc::mn_list::{INV_BROADCAST, INV_PING};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now();
+    mnb.last_ping.sig_time = now() - 3000;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.take_relays(), vec![]);
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    assert_eq!(n.list.take_relays(), vec![(INV_BROADCAST, mnb.hash())]);
+    assert_eq!(n.list.seen_broadcast(&mnb.hash()), Some(mnb.encode()));
+    assert!(n.list.has(INV_BROADCAST, &mnb.hash()));
+    assert!(n.list.has(INV_PING, &mnb.last_ping.hash()));
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(false));
+    assert_eq!(n.list.take_relays(), vec![]);
+
+    let mut ping = CppPing {
+        vin: mnb.vin.clone(),
+        block_hash: recent,
+        sig_time: now(),
+        signature: vec![],
+    };
+    ping.sign(&mn_key).unwrap();
+    assert_eq!(n.list.accept_ping(&n.chain, &ping.to_bytes()), Ok(true));
+    assert_eq!(n.list.take_relays(), vec![(INV_PING, ping.hash())]);
+    assert_eq!(n.list.seen_ping(&ping.hash()), Some(ping.to_bytes()));
+    assert_eq!(n.list.accept_ping(&n.chain, &ping.to_bytes()), Ok(false));
+    assert_eq!(n.list.take_relays(), vec![]);
+    // The broadcast a peer gets carries the last ping (recordLastPing)
+    let shared = CppBroadcast::decode(&n.list.seen_broadcast(&mnb.hash()).unwrap()).unwrap();
+    assert_eq!(shared.last_ping, ping);
+}
