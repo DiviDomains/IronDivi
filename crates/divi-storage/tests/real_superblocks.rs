@@ -89,8 +89,7 @@ fn old_treasury_check(network: NetworkType, block: &Block, height: u32) -> Resul
         let last = coinstake
             .vout
             .iter()
-            .filter(|o| o.script_pubkey == *script)
-            .next_back()
+            .rfind(|o| o.script_pubkey == *script)
             .map(|o| o.value);
         match last {
             None => return Err(format!("missing {name} payment")),
