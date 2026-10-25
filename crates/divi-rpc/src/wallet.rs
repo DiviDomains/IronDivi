@@ -1212,7 +1212,7 @@ impl WalletRpc {
             "immature_balance": divi_immature,
             "spendable_balance": spendable.as_divi_f64(),
             "vaulted_balance": vaulted.as_divi_f64(),
-            "txcount": wallet.get_transactions(None).len(),
+            "txcount": wallet.history_records().len(),
             "keypoolsize": wallet.keypool_size(),
         });
         // Core sends unlocked_until only for an encrypted wallet; clients such
