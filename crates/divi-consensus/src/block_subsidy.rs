@@ -16,6 +16,7 @@
 // - Reward distribution (stakers, masternodes, treasury, charity, lottery)
 // - Weighted calculation for treasury/lottery payments crossing halving boundaries
 
+use crate::spork_values::ConsensusSporks;
 use divi_primitives::{Amount, ChainMode};
 
 /// Halving interval: 60 * 24 * 365 = 525,600 blocks (~1 year at 1 minute/block)
@@ -102,12 +103,36 @@ fn block_subsidy(height: u32, halving_interval: u32) -> i64 {
 /// This calculates the **per-block** portions of each reward type.
 /// For treasury/charity, the actual payment on treasury blocks requires weighted calculation.
 pub fn get_block_subsidy(height: u32, halving_interval: u32) -> BlockRewards {
-    let subsidy = block_subsidy(height, halving_interval);
+    get_block_subsidy_with(height, halving_interval, None)
+}
+
+/// What consensus reads of sporks 13 and 15: their entries, and the time of the
+/// block at a height (Divi Core `CSporkManager::GetBlockTime`, spork.cpp:84-88)
+pub struct SporkView<'a> {
+    pub sporks: &'a ConsensusSporks,
+    pub block_time: &'a dyn Fn(u32) -> i64,
+}
+
+/// [`get_block_subsidy`] with the network's sporks: spork 15 sets the whole block
+/// value and spork 13 the split of what is left after the lottery part
+/// (LegacyBlockSubsidies.cpp:30-112)
+pub fn get_block_subsidy_with(
+    height: u32,
+    halving_interval: u32,
+    sporks: Option<&SporkView>,
+) -> BlockRewards {
+    let default_subsidy = Amount::from_divi(block_subsidy(height, halving_interval));
+    let subsidy = sporks
+        .and_then(|v| {
+            v.sporks
+                .full_block_value(height, halving_interval, (v.block_time)(height))
+        })
+        .unwrap_or(default_subsidy);
 
     // POW blocks (height <= 100): no distribution
     if height <= LAST_POW_BLOCK {
         return BlockRewards {
-            stake: Amount::from_divi(subsidy),
+            stake: subsidy,
             masternode: Amount::ZERO,
             treasury: Amount::ZERO,
             charity: Amount::ZERO,
@@ -116,29 +141,29 @@ pub fn get_block_subsidy(height: u32, halving_interval: u32) -> BlockRewards {
         };
     }
 
-    // Subtract lottery allocation (50 DIVI per block after height 101)
-    let lottery = LOTTERY_PER_BLOCK;
-    let distributable = subsidy - lottery;
+    // Subtract lottery allocation (50 DIVI per block after height 101). Divi
+    // Core asserts the value is at least that (LegacyBlockSubsidies.cpp:56); a
+    // spork value below it is not used here rather than stopping the node.
+    let lottery = Amount::from_divi(LOTTERY_PER_BLOCK);
+    let subsidy = if subsidy < lottery {
+        default_subsidy
+    } else {
+        subsidy
+    };
+    let distributable = subsidy.as_sat() - lottery.as_sat();
 
-    // Default reward distribution (sporks can override, but we use defaults):
-    // - Stakers: 38%
-    // - Masternodes: 45%
-    // - Treasury: 16%
-    // - Charity: 1%
-    // - Proposals: 0%
-    let stake = (distributable * 38) / 100;
-    let masternode = (distributable * 45) / 100;
-    let treasury = (distributable * 16) / 100;
-    let charity = distributable / 100;
-    let proposals = 0;
+    // Reward distribution:
+    // stakers 38%, masternodes 45%, treasury 16%, proposals 0%, charity 1%
+    let (stake, masternode, treasury, proposals, charity) = (38, 45, 16, 0, 1);
+    let part = |percent: i32| Amount::from_sat((distributable * percent as i64) / 100);
 
     BlockRewards {
-        stake: Amount::from_divi(stake),
-        masternode: Amount::from_divi(masternode),
-        treasury: Amount::from_divi(treasury),
-        charity: Amount::from_divi(charity),
-        lottery: Amount::from_divi(lottery),
-        proposals: Amount::from_divi(proposals),
+        stake: part(stake),
+        masternode: part(masternode),
+        treasury: part(treasury),
+        charity: part(charity),
+        lottery,
+        proposals: part(proposals),
     }
 }
 
@@ -168,7 +193,18 @@ pub fn get_block_subsidy_for_chain(
     height: u32,
     halving_interval: u32,
 ) -> BlockRewards {
-    let mut rewards = get_block_subsidy(height, halving_interval);
+    get_block_subsidy_for_chain_with(chain_mode, is_mainnet, height, halving_interval, None)
+}
+
+/// [`get_block_subsidy_for_chain`] with the network's sporks
+pub fn get_block_subsidy_for_chain_with(
+    chain_mode: ChainMode,
+    is_mainnet: bool,
+    height: u32,
+    halving_interval: u32,
+    sporks: Option<&SporkView>,
+) -> BlockRewards {
+    let mut rewards = get_block_subsidy_with(height, halving_interval, sporks);
     if height == 1 {
         rewards.stake = Amount::from_divi(premine_for_chain(chain_mode, is_mainnet));
     }
@@ -217,12 +253,23 @@ pub fn calculate_weighted_treasury_payment(
     cycle_length: u32,
     halving_interval: u32,
 ) -> (Amount, Amount) {
+    calculate_weighted_treasury_payment_with(height, cycle_length, halving_interval, None)
+}
+
+/// [`calculate_weighted_treasury_payment`] with the network's sporks, which set
+/// the per-block rewards at both heights
+pub fn calculate_weighted_treasury_payment_with(
+    height: u32,
+    cycle_length: u32,
+    halving_interval: u32,
+    sporks: Option<&SporkView>,
+) -> (Amount, Amount) {
     // Get prior treasury block height
     let prior_treasury_height = if height <= cycle_length {
         // First treasury block: accumulate full cycle length
         // C++ uses cycle_length blocks, not height - start_block
         // This is verified against actual mainnet block 10081
-        let current_rewards = get_block_subsidy(height, halving_interval);
+        let current_rewards = get_block_subsidy_with(height, halving_interval, sporks);
         let blocks = cycle_length as i64;
         return (
             current_rewards.treasury * blocks,
@@ -233,8 +280,8 @@ pub fn calculate_weighted_treasury_payment(
     };
 
     // Get per-block rewards at both heights
-    let prior_rewards = get_block_subsidy(prior_treasury_height, halving_interval);
-    let current_rewards = get_block_subsidy(height, halving_interval);
+    let prior_rewards = get_block_subsidy_with(prior_treasury_height, halving_interval, sporks);
+    let current_rewards = get_block_subsidy_with(height, halving_interval, sporks);
 
     // Calculate halving boundary
     // numberOfSubsidyIntervals = nHeight / SubsidyHalvingInterval()

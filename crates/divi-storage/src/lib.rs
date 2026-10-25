@@ -76,9 +76,9 @@ pub use address_index::{AddressHistoryEntry, AddressIndex, AddressUtxo, TxIndexE
 pub use block_index::{BlockIndex, BlockStatus};
 pub use chain::{
     bip34_height_script, check_lottery_payments, check_transaction, check_treasury_payments,
-    treasury_payments_due, AcceptBlockResult, BlockListener, Chain, ChainEvent, ChainParams,
-    ChainTip, ChainTipStatus, HeightIndexAudit, NetworkType, SharedSporks, TipListener,
-    TreasuryDue,
+    treasury_payments_due, treasury_payments_due_with, AcceptBlockResult, BlockListener, Chain,
+    ChainEvent, ChainParams, ChainTip, ChainTipStatus, HeightIndexAudit, NetworkType, SharedSporks,
+    TipListener, TreasuryDue,
 };
 pub use database::{ChainDatabase, UtxoStats};
 pub use difficulty::{get_next_work_required, DifficultyParams};
