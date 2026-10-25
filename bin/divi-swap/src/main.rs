@@ -172,58 +172,25 @@ struct Cli {
     /// Highest feerate a maker-leg claim on CHAIN ever pays, as `CHAIN=FEERATE` (base unit per
     /// vbyte; on usdc wei per gas, the claim's `maxFeePerGas`). Repeatable, one per chain.
     /// Unset: the chain's builtin cap (usdc 500 gwei, `500000000000`).
-    #[arg(long, global = true, value_parser = parse_chain_value)]
+    #[arg(long, global = true, value_parser = divi_swap::config::parse_chain_value)]
     claim_fee_cap: Vec<(Chain, u64)>,
     /// Replacement price bump, percent, of the node a same-nonce (usdc) claim is sent to, as
     /// `CHAIN=PCT`: each replacement raises both fees at least this much (geth
     /// `--txpool.pricebump`). Repeatable. Unset: 10, geth's default. A node stricter than this
     /// is still outbid: every second "underpriced" refusal doubles the next step.
-    #[arg(long, global = true, value_parser = parse_chain_value)]
+    #[arg(long, global = true, value_parser = divi_swap::config::parse_chain_value)]
     claim_price_bump: Vec<(Chain, u64)>,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
-/// `CHAIN=N`, for the per-chain claim fee flags.
-fn parse_chain_value(s: &str) -> Result<(Chain, u64), String> {
-    let (chain, value) = s
-        .split_once('=')
-        .ok_or_else(|| format!("expected CHAIN=N, got {s:?}"))?;
-    let chain = chain.parse::<Chain>().map_err(|e| e.to_string())?;
-    let value = value
-        .parse::<u64>()
-        .map_err(|e| format!("{chain}: {e} in {s:?}"))?;
-    Ok((chain, value))
-}
-
-/// The fee escalations `--claim-fee-cap` and `--claim-price-bump` set: each named chain's
-/// builtin ([`divi_swap::FeeEscalation::builtin`]) with the given fields replaced.
+/// The fee escalations `--claim-fee-cap` and `--claim-price-bump` set
+/// ([`divi_swap::config::claim_fee_escalations`]).
 fn claim_fee_escalations(cli: &Cli) -> Result<Vec<(Chain, divi_swap::FeeEscalation)>> {
-    let mut out: Vec<(Chain, divi_swap::FeeEscalation)> = Vec::new();
-    let set = |out: &mut Vec<(Chain, divi_swap::FeeEscalation)>,
-               chain: Chain,
-               f: &dyn Fn(divi_swap::FeeEscalation) -> divi_swap::FeeEscalation|
-     -> Result<()> {
-        let i = match out.iter().position(|(c, _)| *c == chain) {
-            Some(i) => i,
-            None => {
-                let builtin = divi_swap::FeeEscalation::builtin(chain).with_context(|| {
-                    format!("{chain} claims have no fee escalation to configure")
-                })?;
-                out.push((chain, builtin));
-                out.len() - 1
-            }
-        };
-        out[i].1 = f(out[i].1);
-        Ok(())
-    };
-    for &(chain, cap) in &cli.claim_fee_cap {
-        set(&mut out, chain, &|e| e.with_cap_feerate(cap))?;
-    }
-    for &(chain, pct) in &cli.claim_price_bump {
-        set(&mut out, chain, &|e| e.with_price_bump(pct))?;
-    }
-    Ok(out)
+    Ok(divi_swap::config::claim_fee_escalations(
+        &cli.claim_fee_cap,
+        &cli.claim_price_bump,
+    )?)
 }
 
 /// `taker` with the escalations of [`claim_fee_escalations`] applied.

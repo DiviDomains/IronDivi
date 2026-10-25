@@ -94,6 +94,30 @@ struct Args {
     /// With `--release-reservation`: actually release.
     #[arg(long, requires = "release_reservation")]
     yes: bool,
+    /// Highest feerate the maker's claim of a taker leg on CHAIN ever pays, as `CHAIN=FEERATE`
+    /// (base unit per vbyte; on usdc wei per gas, the claim's `maxFeePerGas`). Repeatable,
+    /// one per chain (btc, ltc, usdc; divi and zec claims cannot be bumped). Unset: the
+    /// chain's builtin cap (usdc 500 gwei, `500000000000`).
+    #[arg(long, value_parser = divi_swap::config::parse_chain_value)]
+    claim_fee_cap: Vec<(Chain, u64)>,
+    /// Replacement price bump, percent, of the node a same-nonce (usdc) taker-leg claim is
+    /// sent to, as `CHAIN=PCT`: each replacement raises both fees at least this much (geth
+    /// `--txpool.pricebump`). Repeatable. Unset: 10, geth's default. A node stricter than this
+    /// is still outbid: every second "underpriced" refusal doubles the next step.
+    #[arg(long, value_parser = divi_swap::config::parse_chain_value)]
+    claim_price_bump: Vec<(Chain, u64)>,
+}
+
+/// `maker` with the escalations `--claim-fee-cap` and `--claim-price-bump` set
+/// ([`divi_swap::config::claim_fee_escalations`]) for its taker-leg claims.
+fn with_claim_fees(maker: Maker, args: &Args) -> Result<Maker> {
+    Ok(
+        divi_swap::config::claim_fee_escalations(&args.claim_fee_cap, &args.claim_price_bump)?
+            .into_iter()
+            .fold(maker, |m, (chain, esc)| {
+                m.with_fee_escalation(chain, Some(esc))
+            }),
+    )
 }
 
 fn parse_chain(s: &str) -> Result<Chain, String> {
@@ -807,6 +831,7 @@ async fn main() -> Result<()> {
     let counters = std::iter::once(btc.clone()).chain(others).collect();
     let mut maker =
         Maker::with_counters(cfg.swap_config()?, divi.clone(), counters, store, offers)?;
+    maker = with_claim_fees(maker, &args)?;
     if let Some(x) = &xmr {
         maker = maker.with_engine(x.clone())?;
     }
@@ -859,6 +884,64 @@ mod tests {
     use alloy::providers::Provider;
     use alloy::rpc::types::TransactionRequest;
     use divi_swap::api::{Direction, Offer};
+
+    /// A maker on mock backends for every counter chain, with `flags` applied.
+    fn maker_with_flags(flags: &[&str]) -> Result<Maker> {
+        let argv = ["divi-swapd", "--config", "c"].iter().chain(flags);
+        let args = Args::try_parse_from(argv)?;
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("swaps.db"))?;
+        let divi = MockChain::new(Chain::Divi, 1_700_000_000, 60);
+        let counters = [Chain::Btc, Chain::Ltc, Chain::Zec, Chain::Usdc]
+            .into_iter()
+            .zip(2u8..)
+            .map(|(c, seed)| {
+                Arc::new(MockChain::new(c, 1_700_000_000, 600).backend(seed, Amount(0)))
+                    as Arc<dyn ChainBackend>
+            })
+            .collect();
+        let maker = Maker::with_counters(
+            divi_swap::SwapConfig::profile(divi_swap::Profile::Testnet),
+            Arc::new(divi.backend(1, Amount(0))),
+            counters,
+            store,
+            Vec::new(),
+        )?;
+        with_claim_fees(maker, &args)
+    }
+
+    #[test]
+    fn claim_fee_flags_reach_the_makers_taker_leg_claims() {
+        let builtin = |c| divi_swap::FeeEscalation::builtin(c).unwrap();
+        let plain = maker_with_flags(&[]).unwrap();
+        for c in [Chain::Btc, Chain::Ltc, Chain::Usdc] {
+            assert_eq!(plain.fee_escalation(c), Some(builtin(c)), "{c}");
+        }
+        let maker = maker_with_flags(&[
+            "--claim-fee-cap",
+            "btc=77",
+            "--claim-fee-cap",
+            "usdc=900000000000",
+            "--claim-price-bump",
+            "usdc=25",
+        ])
+        .unwrap();
+        let btc = maker.fee_escalation(Chain::Btc).unwrap();
+        assert_eq!(btc.cap_feerate, 77);
+        assert_eq!(btc, builtin(Chain::Btc).with_cap_feerate(77));
+        let usdc = maker.fee_escalation(Chain::Usdc).unwrap();
+        assert_eq!(usdc.cap_feerate, 900_000_000_000);
+        assert_eq!(usdc.price_bump_pct, 25);
+        // Unnamed chains keep their builtin.
+        assert_eq!(maker.fee_escalation(Chain::Ltc), Some(builtin(Chain::Ltc)));
+        assert_eq!(maker.fee_escalation(Chain::Zec), None);
+        // A chain whose claims cannot be bumped is refused, not ignored.
+        let err = maker_with_flags(&["--claim-fee-cap", "zec=5"])
+            .err()
+            .expect("zec refused");
+        assert!(err.to_string().contains("zec"), "{err}");
+        assert!(maker_with_flags(&["--claim-price-bump", "btc"]).is_err());
+    }
 
     fn offer(id: &str, direction: Direction) -> Offer {
         Offer {

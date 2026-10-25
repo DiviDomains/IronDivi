@@ -409,6 +409,53 @@ impl FeeEscalation {
     }
 }
 
+/// `CHAIN=N`, the value of the per-chain claim fee flags (`--claim-fee-cap`,
+/// `--claim-price-bump`) of the `divi-swap` and `divi-swapd` binaries.
+pub fn parse_chain_value(s: &str) -> std::result::Result<(Chain, u64), String> {
+    let (chain, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected CHAIN=N, got {s:?}"))?;
+    let chain = chain.parse::<Chain>().map_err(|e| e.to_string())?;
+    let value = value
+        .parse::<u64>()
+        .map_err(|e| format!("{chain}: {e} in {s:?}"))?;
+    Ok((chain, value))
+}
+
+/// The fee escalations the claim fee flags set: each named chain's
+/// [`FeeEscalation::builtin`] with `caps` ([`FeeEscalation::with_cap_feerate`]) and `bumps`
+/// ([`FeeEscalation::with_price_bump`]) applied, one entry per chain. Fails on a chain whose
+/// claims cannot be bumped (DIVI, ZEC, XMR).
+pub fn claim_fee_escalations(
+    caps: &[(Chain, u64)],
+    bumps: &[(Chain, u64)],
+) -> Result<Vec<(Chain, FeeEscalation)>> {
+    let mut out: Vec<(Chain, FeeEscalation)> = Vec::new();
+    let mut set = |chain: Chain, f: &dyn Fn(FeeEscalation) -> FeeEscalation| -> Result<()> {
+        let i = match out.iter().position(|(c, _)| *c == chain) {
+            Some(i) => i,
+            None => {
+                let builtin = FeeEscalation::builtin(chain).ok_or_else(|| {
+                    SwapError::InvalidParams(format!(
+                        "{chain} claims have no fee escalation to configure"
+                    ))
+                })?;
+                out.push((chain, builtin));
+                out.len() - 1
+            }
+        };
+        out[i].1 = f(out[i].1);
+        Ok(())
+    };
+    for &(chain, cap) in caps {
+        set(chain, &|e| e.with_cap_feerate(cap))?;
+    }
+    for &(chain, pct) in bumps {
+        set(chain, &|e| e.with_price_bump(pct))?;
+    }
+    Ok(out)
+}
+
 /// Swap timing and confirmation requirements. All durations in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapConfig {
