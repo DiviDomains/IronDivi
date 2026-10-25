@@ -117,13 +117,8 @@ fee does not depend on them. Each scenario prints its fee, size and rate on both
 
 ## KNOWN differences
 
-- **`sendmany "" ...: payee order`** (three rows):
-  - divid writes the payees in the order of the request's JSON object (json_spirit keeps it, `rpcwallet.cpp:1724`).
-  - irondivid parses the request with serde_json, which keeps an object's members in name order
-    (`docs/divid-differences.md` R6), so the payees come in address order.
-  - Each request lists its payees in descending address order, so the rows differ every run. The payees themselves
-    (amounts, addresses) are compared as a set and are the same.
-
-No other row differs from divid.
+None: every row matches divid. The `sendmany "" ...: payee order` rows list the payees of
+each request in descending address order, so they show that irondivid keeps the request's order as divid does
+(json_spirit keeps it, `rpcwallet.cpp:1724`; irondivid's serde_json keeps it with `preserve_order`).
 
 Core paths are under `divi/src/` of the Divi Core source at v3.0.0 (commit 9e2f76c).

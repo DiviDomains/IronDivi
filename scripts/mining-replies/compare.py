@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Compare irondivid's mining and mempool RPC replies with Divi Core 3.0.0's
 divid on regtest. Both nodes share one chain and one mempool; each call is made
-on both and printed as one row: SAME, DIFFERS (with both replies) or ABSENT
-(divid answers, irondivid does not have the method). A wrong argument count
+on both and printed as one row: SAME, DIFFERS (with both replies), ORDER (the
+same members or items in another order than divid's) or ABSENT (divid
+answers, irondivid does not have the method). A wrong argument count
 is answered with the method's help in both; those replies are SAME when the
 code and the usage line agree. A DIFFERS row that is a difference kept on
 purpose names its row of docs/divid-differences.md. The exit code is the
-number of rows that are neither SAME nor kept.
+number of rows that are neither SAME nor kept (ORDER rows count).
 
 Usage: compare.py <irondivid> <divid-bin-dir> <port-base> <workdir>"""
 import base64
@@ -19,6 +20,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
 
 IRONDIVID, DIVI_BIN, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 CORE, IRON = PORT_BASE, PORT_BASE + 2
@@ -157,6 +161,10 @@ def row(method, params, norm=lambda v: v, mines=False, iron_params=None, label="
         why = [] if same else [f"error: {json.dumps(core_err)} vs {json.dumps(iron_err)}"]
     else:
         why = differences(norm(core[0]), norm(iron[0]))
+        moved = member_order.difference(norm(core[0]), norm(iron[0]))
+        if moved:
+            ROWS.append(("ORDER", label, core, iron, [moved] + why))
+            return
     if why and label in KEPT:
         why.append(f"kept: docs/divid-differences.md {KEPT[label]}")
     ROWS.append(("SAME" if not why else "DIFFERS", label, core, iron, why))
@@ -332,9 +340,9 @@ for status, label, core, iron, why in ROWS:
         print(f"           irondivid: {json.dumps(iron[1] or iron[0])[:400]}")
 for n in NOTES:
     print(f"note: {n}")
-counts = {s: sum(1 for r in ROWS if r[0] == s) for s in ("SAME", "DIFFERS", "ABSENT")}
+counts = {s: sum(1 for r in ROWS if r[0] == s) for s in ("SAME", "DIFFERS", "ORDER", "ABSENT")}
 kept = sum(1 for r in ROWS if r[1] in KEPT and r[0] == "DIFFERS")
 print(f"\n{len(ROWS)} calls: " + ", ".join(f"{n} {s}" for s, n in counts.items())
       + f" ({kept} of the DIFFERS kept on purpose)")
 # The exit code counts what is neither the same nor a kept difference
-sys.exit(min(counts["DIFFERS"] - kept + counts["ABSENT"], 254))
+sys.exit(min(counts["DIFFERS"] - kept + counts["ORDER"] + counts["ABSENT"], 254))

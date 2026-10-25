@@ -20,6 +20,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row
 # is changed before it is compared
@@ -124,8 +127,13 @@ KNOWN = {
 fails = 0
 
 
-def row(name, core, iron, same, raw=None):
+def row(name, core, iron, same, raw=None, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}", flush=True)
+        return
     if name in KNOWN:
         reason, shape = KNOWN[name]
         if same:
@@ -354,7 +362,10 @@ def compare(name, c, i, vary=(), message=True):
     elif c[0] == "ok" and i[0] == "ok":
         d = differences(flatten(c[1], set(vary)), flatten(i[1], set(vary)))
         LAST_DIFF.update(k for k, _, _ in d)
-        if not d:
+        moved = member_order.difference(c[1], i[1])
+        if moved:
+            row(name, show(c), show(i), not d, (c, i), moved=moved)
+        elif not d:
             row(name, show(c), "same", True, (c, i))
         else:
             row(name, "; ".join(f"{k}={leaf(x)}" for k, x, _ in d[:6]),

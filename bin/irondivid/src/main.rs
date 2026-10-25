@@ -295,8 +295,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
-    "datacarrier",
-    "datacarriersize",
     "dbcache",
     "disablesystemnotifications",
     "dns",
@@ -320,11 +318,8 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "onlynet",
     "par",
     "peerbloomfilters",
-    "permitbaremultisig",
     "proxyrandomize",
-    "resync",
     "rpcthreads",
-    "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
     "sysperms",
@@ -533,6 +528,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.enable_discovery = false;
     }
     config.p2p.addnode = s.get_multi("addnode").to_vec();
+    config.p2p.seednode = s.get_multi("seednode").to_vec();
     config
         .network
         .static_peers
@@ -581,8 +577,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -loadblock files as given, relative to the working directory as in divid
     config.load_block = s.get_multi("loadblock").iter().map(PathBuf::from).collect();
     config.stop_after_block_import = s.get_bool("stopafterblockimport", false);
-    if let Some(n) = number_option(&s, "checkblocks", 0..=i64::from(u32::MAX)) {
-        config.check_blocks = n as u32;
+    // -resync: the chain's folders are removed before it loads (init.cpp:1480-1483)
+    config.resync = s.get_bool("resync", false);
+    // -checkblocks: atoi64; 0 or below checks every block (verifyDb.cpp:73-74)
+    if let Some(text) = s.get("checkblocks") {
+        config.check_blocks = settings::atoi(text).clamp(0, i64::from(u32::MAX)) as u32;
     }
     if let Some(n) = number_option(&s, "maxreorg", 0..=i64::from(u32::MAX)) {
         config.max_reorg = Some(n as u32);
@@ -601,6 +600,22 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.mempool.min_relay_fee_per_kb = sat;
     }
     config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
+    // GetBoolArg("-permitbaremultisig", true), read once (MempoolConsensus.cpp:31)
+    config.mempool.permit_bare_multisig = s.get_bool("permitbaremultisig", true);
+    // -datacarrier ? GetArg("-datacarriersize", MAX_OP_META_RELAY) : 0, kept as
+    // an unsigned int, read once (MempoolConsensus.cpp:32-33)
+    // GetBoolArg("-relaypriority", true), read for each transaction in Core;
+    // the options do not change while a node runs (MempoolConsensus.cpp:255)
+    config.mempool.relay_priority = s.get_bool("relaypriority", true);
+    // GetArg("-limitfreerelay", 30), thousands of bytes per minute, read for
+    // each free transaction from a peer (MempoolConsensus.cpp:228)
+    config.mempool.limit_free_relay = s.get("limitfreerelay").map_or(30, settings::atoi);
+    config.mempool.max_datacarrier_bytes = if s.get_bool("datacarrier", true) {
+        s.get("datacarriersize")
+            .map_or(603, |text| settings::atoi(text) as u32)
+    } else {
+        0
+    };
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -726,6 +741,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "listen",
         "connect",
         "addnode",
+        "seednode",
         "fullnode",
         "dnsseed",
         "maxconnections",
@@ -737,12 +753,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "banscore",
         "bantime",
         "checkblocks",
+        "resync",
         "loadblock",
         "stopafterblockimport",
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
         "acceptnonstandard",
+        "permitbaremultisig",
+        "datacarrier",
+        "datacarriersize",
+        "relaypriority",
+        "limitfreerelay",
         "maxtxfee",
         "sporkkey",
         "staking",
@@ -1114,6 +1136,53 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Drop the writer's guard in `guard`: it hands the thread a shutdown behind
+/// the lines it holds and waits (up to about a second) until they are written
+fn flush_log_from(guard: &std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>) {
+    let guard = guard.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
+}
+
+#[cfg(test)]
+mod flush_log_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// A log file on a loaded host: each write takes a while
+    #[derive(Clone)]
+    struct SlowFile(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SlowFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lines handed to the writer just before the process ends are in the
+    /// file once `flush_log_from` returns, however slow the writer is
+    #[test]
+    fn flush_writes_out_every_line_the_writer_holds() {
+        let file = SlowFile(Arc::new(Mutex::new(Vec::new())));
+        let (mut writer, guard) = tracing_appender::non_blocking(file.clone());
+        let slot = std::sync::Mutex::new(Some(guard));
+        for i in 0..5 {
+            writer.write_all(format!("line {i}\n").as_bytes()).unwrap();
+        }
+        flush_log_from(&slot);
+        let text = String::from_utf8(file.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 5, "{text:?}");
+        assert!(slot.lock().unwrap().is_none());
+        // A second flush (the end of main after an exit path flushed) is a no-op
+        flush_log_from(&slot);
+    }
+}
+
 /// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     // Use RUST_LOG if set, otherwise use default based on debug config
@@ -1200,10 +1269,13 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
 static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
     std::sync::Mutex::new(None);
 
-/// Write out the log lines not yet in debug.log (waits a second at most)
+/// Write out the log lines not yet in debug.log (waits a second at most).
+/// Neither `std::process::exit` nor the end of `main` drops a static, so every
+/// way out of the process after logging starts calls this first: otherwise the
+/// last lines, a start-up error among them, are lost whenever the writer
+/// thread has not run yet (a loaded host).
 fn flush_log() {
-    let guard = LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()).take();
-    drop(guard);
+    flush_log_from(&LOG_GUARD);
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -2084,6 +2156,7 @@ async fn run_daemon(
         // The node's own masternode list, which the network fills from mnb/mnp
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
+        let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2109,6 +2182,7 @@ async fn run_daemon(
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
                     rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2240,6 +2314,7 @@ async fn run_daemon(
         // The node's own masternode list, which the network fills from mnb/mnp
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
+        let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2264,6 +2339,7 @@ async fn run_daemon(
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
                     rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2857,6 +2933,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     // Check for conflicting network options
     if args.testnet && args.regtest {
         error!("Cannot use both --testnet and --regtest");
+        flush_log();
         std::process::exit(1);
     }
 
@@ -2941,8 +3018,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     .await
     {
         error!("Daemon error: {:#}", e);
-        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40): the log
-        // writer may not get to write the line before the process exits
+        // Also on stderr, as Divi Core's InitError (noui.cpp:38-40)
         {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "Error: {:#}", e);
@@ -2954,6 +3030,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
             source = err.source();
         }
         remove_pid_file(&pid_file);
+        flush_log();
         std::process::exit(1);
     }
 
@@ -3034,6 +3111,9 @@ mod connect_tests {
     fn checkblocks_default_cli_and_config_file() {
         assert_eq!(cfg(&[]).check_blocks, 100);
         assert_eq!(cfg(&["--checkblocks=0"]).check_blocks, 0);
+        // Below 0, as divid's VerifyDB reads it: every block (verifyDb.cpp:73-74)
+        assert_eq!(cfg(&["--checkblocks=-1"]).check_blocks, 0);
+        assert_eq!(cfg(&["--checkblocks=abc"]).check_blocks, 0);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("irondivi.conf"), "checkblocks = 500\n").unwrap();
         let args = Args::parse_from([
@@ -4011,6 +4091,27 @@ mod divid_option_tests {
             c.p2p.addnode,
             ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.2:12"]
         );
+    }
+
+    /// -seednode is applied (Divi Core AddOneShot, net.cpp:1842-1843), every
+    /// value, the command line's first, and not dialled as a lasting peer
+    #[test]
+    fn seednode_values_are_applied() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\nseednode=127.0.0.2:11\nseednode=127.0.0.3\n",
+            &["-seednode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.seednode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.3"]
+        );
+        assert!(!c
+            .peer_sources()
+            .static_peers
+            .contains(&"127.0.0.2:10".to_string()));
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
     }
 
     /// -conf is relative to the data directory (Settings::GetConfigFile)

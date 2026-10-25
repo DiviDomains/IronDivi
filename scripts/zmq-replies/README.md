@@ -9,6 +9,8 @@ line:
 - `PASS`: same as divid;
 - `KNOWN`: differs, and the difference is listed below with the reason;
 - `FAIL`: differs and should not, or a `KNOWN` row that now matches divid (the list below is out of date).
+- `ORDER`: the same members or list items as divid's, in another order (a FAIL, counted in `FAILS`). The line
+  names the first object or list that differs and both orders (`scripts/lib/member_order.py`).
 
 The run ends with `FAILS <n>`; the exit code is the number of FAILs (255: usage error, interrupted, or over 10 minutes).
 
@@ -42,7 +44,7 @@ socket), and `rawblock` and `rawtx` have one each.
 | 25 blocks | mines 25 blocks, one at a time |
 | a transaction | sends 10 DIVI to itself |
 | a block with that transaction | mines one block |
-| two transactions, then a block with both | two sends, then a block |
+| two transactions, then a block with both | a send, a second send once both followers have the first, then a block |
 | a transaction and its block before the reorganization | a send, then a block with it |
 | reorganization: two blocks replace one | `invalidateblock` on its tip, then two blocks on the parent; the followers switch when the second arrives |
 | after restart, before any block | both followers are stopped and started again (nothing may be published) |

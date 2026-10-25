@@ -23,6 +23,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
+import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row
 # gets a changed body before it is compared
@@ -66,11 +69,17 @@ KNOWN = {
 }
 
 fails = 0
-counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0}
+counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0, "ORDER": 0}
 
 
-def row(name, core, iron, same, iron_view=None):
+def row(name, core, iron, same, iron_view=None, moved=None):
     global fails
+    if moved:
+        # The same members or items in another order than divid's: a FAIL of its own kind
+        fails += 1
+        counts["ORDER"] += 1
+        print(f"ORDER  {name}  {moved}  divid={core}  irondivid={iron}"[:500], flush=True)
+        return
     known = KNOWN.get(name)
     if known:
         reason, expected = known
@@ -358,7 +367,7 @@ def compare(name, core, iron, parts=PARTS):
         iron = dict(iron, body=iron["body"] + "injected")
     a, b = view(core, parts), view(iron, parts)
     d = first_difference(a, b)
-    row(name, short(a), d or short(b), d is None, b)
+    row(name, short(a), d or short(b), d is None, b, moved=member_order.difference(a, b))
 
 
 def both(name, make, parts=PARTS, source=None):
@@ -543,6 +552,7 @@ else:
 
 for n in (C, I):
     n.stop()
-print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL", flush=True)
+print(f"# rows: {counts['PASS']} PASS, {counts['KNOWN']} KNOWN, {counts['FAIL']} FAIL, {counts['ORDER']} ORDER",
+      flush=True)
 print(f"FAILS {fails}", flush=True)
 sys.exit(min(fails, 254))
