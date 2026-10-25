@@ -27,8 +27,11 @@ use std::path::PathBuf;
 
 /// MASTERNODE_MIN_CONFIRMATIONS (masternode.h:16)
 const MIN_CONFIRMATIONS: u32 = 15;
-/// MASTERNODE_MIN_MNP_SECONDS (masternode.h:17)
+/// MASTERNODE_MIN_MNP_SECONDS, MASTERNODE_MIN_MNB_SECONDS (masternode.h:17-18)
 const MIN_MNP_SECONDS: i64 = 10 * 60;
+const MIN_MNB_SECONDS: i64 = 5 * 60;
+/// A ping names a block at most this far below the tip (masternodeman.cpp:342-352)
+const PING_BLOCK_DEPTH: u32 = 24;
 /// MASTERNODE_EXPIRATION_SECONDS, MASTERNODE_REMOVAL_SECONDS (masternode.h:20-21)
 const EXPIRATION_SECONDS: i64 = 120 * 60;
 const REMOVAL_SECONDS: i64 = 130 * 60;
@@ -149,61 +152,107 @@ impl MasternodeList {
     }
 
     fn accept_decoded(&self, chain: &Chain, mnb: CppBroadcast, now: i64) -> Result<bool, String> {
+        // CheckMasternodeBroadcastContext (masternodeman.cpp:232-265)
         if mnb.sig_time > now + 3600 {
             return Err("signature too far in the future".into());
+        }
+        if !(0..=4).contains(&mnb.tier) {
+            return Err(format!("invalid tier {}", mnb.tier));
         }
         if mnb.protocol_version < ACTIVE_PROTOCOL {
             return Err("obsolete protocol version".into());
         }
+        if !mnb.vin.script_sig.is_empty() {
+            return Err("the input has a scriptSig".into());
+        }
         if !mnb.signature_is_valid() {
             return Err("bad broadcast signature".into());
         }
-        let ping = &mnb.last_ping;
-        if ping.sig_time > now + 3600 || ping.sig_time <= now - 3600 {
-            return Err("ping signature time out of range".into());
-        }
-        if !ping_signature_valid(&mnb, ping) {
-            return Err("attached ping is invalid".into());
-        }
         let hash = Hash256(mnb.vin.prevout_hash);
-        {
-            let entries = self.entries.read();
-            if let Some(e) = entries.iter().find(|e| {
-                e.mnb.vin.prevout_hash == mnb.vin.prevout_hash
-                    && e.mnb.vin.prevout_n == mnb.vin.prevout_n
-            }) {
-                // CMasternodeMan::UpdateWithNewBroadcast: only a newer one replaces it
-                if mnb.sig_time <= e.mnb.sig_time {
-                    return Ok(false);
+        let outpoint = OutPoint::new(hash, mnb.vin.prevout_n);
+        // UpdateMasternodeFromBroadcast (masternodeman.cpp:267-307): an older
+        // broadcast is refused; a newer one with the same collateral key
+        // replaces an enabled entry when that entry is five minutes old
+        let mut changed = false;
+        let existing_enabled = {
+            let mut entries = self.entries.write();
+            match entries.iter_mut().find(|e| e.outpoint() == outpoint) {
+                None => false,
+                Some(e) => {
+                    if e.mnb.sig_time > mnb.sig_time {
+                        return Err("older than the broadcast in the list".into());
+                    }
+                    let enabled = e.is_enabled(now);
+                    if enabled
+                        && e.mnb.pubkey_collateral == mnb.pubkey_collateral
+                        && now - e.mnb.sig_time >= MIN_MNB_SECONDS
+                        && mnb.sig_time > e.mnb.sig_time
+                    {
+                        // UpdateWithNewBroadcast, then its ping if it may be taken
+                        let last_ping = e.mnb.last_ping.clone();
+                        let ping = mnb.last_ping.clone();
+                        e.mnb = CppBroadcast {
+                            last_ping: last_ping.clone(),
+                            ..mnb.clone()
+                        };
+                        if !ping_is_empty(&ping)
+                            && check_ping(chain, &e.mnb, Some(&last_ping), &ping, now).is_ok()
+                        {
+                            e.mnb.last_ping = ping;
+                        }
+                        changed = true;
+                    }
+                    enabled
                 }
             }
+        };
+        if changed {
+            self.save();
         }
+        // IsVinAssociatedWithPubkey (masternodeman.cpp:57-74): the collateral
+        // pays the tier's amount to the broadcast's collateral key
         let coll = find_collateral(chain, &hash, mnb.vin.prevout_n)
             .ok_or("collateral not found in the active chain")?;
-        if tier_for_collateral(chain, coll.amount) != Some(mnb.tier) {
-            return Err("collateral amount does not match the tier".into());
+        if tier_for_collateral(chain, coll.amount) != Some(mnb.tier)
+            || coll.script != payee_script(&mnb)
+        {
+            return Err("collateral does not match the broadcast's key and tier".into());
         }
-        let outpoint = OutPoint::new(hash, mnb.vin.prevout_n);
-        if !matches!(chain.get_utxo(&outpoint), Ok(Some(_))) {
-            return Err("collateral is spent".into());
+        // CheckInputsForMasternode (masternodeman.cpp:196-230), unless the
+        // masternode is listed and enabled
+        if !existing_enabled {
+            if !matches!(chain.get_utxo(&outpoint), Ok(Some(u)) if u.value.0 == coll.amount) {
+                return Err("collateral is spent".into());
+            }
+            let conf_height = coll.height + MIN_CONFIRMATIONS - 1;
+            if conf_height > chain.height() {
+                return Err(format!(
+                    "collateral must have at least {MIN_CONFIRMATIONS} confirmations"
+                ));
+            }
+            let conf = chain
+                .get_block_index_by_height(conf_height)
+                .ok()
+                .flatten()
+                .ok_or("no confirmation block")?;
+            if conf.time as i64 > mnb.sig_time {
+                return Err("signed before the collateral's confirmation block".into());
+            }
         }
-        if chain.height() + 1 < coll.height + MIN_CONFIRMATIONS {
-            return Err(format!(
-                "collateral must have at least {MIN_CONFIRMATIONS} confirmations"
-            ));
+        // The attached ping, checked as for a masternode with no ping yet
+        // (masternodeman.cpp:456-466)
+        check_ping(chain, &mnb, None, &mnb.last_ping, now)?;
+        // Listed and enabled: nothing more to do (masternodeman.cpp:476-487)
+        if existing_enabled {
+            return Ok(changed);
         }
         {
             let mut entries = self.entries.write();
-            match entries.iter_mut().find(|e| e.outpoint() == outpoint) {
-                Some(e) => {
-                    e.mnb = mnb;
-                    e.vin_spent = false;
-                }
-                None => entries.push(NetworkMasternode {
-                    mnb,
-                    vin_spent: false,
-                }),
-            }
+            entries.retain(|e| e.outpoint() != outpoint);
+            entries.push(NetworkMasternode {
+                mnb,
+                vin_spent: false,
+            });
         }
         self.save();
         Ok(true)
@@ -436,6 +485,49 @@ impl MasternodeList {
             .position(|(_, h)| h == vin_hash)
             .map(|i| i + 1)
     }
+}
+
+/// Whether a ping is the empty one CMasternodePing() makes (its operator==
+/// compares the input and the block hash, MasternodePing.h:39-42)
+fn ping_is_empty(ping: &CppPing) -> bool {
+    ping.vin.prevout_hash == [0u8; 32]
+        && ping.vin.prevout_n == u32::MAX
+        && ping.block_hash == [0u8; 32]
+}
+
+/// CheckAndUpdatePing for the masternode of `mnb` whose last ping is `last`:
+/// Ok when `ping` may be taken (masternodeman.cpp:309-375)
+fn check_ping(
+    chain: &Chain,
+    mnb: &CppBroadcast,
+    last: Option<&CppPing>,
+    ping: &CppPing,
+    now: i64,
+) -> Result<(), String> {
+    if ping.sig_time > now + 3600 || ping.sig_time <= now - 3600 {
+        return Err("ping signature time out of range".into());
+    }
+    if mnb.protocol_version < ACTIVE_PROTOCOL {
+        return Err("no masternode of a compatible protocol".into());
+    }
+    // IsTooEarlyToReceivePingUpdate, measured from the new ping's time
+    // (MasternodeHelpers.cpp:172-190)
+    if last.is_some_and(|l| !ping_is_empty(l) && ping.sig_time - l.sig_time < MIN_MNP_SECONDS - 60)
+    {
+        return Err("ping arrived too early".into());
+    }
+    if !ping_signature_valid(mnb, ping) {
+        return Err("bad ping signature".into());
+    }
+    let block = chain
+        .get_block_index(&Hash256(ping.block_hash))
+        .ok()
+        .flatten()
+        .ok_or("the ping names an unknown block")?;
+    if block.height + PING_BLOCK_DEPTH < chain.height() {
+        return Err("the ping names a block too far below the tip".into());
+    }
+    Ok(())
 }
 
 /// The block a height is scored with: its ancestor 101 below it on the

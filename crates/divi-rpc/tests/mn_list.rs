@@ -350,3 +350,96 @@ fn payment_votes_are_counted_as_divid_counts_them() {
     assert!(n.votes.accept(&n.chain, &n.list, &forged.encode()).is_err());
     let _ = (txhash, vout);
 }
+
+/// The keys of the last set_up as secret keys: the collateral key (from the
+/// wallet) and the masternode key (test-only throwaway regtest keys)
+fn keys(n: &Node, address: &str) -> (divi_crypto::SecretKey, divi_crypto::SecretKey) {
+    let secret = |wif: &str| {
+        divi_crypto::SecretKey::from_bytes(&divi_wallet::decode_wif(wif).unwrap().key_bytes)
+            .unwrap()
+    };
+    let collateral = n.ok("dumpprivkey", vec![json!(address)]);
+    (
+        secret(collateral.as_str().unwrap()),
+        secret(&n_key(n).lock().clone().unwrap()),
+    )
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A broadcast is refused as Divi Core refuses one: a scriptSig on its
+/// input, a tier that does not exist, a collateral that does not pay its
+/// collateral key, a time before the collateral's 15th confirmation, an
+/// attached ping naming an unknown block or one more than 24 below the tip;
+/// an older broadcast than the listed one is refused and a newer one within
+/// five minutes of it is not taken (masternodeman.cpp:196-307, :309-375,
+/// :416-478)
+#[test]
+fn broadcasts_are_refused_as_divid_refuses_them() {
+    use divi_masternode::cpp_wire::CppBroadcast;
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let base = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    let tip_hash = |depth: u32| {
+        n.chain
+            .get_block_index_by_height(n.chain.height() - depth)
+            .unwrap()
+            .unwrap()
+            .hash
+    };
+    let make = |f: &dyn Fn(&mut CppBroadcast)| {
+        let mut mnb = base.clone();
+        mnb.sig_time = now();
+        mnb.last_ping.sig_time = now();
+        mnb.last_ping.block_hash = *tip_hash(2).as_bytes();
+        f(&mut mnb);
+        mnb.last_ping.sign(&mn_key).unwrap();
+        mnb.sign(&coll_key).unwrap();
+        mnb
+    };
+    let accept = |mnb: &CppBroadcast| n.list.accept_broadcast(&n.chain, &mnb.encode());
+    let refused = |what: &str, mnb: CppBroadcast| {
+        assert!(accept(&mnb).is_err(), "{what} was taken");
+        assert!(n.list.entries().is_empty(), "{what} was listed");
+    };
+    refused("a scriptSig", make(&|m| m.vin.script_sig = vec![0x51]));
+    refused("tier 7", make(&|m| m.tier = 7));
+    let other = divi_crypto::SecretKey::new_random();
+    let mut stranger = make(&|m| m.pubkey_collateral = other.public_key().to_bytes().to_vec());
+    stranger.sign(&other).unwrap();
+    refused("a collateral paying another key", stranger);
+    let conf_time = n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 1)
+        .unwrap()
+        .unwrap()
+        .time as i64;
+    refused(
+        "a time before the 15th confirmation",
+        make(&|m| m.sig_time = conf_time - 1000),
+    );
+    refused(
+        "a ping naming an unknown block",
+        make(&|m| m.last_ping.block_hash = [0xcd; 32]),
+    );
+    n.mine_n(30);
+    refused(
+        "a ping naming a block 30 deep",
+        make(&|m| m.last_ping.block_hash = *tip_hash(30).as_bytes()),
+    );
+
+    let good = make(&|_| {});
+    assert_eq!(accept(&good), Ok(true));
+    let newer = make(&|m| m.sig_time = good.sig_time + 60);
+    assert_eq!(accept(&newer), Ok(false));
+    assert_eq!(n.list.entries()[0].mnb.sig_time, good.sig_time);
+    let older = make(&|m| m.sig_time = good.sig_time - 60);
+    assert!(accept(&older).is_err());
+    assert_eq!(n.list.entries()[0].mnb.sig_time, good.sig_time);
+}
