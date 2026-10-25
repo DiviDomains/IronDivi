@@ -292,6 +292,8 @@ pub struct Node {
     /// The thread importing bootstrap.dat and -loadblock files, and the flag
     /// that stops it
     import_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<ImportResult>>>,
+    /// A -reindex's index builds, carried out first on the import thread
+    reindex_plan: parking_lot::Mutex<Option<ReindexPlan>>,
     import_stop: Arc<std::sync::atomic::AtomicBool>,
 
     /// Current status
@@ -385,6 +387,75 @@ async fn stop_tasks(
 /// Chain database metadata present while a -reindex is under way (Divi Core's
 /// DB_REINDEXINGFLAG, txdb.cpp:192-204)
 const REINDEXING_KEY: &[u8] = b"reindexing";
+
+/// What a -reindex has left to do once the node runs: fill in the indexes
+/// `Node::new` cleared and attached, then store their flags and erase the
+/// reindexing mark. Divi Core reindexes in its import thread, after init has
+/// loaded the wallet and while RPC answers (init.cpp:686-690, :1580, :1639).
+struct ReindexPlan {
+    db: Arc<ChainDatabase>,
+    tx_index: Option<Arc<divi_storage::TxIndex>>,
+    search: Option<Arc<divi_storage::SearchIndex>>,
+    /// The height when the indexes were attached: the blocks above it wrote
+    /// their own address and spent entries as they connected
+    height: u32,
+    flags: divi_storage::search_index::IndexFlags,
+}
+
+impl ReindexPlan {
+    /// Carry the reindex out on the import thread; false if `stop` ended it
+    /// first, which leaves the reindexing mark for the next start
+    fn carry_out(self, chain: &Chain, stop: &std::sync::atomic::AtomicBool) -> bool {
+        let stopped = || {
+            tracing::info!("The -reindex was stopped; it is carried out again at the next start");
+            false
+        };
+        if let Some(tx_index) = &self.tx_index {
+            tracing::info!("Building the transaction index from the stored blocks");
+            let started = std::time::Instant::now();
+            match chain.build_tx_index(tx_index, stop) {
+                Ok(Some(blocks)) => tracing::info!(
+                    "Transaction index built for {} blocks in {} ms",
+                    blocks,
+                    started.elapsed().as_millis()
+                ),
+                Ok(None) => return stopped(),
+                Err(e) => {
+                    tracing::error!("Failed to build the transaction index: {}", e);
+                    return true;
+                }
+            }
+        }
+        if let Some(search) = &self.search {
+            tracing::info!("Building the address and spent indexes from the stored blocks");
+            let started = std::time::Instant::now();
+            match chain.build_search_index(search, self.height, stop) {
+                Ok(Some(blocks)) => tracing::info!(
+                    "Address and spent indexes built for {} blocks in {} ms",
+                    blocks,
+                    started.elapsed().as_millis()
+                ),
+                Ok(None) => return stopped(),
+                Err(e) => {
+                    tracing::error!("Failed to build the address and spent indexes: {}", e);
+                    return true;
+                }
+            }
+        }
+        // The flags change only once the indexes they name are complete
+        if let Err(e) = self.flags.store(&self.db) {
+            tracing::error!("Could not store the index settings: {}", e);
+            return true;
+        }
+        if let Err(e) = self.db.delete_metadata(REINDEXING_KEY) {
+            tracing::error!("Could not record the end of the -reindex: {}", e);
+            return true;
+        }
+        // divid's line once its -reindex is done (init.cpp:681)
+        tracing::info!("Reindexing finished");
+        true
+    }
+}
 
 impl Node {
     /// Create a new node with the given configuration
@@ -510,6 +581,13 @@ impl Node {
                 .map_err(damaged)?
                 .is_none();
         let snapshot_base = chain.snapshot_base().map(|(height, _)| height);
+        // A -reindex clears the indexes here and fills them in on the import
+        // thread once the node runs, as Divi Core reindexes in its import
+        // thread (init.cpp:686-690, :1580). A snapshot database cannot be
+        // reindexed in full: its refusal comes here, before the start.
+        let defer = reindex && snapshot_base.is_none();
+        let mut plan_tx_index = None;
+        let mut plan_search = None;
         let mut flags = divi_storage::search_index::IndexFlags::load_or_init(
             &db,
             chain.height(),
@@ -605,34 +683,39 @@ impl Node {
                 NodeError::Init(format!("Failed to open transaction index: {}", e))
             })?;
             let tx_index = Arc::new(tx_index);
-            let build = rebuild_tx_index
-                || (check_unflagged_index
-                    && !chain
-                        .tx_index_covers_chain(&tx_index, 16)
-                        .map_err(damaged)?);
-            if check_unflagged_index && !rebuild_tx_index {
-                tracing::info!(
-                    "No index settings were stored with this chain database; {}",
-                    if build {
-                        "the transaction index does not cover it and is built now"
-                    } else {
-                        "the transaction index covers it"
-                    }
-                );
-            }
-            if build {
-                tracing::info!("Building the transaction index from the stored blocks");
-                let started = std::time::Instant::now();
-                let blocks = chain.rebuild_tx_index(tx_index).map_err(|e| {
-                    NodeError::Init(format!("Failed to build the transaction index: {}", e))
-                })?;
-                tracing::info!(
-                    "Transaction index built for {} blocks in {} ms",
-                    blocks,
-                    started.elapsed().as_millis()
-                );
+            if defer {
+                chain.attach_tx_index(Arc::clone(&tx_index));
+                plan_tx_index = Some(tx_index);
             } else {
-                chain.enable_tx_index(tx_index);
+                let build = rebuild_tx_index
+                    || (check_unflagged_index
+                        && !chain
+                            .tx_index_covers_chain(&tx_index, 16)
+                            .map_err(damaged)?);
+                if check_unflagged_index && !rebuild_tx_index {
+                    tracing::info!(
+                        "No index settings were stored with this chain database; {}",
+                        if build {
+                            "the transaction index does not cover it and is built now"
+                        } else {
+                            "the transaction index covers it"
+                        }
+                    );
+                }
+                if build {
+                    tracing::info!("Building the transaction index from the stored blocks");
+                    let started = std::time::Instant::now();
+                    let blocks = chain.rebuild_tx_index(tx_index).map_err(|e| {
+                        NodeError::Init(format!("Failed to build the transaction index: {}", e))
+                    })?;
+                    tracing::info!(
+                        "Transaction index built for {} blocks in {} ms",
+                        blocks,
+                        started.elapsed().as_millis()
+                    );
+                } else {
+                    chain.enable_tx_index(tx_index);
+                }
             }
             tracing::info!("Transaction index enabled at {:?}", txindex_path);
         }
@@ -649,7 +732,11 @@ impl Node {
                 flags.addressindex,
                 flags.spentindex,
             ));
-            if build_search {
+            if defer {
+                search.clear().map_err(damaged)?;
+                chain.enable_search_index(Arc::clone(&search));
+                plan_search = Some(search);
+            } else if build_search {
                 tracing::info!("Building the address and spent indexes from the stored blocks");
                 let started = std::time::Instant::now();
                 match chain.rebuild_search_index(search) {
@@ -685,10 +772,17 @@ impl Node {
         }
 
         // The flags change only once the indexes they name are complete
-        if reindex || check_unflagged_index || build_unflagged_search {
+        let reindex_plan = defer.then(|| ReindexPlan {
+            db: db.clone(),
+            tx_index: plan_tx_index,
+            search: plan_search,
+            height: chain.height(),
+            flags,
+        });
+        if !defer && (reindex || check_unflagged_index || build_unflagged_search) {
             flags.store(&db).map_err(damaged)?;
         }
-        if reindex {
+        if reindex && !defer {
             db.delete_metadata(REINDEXING_KEY).map_err(damaged)?;
             // divid's line once its -reindex is done (init.cpp:681)
             tracing::info!("Reindexing finished");
@@ -968,6 +1062,7 @@ impl Node {
         Ok(Node {
             config,
             import_thread: parking_lot::Mutex::new(None),
+            reindex_plan: parking_lot::Mutex::new(reindex_plan),
             import_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status: RwLock::new(NodeStatus::Stopped),
             chain,
@@ -1047,10 +1142,10 @@ impl Node {
     }
 
     /// Start the node
-    /// Import bootstrap.dat and the -loadblock files on a thread of their
-    /// own while the node starts and runs, as Divi Core does
-    /// (init.cpp:1580); until it is done blocks from peers are neither asked
-    /// for nor taken
+    /// Carry out a -reindex, then import bootstrap.dat and the -loadblock
+    /// files, on a thread of their own while the node starts and runs, as
+    /// Divi Core does (init.cpp:686-728, :1580); until it is done blocks from
+    /// peers are neither asked for nor taken
     pub fn spawn_import(&self) {
         let mut slot = self.import_thread.lock();
         if slot.is_some() {
@@ -1065,17 +1160,24 @@ impl Node {
             .unwrap_or_else(|| self.config.data_dir.clone());
         let load_block = self.config.load_block.clone();
         let magic = self.config.network.magic;
+        let reindex = self.reindex_plan.lock().take();
         chain.set_importing(true);
         let spawned = std::thread::Builder::new()
             .name("divi-loadblk".into())
             .spawn(move || {
-                let result = crate::block_import::import_at_start(
-                    &chain,
-                    &bootstrap_dir,
-                    &load_block,
-                    magic,
-                    &stop,
-                );
+                // A stopped reindex ends the thread, as Divi Core's
+                // interruption point ends its import thread (init.cpp:575)
+                let result = if reindex.is_none_or(|plan| plan.carry_out(&chain, &stop)) {
+                    crate::block_import::import_at_start(
+                        &chain,
+                        &bootstrap_dir,
+                        &load_block,
+                        magic,
+                        &stop,
+                    )
+                } else {
+                    ImportResult::default()
+                };
                 chain.set_importing(false);
                 result
             });
