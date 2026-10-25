@@ -26,6 +26,8 @@ use divi_swap::api::{Direction, Offer};
 use divi_swap::{Chain, Profile};
 use serde::Deserialize;
 
+use crate::proxy::{default_trusted_proxies, IpCidr, ProxyTrust};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
@@ -477,11 +479,17 @@ pub struct DaemonConfig {
     #[serde(default = "default_profile")]
     pub profile: Profile,
     /// Key the per-IP rate limit on the last `X-Forwarded-For` entry (else `X-Real-IP`) instead
-    /// of the socket peer. Off by default: set it only behind a reverse proxy you control that
-    /// sets those headers (the shipped nginx snippet does), since otherwise any client could
-    /// pick its own rate bucket.
+    /// of the socket peer, for requests whose peer is in [`Self::trusted_proxies`]. Off by
+    /// default: set it only behind a reverse proxy you control that sets those headers (the
+    /// shipped nginx snippet does). On with an empty `trusted_proxies` is refused at start.
     #[serde(default)]
     pub trust_proxy_headers: bool,
+    /// Socket peers (addresses or networks, `"a.b.c.d/n"`, `"x::y/n"`) whose proxy headers are
+    /// believed when [`Self::trust_proxy_headers`] is on; any other peer is keyed on its own
+    /// address, so a client that reaches the daemon directly cannot pick its bucket. Default
+    /// `["127.0.0.1/32", "::1/128"]`: a proxy on the same host.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<IpCidr>,
     /// File holding the operator token (one line) that `GET /swaps`, the full swap listing,
     /// requires in `X-Operator-Token`. Unset: the listing answers 404 to everyone. Keep the
     /// file out of git, mode 0600; the daemon reads it once at start.
@@ -542,6 +550,16 @@ impl DaemonConfig {
             bail!("operator_token_file {} is empty", p.display());
         }
         Ok(Some(t.to_string()))
+    }
+
+    /// The peers the rate limits take the client address from: [`Self::trusted_proxies`] with
+    /// [`Self::trust_proxy_headers`] on, none with it off.
+    pub fn proxy_trust(&self) -> ProxyTrust {
+        if self.trust_proxy_headers {
+            ProxyTrust::proxies(self.trusted_proxies.iter().copied())
+        } else {
+            ProxyTrust::off()
+        }
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -694,6 +712,12 @@ impl DaemonConfig {
     fn validate(&self) -> Result<()> {
         if self.tick_secs == 0 {
             bail!("tick_secs must be > 0");
+        }
+        if self.trust_proxy_headers && self.trusted_proxies.is_empty() {
+            bail!(
+                "trust_proxy_headers = true with an empty trusted_proxies: no peer's headers \
+                 would be believed; list the proxy's address (default [\"127.0.0.1/32\", \"::1/128\"])"
+            );
         }
         let mut seen = std::collections::BTreeSet::new();
         for o in self.offer_entries.iter().map(|e| &e.offer) {
@@ -965,12 +989,79 @@ key = "credential:btc"
         assert_eq!(c.profile, Profile::Testnet);
     }
 
+    /// A config from before `trusted_proxies` loads, with the loopback default and the flag
+    /// off (so no peer's headers are read).
+    #[test]
+    fn an_old_config_without_trusted_proxies_loads() {
+        let c = DaemonConfig::parse(GOOD).unwrap();
+        assert!(!c.trust_proxy_headers);
+        assert_eq!(c.trusted_proxies, crate::proxy::default_trusted_proxies());
+        assert!(!c.proxy_trust().trusts("127.0.0.1".parse().unwrap()));
+        let on = DaemonConfig::parse(&format!("trust_proxy_headers = true\n{GOOD}")).unwrap();
+        let t = on.proxy_trust();
+        assert!(t.trusts("127.0.0.1".parse().unwrap()) && t.trusts("::1".parse().unwrap()));
+        assert!(!t.trusts("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxies_take_addresses_and_networks() {
+        let c = DaemonConfig::parse(&format!(
+            "trust_proxy_headers = true\ntrusted_proxies = [\"10.0.0.0/8\", \"192.0.2.7\", \"fd00::/8\"]\n{GOOD}"
+        ))
+        .unwrap();
+        let t = c.proxy_trust();
+        for (ip, trusted) in [
+            ("10.9.8.7", true),
+            ("192.0.2.7", true),
+            ("192.0.2.8", false),
+            ("fd12::1", true),
+            ("127.0.0.1", false),
+        ] {
+            assert_eq!(t.trusts(ip.parse().unwrap()), trusted, "{ip}");
+        }
+        for bad in ["\"10.0.0.1/8\"", "\"10.0.0.0/33\"", "\"nonsense\"", "8"] {
+            let err = DaemonConfig::parse(&format!("trusted_proxies = [{bad}]\n{GOOD}"));
+            assert!(err.is_err(), "{bad} accepted");
+        }
+    }
+
+    /// The example's commented proxy lines, uncommented, parse to the documented defaults.
+    #[test]
+    fn deploy_example_proxy_lines_parse_uncommented() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/divi-swapd/divi-swapd.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+        let on = text
+            .replace("# trust_proxy_headers = true", "trust_proxy_headers = true")
+            .replace("# trusted_proxies = ", "trusted_proxies = ");
+        assert_ne!(on, text);
+        let c = DaemonConfig::parse(&on).unwrap();
+        assert!(c.trust_proxy_headers);
+        assert_eq!(c.trusted_proxies, crate::proxy::default_trusted_proxies());
+    }
+
+    /// Fails on 75c9b7c, which had no `trusted_proxies` (the key was ignored and the flag
+    /// alone trusted every peer).
+    #[test]
+    fn trust_proxy_headers_with_no_trusted_proxies_is_refused() {
+        let err = DaemonConfig::parse(&format!(
+            "trust_proxy_headers = true\ntrusted_proxies = []\n{GOOD}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("trusted_proxies"), "{err}");
+        // With the flag off an empty list is harmless: the headers are never read.
+        DaemonConfig::parse(&format!("trusted_proxies = []\n{GOOD}")).unwrap();
+    }
+
     #[test]
     fn parses_deploy_example() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../deploy/divi-swapd/divi-swapd.toml.example");
         let c = DaemonConfig::load(&path).unwrap();
         assert_eq!(c.listen.port(), 18480);
+        assert!(!c.trust_proxy_headers, "shipped commented out");
+        assert_eq!(c.trusted_proxies, crate::proxy::default_trusted_proxies());
         assert_eq!(c.prefix(), "");
         assert_eq!(c.offers[0].id, "divi-btc-testnet");
         let d = c.divi.unwrap();

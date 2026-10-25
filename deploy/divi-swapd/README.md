@@ -88,9 +88,13 @@ Set `trust_proxy_headers = true` in `divi-swapd.toml` and the limiter keys on th
 shipped `nginx-swap.conf` sets `X-Forwarded-For $remote_addr` (an overwrite, so the header is a
 single address nginx chose), and the daemon takes the last entry, which is also what nginx's
 `$proxy_add_x_forwarded_for` would have appended: a client-supplied header cannot pick the
-bucket either way. Turn it on only behind a proxy you control and with the daemon reachable
-only through it: if clients can reach the daemon directly, each can choose its own bucket and
-the limit is void. It is off by default and the example config ships it commented out.
+bucket either way. The headers count only from a socket peer listed in `trusted_proxies`
+(addresses or CIDR networks, default `["127.0.0.1/32", "::1/128"]`, a proxy on the same host);
+a request from any other peer is keyed on that peer, whatever its headers say, so a client that
+reaches the daemon directly cannot choose its own bucket. List a proxy on another host by its
+address; `trust_proxy_headers = true` with an empty `trusted_proxies` is refused at start. Turn
+it on only behind a proxy you control. It is off by default and the example config ships both
+keys commented out.
 
 ## Lock-input reservations (BTC, LTC, ZEC)
 

@@ -25,7 +25,9 @@ use std::time::Duration;
 use divi_swap::api::Offer;
 use divi_swap::mock::{MockBackend, MockChain};
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Profile, Store, SwapConfig, Taker};
-use divi_swapd::{router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus};
+use divi_swapd::{
+    router_with_auth, spawn_scheduler, AppState, HashlockAuth, ProxyTrust, ScanStatus,
+};
 use tokio::task::JoinHandle;
 
 pub const OFFER_ID: &str = "o1";
@@ -156,7 +158,7 @@ pub async fn serve(world: &World, maker: Arc<Maker>, tick: Option<Duration>) -> 
     };
     let auth = HashlockAuth::new(Store::in_memory().unwrap())
         .with_operator_token(Some(OPERATOR_TOKEN.into()));
-    let app = router_with_auth(state, None, "/swap", false, auth);
+    let app = router_with_auth(state, None, "/swap", ProxyTrust::off(), auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {

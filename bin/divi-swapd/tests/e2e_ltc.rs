@@ -27,7 +27,8 @@ use divi_swap::{
 };
 use divi_swap_cli::{flow, run_swap, MakerClient, RunOpts, Sessions};
 use divi_swapd::{
-    mock_counter_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ScanStatus,
+    mock_counter_offers, router_with_auth, spawn_scheduler, AppState, HashlockAuth, ProxyTrust,
+    ScanStatus,
 };
 use tokio::task::JoinHandle;
 
@@ -167,7 +168,7 @@ async fn serve(w: &World, db: &std::path::Path) -> Daemon {
     let server = tokio::spawn(async move {
         let auth = HashlockAuth::new(Store::in_memory().unwrap())
             .with_operator_token(Some(OPERATOR_TOKEN.into()));
-        let app = router_with_auth(state, None, "/swap", false, auth);
+        let app = router_with_auth(state, None, "/swap", ProxyTrust::off(), auth);
         axum::serve(listener, app).await.unwrap();
     });
     Daemon {

@@ -23,19 +23,35 @@ use std::sync::Arc;
 use common::*;
 use divi_swap::Store;
 use divi_swapd::{
-    router_with_proxy, AppState, ScanStatus, PUBLIC_READ_LIMIT_PER_WINDOW, READ_LIMIT_PER_WINDOW,
-    WRITE_LIMIT_PER_WINDOW,
+    router_with_auth, router_with_proxy, AppState, HashlockAuth, ProxyTrust, ScanStatus,
+    PUBLIC_READ_LIMIT_PER_WINDOW, READ_LIMIT_PER_WINDOW, WRITE_LIMIT_PER_WINDOW,
+    XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
 };
 
-async fn serve_proxy(trust: bool) -> (String, tokio::task::JoinHandle<()>) {
+fn state() -> AppState {
     let w = World::new();
-    let state = AppState {
+    AppState {
         maker: w.maker(Store::in_memory().unwrap()),
         divi: Arc::new(w.maker_divi.clone()),
         btc: Arc::new(w.maker_btc.clone()),
         scan: ScanStatus::done(),
-    };
-    let app = router_with_proxy(state, None, "/swap", trust);
+    }
+}
+
+/// `trust`: `trust_proxy_headers` with the default `trusted_proxies`, so this test's loopback
+/// connections are a trusted proxy.
+async fn serve_proxy(trust: bool) -> (String, tokio::task::JoinHandle<()>) {
+    serve(router_with_proxy(state(), None, "/swap", trust)).await
+}
+
+/// `trust_proxy_headers` on with `trusted_proxies = proxies`.
+async fn serve_trusting(proxies: &[&str]) -> (String, tokio::task::JoinHandle<()>) {
+    let proxy = ProxyTrust::proxies(proxies.iter().map(|p| p.parse().unwrap()));
+    let auth = HashlockAuth::new(Store::in_memory().unwrap());
+    serve(router_with_auth(state(), None, "/swap", proxy, auth)).await
+}
+
+async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let h = tokio::spawn(async move {
@@ -173,6 +189,52 @@ async fn a_spoofed_forwarded_for_cannot_get_a_fresh_bucket_under_trust_proxy_hea
         hit(&c, "POST", &url, Some("203.0.113.1, 198.51.100.10")).await,
         429
     );
+    h.abort();
+}
+
+/// A client that reaches the daemon directly (its address is not in `trusted_proxies`) cannot
+/// pick its bucket with `X-Forwarded-For`: rotating it, its 21st token miss on `GET /swaps/:id`
+/// is still a 429. Fails on 75c9b7c, where the flag alone made any peer's header count.
+#[tokio::test]
+async fn an_untrusted_peer_rotating_forwarded_for_is_429_on_its_21st_miss() {
+    // The proxy is elsewhere; this test's loopback connection is a client, not the proxy.
+    let (base, h) = serve_trusting(&["192.0.2.0/24", "2001:db8::/32"]).await;
+    let c = reqwest::Client::new();
+    let n = first_429(
+        &c,
+        "GET",
+        &format!("{base}/swaps/nope"),
+        XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
+        |i| Some(format!("198.51.100.{i}")),
+    )
+    .await;
+    assert_eq!(
+        n,
+        Some(XMR_TOKEN_MISS_LIMIT_PER_WINDOW + 1),
+        "keyed on the socket peer"
+    );
+    h.abort();
+}
+
+/// Two clients behind a proxy on this host (the default `trusted_proxies`) keep separate
+/// buckets: one using up its token misses leaves the other's whole.
+#[tokio::test]
+async fn two_clients_behind_a_loopback_proxy_keep_separate_buckets() {
+    let (base, h) = serve_proxy(true).await;
+    let c = reqwest::Client::new();
+    let url = format!("{base}/swaps/nope");
+    let n = first_429(&c, "GET", &url, XMR_TOKEN_MISS_LIMIT_PER_WINDOW, |_| {
+        Some("198.51.100.1".into())
+    })
+    .await;
+    assert_eq!(n, Some(XMR_TOKEN_MISS_LIMIT_PER_WINDOW + 1), "first client");
+    assert_eq!(hit(&c, "GET", &url, Some("198.51.100.2")).await, 404);
+    assert_eq!(
+        hit(&c, "GET", &url, Some("203.0.113.5, 198.51.100.2")).await,
+        404,
+        "the last entry names the client"
+    );
+    assert_eq!(hit(&c, "GET", &url, Some("198.51.100.1")).await, 429);
     h.abort();
 }
 
