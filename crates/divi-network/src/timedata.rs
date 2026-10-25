@@ -13,23 +13,32 @@
 //! peer's version message gives one sample, its time less ours, once per
 //! address for the life of the node; the offset is the median of the samples,
 //! taken when there are at least 5 and an odd number of them, and only when it
-//! is under 70 minutes; past that it is 0.
+//! is under 70 minutes; past that it is 0, and the node warns once that its
+//! clock may be wrong.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
-use std::sync::Mutex;
-use tracing::info;
+use std::sync::{Mutex, OnceLock};
+use tracing::{info, warn};
 
 /// Samples kept (CMedianFilter<int64_t> vTimeOffsets(200, 0))
 const MAX_SAMPLES: usize = 200;
 /// The largest offset taken from the peers (timedata.cpp:81)
 const MAX_OFFSET: i64 = 70 * 60;
+/// A peer this close to our clock, but not on it, means ours is fine
+/// (timedata.cpp:91)
+const CLOSE: i64 = 5 * 60;
+
+/// Divi Core's warning when the peers' median is too far off (timedata.cpp:96)
+pub const CLOCK_WARNING: &str = "Warning: Please check that your computer's date and time are correct! If your clock is wrong DIVI Core will not work properly.";
+
 /// The samples and the addresses they came from
 #[derive(Debug)]
 pub struct TimeData {
     known: HashSet<IpAddr>,
     /// Oldest first; starts with one 0, our own clock (timedata.h:28-33)
     samples: VecDeque<i64>,
+    warned: bool,
 }
 
 /// What one sample changed
@@ -37,6 +46,8 @@ pub struct TimeData {
 pub struct Added {
     /// The new offset, when the samples were counted (at least 5, odd)
     pub offset: Option<i64>,
+    /// The clock warning, the first time it is due
+    pub warn: bool,
 }
 
 impl Default for TimeData {
@@ -44,6 +55,7 @@ impl Default for TimeData {
         TimeData {
             known: HashSet::new(),
             samples: VecDeque::from([0]),
+            warned: false,
         }
     }
 }
@@ -51,7 +63,10 @@ impl Default for TimeData {
 impl TimeData {
     /// One peer's sample, `offset` = its time less ours (AddTimeData)
     pub fn add(&mut self, ip: IpAddr, offset: i64) -> Added {
-        let none = Added { offset: None };
+        let none = Added {
+            offset: None,
+            warn: false,
+        };
         // Ignore duplicates: one sample per address, ports aside (setKnown)
         if !self.known.insert(ip.to_canonical()) {
             return none;
@@ -73,8 +88,20 @@ impl TimeData {
         let mut sorted: Vec<i64> = self.samples.iter().copied().collect();
         sorted.sort_unstable();
         let median = sorted[sorted.len() / 2];
-        // Only let other nodes change our time by so much
-        let new_offset = if median.abs() < MAX_OFFSET { median } else { 0 };
+        let mut warn_now = false;
+        let new_offset = if median.abs() < MAX_OFFSET {
+            median
+        } else {
+            if !self.warned {
+                // Nobody differs from us by a little: our clock is the odd one
+                let close = sorted.iter().any(|&o| o != 0 && o.abs() < CLOSE);
+                if !close {
+                    self.warned = true;
+                    warn_now = true;
+                }
+            }
+            0
+        };
         info!(
             "nTimeOffset = {:+}  ({:+} minutes)",
             new_offset,
@@ -82,11 +109,20 @@ impl TimeData {
         );
         Added {
             offset: Some(new_offset),
+            warn: warn_now,
         }
     }
 }
 
 static TIME_DATA: Mutex<Option<TimeData>> = Mutex::new(None);
+static WARNING: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Where the clock warning goes besides the log (Core's Warnings::setMiscWarning,
+/// shown as getinfo's and getmininginfo's "errors"); set once at start
+pub fn on_clock_warning(show: fn(&str)) {
+    let _ = WARNING.set(show);
+}
+
 /// The version message of the peer at `ip` gave its time `peer_time`: add the
 /// sample and set the node's time offset (Core AddTimeData, called at the end
 /// of the version message, main.cpp:465)
@@ -98,6 +134,12 @@ pub fn add_time_data(ip: IpAddr, peer_time: i64) {
     };
     if let Some(offset) = added.offset {
         divi_primitives::clock::set_time_offset(offset);
+    }
+    if added.warn {
+        warn!("*** {}", CLOCK_WARNING);
+        if let Some(show) = WARNING.get() {
+            show(CLOCK_WARNING);
+        }
     }
 }
 
@@ -131,20 +173,54 @@ mod tests {
         assert_eq!(t.samples.len(), 7);
     }
 
-    /// Past 70 minutes the offset is 0 (timedata.cpp:81-84)
+    /// Past 70 minutes the offset is 0, and the warning comes once, and only
+    /// when no peer is within 5 minutes of us (timedata.cpp:81-101)
     #[test]
-    fn a_median_past_seventy_minutes_is_zero() {
+    fn a_median_past_seventy_minutes_is_zero_and_warns_once() {
         let mut t = TimeData::default();
         for n in 1..=3 {
             t.add(ip(n), 80 * 60);
         }
-        assert_eq!(t.add(ip(4), 80 * 60).offset, Some(0));
+        assert_eq!(
+            t.add(ip(4), 80 * 60),
+            Added {
+                offset: Some(0),
+                warn: true
+            }
+        );
+        t.add(ip(5), 80 * 60);
+        assert_eq!(
+            t.add(ip(6), 80 * 60),
+            Added {
+                offset: Some(0),
+                warn: false
+            },
+            "once"
+        );
         // 69 minutes is taken
         let mut t = TimeData::default();
         for n in 1..=3 {
             t.add(ip(n), 69 * 60);
         }
         assert_eq!(t.add(ip(4), 69 * 60).offset, Some(69 * 60));
+        // A peer within 5 minutes (not on our clock) holds the warning back
+        let mut t = TimeData::default();
+        t.add(ip(1), 60);
+        for n in 2..=4 {
+            t.add(ip(n), -80 * 60);
+        }
+        assert_eq!(
+            t.add(ip(5), -80 * 60).offset,
+            None,
+            "5 peers: an even count"
+        );
+        assert_eq!(
+            t.add(ip(6), -80 * 60),
+            Added {
+                offset: Some(0),
+                warn: false
+            }
+        );
     }
 
     /// The filter keeps the newest 200 samples, our 0 dropped first

@@ -264,3 +264,25 @@ fn the_offset_is_the_median_of_the_peers_version_times() {
     wait_offset(&d, 600);
     drop(again);
 }
+
+/// Four peers 80 minutes ahead: past 70 minutes the offset is 0, and with no
+/// peer within 5 minutes of us the node warns that its clock may be wrong, in
+/// getinfo's errors (timedata.cpp:81-101, rpcmisc.cpp:156)
+#[test]
+fn a_median_past_seventy_minutes_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(dir.path(), &[]);
+    let _peers: Vec<TcpStream> = (20..24).map(|n| peer(&d, n, 80 * 60)).collect();
+    let warning = "Warning: Please check that your computer's date and time are correct! If your clock is wrong DIVI Core will not work properly.";
+    let deadline = Instant::now() + WAIT;
+    while d.rpc("getinfo")["errors"] != warning {
+        assert!(
+            Instant::now() < deadline,
+            "errors: {}",
+            d.rpc("getinfo")["errors"]
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(offsets(&d), (json!(0), json!(0)));
+    assert_eq!(d.rpc("getmininginfo")["errors"], warning);
+}

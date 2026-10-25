@@ -1735,6 +1735,10 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // The clock warning of the network time offset goes where Divi Core's
+    // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
+    // (timedata.cpp:96-97)
+    divi_network::timedata::on_clock_warning(divi_rpc::warnings::set_misc_warning);
     // divid reads masternode.conf (-mnconf) at every start, makes it when
     // missing, and with -masternode checks the masternode's settings
     // (MasternodeModule.cpp:210-240; init.cpp:1594-1597)
