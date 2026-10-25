@@ -1390,6 +1390,31 @@ impl WalletDb {
         *self.last_scan_height.read()
     }
 
+    /// Position the scan for a start, as Divi Core does: it scans from the
+    /// wallet's stored best block, or from the last block of that chain still
+    /// in the active chain, that block itself included (wallet.cpp:244-269,
+    /// :279-313). So a payment in the last block to a script the wallet learned
+    /// only at this start (a vault removed in the running wallet and registered
+    /// again by the file) is found, a wallet put back from before a reorg
+    /// starts from the block the two chains share, and the transactions of the
+    /// block scanned again are notified again.
+    pub fn resume_scan<H: Fn(u32) -> Option<Hash256>>(&self, tip_height: u32, hash_at: H) {
+        let _scan = self.scan_lock.lock();
+        let last = self.last_scan_height();
+        let top = last.min(tip_height);
+        match self.find_fork(top, &hash_at) {
+            Some(fork) => {
+                info!(
+                    "Wallet scanned blocks above {} that left the active chain; rolling back",
+                    fork
+                );
+                self.rollback_heights_notifying(fork + 1, u32::MAX, false);
+                self.set_last_scan_height(fork.saturating_sub(1));
+            }
+            None => self.set_last_scan_height(last.saturating_sub(1)),
+        }
+    }
+
     /// Set last scanned block height
     pub fn set_last_scan_height(&self, height: u32) {
         *self.last_scan_height.write() = height;
@@ -3299,6 +3324,14 @@ impl WalletDb {
     /// history entries go, and coins they spent come back unless those coins
     /// were themselves created in the range.
     fn rollback_heights(&self, start: u32, stop: u32) {
+        self.rollback_heights_notifying(start, stop, true);
+    }
+
+    /// `notify` is whether the transactions that leave their block are told to
+    /// the listener, as Divi Core does when a block is disconnected while it
+    /// runs; at a start nothing is disconnected, the scan that follows tells
+    /// of each transaction it meets
+    fn rollback_heights_notifying(&self, start: u32, stop: u32, notify: bool) {
         let in_range = |h: u32| h >= start && h <= stop;
         let mut pending = self.pending_deletes.write();
 
@@ -3389,7 +3422,9 @@ impl WalletDb {
         // Divi Core updates each one as its block is disconnected
         for (txid, timestamp) in disconnected {
             self.detach(txid, timestamp, None);
-            self.tx_changed(&txid);
+            if notify {
+                self.tx_changed(&txid);
+            }
         }
     }
 
@@ -5888,6 +5923,138 @@ mod tests {
                 .utxos
                 .iter()
                 .all(|u| !divi_script::is_staking_vault_script(&u.script_pubkey)));
+        }
+
+        /// A start after a reorg the wallet did not see: the wallet scans from
+        /// the block the old and the new chain share, that block included, and
+        /// tells of each transaction once (Divi Core: wallet.cpp:244-269).
+        #[test]
+        fn start_after_a_reorg_scans_from_the_shared_block_once() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("owner.dat");
+            let old_hash = |h: u32| Some(Hash256::from_bytes([h as u8; 32]));
+            let new_hash = |h: u32| {
+                Some(Hash256::from_bytes(
+                    [if h >= 4 { 0x80 + h as u8 } else { h as u8 }; 32],
+                ))
+            };
+            let plain;
+            let tx;
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                plain = wallet.new_receiving_address().unwrap();
+                tx = pay(vec![(50 * COIN, Script::new_p2pkh(plain.hash.as_bytes()))]);
+                let blocks = |h: u32| {
+                    let mut block = divi_primitives::block::Block::default();
+                    if h == 5 {
+                        block.transactions = vec![tx.clone()];
+                    }
+                    Some((Hash256::from_bytes([h as u8; 32]), block))
+                };
+                wallet.sync_to_tip(5, old_hash, blocks);
+                assert_eq!(wallet.get_utxos().len(), 1);
+                wallet.save().unwrap();
+            }
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = std::sync::Arc::clone(&heard);
+            wallet.set_tx_listener(std::sync::Arc::new(move |txid: &Hash256| {
+                into.lock().unwrap().push(*txid)
+            }));
+            // The chain now has other blocks from height 4 up, and the payment in block 6
+            wallet.resume_scan(6, new_hash);
+            assert_eq!(
+                wallet.last_scan_height(),
+                2,
+                "block 3 is the shared one: scan from it"
+            );
+            assert!(
+                wallet.get_utxos().is_empty(),
+                "the old branch's coin is gone"
+            );
+            let blocks = |h: u32| {
+                let mut block = divi_primitives::block::Block::default();
+                if h == 6 {
+                    block.transactions = vec![tx.clone()];
+                }
+                Some((
+                    Hash256::from_bytes([if h >= 4 { 0x80 + h as u8 } else { h as u8 }; 32]),
+                    block,
+                ))
+            };
+            wallet.sync_to_tip(6, new_hash, blocks);
+            assert_eq!(wallet.get_utxos().len(), 1);
+            assert_eq!(
+                heard
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|t| **t == tx.txid())
+                    .count(),
+                1,
+                "told once, by the scan"
+            );
+        }
+
+        /// A start scans the last block again, as Divi Core does: a payment in
+        /// that block to a vault removed in the running wallet is found once the
+        /// file registers the vault again, and a second scan adds nothing twice.
+        #[test]
+        fn start_scans_the_last_block_again() {
+            use tempfile::tempdir;
+
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("manager.dat");
+            let hash_at = |h: u32| Some(Hash256::from_bytes([h as u8; 32]));
+            let manager;
+            let vault;
+            let tx;
+            {
+                let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+                let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
+                manager = wallet.new_receiving_address().unwrap();
+                vault =
+                    divi_script::StakingVaultScript::new([0x66; 20], hash20(&manager)).to_script();
+                register(&wallet, [0x66; 20], &manager, &vault);
+                tx = pay(vec![(500 * COIN, vault.clone())]);
+                // removevault in the running wallet, then the block with the payment
+                assert!(wallet.remove_vault(vault.as_bytes()));
+                let block_with = |h: u32| {
+                    let mut block = divi_primitives::block::Block::default();
+                    if h == 5 {
+                        block.transactions = vec![tx.clone()];
+                    }
+                    Some((Hash256::from_bytes([h as u8; 32]), block))
+                };
+                wallet.sync_to_tip(5, hash_at, block_with);
+                assert!(wallet.get_utxos().is_empty());
+                wallet.save().unwrap();
+            }
+            let block_with = |h: u32| {
+                let mut block = divi_primitives::block::Block::default();
+                if h == 5 {
+                    block.transactions = vec![tx.clone()];
+                }
+                Some((Hash256::from_bytes([h as u8; 32]), block))
+            };
+            let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
+            assert!(wallet.get_vault(vault.as_bytes()).is_some());
+            assert_eq!(wallet.last_scan_height(), 5);
+            wallet.resume_scan(5, hash_at);
+            assert_eq!(wallet.last_scan_height(), 4);
+            wallet.sync_to_tip(5, hash_at, block_with);
+            assert_eq!(wallet.get_utxos().len(), 1, "the payment in the last block");
+            let history = wallet.history_records().len();
+            assert_eq!(history, 1);
+
+            // and again: nothing is added twice
+            wallet.resume_scan(5, hash_at);
+            wallet.sync_to_tip(5, hash_at, block_with);
+            assert_eq!(wallet.get_utxos().len(), 1);
+            assert_eq!(wallet.history_records().len(), history);
         }
 
         /// a wallet left by 0.2.6 removevault (metadata gone, the vault

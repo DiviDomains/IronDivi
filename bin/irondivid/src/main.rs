@@ -1930,6 +1930,11 @@ async fn run_daemon(
             if wallet_options.rescan {
                 info!("Rescanning... from height 0 to {}", chain_height);
                 wallet_arc.set_last_scan_height(0);
+            } else {
+                // Divi Core scans from the wallet's stored best block, itself
+                // included (wallet.cpp:258-269, :279-313): the last block is
+                // scanned again at every start
+                divi_rpc::wallet::resume_wallet_scan(wallet_arc, node.chain());
             }
             let last_scan = wallet_arc.last_scan_height();
             if last_scan > chain_height {
