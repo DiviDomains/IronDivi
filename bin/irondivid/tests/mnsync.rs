@@ -56,13 +56,18 @@ impl Drop for Node {
 }
 
 fn start(datadir: &Path, rpc_port: u16, p2p_port: u16) -> Node {
+    start_with(datadir, rpc_port, p2p_port, &["--listen=false"])
+}
+
+fn start_with(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Node {
     let child = Command::new(env!("CARGO_BIN_EXE_irondivid"))
         .arg("--regtest")
         .arg("--datadir")
         .arg(datadir)
         .args(["--rpcport", &rpc_port.to_string()])
         .args(["--port", &p2p_port.to_string()])
-        .args(["--bind", "127.0.0.1", "--staking=false", "--listen=false"])
+        .args(["--bind", "127.0.0.1", "--staking=false"])
+        .args(extra)
         .args(["--rpcuser", "test", "--rpcpassword", "test"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -132,5 +137,34 @@ fn mnsync_stages_follow_the_chain_and_reset() {
     let s = wait_status(rpc_port, 10, |s| {
         s["currentMasternodeSyncStatus"] == json!(1)
     });
+    assert_eq!(s["currentMasternodeSyncStatus"], json!(1), "{s}");
+}
+
+/// getstakingstatus `mnsync` is IsSynced, the sync finished (rpcmisc.cpp:1069):
+/// false at SPORKS on a node that followed a peer's chain, though that chain
+/// is synced
+#[test]
+fn getstakingstatus_mnsync_is_the_finished_sync() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (rpc_a, p2p_a, rpc_b, p2p_b) = (free_port(), free_port(), free_port(), free_port());
+    let _a = start_with(dir_a.path(), rpc_a, p2p_a, &["--listen=1"]);
+    let connect = format!("-connect=127.0.0.1:{p2p_a}");
+    let _b = start_with(dir_b.path(), rpc_b, p2p_b, &["--listen=false", &connect]);
+    ok(rpc_a, "setgenerate", json!([3]));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while ok(rpc_b, "getblockcount", json!([])) != json!(3) {
+        assert!(
+            Instant::now() < deadline,
+            "the follower did not reach the tip"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let s = wait_status(rpc_b, 15, |s| s["currentMasternodeSyncStatus"] == json!(1));
+    assert_eq!(s["IsBlockchainSynced"], json!(true), "{s}");
+    assert_eq!(
+        ok(rpc_b, "getstakingstatus", json!([]))["mnsync"],
+        json!(false),
+        "{s}"
+    );
     assert_eq!(s["currentMasternodeSyncStatus"], json!(1), "{s}");
 }
