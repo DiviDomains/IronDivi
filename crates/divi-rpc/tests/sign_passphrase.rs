@@ -118,3 +118,57 @@ fn signmessage_checks_the_unlock_before_the_arguments() {
         (-1, "value is type int, expected str".to_string())
     );
 }
+
+fn unlocked_until(node: &Node) -> i64 {
+    node.ok("getwalletinfo", vec![])["unlocked_until"]
+        .as_i64()
+        .unwrap()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// walletpassphrase reads its timeout with get_int64 after it has unlocked
+/// the wallet (rpcwallet.cpp:2615-2623). A timeout that is no integer is -1
+/// with the wallet unlocked and unlocked_until as it was; one of 0 or less
+/// unlocks with no timer, unlocked_until now plus it (rpcserver.cpp:1195-1220)
+#[test]
+fn walletpassphrase_reads_its_timeout_after_the_unlock() {
+    let node = encrypted_node();
+    assert_eq!(
+        node.err("walletpassphrase", vec![json!("pass"), json!(1.5)]),
+        (-1, "value is type real, expected int".to_string())
+    );
+    assert_eq!(node.status(), json!("unlocked"));
+    assert_eq!(unlocked_until(&node), 0);
+    node.ok("walletlock", vec![]);
+
+    assert_eq!(
+        node.err("walletpassphrase", vec![json!("pass"), json!(null)]),
+        (-1, "value is type null, expected int".to_string())
+    );
+    assert_eq!(node.status(), json!("unlocked"));
+    node.ok("walletlock", vec![]);
+
+    node.ok("walletpassphrase", vec![json!("pass"), json!(-5)]);
+    assert_eq!(node.status(), json!("unlocked"));
+    assert!((unlocked_until(&node) - (now() - 5)).abs() <= 2);
+    node.ok("walletlock", vec![]);
+    assert_eq!(unlocked_until(&node), 0);
+
+    node.ok("walletpassphrase", vec![json!("pass"), json!(0)]);
+    assert!((unlocked_until(&node) - now()).abs() <= 2);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(node.status(), json!("unlocked"), "no timer for 0");
+    node.ok("walletlock", vec![]);
+
+    node.ok("walletpassphrase", vec![json!("pass"), json!(2)]);
+    assert!((unlocked_until(&node) - (now() + 2)).abs() <= 2);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(node.status(), json!("locked"));
+    assert_eq!(unlocked_until(&node), 0);
+}

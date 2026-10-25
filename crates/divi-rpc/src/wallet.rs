@@ -1516,28 +1516,13 @@ impl WalletRpc {
         }))
     }
 
-    /// walletpassphrase - Unlock wallet for specified time
+    /// walletpassphrase as Divi Core's (rpcwallet.cpp:2573-2625): the
+    /// passphrase and the staking-only flag are read, the wallet unlocked, and
+    /// only then the timeout read (get_int64): a timeout that is no integer is
+    /// refused with the wallet left unlocked and unlocked_until as it was, and
+    /// one of 0 or less unlocks with no timer, unlocked_until now plus it
     pub fn wallet_passphrase(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        if let Ok(wallet) = self.get_wallet() {
-            if !wallet.is_encrypted() {
-                return Err(RpcError::new(
-                    codes::WALLET_WRONG_ENC_STATE,
-                    "Error: running with an unencrypted wallet, but walletpassphrase was called.",
-                )
-                .into());
-            }
-        }
-        let passphrase = params
-            .get_str(0)
-            .ok_or_else(|| RpcError::invalid_params("Passphrase required"))?;
-        let timeout = params
-            .get_u64(1)
-            .ok_or_else(|| RpcError::invalid_params("Timeout required"))?;
-        // Divi Core's third argument: unlock for staking only
-        let staking_only = params.get_bool(2).unwrap_or(false);
-
         let wallet = self.get_wallet()?;
-
         if !wallet.is_encrypted() {
             return Err(RpcError::new(
                 codes::WALLET_WRONG_ENC_STATE,
@@ -1545,7 +1530,12 @@ impl WalletRpc {
             )
             .into());
         }
-
+        let passphrase = spirit_str(params, 0)?;
+        let staking_only = if params.len() == 3 {
+            spirit_bool(params, 2)?
+        } else {
+            false
+        };
         if staking_only && wallet.is_unlocked_for_staking_only() {
             return Err(RpcError::new(
                 codes::WALLET_ALREADY_UNLOCKED,
@@ -1553,9 +1543,10 @@ impl WalletRpc {
             )
             .into());
         }
-
+        // A timer of a wallet unlocked for staking only goes back to staking
+        let revert_to_staking = wallet.is_unlocked_for_staking_only();
         wallet
-            .unlock_for(passphrase, timeout as u32, staking_only)
+            .unlock_keeping_timer(passphrase, staking_only)
             .map_err(|e| match e {
                 divi_wallet::WalletError::WrongPassphrase
                 | divi_wallet::WalletError::InvalidPassphrase => RpcError::new(
@@ -1564,7 +1555,13 @@ impl WalletRpc {
                 ),
                 other => RpcError::new(codes::WALLET_ERROR, other.to_string()),
             })?;
-
+        let timeout = match params.get(1) {
+            Some(serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => n
+                .as_i64()
+                .unwrap_or_else(|| n.as_u64().unwrap_or_default() as i64),
+            other => return Err(spirit_type_error(other, "int")),
+        };
+        wallet.set_unlock_timeout(timeout, revert_to_staking);
         Ok(serde_json::Value::Null)
     }
 

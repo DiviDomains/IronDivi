@@ -368,6 +368,11 @@ struct UnlockState {
     staking_only: bool,
     /// When `until` passes, go back to staking-only instead of locking
     revert_to_staking: bool,
+    /// What getwalletinfo reports as unlocked_until: Divi Core's
+    /// nWalletUnlockTime, set by walletpassphrase to now plus its timeout
+    /// (also 0 or less, which sets no timer) and cleared by walletlock or
+    /// when the timer runs out (rpcserver.cpp:1195-1220)
+    unlock_time: i64,
 }
 
 /// How many recently scanned block hashes the wallet remembers
@@ -2439,6 +2444,11 @@ impl WalletDb {
             until: expiration,
             staking_only,
             revert_to_staking: was_staking_only && expiration.is_some(),
+            unlock_time: if timeout_secs > 0 {
+                unix_time_now() + i64::from(timeout_secs)
+            } else {
+                0
+            },
         };
 
         *self.locked.write() = false;
@@ -2532,23 +2542,55 @@ impl WalletDb {
         }
     }
 
-    /// Unix time at which the wallet re-locks; 0 when locked, unencrypted, or unlocked
-    /// without a timeout.
-    pub fn unlocked_until(&self) -> u64 {
-        if !self.is_encrypted() || self.is_locked() {
+    /// getwalletinfo's unlocked_until, Divi Core's nWalletUnlockTime: the time
+    /// the last walletpassphrase set, until walletlock or the end of its timer
+    /// clears it; 0 for an unencrypted wallet
+    pub fn unlocked_until(&self) -> i64 {
+        if !self.is_encrypted() {
             return 0;
         }
-        match self.unlock.read().until {
-            Some(t) => {
-                let remaining = t.saturating_duration_since(Instant::now()).as_secs();
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    + remaining
-            }
-            None => 0,
+        // Lets a timer that has run out lock the wallet (or go back to staking)
+        self.is_locked();
+        let state = self.unlock.read();
+        if state.until.is_some_and(|t| Instant::now() >= t) {
+            return 0;
         }
+        state.unlock_time
+    }
+
+    /// Divi Core walletpassphrase's unlock (CWallet::Unlock, wallet.cpp:778-803):
+    /// the keys, fully or for staking only, leaving the timer and
+    /// unlocked_until as they are; walletpassphrase sets them once it has read
+    /// its timeout (`set_unlock_timeout`)
+    pub fn unlock_keeping_timer(
+        &self,
+        passphrase: &str,
+        staking_only: bool,
+    ) -> Result<(), WalletError> {
+        // Settle a timer that has run out first
+        self.is_locked();
+        let before = *self.unlock.read();
+        self.unlock_for(passphrase, 0, staking_only)?;
+        let mut state = self.unlock.write();
+        state.until = before.until;
+        state.revert_to_staking = before.revert_to_staking;
+        state.unlock_time = before.unlock_time;
+        Ok(())
+    }
+
+    /// walletpassphrase's timeout (UnlockWalletBriefly, rpcserver.cpp:1195-1220):
+    /// unlocked_until becomes now plus `timeout_secs`, and only a timeout above
+    /// 0 sets a timer; when it ends the wallet locks, or goes back to staking
+    /// only with `revert_to_staking`
+    pub fn set_unlock_timeout(&self, timeout_secs: i64, revert_to_staking: bool) {
+        let mut state = self.unlock.write();
+        state.unlock_time = unix_time_now().saturating_add(timeout_secs);
+        state.until = (timeout_secs > 0)
+            .then(|| {
+                Instant::now().checked_add(std::time::Duration::from_secs(timeout_secs as u64))
+            })
+            .flatten();
+        state.revert_to_staking = revert_to_staking && state.until.is_some();
     }
 
     /// Encrypt the wallet with `passphrase`.
@@ -4189,6 +4231,13 @@ fn parents_first(
         ordered.push((timestamp, tx));
     }
     ordered
+}
+
+/// Seconds since the Unix epoch
+fn unix_time_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]
