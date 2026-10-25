@@ -241,11 +241,16 @@ impl PeerManager {
         if self.config.connect_only || !self.can_connect_outbound() {
             return;
         }
+        let local = self.local_addresses();
         for addr in self.address_book.candidates(self.config.max_outbound * 4) {
             if !self.can_connect_outbound() {
                 break;
             }
-            if self.is_banned(&addr.ip()) || !self.claim_dial(addr, DialRule::Automatic) {
+            // A network -onlynet left out is not dialled (net.cpp:1164-1165)
+            if local.is_limited(&addr.ip())
+                || self.is_banned(&addr.ip())
+                || !self.claim_dial(addr, DialRule::Automatic)
+            {
                 continue;
             }
             debug!("Dialling learnt address {}", addr);
@@ -718,9 +723,15 @@ impl PeerManager {
 
             match tokio::net::lookup_host(format!("{}:{}", seed, self.config.default_port)).await {
                 Ok(addrs) => {
+                    let local = self.local_addresses();
                     for addr in addrs {
                         if self.can_connect_outbound() {
-                            if !self.claim_dial(addr, DialRule::Automatic) {
+                            // Divi Core puts seed addresses in addrman, which
+                            // does not dial a network -onlynet left out
+                            // (net.cpp:1164-1165)
+                            if local.is_limited(&addr.ip())
+                                || !self.claim_dial(addr, DialRule::Automatic)
+                            {
                                 continue;
                             }
                             info!("Discovered peer: {}", addr);

@@ -1864,6 +1864,14 @@ impl Node {
         let p2p = &self.config.p2p;
         let listen = self.config.peer_sources().listen;
         let local = LocalAddresses::new(listen, p2p.discover, p2p.port);
+        // -onlynet first: an address of a left-out network is not ours
+        // (AddLocal, NetworkLocalAddressHelpers.cpp:90)
+        let only: Vec<_> = p2p
+            .only_nets
+            .iter()
+            .filter_map(|n| divi_network::local::Network::parse(n))
+            .collect();
+        local.limit_to(&only);
         let bound = p2p
             .listen_addr
             .trim_matches(['[', ']'])

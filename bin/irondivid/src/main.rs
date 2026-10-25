@@ -317,7 +317,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "mnconflock",
     "monthlybackups",
     "onion",
-    "onlynet",
     "par",
     "peerbloomfilters",
     "permitbaremultisig",
@@ -623,12 +622,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
     for net in s.get_multi("onlynet") {
-        if !matches!(
-            net.to_lowercase().as_str(),
-            "ipv4" | "ipv6" | "tor" | "onion"
-        ) {
+        if divi_network::local::Network::parse(net).is_none() {
             anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
         }
+        config.p2p.only_nets.push(net.to_lowercase());
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -733,6 +730,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "proxy",
         "discover",
         "externalip",
+        "onlynet",
         "protocolversion",
         "banscore",
         "bantime",

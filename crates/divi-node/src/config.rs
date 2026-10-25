@@ -427,6 +427,11 @@ pub struct P2pConfig {
     #[serde(default)]
     pub external_ips: Vec<SocketAddr>,
 
+    /// Divi Core -onlynet: the only networks dialled from learnt addresses
+    /// (`ipv4`, `ipv6`, `onion`); empty: every network
+    #[serde(default)]
+    pub only_nets: Vec<String>,
+
     /// The machine's interface addresses, found at start with `discover`
     #[serde(default)]
     pub interface_ips: Vec<std::net::IpAddr>,
@@ -518,6 +523,7 @@ impl Default for P2pConfig {
             connect_timeout_ms: default_connect_timeout_ms(),
             discover: default_discover(),
             external_ips: Vec::new(),
+            only_nets: Vec::new(),
             interface_ips: Vec::new(),
             whitelist: Vec::new(),
             white_bind: Vec::new(),
