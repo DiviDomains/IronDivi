@@ -4691,4 +4691,48 @@ mod tests {
             assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Managed));
         }
     }
+
+    fn files_containing(dir: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+        let mut hits = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                hits.extend(files_containing(&path, needle));
+            } else if std::fs::read(&path)
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle)
+            {
+                hits.push(path);
+            }
+        }
+        hits
+    }
+
+    /// NODE-9: after encryptwallet no file in the wallet directory still holds
+    /// the plaintext seed, including the write-ahead log, which other column
+    /// families with unflushed writes would otherwise keep alive.
+    #[test]
+    fn node09_encryptwallet_leaves_no_plaintext_seed_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
+        let wallet = WalletDb::create_persistent(&path, Network::Testnet, hd).unwrap();
+        wallet.save().unwrap();
+        wallet.new_receiving_address().unwrap();
+        // An unflushed write in an unrelated column family
+        wallet.db.as_ref().unwrap().mark_address_used("x").unwrap();
+        assert!(!files_containing(&path, TEST_MNEMONIC.as_bytes()).is_empty());
+
+        wallet.encrypt_wallet("pw").unwrap();
+        drop(wallet);
+        assert_eq!(
+            files_containing(&path, TEST_MNEMONIC.as_bytes()),
+            Vec::<std::path::PathBuf>::new()
+        );
+        // The encrypted wallet still opens and unlocks
+        let wallet = WalletDb::open(&path, Network::Testnet).unwrap();
+        wallet.unlock("pw", 60).unwrap();
+        assert_eq!(wallet.mnemonic().as_deref(), Some(TEST_MNEMONIC));
+    }
 }

@@ -43,6 +43,21 @@ const CF_SPENT_UTXO_DATA: &str = "spent_utxo_data";
 // Legacy column families - kept for backward compatibility with existing databases
 const CF_WATCH_ONLY_ADDRESSES: &str = "watch_only_addresses";
 const CF_VAULTS_LEGACY: &str = "vaults";
+const ALL_CFS: [&str; 13] = [
+    CF_DEFAULT,
+    CF_METADATA,
+    CF_KEYS,
+    CF_UTXOS,
+    CF_SPENT,
+    CF_TRANSACTIONS,
+    CF_ADDRESSES,
+    CF_ACCOUNTS,
+    CF_SCRIPTS,
+    CF_VAULTS,
+    CF_SPENT_UTXO_DATA,
+    CF_WATCH_ONLY_ADDRESSES,
+    CF_VAULTS_LEGACY,
+];
 
 /// Metadata keys
 const KEY_MNEMONIC: &[u8] = b"mnemonic";
@@ -93,22 +108,11 @@ impl WalletDatabase {
         cf_opts.set_max_write_buffer_number(2);
         cf_opts.set_level_compaction_dynamic_level_bytes(true);
 
-        let cfs = vec![
-            ColumnFamilyDescriptor::new(CF_DEFAULT, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_METADATA, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_KEYS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_UTXOS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SPENT, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_TRANSACTIONS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_ADDRESSES, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_ACCOUNTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SCRIPTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_VAULTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SPENT_UTXO_DATA, cf_opts.clone()),
-            // Legacy column families for backward compatibility
-            ColumnFamilyDescriptor::new(CF_WATCH_ONLY_ADDRESSES, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_VAULTS_LEGACY, cf_opts),
-        ];
+        // The last two are legacy column families, kept for backward compatibility
+        let cfs: Vec<_> = ALL_CFS
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
+            .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)
             .map_err(|e| WalletError::Storage(e.to_string()))?;
@@ -174,11 +178,25 @@ impl WalletDatabase {
 
     /// Force the metadata and key column families through compaction so that
     /// overwritten/deleted plaintext does not linger in old SST files.
+    ///
+    /// Every column family is flushed first: the write-ahead log is shared, and
+    /// a log file holding the old plaintext writes is kept until all column
+    /// families with data in it have been flushed.
     pub fn compact_secret_cfs(&self) {
+        for name in ALL_CFS {
+            if let Some(cf) = self.db.cf_handle(name) {
+                if let Err(e) = self.db.flush_cf(cf) {
+                    tracing::warn!("Wallet flush of {} failed: {}", name, e);
+                }
+            }
+        }
         for name in [CF_METADATA, CF_KEYS] {
             if let Some(cf) = self.db.cf_handle(name) {
                 self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
             }
+        }
+        if let Err(e) = self.db.flush_wal(true) {
+            tracing::warn!("Wallet log sync failed: {}", e);
         }
     }
 
