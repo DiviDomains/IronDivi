@@ -1492,11 +1492,9 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             .with(filter)
             .init();
 
-        eprintln!("Logging to {:?}", data_dir.join("debug.log"));
-        eprintln!(
-            "Log rotation: max {} bytes per file, {} files kept",
-            log_config.max_file_size, log_config.max_files
-        );
+        // Nothing more on stderr: divid writes there only its warnings and
+        // errors (InitWarning, InitError, noui.cpp:38-40), and a -daemon child
+        // keeps the stderr of the terminal it was started from
     }
 }
 
@@ -1599,13 +1597,14 @@ impl WalletSeed {
 }
 
 /// A start that stops with exit code 1 and no error line, as Divi Core's
-/// AppInit2 returning false without an InitError (-dbloadfailexit)
+/// AppInit2 returning false without an InitError (-dbloadfailexit, or a stop
+/// asked for before the start was done)
 #[derive(Debug)]
 struct QuietExit;
 
 impl std::fmt::Display for QuietExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the wallet loaded with a warning and -dbloadfailexit is set")
+        f.write_str("the start ended before it was done")
     }
 }
 
@@ -2031,6 +2030,7 @@ async fn run_daemon(
     mn_options: masternode_options::MasternodeOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
+    pid_file: PathBuf,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&config.data_dir)
@@ -2038,6 +2038,10 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // Divi Core writes its pid file once it holds the lock, with or without
+    // -daemon (init.cpp:1470), so a second start leaves a running node's alone
+    #[cfg(unix)]
+    write_pid_file(&pid_file);
     // The clock warning of the network time offset goes where Divi Core's
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
@@ -2572,7 +2576,16 @@ async fn run_daemon(
     });
     let wallet_for_shutdown = wallet.clone();
 
-    if !config.rpc.enabled {
+    // Divi Core's init returns !fRequestShutdown (init.cpp:1536-1539, :1661):
+    // a SIGTERM or SIGINT that came while the node was starting stops it here,
+    // with exit code 1 (divid.cpp:180)
+    let stopped_during_start = !matches!(
+        shutdown_rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    );
+    if stopped_during_start {
+        info!("Shutdown requested. Exiting.");
+    } else if !config.rpc.enabled {
         // -server=0: no RPC server, the node runs until it is told to stop
         info!("RPC server disabled (-server=0)");
         let _ = shutdown_rx.recv().await;
@@ -2858,6 +2871,7 @@ async fn run_daemon(
     info!("Node stopped");
     match rpc_error {
         Some(e) => Err(anyhow::anyhow!("RPC server error: {}", e)),
+        None if stopped_during_start => Err(anyhow::Error::new(QuietExit)),
         None => Ok(()),
     }
 }
@@ -3255,6 +3269,11 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// CreatePidFile: the process id and a newline (util.cpp:122-128)
+fn write_pid_file(pid_file: &std::path::Path) {
+    let _ = std::fs::write(pid_file, format!("{}\n", std::process::id()));
+}
+
 /// -pid, default divid.pid, relative to the data directory (util.cpp:115-119)
 fn pid_file_path(args: &Args, data_dir: &std::path::Path) -> PathBuf {
     match &args.pid {
@@ -3340,65 +3359,30 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Handle daemonization BEFORE initializing tokio runtime (Unix only)
+    // -daemon as Divi Core's AppInit does it, before the tokio runtime: the
+    // line on stdout, one fork, the parent exits 0 and the child calls setsid,
+    // keeping its working directory and its standard streams (divid.cpp:122-140)
     #[cfg(unix)]
     if args.daemon {
-        use std::os::unix::io::AsRawFd;
-
-        // Ensure data directory exists before daemonizing
-        if let Err(e) = std::fs::create_dir_all(&data_dir) {
-            eprintln!("Failed to create data directory {:?}: {}", data_dir, e);
-            std::process::exit(1);
-        }
-
-        let log_file = data_dir.join("debug.log");
-
-        eprintln!("Logging to {:?}", log_file);
-
-        // First fork
+        println!("DIVI server starting");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
         match unsafe { libc::fork() } {
             -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "Error: fork() returned -1 errno {}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                );
                 std::process::exit(1);
             }
-            pid if pid > 0 => std::process::exit(0), // Parent exits
-            _ => {}                                  // Child continues
+            pid if pid > 0 => std::process::exit(0), // the parent
+            _ => {}                                  // the child goes on
         }
-
-        // Create new session
         if unsafe { libc::setsid() } == -1 {
-            eprintln!("Failed to setsid: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
-        }
-
-        // Second fork (prevent reacquiring a controlling terminal)
-        match unsafe { libc::fork() } {
-            -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-            pid if pid > 0 => std::process::exit(0), // Intermediate parent exits
-            _ => {}                                  // Grandchild continues
-        }
-
-        // Set working directory
-        let _ = std::env::set_current_dir(&data_dir);
-
-        // Redirect stdout/stderr to log file
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to open log file: {}", e);
-                std::process::exit(1);
-            });
-        let log_fd = log.as_raw_fd();
-        unsafe {
-            libc::dup2(log_fd, libc::STDOUT_FILENO);
-            libc::dup2(log_fd, libc::STDERR_FILENO);
-            // Close stdin
-            libc::close(libc::STDIN_FILENO);
+            eprintln!(
+                "Error: setsid() returned -1 errno {}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            );
         }
     }
 
@@ -3489,9 +3473,6 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     }
 
     // Set up shutdown channel
-    // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
-    #[cfg(unix)]
-    let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
@@ -3568,6 +3549,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         mn_options,
         shutdown_tx,
         shutdown_rx,
+        pid_file.clone(),
     )
     .await
     {

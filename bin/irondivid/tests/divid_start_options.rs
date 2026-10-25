@@ -315,7 +315,7 @@ fn checklevel_is_refused_at_start() {
 /// the network's spork key (init.cpp:971-974)
 #[test]
 fn refused_starts_print_divid_s_error_line() {
-    // The lines of stderr that report an error ("Logging to ..." comes first)
+    // The lines of stderr that report an error (a warning may come first)
     let errors = |out: &Output| -> Vec<String> {
         String::from_utf8_lossy(&out.stderr)
             .lines()
