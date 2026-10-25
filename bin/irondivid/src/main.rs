@@ -301,7 +301,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "disablesystemnotifications",
     "dns",
     "forcednsseed",
-    "forcestart",
     "genproclimit",
     "listenonion",
     "litemode",
@@ -707,6 +706,12 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.vault = s.get_bool("vault", false);
 
     const APPLIED: &[&str] = &[
+        // divid's -forcestart skips the checks it makes after a stop that was
+        // not prepared: its best block in the block index, its coin database
+        // at that block (BlockIndexLoading.cpp:267-285). irondivid writes each
+        // block's chain state in one batch, so after a kill it is at its last
+        // whole block and has no such check to skip: the option is taken as is
+        "forcestart",
         "vault",
         "rescan",
         "salvagewallet",
