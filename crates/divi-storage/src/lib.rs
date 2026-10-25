@@ -64,6 +64,7 @@ pub mod masternode;
 pub mod pos_validation;
 pub mod prune;
 pub mod rewards;
+pub mod script_check;
 pub mod search_index;
 pub mod snapshot;
 pub mod spent_index;

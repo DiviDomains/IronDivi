@@ -314,7 +314,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "override_mnpayee",
     "stakeupdatetime",
     "checklevel",
-    "par",
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
@@ -467,6 +466,7 @@ const APPLIED: &[&str] = &[
     "reindex",
     "utxocachesize",
     "dbcache",
+    "par",
     "forcednsseed",
     "expire",
     "blocknotify",
@@ -967,6 +967,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.block_cache_size = Some(sizes.block_tree + sizes.coin_db);
         config.utxo_cache_size = sizes.coin_cache_entries;
     }
+    // -par, read as divid reads a number (atoi: 0 for a word), against the
+    // machine's cores (init.cpp:801, TransactionInputChecker.cpp:16-26)
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as i64);
+    config.script_check_threads =
+        divi_storage::script_check::threads_for(settings::atoi(s.get("par").unwrap_or("0")), cores);
     if let Some(n) = number_option(&s, "utxocachesize", 0..=i64::MAX) {
         config.utxo_cache_size = n as u64;
     }
@@ -1651,6 +1656,11 @@ fn print_banner(config: &NodeConfig) {
     info!("Data dir: {:?}", config.data_dir);
     info!("RPC: {}:{}", config.rpc.listen_addr, config.rpc.port);
     info!("P2P: {}:{}", config.p2p.listen_addr, config.p2p.port);
+    // divid's line (init.cpp:965)
+    info!(
+        "Using {} threads for script verification",
+        config.script_check_threads
+    );
     info!("========================================");
 }
 
@@ -5400,7 +5410,11 @@ mod divid_option_tests {
         assert_eq!(option_warning(&s, "masternode"), None);
         // applied as divid applies it
         assert_eq!(option_warning(&s, "dbcache"), None);
-        assert!(option_warning(&s, "par").unwrap().contains("not supported"));
+        assert_eq!(option_warning(&s, "par"), None);
+        assert_eq!(option_warning(&s, "peerbloomfilters"), None);
+        assert!(option_warning(&s, "accountlabels")
+            .unwrap()
+            .contains("not supported"));
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));
