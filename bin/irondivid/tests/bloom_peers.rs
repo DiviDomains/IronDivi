@@ -143,6 +143,8 @@ struct Peer {
     buf: Vec<u8>,
     /// The services irondivid named in its version
     services: u64,
+    /// Whether irondivid closed the connection
+    closed: bool,
 }
 
 impl Peer {
@@ -155,6 +157,7 @@ impl Peer {
             stream,
             buf: Vec::new(),
             services: 0,
+            closed: false,
         };
         let mut v = 70915i32.to_le_bytes().to_vec();
         v.extend_from_slice(&1u64.to_le_bytes());
@@ -215,12 +218,18 @@ impl Peer {
             }
             let mut chunk = [0u8; 65536];
             match self.stream.read(&mut chunk) {
-                Ok(0) => return None,
+                Ok(0) => {
+                    self.closed = true;
+                    return None;
+                }
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => return None,
+                Err(_) => {
+                    self.closed = true;
+                    return None;
+                }
             }
         }
     }
@@ -229,7 +238,7 @@ impl Peer {
     fn drain(&mut self, wait: Duration) -> Vec<(String, Vec<u8>)> {
         let deadline = Instant::now() + wait;
         let mut got = Vec::new();
-        while Instant::now() < deadline {
+        while Instant::now() < deadline && !self.closed {
             if let Some(m) = self.next(Duration::from_millis(200)) {
                 got.push(m);
             }
@@ -294,17 +303,18 @@ fn filteradd(bytes: usize) -> Vec<u8> {
     p
 }
 
-/// Send one message on a fresh connection and say whether it got the peer
-/// banned (Divi Core bans at 100: main.cpp:892-939)
-fn bans(daemon: &Daemon, messages: &[(&str, Vec<u8>)]) -> bool {
+/// Send the messages on a fresh connection and say whether they scored 100.
+/// The test's peer is local, which Divi Core disconnects at 100 but never
+/// bans (main.cpp:1107-1125, "not banning local peer"); every bloom score is
+/// 100 (main.cpp:892-939), so the disconnect is the score
+fn scores_100(daemon: &Daemon, messages: &[(&str, Vec<u8>)]) -> bool {
     let mut peer = Peer::connect(daemon.p2p_port, true);
     for (command, payload) in messages {
         peer.send(command, payload);
     }
-    peer.drain(Duration::from_secs(2));
-    let banned = daemon.banned();
-    daemon.rpc("clearbanned", json!([]));
-    banned
+    peer.drain(Duration::from_secs(3));
+    assert!(!daemon.banned(), "a local peer banned");
+    peer.closed
 }
 
 /// The filter messages and their scores, as Divi Core takes them
@@ -317,15 +327,15 @@ fn bans(daemon: &Daemon, messages: &[(&str, Vec<u8>)]) -> bool {
 fn filter_messages_are_taken_and_scored_as_divid() {
     let on = Daemon::start(&[]);
     assert!(
-        !bans(&on, &[("filterload", filterload(10, 0))]),
+        !scores_100(&on, &[("filterload", filterload(10, 0))]),
         "filterload"
     );
     assert!(
-        !bans(&on, &[("filteradd", filteradd(20))]),
+        !scores_100(&on, &[("filteradd", filteradd(20))]),
         "filteradd first"
     );
     assert!(
-        !bans(
+        !scores_100(
             &on,
             &[
                 ("filterload", filterload(10, 0)),
@@ -334,22 +344,25 @@ fn filter_messages_are_taken_and_scored_as_divid() {
         ),
         "filteradd of 520 bytes"
     );
-    assert!(!bans(&on, &[("filterclear", vec![])]), "filterclear");
+    assert!(!scores_100(&on, &[("filterclear", vec![])]), "filterclear");
     assert!(
-        bans(&on, &[("filterload", filterload(36_001, 0))]),
+        scores_100(&on, &[("filterload", filterload(36_001, 0))]),
         "oversize filter"
     );
     assert!(
-        bans(&on, &[("filteradd", filteradd(521))]),
+        scores_100(&on, &[("filteradd", filteradd(521))]),
         "filteradd of 521 bytes"
     );
 
     let off = Daemon::start(&["-peerbloomfilters=0"]);
     assert!(
-        bans(&off, &[("filterload", filterload(10, 0))]),
+        scores_100(&off, &[("filterload", filterload(10, 0))]),
         "off: filterload"
     );
-    assert!(bans(&off, &[("filterclear", vec![])]), "off: filterclear");
+    assert!(
+        scores_100(&off, &[("filterclear", vec![])]),
+        "off: filterclear"
+    );
 }
 
 /// A getdata of one block of inv type `kind` (3: a filtered block)
@@ -460,7 +473,7 @@ fn inv_of(got: &[(String, Vec<u8>)], txid: &str) -> bool {
 #[test]
 fn transactions_are_announced_by_each_peer_s_relay_flag_and_filter() {
     let daemon = Daemon::start(&[]);
-    daemon.rpc("setgenerate", json!([21]));
+    daemon.rpc("setgenerate", json!([101]));
     let mut quiet = Peer::connect(daemon.p2p_port, false);
     let mut plain = Peer::connect(daemon.p2p_port, true);
     let mut filtered = Peer::connect(daemon.p2p_port, true);
