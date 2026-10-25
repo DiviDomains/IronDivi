@@ -759,3 +759,53 @@ fn masternode_messages_wait_for_a_recent_tip() {
         "a tip 15 minutes old"
     );
 }
+
+/// Votes follow the node's masternode sync: before it is finished (here at
+/// INITIAL) a vote with a bad signature costs nothing and any payee is taken;
+/// once FINISHED, 20 and the payee must be near the top of the queue
+/// (masternode-payments.cpp:241-245, :320-330; IsSynced, masternode-sync.cpp:55-58)
+#[test]
+fn votes_follow_the_nodes_masternode_sync() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppWinner};
+    use divi_masternode::mnsync::{shared, SYNC_FINISHED};
+    let n = funded();
+    let sync = shared(now(), false);
+    n.votes.follow_sync(sync.clone());
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    while n.chain.height() < 100 {
+        n.mine();
+    }
+    let recent = *n
+        .chain
+        .get_block_index_by_height(n.chain.height() - 2)
+        .unwrap()
+        .unwrap()
+        .hash
+        .as_bytes();
+    // Old enough to vote (25 minutes on regtest)
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now() - 1800;
+    mnb.last_ping.sig_time = now() - 600;
+    mnb.last_ping.block_hash = recent;
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    let other = divi_crypto::SecretKey::new_random();
+    let vote = |ahead: i32, payee: Vec<u8>, key: &divi_crypto::SecretKey| {
+        let mut w = CppWinner {
+            vin: mnb.vin.clone(),
+            height: n.chain.height() as i32 + ahead,
+            payee,
+            signature: vec![],
+        };
+        w.sign(key).unwrap();
+        n.votes.accept(&n.chain, &n.list, &w.encode())
+    };
+    // INITIAL: not finished
+    assert_eq!(vote(5, payee_script(&mnb), &other).unwrap_err().dos, 0);
+    assert_eq!(vote(6, vec![0x51], &mn_key), Ok(true));
+    sync.lock().sync.status = SYNC_FINISHED;
+    assert_eq!(vote(7, payee_script(&mnb), &other).unwrap_err().dos, 20);
+    assert!(vote(8, vec![0x51], &mn_key).is_err());
+}

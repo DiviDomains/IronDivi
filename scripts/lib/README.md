@@ -16,3 +16,7 @@ It is opt-in: each `scripts/*-replies` check (and `mining-replies/compare.py`) c
 after taking out the fields it does not compare and before any sorting of its own, and prints a row that differs
 only in order as `ORDER`, a kind of FAIL counted in `FAILS`. `cli-replies` compares printed text, which has the
 order in it. The checks run under `python3 -I` and add this directory to `sys.path` themselves.
+
+`mnsync_stages.py`: the masternode sync stages of nodes over time. A `StagePoller` polls `mnsync status` on the
+nodes side by side in a thread and keeps, per node, the stages it saw in order, each once; the scripts compare those
+sequences with divid's, since each node's sync takes its steps at its own moments.

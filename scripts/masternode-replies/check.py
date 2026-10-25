@@ -25,6 +25,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lib"))
 import member_order  # noqa: E402  (scripts/lib: the order check the replies scripts share)
+import mnsync_stages  # noqa: E402  (scripts/lib: the sync stages of nodes over time)
 
 IRONDIVID, DIVID, PORT_BASE, WORK = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 # For the proof that a difference is caught: irondivid's reply of the named row is
@@ -43,11 +44,6 @@ KNOWN = {
     "getmasternodecount: tier counts divid lacks":
         "copper, silver, gold, platinum, diamond, kept on purpose (divid rpcmasternode.cpp:327-358 has the 8 "
         "counts only; scripts/net-replies README)",
-    "mnsync status: currentMasternodeSyncStatus":
-        "irondivid has no masternode sync stages and reports 999 (finished); divid's stages need 3 spork-synced "
-        "peers to move on (masternode-sync.cpp:425-455), so on this two-node chain it stays at the first",
-    "mnsync status after reset: currentMasternodeSyncStatus":
-        "as for mnsync status: reset has no stages to restart in irondivid (rpcmisc.cpp:217-220)",
 }
 
 TIERS = {"copper", "silver", "gold", "platinum", "diamond"}
@@ -323,6 +319,24 @@ def synced():
     return wait_for(lambda: I.rpc("getbestblockhash") == C.rpc("getbestblockhash"), 60)
 
 
+def stage_rows(name, seqs):
+    """The stages each node went through, compared as sequences"""
+    a, b = seqs[C.name], seqs[I.name]
+    row(name, mnsync_stages.text(a), mnsync_stages.text(b), a == b)
+
+
+def mnsync_status(name):
+    """mnsync status without its sync stage, then the stage on a row of its own"""
+    c, i = both(name, "mnsync", "status", drop=MOMENT | {"currentMasternodeSyncStatus"})
+    if c[0] == i[0] == "ok":
+        a, b = c[1].get("currentMasternodeSyncStatus"), i[1].get("currentMasternodeSyncStatus")
+        row(f"{name}: currentMasternodeSyncStatus", a, b, a == b)
+
+
+# The sync stages: INITIAL until the chain is synced (an old genesis block
+# here), then SPORKS, where a node with one peer stays (masternode-sync.cpp:424-454)
+mnsync_status("right after start: mnsync status")
+poller = mnsync_stages.StagePoller([C, I]).start()
 # divid mines past maturity and pays irondivid, so both wallets can fund a
 # copper collateral (100 DIVI on regtest, chainparams.cpp:147-148). Past height
 # 101, so getmasternodewinners has heights to score: height h is scored with the
@@ -340,14 +354,6 @@ if not wait_for(lambda: float(I.rpc("getbalance")) >= 3000, 60) or not synced():
     sys.exit(1)
 
 
-def mnsync_status(name):
-    """mnsync status without its sync stage, then the stage on a row of its own"""
-    c, i = both(name, "mnsync", "status", drop=MOMENT | {"currentMasternodeSyncStatus"})
-    if c[0] == i[0] == "ok":
-        a, b = c[1].get("currentMasternodeSyncStatus"), i[1].get("currentMasternodeSyncStatus")
-        row(f"{name}: currentMasternodeSyncStatus", a, b, a == b)
-
-
 def state(p):
     """Calls whose reply depends only on the chain and the stored broadcasts"""
     both(f"{p}spork show", "spork", "show")
@@ -363,6 +369,8 @@ def state(p):
     both(f"{p}listmnbroadcasts", "listmnbroadcasts", by_shape=True)
 
 
+# Twelve seconds after the chain is synced: two steps of each node's sync
+stage_rows("mnsync stages as the chain becomes synced", poller.stop(settle=12))
 state("")
 
 # spork (rpcmisc.cpp:277-315)
@@ -378,8 +386,11 @@ both("spork three arguments", "spork", "SPORK_2_SWIFTTX_ENABLED", "1", "2")
 both("mnsync no arguments", "mnsync")
 both("mnsync unknown mode", "mnsync", "next")
 both("mnsync two arguments", "mnsync", "status", "status")
+poller = mnsync_stages.StagePoller([C, I]).start()
 both("mnsync reset", "mnsync", "reset")
 mnsync_status("mnsync status after reset")
+# Back to INITIAL, then SPORKS at the next step (rpcmisc.cpp:217-220)
+stage_rows("mnsync stages after reset", poller.stop(settle=12))
 
 # list, count, status, winners (rpcmasternode.cpp:263-593)
 both("listmasternodes filter", "listmasternodes", "127.0.0.1")

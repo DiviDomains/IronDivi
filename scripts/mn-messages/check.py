@@ -50,20 +50,7 @@ def pair(core, iron):
 # Rows where irondivid differs on purpose: (reason, shape); shape is true only
 # for the difference described, so a KNOWN row that matches divid, or differs in
 # another way, is a FAIL
-MNSYNC = ("divid's masternode sync is unfinished here (currentMasternodeSyncStatus 1: with only raw peers it "
-          "does not get past its first stage), irondivid reports it finished (999); divid takes a vote's payee "
-          "without the queue check and charges nothing for a bad vote signature until its sync is finished "
-          "(masternode-payments.cpp:241-245, :320-328). The sync stages are B11's (scripts/mn-life KNOWN too)")
-KNOWN = {
-    "mnsync status: currentMasternodeSyncStatus": (MNSYNC, pair(1, 999)),
-    "a vote with a bad signature: banscore of the sender": (MNSYNC, pair(0, 20)),
-    "a vote for a payee not in the queue: taken": (
-        MNSYNC, lambda c, i: isinstance(c, dict) and c.get("nVotes") == 1 and i == {"address": "Unknown",
-                                                                                     "nVotes": 0}),
-    "a vote for a payee not in the queue: sent to another peer": (MNSYNC, pair(["inv mnw vote other payee"], [])),
-    "a vote for a payee not in the queue: sent back to the sender": (MNSYNC,
-                                                                     pair(["inv mnw vote other payee"], [])),
-}
+KNOWN = {}
 
 fails = 0
 counts = {"PASS": 0, "KNOWN": 0, "FAIL": 0}
