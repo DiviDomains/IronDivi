@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Bert Shuler
 // IronDivi - https://github.com/DiviDomains/IronDivi
 
-//! A pong that ends the node's ping without timing it, as Divi Core reads
-//! one (nonce 0, or under 8 bytes: Node.cpp:754-808).
+//! Two messages a peer sends rarely, answered as Divi Core answers them: a
+//! pong that ends the node's ping without timing it (nonce 0, or under 8
+//! bytes: Node.cpp:754-808), and a dstx, which divid checks as an empty
+//! transaction (main.cpp:705-812).
 
 mod common;
 use common::raw_peer::*;
@@ -71,4 +73,40 @@ async fn pong_with_another_nonce_leaves_the_ping() {
     assert!(ping_outstanding(&t, &p, true).await);
     p.send("pong", &nonce.to_le_bytes()).await;
     assert!(!ping_outstanding(&t, &p, false).await);
+}
+
+/// divid answers a dstx with reject bad-tx and the empty transaction's hash
+/// (all zeros: never computed), and the score of 110 drops the peer
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dstx_is_rejected_and_drops_the_peer() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.handshake().await;
+
+    p.send("dstx", &[]).await;
+    let reject = p.expect("reject", WAIT).await.expect("reject");
+    assert_eq!(
+        parse_reject(&reject),
+        ("dstx".into(), 0x10, "bad-tx".into())
+    );
+    // "dstx", the code, "bad-tx", then the hash
+    assert_eq!(reject.len(), 1 + 4 + 1 + 1 + 6 + 32);
+    assert_eq!(&reject[13..], &[0u8; 32]);
+    assert!(p.closed_within(WAIT).await);
+}
+
+/// With -banscore 1000 the peer stays, and its score is 110
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dstx_scores_110() {
+    let t = TestNode::start().await;
+    t.node
+        .peer_manager()
+        .scoring()
+        .set_ban_policy(1000, std::time::Duration::from_secs(60));
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.handshake().await;
+
+    p.send("dstx", &[1, 2, 3]).await;
+    assert_eq!(t.wait_score(p.ip, 110).await, Some(110));
+    assert!(p.alive().await);
 }

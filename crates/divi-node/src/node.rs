@@ -1221,6 +1221,24 @@ impl Node {
                                     ),
                                 }
                             }
+                            // Divi Core reads no transaction from a dstx
+                            // (main.cpp:705-718) and checks an empty one, which
+                            // fails CheckTransaction (DoS 10,
+                            // BlockCheckingHelpers.cpp:101-103) and then bad-tx
+                            // (DoS 100, MempoolConsensus.cpp:276-277): a reject
+                            // and a score of 110 (main.cpp:803-812)
+                            NetworkMessage::Unknown(cmd, _) if cmd == "dstx" => {
+                                if let Err(e) =
+                                    peer_manager.send_to_peer(peer_id, dstx_reject()).await
+                                {
+                                    tracing::debug!("Failed to send reject to peer {}: {}", peer_id, e);
+                                }
+                                peer_manager.report_misbehavior_score(
+                                    peer_id,
+                                    DSTX_SCORE,
+                                    "Transaction from peer rejected by memory pool",
+                                );
+                            }
                             NetworkMessage::Unknown(cmd, payload) => {
                                 // Unknown messages are logged with payload details for debugging
                                 tracing::info!(
@@ -2112,6 +2130,23 @@ fn clear_folders_for_resync(config: &NodeConfig) {
             Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
         }
     }
+}
+
+/// The score a `dstx` costs its sender: Divi Core checks the empty
+/// transaction it never read, 10 for CheckTransaction and 100 for bad-tx
+/// (BlockCheckingHelpers.cpp:101-103, MempoolConsensus.cpp:276-277)
+pub const DSTX_SCORE: u32 = 110;
+
+/// The `reject` Divi Core sends for a `dstx` (main.cpp:803-809): bad-tx, with
+/// the hash of the empty transaction, which is all zeros since a transaction
+/// that was never read has no hash computed
+pub fn dstx_reject() -> divi_network::NetworkMessage {
+    divi_network::NetworkMessage::Reject(divi_network::RejectMessage {
+        message: "dstx".to_string(),
+        code: crate::error::reject::INVALID,
+        reason: "bad-tx".to_string(),
+        data: vec![0u8; 32],
+    })
 }
 
 /// The `reject` Divi Core sends the peer that relayed a transaction its
