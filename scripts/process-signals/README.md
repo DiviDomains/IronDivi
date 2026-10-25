@@ -43,6 +43,7 @@ only). RPC passwords are made at random per run and kept in each node's 0600 `di
 | a stop after init | exit 0, log ending `MainShutdown: done` (init.cpp:418) |
 | `-reindex` | runs in the import thread after init (init.cpp:686-728): a stop during it exits 0; the next start goes on with it |
 | `-rescan` | runs in init, at the wallet load: a stop during it exits 1 |
+| shutdown order | RPC, then the network with peers.dat (net.cpp:1474-1485), minting, masternode data, then the chain state, the wallet, the pid file, and the peer connections last (init.cpp:371-417) |
 | SIGHUP | the next log write reopens debug.log (init.cpp:513-516, :1396-1401; Logging.cpp:173-178) |
 | SIGPIPE | default action (ends the process), ignored only on Solaris (init.cpp:1404-1406) |
 | the lock | `<datadir>/regtest/.lock`, waits 10 s, then `Error: Cannot obtain a lock on data directory <dir>. DIVI Core is probably already running.` (init.cpp:850-861), and divid aborts (SIGABRT) |
@@ -63,6 +64,7 @@ only). RPC passwords are made at random per run and kept in each node's 0600 `di
 | kill -9 | the pid file left; the next start names its own pid |
 | `-pid=other.pid`, `-pid=<absolute>` | the file while running; after a clean stop |
 | `-daemon` (started from the work directory) | the parent's exit code and first stdout line; the child answers RPC, has the parent's working directory and stdout, and stops on `stop` |
+| a stop while staking (`staking=1`, a raw peer connected, SIGTERM after 15 s) | a peer to stake for; exit code; peers.dat written; the next start has the chain up to the stop, and its height and balance equal a `-rescan` start's (divid stops minting before it flushes, init.cpp:372-373, :381, :386) |
 | a start and a clean stop | the lines on stderr (divid: its InitWarning about the unencrypted wallet, init.cpp:1227-1232) |
 | SIGPIPE | still running |
 
