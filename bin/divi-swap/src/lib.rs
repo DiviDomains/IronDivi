@@ -18,6 +18,7 @@
 
 pub mod client;
 pub mod flow;
+pub mod reservations;
 pub mod session;
 pub mod txids;
 pub mod wallet;

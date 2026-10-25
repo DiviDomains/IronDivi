@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use divi_swap::mock::MockChain;
-use divi_swap::{Amount, Chain, ChainBackend, Store, Taker};
+use divi_swap::{Amount, Chain, ChainBackend, InputReservations, Store, Taker};
 use divi_swap_cli::{flow, ClaimGate, ClaimPolicy, MakerClient, RunOpts, Sessions};
 use swap_chain_btc::BtcBackend;
 use swap_chain_divi::DiviBackend;
@@ -592,42 +592,102 @@ fn live_backends(cli: &Cli) -> Result<Backends> {
             live: None,
         });
     }
-    let (btc, counter): (Arc<dyn ChainBackend>, CounterLive) = match cli.counter_chain {
-        Chain::Btc => {
-            let bkey = secp_key(&cli.btc_key, "--btc-key", "btc")?;
-            let backend = Arc::new(BtcBackend::for_network(
-                &cli.btc_network,
-                bkey,
-                swap_chain_btc::FeePolicy::default(),
-            )?);
-            (backend.clone(), CounterLive::Btc(backend))
-        }
-        Chain::Ltc => {
-            let lkey = secp_key(&cli.ltc_key, "--ltc-key", "ltc")?;
-            let backend = Arc::new(LtcBackend::for_network(
-                &cli.ltc_network,
-                lkey,
-                swap_chain_ltc::FeePolicy::default(),
-            )?);
-            (backend.clone(), CounterLive::Ltc(backend))
-        }
-        Chain::Zec => {
-            let zkey = secp_key(&cli.zec_key, "--zec-key", "zec")?;
-            let backend = Arc::new(ZecBackend::for_network(
-                &cli.zec_network,
-                zkey,
-                swap_chain_zec::FeePolicy::default(),
-            )?);
-            (backend.clone(), CounterLive::Zec(backend))
-        }
+    let (key, endpoints) = match cli.counter_chain {
+        Chain::Btc => (
+            secp_key(&cli.btc_key, "--btc-key", "btc")?,
+            swap_chain_btc::esplora_endpoints(&cli.btc_network)?,
+        ),
+        Chain::Ltc => (
+            secp_key(&cli.ltc_key, "--ltc-key", "ltc")?,
+            swap_chain_ltc::esplora_endpoints(&cli.ltc_network)?,
+        ),
+        Chain::Zec => (
+            secp_key(&cli.zec_key, "--zec-key", "zec")?,
+            swap_chain_zec::lightwalletd_endpoints(&cli.zec_network)?,
+        ),
         other => bail!("no live {other} backend in this build yet; use --backend mock"),
     };
+    let (_, reservations) = divi_swap_cli::reservations::open(&cli.db)?;
+    release_finished_locks(cli);
+    let (btc, counter) = live_counter(cli, key, endpoints, &reservations)?;
 
     Ok(Backends {
         divi: divi.clone(),
         btc,
         live: Some((divi, counter)),
     })
+}
+
+/// The live `--counter-chain` backend for `key` on `endpoints` (the network's defaults in
+/// production), reserving the inputs of its lock in `reservations` so a second taker on the
+/// same wallet and `--db` never funds from them.
+fn live_counter(
+    cli: &Cli,
+    key: bitcoin::secp256k1::SecretKey,
+    endpoints: Vec<String>,
+    reservations: &InputReservations,
+) -> Result<(Arc<dyn ChainBackend>, CounterLive)> {
+    Ok(match cli.counter_chain {
+        Chain::Btc => {
+            let backend = Arc::new(
+                BtcBackend::new_on(
+                    &cli.btc_network,
+                    endpoints,
+                    key,
+                    swap_chain_btc::FeePolicy::default(),
+                    swap_chain_btc::RetryPolicy::default(),
+                )?
+                .with_input_reservations(reservations.clone()),
+            );
+            (backend.clone(), CounterLive::Btc(backend))
+        }
+        Chain::Ltc => {
+            let backend = Arc::new(
+                LtcBackend::new_on(
+                    &cli.ltc_network,
+                    endpoints,
+                    key,
+                    swap_chain_ltc::FeePolicy::default(),
+                    swap_chain_ltc::RetryPolicy::default(),
+                )?
+                .with_input_reservations(reservations.clone()),
+            );
+            (backend.clone(), CounterLive::Ltc(backend))
+        }
+        Chain::Zec => {
+            let backend = Arc::new(
+                ZecBackend::new(
+                    endpoints,
+                    key,
+                    swap_chain_zec::FeePolicy::default(),
+                    swap_chain_zec::RetryPolicy::default(),
+                )?
+                .with_network(&cli.zec_network)?
+                .with_input_reservations(reservations.clone()),
+            );
+            (backend.clone(), CounterLive::Zec(backend))
+        }
+        other => bail!("no live {other} backend in this build yet; use --backend mock"),
+    })
+}
+
+/// Live BTC, LTC or ZEC taker: release the lock inputs of every finished swap in `--db`
+/// ([`divi_swap_cli::reservations::release_finished`]). Run when the backends are built (a
+/// swap that finished in an earlier process) and after each command that can finish one.
+/// A failure only warns: an unreleased input stays out of coin selection, never spent twice.
+fn release_finished_locks(cli: &Cli) {
+    if !matches!(cli.backend, BackendArg::Live)
+        || !matches!(cli.counter_chain, Chain::Btc | Chain::Ltc | Chain::Zec)
+    {
+        return;
+    }
+    let released = divi_swap_cli::reservations::open(&cli.db)
+        .and_then(|(store, res)| divi_swap_cli::reservations::release_finished(&store, &res));
+    match released {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "released the lock inputs of finished taker swaps"),
+        Err(e) => tracing::warn!(error = %e, "could not release finished taker lock inputs"),
+    }
 }
 
 /// Per-chain tip read deadline: a hung endpoint becomes a named error for that chain
@@ -1015,10 +1075,12 @@ async fn main() -> Result<()> {
         Cmd::Claim { swap } => {
             let client = MakerClient::new(&sessions.get(swap)?.maker_url);
             let state = flow::step(&taker(&cli).await?, &client, &sessions, swap).await?;
+            release_finished_locks(&cli);
             println!("{state:?}");
         }
         Cmd::Refund { swap } => {
             let state = flow::refund(&taker(&cli).await?, swap).await?;
+            release_finished_locks(&cli);
             println!("{state:?}");
         }
         Cmd::Run {
@@ -1061,6 +1123,7 @@ async fn main() -> Result<()> {
                 Some(&gate),
             )
             .await?;
+            release_finished_locks(&cli);
             println!("{local} {state:?}");
         }
         Cmd::Tip { .. } => unreachable!("handled before the match"),
@@ -2045,5 +2108,232 @@ mod tests {
             .unwrap();
             assert_eq!(backend.chain(), Chain::Usdc);
         }
+    }
+
+    // ---- lock-input reservations: two takers on one wallet and one --db ----
+
+    use bitcoin::hashes::Hash;
+    use divi_swap::api::{Direction, Quote};
+    use divi_swap::store::TakerRecord;
+    use divi_swap::{Funding, HtlcParams, TakerState};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const WALLET_KEY: [u8; 32] = [0x22; 32];
+
+    fn live_cli(chain: &str, db: &std::path::Path) -> Cli {
+        cli(&[
+            "--backend",
+            "live",
+            "--counter-chain",
+            chain,
+            "--db",
+            db.to_str().unwrap(),
+        ])
+    }
+
+    /// One `divi-swap` process: its own handle on `--db`, the wallet key, `server` as the
+    /// esplora endpoint.
+    fn taker(cli: &Cli, server: &MockServer) -> (Arc<dyn ChainBackend>, CounterLive) {
+        let (_, res) = divi_swap_cli::reservations::open(&cli.db).unwrap();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&WALLET_KEY).unwrap();
+        live_counter(cli, key, vec![server.uri()], &res).unwrap()
+    }
+
+    /// The wallet owns coins `[1; 32]:0` (20,000) and `[2; 32]:0` (15,000) and the address
+    /// query keeps listing both (a broadcast lock not yet confirmed); every broadcast is
+    /// accepted.
+    async fn two_coin_wallet(address: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/address/{address}/utxo")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"txid": hex::encode([1u8; 32]), "vout": 0, "value": 20_000, "status": {"confirmed": true}},
+                {"txid": hex::encode([2u8; 32]), "vout": 0, "value": 15_000, "status": {"confirmed": true}}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tx"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn lock_htlc(hash: u8) -> HtlcParams {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let pk = |k: u8| {
+            bitcoin::secp256k1::SecretKey::from_slice(&[k; 32])
+                .unwrap()
+                .public_key(&secp)
+                .serialize()
+        };
+        HtlcParams {
+            hash: [hash; 32],
+            claim_pubkey: pk(0x11),
+            refund_pubkey: pk(0x22),
+            locktime: 1_900_000_000,
+            script_version: Default::default(),
+        }
+    }
+
+    /// Build and broadcast a 5,000 lock to the HTLC of swap hash `[hash; 32]` (each swap has
+    /// its own, so two locks are never the same tx); a broadcast refused because the other
+    /// taker reserved the same coin first is retried once with a fresh selection.
+    async fn fund(b: &dyn ChainBackend, hash: u8) -> anyhow::Result<Funding> {
+        let h = lock_htlc(hash);
+        let mut last = None;
+        for _ in 0..2 {
+            let f = b.build_funding(&h, Amount::from_sat(5_000)).await?;
+            match b.broadcast(&f.tx).await {
+                Ok(_) => return Ok(f),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap().into())
+    }
+
+    fn spent(f: &Funding) -> Vec<[u8; 32]> {
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&f.tx.raw).unwrap();
+        tx.input
+            .iter()
+            .map(|i| i.previous_output.txid.to_byte_array())
+            .collect()
+    }
+
+    async fn posts(server: &MockServer) -> usize {
+        let reqs = server.received_requests().await.unwrap();
+        reqs.iter().filter(|r| r.method.as_str() == "POST").count()
+    }
+
+    fn held(db: &std::path::Path) -> Vec<(Chain, divi_swap::Txid)> {
+        let mut rows: Vec<_> = InputReservations::open_read_only(db)
+            .unwrap()
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.chain, r.reserved_by))
+            .collect();
+        rows.sort_by_key(|r| r.1 .0);
+        rows.dedup();
+        rows
+    }
+
+    /// The taker swap `id` on `chain` whose taker-leg lock is `lock`.
+    fn taker_swap(id: &str, state: TakerState, chain: Chain, lock: &Funding) -> TakerRecord {
+        TakerRecord {
+            id: id.into(),
+            state,
+            quote: Quote {
+                id: format!("q-{id}"),
+                offer_id: "o".into(),
+                direction: Direction::TakerPaysBtc,
+                counter_chain: chain,
+                btc_amount: Amount::from_sat(5_000),
+                divi_amount: Amount(2),
+                expires_at: 3,
+                maker_btc_pubkey: [2; 33],
+                maker_divi_pubkey: [3; 33],
+                taker_timeout_secs: 4,
+                maker_timeout_secs: 5,
+                btc_confirmations: 1,
+                divi_confirmations: 1,
+            },
+            preimage: [9; 32],
+            hash: [7; 32],
+            maker_swap_id: None,
+            taker_leg_htlc: Some(lock_htlc(7)),
+            taker_leg_funding: Some(lock.clone()),
+            maker_leg_htlc: None,
+            maker_leg_outpoint: None,
+            maker_leg_amount: None,
+            maker_leg_claim: None,
+            taker_leg_refund: None,
+            claim_declined: None,
+            last_error: None,
+        }
+    }
+
+    /// Two concurrent takers on one two-coin wallet and one `--db`: their locks never share
+    /// an input, a third (nothing unreserved left) aborts before broadcasting and reserves
+    /// nothing; a completed swap and a refunded one free their coin for the next lock; a
+    /// restart neither leaks a reservation nor releases one twice.
+    async fn two_takers_never_share_a_lock_input(chain: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let cli = live_cli(chain, &db);
+        let placeholder = MockServer::start().await;
+        let address = taker(&cli, &placeholder).1.address();
+        let server = two_coin_wallet(&address).await;
+
+        let ((one, _), (two, _)) = (taker(&cli, &server), taker(&cli, &server));
+        let (a, b) = tokio::join!(fund(one.as_ref(), 1), fund(two.as_ref(), 2));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (ia, ib) = (spent(&a), spent(&b));
+        let shared = ia.iter().filter(|i| ib.contains(i)).count();
+        assert_eq!(shared, 0, "both locks spend {ia:?} / {ib:?}");
+        assert_eq!(posts(&server).await, 2);
+        let counter = cli.counter_chain;
+        assert_eq!(held(&db).len(), 2, "{:?}", held(&db));
+        assert!(held(&db).iter().all(|(c, _)| *c == counter));
+
+        // Abort: no unreserved coin covers a third lock; nothing posted, nothing reserved.
+        let (three, _) = taker(&cli, &server);
+        assert!(fund(three.as_ref(), 3).await.is_err());
+        assert_eq!(posts(&server).await, 2);
+        assert_eq!(held(&db).len(), 2);
+
+        // Restart: a new process rebroadcasts lock `a`; it keeps its one reservation.
+        let (again, _) = taker(&cli, &server);
+        again.broadcast(&a.tx).await.unwrap();
+        assert_eq!(held(&db).len(), 2);
+
+        // Completion: `a`'s swap is done; the next command releases its coin and only it.
+        let store = Store::open(&db).unwrap();
+        store
+            .put_taker_swap(&taker_swap("a", TakerState::Done, counter, &a))
+            .unwrap();
+        let mut refunding = taker_swap("b", TakerState::Refunded, counter, &b);
+        refunding.taker_leg_refund = Some(b.tx.clone());
+        store.put_taker_swap(&refunding).unwrap();
+        release_finished_locks(&cli);
+        assert_eq!(held(&db), vec![(counter, b.tx.txid)]);
+        let next = fund(three.as_ref(), 4).await.unwrap();
+        assert_eq!(spent(&next), ia, "the completed swap's coin is free again");
+
+        // Refund: `b` finishes; released once, and a restart releases nothing twice.
+        refunding.state = TakerState::Done;
+        store.put_taker_swap(&refunding).unwrap();
+        release_finished_locks(&cli);
+        assert_eq!(held(&db), vec![(counter, next.tx.txid)]);
+        let (_, after_restart) = divi_swap_cli::reservations::open(&db).unwrap();
+        assert_eq!(
+            divi_swap_cli::reservations::release_finished(&store, &after_restart).unwrap(),
+            0
+        );
+        assert_eq!(held(&db), vec![(counter, next.tx.txid)]);
+        let last = fund(three.as_ref(), 5).await.unwrap();
+        assert_eq!(spent(&last), ib, "the refunded swap's coin is free again");
+    }
+
+    #[tokio::test]
+    async fn two_btc_takers_never_share_a_lock_input() {
+        two_takers_never_share_a_lock_input("btc").await;
+    }
+
+    #[tokio::test]
+    async fn two_ltc_takers_never_share_a_lock_input() {
+        two_takers_never_share_a_lock_input("ltc").await;
+    }
+
+    #[test]
+    fn the_sweep_is_live_counter_chain_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cli.db");
+        let mut c = live_cli("btc", &db);
+        c.backend = BackendArg::Mock;
+        release_finished_locks(&c);
+        assert!(!db.exists(), "a mock run never opens --db for reservations");
     }
 }
