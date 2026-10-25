@@ -295,8 +295,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
-    "datacarrier",
-    "datacarriersize",
     "dbcache",
     "disablesystemnotifications",
     "dns",
@@ -320,7 +318,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "onlynet",
     "par",
     "peerbloomfilters",
-    "permitbaremultisig",
     "proxyrandomize",
     "resync",
     "rpcthreads",
@@ -601,6 +598,22 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.mempool.min_relay_fee_per_kb = sat;
     }
     config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
+    // GetBoolArg("-permitbaremultisig", true), read once (MempoolConsensus.cpp:31)
+    config.mempool.permit_bare_multisig = s.get_bool("permitbaremultisig", true);
+    // -datacarrier ? GetArg("-datacarriersize", MAX_OP_META_RELAY) : 0, kept as
+    // an unsigned int, read once (MempoolConsensus.cpp:32-33)
+    // GetBoolArg("-relaypriority", true), read for each transaction in Core;
+    // the options do not change while a node runs (MempoolConsensus.cpp:255)
+    config.mempool.relay_priority = s.get_bool("relaypriority", true);
+    // GetArg("-limitfreerelay", 30), thousands of bytes per minute, read for
+    // each free transaction from a peer (MempoolConsensus.cpp:228)
+    config.mempool.limit_free_relay = s.get("limitfreerelay").map_or(30, settings::atoi);
+    config.mempool.max_datacarrier_bytes = if s.get_bool("datacarrier", true) {
+        s.get("datacarriersize")
+            .map_or(603, |text| settings::atoi(text) as u32)
+    } else {
+        0
+    };
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -743,6 +756,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxorphantx",
         "minrelaytxfee",
         "acceptnonstandard",
+        "permitbaremultisig",
+        "datacarrier",
+        "datacarriersize",
+        "relaypriority",
+        "limitfreerelay",
         "maxtxfee",
         "sporkkey",
         "staking",

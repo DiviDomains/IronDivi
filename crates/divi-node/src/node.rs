@@ -2186,18 +2186,22 @@ const MAX_STANDARD_TX_SIZE: usize = 100_000;
 /// Divi Core `MAX_TX_SIGOPS_CURRENT` (defaultValues.h:61): 40,000 / 5
 const MAX_TX_SIGOPS: u32 = 8_000;
 
-/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121) with
-/// its defaults (`-permitbaremultisig` on, `-datacarriersize` 603): the reason
-/// a transaction is not relayed, if it is not. Applies on every network, as
-/// `-acceptnonstandard` is off by default.
+/// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121): the
+/// reason a transaction is not relayed, if it is not. Applies on every network,
+/// as `-acceptnonstandard` is off by default. Without `permit_bare_multisig`
+/// (`-permitbaremultisig=0`) a bare multisig output is not standard; an OP_META
+/// output script is standard up to `max_datacarrier_bytes` (`-datacarriersize`,
+/// 603 by default; 0 with `-datacarrier=0`).
 pub fn check_standard_tx(
     tx: &Transaction,
     tip_height: u32,
     now: u32,
     relay_fee_per_kb: i64,
+    permit_bare_multisig: bool,
+    max_datacarrier_bytes: usize,
 ) -> Result<(), NodeError> {
     use crate::error::reject;
-    use divi_script::policy::{standard_output_type, MAX_OP_META_RELAY};
+    use divi_script::policy::standard_output_type;
     use divi_script::ScriptType;
 
     let nonstandard = |reason: &str| Err(NodeError::rejected(reject::NONSTANDARD, reason));
@@ -2221,9 +2225,12 @@ pub fn check_standard_tx(
     }
     let mut data_outputs = 0;
     for out in &tx.vout {
-        match standard_output_type(out.script_pubkey.as_bytes(), MAX_OP_META_RELAY) {
+        match standard_output_type(out.script_pubkey.as_bytes(), max_datacarrier_bytes) {
             None => return nonstandard("scriptpubkey"),
             Some(ScriptType::NullData) => data_outputs += 1,
+            Some(ScriptType::Multisig) if !permit_bare_multisig => {
+                return nonstandard("bare-multisig");
+            }
             Some(_) => {
                 if out.value < out.min_non_dust_value(relay_fee_per_kb) {
                     return nonstandard("dust");
@@ -2289,7 +2296,14 @@ pub fn check_mempool_transaction(
     // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
     let require_standard = mempool.requires_standard();
     if require_standard {
-        check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+        check_standard_tx(
+            tx,
+            tip_height,
+            now,
+            mempool.min_relay_fee_per_kb(),
+            mempool.permits_bare_multisig(),
+            mempool.max_datacarrier_bytes(),
+        )?;
     }
     mempool.check_conflicts(tx)?;
 
