@@ -129,6 +129,7 @@ mod tests {
             claim_replaced: Vec::new(),
             claim_children: Vec::new(),
             claim_underpriced: 0,
+            claim_child_replaced: None,
             last_error: None,
         }
     }

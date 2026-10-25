@@ -114,6 +114,10 @@ pub struct ClaimFees {
     /// CPFP children, in spend order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claim_children: Vec<SignedTx>,
+    /// The child the newest child replaces, with the feerate the package paid with it, until
+    /// the replacement is relayed or refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_child_replaced: Option<(SignedTx, u64)>,
     /// Same-nonce replacements refused as underpriced since a version was last taken.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub claim_underpriced: u32,
@@ -176,6 +180,12 @@ pub struct TakerRecord {
     /// the claim's output, each later one its predecessor's. Persisted before broadcast.
     #[serde(default)]
     pub claim_children: Vec<SignedTx>,
+    /// The child the newest of `claim_children` replaces
+    /// ([`crate::FeeEscalation::replace_cpfp_child`]), with the feerate the package paid with
+    /// it, from the replacement's write-ahead until the node relays or refuses it. A node
+    /// that refuses it still holds this one, which is then put back. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_child_replaced: Option<(SignedTx, u64)>,
     /// "replacement transaction underpriced" refusals of a same-nonce replacement
     /// (`FeeBump::SameNonce`) since the claim was last taken: the node holds a stricter price
     /// bump than configured. Every second one doubles the next step
@@ -259,6 +269,7 @@ impl std::fmt::Debug for TakerRecord {
             claim_feerate,
             claim_replaced,
             claim_children,
+            claim_child_replaced,
             claim_underpriced,
             last_error,
         } = self;
@@ -281,6 +292,7 @@ impl std::fmt::Debug for TakerRecord {
             .field("claim_feerate", claim_feerate)
             .field("claim_replaced", claim_replaced)
             .field("claim_children", claim_children)
+            .field("claim_child_replaced", claim_child_replaced)
             .field("claim_underpriced", claim_underpriced)
             .field("last_error", last_error)
             .finish()

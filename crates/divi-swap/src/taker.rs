@@ -242,6 +242,7 @@ impl Taker {
             claim_feerate: None,
             claim_replaced: Vec::new(),
             claim_children: Vec::new(),
+            claim_child_replaced: None,
             claim_underpriced: 0,
             last_error: None,
         })?;
@@ -713,6 +714,7 @@ impl Taker {
         if self.maker_leg_refunded(r).await? {
             r.maker_leg_claim = None;
             r.claim_children.clear();
+            r.claim_child_replaced = None;
             return self.enter(r, TakerState::Refunded);
         }
         if ctx.resign_after_refusal(r, claim, &e).await? {

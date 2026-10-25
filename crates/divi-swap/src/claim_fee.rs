@@ -31,6 +31,9 @@ pub(crate) struct ClaimMut<'a> {
     pub replaced: &'a mut Vec<(SignedTx, u64)>,
     /// CPFP children, in spend order.
     pub children: &'a mut Vec<SignedTx>,
+    /// The child the newest child replaces, with the feerate the package paid with it,
+    /// until the node relays or refuses the replacement.
+    pub child_replaced: &'a mut Option<(SignedTx, u64)>,
     /// Same-nonce replacements refused as underpriced since a version was last taken.
     pub underpriced: &'a mut u32,
 }
@@ -56,6 +59,7 @@ impl ClaimRecord for TakerRecord {
             feerate: &mut self.claim_feerate,
             replaced: &mut self.claim_replaced,
             children: &mut self.claim_children,
+            child_replaced: &mut self.claim_child_replaced,
             underpriced: &mut self.claim_underpriced,
         }
     }
@@ -76,6 +80,7 @@ impl ClaimRecord for MakerRecord {
             feerate: &mut f.claim_feerate,
             replaced: &mut f.claim_replaced,
             children: &mut f.claim_children,
+            child_replaced: &mut f.claim_child_replaced,
             underpriced: &mut f.claim_underpriced,
         }
     }
@@ -131,6 +136,7 @@ impl ClaimCtx<'_> {
         *c.feerate = feerate;
         c.replaced.clear();
         c.children.clear();
+        *c.child_replaced = None;
         *c.underpriced = 0;
         Ok(tx)
     }
@@ -152,12 +158,29 @@ impl ClaimCtx<'_> {
     }
 
     /// Resend every CPFP child. One refused for good is dropped with every child built on
-    /// it (the next bump builds afresh); any failure is returned.
+    /// it (the next bump builds afresh); any failure is returned. A refused replacement of
+    /// a child (e.g. written ahead and never sent before a restart, on a node that takes no
+    /// child replacement) gives back the child it replaced, which the node still holds, for
+    /// the next bump to chain on.
     pub async fn resend_children<R: ClaimRecord>(&self, r: &mut R) -> Result<()> {
         let children = r.claim_mut().children.clone();
         for (i, child) in children.iter().enumerate() {
             if let Err(e) = self.backend.broadcast(child).await {
                 if matches!(e, SwapError::Rejected(_)) {
+                    let c = r.claim_mut();
+                    let replaced = c.child_replaced.take();
+                    if let (Some((old, feerate)), true) = (replaced, i + 1 == children.len()) {
+                        tracing::info!(swap = %r.swap_id(), refused = %child.txid,
+                            back_to = %old.txid, error = %e,
+                            "claim CPFP child replacement refused; back to the child it replaced");
+                        let c = r.claim_mut();
+                        c.children.pop();
+                        c.children.push(old.clone());
+                        *c.feerate = Some(feerate);
+                        r.persist(self.store)?;
+                        self.backend.broadcast(&old).await?;
+                        return Ok(());
+                    }
                     tracing::warn!(swap = %r.swap_id(), refused = %child.txid, error = %e,
                         "claim CPFP child refused; dropping it");
                     let c = r.claim_mut();
@@ -167,6 +190,10 @@ impl ClaimCtx<'_> {
                 }
                 return Err(e);
             }
+        }
+        // Every child relayed: a pending replacement among them was taken.
+        if r.claim_mut().child_replaced.take().is_some() {
+            r.persist(self.store)?;
         }
         Ok(())
     }
@@ -210,6 +237,7 @@ impl ClaimCtx<'_> {
             *c.claim = Some(prev);
             *c.feerate = Some(feerate);
             c.children.clear();
+            *c.child_replaced = None;
             r.persist(self.store)?;
             return Ok(true);
         }
@@ -273,6 +301,7 @@ impl ClaimCtx<'_> {
                 *c.claim = Some(tx.clone());
                 *c.feerate = Some(feerate);
                 c.children.clear();
+                *c.child_replaced = None;
                 *c.underpriced = 0; // a fresh claim, not a replacement
             }
             r.persist(self.store)?; // write-ahead
@@ -286,6 +315,7 @@ impl ClaimCtx<'_> {
             let c = r.claim_mut();
             *c.claim = None;
             c.children.clear();
+            *c.child_replaced = None;
         }
         r.persist(self.store)?;
         Ok(false)
@@ -473,11 +503,19 @@ impl ClaimCtx<'_> {
             let c = r.claim_mut();
             c.children.push(tx.clone());
             *c.feerate = Some(target);
+            // Kept until the node relays or refuses the replacement: one that refuses it
+            // still holds the old child, also after a crash before the broadcast.
+            *c.child_replaced = old.clone().map(|o| (o, current));
         }
         r.persist(self.store)?; // write-ahead
         self.log_child_bump(r, claim, &tx, current, target, left, old.is_some());
         let refused = match b.broadcast(&tx).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if r.claim_mut().child_replaced.take().is_some() {
+                    r.persist(self.store)?;
+                }
+                return Ok(());
+            }
             Err(SwapError::Rejected(e)) if old.is_some() => e,
             Err(e) => {
                 // Kept: the next step resends it and, if refused for good, drops it.
@@ -495,6 +533,7 @@ impl ClaimCtx<'_> {
             c.children.pop();
             c.children.extend(old);
             *c.feerate = Some(current);
+            *c.child_replaced = None;
         }
         let (target, bump) = self.cpfp_target(esc, base, current, left, held + 1);
         if !bump {
