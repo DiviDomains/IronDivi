@@ -220,13 +220,15 @@ pub trait ChainBackend: Send + Sync {
 
     /// Re-sign `prev`, a claim this backend built, as its replacement: the same call at the
     /// same nonce, with `maxFeePerGas` at most `feerate` and both fees past the node's
-    /// replacement minimum ([`FeeBump::SameNonce`]). `Ok(None)` when no replacement the node
-    /// would take fits under `feerate`: the caller keeps `prev`. **Does not broadcast.**
-    /// Only for [`FeeBump::SameNonce`] backends.
+    /// replacement minimum, `price_bump_pct` percent over `prev`'s
+    /// ([`crate::FeeEscalation::price_bump_pct`]; [`FeeBump::SameNonce`]). `Ok(None)` when no
+    /// replacement the node would take fits under `feerate`: the caller keeps `prev`.
+    /// **Does not broadcast.** Only for [`FeeBump::SameNonce`] backends.
     async fn build_claim_replacement(
         &self,
         _prev: &SignedTx,
         _feerate: u64,
+        _price_bump_pct: u64,
     ) -> Result<Option<SignedTx>> {
         Err(SwapError::Other(format!(
             "{} backend cannot replace a claim at its nonce",

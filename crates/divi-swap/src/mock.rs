@@ -718,13 +718,14 @@ impl ChainBackend for MockBackend {
         }))
     }
 
-    /// The same claim at `feerate`, if that clears geth's default price bump over `prev`'s.
-    /// Like the EVM backend it assumes the default, not the relay's
+    /// The same claim at `feerate`, if that clears `price_bump_pct` over `prev`'s. Like the
+    /// EVM backend it takes the bump it is given, not the relay's
     /// ([`MockChain::set_price_bump`]), so a stricter node can still refuse it.
     async fn build_claim_replacement(
         &self,
         prev: &SignedTx,
         feerate: u64,
+        price_bump_pct: u64,
     ) -> Result<Option<SignedTx>> {
         self.check_online()?;
         if self.fee_bump() != FeeBump::SameNonce {
@@ -744,7 +745,7 @@ impl ChainBackend for MockBackend {
         else {
             return Err(SwapError::InvalidParams("not a claim".into()));
         };
-        if feerate < same_nonce_floor(old, None) {
+        if feerate < same_nonce_floor(old, Some(price_bump_pct)) {
             return Ok(None);
         }
         Ok(Some(Self::sign(&MockTx::Claim {

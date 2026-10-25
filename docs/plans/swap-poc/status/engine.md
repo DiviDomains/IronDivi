@@ -528,3 +528,30 @@
   - the 500 gwei cap is a policy figure for the Manager.
   - the replacement keeps the first claim's gas limit. A claim that needs more gas than that is not re-estimated.
 - gates: `fmt --all --check` rc=0; `clippy -p divi-swap -p swap-chain-evm --all-targets -- -D warnings` rc=0; tests `swap-chain-evm` 32 passed / 0 failed, `divi-swap` 324 / 0, `divi-swapd` 134 / 0, `divi-swap-cli` 56 / 0.
+
+## 2026-10-25 round: evm-claim-replacement DM2 (builder DM, `lane/evm-claim-replacement`, on 3fee72d)
+- why: the Manager's rulings on the DM open items. (a) the 500 gwei cap stays the default but is per-chain config; (b) the node's price bump is per-chain config, and a node stricter than it is outbid instead of refusing every step; (c) and (d) are recorded below.
+- cap and price bump (`crates/divi-swap/src/config.rs`): `FeeEscalation` gains `price_bump_pct` (serde default 10, `GETH_PRICE_BUMP_PCT`), with `with_cap_feerate` and `with_price_bump`. `builtin(Usdc)` is unchanged: cap 500 gwei per gas, bump 10. `ChainBackend::build_claim_replacement(prev, feerate, price_bump_pct)` takes the bump. The EVM backend's floor is `old * (100 + price_bump_pct) / 100` on both fees (`geth_replacement_floor`, `replacement_fees`); the constant `GETH_PRICE_BUMP` is gone. The mock applies the same bump.
+- CLI (`bin/divi-swap/src/main.rs`): global, repeatable `--claim-fee-cap CHAIN=FEERATE` and `--claim-price-bump CHAIN=PCT`, applied over `FeeEscalation::builtin` at both taker build sites. A chain with no escalation (none builtin) is refused with "{chain} claims have no fee escalation to configure". `divi-swapd` builds no taker escalation, so it has no such flags.
+- step doubling (`taker.rs`, `store.rs`): `SwapRecord` gains `claim_underpriced: u32` (serde default 0, left out of the stored JSON while 0, so the at-rest fixture is unchanged). In `claim_refused`, when a `SameNonce` claim falls back to a held version and the refusal says "underpriced", the count goes up by one and a warning is logged (swap id, refusals, feerate). After 2 refusals the next `escalate` step uses `FeeEscalation::underpriced_target`: the step over the current rate doubles every second refusal (2-3: x2, 4-5: x4, ...). It is never below the plain target and never over the cap. Each escalation is logged at warn: swap, chain, refusals, price bump, old feerate, step, new feerate, cap. Fees and ids only, nothing secret. The count goes back to 0 on the next accepted broadcast, on a fresh re-sign at a new nonce, and on the first claim.
+- (c) last step under the floor: when the cap is less than the bump above the held version, `build_claim_replacement` returns `None`. The held claim stays just below the cap and is rebroadcast as is. The cap is never exceeded to clear the floor.
+- (d) gas limit: every replacement keeps the first claim's gas limit (no re-estimate). The Manager accepted this.
+- devnet check: foundry v1.8.6 (commit 6bad0a66de7c83f7b33695044138f0f5fa4c5990), installed in user space under `~/.foundry/bin` on hp1. The release tarball's sha256 `58850106984038f3a7200f38a4182c8cb423d3a4f4c7848eacbc2453e6bc35fc` matched both the published checksum and the GitHub asset digest. It is not on the default PATH.
+  - The test is `anvil_txpool_takes_a_same_nonce_replacement_and_refuses_an_underpriced_one` (swap-chain-evm, `#[ignore]`). It runs anvil on 127.0.0.1 with `--no-mining` and dev key 0; no public RPC is used.
+  - A 10% replacement is taken at the same nonce and evicts the original.
+  - Rebroadcasting the original is then refused with "replacement transaction underpriced". The error is `Rejected`, and the pool keeps the replacement.
+  - After `evm_mine`, the replacement has 1 confirmation and the original none. Result: 1 passed. Anvil is dropped with the test, and `pgrep anvil` afterwards finds nothing.
+  - Finding: anvil 1.8.6 has no percentage bump. A first run that expected a +1% replacement to be refused failed, because anvil took it. Geth's percentage floor therefore stays covered by the transcribed-rule unit tests, not by anvil.
+- tests (test-first):
+  - config: `fee_escalation_cap_and_price_bump_are_per_chain_settings`, `an_underpriced_step_doubles_every_second_refusal_within_the_cap`, and proptest `an_underpriced_step_stays_between_the_target_and_the_cap`.
+  - swap-chain-evm: `replacement_fees_follow_the_configured_price_bump` and `claim_replacement_takes_the_price_bump_it_is_given` (3.8 gwei refused at 30%, 3.9 taken), plus the anvil test.
+  - taker_fee_escalation: `usdc_claim_replacement_doubles_its_step_after_two_underpriced_refusals` (a 30%-bump mock node: the 12 step is refused twice, then 14 is taken); `usdc_configured_price_bump_matches_the_node_and_is_never_refused`; `usdc_claim_never_goes_over_the_cap_for_any_node_price_bump` (a sweep of node bumps).
+  - CLI: `claim_fee_flags_override_the_builtin_escalation_per_chain`.
+- fail-first at 3fee72d + new tests:
+  - Compile errors: swap-chain-evm lib 24; divi-swap 10 (lib 5, taker_fee_escalation 5); divi-swap-cli 6.
+  - Against stubs (API present, no behaviour): swap-chain-evm lib 32 passed / 2 failed / 1 ignored; `config::` 32 / 1; taker_fee_escalation 10 / 2. The CLI test aborted on the clap parse error (exit 2).
+  - The sweep and the proptest passed at the stub stage. They guard the cap invariant, which was already enforced; they are not fail-first tests.
+- open:
+  - `claim_underpriced` counts across window steps and resets only on an accepted broadcast. A long run of refusals therefore keeps doubling, bounded by the cap.
+  - No run against a real geth node. Anvil's pool rule is weaker than geth's.
+- gates (branch alone): `fmt --all --check` rc=0; `clippy -p swap-chain-evm -p divi-swap -p divi-swapd -p divi-swap-cli --all-targets -- -D warnings` rc=0; tests `swap-chain-evm` 34 passed / 0 failed / 1 ignored (anvil), `divi-swap` 330 / 0, `divi-swapd` 134 / 0, `divi-swap-cli` 57 / 0.

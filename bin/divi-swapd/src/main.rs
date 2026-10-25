@@ -1356,6 +1356,7 @@ mod tests {
             claim_feerate: None,
             claim_replaced: Vec::new(),
             claim_children: Vec::new(),
+            claim_underpriced: 0,
             last_error: None,
         }
     }

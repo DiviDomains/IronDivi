@@ -169,8 +169,70 @@ struct Cli {
     /// scans once from there, then follows the tip).
     #[arg(long, global = true, default_value_t = 720)]
     xmr_lookback_blocks: u64,
+    /// Highest feerate a maker-leg claim on CHAIN ever pays, as `CHAIN=FEERATE` (base unit per
+    /// vbyte; on usdc wei per gas, the claim's `maxFeePerGas`). Repeatable, one per chain.
+    /// Unset: the chain's builtin cap (usdc 500 gwei, `500000000000`).
+    #[arg(long, global = true, value_parser = parse_chain_value)]
+    claim_fee_cap: Vec<(Chain, u64)>,
+    /// Replacement price bump, percent, of the node a same-nonce (usdc) claim is sent to, as
+    /// `CHAIN=PCT`: each replacement raises both fees at least this much (geth
+    /// `--txpool.pricebump`). Repeatable. Unset: 10, geth's default. A node stricter than this
+    /// is still outbid: every second "underpriced" refusal doubles the next step.
+    #[arg(long, global = true, value_parser = parse_chain_value)]
+    claim_price_bump: Vec<(Chain, u64)>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// `CHAIN=N`, for the per-chain claim fee flags.
+fn parse_chain_value(s: &str) -> Result<(Chain, u64), String> {
+    let (chain, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected CHAIN=N, got {s:?}"))?;
+    let chain = chain.parse::<Chain>().map_err(|e| e.to_string())?;
+    let value = value
+        .parse::<u64>()
+        .map_err(|e| format!("{chain}: {e} in {s:?}"))?;
+    Ok((chain, value))
+}
+
+/// The fee escalations `--claim-fee-cap` and `--claim-price-bump` set: each named chain's
+/// builtin ([`divi_swap::FeeEscalation::builtin`]) with the given fields replaced.
+fn claim_fee_escalations(cli: &Cli) -> Result<Vec<(Chain, divi_swap::FeeEscalation)>> {
+    let mut out: Vec<(Chain, divi_swap::FeeEscalation)> = Vec::new();
+    let set = |out: &mut Vec<(Chain, divi_swap::FeeEscalation)>,
+               chain: Chain,
+               f: &dyn Fn(divi_swap::FeeEscalation) -> divi_swap::FeeEscalation|
+     -> Result<()> {
+        let i = match out.iter().position(|(c, _)| *c == chain) {
+            Some(i) => i,
+            None => {
+                let builtin = divi_swap::FeeEscalation::builtin(chain).with_context(|| {
+                    format!("{chain} claims have no fee escalation to configure")
+                })?;
+                out.push((chain, builtin));
+                out.len() - 1
+            }
+        };
+        out[i].1 = f(out[i].1);
+        Ok(())
+    };
+    for &(chain, cap) in &cli.claim_fee_cap {
+        set(&mut out, chain, &|e| e.with_cap_feerate(cap))?;
+    }
+    for &(chain, pct) in &cli.claim_price_bump {
+        set(&mut out, chain, &|e| e.with_price_bump(pct))?;
+    }
+    Ok(out)
+}
+
+/// `taker` with the escalations of [`claim_fee_escalations`] applied.
+fn with_claim_fees(taker: Taker, cli: &Cli) -> Result<Taker> {
+    Ok(claim_fee_escalations(cli)?
+        .into_iter()
+        .fold(taker, |t, (chain, esc)| {
+            t.with_fee_escalation(chain, Some(esc))
+        }))
 }
 
 fn parse_profile(s: &str) -> Result<divi_swap::Profile, String> {
@@ -960,7 +1022,10 @@ async fn taker(cli: &Cli) -> Result<Taker> {
     let b = backends(cli)?;
     ltc_preflight(cli, &b).await?;
     sync_divi(cli, &b).await?;
-    Ok(Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile))
+    with_claim_fees(
+        Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile),
+        cli,
+    )
 }
 
 #[tokio::main]
@@ -1048,8 +1113,10 @@ async fn main() -> Result<()> {
                 divi: b.divi.clone(),
                 btc: b.btc.clone(),
             };
-            let taker =
-                Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile);
+            let taker = with_claim_fees(
+                Taker::new(b.divi, b.btc, Store::open(&cli.db)?).with_profile_floor(cli.profile),
+                &cli,
+            )?;
             let (local, state) = flow::run_swap_gated(
                 &taker,
                 &MakerClient::new(&deal.maker.maker),
@@ -1289,6 +1356,70 @@ mod tests {
         argv.extend_from_slice(extra);
         argv.push("tip");
         Cli::parse_from(argv)
+    }
+
+    /// `--claim-fee-cap` and `--claim-price-bump` override the chain's builtin escalation one
+    /// field at a time (repeatable, `CHAIN=N`); unset, nothing is overridden and the builtin
+    /// 500 gwei cap and 10% bump hold. A chain with no escalation, or a malformed value, is
+    /// refused.
+    #[test]
+    fn claim_fee_flags_override_the_builtin_escalation_per_chain() {
+        use divi_swap::FeeEscalation;
+        assert!(claim_fee_escalations(&tip_cli(&[])).unwrap().is_empty());
+        let cli = tip_cli(&[
+            "--claim-fee-cap",
+            "usdc=40000000000",
+            "--claim-price-bump",
+            "usdc=30",
+            "--claim-fee-cap",
+            "btc=200",
+        ]);
+        let got = claim_fee_escalations(&cli).unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        let of = |c: Chain| got.iter().find(|(g, _)| *g == c).map(|(_, e)| *e);
+        assert_eq!(
+            of(Chain::Usdc),
+            Some(
+                FeeEscalation::builtin(Chain::Usdc)
+                    .unwrap()
+                    .with_cap_feerate(40_000_000_000)
+                    .with_price_bump(30)
+            )
+        );
+        assert_eq!(
+            of(Chain::Btc),
+            Some(
+                FeeEscalation::builtin(Chain::Btc)
+                    .unwrap()
+                    .with_cap_feerate(200)
+            )
+        );
+        let taker_esc = with_claim_fees(
+            Taker::new(
+                std::sync::Arc::new(
+                    divi_swap::mock::MockChain::new(Chain::Divi, 0, 60)
+                        .backend(1, divi_swap::Amount(1)),
+                ),
+                std::sync::Arc::new(
+                    divi_swap::mock::MockChain::new(Chain::Usdc, 0, 12)
+                        .backend(2, divi_swap::Amount(1)),
+                ),
+                Store::in_memory().unwrap(),
+            ),
+            &cli,
+        )
+        .unwrap()
+        .fee_escalation(Chain::Usdc)
+        .unwrap();
+        assert_eq!(taker_esc.cap_feerate, 40_000_000_000);
+        assert_eq!(taker_esc.price_bump_pct, 30);
+
+        let err = claim_fee_escalations(&tip_cli(&["--claim-fee-cap", "divi=5"])).unwrap_err();
+        assert!(err.to_string().contains("divi"), "{err}");
+        for bad in ["usdc", "usdc=", "usdc=-1", "usdc=x", "nope=5"] {
+            let argv = ["divi-swap", "--claim-price-bump", bad, "tip"];
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

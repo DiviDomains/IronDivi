@@ -187,6 +187,21 @@ pub struct FeeEscalation {
     pub cap_feerate: u64,
     /// Highest multiple of the first claim's feerate ever paid.
     pub max_multiple: u64,
+    /// The replacement price bump, percent, of the node a same-nonce (`FeeBump::SameNonce`,
+    /// EVM) claim is sent to: a replacement raises both `maxFeePerGas` and
+    /// `maxPriorityFeePerGas` at least this much over the version it replaces. go-ethereum's
+    /// default is 10 (`--txpool.pricebump`, `legacypool.DefaultConfig.PriceBump`; checked in
+    /// `list.Add`, `core/txpool/legacypool/list.go`); set it to the node's own where that is
+    /// stricter. Absent from a config written before it existed: 10. Unused by RBF and CPFP.
+    #[serde(default = "default_price_bump_pct")]
+    pub price_bump_pct: u64,
+}
+
+/// go-ethereum's default replacement price bump, percent ([`FeeEscalation::price_bump_pct`]).
+pub const GETH_PRICE_BUMP_PCT: u64 = 10;
+
+fn default_price_bump_pct() -> u64 {
+    GETH_PRICE_BUMP_PCT
 }
 
 impl FeeEscalation {
@@ -214,7 +229,37 @@ impl FeeEscalation {
             cap_secs_left: m / 2,
             cap_feerate,
             max_multiple: 50,
+            price_bump_pct: GETH_PRICE_BUMP_PCT,
         })
+    }
+
+    /// This schedule with `cap_feerate` instead (the chain's configured cap).
+    pub fn with_cap_feerate(self, cap_feerate: u64) -> Self {
+        FeeEscalation {
+            cap_feerate,
+            ..self
+        }
+    }
+
+    /// This schedule with `price_bump_pct` instead (the node's replacement price bump).
+    pub fn with_price_bump(self, price_bump_pct: u64) -> Self {
+        FeeEscalation {
+            price_bump_pct,
+            ..self
+        }
+    }
+
+    /// The feerate for a same-nonce replacement of a claim paying `current` (first version
+    /// `base`) towards `target`, after `refusals` "replacement transaction underpriced"
+    /// refusals at this step: the step from `current` to `target` doubles after every second
+    /// refusal, so a node with a stricter bump than configured is outbid within a few tries
+    /// instead of refusing the same step forever. Never below `target`, never above the cap
+    /// (or `target`, where a post-leak target is already above the cap).
+    pub fn underpriced_target(&self, base: u64, current: u64, target: u64, refusals: u32) -> u64 {
+        let step = u128::from(target.saturating_sub(current));
+        let doubled = step << (refusals / 2).min(64);
+        let raised = (u128::from(current) + doubled).min(u128::from(u64::MAX)) as u64;
+        raised.min(self.cap(base).max(target)).max(target)
     }
 
     /// The feerate to pay with `left` seconds before the locktime, the first claim having paid
@@ -830,6 +875,80 @@ mod tests {
         let usdc = FeeEscalation::builtin(Chain::Usdc).expect("EVM claims escalate");
         assert_eq!(usdc.cap_feerate, 500_000_000_000, "500 gwei");
         assert_eq!((usdc.start_secs_left, usdc.cap_secs_left), (3600, 900));
+    }
+
+    /// The cap and the node's replacement price bump are per-chain settings: the builtin
+    /// USDC cap stays 500 gwei and the bump geth's default 10%, a config written before the
+    /// bump existed reads as 10, and the `with_` helpers change one field only.
+    #[test]
+    fn fee_escalation_cap_and_price_bump_are_per_chain_settings() {
+        let usdc = FeeEscalation::builtin(Chain::Usdc).unwrap();
+        assert_eq!(usdc.price_bump_pct, 10, "geth's default PriceBump");
+        assert_eq!(usdc.cap_feerate, 500_000_000_000);
+        let old: FeeEscalation = serde_json::from_str(
+            r#"{"start_secs_left":3600,"cap_secs_left":900,"cap_feerate":7,"max_multiple":50}"#,
+        )
+        .unwrap();
+        assert_eq!(old.price_bump_pct, 10);
+        let tight = usdc.with_cap_feerate(40_000_000_000).with_price_bump(30);
+        assert_eq!(tight.cap_feerate, 40_000_000_000);
+        assert_eq!(tight.price_bump_pct, 30);
+        assert_eq!(
+            (
+                tight.start_secs_left,
+                tight.cap_secs_left,
+                tight.max_multiple
+            ),
+            (usdc.start_secs_left, usdc.cap_secs_left, usdc.max_multiple)
+        );
+        assert_eq!(tight.cap(1_000_000_000), 40_000_000_000);
+        let back: FeeEscalation =
+            serde_json::from_str(&serde_json::to_string(&tight).unwrap()).unwrap();
+        assert_eq!(back, tight);
+    }
+
+    /// After every second "replacement underpriced" refusal at a step, the step from the
+    /// claim's feerate to the target doubles, never past the cap.
+    #[test]
+    fn an_underpriced_step_doubles_every_second_refusal_within_the_cap() {
+        let esc = FeeEscalation::builtin(Chain::Usdc)
+            .unwrap()
+            .with_cap_feerate(500);
+        let steps: Vec<u64> = (0..6)
+            .map(|n| esc.underpriced_target(10, 10, 12, n))
+            .collect();
+        assert_eq!(steps, [12, 12, 14, 14, 18, 18]);
+        assert_eq!(esc.underpriced_target(10, 10, 12, 200), 500, "the cap");
+        assert_eq!(esc.underpriced_target(10, 490, 500, 2), 500);
+        assert_eq!(esc.underpriced_target(10, 400, 480, 2), 500, "560 capped");
+        assert_eq!(
+            esc.underpriced_target(10, 10, 10, 4),
+            10,
+            "no step to double"
+        );
+    }
+
+    proptest::proptest! {
+        /// Whatever the refusals, the doubled step never lowers the target nor passes the
+        /// cap (or the target, where a post-leak target is already above it).
+        #[test]
+        fn an_underpriced_step_stays_between_the_target_and_the_cap(
+            base in 1u64..1_000_000_000_000,
+            current_over in 0u64..1_000_000_000_000,
+            step in 0u64..1_000_000_000_000,
+            refusals in 0u32..200,
+            cap in 1u64..1_000_000_000_000,
+        ) {
+            let esc = FeeEscalation::builtin(Chain::Usdc).unwrap().with_cap_feerate(cap);
+            let current = base.saturating_add(current_over);
+            let target = current.saturating_add(step);
+            let got = esc.underpriced_target(base, current, target, refusals);
+            proptest::prop_assert!(got >= target);
+            proptest::prop_assert!(got <= esc.cap(base).max(target));
+            if refusals < 2 {
+                proptest::prop_assert_eq!(got, target);
+            }
+        }
     }
 
     #[test]

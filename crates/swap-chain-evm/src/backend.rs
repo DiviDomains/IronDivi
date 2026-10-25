@@ -484,12 +484,13 @@ impl ChainBackend for UsdcBackend {
 
     /// `prev` re-signed at its own nonce: same contract, calldata, value, gas limit, chain id
     /// and access list, with `maxFeePerGas` = `feerate` and the tip raised in proportion, both
-    /// past geth's price bump ([`replacement_fees`]). Signed offline: no node call, so the
+    /// past the node's price bump, `price_bump_pct` ([`replacement_fees`]). Signed offline: no node call, so the
     /// gas limit is not re-estimated and the nonce is the stuck claim's, not `pending`.
     async fn build_claim_replacement(
         &self,
         prev: &SignedTx,
         feerate: u64,
+        price_bump_pct: u64,
     ) -> Result<Option<SignedTx>> {
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::consensus::TxEnvelope;
@@ -518,6 +519,7 @@ impl ChainBackend for UsdcBackend {
             old.max_fee_per_gas,
             old.max_priority_fee_per_gas,
             u128::from(feerate),
+            price_bump_pct,
         ) else {
             return Ok(None);
         };
@@ -768,29 +770,34 @@ impl ChainBackend for UsdcBackend {
     }
 }
 
-/// go-ethereum's `PriceBump` default, percent (`core/txpool/legacypool/legacypool.go`,
-/// `DefaultConfig`; `--txpool.pricebump`).
-const GETH_PRICE_BUMP: u128 = 10;
-
-/// Least fee geth takes in a replacement of a transaction paying `old`: `list.Add` in
-/// `core/txpool/legacypool/list.go` refuses unless the new fee is strictly greater *and* at
-/// least `old * (100 + PriceBump) / 100` (integer division), checked separately for
-/// `maxFeePerGas` and `maxPriorityFeePerGas`; it answers `replacement transaction
-/// underpriced` (`ErrReplaceUnderpriced`, `core/txpool/errors.go`).
-fn geth_replacement_floor(old: u128) -> u128 {
-    (old.saturating_mul(100 + GETH_PRICE_BUMP) / 100).max(old.saturating_add(1))
+/// Least fee geth takes in a replacement of a transaction paying `old` on a node whose
+/// `PriceBump` is `price_bump_pct` (`--txpool.pricebump`, default 10 in
+/// `core/txpool/legacypool/legacypool.go`, `DefaultConfig`; the chain's
+/// `FeeEscalation::price_bump_pct`): `list.Add` in `core/txpool/legacypool/list.go` refuses
+/// unless the new fee is strictly greater *and* at least `old * (100 + PriceBump) / 100`
+/// (integer division), checked separately for `maxFeePerGas` and `maxPriorityFeePerGas`; it
+/// answers `replacement transaction underpriced` (`ErrReplaceUnderpriced`,
+/// `core/txpool/errors.go`).
+fn geth_replacement_floor(old: u128, price_bump_pct: u64) -> u128 {
+    (old.saturating_mul(100 + u128::from(price_bump_pct)) / 100).max(old.saturating_add(1))
 }
 
 /// `(maxFeePerGas, maxPriorityFeePerGas)` for a replacement of a transaction paying
 /// `(old_max, old_tip)`, with the max fee at `target`: the tip rises in proportion to the max
-/// fee, and at least to geth's floor. `None` when `target` is under geth's floor for the max
-/// fee, or the tip's floor is over `target`: no replacement geth takes fits.
-fn replacement_fees(old_max: u128, old_tip: u128, target: u128) -> Option<(u128, u128)> {
-    if target < geth_replacement_floor(old_max) {
+/// fee, and at least to the node's floor at `price_bump_pct`. `None` when `target` is under
+/// that floor for the max fee, or the tip's floor is over `target`: no replacement the node
+/// takes fits.
+fn replacement_fees(
+    old_max: u128,
+    old_tip: u128,
+    target: u128,
+    price_bump_pct: u64,
+) -> Option<(u128, u128)> {
+    if target < geth_replacement_floor(old_max, price_bump_pct) {
         return None;
     }
     let scaled = old_tip.saturating_mul(target).div_ceil(old_max.max(1));
-    let tip = geth_replacement_floor(old_tip).max(scaled);
+    let tip = geth_replacement_floor(old_tip, price_bump_pct).max(scaled);
     (tip <= target).then_some((target, tip))
 }
 
@@ -1166,12 +1173,183 @@ mod tests {
     /// Geth's replacement rule, transcribed from `core/txpool/legacypool/list.go`
     /// (`list.Add`) with the default `PriceBump` of 10 (`legacypool.go`, `DefaultConfig`).
     fn geth_accepts(old: (u128, u128), new: (u128, u128)) -> bool {
+        geth_accepts_at(old, new, 10)
+    }
+
+    /// [`geth_accepts`] on a node run with `--txpool.pricebump=bump`.
+    fn geth_accepts_at(old: (u128, u128), new: (u128, u128), bump: u64) -> bool {
         let (old_cap, old_tip) = old;
         let (new_cap, new_tip) = new;
         if old_cap >= new_cap || old_tip >= new_tip {
             return false;
         }
-        new_cap >= old_cap * 110 / 100 && new_tip >= old_tip * 110 / 100
+        let pct = 100 + u128::from(bump);
+        new_cap >= old_cap * pct / 100 && new_tip >= old_tip * pct / 100
+    }
+
+    /// A node run with a stricter `--txpool.pricebump` (30 here) needs both fees that much
+    /// higher: the bump is the caller's (the chain's configured one), not a constant, and
+    /// every replacement it signs is one that node takes.
+    #[test]
+    fn replacement_fees_follow_the_configured_price_bump() {
+        assert_eq!(replacement_fees(100, 10, 129, 30), None, "under 30%");
+        assert_eq!(replacement_fees(100, 10, 130, 30), Some((130, 13)));
+        assert_eq!(
+            replacement_fees(100, 10, 101, 0),
+            Some((101, 11)),
+            "no bump: strictly more"
+        );
+        assert_eq!(replacement_fees(100, 10, 499, 400), None);
+        assert_eq!(replacement_fees(100, 10, 500, 400), Some((500, 50)));
+        for bump in [0u64, 1, 10, 25, 30, 100, 400] {
+            for (old_cap, old_tip) in [
+                (7u128, 1u128),
+                (1_000_000_007, 300_000_000),
+                (3_000_000_000, 3_000_000_000),
+            ] {
+                for target in [
+                    old_cap,
+                    old_cap * 11 / 10,
+                    old_cap * 13 / 10,
+                    old_cap * 2,
+                    old_cap * 6,
+                ] {
+                    match replacement_fees(old_cap, old_tip, target, bump) {
+                        Some((cap, tip)) => {
+                            assert!(
+                                geth_accepts_at((old_cap, old_tip), (cap, tip), bump),
+                                "{bump} {old_cap} {old_tip} {target}"
+                            );
+                            assert!(cap <= target && tip <= cap);
+                        }
+                        None => assert!(
+                            !geth_accepts_at((old_cap, old_tip), (target, target), bump),
+                            "refused a target the node takes: {bump} {old_cap} {old_tip} {target}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The backend signs a replacement only past the bump it is given: 3.8 gwei over 3 gwei
+    /// clears geth's default 10% but not a 30% node's, and 3.9 gwei clears both.
+    #[tokio::test]
+    async fn claim_replacement_takes_the_price_bump_it_is_given() {
+        let (_server, _node, backend) = relay_backend().await;
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        assert!(backend
+            .build_claim_replacement(&first, 3_800_000_000, 10)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            backend
+                .build_claim_replacement(&first, 3_800_000_000, 30)
+                .await
+                .unwrap(),
+            None
+        );
+        let next = backend
+            .build_claim_replacement(&first, 3_900_000_000, 30)
+            .await
+            .unwrap()
+            .expect("30% over");
+        let (old, new) = (decoded(&first), decoded(&next));
+        use alloy::consensus::Transaction as _;
+        assert!(geth_accepts_at(
+            (
+                old.max_fee_per_gas(),
+                old.max_priority_fee_per_gas().unwrap()
+            ),
+            (
+                new.max_fee_per_gas(),
+                new.max_priority_fee_per_gas().unwrap()
+            ),
+            30
+        ));
+    }
+
+    /// Devnet check of the same-nonce replacement against a real txpool: foundry's `anvil`
+    /// on 127.0.0.1 with its own dev accounts (no funds, no secrets, no public RPC), started
+    /// with `--no-mining` so the claim and its replacement meet in the pool. A 10%
+    /// replacement is taken at the same nonce and evicts the original; rebroadcasting the
+    /// original (same nonce, lower fees) is then refused "replacement transaction
+    /// underpriced" and the replacement is the one mined. Anvil 1.8.6 has no percentage
+    /// bump (it takes any strictly higher fee, even +1%), so geth's 10% floor is covered by
+    /// the unit tests above, not here. The "HTLC" is an empty address, so the call costs plain gas and needs
+    /// no contract build. Ignored by default: needs `anvil` on `PATH` (foundry installs it
+    /// under `~/.foundry/bin`); run with
+    /// `PATH=$HOME/.foundry/bin:$PATH cargo test -p swap-chain-evm --lib anvil_ -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs foundry's anvil on PATH"]
+    async fn anvil_txpool_takes_a_same_nonce_replacement_and_refuses_an_underpriced_one() {
+        use alloy::consensus::Transaction as _;
+        let anvil = alloy::node_bindings::Anvil::new()
+            .arg("--no-mining")
+            .spawn();
+        let key = PrivateKeySigner::from(&anvil.keys()[0]);
+        let backend = UsdcBackend::new(
+            &anvil.endpoint(),
+            key,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap();
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(backend.broadcast(&first).await.unwrap(), first.txid);
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), Some(0));
+
+        let next = backend
+            .build_claim_replacement(&first, 3_300_000_000, 10)
+            .await
+            .unwrap()
+            .expect("10% over");
+        assert_eq!(decoded(&next).nonce(), decoded(&first).nonce());
+        assert_eq!(backend.broadcast(&next).await.unwrap(), next.txid);
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(0));
+        assert_eq!(
+            backend.confirmations(&first.txid).await.unwrap(),
+            None,
+            "the replacement evicted the original"
+        );
+
+        // The taker's rebroadcast of an older version: same nonce, lower fees than the
+        // pool's. Refused, and the pool keeps the replacement.
+        let err = backend.broadcast(&first).await.unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("replacement transaction underpriced"),
+            "{err}"
+        );
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), None);
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(0));
+
+        backend
+            .client
+            .provider()
+            .raw_request::<_, alloy::primitives::U256>("evm_mine".into(), ())
+            .await
+            .expect("evm_mine");
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(1));
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), None);
     }
 
     /// The replacement's fees: the max fee is the target, the tip rises with it, and both
@@ -1179,26 +1357,26 @@ mod tests {
     /// what the caller allowed. The tip never exceeds the max fee.
     #[test]
     fn replacement_fees_clear_geths_price_bump_within_the_target() {
-        assert_eq!(replacement_fees(100, 10, 200), Some((200, 20)));
-        assert_eq!(replacement_fees(100, 10, 110), Some((110, 11)));
+        assert_eq!(replacement_fees(100, 10, 200, 10), Some((200, 20)));
+        assert_eq!(replacement_fees(100, 10, 110, 10), Some((110, 11)));
         assert_eq!(
-            replacement_fees(100, 10, 109),
+            replacement_fees(100, 10, 109, 10),
             None,
             "under 10% on the max fee"
         );
         assert_eq!(
-            replacement_fees(100, 0, 200),
+            replacement_fees(100, 0, 200, 10),
             Some((200, 1)),
             "a zero tip still rises"
         );
-        assert_eq!(replacement_fees(100, 9, 110), Some((110, 10)));
-        assert_eq!(replacement_fees(100, 100, 110), Some((110, 110)));
+        assert_eq!(replacement_fees(100, 9, 110, 10), Some((110, 10)));
+        assert_eq!(replacement_fees(100, 100, 110, 10), Some((110, 110)));
         assert_eq!(
-            replacement_fees(5, 1, 6),
+            replacement_fees(5, 1, 6, 10),
             Some((6, 2)),
             "wei-level: strictly more"
         );
-        assert_eq!(replacement_fees(5, 5, 5), None);
+        assert_eq!(replacement_fees(5, 5, 5, 10), None);
         for old_cap in [1u128, 7, 99, 1_000_000_007, 30_000_000_000] {
             for old_tip in [0, 1, old_cap / 3, old_cap] {
                 for target in [
@@ -1208,7 +1386,7 @@ mod tests {
                     old_cap * 5 / 4,
                     old_cap * 3,
                 ] {
-                    match replacement_fees(old_cap, old_tip, target) {
+                    match replacement_fees(old_cap, old_tip, target, 10) {
                         Some((cap, tip)) => {
                             assert!(
                                 geth_accepts((old_cap, old_tip), (cap, tip)),
@@ -1266,7 +1444,7 @@ mod tests {
             .store(1, std::sync::atomic::Ordering::SeqCst);
 
         let new = backend
-            .build_claim_replacement(&first, 4_000_000_000)
+            .build_claim_replacement(&first, 4_000_000_000, 10)
             .await
             .unwrap()
             .expect("25% over clears geth's 10%");
@@ -1295,7 +1473,7 @@ mod tests {
         // Under geth's bump within the target: nothing is signed.
         assert_eq!(
             backend
-                .build_claim_replacement(&first, 3_200_000_000)
+                .build_claim_replacement(&first, 3_200_000_000, 10)
                 .await
                 .unwrap(),
             None
@@ -1318,7 +1496,7 @@ mod tests {
             .await
             .unwrap();
         let next = backend
-            .build_claim_replacement(&first, 3_300_000_000)
+            .build_claim_replacement(&first, 3_300_000_000, 10)
             .await
             .unwrap()
             .unwrap();
@@ -1345,7 +1523,7 @@ mod tests {
             .await
             .unwrap();
         let next = backend
-            .build_claim_replacement(&first, 4_000_000_000)
+            .build_claim_replacement(&first, 4_000_000_000, 10)
             .await
             .unwrap()
             .unwrap();
