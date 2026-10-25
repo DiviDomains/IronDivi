@@ -64,8 +64,10 @@ pub struct MasternodeRpc {
     vote_tracker: Arc<RwLock<PaymentVoteTracker>>,
     /// Pre-signed broadcasts (`importmnbroadcast` / `listmnbroadcasts`)
     stored: BroadcastStore,
-    /// Datadir holding `masternode.conf`
+    /// Datadir holding `mnbroadcasts.json`
     datadir: RwLock<Option<std::path::PathBuf>>,
+    /// masternode.conf (-mnconf; `<datadir>/masternode.conf` by default)
+    conf_path: RwLock<Option<std::path::PathBuf>>,
     /// Sends raw broadcast bytes to the P2P layer
     relay: RwLock<Option<BroadcastRelay>>,
     /// The masternodes the network announced, in Divi Core's form
@@ -81,6 +83,7 @@ impl MasternodeRpc {
             vote_tracker: Arc::new(RwLock::new(PaymentVoteTracker::new(10, 3))),
             stored: BroadcastStore::default(),
             datadir: RwLock::new(None),
+            conf_path: RwLock::new(None),
             relay: RwLock::new(None),
             network_list: RwLock::new(None),
             votes: RwLock::new(None),
@@ -98,7 +101,15 @@ impl MasternodeRpc {
     /// Set the datadir: broadcasts persist to `mnbroadcasts.json`, config is `masternode.conf`
     pub fn set_datadir(&self, dir: std::path::PathBuf) {
         self.stored.set_path(dir.join("mnbroadcasts.json"));
+        if self.conf_path.read().is_none() {
+            *self.conf_path.write() = Some(dir.join("masternode.conf"));
+        }
         *self.datadir.write() = Some(dir);
+    }
+
+    /// The masternode.conf -mnconf names (masternodeconfig.cpp:33-38)
+    pub fn set_conf_path(&self, path: std::path::PathBuf) {
+        *self.conf_path.write() = Some(path);
     }
 
     pub fn set_broadcast_relay(&self, relay: BroadcastRelay) {
@@ -317,10 +328,10 @@ impl MasternodeRpc {
             _ => {}
         }
         let conf = self
-            .datadir
+            .conf_path
             .read()
             .as_ref()
-            .map(|d| mn_broadcast::read_conf(&d.join("masternode.conf")))
+            .map(|p| mn_broadcast::read_conf(p))
             .unwrap_or_default();
         // This node never runs as the masternode itself, as on a C++ controller wallet
         Ok(mn_broadcast::start_masternode(
@@ -453,19 +464,19 @@ impl MasternodeRpc {
 
         match command {
             "status" => {
-                // Return basic sync status
+                // Return basic sync status, in Divi Core's order (rpcmisc.cpp:203-213)
                 Ok(json!({
                     "IsBlockchainSynced": true,
                     "timestampOfLastMasternodeListUpdate": 0,
                     "timestampOfLastMasternodeWinnerUpdate": 0,
-                    "currentMasternodeSyncStatus": 999,
-                    "countOfFailedSyncAttempts": 0,
-                    "totalSuccessivePeerSyncRequests": 0,
                     "timestampOfLastFailedSync": 0,
+                    "countOfFailedSyncAttempts": 0,
+                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
+                    "nominalNumberOfMasternodeWinnersReceived": 0,
                     "fulfilledMasternodeListSyncRequests": 0,
                     "fulfilledMasternodeWinnerSyncRequests": 0,
-                    "nominalNumberOfMasternodeBroadcastsReceived": 0,
-                    "nominalNumberOfMasternodeWinnersReceived": 0
+                    "currentMasternodeSyncStatus": 999,
+                    "totalSuccessivePeerSyncRequests": 0
                 }))
             }
             // Divi Core restarts its masternode sync and answers "success"

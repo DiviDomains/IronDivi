@@ -77,6 +77,49 @@ pub fn getblocks_reply(
     (items, None)
 }
 
+/// One block of a getdata, as Divi Core's ProcessGetData sends it
+/// (main.cpp:300-319): only a block the node has and may send
+/// (GetBlockIndexOfRequestedBlock, main.cpp:213-247), and after the last block
+/// of a full getblocks answer an inv of the tip, so the peer asks for more.
+/// Nothing is sent for a block it does not have.
+async fn serve_block(
+    chain: &Chain,
+    peer_manager: &PeerManager,
+    hash_continue: &mut HashMap<divi_network::PeerId, Hash256>,
+    peer_id: divi_network::PeerId,
+    hash: &Hash256,
+) {
+    match chain.get_block_for_peer(hash) {
+        Ok(Some(block)) => {
+            if let Err(e) = peer_manager
+                .send_block_to_peer(peer_id, NetworkMessage::Block(block))
+                .await
+            {
+                tracing::warn!("Failed to send block {} to peer {}: {}", hash, peer_id, e);
+                return;
+            }
+            tracing::debug!("Served block {} to peer {} (getdata)", hash, peer_id);
+            if hash_continue.get(&peer_id) == Some(hash) {
+                hash_continue.remove(&peer_id);
+                if let Some(tip) = chain.tip() {
+                    let inv = NetworkMessage::Inv(vec![divi_network::InvItem::new(
+                        divi_network::InvType::Block,
+                        tip.hash,
+                    )]);
+                    let _ = peer_manager.send_block_to_peer(peer_id, inv).await;
+                }
+            }
+        }
+        Ok(None) => tracing::debug!("Block {} not found for getdata from peer {}", hash, peer_id),
+        Err(e) => tracing::warn!(
+            "Error looking up block {} for peer {}: {}",
+            hash,
+            peer_id,
+            e
+        ),
+    }
+}
+
 /// Node status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -222,6 +265,9 @@ impl Node {
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| NodeError::Init(format!("Failed to create data directory: {}", e)))?;
+        if config.resync {
+            clear_folders_for_resync(&config);
+        }
 
         // Initialize database, optionally with UTXO cache
         let db = Arc::new(if let Some(block_cache) = config.block_cache_size {
@@ -270,9 +316,20 @@ impl Node {
         // C++ checks the newest blocks at every start (-checkblocks); a damaged
         // database otherwise goes unnoticed until the bad record is read.
         let started = std::time::Instant::now();
+        // A failed check stops the start with Divi Core's InitError text
+        // (init.cpp:1116-1119) on the first line; what was found, and how to
+        // recover, after it and in the log
         let checked = chain
             .verify_recent_blocks(config.check_blocks)
-            .map_err(damaged)?;
+            .map_err(|e| {
+                tracing::error!("VerifyDB() : *** {}", e);
+                match damaged(e) {
+                    NodeError::Init(detail) => {
+                        NodeError::Init(format!("Corrupted block database detected\n{detail}"))
+                    }
+                    other => other,
+                }
+            })?;
         tracing::info!(
             "Verified the last {} blocks in {} ms",
             checked,
@@ -1046,99 +1103,59 @@ impl Node {
                                     );
                                     continue;
                                 }
-                                // Split block and tx getdata items
-                                let block_items: Vec<_> = items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::Block)
-                                    .cloned()
-                                    .collect();
-                                let tx_items: Vec<_> = items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::Tx)
-                                    .cloned()
-                                    .collect();
-
-                                // Handle block getdata: serve blocks from our chain
-                                for item in block_items {
-                                    match chain.get_block_for_peer(&item.hash) {
-                                        Ok(Some(block)) => {
-                                            let msg = NetworkMessage::Block(block);
-                                            if let Err(e) =
-                                                peer_manager.send_block_to_peer(peer_id, msg).await
-                                            {
-                                                tracing::warn!(
-                                                    "Failed to send block {} to peer {}: {}",
-                                                    item.hash,
-                                                    peer_id,
-                                                    e
-                                                );
-                                            } else {
-                                                tracing::debug!(
-                                                    "Served block {} to peer {} (getdata)",
-                                                    item.hash,
-                                                    peer_id
-                                                );
-                                                // The last block of a full getblocks
-                                                // answer: announce our tip so the peer
-                                                // asks for the next batch
-                                                if hash_continue.get(&peer_id) == Some(&item.hash) {
-                                                    hash_continue.remove(&peer_id);
-                                                    if let Some(tip) = chain.tip() {
-                                                        let inv = NetworkMessage::Inv(vec![
-                                                            divi_network::InvItem::new(
-                                                                divi_network::InvType::Block,
-                                                                tip.hash,
-                                                            ),
-                                                        ]);
-                                                        let _ = peer_manager
-                                                            .send_block_to_peer(peer_id, inv)
-                                                            .await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            tracing::debug!(
-                                                "Block {} not found for getdata from peer {}",
-                                                item.hash,
-                                                peer_id
-                                            );
-                                            // Tell the peer so it can ask elsewhere (pruned or unknown).
-                                            let msg = NetworkMessage::NotFound(vec![item.clone()]);
-                                            if let Err(e) =
-                                                peer_manager.send_block_to_peer(peer_id, msg).await
-                                            {
-                                                tracing::debug!(
-                                                    "Failed to send notfound for {} to peer {}: {}",
-                                                    item.hash,
-                                                    peer_id,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Error looking up block {} for peer {}: {}",
-                                                item.hash,
+                                // Divi Core's ProcessGetData (main.cpp:283-347): the
+                                // items in the order asked. A block is sent if the
+                                // node has it (and may send it, outside the main
+                                // chain only within the reorg depth), else nothing;
+                                // a transaction is sent from the mempool, else it is
+                                // named in a notfound. Each pass ends after a block
+                                // item, and its notfound goes out then, after the block
+                                let mut not_found = Vec::new();
+                                for item in items {
+                                    match item.inv_type {
+                                        divi_network::InvType::Block => {
+                                            serve_block(
+                                                &chain,
+                                                &peer_manager,
+                                                &mut hash_continue,
                                                 peer_id,
-                                                e
-                                            );
+                                                &item.hash,
+                                            )
+                                            .await;
+                                            if !not_found.is_empty() {
+                                                let msg = NetworkMessage::NotFound(std::mem::take(
+                                                    &mut not_found,
+                                                ));
+                                                let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
+                                            }
                                         }
+                                        // From what was relayed in the last 15
+                                        // minutes, then the mempool (main.cpp:324)
+                                        divi_network::InvType::Tx => match tx_relay
+                                            .relayed_tx(&item.hash)
+                                            .or_else(|| mempool.get(&item.hash).map(|e| e.tx))
+                                        {
+                                            Some(tx) => {
+                                                let msg = NetworkMessage::Tx(tx);
+                                                let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
+                                            }
+                                            None => not_found.push(item),
+                                        },
+                                        _ => {}
                                     }
                                 }
-
-                                // Handle tx getdata requests
-                                if !tx_items.is_empty() {
-                                    let mempool_ref = &mempool;
-                                    tx_relay
-                                        .handle_getdata(peer_id, tx_items, |txid| {
-                                            mempool_ref.get(txid).map(|e| e.tx)
-                                        })
+                                if !not_found.is_empty() {
+                                    let _ = peer_manager
+                                        .send_block_to_peer(peer_id, NetworkMessage::NotFound(not_found))
                                         .await;
                                 }
                             }
-                            // Handle getblocks: respond with inv for blocks after locator
-                            NetworkMessage::GetBlocks(msg) => {
+                            // Handle getblocks: respond with inv for blocks after locator.
+                            // Divi Core answers getheaders the same way (main.cpp:624):
+                            // its headers answer is built only for a "headers" request
+                            // with headers-first syncing on, which no network has
+                            // (main.cpp:680-702, chainparams.cpp:251, :360, :440)
+                            NetworkMessage::GetBlocks(msg) | NetworkMessage::GetHeaders(msg) => {
                                 let (inv_items, continue_at) =
                                     getblocks_reply(&chain, &msg, GETBLOCKS_LIMIT);
                                 if let Some(hash) = continue_at {
@@ -1224,6 +1241,24 @@ impl Node {
                                         e
                                     ),
                                 }
+                            }
+                            // Divi Core reads no transaction from a dstx
+                            // (main.cpp:705-718) and checks an empty one, which
+                            // fails CheckTransaction (DoS 10,
+                            // BlockCheckingHelpers.cpp:101-103) and then bad-tx
+                            // (DoS 100, MempoolConsensus.cpp:276-277): a reject
+                            // and a score of 110 (main.cpp:803-812)
+                            NetworkMessage::Unknown(cmd, _) if cmd == "dstx" => {
+                                if let Err(e) =
+                                    peer_manager.send_to_peer(peer_id, dstx_reject()).await
+                                {
+                                    tracing::debug!("Failed to send reject to peer {}: {}", peer_id, e);
+                                }
+                                peer_manager.report_misbehavior_score(
+                                    peer_id,
+                                    DSTX_SCORE,
+                                    "Transaction from peer rejected by memory pool",
+                                );
                             }
                             NetworkMessage::Unknown(cmd, payload) => {
                                 // Unknown messages are logged with payload details for debugging
@@ -1430,6 +1465,7 @@ impl Node {
                         tracing::debug!("Added relayed tx {} to mempool", txid);
                         // Relayed once the mempool took it, and so is each
                         // orphan it lets in (Divi Core main.cpp:734, :763)
+                        tx_relay_for_mempool.keep_relayed(event.tx.clone());
                         tx_relay_for_mempool
                             .relay_accepted(txid, Some(event.from_peer))
                             .await;
@@ -1440,6 +1476,9 @@ impl Node {
                             &orphans_for_relay,
                             txid,
                         ) {
+                            if let Some(entry) = mempool_for_relay.get(&txid) {
+                                tx_relay_for_mempool.keep_relayed(entry.tx);
+                            }
                             tx_relay_for_mempool.relay_accepted(txid, None).await;
                             let _ = event_tx_for_relay.send(NodeEvent::TransactionAccepted(txid));
                         }
@@ -1860,11 +1899,13 @@ impl Node {
             fee
         };
 
+        let relayed = tx.clone();
         let txid = self.mempool.add(tx, actual_fee)?;
         let _ = self.event_tx.send(NodeEvent::TransactionAccepted(txid));
 
-        // Mark as seen and announce to peers
+        // Mark as seen and announce to peers, and keep it for their getdata
         self.tx_relay.mark_seen(txid);
+        self.tx_relay.keep_relayed(relayed);
         let relay = Arc::clone(&self.tx_relay);
         tokio::spawn(async move {
             relay.announce_tx(txid).await;
@@ -2093,6 +2134,46 @@ fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent
         e.misbehaviour_score(),
         &format!("tx {} rejected by the mempool: {}", event.txid, e),
     );
+}
+
+/// Divi Core's -resync (ClearFoldersForResync, init.cpp:901-930): the chain's
+/// folders are deleted before it is loaded, one by one so a missing one does not
+/// stop the rest, and a failure is logged, not fatal. irondivid's chain database
+/// holds its blocks, undo data, sporks and the address and spent indexes; the
+/// transaction index has its own folder. The wallet, the configuration and the
+/// peer and masternode files stay.
+fn clear_folders_for_resync(config: &NodeConfig) {
+    tracing::info!("Deleting blockchain folders blocks, chainstate and sporks");
+    for dir in [
+        config.blocks_path(),
+        config.chainstate_path(),
+        config.data_dir.join("txindex"),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!("-resync: folder deleted: {}", dir.display()),
+            Err(e) => tracing::warn!("Failed to delete blockchain folders {}", e),
+        }
+    }
+}
+
+/// The score a `dstx` costs its sender: Divi Core checks the empty
+/// transaction it never read, 10 for CheckTransaction and 100 for bad-tx
+/// (BlockCheckingHelpers.cpp:101-103, MempoolConsensus.cpp:276-277)
+pub const DSTX_SCORE: u32 = 110;
+
+/// The `reject` Divi Core sends for a `dstx` (main.cpp:803-809): bad-tx, with
+/// the hash of the empty transaction, which is all zeros since a transaction
+/// that was never read has no hash computed
+pub fn dstx_reject() -> divi_network::NetworkMessage {
+    divi_network::NetworkMessage::Reject(divi_network::RejectMessage {
+        message: "dstx".to_string(),
+        code: crate::error::reject::INVALID,
+        reason: "bad-tx".to_string(),
+        data: vec![0u8; 32],
+    })
 }
 
 /// The `reject` Divi Core sends the peer that relayed a transaction its
@@ -2646,8 +2727,15 @@ mod tests {
 
         let err = match Node::new(config.clone()) {
             Ok(_) => panic!("node started on a damaged chain database"),
-            Err(e) => e.to_string(),
+            Err(NodeError::Init(reason)) => reason,
+            Err(e) => panic!("not a start refusal: {e}"),
         };
+        // Divi Core's InitError text first (init.cpp:1116-1119), then the detail
+        assert_eq!(
+            err.lines().next(),
+            Some("Corrupted block database detected"),
+            "{err}"
+        );
         assert!(err.contains("damaged at height"), "{err}");
         assert!(err.contains("move that directory aside"), "{err}");
 
