@@ -949,6 +949,57 @@ impl WalletRpc {
         *self.height.read()
     }
 
+    /// Run a wallet send with no other transaction let into the mempool from
+    /// the moment it picks its coins to its commit, as Divi Core runs it under
+    /// cs_main (MempoolProvider::with_admission)
+    fn exclusive(
+        &self,
+        send: impl FnOnce() -> Result<serde_json::Value, Error>,
+    ) -> Result<serde_json::Value, Error> {
+        let Some(mempool) = self.mempool.read().clone() else {
+            return send();
+        };
+        let mut send = Some(send);
+        let mut out = None;
+        mempool.with_admission(&mut || out = send.take().map(|f| f()));
+        out.expect("with_admission runs the send")
+    }
+
+    /// sendtoaddress, picking its coins and committing with no relayed transaction let in between
+    pub fn send_to_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.send_to_address_held(params))
+    }
+
+    /// fundvault, picking its coins and committing with no relayed transaction let in between
+    pub fn fund_vault(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.fund_vault_held(params))
+    }
+
+    /// debitvaultbyname, picking its coins and committing with no relayed transaction let in between
+    pub fn debit_vault_by_name(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.debit_vault_by_name_held(params))
+    }
+
+    /// reclaimvaultfunds, picking its coins and committing with no relayed transaction let in between
+    pub fn reclaim_vault_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.reclaim_vault_funds_held(params))
+    }
+
+    /// allocatefunds, picking its coins and committing with no relayed transaction let in between
+    pub fn allocate_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.allocate_funds_held(params))
+    }
+
+    /// sendmany, picking its coins and committing with no relayed transaction let in between
+    pub fn send_many(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.send_many_held(params))
+    }
+
+    /// sendfrom, picking its coins and committing with no relayed transaction let in between
+    pub fn send_from(&self, params: &Params) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.send_from_held(params))
+    }
+
     /// Submit a transaction to mempool and broadcast
     fn submit_transaction(&self, tx: Transaction) -> Result<Hash256, Error> {
         let callback = self.tx_submit.read();
@@ -1911,7 +1962,7 @@ impl WalletRpc {
     }
 
     /// sendtoaddress - Send amount to a given address
-    pub fn send_to_address(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn send_to_address_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let addr_str = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Address required"))?;
@@ -3124,7 +3175,7 @@ impl WalletRpc {
     }
 
     /// Fund a vault - Adds funds to existing vault
-    pub fn fund_vault(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn fund_vault_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
@@ -3213,7 +3264,7 @@ impl WalletRpc {
 
     /// Debit vault by name - pay out of one vault with the owner key; the rest
     /// stays in that vault (Divi Core sets the change script to the vault)
-    pub fn debit_vault_by_name(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn debit_vault_by_name_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let vault_encoding = params.get_str(0).ok_or_else(|| {
             RpcError::invalid_params("Missing required parameter: vault-encoding")
         })?;
@@ -3300,7 +3351,7 @@ impl WalletRpc {
     }
 
     /// Reclaim vault funds - Withdraw from vault using owner key (can spend anytime)
-    pub fn reclaim_vault_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn reclaim_vault_funds_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
@@ -3523,7 +3574,7 @@ impl WalletRpc {
     /// masternode <alias> <tier>` sends the tier's collateral to the account
     /// address of "alloc-><alias>" and returns the transaction and the output
     /// that holds it
-    pub fn allocate_funds(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn allocate_funds_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         const USAGE: &str = "allocatefunds purpose alias tier ( \"pay wallet\" ( \"voting wallet\" ) )\n\nStarts escrows funds for some purpose.\n";
         if params.len() != 3 {
             return Err(RpcError::new(codes::MISC_ERROR, USAGE).into());
@@ -3648,7 +3699,7 @@ impl WalletRpc {
     }
 
     /// sendmany - Send to multiple addresses in one transaction
-    pub fn send_many(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn send_many_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         // Divi Core spends only the named account's coins ("" for all)
         let account = account_from_value(
             params
@@ -4131,7 +4182,7 @@ impl WalletRpc {
     }
 
     /// sendfrom - Send from a specific account (legacy)
-    pub fn send_from(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn send_from_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let account = account_from_value(
             params
                 .get_str(0)
