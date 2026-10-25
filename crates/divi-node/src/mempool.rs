@@ -601,45 +601,15 @@ impl Mempool {
         Some(entry)
     }
 
-    /// Remove transactions that are now confirmed in a block, then any that
-    /// can no longer be mined in the next block (after a reorg to a lower tip)
+    /// Remove transactions that are now confirmed in a block. One a lower tip
+    /// made non-final stays, as in Divi Core, whose connectTip and
+    /// disconnectTip never check the mempool's lock times
+    /// (ChainTipManager.cpp:139-141, :175-183); the staker leaves it out of
+    /// its blocks until it is final.
     pub fn remove_for_block(&self, txids: &[Hash256]) {
         for txid in txids {
             self.remove(txid);
         }
-        self.remove_non_final();
-    }
-
-    /// Remove transactions that are not final for the next block, together
-    /// with the mempool transactions that spend their outputs
-    pub fn remove_non_final(&self) -> usize {
-        let tip_height = self.tip_height();
-        let now = unix_now();
-        let mut to_remove: Vec<Hash256> = self
-            .txs
-            .read()
-            .values()
-            .filter(|entry| !is_final_for_next_block(&entry.tx, tip_height, now))
-            .map(|entry| entry.txid)
-            .collect();
-
-        let mut removed = 0;
-        while let Some(txid) = to_remove.pop() {
-            if let Some(entry) = self.remove(&txid) {
-                removed += 1;
-                let spenders = self.spenders.read();
-                for vout in 0..entry.tx.vout.len() as u32 {
-                    if let Some(child) = spenders.get(&(txid, vout)) {
-                        to_remove.push(*child);
-                    }
-                }
-            }
-        }
-
-        if removed > 0 {
-            tracing::info!("Removed {} non-final transaction(s) from mempool", removed);
-        }
-        removed
     }
 
     /// Remove every transaction with an input that is neither spendable on chain
@@ -1158,25 +1128,25 @@ mod tests {
     }
 
     #[test]
-    fn test_reorg_evicts_non_final_tx_and_its_spender() {
+    fn test_reorg_keeps_non_final_tx_and_its_spender() {
         let height = Arc::new(std::sync::atomic::AtomicU32::new(300));
         let mempool = mempool_at_height(Arc::clone(&height));
         let parent = locked_tx([11u8; 32], 250, 0);
         let parent_txid = mempool.add(parent, Amount::from_sat(10000)).unwrap();
         let child = create_test_tx(*parent_txid.as_bytes(), 1);
         mempool.add(child, Amount::from_sat(10000)).unwrap();
-        let unrelated = mempool
+        mempool
             .add(create_test_tx([12u8; 32], 1), Amount::from_sat(10000))
             .unwrap();
         assert_eq!(mempool.size(), 3);
 
-        // Reorg to a chain whose tip is below the lock height
+        // Reorg to a chain whose tip is below the lock height: Divi Core keeps
+        // them (ChainTipManager.cpp:139-141, :175-183)
         height.store(240, std::sync::atomic::Ordering::SeqCst);
         mempool.remove_for_block(&[]);
 
-        assert_eq!(mempool.size(), 1);
-        assert!(mempool.contains(&unrelated));
-        assert!(!mempool.contains(&parent_txid));
+        assert_eq!(mempool.size(), 3);
+        assert!(mempool.contains(&parent_txid));
     }
 
     #[test]

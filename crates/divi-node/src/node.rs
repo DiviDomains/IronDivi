@@ -2343,10 +2343,10 @@ pub fn update_mempool_after_reorg(
             ),
         }
     }
+    // A transaction a lower tip makes non-final stays, as in Core: only the
+    // staker waits for its lock
     let dropped = mempool
         .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
-    // The tip may now be lower: drop what can no longer be mined
-    mempool.remove_non_final();
     tracing::info!(
         "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
         returned,
