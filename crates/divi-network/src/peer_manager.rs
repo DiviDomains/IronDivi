@@ -716,8 +716,9 @@ impl PeerManager {
     /// Get info about added nodes
     pub fn get_added_node_info(&self) -> Vec<AddedNode> {
         let added = self.added_nodes.read();
-        let peers = self.peers.read();
+        // the dialled set before the peers, as claim_dial takes them
         let connecting = self.connecting_addrs.read();
+        let peers = self.peers.read();
 
         let connected_addrs: HashSet<_> = peers.values().map(|p| p.addr).collect();
 
@@ -1049,13 +1050,24 @@ impl PeerManager {
     /// is marked as being dialled, so a second dial to it (or, by address, to
     /// its IP) is skipped until `connect_to_peer` has finished with it.
     pub fn claim_dial(&self, addr: SocketAddr, rule: DialRule) -> bool {
+        self.claim_dial_with(addr, rule, || {})
+    }
+
+    /// `claim_dial`, with `between` run after the dialled set is locked and
+    /// before the connected peers are read: the moment a dial that is just
+    /// finishing could be missed. `connect_peer` stores the peer and only then
+    /// removes the address from the dialled set, and the set stays locked here
+    /// while the peers are read, so an address is always in one of the two (it
+    /// was read from the peers first, which let a second dial in between)
+    fn claim_dial_with(&self, addr: SocketAddr, rule: DialRule, between: impl FnOnce()) -> bool {
+        let mut connecting = self.connecting_addrs.write();
+        between();
         let peers: Vec<(SocketAddr, bool)> = self
             .peers
             .read()
             .values()
             .map(|p| (p.addr, p.inbound))
             .collect();
-        let mut connecting = self.connecting_addrs.write();
         let taken = match rule {
             DialRule::ByName => connecting.contains(&addr) || peers.iter().any(|(a, _)| *a == addr),
             DialRule::ByAddress | DialRule::Automatic => {
@@ -1773,6 +1785,41 @@ mod tests {
             inbound,
             stats: Default::default(),
         }
+    }
+
+    /// A dial that finishes while a second is being claimed (connect_peer stores
+    /// the peer, then drops the address from the dialled set) must not let the
+    /// second through: Divi Core's OpenNetworkConnection finds the node with the
+    /// name it dials (net.cpp, FindNode) and does not dial it twice. The node
+    /// used to read the peers first and lock the dialled set after, so a dial
+    /// that finished in between was in neither.
+    #[test]
+    fn claim_dial_sees_a_dial_that_finishes_meanwhile() {
+        let pm = PeerManager::new(PeerManagerConfig {
+            magic: crate::REGTEST_MAGIC,
+            connect_only: true,
+            dns_seeds: vec![],
+            ..Default::default()
+        });
+        let addr = sa("127.0.0.1:51477");
+        assert!(pm.claim_dial(addr, DialRule::ByName), "the first dial");
+        let (started, go) = std::sync::mpsc::channel::<()>();
+        let finisher = {
+            let pm = Arc::clone(&pm);
+            std::thread::spawn(move || {
+                go.recv().unwrap();
+                let handle = test_handle("127.0.0.1:51477", false);
+                pm.peers.write().insert(handle.id, handle);
+                pm.connecting_addrs.write().remove(&addr);
+            })
+        };
+        // the first dial finishes inside the claim of the second
+        let second = pm.claim_dial_with(addr, DialRule::ByName, || {
+            started.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        finisher.join().unwrap();
+        assert!(!second, "a second dial to the same peer got through");
     }
 
     fn sa(s: &str) -> SocketAddr {
