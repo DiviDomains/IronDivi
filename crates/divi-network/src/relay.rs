@@ -358,6 +358,15 @@ impl TxRelay {
         self.relay_tx(txid, None).await;
     }
 
+    /// Announce mempool transactions again to every peer not known to have
+    /// them, as Divi Core's RebroadcastSomeMempoolTxs relays each to all peers
+    /// (main.cpp:1269-1271)
+    pub async fn rebroadcast(&self, txids: &[Hash256]) {
+        for txid in txids {
+            self.relay_tx(*txid, None).await;
+        }
+    }
+
     /// Relay a transaction to peers that don't have it
     async fn relay_tx(&self, txid: Hash256, exclude_peer: Option<PeerId>) {
         let peers_to_notify: Vec<PeerId> = {
