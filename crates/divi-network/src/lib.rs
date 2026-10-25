@@ -65,12 +65,14 @@ mod wire;
 
 // P2P networking
 pub mod addrbook;
+pub mod buffers;
 pub mod codec;
 pub mod connection;
 pub mod gossip;
 pub mod local;
 pub mod masternode_handler;
 pub mod peer;
+pub mod peer_log;
 pub mod peer_manager;
 pub mod relay;
 pub mod scoring;
@@ -98,7 +100,7 @@ pub use masternode_handler::MasternodeHandler;
 pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_manager::{
     mainnet_peer_manager, regtest_peer_manager, testnet_peer_manager, AddedNode, PeerManager,
-    PeerManagerConfig,
+    PeerManagerConfig, TrySend,
 };
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
 pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};

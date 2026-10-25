@@ -58,6 +58,9 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    logips: bool,
+    logtimestamps: bool,
+    shrinkdebugfile: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     sysperms: bool,
@@ -173,6 +176,10 @@ impl Args {
         // -debug=<category> may repeat; -debug=0 is no debugging
         let debug = s.get_multi("debug");
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.logips = s.get_bool("logips", false);
+        self.logtimestamps = s.get_bool("logtimestamps", true);
+        // Default: shrink unless debugging (Logging.cpp:204)
+        self.shrinkdebugfile = s.get_bool("shrinkdebugfile", !self.debug);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.sysperms = s.get_bool("sysperms", false);
@@ -296,16 +303,10 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "checklevel",
     "dns",
     "listenonion",
-    "logips",
-    "logtimestamps",
-    "maxreceivebuffer",
-    "maxsendbuffer",
     "onion",
-    "onlynet",
     "par",
     "peerbloomfilters",
     "proxyrandomize",
-    "shrinkdebugfile",
     "torcontrol",
     "torpassword",
     "upnp",
@@ -372,6 +373,12 @@ const APPLIED: &[&str] = &[
     "proxy",
     "discover",
     "externalip",
+    "onlynet",
+    "maxreceivebuffer",
+    "maxsendbuffer",
+    "logips",
+    "logtimestamps",
+    "shrinkdebugfile",
     "protocolversion",
     "banscore",
     "bantime",
@@ -730,12 +737,18 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // -onlynet: each one of Divi Core's network names (ParseNetwork,
     // netbase.cpp:70-77; init.cpp:1734-1740)
     for net in s.get_multi("onlynet") {
-        if !matches!(
-            net.to_lowercase().as_str(),
-            "ipv4" | "ipv6" | "tor" | "onion"
-        ) {
+        if divi_network::local::Network::parse(net).is_none() {
             anyhow::bail!("Unknown network specified in -onlynet: '{}'", net);
         }
+        config.p2p.only_nets.push(net.to_lowercase());
+    }
+    // -maxreceivebuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxreceivebuffer") {
+        config.p2p.max_receive_buffer = settings::atoi(v);
+    }
+    // -maxsendbuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxsendbuffer") {
+        config.p2p.max_send_buffer = settings::atoi(v);
     }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
@@ -1074,6 +1087,32 @@ struct RotatingLog {
     redirect_std: bool,
     file: Option<std::fs::File>,
     size: u64,
+    /// -shrinkdebugfile, and when the size was last checked for it
+    shrink: bool,
+    shrink_checked: std::time::Instant,
+}
+
+/// Over this size debug.log is shrunk (Logging.cpp:99)
+const SHRINK_ABOVE: u64 = 10 * 1_000_000;
+/// What a shrink keeps of the end of debug.log (Logging.cpp:105)
+const SHRINK_KEEP: u64 = 200_000;
+/// How often a running node checks whether to shrink (Logging.cpp:186)
+const SHRINK_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Divi Core ShrinkDebugFile (Logging.cpp:94-118): a debug.log over 10 MB is
+/// cut to its last 200 000 bytes
+fn shrink_debug_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let size = std::fs::metadata(path)?.len();
+    if size <= SHRINK_ABOVE {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-(SHRINK_KEEP as i64)))?;
+    let mut tail = Vec::with_capacity(SHRINK_KEEP as usize);
+    file.read_to_end(&mut tail)?;
+    drop(file);
+    std::fs::write(path, tail)
 }
 
 impl RotatingLog {
@@ -1082,6 +1121,7 @@ impl RotatingLog {
         max_size: u64,
         max_files: u32,
         redirect_std: bool,
+        shrink: bool,
     ) -> std::io::Result<Self> {
         let mut log = RotatingLog {
             dir: dir.to_path_buf(),
@@ -1090,7 +1130,14 @@ impl RotatingLog {
             redirect_std,
             file: None,
             size: 0,
+            shrink,
+            shrink_checked: std::time::Instant::now(),
         };
+        // Shrunk at start as divid does (Logging.cpp:205); a file that is
+        // still over the size limit after that is rotated
+        if shrink {
+            let _ = shrink_debug_file(&dir.join("debug.log"));
+        }
         log.reopen()?;
         // The log may already be too big from an earlier run
         if log.size >= max_size {
@@ -1133,6 +1180,15 @@ impl std::io::Write for RotatingLog {
         if REOPEN_LOG.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.file = None;
             self.reopen()?;
+        }
+        // And every five minutes while running (Logging.cpp:186-191)
+        if self.shrink && self.shrink_checked.elapsed() > SHRINK_EVERY {
+            self.shrink_checked = std::time::Instant::now();
+            if self.size > SHRINK_ABOVE {
+                self.file = None;
+                let _ = shrink_debug_file(&self.dir.join("debug.log"));
+                self.reopen()?;
+            }
         }
         if self.size > 0 && self.size + buf.len() as u64 > self.max_size {
             self.rotate()?;
@@ -1227,6 +1283,8 @@ mod flush_log_tests {
 
 /// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
+    // -logips: whether log lines name peers by address too (Logging.cpp:202)
+    divi_network::peer_log::set_log_ips(log_config.log_ips);
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if log_config.debug {
@@ -1267,6 +1325,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             log_config.max_file_size,
             log_config.max_files,
             std_is_log,
+            log_config.shrink,
         ) {
             Ok(log) => log,
             Err(e) => {
@@ -1290,10 +1349,15 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
         // still holds
         *LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(_guard);
 
-        // Set up file logging with timestamps
+        // Lines as divid writes them, without ANSI colours
         tracing_subscriber::registry()
             .with(
-                fmt::layer().with_writer(non_blocking).with_ansi(false), // No ANSI colors in file
+                fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .event_format(DividLogFormat {
+                        timestamps: log_config.timestamps,
+                    }),
             )
             .with(filter)
             .init();
@@ -1303,6 +1367,42 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
             "Log rotation: max {} bytes per file, {} files kept",
             log_config.max_file_size, log_config.max_files
         );
+    }
+}
+
+/// A debug.log line as Divi Core writes it (Logging.cpp:179-184): with
+/// -logtimestamps (default 1) the time, `%Y-%m-%d %H:%M:%S` in UTC, and a
+/// space; then the message. Warnings and errors begin `WARNING: ` and
+/// `ERROR: ` (divid's error() writes `ERROR: `); no level or module name.
+struct DividLogFormat {
+    timestamps: bool,
+}
+
+impl<S, N> fmt::FormatEvent<S, N> for DividLogFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if self.timestamps {
+            write!(
+                writer,
+                "{} ",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+            )?;
+        }
+        match *event.metadata().level() {
+            tracing::Level::ERROR => write!(writer, "ERROR: ")?,
+            tracing::Level::WARN => write!(writer, "WARNING: ")?,
+            _ => {}
+        }
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
@@ -3151,6 +3251,9 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
+        log_ips: args.logips,
+        timestamps: args.logtimestamps,
+        shrink: args.shrinkdebugfile,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };
@@ -3961,7 +4064,7 @@ mod log_rotation_tests {
     /// Write `lines` records of 50 bytes, checking the files after each
     fn write_and_check(max_size: u64, max_files: u32, lines: usize) -> Vec<(String, u64)> {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), max_size, max_files, false, false).unwrap();
         for i in 0..lines {
             let line = format!("{:049}\n", i);
             log.write_all(line.as_bytes()).unwrap();
@@ -4014,7 +4117,7 @@ mod log_rotation_tests {
     fn log_rotation_rotates_oversized_log_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("debug.log"), vec![b'x'; 2000]).unwrap();
-        let mut log = RotatingLog::open(dir.path(), 1000, 3, false).unwrap();
+        let mut log = RotatingLog::open(dir.path(), 1000, 3, false, false).unwrap();
         log.write_all(b"new\n").unwrap();
         assert_eq!(
             log_files(dir.path()),
