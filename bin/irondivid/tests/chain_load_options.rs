@@ -88,14 +88,20 @@ fn debug_log(datadir: &Path) -> String {
 
 /// Wait (bounded) until the log holds `text`
 fn log_has(datadir: &Path, text: &str) -> bool {
+    log_count(datadir, text, 1) >= 1
+}
+
+/// How often the log holds `text`, once that is `count` or the wait (bounded)
+/// is over: a line can reach the file after the RPC reply
+fn log_count(datadir: &Path, text: &str, count: usize) -> usize {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if debug_log(datadir).contains(text) {
-            return true;
+    loop {
+        let seen = debug_log(datadir).matches(text).count();
+        if seen >= count || Instant::now() >= deadline {
+            return seen;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    false
 }
 
 /// A -loadblock file that does not open is named in divid's warning and
@@ -142,9 +148,7 @@ fn the_chain_check_logs_divid_s_verifying_line() {
             let reply = rpc(port, "verifychain", json!([4, 99])).unwrap();
             assert_eq!(reply["result"], true, "{reply}");
             assert_eq!(
-                debug_log(dir.path())
-                    .matches("Verifying last 3 blocks at level 4")
-                    .count(),
+                log_count(dir.path(), "Verifying last 3 blocks at level 4", 2),
                 2
             );
         }
