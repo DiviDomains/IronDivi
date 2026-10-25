@@ -715,6 +715,11 @@ pub struct MempoolConfig {
     /// Take transactions that are not standard (Divi Core's
     /// `-acceptnonstandard`, off by default; MempoolConsensus.cpp:274)
     pub accept_nonstandard: bool,
+
+    /// Bare multisig outputs are standard (Divi Core's `-permitbaremultisig`,
+    /// on by default; MempoolConsensus.cpp:31, :107-109)
+    #[serde(default = "default_true")]
+    pub permit_bare_multisig: bool,
 }
 
 impl Default for MempoolConfig {
@@ -726,8 +731,13 @@ impl Default for MempoolConfig {
             max_orphan_txs: 100,
             expiry_time: 336 * 60 * 60, // 2 weeks
             accept_nonstandard: false,
+            permit_bare_multisig: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)

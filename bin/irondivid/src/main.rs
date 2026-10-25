@@ -320,7 +320,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "onlynet",
     "par",
     "peerbloomfilters",
-    "permitbaremultisig",
     "proxyrandomize",
     "resync",
     "rpcthreads",
@@ -599,6 +598,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.mempool.min_relay_fee_per_kb = sat;
     }
     config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
+    // GetBoolArg("-permitbaremultisig", true), read once (MempoolConsensus.cpp:31)
+    config.mempool.permit_bare_multisig = s.get_bool("permitbaremultisig", true);
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -741,6 +742,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxorphantx",
         "minrelaytxfee",
         "acceptnonstandard",
+        "permitbaremultisig",
         "maxtxfee",
         "sporkkey",
         "staking",

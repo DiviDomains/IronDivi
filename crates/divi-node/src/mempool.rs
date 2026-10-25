@@ -483,6 +483,11 @@ impl Mempool {
         !self.config.accept_nonstandard
     }
 
+    /// Whether bare multisig outputs are standard (Core's `-permitbaremultisig`)
+    pub fn permits_bare_multisig(&self) -> bool {
+        self.config.permit_bare_multisig
+    }
+
     /// The minimum relay fee in satoshis per 1000 bytes (Core's
     /// `minimumRelayTransactionFee`)
     pub fn min_relay_fee_per_kb(&self) -> i64 {

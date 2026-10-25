@@ -2168,14 +2168,16 @@ const MAX_STANDARD_TX_SIZE: usize = 100_000;
 const MAX_TX_SIGOPS: u32 = 8_000;
 
 /// Divi Core `MempoolConsensus::IsStandardTx` (MempoolConsensus.cpp:29-121) with
-/// its defaults (`-permitbaremultisig` on, `-datacarriersize` 603): the reason
-/// a transaction is not relayed, if it is not. Applies on every network, as
-/// `-acceptnonstandard` is off by default.
+/// `-datacarriersize` at its default of 603: the reason a transaction is not
+/// relayed, if it is not. Applies on every network, as `-acceptnonstandard` is
+/// off by default. Without `permit_bare_multisig` (`-permitbaremultisig=0`) a
+/// bare multisig output is not standard.
 pub fn check_standard_tx(
     tx: &Transaction,
     tip_height: u32,
     now: u32,
     relay_fee_per_kb: i64,
+    permit_bare_multisig: bool,
 ) -> Result<(), NodeError> {
     use crate::error::reject;
     use divi_script::policy::{standard_output_type, MAX_OP_META_RELAY};
@@ -2205,6 +2207,9 @@ pub fn check_standard_tx(
         match standard_output_type(out.script_pubkey.as_bytes(), MAX_OP_META_RELAY) {
             None => return nonstandard("scriptpubkey"),
             Some(ScriptType::NullData) => data_outputs += 1,
+            Some(ScriptType::Multisig) if !permit_bare_multisig => {
+                return nonstandard("bare-multisig");
+            }
             Some(_) => {
                 if out.value < out.min_non_dust_value(relay_fee_per_kb) {
                     return nonstandard("dust");
@@ -2270,7 +2275,13 @@ pub fn check_mempool_transaction(
     // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
     let require_standard = mempool.requires_standard();
     if require_standard {
-        check_standard_tx(tx, tip_height, now, mempool.min_relay_fee_per_kb())?;
+        check_standard_tx(
+            tx,
+            tip_height,
+            now,
+            mempool.min_relay_fee_per_kb(),
+            mempool.permits_bare_multisig(),
+        )?;
     }
     mempool.check_conflicts(tx)?;
 
