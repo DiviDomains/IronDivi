@@ -133,6 +133,14 @@ pub trait MempoolProvider: Send + Sync {
         false
     }
 
+    /// Run `f` while no other transaction can enter the pool. Divi Core runs a
+    /// wallet send holding cs_main (rpcserver.cpp:452-454, :1060-1093), which
+    /// its `tx` handler takes too (main.cpp:726): the send picks its coins and
+    /// commits with no relayed transaction accepted in between.
+    fn with_admission(&self, f: &mut dyn FnMut()) {
+        f()
+    }
+
     /// The pool's copy of a transaction, if it holds `txid`
     fn get_transaction(
         &self,
