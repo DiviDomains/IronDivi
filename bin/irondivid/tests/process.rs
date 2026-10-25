@@ -278,3 +278,47 @@ fn a_start_and_a_stop_write_only_divids_warning_on_stderr() {
         "Warning: Make sure to encrypt your wallet and delete all non-encrypted backups after you verified that wallet works!\n"
     );
 }
+
+/// The lines of the node's debug.log
+fn log_lines(datadir: &Path) -> Vec<String> {
+    std::fs::read_to_string(datadir.join("debug.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// Where the first line containing `what` is in `lines`
+fn line_of(lines: &[String], what: &str) -> Option<usize> {
+    lines.iter().position(|l| l.contains(what))
+}
+
+/// A node that stakes stops staking before it flushes the chain state and
+/// saves the wallet, as Divi Core stops minting first (init.cpp:372-373,
+/// :381, :386)
+#[test]
+fn staking_stops_before_the_flush_and_the_wallet_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc_port = free_port();
+    let mut child = irondivid(dir.path(), rpc_port)
+        .arg("--staking=true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = try_rpc(rpc_port, "stop", &json!([]));
+    let code = wait_exit(&mut child, 60);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code, Some(0));
+    let lines = log_lines(dir.path());
+    let stopped =
+        line_of(&lines, "Stopping proof-of-stake block production").expect("staking stopped");
+    let flushed = line_of(&lines, "Shutdown: UTXO cache flushed").expect("UTXO cache flushed");
+    let saved = line_of(&lines, "Wallet saved").expect("wallet saved");
+    assert!(stopped < flushed && stopped < saved, "{lines:#?}");
+}

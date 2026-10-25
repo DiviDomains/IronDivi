@@ -2878,6 +2878,14 @@ async fn run_daemon(
         }
     }
 
+    // Divi Core stops minting before it flushes the chain state and the wallet
+    // (init.cpp:372-373, :381, :386): no block is staked while they are written
+    if let Some(staker) = staker.clone() {
+        let started = std::time::Instant::now();
+        let _ = tokio::task::spawn_blocking(move || staker.stop_and_wait()).await;
+        shutdown_stage("staking stopped", started);
+    }
+
     // Stop the node
     info!("Stopping node...");
     let started = std::time::Instant::now();
