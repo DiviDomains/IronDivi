@@ -539,6 +539,7 @@ impl BlockchainRpc {
                 })
                 .collect();
 
+            // Divi Core's members in blockToJSON's order (JsonBlockHelpers.cpp:38-77)
             let mut result = json!({
                 "hash": hash.to_string(),
                 "confirmations": confirmations,
@@ -546,19 +547,20 @@ impl BlockchainRpc {
                 "height": index.height,
                 "version": index.version,
                 "merkleroot": index.merkle_root.to_string(),
+                "acc_checkpoint": block.header.accumulator_checkpoint.to_string(),
                 "tx": txs,
                 "time": index.time,
-                "mediantime": self.get_median_time(&index),
                 "nonce": index.nonce,
                 "bits": format!("{:08x}", index.bits),
                 "difficulty": bits_to_difficulty(index.bits),
                 "chainwork": self.chainwork(&index),
-                "acc_checkpoint": block.header.accumulator_checkpoint.to_string(),
-                "nTx": block.transactions.len(),
             });
             // The genesis block has no previousblockhash key (JsonBlockHelpers.cpp:68)
             if index.height > 0 {
                 result["previousblockhash"] = json!(index.prev_hash.to_string());
+            }
+            if let Some(next) = self.next_on_main_chain(&index) {
+                result["nextblockhash"] = json!(next);
             }
 
             // Per-block supply is only known for blocks connected since the
@@ -569,14 +571,9 @@ impl BlockchainRpc {
                 result["moneysupply"] = json!(supply as f64 / 100_000_000.0);
             }
 
-            // Add nextblockhash if on the active chain and not the tip
-            if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
-                if index.height < tip.height {
-                    if let Ok(Some(next)) = self.chain.get_block_index_by_height(index.height + 1) {
-                        result["nextblockhash"] = json!(next.hash.to_string());
-                    }
-                }
-            }
+            // irondivid's own members, after divid's
+            result["mediantime"] = json!(self.get_median_time(&index));
+            result["nTx"] = json!(block.transactions.len());
 
             Ok(result)
         }
@@ -619,34 +616,43 @@ impl BlockchainRpc {
             let raw = serialize(&header);
             Ok(json!(hex::encode(raw)))
         } else {
-            let mut result = json!({
-                "hash": hash.to_string(),
-                "confirmations": self.get_confirmations(&index),
-                "height": index.height,
-                "version": index.version,
-                "merkleroot": index.merkle_root.to_string(),
-                "time": index.time,
-                "mediantime": self.get_median_time(&index),
-                "nonce": index.nonce,
-                "bits": format!("{:08x}", index.bits),
-                "difficulty": bits_to_difficulty(index.bits),
-                "chainwork": self.chainwork(&index),
-                "nTx": index.n_tx,
-            });
+            // Divi Core's members in blockHeaderToJSON's order
+            // (JsonBlockHelpers.cpp:80-91)
+            let mut result = json!({ "version": index.version });
             if index.height > 0 {
                 result["previousblockhash"] = json!(index.prev_hash.to_string());
             }
+            result["merkleroot"] = json!(index.merkle_root.to_string());
+            result["time"] = json!(index.time);
+            result["bits"] = json!(format!("{:08x}", index.bits));
+            result["nonce"] = json!(index.nonce);
 
-            // Add nextblockhash if on the active chain and not the tip
-            if let Some(tip) = self.chain.tip().filter(|_| index.is_on_main_chain()) {
-                if index.height < tip.height {
-                    if let Ok(Some(next)) = self.chain.get_block_index_by_height(index.height + 1) {
-                        result["nextblockhash"] = json!(next.hash.to_string());
-                    }
-                }
+            // irondivid's own members, after divid's
+            result["hash"] = json!(hash.to_string());
+            result["confirmations"] = json!(self.get_confirmations(&index));
+            result["height"] = json!(index.height);
+            result["mediantime"] = json!(self.get_median_time(&index));
+            result["difficulty"] = json!(bits_to_difficulty(index.bits));
+            result["chainwork"] = json!(self.chainwork(&index));
+            result["nTx"] = json!(index.n_tx);
+            if let Some(next) = self.next_on_main_chain(&index) {
+                result["nextblockhash"] = json!(next);
             }
 
             Ok(result)
+        }
+    }
+
+    /// The hash of the block after `index`, when `index` is on the active chain
+    /// and not the tip
+    fn next_on_main_chain(&self, index: &divi_storage::BlockIndex) -> Option<String> {
+        let tip = self.chain.tip().filter(|_| index.is_on_main_chain())?;
+        if index.height >= tip.height {
+            return None;
+        }
+        match self.chain.get_block_index_by_height(index.height + 1) {
+            Ok(Some(next)) => Some(next.hash.to_string()),
+            _ => None,
         }
     }
 
