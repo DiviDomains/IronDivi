@@ -671,8 +671,8 @@ impl Node {
         {
             let chain_for_scripts = Arc::clone(&chain);
             mempool.set_validator(Arc::new(
-                move |pool: &Mempool, tx: &Transaction, limit_free: bool| {
-                    check_mempool_transaction(&chain_for_scripts, pool, tx, limit_free)
+                move |pool: &Mempool, tx: &Transaction, origin: crate::mempool::Origin| {
+                    check_mempool_transaction(&chain_for_scripts, pool, tx, origin)
                 },
             ));
         }
@@ -2452,10 +2452,11 @@ fn spendable_in_next_block(chain: &Chain, outpoint: &OutPoint) -> Result<bool, N
 /// each connected block confirms and those conflicting with it
 /// (ChainTipManager.cpp:139-141, :175-183). Here the chain has already moved:
 /// `disconnected` (parents before children, as `Chain::accept_block` returns
-/// them) is offered first, through `Mempool::add`, which works out the fee and
-/// applies Core's AcceptToMemoryPool with `fLimitFree` false as disconnectTip
-/// does; then every transaction the new chain made unspendable goes, with its
-/// descendants.
+/// them) is offered first, through `Mempool::add_from_disconnected_block`,
+/// which works out the fee and applies Core's AcceptToMemoryPool with
+/// `fLimitFree` false and the height lock checked at the transaction's block,
+/// as disconnectTip does; then every transaction the new chain made
+/// unspendable goes, with its descendants.
 pub fn update_mempool_after_reorg(
     chain: &Arc<Chain>,
     mempool: &Arc<Mempool>,
@@ -2465,7 +2466,7 @@ pub fn update_mempool_after_reorg(
     let mut returned = 0;
     for tx in disconnected {
         let txid = tx.txid();
-        match mempool.add(tx, divi_primitives::amount::Amount::ZERO) {
+        match mempool.add_from_disconnected_block(tx) {
             Ok(_) => returned += 1,
             Err(e) => tracing::debug!(
                 "Transaction {} of a disconnected block not returned to the mempool: {}",
@@ -2474,10 +2475,10 @@ pub fn update_mempool_after_reorg(
             ),
         }
     }
+    // A transaction a lower tip makes non-final stays, as in Core: only the
+    // staker waits for its lock
     let dropped = mempool
         .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
-    // The tip may now be lower: drop what can no longer be mined
-    mempool.remove_non_final();
     tracing::info!(
         "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
         returned,
@@ -2558,14 +2559,15 @@ pub fn check_standard_tx(
 /// CheckInputs (maturity, input values, value in at least value out) and every
 /// input script under the standard flags (and, to pick the reject reason, the
 /// mandatory ones). Returns the fee. Each refusal carries Core's reject code,
-/// reason and misbehaviour score. `limit_free` is Core's `fLimitFree` (true for
-/// relayed transactions).
+/// reason and misbehaviour score. `origin` gives Core's `fLimitFree` (true for
+/// relayed transactions) and the tip a height lock is checked against.
 pub fn check_mempool_transaction(
     chain: &Chain,
     mempool: &Mempool,
     tx: &Transaction,
-    limit_free: bool,
+    origin: crate::mempool::Origin,
 ) -> Result<crate::mempool::Admission, NodeError> {
+    let limit_free = origin.limit_free();
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -2604,7 +2606,7 @@ pub fn check_mempool_transaction(
     if require_standard {
         check_standard_tx(
             tx,
-            tip_height,
+            origin.lock_tip(tip_height),
             now,
             mempool.min_relay_fee_per_kb(),
             mempool.permits_bare_multisig(),
