@@ -115,6 +115,8 @@ pub(crate) struct Collateral {
     pub(crate) amount: i64,
     /// Height of the block holding the collateral transaction
     pub(crate) height: u32,
+    /// The script the collateral pays
+    pub(crate) script: Vec<u8>,
 }
 
 pub(crate) fn find_collateral(chain: &Chain, hash: &Hash256, n: u32) -> Option<Collateral> {
@@ -128,6 +130,7 @@ pub(crate) fn find_collateral(chain: &Chain, hash: &Hash256, n: u32) -> Option<C
     Some(Collateral {
         amount: out.value.0,
         height: bi.height,
+        script: out.script_pubkey.as_bytes().to_vec(),
     })
 }
 

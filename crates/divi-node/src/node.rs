@@ -689,8 +689,8 @@ impl Node {
         {
             let chain_for_scripts = Arc::clone(&chain);
             mempool.set_validator(Arc::new(
-                move |pool: &Mempool, tx: &Transaction, limit_free: bool| {
-                    check_mempool_transaction(&chain_for_scripts, pool, tx, limit_free)
+                move |pool: &Mempool, tx: &Transaction, origin: crate::mempool::Origin| {
+                    check_mempool_transaction(&chain_for_scripts, pool, tx, origin)
                 },
             ));
         }
@@ -939,6 +939,9 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
+            // The peers known to have each masternode item: it came from them
+            // in an inv, or went to them in one (CNode::setInventoryKnown)
+            let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
             while let Ok(event) = peer_events.recv().await {
                 match event {
                     PeerEvent::Connected {
@@ -1065,13 +1068,15 @@ impl Node {
                                 }
                                 let masternode_items: Vec<_> = items
                                     .iter()
+                                    .filter(|i| masternode_inv_kind(i.inv_type).is_some())
                                     .filter(|i| {
-                                        matches!(
-                                            i.inv_type,
-                                            divi_network::message::InvType::MasternodeAnnounce
-                                                | divi_network::message::InvType::MasternodePing
-                                                | divi_network::message::InvType::MasternodeWinner
-                                        )
+                                        masternode_items_known
+                                            .entry(*i.hash.as_bytes())
+                                            .or_default()
+                                            .insert(peer_id);
+                                        let kind = masternode_inv_kind(i.inv_type).unwrap();
+                                        !masternode_list.has(kind, i.hash.as_bytes())
+                                            && !masternode_votes.is_known(i.hash.as_bytes())
                                     })
                                     .filter(|i| masternode_items_asked.insert(i.hash))
                                     .cloned()
@@ -1156,6 +1161,35 @@ impl Node {
                                                 None => not_found.push(item),
                                             }
                                         }
+                                        // A masternode broadcast, ping or vote taken
+                                        // is sent, else named in the notfound
+                                        // (main.cpp:190-198)
+                                        divi_network::InvType::MasternodeAnnounce
+                                        | divi_network::InvType::MasternodePing
+                                        | divi_network::InvType::MasternodeWinner => {
+                                            let hash = item.hash.as_bytes();
+                                            let msg = match item.inv_type {
+                                                divi_network::InvType::MasternodeAnnounce => {
+                                                    masternode_list
+                                                        .seen_broadcast(hash)
+                                                        .map(NetworkMessage::MasternodeBroadcast)
+                                                }
+                                                divi_network::InvType::MasternodePing => masternode_list
+                                                    .seen_ping(hash)
+                                                    .map(NetworkMessage::MasternodePing),
+                                                _ => masternode_votes
+                                                    .winner_bytes(hash)
+                                                    .map(NetworkMessage::MasternodeWinner),
+                                            };
+                                            match msg {
+                                                Some(msg) => {
+                                                    let _ = peer_manager
+                                                        .send_block_to_peer(peer_id, msg)
+                                                        .await;
+                                                }
+                                                None => not_found.push(item),
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1215,6 +1249,19 @@ impl Node {
                             NetworkMessage::RequestMasternodeList(_) => {
                                 tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
+                            // Masternode messages are read once the chain is
+                            // synced (ProcessMasternodeMessages,
+                            // MasternodeModule.cpp:371-382)
+                            NetworkMessage::MasternodeBroadcast(_)
+                            | NetworkMessage::MasternodePing(_)
+                            | NetworkMessage::MasternodeWinner(_)
+                                if !masternode_list.blockchain_synced(&chain) =>
+                            {
+                                tracing::debug!(
+                                    "Masternode message from peer {} not read: the chain is not synced",
+                                    peer_id
+                                );
+                            }
                             // Broadcasts and pings in Divi Core's wire format, kept
                             // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
@@ -1224,37 +1271,83 @@ impl Node {
                                         peer_id
                                     ),
                                     Ok(false) => {}
-                                    Err(e) => tracing::debug!(
-                                        "Masternode broadcast from peer {} not taken: {}",
-                                        peer_id,
-                                        e
-                                    ),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Masternode broadcast from peer {} not taken: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        if e.dos > 0 {
+                                            peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                        }
+                                    }
                                 }
+                                relay_masternode_items(
+                                    &peer_manager,
+                                    &mut masternode_items_known,
+                                    masternode_list.take_relays(),
+                                )
+                                .await;
                             }
                             NetworkMessage::MasternodePing(payload) => {
-                                if let Err(e) = masternode_list.accept_ping(&payload) {
+                                if let Err(e) = masternode_list.accept_ping(&chain, &payload) {
                                     tracing::debug!(
                                         "Masternode ping from peer {} not taken: {}",
                                         peer_id,
                                         e
                                     );
+                                    if e.dos > 0 {
+                                        peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                    }
+                                    if let Some(vin) = e.ask {
+                                        let _ = peer_manager
+                                            .send_to_peer(peer_id, NetworkMessage::RequestMasternodeList(vin))
+                                            .await;
+                                    }
                                 }
+                                relay_masternode_items(
+                                    &peer_manager,
+                                    &mut masternode_items_known,
+                                    masternode_list.take_relays(),
+                                )
+                                .await;
                             }
                             // A payment vote, counted when it passes Divi Core's
-                            // checks and then passed on, as ProcessMasternodeWinners
+                            // checks and then announced, as ProcessMasternodeWinners
                             // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
                                 match masternode_votes.accept(&chain, &masternode_list, &payload) {
-                                    Ok(true) => peer_manager.broadcast_except(
-                                        NetworkMessage::MasternodeWinner(payload),
-                                        peer_id,
-                                    ),
+                                    Ok(true) => {
+                                        let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
+                                            .map(|w| w.hash());
+                                        if let Ok(hash) = hash {
+                                            relay_masternode_items(
+                                                &peer_manager,
+                                                &mut masternode_items_known,
+                                                vec![(divi_rpc::mn_list::INV_WINNER, hash)],
+                                            )
+                                            .await;
+                                        }
+                                    }
                                     Ok(false) => {}
-                                    Err(e) => tracing::debug!(
-                                        "Masternode winner from peer {} not taken: {}",
-                                        peer_id,
-                                        e
-                                    ),
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Masternode winner from peer {} not taken: {}",
+                                            peer_id,
+                                            e
+                                        );
+                                        if e.dos > 0 {
+                                            peer_manager.report_misbehavior_score(peer_id, e.dos, e.cause);
+                                        }
+                                        if let Some(vin) = e.ask {
+                                            let _ = peer_manager
+                                                .send_to_peer(
+                                                    peer_id,
+                                                    NetworkMessage::RequestMasternodeList(vin),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                 }
                             }
                             // Divi Core reads no transaction from a dstx
@@ -2182,6 +2275,44 @@ pub fn accept_relayed_transaction(
     result
 }
 
+/// The masternode inv kinds (mn_list's INV_*) of an inv type
+fn masternode_inv_kind(inv_type: divi_network::InvType) -> Option<u32> {
+    match inv_type {
+        divi_network::InvType::MasternodeWinner => Some(divi_rpc::mn_list::INV_WINNER),
+        divi_network::InvType::MasternodeAnnounce => Some(divi_rpc::mn_list::INV_BROADCAST),
+        divi_network::InvType::MasternodePing => Some(divi_rpc::mn_list::INV_PING),
+        _ => None,
+    }
+}
+
+/// Announce masternode items as RelayInv does: an inv to every peer that does
+/// not know the item yet, the peer that sent it included unless it announced
+/// it (net.cpp:1617-1624, CNode::PushInventory)
+async fn relay_masternode_items(
+    peers: &PeerManager,
+    known: &mut HashMap<[u8; 32], HashSet<u64>>,
+    items: Vec<(u32, [u8; 32])>,
+) {
+    if known.len() > 100_000 {
+        known.clear();
+    }
+    for (kind, hash) in items {
+        let inv_type = match kind {
+            divi_rpc::mn_list::INV_WINNER => divi_network::InvType::MasternodeWinner,
+            divi_rpc::mn_list::INV_BROADCAST => divi_network::InvType::MasternodeAnnounce,
+            _ => divi_network::InvType::MasternodePing,
+        };
+        let knows = known.entry(hash).or_default();
+        for peer in peers.connected_peers() {
+            if knows.insert(peer) {
+                let inv =
+                    NetworkMessage::Inv(vec![divi_network::InvItem::new(inv_type, Hash256(hash))]);
+                let _ = peers.send_to_peer(peer, inv).await;
+            }
+        }
+    }
+}
+
 /// The misbehaviour score of a refused relayed transaction, charged to the
 /// peer that sent it
 fn score_relayed_refusal(peers: &PeerManager, event: &divi_network::TxRelayEvent, e: &NodeError) {
@@ -2339,10 +2470,11 @@ fn spendable_in_next_block(chain: &Chain, outpoint: &OutPoint) -> Result<bool, N
 /// each connected block confirms and those conflicting with it
 /// (ChainTipManager.cpp:139-141, :175-183). Here the chain has already moved:
 /// `disconnected` (parents before children, as `Chain::accept_block` returns
-/// them) is offered first, through `Mempool::add`, which works out the fee and
-/// applies Core's AcceptToMemoryPool with `fLimitFree` false as disconnectTip
-/// does; then every transaction the new chain made unspendable goes, with its
-/// descendants.
+/// them) is offered first, through `Mempool::add_from_disconnected_block`,
+/// which works out the fee and applies Core's AcceptToMemoryPool with
+/// `fLimitFree` false and the height lock checked at the transaction's block,
+/// as disconnectTip does; then every transaction the new chain made
+/// unspendable goes, with its descendants.
 pub fn update_mempool_after_reorg(
     chain: &Arc<Chain>,
     mempool: &Arc<Mempool>,
@@ -2352,7 +2484,7 @@ pub fn update_mempool_after_reorg(
     let mut returned = 0;
     for tx in disconnected {
         let txid = tx.txid();
-        match mempool.add(tx, divi_primitives::amount::Amount::ZERO) {
+        match mempool.add_from_disconnected_block(tx) {
             Ok(_) => returned += 1,
             Err(e) => tracing::debug!(
                 "Transaction {} of a disconnected block not returned to the mempool: {}",
@@ -2361,10 +2493,10 @@ pub fn update_mempool_after_reorg(
             ),
         }
     }
+    // A transaction a lower tip makes non-final stays, as in Core: only the
+    // staker waits for its lock
     let dropped = mempool
         .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
-    // The tip may now be lower: drop what can no longer be mined
-    mempool.remove_non_final();
     tracing::info!(
         "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
         returned,
@@ -2445,14 +2577,15 @@ pub fn check_standard_tx(
 /// CheckInputs (maturity, input values, value in at least value out) and every
 /// input script under the standard flags (and, to pick the reject reason, the
 /// mandatory ones). Returns the fee. Each refusal carries Core's reject code,
-/// reason and misbehaviour score. `limit_free` is Core's `fLimitFree` (true for
-/// relayed transactions).
+/// reason and misbehaviour score. `origin` gives Core's `fLimitFree` (true for
+/// relayed transactions) and the tip a height lock is checked against.
 pub fn check_mempool_transaction(
     chain: &Chain,
     mempool: &Mempool,
     tx: &Transaction,
-    limit_free: bool,
+    origin: crate::mempool::Origin,
 ) -> Result<crate::mempool::Admission, NodeError> {
+    let limit_free = origin.limit_free();
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -2491,7 +2624,7 @@ pub fn check_mempool_transaction(
     if require_standard {
         check_standard_tx(
             tx,
-            tip_height,
+            origin.lock_tip(tip_height),
             now,
             mempool.min_relay_fee_per_kb(),
             mempool.permits_bare_multisig(),

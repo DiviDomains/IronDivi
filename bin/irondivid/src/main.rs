@@ -2285,12 +2285,18 @@ async fn run_daemon(
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
-                    rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
                     rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_conf(mnconf_for_rpc);
-                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
-                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    // broadcaststartmasternode: the list took the broadcast and
+                    // left its inv to announce (RelayParsedMasternodeBroadcast,
+                    // RpcMasternodeFeatures.cpp:80-121)
+                    let mn_list_for_relay = Arc::clone(&mn_list_for_rpc);
+                    rpc_server.set_masternode_relay(Arc::new(move |_bytes: Vec<u8>| {
+                        for item in mn_list_for_relay.take_relays() {
+                            pm_for_mn.broadcast(masternode_inv(item));
+                        }
                     }));
                     info!("Masternode manager initialized");
 
@@ -2444,12 +2450,18 @@ async fn run_daemon(
 
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
-                    rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_list(Arc::clone(&mn_list_for_rpc));
                     rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_conf(mnconf_for_rpc);
-                    rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
-                        pm_for_mn.broadcast_masternode_broadcast(bytes);
+                    // broadcaststartmasternode: the list took the broadcast and
+                    // left its inv to announce (RelayParsedMasternodeBroadcast,
+                    // RpcMasternodeFeatures.cpp:80-121)
+                    let mn_list_for_relay = Arc::clone(&mn_list_for_rpc);
+                    rpc_server.set_masternode_relay(Arc::new(move |_bytes: Vec<u8>| {
+                        for item in mn_list_for_relay.take_relays() {
+                            pm_for_mn.broadcast(masternode_inv(item));
+                        }
                     }));
                     info!("Masternode manager initialized");
                 }
@@ -2600,6 +2612,19 @@ fn staking_info(
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
+}
+
+/// An inv for a masternode item the list left to relay
+fn masternode_inv((kind, hash): (u32, [u8; 32])) -> divi_network::NetworkMessage {
+    let inv_type = match kind {
+        divi_rpc::mn_list::INV_WINNER => divi_network::InvType::MasternodeWinner,
+        divi_rpc::mn_list::INV_BROADCAST => divi_network::InvType::MasternodeAnnounce,
+        _ => divi_network::InvType::MasternodePing,
+    };
+    divi_network::NetworkMessage::Inv(vec![divi_network::InvItem::new(
+        inv_type,
+        divi_primitives::hash::Hash256(hash),
+    )])
 }
 
 /// Divi Core `IsBlockchainSynced`, which its masternode sync waits for: not in

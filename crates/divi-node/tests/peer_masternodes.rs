@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Bert Shuler
 // IronDivi - https://github.com/DiviDomains/IronDivi
 
-//! Masternode messages from peers are not passed on, and `dseg` is not
-//! answered: Divi Core relays an entry, or announces it on `dseg`, only after
-//! checking its signatures and collateral (masternodeman.cpp, masternode-sync.cpp),
-//! which IronDivi does not do.
+//! Masternode messages from peers that are not taken are not passed on, and
+//! `dseg` is not answered: Divi Core announces an entry by inv only once it
+//! passed its checks (masternodeman.cpp:420-499), and these forged ones are
+//! not even read while the test node's tip is old (MasternodeModule.cpp:371-382).
 
 mod common;
 use common::raw_peer::*;
