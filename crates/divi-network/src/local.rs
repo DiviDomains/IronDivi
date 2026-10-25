@@ -111,6 +111,48 @@ pub fn onion_service(text: &str, default_port: u16) -> Option<SocketAddr> {
     Some(SocketAddr::new(onion_from_name(name)?, port))
 }
 
+/// The networks of Divi Core's `enum Network` an address can be in (netbase.h);
+/// an address that is not routable is in none (NET_UNROUTABLE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Ipv4,
+    Ipv6,
+    Tor,
+}
+
+impl Network {
+    /// Divi Core ParseNetwork (netbase.cpp:70-77): `ipv4`, `ipv6`, `tor` or
+    /// `onion`, in any case
+    pub fn parse(name: &str) -> Option<Network> {
+        match name.to_lowercase().as_str() {
+            "ipv4" => Some(Network::Ipv4),
+            "ipv6" => Some(Network::Ipv6),
+            "tor" | "onion" => Some(Network::Tor),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Divi Core CNetAddr::GetNetwork (netbase.cpp:880-892): None when the
+/// address is not routable
+pub fn network_of(ip: &IpAddr) -> Option<Network> {
+    if !is_routable(ip) {
+        return None;
+    }
+    let b = bytes(ip);
+    Some(if b[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {
+        Network::Ipv4
+    } else if is_tor(&b) {
+        Network::Tor
+    } else {
+        Network::Ipv6
+    })
+}
+
 /// Divi Core CNetAddr::IsValid (netbase.cpp:840-873): not unspecified, not a
 /// documentation address, not 0.0.0.0 or 255.255.255.255
 pub fn is_valid(ip: &IpAddr) -> bool {
@@ -244,6 +286,8 @@ pub struct LocalAddresses {
     listen: bool,
     discover: bool,
     port: u16,
+    /// Networks left out by -onlynet (Divi Core vfLimited)
+    limited: RwLock<[bool; 3]>,
 }
 
 impl LocalAddresses {
@@ -254,6 +298,34 @@ impl LocalAddresses {
             listen,
             discover,
             port,
+            limited: RwLock::new([false; 3]),
+        }
+    }
+
+    /// Divi Core SetLimited (NetworkLocalAddressHelpers.cpp:123-129)
+    pub fn set_limited(&self, net: Network, limited: bool) {
+        self.limited.write()[net.index()] = limited;
+    }
+
+    /// Divi Core IsLimited(enum Network): a network -onlynet left out
+    pub fn is_net_limited(&self, net: Network) -> bool {
+        self.limited.read()[net.index()]
+    }
+
+    /// Divi Core IsLimited(const CNetAddr&): an address that is not routable
+    /// is never limited
+    pub fn is_limited(&self, ip: &IpAddr) -> bool {
+        network_of(ip).is_some_and(|net| self.is_net_limited(net))
+    }
+
+    /// -onlynet: every network not named is limited (net.cpp:1734-1746); no
+    /// name limits none
+    pub fn limit_to(&self, nets: &[Network]) {
+        if nets.is_empty() {
+            return;
+        }
+        for net in [Network::Ipv4, Network::Ipv6, Network::Tor] {
+            self.set_limited(net, !nets.contains(&net));
         }
     }
 
@@ -263,10 +335,14 @@ impl LocalAddresses {
     }
 
     /// Learn a local address (Divi Core AddLocal, NetworkLocalAddressHelpers.cpp:82-107):
-    /// routable only, and below LOCAL_MANUAL only with -discover. A known
-    /// address keeps the higher score, plus one.
+    /// routable only, below LOCAL_MANUAL only with -discover, and not in a
+    /// network -onlynet left out. A known address keeps the higher score,
+    /// plus one.
     pub fn add(&self, addr: SocketAddr, score: i32) -> bool {
-        if !is_routable(&addr.ip()) || (!self.discover && score < LOCAL_MANUAL) {
+        if !is_routable(&addr.ip())
+            || (!self.discover && score < LOCAL_MANUAL)
+            || self.is_limited(&addr.ip())
+        {
             return false;
         }
         let mut map = self.map.write();
@@ -466,5 +542,28 @@ mod tests {
             order,
             vec![ip("1.2.3.4"), ip("8.8.4.4"), ip("2600:1700::43")]
         );
+    }
+
+    #[test]
+    fn onlynet_limits_routable_addresses_of_other_networks() {
+        assert_eq!(Network::parse("IPv4"), Some(Network::Ipv4));
+        assert_eq!(Network::parse("onion"), Some(Network::Tor));
+        assert_eq!(Network::parse("tor"), Some(Network::Tor));
+        assert_eq!(Network::parse("i2p"), None);
+        assert_eq!(network_of(&ip("1.2.3.4")), Some(Network::Ipv4));
+        assert_eq!(network_of(&ip("2600:1700::43")), Some(Network::Ipv6));
+        assert_eq!(network_of(&ip("127.0.0.2")), None);
+
+        let local = LocalAddresses::new(true, true, 51472);
+        local.limit_to(&[]);
+        assert!(!local.is_limited(&ip("1.2.3.4")));
+        local.limit_to(&[Network::Ipv6]);
+        assert!(local.is_net_limited(Network::Ipv4) && local.is_net_limited(Network::Tor));
+        assert!(!local.is_net_limited(Network::Ipv6));
+        assert!(local.is_limited(&ip("1.2.3.4")));
+        // An address that is not routable is in no network, so never limited
+        assert!(!local.is_limited(&ip("127.0.0.2")));
+        assert!(!local.add(SocketAddr::new(ip("1.2.3.4"), 1), LOCAL_MANUAL));
+        assert!(local.add(SocketAddr::new(ip("2600:1700::43"), 1), LOCAL_MANUAL));
     }
 }

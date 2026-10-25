@@ -100,7 +100,6 @@ pub struct StakingRpc {
     split_threshold_callback: RwLock<Option<SplitThresholdCallback>>,
     generate_callback: RwLock<Option<GenerateCallback>>,
     generate_block_callback: RwLock<Option<GenerateBlockCallback>>,
-    reserve_balance: RwLock<f64>,
 }
 
 impl StakingRpc {
@@ -111,7 +110,6 @@ impl StakingRpc {
             split_threshold_callback: RwLock::new(None),
             generate_callback: RwLock::new(None),
             generate_block_callback: RwLock::new(None),
-            reserve_balance: RwLock::new(0.0),
         }
     }
 
@@ -398,34 +396,6 @@ impl StakingRpc {
                 info!("generateblock failed: {}", why);
                 Err(RpcError::new(codes::VERIFY_ERROR, "failed to generate a valid block").into())
             }
-        }
-    }
-
-    pub fn reserve_balance(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        let show = params.get_bool(0).unwrap_or(true);
-
-        if show {
-            let reserve = *self.reserve_balance.read();
-            Ok(serde_json::json!({
-                "reserve": reserve,
-                "amount": reserve
-            }))
-        } else {
-            let amount = params
-                .get(1)
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| RpcError::invalid_params("Amount required"))?;
-
-            if amount < 0.0 {
-                return Err(RpcError::invalid_params("Amount must be non-negative").into());
-            }
-
-            *self.reserve_balance.write() = amount;
-
-            Ok(serde_json::json!({
-                "reserve": amount,
-                "amount": amount
-            }))
         }
     }
 }

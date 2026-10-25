@@ -77,46 +77,144 @@ pub fn getblocks_reply(
     (items, None)
 }
 
-/// One block of a getdata, as Divi Core's ProcessGetData sends it
-/// (main.cpp:300-319): only a block the node has and may send
-/// (GetBlockIndexOfRequestedBlock, main.cpp:213-247), and after the last block
-/// of a full getblocks answer an inv of the tip, so the peer asks for more.
-/// Nothing is sent for a block it does not have.
-async fn serve_block(
-    chain: &Chain,
+/// What getdata items are served from
+pub struct GetDataStores<'a> {
+    pub chain: &'a Chain,
+    pub tx_relay: &'a TxRelay,
+    pub mempool: &'a Mempool,
+    pub spork_manager: &'a SporkManager,
+    pub masternode_list: &'a divi_rpc::mn_list::MasternodeList,
+    pub masternode_votes: &'a divi_rpc::mn_votes::MasternodeVotes,
+}
+
+/// Answer a peer's waiting getdata as Divi Core's ProcessGetData
+/// (main.cpp:283-347), in the order asked, while the bytes queued for the
+/// peer are under -maxsendbuffer (main.cpp:291-293); what is left waits for
+/// the next pass, so a peer that does not read holds up no other.
+///
+/// A block is sent only if the node has it and may send it
+/// (GetBlockIndexOfRequestedBlock, main.cpp:213-247), else nothing; after the
+/// last block of a full getblocks answer an inv of the tip follows, so the peer
+/// asks for more. A transaction comes from what was relayed in the last 15
+/// minutes, then the mempool (main.cpp:324), else it is named in a notfound,
+/// which goes out after the next block, or at the end of the pass. A spork,
+/// masternode broadcast, ping or vote held is sent, else named in the same
+/// notfound (main.cpp:187-198, :337-346).
+pub fn serve_getdata(
+    stores: &GetDataStores<'_>,
     peer_manager: &PeerManager,
     hash_continue: &mut HashMap<divi_network::PeerId, Hash256>,
+    queue: &mut std::collections::VecDeque<divi_network::InvItem>,
     peer_id: divi_network::PeerId,
-    hash: &Hash256,
 ) {
-    match chain.get_block_for_peer(hash) {
-        Ok(Some(block)) => {
-            if let Err(e) = peer_manager
-                .send_block_to_peer(peer_id, NetworkMessage::Block(block))
-                .await
-            {
-                tracing::warn!("Failed to send block {} to peer {}: {}", hash, peer_id, e);
-                return;
-            }
-            tracing::debug!("Served block {} to peer {} (getdata)", hash, peer_id);
-            if hash_continue.get(&peer_id) == Some(hash) {
-                hash_continue.remove(&peer_id);
-                if let Some(tip) = chain.tip() {
-                    let inv = NetworkMessage::Inv(vec![divi_network::InvItem::new(
-                        divi_network::InvType::Block,
-                        tip.hash,
-                    )]);
-                    let _ = peer_manager.send_block_to_peer(peer_id, inv).await;
+    use divi_network::TrySend;
+    let GetDataStores {
+        chain,
+        tx_relay,
+        mempool,
+        spork_manager,
+        masternode_list,
+        masternode_votes,
+    } = stores;
+    let mut not_found = Vec::new();
+    while let Some(item) = queue.front().cloned() {
+        match peer_manager.send_queued(peer_id) {
+            None => return queue.clear(),
+            Some(queued) if queued >= divi_network::buffers::max_send_buffer() => break,
+            Some(_) => {}
+        }
+        match item.inv_type {
+            divi_network::InvType::Block => {
+                match chain.get_block_for_peer(&item.hash) {
+                    Ok(Some(block)) => {
+                        match peer_manager.try_send_to_peer(peer_id, NetworkMessage::Block(block)) {
+                            TrySend::Sent => {}
+                            TrySend::Full => break,
+                            TrySend::Gone => return queue.clear(),
+                        }
+                        tracing::debug!("Served block {} to peer {} (getdata)", item.hash, peer_id);
+                        if hash_continue.get(&peer_id) == Some(&item.hash) {
+                            hash_continue.remove(&peer_id);
+                            if let Some(tip) = chain.tip() {
+                                let inv = NetworkMessage::Inv(vec![divi_network::InvItem::new(
+                                    divi_network::InvType::Block,
+                                    tip.hash,
+                                )]);
+                                let _ = peer_manager.try_send_to_peer(peer_id, inv);
+                            }
+                        }
+                    }
+                    Ok(None) => tracing::debug!(
+                        "Block {} not found for getdata from peer {}",
+                        item.hash,
+                        peer_id
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Error looking up block {} for peer {}: {}",
+                        item.hash,
+                        peer_id,
+                        e
+                    ),
+                }
+                queue.pop_front();
+                // The pass's notfound goes out after the block
+                if !not_found.is_empty() {
+                    let msg = NetworkMessage::NotFound(std::mem::take(&mut not_found));
+                    let _ = peer_manager.try_send_to_peer(peer_id, msg);
                 }
             }
+            divi_network::InvType::Tx => {
+                match tx_relay
+                    .relayed_tx(&item.hash)
+                    .or_else(|| mempool.get(&item.hash).map(|e| e.tx))
+                {
+                    Some(tx) => {
+                        match peer_manager.try_send_to_peer(peer_id, NetworkMessage::Tx(tx)) {
+                            TrySend::Sent => {}
+                            TrySend::Full => break,
+                            TrySend::Gone => return queue.clear(),
+                        }
+                    }
+                    None => not_found.push(item),
+                }
+                queue.pop_front();
+            }
+            divi_network::InvType::Spork
+            | divi_network::InvType::MasternodeAnnounce
+            | divi_network::InvType::MasternodePing
+            | divi_network::InvType::MasternodeWinner => {
+                let hash = item.hash.as_bytes();
+                let held = match item.inv_type {
+                    divi_network::InvType::Spork => spork_manager
+                        .spork_by_hash(&item.hash)
+                        .map(NetworkMessage::Spork),
+                    divi_network::InvType::MasternodeAnnounce => masternode_list
+                        .seen_broadcast(hash)
+                        .map(NetworkMessage::MasternodeBroadcast),
+                    divi_network::InvType::MasternodePing => masternode_list
+                        .seen_ping(hash)
+                        .map(NetworkMessage::MasternodePing),
+                    _ => masternode_votes
+                        .winner_bytes(hash)
+                        .map(NetworkMessage::MasternodeWinner),
+                };
+                match held {
+                    Some(msg) => match peer_manager.try_send_to_peer(peer_id, msg) {
+                        TrySend::Sent => {}
+                        TrySend::Full => break,
+                        TrySend::Gone => return queue.clear(),
+                    },
+                    None => not_found.push(item),
+                }
+                queue.pop_front();
+            }
+            _ => {
+                queue.pop_front();
+            }
         }
-        Ok(None) => tracing::debug!("Block {} not found for getdata from peer {}", hash, peer_id),
-        Err(e) => tracing::warn!(
-            "Error looking up block {} for peer {}: {}",
-            hash,
-            peer_id,
-            e
-        ),
+    }
+    if !not_found.is_empty() {
+        let _ = peer_manager.try_send_to_peer(peer_id, NetworkMessage::NotFound(not_found));
     }
 }
 
@@ -994,6 +1092,8 @@ impl Node {
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
         self.peer_manager
             .set_local_addresses(self.local_addresses());
+        divi_network::buffers::set_max_receive_buffer(self.config.p2p.max_receive_buffer);
+        divi_network::buffers::set_max_send_buffer(self.config.p2p.max_send_buffer);
         // -listenonion: the Tor controller, for the life of the node
         // (init.cpp:1621-1622)
         if self.config.p2p.listen_onion {
@@ -1093,14 +1193,63 @@ impl Node {
             // The peers known to have each masternode item: it came from them
             // in an inv, or went to them in one (CNode::setInventoryKnown)
             let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
-            while let Ok(event) = peer_events.recv().await {
+            // Per peer: block getdata not answered yet (its send buffer was
+            // full), answered again when a peer's buffer has room, or on the
+            // `resume` tick
+            let mut pending_getdata: HashMap<u64, std::collections::VecDeque<divi_network::InvItem>> =
+                HashMap::new();
+            let stores = GetDataStores {
+                chain: &chain,
+                tx_relay: &tx_relay,
+                mempool: &mempool,
+                spork_manager: &spork_manager,
+                masternode_list: &masternode_list,
+                masternode_votes: &masternode_votes,
+            };
+            let mut resume = tokio::time::interval(std::time::Duration::from_millis(50));
+            resume.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // A message is taken off the queue here; falling behind the
+                // queue drops messages, and the loop goes on
+                let received = tokio::select! {
+                    received = peer_events.recv() => received,
+                    _ = divi_network::buffers::send_space().notified(), if !pending_getdata.is_empty() => {
+                        pending_getdata.retain(|peer_id, queue| {
+                            serve_getdata(&stores, &peer_manager, &mut hash_continue, queue, *peer_id);
+                            !queue.is_empty()
+                        });
+                        continue;
+                    }
+                    _ = resume.tick(), if !pending_getdata.is_empty() => {
+                        pending_getdata.retain(|peer_id, queue| {
+                            serve_getdata(&stores, &peer_manager, &mut hash_continue, queue, *peer_id);
+                            !queue.is_empty()
+                        });
+                        continue;
+                    }
+                };
+                let event = match received {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!("Peer messages came faster than they were handled: {} missed", missed);
+                        peer_manager.clear_receive_queues();
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if let PeerEvent::Message { peer_id, size, .. } = &event {
+                    peer_manager.message_taken(*peer_id, *size);
+                }
                 match event {
                     PeerEvent::Connected {
                         peer_id,
                         addr,
                         version,
                     } => {
-                        tracing::info!("Peer connected: {}", addr);
+                        tracing::info!(
+                            "Peer connected: {}",
+                            divi_network::peer_log::peer(peer_id, addr)
+                        );
                         let _ = event_tx.send(NodeEvent::PeerConnected(addr.to_string()));
 
                         // Update sync with peer's height
@@ -1124,6 +1273,7 @@ impl Node {
                     }
                     PeerEvent::Disconnected { peer_id, reason } => {
                         tracing::warn!("Peer {} disconnected: {}", peer_id, reason);
+                        pending_getdata.remove(&peer_id);
                         block_sync.remove_peer(peer_id);
                         tx_relay.remove_peer(peer_id);
                         // Divi Core FinalizeNode: EraseOrphansFor (NodeState.cpp:41)
@@ -1133,7 +1283,9 @@ impl Node {
                         alerts_known.remove(&peer_id);
                         peer_manager.gossip().disconnected(peer_id);
                     }
-                    PeerEvent::Message { peer_id, message } => {
+                    PeerEvent::Message {
+                        peer_id, message, ..
+                    } => {
                         // Log all message types at INFO for debugging sync issues
                         let cmd = message.command();
                         if cmd == "block" || cmd == "notfound" {
@@ -1274,93 +1426,21 @@ impl Node {
                                     );
                                     continue;
                                 }
-                                // Divi Core's ProcessGetData (main.cpp:283-347): the
-                                // items in the order asked. A block is sent if the
-                                // node has it (and may send it, outside the main
-                                // chain only within the reorg depth), else nothing;
-                                // a transaction is sent from the mempool, else it is
-                                // named in a notfound. Each pass ends after a block
-                                // item, and its notfound goes out then, after the block
-                                let mut not_found = Vec::new();
-                                for item in items {
-                                    match item.inv_type {
-                                        divi_network::InvType::Block => {
-                                            serve_block(
-                                                &chain,
-                                                &peer_manager,
-                                                &mut hash_continue,
-                                                peer_id,
-                                                &item.hash,
-                                            )
-                                            .await;
-                                            if !not_found.is_empty() {
-                                                let msg = NetworkMessage::NotFound(std::mem::take(
-                                                    &mut not_found,
-                                                ));
-                                                let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
-                                            }
-                                        }
-                                        // From what was relayed in the last 15
-                                        // minutes, then the mempool (main.cpp:324)
-                                        divi_network::InvType::Tx => match tx_relay
-                                            .relayed_tx(&item.hash)
-                                            .or_else(|| mempool.get(&item.hash).map(|e| e.tx))
-                                        {
-                                            Some(tx) => {
-                                                let msg = NetworkMessage::Tx(tx);
-                                                let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
-                                            }
-                                            None => not_found.push(item),
-                                        },
-                                        // A spork held is sent, else named in the notfound
-                                        // (main.cpp:187-189, :337-346)
-                                        divi_network::InvType::Spork => {
-                                            match spork_manager.spork_by_hash(&item.hash) {
-                                                Some(spork) => {
-                                                    let msg = NetworkMessage::Spork(spork);
-                                                    let _ = peer_manager
-                                                        .send_block_to_peer(peer_id, msg)
-                                                        .await;
-                                                }
-                                                None => not_found.push(item),
-                                            }
-                                        }
-                                        // A masternode broadcast, ping or vote taken
-                                        // is sent, else named in the notfound
-                                        // (main.cpp:190-198)
-                                        divi_network::InvType::MasternodeAnnounce
-                                        | divi_network::InvType::MasternodePing
-                                        | divi_network::InvType::MasternodeWinner => {
-                                            let hash = item.hash.as_bytes();
-                                            let msg = match item.inv_type {
-                                                divi_network::InvType::MasternodeAnnounce => {
-                                                    masternode_list
-                                                        .seen_broadcast(hash)
-                                                        .map(NetworkMessage::MasternodeBroadcast)
-                                                }
-                                                divi_network::InvType::MasternodePing => masternode_list
-                                                    .seen_ping(hash)
-                                                    .map(NetworkMessage::MasternodePing),
-                                                _ => masternode_votes
-                                                    .winner_bytes(hash)
-                                                    .map(NetworkMessage::MasternodeWinner),
-                                            };
-                                            match msg {
-                                                Some(msg) => {
-                                                    let _ = peer_manager
-                                                        .send_block_to_peer(peer_id, msg)
-                                                        .await;
-                                                }
-                                                None => not_found.push(item),
-                                            }
-                                        }
-                                        _ => {}
+                                // Queued for the peer, answered in order as its
+                                // send buffer allows
+                                if !items.is_empty() {
+                                    let queue = pending_getdata.entry(peer_id).or_default();
+                                    queue.extend(items);
+                                    serve_getdata(
+                                        &stores,
+                                        &peer_manager,
+                                        &mut hash_continue,
+                                        queue,
+                                        peer_id,
+                                    );
+                                    if queue.is_empty() {
+                                        pending_getdata.remove(&peer_id);
                                     }
-                                }
-                                if !not_found.is_empty() {
-                                    let _ = peer_manager
-                                        .send_block_to_peer(peer_id, NetworkMessage::NotFound(not_found))
-                                        .await;
                                 }
                             }
                             // Handle getblocks: respond with inv for blocks after locator.
@@ -2359,6 +2439,14 @@ impl Node {
         let p2p = &self.config.p2p;
         let listen = self.config.peer_sources().listen;
         let local = LocalAddresses::new(listen, p2p.discover, p2p.port);
+        // -onlynet first: an address of a left-out network is not ours
+        // (AddLocal, NetworkLocalAddressHelpers.cpp:90)
+        let only: Vec<_> = p2p
+            .only_nets
+            .iter()
+            .filter_map(|n| divi_network::local::Network::parse(n))
+            .collect();
+        local.limit_to(&only);
         let bound = p2p
             .listen_addr
             .trim_matches(['[', ']'])
