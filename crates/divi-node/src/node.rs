@@ -912,7 +912,9 @@ impl Node {
                 }
             }));
         }
-        let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
+        // With -alerts=0 an alert message is not read at all (main.cpp:870)
+        let alert_key = divi_network::alert::alert_key(&self.config.network.magic)
+            .filter(|_| self.config.p2p.alerts);
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it

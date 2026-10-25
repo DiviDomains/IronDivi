@@ -67,6 +67,7 @@ pub mod spork;
 pub mod staking;
 pub mod wallet;
 mod wallet_history;
+pub mod warnings;
 pub mod websocket;
 
 pub use auth_cookie::{resolve_rpc_auth, AuthCookie, COOKIE_AUTH_USER};

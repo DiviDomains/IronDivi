@@ -229,7 +229,7 @@ impl StakingRpc {
             "currentblocksize": info.current_block_size,
             "currentblocktx": info.current_block_tx,
             "difficulty": info.difficulty,
-            "errors": info.errors.unwrap_or_default(),
+            "errors": info.errors.unwrap_or_else(crate::warnings::status_bar),
             "generate": info.enabled,
             "genproclimit": 1,
             "pooledtx": info.pooled_tx,
