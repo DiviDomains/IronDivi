@@ -104,7 +104,8 @@ episode) and the remaining steps, so every comparison stays exact:
 - **divid reindex after a kill:** see below. divid's reindex runs on a thread of its own (`init.cpp:1580`), while
   its wallet's unconfirmed transactions are offered to the mempool at the end of the start (`init.cpp:1646`), before
   the chain is rebuilt. So they are refused, and divid's wallet counts their inputs unspent.
-- **divid wallet after a kill:** after a kill, divid's restarted node holds fewer transactions than irondivid's.
+- **divid wallet after a kill:** after a kill, divid's restarted node holds fewer transactions (or blocks) than
+  irondivid's.
   divid writes its wallet to disk 2 s after the last change (`ThreadFlushWalletDB`,
   `LegacyWalletDatabaseEndpointFactory.cpp:23-50`), so a send made just before a `kill -9` is lost. irondivid stores
   a send before the RPC that made it answers.

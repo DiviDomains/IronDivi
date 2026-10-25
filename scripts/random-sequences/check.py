@@ -551,10 +551,11 @@ EXPLAINED = {
         "of the start (init.cpp:1646), before the chain is rebuilt, so they are refused and the wallet "
         "counts their inputs unspent; irondivid starts without -reindex and keeps them"),
     "divid wallet after a kill": (
-        "after the kill divid's restarted node has fewer transactions than irondivid's: divid writes its "
-        "wallet to disk 2 s after the last change (ThreadFlushWalletDB, "
-        "LegacyWalletDatabaseEndpointFactory.cpp:23-50), so a send made just before a kill -9 is lost; "
-        "irondivid stores a send before the RPC that made it answers"),
+        "after the kill divid's restarted node has fewer transactions or blocks than irondivid's: divid writes "
+        "its wallet to disk 2 s after the last change (ThreadFlushWalletDB, "
+        "LegacyWalletDatabaseEndpointFactory.cpp:23-50) and its chain state when it flushes (FlushStateToDisk), "
+        "so what came just before a kill -9 is lost and has to come again from its peer; irondivid stores a "
+        "send before the RPC that made it answers"),
     "maturity window": (
         "only the middle of the invalidate differs, by one or two coins of one value: the two sides had "
         "spent different coins of that value (divid's choice among equal coins is by txid order), and with "
@@ -744,8 +745,9 @@ for step in steps:
             explained = "maturity window"
         elif step["kind"] == "kill" and PAIRS[0].note:
             explained = "divid reindex after a kill"
-        elif step["kind"] == "kill" and counted(PAIRS[0].node(n).call("getrawmempool"))[1:] \
-                < counted(PAIRS[1].node(n).call("getrawmempool"))[1:]:
+        elif step["kind"] == "kill" and (
+                counted(PAIRS[0].node(n).call("getrawmempool"))[1:] < counted(PAIRS[1].node(n).call("getrawmempool"))[1:]
+                or PAIRS[0].node(n).call("getblockcount")[1:] < PAIRS[1].node(n).call("getblockcount")[1:]):
             explained = "divid wallet after a kill"
         elif all(k.split(": ")[-1].startswith("getbalance") or k == "after invalidateblock: listunspent 0 amounts"
                  for k in diff) and any(not k.startswith("after") for k in diff) and balance_cache_explains():
