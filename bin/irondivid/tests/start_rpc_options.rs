@@ -125,3 +125,78 @@ fn forcestart_is_taken_and_a_killed_node_starts_at_its_last_block() {
         "-forcestart called unsupported"
     );
 }
+
+/// The modes of the files and directories under `dir`
+fn modes(dir: &Path) -> (Vec<u32>, Vec<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            if meta.is_dir() {
+                dirs.push(mode);
+                todo.push(entry.path());
+            } else if meta.is_file() {
+                files.push(mode);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    dirs.sort();
+    dirs.dedup();
+    (files, dirs)
+}
+
+/// Start under umask 022 with `extra`, stop, and give the modes made
+fn modes_made(extra: &[&str]) -> (Vec<u32>, Vec<u32>) {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (child, rpc_port, _) = start_node(
+        dir.path(),
+        |rpc_port, p2p_port| {
+            let mut cmd = command(dir.path(), rpc_port, p2p_port, extra);
+            // SAFETY: umask(2) in the child before exec
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::umask(0o022);
+                    Ok(())
+                });
+            }
+            cmd
+        },
+        |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
+    );
+    Node { child, rpc_port }.stop();
+    modes(dir.path())
+}
+
+/// -sysperms: divid sets umask 077 unless it is given, and refuses it with
+/// the wallet on (init.cpp:1378-1385)
+#[test]
+fn files_are_private_unless_sysperms_with_the_wallet_off() {
+    assert_eq!(modes_made(&[]), (vec![0o600], vec![0o700]));
+    assert_eq!(modes_made(&["-disablewallet"]), (vec![0o600], vec![0o700]));
+    let (files, dirs) = modes_made(&["-sysperms", "-disablewallet"]);
+    assert!(
+        files.contains(&0o644) && dirs.contains(&0o755),
+        "{files:?} {dirs:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = command(dir.path(), 1, 1, &["-sysperms"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
+        ),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

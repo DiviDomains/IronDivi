@@ -59,6 +59,7 @@ struct Args {
     debug: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
+    sysperms: bool,
     pid: Option<PathBuf>,
     export_chain: bool,
     export_start: Option<u32>,
@@ -173,6 +174,7 @@ impl Args {
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
+        self.sysperms = s.get_bool("sysperms", false);
         self.pid = path("pid");
         self.export_chain = self.cli.get_bool("export-chain", false);
         self.export_start = number("export-start")?;
@@ -326,7 +328,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
-    "sysperms",
     "torcontrol",
     "torpassword",
     "txconfirmtarget",
@@ -349,6 +350,7 @@ const READ_ELSEWHERE: &[&str] = &[
     "debug",
     "wallet",
     "disablewallet",
+    "sysperms",
     "pid",
     "export-chain",
     "export-start",
@@ -2721,6 +2723,20 @@ fn main() -> Result<()> {
     // ... and so are -testnet and -regtest together
     if args.testnet && args.regtest {
         eprintln!("Error: Invalid combination of -regtest and -testnet.");
+        std::process::exit(1);
+    }
+
+    // divid creates its files 0600 and its directories 0700 (umask 077), or
+    // with the system's umask under -sysperms, which it refuses with the
+    // wallet on (init.cpp:1378-1385)
+    #[cfg(unix)]
+    if !args.sysperms {
+        // SAFETY: umask(2) only sets this process's file-creation mask
+        unsafe { libc::umask(0o077) };
+    } else if !args.disablewallet {
+        eprintln!(
+            "Error: Error: -sysperms is not allowed in combination with enabled wallet functionality"
+        );
         std::process::exit(1);
     }
 
