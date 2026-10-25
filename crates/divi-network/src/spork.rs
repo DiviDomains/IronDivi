@@ -153,6 +153,10 @@ pub struct SporkManager {
     /// them to value and pay blocks
     consensus: SharedSporks,
 
+    /// Called when a spork 14 entry arrives (Divi Core `ExecuteSpork`,
+    /// spork.cpp:256, :278-302); not at start, as it does not load sporks that way
+    fee_listeners: RwLock<Vec<Arc<dyn Fn() + Send + Sync>>>,
+
     /// When each spork inventory item was asked for, so it is asked for once
     /// (Divi Core `AskFor` waits two minutes before asking again)
     asked: Mutex<HashMap<Hash256, Instant>>,
@@ -221,6 +225,7 @@ impl SporkManager {
             active_sporks: RwLock::new(BTreeMap::new()),
             db,
             consensus,
+            fee_listeners: RwLock::new(Vec::new()),
             asked: Mutex::new(HashMap::new()),
             progress_tx,
         };
@@ -279,6 +284,11 @@ impl SporkManager {
         // Consensus reads the entries of the multi-value sporks from here
         self.consensus.write().set(id, entries);
         true
+    }
+
+    /// Call `listener` when a spork 14 entry arrives, to take its fee settings
+    pub fn on_tx_fee_spork(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        self.fee_listeners.write().push(listener);
     }
 
     /// Subscribe to progress events
@@ -390,6 +400,12 @@ impl SporkManager {
                 if let Err(e) = db.put_metadata(&db_key(spork.spork_id), &spork.serialize()) {
                     tracing::warn!("Could not store spork {}: {}", spork.spork_id, e);
                 }
+            }
+        }
+
+        if spork.spork_id == divi_consensus::spork_values::ids::TX_FEE && added {
+            for listener in self.fee_listeners.read().iter() {
+                listener();
             }
         }
 
@@ -737,6 +753,38 @@ mod tests {
         let _ =
             SporkManager::with_key_and_chain(quiet_peers(), Some(key), Some(db), restarted.clone());
         assert_eq!(entries(&restarted), vec![SporkEntry::new("3000;200", 2000)]);
+    }
+
+    /// A spork 14 entry that is added tells the node to take its fees; a copy of
+    /// it, another spork and a refused one do not (spork.cpp:253-257)
+    #[tokio::test]
+    async fn only_a_new_tx_fee_entry_runs_the_fee_listener() {
+        let kp = divi_crypto::KeyPair::new_random();
+        let sporks = SporkManager::with_key(quiet_peers(), Some(kp.public_key().to_bytes()), None);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        sporks.on_tx_fee_spork(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let count = || runs.load(std::sync::atomic::Ordering::SeqCst);
+
+        let fee = signed(&kp, 10013, "10000;300;100000;20000;50;0", 1000);
+        sporks.handle_spork(1, fee.clone()).await;
+        assert_eq!(count(), 1);
+        sporks.handle_spork(2, fee).await;
+        assert_eq!(count(), 1, "the same entry again");
+        sporks
+            .handle_spork(1, signed(&kp, 10015, "5000;100", 1000))
+            .await;
+        assert_eq!(count(), 1, "another spork");
+        let mut forged = signed(&kp, 10013, "1;1;1;1;1;0", 3000);
+        forged.signature[10] ^= 1;
+        sporks.handle_spork(1, forged).await;
+        assert_eq!(count(), 1, "a refused entry");
+        sporks
+            .handle_spork(1, signed(&kp, 10013, "10000;300;100000;30000;60;0", 2000))
+            .await;
+        assert_eq!(count(), 2);
     }
 
     /// Divi Core AddActiveSpork and GetActiveSporkCount (spork.cpp:144-168,

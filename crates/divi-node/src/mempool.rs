@@ -21,6 +21,7 @@ use divi_primitives::transaction::{OutPoint, Transaction};
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -234,6 +235,11 @@ pub struct Mempool {
     /// Configuration
     config: MempoolConfig,
 
+    /// The minimum relay fee and the highest fee a spork 14 entry set, in
+    /// satoshis (Divi Core `FeeAndPriorityCalculator::setFeeRate`, `SetMaxFee`,
+    /// spork.cpp:295-296); `i64::MIN` while none has
+    spork_fees: (AtomicI64, AtomicI64),
+
     /// All transactions indexed by txid
     txs: RwLock<HashMap<Hash256, MempoolEntry>>,
 
@@ -270,6 +276,7 @@ impl Mempool {
     pub fn new(config: MempoolConfig) -> Self {
         Mempool {
             config,
+            spork_fees: (AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)),
             txs: RwLock::new(HashMap::new()),
             priority_queue: RwLock::new(BinaryHeap::new()),
             spenders: RwLock::new(HashMap::new()),
@@ -492,13 +499,28 @@ impl Mempool {
     /// The minimum relay fee in satoshis per 1000 bytes (Core's
     /// `minimumRelayTransactionFee`)
     pub fn min_relay_fee_per_kb(&self) -> i64 {
-        self.config.min_relay_fee_per_kb
+        match self.spork_fees.0.load(AtomicOrdering::Relaxed) {
+            i64::MIN => self.config.min_relay_fee_per_kb,
+            set => set,
+        }
+    }
+
+    /// Take the fee settings of a spork 14 entry: the minimum relay fee per
+    /// 1000 bytes and the highest fee, in satoshis
+    pub fn set_spork_fees(&self, min_relay_fee_per_kb: i64, max_tx_fee: i64) {
+        self.spork_fees
+            .0
+            .store(min_relay_fee_per_kb, AtomicOrdering::Relaxed);
+        self.spork_fees.1.store(max_tx_fee, AtomicOrdering::Relaxed);
     }
 
     /// The highest fee sendrawtransaction takes without allowhighfees
     /// (Core's `CFeeRate::GetMaxTxFee`, -maxtxfee)
     pub fn max_tx_fee(&self) -> Amount {
-        Amount::from_sat(self.config.max_tx_fee)
+        match self.spork_fees.1.load(AtomicOrdering::Relaxed) {
+            i64::MIN => Amount::from_sat(self.config.max_tx_fee),
+            set => Amount::from_sat(set),
+        }
     }
 
     /// Divi Core `CFeeRate::GetFee` (FeeRate.cpp:35-43) of the relay fee
@@ -1112,6 +1134,20 @@ mod tests {
             height.load(std::sync::atomic::Ordering::SeqCst)
         }));
         mempool
+    }
+
+    /// A spork 14 entry sets the relay fee and the highest fee the mempool
+    /// uses (Divi Core spork.cpp:295-296)
+    #[test]
+    fn spork_fees_replace_the_configured_ones() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        assert_eq!(mempool.min_relay_fee_per_kb(), 10_000);
+        let configured_max = mempool.max_tx_fee();
+        mempool.set_spork_fees(25_000, 500_000);
+        assert_eq!(mempool.min_relay_fee_per_kb(), 25_000);
+        assert_eq!(mempool.min_relay_fee_for(2_000), 50_000);
+        assert_eq!(mempool.max_tx_fee(), Amount::from_sat(500_000));
+        assert_ne!(configured_max, mempool.max_tx_fee());
     }
 
     #[test]

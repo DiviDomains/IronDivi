@@ -4673,6 +4673,15 @@ impl Chain {
             .unwrap_or(divi_consensus::LOTTERY_TICKET_MINIMUM)
     }
 
+    /// The fee settings spork 14 has in force at the tip, as Divi Core reads
+    /// them when the spork arrives (`ExecuteMultiValueSpork`, spork.cpp:286-302)
+    pub fn tx_fee_spork_at_tip(&self) -> Option<divi_consensus::spork_values::TxFeeValue> {
+        let tip = self.tip()?;
+        self.consensus_sporks
+            .read()
+            .tx_fee(tip.height, tip.time as i64)
+    }
+
     /// Treasury and charity payments due at `height` (None: not a treasury block)
     pub fn treasury_payments_due(&self, height: u32) -> Option<TreasuryDue> {
         self.with_sporks(|sporks| treasury_payments_due_with(self.network_type(), height, sporks))
