@@ -294,17 +294,12 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "checklevel",
-    "dbcache",
-    "disablesystemnotifications",
     "dns",
-    "forcednsseed",
-    "genproclimit",
     "listenonion",
     "logips",
     "logtimestamps",
     "maxreceivebuffer",
     "maxsendbuffer",
-    "mining",
     "onion",
     "onlynet",
     "par",
@@ -317,8 +312,15 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
-/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143)
-const UNUSED_BY_DIVID: &[&str] = &["sendfreetransactions", "txconfirmtarget"];
+/// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
+/// -disablesystemnotifications :142, -mining and -genproclimit :186-187, :205)
+const UNUSED_BY_DIVID: &[&str] = &[
+    "sendfreetransactions",
+    "txconfirmtarget",
+    "disablesystemnotifications",
+    "mining",
+    "genproclimit",
+];
 
 /// Options apply_settings reads
 const APPLIED: &[&str] = &[
@@ -399,6 +401,8 @@ const APPLIED: &[&str] = &[
     "addressindex",
     "reindex",
     "utxocachesize",
+    "dbcache",
+    "forcednsseed",
     "expire",
     "blocknotify",
     "alertnotify",
@@ -491,7 +495,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         s.soft_set_bool("listen", true);
     }
     if !s.get_multi("connect").is_empty() {
-        s.soft_set_bool("dnsseed", false);
+        if s.soft_set_bool("dnsseed", false) {
+            info!("InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0");
+        }
         s.soft_set_bool("listen", false);
     }
     if s.is_set("proxy") {
@@ -622,6 +628,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if !s.get_bool("dnsseed", true) {
         config.network.dns_seeds.clear();
     }
+    if s.is_set("dnsseed") {
+        config.p2p.dns_seed = Some(s.get_bool("dnsseed", true));
+    }
+    config.p2p.force_dns_seed = s.get_bool("forcednsseed", false);
     // -maxconnections counts inbound and outbound; at most 16 are outbound
     // (net.cpp:106, :757, :1727)
     if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
@@ -776,6 +786,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if let Some(n) = number_option(&s, "maxlogfiles", 1..=100) {
         config.log.max_files = n as u32;
+    }
+    // -dbcache in MiB, read as divid reads a number (atoi: 0 for a word) and
+    // split as divid splits it (init.cpp:1030, :1046-1056): the block tree and
+    // coin database caches make the chain database's block cache, the coins
+    // in memory the UTXO cache (unless -utxocachesize gives that)
+    if let Some(text) = s.get("dbcache") {
+        let sizes = divi_node::config::db_cache_sizes(settings::atoi(text), config.index.txindex);
+        config.block_cache_size = Some(sizes.block_tree + sizes.coin_db);
+        config.utxo_cache_size = sizes.coin_cache_entries;
     }
     if let Some(n) = number_option(&s, "utxocachesize", 0..=i64::MAX) {
         config.utxo_cache_size = n as u64;
@@ -4352,6 +4371,74 @@ mod divid_option_tests {
         assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
     }
 
+    /// -dbcache is applied as divid splits it (init.cpp:1030, :1046-1056):
+    /// read with atoi, clamped, the coins in memory unless -utxocachesize
+    #[test]
+    fn dbcache_sets_the_caches() {
+        const MIB: usize = 1 << 20;
+        let c = cfg_in("divi.conf", "rpcuser=u\ndbcache=100\n", &[]).unwrap();
+        let d = divi_node::config::db_cache_sizes(100, c.index.txindex);
+        assert_eq!(c.block_cache_size, Some(d.block_tree + d.coin_db));
+        assert_eq!(c.utxo_cache_size, d.coin_cache_entries);
+        let word = cfg_in("divi.conf", "rpcuser=u\n", &["-dbcache=abc"]).unwrap();
+        assert_eq!(word.block_cache_size.map(|b| b < 4 * MIB), Some(true));
+        let big = cfg_in("divi.conf", "rpcuser=u\n", &["-dbcache=99999999"]).unwrap();
+        // Clamped to 4096 MiB: 512 to the block tree, 1792 to the coin database
+        assert_eq!(big.block_cache_size, Some(2304 * MIB));
+        let both = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &["-dbcache=100", "-utxocachesize=7"],
+        )
+        .unwrap();
+        assert_eq!(both.utxo_cache_size, 7);
+        // Not given: irondivid's own sizes
+        let none = cfg_in("divi.conf", "rpcuser=u\n", &[]).unwrap();
+        assert_eq!(none.block_cache_size, None);
+        assert_eq!(none.utxo_cache_size, 10_000_000);
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"dbcache"));
+    }
+
+    /// -dnsseed and -forcednsseed, and -connect turning -dnsseed off unless it
+    /// is given (net.cpp:1015-1030, :1683-1685)
+    #[test]
+    fn dnsseed_and_forcednsseed_are_applied() {
+        let c = cfg_in("divi.conf", "rpcuser=u\n", &["-forcednsseed=1"]).unwrap();
+        assert!(c.p2p.force_dns_seed);
+        assert_eq!(c.p2p.dns_seed, None);
+        let c = cfg_in("divi.conf", "rpcuser=u\nforcednsseed=0\ndnsseed=0\n", &[]).unwrap();
+        assert!(!c.p2p.force_dns_seed);
+        assert_eq!(c.p2p.dns_seed, Some(false));
+        let c = cfg_in("divi.conf", "rpcuser=u\n", &["-connect=127.0.0.2:1"]).unwrap();
+        assert_eq!(c.p2p.dns_seed, Some(false), "-connect sets -dnsseed=0");
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\n",
+            &["-connect=127.0.0.2:1", "-dnsseed=1"],
+        )
+        .unwrap();
+        assert_eq!(c.p2p.dns_seed, Some(true));
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"forcednsseed"));
+    }
+
+    /// -mining, -genproclimit and -disablesystemnotifications: divid lists them
+    /// in its help only (LicenseAndInfo.cpp:142, :186-187), so they are taken
+    /// without a warning
+    #[test]
+    fn help_only_options_are_taken_without_a_warning() {
+        let s = Settings::default();
+        for o in ["mining", "genproclimit", "disablesystemnotifications"] {
+            assert!(!UNSUPPORTED_OPTIONS.contains(&o), "{o}");
+            assert_eq!(option_warning(&s, o), None, "{o}");
+        }
+        assert!(cfg_in(
+            "divi.conf",
+            "rpcuser=u\nmining=1\ngenproclimit=-1\ndisablesystemnotifications=1\n",
+            &["-genproclimit=4"],
+        )
+        .is_ok());
+    }
+
     /// Each option is in one list only: read by apply_settings, read
     /// elsewhere, one divid does not use, or one irondivid does not support
     #[test]
@@ -4554,9 +4641,9 @@ mod divid_option_tests {
         assert_eq!(option_warning(&s, "litemode"), None);
         assert_eq!(option_warning(&s, "budgetvotemode"), None);
         assert_eq!(option_warning(&s, "masternode"), None);
-        assert!(option_warning(&s, "dbcache")
-            .unwrap()
-            .contains("not supported"));
+        // applied as divid applies it
+        assert_eq!(option_warning(&s, "dbcache"), None);
+        assert!(option_warning(&s, "par").unwrap().contains("not supported"));
         assert!(option_warning(&s, "nosuchoption")
             .unwrap()
             .starts_with("Unknown option"));
