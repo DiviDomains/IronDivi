@@ -105,6 +105,12 @@ impl StorageError {
         }
     }
 
+    /// A write (or read) of the node's own data that failed: Divi Core aborts
+    /// the node on these (AbortNode) instead of refusing the block
+    pub fn is_write_failure(&self) -> bool {
+        matches!(self, StorageError::Database(_) | StorageError::Io(_))
+    }
+
     /// A consensus failure Divi Core scores `score`
     pub fn invalid_block_scored(score: u32, reason: String) -> Self {
         StorageError::InvalidBlockScored { score, reason }

@@ -1963,7 +1963,7 @@ impl Chain {
 
     /// Accept a new block into the chain
     pub fn accept_block(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
-        self.notifying_tip(|| self.accept_block_unnotified(block))
+        abort_on_write_failure(self.notifying_tip(|| self.accept_block_unnotified(block)))
     }
 
     fn accept_block_unnotified(&self, block: Block) -> Result<AcceptBlockResult, StorageError> {
@@ -2189,7 +2189,12 @@ impl Chain {
             }
         }
 
-        // 8. Store block and index
+        // 8. Store block and index. Divi Core first checks that 50 MB stay
+        // free beyond what the block adds (BlockFileHelpers.cpp:132-142).
+        let size = divi_primitives::serialize::serialize(&block).len() as u64;
+        if !crate::disk_space::check_disk_space(self.db.path(), size) {
+            return Err(crate::disk_space::disk_space_low());
+        }
         debug!("  ├─ Storing block data and index");
         self.db.store_block(&hash, &block)?;
         // Index entry only: the height -> hash mapping is written solely when the
@@ -2750,7 +2755,7 @@ impl Chain {
     /// is rolled back to its parent, then the best remaining valid chain is
     /// activated.
     pub fn invalidate_block(&self, hash: &Hash256) -> Result<Vec<Transaction>, StorageError> {
-        self.notifying_tip(|| self.invalidate_block_unnotified(hash, true))
+        abort_on_write_failure(self.notifying_tip(|| self.invalidate_block_unnotified(hash, true)))
     }
 
     /// Mark the block failed and disconnect it and the blocks above it; with
@@ -2895,7 +2900,7 @@ impl Chain {
     /// Clear the invalid flag on a block, its ancestors and its descendants
     /// (`reconsiderblock`), then activate the best valid chain.
     pub fn reconsider_block(&self, hash: &Hash256) -> Result<(), StorageError> {
-        self.notifying_tip(|| self.reconsider_block_unnotified(hash))
+        abort_on_write_failure(self.notifying_tip(|| self.reconsider_block_unnotified(hash)))
     }
 
     fn reconsider_block_unnotified(&self, hash: &Hash256) -> Result<(), StorageError> {
@@ -4060,10 +4065,10 @@ impl Chain {
     /// (e.g., the sync layer after processing orphan blocks). For the internal
     /// lock-free version used by `accept_block`, see `activate_best_chain_inner`.
     pub fn activate_best_chain(&self) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
-        self.notifying_tip(|| {
+        abort_on_write_failure(self.notifying_tip(|| {
             let _chain_guard = self.chain_lock.lock();
             self.activate_best_chain_inner()
-        })
+        }))
     }
 
     /// Inner implementation of activate_best_chain (caller must hold chain_lock).
@@ -5117,7 +5122,14 @@ impl Chain {
     /// Should be called periodically during sync for durability.
     /// Returns the number of entries flushed, or 0 if cache is not enabled.
     pub fn flush_utxo_cache(&self) -> Result<usize, StorageError> {
-        self.db.flush_utxo_cache()
+        // Divi Core FlushStateToDisk: room for each coin, 100 bytes written
+        // twice with a safety factor of 2 (FlushChainState.cpp:31-40), then
+        // "Failed to write to coin database" (:49-50)
+        let room = 100 * 2 * 2 * self.db.utxo_dirty_count() as u64;
+        if !crate::disk_space::check_disk_space(self.db.path(), room) {
+            return Err(crate::disk_space::disk_space_low());
+        }
+        abort_on_write_failure(self.db.flush_utxo_cache())
     }
 
     /// Get UTXO cache statistics (if cache is enabled)
@@ -5136,6 +5148,13 @@ impl Chain {
     /// When it does, returns the fork height and the transactions of the
     /// disconnected blocks to return to the mempool, as `accept_block` reports them.
     pub fn try_activate_block(
+        &self,
+        hash: &Hash256,
+    ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
+        abort_on_write_failure(self.try_activate_block_unchecked(hash))
+    }
+
+    fn try_activate_block_unchecked(
         &self,
         hash: &Hash256,
     ) -> Result<Option<(u32, Vec<Transaction>)>, StorageError> {
@@ -5331,6 +5350,19 @@ fn coinstake_stake_reward(
     }
 }
 
+/// A chain change that failed to write the node's own data stops the node, as
+/// Divi Core's state.Abort does (ChainExtensionService.cpp:513-518,
+/// BlockConnectionService.cpp:111-192, FlushChainState.cpp:37-58); the error is
+/// returned as it was
+fn abort_on_write_failure<T>(result: Result<T, StorageError>) -> Result<T, StorageError> {
+    if let Err(e) = &result {
+        if e.is_write_failure() {
+            crate::abort::abort_node(&format!("System error: {e}"));
+        }
+    }
+    result
+}
+
 /// `CScript() << height` (Divi Core script.h:210-225): OP_1..OP_16 for 1-16,
 /// otherwise the minimal CScriptNum encoding pushed as data
 pub fn bip34_height_script(height: u32) -> Vec<u8> {
@@ -5518,6 +5550,7 @@ fn check_block_txs_final(block: &Block, height: u32) -> Result<(), StorageError>
 #[cfg(test)]
 mod tests {
     mod crash;
+    mod disk_space;
 
     use super::*;
     use divi_primitives::amount::Amount;
