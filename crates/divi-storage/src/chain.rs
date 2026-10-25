@@ -2090,11 +2090,25 @@ impl Chain {
             }
         }
 
-        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), then
-        // ContextualCheckBlockHeader's depth limit (ChainExtensionService.cpp:308-311).
-        // Both run for every block, whether it extends the tip or not.
+        // 5b. Divi Core AcceptBlock -> CheckWork (BlockProofVerifier.cpp:136-155), which
+        // includes the proof of stake, then ContextualCheckBlockHeader's depth limit,
+        // time and version (ChainExtensionService.cpp:292-353). A block that fails the
+        // proof is refused before its time or version is looked at, so it draws no
+        // reject. The bits and the work run for every block; the proof of stake needs the
+        // UTXO set at the parent, so it runs here for a block on the tip and during a
+        // reorg for any other.
+        let extends_tip = parent_index.as_ref().is_some_and(|parent| {
+            self.tip
+                .read()
+                .as_ref()
+                .map(|t| t.hash == parent.hash)
+                .unwrap_or(true)
+        });
         if let Some(ref parent) = parent_index {
             self.check_block_work(&block, &hash, parent)?;
+            if extends_tip {
+                self.check_block_proof_of_stake(&block, parent)?;
+            }
             self.check_reorg_depth(parent.height + 1)?;
             Self::check_block_version_and_height(&block, parent.height + 1)?;
         }
@@ -2105,10 +2119,6 @@ impl Chain {
         // during reorg (connect_block). This matches C++ Divi's AcceptBlock vs ConnectTip
         // separation and allows storing competing chain blocks for proper fork selection.
         if let Some(ref parent) = parent_index {
-            let extends_tip = {
-                let tip = self.tip.read();
-                tip.as_ref().map(|t| t.hash == parent.hash).unwrap_or(true)
-            };
             if extends_tip {
                 debug!("  ├─ Full context validation (extends tip)");
                 self.check_block_context(&block, parent)?;
@@ -3475,7 +3485,7 @@ impl Chain {
             ));
         }
 
-        self.check_block_proof_of_stake(block, parent)
+        Ok(())
     }
 
     /// The proof of stake (kernel, stake modifier, target, coin age) and the block
@@ -6980,6 +6990,43 @@ mod tests {
             .stake_prevout(&OutPoint::new(Hash256::from_bytes([7; 32]), 0))
             .unwrap()
             .is_none());
+    }
+
+    /// Divi Core checks the proof of a block (bits, work or stake) before the
+    /// block's version and time (AcceptBlock, ChainExtensionService.cpp:441-493:
+    /// CheckWork first, then ContextualCheckBlockHeader), and a proof that fails
+    /// draws no reject. A block that fails both is therefore refused for its proof.
+    #[test]
+    fn a_block_failing_its_proof_is_refused_before_its_version_is_looked_at() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        let mut block = create_child_block(hash1, block1.header.time);
+        block.transactions[0].vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+        block.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        seal(&mut block);
+        block.header.version = 2;
+        let err = chain.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
+        assert_eq!(err.block_reject(), None);
     }
 
     #[test]
