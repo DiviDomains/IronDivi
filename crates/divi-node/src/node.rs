@@ -1343,7 +1343,15 @@ impl Node {
                         // Update sync with peer's height
                         block_sync.update_peer_height(peer_id, version.start_height.max(0) as u32);
                         block_sync
-                            .begin_syncing_with_peer(peer_id, version.services)
+                            .begin_syncing_with_peer(
+                                peer_id,
+                                divi_network::SyncPeer {
+                                    services: version.services,
+                                    inbound: peer_manager.is_inbound(peer_id),
+                                    whitelisted: peer_manager.is_whitelisted(peer_id),
+                                    one_shot: peer_manager.is_one_shot(peer_id),
+                                },
+                            )
                             .await;
 
                         peer_manager
@@ -1363,6 +1371,9 @@ impl Node {
                         tracing::warn!("Peer {} disconnected: {}", peer_id, reason);
                         pending_getdata.remove(&peer_id);
                         block_sync.remove_peer(peer_id);
+                        // The peers kept waiting while it was there are asked
+                        // for blocks now if it was the last one preferred
+                        block_sync.ask_peers_to_sync().await;
                         tx_relay.remove_peer(peer_id);
                         // Divi Core FinalizeNode: EraseOrphansFor (NodeState.cpp:41)
                         orphans.erase_for_peer(peer_id);
