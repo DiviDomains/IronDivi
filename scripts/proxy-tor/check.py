@@ -14,9 +14,9 @@ stand-ins, made here, one set per node:
 - a plain TCP listener the -dns cases name by host name, logging accepts.
 
 No -upnp=1 case is started: this divid is built with miniupnpc, and its port
-mapping would send SSDP to the LAN (README.md). The -torpassword of the conf
-cases is made at random by the run and kept only in the node's 0600 divi.conf
-in the work directory; the command-line case uses a fixed fake literal. RPC
+mapping would send SSDP to the LAN (README.md). The -torpassword is made
+at random by the run and kept only in the node's 0600 divi.conf in the work
+directory, never on a command line. RPC
 passwords are random per run, in the same 0600 divi.conf files.
 
 Started by run.sh, which owns the work directory and stops the nodes.
@@ -51,7 +51,6 @@ START_TIMEOUT = 180
 # How long a started node is left to dial its proxy, Tor control port or
 # added node before it is looked at
 SETTLE = 5
-CLI_TORPASSWORD = "dummy-not-a-password"
 SERVICE_ID = "abcdefghij234567"  # a well-formed v2 onion service id, no one's
 PRIVATE_KEY = "RSA1024:" + base64.b64encode(b"not a key, a stand-in's reply").decode()
 SERVER_KEY = b"Tor safe cookie authentication server-to-controller hash"
@@ -542,8 +541,6 @@ case("tor control, NULL auth, -onion=<onion socks>", TORCTL + ["onion=127.0.0.1:
      onion=True)
 case("tor control, HASHEDPASSWORD, -torpassword in divi.conf", TORCTL,
      tor=("HASHEDPASSWORD", lambda n: n.tor_password, False, lambda n: [f"torpassword={n.tor_password}"]))
-case("tor control, HASHEDPASSWORD, -torpassword on the command line", TORCTL, args=[f"-torpassword={CLI_TORPASSWORD}"],
-     tor=("HASHEDPASSWORD", CLI_TORPASSWORD, False))
 case("tor control, HASHEDPASSWORD, no -torpassword", TORCTL, tor=("HASHEDPASSWORD", None, False))
 case("tor control, SAFECOOKIE", TORCTL, tor=("COOKIE,SAFECOOKIE", None, True))
 case("tor control, COOKIE only", TORCTL, tor=("COOKIE", None, True))

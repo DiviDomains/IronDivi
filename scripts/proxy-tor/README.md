@@ -55,9 +55,9 @@ every directory deleted. Needs bash and python3 (standard library only).
   port (default: 0)"), so `-upnp=1` would send SSDP multicast to the LAN. Its rows are KNOWN, taken from the source.
   irondivid's UPnP is tested in Rust against a stubbed port mapper and an HTTP stand-in on 127.0.0.1.
 - **`-torpassword`:**
-  - the conf case's password is made at random per run and written only into that node's 0600 `divi.conf` in the
-    work directory;
-  - the command-line case uses the fixed fake `dummy-not-a-password`;
+  - the password is made at random per run and written only into that node's 0600 `divi.conf` in the work
+    directory;
+  - no case puts a password on a command line, where other users of the host could read it;
   - the stand-in logs a matching password as `<the configured password>` and anything else as
     `<something else>`, never the value.
 - RPC passwords are random per run, in the same 0600 files.
@@ -91,7 +91,7 @@ It compares:
 | defaults | defaults, `-upnp=0` |
 | `-proxy` | the stand-in; with `-listen=1`; with an added node on 127.0.0.1 (not routable: dialled direct), with and without `-proxyrandomize=0`; an added node by host name (given to the proxy unresolved) and by onion name; `localhost:<port>`, also with `-dns=0`; no port; `0`; empty; `-noproxy`; an unresolvable name; port 99999; `-proxyrandomize=0` alone |
 | `-onion` | the stand-in; with `-proxy`; `-proxy` with `-onion=0` and `-noonion`; onion added nodes with `-onion`, and with both; `-onion=0` alone; an unresolvable name; `localhost:<port> -dns=0`; with `-proxyrandomize=0` |
-| Tor control | NULL; NULL then a restart on the same datadir (the saved `onion_private_key`); NULL with `-onion`; HASHEDPASSWORD with `-torpassword` in divi.conf and on the command line, and without one; SAFECOOKIE; COOKIE only; `-listenonion=0`; `-listen=0 -listenonion=1`; a control port nothing listens on |
+| Tor control | NULL; NULL then a restart on the same datadir (the saved `onion_private_key`); NULL with `-onion`; HASHEDPASSWORD with `-torpassword` in divi.conf, and without one; SAFECOOKIE; COOKIE only; `-listenonion=0`; `-listen=0 -listenonion=1`; a control port nothing listens on |
 | `-dns` | `-addnode` and `-connect` by `localhost`, each with and without `-dns=0`; `-externalip=localhost -dns=0`; `-dns=0` alone |
 | `-upnp=1` | not started (KNOWN) |
 
