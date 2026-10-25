@@ -122,6 +122,11 @@ pub enum NetworkMessage {
 }
 
 impl NetworkMessage {
+    /// Bytes this message takes on the wire, its 24-byte header included
+    pub fn wire_size(&self) -> u64 {
+        24 + self.serialize_payload().map_or(0, |p| p.len() as u64)
+    }
+
     /// Get the command name for this message
     pub fn command(&self) -> &str {
         match self {

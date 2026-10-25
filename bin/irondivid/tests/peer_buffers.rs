@@ -230,3 +230,137 @@ fn a_flooding_peer_does_not_stop_the_node_serving_others() {
     let log = read_log(dir.path());
     assert!(!log.contains("Option -maxreceivebuffer"), "{log}");
 }
+
+/// SO_RCVBUF of `s`
+fn set_receive_buffer(s: &TcpStream, size: libc::c_int) {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+/// A connection to 127.0.0.1:`port` whose receive buffer is `size` from the
+/// start
+fn connect_with_receive_buffer(port: u16, size: libc::c_int) -> TcpStream {
+    use std::os::unix::io::FromRawFd;
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
+        let stream = TcpStream::from_raw_fd(fd);
+        set_receive_buffer(&stream, size);
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        let rc = libc::connect(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        assert_eq!(rc, 0, "connect");
+        stream
+    }
+}
+
+/// A getdata for `n` blocks, all `hash`
+fn getdata_many(hash: &[u8; 32], n: u16) -> Vec<u8> {
+    let mut v = vec![0xfd];
+    v.extend_from_slice(&n.to_le_bytes());
+    for _ in 0..n {
+        v.extend_from_slice(&2u32.to_le_bytes());
+        v.extend_from_slice(hash);
+    }
+    v
+}
+
+/// How many blocks `s` reads within `wait`, until it has `want`
+fn blocks_read(s: &mut TcpStream, want: usize, wait: Duration) -> usize {
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut s = std::io::BufReader::with_capacity(1 << 16, s);
+    let (mut blocks, deadline) = (0, Instant::now() + wait);
+    while blocks < want && Instant::now() < deadline {
+        let mut header = [0u8; 24];
+        if s.read_exact(&mut header).is_err() {
+            break;
+        }
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        if s.read_exact(&mut payload).is_err() {
+            break;
+        }
+        if &header[4..10] == b"block\0" {
+            blocks += 1;
+        }
+    }
+    blocks
+}
+
+/// A peer that asks for many blocks and does not read them is answered as
+/// its send buffer allows (-maxsendbuffer, Node.cpp:22, main.cpp:291-293):
+/// other peers are served meanwhile, and once it reads it gets every block
+#[test]
+fn a_peer_that_does_not_read_holds_up_no_other() {
+    // 200 000 bytes, and 1000: a few blocks at a time
+    for option in ["-maxsendbuffer=200", "-maxsendbuffer=1"] {
+        slow_reader(option);
+    }
+}
+
+fn slow_reader(option: &str) {
+    // The most one getdata may ask for (MAX_INV_SZ), about 15 MB of answers
+    const ASKED: u16 = 50_000;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Daemon::start(dir.path(), &[option]);
+    let hash = genesis(&node);
+
+    // A small receive buffer, set before it connects so the window stays
+    // small: the answers wait at the node
+    let mut slow = connect_with_receive_buffer(node.p2p_port, 4096);
+    // The handshake first: the node's version and verack are read
+    slow.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    slow.write_all(&frame("version", &version_payload()))
+        .unwrap();
+    loop {
+        let mut header = [0u8; 24];
+        slow.read_exact(&mut header).expect("handshake");
+        let len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        slow.read_exact(&mut payload).expect("handshake");
+        if &header[4..11] == b"verack\0" {
+            break;
+        }
+    }
+    slow.write_all(&frame("verack", &[])).unwrap();
+    slow.write_all(&frame("getdata", &getdata_many(&hash, ASKED)))
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert!(
+        block_served(&node, Duration::from_secs(10)),
+        "{option}: another peer not served"
+    );
+    // It reads again, with room to read at speed
+    set_receive_buffer(&slow, 1 << 20);
+    let got = blocks_read(&mut slow, ASKED as usize, Duration::from_secs(120));
+    assert_eq!(
+        got,
+        ASKED as usize,
+        "{option}: blocks the slow peer got; the log ends:\n{}",
+        divi_test_support::log_tail(dir.path())
+    );
+    node.stop();
+    let log = read_log(dir.path());
+    assert!(!log.contains("Option -maxsendbuffer"), "{log}");
+}

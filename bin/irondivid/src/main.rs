@@ -315,7 +315,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "masternode",
     "masternodeaddr",
     "masternodeprivkey",
-    "maxsendbuffer",
     "mining",
     "mnconf",
     "mnconflock",
@@ -634,6 +633,10 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(v) = s.get("maxreceivebuffer") {
         config.p2p.max_receive_buffer = settings::atoi(v);
     }
+    // -maxsendbuffer: thousands of bytes, read as divid's GetArg
+    if let Some(v) = s.get("maxsendbuffer") {
+        config.p2p.max_send_buffer = settings::atoi(v);
+    }
     if let Some(wif) = s.get("sporkkey") {
         // Divi Core's SetSporkKey (init.cpp:968-975): a key that is not this
         // network's spork key stops the start
@@ -739,6 +742,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "externalip",
         "onlynet",
         "maxreceivebuffer",
+        "maxsendbuffer",
         "logips",
         "logtimestamps",
         "shrinkdebugfile",

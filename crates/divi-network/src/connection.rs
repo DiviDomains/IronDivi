@@ -65,7 +65,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const PING_CHECK: Duration = Duration::from_secs(1);
 
 /// Channel buffer size for outgoing messages
-const OUTBOUND_BUFFER: usize = 100;
+/// Messages that may wait for a peer's connection; what getdata answers put
+/// there is bounded in bytes by -maxsendbuffer (crate::buffers)
+const OUTBOUND_BUFFER: usize = 10_000;
 
 /// Connection handler for a single peer
 pub struct Connection {
@@ -593,6 +595,8 @@ impl Connection {
                         info!("Disconnecting from {} (dropped by the peer manager)", crate::peer_log::peer(peer_id, info.addr));
                         break;
                     };
+                    // Counted until written, as Divi Core's nSendSize
+                    let queued = msg.wire_size();
                     // A queued ping (the `ping` RPC) gets a fresh nonce and is timed like the
                     // keep-alive, so its pong updates pingtime (C++ fPingQueued)
                     let msg = match msg {
@@ -605,7 +609,9 @@ impl Connection {
                         }
                         other => other,
                     };
-                    if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await {
+                    let written = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await;
+                    stats.send_written(queued);
+                    if let Err(e) = written {
                         error!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                         break;
                     }

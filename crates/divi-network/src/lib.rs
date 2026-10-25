@@ -98,7 +98,7 @@ pub use masternode_handler::MasternodeHandler;
 pub use peer::{LivePeerStats, PeerDirection, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerState};
 pub use peer_manager::{
     mainnet_peer_manager, regtest_peer_manager, testnet_peer_manager, AddedNode, PeerManager,
-    PeerManagerConfig,
+    PeerManagerConfig, TrySend,
 };
 pub use relay::{TxRelay, TxRelayEvent, TxRelayStats};
 pub use scoring::{BanEntry, Misbehavior, MisbehaviourOutcome, PeerScoring, PeerStats};

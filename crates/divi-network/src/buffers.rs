@@ -47,6 +47,13 @@ pub fn max_send_buffer() -> u64 {
     MAX_SEND.load(Ordering::Relaxed)
 }
 
+/// Woken when a write takes a peer's queued bytes from -maxsendbuffer or
+/// more to under it, so getdata waiting for that peer is answered at once
+pub fn send_space() -> &'static tokio::sync::Notify {
+    static SPACE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    SPACE.get_or_init(tokio::sync::Notify::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

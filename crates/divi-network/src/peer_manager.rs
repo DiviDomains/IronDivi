@@ -35,6 +35,17 @@ use tracing::{debug, error, info, warn};
 /// Reads the node's current chain height
 pub type HeightSource = Arc<dyn Fn() -> u32 + Send + Sync>;
 
+/// What `try_send_to_peer` did
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySend {
+    /// Queued
+    Sent,
+    /// The peer's queue is full: try again later
+    Full,
+    /// No such peer, or it is going
+    Gone,
+}
+
 /// Configuration for the peer manager
 #[derive(Debug, Clone)]
 pub struct PeerManagerConfig {
@@ -1117,37 +1128,32 @@ impl PeerManager {
         }
     }
 
+    /// Bytes queued for `peer_id` and not yet written; None for no such peer
+    pub fn send_queued(&self, peer_id: PeerId) -> Option<u64> {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .map(|h| h.stats.send_queued_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Queue a message for `peer_id` without waiting
+    pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> TrySend {
+        let Some(handle) = self.peers.read().get(&peer_id).cloned() else {
+            return TrySend::Gone;
+        };
+        match handle.try_send(msg) {
+            Ok(()) => TrySend::Sent,
+            Err(e) if matches!(*e, tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                TrySend::Full
+            }
+            Err(_) => TrySend::Gone,
+        }
+    }
+
     /// The node missed messages it cannot count: every peer may be read again
     pub fn clear_receive_queues(&self) {
         for handle in self.peers.read().values() {
             handle.stats.clear_queued();
-        }
-    }
-
-    /// Send a full block to a specific peer (in response to a getdata request).
-    ///
-    /// Uses async `send` with a timeout for reliable delivery.
-    pub async fn send_block_to_peer(
-        &self,
-        peer_id: PeerId,
-        msg: NetworkMessage,
-    ) -> Result<(), NetworkError> {
-        let handle = self.peers.read().get(&peer_id).cloned();
-
-        if let Some(handle) = handle {
-            match tokio::time::timeout(Duration::from_secs(10), handle.send(msg)).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => {
-                    warn!("Failed to send block to peer {}: {}", peer_id, e);
-                    Err(NetworkError::Disconnected)
-                }
-                Err(_) => {
-                    warn!("Timeout sending block to peer {}", peer_id);
-                    Err(NetworkError::Timeout)
-                }
-            }
-        } else {
-            Err(NetworkError::PeerNotFound(peer_id))
         }
     }
 

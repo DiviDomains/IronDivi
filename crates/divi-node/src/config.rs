@@ -436,6 +436,10 @@ pub struct P2pConfig {
     #[serde(default = "default_max_receive_buffer")]
     pub max_receive_buffer: i64,
 
+    /// Divi Core -maxsendbuffer, in thousands of bytes (default 1000)
+    #[serde(default = "default_max_send_buffer")]
+    pub max_send_buffer: i64,
+
     /// The machine's interface addresses, found at start with `discover`
     #[serde(default)]
     pub interface_ips: Vec<std::net::IpAddr>,
@@ -494,6 +498,10 @@ fn default_max_receive_buffer() -> i64 {
     5000
 }
 
+fn default_max_send_buffer() -> i64 {
+    1000
+}
+
 fn default_discover() -> bool {
     true
 }
@@ -533,6 +541,7 @@ impl Default for P2pConfig {
             external_ips: Vec::new(),
             only_nets: Vec::new(),
             max_receive_buffer: default_max_receive_buffer(),
+            max_send_buffer: default_max_send_buffer(),
             interface_ips: Vec::new(),
             whitelist: Vec::new(),
             white_bind: Vec::new(),

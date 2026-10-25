@@ -235,6 +235,8 @@ pub struct LivePeerStats {
     pub recv_queued_msgs: AtomicU64,
     /// Woken when the node takes one of this peer's messages
     pub recv_space: tokio::sync::Notify,
+    /// Bytes queued for the peer and not yet written (Divi Core nSendSize)
+    pub send_queued_bytes: AtomicU64,
 }
 
 impl LivePeerStats {
@@ -268,6 +270,24 @@ impl LivePeerStats {
         sub(&self.recv_queued_bytes, bytes);
         sub(&self.recv_queued_msgs, 1);
         self.recv_space.notify_one();
+    }
+
+    /// A queued message of `bytes` was written (or will not be)
+    pub fn send_written(&self, bytes: u64) {
+        let mut v = self.send_queued_bytes.load(Ordering::Relaxed);
+        while let Err(now) = self.send_queued_bytes.compare_exchange_weak(
+            v,
+            v.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            v = now;
+        }
+        // Room again: getdata waiting for this peer can be answered
+        let max = crate::buffers::max_send_buffer();
+        if v >= max && v.saturating_sub(bytes) < max {
+            crate::buffers::send_space().notify_one();
+        }
     }
 
     /// Forget what is waiting (the node missed messages it cannot count)
@@ -345,7 +365,15 @@ impl PeerHandle {
         &self,
         msg: NetworkMessage,
     ) -> Result<(), mpsc::error::SendError<NetworkMessage>> {
-        self.tx.send(msg).await
+        let size = msg.wire_size();
+        self.stats
+            .send_queued_bytes
+            .fetch_add(size, Ordering::Relaxed);
+        let sent = self.tx.send(msg).await;
+        if sent.is_err() {
+            self.stats.send_written(size);
+        }
+        sent
     }
 
     /// Try to send a message without blocking
@@ -353,7 +381,14 @@ impl PeerHandle {
         &self,
         msg: NetworkMessage,
     ) -> Result<(), Box<mpsc::error::TrySendError<NetworkMessage>>> {
-        self.tx.try_send(msg).map_err(Box::new)
+        let size = msg.wire_size();
+        self.stats
+            .send_queued_bytes
+            .fetch_add(size, Ordering::Relaxed);
+        self.tx.try_send(msg).map_err(|e| {
+            self.stats.send_written(size);
+            Box::new(e)
+        })
     }
 }
 
