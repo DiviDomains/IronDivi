@@ -55,7 +55,7 @@ Core paths are under `divi/src/` of the Divi Core source at v3.0.0.
 |---|---|
 | blocks until the limit | the miner mines 20 blocks at a time until the follower stops, or stops taking blocks. A write fails and divid aborts: `*** System error: CAutoFile::write : write failed` or `*** System error while flushing: Database I/O error` and `Error: A fatal internal error occured, see debug.log for details` (AbortNode, `ValidationState.cpp:17-27`; `ChainExtensionService.cpp:513-518`, `FlushChainState.cpp:37-58`), and shuts down. So `getblockcount` and a `sendtoaddress` at the limit find no node |
 | ... and a start without the limit | divid's own state is left damaged (KNOWN below); with `-reindex` it comes back at the best block it had written, the miner's block at that height, with its coin and wallet |
-| start with the limit reached | the limit is half the largest file's bytes in use, then the miner mines 5 blocks: the first write past the limit stops divid within seconds; the start without the limit finds the same as above |
+| start with the limit reached | the limit is half the largest file's bytes in use. The node starts alone (it comes up), is then told to connect to the miner (`addnode … onetry`, the miner is far ahead by now) and the miner mines 5 more: the first block write past the limit stops divid within seconds; the start without the limit finds the same as above |
 
 ## Not covered here
 

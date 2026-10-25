@@ -455,14 +455,15 @@ def start_at_limit(n):
     limit = max(1, largest // 1024 // 2)
     note(f"{n.name}: start with limit {limit} KB, under half of {path} ({largest} bytes)")
     facts = {}
-    out = n.start(PEER, limit_kb=limit)
+    # Alone at first, so the start itself is seen; then the miner's blocks
+    out = n.start(ALONE, limit_kb=limit)
     facts["start under the limit"] = out[0] if out[0] != "exit" else "exit"
     if out == ("up",):
-        # Blocks to write
+        n.call("addnode", f"{HOST}:{PORT_BASE}", "onetry")
         with mine_lock:
             mine(M, 5)
-        n.wait_exit(20)
-        facts["running 20 s after 5 more blocks"] = n.alive()
+        n.wait_exit(60)
+        facts["running 60 s after it is sent blocks"] = n.alive()
     facts["what it printed"] = error_lines(n.output())
     facts["printed a line naming the failed write"] = any(
         NAMES_WRITE.search(ln) for ln in error_lines(n.output(), 50))
@@ -475,7 +476,7 @@ def start_at_limit(n):
 
 core, iron = on_both(start_at_limit)
 rows("start with the limit reached", core, iron, [
-    "start under the limit", "running 20 s after 5 more blocks", "printed a line naming the failed write",
+    "start under the limit", "running 60 s after it is sent blocks", "printed a line naming the failed write",
     "restart without the limit",
     "best block after restart is the miner's block at that height", "balance after restart"])
 
