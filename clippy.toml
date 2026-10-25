@@ -1,0 +1,7 @@
+# serde_json keeps an object's members in insertion order (preserve_order), as
+# Divi Core's json_spirit does; Map::remove is then swap_remove, which moves the
+# last member into the removed one's place
+disallowed-methods = [
+    { path = "serde_json::map::Map::remove", reason = "moves the last member into its place; shift_remove keeps the order" },
+    { path = "serde_json::map::Map::remove_entry", reason = "moves the last member into its place; shift_remove_entry keeps the order" },
+]

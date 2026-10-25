@@ -42,8 +42,6 @@ DEAD_PORT = PORT_BASE + 4
 # Differences irondivid has on purpose, one per row name, each listed in
 # README.md with divid's source line. A KNOWN row that starts to match divid is a
 # FAIL, so the list stays true.
-ORDER = ("irondivid writes the members of every reply object in name order (serde_json without "
-         "preserve_order, all replies); the other rows compare members as sets, as the other reply scripts do")
 STAKING_BALANCE = ("divid's lockedCoinBalance takes off the credit of the whole transaction once for each locked "
                    "output of it (wallet.cpp:2236-2252), so staking_balance falls below the coins left, even below "
                    "0, and HasAgedCoins (wallet.cpp:1468) and enoughcoins (rpcmisc.cpp:1066) follow it; irondivid "
@@ -52,9 +50,6 @@ LOADWALLET = ("irondivid keeps the wallet it started with (it is wired into the 
               "callbacks and the staker at start) and refuses another; divid switches (init.cpp:260-279), "
               "creating a new empty wallet for a name with no file and opening a file outside its datadir")
 KNOWN = {
-    "member order: listunspent item": ORDER,
-    "member order: gettxoutsetinfo": ORDER,
-    "member order: getcoinavailability": ORDER,
     "one wallet coin locked: getstakingstatus": STAKING_BALANCE,
     "every coin locked: getstakingstatus": STAKING_BALANCE,
     "one coin free: getstakingstatus": STAKING_BALANCE,

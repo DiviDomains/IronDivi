@@ -9,7 +9,7 @@
 //! Moving from divid, the cases `move_from_core.rs` does not start
 //! irondivid for: Core's testnet3 folder, a plain file or a Core folder given
 //! as the wallet, a wallet made from `-hdseed`, the masternode.conf lock with
-//! `-mnconflock=0` and lines it cannot use, the default data folder beside
+//! and without `-mnconflock=0` and a line it cannot parse, the default data folder beside
 //! Core's, and the bulk wallet dump neither program has.
 
 #![cfg(unix)]
@@ -289,43 +289,57 @@ fn hdseed_option_makes_cores_wallet() {
     );
 }
 
-/// The masternode.conf collateral lock is always on: `-mnconflock=0` is
-/// named as not supported and the entry is still locked. A line with too
-/// few fields is skipped, a collateral that is not a txid is named in the
-/// log, and irondivid starts with the entries it can use.
+/// The masternode.conf collateral lock follows `-mnconflock` as in divid:
+/// on by default, with a collateral that is not a txid named in the log,
+/// and off with `-mnconflock=0`. A line with too few fields stops the start
+/// with divid's text (masternodeconfig.cpp:66-88, MasternodeModule.cpp:454-466)
 #[test]
-fn masternode_conf_lock_is_always_on_and_unusable_lines_are_skipped() {
-    let dir = tempfile::tempdir().unwrap();
-    let datadir = dir.path();
+fn masternode_conf_lock_follows_mnconflock_and_a_short_line_stops_the_start() {
     let txid = "52e93b7c00000000000000000000000000000000000000000000000000009434";
+    // Test-only fixture: the example key of divid's masternode.conf header
+    let key = "93HaYBVUCYjEMeeH1Y4sBGLALQZE1Yc1K64xiqgX37tGBDQL8Xg";
+    let conf = format!(
+        "# Masternode config file\n\
+         mn1 127.0.0.1:51476 {key} {txid} 1\n\
+         mn2 127.0.0.2:51476 {key} not-a-txid 0\n"
+    );
+    for (flag, locked) in [
+        (None, json!([{"txid": txid, "vout": 1}])),
+        (Some("-mnconflock=0"), json!([])),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path();
+        std::fs::write(datadir.join("masternode.conf"), &conf).unwrap();
+        let daemon = Daemon::start(datadir, |rpc_port| {
+            let mut cmd = irondivid(Some(datadir), "--regtest", rpc_port);
+            cmd.args(flag);
+            cmd
+        });
+        assert_eq!(daemon.rpc("listlockunspent", json!([])), locked, "{flag:?}");
+        daemon.stop();
+        let log = debug_log(datadir);
+        assert!(!log.contains("-mnconflock is not supported"), "{log}");
+        assert_eq!(
+            log.contains("masternode.conf entry mn2: collateral not-a-txid 0"),
+            flag.is_none(),
+            "{log}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        datadir.join("masternode.conf"),
-        format!(
-            "# Masternode config file\n\
-             mn1 127.0.0.1:51476 93HaYBVUCYjEMeeH1Y4sBGLALQZE1Yc1K64xiqgX37tGBDQL8Xg {txid} 1\n\
-             short line\n\
-             mn2 127.0.0.2:51476 93HaYBVUCYjEMeeH1Y4sBGLALQZE1Yc1K64xiqgX37tGBDQL8Xg not-a-txid 0\n"
-        ),
+        dir.path().join("masternode.conf"),
+        format!("{conf}short line\n"),
     )
     .unwrap();
-    let daemon = Daemon::start(datadir, |rpc_port| {
-        let mut cmd = irondivid(Some(datadir), "--regtest", rpc_port);
-        cmd.arg("-mnconflock=0");
-        cmd
-    });
-    assert_eq!(
-        daemon.rpc("listlockunspent", json!([])),
-        json!([{"txid": txid, "vout": 1}])
-    );
-    daemon.stop();
-    let log = debug_log(datadir);
+    let out = run_to_exit(irondivid(Some(dir.path()), "--regtest", free_port()), 60)
+        .expect("irondivid did not stop at the short line");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        log.contains("Option -mnconflock is not supported by irondivid; ignored"),
-        "{log}"
-    );
-    assert!(
-        log.contains("masternode.conf entry mn2: collateral not-a-txid 0"),
-        "{log}"
+        stderr.contains(
+            "Error reading masternode configuration file: Could not parse masternode.conf\nLine: 4\n\"short line\""
+        ),
+        "{stderr}"
     );
 }
 
