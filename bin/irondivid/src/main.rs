@@ -1785,6 +1785,7 @@ async fn run_daemon(
         username: Some(rpc_user),
         password: Some(rpc_password),
         access: config.rpc.access(),
+        max_request_size: config.rpc.max_request_size,
     };
     // Fail at startup, not on the first request, on a bad rpcauth/rpcwhitelist/
     // rpcallowip entry or a non-loopback bind without rpcallowip.

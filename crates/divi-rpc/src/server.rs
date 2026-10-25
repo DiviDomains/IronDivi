@@ -28,7 +28,7 @@ use divi_wallet::WalletDb;
 
 use crate::access::{AccessConfig, Denial, MethodGrant, RpcAccess};
 use axum::{
-    extract::{ConnectInfo, Path, Request as HttpRequest, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request as HttpRequest, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -38,6 +38,7 @@ use axum::{
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -52,7 +53,21 @@ pub struct RpcConfig {
     pub password: Option<String>,
     /// Peer, host, origin, rpcauth and whitelist settings
     pub access: AccessConfig,
+    /// Largest request body accepted, in bytes; a bigger one gets HTTP 413
+    pub max_request_size: usize,
 }
+
+/// Default for [`RpcConfig::max_request_size`]: room for submitblock with a
+/// full 2 MB block in hex
+pub const DEFAULT_MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
+/// Most calls one batch may hold; a bigger batch is refused whole
+pub const MAX_BATCH_CALLS: usize = 100;
+
+/// Most requests run at once. Handlers block (RocksDB, signing, scans), so
+/// they run on the blocking pool, and a flood of requests waits here instead
+/// of starving the runtime that drives P2P, staking and masternode pings.
+const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 impl Default for RpcConfig {
     fn default() -> Self {
@@ -61,6 +76,7 @@ impl Default for RpcConfig {
             username: None,
             password: None,
             access: AccessConfig::default(),
+            max_request_size: DEFAULT_MAX_REQUEST_SIZE,
         }
     }
 }
@@ -696,14 +712,14 @@ impl RpcServer {
                 "setstakesplitthreshold" => "setstakesplitthreshold value\n\nSet the stake split threshold in whole DIVI for this run: a stake whose value plus reward exceeds it is paid back as two outputs; smaller coins of the same address are combined up to half of it.",
                 // Lite wallet (external address queries)
                 "getaddressbalance" => "getaddressbalance \"address\" ( minconf )\n\nReturns the balance for an external address.\nDoes not require a local wallet.",
-                "getaddressutxos" => "getaddressutxos \"address\" ( minconf maxconf )\n\nReturns UTXOs for an external address.\nDoes not require a local wallet.",
+                "getaddressutxos" => "getaddressutxos \"address\" ( minconf maxconf skip limit )\n\nReturns UTXOs for an external address, at most limit (default and most 1000) after skipping skip of them.\nDoes not require a local wallet.",
                 "getaddresshistory" => "getaddresshistory \"address\" ( skip limit )\n\nReturns transaction history for an external address.\nDoes not require a local wallet.",
                 "gettxindex" => "gettxindex \"txid\"\n\nReturns block location info for a transaction.",
                 "estimatefee" => "estimatefee ( nblocks )\n\nEstimates the fee per kilobyte needed for confirmation in nblocks.",
                 "estimatepriority" => "estimatepriority nblocks\n\nDeprecated. Always returns -1.",
                 "estimatesmartfee" => "estimatesmartfee ( nblocks )\n\nEstimates the smart fee per kilobyte needed for confirmation.",
                 "getmempoolinfo" => "getmempoolinfo\n\nReturns details on the active state of the mempool.",
-                "validateaddresses" => "validateaddresses [\"address\",...]\n\nValidates multiple addresses at once.",
+                "validateaddresses" => "validateaddresses [\"address\",...]\n\nValidates up to 1000 addresses at once.",
                 "getlitewalletinfo" => "getlitewalletinfo\n\nReturns info about lite wallet service availability.",
                 // Masternode
                 "getmasternodecount" => "getmasternodecount\n\nGet masternode count values\n\nResult:\n{\n  \"total\": n,        (numeric) Total masternodes\n  \"stable\": n,       (numeric) Stable count\n  \"obfcompat\": n,    (numeric) Obfuscation Compatible\n  \"enabled\": n,      (numeric) Enabled masternodes\n  \"inqueue\": n       (numeric) Masternodes in queue\n}\n\nExamples:\n> divi-cli getmasternodecount \n> curl --user myusername --data-binary '{\"jsonrpc\": \"1.0\", \"id\":\"curltest\", \"method\": \"getmasternodecount\", \"params\": [] }' -H 'content-type: text/plain;' http://127.0.0.1:51473/",
@@ -968,6 +984,21 @@ fn process_body(server: &RpcServer, grant: &MethodGrant, body: &str) -> axum::re
         }
         Err(e) => {
             if let Ok(requests) = serde_json::from_str::<Vec<Request>>(body) {
+                if requests.len() > MAX_BATCH_CALLS {
+                    warn!(
+                        "RPC batch of {} calls refused (limit {MAX_BATCH_CALLS})",
+                        requests.len()
+                    );
+                    return json_response(
+                        serde_json::to_string(&Response::error_only(RpcError::invalid_request(
+                            format!(
+                                "Batch of {} calls is over the limit of {MAX_BATCH_CALLS}",
+                                requests.len()
+                            ),
+                        )))
+                        .unwrap_or_default(),
+                    );
+                }
                 if let Some(denied) = requests.iter().find(|r| !grant.allows(&r.method)) {
                     return forbidden(&denied.method);
                 }
@@ -997,13 +1028,33 @@ fn process_body(server: &RpcServer, grant: &MethodGrant, body: &str) -> axum::re
     }
 }
 
+/// Run [`process_body`] on the blocking pool once one of the
+/// [`MAX_CONCURRENT_REQUESTS`] slots is free.
+async fn process_body_blocking(
+    server: Arc<RpcServer>,
+    slots: Arc<Semaphore>,
+    grant: MethodGrant,
+    body: String,
+) -> axum::response::Response {
+    let Ok(_slot) = slots.acquire_owned().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    tokio::task::spawn_blocking(move || process_body(&server, &grant, &body))
+        .await
+        .unwrap_or_else(|e| {
+            error!("RPC handler failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })
+}
+
 /// HTTP handler for JSON-RPC requests
 async fn handle_rpc(
     State(server): State<Arc<RpcServer>>,
+    Extension(slots): Extension<Arc<Semaphore>>,
     Extension(grant): Extension<MethodGrant>,
     body: String,
 ) -> axum::response::Response {
-    process_body(&server, &grant, &body)
+    process_body_blocking(server, slots, grant, body).await
 }
 
 /// HTTP handler for wallet-specific JSON-RPC requests. The wallet name is not
@@ -1012,10 +1063,11 @@ async fn handle_rpc(
 async fn handle_wallet_rpc(
     State(server): State<Arc<RpcServer>>,
     Path(_wallet_name): Path<String>,
+    Extension(slots): Extension<Arc<Semaphore>>,
     Extension(grant): Extension<MethodGrant>,
     body: String,
 ) -> axum::response::Response {
-    process_body(&server, &grant, &body)
+    process_body_blocking(server, slots, grant, body).await
 }
 
 /// Build the access-control state for `config`. A malformed `rpcauth`,
@@ -1047,10 +1099,10 @@ pub fn create_router_with_auth(server: Arc<RpcServer>, config: &RpcConfig) -> Ro
     if !access.has_credentials() {
         error!("RPC has no credentials: every request will be refused");
     }
-    build_router(server, Arc::new(access))
+    build_router(server, Arc::new(access), config.max_request_size)
 }
 
-fn build_router(server: Arc<RpcServer>, access: Arc<RpcAccess>) -> Router {
+fn build_router(server: Arc<RpcServer>, access: Arc<RpcAccess>, max_request_size: usize) -> Router {
     let origins: Vec<HeaderValue> = access
         .allowed_origins()
         .iter()
@@ -1060,6 +1112,8 @@ fn build_router(server: Arc<RpcServer>, access: Arc<RpcAccess>) -> Router {
     let router = Router::new()
         .route("/", post(handle_rpc))
         .route("/wallet/:wallet_name", post(handle_wallet_rpc))
+        .layer(Extension(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
+        .layer(DefaultBodyLimit::max(max_request_size))
         .with_state(server);
 
     let router = router.layer(middleware::from_fn(
@@ -1125,7 +1179,7 @@ async fn serve(config: &RpcConfig, server: Arc<RpcServer>) -> Result<(), Error> 
     access
         .check_bind(config.bind_address)
         .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let app = build_router(server, Arc::new(access));
+    let app = build_router(server, Arc::new(access), config.max_request_size);
 
     info!("Starting RPC server on {}", config.bind_address);
 
@@ -1892,5 +1946,58 @@ mod tests {
         config.bind_address = "0.0.0.0:0".parse().unwrap();
         let err = serve(&config, server).await.unwrap_err();
         assert!(err.to_string().contains("rpcallowip"), "{err}");
+    }
+
+    /// The JSON body of a raw HTTP response
+    fn body_json(response: &str) -> serde_json::Value {
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body:?}"))
+    }
+
+    #[tokio::test]
+    async fn node13_batch_over_the_limit_is_refused() {
+        let (server, _dir) = create_test_server();
+        let router = create_router_with_auth(server, &alice_config(AccessConfig::default()));
+        let auth = format!("Authorization: {}\r\n", basic("alice", "s3cret"));
+
+        let batch = format!("[{}]", vec![GETBLOCKCOUNT; MAX_BATCH_CALLS].join(","));
+        let (status, response) = exchange(router.clone(), "POST", None, &auth, &batch).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body_json(&response).as_array().unwrap().len(),
+            MAX_BATCH_CALLS
+        );
+
+        let batch = format!("[{}]", vec![GETBLOCKCOUNT; MAX_BATCH_CALLS + 1].join(","));
+        let (status, response) = exchange(router, "POST", None, &auth, &batch).await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body_json(&response);
+        assert!(
+            reply.is_object(),
+            "one error, not a batch of results: {reply}"
+        );
+        assert_eq!(reply["error"]["code"], -32600, "{reply}");
+    }
+
+    #[tokio::test]
+    async fn node13_body_over_max_request_size_gets_413() {
+        let (server, _dir) = create_test_server();
+        let mut config = alice_config(AccessConfig::default());
+        config.max_request_size = 1024;
+        let router = create_router_with_auth(server, &config);
+        let auth = format!("Authorization: {}\r\n", basic("alice", "s3cret"));
+
+        let (status, _) = exchange(router.clone(), "POST", None, &auth, GETBLOCKCOUNT).await;
+        assert_eq!(status, StatusCode::OK);
+        let padding = " ".repeat(2000);
+        let big = format!("{GETBLOCKCOUNT}{padding}");
+        let (status, _) = exchange(router, "POST", None, &auth, &big).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn node13_default_body_limit_holds_a_full_block() {
+        // submitblock sends a 2 MB block as 4 MB of hex
+        assert!(RpcConfig::default().max_request_size >= 4 * 1024 * 1024 + 1024);
     }
 }

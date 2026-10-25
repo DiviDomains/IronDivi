@@ -23,6 +23,10 @@ use divi_primitives::script::Script;
 use divi_storage::{AddressIndex, Chain, NetworkType};
 use std::sync::Arc;
 
+/// Most entries one getaddressutxos or getaddresshistory call returns, and
+/// most addresses one validateaddresses call takes
+pub const MAX_PAGE: usize = 1000;
+
 /// Lite wallet RPC handler
 pub struct LiteWalletRpc {
     /// Chain reference for height queries
@@ -151,8 +155,8 @@ impl LiteWalletRpc {
         }))
     }
 
-    /// Get UTXOs for an external address
-    /// getaddressutxos "address" ( minconf maxconf )
+    /// Get UTXOs for an external address, a page at a time
+    /// getaddressutxos "address" ( minconf maxconf skip limit )
     pub fn get_address_utxos(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let index = self
             .address_index
@@ -165,6 +169,10 @@ impl LiteWalletRpc {
 
         let min_conf = params.get_u64(1).unwrap_or(1) as u32;
         let max_conf = params.get_u64(2).unwrap_or(9999999) as u32;
+        let skip = params.get_u64(3).unwrap_or(0) as usize;
+        let limit = params
+            .get_u64(4)
+            .map_or(MAX_PAGE, |l| (l as usize).min(MAX_PAGE));
         let height = self.get_height();
 
         let script = self.parse_address(addr_str)?;
@@ -195,6 +203,8 @@ impl LiteWalletRpc {
                     None
                 }
             })
+            .skip(skip)
+            .take(limit)
             .collect();
 
         Ok(serde_json::json!(result))
@@ -214,7 +224,7 @@ impl LiteWalletRpc {
 
         let skip = params.get_u64(1).unwrap_or(0) as usize;
         let limit = params.get_u64(2).unwrap_or(100) as usize;
-        let limit = std::cmp::min(limit, 1000); // Cap at 1000
+        let limit = std::cmp::min(limit, MAX_PAGE);
 
         let script = self.parse_address(addr_str)?;
         let history = index
@@ -339,6 +349,13 @@ impl LiteWalletRpc {
             .get(0)
             .and_then(|v| v.as_array())
             .ok_or_else(|| RpcError::invalid_params("Array of addresses required"))?;
+        if addresses.len() > MAX_PAGE {
+            return Err(RpcError::invalid_params(format!(
+                "At most {MAX_PAGE} addresses at once, got {}",
+                addresses.len()
+            ))
+            .into());
+        }
 
         let results: Vec<serde_json::Value> = addresses
             .iter()
@@ -422,5 +439,17 @@ mod tests {
         let result = rpc.get_lite_wallet_info(&Params::None).unwrap();
         assert!(!result["enabled"].as_bool().unwrap());
         assert!(result["services"].as_array().is_some());
+    }
+
+    #[test]
+    fn node13_validateaddresses_caps_its_array() {
+        let rpc = LiteWalletRpc::new();
+        let addresses = |n| Params::Array(vec![serde_json::json!(vec!["x"; n])]);
+        let result = rpc.validate_addresses(&addresses(MAX_PAGE)).unwrap();
+        assert_eq!(result.as_array().map(Vec::len), Some(MAX_PAGE));
+        let err = rpc
+            .validate_addresses(&addresses(MAX_PAGE + 1))
+            .unwrap_err();
+        assert!(err.to_string().contains("At most 1000"), "{err}");
     }
 }
