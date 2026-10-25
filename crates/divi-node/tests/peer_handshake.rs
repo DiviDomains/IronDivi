@@ -10,6 +10,8 @@
 mod common;
 use common::raw_peer::*;
 use divi_network::PeerEvent;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn message_before_version_scores_one() {
@@ -88,4 +90,96 @@ async fn connection_to_self_is_dropped() {
         }
     };
     assert_eq!(watch.await, 0, "the node completed a handshake with itself");
+}
+
+/// The live stats getpeerinfo reads for the peer from `ip`, once it is listed
+async fn peer_stats(t: &TestNode, ip: std::net::IpAddr) -> Arc<divi_network::LivePeerStats> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let found = t
+            .node
+            .peer_manager()
+            .get_peer_details()
+            .into_iter()
+            .find(|(_, addr, _, _, _)| addr.ip() == ip);
+        if let Some((_, _, _, stats, _)) = found {
+            return stats;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "peer listed");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Divi Core handles a message once the peer's version is in, before its
+/// verack (main.cpp:484-514 checks only for the version): a ping between the
+/// two is answered
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ping_between_version_and_verack_is_answered() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    assert!(p.expect("verack", WAIT).await.is_some(), "node verack");
+
+    let nonce = 0x1122_3344_5566_7788u64.to_le_bytes();
+    p.send("ping", &nonce).await;
+    assert_eq!(p.expect("pong", WAIT).await, Some(nonce.to_vec()));
+}
+
+/// The other messages between version and verack are handled too, once the
+/// verack is in: an inventory list over 50,000 items costs 20 (main.cpp:563-566)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_between_version_and_verack_is_handled_after_it() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    assert!(p.expect("verack", WAIT).await.is_some(), "node verack");
+
+    p.send("inv", &inv_payload(1, 50_001)).await;
+    p.send("verack", &[]).await;
+    assert_eq!(t.wait_score(p.ip, 20).await, Some(20));
+    assert!(p.alive().await);
+}
+
+/// getpeerinfo shows a peer's version, sub-version and start height as soon
+/// as its version is read, before its verack (main.cpp:372-391 keeps them as
+/// it reads them)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getpeerinfo_shows_the_version_before_the_verack() {
+    let t = TestNode::start().await;
+    let mut p = RawPeer::connect(&t, "127.0.0.2").await;
+    p.send(
+        "version",
+        &version_payload(PROTOCOL_VERSION, rand_nonce(), b"/raw:1/"),
+    )
+    .await;
+    assert!(p.expect("verack", WAIT).await.is_some(), "node verack");
+
+    let stats = peer_stats(&t, p.ip).await;
+    assert_eq!(
+        stats.version.load(Ordering::Relaxed),
+        PROTOCOL_VERSION as u64
+    );
+    assert_eq!(*stats.subver.lock(), "/raw:1/");
+    assert_eq!(stats.start_height.load(Ordering::Relaxed), 0);
+}
+
+/// A peer that has sent no version yet shows start height -1, Divi Core's
+/// nStartingHeight before a version names one (Node.cpp:561)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startingheight_is_minus_one_before_any_version() {
+    let t = TestNode::start().await;
+    let p = RawPeer::connect(&t, "127.0.0.2").await;
+
+    let stats = peer_stats(&t, p.ip).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(stats.version.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.start_height.load(Ordering::Relaxed), -1);
 }
