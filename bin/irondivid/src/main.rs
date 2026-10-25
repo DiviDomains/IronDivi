@@ -328,9 +328,12 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "sysperms",
     "torcontrol",
     "torpassword",
-    "txconfirmtarget",
     "upnp",
 ];
+
+/// Options divid takes and does nothing with, only naming them in its help:
+/// accepted without a word, as divid does (LicenseAndInfo.cpp:143)
+const UNUSED_BY_DIVID: &[&str] = &["txconfirmtarget"];
 
 /// Options read elsewhere (before the node config is built, or by a command)
 const READ_ELSEWHERE: &[&str] = &[
@@ -770,7 +773,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     keys.sort();
     for key in keys {
         let k = key.as_str();
-        if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) {
+        if APPLIED.contains(&k) || READ_ELSEWHERE.contains(&k) || UNUSED_BY_DIVID.contains(&k) {
             continue;
         }
         if UNSUPPORTED_OPTIONS.contains(&k) {
