@@ -41,37 +41,28 @@ RPC_TIMEOUT = 60
 START_TIMEOUT = 120
 
 # Differences listed in README.md with divid's source line. A KNOWN row that
-# starts to match divid is a FAIL, so the list stays true. "open:" rows are gaps
-# not closed yet.
+# starts to match divid is a FAIL, so the list stays true.
 KNOWN = {
     "*getcoinavailability: fields divid lacks":
         "total_vaults and vaults, kept as extra fields (divid getcoinavailability, rpcwallet.cpp:818-987, has Vaulted, Stakable, Spendable)",
     "removevault with tx_hash: reply":
         "by design: irondivid still takes a second argument for older IronDivi callers (its help says so); divid takes exactly one (rpcwallet.cpp:1194-1201)",
     "after removevault: manager listtransactions * 100 0 true":
-        "open: divid's removevault drops the vault script from memory only (wallet.cpp:707-716) and keeps the wallet's transactions, so the manager still lists them; irondivid removes the vault and its records",
+        "by design: divid keeps each transaction's credit and debit in CachedTransactionDeltasCalculator "
+        "(CachedTransactionDeltasCalculator.cpp:108-118), filled before removevault and not cleared by it "
+        "(wallet.cpp:707-716), so the manager still lists the removed vault's transactions, with their amounts, "
+        "until its next start; irondivid works the entries out from the wallet as it is. The next start gives "
+        "the same on both (the vault is registered again), as the after restart rows show",
     "after removevault: manager gettransaction of * fundvault owner:manager":
-        "open: the same",
+        "by design: the same cached credit and debit",
     "after removevault: manager gettransaction of * debitvaultbyname":
-        "open: the same",
+        "by design: the same",
     "after removevault: manager gettransaction of * debitvaultbyname receiver_pays":
-        "open: the same",
+        "by design: the same",
     "after removevault: manager gettransaction of * reclaimvaultfunds":
-        "open: the same",
+        "by design: the same",
     "after removevault: manager gettransaction of * reclaimvaultfunds metadata":
-        "open: the same",
-    "after restart: manager listtransactions * 100 0 true":
-        "open: the same; divid also reads the vault script back from its wallet file at the restart, so the vault is managed again (wallet.cpp:707-716 erases mapScripts only)",
-    "after restart: manager gettransaction of * fundvault owner:manager":
-        "open: the same",
-    "after restart: manager gettransaction of * debitvaultbyname":
-        "open: the same",
-    "after restart: manager gettransaction of * debitvaultbyname receiver_pays":
-        "open: the same",
-    "after restart: manager gettransaction of * reclaimvaultfunds":
-        "open: the same",
-    "after restart: manager gettransaction of * reclaimvaultfunds metadata":
-        "open: the same",
+        "by design: the same",
 }
 
 # Fields irondivid adds to a reply on purpose: compared without them, and named
