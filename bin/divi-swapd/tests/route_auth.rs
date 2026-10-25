@@ -43,6 +43,17 @@ struct Served {
 
 /// A daemon over a fresh world with the given operator credential and tokenless policy.
 async fn serve_with(w: &World, operator: Option<&str>, tokenless: bool) -> Served {
+    serve_opts(w, operator, tokenless, false).await
+}
+
+/// [`serve_with`], and `trust_proxy_headers` (a test picks its address with
+/// `X-Forwarded-For`).
+async fn serve_opts(
+    w: &World,
+    operator: Option<&str>,
+    tokenless: bool,
+    trust_proxy_headers: bool,
+) -> Served {
     let state = AppState {
         maker: w.maker(Store::in_memory().unwrap()),
         divi: Arc::new(w.maker_divi.clone()),
@@ -52,7 +63,7 @@ async fn serve_with(w: &World, operator: Option<&str>, tokenless: bool) -> Serve
     let auth = HashlockAuth::new(Store::in_memory().unwrap())
         .with_operator_token(operator.map(str::to_string))
         .allow_tokenless(tokenless);
-    let app = router_with_auth(state, None, "/swap", false, auth);
+    let app = router_with_auth(state, None, "/swap", trust_proxy_headers, auth);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/swap", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move {
@@ -297,6 +308,57 @@ async fn legacy_swap_stays_readable_and_lockable_by_id_but_never_listed() {
         404
     );
     assert_eq!(call("GET", &format!("{}/swaps", s.base), None).await.0, 404);
+    s.handle.abort();
+}
+
+/// A legacy (tokenless) swap is throttled per (swap, address), not per swap: a second address
+/// spending the read and lock limits on a legacy id leaves the first address's budget on that
+/// id whole. Fails on 4310796 (one bucket per swap: the first address gets 429).
+#[tokio::test]
+async fn a_second_address_cannot_spend_a_legacy_swaps_budget() {
+    let w = World::new();
+    let s = serve_opts(&w, Some("op"), true, true).await;
+    let (code, v) = take(&w, &s.base, false).await;
+    assert_eq!(code, 201, "tokenless allowed by config: {v}");
+    let url = format!("{}/swaps/{}", s.base, v["id"].as_str().unwrap());
+    let lock = format!("{url}/lock");
+    let c = reqwest::Client::new();
+    let send = |get: bool, ip: &str| {
+        let req = if get {
+            c.get(&url)
+        } else {
+            c.post(&lock).json(&json!({}))
+        };
+        let r = req.header("x-forwarded-for", ip).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    let (first, second) = ("198.51.100.1", "198.51.100.2");
+    for i in 0..READ_LIMIT_PER_WINDOW {
+        assert_eq!(send(true, second).await, 200, "read {i}");
+    }
+    assert_eq!(
+        send(true, second).await,
+        429,
+        "the second address's next read"
+    );
+    for i in 0..WRITE_LIMIT_PER_WINDOW {
+        assert_ne!(send(false, second).await, 429, "lock {i}");
+    }
+    assert_eq!(
+        send(false, second).await,
+        429,
+        "the second address's next lock"
+    );
+    assert_eq!(
+        send(true, first).await,
+        200,
+        "the first address still reads"
+    );
+    assert_ne!(
+        send(false, first).await,
+        429,
+        "the first address still locks"
+    );
     s.handle.abort();
 }
 

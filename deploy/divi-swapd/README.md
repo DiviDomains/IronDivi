@@ -67,17 +67,18 @@ The quote and XMR setup routes are limited to 20 requests a minute per client ad
 (`POST /swaps`) to 20 a minute in its own bucket; and `GET /swaps` to 300 a minute in a third,
 so a taker's status polling cannot use up its accept/lock budget. `/healthz` and `GET /offers`
 share a public bucket of 600 a minute.
-On the token-gated `:id` routes a request the gate lets through (the swap's right token, or any
-request for a legacy swap without one) counts in that swap's own bucket, so clients sharing an
-address cannot use up each other's: 20 a minute for `POST /swaps/:id/lock`, 300 for
-`GET /swaps/:id`, 300 across the XMR routes (`GET /xmr/swaps/:id`, `/j`, `/sigs`, `/xmr-lock`).
-Any other request (no, wrong or another swap's token, or an unknown id) counts in the address's
-bucket for that route (the accept bucket for a lock, the `GET /swaps` bucket for a hashlock read,
-300 for the XMR routes) and as one of its 20 token misses a minute (one count for the two
-hashlock routes, another for the XMR ones): past either, every such request from the address is
-a 429 until the window ends, while the right token still passes. The miss limit comes first, so
-on the XMR routes the per-address 300 never refuses on its own. A wrong token for a real swap id
-never touches that swap's bucket. Once an
+On the token-gated `:id` routes a request with the swap's right token counts in that swap's own
+bucket, so clients sharing an address cannot use up each other's: 20 a minute for
+`POST /swaps/:id/lock`, 300 for `GET /swaps/:id`, 300 across the XMR routes
+(`GET /xmr/swaps/:id`, `/j`, `/sigs`, `/xmr-lock`). A request for a legacy swap (no token)
+counts in a bucket of the same size per swap and address, so one address cannot use up
+another's on that id. Any other request (no, wrong or another swap's token, or an unknown id) is
+a token miss: an address gets 20 a minute in all, across the hashlock and XMR `:id` routes
+together. On the hashlock routes a miss also counts in the address's bucket for that route (the
+accept bucket for a lock, the `GET /swaps` bucket for a read); the XMR routes have no
+per-address bucket, as the 20 misses always run out first. Past the misses (or that bucket)
+every such request from the address is a 429 until the window ends, while the right token still
+passes. A wrong token for a real swap id never touches that swap's bucket. Once an
 address is locked out, a 429 for a wrong token beside a 200 for the right one tells a guesser
 which guess was right; what stops guessing is the token's 256 bits from the OS-seeded CSPRNG, not
 the miss limit. The token compare is constant-time (`subtle`). `nginx-swap.conf` carries a commented `limit_req` example. By default the

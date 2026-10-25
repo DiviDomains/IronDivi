@@ -569,11 +569,71 @@ async fn xmr_token_guesses_are_throttled() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 429, "every :id route");
-    // Hashlock reads are a different bucket.
+    // One miss budget per address: the hashlock `:id` routes are locked out too.
     let r = reqwest::get(format!("{}/swaps/nope", d.base))
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 404);
+    assert_eq!(r.status().as_u16(), 429, "hashlock misses share the budget");
+}
+
+/// One miss budget per address across the hashlock and XMR `:id` routes: a prober mixing them
+/// gets [`divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW`] misses in all, not twice that. Fails
+/// on 4310796 (two budgets: the 21st miss is a 404).
+#[tokio::test]
+async fn hashlock_and_xmr_misses_share_one_budget() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let http = reqwest::Client::new();
+    let hashlock = format!("{}/swaps/nope", d.base);
+    let xmr = format!("{}/xmr/swaps/nope", d.base);
+    let get = |url: &str| {
+        let r = http.get(url).header("X-Swap-Token", "0".repeat(64)).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        let url = if i % 2 == 0 { &hashlock } else { &xmr };
+        assert_eq!(get(url).await, 404, "miss {i} on {url}");
+    }
+    assert_eq!(get(&xmr).await, 429, "the next miss, on the XMR route");
+    assert_eq!(get(&hashlock).await, 429, "and on the hashlock route");
+}
+
+/// The XMR `:id` routes have no per-address bucket: right-token traffic counts only in its
+/// swap's bucket, never per address, so after its swap's whole bucket the address still has
+/// every miss, and the next one is the 429. Passes on 4310796 as well: the per-address bucket
+/// there (as large as the swap's) counted only misses, so the miss limit always bound first.
+#[tokio::test]
+async fn xmr_right_tokens_are_not_counted_per_address() {
+    let w = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let d = serve(&w, &tmp.path().join("m.db")).await;
+    let (id, token) = begun(&w, tmp.path(), &d.base).await;
+    let url = format!("{}/xmr/swaps/{id}", d.base);
+    let http = reqwest::Client::new();
+    let get = |token: &str| {
+        let r = http.get(&url).header("X-Swap-Token", token).send();
+        async move { r.await.unwrap().status().as_u16() }
+    };
+    // Spend the swap's whole bucket (`begin` already used some of it).
+    let mut ok = 0;
+    loop {
+        match get(&token).await {
+            200 => ok += 1,
+            429 => break,
+            other => panic!("status {other}"),
+        }
+        assert!(
+            ok <= divi_swapd::XMR_SWAP_LIMIT_PER_WINDOW,
+            "no 429 after {ok}"
+        );
+    }
+    let misses = divi_swapd::XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        assert_eq!(get(&format!("{i:064x}")).await, 404, "miss {i}");
+    }
+    assert_eq!(get(&format!("{misses:064x}")).await, 429, "the next miss");
 }
 
 /// With `trust_proxy_headers`, a prober rotating the first `X-Forwarded-For` entry keeps the
