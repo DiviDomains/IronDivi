@@ -15,14 +15,14 @@ use std::time::Duration;
 
 use common::*;
 use divi_swap::Store;
-use divi_swapd::{router, run_scan, AppState, ScanStatus, WalletScan};
+use divi_swapd::{follow_once, router, run_scan, AppState, ScanStatus, WalletScan};
 use parking_lot::Mutex;
 use serde_json::Value;
 
 /// Scanner with a saved cursor, a fixed tip, and an optional number of initial failures.
 struct Fake {
     cursor: Mutex<Option<u64>>,
-    tip: u64,
+    tip: Mutex<u64>,
     calls: Mutex<Vec<(u64, u64)>>,
     failures: Mutex<u32>,
 }
@@ -31,7 +31,7 @@ impl Fake {
     fn new(cursor: Option<u64>, tip: u64) -> Self {
         Fake {
             cursor: Mutex::new(cursor),
-            tip,
+            tip: Mutex::new(tip),
             calls: Mutex::new(vec![]),
             failures: Mutex::new(0),
         }
@@ -43,7 +43,7 @@ impl WalletScan for Fake {
         *self.cursor.lock()
     }
     async fn tip(&self) -> Result<u64, String> {
-        Ok(self.tip)
+        Ok(*self.tip.lock())
     }
     async fn scan_range(&self, from: u64, to: u64) -> Result<u64, String> {
         {
@@ -156,4 +156,33 @@ async fn scan_resumes_from_saved_cursor() {
         vec![(339_900, 339_959), (339_960, 340_000)]
     );
     assert_eq!(fake.scanned_height(), Some(340_001));
+}
+
+#[tokio::test]
+async fn follow_keeps_the_cursor_behind_the_tip_and_stays_done() {
+    let fake = Fake::new(None, 1_000);
+    let scan = ScanStatus::scanning();
+    run_scan(&fake, 0, &scan, 500, Duration::from_millis(1)).await;
+    assert_eq!(fake.scanned_height(), Some(1_001));
+
+    // Fewer new blocks than the lag: nothing to scan yet.
+    *fake.tip.lock() = 1_004;
+    follow_once(&fake, &scan, 500, 6).await.unwrap();
+    assert_eq!(fake.scanned_height(), Some(1_001));
+
+    // The tip moves on: the cursor follows to tip - lag, and the scan never stops being done.
+    *fake.tip.lock() = 1_020;
+    fake.calls.lock().clear();
+    follow_once(&fake, &scan, 10, 6).await.unwrap();
+    assert_eq!(*fake.calls.lock(), vec![(1_001, 1_010), (1_011, 1_014)]);
+    assert_eq!(fake.scanned_height(), Some(1_015));
+    assert!(scan.is_done());
+    assert_eq!(scan.info().next_height, 1_015);
+
+    // A failure leaves the status done and the cursor where it was.
+    *fake.tip.lock() = 1_030;
+    *fake.failures.lock() = 1;
+    assert!(follow_once(&fake, &scan, 10, 6).await.is_err());
+    assert!(scan.is_done());
+    assert_eq!(fake.scanned_height(), Some(1_015));
 }

@@ -27,9 +27,9 @@ use divi_swap::mock::MockChain;
 use divi_swap::secrets::SecretRef;
 use divi_swap::{Amount, Chain, ChainBackend, Maker, Store};
 use divi_swapd::{
-    mock_counter_offers, mock_xmr_offers, router_with_xmr, run_scan, spawn_gated_scheduler,
-    AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus, XmrSection,
-    ZecSection, MOCK_ONLY_CHAINS,
+    follow_tip, mock_counter_offers, mock_xmr_offers, router_with_xmr, run_scan,
+    spawn_gated_scheduler, AppState, BackendKind, BtcSection, DaemonConfig, LtcSection, ScanStatus,
+    XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
 use divi_wallet::address::Network as DiviNetwork;
 use swap_chain_btc::{BtcBackend, FeePolicy, RetryPolicy};
@@ -73,6 +73,10 @@ struct ScanJob {
 /// Blocks per scan step; the cursor is persisted after each.
 const SCAN_CHUNK: u64 = 500;
 const SCAN_RETRY: Duration = Duration::from_secs(30);
+/// After the startup scan, follow the tip this many blocks behind (the wallet has no reorg
+/// handling), checking this often.
+const FOLLOW_LAG: u64 = 6;
+const FOLLOW_EVERY: Duration = Duration::from_secs(60);
 
 fn mock_backends() -> Backends {
     let now = std::time::SystemTime::now()
@@ -527,6 +531,7 @@ async fn main() -> Result<()> {
     if let Some(job) = scan_job {
         tokio::spawn(async move {
             run_scan(&*job.divi, job.from, &scan, SCAN_CHUNK, SCAN_RETRY).await;
+            follow_tip(&*job.divi, &scan, SCAN_CHUNK, FOLLOW_LAG, FOLLOW_EVERY).await;
         });
     }
     axum::serve(listener, app).await?;

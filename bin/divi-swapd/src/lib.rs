@@ -26,5 +26,5 @@ pub use config::{
     DaemonConfig, LtcSection, UsdcSection, XmrSection, ZecSection, MOCK_ONLY_CHAINS,
 };
 pub use routes::{router, router_with_xmr, AppState};
-pub use scan::{run_scan, ScanState, ScanStatus, WalletScan};
+pub use scan::{follow_once, follow_tip, run_scan, ScanState, ScanStatus, WalletScan};
 pub use scheduler::{spawn_gated_scheduler, spawn_scheduler};
