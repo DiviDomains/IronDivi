@@ -1123,6 +1123,8 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
+            // Transaction lock requests and votes already asked for
+            let mut lock_items_asked: HashSet<Hash256> = HashSet::new();
             // The peers known to have each masternode item: it came from them
             // in an inv, or went to them in one (CNode::setInventoryKnown)
             let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
@@ -1333,6 +1335,30 @@ impl Node {
                                 if !masternode_items.is_empty() {
                                     let _ = peer_manager
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
+                                        .await;
+                                }
+                                // Divi Core never has a transaction lock request or
+                                // vote (AlreadyHave, main.cpp:143-146), so it asks for
+                                // each one announced (AskFor, main.cpp:580-581); what
+                                // comes back is not read (main.cpp:963-966)
+                                if lock_items_asked.len() > 100_000 {
+                                    lock_items_asked.clear();
+                                }
+                                let lock_items: Vec<_> = items
+                                    .iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.inv_type,
+                                            divi_network::message::InvType::TxLockRequest
+                                                | divi_network::message::InvType::TxLockVote
+                                        )
+                                    })
+                                    .filter(|i| lock_items_asked.insert(i.hash))
+                                    .cloned()
+                                    .collect();
+                                if !lock_items.is_empty() {
+                                    let _ = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::GetData(lock_items))
                                         .await;
                                 }
                                 // Sporks are announced by inv as well
