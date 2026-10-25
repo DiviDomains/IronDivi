@@ -152,12 +152,16 @@ impl Gossip {
     /// in answer to our getaddr, goes to the two peers (one if its network is
     /// not reachable) its hash picks for the day, the sender among them, but
     /// not to one that has it; one of a reachable network is kept
+    /// `now` is the network-adjusted clock, which dates the addresses
+    /// (main.cpp:536); `day_now` the node's own, which picks the day's peers
+    /// (net.cpp:1508)
     pub fn received(
         &self,
         from: PeerId,
         addrs: &[(u32, NetAddr)],
         peers: &[PeerId],
         now: u32,
+        day_now: u32,
     ) -> Received {
         let mut map = self.peers.lock();
         let mut out = Received::default();
@@ -172,7 +176,7 @@ impl Gossip {
                 && addrs.len() <= RELAY_MAX_ENTRIES
                 && is_routable(&ip_of(&addr.ip))
             {
-                for to in self.relay_to(addr, peers, if reachable { 2 } else { 1 }, now) {
+                for to in self.relay_to(addr, peers, if reachable { 2 } else { 1 }, day_now) {
                     let p = map.entry(to).or_default();
                     if !p.known.contains(&key(addr)) {
                         p.known.insert(key(addr));
@@ -287,12 +291,12 @@ mod tests {
         let g = Gossip::new();
         connected(&g, &[1, 2]);
         let addrs: Vec<_> = (0..10).map(|k| (NOW, public(k))).collect();
-        let r = g.received(1, &addrs, &[1, 2], NOW);
+        let r = g.received(1, &addrs, &[1, 2], NOW, NOW);
         // With two peers both are picked: the sender has them, so only peer 2 gets them
         assert_eq!(r.relay, vec![(2, addrs.clone())]);
         assert_eq!(r.keep, addrs);
         // Peer 2 is known to have them now: not sent again
-        let again = g.received(1, &addrs[..1], &[1, 2], NOW);
+        let again = g.received(1, &addrs[..1], &[1, 2], NOW, NOW);
         assert!(again.relay.is_empty());
     }
 
@@ -302,28 +306,28 @@ mod tests {
         connected(&g, &[1, 2]);
         // more than 10 entries
         let eleven: Vec<_> = (0..11).map(|k| (NOW, public(k))).collect();
-        assert!(g.received(1, &eleven, &[1, 2], NOW).relay.is_empty());
+        assert!(g.received(1, &eleven, &[1, 2], NOW, NOW).relay.is_empty());
         // older than ten minutes, or a time read as five days ago
         for t in [NOW - 601, NOW + 601, 0] {
             assert!(g
-                .received(1, &[(t, public(20))], &[1, 2], NOW)
+                .received(1, &[(t, public(20))], &[1, 2], NOW, NOW)
                 .relay
                 .is_empty());
         }
         // not routable
         let local = NetAddr::from_ipv4([10, 1, 2, 3], 51476, 1);
         assert!(g
-            .received(1, &[(NOW, local)], &[1, 2], NOW)
+            .received(1, &[(NOW, local)], &[1, 2], NOW, NOW)
             .relay
             .is_empty());
         // in answer to our getaddr, until a message of fewer than 1000 came
         g.asked(1);
         assert!(g
-            .received(1, &[(NOW, public(30))], &[1, 2], NOW)
+            .received(1, &[(NOW, public(30))], &[1, 2], NOW, NOW)
             .relay
             .is_empty());
         assert_eq!(
-            g.received(1, &[(NOW, public(31))], &[1, 2], NOW)
+            g.received(1, &[(NOW, public(31))], &[1, 2], NOW, NOW)
                 .relay
                 .len(),
             1
@@ -334,7 +338,7 @@ mod tests {
     fn an_onion_address_is_not_kept_and_goes_to_one_peer() {
         let g = Gossip::new();
         connected(&g, &[1, 2, 3]);
-        let r = g.received(1, &[(NOW, onion())], &[1, 2, 3], NOW);
+        let r = g.received(1, &[(NOW, onion())], &[1, 2, 3], NOW, NOW);
         assert!(r.keep.is_empty());
         assert!(r.relay.len() <= 1);
         assert!(!reachable(&onion()));
@@ -360,7 +364,7 @@ mod tests {
         let g = Gossip::new();
         connected(&g, &[1]);
         let mine: Vec<_> = (0..5).map(|k| (NOW, public(k))).collect();
-        g.received(1, &mine, &[1], NOW);
+        g.received(1, &mine, &[1], NOW, NOW);
         let sample: Vec<_> = (0..10).map(|k| (NOW, public(k))).collect();
         let answer = g.answer(1, sample.clone());
         assert_eq!(answer, sample[5..].to_vec(), "not the addresses it sent");
@@ -387,8 +391,11 @@ mod tests {
         let g = Gossip::new();
         g.connected(7, true);
         g.asked(7);
-        let r = g.received(7, &[(NOW, public(1))], &[7], NOW);
+        let r = g.received(7, &[(NOW, public(1))], &[7], NOW, NOW);
         assert!(r.disconnect);
-        assert!(!g.received(8, &[(NOW, public(2))], &[7, 8], NOW).disconnect);
+        assert!(
+            !g.received(8, &[(NOW, public(2))], &[7, 8], NOW, NOW)
+                .disconnect
+        );
     }
 }

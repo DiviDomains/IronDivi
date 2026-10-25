@@ -500,7 +500,8 @@ impl Staker {
     /// a locked coin does not, AvailableUtxoCalculator.cpp:91)
     pub fn has_mintable_coins(&self) -> bool {
         let height = self.chain.height();
-        let now = current_timestamp() as u32;
+        // GetAdjustedTime (wallet.cpp:1477)
+        let now = adjusted_timestamp() as u32;
         let maturity = self.coinbase_maturity();
         let (min_amount, min_age) = {
             let c = self.config.read();
@@ -1010,9 +1011,11 @@ impl Staker {
         Err("Sign failed: the coinstake output is not a key hash, key or vault".to_string())
     }
 
-    /// Earliest time a block on `tip` may carry: now, but past the median time
+    /// Earliest time a block on `tip` may carry: now on the network-adjusted
+    /// clock, but past the median time (BlockFactory.cpp:77,
+    /// BlockProofProver.cpp:36)
     fn next_block_time(&self, tip: &divi_storage::BlockIndex) -> u32 {
-        (current_timestamp() as u32).max(self.get_median_time_past(&tip.hash) + 1)
+        (adjusted_timestamp() as u32).max(self.get_median_time_past(&tip.hash) + 1)
     }
 
     /// A proof-of-work block on `tip` whose coinbase pays this wallet
@@ -1224,7 +1227,11 @@ impl Staker {
     }
 
     fn try_stake(&self) -> StakeResult {
-        let current_time = current_timestamp() as u32;
+        // The coinstake's time and search window on the network-adjusted clock
+        // (PoSTransactionCreator.cpp:335-341); the rate limit and the attempt
+        // record on the node's own (CoinMinter.cpp:89, PoSTransactionCreator.cpp:236)
+        let current_time = adjusted_timestamp() as u32;
+        let local_time = current_timestamp();
 
         // A locked wallet cannot sign a coinstake; say so once instead of
         // failing every candidate at debug level
@@ -1283,13 +1290,13 @@ impl Staker {
 
         // CRITICAL: Rate limiting check (matches C++ limitStakingSpeed)
         // Check if we tried at this height recently (before updating the timestamp)
-        if self.limit_staking_speed(current_height, current_time as u64) {
+        if self.limit_staking_speed(current_height, local_time) {
             return StakeResult::RateLimited;
         }
 
         // Record this staking attempt (matches C++ PoSTransactionCreator)
         // Only record if we pass rate limiting
-        self.record_staking_attempt(current_height, current_time as u64);
+        self.record_staking_attempt(current_height, local_time);
 
         self.build_stake_block(&tip, current_time)
     }
@@ -2311,10 +2318,15 @@ fn older_than(now: u32, coin_time: u32, min_age: u32) -> bool {
     i64::from(now) - i64::from(coin_time) > i64::from(min_age)
 }
 
-/// Get current Unix timestamp
-/// The node's clock (Core GetAdjustedTime and GetTime: setmocktime sets it)
+/// The node's clock (Core GetTime: setmocktime sets it)
 fn current_timestamp() -> u64 {
     divi_primitives::clock::now().max(0) as u64
+}
+
+/// The network-adjusted clock (Core GetAdjustedTime: the node's clock plus the
+/// peers' time offset, timedata.cpp:35-38)
+fn adjusted_timestamp() -> u64 {
+    divi_primitives::clock::adjusted_now().max(0) as u64
 }
 
 /// Create a minimal coinbase marker transaction for PoS blocks

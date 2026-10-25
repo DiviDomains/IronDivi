@@ -1402,15 +1402,17 @@ impl Node {
                                         "Requested too many addresses",
                                     );
                                 } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as u32)
-                                        .unwrap_or(0);
+                                    // Addresses are dated on the network-adjusted
+                                    // clock (main.cpp:536), the day's peers picked
+                                    // on the node's own (net.cpp:1508)
+                                    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
+                                    let day_now = divi_primitives::clock::now().max(0) as u32;
                                     let got = peer_manager.gossip().received(
                                         peer_id,
                                         &addrs,
                                         &peer_manager.connected_peers(),
                                         now,
+                                        day_now,
                                     );
                                     if let Some(from) = peer_manager.peer_addr(peer_id) {
                                         peer_manager.address_book().add(&got.keep, from.ip());
@@ -2628,10 +2630,10 @@ pub fn check_mempool_transaction(
         return Err(NodeError::rejected(reject::INVALID, "coinstake"));
     }
     let tip_height = chain.height();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // IsStandardTx reads a time lock on GetAdjustedTime: the node's clock
+    // (setmocktime sets it) plus the network time offset
+    // (MempoolConsensus.cpp:61, TransactionFinalityHelpers.cpp:16-17)
+    let now = divi_primitives::clock::adjusted_now().max(0) as u32;
     // Divi Core checks IsStandardTx and AreInputsStandard only without
     // -acceptnonstandard (MempoolConsensus.cpp:274, :291, :363)
     let require_standard = mempool.requires_standard();

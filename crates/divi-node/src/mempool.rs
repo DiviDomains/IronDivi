@@ -504,7 +504,10 @@ impl Mempool {
         fee: Amount,
         origin: Origin,
     ) -> Result<(), NodeError> {
-        if !is_final_for_next_block(tx, origin.lock_tip(self.tip_height()), unix_now()) {
+        // IsFinalTx at the next height and GetAdjustedTime (MempoolConsensus.cpp:61,
+        // TransactionFinalityHelpers.cpp:16-17)
+        let adjusted = divi_primitives::clock::adjusted_now().max(0) as u32;
+        if !is_final_for_next_block(tx, origin.lock_tip(self.tip_height()), adjusted) {
             return Err(NodeError::NonFinal);
         }
         if tx.is_coinbase() {

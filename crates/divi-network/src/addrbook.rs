@@ -72,11 +72,10 @@ const LEGACY_HEADER: &[u8; 8] = b"IRDPEERS";
 const LEGACY_ENTRY_LEN: usize = 16 + 2 + 8 + 4;
 const EMPTY: i32 = -1;
 
+/// The address manager's clock: GetAdjustedTime, the node's clock plus the
+/// network time offset (addrman.h:97-100, :509-560; addrman.cpp:258)
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    divi_primitives::clock::adjusted_now()
 }
 
 fn dsha(data: &[u8]) -> [u8; 32] {
