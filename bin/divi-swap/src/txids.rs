@@ -167,6 +167,19 @@ mod tests {
     }
 
     #[test]
+    fn txids_show_a_lost_maker_swap() {
+        // The taker claimed the DIVI (30) and then refunded its BTC (60) before the maker's
+        // claim confirmed: the maker shows `Lost` and reports no claim of the taker leg.
+        let l = lines(
+            &record("taker_pays_btc", "done", Some(30), Some(60)),
+            &view("Lost", "taker_pays_btc", None, Some(30)),
+        );
+        assert!(l.contains(&"maker_state=Lost".to_string()), "{l:?}");
+        assert!(!keys(&l).contains(&"btc_claim_by_maker"), "{l:?}");
+        assert!(l.contains(&format!("btc_refund_by_taker={}", id(60))));
+    }
+
+    #[test]
     fn txids_reverse_keys() {
         // Happy path: the taker claimed the BTC (30); the maker claimed the DIVI (40).
         let l = lines(

@@ -144,6 +144,8 @@ struct ChainState {
     attempts: HashMap<TxKind, usize>,
     /// Every distinct claim/refund ever handed to `broadcast`, accepted or not.
     spend_attempts: HashMap<Txid, MockTx>,
+    /// Calls of `broadcast` with a claim/refund, resends of the same bytes included.
+    spend_broadcasts: u64,
     /// How this chain's backends bump a claim, and what its relay accepts as a bump.
     fee_bump: FeeBump,
     /// Feerate backends report through `claim_feerate` (`None`: [`MOCK_FEERATE`]).
@@ -774,6 +776,13 @@ impl MockChain {
         c
     }
 
+    /// How many times any backend handed a claim or refund to `broadcast`, counting every
+    /// resend of the same bytes. Test-only observation, e.g. that a terminal swap is not
+    /// resent.
+    pub fn spend_broadcasts(&self) -> u64 {
+        self.state.lock().spend_broadcasts
+    }
+
     /// Current MTP.
     pub fn mtp(&self) -> u32 {
         self.state.lock().mtp
@@ -1259,6 +1268,7 @@ impl ChainBackend for MockBackend {
         *s.attempts.entry(parsed.kind()).or_default() += 1;
         if !matches!(parsed, MockTx::Fund { .. }) {
             s.spend_attempts.insert(tx.txid, parsed.clone());
+            s.spend_broadcasts += 1;
         }
         if let Some(e) = &s.fail_broadcasts {
             return Err(e.clone());

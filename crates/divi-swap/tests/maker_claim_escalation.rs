@@ -17,7 +17,7 @@
 
 use divi_swap::api::{Direction, Offer};
 use divi_swap::mock::{MockBackend, MockChain, MOCK_FEERATE};
-use divi_swap::store::ClaimFees;
+use divi_swap::store::{ClaimFees, MakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, ClaimDeadline, FeeBump, FeeEscalation, Maker, Profile, Store,
     SwapConfig, SwapState, Taker, TakerState,
@@ -50,6 +50,14 @@ struct Outcome {
     refunded: bool,
     /// The maker's persisted claim fee history.
     fees: ClaimFees,
+    /// The maker's persisted record at the end.
+    record: MakerRecord,
+    /// The maker's state in `Maker::list`, and the `state` of its JSON view.
+    listed: (SwapState, String),
+    /// Spend broadcasts on the taker-leg chain at the end, and after 20 more rounds of ticks.
+    broadcasts: (u64, u64),
+    /// `Maker::step` and the record's state after those 20 rounds.
+    after: (SwapState, SwapState),
 }
 
 /// One swap with the taker paying `chain` (the maker claims on `chain`), revealed at the
@@ -144,7 +152,7 @@ async fn race(chain: Chain, escalation: bool) -> Outcome {
         divi.advance_time(240);
         divi.mine(1);
         let mk = maker.view(&mid).unwrap().unwrap().state;
-        if mk == SwapState::Done || tl.mtp() > taker_htlc.locktime + 7200 {
+        if mk.is_terminal() || tl.mtp() > taker_htlc.locktime + 7200 {
             break;
         }
     }
@@ -156,11 +164,31 @@ async fn race(chain: Chain, escalation: bool) -> Outcome {
             .is_some_and(|c| c >= 1),
         None => false,
     };
+    let record = store.get_maker_swap(&mid).unwrap().unwrap();
+    let listed = maker.list().unwrap();
+    let listed = listed.iter().find(|v| v.id == mid).unwrap();
+    let json = serde_json::to_value(listed).unwrap();
+    let listed = (listed.state, json["state"].as_str().unwrap().to_string());
+    let sent = tl.spend_broadcasts();
+    let maker_state = maker.view(&mid).unwrap().unwrap().state;
+    // Keep the watcher running: nothing may be resent or move once the swap is terminal.
+    for _ in 0..20 {
+        let _ = maker.tick().await;
+        tl.advance_time(300u32.saturating_sub(block_secs(chain)));
+        tl.mine(1);
+        divi.mine(1);
+    }
+    let stepped = maker.step(&mid).await.unwrap();
+    let after = (stepped, store.get_maker_swap(&mid).unwrap().unwrap().state);
     Outcome {
-        maker: maker.view(&mid).unwrap().unwrap().state,
+        maker: maker_state,
         maker_gained: tl.balance(&maker_pk).0 > before,
         refunded,
-        fees: store.get_maker_swap(&mid).unwrap().unwrap().claim_fees,
+        fees: record.claim_fees.clone(),
+        record,
+        listed,
+        broadcasts: (sent, tl.spend_broadcasts()),
+        after,
     }
 }
 
@@ -201,4 +229,25 @@ async fn without_escalation_the_stuck_maker_claim_loses_the_taker_leg() {
     let o = race(Chain::Btc, false).await;
     assert!(o.refunded, "the hostile taker's refund confirmed");
     assert!(!o.maker_gained, "the maker got nothing for its leg");
+    // The loss is recorded on the swap, not only returned as an error.
+    assert_eq!(o.maker, SwapState::Lost, "{:?}", o.record.last_error);
+    assert_eq!(o.record.state, SwapState::Lost);
+    let err = o.record.last_error.as_deref().unwrap_or_default();
+    assert!(err.starts_with("lost: "), "{err}");
+    assert!(err.contains("refunded"), "{err}");
+    // The never-confirmed claim is no longer reported as the taker leg's spend.
+    assert!(o.record.taker_leg_claim.is_none());
+    assert_eq!(o.listed, (SwapState::Lost, "Lost".to_string()));
+    // Terminal: the watcher stops resending and nothing moves it.
+    assert_eq!(o.broadcasts.0, o.broadcasts.1, "claim resent after Lost");
+    assert_eq!(o.after, (SwapState::Lost, SwapState::Lost));
+}
+
+#[tokio::test]
+async fn a_won_claim_stays_done_and_is_not_resent() {
+    let o = race(Chain::Btc, true).await;
+    assert_eq!(o.maker, SwapState::Done);
+    assert_eq!(o.listed, (SwapState::Done, "Done".to_string()));
+    assert_eq!(o.broadcasts.0, o.broadcasts.1);
+    assert_eq!(o.after, (SwapState::Done, SwapState::Done));
 }

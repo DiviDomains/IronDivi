@@ -621,6 +621,10 @@ impl World {
                 tl == Leg::Claimed || ml == Leg::Refunded,
                 "swap {i}: maker Done with taker leg {tl:?}, maker leg {ml:?}"
             ),
+            SwapState::Lost => assert!(
+                tl == Leg::Refunded && ml == Leg::Claimed,
+                "swap {i}: maker Lost with taker leg {tl:?}, maker leg {ml:?}"
+            ),
             _ => {}
         }
     }

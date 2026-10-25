@@ -257,3 +257,59 @@ fn stored_json_is_byte_identical_to_the_fixture() {
     assert_eq!(mj, m);
     assert_eq!(tj, t);
 }
+
+/// Maker records written before `SwapState::Lost` existed (the at-rest fixture, the v0.2.5
+/// daemon's records, the forward-done fixtures) still read, and the at-rest one writes back
+/// byte for byte: the new variant moved no existing encoding.
+#[test]
+fn maker_records_from_before_lost_still_read() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in [
+        "store-at-rest/maker-record.json",
+        "v0.2.5/maker-forward-done.json",
+        "v0.2.5/maker-reverse-done.json",
+        "maker-forward-done-happy.json",
+        "maker-forward-done-casec.json",
+    ] {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap();
+        let rec: MakerRecord =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_ne!(rec.state, SwapState::Lost, "{name}");
+    }
+    let text = std::fs::read_to_string(dir.join("store-at-rest/maker-record.json")).unwrap();
+    let rec: MakerRecord = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_string(&rec).unwrap(), text);
+}
+
+/// A `Lost` maker record goes through the store: JSON `"state":"Lost"` (the variant name,
+/// like every other maker state), the `state` column `lost`, read back and listed as `Lost`.
+#[test]
+fn a_lost_maker_record_round_trips_through_the_store() {
+    let mut m = maker();
+    m.state = SwapState::Lost;
+    m.last_error = Some("lost: the taker leg was refunded".into());
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"state\":\"Lost\""), "{json}");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("swaps.db");
+    let store = Store::open(&db).unwrap();
+    store.put_maker_swap(&m).unwrap();
+    let back = store.get_maker_swap("m1").unwrap().unwrap();
+    assert_eq!(back.state, SwapState::Lost);
+    assert!(back.state.is_terminal());
+    assert_eq!(back.last_error, m.last_error);
+    let listed = store.list_maker_swaps().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, SwapState::Lost);
+    drop(store);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (col, stored): (String, String) = conn
+        .query_row(
+            "SELECT state, json FROM maker_swaps WHERE id='m1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(col, "lost");
+    assert_eq!(stored, json);
+}
