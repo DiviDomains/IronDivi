@@ -664,8 +664,8 @@ for side, c, i in PAIRS:
         cv = [t in c.rpc("getrawmempool") for t in ids]
         iv = [t in i.rpc("getrawmempool") for t in ids]
         row("non-standard: reached side R (no -acceptnonstandard there)", cv, iv, cv == iv)
-row("non-standard: reached bridge L (no -acceptnonstandard)",
-    [t in C1.rpc("getrawmempool") for t in ids], "", True)
+# Bridge L, a divid without -acceptnonstandard, is no pair: what it holds is shown, not compared
+print(f"# non-standard: in bridge L's mempool: {[t in C1.rpc('getrawmempool') for t in ids]}", flush=True)
 # Each stays on the node that took it (the bridge refuses it): each node mines
 # its own into a block, so the later rows see only relayed transactions
 for n, t in ((C3, nc), (I1, ni)):
