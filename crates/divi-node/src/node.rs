@@ -215,6 +215,10 @@ pub struct Node {
     /// The loops `start` runs (peer events, sync, relay, peer upkeep):
     /// stopped by `stop` before it flushes, so nothing writes after it
     tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+
+    /// The -upnp port mapping: its stop signal and task, which removes the
+    /// mapping once told to stop
+    upnp: parking_lot::Mutex<Option<(broadcast::Sender<()>, tokio::task::JoinHandle<()>)>>,
 }
 
 /// How long `Node::stop` waits for the node's loops once told to stop
@@ -786,6 +790,7 @@ impl Node {
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
+            upnp: parking_lot::Mutex::new(None),
         })
     }
 
@@ -928,7 +933,7 @@ impl Node {
         // -listenonion: the Tor controller, for the life of the node
         // (init.cpp:1621-1622)
         if self.config.p2p.listen_onion {
-            divi_network::torcontrol::spawn(
+            self.keep(divi_network::torcontrol::spawn(
                 divi_network::torcontrol::TorControl {
                     target: self.config.p2p.tor_control.clone(),
                     password: self.config.p2p.tor_password.clone(),
@@ -936,18 +941,19 @@ impl Node {
                     set_onion_proxy: self.config.p2p.onion.as_deref().unwrap_or("").is_empty(),
                 },
                 Arc::clone(&self.peer_manager),
-            );
+            ));
         }
         // -upnp: map the listen port until shutdown (net.cpp:1454, :1477)
         if self.config.p2p.upnp {
             let local = self.peer_manager.local_addresses();
-            let shutdown = self.peer_manager.shutdown_signal();
+            let (stop, shutdown) = broadcast::channel(1);
             let discover = self.config.p2p.discover;
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let igd = divi_network::upnp::Igd::discover().await;
                 let description = format!("DIVI v{}", env!("CARGO_PKG_VERSION"));
                 divi_network::upnp::map_port(igd, local, discover, description, shutdown).await;
             });
+            *self.upnp.lock() = Some((stop, task));
         }
 
         // Start peer event handler
@@ -1777,6 +1783,18 @@ impl Node {
         // or transaction is taken and no peer dialled while the state below
         // is written, as Divi Core's StopNode joins its threads before the
         // flush (init.cpp Shutdown)
+        // -upnp: remove the port mapping (MapPort(false), net.cpp:1477)
+        let upnp = self.upnp.lock().take();
+        if let Some((stop, mut task)) = upnp {
+            let _ = stop.send(());
+            if tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+
         let started = std::time::Instant::now();
         let tasks = std::mem::take(&mut *self.tasks.lock());
         let stalled = stop_tasks(tasks, STOP_TASKS_TIMEOUT).await;
