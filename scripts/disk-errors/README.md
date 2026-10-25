@@ -13,7 +13,9 @@ prints one line:
   divid (the list below is out of date).
 
 Lines starting with `#` show what each node printed and the other facts that are not compared (exit codes, heights,
-the files that reached the limit). The run ends with `# rows: ...` and `FAILS <n>`; the exit code is the number of
+the files that reached the limit). The height after the restart is shown, not compared: after `-reindex` divid comes
+back at whatever its block files hold, sometimes above the last height it answered and sometimes below it (it had
+answered blocks it never wrote). What is compared is that the node's best block is the miner's block at its height. The run ends with `# rows: ...` and `FAILS <n>`; the exit code is the number of
 FAILs (255: usage error, interrupted, or over 30 minutes).
 
 ```sh

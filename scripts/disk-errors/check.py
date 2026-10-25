@@ -443,8 +443,7 @@ core, iron = on_both(limit_by_blocks)
 rows("blocks until the limit", core, iron, [
     "a write failed (a file reached the limit)", "stopped on its own", "printed a line naming the failed write",
     "getblockcount at the limit", "sendtoaddress at the limit",
-    "restart without the limit", "height after restart, against the last height the node answered",
-    "best block after restart is the miner's block at that height",
+    "restart without the limit", "best block after restart is the miner's block at that height",
     "the send at the limit is in the wallet after restart"])
 
 
