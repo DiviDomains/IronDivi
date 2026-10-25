@@ -314,32 +314,12 @@ impl MasternodeList {
             .collect();
         let mn_count = enabled.len();
         let tip = chain.height();
-        // GetMasternodePaymentQueue: a pass that skips the young ones, and when
-        // it finds under a third of them, a second pass without that filter
-        // whose entries are added to the first's (masternode-payments.cpp:474-510)
-        let pass = |filter_sig_time: bool| {
-            enabled
-                .iter()
-                .filter(|e| {
-                    !(filter_sig_time
-                        && e.mnb.sig_time + (mn_count as f64 * 2.6 * 60.0) as i64 > now)
-                })
-                .filter(|e| {
-                    find_collateral(chain, &Hash256(e.mnb.vin.prevout_hash), e.mnb.vin.prevout_n)
-                        .map(|c| (tip + 1).saturating_sub(c.height) as usize >= mn_count)
-                        .unwrap_or(false)
-                })
-                .count()
-        };
         // No queue before there is a block to score with, 101 below the tip
         // (GetBlockHashForScoring, MasternodeHelpers.cpp:75-86)
-        let mut queue = 0;
-        if tip >= SCORING_DEPTH {
-            queue = pass(true);
-            if queue < mn_count / 3 {
-                queue += pass(false);
-            }
-        }
+        let queue = match scoring_hash(chain, tip as i64) {
+            Some(hash) => self.queue_from(chain, &entries, &hash, now).len(),
+            None => 0,
+        };
         let (mut ipv4, mut ipv6, mut onion) = (0, 0, 0);
         for e in &entries {
             match network_name(&e.mnb) {
@@ -362,6 +342,197 @@ impl MasternodeList {
             onion,
         }
     }
+}
+
+impl MasternodeList {
+    /// GetMasternodePaymentQueue for a scoring block: the enabled
+    /// masternodes in a pass that skips the young ones and, when it finds
+    /// under a third of them, a second pass without that filter whose entries
+    /// are added to the first's; then by score, highest first
+    /// (masternode-payments.cpp:435-545). Each entry is the masternode's
+    /// payee script (P2PKH of its collateral key).
+    pub fn payment_queue(&self, chain: &Chain, scoring: &Hash256) -> Vec<Vec<u8>> {
+        self.check_collateral(chain);
+        self.queue_from(chain, &self.entries(), scoring, now())
+    }
+
+    fn queue_from(
+        &self,
+        chain: &Chain,
+        entries: &[NetworkMasternode],
+        scoring: &Hash256,
+        now: i64,
+    ) -> Vec<Vec<u8>> {
+        let enabled: Vec<&NetworkMasternode> = entries
+            .iter()
+            .filter(|e| e.mnb.protocol_version >= ACTIVE_PROTOCOL && e.is_enabled(now))
+            .collect();
+        let mn_count = enabled.len();
+        let tip = chain.height();
+        let pass = |filter_sig_time: bool| -> Vec<&NetworkMasternode> {
+            enabled
+                .iter()
+                .filter(|e| {
+                    !(filter_sig_time
+                        && e.mnb.sig_time + (mn_count as f64 * 2.6 * 60.0) as i64 > now)
+                })
+                .filter(|e| {
+                    find_collateral(chain, &Hash256(e.mnb.vin.prevout_hash), e.mnb.vin.prevout_n)
+                        .map(|c| (tip + 1).saturating_sub(c.height) as usize >= mn_count)
+                        .unwrap_or(false)
+                })
+                .copied()
+                .collect()
+        };
+        let mut queue = pass(true);
+        if queue.len() < mn_count / 3 {
+            queue.extend(pass(false));
+        }
+        let mut scored: Vec<([u8; 32], &NetworkMasternode)> = queue
+            .into_iter()
+            .map(|e| (calculate_score(&e.mnb, scoring), e))
+            .collect();
+        scored.sort_by(|a, b| cmp_u256(&b.0, &a.0));
+        scored
+            .into_iter()
+            .map(|(_, e)| payee_script(&e.mnb))
+            .collect()
+    }
+
+    /// GetMasternodeRank: the place of the masternode with collateral hash
+    /// `vin_hash` among the ones old, recent and enabled enough to be ranked,
+    /// by the compact form of their score, highest first; None past
+    /// `check_num` (masternode-payments.cpp:548-620)
+    pub fn rank(
+        &self,
+        chain: &Chain,
+        vin_hash: &[u8; 32],
+        scoring: &Hash256,
+        check_num: usize,
+    ) -> Option<usize> {
+        let now = now();
+        let min_age = if chain.network_type() == NetworkType::Regtest {
+            25 * 60
+        } else {
+            STABLE_AGE
+        };
+        let mut ranked: Vec<(u32, [u8; 32])> = self
+            .entries()
+            .iter()
+            .filter(|e| e.mnb.protocol_version >= ACTIVE_PROTOCOL)
+            .filter(|e| now - e.mnb.sig_time >= min_age)
+            .filter(|e| e.is_enabled(now))
+            .map(|e| {
+                (
+                    get_compact(&calculate_score(&e.mnb, scoring)),
+                    e.mnb.vin.prevout_hash,
+                )
+            })
+            .collect();
+        ranked.sort_by_key(|e| std::cmp::Reverse(e.0));
+        ranked
+            .iter()
+            .take(check_num)
+            .position(|(_, h)| h == vin_hash)
+            .map(|i| i + 1)
+    }
+}
+
+/// The block a height is scored with: its ancestor 101 below it on the
+/// active chain (GetBlockHashForScoring, MasternodeHelpers.cpp:66-86)
+pub fn scoring_hash(chain: &Chain, height: i64) -> Option<Hash256> {
+    let at = height - SCORING_DEPTH as i64;
+    if at < 0 || at > chain.height() as i64 {
+        return None;
+    }
+    chain
+        .get_block_index_by_height(at as u32)
+        .ok()
+        .flatten()
+        .map(|b| b.hash)
+}
+
+/// GetHashRoundsForTierMasternodes (masternode.cpp:26-38)
+fn hash_rounds(tier: i32) -> u32 {
+    match tier {
+        0 => 20,
+        1 => 63,
+        2 => 220,
+        3 => 690,
+        4 => 2400,
+        _ => 0,
+    }
+}
+
+/// CMasternode::CalculateScore: the scoring hash and `prevout.hash +
+/// prevout.n` (a 256-bit sum), hashed with each round number; the highest
+/// of the rounds' hashes (masternode.cpp:153-179)
+pub fn calculate_score(mnb: &CppBroadcast, scoring: &Hash256) -> [u8; 32] {
+    let mut aux = mnb.vin.prevout_hash;
+    let mut carry = mnb.vin.prevout_n as u64;
+    for b in aux.iter_mut() {
+        if carry == 0 {
+            break;
+        }
+        let sum = *b as u64 + (carry & 0xff);
+        *b = sum as u8;
+        carry = (carry >> 8) + (sum >> 8);
+    }
+    let mut base = Vec::with_capacity(68);
+    base.extend_from_slice(scoring.as_bytes());
+    base.extend_from_slice(&aux);
+    let mut best = [0u8; 32];
+    for round in 0..hash_rounds(mnb.tier) {
+        let mut data = base.clone();
+        data.extend_from_slice(&(round as i32).to_le_bytes());
+        let h = divi_crypto::double_sha256(&data);
+        if cmp_u256(&h, &best) == std::cmp::Ordering::Greater {
+            best = h;
+        }
+    }
+    best
+}
+
+/// Compare two little-endian 256-bit numbers
+fn cmp_u256(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+    a.iter().rev().cmp(b.iter().rev())
+}
+
+/// arith_uint256::GetCompact(false)
+pub fn get_compact(n: &[u8; 32]) -> u32 {
+    let mut size = 32usize;
+    while size > 0 && n[size - 1] == 0 {
+        size -= 1;
+    }
+    let low64 = |shift_bytes: usize| -> u64 {
+        let mut v = 0u64;
+        for i in 0..8 {
+            let idx = shift_bytes + i;
+            if idx < 32 {
+                v |= (n[idx] as u64) << (8 * i);
+            }
+        }
+        v
+    };
+    let mut compact: u32 = if size <= 3 {
+        (low64(0) << (8 * (3 - size))) as u32
+    } else {
+        low64(size - 3) as u32
+    };
+    if compact & 0x0080_0000 != 0 {
+        compact >>= 8;
+        size += 1;
+    }
+    compact | ((size as u32) << 24)
+}
+
+/// The script a masternode is paid to: P2PKH of its collateral key
+pub fn payee_script(mnb: &CppBroadcast) -> Vec<u8> {
+    let id: Hash160 = divi_crypto::hash160(&mnb.pubkey_collateral);
+    let mut s = vec![0x76, 0xa9, 0x14];
+    s.extend_from_slice(id.as_bytes());
+    s.extend_from_slice(&[0x88, 0xac]);
+    s
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

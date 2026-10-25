@@ -23,8 +23,8 @@ use divi_crypto::compute_block_hash;
 use divi_masternode::MasternodeManager;
 use divi_network::constants::MAX_INV_SIZE;
 use divi_network::{
-    BlockSync, MasternodeHandler, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
-    SporkManager, SyncState, TxRelay,
+    BlockSync, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig, SporkManager, SyncState,
+    TxRelay,
 };
 use divi_primitives::block::Block;
 use divi_primitives::hash::Hash256;
@@ -157,11 +157,11 @@ pub struct Node {
     /// Masternode manager
     masternode_manager: Arc<MasternodeManager>,
 
-    /// Masternode P2P message handler
-    masternode_handler: Arc<MasternodeHandler>,
-
     /// The masternodes the network announced, as Divi Core keeps them
     masternode_list: Arc<divi_rpc::mn_list::MasternodeList>,
+
+    /// The masternodes' payment votes (mnw)
+    masternode_votes: Arc<divi_rpc::mn_votes::MasternodeVotes>,
 
     /// Event broadcaster
     event_tx: broadcast::Sender<NodeEvent>,
@@ -644,11 +644,11 @@ impl Node {
             }
         };
 
-        // Create masternode P2P handler
-        let masternode_handler = Arc::new(MasternodeHandler::new(Arc::clone(&masternode_manager)));
-        // Kept in the datadir as Divi Core keeps mncache.dat
+        // The network's masternodes, kept in the datadir as Divi Core keeps
+        // mncache.dat, and their payment votes
         let masternode_list = Arc::new(divi_rpc::mn_list::MasternodeList::new());
         masternode_list.set_path(config.data_dir.join("masternodes.list"));
+        let masternode_votes = Arc::new(divi_rpc::mn_votes::MasternodeVotes::new());
 
         // NOTE: block_connected_callback is set in main.rs where it can include
         // both node-level processing (mempool cleanup, fee estimation) and wallet scanning.
@@ -674,8 +674,8 @@ impl Node {
             orphans: Arc::new(crate::orphans::OrphanPool::new()),
             spork_manager,
             masternode_manager,
-            masternode_handler,
             masternode_list,
+            masternode_votes,
             event_tx,
             shutdown_tx,
             tasks: parking_lot::Mutex::new(Vec::new()),
@@ -828,8 +828,8 @@ impl Node {
         let spork_manager = Arc::clone(&self.spork_manager);
         let chain = Arc::clone(&self.chain);
         let mempool = Arc::clone(&self.mempool);
-        let masternode_handler = Arc::clone(&self.masternode_handler);
         let masternode_list = Arc::clone(&self.masternode_list);
+        let masternode_votes = Arc::clone(&self.masternode_votes);
         let peer_manager = Arc::clone(&self.peer_manager);
         let mut peer_events = self.peer_manager.subscribe();
         // Divi Core checks every masternode once a minute (MasternodeModule.cpp:524-529)
@@ -976,6 +976,7 @@ impl Node {
                                             i.inv_type,
                                             divi_network::message::InvType::MasternodeAnnounce
                                                 | divi_network::message::InvType::MasternodePing
+                                                | divi_network::message::InvType::MasternodeWinner
                                         )
                                     })
                                     .filter(|i| masternode_items_asked.insert(i.hash))
@@ -1141,8 +1142,7 @@ impl Node {
                                 tracing::debug!("Received govsync request from peer {}", peer_id);
                             }
                             // Masternode P2P messages
-                            // Not answered: IronDivi cannot vouch for masternode
-                            // entries as Divi Core does (see MasternodeHandler)
+                            // dseg is not answered (a peer's masternode list sync)
                             NetworkMessage::RequestMasternodeList(_) => {
                                 tracing::debug!("dseg from peer {} not answered", peer_id);
                             }
@@ -1171,14 +1171,21 @@ impl Node {
                                     );
                                 }
                             }
+                            // A payment vote, counted when it passes Divi Core's
+                            // checks and then passed on, as ProcessMasternodeWinners
+                            // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
-                                if let Err(e) = masternode_handler.handle_winner(peer_id, &payload)
-                                {
-                                    tracing::warn!(
-                                        "Failed to handle masternode winner from peer {}: {}",
+                                match masternode_votes.accept(&chain, &masternode_list, &payload) {
+                                    Ok(true) => peer_manager.broadcast_except(
+                                        NetworkMessage::MasternodeWinner(payload),
+                                        peer_id,
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => tracing::debug!(
+                                        "Masternode winner from peer {} not taken: {}",
                                         peer_id,
                                         e
-                                    );
+                                    ),
                                 }
                             }
                             NetworkMessage::Unknown(cmd, payload) => {
@@ -1931,6 +1938,11 @@ impl Node {
     /// The masternodes the network announced (listmasternodes)
     pub fn masternode_list(&self) -> &Arc<divi_rpc::mn_list::MasternodeList> {
         &self.masternode_list
+    }
+
+    /// The masternodes' payment votes (getmasternodewinners)
+    pub fn masternode_votes(&self) -> &Arc<divi_rpc::mn_votes::MasternodeVotes> {
+        &self.masternode_votes
     }
 }
 

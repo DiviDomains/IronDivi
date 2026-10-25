@@ -2080,6 +2080,7 @@ async fn run_daemon(
         // The node's own masternode list, which the network fills from mnb/mnp
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
+        let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2105,6 +2106,7 @@ async fn run_daemon(
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
                     rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2236,6 +2238,7 @@ async fn run_daemon(
         // The node's own masternode list, which the network fills from mnb/mnp
         let mn_for_rpc = node.masternode_manager().as_ref().clone();
         let mn_list_for_rpc = Arc::clone(node.masternode_list());
+        let mn_votes_for_rpc = Arc::clone(node.masternode_votes());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2260,6 +2263,7 @@ async fn run_daemon(
                     // The masternode RPCs read the node's masternode list
                     rpc_server.set_masternode_manager(mn_for_rpc);
                     rpc_server.set_masternode_list(mn_list_for_rpc);
+                    rpc_server.set_masternode_votes(mn_votes_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
