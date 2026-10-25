@@ -13,8 +13,11 @@ stops every node it lists.
 import base64
 import json
 import os
+import hashlib
 import secrets
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -217,6 +220,38 @@ class Node:
         return ""
 
 
+def raw_peer(n, src):
+    """A P2P connection from `src` that has done the handshake, so the node has a
+    peer to stake for (both stake only with one: CoinMinter.cpp:73-75); None if
+    it did not get in"""
+    def msg(cmd, payload=b""):
+        return (bytes([0xa1, 0xcf, 0x7e, 0xac]) + cmd.encode().ljust(12, b"\0") + struct.pack("<I", len(payload))
+                + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] + payload)
+
+    def addr(ip, port):
+        return struct.pack("<Q", 1) + bytes(10) + b"\xff\xff" + socket.inet_aton(ip) + struct.pack(">H", port)
+    sub = b"/process-signals:1/"
+    version = (struct.pack("<iQq", 70920, 1, int(time.time())) + addr(NODE_IP, n.p2p) + addr(src, 0)
+               + secrets.token_bytes(8) + bytes([len(sub)]) + sub + struct.pack("<i", 0) + b"\x01")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.bind((src, 0))
+        sock.connect((NODE_IP, n.p2p))
+        sock.sendall(msg("version", version))
+        got = b""
+        deadline = time.time() + 10
+        while b"verack" not in got and time.time() < deadline:
+            part = sock.recv(65536)
+            if not part:
+                return None
+            got += part
+        sock.sendall(msg("verack"))
+        return sock
+    except OSError:
+        return None
+
+
 def pid_file(n, name="divid.pid"):
     return name if os.path.isabs(name) else os.path.join(n.netdir(), name)
 
@@ -320,6 +355,9 @@ for name, sig in (("SIGTERM", signal.SIGTERM), ("SIGINT", signal.SIGINT)):
     for n in NODES:
         n.proc = n.launch(args=["-reindex"])
         wait_for(lambda: n.call("getblockcount")[0] == "ok", START_TIMEOUT, 0.02)
+        # divid's RPC answers just before its init returns (the warm-up ends
+        # there, init.cpp:1639-1661): a second on, the stop comes after init
+        time.sleep(1)
         n.signal(sig)
     facts(f"{name} during -reindex: exit code", lambda n: n.wait_exit())
     for n in NODES:
@@ -386,6 +424,33 @@ for n in NODES:
     n.call("stop")
 facts("-daemon: the child stops on stop",
       lambda n: wait_for(lambda: not os.path.exists(f"/proc/{n.child_pid}"), 120, 0.5))
+
+# --- a stop while staking: divid stops its minting before it flushes the chain
+# state and the wallet (init.cpp:372-373, :381, :386); the chain and the wallet
+# agree at the next start, and peers.dat is written (net.cpp:1474-1485) ------------------------
+for n in NODES:
+    n.start(["staking=1"])
+    n.peer = raw_peer(n, "127.0.0.31" if n is C else "127.0.0.32")
+facts("stop while staking: a peer to stake for", lambda n: n.peer is not None)
+time.sleep(15)
+for n in NODES:
+    n.height_at_stop = n.rpc("getblockcount")
+    n.signal(signal.SIGTERM)
+facts("stop while staking: exit code", lambda n: n.wait_exit())
+for n in NODES:
+    if n.peer:
+        n.peer.close()
+facts("stop while staking: peers.dat written", lambda n: os.path.exists(os.path.join(n.netdir(), "peers.dat")))
+for n in NODES:
+    n.start()
+    n.after = n.state()
+    n.stop()
+    n.start(args=["-rescan"])
+    n.rescanned = n.state()
+    n.stop()
+facts("stop while staking: the next start has the chain up to the stop",
+      lambda n: n.after[0] >= n.height_at_stop)
+facts("stop while staking: the wallet at the next start matches a -rescan", lambda n: n.after == n.rescanned)
 
 # --- stderr of a start and a clean stop: divid writes there only its warnings and
 # errors (InitWarning, InitError, noui.cpp:38-40), here the unencrypted wallet

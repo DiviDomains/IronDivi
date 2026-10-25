@@ -124,13 +124,48 @@ pub fn serve_getdata(
             Some(_) => {}
         }
         match item.inv_type {
-            divi_network::InvType::Block => {
+            // A filtered block is found and followed as a block is
+            // (main.cpp:300-318), sent as a merkleblock under the peer's
+            // filter (which matching updates), then each matched transaction
+            // the peer is not known to have (main.cpp:249-278); served whatever
+            // -peerbloomfilters says, as every peer has a filter (Node.cpp:556)
+            divi_network::InvType::Block | divi_network::InvType::FilteredBlock => {
                 match chain.get_block_for_peer(&item.hash) {
                     Ok(Some(block)) => {
-                        match peer_manager.try_send_to_peer(peer_id, NetworkMessage::Block(block)) {
-                            TrySend::Sent => {}
-                            TrySend::Full => break,
-                            TrySend::Gone => return queue.clear(),
+                        let messages = if item.inv_type == divi_network::InvType::Block {
+                            vec![NetworkMessage::Block(block)]
+                        } else {
+                            let Some(stats) = peer_manager.peer_stats(peer_id) else {
+                                return queue.clear();
+                            };
+                            let (payload, matched) = {
+                                let mut filter = stats.bloom.filter();
+                                divi_network::bloom::merkle_block(&block, &mut filter)
+                            };
+                            let mut messages = vec![NetworkMessage::MerkleBlock(payload)];
+                            for (i, txid) in matched {
+                                if !tx_relay.peer_knows(peer_id, &txid) {
+                                    messages
+                                        .push(NetworkMessage::Tx(block.transactions[i].clone()));
+                                }
+                            }
+                            messages
+                        };
+                        // A full queue keeps the item for the next pass; the
+                        // transactions after a merkleblock follow it at once,
+                        // as divid pushes them together
+                        let mut messages = messages.into_iter();
+                        if let Some(first) = messages.next() {
+                            match peer_manager.try_send_to_peer(peer_id, first) {
+                                TrySend::Sent => {}
+                                TrySend::Full => break,
+                                TrySend::Gone => return queue.clear(),
+                            }
+                        }
+                        for msg in messages {
+                            if let TrySend::Gone = peer_manager.try_send_to_peer(peer_id, msg) {
+                                return queue.clear();
+                            }
                         }
                         tracing::debug!("Served block {} to peer {} (getdata)", item.hash, peer_id);
                         if hash_continue.get(&peer_id) == Some(&item.hash) {
@@ -208,13 +243,35 @@ pub fn serve_getdata(
                 }
                 queue.pop_front();
             }
+            // A type outside 1..15 is not known and gets nothing (main.cpp:321,
+            // protocol.cpp:146-149)
+            divi_network::InvType::Unknown => {
+                queue.pop_front();
+            }
+            // The other known types: Divi Core holds nothing to send for them,
+            // neither in its relay map nor in PushKnownInventory, so they are
+            // not found (main.cpp:168-211, :321-327, net.cpp:1565-1575)
             _ => {
+                not_found.push(item);
                 queue.pop_front();
             }
         }
     }
     if !not_found.is_empty() {
         let _ = peer_manager.try_send_to_peer(peer_id, NetworkMessage::NotFound(not_found));
+    }
+}
+
+/// A peer's message the node is handling, marked taken when dropped
+struct Taken<'a> {
+    peer_manager: &'a PeerManager,
+    peer_id: divi_network::PeerId,
+    size: u64,
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        self.peer_manager.message_taken(self.peer_id, self.size);
     }
 }
 
@@ -877,6 +934,10 @@ impl Node {
                 (mempool.contains(txid), orphans.contains(txid))
             }));
         }
+        let mempool_for_filters = Arc::clone(&mempool);
+        tx_relay.set_tx_source(Arc::new(move |txid| {
+            mempool_for_filters.get(txid).map(|entry| entry.tx.clone())
+        }));
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
@@ -1094,8 +1155,15 @@ impl Node {
         // A pruning node must not advertise NODE_NETWORK (full history). Key it off the
         // database too, so a node that pruned earlier stays honest if expire is later off.
         let prunes = self.config.expire.is_enabled() || self.chain.prune_height() > 0;
+        // NODE_BLOOM while bloom filters are served (Divi Core EnableBloomFilters,
+        // net.cpp:1722-1723, NetworkLocalAddressHelpers.cpp:224-227)
+        let bloom = if self.config.p2p.peer_bloom_filters {
+            divi_network::constants::services::NODE_BLOOM
+        } else {
+            0
+        };
         self.peer_manager
-            .set_services(divi_network::constants::advertised_services(prunes));
+            .set_services(divi_network::constants::advertised_services(prunes) | bloom);
         divi_network::constants::set_protocol_version(self.config.network.protocol_version as i32);
         self.peer_manager
             .set_local_addresses(self.local_addresses());
@@ -1189,6 +1257,7 @@ impl Node {
         // With -alerts=0 an alert message is not read at all (main.cpp:870)
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic)
             .filter(|_| self.config.p2p.alerts);
+        let peer_bloom_filters = self.config.p2p.peer_bloom_filters;
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
@@ -1197,6 +1266,8 @@ impl Node {
             // Masternode broadcasts and pings already asked for (Divi Core's
             // AlreadyHave for MSG_MASTERNODE_ANNOUNCE / _PING)
             let mut masternode_items_asked: HashSet<Hash256> = HashSet::new();
+            // Transaction lock requests and votes already asked for
+            let mut lock_items_asked: HashSet<Hash256> = HashSet::new();
             // The peers known to have each masternode item: it came from them
             // in an inv, or went to them in one (CNode::setInventoryKnown)
             let mut masternode_items_known: HashMap<[u8; 32], HashSet<u64>> = HashMap::new();
@@ -1244,9 +1315,19 @@ impl Node {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if let PeerEvent::Message { peer_id, size, .. } = &event {
-                    peer_manager.message_taken(*peer_id, *size);
-                }
+                // Taken once handled, at the end of this turn of the loop: until
+                // then it counts against the peer's receive limits, and the
+                // connection's own answers to later messages wait for it (Divi
+                // Core erases a message from vRecvMsg after ProcessMessage,
+                // main.cpp:1072-1077)
+                let _taken = match &event {
+                    PeerEvent::Message { peer_id, size, .. } => Some(Taken {
+                        peer_manager: &peer_manager,
+                        peer_id: *peer_id,
+                        size: *size,
+                    }),
+                    _ => None,
+                };
                 match event {
                     PeerEvent::Connected {
                         peer_id,
@@ -1310,8 +1391,17 @@ impl Node {
                         }
 
                         match message {
+                            // Divi Core reads a headers message only with
+                            // headers-first syncing, which no network has, so it
+                            // never acts on one or answers it (main.cpp:669,
+                            // chainparams.cpp:251, :360, :440); nor does any node
+                            // send one, as getheaders is answered with an inv
                             NetworkMessage::Headers(headers) => {
-                                block_sync.handle_headers(peer_id, headers).await;
+                                tracing::debug!(
+                                    "headers ({} entries) from peer {} not read",
+                                    headers.len(),
+                                    peer_id
+                                );
                             }
                             NetworkMessage::Block(block) => {
                                 if history.deliver(
@@ -1407,6 +1497,30 @@ impl Node {
                                 if !masternode_items.is_empty() {
                                     let _ = peer_manager
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
+                                        .await;
+                                }
+                                // Divi Core never has a transaction lock request or
+                                // vote (AlreadyHave, main.cpp:143-146), so it asks for
+                                // each one announced (AskFor, main.cpp:580-581); what
+                                // comes back is not read (main.cpp:963-966)
+                                if lock_items_asked.len() > 100_000 {
+                                    lock_items_asked.clear();
+                                }
+                                let lock_items: Vec<_> = items
+                                    .iter()
+                                    .filter(|i| {
+                                        matches!(
+                                            i.inv_type,
+                                            divi_network::message::InvType::TxLockRequest
+                                                | divi_network::message::InvType::TxLockVote
+                                        )
+                                    })
+                                    .filter(|i| lock_items_asked.insert(i.hash))
+                                    .cloned()
+                                    .collect();
+                                if !lock_items.is_empty() {
+                                    let _ = peer_manager
+                                        .send_to_peer(peer_id, NetworkMessage::GetData(lock_items))
                                         .await;
                                 }
                                 // Sporks are announced by inv as well
@@ -1745,16 +1859,70 @@ impl Node {
                                     }
                                 }
                             }
-                            // IronDivi does not offer NODE_BLOOM, and Divi Core without
-                            // bloom filters bans a peer that sends these
+                            // With -peerbloomfilters=0 Divi Core bans a peer that
+                            // sends these (main.cpp:892-899)
                             NetworkMessage::FilterLoad(_)
                             | NetworkMessage::FilterAdd(_)
-                            | NetworkMessage::FilterClear => {
+                            | NetworkMessage::FilterClear
+                                if !peer_bloom_filters =>
+                            {
                                 peer_manager.report_misbehavior_score(
                                     peer_id,
                                     100,
                                     "Sent bloom filter msg but they are disabled",
                                 );
+                            }
+                            // filterload, filteradd and filterclear as Divi Core
+                            // takes them (main.cpp:900-939)
+                            NetworkMessage::FilterLoad(payload) => {
+                                let Some(stats) = peer_manager.peer_stats(peer_id) else {
+                                    continue;
+                                };
+                                // A payload that does not read is dropped, as
+                                // Core's deserialization throws
+                                let Some(mut filter) =
+                                    divi_network::bloom::BloomFilter::deserialize(&payload)
+                                else {
+                                    continue;
+                                };
+                                if filter.is_within_size_constraints() {
+                                    filter.update_empty_full();
+                                    stats.bloom.set_filter(filter);
+                                } else {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        100,
+                                        "Sent too large a bloom filter message",
+                                    );
+                                }
+                                stats.bloom.set_relay(true);
+                            }
+                            NetworkMessage::FilterAdd(payload) => {
+                                let Some(stats) = peer_manager.peer_stats(peer_id) else {
+                                    continue;
+                                };
+                                let Some(item) = divi_network::bloom::read_bytes(&payload) else {
+                                    continue;
+                                };
+                                // Every peer has a filter from the start (Node.cpp:556),
+                                // so Core's "before enabling it" (main.cpp:930) is not met
+                                if item.len() > divi_network::bloom::MAX_FILTERADD_SIZE {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        100,
+                                        "Exceeded maximum size of script element to be added to filter",
+                                    );
+                                } else {
+                                    stats.bloom.filter().insert(item);
+                                }
+                            }
+                            NetworkMessage::FilterClear => {
+                                if let Some(stats) = peer_manager.peer_stats(peer_id) {
+                                    stats
+                                        .bloom
+                                        .set_filter(divi_network::bloom::BloomFilter::default());
+                                    stats.bloom.set_relay(true);
+                                }
                             }
                             NetworkMessage::Alert(payload) => {
                                 let (Some(key), Ok(alert)) =
@@ -2020,8 +2188,6 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
-        // netfulfilled.dat is written at shutdown (MasternodeModule.cpp:290-296)
-        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
@@ -2070,10 +2236,12 @@ impl Node {
         }
         shutdown_stage("node loops stopped", started);
 
-        // Disconnect all peers
+        // netfulfilled.dat once the loops that change it have stopped, as
+        // Divi Core's SaveMasternodeDataToDisk follows StopNode
+        // (init.cpp:372, :376; MasternodeModule.cpp:284-297)
         let started = std::time::Instant::now();
-        self.peer_manager.disconnect_all();
-        shutdown_stage("peers disconnected", started);
+        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
+        shutdown_stage("netfulfilled.dat written", started);
 
         // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
         let started = std::time::Instant::now();
@@ -2104,6 +2272,14 @@ impl Node {
             }
         }
         shutdown_stage("UTXO cache flushed", started);
+
+        // The connections close last, after the chain state is flushed, as
+        // Divi Core's CleanupP2PConnections ends its shutdown (init.cpp:417);
+        // peers.dat was written above, while they were open (StopNode,
+        // net.cpp:1474-1485)
+        let started = std::time::Instant::now();
+        self.peer_manager.disconnect_all();
+        shutdown_stage("peers disconnected", started);
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());

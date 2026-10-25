@@ -317,7 +317,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "whitelisted_vault",
     "checklevel",
     "par",
-    "peerbloomfilters",
 ];
 
 /// Options divid takes and does nothing with, only naming them in its help:
@@ -397,6 +396,7 @@ const APPLIED: &[&str] = &[
     "createwalletbackups",
     "monthlybackups",
     "vault_min",
+    "whitelisted_vault",
     "rpcuser",
     "rpcpassword",
     "rpcport",
@@ -446,6 +446,7 @@ const APPLIED: &[&str] = &[
     "maxreorg",
     "maxorphantx",
     "minrelaytxfee",
+    "peerbloomfilters",
     "acceptnonstandard",
     "permitbaremultisig",
     "datacarrier",
@@ -802,6 +803,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.p2p.tor_password = s.get("torpassword").unwrap_or("").to_string();
     config.p2p.upnp = s.get_bool("upnp", divi_network::upnp::DEFAULT_UPNP);
     config.p2p.discover = s.get_bool("discover", true);
+    config.p2p.peer_bloom_filters = s.get_bool("peerbloomfilters", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
     for raw in s.get_multi("externalip") {
@@ -1713,7 +1715,7 @@ fn move_wallet_for_restore(wallet_path: &Path) -> Result<()> {
 }
 
 /// Wallet start options
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WalletOptions {
     /// -rescan: scan the whole chain at the start; -salvagewallet sets it
     /// unless it is given (init.cpp:763-766, :1242)
@@ -1750,6 +1752,36 @@ struct WalletOptions {
     /// -vault_min, whole DIVI read as a number: managed vault coins below it
     /// are not staked (AvailableUtxoCollector.cpp:22)
     vault_min: Amount,
+    /// -whitelisted_vault, each read with ParseHex: vault scripts registered
+    /// at every load (init.cpp:1182-1191, :1201)
+    whitelisted_vaults: Vec<Vec<u8>>,
+}
+
+/// Divi Core's IsHex (utilstrencodings.cpp:64-71): an even number of hex
+/// digits, at least two, and nothing else
+fn core_is_hex(text: &str) -> bool {
+    !text.is_empty() && text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Divi Core's ParseHex (utilstrencodings.cpp:73-91): pairs of hex digits,
+/// spaces skipped before each pair, up to the first pair that is not one
+fn parse_hex_prefix(text: &str) -> Vec<u8> {
+    let mut bytes = text.bytes().peekable();
+    let nibble = |b: Option<u8>| b.and_then(|b| (b as char).to_digit(16));
+    let mut out = Vec::new();
+    loop {
+        while bytes
+            .next_if(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+            .is_some()
+        {}
+        let Some(high) = nibble(bytes.next()) else {
+            return out;
+        };
+        let Some(low) = nibble(bytes.next()) else {
+            return out;
+        };
+        out.push((high << 4 | low) as u8);
+    }
 }
 
 /// divid's defaults: the options as when none is given
@@ -1787,6 +1819,11 @@ impl WalletOptions {
                     .get("vault_min")
                     .map_or(0, |v| atoi(v).saturating_mul(100_000_000)),
             ),
+            whitelisted_vaults: settings
+                .get_multi("whitelisted_vault")
+                .iter()
+                .map(|v| parse_hex_prefix(v))
+                .collect(),
         }
     }
 
@@ -1812,6 +1849,13 @@ fn load_or_create_wallet(
     if seed.restore {
         move_wallet_for_restore(wallet_path)?;
     }
+    // A hex -hdseed is preferred over -mnemonic and -mnemonicpassphrase,
+    // logged at every start, a wallet there or not (init.cpp:945-951)
+    if seed.hdseed.as_deref().is_some_and(core_is_hex)
+        && (seed.mnemonic.is_some() || seed.passphrase.is_some())
+    {
+        info!("PruneHDSeedParameterInteraction: parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed");
+    }
     let env = |name: &str| std::env::var(name).ok();
     // An empty mnemonic asks for a new one, as in Core
     let mnemonic = seed
@@ -1821,7 +1865,6 @@ fn load_or_create_wallet(
     let passphrase = seed
         .passphrase
         .or_else(|| env("WALLET_MNEMONIC_PASSPHRASE"));
-    // -hdseed is preferred over a mnemonic (init.cpp:947-951)
     let hdseed = seed.hdseed.or_else(|| env("WALLET_HDSEED"));
     load_or_restore_wallet_with_seed(
         wallet_path,
@@ -1948,18 +1991,13 @@ fn load_or_restore_wallet_with_seed(
     // Divi Core takes -hdseed when it is hex and logs anything else, then
     // goes on with the mnemonic or a new seed (wallet.cpp:2286-2297)
     let seed = match seed {
-        Some(hex_seed) => match hex::decode(hex_seed.trim()) {
-            Ok(bytes) if !bytes.is_empty() => Some(bytes),
-            _ => {
-                warn!("-hdseed is not a hex seed; not using it");
-                None
-            }
-        },
+        Some(hex_seed) if core_is_hex(&hex_seed) => hex::decode(&hex_seed).ok(),
+        Some(_) => {
+            info!("CWallet::GenerateNewHDChain -- Incorrect seed, generating random one instead");
+            None
+        }
         None => None,
     };
-    if seed.is_some() && (restoring.is_some() || passphrase.is_some()) {
-        warn!("-hdseed and -mnemonic/-mnemonicpassphrase together: using the seed");
-    }
     let restoring = if seed.is_some() { None } else { restoring };
     let passphrase = if seed.is_some() { None } else { passphrase };
     // The version limit is checked before the seed is made
@@ -2125,17 +2163,28 @@ fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File> {
         .append(true)
         .open(dir.join(".lock"))
         .with_context(|| format!("Failed to open {:?}", dir.join(".lock")))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
-            dir.display()
-        ),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("Failed to lock {:?}", dir.join(".lock")))
+    // Divi Core waits up to 10 seconds for the lock, for a node still on its
+    // way out (init.cpp:858-860)
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "Cannot obtain a lock on data directory {}. Divi Core or irondivid is probably already running.",
+                dir.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("Failed to lock {:?}", dir.join(".lock")))
+            }
         }
     }
 }
+
+/// How long a start waits for the data directory lock (init.cpp:858-860)
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the daemon
 #[allow(clippy::too_many_arguments)]
@@ -2240,7 +2289,7 @@ async fn run_daemon(
 
     // Load or create wallet (unless disabled)
     let wallet = if disable_wallet {
-        info!("Wallet disabled");
+        info!("Wallet disabled!");
 
         // Still need mempool cleanup + fee estimation callback even without wallet
         let block_sync = node.block_sync();
@@ -2292,6 +2341,13 @@ async fn run_daemon(
                 core_files::lock_masternode_collateral(w, &mn_options.conf_path);
             }
             w.set_vault_mode(config.vault);
+            // Before the wallet catches up with the chain, as divid loads
+            // them with the wallet (init.cpp:1201, :1242)
+            for script in &wallet_options.whitelisted_vaults {
+                if w.whitelist_vault(script) {
+                    info!("Whitelisted vault {} registered", hex::encode(script));
+                }
+            }
             w.set_spend_zero_conf_change(wallet_options.spend_zero_conf_change);
             w.set_vault_min(wallet_options.vault_min);
             w.set_relay_fee_per_kb(config.mempool.min_relay_fee_per_kb);
@@ -2983,6 +3039,14 @@ async fn run_daemon(
                 info!("Shutdown signal received");
             }
         }
+    }
+
+    // Divi Core stops minting before it flushes the chain state and the wallet
+    // (init.cpp:372-373, :381, :386): no block is staked while they are written
+    if let Some(staker) = staker.clone() {
+        let started = std::time::Instant::now();
+        let _ = tokio::task::spawn_blocking(move || staker.stop_and_wait()).await;
+        shutdown_stage("staking stopped", started);
     }
 
     // Stop the node
@@ -4152,6 +4216,7 @@ mod wallet_log_tests {
     /// -mnemonic or -hdseed the wallet there is loaded
     #[test]
     fn a_mnemonic_moves_a_wallet_already_there() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let mnemonic = "abandon abandon abandon abandon abandon abandon \
                         abandon abandon abandon abandon abandon about";
         let mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -4207,6 +4272,7 @@ mod wallet_log_tests {
     /// moved, and leave no new wallet
     #[test]
     fn invalid_mnemonic_words_stop_the_start() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // "abandon" twelve times: every word is in the list, the checksum fails
         let words = ["abandon"; 12].join(" ");
         let dir = tempfile::tempdir().unwrap();
@@ -4770,6 +4836,12 @@ mod submit_error_tests {
     }
 }
 
+/// Held by the tests that set the WALLET_* environment variables or call
+/// `load_or_create_wallet`, which reads them: tests run in parallel threads
+/// of one process
+#[cfg(test)]
+static WALLET_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod wallet_move_tests {
     use super::*;
@@ -4779,9 +4851,11 @@ mod wallet_move_tests {
     const CORE_FIRST_ADDRESS: &str = "y7VQ7R3SDRxzNuUsUuFzuq2FT1uVtW8iBz";
 
     /// WALLET_HDSEED restores a wallet from a hex seed, as Core's -hdseed, and
-    /// is taken over WALLET_MNEMONIC (the only test here that sets them)
+    /// is taken over WALLET_MNEMONIC (the only test here that sets them; it
+    /// holds `WALLET_ENV`)
     #[test]
     fn hex_seed_restores_cores_first_address() {
+        let _env = WALLET_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet");
         std::env::set_var("WALLET_HDSEED", "000102030405060708090a0b0c0d0e0f");
@@ -5382,6 +5456,22 @@ mod start_errors {
         assert!(parse("-version").version);
         assert!(!parse("-h").help && !parse("-h").version);
         assert!(!parse("-V").version);
+    }
+
+    /// A lock let go within 10 seconds is taken: Divi Core waits that long for
+    /// a node still on its way out (init.cpp:858-860)
+    #[test]
+    fn the_data_directory_lock_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            drop(first);
+        });
+        let started = std::time::Instant::now();
+        assert!(lock_data_dir(dir.path()).is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+        release.join().unwrap();
     }
 
     /// One process per data directory, with divid's text (init.cpp:850-862)

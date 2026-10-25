@@ -284,7 +284,7 @@ fn hdseed_option_makes_cores_wallet() {
     );
     daemon.stop();
     assert!(
-        debug_log(dir.path()).contains("-hdseed is not a hex seed"),
+        debug_log(dir.path()).contains("Incorrect seed, generating random one instead"),
         "no warning for a seed that is not hex"
     );
 }

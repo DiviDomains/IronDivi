@@ -352,6 +352,9 @@ pub struct BlockSync {
     block_sources: RwLock<HashMap<Hash256, PeerId>>,
     /// Orphan blocks (blocks whose parent we don't have yet)
     orphan_blocks: RwLock<HashMap<Hash256, OrphanBlock>>,
+
+    /// The blocks a peer was asked for because a block it sent has no known parent
+    parent_asked: RwLock<HashSet<(PeerId, Hash256)>>,
     /// Blocks we've requested from each peer
     peer_block_requests: RwLock<HashMap<PeerId, HashSet<Hash256>>>,
     /// Blocks queued for download (not yet requested due to in-flight limits)
@@ -391,6 +394,9 @@ pub struct BlockSync {
     /// Peers sent the getblocks that starts a sync when they connected
     /// (Divi Core CNodeState::Syncing, NodeState.cpp)
     sync_started_peers: RwLock<HashSet<PeerId>>,
+    /// Per peer: the blocks a getblocks was sent up to after it sent a block
+    /// whose parent is unknown (Divi Core CNode::vBlockRequested)
+    blocks_requested: RwLock<HashMap<PeerId, Vec<Hash256>>>,
 }
 
 /// Sync statistics
@@ -418,6 +424,7 @@ impl BlockSync {
             downloaded_blocks: RwLock::new(HashMap::new()),
             block_sources: RwLock::new(HashMap::new()),
             orphan_blocks: RwLock::new(HashMap::new()),
+            parent_asked: RwLock::new(HashSet::new()),
             peer_block_requests: RwLock::new(HashMap::new()),
             pending_block_requests: RwLock::new(VecDeque::new()),
             block_retry: RwLock::new(HashMap::new()),
@@ -433,6 +440,7 @@ impl BlockSync {
             stalled_sync_peers: RwLock::new(HashSet::new()),
             side_chain_tip: RwLock::new(None),
             sync_started_peers: RwLock::new(HashSet::new()),
+            blocks_requested: RwLock::new(HashMap::new()),
         })
     }
 
@@ -609,6 +617,7 @@ impl BlockSync {
     /// Remove peer from tracking
     pub fn remove_peer(&self, peer_id: PeerId) {
         self.sync_started_peers.write().remove(&peer_id);
+        self.blocks_requested.write().remove(&peer_id);
         let removed_height = self.peer_heights.write().remove(&peer_id);
         let remaining_peers = self.peer_heights.read().len();
 
@@ -1193,8 +1202,9 @@ impl BlockSync {
 
     /// A block was refused. As Divi Core's ProcessMessage ("Bad block
     /// processed"), the peer that sent it gets the refusal's misbehaviour score.
-    /// Returns true when the block is invalid (scored), so callers drop it
-    /// instead of retrying; an orphan or a local error scores 0 and is kept.
+    /// Returns true when the block is invalid, scored or not, so callers drop it
+    /// instead of retrying: Divi Core keeps nothing of a block it refuses, and asks
+    /// for nothing more because of it. An orphan or a local error is kept.
     fn note_block_rejected(&self, hash: &Hash256, err: &StorageError) -> bool {
         // Divi Core tells the peer why (main.cpp:840-843), score or none
         if let Some((code, reason)) = err.block_reject() {
@@ -1211,18 +1221,60 @@ impl BlockSync {
                 );
             }
         }
+        let invalid = matches!(
+            err,
+            StorageError::InvalidBlock(_)
+                | StorageError::InvalidBlockScored { .. }
+                | StorageError::UtxoNotFound(_)
+                | StorageError::DoubleSpend(_)
+        );
         let score = err.misbehaviour_score();
-        if score == 0 {
+        if !invalid {
             return false;
         }
         if let Some(peer_id) = self.block_sources.write().remove(hash) {
-            self.peer_manager.report_misbehavior_score(
-                peer_id,
-                score,
-                &format!("bad block {}: {}", hash, err),
-            );
+            if score > 0 {
+                self.peer_manager.report_misbehavior_score(
+                    peer_id,
+                    score,
+                    &format!("bad block {}: {}", hash, err),
+                );
+            }
         }
         true
+    }
+
+    /// A block we did not ask for whose parent we do not know: Divi Core asks the
+    /// peer for the blocks up to it (main.cpp:820-830, `getblocks` with our locator
+    /// and the block as the stop), and, if it already asked for this block of this
+    /// peer, for the block before it. Blocks that came because we asked for them are
+    /// left to the download.
+    async fn ask_for_parent(&self, peer_id: PeerId, block: &Block, hash: Hash256) {
+        let parent = block.header.prev_block;
+        if parent.is_zero() || self.chain.has_block(&parent).unwrap_or(true) {
+            return;
+        }
+        let stop = {
+            let mut asked = self.parent_asked.write();
+            if asked.len() >= MAX_TRACKED_BLOCK_SOURCES {
+                asked.clear();
+            }
+            let stop = if asked.contains(&(peer_id, hash)) {
+                parent
+            } else {
+                hash
+            };
+            asked.insert((peer_id, stop));
+            stop
+        };
+        let locator = self.build_block_locator();
+        let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, stop));
+        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+            debug!(
+                "Failed to ask peer {} for the parent of {}: {}",
+                peer_id, hash, e
+            );
+        }
     }
 
     /// Handle received block
@@ -1238,11 +1290,31 @@ impl BlockSync {
         }
         debug!("Received block {} from peer {}", hash, peer_id);
 
+        // A block not asked for whose parent is unknown: Divi Core asks the
+        // peer for the blocks up to it with a getblocks, or up to its parent
+        // when it asked for this block that way before (main.cpp:822-833).
+        // A block asked for may come before its parent from a download in
+        // parallel; it is kept for it
+        let requested = self.blocks_in_flight.read().contains_key(&hash);
+        if !requested
+            && self
+                .chain
+                .get_block_index(&block.header.prev_block)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            self.ask_up_to(peer_id, hash, block.header.prev_block).await;
+        }
+
         // Track chain height before processing to detect newly connected blocks
         let height_before = self.chain.height();
 
         // Remove from in-flight
-        self.blocks_in_flight.write().remove(&hash);
+        let solicited = self.blocks_in_flight.write().remove(&hash).is_some();
+        if !solicited {
+            self.ask_for_parent(peer_id, &block, hash).await;
+        }
         if let Some(requests) = self.peer_block_requests.write().get_mut(&peer_id) {
             requests.remove(&hash);
         }
@@ -1286,6 +1358,28 @@ impl BlockSync {
 
         // Emit progress
         let _ = self.progress_tx.send(self.progress());
+    }
+
+    /// The getblocks Divi Core sends for a block whose parent it does not
+    /// know: up to the block, or up to its parent once it has asked for the
+    /// block (main.cpp:822-833)
+    async fn ask_up_to(&self, peer_id: PeerId, hash: Hash256, prev: Hash256) {
+        let stop = {
+            let mut requested = self.blocks_requested.write();
+            let asked = requested.entry(peer_id).or_default();
+            // Kept bounded: a peer could send unknown blocks without end
+            if asked.len() >= 1000 {
+                asked.clear();
+            }
+            let stop = if asked.contains(&hash) { prev } else { hash };
+            asked.push(stop);
+            stop
+        };
+        let msg =
+            NetworkMessage::GetBlocks(GetHeadersMessage::new(self.build_block_locator(), stop));
+        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+            warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
+        }
     }
 
     /// Try to connect downloaded blocks to the chain
@@ -2501,6 +2595,31 @@ mod tests {
     fn test_sync_creation() {
         let (sync, _dir) = create_test_sync();
         assert_eq!(sync.state(), SyncState::Idle);
+    }
+
+    /// A refused block is dropped whether or not it scores: Divi Core keeps nothing
+    /// of it. Only an orphan or a local error is kept to try again; a refusal with
+    /// no score was kept, and with it the sync never counted itself done.
+    #[test]
+    fn a_refused_block_is_dropped_whatever_its_score() {
+        use divi_storage::StorageError;
+        let (sync, _dir) = create_test_sync();
+        let hash = Hash256::from_bytes([5; 32]);
+        for (error, dropped) in [
+            (
+                StorageError::invalid_block_scored(0, "bad-diffbits".into()),
+                true,
+            ),
+            (
+                StorageError::invalid_block_scored(10, "bad-txns-nonfinal".into()),
+                true,
+            ),
+            (StorageError::InvalidBlock("bad-txnmrklroot".into()), true),
+            (StorageError::OrphanBlock("parent".into()), false),
+            (StorageError::ChainState("local".into()), false),
+        ] {
+            assert_eq!(sync.note_block_rejected(&hash, &error), dropped, "{error}");
+        }
     }
 
     #[test]

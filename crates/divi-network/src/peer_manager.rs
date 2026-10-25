@@ -620,6 +620,14 @@ impl PeerManager {
         self.peers.read().get(&peer_id).map(|p| p.addr)
     }
 
+    /// A connected peer's live stats, with its bloom filter
+    pub fn peer_stats(&self, peer_id: PeerId) -> Option<Arc<crate::peer::LivePeerStats>> {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .map(|p| Arc::clone(&p.stats))
+    }
+
     /// Whether a connected peer dialled us
     pub fn is_inbound(&self, peer_id: PeerId) -> bool {
         self.peers.read().get(&peer_id).is_some_and(|p| p.inbound)

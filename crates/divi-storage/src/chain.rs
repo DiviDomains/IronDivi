@@ -546,6 +546,12 @@ pub struct Chain {
 /// them and the chain that reads them
 pub type SharedSporks = Arc<RwLock<ConsensusSporks>>;
 
+/// Whether a proof of stake failed for want of the coin it stakes
+fn is_unknown_stake_coin(error: &StorageError) -> bool {
+    let text = error.to_string();
+    text.contains("Kernel UTXO not found") || text.contains("Failed to get kernel UTXO")
+}
+
 /// An output a coinstake spends, as proof of stake reads it
 struct StakePrevout {
     value: Amount,
@@ -1753,7 +1759,10 @@ impl Chain {
             let within_depth = self.params.max_reorg_depth.is_none_or(|depth| {
                 i64::from(self.height()) - i64::from(index.height) < i64::from(depth)
             });
+            // CBlockIndex::IsValid(BLOCK_VALID_SCRIPTS): never a block that
+            // failed, as one invalidateblock marks (chain.h:313-319)
             if !(index.status.contains(BlockStatus::VALID_SCRIPTS)
+                && !index.failed()
                 && best_header_height > 0
                 && within_depth)
             {
@@ -2118,9 +2127,9 @@ impl Chain {
         // includes the proof of stake, then ContextualCheckBlockHeader's depth limit,
         // time and version (ChainExtensionService.cpp:292-353). A block that fails the
         // proof is refused before its time or version is looked at, so it draws no
-        // reject. The bits and the work run for every block; the proof of stake needs the
-        // UTXO set at the parent, so it runs here for a block on the tip and during a
-        // reorg for any other.
+        // reject, and before it is stored: a block of a side chain is checked the same
+        // way when it arrives (ChainExtensionService.cpp:477), not when a reorg
+        // reaches it.
         let extends_tip = parent_index.as_ref().is_some_and(|parent| {
             self.tip
                 .read()
@@ -2130,18 +2139,26 @@ impl Chain {
         });
         if let Some(ref parent) = parent_index {
             self.check_block_work(&block, &hash, parent)?;
-            if extends_tip {
-                self.check_block_proof_of_stake(&block, parent)?;
+            match self.check_block_proof_of_stake(&block, parent) {
+                // A block of a side chain may stake a coin that only its own branch
+                // made, which is in neither the unspent outputs nor the chain we hold,
+                // so its proof can be checked only when the branch is connected. Divi
+                // Core refuses such a block, because its transaction index holds only
+                // the blocks it has connected (TransactionDiskAccessor.cpp:56-72,
+                // BlockProofVerifier.cpp:56-57); irondivid keeps it, so that a fork
+                // that restakes its own coins can still be followed.
+                Err(e) if !extends_tip && is_unknown_stake_coin(&e) => {}
+                other => other?,
             }
             self.check_reorg_depth(parent.height + 1)?;
             Self::check_block_version_and_height(&block, parent.height + 1)?;
         }
 
         // 6. Check contextual validity (skip for genesis)
-        // Only perform full PoS/signature validation for blocks extending the current tip.
-        // Side-chain blocks are stored with header-only validation and get full validation
-        // during reorg (connect_block). This matches C++ Divi's AcceptBlock vs ConnectTip
-        // separation and allows storing competing chain blocks for proper fork selection.
+        // The proof of stake and the signature were checked above for every block.
+        // What is left of the full validation (the coins, scripts and amounts) is done
+        // when the block is connected: on arrival for a block on the tip, during a reorg
+        // for a block of a side chain, as in C++ Divi's AcceptBlock vs ConnectTip.
         if let Some(ref parent) = parent_index {
             if extends_tip {
                 debug!("  ├─ Full context validation (extends tip)");
@@ -2203,19 +2220,22 @@ impl Chain {
                 let db_clone = self.db.clone();
                 let mut block_map = std::collections::HashMap::new();
 
-                // Stake modifier needs blocks within the selection interval (~2087 seconds).
-                // On testnets with fast block production (~12s/block), this can span ~200 blocks.
-                // The selection algorithm also needs to find blocks by hash for entropy selection,
-                // and the last_modifier_index walk needs to find generated_stake_modifier flags.
-                // Use 2000 as a safe upper bound that covers all networks while still being
-                // much cheaper than the original full-chain walk.
-                let max_walk_depth = 2000;
-                let mut walk_count = 0u32;
+                // The modifier reads every block back to the last one that generated a
+                // modifier, and every block of the selection interval (~2087 seconds) up
+                // to the first older one, however many blocks that is
+                // (ChainExtensionService.cpp:115-130, :161, :172-185)
+                let interval_start = (parent.time / crate::stake_modifier::MODIFIER_INTERVAL
+                    * crate::stake_modifier::MODIFIER_INTERVAL)
+                    as i64
+                    - crate::stake_modifier::get_stake_modifier_selection_interval();
+                let mut seen_generated = false;
+                let mut seen_older = false;
                 let mut current = Some(parent.clone());
                 while let Some(ref idx) = current {
                     block_map.insert(idx.hash, idx.clone());
-                    walk_count += 1;
-                    if idx.prev_hash.is_zero() || walk_count >= max_walk_depth {
+                    seen_generated |= idx.generated_stake_modifier;
+                    seen_older |= (idx.time as i64) < interval_start;
+                    if idx.prev_hash.is_zero() || (seen_generated && seen_older) {
                         break;
                     }
                     current = db_clone.get_block_index(&idx.prev_hash).ok().flatten();
@@ -6351,6 +6371,58 @@ mod tests {
         assert_eq!(chain.height(), 2);
     }
 
+    /// Divi Core picks the stake modifier's blocks from every block of the
+    /// selection interval, however many (ChainExtensionService.cpp:115-130,
+    /// :172-185). A chain making a block a second has over 2,000 in it.
+    #[test]
+    fn stake_modifier_sees_every_block_of_the_selection_interval() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        // Mainnet's first lottery and treasury blocks are far past these heights
+        let params = ChainParams {
+            check_block_work: false,
+            checkpoints: Vec::new(),
+            ..ChainParams::for_network(NetworkType::Mainnet, ChainMode::Divi)
+        };
+        let chain = Chain::new(db, params).unwrap();
+        let (mut prev_hash, mut prev_time) = get_genesis_info(&chain);
+        for _ in 0..2200 {
+            let mut block = create_child_block_with_pubkey(prev_hash, prev_time, [3u8; 20]);
+            block.header.time = prev_time + 1;
+            block.transactions[0].vout[0].value = Amount::from_divi(1);
+            seal(&mut block);
+            prev_hash = chain.accept_block(block).unwrap().hash;
+            prev_time += 1;
+        }
+        assert_eq!(chain.height(), 2200);
+
+        let all: HashMap<Hash256, BlockIndex> = (0..=2200)
+            .map(|h| chain.get_block_index_by_height(h).unwrap().unwrap())
+            .map(|b| (b.hash, b))
+            .collect();
+        let refs: HashMap<Hash256, &BlockIndex> = all.iter().map(|(k, v)| (*k, v)).collect();
+        let get_prev = |hash: &Hash256| refs.get(hash).copied();
+        for height in 2000..=2200 {
+            let index = chain.get_block_index_by_height(height).unwrap().unwrap();
+            let parent = refs[&index.prev_hash];
+            let hardened = crate::fork_activation::ActivationState::new(parent)
+                .is_hardened_stake_modifier_active();
+            let expected = crate::stake_modifier::compute_next_stake_modifier(
+                Some(parent),
+                &get_prev,
+                &refs,
+                hardened,
+            )
+            .unwrap();
+            assert_eq!(
+                (index.stake_modifier, index.generated_stake_modifier),
+                expected,
+                "stake modifier at height {}",
+                height
+            );
+        }
+    }
+
     #[test]
     fn test_block_with_non_final_tx_rejected() {
         // Consensus side: Divi Core rejects a block holding a tx that is
@@ -7080,6 +7152,50 @@ mod tests {
         let err = chain.accept_block(block).unwrap_err();
         assert!(err.to_string().contains("VerifySignature failed"), "{err}");
         assert_eq!(err.block_reject(), None);
+    }
+
+    /// A block that does not extend the tip is checked for its proof of stake when
+    /// it arrives, as Divi Core does (ChainExtensionService.cpp:477): one that fails
+    /// is refused and not stored, so no side chain can be built on it. It was kept
+    /// until a reorg reached it.
+    #[test]
+    fn a_side_chain_block_with_a_bad_proof_is_refused_and_not_stored() {
+        let (chain, _dir) = create_test_chain();
+        let (genesis_hash, genesis_time) = get_genesis_info(&chain);
+        let block1 = create_child_block(genesis_hash, genesis_time);
+        let hash1 = chain.accept_block(block1.clone()).unwrap().hash;
+        let coinbase_txid =
+            chain.compute_txid(&chain.get_block(&hash1).unwrap().unwrap().transactions[0]);
+        // the tip moves on, so a second child of block 1 is a block of a side chain
+        let block2 = create_child_block(hash1, block1.header.time);
+        chain.accept_block(block2).unwrap();
+        assert_eq!(chain.height(), 2);
+
+        let mut side = create_child_block(hash1, block1.header.time + 5);
+        side.transactions[0].vout = vec![TxOut::new(Amount::ZERO, Script::new())];
+        side.transactions.push(Transaction {
+            version: 1,
+            vin: vec![TxIn {
+                prevout: OutPoint::new(coinbase_txid, 0),
+                script_sig: Script::from_bytes(vec![0x01, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            vout: vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(
+                    Amount::from_sat(1251_00000000),
+                    Script::new_p2pkh(&[0x99; 20]),
+                ),
+            ],
+            lock_time: 0,
+        });
+        seal(&mut side);
+        let side_hash = compute_block_hash(&side.header);
+        let err = chain.accept_block(side).unwrap_err();
+        assert!(err.to_string().contains("VerifySignature failed"), "{err}");
+        assert_eq!(err.misbehaviour_score(), 0);
+        assert!(chain.get_block_index(&side_hash).unwrap().is_none());
+        assert_eq!(chain.get_chain_tips().unwrap().len(), 1);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::version::VersionMessage;
 use crate::{NetworkMessage, USER_AGENT};
 
 use futures::StreamExt;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -446,6 +447,9 @@ impl Connection {
         }
         self.info.services = their_version.services;
         self.info.start_height = their_version.start_height;
+        // fRelayTxes from the version message, true when it names none
+        // (Divi Core main.cpp:388-391)
+        self.stats.bloom.set_relay(their_version.relay);
         self.info.version = Some(their_version);
         self.info.state = PeerState::VersionReceived;
         // Divi Core keeps the version's fields as it reads them (main.cpp:372-391),
@@ -677,6 +681,10 @@ impl Connection {
             );
         }
 
+        // What the connection answers itself (pongs, rejects), each behind the
+        // peer's messages before it that the node has not handled yet
+        let mut waiting: VecDeque<(u64, NetworkMessage)> = VecDeque::new();
+
         loop {
             info.publish(&stats);
             // Not read while its messages the node has not taken pass the
@@ -698,23 +706,7 @@ impl Connection {
                         info!("Disconnecting from {} (dropped by the peer manager)", crate::peer_log::peer(peer_id, info.addr));
                         break;
                     };
-                    // Counted until written, as Divi Core's nSendSize
-                    let queued = msg.wire_size();
-                    // A queued ping (the `ping` RPC) gets a fresh nonce and is timed like the
-                    // keep-alive, so its pong updates pingtime (C++ fPingQueued)
-                    let msg = match msg {
-                        NetworkMessage::Ping(_) => {
-                            let nonce = rand::random();
-                            info.ping_nonce = Some(nonce);
-                            info.ping_time = Some(std::time::Instant::now());
-                            last_ping_sent = info.ping_time;
-                            NetworkMessage::Ping(nonce)
-                        }
-                        other => other,
-                    };
-                    let written = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, msg).await;
-                    stats.send_written(queued);
-                    if let Err(e) = written {
+                    if let Err(e) = Self::write_queued(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, msg).await {
                         error!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                         break;
                     }
@@ -739,8 +731,14 @@ impl Connection {
                     }
                 }
 
-                // The node took a message: read again if there is room
-                _ = stats.recv_space.notified(), if !can_receive => {}
+                // The node took a message: read again if there is room, and
+                // write the answers whose turn has come
+                _ = stats.recv_space.notified(), if !can_receive || !waiting.is_empty() => {
+                    if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
+                        error!("Failed to send message to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                        break;
+                    }
+                }
 
                 // Handle incoming messages - framed.next() IS CANCELLATION SAFE!
                 result = timeout(READ_TIMEOUT, framed.next()), if can_receive => {
@@ -749,7 +747,8 @@ impl Connection {
                             let bytes_received = framed.decoder_mut().take_bytes_consumed();
                             info.bytes_recv += bytes_received;
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
-                            if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, duplicate_version_reject()).await {
+                            Self::answer_in_turn(&stats, &mut waiting, duplicate_version_reject());
+                            if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
                                 error!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                                 break;
                             }
@@ -770,7 +769,8 @@ impl Connection {
                                 info.ping_time = None;
                             }
                             if let Some(answer) = malformed_reject(&command) {
-                                if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, answer).await {
+                                Self::answer_in_turn(&stats, &mut waiting, answer);
+                                if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
                                     error!("Failed to send reject to {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                                     break;
                                 }
@@ -789,10 +789,11 @@ impl Connection {
 
                             trace!("Received {} from {}", msg.command(), info.addr);
 
-                            if let Err(e) = Self::handle_message(
-                                &mut writer, &mut info, magic, &total_bytes_sent, peer_id, &event_tx, &stats, msg, bytes_received
-                            ).await {
-                                warn!("Error handling message from {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
+                            Self::handle_message(
+                                &mut info, peer_id, &event_tx, &stats, &mut waiting, msg, bytes_received
+                            );
+                            if let Err(e) = Self::write_turns(&mut writer, &mut info, magic, &total_bytes_sent, &stats, &mut last_ping_sent, &mut outbound_rx, &mut waiting).await {
+                                warn!("Error answering {}: {}", crate::peer_log::peer(peer_id, info.addr), e);
                             }
                         }
                         Ok(Some(Err(e))) => {
@@ -826,44 +827,27 @@ impl Connection {
         Ok(())
     }
 
-    /// Handle a received message
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_message<W: AsyncWriteExt + Unpin>(
-        writer: &mut W,
+    /// Handle a received message: what the connection answers itself waits
+    /// in `waiting` for its turn
+    fn handle_message(
         info: &mut PeerInfo,
-        magic: Magic,
-        total_bytes_sent: &Arc<AtomicU64>,
         peer_id: PeerId,
         event_tx: &broadcast::Sender<PeerEvent>,
         stats: &LivePeerStats,
+        waiting: &mut VecDeque<(u64, NetworkMessage)>,
         msg: NetworkMessage,
         size: u64,
-    ) -> Result<(), NetworkError> {
+    ) {
         match &msg {
             // The peer's verack: nothing waits for it (main.cpp:498-507)
             NetworkMessage::Verack => {}
             // Divi Core: one version per connection
             NetworkMessage::Version(_) => {
-                Self::write_message(
-                    writer,
-                    info,
-                    magic,
-                    total_bytes_sent,
-                    duplicate_version_reject(),
-                )
-                .await?;
+                Self::answer_in_turn(stats, waiting, duplicate_version_reject());
                 let _ = event_tx.send(duplicate_version(peer_id));
             }
             NetworkMessage::Ping(nonce) => {
-                // Respond with pong
-                Self::write_message(
-                    writer,
-                    info,
-                    magic,
-                    total_bytes_sent,
-                    NetworkMessage::Pong(*nonce),
-                )
-                .await?;
+                Self::answer_in_turn(stats, waiting, NetworkMessage::Pong(*nonce));
             }
             NetworkMessage::Pong(nonce) => {
                 // Divi Core ProcessReceivedPong (Node.cpp:754-808): our nonce
@@ -891,17 +875,95 @@ impl Connection {
                 trace!("Received {} message from peer {}", msg.command(), peer_id);
 
                 // Forward to event handler for processing; counted until
-                // the node takes it
+                // the node has handled it (none left to count with no node)
                 stats.message_queued(size);
-                let _ = event_tx.send(PeerEvent::Message {
+                let sent = event_tx.send(PeerEvent::Message {
                     peer_id,
                     message: msg,
                     size,
                 });
+                if sent.is_err() {
+                    stats.message_taken(size);
+                }
             }
         }
+    }
 
-        Ok(())
+    /// Queue an answer the connection gives itself (a pong, a reject) behind
+    /// the peer's messages handed to the node before it
+    fn answer_in_turn(
+        stats: &LivePeerStats,
+        waiting: &mut VecDeque<(u64, NetworkMessage)>,
+        msg: NetworkMessage,
+    ) {
+        waiting.push_back((stats.recv_handed.load(Ordering::Acquire), msg));
+    }
+
+    /// Write the answers whose turn has come: the node has handled every
+    /// message before them. What the node queued for the peer meanwhile goes
+    /// first, as it answers those earlier messages
+    #[allow(clippy::too_many_arguments)]
+    async fn write_turns<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        info: &mut PeerInfo,
+        magic: Magic,
+        total_bytes_sent: &Arc<AtomicU64>,
+        stats: &LivePeerStats,
+        last_ping_sent: &mut Option<std::time::Instant>,
+        outbound_rx: &mut mpsc::Receiver<NetworkMessage>,
+        waiting: &mut VecDeque<(u64, NetworkMessage)>,
+    ) -> Result<(), NetworkError> {
+        loop {
+            let taken = stats.recv_taken.load(Ordering::Acquire);
+            match waiting.front() {
+                Some((handed, _)) if *handed <= taken => {}
+                _ => return Ok(()),
+            }
+            while let Ok(msg) = outbound_rx.try_recv() {
+                Self::write_queued(
+                    writer,
+                    info,
+                    magic,
+                    total_bytes_sent,
+                    stats,
+                    last_ping_sent,
+                    msg,
+                )
+                .await?;
+            }
+            if let Some((_, msg)) = waiting.pop_front() {
+                Self::write_message(writer, info, magic, total_bytes_sent, msg).await?;
+            }
+        }
+    }
+
+    /// Write a message the node queued for the peer, counted until written
+    /// as Divi Core's nSendSize. A queued ping (the `ping` RPC) gets a fresh
+    /// nonce and is timed like the keep-alive, so its pong updates pingtime
+    /// (C++ fPingQueued)
+    async fn write_queued<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        info: &mut PeerInfo,
+        magic: Magic,
+        total_bytes_sent: &Arc<AtomicU64>,
+        stats: &LivePeerStats,
+        last_ping_sent: &mut Option<std::time::Instant>,
+        msg: NetworkMessage,
+    ) -> Result<(), NetworkError> {
+        let queued = msg.wire_size();
+        let msg = match msg {
+            NetworkMessage::Ping(_) => {
+                let nonce = rand::random();
+                info.ping_nonce = Some(nonce);
+                info.ping_time = Some(std::time::Instant::now());
+                *last_ping_sent = info.ping_time;
+                NetworkMessage::Ping(nonce)
+            }
+            other => other,
+        };
+        let written = Self::write_message(writer, info, magic, total_bytes_sent, msg).await;
+        stats.send_written(queued);
+        written
     }
 
     /// Write a message to a writer

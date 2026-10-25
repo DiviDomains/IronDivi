@@ -58,3 +58,16 @@ async fn unknown_masternode_items_asked_for_are_not_found() {
     peer.send("getdata", &inv(&items)).await;
     assert_eq!(peer.expect("notfound", WAIT).await, Some(inv(&items)));
 }
+
+/// Transaction lock requests and votes (MSG_TXLOCK_REQUEST 4, MSG_TXLOCK_VOTE
+/// 5) are asked for when announced: Divi Core's AlreadyHave is false for them
+/// (main.cpp:143-146, :580-581)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn announced_transaction_lock_items_are_asked_for() {
+    let t = TestNode::start().await;
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+    let items = [(4u32, [0x77u8; 32]), (5u32, [0x88u8; 32])];
+    peer.send("inv", &inv(&items)).await;
+    assert_eq!(peer.expect("getdata", WAIT).await, Some(inv(&items)));
+}

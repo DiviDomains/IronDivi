@@ -740,13 +740,14 @@ def header_u32(block, offset):
     return struct.unpack_from("<I", block["header"], offset)[0]
 
 
-def offer(node, hexstr, restore=True):
+def offer(node, hexstr, restore=True, watch=False):
     """A raw peer sends the block to `node`. What comes back: its first `reject`
     (command, code, reason up to the first space, colon or bracket), whether it
     closed the connection, whether its tip moved, whether it banned the address.
     A tip that moved is put back with invalidateblock."""
     before = node.rpc("getbestblockhash")
     reject, closed, raw = None, False, None
+    seen = set()
     try:
         sock = socket.create_connection((HOST, node.p2p), timeout=10)
     except OSError as e:
@@ -765,6 +766,18 @@ def offer(node, hexstr, restore=True):
                 got.add(command)
         if got != {"version", "verack"}:
             return ("ok", {"answer": "no handshake"})
+        if watch:
+            # what the node sends a new peer on its own comes first, so that only its answer
+            # to the block is counted
+            settle = time.time() + 2
+            while time.time() < settle:
+                sock.settimeout(max(0.1, settle - time.time()))
+                try:
+                    command, payload = read_message(sock)
+                except socket.timeout:
+                    break
+                if command == "ping":
+                    sock.sendall(message("pong", payload))
         sock.sendall(message("block", bytes.fromhex(hexstr)))
         deadline = time.time() + OFFER_WAIT
         while time.time() < deadline:
@@ -776,6 +789,7 @@ def offer(node, hexstr, restore=True):
             except (EOFError, ConnectionError, OSError):
                 closed = True
                 break
+            seen.add(command)
             if command == "ping":
                 sock.sendall(message("pong", payload))
             elif command == "reject" and reject is None:
@@ -797,15 +811,18 @@ def offer(node, hexstr, restore=True):
     banned = "127.0.0.1" in json.dumps(node.call("listbanned")[1])
     if TRACE:
         print(f"#     {node.name}: reject {raw!r} closed {closed}", flush=True)
-    return ("ok", {"reject": reject, "closed the connection": closed, "tip moved": moved, "banned": banned})
+    out = {"reject": reject, "closed the connection": closed, "tip moved": moved, "banned": banned}
+    if watch:
+        out["asked the sender for blocks"] = "getblocks" in seen
+    return ("ok", out)
 
 
-def offer_both(hexstr, restore=True):
+def offer_both(hexstr, restore=True, watch=False):
     """The block offered to divid B and to irondivid at the same time"""
     out = {}
     def run(n):
         try:
-            out[n.name] = offer(n, hexstr, restore)
+            out[n.name] = offer(n, hexstr, restore, watch)
         except Exception as e:      # shown as the node's answer, not lost with its thread
             out[n.name] = ("ok", {"error": f"{e.__class__.__name__}: {str(e)[:100]}"})
     threads = [threading.Thread(target=run, args=(n,)) for n in (B, I)]
@@ -816,8 +833,8 @@ def offer_both(hexstr, restore=True):
     return out[B.name], out[I.name]
 
 
-def check_case(name, hexstr, restore=True):
-    core, iron = offer_both(hexstr, restore)
+def check_case(name, hexstr, restore=True, watch=False):
+    core, iron = offer_both(hexstr, restore, watch)
     compare(name, "block", core, iron)
 
 
@@ -1040,6 +1057,155 @@ def sibling_round(label):
 
 
 sibling_round("side chain")
+
+
+# --- a side chain whose first block has a bad proof ------------------------------------------------
+
+def block_hash(hexstr):
+    return sha256d(bytes.fromhex(hexstr)[:112])[::-1].hex()
+
+
+def height_script(n):
+    """The script a coinbase begins with: the height, as CScript() << n"""
+    if n == 0:
+        return b"\x00"
+    if n <= 16:
+        return bytes([0x50 + n])
+    out = bytearray()
+    m = n
+    while m:
+        out.append(m & 0xFF)
+        m >>= 8
+    if out[-1] & 0x80:
+        out.append(0)
+    return bytes([len(out)]) + bytes(out)
+
+
+def child_of(block_hex, parent_hash, height, secret):
+    """A copy of the block on top of `parent_hash`, as the block at `height`"""
+    block = parse_block(bytes.fromhex(block_hex))
+    old = struct.unpack_from("<I", block["header"], 68)[0]
+    script = block["txs"][0]["vin"][0][1]
+    old_height = height - 1
+    prefix = height_script(old_height)
+    if script.startswith(prefix):
+        script = height_script(height) + script[len(prefix):]
+    block["txs"][0]["vin"][0][1] = script
+    set_header(block, 4, bytes.fromhex(parent_hash)[::-1])
+    set_header(block, TIME, struct.pack("<I", old + 60))
+    return finish(block, secret)
+
+
+class Observer:
+    """A raw peer of `node` that keeps the block hashes the node announces to it"""
+
+    def __init__(self, node):
+        self.invs = set()
+        self.sock = socket.create_connection((HOST, node.p2p), timeout=10)
+        version = (struct.pack("<iQq", 70920, 1, int(time.time())) + netaddr(node.p2p) + netaddr(0)
+                   + secrets.token_bytes(8) + compact(len(AGENT)) + AGENT + struct.pack("<i", 0) + b"\x01")
+        self.sock.sendall(message("version", version))
+        self.thread = threading.Thread(target=self.read, daemon=True)
+        self.thread.start()
+
+    def read(self):
+        try:
+            while True:
+                command, payload = read_message(self.sock)
+                if command == "version":
+                    self.sock.sendall(message("verack"))
+                elif command == "ping":
+                    self.sock.sendall(message("pong", payload))
+                elif command == "inv":
+                    n, pos = read_compact(payload, 0)
+                    for k in range(n):
+                        kind = struct.unpack_from("<I", payload, pos)[0]
+                        if kind == 2:
+                            self.invs.add(payload[pos + 4:pos + 36][::-1].hex())
+                        pos += 36
+        except (EOFError, ConnectionError, OSError, struct.error):
+            pass
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def chain_tips(node):
+    return sorted((t["height"], t["branchlen"], t["status"]) for t in node.rpc("getchaintips"))
+
+
+def chain_state(node, hashes, before):
+    """What a node holds of these blocks and what its chain tips gained since `before`:
+    found by getblock, the new tips as (height, branch length, status), the block count"""
+    now = chain_tips(node)
+    tips = [t for t in set(now) if now.count(t) > before.count(t)]
+    tips.sort()
+    if TRACE:
+        print(f"#     {node.name} tips {tips}", flush=True)
+    return ("ok", {"known": [node.call("getblock", h)[0] == "ok" for h in hashes], "tips": tips,
+                   "blocks": node.rpc("getblockcount")})
+
+
+def side_chain_proof(label):
+    """A sibling of the tip block whose proof of stake is bad (the kernel's signature
+    damaged), then two blocks on top of it, so that this side chain is the longer one.
+    Divi Core checks the proof when a block arrives (ChainExtensionService.cpp:477) and
+    refuses a block that fails it before it is stored"""
+    height = A.rpc("getblockcount")
+    tip_hex = A.rpc("getblock", A.rpc("getbestblockhash"), False)
+    secret = staker_secret(A, parse_block(bytes.fromhex(tip_hex)))
+    bad = dict(build_cases(tip_hex, {"mtp": median_time_past_of_parent(A, height)}))["coinstake signature damaged"]
+    watchers = {n.name: Observer(n) for n in (B, I)}
+    before = {n.name: chain_tips(n) for n in (B, I)}
+    time.sleep(2)
+    blocks = [bad]
+    for k in (1, 2):
+        blocks.append(child_of(blocks[-1], block_hash(blocks[-1]), height + k, secret))
+    hashes = [block_hash(b) for b in blocks]
+    names = ["the bad sibling", "a block on it", "a second block on it"]
+    for k, (name, hexstr) in enumerate(zip(names, blocks)):
+        check_case(f"{label}: {name}, offered", hexstr, watch=True)
+        compare(f"{label}: after {name}: the blocks held and the chain tips", "chain_state",
+                chain_state(B, hashes, before[B.name]), chain_state(I, hashes, before[I.name]))
+    time.sleep(1)
+    compare(f"{label}: announced to another peer", "announced",
+            ("ok", sorted(h for h in hashes if h in watchers[B.name].invs)),
+            ("ok", sorted(h for h in hashes if h in watchers[I.name].invs)))
+    for w in watchers.values():
+        w.close()
+
+
+side_chain_proof("bad-proof side chain")
+
+
+KNOWN["unknown-coin side chain: the sibling is held"] = (
+    "divid refuses a side-chain block that stakes a coin only its own branch made, because its transaction index "
+    "holds only the blocks it has connected (TransactionDiskAccessor.cpp:56-72, BlockProofVerifier.cpp:56-57); "
+    "irondivid keeps it until the branch is connected, so that a fork that restakes its own coins can be followed")
+
+
+def unknown_coin_sibling():
+    """A sibling of the tip block that stakes a coin in no block yet (a coin of the
+    mempool), which is also what a coin only a side chain made looks like"""
+    height = A.rpc("getblockcount")
+    tip_hex = A.rpc("getblock", A.rpc("getbestblockhash"), False)
+    block = parse_block(bytes.fromhex(tip_hex))
+    secret = staker_secret(A, block)
+    A.rpc("sendtoaddress", A.rpc("getnewaddress"), 5)
+    txid = A.rpc("getrawmempool")[0]
+    n = next(k for k, o in enumerate(rawtx(A, txid)["vout"]) if sats(o["value"]) == 5 * COIN)
+    block["txs"][1] = new_coinstake(A, block, txid, n)
+    hexstr = finish(block, secret)
+    before = {x.name: chain_tips(x) for x in (B, I)}
+    check_case("unknown-coin side chain: the sibling, offered", hexstr, watch=True)
+    compare("unknown-coin side chain: the sibling is held", "chain_state",
+            chain_state(B, [block_hash(hexstr)], before[B.name]), chain_state(I, [block_hash(hexstr)], before[I.name]))
+
+
+unknown_coin_sibling()
 h, node = next_block()
 row("after the side-chain blocks: a valid block from another peer reaches all three",
     f"{B.rpc('getblockcount')}", f"{I.rpc('getblockcount')}",

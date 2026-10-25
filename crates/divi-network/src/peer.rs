@@ -233,10 +233,20 @@ pub struct LivePeerStats {
     /// (crate::buffers)
     pub recv_queued_bytes: AtomicU64,
     pub recv_queued_msgs: AtomicU64,
+    /// This peer's messages handed to the node, and taken by it once handled,
+    /// since the connection began: what the connection answers itself (a
+    /// pong, a reject) waits until the node has handled every message before
+    /// it, as Divi Core handles a peer's messages one at a time, in order
+    /// (main.cpp:1023-1077)
+    pub recv_handed: AtomicU64,
+    pub recv_taken: AtomicU64,
     /// Woken when the node takes one of this peer's messages
     pub recv_space: tokio::sync::Notify,
     /// Bytes queued for the peer and not yet written (Divi Core nSendSize)
     pub send_queued_bytes: AtomicU64,
+    /// The peer's bloom filter and transaction relay flag (not published by
+    /// the connection: the filter messages change them)
+    pub bloom: crate::bloom::PeerBloom,
 }
 
 impl LivePeerStats {
@@ -251,9 +261,10 @@ impl LivePeerStats {
     pub fn message_queued(&self, bytes: u64) {
         self.recv_queued_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.recv_queued_msgs.fetch_add(1, Ordering::Relaxed);
+        self.recv_handed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The node took a message of `bytes`
+    /// The node took a message of `bytes`, and has handled it
     pub fn message_taken(&self, bytes: u64) {
         // Never below 0: a count cleared after missed messages may be smaller
         let sub = |a: &AtomicU64, n: u64| {
@@ -269,6 +280,8 @@ impl LivePeerStats {
         };
         sub(&self.recv_queued_bytes, bytes);
         sub(&self.recv_queued_msgs, 1);
+        // Release: what the node queued for the peer before is seen with it
+        self.recv_taken.fetch_add(1, Ordering::Release);
         self.recv_space.notify_one();
     }
 
@@ -294,6 +307,8 @@ impl LivePeerStats {
     pub fn clear_queued(&self) {
         self.recv_queued_bytes.store(0, Ordering::Relaxed);
         self.recv_queued_msgs.store(0, Ordering::Relaxed);
+        self.recv_taken
+            .store(self.recv_handed.load(Ordering::Relaxed), Ordering::Release);
         self.recv_space.notify_one();
     }
 }

@@ -87,6 +87,8 @@ pub enum NetworkMessage {
     FilterAdd(Vec<u8>),
     /// Clear bloom filter
     FilterClear,
+    /// A filtered block: header and partial merkle tree (Divi Core CMerkleBlock)
+    MerkleBlock(Vec<u8>),
 
     // Send headers preference
     /// Prefer headers announcements
@@ -152,6 +154,7 @@ impl NetworkMessage {
             NetworkMessage::FilterLoad(_) => "filterload",
             NetworkMessage::FilterAdd(_) => "filteradd",
             NetworkMessage::FilterClear => "filterclear",
+            NetworkMessage::MerkleBlock(_) => "merkleblock",
             NetworkMessage::SporkCount(_) => "sporkcount",
             NetworkMessage::GetSporks => "getsporks",
             NetworkMessage::Spork(_) => "spork",
@@ -232,6 +235,7 @@ impl NetworkMessage {
             NetworkMessage::Alert(data)
             | NetworkMessage::FilterLoad(data)
             | NetworkMessage::FilterAdd(data)
+            | NetworkMessage::MerkleBlock(data)
             | NetworkMessage::RequestMasternodeList(data)
             | NetworkMessage::MasternodeBroadcast(data)
             | NetworkMessage::MasternodePing(data)
@@ -327,6 +331,7 @@ impl NetworkMessage {
             }
             "filterload" => NetworkMessage::FilterLoad(payload.to_vec()),
             "filteradd" => NetworkMessage::FilterAdd(payload.to_vec()),
+            "merkleblock" => NetworkMessage::MerkleBlock(payload.to_vec()),
 
             "sporkcount" => NetworkMessage::SporkCount(r.u32()?),
             "getsporks" => NetworkMessage::GetSporks,

@@ -273,3 +273,82 @@ fn vault_min_leaves_smaller_vault_coins_out_of_staking() {
     assert_eq!(stakable_vault_coins(rpc_port), 1000, "the 100 left out");
     stop(n, rpc_port);
 }
+
+/// A 2-key staking vault script: OP_IF <owner> OP_ELSE OP_REQUIRE_COINSTAKE
+/// <manager> OP_ENDIF OP_OVER OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG
+fn vault_hex(owner: &[u8], manager: &[u8]) -> String {
+    let mut script = vec![0x63, 0x14];
+    script.extend_from_slice(owner);
+    script.extend_from_slice(&[0x67, 0xb9, 0x14]);
+    script.extend_from_slice(manager);
+    script.extend_from_slice(&[0x68, 0x78, 0xa9, 0x88, 0xac]);
+    hex::encode(script)
+}
+
+/// -whitelisted_vault registers, at each load, a vault the wallet holds the
+/// manager key of and not the owner key; an owned vault, a script that is no
+/// vault and text that is not hex are left out. The registration stays in
+/// the wallet, so a later start without the option still has it
+/// (init.cpp:1182-1201, wallet.cpp:1992-2003, wallet_ismine.cpp:80-91)
+#[test]
+fn whitelisted_vaults_are_registered_as_divid_registers_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    let key_hash = |n: &Value| {
+        let a: divi_wallet::Address = n.as_str().unwrap().parse().unwrap();
+        a.hash.as_bytes().to_vec()
+    };
+    let manager = key_hash(&ok(rpc, "getnewaddress", json!([])));
+    let owner = key_hash(&ok(rpc, "getnewaddress", json!([])));
+    let registered = || {
+        let reply = ok(rpc, "getcoinavailability", json!([]));
+        reply["vaults"].as_array().unwrap().len()
+    };
+    assert_eq!(registered(), 0);
+    stop(node, rpc);
+
+    let managed = format!("-whitelisted_vault={}", vault_hex(&[0x42; 20], &manager));
+    let owned = format!("-whitelisted_vault={}", vault_hex(&owner, &[0x43; 20]));
+    let p2pkh = format!("-whitelisted_vault=76a914{}88ac", hex::encode(&manager));
+    let node = start(
+        dir.path(),
+        rpc,
+        p2p,
+        &[&managed, &owned, &p2pkh, "-whitelisted_vault=nothex"],
+    );
+    assert_eq!(registered(), 1);
+    stop(node, rpc);
+
+    let node = start(dir.path(), rpc, p2p, &[]);
+    assert_eq!(registered(), 1);
+    stop(node, rpc);
+}
+
+/// -hdseed is logged with divid's texts: a hex seed with -mnemonic is
+/// preferred, logged at every start, a wallet there or not (init.cpp:945-951);
+/// a seed that is not hex is logged when a new wallet is made
+/// (wallet.cpp:2295-2297)
+#[test]
+fn hdseed_is_logged_as_divid_logs_it() {
+    const PREFER: &str = "parameter interaction: can't use -hdseed and -mnemonic/-mnemonicpassphrase together, will prefer -seed";
+    const INCORRECT: &str = "Incorrect seed, generating random one instead";
+    let log = |dir: &Path| std::fs::read_to_string(dir.join("debug.log")).unwrap_or_default();
+    let seed = format!("-hdseed={}", "5a".repeat(32));
+    let words = "-mnemonic=these words are dropped unread";
+    let (rpc, p2p) = (free_port(), free_port());
+
+    let dir = tempfile::tempdir().unwrap();
+    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
+    assert!(!log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
+    // A wallet already there: logged all the same
+    std::fs::remove_file(dir.path().join("debug.log")).unwrap();
+    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
+
+    let dir = tempfile::tempdir().unwrap();
+    stop(start(dir.path(), rpc, p2p, &["-hdseed=nothex"]), rpc);
+    assert!(log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
+    assert!(!log(dir.path()).contains(PREFER), "{}", log(dir.path()));
+}

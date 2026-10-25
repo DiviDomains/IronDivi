@@ -4,8 +4,8 @@
 
 //! Per-message limits and scores as Divi Core applies them (main.cpp
 //! ProcessMessage): more than 1000 addresses or 50,000 inventory items cost
-//! 20, bloom filter messages cost 100 when bloom filters are not offered, and
-//! an alert that cannot be accepted costs 10.
+//! 20, bloom filter messages cost 100 when bloom filters are not offered
+//! (-peerbloomfilters=0), and an alert that cannot be accepted costs 10.
 
 mod common;
 use common::raw_peer::*;
@@ -50,13 +50,13 @@ async fn more_than_50000_inventory_items_score_20() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bloom_filter_messages_score_100() {
+async fn bloom_filter_messages_score_100_with_peerbloomfilters_off() {
     for (command, payload) in [
         ("filterload", vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         ("filteradd", vec![1u8, 0]),
         ("filterclear", vec![]),
     ] {
-        let t = TestNode::start().await;
+        let t = TestNode::start_with(|c| c.p2p.peer_bloom_filters = false).await;
         let mut p = RawPeer::connect(&t, "127.0.0.2").await;
         p.handshake().await;
         p.send(command, &payload).await;
