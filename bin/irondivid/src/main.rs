@@ -57,6 +57,7 @@ struct Args {
     daemon: bool,
     printtoconsole: bool,
     debug: bool,
+    logips: bool,
     wallet: Option<PathBuf>,
     disablewallet: bool,
     pid: Option<PathBuf>,
@@ -171,6 +172,7 @@ impl Args {
         // -debug=<category> may repeat; -debug=0 is no debugging
         let debug = s.get_multi("debug");
         self.debug = !debug.is_empty() && !debug.iter().any(|c| c == "0");
+        self.logips = s.get_bool("logips", false);
         self.wallet = path("wallet");
         self.disablewallet = s.get_bool("disablewallet", false);
         self.pid = path("pid");
@@ -305,7 +307,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "genproclimit",
     "listenonion",
     "litemode",
-    "logips",
     "logtimestamps",
     "masternode",
     "masternodeaddr",
@@ -731,6 +732,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "discover",
         "externalip",
         "onlynet",
+        "logips",
         "protocolversion",
         "banscore",
         "bantime",
@@ -1114,6 +1116,8 @@ fn stderr_is_file(_path: &std::path::Path) -> bool {
 
 /// Initialize logging
 fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
+    // -logips: whether log lines name peers by address too (Logging.cpp:202)
+    divi_network::peer_log::set_log_ips(log_config.log_ips);
     // Use RUST_LOG if set, otherwise use default based on debug config
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if log_config.debug {
@@ -2837,6 +2841,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         max_file_size: args.maxlogsize.unwrap_or(1) as u64 * 1_048_576, // Convert MB to bytes
         max_files: args.maxlogfiles.unwrap_or(5),
         debug: args.debug,
+        log_ips: args.logips,
         // An export only reads the data directory: it logs to the console
         print_to_console: args.printtoconsole || args.export_chain,
     };

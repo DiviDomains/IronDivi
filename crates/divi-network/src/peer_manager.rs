@@ -671,7 +671,11 @@ impl PeerManager {
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
                     if let Err(e) = self_clone.connect_to_peer(addr).await {
-                        warn!("Failed to connect to static peer {}: {}", addr, e);
+                        warn!(
+                            "Failed to connect to static peer {}: {}",
+                            crate::peer_log::address(addr),
+                            e
+                        );
                     }
                 })
             })
@@ -734,7 +738,7 @@ impl PeerManager {
                             {
                                 continue;
                             }
-                            info!("Discovered peer: {}", addr);
+                            info!("Discovered peer: {}", crate::peer_log::address(addr));
                             let self_clone = Arc::clone(&self);
                             tokio::spawn(async move {
                                 if let Err(e) = self_clone.connect_to_peer(addr).await {
@@ -779,13 +783,13 @@ impl PeerManager {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
-                            info!("Accepted connection from {}", peer_addr);
+                            info!("Accepted connection from {}", crate::peer_log::address(peer_addr));
 
                             // Divi Core counts every inbound connection, handshake
                             // done or not, against -maxconnections less the outbound
                             // slots; outbound peers do not use them (net.cpp:744-759)
                             if !self.has_inbound_room() {
-                                warn!("Connection from {} dropped (full)", peer_addr);
+                                warn!("Connection from {} dropped (full)", crate::peer_log::address(peer_addr));
                                 continue;
                             }
 
@@ -1277,7 +1281,10 @@ impl PeerManager {
                 if !self.claim_dial(addr, DialRule::ByAddress) {
                     continue;
                 }
-                info!("Reconnecting to added node: {}", addr);
+                info!(
+                    "Reconnecting to added node: {}",
+                    crate::peer_log::address(addr)
+                );
                 let self_clone = Arc::clone(&self);
                 tokio::spawn(async move {
                     let self_for_record = Arc::clone(&self_clone);
@@ -1311,7 +1318,10 @@ impl PeerManager {
                     if !self.claim_dial(addr, rule) {
                         continue;
                     }
-                    info!("Reconnecting to static peer: {}", addr);
+                    info!(
+                        "Reconnecting to static peer: {}",
+                        crate::peer_log::address(addr)
+                    );
                     let self_clone = Arc::clone(&self);
                     tokio::spawn(async move {
                         let self_for_record = Arc::clone(&self_clone);

@@ -70,6 +70,7 @@ pub mod connection;
 pub mod local;
 pub mod masternode_handler;
 pub mod peer;
+pub mod peer_log;
 pub mod peer_manager;
 pub mod relay;
 pub mod scoring;

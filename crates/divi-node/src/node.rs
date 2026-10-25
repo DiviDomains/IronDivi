@@ -870,7 +870,10 @@ impl Node {
                         addr,
                         version,
                     } => {
-                        tracing::info!("Peer connected: {}", addr);
+                        tracing::info!(
+                            "Peer connected: {}",
+                            divi_network::peer_log::peer(peer_id, addr)
+                        );
                         let _ = event_tx.send(NodeEvent::PeerConnected(addr.to_string()));
 
                         // Update sync with peer's height

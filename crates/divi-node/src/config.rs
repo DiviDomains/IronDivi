@@ -803,6 +803,10 @@ pub struct LogConfig {
 
     /// Print to console instead of file
     pub print_to_console: bool,
+
+    /// Divi Core -logips: log lines carry peers' addresses (default off)
+    #[serde(default)]
+    pub log_ips: bool,
 }
 
 impl Default for LogConfig {
@@ -812,6 +816,7 @@ impl Default for LogConfig {
             max_files: 5,
             debug: false,
             print_to_console: false,
+            log_ips: false,
         }
     }
 }
