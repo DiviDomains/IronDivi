@@ -13,6 +13,7 @@
 //! Where the two agree the combined answer is the more conservative of the two, so a single
 //! liar can lower a number but never raise one.
 
+use divi_swap::backend::TipHeader;
 use divi_swap::{LockedOutput, SpendInfo, SwapError};
 use serde_json::Value;
 
@@ -147,6 +148,26 @@ pub(crate) fn agree_tip_height(a: u64, b: u64) -> Result<u64> {
 pub(crate) fn agree_tip_hash(a: String, b: String) -> Result<String> {
     if a != b {
         return Err(disagree("tip_hash", format!("{a} vs {b}")));
+    }
+    Ok(a)
+}
+
+/// The best block, as two endpoints name it: the same block or a disagreement (retried, as
+/// for [`agree_tip_hash`]).
+pub(crate) fn agree_tip_header(a: TipHeader, b: TipHeader) -> Result<TipHeader> {
+    if a != b {
+        return Err(disagree(
+            "tip_header",
+            format!("{} at {} vs {} at {}", a.hash, a.height, b.hash, b.height),
+        ));
+    }
+    Ok(a)
+}
+
+/// Whether a block is on the main chain, as two endpoints answer: the same or a disagreement.
+pub(crate) fn agree_in_best_chain(a: bool, b: bool) -> Result<bool> {
+    if a != b {
+        return Err(disagree("in_best_chain", format!("{a} vs {b}")));
     }
     Ok(a)
 }

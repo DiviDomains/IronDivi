@@ -12,6 +12,13 @@
 //! transaction we broadcast). Selected coins are *reserved* until their spending transaction
 //! is broadcast (then they are tombstoned) or the reservation is dropped. Only public data
 //! is persisted.
+//!
+//! More than one process may hold the same file (two `divi-swap` takers on one wallet).
+//! Each write, and [`Wallet::refresh`], first takes in the tombstones and exclusions another
+//! process wrote, so one process's write never brings back a coin the other spent; only a
+//! coin this process gave back itself ([`Wallet::release_dead_tx`]) is left untombstoned.
+//! Which process selects which coin is settled by the swap database's `input_reservation`
+//! table, not here.
 
 use std::path::PathBuf;
 
@@ -45,6 +52,10 @@ pub struct Wallet {
     pub scanned_height: Option<u64>,
     #[serde(skip)]
     path: Option<PathBuf>,
+    /// Tombstones this process lifted ([`Self::release_dead_tx`]): a copy of them still on
+    /// disk is not taken back in.
+    #[serde(skip)]
+    revived: Vec<Outpoint>,
 }
 
 impl Wallet {
@@ -63,9 +74,37 @@ impl Wallet {
         Ok(w)
     }
 
-    fn persist(&self) -> Result<(), SwapError> {
+    /// Take in the tombstones and exclusions another process on the same file wrote since
+    /// this one read it. An unreadable file adds nothing (the next write replaces it).
+    pub fn refresh(&mut self) {
+        let Some(p) = &self.path else { return };
+        let Some(disk) = std::fs::read_to_string(p)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Wallet>(&t).ok())
+        else {
+            return;
+        };
+        for op in disk.spent {
+            if !self.revived.contains(&op) {
+                self.mark_spent(op);
+            }
+        }
+        for txid in disk.excluded {
+            if !self.excluded.contains(&txid) {
+                self.excluded.push(txid);
+                self.utxos.retain(|u| u.outpoint.txid != txid);
+            }
+        }
+    }
+
+    fn persist(&mut self) -> Result<(), SwapError> {
+        self.refresh();
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(p) = &self.path else { return Ok(()) };
-        let tmp = p.with_extension("tmp");
+        // Each write has its own temporary file: two processes (or two backends in one) on
+        // the same wallet file must not interleave their bytes in one before the rename.
+        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = p.with_extension(format!("tmp.{}.{n}", std::process::id()));
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| SwapError::Storage(format!("serialize wallet: {e}")))?;
         std::fs::write(&tmp, text)
@@ -148,6 +187,7 @@ impl Wallet {
     }
 
     fn mark_spent(&mut self, op: Outpoint) {
+        self.revived.retain(|r| *r != op);
         self.utxos.retain(|u| u.outpoint != op);
         self.reserved.retain(|r| r.utxo.outpoint != op);
         if !self.spent.contains(&op) {
@@ -227,6 +267,7 @@ impl Wallet {
         for u in inputs {
             if let Some(i) = self.spent.iter().position(|s| *s == u.outpoint) {
                 self.spent.remove(i);
+                self.revived.push(u.outpoint);
                 self.add(*u);
                 changed = true;
             }
@@ -276,5 +317,50 @@ mod orphan_tests {
             1,
             "persisted"
         );
+    }
+
+    #[test]
+    fn a_write_never_brings_back_a_coin_another_process_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut seed = Wallet::open(Some(path.clone())).unwrap();
+        seed.record_broadcast(&[], &[coin(1, 10), coin(2, 20)])
+            .unwrap();
+        // Two processes read the same file.
+        let mut a = Wallet::open(Some(path.clone())).unwrap();
+        let mut b = Wallet::open(Some(path.clone())).unwrap();
+        a.record_broadcast(&[coin(1, 10).outpoint], &[]).unwrap();
+        // `b` never saw `a`'s lock: its write keeps `a`'s tombstone, and it takes it in.
+        b.record_broadcast(&[coin(2, 20).outpoint], &[]).unwrap();
+        assert!(b.available().is_empty(), "{:?}", b.available());
+        assert!(Wallet::open(Some(path.clone()))
+            .unwrap()
+            .available()
+            .is_empty());
+        // An exclusion travels the same way.
+        let mut c = Wallet::open(Some(path.clone())).unwrap();
+        c.record_broadcast(&[], &[coin(3, 30)]).unwrap();
+        let mut d = Wallet::open(Some(path.clone())).unwrap();
+        c.exclude_txid(Txid([3; 32])).unwrap();
+        d.refresh();
+        assert!(d.available().is_empty());
+    }
+
+    #[test]
+    fn a_coin_this_process_gave_back_is_not_tombstoned_again_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let mut w = Wallet::open(Some(path.clone())).unwrap();
+        w.record_broadcast(&[], &[coin(1, 10)]).unwrap();
+        w.record_broadcast(&[coin(1, 10).outpoint], &[]).unwrap();
+        // A stale process still holding the tombstone writes after the give-back.
+        let mut stale = Wallet::open(Some(path.clone())).unwrap();
+        assert!(w.release_dead_tx(Txid([9; 32]), &[coin(1, 10)]).unwrap());
+        stale.record_broadcast(&[], &[]).unwrap();
+        w.refresh();
+        assert_eq!(w.available(), vec![coin(1, 10)], "this process keeps it");
+        // A real spend of it later is tombstoned as usual.
+        w.record_broadcast(&[coin(1, 10).outpoint], &[]).unwrap();
+        assert!(w.available().is_empty());
     }
 }

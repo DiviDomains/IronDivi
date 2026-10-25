@@ -88,7 +88,7 @@ struct Args {
         conflicts_with = "xmr_inflight"
     )]
     release_reservation: Option<String>,
-    /// With `--release-reservation`: the chain the reservation is on (btc, ltc, zec).
+    /// With `--release-reservation`: the chain the reservation is on (btc, ltc, zec, divi).
     #[arg(long, requires = "release_reservation", value_parser = parse_chain)]
     chain: Option<Chain>,
     /// With `--release-reservation`: actually release.
@@ -630,10 +630,10 @@ fn swap_for_txid(
     chain: Chain,
     txid: &divi_swap::Txid,
 ) -> Result<Option<(String, String, bool)>> {
+    // Every swap has a leg on DIVI and one on its counter chain; a txid names one lock.
+    let on = |q: &divi_swap::api::Quote| chain == Chain::Divi || q.counter_chain == chain;
     for s in store.list_maker_swaps()? {
-        if s.quote.counter_chain == chain
-            && s.maker_leg_funding.as_ref().map(|f| f.tx.txid) == Some(*txid)
-        {
+        if on(&s.quote) && s.maker_leg_funding.as_ref().map(|f| f.tx.txid) == Some(*txid) {
             let state = serde_json::to_value(s.state)?;
             return Ok(Some((
                 s.id,
@@ -643,9 +643,7 @@ fn swap_for_txid(
         }
     }
     for s in store.list_taker_swaps()? {
-        if s.quote.counter_chain == chain
-            && s.taker_leg_funding.as_ref().map(|f| f.tx.txid) == Some(*txid)
-        {
+        if on(&s.quote) && s.taker_leg_funding.as_ref().map(|f| f.tx.txid) == Some(*txid) {
             let state = serde_json::to_value(s.state)?;
             return Ok(Some((
                 s.id,
@@ -1654,9 +1652,14 @@ mod tests {
         }
         s.state = divi_swap::TakerState::Done;
         store.put_taker_swap(&s).unwrap();
+        drop(store); // `--yes` needs the database to itself
         let out = release_reservation(&cfg, Chain::Divi, &hex_of(0x55), true).unwrap();
         assert!(out.released);
-        assert!(out.text.contains("swap tdivi (done, terminal)"), "{}", out.text);
+        assert!(
+            out.text.contains("swap tdivi (done, terminal)"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

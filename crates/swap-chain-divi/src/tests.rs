@@ -896,7 +896,10 @@ async fn a_lock_reserves_its_inputs_before_it_is_sent() {
     let key = SecretKey::new_random();
     let a = reserving(&server.uri(), key.clone(), &res, &[coin(1, COIN_SAT)]);
     let f = a.build_funding(&new_htlc(&a), AMOUNT).await.unwrap();
-    assert!(divi_rows(&res).is_empty(), "built, not sent: nothing reserved");
+    assert!(
+        divi_rows(&res).is_empty(),
+        "built, not sent: nothing reserved"
+    );
     node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
     a.broadcast(&f.tx).await.unwrap();
     assert_eq!(divi_rows(&res), vec![(coin(1, 0).outpoint, f.tx.txid)]);
@@ -967,11 +970,26 @@ async fn claims_and_refunds_reserve_nothing() {
     let (pre, hash) = new_preimage();
     let h = htlc_for(&b, hash);
     let claim = b
-        .build_claim(&h, &Outpoint { txid: txid_n(7), vout: 0 }, AMOUNT, &pre)
+        .build_claim(
+            &h,
+            &Outpoint {
+                txid: txid_n(7),
+                vout: 0,
+            },
+            AMOUNT,
+            &pre,
+        )
         .await
         .unwrap();
     let refund = b
-        .build_refund(&h, &Outpoint { txid: txid_n(8), vout: 0 }, AMOUNT)
+        .build_refund(
+            &h,
+            &Outpoint {
+                txid: txid_n(8),
+                vout: 0,
+            },
+            AMOUNT,
+        )
         .await
         .unwrap();
     node.result("sendrawtransaction", json!("00"));
@@ -993,10 +1011,16 @@ async fn a_confirmed_lock_releases_its_reservation() {
     let f = b.build_funding(&new_htlc(&b), AMOUNT).await.unwrap();
     node.result("sendrawtransaction", json!(f.tx.txid.to_rpc_hex()));
     b.broadcast(&f.tx).await.unwrap();
-    node.result("getrawtransaction", json!({"txid": f.tx.txid.to_rpc_hex(), "confirmations": 0}));
+    node.result(
+        "getrawtransaction",
+        json!({"txid": f.tx.txid.to_rpc_hex(), "confirmations": 0}),
+    );
     assert_eq!(b.confirmations(&f.tx.txid).await.unwrap(), Some(0));
     assert_eq!(divi_rows(&res).len(), 1, "in the mempool: kept");
-    node.result("getrawtransaction", json!({"txid": f.tx.txid.to_rpc_hex(), "confirmations": 1}));
+    node.result(
+        "getrawtransaction",
+        json!({"txid": f.tx.txid.to_rpc_hex(), "confirmations": 1}),
+    );
     assert_eq!(b.confirmations(&f.tx.txid).await.unwrap(), Some(1));
     assert!(divi_rows(&res).is_empty(), "confirmed: released");
     // The wallet keeps the input tombstoned: it is spent on chain.
@@ -1049,15 +1073,9 @@ async fn the_tip_header_comes_from_the_best_block() {
         "getblock",
         json!({"hash": "00".repeat(32), "height": 1234, "time": 1_800_000_000u32}),
     );
-    assert!(matches!(
-        b.tip_header().await,
-        Err(SwapError::Transient(_))
-    ));
+    assert!(matches!(b.tip_header().await, Err(SwapError::Transient(_))));
     node.result("getblock", json!({"hash": TIP, "height": 1234}));
-    assert!(matches!(
-        b.tip_header().await,
-        Err(SwapError::Transient(_))
-    ));
+    assert!(matches!(b.tip_header().await, Err(SwapError::Transient(_))));
 }
 
 #[tokio::test]
@@ -1081,7 +1099,10 @@ async fn with_a_fallback_the_tip_header_and_best_chain_must_agree() {
     let b = backend(&primary.uri(), SecretKey::new_random()).with_fallback_rpc(&fallback.uri());
     for n in [&p, &f] {
         n.result("getbestblockhash", json!(TIP));
-        n.result("getblock", json!({"hash": TIP, "height": 9, "time": 1_800_000_000u32}));
+        n.result(
+            "getblock",
+            json!({"hash": TIP, "height": 9, "time": 1_800_000_000u32}),
+        );
         n.result("getblockhash", json!(TIP));
     }
     assert_eq!(b.tip_header().await.unwrap().height, 9);
@@ -1096,8 +1117,5 @@ async fn with_a_fallback_the_tip_header_and_best_chain_must_agree() {
         "getblock",
         json!({"hash": "00".repeat(32), "height": 9, "time": 1_800_000_000u32}),
     );
-    assert!(matches!(
-        b.tip_header().await,
-        Err(SwapError::Transient(_))
-    ));
+    assert!(matches!(b.tip_header().await, Err(SwapError::Transient(_))));
 }
