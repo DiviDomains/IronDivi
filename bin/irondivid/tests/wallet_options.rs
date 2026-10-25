@@ -461,3 +461,29 @@ fn backupwallet_logs_where_it_copied_the_wallet() {
     ));
     stop(node, rpc);
 }
+
+/// encryptwallet and walletpassphrasechange log divid's lines with the key
+/// derivation count (wallet.cpp:949, :836)
+#[test]
+fn encryption_logs_its_derivation_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    // Throwaway test passphrases, over RPC
+    ok(rpc, "encryptwallet", json!(["first-throwaway"]));
+    ok(rpc, "walletpassphrase", json!(["first-throwaway", 60]));
+    ok(
+        rpc,
+        "walletpassphrasechange",
+        json!(["first-throwaway", "second-throwaway"]),
+    );
+    assert!(logged(
+        dir.path(),
+        "Encrypting Wallet with an nDeriveIterations of "
+    ));
+    assert!(logged(
+        dir.path(),
+        "Wallet passphrase changed to an nDeriveIterations of "
+    ));
+    stop(node, rpc);
+}

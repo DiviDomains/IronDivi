@@ -2806,6 +2806,11 @@ impl WalletDb {
         rand::rngs::OsRng.fill_bytes(&mut master_key);
 
         let passphrase_key = Zeroizing::new(derive_key_from_passphrase(passphrase, &salt));
+        // wallet.cpp:949, with irondivid's fixed count
+        info!(
+            "Encrypting Wallet with an nDeriveIterations of {}",
+            PBKDF2_ITERATIONS
+        );
         let sealed_master = seal_master_key(&master_key, &passphrase_key);
 
         // Fill the keypool while the seed is still in the clear: the pool keys go
@@ -2913,6 +2918,11 @@ impl WalletDb {
             .ok_or(WalletError::WrongPassphrase)?;
         let old_key = Zeroizing::new(derive_key_from_passphrase(old_pass, &salt));
         let master_key = open_master_key(&sealed, &old_key)?;
+        // wallet.cpp:836, with irondivid's fixed count
+        info!(
+            "Wallet passphrase changed to an nDeriveIterations of {}",
+            PBKDF2_ITERATIONS
+        );
 
         let mut new_salt = vec![0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut new_salt);
