@@ -321,7 +321,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "proxyrandomize",
     "resync",
     "rpcthreads",
-    "seednode",
     "sendfreetransactions",
     "shrinkdebugfile",
     "sysperms",
@@ -530,6 +529,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.enable_discovery = false;
     }
     config.p2p.addnode = s.get_multi("addnode").to_vec();
+    config.p2p.seednode = s.get_multi("seednode").to_vec();
     config
         .network
         .static_peers
@@ -739,6 +739,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "listen",
         "connect",
         "addnode",
+        "seednode",
         "fullnode",
         "dnsseed",
         "maxconnections",
@@ -4084,6 +4085,27 @@ mod divid_option_tests {
             c.p2p.addnode,
             ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.2:12"]
         );
+    }
+
+    /// -seednode is applied (Divi Core AddOneShot, net.cpp:1842-1843), every
+    /// value, the command line's first, and not dialled as a lasting peer
+    #[test]
+    fn seednode_values_are_applied() {
+        let c = cfg_in(
+            "divi.conf",
+            "rpcuser=u\nseednode=127.0.0.2:11\nseednode=127.0.0.3\n",
+            &["-seednode=127.0.0.2:10"],
+        )
+        .unwrap();
+        assert_eq!(
+            c.p2p.seednode,
+            ["127.0.0.2:10", "127.0.0.2:11", "127.0.0.3"]
+        );
+        assert!(!c
+            .peer_sources()
+            .static_peers
+            .contains(&"127.0.0.2:10".to_string()));
+        assert!(!UNSUPPORTED_OPTIONS.contains(&"seednode"));
     }
 
     /// -conf is relative to the data directory (Settings::GetConfigFile)
