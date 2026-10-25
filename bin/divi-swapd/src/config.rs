@@ -47,12 +47,16 @@ pub struct DiviSection {
     /// DIVI JSON-RPC proxy URL. When absent, [`DiviSection::rpc_url`] falls back to
     /// `swap_chain_divi::default_rpc(network)`.
     pub rpc_url: Option<String>,
-    /// Optional second, independent DIVI JSON-RPC endpoint (ideally the operator's own node).
+    /// Second, independent DIVI JSON-RPC endpoint (ideally the operator's own node).
     /// When set, every swap-relevant read is made on both endpoints and a disagreement is
-    /// `Transient` (retried later), never a decision; a broadcast goes to both. Unset (the
-    /// default) keeps the single-source behavior.
+    /// `Transient` (retried later), never a decision; a broadcast goes to both. Optional on
+    /// testnet; required on a mainnet profile unless `allow_single_source = true`.
     #[serde(default)]
     pub fallback_rpc_url: Option<String>,
+    /// Let a mainnet profile start without `fallback_rpc_url`, trusting one endpoint for every
+    /// swap read. Off by default; when it is used, a warning is logged at every start.
+    #[serde(default)]
+    pub allow_single_source: bool,
     /// Reference (`op://…` or `credential:<name>`) to the maker's DIVI key.
     pub key: String,
     /// Known-UTXO file (public data only).
@@ -150,11 +154,16 @@ pub struct LtcSection {
     pub fallback_esplora_url: Option<String>,
     /// Reference (`op://…` or `credential:<name>`) to the maker's LTC key.
     pub key: String,
-    /// Opt-in tip-hash cross-check of the primary Esplora against an independent source:
+    /// Tip-hash cross-check of the primary Esplora against an independent source:
     /// `"blockbook"`, `"blockcypher"` or `"off"` (default). Mainnet only; refused at config
-    /// load on testnet. Run once at startup, before any LTC action.
+    /// load on testnet, required on a mainnet profile unless `allow_single_source = true`.
+    /// Run once at startup, before any LTC action.
     #[serde(default = "default_ltc_crosscheck")]
     pub crosscheck: String,
+    /// Let a mainnet profile start with `crosscheck = "off"`, trusting the one Esplora source.
+    /// Off by default; when it is used, a warning is logged at every start.
+    #[serde(default)]
+    pub allow_single_source: bool,
 }
 
 impl LtcSection {
@@ -751,6 +760,9 @@ impl DaemonConfig {
             if l.crosscheck_source()?.is_some() && l.network != "mainnet" {
                 bail!("[ltc].crosscheck is mainnet-only: no testnet source is verified");
             }
+            if self.profile == Profile::Mainnet && l.crosscheck_source()?.is_none() {
+                require_second_source("ltc", "[ltc].crosscheck is \"off\"", l.allow_single_source)?;
+            }
         }
         if let Some(z) = &self.zec {
             match z.network.as_str() {
@@ -810,9 +822,33 @@ impl DaemonConfig {
                     self.profile
                 );
             }
+            if self.profile == Profile::Mainnet && d.fallback_rpc_url()?.is_none() {
+                require_second_source(
+                    "divi",
+                    "[divi].fallback_rpc_url is not set",
+                    d.allow_single_source,
+                )?;
+            }
         }
         Ok(())
     }
+}
+
+/// A mainnet `[section]` without its second source (`missing` says which key): refused, unless
+/// `[section].allow_single_source = true` waives it, which logs a warning. Config load runs at
+/// every start, so the warning does too.
+fn require_second_source(section: &str, missing: &str, waived: bool) -> Result<()> {
+    if !waived {
+        bail!(
+            "{missing}: a mainnet [{section}] needs a second, independent source; set it, or set \
+             [{section}].allow_single_source = true to run on one source deliberately"
+        );
+    }
+    tracing::warn!(
+        "{missing}: mainnet [{section}] runs on a single source ([{section}].allow_single_source \
+         = true); one lying or broken endpoint is trusted for HTLC, confirmation and spend reads"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -857,11 +893,13 @@ key = "credential:btc"
         )
     }
 
-    /// As [`good_mainnet_btc_only`], with `[divi]` on mainnet (allowed) too.
+    /// As [`good_mainnet_btc_only`], with `[divi]` on mainnet (allowed) too, and the second
+    /// DIVI endpoint a mainnet config needs.
     fn good_mainnet_btc() -> String {
         good_mainnet_btc_only().replace(
             "[divi]\nkey",
-            "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\nkey",
+            "[divi]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             fallback_rpc_url = \"http://127.0.0.1:51473\"\nkey",
         )
     }
 
@@ -1271,7 +1309,7 @@ divi_fund_txids = ["ab"]
     fn btc_ltc_mainnet_with_allow_and_matching_profile_is_ok_with_crate_default_endpoints() {
         let text = format!(
             "profile = \"mainnet\"\n{}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
-             key = \"credential:btc\"\n",
+             key = \"credential:btc\"\ncrosscheck = \"blockbook\"\n",
             good_mainnet_btc()
         );
         let c = DaemonConfig::parse(&text).unwrap();
@@ -1840,5 +1878,130 @@ divi_fund_txids = ["ab"]
         let s = c.swap_config().unwrap();
         assert_eq!(s.taker_timeout_secs, 14410);
         assert_eq!(s.maker_timeout_secs, 3600);
+    }
+
+    /// A mainnet config with `[ltc]` on mainnet and the given extra `[ltc]` lines.
+    fn mainnet_with_ltc(divi: &str, ltc_extra: &str) -> String {
+        format!(
+            "profile = \"mainnet\"\n{divi}\n[ltc]\nnetwork = \"mainnet\"\nallow_mainnet = true\n\
+             key = \"credential:btc\"\n{ltc_extra}"
+        )
+    }
+
+    /// Parses `text` with a capturing log subscriber; returns the result and the log text.
+    fn parse_logged(text: &str) -> (Result<DaemonConfig>, String) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Default::default());
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, || DaemonConfig::parse(text));
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, log)
+    }
+
+    #[test]
+    fn mainnet_ltc_with_crosscheck_off_or_absent_is_refused_naming_the_key() {
+        for extra in ["", "crosscheck = \"off\"\n"] {
+            let text = mainnet_with_ltc(&good_mainnet_btc(), extra);
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(
+                e.contains("[ltc].crosscheck") && e.contains("allow_single_source"),
+                "{extra:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_divi_without_a_fallback_is_refused_naming_the_key() {
+        let no_fallback =
+            good_mainnet_btc().replace("fallback_rpc_url = \"http://127.0.0.1:51473\"\n", "");
+        let blank = good_mainnet_btc().replace("\"http://127.0.0.1:51473\"", "\"  \"");
+        for divi in [no_fallback, blank] {
+            let text = format!("profile = \"mainnet\"\n{divi}");
+            let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+            assert!(
+                e.contains("[divi].fallback_rpc_url") && e.contains("allow_single_source"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_single_source_lets_a_mainnet_config_start_and_warns() {
+        // DIVI without a fallback, waived in [divi].
+        let divi = good_mainnet_btc().replace(
+            "fallback_rpc_url = \"http://127.0.0.1:51473\"\n",
+            "allow_single_source = true\n",
+        );
+        let (r, log) = parse_logged(&format!("profile = \"mainnet\"\n{divi}"));
+        r.unwrap();
+        assert!(
+            log.contains("WARN")
+                && log.contains("[divi].fallback_rpc_url")
+                && log.contains("allow_single_source"),
+            "{log}"
+        );
+        // LTC crosscheck off, waived in [ltc]; the DIVI fallback is set, so only LTC warns.
+        let (r, log) = parse_logged(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "allow_single_source = true\n",
+        ));
+        r.unwrap();
+        assert!(
+            log.contains("WARN") && log.contains("[ltc].crosscheck"),
+            "{log}"
+        );
+        assert!(!log.contains("[divi].fallback_rpc_url"), "{log}");
+        // A waiver in one section does not cover the other.
+        let text = mainnet_with_ltc(&divi, "");
+        let e = DaemonConfig::parse(&text).unwrap_err().to_string();
+        assert!(e.contains("[ltc].crosscheck"), "{e}");
+        // Both sources present: no warning, waiver or not.
+        let (r, log) = parse_logged(&mainnet_with_ltc(
+            &good_mainnet_btc(),
+            "crosscheck = \"blockcypher\"\nallow_single_source = true\n",
+        ));
+        r.unwrap();
+        assert!(!log.contains("allow_single_source"), "{log}");
+    }
+
+    #[test]
+    fn testnet_configs_without_either_source_still_load_without_a_warning() {
+        let (r, log) = parse_logged(&format!("{GOOD}\n[ltc]\nkey = \"credential:btc\"\n"));
+        let c = r.unwrap();
+        assert_eq!(c.profile, Profile::Testnet);
+        assert_eq!(c.divi.unwrap().fallback_rpc_url().unwrap(), None);
+        assert_eq!(c.ltc.unwrap().crosscheck_source().unwrap(), None);
+        assert!(!log.contains("allow_single_source"), "{log}");
+    }
+
+    #[test]
+    fn deploy_example_documents_the_mainnet_two_source_keys() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/divi-swapd/divi-swapd.toml.example");
+        let text = std::fs::read_to_string(&path).unwrap();
+        DaemonConfig::parse(&text).unwrap();
+        // Both sections name the mainnet requirement and the waiver.
+        for section in ["[divi]", "[ltc]"] {
+            let body = text.split(&format!("\n{section}\n")).nth(1).unwrap();
+            let body = body.split("\n[").next().unwrap();
+            assert!(
+                body.contains("allow_single_source") && body.contains("required on mainnet"),
+                "{section}: {body}"
+            );
+        }
     }
 }
