@@ -22,8 +22,8 @@ use divi_primitives::script::Script;
 use divi_primitives::transaction::{Transaction, TxIn, TxOut};
 use std::time::Duration;
 
-/// A work block on the node's tip; its hash
-fn mine(t: &TestNode) -> Hash256 {
+/// A work block on the node's tip, not given to the node
+fn next_block(t: &TestNode) -> Block {
     let chain = t.node.chain();
     let tip = chain.tip().unwrap();
     let mut tag = divi_storage::bip34_height_script(tip.height + 1);
@@ -48,8 +48,14 @@ fn mine(t: &TestNode) -> Hash256 {
     while divi_crypto::compute_block_hash(&block.header) > target {
         block.header.nonce += 1;
     }
+    block
+}
+
+/// A work block on the node's tip; its hash
+fn mine(t: &TestNode) -> Hash256 {
+    let block = next_block(t);
     let hash = divi_crypto::compute_block_hash(&block.header);
-    chain.accept_block(block).unwrap();
+    t.node.chain().accept_block(block).unwrap();
     hash
 }
 
@@ -236,6 +242,25 @@ async fn getdata_of_an_invalidated_block_gets_nothing() {
     t.node.chain().invalidate_block(&b2).unwrap();
     let mut p = peer(&t, "127.0.0.3").await;
     p.send("getdata", &getdata(&[(2, b2)])).await;
+    let got: Vec<String> = replies(&mut p).await.into_iter().map(|(c, _)| c).collect();
+    assert!(got.is_empty(), "{got:?}");
+}
+
+/// A headers message is not read: Divi Core reads one only with
+/// headers-first syncing, which no network has (main.cpp:669,
+/// chainparams.cpp:251, :360, :440), so a header of a block the node lacks
+/// is not asked for, and an empty one is not answered either
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn headers_message_is_not_read() {
+    let t = TestNode::start().await;
+    mine(&t);
+    let header = divi_primitives::serialize::serialize(&next_block(&t).header);
+    let mut p = peer(&t, "127.0.0.3").await;
+    let mut one = compact(1);
+    one.extend_from_slice(&header);
+    one.push(0);
+    p.send("headers", &one).await;
+    p.send("headers", &compact(0)).await;
     let got: Vec<String> = replies(&mut p).await.into_iter().map(|(c, _)| c).collect();
     assert!(got.is_empty(), "{got:?}");
 }

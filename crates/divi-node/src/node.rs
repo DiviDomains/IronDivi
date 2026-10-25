@@ -1238,8 +1238,17 @@ impl Node {
                         }
 
                         match message {
+                            // Divi Core reads a headers message only with
+                            // headers-first syncing, which no network has, so it
+                            // never acts on one or answers it (main.cpp:669,
+                            // chainparams.cpp:251, :360, :440); nor does any node
+                            // send one, as getheaders is answered with an inv
                             NetworkMessage::Headers(headers) => {
-                                block_sync.handle_headers(peer_id, headers).await;
+                                tracing::debug!(
+                                    "headers ({} entries) from peer {} not read",
+                                    headers.len(),
+                                    peer_id
+                                );
                             }
                             NetworkMessage::Block(block) => {
                                 if history.deliver(
