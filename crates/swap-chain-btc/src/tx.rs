@@ -273,6 +273,24 @@ pub fn build_spend_tx(
     Ok(tx)
 }
 
+/// Virtual size of a claim of `htlc` as [`build_spend_tx`] builds it, the signature at its
+/// 72-byte maximum (what the fee is computed on).
+pub fn claim_vsize(htlc: &HtlcParams) -> u64 {
+    let ws = ScriptBuf::from_bytes(htlc.redeem_script());
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(OutPoint::null(), Sequence::ENABLE_RBF_NO_LOCKTIME)],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
+        }],
+    };
+    tx.input[0].witness =
+        Witness::from_slice(&[DUMMY_SIG.to_vec(), vec![0; 32], vec![1], ws.to_bytes()]);
+    tx.vsize() as u64
+}
+
 /// Run libbitcoinconsensus over input 0 of `tx` against the HTLC's P2WSH output.
 pub fn verify_htlc_spend(
     tx: &Transaction,

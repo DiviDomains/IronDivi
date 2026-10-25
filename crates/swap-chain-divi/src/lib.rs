@@ -65,6 +65,20 @@ const DUST: u64 = 10_000;
 /// Size of a DER signature + sighash byte used while estimating fees.
 const SIG_LEN_EST: usize = 72;
 
+/// DIVI Core's default relay minimum, satoshis per 1000 bytes (ab3bf31
+/// `divi/src/defaultValues.h:38` `DEFAULT_TX_RELAY_FEE_PER_KILOBYTE`). A mempool admits a
+/// transaction paying less only on coin-age priority (`MempoolConsensus.cpp:236-266`
+/// `CheckFeesPaidAreAcceptable`).
+pub const RELAY_FEE_PER_KB: u64 = 10_000;
+/// A maker-leg claim pays at least this many times [`RELAY_FEE_PER_KB`] for its size,
+/// whatever the [`FeePolicy`]. DIVI cannot bump a claim (replacement is disabled and block
+/// assembly ignores packages, ab3bf31 `MempoolConsensus.cpp:303-313`,
+/// `BlockMemoryPoolTransactionCollector.cpp:66-83,110-119`), so the first claim must clear
+/// a node whose operator raised `-minimumRelayTransactionFee` and still sort ahead of
+/// transactions paying the minimum. 10 leaves an order of magnitude for both; the default
+/// policy pays about 100.
+pub const CLAIM_FEE_FACTOR: u64 = 10;
+
 /// Fee policy: `max(min_fee, rate * size / 1000)`, in satoshis.
 #[derive(Debug, Clone, Copy)]
 pub struct FeePolicy {
@@ -321,7 +335,10 @@ impl DiviBackend {
             .push(TxOut::new(DiviAmount::from_sat(0), self.spk.clone()));
         // Fee from the real size with a placeholder signature.
         tx.vin[0].script_sig = Script::from_bytes(script_sig(&[0u8; SIG_LEN_EST]));
-        let fee = self.fee.fee(tx.size());
+        let mut fee = self.fee.fee(tx.size());
+        if claim_with.is_some() {
+            fee = fee.max(CLAIM_FEE_FACTOR * (RELAY_FEE_PER_KB * tx.size() as u64).div_ceil(1000));
+        }
         let value = amount
             .to_sat()
             .checked_sub(fee)

@@ -170,6 +170,13 @@ impl ClaimDeadline {
 /// lower of `cap_feerate` and `max_multiple` times the first claim's feerate: the claim is
 /// worth the maker leg, so overpaying beats losing it, but not without bound (a fee estimate
 /// gone wrong must not hand the leg to the miners).
+///
+/// The cap only bounds what is paid while it is enough. Every claim is sent after its
+/// preimage is out (the first one reveals it), and from then on the maker leg is lost unless
+/// the claim confirms, so where the backend reports its sizes the fee is bounded by
+/// [`FeeEscalation::ceiling_fee`], a share of the leg, instead
+/// ([`FeeEscalation::target_after_leak`]). Before the preimage is out the taker declines a
+/// claim whose current feerate alone would cost more than half the leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeEscalation {
     /// Seconds left before the maker-leg locktime when bumping starts.
@@ -180,6 +187,15 @@ pub struct FeeEscalation {
     pub cap_feerate: u64,
     /// Highest multiple of the first claim's feerate ever paid.
     pub max_multiple: u64,
+    /// Under `FeeBump::Cpfp`, bump by replacing the newest CPFP child (falling back to a
+    /// new child where the node refuses that) rather than by adding a child on top of it.
+    /// Off in every built-in schedule: Litecoin Core 0.21.4 relays no replacement
+    /// (`DEFAULT_ENABLE_REPLACEMENT=false`) and the LTC backend refuses to spend an input
+    /// an unmined child already spends before it reaches the node, so the replacement is
+    /// only ever refused. Off, a crash between a bump's write-ahead and its broadcast
+    /// leaves a child on top of the one the node holds, which the next step resends.
+    #[serde(default)]
+    pub replace_cpfp_child: bool,
 }
 
 impl FeeEscalation {
@@ -204,6 +220,7 @@ impl FeeEscalation {
             cap_secs_left: m / 2,
             cap_feerate,
             max_multiple: 50,
+            replace_cpfp_child: false,
         })
     }
 
@@ -241,6 +258,96 @@ impl FeeEscalation {
         self.cap_feerate
             .min(base.saturating_mul(self.max_multiple))
             .max(base)
+    }
+
+    /// The most a maker-leg claim (with every CPFP child of it) pays in fees once its
+    /// preimage is out, in base units: half the leg `amount` while `left ≥ window`, then
+    /// rising linearly to `amount − dust − step` at the locktime (`left ≤ 0`), never below
+    /// half. `window` is the chain's claim-deadline margin
+    /// ([`ClaimDeadline::margin_secs`]), `dust` the smallest output the chain relays and
+    /// `step` one minimal fee bump (one base unit per vbyte of the package), so the last
+    /// version still leaves a relayable output and room to replace it.
+    ///
+    /// Half is what the taker may still lose and call the swap worth doing; it is also the
+    /// share the taker declines above before revealing anything. The rise is there because
+    /// at the locktime the maker's refund takes the whole leg: any fee short of the whole
+    /// leg is better than that, and it costs the hostile maker its refund.
+    pub fn ceiling_fee(amount: u64, dust: u64, step: u64, left: i64, window: u32) -> u64 {
+        let half = amount / 2;
+        let top = amount.saturating_sub(dust).saturating_sub(step).max(half);
+        let window = i64::from(window);
+        if left >= window || window <= 0 {
+            return half;
+        }
+        let gone = (window - left.max(0)) as u128;
+        half + (u128::from(top - half) * gone / window as u128) as u64
+    }
+
+    /// The feerate to pay with `left` seconds before the locktime once the preimage is out,
+    /// the first claim having paid `base`, with the post-leak ceiling
+    /// ([`FeeEscalation::ceiling_fee`]) at `ceiling` per vbyte. Until `cap_secs_left` it is
+    /// [`FeeEscalation::target`], never above `ceiling` (a small leg's ceiling can be under
+    /// the fixed cap). From there the claim is unconfirmed at the fixed cap with blocks
+    /// running out, which is evidence the cap is not enough, so it climbs on geometrically
+    /// from the cap to `ceiling` at the locktime.
+    pub fn target_after_leak(&self, base: u64, left: i64, ceiling: u64) -> u64 {
+        let ceiling = ceiling.max(1);
+        let cap = self.cap(base);
+        let end = i64::from(self.cap_secs_left);
+        if left >= end || end <= 0 || ceiling <= cap {
+            return self.target(base, left).min(ceiling);
+        }
+        let t = (end - left.max(0)) as f64 / end as f64;
+        let rate = cap as f64 * (ceiling as f64 / cap as f64).powf(t);
+        (rate.ceil() as u64).clamp(cap, ceiling)
+    }
+
+    /// Past `cap_secs_left`, which quarter of the stretch to the locktime `left` falls in (1
+    /// to 4, the last one running on past the locktime) and the seconds left at its start;
+    /// `None` before. A CPFP claim climbs one step per quarter
+    /// ([`FeeEscalation::cpfp_target_after_leak`]).
+    pub fn cpfp_step(&self, left: i64) -> Option<(u32, i64)> {
+        let end = i64::from(self.cap_secs_left);
+        if left >= end || end <= 0 {
+            return None;
+        }
+        let gone = end - left.max(0);
+        let k = ((4 * gone + end - 1) / end).clamp(1, 4);
+        Some((k as u32, end - (k - 1) * end / 4))
+    }
+
+    /// [`FeeEscalation::target_after_leak`] for a CPFP claim. Until `cap_secs_left` it is
+    /// [`FeeEscalation::target`], never above `ceiling`. Past it the climb goes on from the
+    /// cap towards the ceiling in at most four steps, one per quarter `k` of what is left
+    /// ([`FeeEscalation::cpfp_step`]): `cap · (ceiling / cap)^(k/4)`, where `ceiling` is the
+    /// post-leak ceiling at the start of that quarter. Each step replaces the child (or, on a
+    /// node that refuses that, adds one), and a package must pay its whole size at the new
+    /// feerate, so a few large steps keep it small, where a geometric climb in small steps
+    /// would grow it at each and price it out.
+    pub fn cpfp_target_after_leak(&self, base: u64, left: i64, ceiling: u64) -> u64 {
+        let ceiling = ceiling.max(1);
+        let cap = self.cap(base);
+        match self.cpfp_step(left) {
+            Some((k, _)) if ceiling > cap => {
+                let t = f64::from(k) / 4.0;
+                let rate = cap as f64 * (ceiling as f64 / cap as f64).powf(t);
+                (rate.ceil() as u64).clamp(cap, ceiling)
+            }
+            _ => self.target(base, left).min(ceiling),
+        }
+    }
+
+    /// [`FeeEscalation::should_bump`] for a CPFP claim (first version `base`) whose package
+    /// pays `current`, with `left` seconds before the locktime. Until `cap_secs_left`, only
+    /// when `target` at least doubles `current` or reaches the fixed cap; past it, whenever
+    /// `target` is higher, which [`FeeEscalation::cpfp_target_after_leak`] makes at most
+    /// four times. Fewer, larger steps keep the package, and with it the fee of every later
+    /// step, small: about six bumps to the cap and four past it.
+    pub fn should_add_child(&self, base: u64, left: i64, current: u64, target: u64) -> bool {
+        if self.cpfp_step(left).is_some() {
+            return target > current;
+        }
+        target > current && (target >= current.saturating_mul(2) || target == self.cap(base))
     }
 
     /// Whether to bump a claim paying `current` (first version `base`) to `target`: when
@@ -820,6 +927,126 @@ mod tests {
         c.validate().unwrap();
         c.chains.get_mut(&Chain::Ltc).unwrap().confirmations = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_post_leak_ceiling_is_half_the_leg_then_rises_to_all_but_dust_and_a_step() {
+        let w = ClaimDeadline::builtin(Chain::Btc).margin_secs();
+        let c = |left| FeeEscalation::ceiling_fee(1_000_000, 294, 150, left, w);
+        assert_eq!(c(i64::from(w) * 3), 500_000);
+        assert_eq!(c(i64::from(w)), 500_000);
+        assert_eq!(
+            c(i64::from(w) / 2),
+            500_000 + (1_000_000 - 294 - 150 - 500_000) / 2
+        );
+        assert_eq!(c(0), 1_000_000 - 294 - 150);
+        assert_eq!(c(-600), 1_000_000 - 294 - 150);
+        let mut prev = 0;
+        for left in (-60..=i64::from(w) + 60).rev() {
+            assert!(c(left) >= prev, "falls at {left}");
+            prev = c(left);
+        }
+        // A leg too small for dust and a step stays at half.
+        assert_eq!(FeeEscalation::ceiling_fee(400, 294, 150, 0, w), 200);
+    }
+
+    #[test]
+    fn after_the_leak_the_target_passes_the_fixed_cap_only_late_and_never_the_ceiling() {
+        let e = FeeEscalation::builtin(Chain::Btc).unwrap();
+        let end = i64::from(e.cap_secs_left);
+        // Before the cap point: the fixed schedule.
+        for left in [7200, 5000, 3600, end] {
+            assert_eq!(e.target_after_leak(10, left, 5000), e.target(10, left));
+        }
+        // After it: above the cap (500), up to the ceiling at the locktime.
+        assert!(e.target_after_leak(10, end - 600, 5000) > 500);
+        assert_eq!(e.target_after_leak(10, 0, 5000), 5000);
+        assert_eq!(e.target_after_leak(10, -60, 5000), 5000);
+        // A ceiling under the fixed cap (a small leg) holds throughout.
+        for left in [7200, 2000, end, 600, 0] {
+            assert!(e.target_after_leak(10, left, 50) <= 50);
+        }
+    }
+
+    /// The geometric climb past the cap point holds the ceiling: for any first feerate,
+    /// ceiling and time left, a replaced claim never pays above the ceiling.
+    #[test]
+    fn after_the_leak_a_replaced_claim_never_passes_the_ceiling() {
+        let e = FeeEscalation::builtin(Chain::Btc).unwrap();
+        let start = i64::from(e.start_secs_left);
+        for base in [0, 1, 2, 3, 7, 10, 19, 20, 37, 100, 999, 1000, 1001, 50_000] {
+            for ceiling in [
+                0,
+                1,
+                2,
+                5,
+                19,
+                20,
+                21,
+                499,
+                500,
+                501,
+                999,
+                1000,
+                1001,
+                7919,
+                1 << 40,
+            ] {
+                for left in (-700..=start + 700).step_by(13) {
+                    let t = e.target_after_leak(base, left, ceiling);
+                    assert!(
+                        t <= ceiling.max(1),
+                        "base {base} ceiling {ceiling} left {left}: {t}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cpfp_claim_steps_to_the_ceiling_past_the_cap_point_in_four_bumps() {
+        let e = FeeEscalation::builtin(Chain::Ltc).unwrap();
+        let end = i64::from(e.cap_secs_left);
+        // Before the cap point: the fixed schedule, in doublings.
+        assert_eq!(e.cpfp_step(end), None);
+        assert_eq!(
+            e.cpfp_target_after_leak(10, end + 60, 900),
+            e.target(10, end + 60)
+        );
+        assert!(!e.should_add_child(10, end, 10, 19));
+        assert!(e.should_add_child(10, end, 10, 20));
+        assert!(e.should_add_child(10, end, 320, e.cap(10)));
+        assert!(!e.should_add_child(10, end, e.cap(10), e.cap(10)));
+        // Past it: four quarters, the last one running on past the locktime.
+        assert_eq!(e.cpfp_step(end - 1), Some((1, end)));
+        assert_eq!(e.cpfp_step(end * 3 / 4), Some((1, end)));
+        assert_eq!(e.cpfp_step(end * 3 / 4 - 1), Some((2, end - end / 4)));
+        assert_eq!(e.cpfp_step(1), Some((4, end - 3 * end / 4)));
+        assert_eq!(e.cpfp_step(-600), Some((4, end - 3 * end / 4)));
+        // One step per quarter, from the cap (500) to the ceiling: 500 · (8000/500)^(k/4).
+        let steps: Vec<u64> = (1..=4)
+            .map(|k| e.cpfp_target_after_leak(10, end - (k - 1) * end / 4 - 1, 8000))
+            .collect();
+        assert_eq!(steps, vec![1000, 2000, 4000, 8000]);
+        // Every time left gives one of those, so at most four bumps, each one higher.
+        let mut current = e.cap(10);
+        let mut bumps = 0;
+        for left in (-300..end).rev() {
+            let t = e.cpfp_target_after_leak(10, left, 8000);
+            assert!(steps.contains(&t), "{t} at {left}");
+            if e.should_add_child(10, left, current, t) {
+                bumps += 1;
+                current = t;
+            }
+        }
+        assert_eq!((bumps, current), (4, 8000));
+        // The ceiling holds, and a ceiling under the cap holds throughout.
+        for left in (-300..=i64::from(e.start_secs_left)).step_by(7) {
+            for ceiling in [0, 1, 50, 499, 500, 501, 8000] {
+                assert!(e.cpfp_target_after_leak(10, left, ceiling) <= ceiling.max(1));
+            }
+        }
+        assert_eq!(e.cpfp_target_after_leak(10, 0, 50), 50);
     }
 
     /// A `SwapConfig` written before per-chain settings existed (no `chains`) still parses,

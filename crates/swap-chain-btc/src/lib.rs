@@ -16,7 +16,8 @@ mod tx;
 
 pub use client::{ClientError, EsploraClient, RetryPolicy};
 pub use tx::{
-    build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin, Spend,
+    build_funding_tx, build_spend_tx, claim_vsize, htlc_script_pubkey, verify_htlc_spend, Coin,
+    Spend, DUST_SATS,
 };
 
 use std::str::FromStr;
@@ -27,8 +28,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{Address, CompressedPublicKey, Network, OutPoint};
 use divi_swap::{
-    Amount, Chain, ChainBackend, FeeBump, Funding, HtlcParams, InputReservations, LockedOutput,
-    Outpoint, SignedTx, SpendInfo, SwapError, Txid,
+    Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
+    LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -581,6 +582,14 @@ impl ChainBackend for BtcBackend {
 
     async fn claim_feerate(&self) -> Result<Option<u64>> {
         Ok(Some(self.sat_per_vb().await))
+    }
+
+    fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
+        Some(ClaimSizes {
+            claim_vsize: claim_vsize(htlc),
+            child_vsize: 0,
+            dust: DUST_SATS,
+        })
     }
 
     async fn build_claim_at(

@@ -197,6 +197,40 @@ async fn claim_verifies_with_interpreter() {
 }
 
 #[tokio::test]
+async fn a_claim_pays_the_relay_minimum_times_the_claim_factor() {
+    let b = DiviBackend::new(
+        "http://127.0.0.1:1/",
+        SecretKey::new_random(),
+        Network::Testnet,
+        FeePolicy {
+            sat_per_kb: 1,
+            min_fee: 1,
+        },
+        None,
+    )
+    .unwrap();
+    let (pre, hash) = new_preimage();
+    let h = htlc_for(&b, hash);
+    let at = Outpoint {
+        txid: txid_n(7),
+        vout: 1,
+    };
+    let t = parse(&b.build_claim(&h, &at, AMOUNT, &pre).await.unwrap());
+    let fee = AMOUNT.0 - t.vout[0].value.as_sat() as u64;
+    let relay = RELAY_FEE_PER_KB * t.size() as u64 / 1000;
+    assert!(
+        fee >= CLAIM_FEE_FACTOR * relay,
+        "claim fee {fee} < {CLAIM_FEE_FACTOR} x relay minimum {relay}"
+    );
+    // The default policy is above the floor on its own.
+    let d = offline();
+    let h = htlc_for(&d, hash);
+    let t = parse(&d.build_claim(&h, &at, AMOUNT, &pre).await.unwrap());
+    let fee = AMOUNT.0 - t.vout[0].value.as_sat() as u64;
+    assert!(fee >= CLAIM_FEE_FACTOR * RELAY_FEE_PER_KB * t.size() as u64 / 1000);
+}
+
+#[tokio::test]
 async fn refund_verifies_with_interpreter() {
     let b = offline();
     let (_, hash) = new_preimage();

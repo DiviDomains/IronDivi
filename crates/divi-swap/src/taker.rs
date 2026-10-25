@@ -614,7 +614,10 @@ impl Taker {
         let chain = r.quote.maker_chain();
         let deadline = match r.claim_declined {
             Some(_) => Ok(()), // decided below on an earlier pass
-            None => self.claim_deadline(chain).check(chain, mtp, htlc.locktime),
+            None => match self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
+                Ok(()) => self.claim_fee_check(r, &htlc).await?,
+                late => late,
+            },
         };
         if r.claim_declined.is_none() && deadline.is_ok() {
             let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
@@ -623,8 +626,8 @@ impl Taker {
             // Persist the signed claim (which reveals the preimage) before broadcasting it.
             return self.enter(r, TakerState::Claimed);
         }
-        // Too late to claim safely: decide for good, record why, and wait out our own
-        // taker-leg timelock. Nothing has been revealed, so both legs refund.
+        // Too late or too dear to claim safely: decide for good, record why, and wait out
+        // our own taker-leg timelock. Nothing has been revealed, so both legs refund.
         if let Err(reason) = deadline {
             tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
             r.claim_declined = Some(reason);
@@ -745,11 +748,21 @@ impl Taker {
             let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
             let left = i64::from(htlc.locktime) - i64::from(mk.median_time_past().await?);
             let estimate = mk.claim_feerate().await?.unwrap_or(0);
-            let feerate = esc
-                .target(base, left)
+            let (target, cap) = match self.claim_ceiling(r, &htlc, amount, left, 0)? {
+                Some(ceiling) => (esc.target_after_leak(base, left, ceiling), ceiling),
+                None => (esc.target(base, left), esc.cap(base)),
+            };
+            // Refused at the fixed cap or above: the mempool wants more than the cap, so
+            // step up by a bump's worth rather than one unit per vbyte.
+            let step = if current >= esc.cap(base) {
+                (current / 4).max(1)
+            } else {
+                1
+            };
+            let feerate = target
                 .max(estimate)
-                .max(current.saturating_add(1))
-                .min(esc.cap(base));
+                .max(current.saturating_add(step))
+                .min(cap);
             if feerate <= current {
                 tracing::warn!(swap = %r.id, txid = %claim.txid, feerate = current, error = %e,
                     "claim refused at the fee cap; resending it unchanged");
@@ -773,6 +786,59 @@ impl Taker {
         r.claim_children.clear();
         self.store.put_taker_swap(r)?;
         Err(e)
+    }
+
+    /// `Err(reason)` if a claim at the feerate the backend reports now would pay more than
+    /// half the maker leg, the post-leak ceiling's first share
+    /// ([`FeeEscalation::ceiling_fee`]). Checked before the first claim reveals the
+    /// preimage, while declining still refunds both legs; past that point the leg is won or
+    /// lost on fees. `Ok` where the backend reports no feerate or no sizes.
+    async fn claim_fee_check(
+        &self,
+        r: &TakerRecord,
+        htlc: &HtlcParams,
+    ) -> Result<std::result::Result<(), String>> {
+        let mk = self.mk(r)?;
+        let chain = r.quote.maker_chain();
+        let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
+        let (Some(sizes), Some(feerate)) = (mk.claim_sizes(htlc), mk.claim_feerate().await?) else {
+            return Ok(Ok(()));
+        };
+        let fee = feerate.saturating_mul(sizes.claim_vsize);
+        let share = amount.0 / 2;
+        if fee > share {
+            return Ok(Err(format!(
+                "a {chain} claim at the current {feerate}/vB pays {fee}, more than half the \
+                 maker leg ({share} of {}); not claiming, waiting for the taker-leg refund",
+                amount.0
+            )));
+        }
+        Ok(Ok(()))
+    }
+
+    /// The post-leak fee ceiling ([`FeeEscalation::ceiling_fee`]) for the maker-leg claim
+    /// with `left` seconds before the locktime, as a feerate over the package the next
+    /// version makes: the claim and `children` CPFP children (the new one included), so a
+    /// CPFP ceiling covers the fee of parent and children together. `None` where the backend
+    /// reports no sizes: the fixed cap then holds.
+    fn claim_ceiling(
+        &self,
+        r: &TakerRecord,
+        htlc: &HtlcParams,
+        amount: Amount,
+        left: i64,
+        children: u64,
+    ) -> Result<Option<u64>> {
+        let Some(sizes) = self.mk(r)?.claim_sizes(htlc) else {
+            return Ok(None);
+        };
+        let vsize = sizes
+            .claim_vsize
+            .saturating_add(sizes.child_vsize.saturating_mul(children))
+            .max(1);
+        let window = self.claim_deadline(r.quote.maker_chain()).margin_secs();
+        let fee = FeeEscalation::ceiling_fee(amount.0, sizes.dust, vsize, left, window);
+        Ok(Some(fee / vsize))
     }
 
     /// Sign the first maker-leg claim. Where the backend can bump it, at the feerate it
@@ -802,9 +868,16 @@ impl Taker {
     }
 
     /// Raise the fee of the unconfirmed `claim` along the chain's [`FeeEscalation`] as the
-    /// maker-leg locktime nears: replace it (RBF) or add a child (CPFP), persisting the new
-    /// transaction before broadcasting it and logging every bump. A no-op where the backend
-    /// cannot bump, escalation is off, or the target is not yet worth a new transaction.
+    /// maker-leg locktime nears: replace it (RBF), or bump it through a CPFP child,
+    /// persisting the new transaction before broadcasting it and logging every bump. A no-op
+    /// where the backend cannot bump, escalation is off, or the target is not yet worth a
+    /// new transaction.
+    ///
+    /// A CPFP bump replaces the newest child, so the package stays the claim and one child
+    /// (the child signals BIP125). A node that refuses that (Litecoin Core's default,
+    /// `-mempoolreplacement=0`) gets the old child back and a new one on top instead, which
+    /// [`FeeEscalation::should_add_child`] keeps to about ten in all, inside the
+    /// 25-transaction ancestor limit.
     async fn escalate_claim_fee(&self, r: &mut TakerRecord, claim: &SignedTx) -> Result<()> {
         let chain = r.quote.maker_chain();
         let mk = self.mk(r)?;
@@ -825,28 +898,29 @@ impl Taker {
             return Ok(());
         };
         let left = i64::from(htlc.locktime) - i64::from(mk.median_time_past().await?);
-        let target = esc.target(base, left);
-        if !esc.should_bump(base, current, target) {
+        if kind == FeeBump::Cpfp {
+            return self
+                .bump_claim_child(r, claim, &esc, base, current, left)
+                .await;
+        }
+        let (target, bump) = match self.claim_ceiling(r, &htlc, amount, left, 0)? {
+            Some(c) => {
+                let t = esc.target_after_leak(base, left, c);
+                (t, esc.should_bump(base, current, t))
+            }
+            None => {
+                let t = esc.target(base, left);
+                (t, esc.should_bump(base, current, t))
+            }
+        };
+        if !bump {
             return Ok(());
         }
-        let tx = match kind {
-            FeeBump::Rbf => {
-                let tx = mk
-                    .build_claim_at(&htlc, &op, amount, &r.preimage, target)
-                    .await?;
-                r.claim_replaced.push((claim.clone(), current));
-                r.maker_leg_claim = Some(tx.clone());
-                tx
-            }
-            FeeBump::Cpfp => {
-                let mut package = vec![claim.clone()];
-                package.extend(r.claim_children.iter().cloned());
-                let tx = mk.build_cpfp(&package, amount, target).await?;
-                r.claim_children.push(tx.clone());
-                tx
-            }
-            FeeBump::None => unreachable!("returned above"),
-        };
+        let tx = mk
+            .build_claim_at(&htlc, &op, amount, &r.preimage, target)
+            .await?;
+        r.claim_replaced.push((claim.clone(), current));
+        r.maker_leg_claim = Some(tx.clone());
         r.claim_feerate = Some(target);
         self.store.put_taker_swap(r)?; // write-ahead
         tracing::info!(
@@ -865,6 +939,137 @@ impl Taker {
             tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e, "fee bump broadcast failed");
         }
         Ok(())
+    }
+
+    /// The CPFP target for the package of `claim` and `children` CPFP children (the new one
+    /// included), with `left` seconds before the locktime, and whether it is worth a bump
+    /// from `current`. Past the cap point the ceiling is the one at the start of the
+    /// current step ([`FeeEscalation::cpfp_step`]), so the step's target holds through it.
+    fn cpfp_target(
+        &self,
+        r: &TakerRecord,
+        esc: &FeeEscalation,
+        base: u64,
+        current: u64,
+        left: i64,
+        children: u64,
+    ) -> Result<(u64, bool)> {
+        let (Some(htlc), Some(amount)) = (r.maker_leg_htlc, r.maker_leg_amount) else {
+            return Ok((current, false));
+        };
+        let at = esc.cpfp_step(left).map_or(left, |(_, start)| start);
+        let target = match self.claim_ceiling(r, &htlc, amount, at, children)? {
+            Some(c) => esc.cpfp_target_after_leak(base, left, c),
+            None => esc.target(base, left),
+        };
+        Ok((target, esc.should_add_child(base, left, current, target)))
+    }
+
+    /// [`Taker::escalate_claim_fee`] for a CPFP claim: add a child on top of the newest
+    /// child of `claim` (or the first). With [`FeeEscalation::replace_cpfp_child`], replace
+    /// the newest child instead, and where the node refuses the replacement, keep the old
+    /// child and add one on top of it.
+    async fn bump_claim_child(
+        &self,
+        r: &mut TakerRecord,
+        claim: &SignedTx,
+        esc: &FeeEscalation,
+        base: u64,
+        current: u64,
+        left: i64,
+    ) -> Result<()> {
+        let mk = self.mk(r)?;
+        let amount = r.maker_leg_amount.expect("checked by the caller");
+        let held = r.claim_children.len() as u64;
+        let replace = esc.replace_cpfp_child && held > 0;
+        let children = if replace { held } else { held + 1 };
+        let (target, bump) = self.cpfp_target(r, esc, base, current, left, children)?;
+        if !bump {
+            return Ok(());
+        }
+        let old = if replace {
+            r.claim_children.pop()
+        } else {
+            None
+        };
+        let mut package = vec![claim.clone()];
+        package.extend(r.claim_children.iter().cloned());
+        let tx = match mk.build_cpfp(&package, amount, target).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                r.claim_children.extend(old);
+                return Err(e);
+            }
+        };
+        r.claim_children.push(tx.clone());
+        r.claim_feerate = Some(target);
+        self.store.put_taker_swap(r)?; // write-ahead
+        self.log_child_bump(r, claim, &tx, current, target, left, old.is_some());
+        let refused = match mk.broadcast(&tx).await {
+            Ok(_) => return Ok(()),
+            Err(SwapError::Rejected(e)) if old.is_some() => e,
+            Err(e) => {
+                // Kept: the next step resends it and, if refused for good, drops it.
+                tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e,
+                    "fee bump broadcast failed");
+                return Ok(());
+            }
+        };
+        // The node keeps the old child (no child replacement): put it back, then chain a
+        // new child onto the whole package, which is one child bigger.
+        tracing::info!(swap = %r.id, refused = %tx.txid, error = %refused,
+            "claim CPFP child replacement refused; adding a child instead");
+        r.claim_children.pop();
+        r.claim_children.extend(old);
+        r.claim_feerate = Some(current);
+        let (target, bump) = self.cpfp_target(r, esc, base, current, left, held + 1)?;
+        if !bump {
+            self.store.put_taker_swap(r)?;
+            return Ok(());
+        }
+        let mut package = vec![claim.clone()];
+        package.extend(r.claim_children.iter().cloned());
+        let tx = match mk.build_cpfp(&package, amount, target).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.store.put_taker_swap(r)?;
+                return Err(e);
+            }
+        };
+        r.claim_children.push(tx.clone());
+        r.claim_feerate = Some(target);
+        self.store.put_taker_swap(r)?; // write-ahead
+        self.log_child_bump(r, claim, &tx, current, target, left, false);
+        if let Err(e) = mk.broadcast(&tx).await {
+            tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e, "fee bump broadcast failed");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_child_bump(
+        &self,
+        r: &TakerRecord,
+        claim: &SignedTx,
+        tx: &SignedTx,
+        current: u64,
+        target: u64,
+        left: i64,
+        replaces: bool,
+    ) {
+        tracing::info!(
+            swap = %r.id,
+            chain = %r.quote.maker_chain(),
+            bump = ?FeeBump::Cpfp,
+            replaces,
+            children = r.claim_children.len(),
+            old_feerate = current,
+            new_feerate = target,
+            txid = %tx.txid,
+            claim = %claim.txid,
+            secs_left = left,
+            "claim fee bumped"
+        );
     }
 
     async fn on_refunded(&self, r: &mut TakerRecord) -> Result<Flow> {

@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::backend::{ChainBackend, FeeBump, TipHeader};
+use crate::backend::{ChainBackend, ClaimSizes, FeeBump, TipHeader};
 use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, LOCKTIME_THRESHOLD, REFUND_SEQUENCE};
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
@@ -117,6 +117,9 @@ struct ChainState {
     /// One-shot: the next `broadcast()` call fails with `SwapError::Rejected` instead of
     /// whatever it would otherwise do, then clears itself.
     reject_next_broadcast: bool,
+    /// One-shot: the next `broadcast()` of a transaction the chain does not hold yet fails
+    /// with `SwapError::Transient` and relays nothing, then clears itself.
+    lose_next_new_broadcast: bool,
     /// Txids the node cannot look up (no txindex): `confirmations`/`htlc_output` say `None`
     /// although the tx stays in the chain and `broadcast` still answers already-known.
     blind: HashSet<Txid>,
@@ -147,6 +150,13 @@ struct ChainState {
     branch_of: HashMap<u64, u64>,
     /// The branch new blocks are mined on; each rewind starts a new one.
     branch: u64,
+    /// Under [`FeeBump::Cpfp`], whether a CPFP child replaces an unmined child of the same
+    /// parent (a Litecoin node run with `-mempoolreplacement=1`) instead of being refused as
+    /// a double spend (the default, as Litecoin Core's).
+    child_replacement: bool,
+    /// The most unconfirmed transactions any accepted tx has had in its chain, itself
+    /// included.
+    longest_chain: u64,
 }
 
 /// The kind of a mock transaction.
@@ -158,6 +168,11 @@ pub enum TxKind {
     /// A CPFP child of a claim.
     Child,
 }
+
+/// Unconfirmed ancestors, and unconfirmed descendants of each ancestor, a node takes for a
+/// tx, both counts including the tx (Litecoin Core v0.21's `DEFAULT_ANCESTOR_LIMIT` and
+/// `DEFAULT_DESCENDANT_LIMIT`, `src/validation.h:58,62`; Bitcoin Core's are the same).
+pub const MOCK_CHAIN_LIMIT: u64 = 25;
 
 impl MockTx {
     fn kind(&self) -> TxKind {
@@ -195,6 +210,18 @@ impl MockTx {
 
     fn feerate(&self) -> u64 {
         self.fee_and_out().map_or(0, |(fee, _)| fee / MOCK_VSIZE)
+    }
+
+    /// The outpoint a claim, refund or child spends (`None` for a funding).
+    fn spends(&self) -> Option<Outpoint> {
+        match self {
+            MockTx::Fund { .. } => None,
+            MockTx::Claim { at, .. } | MockTx::Refund { at, .. } => Some(*at),
+            MockTx::Child { parent, .. } => Some(Outpoint {
+                txid: *parent,
+                vout: 0,
+            }),
+        }
     }
 }
 
@@ -342,6 +369,43 @@ impl MockChain {
             .filter(|(at, _)| at.txid == id)
             .map(|(_, spender)| *spender)
             .collect()
+    }
+
+    /// The unmined txs `tx` spends from, directly or through others, nearest first.
+    fn unconfirmed_ancestors(s: &ChainState, tx: &MockTx) -> Vec<Txid> {
+        let mut out = Vec::new();
+        let mut at = tx.spends();
+        while let Some(Outpoint { txid, .. }) = at {
+            let Some((parent, None)) = s.txs.get(&txid) else {
+                break;
+            };
+            out.push(txid);
+            at = parent.spends();
+        }
+        out
+    }
+
+    /// Refuse `new` ("too-long-mempool-chain") if it would have more than
+    /// [`MOCK_CHAIN_LIMIT`] unconfirmed ancestors, or give one of them more than that many
+    /// unconfirmed descendants, itself included. A tx `new` replaces does not count.
+    fn check_chain_limits(s: &ChainState, new: &MockTx) -> Result<()> {
+        let ancestors = Self::unconfirmed_ancestors(s, new);
+        let replaced = new
+            .spends()
+            .and_then(|at| s.spends.get(&at))
+            .filter(|old| matches!(s.txs.get(old), Some((_, None))))
+            .map_or(0, |old| Self::package_with_descendants(s, *old).1);
+        let too_long = ancestors.len() as u64 + 1 > MOCK_CHAIN_LIMIT
+            || ancestors
+                .iter()
+                .any(|a| Self::package_with_descendants(s, *a).1 - replaced + 1 > MOCK_CHAIN_LIMIT);
+        if too_long {
+            return Err(SwapError::Rejected(format!(
+                "too-long-mempool-chain: {} unconfirmed ancestors, limit {MOCK_CHAIN_LIMIT}",
+                ancestors.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Fee and count of unmined `id` and every unmined tx spending it.
@@ -539,6 +603,14 @@ impl MockChain {
         self.state.lock().fail_broadcasts = err;
     }
 
+    /// The next `broadcast()` on this chain of a transaction it does not hold yet fails
+    /// with `SwapError::Transient` and relays nothing; rebroadcasts of transactions it holds
+    /// still answer already-known. One-shot. As if the process died between persisting a
+    /// transaction and sending it: the record has it, the chain never saw it.
+    pub fn lose_next_new_broadcast(&self) {
+        self.state.lock().lose_next_new_broadcast = true;
+    }
+
     /// How backends on this chain bump a claim ([`ChainBackend::fee_bump`]) and what the
     /// relay accepts: under [`FeeBump::Rbf`] a spend of an outpoint an unmined claim or
     /// refund already spends replaces it if it pays at least that one's fee plus one unit
@@ -547,6 +619,21 @@ impl MockChain {
     /// ever replaced, as before.
     pub fn set_fee_bump(&self, bump: FeeBump) {
         self.state.lock().fee_bump = bump;
+    }
+
+    /// Under [`FeeBump::Cpfp`], from now on a CPFP child spending the output an unmined
+    /// child already spends replaces it if it pays at least that one's fee (with its
+    /// descendants') plus one unit per vbyte, at a higher feerate: a Litecoin node run with
+    /// `-mempoolreplacement=1`, the child signalling BIP125. Off (the default, as Litecoin
+    /// Core's `DEFAULT_ENABLE_REPLACEMENT`): it is refused as a double spend.
+    pub fn set_child_replacement(&self, on: bool) {
+        self.state.lock().child_replacement = on;
+    }
+
+    /// The most unconfirmed transactions in one chain (ancestors of a tx, itself included)
+    /// the chain has accepted so far. Test-only observation of how deep a CPFP package got.
+    pub fn longest_unconfirmed_chain(&self) -> u64 {
+        self.state.lock().longest_chain
     }
 
     /// The feerate backends report through `claim_feerate` from now on.
@@ -604,16 +691,21 @@ impl MockChain {
 
     /// Make room for `new` spending `at`, or refuse it as a double spend: an unmined
     /// claim or refund there is replaced if the relay takes replacements and `new` pays
-    /// enough more ([`MockChain::set_fee_bump`]).
+    /// enough more ([`MockChain::set_fee_bump`]), and so is an unmined CPFP child where the
+    /// relay takes child replacements ([`MockChain::set_child_replacement`]).
     fn replace_spend(s: &mut ChainState, at: &Outpoint, new: &MockTx) -> Result<()> {
         let Some(&old) = s.spends.get(at) else {
             return Ok(());
         };
-        let replaceable = s.fee_bump == FeeBump::Rbf
-            && matches!(
-                s.txs.get(&old),
-                Some((MockTx::Claim { .. } | MockTx::Refund { .. }, None))
-            );
+        let replaceable = match (s.txs.get(&old), new) {
+            (Some((MockTx::Claim { .. } | MockTx::Refund { .. }, None)), _) => {
+                s.fee_bump == FeeBump::Rbf
+            }
+            (Some((MockTx::Child { .. }, None)), MockTx::Child { .. }) => {
+                s.fee_bump == FeeBump::Cpfp && s.child_replacement
+            }
+            _ => false,
+        };
         if !replaceable {
             return Err(SwapError::Rejected("double spend".into()));
         }
@@ -1000,6 +1092,15 @@ impl ChainBackend for MockBackend {
         Ok((s.fee_bump != FeeBump::None).then(|| s.fee_estimate.unwrap_or(MOCK_FEERATE)))
     }
 
+    /// Every mock claim and child is [`MOCK_VSIZE`]; the mock has no dust limit.
+    fn claim_sizes(&self, _htlc: &HtlcParams) -> Option<ClaimSizes> {
+        (self.fee_bump() != FeeBump::None).then_some(ClaimSizes {
+            claim_vsize: MOCK_VSIZE,
+            child_vsize: MOCK_VSIZE,
+            dust: 0,
+        })
+    }
+
     async fn build_claim_at(
         &self,
         htlc: &HtlcParams,
@@ -1099,6 +1200,12 @@ impl ChainBackend for MockBackend {
         if s.txs.contains_key(&tx.txid) {
             return Ok(tx.txid);
         }
+        if s.lose_next_new_broadcast {
+            s.lose_next_new_broadcast = false;
+            return Err(SwapError::Transient(
+                "mock: lost before broadcast (test)".into(),
+            ));
+        }
         if !matches!(parsed, MockTx::Fund { .. }) && parsed.feerate() < s.mempool_floor {
             return Err(SwapError::Rejected(format!(
                 "mempool min fee not met: {} < {}",
@@ -1106,6 +1213,7 @@ impl ChainBackend for MockBackend {
                 s.mempool_floor
             )));
         }
+        MockChain::check_chain_limits(&s, &parsed)?;
         match &parsed {
             MockTx::Fund { from, amount, .. } => {
                 let bal = s.balances.entry(from.clone()).or_default();
@@ -1153,9 +1261,7 @@ impl ChainBackend for MockBackend {
                 if parent_out != *value_in {
                     return Err(SwapError::Rejected("amount mismatch".into()));
                 }
-                if s.spends.contains_key(&at) {
-                    return Err(SwapError::Rejected("double spend".into()));
-                }
+                MockChain::replace_spend(&mut s, &at, &parsed)?;
                 s.spends.insert(at, tx.txid);
                 let (_, out) = parsed.fee_and_out().expect("a spend");
                 let bal = s.balances.entry(to.clone()).or_default();
@@ -1185,6 +1291,8 @@ impl ChainBackend for MockBackend {
             }
         }
         s.accepted.insert(tx.txid, parsed.kind());
+        let depth = MockChain::unconfirmed_ancestors(&s, &parsed).len() as u64 + 1;
+        s.longest_chain = s.longest_chain.max(depth);
         s.txs.insert(tx.txid, (parsed, None));
         Ok(tx.txid)
     }
@@ -1542,5 +1650,92 @@ mod tests {
             SEQUENCE_LOCKTIME_DISABLE_FLAG | 0xffff,
         );
         taker.broadcast(&r).await.unwrap();
+    }
+
+    /// A claim with a mined funding and `children` CPFP children chained on it, the last
+    /// paying for the whole package at `feerate`; returns the package, claim first.
+    async fn claim_chain(
+        chain: &MockChain,
+        children: usize,
+        feerate: u64,
+    ) -> (MockBackend, Amount, Vec<SignedTx>) {
+        chain.set_fee_bump(FeeBump::Cpfp);
+        let maker = chain.backend(1, Amount(10_000_000));
+        let taker = chain.backend(2, Amount(0));
+        let (pre, hash) = new_preimage();
+        let h = htlc(taker.pubkey(), maker.pubkey(), hash, 1_800_003_600);
+        let f = maker.build_funding(&h, Amount(5_000_000)).await.unwrap();
+        maker.broadcast(&f.tx).await.unwrap();
+        chain.mine(1);
+        let claim = taker
+            .build_claim_at(&h, &f.outpoint, f.amount, &pre, 1)
+            .await
+            .unwrap();
+        taker.broadcast(&claim).await.unwrap();
+        let mut package = vec![claim];
+        for _ in 0..children {
+            let child = taker.build_cpfp(&package, f.amount, feerate).await.unwrap();
+            taker.broadcast(&child).await.unwrap();
+            package.push(child);
+        }
+        (taker, f.amount, package)
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_chain_stops_at_the_25_transaction_limit() {
+        // Litecoin Core (and Bitcoin Core) refuse a tx with more than 25 unconfirmed
+        // ancestors, itself included, or one that would give an ancestor more than 25
+        // unconfirmed descendants, itself included ("too-long-mempool-chain").
+        let chain = MockChain::new(Chain::Ltc, 1_800_000_000, 150);
+        let (taker, amount, package) = claim_chain(&chain, 24, 2).await;
+        let child = taker.build_cpfp(&package, amount, 2).await.unwrap();
+        let refused = taker.broadcast(&child).await;
+        assert!(
+            matches!(&refused, Err(SwapError::Rejected(m)) if m.contains("too-long-mempool-chain")),
+            "{refused:?}"
+        );
+        assert_eq!(chain.feerate_of(&child.txid), None);
+        // Once the package is mined the child fits.
+        chain.mine(1);
+        taker.broadcast(&child).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cpfp_child_replaces_its_sibling_only_where_the_relay_takes_it() {
+        let chain = MockChain::new(Chain::Ltc, 1_800_000_000, 150);
+        let (taker, amount, package) = claim_chain(&chain, 1, 20).await;
+        let (claim, first) = (&package[0], &package[1]);
+        let higher = taker
+            .build_cpfp(std::slice::from_ref(claim), amount, 30)
+            .await
+            .unwrap();
+        // Litecoin Core's default: a second spend of the claim's output is a conflict.
+        let refused = taker.broadcast(&higher).await;
+        assert!(
+            matches!(&refused, Err(SwapError::Rejected(m)) if m.contains("double spend")),
+            "{refused:?}"
+        );
+
+        chain.set_child_replacement(true);
+        taker.broadcast(&higher).await.unwrap();
+        let at = Outpoint {
+            txid: claim.txid,
+            vout: 0,
+        };
+        assert_eq!(chain.spender(&at), Some(higher.txid));
+        assert_eq!(
+            chain.feerate_of(&first.txid),
+            None,
+            "the sibling is evicted"
+        );
+        // The evicted sibling pays less, so it cannot come back.
+        let refused = taker.broadcast(first).await;
+        assert!(
+            matches!(&refused, Err(SwapError::Rejected(m)) if m.contains("insufficient fee")),
+            "{refused:?}"
+        );
+        assert_eq!(chain.longest_unconfirmed_chain(), 2);
+        chain.mine(1);
+        assert_eq!(taker.confirmations(&higher.txid).await.unwrap(), Some(1));
     }
 }
