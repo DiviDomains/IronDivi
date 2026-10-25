@@ -600,6 +600,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         })?;
         config.mempool.min_relay_fee_per_kb = sat;
     }
+    config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -741,6 +742,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "maxreorg",
         "maxorphantx",
         "minrelaytxfee",
+        "acceptnonstandard",
         "maxtxfee",
         "sporkkey",
         "staking",
@@ -2071,7 +2073,7 @@ async fn run_daemon(
         let peers_for_staking_status = Arc::clone(&peer_manager);
         let split_threshold_divi = config.staking.split_threshold as f64 / 100_000_000.0;
         let mempool_for_rpc = node.mempool().clone();
-        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, Some(Arc::clone(&wallet)));
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
@@ -2079,6 +2081,9 @@ async fn run_daemon(
         let tx_relay_for_tx = node.tx_relay().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2101,9 +2106,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2226,12 +2231,15 @@ async fn run_daemon(
         }
     } else {
         let mempool_for_rpc = node.mempool().clone();
-        let reorg_hook_for_rpc = mempool_reorg_hook(&node);
+        let reorg_hook_for_rpc = mempool_reorg_hook(&node, None);
         let spork_for_rpc = node.spork_manager().clone();
         let history_for_rpc = node.history_fetcher();
         let block_sync_for_rpc = node.block_sync().clone();
         let datadir_for_mn = config.data_dir.clone();
         let pm_for_mn = node.peer_manager().clone();
+        // The node's own masternode list, which the network fills from mnb/mnp
+        let mn_for_rpc = node.masternode_manager().as_ref().clone();
+        let mn_list_for_rpc = Arc::clone(node.masternode_list());
         let log_config_for_rpc = divi_rpc::LogConfigInfo {
             max_file_size: config.log.max_file_size,
             max_files: config.log.max_files,
@@ -2253,9 +2261,9 @@ async fn run_daemon(
                     rpc_server.set_spork_manager(spork_for_rpc);
                     rpc_server.set_log_config(log_config_for_rpc);
 
-                    // Initialize masternode manager
-                    let mn_manager = divi_masternode::MasternodeManager::new();
-                    rpc_server.set_masternode_manager(mn_manager);
+                    // The masternode RPCs read the node's masternode list
+                    rpc_server.set_masternode_manager(mn_for_rpc);
+                    rpc_server.set_masternode_list(mn_list_for_rpc);
                     rpc_server.set_masternode_datadir(datadir_for_mn);
                     rpc_server.set_masternode_relay(Arc::new(move |bytes: Vec<u8>| {
                         pm_for_mn.broadcast_masternode_broadcast(bytes);
@@ -2405,6 +2413,7 @@ fn staking_info(
         // IronDivi keeps no masternode list sync of its own; Divi Core's
         // starts once the chain is synced
         mnsync: synced,
+        recently_attempted: status.recently_attempted,
         blocks: status.blocks,
         stake_split_threshold: split_threshold_divi,
     }
@@ -2438,11 +2447,25 @@ fn block_is_active(chain: &divi_storage::Chain, block: &divi_primitives::block::
 
 /// The mempool side of invalidateblock and its family: the disconnected
 /// blocks' transactions go back to the mempool and what the chain now spends
-/// leaves it, as after any reorganization
-fn mempool_reorg_hook(node: &Node) -> divi_rpc::blockchain::ReorgHook {
+/// leaves it, as after any reorganization. The wallet is brought to the tip
+/// first, as Divi Core's disconnectTip and connectTip tell it of every block
+/// that leaves or joins the chain (SyncTransactions, ChainTipManager.cpp:189,
+/// :150): blocks that left are rolled back, blocks that joined are scanned.
+/// Before the mempool, so a returned transaction reaches a wallet that no
+/// longer holds it as confirmed.
+fn mempool_reorg_hook(
+    node: &Node,
+    wallet: Option<Arc<WalletDb>>,
+) -> divi_rpc::blockchain::ReorgHook {
     let chain = node.chain().clone();
     let mempool = node.mempool().clone();
     Arc::new(move |disconnected| {
+        if let Some(wallet) = &wallet {
+            sync_wallet_to_tip(wallet, &chain);
+            if let Err(e) = wallet.save_incremental() {
+                error!("Failed to save the wallet after the chain moved: {}", e);
+            }
+        }
         divi_node::update_mempool_after_reorg(&chain, &mempool, disconnected)
     })
 }
@@ -3563,6 +3586,7 @@ mod staking_status_tests {
             expected_time: None,
             last_stake_time: 0,
             blocks: 100,
+            recently_attempted: false,
         };
         let info = staking_info(&status, true, 0, 0, false, 5000.0);
         assert!(!info.wallet_unlocked, "locked wallet reported unlocked");

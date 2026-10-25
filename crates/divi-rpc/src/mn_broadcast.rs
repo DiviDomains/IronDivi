@@ -98,7 +98,7 @@ fn wallet_secret(wallet: &WalletDb, pubkey: &[u8]) -> Option<SecretKey> {
 }
 
 /// C++ `MasternodeTier` int for a collateral amount (regtest collaterals are 1000x cheaper)
-fn tier_for_collateral(chain: &Chain, amount: i64) -> Option<i32> {
+pub(crate) fn tier_for_collateral(chain: &Chain, amount: i64) -> Option<i32> {
     let scale = if chain.network_type() == NetworkType::Regtest {
         1000
     } else {
@@ -111,13 +111,13 @@ fn tier_for_collateral(chain: &Chain, amount: i64) -> Option<i32> {
 }
 
 /// Collateral facts for an outpoint on the active chain
-struct Collateral {
-    amount: i64,
+pub(crate) struct Collateral {
+    pub(crate) amount: i64,
     /// Height of the block holding the collateral transaction
-    height: u32,
+    pub(crate) height: u32,
 }
 
-fn find_collateral(chain: &Chain, hash: &Hash256, n: u32) -> Option<Collateral> {
+pub(crate) fn find_collateral(chain: &Chain, hash: &Hash256, n: u32) -> Option<Collateral> {
     let (tx, loc) = chain.get_transaction_with_location(hash).ok()??;
     let out = tx.vout.get(n as usize)?;
     let bi = chain.get_block_index(&loc.block_hash).ok()??;
@@ -411,6 +411,15 @@ fn check_broadcast(ctx: &MnContext, mnb: &CppBroadcast) -> Result<(), String> {
         .ok_or("Collateral not found in the active chain")?;
     if tier_for_collateral(ctx.chain, coll.amount) != Some(mnb.tier) {
         return Err("Collateral amount does not match the tier".into());
+    }
+    // CheckInputsAndAdd: the collateral unspent, with 15 confirmations
+    // (masternode.h:16)
+    let outpoint = divi_primitives::transaction::OutPoint::new(hash, mnb.vin.prevout_n);
+    if !matches!(ctx.chain.get_utxo(&outpoint), Ok(Some(_))) {
+        return Err("Collateral is spent".into());
+    }
+    if ctx.chain.height() + 1 < coll.height + 15 {
+        return Err("Collateral must have at least 15 confirmations".into());
     }
     Ok(())
 }

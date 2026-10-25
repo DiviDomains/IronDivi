@@ -149,12 +149,6 @@ impl TxRelay {
         }
     }
 
-    /// Announce a transaction the mempool accepted to every peer not known to
-    /// have it (Divi Core RelayTransactionToAllPeers, main.cpp:733, :762)
-    pub async fn relay_accepted(&self, txid: Hash256) {
-        self.relay_tx(txid, None).await;
-    }
-
     /// Mark a transaction as seen (e.g., from mempool or block)
     pub fn mark_seen(&self, txid: Hash256) {
         self.seen_txs.write().insert(txid);
@@ -342,9 +336,18 @@ impl TxRelay {
             from_peer: peer_id,
         };
 
-        // The mempool decides; only a transaction it accepts is announced
-        // (relay_accepted; Divi Core main.cpp:731-734)
+        // The mempool decides; it is relayed once accepted (relay_accepted),
+        // as Divi Core relays a transaction only after AcceptToMemoryPool took
+        // it (main.cpp:732-734), so a transaction it cannot take yet, such as
+        // a child whose parent has not come, is not announced
         let _ = self.event_tx.send(event);
+    }
+
+    /// Relay a transaction the mempool took, to every peer but the one it came
+    /// from (Divi Core RelayTransactionToAllPeers after AcceptToMemoryPool,
+    /// main.cpp:734, and for an orphan accepted once its parent came, :763)
+    pub async fn relay_accepted(&self, txid: Hash256, from_peer: Option<PeerId>) {
+        self.relay_tx(txid, from_peer).await;
     }
 
     /// Handle getdata request for transactions
@@ -579,6 +582,60 @@ mod tests {
             .unwrap_or(false));
     }
 
+    /// A peer and the receiver of the messages sent to it
+    fn test_peer(relay: &TxRelay, id: PeerId) -> tokio::sync::mpsc::Receiver<NetworkMessage> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        relay
+            .peer_manager
+            .insert_test_peer(crate::peer::PeerHandle {
+                id,
+                addr: format!("127.0.0.1:{}", 2000 + id).parse().unwrap(),
+                tx,
+                inbound: false,
+                stats: Default::default(),
+            });
+        rx
+    }
+
+    fn invs(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<Hash256> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let NetworkMessage::Inv(items) = msg {
+                got.extend(items.iter().map(|i| i.hash));
+            }
+        }
+        got
+    }
+
+    /// A received transaction is announced to the other peers only once the
+    /// mempool took it (Divi Core main.cpp:732-734): a child that came before
+    /// its parent is not announced while it waits, then is when accepted
+    /// (:763)
+    #[tokio::test]
+    async fn a_received_transaction_is_announced_only_once_accepted() {
+        let relay = create_test_relay();
+        let _from = test_peer(&relay, 1);
+        let mut other = test_peer(&relay, 2);
+        let mut events = relay.subscribe();
+        let tx = Transaction {
+            version: 1,
+            vin: vec![],
+            vout: vec![],
+            lock_time: 7,
+        };
+        let txid = tx.txid();
+
+        relay.handle_tx(1, tx).await;
+        assert_eq!(events.try_recv().map(|e| e.txid).ok(), Some(txid));
+        assert!(
+            invs(&mut other).is_empty(),
+            "announced before the mempool took it"
+        );
+
+        relay.relay_accepted(txid, Some(1)).await;
+        assert_eq!(invs(&mut other), vec![txid]);
+    }
+
     #[test]
     fn test_stats() {
         let relay = create_test_relay();
@@ -590,25 +647,6 @@ mod tests {
 
         let stats = relay.stats();
         assert_eq!(stats.seen_count, 10);
-    }
-
-    /// A test peer whose outbound messages the test reads
-    fn test_peer(
-        relay: &TxRelay,
-        addr: &str,
-    ) -> (PeerId, tokio::sync::mpsc::Receiver<NetworkMessage>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let id = crate::peer::new_peer_id();
-        relay
-            .peer_manager
-            .insert_test_peer(crate::peer::PeerHandle {
-                id,
-                addr: addr.parse().unwrap(),
-                tx,
-                inbound: true,
-                stats: Default::default(),
-            });
-        (id, rx)
     }
 
     fn test_tx(n: u8) -> Transaction {
@@ -626,41 +664,6 @@ mod tests {
         }
     }
 
-    fn invs(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<Hash256> {
-        let mut out = Vec::new();
-        while let Ok(msg) = rx.try_recv() {
-            if let NetworkMessage::Inv(items) = msg {
-                out.extend(items.into_iter().map(|i| i.hash));
-            }
-        }
-        out
-    }
-
-    /// A transaction a peer sends is not announced before the mempool takes
-    /// it: an orphan or a refused one is never announced (Divi Core relays
-    /// from main.cpp:733-734 and :760-762 only)
-    #[tokio::test]
-    async fn a_received_transaction_is_not_announced_at_once() {
-        let relay = create_test_relay();
-        let (from, _from_rx) = test_peer(&relay, "127.0.0.3:1000");
-        let (_other, mut other_rx) = test_peer(&relay, "127.0.0.4:1000");
-        relay.handle_tx(from, test_tx(1)).await;
-        assert_eq!(invs(&mut other_rx), vec![]);
-    }
-
-    /// Once accepted it is announced to each peer but the one that sent it
-    #[tokio::test]
-    async fn an_accepted_transaction_is_announced_to_the_other_peers() {
-        let relay = create_test_relay();
-        let (from, mut from_rx) = test_peer(&relay, "127.0.0.3:1000");
-        let (_other, mut other_rx) = test_peer(&relay, "127.0.0.4:1000");
-        let tx = test_tx(2);
-        relay.handle_tx(from, tx.clone()).await;
-        relay.relay_accepted(tx.txid()).await;
-        assert_eq!(invs(&mut other_rx), vec![tx.txid()]);
-        assert_eq!(invs(&mut from_rx), vec![], "the sender has it");
-    }
-
     /// AlreadyHave (main.cpp:140-144): an inv is asked for unless the
     /// transaction is in the mempool or a held orphan; one seen and refused
     /// before is asked for again
@@ -674,7 +677,8 @@ mod tests {
         );
         relay.set_have_check(Arc::new(move |t| (*t == in_pool, *t == orphan)));
         relay.mark_seen(refused);
-        let (peer, mut rx) = test_peer(&relay, "127.0.0.3:1000");
+        let mut rx = test_peer(&relay, 1);
+        let peer = 1;
         let items = [in_pool, orphan, refused]
             .iter()
             .map(|h| InvItem::new(InvType::Tx, *h))
@@ -699,7 +703,8 @@ mod tests {
         let (orphan_id, pooled_id) = (orphan.txid(), pooled.txid());
         relay.set_have_check(Arc::new(move |t| (*t == pooled_id, *t == orphan_id)));
         let mut events = relay.subscribe();
-        let (peer, _rx) = test_peer(&relay, "127.0.0.3:1000");
+        let _rx = test_peer(&relay, 1);
+        let peer = 1;
         relay.handle_tx(peer, orphan).await;
         relay.handle_tx(peer, pooled).await;
         assert_eq!(events.try_recv().map(|e| e.txid).ok(), Some(orphan_id));

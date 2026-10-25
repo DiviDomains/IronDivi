@@ -2742,14 +2742,31 @@ impl Chain {
     /// clear the invalid mark again without moving the tip, as Core's
     /// reconsiderBlock (ChainExtensionService.cpp:662-689) does there. The
     /// tip stays at the block's parent until another block is connected.
+    ///
+    /// For the genesis block Core disconnects every block above it, fails to
+    /// disconnect the genesis block itself and still answers null
+    /// (BlockInvalidationHelpers.cpp:134-143, rpcblockchain.cpp:605-609): the
+    /// tip is the genesis block, so here the reversal starts at block 1.
     pub fn reverse_block_transactions(
         &self,
         hash: &Hash256,
     ) -> Result<Vec<Transaction>, StorageError> {
         self.notifying_tip(|| {
-            let disconnected = self.invalidate_block_unnotified(hash, false)?;
+            let target = self
+                .db
+                .get_block_index(hash)?
+                .ok_or_else(|| StorageError::BlockNotFound(hash.to_string()))?;
+            let first = if target.height == 0 {
+                match self.get_block_index_by_height(1)? {
+                    Some(block_1) => block_1.hash,
+                    None => return Ok(Vec::new()),
+                }
+            } else {
+                *hash
+            };
+            let disconnected = self.invalidate_block_unnotified(&first, false)?;
             let _chain_guard = self.chain_lock.lock();
-            self.clear_failed_marks(hash)?;
+            self.clear_failed_marks(&first)?;
             Ok(disconnected)
         })
     }
@@ -2933,14 +2950,25 @@ impl Chain {
         }
 
         // Divi Core DisconnectBlock: reverse the block's address and spent
-        // index entries from the outputs its inputs spent
+        // index entries from the outputs its inputs spent. A coin made and
+        // spent in the block is not restored, but Core's view still holds it
+        // when the spender is reversed, so its spend is erased too
         let updates = match self.search_index {
             Some(ref search) => {
-                let prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
+                let mut prevouts: HashMap<OutPoint, search_index::PrevOut> = utxo_batch
                     .adds
                     .iter()
                     .map(|(outpoint, utxo)| (*outpoint, (utxo.value, utxo.script_pubkey.clone())))
                     .collect();
+                for tx in &block.transactions {
+                    let txid = self.compute_txid(tx);
+                    for (k, out) in tx.vout.iter().enumerate() {
+                        prevouts.insert(
+                            OutPoint::new(txid, k as u32),
+                            (out.value, out.script_pubkey.clone()),
+                        );
+                    }
+                }
                 Some(search_index::collect_disconnect(
                     block,
                     index.height,
@@ -4029,15 +4057,6 @@ impl Chain {
             }
         }
 
-        // IMPORTANT: Validate treasury payments BEFORE modifying any state
-        // This prevents UTXO corruption if validation fails
-        debug!(
-            "  ├─ Treasury validation check (network: {:?})",
-            self.network_type()
-        );
-        self.validate_treasury_payments(block, index)?;
-        debug!("  ├─ Treasury validation: ✅ PASS");
-
         debug!("  ├─ Processing {} transactions", block.transactions.len());
         let mut total_inputs = 0;
         let mut total_outputs = 0;
@@ -4447,11 +4466,9 @@ impl Chain {
             return Ok(());
         }
 
+        // Regtest pays testnet's treasury and charity addresses, as every
+        // network but mainnet does (BlockIncentivesPopulator.cpp:34-42)
         let is_mainnet = matches!(network_type, NetworkType::Mainnet);
-
-        if matches!(network_type, NetworkType::Regtest) {
-            return Ok(());
-        }
 
         let halving_interval = match network_type {
             NetworkType::Mainnet => 525_600u32,
@@ -4476,54 +4493,31 @@ impl Chain {
                 halving_interval,
             );
 
-        let mut treasury_found = None;
-        let mut charity_found = None;
-
-        for output in &coinstake.vout {
-            if output.script_pubkey == treasury_script {
-                treasury_found = Some(output.value);
-            }
-            if output.script_pubkey == charity_script {
-                charity_found = Some(output.value);
-            }
+        // Divi Core's IsValidTreasuryPayment (BlockIncentivesPopulator.cpp:66-90):
+        // an output of exactly the amount to exactly the script, for each
+        let pays = |script: &divi_primitives::script::Script, amount| {
+            coinstake
+                .vout
+                .iter()
+                .any(|o| o.script_pubkey == *script && o.value == amount)
+        };
+        if !pays(&treasury_script, expected_treasury) {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Treasury block {} does not pay the treasury {}",
+                    height, expected_treasury
+                ),
+            ));
         }
-
-        match treasury_found {
-            None => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!("Treasury block {} missing treasury payment", height),
-                ));
-            }
-            Some(actual) if actual != expected_treasury => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!(
-                        "Treasury block {} has incorrect treasury payment: expected {}, got {}",
-                        height, expected_treasury, actual
-                    ),
-                ));
-            }
-            Some(_) => {}
-        }
-
-        match charity_found {
-            None => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!("Treasury block {} missing charity payment", height),
-                ));
-            }
-            Some(actual) if actual != expected_charity => {
-                return Err(StorageError::invalid_block_scored(
-                    0,
-                    format!(
-                        "Treasury block {} has incorrect charity payment: expected {}, got {}",
-                        height, expected_charity, actual
-                    ),
-                ));
-            }
-            Some(_) => {}
+        if !pays(&charity_script, expected_charity) {
+            return Err(StorageError::invalid_block_scored(
+                0,
+                format!(
+                    "Treasury block {} does not pay the charity {}",
+                    height, expected_charity
+                ),
+            ));
         }
 
         Ok(())
@@ -4696,6 +4690,12 @@ impl Chain {
                 mint, expected_mint, height
             )));
         }
+
+        // The payees after the amount, as Divi Core's
+        // CheckMintTotalsAndBlockPayees (BlockConnectionService.cpp:77-98): a
+        // block paying too much is refused with DoS 100 even when it also
+        // pays the wrong payee (DoS 0); the UTXO changes are not written yet
+        self.validate_treasury_payments(block, index)?;
 
         // Validate lottery payments on lottery blocks
         if is_lottery {
@@ -5700,6 +5700,100 @@ mod tests {
         )
         .unwrap();
         (chain, dir)
+    }
+
+    /// A regtest treasury block pays exactly the treasury and the charity, as
+    /// Divi Core checks on every network (BlockIncentivesPopulator.cpp:66-90,
+    /// :180-185): at block 150 divid pays 9600 and 600 DIVI to testnet's
+    /// treasury and charity addresses
+    #[test]
+    fn regtest_treasury_payments_are_checked() {
+        use divi_primitives::script::Script;
+        use divi_primitives::transaction::{TxIn, TxOut};
+        let (chain, _dir) = create_test_chain();
+        let mut index = chain.tip().unwrap();
+        index.height = 150;
+        let treasury = divi_consensus::treasury::get_treasury_script(false);
+        let charity = divi_consensus::treasury::get_charity_script(false);
+        let block_paying = |outputs: Vec<TxOut>| {
+            let mut vout = vec![
+                TxOut::new(Amount::ZERO, Script::new()),
+                TxOut::new(Amount::from_divi(1696), Script::new_p2pkh(&[7u8; 20])),
+            ];
+            vout.extend(outputs);
+            Block {
+                transactions: vec![
+                    Transaction::default(),
+                    Transaction {
+                        version: 1,
+                        vin: vec![TxIn::new(
+                            OutPoint::new(Hash256::from_bytes([3u8; 32]), 1),
+                            Script::new(),
+                            0xffff_ffff,
+                        )],
+                        vout,
+                        lock_time: 0,
+                    },
+                ],
+                ..Block::default()
+            }
+        };
+        let t = Amount::from_divi(9600);
+        let c = Amount::from_divi(600);
+        let pay = |script: &Script, amount: Amount| TxOut::new(amount, script.clone());
+        let less = Amount::from_sat(t.as_sat() - 1);
+        let other = Script::new_p2pkh(&[9u8; 20]);
+
+        let ok = block_paying(vec![pay(&treasury, t), pay(&charity, c)]);
+        assert!(chain.validate_treasury_payments(&ok, &index).is_ok());
+        // Another output to the treasury script beside the exact one is fine
+        let also = block_paying(vec![
+            pay(&treasury, less),
+            pay(&treasury, t),
+            pay(&charity, c),
+        ]);
+        assert!(chain.validate_treasury_payments(&also, &index).is_ok());
+        for (what, outputs) in [
+            (
+                "one satoshi less",
+                vec![pay(&treasury, less), pay(&charity, c)],
+            ),
+            (
+                "one satoshi more",
+                vec![
+                    pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+                    pay(&charity, c),
+                ],
+            ),
+            ("to another script", vec![pay(&other, t), pay(&charity, c)]),
+            ("no charity", vec![pay(&treasury, t)]),
+        ] {
+            let err = chain
+                .validate_treasury_payments(&block_paying(outputs), &index)
+                .expect_err(what);
+            assert_eq!(err.misbehaviour_score(), 0, "{what}: bad-cb-payee scores 0");
+        }
+
+        // In the block's value check: the payees are checked there, after the
+        // amount, so paying too much is bad-cb-amount (DoS 100) first
+        // (BlockConnectionService.cpp:84-97)
+        let limit = Chain::stake_reward(&chain.block_rewards(150)) + t + c;
+        let under = block_paying(vec![pay(&treasury, less), pay(&charity, c)]);
+        let err = chain
+            .validate_block_value(&under, &index, limit, Amount::ZERO)
+            .expect_err("a treasury paid one satoshi less");
+        assert_eq!(err.misbehaviour_score(), 0);
+        let over = block_paying(vec![
+            pay(&treasury, Amount::from_sat(t.as_sat() + 1)),
+            pay(&charity, c),
+        ]);
+        let err = chain
+            .validate_block_value(&over, &index, limit + Amount::from_sat(1), Amount::ZERO)
+            .expect_err("a treasury paid one satoshi more");
+        assert_eq!(err.misbehaviour_score(), 100, "{err}");
+        assert!(chain
+            .validate_block_value(&ok, &index, limit, Amount::ZERO)
+            .is_ok());
     }
 
     thread_local! {

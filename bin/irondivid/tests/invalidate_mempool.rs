@@ -125,3 +125,45 @@ fn invalidateblock_returns_the_block_transactions_to_the_mempool() {
     assert_eq!(ok(rpc_port, "getbestblockhash", json!([])), tip);
     assert_eq!(pool(rpc_port), (0, 0), "confirmed again");
 }
+
+/// The wallet follows invalidateblock and reconsiderblock as divid's does: it
+/// hears of the disconnected block (SyncTransactions BLOCK_DISCONNECT,
+/// ChainTipManager.cpp:189), so its send is unconfirmed again and its balance
+/// is what it was before the block; the block's return confirms it again
+#[test]
+fn the_wallet_follows_invalidateblock_and_reconsiderblock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    let _node = start(dir.path(), rpc_port, p2p_port);
+    ok(rpc_port, "setgenerate", json!([101]));
+    let txid = ok(
+        rpc_port,
+        "sendtoaddress",
+        json!([ok(rpc_port, "getnewaddress", json!([])), 1]),
+    );
+    let state = || {
+        let tx = ok(rpc_port, "gettransaction", json!([txid]));
+        (
+            ok(rpc_port, "getbalance", json!([])),
+            ok(rpc_port, "getunconfirmedbalance", json!([])),
+            tx["confirmations"].clone(),
+            ok(rpc_port, "listunspent", json!([0]))
+                .as_array()
+                .unwrap()
+                .len(),
+        )
+    };
+    let unconfirmed = state();
+    ok(rpc_port, "setgenerate", json!([1]));
+    let confirmed = state();
+    assert_ne!(unconfirmed, confirmed);
+
+    let tip = ok(rpc_port, "getbestblockhash", json!([]));
+    ok(rpc_port, "invalidateblock", json!([tip]));
+    assert_eq!(state(), unconfirmed, "after invalidateblock");
+    ok(rpc_port, "reconsiderblock", json!([tip]));
+    assert_eq!(state(), confirmed, "after reconsiderblock");
+
+    ok(rpc_port, "reverseblocktransactions", json!([tip]));
+    assert_eq!(state(), unconfirmed, "after reverseblocktransactions");
+}
