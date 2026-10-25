@@ -17,7 +17,6 @@
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -263,4 +262,92 @@ fn node_bloom_is_advertised_while_peerbloomfilters_is_on() {
         0,
         "=0"
     );
+}
+
+/// A filterload payload: `bytes` of filter data all set to `fill`, five hash
+/// functions, no tweak, BLOOM_UPDATE_ALL
+fn filterload(bytes: usize, fill: u8) -> Vec<u8> {
+    let mut p = Vec::new();
+    if bytes < 0xfd {
+        p.push(bytes as u8);
+    } else {
+        p.push(0xfd);
+        p.extend_from_slice(&(bytes as u16).to_le_bytes());
+    }
+    p.extend(std::iter::repeat_n(fill, bytes));
+    p.extend_from_slice(&5u32.to_le_bytes());
+    p.extend_from_slice(&0u32.to_le_bytes());
+    p.push(1);
+    p
+}
+
+/// A filteradd payload of `bytes` bytes
+fn filteradd(bytes: usize) -> Vec<u8> {
+    let mut p = Vec::new();
+    if bytes < 0xfd {
+        p.push(bytes as u8);
+    } else {
+        p.push(0xfd);
+        p.extend_from_slice(&(bytes as u16).to_le_bytes());
+    }
+    p.extend(std::iter::repeat_n(7u8, bytes));
+    p
+}
+
+/// Send one message on a fresh connection and say whether it got the peer
+/// banned (Divi Core bans at 100: main.cpp:892-939)
+fn bans(daemon: &Daemon, messages: &[(&str, Vec<u8>)]) -> bool {
+    let mut peer = Peer::connect(daemon.p2p_port, true);
+    for (command, payload) in messages {
+        peer.send(command, payload);
+    }
+    peer.drain(Duration::from_secs(2));
+    let banned = daemon.banned();
+    daemon.rpc("clearbanned", json!([]));
+    banned
+}
+
+/// The filter messages and their scores, as Divi Core takes them
+/// (main.cpp:892-939): a filter within the limits, a filteradd (even before
+/// any filterload: every peer starts with a filter, Node.cpp:556) and a
+/// filterclear are taken; a filter over 36,000 bytes and a filteradd item
+/// over 520 bytes score 100; with -peerbloomfilters=0 any filter message
+/// scores 100
+#[test]
+fn filter_messages_are_taken_and_scored_as_divid() {
+    let on = Daemon::start(&[]);
+    assert!(
+        !bans(&on, &[("filterload", filterload(10, 0))]),
+        "filterload"
+    );
+    assert!(
+        !bans(&on, &[("filteradd", filteradd(20))]),
+        "filteradd first"
+    );
+    assert!(
+        !bans(
+            &on,
+            &[
+                ("filterload", filterload(10, 0)),
+                ("filteradd", filteradd(520))
+            ]
+        ),
+        "filteradd of 520 bytes"
+    );
+    assert!(!bans(&on, &[("filterclear", vec![])]), "filterclear");
+    assert!(
+        bans(&on, &[("filterload", filterload(36_001, 0))]),
+        "oversize filter"
+    );
+    assert!(
+        bans(&on, &[("filteradd", filteradd(521))]),
+        "filteradd of 521 bytes"
+    );
+
+    let off = Daemon::start(&["-peerbloomfilters=0"]);
+    assert!(
+        bans(&off, &[("filterload", filterload(10, 0))]),
+        "off: filterload"
+    );
+    assert!(bans(&off, &[("filterclear", vec![])]), "off: filterclear");
 }

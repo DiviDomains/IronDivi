@@ -855,6 +855,7 @@ impl Node {
             }));
         }
         let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
+        let peer_bloom_filters = self.config.p2p.peer_bloom_filters;
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
@@ -1224,16 +1225,70 @@ impl Node {
                                     }
                                 }
                             }
-                            // IronDivi does not offer NODE_BLOOM, and Divi Core without
-                            // bloom filters bans a peer that sends these
+                            // With -peerbloomfilters=0 Divi Core bans a peer that
+                            // sends these (main.cpp:892-899)
                             NetworkMessage::FilterLoad(_)
                             | NetworkMessage::FilterAdd(_)
-                            | NetworkMessage::FilterClear => {
+                            | NetworkMessage::FilterClear
+                                if !peer_bloom_filters =>
+                            {
                                 peer_manager.report_misbehavior_score(
                                     peer_id,
                                     100,
                                     "Sent bloom filter msg but they are disabled",
                                 );
+                            }
+                            // filterload, filteradd and filterclear as Divi Core
+                            // takes them (main.cpp:900-939)
+                            NetworkMessage::FilterLoad(payload) => {
+                                let Some(stats) = peer_manager.peer_stats(peer_id) else {
+                                    continue;
+                                };
+                                // A payload that does not read is dropped, as
+                                // Core's deserialization throws
+                                let Some(mut filter) =
+                                    divi_network::bloom::BloomFilter::deserialize(&payload)
+                                else {
+                                    continue;
+                                };
+                                if filter.is_within_size_constraints() {
+                                    filter.update_empty_full();
+                                    stats.bloom.set_filter(filter);
+                                } else {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        100,
+                                        "Sent too large a bloom filter message",
+                                    );
+                                }
+                                stats.bloom.set_relay(true);
+                            }
+                            NetworkMessage::FilterAdd(payload) => {
+                                let Some(stats) = peer_manager.peer_stats(peer_id) else {
+                                    continue;
+                                };
+                                let Some(item) = divi_network::bloom::read_bytes(&payload) else {
+                                    continue;
+                                };
+                                // Every peer has a filter from the start (Node.cpp:556),
+                                // so Core's "before enabling it" (main.cpp:930) is not met
+                                if item.len() > divi_network::bloom::MAX_FILTERADD_SIZE {
+                                    peer_manager.report_misbehavior_score(
+                                        peer_id,
+                                        100,
+                                        "Exceeded maximum size of script element to be added to filter",
+                                    );
+                                } else {
+                                    stats.bloom.filter().insert(item);
+                                }
+                            }
+                            NetworkMessage::FilterClear => {
+                                if let Some(stats) = peer_manager.peer_stats(peer_id) {
+                                    stats
+                                        .bloom
+                                        .set_filter(divi_network::bloom::BloomFilter::default());
+                                    stats.bloom.set_relay(true);
+                                }
                             }
                             NetworkMessage::Alert(payload) => {
                                 let (Some(key), Ok(alert)) =

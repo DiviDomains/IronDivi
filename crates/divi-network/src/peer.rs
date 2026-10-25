@@ -226,6 +226,9 @@ pub struct LivePeerStats {
     pub start_height: AtomicI64,
     /// Peer's user agent
     pub subver: parking_lot::Mutex<String>,
+    /// The peer's bloom filter and transaction relay flag (not published by
+    /// the connection: the filter messages change them)
+    pub bloom: crate::bloom::PeerBloom,
 }
 
 /// The node's clock in Unix seconds (mocked by setmocktime)
