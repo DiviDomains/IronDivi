@@ -1301,11 +1301,16 @@ fn core_argument_types(method: &str) -> &'static [(usize, &'static str)] {
     }
 }
 
-/// The calls whose arguments of `core_argument_types` Divi Core reads with no
-/// test for null first, so a null makes the getter throw too
-/// (rpcwallet.cpp:550, :1576-1584, :1752, :1798-1808, :2272-2283, :2342-2348, :2410-2427;
-/// rpcrawtransaction.cpp:206-207, :571-572; rpcblockchain.cpp:418-420)
-fn getter_reads_null(method: &str) -> bool {
+/// The arguments of `core_argument_types` Divi Core reads with no test for
+/// null first, so a null makes the getter throw too: every one of the calls
+/// listed first (rpcwallet.cpp:550, :1576-1584, :1752, :1798-1808,
+/// :2272-2283, :2342-2348, :2410-2427; rpcrawtransaction.cpp:206-207,
+/// :571-572; rpcblockchain.cpp:418-420), and the account names, addresses,
+/// messages and paths of the others, which take them with get_str or
+/// AccountFromValue while their comments are read only when not null
+/// (rpcwallet.cpp:299, :598-605, :637, :667, :1388-1391, :1422, :1631-1632,
+/// :1718-1719, :2536; rpcmisc.cpp:504-506; rpcdump.cpp:132-140)
+fn getter_reads_null(method: &str, index: usize) -> bool {
     matches!(
         method,
         "addmultisigaddress"
@@ -1319,6 +1324,18 @@ fn getter_reads_null(method: &str) -> bool {
             | "listtransactions"
             | "signtransactionwithaddresskey"
             | "verifychain"
+    ) || matches!(
+        (method, index),
+        ("getnewaddress", 0)
+            | ("setaccount", 0 | 1)
+            | ("getaccount", 0)
+            | ("getaddressesbyaccount", 0)
+            | ("sendfrom", 0 | 1)
+            | ("sendmany", 0 | 1)
+            | ("signmessage", 0..=3)
+            | ("verifymessage", 0..=2)
+            | ("backupwallet", 0)
+            | ("importaddress", 0..=2)
     )
 }
 
@@ -1392,7 +1409,7 @@ fn json_spirit_getter_check(method: &str, params: &Params) -> Result<(), RpcErro
             continue;
         };
         let got = crate::wallet::json_spirit_type(value);
-        if (value.is_null() && !getter_reads_null(method)) || got == *want {
+        if (value.is_null() && !getter_reads_null(method, *index)) || got == *want {
             continue;
         }
         return Err(RpcError::new(
@@ -1825,6 +1842,50 @@ mod tests {
     use crate::protocol::RequestId;
     use divi_storage::{ChainDatabase, ChainParams};
     use tempfile::tempdir;
+
+    /// A JSON null where Divi Core reads an account name, an address or a
+    /// message with get_str is refused as its getter refuses it; a null
+    /// comment, read only when not null, is not
+    #[test]
+    fn null_text_is_refused_where_divid_reads_it() {
+        let p = |v: serde_json::Value| Params::Array(v.as_array().unwrap().clone());
+        let addr = "yCCufdT3MD8pu8RZopRAxerr65YRHiUbH2";
+        let refused = |method: &str, params: serde_json::Value, want: &str| {
+            let err = json_spirit_getter_check(method, &p(params.clone()))
+                .expect_err(&format!("{method} {params}"));
+            assert_eq!(err.code, codes::MISC_ERROR, "{method} {params}");
+            assert_eq!(err.message, format!("value is type null, expected {want}"));
+        };
+        refused("getnewaddress", serde_json::json!([null]), "str");
+        refused("setaccount", serde_json::json!([addr, null]), "str");
+        refused("getaccount", serde_json::json!([null]), "str");
+        refused("getaddressesbyaccount", serde_json::json!([null]), "str");
+        refused("sendfrom", serde_json::json!([null, addr, 1]), "str");
+        refused("sendmany", serde_json::json!([null, {addr: 1}]), "str");
+        refused("sendmany", serde_json::json!(["", null]), "obj");
+        refused("signmessage", serde_json::json!([addr, null]), "str");
+        refused(
+            "verifymessage",
+            serde_json::json!([addr, "sig", null]),
+            "str",
+        );
+        refused("backupwallet", serde_json::json!([null]), "str");
+        // Comments are read only when they are not null (rpcwallet.cpp:1336,
+        // :1639-1642, :1722)
+        for (method, params) in [
+            (
+                "sendtoaddress",
+                serde_json::json!([addr, 1, null, null, null]),
+            ),
+            ("sendfrom", serde_json::json!(["", addr, 1, null, null])),
+            ("sendmany", serde_json::json!(["", {addr: 1}, null])),
+        ] {
+            assert!(
+                json_spirit_getter_check(method, &p(params.clone())).is_ok(),
+                "{method} {params}"
+            );
+        }
+    }
 
     /// -rpcallowip values as Divi Core's CSubNet reads them
     #[test]

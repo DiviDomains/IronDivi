@@ -19,7 +19,7 @@ scripts/tx-relay/run.sh target/release ~/divi-3.0.0/bin 53900 /var/tmp
 ```
 
 - `<irondivid-bin-dir>` holds `irondivid`; `<core-bin-dir>` holds Divi Core's `divid`.
-- `<port-base>`: **12 ports**, `<port-base>` to `<port-base>+11` on 127.0.0.1 (p2p and RPC of each of the six nodes).
+- `<port-base>`: **12 ports**, `<port-base>` to `<port-base>+11` on 127.0.0.2 (p2p and RPC of each of the six nodes).
 - `[root]`: a fresh directory is made under it (default `$TMPDIR`, else `/tmp`) and deleted at the end.
 
 A run takes about 2 minutes and is stopped after 10 minutes. However it ends, all six nodes are stopped and their

@@ -41,3 +41,20 @@ async fn announced_masternode_items_are_fetched_once() {
     peer.send("inv", &inv(&items)).await;
     assert_eq!(peer.expect("getdata", QUIET).await, None);
 }
+
+/// Masternode items the node does not have are answered with notfound, as
+/// divid's ProcessGetData answers what PushKnownInventory cannot send
+/// (main.cpp:165-212, :322-345)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_masternode_items_asked_for_are_not_found() {
+    let t = TestNode::start().await;
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+    let items = [
+        (14u32, [0x44u8; 32]),
+        (15u32, [0x55u8; 32]),
+        (7u32, [0x66u8; 32]),
+    ];
+    peer.send("getdata", &inv(&items)).await;
+    assert_eq!(peer.expect("notfound", WAIT).await, Some(inv(&items)));
+}

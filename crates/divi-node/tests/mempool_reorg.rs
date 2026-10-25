@@ -30,11 +30,22 @@ fn p2pkh(kp: &KeyPair) -> Script {
 
 /// Spend `coin`, worth `value` and paying `kp`, back to `kp`, less `fee`
 fn spend_with_fee(kp: &KeyPair, coin: OutPoint, value: i64, fee: i64) -> Transaction {
+    spend_locked(kp, coin, value, fee, 0)
+}
+
+/// As `spend_with_fee`, with `lock_time` set and the input's sequence below
+/// final, so the lock time applies
+fn spend_locked(kp: &KeyPair, coin: OutPoint, value: i64, fee: i64, lock_time: u32) -> Transaction {
+    let sequence = if lock_time == 0 {
+        0xffffffff
+    } else {
+        0xfffffffe
+    };
     let mut tx = Transaction {
         version: 1,
-        vin: vec![TxIn::new(coin, Script::new(), 0xffffffff)],
+        vin: vec![TxIn::new(coin, Script::new(), sequence)],
         vout: vec![TxOut::new(Amount::from_sat(value - fee), p2pkh(kp))],
-        lock_time: 0,
+        lock_time,
     };
     let checker = TransactionSignatureChecker::new(&tx, 0, Amount::from_sat(value));
     let sighash = checker.signature_hash(&p2pkh(kp), 1);
@@ -251,5 +262,60 @@ fn side_chain_block_leaves_the_mempool_alone() {
     assert!(
         t.in_mempool(&pending),
         "a side-chain block confirms nothing"
+    );
+}
+
+/// A send with a height lock, final for the next block, and a send spending
+/// it stay in the mempool when invalidateblock lowers the tip below the lock:
+/// Divi Core's disconnectTip only drops spends of coins that are gone or no
+/// longer mature (removeCoinbaseSpends, ChainTipManager.cpp:175-183), and no
+/// other path removes a non-final transaction from its mempool.
+#[test]
+fn a_send_a_lower_tip_makes_non_final_stays_in_the_mempool() {
+    let t = TestNode::new();
+    let coin = t.mature_coins(1)[0];
+    let height = t.node.chain().height();
+
+    // Final for the next block (height + 1), not for the one below it
+    let locked = spend_locked(&t.key, coin, 1250 * COIN, FEE, height);
+    let child = t.spend(OutPoint::new(locked.txid(), 0), 1250 * COIN - FEE);
+    t.add(&locked);
+    t.add(&child);
+
+    let tip = t.tip();
+    let disconnected = t.node.chain().invalidate_block(&tip).unwrap();
+    assert_eq!(t.node.chain().height(), height - 1);
+    update_mempool_after_reorg(t.node.chain(), t.node.mempool(), disconnected);
+
+    assert!(t.in_mempool(&locked), "the locked send stays");
+    assert!(t.in_mempool(&child), "its child stays");
+}
+
+/// A send with a height lock, confirmed in a block that invalidateblock
+/// disconnects together with the block below it, comes back to the mempool
+/// although the new tip is below its lock: Divi Core's disconnectTip offers a
+/// block's transactions to AcceptToMemoryPool before it moves the tip
+/// (ChainTipManager.cpp:175-185), so IsStandardTx checks the lock against the
+/// block that held it (MempoolConsensus.cpp:61), where it passed.
+#[test]
+fn a_locked_send_of_a_disconnected_block_returns_to_the_mempool() {
+    let t = TestNode::new();
+    let coin = t.mature_coins(1)[0];
+    t.mine(&[]);
+    let lock_height = t.node.chain().height();
+    let below = t.tip();
+
+    // Final for the next block (lock_height + 1), which confirms it
+    let locked = spend_locked(&t.key, coin, 1250 * COIN, FEE, lock_height);
+    t.mine(std::slice::from_ref(&locked));
+
+    // Both blocks off: the next height is lock_height, where the lock holds
+    let disconnected = t.node.chain().invalidate_block(&below).unwrap();
+    assert_eq!(t.node.chain().height(), lock_height - 1);
+    update_mempool_after_reorg(t.node.chain(), t.node.mempool(), disconnected);
+
+    assert!(
+        t.in_mempool(&locked),
+        "the locked send is back in the mempool"
     );
 }
