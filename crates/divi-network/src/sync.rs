@@ -391,12 +391,42 @@ pub struct BlockSync {
     /// fetched across several rounds; this lets each round resume from where
     /// the side chain ends instead of from the fork point.
     side_chain_tip: RwLock<Option<(Hash256, u32)>>,
-    /// Peers sent the getblocks that starts a sync when they connected
+    /// Peers sent the getblocks that starts a sync
     /// (Divi Core CNodeState::Syncing, NodeState.cpp)
     sync_started_peers: RwLock<HashSet<PeerId>>,
     /// Per peer: the blocks a getblocks was sent up to after it sent a block
     /// whose parent is unknown (Divi Core CNode::vBlockRequested)
     blocks_requested: RwLock<HashMap<PeerId, Vec<Hash256>>>,
+    /// Connected peers that may be asked to start a sync, with what decides it
+    start_peers: RwLock<HashMap<PeerId, SyncPeer>>,
+}
+
+/// What decides whether a peer is asked for blocks when it connects
+#[derive(Debug, Clone, Copy)]
+pub struct SyncPeer {
+    /// Services from its version message
+    pub services: u64,
+    /// It dialled us
+    pub inbound: bool,
+    /// A whitelisted peer (Divi Core fWhitelisted)
+    pub whitelisted: bool,
+    /// A peer dropped after one exchange (Divi Core fOneShot)
+    pub one_shot: bool,
+}
+
+impl SyncPeer {
+    /// A full node, not one that keeps only recent blocks (fClient is the
+    /// opposite, main.cpp:410)
+    fn full_node(&self) -> bool {
+        self.services & crate::constants::services::NODE_NETWORK != 0
+    }
+
+    /// One we download from by preference: a peer we dialled or a whitelisted
+    /// one, not one-shot, a full node (CNode::IsPreferredDownloadSource,
+    /// Node.cpp:1075)
+    fn preferred(&self) -> bool {
+        (!self.inbound || self.whitelisted) && !self.one_shot && self.full_node()
+    }
 }
 
 /// Sync statistics
@@ -441,6 +471,7 @@ impl BlockSync {
             side_chain_tip: RwLock::new(None),
             sync_started_peers: RwLock::new(HashSet::new()),
             blocks_requested: RwLock::new(HashMap::new()),
+            start_peers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -563,19 +594,29 @@ impl BlockSync {
         }
     }
 
-    /// A peer finished its handshake (`services` from its version): ask it
-    /// for blocks from our tip, as
-    /// Divi Core's BeginSyncingWithPeer does (main.cpp:1130-1142) whatever
-    /// height the peer named. Core asks a full-node peer (not fClient), once,
-    /// when no peer has been asked yet or its best block is less than six
-    /// hours old; so a node learns of a peer's blocks even when the peer named
-    /// a lower height than it has. Nothing is asked while importing (the
-    /// answer would be ignored, main.cpp:581-587).
-    pub async fn begin_syncing_with_peer(&self, peer_id: PeerId, services: u64) {
+    /// A peer finished its handshake: it may be asked for blocks from our tip
+    /// now (see `ask_peers_to_sync`), or later when the peers we prefer have
+    /// gone. Nothing is asked while importing (the answer would be ignored,
+    /// main.cpp:581-587).
+    pub async fn begin_syncing_with_peer(&self, peer_id: PeerId, peer: SyncPeer) {
         if self.chain.is_importing() {
             return;
         }
-        if services & crate::constants::services::NODE_NETWORK == 0 {
+        self.start_peers.write().insert(peer_id, peer);
+        self.ask_peers_to_sync().await;
+    }
+
+    /// Ask for blocks from our tip the connected peers that are due it, as
+    /// Divi Core's SendMessages does for each peer on every pass
+    /// (main.cpp:1304-1311, BeginSyncingWithPeer main.cpp:1130-1143): a peer
+    /// we prefer to download from, or any full node while we have no such
+    /// peer; once per peer, and only when no peer has been asked yet or our
+    /// best block is less than six hours old. A node learns of a peer's blocks
+    /// even when the peer named a lower height than it has. Peers that came in
+    /// on a node with a preferred peer wait, and are asked when the last
+    /// preferred peer goes.
+    pub async fn ask_peers_to_sync(&self) {
+        if self.chain.is_importing() {
             return;
         }
         let now = std::time::SystemTime::now()
@@ -586,23 +627,41 @@ impl BlockSync {
             .chain
             .tip()
             .is_some_and(|tip| u64::from(tip.time) + 6 * 60 * 60 > now);
-        {
+        let due: Vec<PeerId> = {
+            let peers = self.start_peers.read();
+            let have_preferred = peers.values().any(SyncPeer::preferred);
+            let mut candidates: Vec<PeerId> = peers
+                .iter()
+                .filter(|(_, p)| {
+                    p.full_node() && (p.preferred() || (!have_preferred && !p.one_shot))
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            candidates.sort_unstable();
             let mut started = self.sync_started_peers.write();
-            if started.contains(&peer_id) || !(started.is_empty() || recent) {
-                return;
+            candidates
+                .into_iter()
+                .filter(|id| {
+                    if started.contains(id) || !(started.is_empty() || recent) {
+                        return false;
+                    }
+                    started.insert(*id);
+                    true
+                })
+                .collect()
+        };
+        for peer_id in due {
+            let locator = self.build_block_locator();
+            let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
+            info!(
+                "Sending getblocks to peer {} from height {} (start of sync)",
+                peer_id,
+                self.chain.height()
+            );
+            if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
+                warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
+                self.sync_started_peers.write().remove(&peer_id);
             }
-            started.insert(peer_id);
-        }
-        let locator = self.build_block_locator();
-        let msg = NetworkMessage::GetBlocks(GetHeadersMessage::new(locator, Hash256::zero()));
-        info!(
-            "Sending getblocks to peer {} from height {} (start of sync)",
-            peer_id,
-            self.chain.height()
-        );
-        if let Err(e) = self.peer_manager.send_to_peer(peer_id, msg).await {
-            warn!("Failed to send getblocks to peer {}: {}", peer_id, e);
-            self.sync_started_peers.write().remove(&peer_id);
         }
     }
 
@@ -618,6 +677,7 @@ impl BlockSync {
     pub fn remove_peer(&self, peer_id: PeerId) {
         self.sync_started_peers.write().remove(&peer_id);
         self.blocks_requested.write().remove(&peer_id);
+        self.start_peers.write().remove(&peer_id);
         let removed_height = self.peer_heights.write().remove(&peer_id);
         let remaining_peers = self.peer_heights.read().len();
 
@@ -4240,5 +4300,77 @@ mod tests {
         assert_eq!(sync.chain.height(), 0);
         assert_eq!(score(&sync, peer_id), 0);
         assert!(!sync.peer_manager.is_banned(&ip));
+    }
+
+    fn full_node(inbound: bool) -> SyncPeer {
+        SyncPeer {
+            services: crate::constants::services::NODE_NETWORK,
+            inbound,
+            whitelisted: false,
+            one_shot: false,
+        }
+    }
+
+    /// Divi Core sends the start getblocks to the peers it dialled, and to
+    /// one that dialled it only while it has no peer it dialled
+    /// (main.cpp:1307; CNode::IsPreferredDownloadSource, Node.cpp:1075)
+    #[tokio::test]
+    async fn a_peer_that_dialled_us_is_not_asked_while_a_dialled_peer_is_there() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        sync.begin_syncing_with_peer(1, full_node(false)).await;
+        sync.begin_syncing_with_peer(2, full_node(true)).await;
+        sync.begin_syncing_with_peer(3, full_node(true)).await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_dialled_us_is_asked_when_the_last_dialled_peer_goes() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        sync.begin_syncing_with_peer(1, full_node(false)).await;
+        sync.begin_syncing_with_peer(2, full_node(true)).await;
+        sync.begin_syncing_with_peer(3, full_node(true)).await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+
+        sync.remove_peer(1);
+        sync.ask_peers_to_sync().await;
+        sync.ask_peers_to_sync().await; // once each
+                                        // the best block is old, so only the first is asked
+                                        // (a node that is not at the tip syncs from one peer, main.cpp:1138)
+        assert_eq!(getblocks_recipients(&mut rxs), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn peers_that_dialled_us_are_asked_when_none_was_dialled() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        sync.begin_syncing_with_peer(1, full_node(true)).await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![1]);
+        sync.begin_syncing_with_peer(2, full_node(true)).await;
+        assert!(getblocks_recipients(&mut rxs).is_empty()); // old tip: one sync peer
+    }
+
+    #[tokio::test]
+    async fn a_whitelisted_peer_that_dialled_us_is_asked_with_a_dialled_peer_there() {
+        let (sync, mut rxs, _dir) = sync_with_peers(2);
+        let mut white = full_node(true);
+        white.whitelisted = true;
+        sync.begin_syncing_with_peer(2, white).await;
+        sync.begin_syncing_with_peer(1, full_node(false)).await;
+        // the whitelisted peer came first and took the one sync of an old chain
+        assert_eq!(getblocks_recipients(&mut rxs), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_or_pruned_peer_is_not_preferred() {
+        let (sync, mut rxs, _dir) = sync_with_peers(3);
+        let mut one_shot = full_node(false);
+        one_shot.one_shot = true;
+        let mut pruned = full_node(false);
+        pruned.services = 0;
+        sync.begin_syncing_with_peer(1, one_shot).await;
+        sync.begin_syncing_with_peer(2, pruned).await;
+        assert!(getblocks_recipients(&mut rxs).is_empty());
+        // neither stands in the way of a peer that dialled us
+        sync.begin_syncing_with_peer(3, full_node(true)).await;
+        assert_eq!(getblocks_recipients(&mut rxs), vec![3]);
     }
 }
