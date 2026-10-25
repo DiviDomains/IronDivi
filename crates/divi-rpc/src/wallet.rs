@@ -3981,63 +3981,35 @@ impl WalletRpc {
         }))
     }
 
-    /// backupwallet - Copy wallet.dat to destination
+    /// backupwallet - Write a consistent copy of the wallet to destination
+    ///
+    /// As in C++ Divi, a destination that is a directory gets the backup inside
+    /// it. Unlike C++, an existing backup is never overwritten, and the copy is
+    /// a RocksDB checkpoint readable by the owner only.
     pub fn backup_wallet(&self, params: &Params) -> Result<serde_json::Value, Error> {
         let destination = params
             .get_str(0)
             .ok_or_else(|| RpcError::invalid_params("Destination path required"))?;
 
         let wallet = self.get_wallet()?;
-
-        // Get the wallet database path
-        let wallet_path = wallet.database_path();
-
-        let src = std::path::Path::new(&wallet_path);
-        let dst = std::path::Path::new(destination);
-
-        // RocksDB uses a directory; legacy wallets use a single file.
-        if src.is_dir() {
-            Self::copy_dir_recursively(src, dst).map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to backup wallet: {}", e),
-                )
-            })?;
-        } else {
-            // Ensure parent directory exists for file destination
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    RpcError::new(
-                        codes::WALLET_ERROR,
-                        format!("Failed to create destination directory: {}", e),
-                    )
-                })?;
-            }
-            std::fs::copy(src, dst).map_err(|e| {
-                RpcError::new(
-                    codes::WALLET_ERROR,
-                    format!("Failed to backup wallet: {}", e),
-                )
-            })?;
+        let mut dst = std::path::PathBuf::from(destination);
+        if dst.is_dir() {
+            let name = wallet
+                .database_path()
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_else(|| "wallet".into());
+            dst.push(name);
         }
+        wallet.backup_to(&dst).map_err(|e| {
+            RpcError::new(
+                codes::WALLET_ERROR,
+                format!("Failed to backup wallet: {}", e),
+            )
+        })?;
 
-        info!("Wallet backed up to: {}", destination);
+        info!("Wallet backed up to: {}", dst.display());
         Ok(serde_json::Value::Null)
-    }
-
-    fn copy_dir_recursively(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            let dst_path = dst.join(entry.file_name());
-            if ty.is_dir() {
-                Self::copy_dir_recursively(&entry.path(), &dst_path)?;
-            } else {
-                std::fs::copy(entry.path(), dst_path)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -5403,6 +5375,41 @@ mod send_unlock_regression {
         assert_eq!(locked, unlocked);
     }
 
+
+    /// NODE-14: backupwallet writes a consistent, owner-only checkpoint that
+    /// opens as a wallet, and never overwrites an existing backup
+    #[test]
+    fn node14_backupwallet_checkpoint_is_private_and_never_overwrites() {
+        let (_dir, rpc, db, _) = encrypted_rpc();
+        let out = tempfile::tempdir().unwrap();
+        let dst = out.path().join("bk");
+        let arg = |path: &std::path::Path| p(vec![json!(path.to_str().unwrap())]);
+        rpc.backup_wallet(&arg(&dst)).unwrap();
+        assert!(rpc.backup_wallet(&arg(&dst)).is_err());
+        // A directory destination gets the backup inside it, once
+        rpc.backup_wallet(&arg(out.path())).unwrap();
+        let inside = out.path().join(db.database_path().file_name().unwrap());
+        assert!(inside.is_dir());
+        assert!(rpc.backup_wallet(&arg(out.path())).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+            assert_eq!(mode(&dst) & 0o777, 0o700);
+            for entry in std::fs::read_dir(&dst).unwrap() {
+                assert_eq!(mode(&entry.unwrap().path()) & 0o077, 0);
+            }
+        }
+        let restored = WalletDb::open(&dst, Network::Testnet).unwrap();
+        assert!(restored.is_encrypted());
+        let sorted = |w: &WalletDb| {
+            let mut a: Vec<String> = w.get_addresses().iter().map(|a| a.to_string()).collect();
+            a.sort();
+            a
+        };
+        assert_eq!(sorted(&restored), sorted(&db));
+    }
     #[test]
     fn short_unlock_falls_back_to_staking_only() {
         let (_dir, rpc, db, _sent) = encrypted_rpc();

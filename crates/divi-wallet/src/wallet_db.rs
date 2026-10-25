@@ -1092,6 +1092,17 @@ impl WalletDb {
         }
     }
 
+    /// Write a consistent, owner-only copy of the wallet database to `dst`,
+    /// which must not exist yet
+    pub fn backup_to(&self, dst: &Path) -> Result<(), WalletError> {
+        match &self.db {
+            Some(db) => db.checkpoint_to(dst),
+            None => Err(WalletError::Storage(
+                "the wallet is not stored on disk".into(),
+            )),
+        }
+    }
+
     /// Get network
     pub fn network(&self) -> Network {
         self.network

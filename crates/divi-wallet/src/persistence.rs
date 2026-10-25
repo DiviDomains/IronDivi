@@ -748,6 +748,23 @@ impl WalletDatabase {
         Ok(())
     }
 
+    /// Write a consistent copy of the database to `dst`, which must not exist
+    /// yet, readable by the owner only
+    pub fn checkpoint_to(&self, dst: &Path) -> Result<(), WalletError> {
+        if dst.exists() {
+            return Err(WalletError::Storage(format!(
+                "{} already exists",
+                dst.display()
+            )));
+        }
+        let storage = |e: rocksdb::Error| WalletError::Storage(e.to_string());
+        rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .map_err(storage)?
+            .create_checkpoint(dst)
+            .map_err(storage)?;
+        restrict_to_owner(dst).map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
     pub fn flush(&self) -> Result<(), WalletError> {
         self.db
             .flush()
@@ -1510,6 +1527,28 @@ fn deserialize_vault_metadata(data: &[u8]) -> Result<crate::wallet_db::VaultMeta
         vault_script,
         funding_txid,
     })
+}
+
+/// Mode 0700 on `dir` and 0600 on the files in it. Checkpoint files may be
+/// hard links to the live database's, which get the same (stricter) mode.
+#[cfg(unix)]
+fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            restrict_to_owner(&path)?;
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
