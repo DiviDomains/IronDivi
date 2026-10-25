@@ -2396,15 +2396,39 @@ impl WalletDb {
                 None => None,
             },
         };
+        // Divi Core's CCryptoKeyStore::Unlock (crypter.cpp:225-250) decrypts the
+        // imported keys in CKeyID order, each checked against its public key: a
+        // key that fails first is a wrong passphrase; one that fails after
+        // another decrypted means the wallet is corrupted, which divid logs (and
+        // then stops on an assert). A CKeyID compares as a little-endian number
+        // (uint256.cpp CompareTo), so by its bytes from the last.
+        let mut stored = db.load_encrypted_secrets()?;
+        stored.sort_by_key(|(hash, _)| {
+            let mut bytes = *hash.as_bytes();
+            bytes.reverse();
+            bytes
+        });
         let mut secrets = Vec::new();
-        for (hash, blob) in db.load_encrypted_secrets()? {
-            let bytes = Zeroizing::new(decrypt_blob(&blob, &master_key)?);
-            let arr: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| WalletError::Storage("corrupt encrypted private key".into()))?;
-            let secret = divi_crypto::keys::SecretKey::from_bytes(&arr)
-                .map_err(|e| WalletError::Storage(format!("corrupt private key: {}", e)))?;
+        let mut imported_decrypted = false;
+        for (hash, blob) in stored {
+            let entry = self.keystore.get_key(&hash);
+            let imported = entry.as_ref().is_some_and(|e| e.hd_path.is_none());
+            let secret = decrypt_blob(&blob, &master_key).ok().and_then(|bytes| {
+                let bytes = Zeroizing::new(bytes);
+                let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+                let secret = divi_crypto::keys::SecretKey::from_bytes(&arr).ok()?;
+                match &entry {
+                    Some(e) if secret.public_key() != e.public => None,
+                    _ => Some(secret),
+                }
+            });
+            let Some(secret) = secret else {
+                if imported && imported_decrypted {
+                    error!("The wallet is probably corrupted: Some keys decrypt but not all.");
+                }
+                return Err(WalletError::WrongPassphrase);
+            };
+            imported_decrypted |= imported;
             secrets.push((hash, secret));
         }
 
