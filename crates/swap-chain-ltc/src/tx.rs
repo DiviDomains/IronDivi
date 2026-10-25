@@ -292,6 +292,41 @@ pub fn build_spend_tx(
     Ok(tx)
 }
 
+/// Virtual size of a claim of `htlc` as [`build_spend_tx`] builds it, the signature at its
+/// 72-byte maximum (what the fee is computed on).
+pub fn claim_vsize(htlc: &HtlcParams) -> u64 {
+    let ws = ScriptBuf::from_bytes(htlc.redeem_script());
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(OutPoint::null(), Sequence::MAX)],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()),
+        }],
+    };
+    tx.input[0].witness =
+        Witness::from_slice(&[DUMMY_SIG.to_vec(), vec![0; 32], vec![1], ws.to_bytes()]);
+    tx.vsize() as u64
+}
+
+/// Virtual size of a CPFP child as [`build_cpfp_tx`] builds it (one P2WPKH input and output,
+/// the signature at its 72-byte maximum).
+pub fn cpfp_child_vsize() -> u64 {
+    let spk = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(OutPoint::null(), Sequence::MAX)],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: spk,
+        }],
+    };
+    tx.input[0].witness = Witness::from_slice(&[DUMMY_SIG.to_vec(), vec![0; 33]]);
+    tx.vsize() as u64
+}
+
 /// Run libbitcoinconsensus over input 0 of `tx` against the HTLC's P2WSH output. The
 /// interpreter is script-identical for Litecoin and Bitcoin SegWit v0 (brief).
 pub fn verify_htlc_spend(

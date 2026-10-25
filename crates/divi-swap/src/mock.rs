@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::backend::{ChainBackend, FeeBump};
+use crate::backend::{ChainBackend, ClaimSizes, FeeBump};
 use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
@@ -655,6 +655,15 @@ impl ChainBackend for MockBackend {
         self.check_online()?;
         let s = self.chain.state.lock();
         Ok((s.fee_bump != FeeBump::None).then(|| s.fee_estimate.unwrap_or(MOCK_FEERATE)))
+    }
+
+    /// Every mock claim and child is [`MOCK_VSIZE`]; the mock has no dust limit.
+    fn claim_sizes(&self, _htlc: &HtlcParams) -> Option<ClaimSizes> {
+        (self.fee_bump() != FeeBump::None).then_some(ClaimSizes {
+            claim_vsize: MOCK_VSIZE,
+            child_vsize: MOCK_VSIZE,
+            dust: 0,
+        })
     }
 
     async fn build_claim_at(

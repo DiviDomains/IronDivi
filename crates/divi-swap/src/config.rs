@@ -170,6 +170,13 @@ impl ClaimDeadline {
 /// lower of `cap_feerate` and `max_multiple` times the first claim's feerate: the claim is
 /// worth the maker leg, so overpaying beats losing it, but not without bound (a fee estimate
 /// gone wrong must not hand the leg to the miners).
+///
+/// The cap only bounds what is paid while it is enough. Every claim is sent after its
+/// preimage is out (the first one reveals it), and from then on the maker leg is lost unless
+/// the claim confirms, so where the backend reports its sizes the fee is bounded by
+/// [`FeeEscalation::ceiling_fee`], a share of the leg, instead
+/// ([`FeeEscalation::target_after_leak`]). Before the preimage is out the taker declines a
+/// claim whose current feerate alone would cost more than half the leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeEscalation {
     /// Seconds left before the maker-leg locktime when bumping starts.
@@ -241,6 +248,74 @@ impl FeeEscalation {
         self.cap_feerate
             .min(base.saturating_mul(self.max_multiple))
             .max(base)
+    }
+
+    /// The most a maker-leg claim (with every CPFP child of it) pays in fees once its
+    /// preimage is out, in base units: half the leg `amount` while `left ≥ window`, then
+    /// rising linearly to `amount − dust − step` at the locktime (`left ≤ 0`), never below
+    /// half. `window` is the chain's claim-deadline margin
+    /// ([`ClaimDeadline::margin_secs`]), `dust` the smallest output the chain relays and
+    /// `step` one minimal fee bump (one base unit per vbyte of the package), so the last
+    /// version still leaves a relayable output and room to replace it.
+    ///
+    /// Half is what the taker may still lose and call the swap worth doing; it is also the
+    /// share the taker declines above before revealing anything. The rise is there because
+    /// at the locktime the maker's refund takes the whole leg: any fee short of the whole
+    /// leg is better than that, and it costs the hostile maker its refund.
+    pub fn ceiling_fee(amount: u64, dust: u64, step: u64, left: i64, window: u32) -> u64 {
+        let half = amount / 2;
+        let top = amount.saturating_sub(dust).saturating_sub(step).max(half);
+        let window = i64::from(window);
+        if left >= window || window <= 0 {
+            return half;
+        }
+        let gone = (window - left.max(0)) as u128;
+        half + (u128::from(top - half) * gone / window as u128) as u64
+    }
+
+    /// The feerate to pay with `left` seconds before the locktime once the preimage is out,
+    /// the first claim having paid `base`, with the post-leak ceiling
+    /// ([`FeeEscalation::ceiling_fee`]) at `ceiling` per vbyte. Until `cap_secs_left` it is
+    /// [`FeeEscalation::target`], never above `ceiling` (a small leg's ceiling can be under
+    /// the fixed cap). From there the claim is unconfirmed at the fixed cap with blocks
+    /// running out, which is evidence the cap is not enough, so it climbs on geometrically
+    /// from the cap to `ceiling` at the locktime.
+    pub fn target_after_leak(&self, base: u64, left: i64, ceiling: u64) -> u64 {
+        let ceiling = ceiling.max(1);
+        let cap = self.cap(base);
+        let end = i64::from(self.cap_secs_left);
+        if left >= end || end <= 0 || ceiling <= cap {
+            return self.target(base, left).min(ceiling);
+        }
+        let t = (end - left.max(0)) as f64 / end as f64;
+        let rate = cap as f64 * (ceiling as f64 / cap as f64).powf(t);
+        (rate.ceil() as u64).clamp(cap, ceiling)
+    }
+
+    /// [`FeeEscalation::target_after_leak`] for a CPFP claim, whose every bump adds a child
+    /// to the package: past `cap_secs_left` it is `ceiling` itself. A package must pay its
+    /// whole size at the new feerate, so each child spends part of the budget on its own
+    /// bytes; one step to the ceiling clears the most for it, where a geometric climb in small
+    /// steps would add a child at each and price itself out.
+    pub fn cpfp_target_after_leak(&self, base: u64, left: i64, ceiling: u64) -> u64 {
+        let ceiling = ceiling.max(1);
+        if left < i64::from(self.cap_secs_left) && ceiling > self.cap(base) {
+            return ceiling;
+        }
+        self.target(base, left).min(ceiling)
+    }
+
+    /// [`FeeEscalation::should_bump`] for a CPFP claim (first version `base`) whose package
+    /// pays `current`: only when `target` at least doubles it, reaches the fixed cap, or,
+    /// already at the cap or above, is worth a bump. Fewer, larger steps keep the package,
+    /// and with it the fee of every later step, small, and well inside the 25-transaction
+    /// ancestor limit.
+    pub fn should_add_child(&self, base: u64, current: u64, target: u64) -> bool {
+        let cap = self.cap(base);
+        target > current
+            && (target >= current.saturating_mul(2)
+                || target == cap
+                || (current >= cap && Self::worth_bumping(current, target)))
     }
 
     /// Whether to bump a claim paying `current` (first version `base`) to `target`: when
@@ -820,6 +895,66 @@ mod tests {
         c.validate().unwrap();
         c.chains.get_mut(&Chain::Ltc).unwrap().confirmations = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_post_leak_ceiling_is_half_the_leg_then_rises_to_all_but_dust_and_a_step() {
+        let w = ClaimDeadline::builtin(Chain::Btc).margin_secs();
+        let c = |left| FeeEscalation::ceiling_fee(1_000_000, 294, 150, left, w);
+        assert_eq!(c(i64::from(w) * 3), 500_000);
+        assert_eq!(c(i64::from(w)), 500_000);
+        assert_eq!(
+            c(i64::from(w) / 2),
+            500_000 + (1_000_000 - 294 - 150 - 500_000) / 2
+        );
+        assert_eq!(c(0), 1_000_000 - 294 - 150);
+        assert_eq!(c(-600), 1_000_000 - 294 - 150);
+        let mut prev = 0;
+        for left in (-60..=i64::from(w) + 60).rev() {
+            assert!(c(left) >= prev, "falls at {left}");
+            prev = c(left);
+        }
+        // A leg too small for dust and a step stays at half.
+        assert_eq!(FeeEscalation::ceiling_fee(400, 294, 150, 0, w), 200);
+    }
+
+    #[test]
+    fn after_the_leak_the_target_passes_the_fixed_cap_only_late_and_never_the_ceiling() {
+        let e = FeeEscalation::builtin(Chain::Btc).unwrap();
+        let end = i64::from(e.cap_secs_left);
+        // Before the cap point: the fixed schedule.
+        for left in [7200, 5000, 3600, end] {
+            assert_eq!(e.target_after_leak(10, left, 5000), e.target(10, left));
+        }
+        // After it: above the cap (500), up to the ceiling at the locktime.
+        assert!(e.target_after_leak(10, end - 600, 5000) > 500);
+        assert_eq!(e.target_after_leak(10, 0, 5000), 5000);
+        assert_eq!(e.target_after_leak(10, -60, 5000), 5000);
+        // A ceiling under the fixed cap (a small leg) holds throughout.
+        for left in [7200, 2000, end, 600, 0] {
+            assert!(e.target_after_leak(10, left, 50) <= 50);
+        }
+    }
+
+    #[test]
+    fn a_cpfp_claim_adds_few_children_and_steps_to_the_ceiling_past_the_cap_point() {
+        let e = FeeEscalation::builtin(Chain::Ltc).unwrap();
+        let end = i64::from(e.cap_secs_left);
+        // Before the cap point: the fixed schedule, in doublings.
+        assert_eq!(
+            e.cpfp_target_after_leak(10, end + 60, 900),
+            e.target(10, end + 60)
+        );
+        assert!(!e.should_add_child(10, 10, 19));
+        assert!(e.should_add_child(10, 10, 20));
+        assert!(e.should_add_child(10, 320, e.cap(10)));
+        // Past it: straight to the ceiling, then 25% steps.
+        assert_eq!(e.cpfp_target_after_leak(10, end - 1, 900), 900);
+        assert!(e.should_add_child(10, e.cap(10), 900));
+        assert!(!e.should_add_child(10, 900, 1000));
+        assert!(e.should_add_child(10, 900, 1125));
+        // A ceiling under the cap holds.
+        assert_eq!(e.cpfp_target_after_leak(10, 0, 50), 50);
     }
 
     /// A `SwapConfig` written before per-chain settings existed (no `chains`) still parses,

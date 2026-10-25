@@ -135,25 +135,34 @@ async fn ride_to_locktime(
     seen
 }
 
+/// The claim's feerate stays at `base` until the window, climbs to at most the fixed cap
+/// until `cap_secs_left`, and, still unconfirmed after that, climbs past the cap towards the
+/// post-leak ceiling (a share of the 1M sat leg; each claim and child is `MOCK_VSIZE`).
 fn assert_climbs_inside_the_window(seen: &[(i64, u64)], esc: FeeEscalation, base: u64) {
-    let cap = esc.cap_feerate.min(base * esc.max_multiple);
+    let cap = esc.cap(base);
     let mut last = base;
     for &(left, rate) in seen {
         assert!(rate >= last, "never falls: {seen:?}");
-        assert!(rate <= cap, "never past the cap {cap}: {seen:?}");
+        if left >= i64::from(esc.cap_secs_left) {
+            assert!(
+                rate <= cap,
+                "the fixed cap {cap} holds until the cap point: {seen:?}"
+            );
+        }
+        assert!(
+            rate * MOCK_VSIZE < 1_000_000,
+            "never the whole leg: {seen:?}"
+        );
         if left >= i64::from(esc.start_secs_left) {
             assert_eq!(rate, base, "no bump before the window: {seen:?}");
         }
         last = rate;
     }
-    assert!(
-        last * 5 >= cap * 4,
-        "near the cap by the locktime: {seen:?}"
-    );
+    assert!(last > cap, "past the cap {cap} by the locktime: {seen:?}");
 }
 
 #[tokio::test]
-async fn btc_claim_is_replaced_at_rising_feerates_up_to_the_cap() {
+async fn btc_claim_is_replaced_at_rising_feerates_up_to_the_cap_and_past_it_late() {
     let w = world(Chain::Btc, 600, FeeBump::Rbf);
     let store = Store::in_memory().unwrap();
     let maker = maker(&w, &store);
@@ -227,6 +236,8 @@ async fn ltc_claim_gets_cpfp_children_at_rising_package_feerates() {
         fee >= rec.claim_feerate.unwrap() * vsize - MOCK_VSIZE,
         "{fee} over {vsize}"
     );
+    // The post-leak ceiling bounds the fee of the whole package, not just the child.
+    assert!(fee < 1_000_000, "{fee} for the package");
 
     w.ml.mine(1);
     assert_eq!(

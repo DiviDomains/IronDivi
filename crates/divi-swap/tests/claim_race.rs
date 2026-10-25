@@ -12,11 +12,14 @@
 //! hostile maker sends one although it saw the claim, paying far more).
 //!
 //! Random fee markets drive the mock: per block, a block floor (feerate below which nothing
-//! is mined) and a mempool floor (below which claims are evicted and refused), both at most
-//! the escalation cap, and a fee estimate the first claim trusts.
+//! is mined) and a mempool floor (below which claims are evicted and refused), each up to
+//! twice the fixed escalation cap, and a fee estimate the first claim trusts.
 //!
 //! Property: with fee escalation on and the claim-deadline margin held, `Lost` is
-//! unreachable on BTC (RBF) and LTC (CPFP). The same market with escalation off loses.
+//! unreachable on BTC (RBF) and LTC (CPFP), floors above the fixed cap included: once the
+//! preimage is out the fee ceiling is a share of the maker leg, not the fixed cap. The same
+//! market with escalation off loses. A floor that would cost more than half the leg before
+//! anything is revealed is declined and refunded instead.
 //! ZEC (and DIVI) cannot bump at all (no replacement, CPFP inert): the margin is all they
 //! have, so there the test is only that a claim paying the block floor confirms in time.
 //!
@@ -50,9 +53,13 @@ struct Market {
     /// Seconds of maker-leg time that pass before the taker first looks.
     delay_secs: u32,
     /// Per maker-leg block: block floor and mempool floor, as fractions (per mille) of
-    /// the escalation cap. Repeats its last entry once exhausted.
+    /// the fixed escalation cap (`FeeEscalation::cap`). Repeats its last entry once
+    /// exhausted.
     floors: Vec<(u16, u16)>,
-    /// What the maker's refund of its leg pays.
+    /// What the maker's refund of its leg pays: at least twice the BTC fixed cap, so above
+    /// every floor drawn. The hostile refund always gets mined once the locktime passes, the
+    /// worst case for the taker; a maker whose own refund is under the floor is a maker-side
+    /// fee question, not this race.
     refund_feerate: u64,
 }
 
@@ -61,8 +68,11 @@ fn market() -> impl Strategy<Value = Market> {
         prop_oneof![Just(Chain::Btc), Just(Chain::Ltc)],
         1u64..60,
         0u32..7200,
-        proptest::collection::vec((0u16..=1000, 0u16..=1000), 1..40),
-        1000u64..20_000,
+        // Up to twice the fixed cap: at most 2000 sat/vB on BTC, a fifth of the 1M sat leg
+        // over the mock's 100 vB claim, so always under the half-leg ceiling the taker may
+        // pay once the preimage is out. A floor above that ceiling is lost by design.
+        proptest::collection::vec((0u16..=2000, 0u16..=2000), 1..40),
+        2000u64..20_000,
     )
         .prop_map(
             |(chain, estimate, delay_secs, floors, refund_feerate)| Market {
@@ -100,6 +110,8 @@ struct Outcome {
     claimed: bool,
     /// The preimage was out (a claim reached a mempool) before the end.
     leaked: bool,
+    /// The taker recorded `claim_declined`.
+    declined: bool,
 }
 
 /// One swap through `m`, the taker paying DIVI so the maker leg is on `m.chain`.
@@ -208,6 +220,7 @@ async fn race(m: &Market, escalation: bool) -> Outcome {
         maker: maker.view(&mid).unwrap().unwrap().state,
         claimed,
         leaked,
+        declined: rec.claim_declined.is_some(),
     }
 }
 
@@ -277,4 +290,50 @@ fn without_a_bump_a_zec_claim_paying_the_block_floor_confirms_in_time() {
     m.floors = vec![(1000, 0)];
     let o = run(&m, true);
     assert_eq!((o.taker, o.claimed), (TakerState::Done, true), "{o:?}");
+}
+
+#[test]
+fn a_block_floor_above_the_fixed_cap_after_the_leak_is_outbid_on_btc_and_ltc() {
+    // The first claim (10) reaches the mempool, so the preimage is out. Then the block floor
+    // sits at 1.5x the fixed cap (750 against 500) and the mempool floor at the cap, which
+    // evicts the first claim. A taker held to the fixed cap cannot get mined: BTC loses to
+    // the maker's refund and LTC sits unconfirmed at the cap. The post-leak ceiling (half
+    // the leg, rising towards all of it) outbids the floor.
+    for chain in [Chain::Btc, Chain::Ltc] {
+        let mut m = congested(chain);
+        m.floors = vec![(400, 0), (1500, 1000)];
+        let o = run(&m, true);
+        assert_eq!(
+            (o.taker, o.claimed, o.leaked),
+            (TakerState::Done, true, true),
+            "{chain}: {o:?}"
+        );
+    }
+}
+
+#[test]
+fn a_floor_above_half_the_leg_is_declined_before_the_preimage_is_revealed() {
+    // The leg is 1M sat and the mock claim 100 vB: an estimate of 6000/vB is a 600 000 sat
+    // claim, more than half the leg. Nothing has been revealed, so the taker declines and
+    // both legs refund (the taker ends `Done` through `Refunded`). At 4900/vB (490 000 sat, under half) it still claims.
+    for chain in [Chain::Btc, Chain::Ltc] {
+        let mut m = congested(chain);
+        m.estimate = 6000;
+        m.floors = vec![(0, 0)];
+        let o = run(&m, true);
+        assert_eq!(
+            (o.taker, o.declined, o.leaked, o.claimed),
+            (TakerState::Done, true, false, false),
+            "{chain}: {o:?}"
+        );
+        assert_eq!(o.maker, SwapState::Done, "{chain}: {o:?}");
+
+        m.estimate = 4900;
+        let o = run(&m, true);
+        assert_eq!(
+            (o.taker, o.declined, o.claimed),
+            (TakerState::Done, false, true),
+            "{chain}: {o:?}"
+        );
+    }
 }

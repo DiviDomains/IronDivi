@@ -51,6 +51,18 @@ pub enum FeeBump {
     Cpfp,
 }
 
+/// Sizes of a maker-leg claim on one chain ([`ChainBackend::claim_sizes`]), so the taker can
+/// turn a fee ceiling in base units (a share of the maker leg) into a feerate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimSizes {
+    /// Virtual size of the claim, vbytes.
+    pub claim_vsize: u64,
+    /// Virtual size of one CPFP child of it, vbytes (0 where the chain takes none).
+    pub child_vsize: u64,
+    /// Smallest output value the chain relays, base units.
+    pub dust: u64,
+}
+
 /// One chain, one engine key. A backend owns exactly one secp256k1 key (resolved from
 /// 1Password at startup): it funds HTLCs from that key's coins, and claims / refunds to it.
 // clippy >= 1.99 flags the `#[must_use]` that `async_trait` adds to the boxed futures.
@@ -153,6 +165,13 @@ pub trait ChainBackend: Send + Sync {
     /// nothing to escalate from.
     async fn claim_feerate(&self) -> Result<Option<u64>> {
         Ok(None)
+    }
+
+    /// Sizes of a claim of `htlc` as [`build_claim_at`](Self::build_claim_at) and
+    /// [`build_cpfp`](Self::build_cpfp) build it. `None`: not known, and the taker keeps the
+    /// fixed [`FeeEscalation`](crate::FeeEscalation) cap and never declines on the fee.
+    fn claim_sizes(&self, _htlc: &HtlcParams) -> Option<ClaimSizes> {
+        None
     }
 
     /// [`build_claim`](Self::build_claim) paying `feerate` (base unit per vbyte) instead of

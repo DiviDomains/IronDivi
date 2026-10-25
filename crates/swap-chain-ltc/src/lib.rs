@@ -28,8 +28,8 @@ pub use crosscheck::{
 };
 pub use send::build_send_tx;
 pub use tx::{
-    build_cpfp_tx, build_funding_tx, build_spend_tx, htlc_script_pubkey, verify_htlc_spend, Coin,
-    Spend,
+    build_cpfp_tx, build_funding_tx, build_spend_tx, claim_vsize, cpfp_child_vsize,
+    htlc_script_pubkey, verify_htlc_spend, Coin, Spend, DUST_SATS,
 };
 
 use std::str::FromStr;
@@ -41,8 +41,8 @@ use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{CompressedPublicKey, OutPoint};
 use crosscheck::enforce;
 use divi_swap::{
-    Amount, Chain, ChainBackend, FeeBump, Funding, HtlcParams, InputReservations, LockedOutput,
-    Outpoint, SignedTx, SpendInfo, SwapError, Txid,
+    Amount, Chain, ChainBackend, ClaimSizes, FeeBump, Funding, HtlcParams, InputReservations,
+    LockedOutput, Outpoint, SignedTx, SpendInfo, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -573,6 +573,14 @@ impl ChainBackend for LtcBackend {
 
     async fn claim_feerate(&self) -> Result<Option<u64>> {
         Ok(Some(self.sat_per_vb().await))
+    }
+
+    fn claim_sizes(&self, htlc: &HtlcParams) -> Option<ClaimSizes> {
+        Some(ClaimSizes {
+            claim_vsize: claim_vsize(htlc),
+            child_vsize: cpfp_child_vsize(),
+            dust: DUST_SATS,
+        })
     }
 
     async fn build_claim_at(

@@ -29,7 +29,7 @@ pub mod taker;
 pub mod types;
 
 pub use api::Direction;
-pub use backend::{ChainBackend, FeeBump};
+pub use backend::{ChainBackend, ClaimSizes, FeeBump};
 pub use config::{ChainParams, ClaimDeadline, FeeEscalation, Profile, SwapConfig};
 pub use error::{Result, SwapError};
 pub use htlc::HtlcParams;
