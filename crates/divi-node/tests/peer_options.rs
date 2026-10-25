@@ -167,3 +167,25 @@ async fn whitebind_peers_are_whitelisted() {
     assert!(pm.is_whitelisted(id("127.0.0.4")));
     assert!(!pm.is_whitelisted(id("127.0.0.5")));
 }
+
+/// A -connect peer that is down when the node starts is dialled again within
+/// seconds once it is up: Divi Core tries the -connect addresses again and
+/// again with no backoff (ThreadOpenConnections, net.cpp:1094-1105)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connect_peer_that_comes_up_later_is_dialled() {
+    let peer_port = divi_test_support::free_port();
+    let t = TestNode::start_with(|c| {
+        c.p2p.connect = vec![format!("127.0.0.1:{peer_port}")];
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", peer_port))
+        .await
+        .unwrap();
+    let dialled = tokio::time::timeout(std::time::Duration::from_secs(12), listener.accept()).await;
+    assert!(
+        dialled.is_ok(),
+        "the -connect peer was not dialled within 12 s of coming up"
+    );
+    drop(t);
+}

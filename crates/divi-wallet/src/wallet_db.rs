@@ -513,7 +513,7 @@ impl WalletDb {
         debug!("Restored {} vaults", wallet.vaults.read().len());
 
         // Wallets written before removevault dropped its outputs still hold them
-        wallet.prune_unowned_vault_utxos();
+        wallet.drop_unowned_vault_utxos(true);
 
         Ok(wallet)
     }
@@ -682,6 +682,42 @@ impl WalletDb {
             category: String::new(),
             confirmations: 0,
         }
+    }
+
+    /// The wallet transactions to offer the mempool at start, parents before
+    /// children, each with whether it is detached: the unconfirmed ones, and
+    /// those that left the chain or the mempool (kept at depth -1), coinbases
+    /// and coinstakes left out, as Divi Core's
+    /// SubmitUnconfirmedWalletTransactionsToMempool offers every wallet
+    /// transaction with fewer than 0 confirmations (init.cpp:1262-1275)
+    pub fn transactions_to_resubmit(
+        &self,
+    ) -> Vec<(divi_primitives::transaction::Transaction, bool)> {
+        let mut txs: Vec<(u64, divi_primitives::transaction::Transaction)> = self
+            .mempool_txs
+            .read()
+            .values()
+            .map(|e| (e.record.timestamp, e.tx.clone()))
+            .collect();
+        let mut detached = HashSet::new();
+        for (txid, d) in self.detached_txs.read().iter() {
+            if let Some(tx) = &d.tx {
+                if !tx.is_coinbase()
+                    && !tx.is_coinstake()
+                    && !txs.iter().any(|(_, t)| t.txid() == *txid)
+                {
+                    detached.insert(*txid);
+                    txs.push((d.timestamp, tx.clone()));
+                }
+            }
+        }
+        parents_first(txs)
+            .into_iter()
+            .map(|(_, tx)| {
+                let is_detached = detached.contains(&tx.txid());
+                (tx, is_detached)
+            })
+            .collect()
     }
 
     /// Unconfirmed wallet transactions, parents before children, to resubmit
@@ -3741,20 +3777,17 @@ impl WalletDb {
         self.vaults.read().get(vault_script).cloned()
     }
 
-    /// Remove vault metadata. Outputs of the vault that the wallet no longer
-    /// owns once it is unregistered (the manager side) leave the wallet.
+    /// Unregister a vault in memory, as Divi Core's RemoveVault does
+    /// (wallet.cpp:707-716): the registration stays in the wallet file, so the
+    /// next start manages the vault again (the file's "cscript" record is
+    /// never erased, wallet.cpp:671-675, walletdb.cpp:402-409). Until then the
+    /// outputs of the vault that the wallet no longer owns (the manager side)
+    /// leave its coin set; their rows stay on disk for that start.
     pub fn remove_vault(&self, vault_script: &[u8]) -> bool {
         let removed = self.vaults.write().remove(vault_script).is_some();
         if removed {
-            self.prune_unowned_vault_utxos();
+            self.drop_unowned_vault_utxos(false);
         }
-
-        if removed {
-            if let Some(ref db) = self.db {
-                db.remove_vault(vault_script).ok();
-            }
-        }
-
         removed
     }
 
@@ -3765,9 +3798,11 @@ impl WalletDb {
 
     /// Drop vault outputs that are no longer the wallet's (is_mine_script is
     /// false for them, e.g. after removevault on the manager). They are not
-    /// spent, so they are deleted rather than moved to the spent set; a later
-    /// addvault brings them back.
-    fn prune_unowned_vault_utxos(&self) -> usize {
+    /// spent, so they are not moved to the spent set; a later addvault, or
+    /// the next start while the registration is still on disk, brings them
+    /// back. `forget` also deletes their rows from the wallet file, for a
+    /// wallet whose registration is gone.
+    fn drop_unowned_vault_utxos(&self, forget: bool) -> usize {
         // Ownership checks take keystore/vault locks, so do them before
         // locking the UTXO set or the overlay
         let is_vault = |u: &&WalletUtxo| divi_script::is_staking_vault_script(&u.script_pubkey);
@@ -3810,7 +3845,7 @@ impl WalletDb {
             doomed
         };
         if let Some(ref db) = self.db {
-            for outpoint in &doomed {
+            for outpoint in doomed.iter().filter(|_| forget) {
                 if let Err(e) = db.remove_utxo(outpoint) {
                     debug!("Failed to delete vault UTXO {:?}: {}", outpoint, e);
                 }
@@ -4598,14 +4633,15 @@ mod tests {
             assert!(wallet.get_vault(&vault_script).is_none());
         }
 
+        // Divi Core's RemoveVault drops the script from memory only
+        // (wallet.cpp:707-716): the wallet file still holds it, and the next
+        // start manages the vault again
         {
             let wallet = WalletDb::open(&wallet_path, Network::Mainnet).unwrap();
 
             let retrieved = wallet.get_vault(&vault_script);
-            assert!(retrieved.is_none());
-
-            let all_vaults = wallet.get_all_vaults();
-            assert_eq!(all_vaults.len(), 0);
+            assert!(retrieved.is_some());
+            assert_eq!(wallet.get_all_vaults().len(), 1);
         }
     }
 
@@ -5126,6 +5162,24 @@ mod tests {
             let swapped = parents_first(vec![(5, child.clone()), (5, tx.clone())]);
             assert_eq!(swapped[0].1.txid(), tx.txid());
             assert_eq!(wallet.unconfirmed_transactions(), vec![tx, child]);
+        }
+
+        /// A send the mempool dropped stays in the wallet at depth -1 and is
+        /// offered again at start, as Divi Core offers every wallet
+        /// transaction with fewer than 0 confirmations (init.cpp:1262-1275)
+        #[test]
+        fn dropped_sends_are_offered_again_at_start() {
+            let (wallet, fund) = funded();
+            let tx = own_send(&wallet, &fund);
+            let child = spend(&[(tx.txid(), 1)], vec![(69 * COIN, stranger())]);
+            assert!(wallet.add_mempool_tx(&tx));
+            assert!(wallet.add_mempool_tx(&child));
+            assert!(wallet.remove_mempool_tx(&tx.txid()));
+            assert_eq!(
+                wallet.transactions_to_resubmit(),
+                vec![(tx.clone(), true), (child.clone(), false)]
+            );
+            assert_eq!(wallet.unconfirmed_transactions(), vec![child]);
         }
     }
 
@@ -5838,40 +5892,56 @@ mod tests {
                 .all(|u| !divi_script::is_staking_vault_script(&u.script_pubkey)));
         }
 
-        /// removevault on the manager drops the vault outputs, and the
-        /// drop survives a restart. A wallet written by 0.2.6 (vault removed,
-        /// outputs left behind) is cleaned when it is opened.
+        /// removevault on the manager takes the vault outputs out of the wallet
+        /// until the next start, which manages the vault again with its coins
+        /// (Divi Core erases the script from memory only, wallet.cpp:707-716).
+        /// Plain coins spend all along.
         #[test]
-        fn removevault_drops_manager_vault_outputs_persistently() {
+        fn removevault_returns_at_the_next_start() {
             use tempfile::tempdir;
 
             let dir = tempdir().unwrap();
             let path = dir.path().join("manager.dat");
             let vault;
+            let manager;
             {
                 let hd = HdWallet::from_mnemonic(TEST_MNEMONIC, None, ChainMode::Divi).unwrap();
                 let wallet = WalletDb::create_persistent(&path, Network::Mainnet, hd).unwrap();
-                let manager = wallet.new_receiving_address().unwrap();
+                manager = wallet.new_receiving_address().unwrap();
+                let plain = wallet.new_receiving_address().unwrap();
                 vault =
                     divi_script::StakingVaultScript::new([0x22; 20], hash20(&manager)).to_script();
                 register(&wallet, [0x22; 20], &manager, &vault);
-                let tx = pay(vec![(500 * COIN, vault.clone())]);
+                let tx = pay(vec![
+                    (500 * COIN, vault.clone()),
+                    (50 * COIN, Script::new_p2pkh(plain.hash.as_bytes())),
+                ]);
                 wallet.scan_transaction(&tx, Some(Hash256::from_bytes([2; 32])), Some(10), None);
                 wallet.save().unwrap();
-                assert_eq!(wallet.get_utxos().len(), 1);
+                assert_eq!(wallet.get_utxos().len(), 2);
 
                 assert!(wallet.remove_vault(vault.as_bytes()));
-                assert!(wallet.get_utxos().is_empty(), "removed vault still held");
-                assert_eq!(wallet.get_balance(), Amount::ZERO);
+                assert_eq!(wallet.get_utxos().len(), 1, "removed vault still held");
+                assert!(wallet.get_stakeable_vault_utxos(20, 1).is_empty());
+                assert_eq!(wallet.get_spendable_utxos(20, 1).len(), 1);
                 wallet.save_incremental().unwrap();
             }
             let wallet = WalletDb::open(&path, Network::Mainnet).unwrap();
-            assert!(wallet.get_vault(vault.as_bytes()).is_none());
-            assert!(
-                wallet.get_utxos().is_empty(),
-                "removed vault output came back after restart"
-            );
-            assert_eq!(wallet.get_balance(), Amount::ZERO);
+            assert!(wallet.get_vault(vault.as_bytes()).is_some());
+            assert_eq!(wallet.get_utxos().len(), 2, "the vault's coin is back");
+            assert_eq!(wallet.vault_role(&vault), Some(VaultRole::Managed));
+            assert_eq!(wallet.get_stakeable_vault_utxos(20, 1).len(), 1);
+            // the plain coin is still the only one ordinary sends may pick
+            let spendable = wallet.get_spendable_utxos(20, 1);
+            assert_eq!(spendable.len(), 1);
+            assert_eq!(spendable[0].value.as_sat(), 50 * COIN);
+            let selection = wallet
+                .select_coins(Amount::from_sat(COIN), 10, 2, 20, 1)
+                .unwrap();
+            assert!(selection
+                .utxos
+                .iter()
+                .all(|u| !divi_script::is_staking_vault_script(&u.script_pubkey)));
         }
 
         /// a wallet left by 0.2.6 removevault (metadata gone, the vault

@@ -87,12 +87,11 @@ mined by the owner instead), so each coinstake holds only the vault's payout.
   out (rpcmisc.cpp:1068; the same gap as `mnsync status` in scripts/net-replies). The row is a PASS once both say
   true.
 - `getcoinavailability`: irondivid adds `total_vaults` and `vaults` (also KNOWN in scripts/vault-replies).
-- `manager listtransactions * 100 0 true (a removed vault's records)`: open: after `removevault`, divid still lists
-  the records of the removed vault's coins until it restarts (removevault drops the script from memory only,
-  wallet.cpp:707-716); irondivid drops them at once.
-- `removevault vault 1/2 again (divid manages it again)`: open: after a restart or `-reindex` divid reads the
-  removed vault back from its wallet file and manages it again (the same wallet.cpp:707-716). The run removes it
-  again on both, so the rows after compare like with like.
+- `manager listtransactions * 100 0 true (a removed vault's records)`: by design: after `removevault`, divid still lists
+  the removed vault's transactions, with their amounts, until its next start. It keeps each transaction's credit and
+  debit in a cache (`CachedTransactionDeltasCalculator.cpp:108-118`) that `removevault` never clears
+  (`wallet.cpp:707-716`); irondivid works the entries out from the wallet as it is, which is what divid gives too once
+  it has restarted. Copying the stale entries would list coins the manager can no longer stake.
 - `locked manager: setgenerate`: divid's locked wallet throws from key derivation (`CWallet::GetKey`,
   wallet.cpp:544) and the RPC layer returns that text as -1 "GetKey: DecryptHDChainSeed failed"; irondivid answers
   -25 "failed to generate a valid block", as divid does when it finds no stake.
