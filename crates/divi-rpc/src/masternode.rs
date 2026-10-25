@@ -264,7 +264,8 @@ impl MasternodeRpc {
             return Err(Self::usage(LISTMASTERNODES_USAGE));
         }
         if let Some(list) = self.network_list.read().clone() {
-            return Ok(list.list_json(chain, filter));
+            let votes = self.votes.read().clone();
+            return Ok(list.list_json(chain, filter, votes.as_deref()));
         }
         let rpc = self.get_rpc()?;
         let mode = filter.map(|s| s.to_string());
