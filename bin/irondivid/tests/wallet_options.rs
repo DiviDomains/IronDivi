@@ -416,3 +416,32 @@ fn prunewalletconfs_leaves_deeply_spent_transactions_out() {
     );
     stop(node, rpc);
 }
+
+/// Whether `text` is in the node's debug.log within 10 seconds (the log is
+/// written behind the calls)
+fn logged(dir: &Path, text: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(dir.join("debug.log")).unwrap_or_default();
+        if log.contains(text) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// At the end of the start the log has divid's "Key Pool size = <n>" and
+/// "Address Book size = <n>" (init.cpp:1613-1618)
+#[test]
+fn the_start_logs_the_key_pool_and_address_book_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc, p2p) = (free_port(), free_port());
+    let node = start(dir.path(), rpc, p2p, &[]);
+    let pool = ok(rpc, "getwalletinfo", json!([]))["keypoolsize"].clone();
+    assert!(logged(dir.path(), &format!("Key Pool size = {pool}")));
+    assert!(logged(dir.path(), "Address Book size = "));
+    stop(node, rpc);
+}

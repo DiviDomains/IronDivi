@@ -2585,6 +2585,14 @@ async fn run_daemon(
             }
         }
 
+        // Divi Core's debug print at the end of the start, 0 without a
+        // wallet (init.cpp:1613-1618)
+        let (pool, book) = wallet
+            .as_ref()
+            .map_or((0, 0), |w| (w.keypool_size(), w.address_book().len()));
+        info!("Key Pool size = {}", pool);
+        info!("Address Book size = {}", book);
+
         wallet
     };
 
