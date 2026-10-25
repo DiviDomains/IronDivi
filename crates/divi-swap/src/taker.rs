@@ -241,6 +241,7 @@ impl Taker {
             claim_feerate: None,
             claim_replaced: Vec::new(),
             claim_children: Vec::new(),
+            claim_underpriced: 0,
             last_error: None,
         })?;
         Ok((id, req))
@@ -723,6 +724,16 @@ impl Taker {
             if mk.confirmations(&prev.txid).await?.is_some() {
                 tracing::warn!(swap = %r.id, refused = %claim.txid, back_to = %prev.txid,
                     error = %e, "claim replacement refused; back to the claim the chain holds");
+                // The node wants a bigger step than the configured price bump: counted, so
+                // the next replacement outbids it (`FeeEscalation::underpriced_target`).
+                if mk.fee_bump() == FeeBump::SameNonce
+                    && e.to_string().to_ascii_lowercase().contains("underpriced")
+                {
+                    r.claim_underpriced = r.claim_underpriced.saturating_add(1);
+                    tracing::warn!(swap = %r.id, chain = %r.quote.maker_chain(),
+                        refusals = r.claim_underpriced, feerate = feerate,
+                        "claim replacement refused as underpriced");
+                }
                 r.claim_replaced.truncate(i);
                 r.maker_leg_claim = Some(prev);
                 r.claim_feerate = Some(feerate);
@@ -737,7 +748,14 @@ impl Taker {
             return self.enter(r, TakerState::Refunded);
         }
         let chain = r.quote.maker_chain();
-        if let (Some(esc), Some(base), Some(current), FeeBump::Rbf | FeeBump::Cpfp) = (
+        // Under `SameNonce` nothing at the claim's nonce is held here, so it is free (or a
+        // different transaction took it): `build_claim_at` signs at the next free nonce.
+        if let (
+            Some(esc),
+            Some(base),
+            Some(current),
+            FeeBump::Rbf | FeeBump::Cpfp | FeeBump::SameNonce,
+        ) = (
             self.fee_escalation(chain),
             r.claim_base_feerate,
             r.claim_feerate,
@@ -775,6 +793,7 @@ impl Taker {
             r.maker_leg_claim = Some(tx.clone());
             r.claim_feerate = Some(feerate);
             r.claim_children.clear();
+            r.claim_underpriced = 0; // a fresh claim, not a replacement
             self.store.put_taker_swap(r)?; // write-ahead
             tracing::info!(swap = %r.id, %chain, old_feerate = current, new_feerate = feerate,
                 txid = %tx.txid, claim = %claim.txid, secs_left = left, error = %e,
@@ -864,14 +883,15 @@ impl Taker {
         r.claim_feerate = feerate;
         r.claim_replaced.clear();
         r.claim_children.clear();
+        r.claim_underpriced = 0;
         Ok(tx)
     }
 
     /// Raise the fee of the unconfirmed `claim` along the chain's [`FeeEscalation`] as the
-    /// maker-leg locktime nears: replace it (RBF), or bump it through a CPFP child,
-    /// persisting the new transaction before broadcasting it and logging every bump. A no-op
-    /// where the backend cannot bump, escalation is off, or the target is not yet worth a
-    /// new transaction.
+    /// maker-leg locktime nears: replace it (RBF, or at its nonce on EVM), or bump it
+    /// through a CPFP child, persisting the new transaction before broadcasting it and
+    /// logging every bump. A no-op where the backend cannot bump, escalation is off, or the
+    /// target is not yet worth a new transaction.
     ///
     /// A CPFP bump replaces the newest child, so the package stays the claim and one child
     /// (the child signals BIP125). A node that refuses that (Litecoin Core's default,
@@ -916,11 +936,50 @@ impl Taker {
         if !bump {
             return Ok(());
         }
-        let tx = mk
-            .build_claim_at(&htlc, &op, amount, &r.preimage, target)
-            .await?;
-        r.claim_replaced.push((claim.clone(), current));
-        r.maker_leg_claim = Some(tx.clone());
+        // Refused as underpriced at least twice since the node last took a version: it holds
+        // a stricter price bump than the chain's configured one. Double the step every second
+        // refusal, within the cap.
+        let target = match kind {
+            FeeBump::SameNonce if r.claim_underpriced >= 2 => {
+                let raised = esc.underpriced_target(base, current, target, r.claim_underpriced);
+                tracing::warn!(
+                    swap = %r.id,
+                    %chain,
+                    refusals = r.claim_underpriced,
+                    price_bump_pct = esc.price_bump_pct,
+                    old_feerate = current,
+                    step_feerate = target,
+                    new_feerate = raised,
+                    cap = esc.cap(base),
+                    "claim replacements refused as underpriced; doubling the step"
+                );
+                raised
+            }
+            _ => target,
+        };
+        let tx = match kind {
+            FeeBump::Rbf => {
+                let tx = mk
+                    .build_claim_at(&htlc, &op, amount, &r.preimage, target)
+                    .await?;
+                r.claim_replaced.push((claim.clone(), current));
+                r.maker_leg_claim = Some(tx.clone());
+                tx
+            }
+            FeeBump::SameNonce => {
+                // `None`: the node's replacement minimum is above the target; keep the claim.
+                let Some(tx) = mk
+                    .build_claim_replacement(claim, target, esc.price_bump_pct)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                r.claim_replaced.push((claim.clone(), current));
+                r.maker_leg_claim = Some(tx.clone());
+                tx
+            }
+            FeeBump::Cpfp | FeeBump::None => unreachable!("returned above"),
+        };
         r.claim_feerate = Some(target);
         self.store.put_taker_swap(r)?; // write-ahead
         tracing::info!(
@@ -934,9 +993,18 @@ impl Taker {
             secs_left = left,
             "claim fee bumped"
         );
-        if let Err(e) = mk.broadcast(&tx).await {
+        match mk.broadcast(&tx).await {
+            Ok(_) if r.claim_underpriced > 0 => {
+                // The node took a version: the next step starts from the configured bump.
+                r.claim_underpriced = 0;
+                self.store.put_taker_swap(r)?;
+            }
+            Ok(_) => {}
             // Kept: the next step resends it and, if refused for good, falls back.
-            tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e, "fee bump broadcast failed");
+            Err(e) => {
+                tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e,
+                    "fee bump broadcast failed");
+            }
         }
         Ok(())
     }

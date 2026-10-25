@@ -38,8 +38,8 @@ use secp256k1::{PublicKey as Secp256k1PublicKey, SecretKey as Secp256k1SecretKey
 
 use divi_swap::api::Direction;
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx, SpendInfo,
-    SwapError, Txid,
+    Amount, Chain, ChainBackend, FeeBump, Funding, HtlcParams, LockedOutput, Outpoint, SignedTx,
+    SpendInfo, SwapError, Txid,
 };
 
 use crate::client::{connect_provider, swap_id, EvmHtlcClient};
@@ -124,8 +124,10 @@ fn is_already_known(msg: &str) -> bool {
 /// A non-retryable RPC rejection that means *some* transaction already occupies this
 /// nonce — but, unlike [`is_already_known`], not necessarily *this* one. The common case is
 /// genuinely safe (our own earlier broadcast already mined, and the chain caught up between
-/// retries — the write-ahead design here only ever signs a claim/refund once and keeps
-/// rebroadcasting the identical bytes, so nothing else should normally touch this nonce).
+/// retries — the write-ahead design rebroadcasts identical bytes, and the only other thing
+/// it signs at a claim's nonce is a same-nonce replacement of it, `FeeBump::SameNonce`, so
+/// either the message means another version of the same claim holds the nonce or nothing
+/// of ours should touch it).
 /// But it is not the only case: a stale read from a load-balanced public RPC, or the same
 /// key used by a second process at once (both explicitly against this lane's own
 /// conventions, but not impossible), can mean a *different* transaction took the nonce —
@@ -216,18 +218,50 @@ impl UsdcBackend {
         Ok((eth, usdc))
     }
 
+    /// The HTLC's `claim(id, preimage)` call, if this backend's key is its claim key.
+    fn claim_call(
+        &self,
+        htlc: &HtlcParams,
+        amount: Amount,
+        preimage: &[u8; 32],
+    ) -> Result<IErc20Htlc::claimCall> {
+        htlc.validate()?;
+        let (sender, receiver) = htlc_addresses(htlc)?;
+        if receiver != self.client.address() {
+            return Err(SwapError::InvalidParams(
+                "backend key is not the HTLC claim key".into(),
+            ));
+        }
+        let units = amount_to_usdc_units(amount)?;
+        let id = swap_id(
+            sender,
+            receiver,
+            self.token,
+            units,
+            B256::from(htlc.hash),
+            U256::from(htlc.locktime),
+        );
+        Ok(IErc20Htlc::claimCall {
+            id,
+            preimage: B256::from(*preimage),
+        })
+    }
+
     /// Sign (but do not send) a call to the HTLC contract from this backend's key.
     async fn sign_htlc_call<C: alloy::sol_types::SolCall + Send + Sync>(
         &self,
         call: &C,
     ) -> Result<SignedTx> {
-        self.sign_call(self.client.htlc_address(), call).await
+        self.sign_call(self.client.htlc_address(), call, None).await
     }
 
+    /// Sign a call at the next free (`pending`) nonce. `max_fee`: `maxFeePerGas` in wei, with
+    /// the tip no higher; `None` takes both from the node's current estimate.
     async fn sign_call<C: alloy::sol_types::SolCall + Send + Sync>(
         &self,
         to: Address,
         call: &C,
+        max_fee: Option<u128>,
     ) -> Result<SignedTx> {
         let provider = self.client.provider();
         let from = self.client.address();
@@ -264,10 +298,11 @@ impl UsdcBackend {
             .estimate_eip1559_fees()
             .await
             .map_err(|e| SwapError::Transient(format!("estimate_eip1559_fees: {e}")))?;
+        let max_fee = max_fee.unwrap_or(fees.max_fee_per_gas);
         let tx = probe
             .with_gas_limit(gas + gas / 5) // 20% headroom over the current-state estimate
-            .with_max_fee_per_gas(fees.max_fee_per_gas)
-            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+            .with_max_fee_per_gas(max_fee)
+            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(max_fee));
         let envelope = tx
             .build(&self.wallet)
             .await
@@ -416,27 +451,103 @@ impl ChainBackend for UsdcBackend {
         amount: Amount,
         preimage: &[u8; 32],
     ) -> Result<SignedTx> {
-        htlc.validate()?;
-        let (sender, receiver) = htlc_addresses(htlc)?;
-        if receiver != self.client.address() {
-            return Err(SwapError::InvalidParams(
-                "backend key is not the HTLC claim key".into(),
-            ));
+        let call = self.claim_call(htlc, amount, preimage)?;
+        self.sign_htlc_call(&call).await
+    }
+
+    fn fee_bump(&self) -> FeeBump {
+        FeeBump::SameNonce
+    }
+
+    /// `maxFeePerGas` the node estimates now, wei per gas.
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        let fees = self
+            .client
+            .provider()
+            .estimate_eip1559_fees()
+            .await
+            .map_err(|e| SwapError::Transient(format!("estimate_eip1559_fees: {e}")))?;
+        Ok(Some(
+            u64::try_from(fees.max_fee_per_gas).unwrap_or(u64::MAX),
+        ))
+    }
+
+    // `claim_sizes` stays `None`: the fee is paid in ETH and the leg is USDC, so a share of
+    // the leg is no gas price; the fixed `FeeEscalation` cap bounds the claim instead.
+
+    /// The claim with `maxFeePerGas` = `feerate` (wei per gas), at the next free nonce.
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        _at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        let call = self.claim_call(htlc, amount, preimage)?;
+        self.sign_call(self.client.htlc_address(), &call, Some(u128::from(feerate)))
+            .await
+    }
+
+    /// `prev` re-signed at its own nonce: same contract, calldata, value, gas limit, chain id
+    /// and access list, with `maxFeePerGas` = `feerate` and the tip raised in proportion, both
+    /// past the node's price bump, `price_bump_pct` ([`replacement_fees`]). Signed offline: no node call, so the
+    /// gas limit is not re-estimated and the nonce is the stuck claim's, not `pending`.
+    async fn build_claim_replacement(
+        &self,
+        prev: &SignedTx,
+        feerate: u64,
+        price_bump_pct: u64,
+    ) -> Result<Option<SignedTx>> {
+        use alloy::consensus::transaction::SignerRecoverable;
+        use alloy::consensus::TxEnvelope;
+        use alloy::eips::Decodable2718;
+        use alloy::primitives::TxKind;
+        let bad = |why: String| SwapError::InvalidParams(format!("claim {}: {why}", prev.txid));
+        let envelope = TxEnvelope::decode_2718(&mut prev.raw.as_slice())
+            .map_err(|e| bad(format!("decode: {e}")))?;
+        let signer = envelope
+            .recover_signer()
+            .map_err(|e| bad(format!("recover signer: {e}")))?;
+        if signer != self.address() {
+            return Err(bad("not signed by this backend's key".into()));
         }
-        let units = amount_to_usdc_units(amount)?;
-        let id = swap_id(
-            sender,
-            receiver,
-            self.token,
-            units,
-            B256::from(htlc.hash),
-            U256::from(htlc.locktime),
-        );
-        self.sign_htlc_call(&IErc20Htlc::claimCall {
-            id,
-            preimage: B256::from(*preimage),
-        })
-        .await
+        let TxEnvelope::Eip1559(signed) = envelope else {
+            return Err(bad("not an EIP-1559 transaction".into()));
+        };
+        let old = signed.tx();
+        let TxKind::Call(to) = old.to else {
+            return Err(bad("a contract creation".into()));
+        };
+        if to != self.client.htlc_address() {
+            return Err(bad("not a call to this backend's HTLC contract".into()));
+        }
+        let Some((max_fee, tip)) = replacement_fees(
+            old.max_fee_per_gas,
+            old.max_priority_fee_per_gas,
+            u128::from(feerate),
+            price_bump_pct,
+        ) else {
+            return Ok(None);
+        };
+        let tx = TransactionRequest::default()
+            .with_from(signer)
+            .with_to(to)
+            .with_input(old.input.clone())
+            .with_value(old.value)
+            .with_chain_id(old.chain_id)
+            .with_nonce(old.nonce)
+            .with_gas_limit(old.gas_limit)
+            .with_access_list(old.access_list.clone())
+            .with_max_fee_per_gas(max_fee)
+            .with_max_priority_fee_per_gas(tip);
+        let envelope = tx
+            .build(&self.wallet)
+            .await
+            .map_err(|e| SwapError::Other(format!("sign transaction: {e}")))?;
+        let raw = envelope.encoded_2718();
+        let txid = Txid((*envelope.tx_hash()).into());
+        Ok(Some(SignedTx { txid, raw }))
     }
 
     async fn build_refund(
@@ -481,6 +592,16 @@ impl ChainBackend for UsdcBackend {
                     .map_err(|e| SwapError::Transient(format!("get_transaction_receipt: {e}")))?;
                 match mined {
                     Some(_) => Ok(tx.txid),
+                    // A pending transaction holds this nonce (an earlier version of this
+                    // claim, say) and this one does not pay enough more to replace it.
+                    None if e.to_string().to_ascii_lowercase().contains("underpriced") => {
+                        Err(SwapError::Rejected(format!(
+                            "{} not taken: the node holds another transaction at its nonce \
+                             (an earlier version of it, or not ours) and this one does not \
+                             clear the node's price bump: {e}",
+                            tx.txid
+                        )))
+                    }
                     None => Err(SwapError::Rejected(format!(
                         "nonce conflict and {} was never mined — a different transaction \
                          took this nonce (stale RPC view, or this key in use elsewhere): {e}",
@@ -654,6 +775,37 @@ impl ChainBackend for UsdcBackend {
         }
         Ok(None)
     }
+}
+
+/// Least fee geth takes in a replacement of a transaction paying `old` on a node whose
+/// `PriceBump` is `price_bump_pct` (`--txpool.pricebump`, default 10 in
+/// `core/txpool/legacypool/legacypool.go`, `DefaultConfig`; the chain's
+/// `FeeEscalation::price_bump_pct`): `list.Add` in `core/txpool/legacypool/list.go` refuses
+/// unless the new fee is strictly greater *and* at least `old * (100 + PriceBump) / 100`
+/// (integer division), checked separately for `maxFeePerGas` and `maxPriorityFeePerGas`; it
+/// answers `replacement transaction underpriced` (`ErrReplaceUnderpriced`,
+/// `core/txpool/errors.go`).
+fn geth_replacement_floor(old: u128, price_bump_pct: u64) -> u128 {
+    (old.saturating_mul(100 + u128::from(price_bump_pct)) / 100).max(old.saturating_add(1))
+}
+
+/// `(maxFeePerGas, maxPriorityFeePerGas)` for a replacement of a transaction paying
+/// `(old_max, old_tip)`, with the max fee at `target`: the tip rises in proportion to the max
+/// fee, and at least to the node's floor at `price_bump_pct`. `None` when `target` is under
+/// that floor for the max fee, or the tip's floor is over `target`: no replacement the node
+/// takes fits.
+fn replacement_fees(
+    old_max: u128,
+    old_tip: u128,
+    target: u128,
+    price_bump_pct: u64,
+) -> Option<(u128, u128)> {
+    if target < geth_replacement_floor(old_max, price_bump_pct) {
+        return None;
+    }
+    let scaled = old_tip.saturating_mul(target).div_ceil(old_max.max(1));
+    let tip = geth_replacement_floor(old_tip, price_bump_pct).max(scaled);
+    (tip <= target).then_some((target, tip))
 }
 
 #[cfg(test)]
@@ -948,6 +1100,465 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A [`NonceNode`] that also relays: `eth_sendRawTransaction` succeeds, or fails with
+    /// `send_error`; `eth_getTransactionReceipt` reports a mined receipt for the hashes in
+    /// `mined` only; nothing is pending by hash; the tip is block 0x10.
+    #[derive(Clone, Default)]
+    struct RelayNode {
+        nonces: NonceNode,
+        send_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        mined: std::sync::Arc<std::sync::Mutex<Vec<B256>>>,
+    }
+
+    impl wiremock::Respond for RelayNode {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use serde_json::{json, Value};
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let ok = |result: Value| {
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+            };
+            match body["method"].as_str().unwrap_or("") {
+                "eth_sendRawTransaction" => {
+                    if let Some(msg) = self.send_error.lock().unwrap().clone() {
+                        return wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                            "jsonrpc": "2.0", "id": body["id"],
+                            "error": {"code": -32000, "message": msg},
+                        }));
+                    }
+                    let raw =
+                        hex::decode(body["params"][0].as_str().unwrap().trim_start_matches("0x"))
+                            .unwrap();
+                    ok(json!(keccak256(raw).to_string()))
+                }
+                "eth_getTransactionReceipt" => {
+                    let hash: B256 = body["params"][0].as_str().unwrap().parse().unwrap();
+                    if !self.mined.lock().unwrap().contains(&hash) {
+                        return ok(Value::Null);
+                    }
+                    let addr = Address::repeat_byte(0x11).to_string();
+                    ok(json!({
+                        "transactionHash": hash.to_string(),
+                        "transactionIndex": "0x0",
+                        "blockHash": B256::repeat_byte(0x42).to_string(),
+                        "blockNumber": "0xe",
+                        "from": addr, "to": addr,
+                        "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208",
+                        "effectiveGasPrice": "0x3b9aca00",
+                        "contractAddress": null,
+                        "logs": [],
+                        "logsBloom": format!("0x{}", "00".repeat(256)),
+                        "type": "0x2", "status": "0x1",
+                    }))
+                }
+                "eth_getTransactionByHash" => ok(Value::Null),
+                "eth_blockNumber" => ok(json!("0x10")),
+                _ => self.nonces.respond(req),
+            }
+        }
+    }
+
+    async fn relay_backend() -> (wiremock::MockServer, RelayNode, UsdcBackend) {
+        let server = wiremock::MockServer::start().await;
+        let node = RelayNode::default();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(node.clone())
+            .mount(&server)
+            .await;
+        let backend = UsdcBackend::new(
+            &server.uri(),
+            PrivateKeySigner::random(),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap();
+        (server, node, backend)
+    }
+
+    /// An HTLC `backend` may claim.
+    fn claimable_by(backend: &UsdcBackend) -> HtlcParams {
+        let other = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        HtlcParams {
+            hash: [0xab; 32],
+            claim_pubkey: backend.pubkey(),
+            refund_pubkey: other.public_key(&secp256k1::Secp256k1::new()).serialize(),
+            locktime: 1_800_000_000,
+            script_version: Default::default(),
+        }
+    }
+
+    fn decoded(tx: &SignedTx) -> alloy::consensus::TxEnvelope {
+        use alloy::eips::Decodable2718;
+        alloy::consensus::TxEnvelope::decode_2718(&mut tx.raw.as_slice()).unwrap()
+    }
+
+    /// Geth's replacement rule, transcribed from `core/txpool/legacypool/list.go`
+    /// (`list.Add`) with the default `PriceBump` of 10 (`legacypool.go`, `DefaultConfig`).
+    fn geth_accepts(old: (u128, u128), new: (u128, u128)) -> bool {
+        geth_accepts_at(old, new, 10)
+    }
+
+    /// [`geth_accepts`] on a node run with `--txpool.pricebump=bump`.
+    fn geth_accepts_at(old: (u128, u128), new: (u128, u128), bump: u64) -> bool {
+        let (old_cap, old_tip) = old;
+        let (new_cap, new_tip) = new;
+        if old_cap >= new_cap || old_tip >= new_tip {
+            return false;
+        }
+        let pct = 100 + u128::from(bump);
+        new_cap >= old_cap * pct / 100 && new_tip >= old_tip * pct / 100
+    }
+
+    /// A node run with a stricter `--txpool.pricebump` (30 here) needs both fees that much
+    /// higher: the bump is the caller's (the chain's configured one), not a constant, and
+    /// every replacement it signs is one that node takes.
+    #[test]
+    fn replacement_fees_follow_the_configured_price_bump() {
+        assert_eq!(replacement_fees(100, 10, 129, 30), None, "under 30%");
+        assert_eq!(replacement_fees(100, 10, 130, 30), Some((130, 13)));
+        assert_eq!(
+            replacement_fees(100, 10, 101, 0),
+            Some((101, 11)),
+            "no bump: strictly more"
+        );
+        assert_eq!(replacement_fees(100, 10, 499, 400), None);
+        assert_eq!(replacement_fees(100, 10, 500, 400), Some((500, 50)));
+        for bump in [0u64, 1, 10, 25, 30, 100, 400] {
+            for (old_cap, old_tip) in [
+                (7u128, 1u128),
+                (1_000_000_007, 300_000_000),
+                (3_000_000_000, 3_000_000_000),
+            ] {
+                for target in [
+                    old_cap,
+                    old_cap * 11 / 10,
+                    old_cap * 13 / 10,
+                    old_cap * 2,
+                    old_cap * 6,
+                ] {
+                    match replacement_fees(old_cap, old_tip, target, bump) {
+                        Some((cap, tip)) => {
+                            assert!(
+                                geth_accepts_at((old_cap, old_tip), (cap, tip), bump),
+                                "{bump} {old_cap} {old_tip} {target}"
+                            );
+                            assert!(cap <= target && tip <= cap);
+                        }
+                        None => assert!(
+                            !geth_accepts_at((old_cap, old_tip), (target, target), bump),
+                            "refused a target the node takes: {bump} {old_cap} {old_tip} {target}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The backend signs a replacement only past the bump it is given: 3.8 gwei over 3 gwei
+    /// clears geth's default 10% but not a 30% node's, and 3.9 gwei clears both.
+    #[tokio::test]
+    async fn claim_replacement_takes_the_price_bump_it_is_given() {
+        let (_server, _node, backend) = relay_backend().await;
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        assert!(backend
+            .build_claim_replacement(&first, 3_800_000_000, 10)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            backend
+                .build_claim_replacement(&first, 3_800_000_000, 30)
+                .await
+                .unwrap(),
+            None
+        );
+        let next = backend
+            .build_claim_replacement(&first, 3_900_000_000, 30)
+            .await
+            .unwrap()
+            .expect("30% over");
+        let (old, new) = (decoded(&first), decoded(&next));
+        use alloy::consensus::Transaction as _;
+        assert!(geth_accepts_at(
+            (
+                old.max_fee_per_gas(),
+                old.max_priority_fee_per_gas().unwrap()
+            ),
+            (
+                new.max_fee_per_gas(),
+                new.max_priority_fee_per_gas().unwrap()
+            ),
+            30
+        ));
+    }
+
+    /// Devnet check of the same-nonce replacement against a real txpool: foundry's `anvil`
+    /// on 127.0.0.1 with its own dev accounts (no funds, no secrets, no public RPC), started
+    /// with `--no-mining` so the claim and its replacement meet in the pool. A 10%
+    /// replacement is taken at the same nonce and evicts the original; rebroadcasting the
+    /// original (same nonce, lower fees) is then refused "replacement transaction
+    /// underpriced" and the replacement is the one mined. Anvil 1.8.6 has no percentage
+    /// bump (it takes any strictly higher fee, even +1%), so geth's 10% floor is covered by
+    /// the unit tests above, not here. The "HTLC" is an empty address, so the call costs plain gas and needs
+    /// no contract build. Ignored by default: needs `anvil` on `PATH` (foundry installs it
+    /// under `~/.foundry/bin`); run with
+    /// `PATH=$HOME/.foundry/bin:$PATH cargo test -p swap-chain-evm --lib anvil_ -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs foundry's anvil on PATH"]
+    async fn anvil_txpool_takes_a_same_nonce_replacement_and_refuses_an_underpriced_one() {
+        use alloy::consensus::Transaction as _;
+        let anvil = alloy::node_bindings::Anvil::new()
+            .arg("--no-mining")
+            .spawn();
+        let key = PrivateKeySigner::from(&anvil.keys()[0]);
+        let backend = UsdcBackend::new(
+            &anvil.endpoint(),
+            key,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )
+        .unwrap();
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(backend.broadcast(&first).await.unwrap(), first.txid);
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), Some(0));
+
+        let next = backend
+            .build_claim_replacement(&first, 3_300_000_000, 10)
+            .await
+            .unwrap()
+            .expect("10% over");
+        assert_eq!(decoded(&next).nonce(), decoded(&first).nonce());
+        assert_eq!(backend.broadcast(&next).await.unwrap(), next.txid);
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(0));
+        assert_eq!(
+            backend.confirmations(&first.txid).await.unwrap(),
+            None,
+            "the replacement evicted the original"
+        );
+
+        // The taker's rebroadcast of an older version: same nonce, lower fees than the
+        // pool's. Refused, and the pool keeps the replacement.
+        let err = backend.broadcast(&first).await.unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("replacement transaction underpriced"),
+            "{err}"
+        );
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), None);
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(0));
+
+        backend
+            .client
+            .provider()
+            .raw_request::<_, alloy::primitives::U256>("evm_mine".into(), ())
+            .await
+            .expect("evm_mine");
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), Some(1));
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), None);
+    }
+
+    /// The replacement's fees: the max fee is the target, the tip rises with it, and both
+    /// clear geth's price bump; a target under the bump is refused (`None`), not raised past
+    /// what the caller allowed. The tip never exceeds the max fee.
+    #[test]
+    fn replacement_fees_clear_geths_price_bump_within_the_target() {
+        assert_eq!(replacement_fees(100, 10, 200, 10), Some((200, 20)));
+        assert_eq!(replacement_fees(100, 10, 110, 10), Some((110, 11)));
+        assert_eq!(
+            replacement_fees(100, 10, 109, 10),
+            None,
+            "under 10% on the max fee"
+        );
+        assert_eq!(
+            replacement_fees(100, 0, 200, 10),
+            Some((200, 1)),
+            "a zero tip still rises"
+        );
+        assert_eq!(replacement_fees(100, 9, 110, 10), Some((110, 10)));
+        assert_eq!(replacement_fees(100, 100, 110, 10), Some((110, 110)));
+        assert_eq!(
+            replacement_fees(5, 1, 6, 10),
+            Some((6, 2)),
+            "wei-level: strictly more"
+        );
+        assert_eq!(replacement_fees(5, 5, 5, 10), None);
+        for old_cap in [1u128, 7, 99, 1_000_000_007, 30_000_000_000] {
+            for old_tip in [0, 1, old_cap / 3, old_cap] {
+                for target in [
+                    old_cap,
+                    old_cap + 1,
+                    old_cap * 11 / 10,
+                    old_cap * 5 / 4,
+                    old_cap * 3,
+                ] {
+                    match replacement_fees(old_cap, old_tip, target, 10) {
+                        Some((cap, tip)) => {
+                            assert!(
+                                geth_accepts((old_cap, old_tip), (cap, tip)),
+                                "{old_cap} {old_tip} {target}"
+                            );
+                            assert!(cap <= target && tip <= cap, "{old_cap} {old_tip} {target}");
+                        }
+                        None => assert!(
+                            !geth_accepts((old_cap, old_tip), (target, target)),
+                            "refused a target geth takes: {old_cap} {old_tip} {target}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same-nonce replacement of a claim re-signs the identical call (target, calldata,
+    /// value, gas limit, chain id) at the claim's own nonce, though the node's pending count
+    /// has moved past it, from the same key, with both fees raised. Before this, the only way
+    /// to re-sign at a feerate was a fresh `pending` nonce: a second transaction behind the
+    /// stuck one, not a replacement of it.
+    #[tokio::test]
+    async fn claim_replacement_keeps_the_call_and_nonce_and_raises_both_fees() {
+        use alloy::consensus::transaction::SignerRecoverable;
+        use alloy::consensus::Transaction as _;
+        let (_server, node, backend) = relay_backend().await;
+        assert_eq!(backend.fee_bump(), FeeBump::SameNonce);
+        let htlc = claimable_by(&backend);
+        assert_eq!(backend.claim_sizes(&htlc), None, "fee in ETH, leg in USDC");
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let estimate = backend.claim_feerate().await.unwrap().expect("a feerate");
+        let plain = backend
+            .build_claim(&htlc, &at, Amount(1_000_000), &[7; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            u64::try_from(decoded(&plain).max_fee_per_gas()).unwrap(),
+            estimate
+        );
+
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        let old = decoded(&first);
+        assert_eq!(old.max_fee_per_gas(), 3_000_000_000);
+        assert!(old.max_priority_fee_per_gas().unwrap() <= 3_000_000_000);
+        // The claim sits unmined: the pending count is past its nonce.
+        node.nonces
+            .pending_txs
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let new = backend
+            .build_claim_replacement(&first, 4_000_000_000, 10)
+            .await
+            .unwrap()
+            .expect("25% over clears geth's 10%");
+        let new = decoded(&new);
+        assert_eq!(new.nonce(), old.nonce(), "same nonce");
+        assert_eq!(new.nonce(), 5);
+        assert_eq!(new.to(), old.to());
+        assert_eq!(new.input(), old.input(), "identical call");
+        assert_eq!(new.value(), old.value());
+        assert_eq!(new.gas_limit(), old.gas_limit());
+        assert_eq!(new.chain_id(), old.chain_id());
+        assert_eq!(new.recover_signer().unwrap(), backend.address());
+        assert_eq!(new.max_fee_per_gas(), 4_000_000_000);
+        assert!(geth_accepts(
+            (
+                old.max_fee_per_gas(),
+                old.max_priority_fee_per_gas().unwrap()
+            ),
+            (
+                new.max_fee_per_gas(),
+                new.max_priority_fee_per_gas().unwrap()
+            ),
+        ));
+        assert_ne!(new.tx_hash(), old.tx_hash());
+
+        // Under geth's bump within the target: nothing is signed.
+        assert_eq!(
+            backend
+                .build_claim_replacement(&first, 3_200_000_000, 10)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// "replacement transaction underpriced" with the replacement unmined is a refusal of
+    /// that transaction (the node holds another at its nonce), never success; the message
+    /// says which refusal it was.
+    #[tokio::test]
+    async fn underpriced_replacement_is_rejected_not_success() {
+        let (_server, node, backend) = relay_backend().await;
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        let next = backend
+            .build_claim_replacement(&first, 3_300_000_000, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        *node.send_error.lock().unwrap() = Some("replacement transaction underpriced".into());
+        let err = backend.broadcast(&next).await.unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("underpriced"), "{err}");
+    }
+
+    /// The original claim mined while its replacement was in flight: the replacement is
+    /// refused ("nonce too low") and stays refused, while the original reads as confirmed,
+    /// which is what the taker's check of replaced versions turns into success. And a nonce
+    /// a different transaction took is a refusal; one this transaction took is success.
+    #[tokio::test]
+    async fn nonce_too_low_is_success_only_for_the_transaction_that_was_mined() {
+        let (_server, node, backend) = relay_backend().await;
+        let htlc = claimable_by(&backend);
+        let at = Outpoint {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let first = backend
+            .build_claim_at(&htlc, &at, Amount(1_000_000), &[7; 32], 3_000_000_000)
+            .await
+            .unwrap();
+        let next = backend
+            .build_claim_replacement(&first, 4_000_000_000, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        node.mined.lock().unwrap().push(B256::from(first.txid.0));
+        *node.send_error.lock().unwrap() = Some("nonce too low: next nonce 6, tx nonce 5".into());
+
+        let err = backend.broadcast(&next).await.unwrap_err();
+        assert!(matches!(err, SwapError::Rejected(_)), "{err:?}");
+        assert_eq!(backend.confirmations(&first.txid).await.unwrap(), Some(3));
+        assert_eq!(backend.confirmations(&next.txid).await.unwrap(), None);
+        assert_eq!(backend.broadcast(&first).await.unwrap(), first.txid);
     }
 
     #[test]

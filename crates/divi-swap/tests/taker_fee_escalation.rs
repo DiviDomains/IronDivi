@@ -517,3 +517,359 @@ async fn a_replacement_the_chain_never_took_falls_back_to_the_one_it_holds() {
     assert_eq!(rec.claim_feerate, Some(MOCK_FEERATE));
     assert!(rec.claim_replaced.is_empty());
 }
+
+/// Geth's replacement floor (`core/txpool/legacypool/list.go`, `list.Add`, default
+/// `PriceBump` 10): strictly more, and at least `old * 110 / 100`.
+fn geth_floor(old: u64) -> u64 {
+    (old * 110 / 100).max(old + 1)
+}
+
+/// An EVM (USDC) claim stuck in the mempool is replaced by re-signing the same call at the
+/// same nonce with higher fees (the mock's same-nonce conflict is the HTLC outpoint): each
+/// version clears geth's price bump over the one it replaces, the feerate climbs only
+/// inside the window, and the fixed cap holds to the locktime (no post-leak ceiling: the fee
+/// is paid in ETH, the leg is USDC).
+#[tokio::test]
+async fn usdc_claim_is_replaced_at_the_same_nonce_up_to_the_fixed_cap() {
+    let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store);
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.claim_base_feerate, Some(MOCK_FEERATE));
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let first = rec.maker_leg_claim.clone().unwrap();
+
+    let esc = FeeEscalation::builtin(Chain::Usdc).expect("USDC claims escalate");
+    let cap = esc.cap(MOCK_FEERATE);
+    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 300).await;
+    let mut last = MOCK_FEERATE;
+    for &(left, rate) in &seen {
+        assert!(rate >= last, "never falls: {seen:?}");
+        assert!(
+            rate <= cap,
+            "the fixed cap {cap} holds to the end: {seen:?}"
+        );
+        if left >= i64::from(esc.start_secs_left) {
+            assert_eq!(rate, MOCK_FEERATE, "no bump before the window: {seen:?}");
+        }
+        last = rate;
+    }
+    assert_eq!(last, cap, "at the cap by the locktime: {seen:?}");
+
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let claim = rec.maker_leg_claim.clone().unwrap();
+    assert!(rec.claim_replaced.len() >= 3, "{:?}", rec.claim_replaced);
+    assert!(rec.claim_children.is_empty());
+    assert_eq!(rec.claim_replaced[0], (first, MOCK_FEERATE));
+    let mut rates: Vec<u64> = rec.claim_replaced.iter().map(|(_, f)| *f).collect();
+    rates.push(rec.claim_feerate.unwrap());
+    for pair in rates.windows(2) {
+        assert!(
+            pair[1] >= geth_floor(pair[0]),
+            "under geth's bump: {rates:?}"
+        );
+    }
+    assert_eq!(
+        w.ml.spender(&at),
+        Some(claim.txid),
+        "the latest version won"
+    );
+    assert_eq!(w.ml.feerate_of(&claim.txid), rec.claim_feerate);
+    assert_eq!(w.ml.tx_counts(&at).claims, 1);
+
+    w.ml.mine(1);
+    assert_eq!(
+        taker.step(&tid, Some(&view)).await.unwrap(),
+        TakerState::Done
+    );
+}
+
+/// Into the window with one same-nonce replacement sent: returns the first claim and the
+/// replacement.
+async fn usdc_bumped_once(
+    w: &World,
+    store: &Store,
+    taker: &Taker,
+    tid: &str,
+    view: &SwapView,
+) -> (divi_swap::SignedTx, divi_swap::SignedTx) {
+    let first = store
+        .get_taker_swap(tid)
+        .unwrap()
+        .unwrap()
+        .maker_leg_claim
+        .unwrap();
+    let esc = FeeEscalation::builtin(Chain::Usdc).unwrap();
+    w.ml.advance_time(locktime(view) - w.ml.mtp() - esc.start_secs_left + 900);
+    taker.step(tid, Some(view)).await.unwrap();
+    let rec = store.get_taker_swap(tid).unwrap().unwrap();
+    assert_eq!(rec.claim_replaced.len(), 1, "one replacement");
+    let bumped = rec.maker_leg_claim.unwrap();
+    assert_ne!(bumped.txid, first.txid);
+    (first, bumped)
+}
+
+/// The original claim is mined while its replacement is in flight (the replacement never
+/// reached the miner, and on an EVM node it is now refused: "nonce too low"). The swap is
+/// done: the original paid out.
+#[tokio::test]
+async fn usdc_original_mined_while_its_replacement_is_in_flight_is_success() {
+    let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store);
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let (first, bumped) = usdc_bumped_once(&w, &store, &taker, &tid, &view).await;
+    w.ml.forget(&bumped.txid);
+    w.tml.broadcast(&first).await.unwrap();
+    w.ml.mine(1);
+    assert_eq!(w.ml.spender(&at), Some(first.txid));
+    // The replacement is now refused for good: the slot is taken by the mined original.
+    assert!(w.tml.broadcast(&bumped).await.is_err());
+
+    assert_eq!(
+        taker.step(&tid, Some(&view)).await.unwrap(),
+        TakerState::Done
+    );
+    assert!(w.tml.confirmations(&first.txid).await.unwrap() >= Some(1));
+    assert_eq!(w.ml.tx_counts(&at).claims, 1, "only the original");
+}
+
+/// A node with a stricter price bump than geth's default refuses the replacement as
+/// "replacement transaction underpriced". The taker goes back to the version the mempool
+/// holds, keeps it, and replaces it later at a feerate the node takes.
+#[tokio::test]
+async fn usdc_underpriced_replacement_falls_back_to_the_held_claim_and_climbs_on() {
+    let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+    w.ml.set_price_bump(1000);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store);
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let (first, bumped) = usdc_bumped_once(&w, &store, &taker, &tid, &view).await;
+    assert_eq!(w.ml.spender(&at), Some(first.txid), "refused: underpriced");
+    let err = w.tml.broadcast(&bumped).await.unwrap_err();
+    assert!(err.to_string().contains("underpriced"), "{err}");
+
+    // Next step: the replacement is refused again and not held; back to the first claim.
+    assert!(taker.step(&tid, Some(&view)).await.is_err());
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.state, TakerState::Claimed);
+    assert_eq!(rec.maker_leg_claim.as_ref(), Some(&first));
+    assert_eq!(rec.claim_feerate, Some(MOCK_FEERATE));
+    assert!(rec.claim_replaced.is_empty());
+
+    // The node relaxes to geth's default; the next bump replaces the held claim.
+    w.ml.set_price_bump(10);
+    w.ml.advance_time(1800);
+    taker.step(&tid, Some(&view)).await.unwrap();
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.claim_replaced.len(), 1);
+    assert!(rec.claim_feerate.unwrap() >= geth_floor(MOCK_FEERATE));
+    assert_eq!(w.ml.spender(&at), rec.maker_leg_claim.map(|c| c.txid));
+}
+
+/// The claim's nonce was taken by a different transaction: the claim is refused and the
+/// chain holds no version of it. It is re-signed as a fresh claim (a fresh nonce on EVM) at a
+/// higher feerate, within the cap, and sent at once.
+#[tokio::test]
+async fn usdc_claim_whose_nonce_was_taken_is_re_signed_fresh() {
+    let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store);
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let first = store
+        .get_taker_swap(&tid)
+        .unwrap()
+        .unwrap()
+        .maker_leg_claim
+        .unwrap();
+    w.ml.forget(&first.txid);
+    w.ml.reject_next_broadcast();
+
+    assert!(taker.step(&tid, Some(&view)).await.is_ok());
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    let fresh = rec.maker_leg_claim.clone().unwrap();
+    assert_ne!(fresh.txid, first.txid);
+    assert_eq!(rec.claim_replaced, vec![(first, MOCK_FEERATE)]);
+    let esc = FeeEscalation::builtin(Chain::Usdc).unwrap();
+    let rate = rec.claim_feerate.unwrap();
+    assert!(
+        rate > MOCK_FEERATE && rate <= esc.cap(MOCK_FEERATE),
+        "{rate}"
+    );
+    assert_eq!(w.ml.spender(&at), Some(fresh.txid));
+
+    w.ml.mine(1);
+    assert_eq!(
+        taker.step(&tid, Some(&view)).await.unwrap(),
+        TakerState::Done
+    );
+}
+
+/// Advance the maker-leg MTP to the first point of the USDC window where the escalation
+/// first asks for a bump from the base: a step of 2 wei per gas over 10, which clears geth's
+/// default 10% (11) but not a 30% node's (13).
+fn usdc_to_the_first_step(w: &World, view: &SwapView, esc: FeeEscalation) {
+    let left = (0..esc.start_secs_left)
+        .rev()
+        .find(|&l| {
+            esc.should_bump(
+                MOCK_FEERATE,
+                MOCK_FEERATE,
+                esc.target(MOCK_FEERATE, l.into()),
+            )
+        })
+        .unwrap();
+    assert_eq!(esc.target(MOCK_FEERATE, left.into()), 12);
+    w.ml.advance_time(locktime(view) - w.ml.mtp() - left);
+}
+
+/// A node run with a 30% price bump refuses the first replacement (a 20% step, signed for
+/// geth's default 10%) as underpriced, at every try. After two refusals at that step the
+/// taker doubles the step (10 + 2·2 = 14), which the node takes: the claim is replaced at
+/// its nonce with no time having passed, within the cap, and the refusal count clears.
+#[tokio::test]
+async fn usdc_claim_replacement_doubles_its_step_after_two_underpriced_refusals() {
+    let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+    w.ml.set_price_bump(30);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let taker = taker(&w, &store);
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let first = store
+        .get_taker_swap(&tid)
+        .unwrap()
+        .unwrap()
+        .maker_leg_claim
+        .unwrap();
+    let esc = FeeEscalation::builtin(Chain::Usdc).unwrap();
+    usdc_to_the_first_step(&w, &view, esc);
+    let rec_of = || store.get_taker_swap(&tid).unwrap().unwrap();
+
+    for refusals in 1..=2u32 {
+        // The step sends the 12 wei version; the node refuses it.
+        taker.step(&tid, Some(&view)).await.unwrap();
+        let rec = rec_of();
+        assert_eq!(rec.claim_feerate, Some(12), "refusals {refusals}");
+        assert_eq!(w.ml.spender(&at), Some(first.txid), "underpriced");
+        // The next step finds it refused and not held: back to the held claim, counted.
+        assert!(taker.step(&tid, Some(&view)).await.is_err());
+        let rec = rec_of();
+        assert_eq!(rec.maker_leg_claim.as_ref(), Some(&first));
+        assert_eq!(rec.claim_feerate, Some(MOCK_FEERATE));
+        assert_eq!(rec.claim_underpriced, refusals);
+    }
+
+    taker.step(&tid, Some(&view)).await.unwrap();
+    let rec = rec_of();
+    let claim = rec.maker_leg_claim.clone().unwrap();
+    assert_eq!(rec.claim_feerate, Some(14), "the step doubled");
+    assert!(rec.claim_feerate.unwrap() <= esc.cap(MOCK_FEERATE));
+    assert_eq!(w.ml.spender(&at), Some(claim.txid), "the node took it");
+    assert_eq!(rec.claim_replaced, vec![(first, MOCK_FEERATE)]);
+    assert_eq!(rec.claim_underpriced, 0, "cleared once taken");
+
+    w.ml.mine(1);
+    assert_eq!(
+        taker.step(&tid, Some(&view)).await.unwrap(),
+        TakerState::Done
+    );
+}
+
+/// With the chain's price bump configured to the node's 30%, the taker never sends a
+/// replacement the node refuses: it keeps the claim while the target is under 30% more and
+/// replaces it once the target clears that.
+#[tokio::test]
+async fn usdc_configured_price_bump_matches_the_node_and_is_never_refused() {
+    let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+    w.ml.set_price_bump(30);
+    let store = Store::in_memory().unwrap();
+    let maker = maker(&w, &store);
+    let esc = FeeEscalation::builtin(Chain::Usdc)
+        .unwrap()
+        .with_price_bump(30);
+    let taker = taker(&w, &store).with_fee_escalation(Chain::Usdc, Some(esc));
+    let (tid, view) = to_claimed(&w, &maker, &taker).await;
+    let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+    let first = store
+        .get_taker_swap(&tid)
+        .unwrap()
+        .unwrap()
+        .maker_leg_claim
+        .unwrap();
+    usdc_to_the_first_step(&w, &view, esc);
+    taker.step(&tid, Some(&view)).await.unwrap();
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(
+        rec.maker_leg_claim.as_ref(),
+        Some(&first),
+        "12 is under 30%"
+    );
+    assert!(rec.claim_replaced.is_empty());
+
+    let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 120).await;
+    let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+    assert_eq!(rec.claim_underpriced, 0, "never refused: {seen:?}");
+    let claim = rec.maker_leg_claim.clone().unwrap();
+    assert_eq!(w.ml.spender(&at), Some(claim.txid));
+    assert_eq!(rec.claim_replaced[0], (first, MOCK_FEERATE));
+    let mut rates: Vec<u64> = rec.claim_replaced.iter().map(|(_, f)| *f).collect();
+    rates.push(rec.claim_feerate.unwrap());
+    for pair in rates.windows(2) {
+        assert!(pair[1] * 100 >= pair[0] * 130, "under 30%: {rates:?}");
+    }
+    // Within the cap, and short of it only by less than one 30% bump (a last step the
+    // node would refuse is not sent).
+    let last = rec.claim_feerate.unwrap();
+    let cap = esc.cap(MOCK_FEERATE);
+    assert!(last <= cap && last * 130 / 100 > cap, "{rates:?}");
+}
+
+/// No version of a USDC claim ever pays over the cap, whatever the node's price bump and
+/// whatever cap the chain is configured with, through every refusal and doubling to the
+/// locktime; and wherever the node's floor fits under the cap the claim it holds climbs.
+#[tokio::test]
+async fn usdc_claim_never_goes_over_the_cap_for_any_node_price_bump() {
+    let builtin = FeeEscalation::builtin(Chain::Usdc).unwrap();
+    for esc in [builtin, builtin.with_cap_feerate(40)] {
+        let cap = esc.cap(MOCK_FEERATE);
+        for node_bump in [0u64, 10, 25, 30, 50, 100, 400] {
+            let w = world(Chain::Usdc, 12, FeeBump::SameNonce);
+            w.ml.set_price_bump(node_bump);
+            let store = Store::in_memory().unwrap();
+            let maker = maker(&w, &store);
+            let taker = taker(&w, &store).with_fee_escalation(Chain::Usdc, Some(esc));
+            let (tid, view) = to_claimed(&w, &maker, &taker).await;
+            let at = view.maker_leg.as_ref().unwrap().outpoint.unwrap();
+            let seen = ride_to_locktime(&w, &store, &taker, &tid, &view, 120).await;
+            let ctx = format!("cap {cap}, node bump {node_bump}: {seen:?}");
+            for &(_, rate) in &seen {
+                assert!(rate <= cap, "{ctx}");
+            }
+            let rec = store.get_taker_swap(&tid).unwrap().unwrap();
+            for (_, rate) in &rec.claim_replaced {
+                assert!(*rate <= cap, "{ctx}");
+            }
+            let held = w.ml.spender(&at).expect("a claim is held");
+            let held_rate = w.ml.feerate_of(&held).unwrap();
+            assert!(held_rate <= cap, "{ctx}");
+            let node_floor = (MOCK_FEERATE * (100 + node_bump) / 100).max(MOCK_FEERATE + 1);
+            if node_floor <= cap {
+                assert!(
+                    held_rate >= node_floor,
+                    "climbed past the node's floor: {ctx}"
+                );
+            } else {
+                assert_eq!(held_rate, MOCK_FEERATE, "nothing fits under the cap: {ctx}");
+            }
+        }
+    }
+}

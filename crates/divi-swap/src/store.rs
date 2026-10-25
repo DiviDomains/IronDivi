@@ -151,6 +151,12 @@ pub struct TakerRecord {
     /// the claim's output, each later one its predecessor's. Persisted before broadcast.
     #[serde(default)]
     pub claim_children: Vec<SignedTx>,
+    /// "replacement transaction underpriced" refusals of a same-nonce replacement
+    /// (`FeeBump::SameNonce`) since the claim was last taken: the node holds a stricter price
+    /// bump than configured. Every second one doubles the next step
+    /// ([`crate::FeeEscalation::underpriced_target`]); cleared when a version is taken.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub claim_underpriced: u32,
     /// Last error.
     pub last_error: Option<String>,
 }
@@ -226,6 +232,7 @@ impl std::fmt::Debug for TakerRecord {
             claim_feerate,
             claim_replaced,
             claim_children,
+            claim_underpriced,
             last_error,
         } = self;
         f.debug_struct("TakerRecord")
@@ -247,6 +254,7 @@ impl std::fmt::Debug for TakerRecord {
             .field("claim_feerate", claim_feerate)
             .field("claim_replaced", claim_replaced)
             .field("claim_children", claim_children)
+            .field("claim_underpriced", claim_underpriced)
             .field("last_error", last_error)
             .finish()
     }
@@ -631,6 +639,11 @@ mod hex33 {
             .try_into()
             .map_err(|_| serde::de::Error::custom("expected 33 bytes"))
     }
+}
+
+/// Serde: leave a zero count out, so records at rest keep their earlier shape.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[cfg(test)]

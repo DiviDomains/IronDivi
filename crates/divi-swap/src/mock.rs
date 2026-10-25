@@ -37,6 +37,16 @@ pub const MOCK_VSIZE: u64 = 100;
 /// [`MOCK_VSIZE`].
 pub const MOCK_FEERATE: u64 = MOCK_FEE.0 / MOCK_VSIZE;
 
+/// Least feerate that replaces one of `old` under [`FeeBump::SameNonce`]: go-ethereum's
+/// `list.Add` (`core/txpool/legacypool/list.go`), strictly more and at least
+/// `old * (100 + price_bump) / 100`, default bump 10.
+fn same_nonce_floor(old: u64, price_bump: Option<u64>) -> u64 {
+    let pct = 100 + price_bump.unwrap_or(10);
+    (u128::from(old) * u128::from(pct) / 100)
+        .min(u128::from(u64::MAX))
+        .max(u128::from(old) + 1) as u64
+}
+
 fn default_feerate() -> u64 {
     MOCK_FEERATE
 }
@@ -150,6 +160,9 @@ struct ChainState {
     branch_of: HashMap<u64, u64>,
     /// The branch new blocks are mined on; each rewind starts a new one.
     branch: u64,
+    /// Under [`FeeBump::SameNonce`], the percentage both fees must rise by to replace a
+    /// held claim (`None`: geth's default of 10).
+    price_bump: Option<u64>,
     /// Under [`FeeBump::Cpfp`], whether a CPFP child replaces an unmined child of the same
     /// parent (a Litecoin node run with `-mempoolreplacement=1`) instead of being refused as
     /// a double spend (the default, as Litecoin Core's).
@@ -621,6 +634,12 @@ impl MockChain {
         self.state.lock().fee_bump = bump;
     }
 
+    /// Under [`FeeBump::SameNonce`], the percentage a replacement's feerate must rise by
+    /// (go-ethereum's `--txpool.pricebump`; default 10).
+    pub fn set_price_bump(&self, pct: u64) {
+        self.state.lock().price_bump = Some(pct);
+    }
+
     /// Under [`FeeBump::Cpfp`], from now on a CPFP child spending the output an unmined
     /// child already spends replaces it if it pays at least that one's fee (with its
     /// descendants') plus one unit per vbyte, at a higher feerate: a Litecoin node run with
@@ -699,7 +718,7 @@ impl MockChain {
         };
         let replaceable = match (s.txs.get(&old), new) {
             (Some((MockTx::Claim { .. } | MockTx::Refund { .. }, None)), _) => {
-                s.fee_bump == FeeBump::Rbf
+                matches!(s.fee_bump, FeeBump::Rbf | FeeBump::SameNonce)
             }
             (Some((MockTx::Child { .. }, None)), MockTx::Child { .. }) => {
                 s.fee_bump == FeeBump::Cpfp && s.child_replacement
@@ -708,6 +727,16 @@ impl MockChain {
         };
         if !replaceable {
             return Err(SwapError::Rejected("double spend".into()));
+        }
+        if s.fee_bump == FeeBump::SameNonce {
+            let old_rate = s.txs[&old].0.feerate();
+            if new.feerate() < same_nonce_floor(old_rate, s.price_bump) {
+                return Err(SwapError::Rejected(
+                    "replacement transaction underpriced".into(),
+                ));
+            }
+            Self::evict(s, old);
+            return Ok(());
         }
         let (new_fee, _) = new.fee_and_out().expect("a spend");
         let need = Self::package_with_descendants(s, old).0 + MOCK_VSIZE;
@@ -1092,9 +1121,10 @@ impl ChainBackend for MockBackend {
         Ok((s.fee_bump != FeeBump::None).then(|| s.fee_estimate.unwrap_or(MOCK_FEERATE)))
     }
 
-    /// Every mock claim and child is [`MOCK_VSIZE`]; the mock has no dust limit.
+    /// Every mock claim and child is [`MOCK_VSIZE`]; the mock has no dust limit. None under
+    /// [`FeeBump::SameNonce`], as on EVM: the fee is paid in another asset than the leg.
     fn claim_sizes(&self, _htlc: &HtlcParams) -> Option<ClaimSizes> {
-        (self.fee_bump() != FeeBump::None).then_some(ClaimSizes {
+        matches!(self.fee_bump(), FeeBump::Rbf | FeeBump::Cpfp).then_some(ClaimSizes {
             claim_vsize: MOCK_VSIZE,
             child_vsize: MOCK_VSIZE,
             dust: 0,
@@ -1121,6 +1151,46 @@ impl ChainBackend for MockBackend {
             preimage: *preimage,
             feerate: feerate.max(1),
         }))
+    }
+
+    /// The same claim at `feerate`, if that clears `price_bump_pct` over `prev`'s. Like the
+    /// EVM backend it takes the bump it is given, not the relay's
+    /// ([`MockChain::set_price_bump`]), so a stricter node can still refuse it.
+    async fn build_claim_replacement(
+        &self,
+        prev: &SignedTx,
+        feerate: u64,
+        price_bump_pct: u64,
+    ) -> Result<Option<SignedTx>> {
+        self.check_online()?;
+        if self.fee_bump() != FeeBump::SameNonce {
+            return Err(SwapError::Other(
+                "mock chain takes no same-nonce bumps".into(),
+            ));
+        }
+        let MockTx::Claim {
+            to,
+            htlc,
+            at,
+            amount,
+            preimage,
+            feerate: old,
+        } = serde_json::from_slice(&prev.raw)
+            .map_err(|e| SwapError::Other(format!("decode: {e}")))?
+        else {
+            return Err(SwapError::InvalidParams("not a claim".into()));
+        };
+        if feerate < same_nonce_floor(old, Some(price_bump_pct)) {
+            return Ok(None);
+        }
+        Ok(Some(Self::sign(&MockTx::Claim {
+            to,
+            htlc,
+            at,
+            amount,
+            preimage,
+            feerate,
+        })))
     }
 
     async fn build_cpfp(
