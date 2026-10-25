@@ -181,6 +181,17 @@ impl MasternodeList {
                     });
                 }
             }
+            // Core keeps its seen broadcasts and pings in mncache.dat with the
+            // list (MasternodeNetworkMessageManager.h:68-78), so after a restart
+            // it still knows and serves them: each entry's broadcast and last ping
+            {
+                let mut broadcasts = self.seen_broadcasts.write();
+                let mut pings = self.seen_pings.write();
+                for e in &loaded {
+                    broadcasts.insert(e.mnb.hash(), e.mnb.clone());
+                    pings.insert(e.mnb.last_ping.hash(), e.mnb.last_ping.clone());
+                }
+            }
             *self.entries.write() = loaded;
         }
         *self.path.write() = Some(path);
