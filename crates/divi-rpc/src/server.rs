@@ -272,6 +272,11 @@ impl RpcServer {
         self.masternode.set_datadir(dir);
     }
 
+    /// The masternode.conf -mnconf names, read by startmasternode
+    pub fn set_masternode_conf(&self, path: std::path::PathBuf) {
+        self.masternode.set_conf_path(path);
+    }
+
     /// Set the hook that relays raw masternode broadcasts to peers
     pub fn set_masternode_relay(&self, relay: crate::mn_broadcast::BroadcastRelay) {
         self.masternode.set_broadcast_relay(relay);
