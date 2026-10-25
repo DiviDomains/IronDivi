@@ -81,6 +81,8 @@ pub mod spork;
 pub mod subnet;
 pub mod sync;
 pub mod timedata;
+pub mod torcontrol;
+pub mod upnp;
 
 pub use constants::{
     services, Magic, MAINNET_MAGIC, MAX_MESSAGE_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION,

@@ -299,18 +299,7 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 }
 
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
-const UNSUPPORTED_OPTIONS: &[&str] = &[
-    "checklevel",
-    "dns",
-    "listenonion",
-    "onion",
-    "par",
-    "peerbloomfilters",
-    "proxyrandomize",
-    "torcontrol",
-    "torpassword",
-    "upnp",
-];
+const UNSUPPORTED_OPTIONS: &[&str] = &["checklevel", "par", "peerbloomfilters"];
 
 /// Options divid takes and does nothing with, only naming them in its help:
 /// accepted without a word, as divid does (LicenseAndInfo.cpp:135, :143;
@@ -392,6 +381,13 @@ const APPLIED: &[&str] = &[
     "maxconnections",
     "timeout",
     "proxy",
+    "proxyrandomize",
+    "onion",
+    "dns",
+    "listenonion",
+    "torcontrol",
+    "torpassword",
+    "upnp",
     "discover",
     "externalip",
     "onlynet",
@@ -530,6 +526,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     }
     if s.is_set("proxy") {
         s.soft_set_bool("listen", false);
+        s.soft_set_bool("upnp", false);
     }
     // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
     // (EnableWalletFeatures, init.cpp:763-766)
@@ -540,6 +537,11 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     // given (net.cpp:1690-1716)
     if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
         s.soft_set_bool("discover", false);
+    }
+    // -listen=0 turns -upnp and -listenonion off unless given (net.cpp:1700-1711)
+    if !s.get_bool("listen", true) {
+        s.soft_set_bool("upnp", false);
+        s.soft_set_bool("listenonion", false);
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
@@ -680,11 +682,26 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(proxy) = s.get("proxy") {
         config.p2p.proxy = Some(proxy.to_string());
     }
+    // GetBoolArg("-proxyrandomize", true) (net.cpp:1761)
+    config.p2p.proxy_randomize = s.get_bool("proxyrandomize", true);
+    // -onion=<ip:port>, -onion=0 / -noonion (net.cpp:1785-1800)
+    config.p2p.onion = s.get("onion").map(str::to_string);
+    // GetBoolArg("-dns", DEFAULT_NAME_LOOKUP): host names are looked up only
+    // with it (net.cpp:1759)
+    config.p2p.name_lookup = s.get_bool("dns", true);
+    // The Tor controller (init.cpp:1621, torcontrol.cpp:640, :744)
+    config.p2p.listen_onion = s.get_bool("listenonion", true);
+    config.p2p.tor_control = s
+        .get("torcontrol")
+        .unwrap_or(divi_network::torcontrol::DEFAULT_TOR_CONTROL)
+        .to_string();
+    config.p2p.tor_password = s.get("torpassword").unwrap_or("").to_string();
+    config.p2p.upnp = s.get_bool("upnp", divi_network::upnp::DEFAULT_UPNP);
     config.p2p.discover = s.get_bool("discover", true);
     // -externalip=<ip>[:port], the listen port when none is given; one that
     // does not resolve to a valid address stops the start (net.cpp:1834-1839)
     for raw in s.get_multi("externalip") {
-        let addr = resolve_service(raw, config.p2p.port)
+        let addr = resolve_service(raw, config.p2p.port, config.p2p.name_lookup)
             .filter(|a| divi_network::local::is_valid(&a.ip()))
             .ok_or_else(|| anyhow::anyhow!("Cannot resolve -externalip address: '{}'", raw))?;
         config.p2p.external_ips.push(addr);
@@ -962,7 +979,11 @@ fn is_spork_key(wif: &str, mainnet: bool, spork: &[u8]) -> bool {
 
 /// A host with an optional port, as Divi Core's CService reads it: `ip`,
 /// `ip:port`, `[ipv6]:port`, or a name, with `default_port` when none is given
-fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+fn resolve_service(
+    text: &str,
+    default_port: u16,
+    name_lookup: bool,
+) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
     let text = text.trim();
     if let Ok(addr) = text.parse::<SocketAddr>() {
@@ -970,6 +991,10 @@ fn resolve_service(text: &str, default_port: u16) -> Option<std::net::SocketAddr
     }
     if let Ok(ip) = text.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Some(SocketAddr::new(ip, default_port));
+    }
+    // A host name only with -dns (CService(strAddr, port, fNameLookup))
+    if !name_lookup {
+        return None;
     }
     let (host, port) = match text.rsplit_once(':') {
         Some((h, p)) if !h.contains(':') => (h, p.parse().ok()?),
@@ -5032,5 +5057,54 @@ mod start_errors {
             lock_data_dir(dir.path()).is_ok(),
             "free again once the first exits"
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_tor_settings_tests {
+    use super::*;
+
+    fn p2p(argv: &[&str]) -> divi_node::config::P2pConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = vec![
+            "irondivid".to_string(),
+            "--regtest".to_string(),
+            format!("--datadir={}", dir.path().display()),
+        ];
+        v.extend(argv.iter().map(|s| s.to_string()));
+        build_config(&Args::parse_from(v)).unwrap().p2p
+    }
+
+    /// -upnp: off by default; -proxy and -listen=0 turn it off unless it is
+    /// given (DEFAULT_UPNP, net.cpp:1690-1706)
+    #[test]
+    fn upnp_default_and_soft_sets() {
+        assert!(!p2p(&[]).upnp);
+        assert!(p2p(&["-upnp=1"]).upnp);
+        assert!(p2p(&["-upnp"]).upnp);
+        assert!(!p2p(&["-upnp=0"]).upnp);
+        assert!(p2p(&["-upnp=1", "-listen=0"]).upnp);
+        assert!(p2p(&["-upnp=1", "-proxy=127.0.0.1:9050"]).upnp);
+    }
+
+    /// -listenonion: on by default, off under -listen=0 (also by -connect or
+    /// -proxy) unless given; -torcontrol and -torpassword as given
+    #[test]
+    fn tor_settings_default_and_soft_sets() {
+        let d = p2p(&[]);
+        assert!(d.listen_onion);
+        assert_eq!(d.tor_control, "127.0.0.1:9051");
+        assert_eq!(d.tor_password, "");
+        assert!(!p2p(&["-listen=0"]).listen_onion);
+        assert!(!p2p(&["-connect=127.0.0.1:1"]).listen_onion);
+        assert!(!p2p(&["-proxy=127.0.0.1:9050"]).listen_onion);
+        assert!(p2p(&["-listen=0", "-listenonion=1"]).listen_onion);
+        assert!(p2p(&["-bind=127.0.0.1", "-connect=127.0.0.1:1"]).listen_onion);
+        let t = p2p(&[
+            "-torcontrol=127.0.0.1:9999",
+            "-torpassword=dummy-not-a-password",
+        ]);
+        assert_eq!(t.tor_control, "127.0.0.1:9999");
+        assert_eq!(t.tor_password, "dummy-not-a-password");
     }
 }
