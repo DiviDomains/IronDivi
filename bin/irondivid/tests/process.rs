@@ -116,3 +116,35 @@ fn pid_file_names_the_process_with_a_newline() {
     daemon.stop();
     assert!(!dir.path().join("divid.pid").exists());
 }
+
+/// A second start on the data directory of a running node stops at the lock
+/// and leaves the running node's pid file alone: divid writes its pid file
+/// only once it holds the lock (init.cpp:850-861, :1470)
+#[test]
+fn second_start_leaves_the_running_nodes_pid_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    let first = std::fs::read_to_string(dir.path().join("divid.pid")).unwrap();
+    let mut second = irondivid(dir.path(), free_port())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(wait_exit(&mut second, 60), Some(1));
+    let mut err = String::new();
+    second
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(
+        err.contains("Cannot obtain a lock on data directory"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("divid.pid")).ok(),
+        Some(first)
+    );
+    daemon.stop();
+}

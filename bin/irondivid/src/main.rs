@@ -1931,6 +1931,7 @@ async fn run_daemon(
     mn_options: masternode_options::MasternodeOptions,
     shutdown_tx: broadcast::Sender<()>,
     shutdown_rx: broadcast::Receiver<()>,
+    pid_file: PathBuf,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
     std::fs::create_dir_all(&config.data_dir)
@@ -1938,6 +1939,10 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
+    // Divi Core writes its pid file once it holds the lock, with or without
+    // -daemon (init.cpp:1470), so a second start leaves a running node's alone
+    #[cfg(unix)]
+    write_pid_file(&pid_file);
     // The clock warning of the network time offset goes where Divi Core's
     // Warnings::setMiscWarning puts it: getinfo's and getmininginfo's "errors"
     // (timedata.cpp:96-97)
@@ -3394,9 +3399,6 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
     }
 
     // Set up shutdown channel
-    // Divi Core writes its pid file with or without -daemon (init.cpp:1470)
-    #[cfg(unix)]
-    write_pid_file(&pid_file);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
@@ -3473,6 +3475,7 @@ async fn async_main(args: Args, data_dir: PathBuf) -> Result<()> {
         mn_options,
         shutdown_tx,
         shutdown_rx,
+        pid_file.clone(),
     )
     .await
     {
