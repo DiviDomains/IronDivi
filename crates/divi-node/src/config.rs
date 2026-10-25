@@ -407,6 +407,11 @@ pub struct P2pConfig {
     #[serde(default = "default_ban_score")]
     pub ban_score: u32,
 
+    /// Read the alerts peers send (Divi Core -alerts, default on); off, an
+    /// alert message is ignored (main.cpp:870)
+    #[serde(default = "default_alerts")]
+    pub alerts: bool,
+
     /// User agent string
     pub user_agent: String,
 
@@ -489,6 +494,10 @@ fn default_listen_on_addr() -> bool {
     true
 }
 
+fn default_alerts() -> bool {
+    true
+}
+
 fn default_ban_score() -> u32 {
     100
 }
@@ -513,6 +522,7 @@ impl Default for P2pConfig {
             listen: None,
             ban_time: 86400, // 24 hours
             ban_score: default_ban_score(),
+            alerts: true,
             user_agent: format!("/DiviRust:{}/", env!("CARGO_PKG_VERSION")),
             proxy: None,
             connect_timeout_ms: default_connect_timeout_ms(),

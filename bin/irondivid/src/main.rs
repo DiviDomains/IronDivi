@@ -293,7 +293,6 @@ fn resolve_args(mut args: Args) -> Result<Args> {
 /// Options divid takes that irondivid has nothing for: accepted, with a warning
 const UNSUPPORTED_OPTIONS: &[&str] = &[
     "alertnotify",
-    "alerts",
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
@@ -709,6 +708,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(n) = s.get("rpcthreads") {
         config.rpc.threads = settings::atoi(n);
     }
+    config.p2p.alerts = s.get_bool("alerts", true);
 
     const APPLIED: &[&str] = &[
         // divid's -forcestart skips the checks it makes after a stop that was
@@ -718,6 +718,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         // whole block and has no such check to skip: the option is taken as is
         "forcestart",
         "rpcthreads",
+        "alerts",
         "vault",
         "rescan",
         "salvagewallet",

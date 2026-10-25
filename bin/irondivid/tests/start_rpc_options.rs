@@ -51,6 +51,7 @@ fn result(port: u16, method: &str, params: Value) -> Value {
 struct Node {
     child: Child,
     rpc_port: u16,
+    p2p_port: u16,
 }
 
 impl Node {
@@ -92,12 +93,16 @@ fn command(datadir: &Path, rpc_port: u16, p2p_port: u16, extra: &[&str]) -> Comm
 }
 
 fn start(datadir: &Path, extra: &[&str]) -> Node {
-    let (child, rpc_port, _) = start_node(
+    let (child, rpc_port, p2p_port) = start_node(
         datadir,
         |rpc_port, p2p_port| command(datadir, rpc_port, p2p_port, extra),
         |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
     );
-    Node { child, rpc_port }
+    Node {
+        child,
+        rpc_port,
+        p2p_port,
+    }
 }
 
 fn debug_log(datadir: &Path) -> String {
@@ -155,7 +160,7 @@ fn modes(dir: &Path) -> (Vec<u32>, Vec<u32>) {
 fn modes_made(extra: &[&str]) -> (Vec<u32>, Vec<u32>) {
     use std::os::unix::process::CommandExt;
     let dir = tempfile::tempdir().unwrap();
-    let (child, rpc_port, _) = start_node(
+    let (child, rpc_port, p2p_port) = start_node(
         dir.path(),
         |rpc_port, p2p_port| {
             let mut cmd = command(dir.path(), rpc_port, p2p_port, extra);
@@ -170,7 +175,12 @@ fn modes_made(extra: &[&str]) -> (Vec<u32>, Vec<u32>) {
         },
         |rpc_port| rpc(rpc_port, "getblockcount", json!([])).is_some(),
     );
-    Node { child, rpc_port }.stop();
+    Node {
+        child,
+        rpc_port,
+        p2p_port,
+    }
+    .stop();
     modes(dir.path())
 }
 
@@ -277,4 +287,115 @@ fn rpcthreads_is_how_many_connections_are_served_at_once() {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+const REGTEST_MAGIC: [u8; 4] = [0xa1, 0xcf, 0x7e, 0xac];
+const AGENT: &str = "/start-rpc-options-test:1/";
+
+fn message(cmd: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = REGTEST_MAGIC.to_vec();
+    let mut name = [0u8; 12];
+    name[..cmd.len()].copy_from_slice(cmd.as_bytes());
+    out.extend_from_slice(&name);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&divi_crypto::double_sha256(payload)[..4]);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn net_addr(port: u16) -> Vec<u8> {
+    let mut out = 1u64.to_le_bytes().to_vec();
+    out.extend_from_slice(&[0u8; 10]);
+    out.extend_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+    out.extend_from_slice(&port.to_be_bytes());
+    out
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A raw peer that has sent its version and verack
+fn raw_peer(p2p_port: u16) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", p2p_port)).unwrap();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&70920i32.to_le_bytes());
+    payload.extend_from_slice(&1u64.to_le_bytes());
+    payload.extend_from_slice(&now().to_le_bytes());
+    payload.extend_from_slice(&net_addr(p2p_port));
+    payload.extend_from_slice(&net_addr(0));
+    payload.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+    payload.push(AGENT.len() as u8);
+    payload.extend_from_slice(AGENT.as_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(1);
+    stream.write_all(&message("version", &payload)).unwrap();
+    stream.write_all(&message("verack", &[])).unwrap();
+    stream
+}
+
+/// An alert in effect for an hour, for every version, whose signature is not
+/// the alert key's
+fn bad_alert() -> Vec<u8> {
+    let mut unsigned = Vec::new();
+    unsigned.extend_from_slice(&1i32.to_le_bytes());
+    unsigned.extend_from_slice(&(now() + 3600).to_le_bytes());
+    unsigned.extend_from_slice(&(now() + 3600).to_le_bytes());
+    unsigned.extend_from_slice(&1234i32.to_le_bytes());
+    unsigned.extend_from_slice(&0i32.to_le_bytes());
+    unsigned.push(0);
+    unsigned.extend_from_slice(&0i32.to_le_bytes());
+    unsigned.extend_from_slice(&999_999i32.to_le_bytes());
+    unsigned.push(0);
+    unsigned.extend_from_slice(&1i32.to_le_bytes());
+    unsigned.extend_from_slice(&[0, 10]);
+    unsigned.extend_from_slice(b"test alert");
+    unsigned.push(0);
+    let mut signature = vec![0x30, 0x44, 0x02, 0x20, 0x00];
+    signature.extend_from_slice(&[0x11; 31]);
+    signature.extend_from_slice(&[0x02, 0x20, 0x00]);
+    signature.extend_from_slice(&[0x22; 31]);
+    let mut out = vec![unsigned.len() as u8];
+    out.extend_from_slice(&unsigned);
+    out.push(signature.len() as u8);
+    out.extend_from_slice(&signature);
+    out
+}
+
+/// The ban score of the raw peer, once the node lists it
+fn raw_peer_banscore(rpc_port: u16) -> Option<i64> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let peers = result(rpc_port, "getpeerinfo", json!([]));
+        if let Some(p) = peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["subver"] == json!(AGENT))
+        {
+            return p["banscore"].as_i64();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
+}
+
+/// -alerts: divid reads a peer's alert unless -alerts=0, and scores 10 for one
+/// it cannot process, here a bad signature (main.cpp:870-890)
+#[test]
+fn a_bad_alert_scores_unless_alerts_are_off() {
+    for (extra, score) in [(&[][..], 10), (&["-alerts=0"][..], 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = start(dir.path(), extra);
+        let mut peer = raw_peer(node.p2p_port);
+        assert_eq!(raw_peer_banscore(node.rpc_port), Some(0), "{extra:?}");
+        peer.write_all(&message("alert", &bad_alert())).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(raw_peer_banscore(node.rpc_port), Some(score), "{extra:?}");
+        drop(peer);
+        node.stop();
+    }
 }
