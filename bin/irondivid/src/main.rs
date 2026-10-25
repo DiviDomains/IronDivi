@@ -314,7 +314,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "mining",
     "mnconf",
     "mnconflock",
-    "monthlybackups",
     "onion",
     "onlynet",
     "par",
@@ -713,6 +712,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "keypool",
         "upgradewallet",
         "createwalletbackups",
+        "monthlybackups",
         "rpcuser",
         "rpcpassword",
         "rpcport",
@@ -1273,6 +1273,10 @@ struct WalletOptions {
     /// the backup at start, 20 by default, a negative count as 0
     /// (init.cpp:124, :938; WalletBackupCreator.cpp:21)
     wallet_backups: usize,
+    /// -monthlybackups: backups kept in monthlyBackups/ by the daily check,
+    /// 12 by default; 0 or less leaves the check off (init.cpp:1284,
+    /// LegacyWalletDatabaseEndpointFactory.cpp:77)
+    monthly_backups: usize,
 }
 
 /// divid's defaults: the options as when none is given
@@ -1294,6 +1298,11 @@ impl WalletOptions {
             wallet_backups: settings
                 .get("createwalletbackups")
                 .map_or(divi_wallet::backup::STARTUP_BACKUPS, |v| {
+                    atoi(v).max(0) as usize
+                }),
+            monthly_backups: settings
+                .get("monthlybackups")
+                .map_or(divi_wallet::backup::MONTHLY_BACKUPS, |v| {
                     atoi(v).max(0) as usize
                 }),
         }
@@ -1862,27 +1871,32 @@ async fn run_daemon(
 
             resubmit_wallet_txs(&node, wallet_arc);
 
-            // Divi Core checks once a day whether a monthly backup is due
-            // (LegacyWalletDatabaseEndpointFactory.cpp:111-121; on regtest
-            // that loop runs on mock time)
-            if config.network.network_type != NetworkType::Regtest {
+            // Divi Core checks a day after start, and a day after each check,
+            // whether a monthly backup is due; on regtest the day is counted
+            // on mock time (LegacyWalletDatabaseEndpointFactory.cpp:111-121,
+            // MockMilliSleep in utiltime.cpp:54-60)
+            if wallet_options.monthly_backups > 0 {
                 let wallet_for_backup = Arc::clone(wallet_arc);
                 let backup_root = wallet_dir.parent().map(|p| p.to_path_buf());
+                let keep = wallet_options.monthly_backups;
+                let clock: fn() -> i64 = if config.network.network_type == NetworkType::Regtest {
+                    divi_primitives::clock::now
+                } else {
+                    divi_primitives::clock::system_now
+                };
                 tokio::spawn(async move {
                     let Some(root) = backup_root else { return };
-                    let mut daily =
-                        tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
-                    daily.tick().await;
+                    const DAY: i64 = 24 * 3600;
+                    let mut since = clock();
                     loop {
-                        daily.tick().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if clock() - since <= DAY {
+                            continue;
+                        }
                         let wallet = Arc::clone(&wallet_for_backup);
                         let root = root.clone();
                         let made = tokio::task::spawn_blocking(move || {
-                            divi_wallet::backup::monthly_backup(
-                                &wallet,
-                                &root,
-                                divi_wallet::backup::MONTHLY_BACKUPS,
-                            )
+                            divi_wallet::backup::monthly_backup(&wallet, &root, keep)
                         })
                         .await;
                         match made {
@@ -1891,6 +1905,7 @@ async fn run_daemon(
                             Ok(Err(e)) => warn!("Monthly wallet backup failed: {}", e),
                             Err(e) => warn!("Monthly wallet backup failed: {}", e),
                         }
+                        since = clock();
                     }
                 });
             }

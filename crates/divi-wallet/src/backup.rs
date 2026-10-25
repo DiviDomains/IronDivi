@@ -20,8 +20,8 @@ use tracing::{info, warn};
 /// Backups kept in `backups/` unless -createwalletbackups says otherwise
 /// (Divi Core nWalletBackups, init.cpp:124, read at init.cpp:938)
 pub const STARTUP_BACKUPS: usize = 20;
-/// Backups kept in `monthlyBackups/` by the daily check (Divi Core
-/// -monthlybackups default, LegacyWalletDatabaseEndpointFactory.cpp:77)
+/// Backups kept in `monthlyBackups/` by the daily check unless
+/// -monthlybackups says otherwise (LegacyWalletDatabaseEndpointFactory.cpp:77)
 pub const MONTHLY_BACKUPS: usize = 12;
 /// Age of the newest monthly backup that calls for a new one
 /// (timeIntervalConstants.h: 30 days)
@@ -182,25 +182,36 @@ pub fn backup_at_start(wallet: &Path, data_dir: &Path, keep: usize) -> Result<()
 }
 
 /// The daily check of a running node: a backup of the open wallet in
-/// `<data_dir>/monthlyBackups` when the newest there is a month old, `keep`
-/// kept
+/// `<data_dir>/monthlyBackups` when the newest there is a month old by the
+/// node's clock, `keep` kept (Divi Core MonthlyWalletBackupThread with
+/// -monthlybackups, LegacyWalletDatabaseEndpointFactory.cpp:75-88; the age
+/// and the name come from GetTime, which setmocktime sets)
 pub fn monthly_backup(
     wallet: &crate::WalletDb,
     data_dir: &Path,
     keep: usize,
 ) -> Result<Option<PathBuf>, WalletError> {
-    let now = SystemTime::now();
+    let now = node_now();
     let dir = data_dir.join("monthlyBackups");
     std::fs::create_dir_all(&dir).map_err(|e| WalletError::Storage(e.to_string()))?;
     let path = wallet.database_path();
     let name = wallet_name(&path);
-    if !monthly_due(&dir, &name, now) {
+    if keep == 0 || !monthly_due(&dir, &name, now) {
         return Ok(None);
     }
     let target = backup_path(&dir, &path, now);
+    if target.exists() {
+        warn!("Backup {} already exists; not made again", target.display());
+        return Ok(None);
+    }
     wallet.backup_to(&target)?;
     prune(&dir, &name, keep);
     Ok(Some(target))
+}
+
+/// The node's clock as a SystemTime (the mocked time when one is set)
+fn node_now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(divi_primitives::clock::now().max(0) as u64)
 }
 
 #[cfg(test)]

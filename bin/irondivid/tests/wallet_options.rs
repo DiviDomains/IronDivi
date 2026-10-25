@@ -38,6 +38,13 @@ fn try_rpc(port: u16, method: &str, params: &Value, timeout: Duration) -> Option
     serde_json::from_str(&response[start..]).ok()
 }
 
+fn ok(port: u16, method: &str, params: Value) -> Value {
+    let reply = try_rpc(port, method, &params, Duration::from_secs(120))
+        .unwrap_or_else(|| panic!("{method}: no reply"));
+    assert!(reply["error"].is_null(), "{method}: {reply}");
+    reply["result"].clone()
+}
+
 struct Node(Child);
 
 impl Drop for Node {
@@ -147,4 +154,57 @@ fn createwalletbackups_sets_the_count_kept() {
         rpc_port,
     );
     assert_eq!(entries(&backups), 2, "none made, none removed");
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// -monthlybackups=<n>: a day after start (on mock time on regtest) the node
+/// makes a monthly backup when the newest is a month old, n kept
+/// (init.cpp:1284, LegacyWalletDatabaseEndpointFactory.cpp:75-121); 0 makes
+/// none
+#[test]
+fn monthlybackups_sets_the_count_and_zero_leaves_it_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rpc_port, p2p_port) = (free_port(), free_port());
+    stop(start(dir.path(), rpc_port, p2p_port, &[]), rpc_port);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let later = now + 31 * 24 * 3600;
+    // The time suffix of the backup made at start
+    let suffix = {
+        let n = start(dir.path(), rpc_port, p2p_port, &["-monthlybackups=0"]);
+        let monthly = find_dir(dir.path(), "monthlyBackups").expect("monthlyBackups/");
+        let before = names(&monthly);
+        assert_eq!(before.len(), 1, "the backup at start: {before:?}");
+        ok(rpc_port, "setmocktime", json!([later]));
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(names(&monthly), before, "0: no monthly backup");
+        stop(n, rpc_port);
+        before[0].rsplit_once('.').unwrap().1.to_string()
+    };
+    let n = start(dir.path(), rpc_port, p2p_port, &["-monthlybackups=1"]);
+    let monthly = find_dir(dir.path(), "monthlyBackups").expect("monthlyBackups/");
+    ok(rpc_port, "setmocktime", json!([later]));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while names(&monthly).iter().any(|n| n.ends_with(&suffix)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let after = names(&monthly);
+    stop(n, rpc_port);
+    assert_eq!(after.len(), 1, "one kept: {after:?}");
+    assert!(
+        !after[0].ends_with(&suffix),
+        "made on the mock date: {after:?}"
+    );
 }
