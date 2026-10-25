@@ -3274,7 +3274,12 @@ fn main() -> Result<()> {
 
         let log_file = data_dir.join("debug.log");
 
-        eprintln!("Logging to {:?}", log_file);
+        // Divi Core's line before it forks (divid.cpp:124)
+        println!("DIVI server starting");
+        {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
 
         // First fork
         match unsafe { libc::fork() } {

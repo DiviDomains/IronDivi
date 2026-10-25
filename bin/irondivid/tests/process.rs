@@ -178,3 +178,58 @@ fn a_stop_during_start_exits_with_one() {
     assert_eq!(code, Some(1));
     assert!(!pid_file.exists());
 }
+
+/// `-daemon`: started from `cwd` with stdout and stderr to files there; the
+/// parent's exit code, its stdout, and the child's pid from its pid file once
+/// it answers RPC
+fn start_daemon(datadir: &Path, cwd: &Path) -> (Option<i32>, String, Option<u32>, u16) {
+    let rpc_port = free_port();
+    let out = cwd.join("out");
+    let mut parent = irondivid(datadir, rpc_port)
+        .arg("-daemon")
+        .current_dir(cwd)
+        .stdout(std::fs::File::create(&out).unwrap())
+        .stderr(std::fs::File::create(cwd.join("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let code = wait_exit(&mut parent, 60);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while try_rpc(rpc_port, "getblockcount", &json!([])).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let child = std::fs::read_to_string(datadir.join("divid.pid"))
+        .ok()
+        .and_then(|p| p.trim().parse().ok());
+    (
+        code,
+        std::fs::read_to_string(&out).unwrap(),
+        child,
+        rpc_port,
+    )
+}
+
+/// Stop the `-daemon` child by RPC and wait for it to go, killing it after a
+/// minute
+fn stop_daemon(child: Option<u32>, rpc_port: u16) {
+    let _ = try_rpc(rpc_port, "stop", &json!([]));
+    if let Some(pid) = child {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+}
+
+/// divid's `-daemon` prints "DIVI server starting" on stdout, and its parent
+/// exits 0 (divid.cpp:122-131)
+#[test]
+fn daemon_parent_says_divi_server_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (code, out, child, rpc_port) = start_daemon(dir.path(), cwd.path());
+    stop_daemon(child, rpc_port);
+    assert_eq!(code, Some(0));
+    assert_eq!(out.lines().next(), Some("DIVI server starting"), "{out}");
+    assert!(child.is_some(), "the child answered and wrote its pid file");
+}
