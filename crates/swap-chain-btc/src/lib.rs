@@ -27,8 +27,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
 use bitcoin::{Address, CompressedPublicKey, Network, OutPoint};
 use divi_swap::{
-    Amount, Chain, ChainBackend, Funding, HtlcParams, InputReservations, LockedOutput, Outpoint,
-    SignedTx, SpendInfo, SwapError, Txid,
+    Amount, Chain, ChainBackend, FeeBump, Funding, HtlcParams, InputReservations, LockedOutput,
+    Outpoint, SignedTx, SpendInfo, SwapError, Txid,
 };
 use serde_json::Value;
 
@@ -511,6 +511,36 @@ impl ChainBackend for BtcBackend {
             amount.to_sat(),
             Spend::Claim(preimage),
             self.sat_per_vb().await,
+        )?;
+        Ok(Self::to_signed(&tx))
+    }
+
+    /// Bitcoin Core relays replacements (full RBF is on by default since v28,
+    /// `src/kernel/mempool_options.h:25`), and the claim signals BIP125 anyway.
+    fn fee_bump(&self) -> FeeBump {
+        FeeBump::Rbf
+    }
+
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        Ok(Some(self.sat_per_vb().await))
+    }
+
+    async fn build_claim_at(
+        &self,
+        htlc: &HtlcParams,
+        at: &Outpoint,
+        amount: Amount,
+        preimage: &[u8; 32],
+        feerate: u64,
+    ) -> Result<SignedTx> {
+        let tx = build_spend_tx(
+            &self.secp,
+            &self.key,
+            htlc,
+            btc_outpoint(at),
+            amount.to_sat(),
+            Spend::Claim(preimage),
+            feerate.max(1),
         )?;
         Ok(Self::to_signed(&tx))
     }

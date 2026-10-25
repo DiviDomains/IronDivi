@@ -135,6 +135,22 @@ pub struct TakerRecord {
     /// waits out the taker-leg refund. Absent in records written before the field existed.
     #[serde(default)]
     pub claim_declined: Option<String>,
+    /// Feerate (base unit per vbyte) the first maker-leg claim paid, where its backend can
+    /// bump it (`FeeBump::Rbf`/`Cpfp`); the base [`crate::FeeEscalation`] climbs from.
+    #[serde(default)]
+    pub claim_base_feerate: Option<u64>,
+    /// Feerate the claim pays now: `maker_leg_claim`'s own under RBF, the package's (claim
+    /// plus `claim_children`) under CPFP.
+    #[serde(default)]
+    pub claim_feerate: Option<u64>,
+    /// Earlier versions of the maker-leg claim that an RBF bump replaced, oldest first, with
+    /// the feerate each paid. Any of them may still be the one that confirms.
+    #[serde(default)]
+    pub claim_replaced: Vec<(SignedTx, u64)>,
+    /// CPFP children raising the claim's package feerate, in spend order: the first spends
+    /// the claim's output, each later one its predecessor's. Persisted before broadcast.
+    #[serde(default)]
+    pub claim_children: Vec<SignedTx>,
     /// Last error.
     pub last_error: Option<String>,
 }
@@ -206,6 +222,10 @@ impl std::fmt::Debug for TakerRecord {
             maker_leg_claim,
             taker_leg_refund,
             claim_declined,
+            claim_base_feerate,
+            claim_feerate,
+            claim_replaced,
+            claim_children,
             last_error,
         } = self;
         f.debug_struct("TakerRecord")
@@ -223,6 +243,10 @@ impl std::fmt::Debug for TakerRecord {
             .field("maker_leg_claim", maker_leg_claim)
             .field("taker_leg_refund", taker_leg_refund)
             .field("claim_declined", claim_declined)
+            .field("claim_base_feerate", claim_base_feerate)
+            .field("claim_feerate", claim_feerate)
+            .field("claim_replaced", claim_replaced)
+            .field("claim_children", claim_children)
             .field("last_error", last_error)
             .finish()
     }

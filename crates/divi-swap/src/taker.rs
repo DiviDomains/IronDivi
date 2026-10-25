@@ -19,18 +19,20 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::api::{AcceptRequest, LockNotice, Quote, SwapView};
-use crate::backend::ChainBackend;
+use crate::backend::{ChainBackend, FeeBump};
 use crate::config::{
     check_maker_leg_locktime, check_maker_leg_locktime_exact, check_terms_against_profile,
-    OfferedTerms, Profile,
+    ClaimDeadline, FeeEscalation, OfferedTerms, Profile,
 };
 use crate::error::{Result, SwapError};
 use crate::htlc::{new_preimage, HtlcParams};
 use crate::store::{Store, TakerRecord};
-use crate::types::Chain;
+use crate::types::{Amount, Chain, Outpoint, SignedTx, SpendInfo};
 
-/// The taker stops claiming the maker leg this many seconds before the maker's locktime: a claim
-/// that confirms after the maker refunds would lose the maker leg while revealing the preimage.
+/// The least margin, on any chain, that the taker keeps before the maker's locktime when it
+/// broadcasts its first claim: a claim that confirms after the maker refunds would lose the
+/// maker leg while revealing the preimage. Each chain's own margin
+/// ([`ClaimDeadline::builtin`]) is at least this, and higher where blocks are slow.
 pub const TAKER_SAFETY_MARGIN_SECS: u32 = 1800;
 
 /// How far the taker-leg locktime may drift from `taker_chain_mtp + taker_timeout` (clock skew
@@ -47,14 +49,28 @@ pub enum TakerState {
     Accepted,
     /// Taker-leg HTLC funding tx persisted (broadcast follows).
     Locked,
-    /// Maker's lock verified (amount, script) and confirmed.
+    /// Maker's lock verified (amount, script) and confirmed. The first claim is sent from
+    /// here only while the chain's [`crate::ClaimDeadline`] margin is left before the
+    /// maker-leg locktime; below it the taker records `claim_declined`, never reveals the
+    /// preimage and waits for its taker-leg refund (`Refunded`).
     MakerLockConfirmed,
-    /// Maker-leg claim broadcast (preimage revealed).
+    /// Maker-leg claim broadcast (preimage revealed). Resent every step until it confirms;
+    /// where the backend can bump it ([`crate::FeeBump`]) its fee climbs towards the
+    /// [`crate::FeeEscalation`] cap as the maker-leg locktime nears, by replacement (BTC,
+    /// earlier versions kept in `claim_replaced`) or by CPFP children (LTC,
+    /// `claim_children`). An evicted or refused claim is re-signed at a higher feerate.
     Claimed,
     /// Taker leg refunded after the taker timeout.
     Refunded,
     /// Finished.
     Done,
+    /// Both legs went to the maker: our maker-leg claim revealed the preimage but never
+    /// confirmed (e.g. evicted from the mempool), the maker refunded the maker leg and then
+    /// claimed the taker leg with the preimage. Nothing is left to spend; logged at error
+    /// level with both outpoints. The claim-deadline margin and fee escalation make this
+    /// unreachable in the mock's fee markets on BTC and LTC (`tests/claim_race.rs`); DIVI
+    /// and ZEC cannot bump and rely on the margin alone.
+    Lost,
 }
 
 impl TakerState {
@@ -68,17 +84,21 @@ impl TakerState {
     ///   `MakerLockConfirmed` or `Refunded`.
     /// - `MakerLockConfirmed`: not terminal. Moves to `Claimed` or `Refunded`.
     /// - `Claimed`: not terminal. The maker-leg claim is still being broadcast until it
-    ///   confirms (`Done`).
+    ///   confirms (`Done`), unless the maker refunded its leg first (`Refunded`).
     /// - `Refunded`: not terminal. The refund is only built and broadcast from here, and
     ///   still owed until it confirms (`Done`); the taker leg stays funded and spendable
-    ///   by the refund.
+    ///   by the refund, unless the maker claimed it with a leaked preimage (`Lost`).
     /// - `Done`: terminal. Reached from `Claimed` or `Refunded` once the claim or refund
     ///   confirmed; `step` and `refund` return at once and nothing else leaves it.
+    /// - `Lost`: terminal. Reached from `Refunded` once a claim of the taker leg that
+    ///   carries our preimage is buried as deep as the quote's confirmations on that
+    ///   chain: the refund can never confirm, so it is not re-signed or sent again;
+    ///   `step` and `refund` return at once and nothing else leaves it.
     ///
     /// The `match` is exhaustive on purpose: a new variant must be decided here.
     pub fn is_terminal(self) -> bool {
         match self {
-            TakerState::Done => true,
+            TakerState::Done | TakerState::Lost => true,
             TakerState::Prepared
             | TakerState::Accepted
             | TakerState::Locked
@@ -98,6 +118,10 @@ pub struct Taker {
     store: Store,
     /// Profile whose floors every quote's terms must meet (`None`: terms are taken as offered).
     profile_floor: Option<Profile>,
+    /// Per-chain claim deadlines replacing [`ClaimDeadline::builtin`].
+    claim_deadlines: BTreeMap<Chain, ClaimDeadline>,
+    /// Per-chain fee escalations replacing [`FeeEscalation::builtin`] (`None`: off).
+    fee_escalations: BTreeMap<Chain, Option<FeeEscalation>>,
     halt_after: Mutex<Option<TakerState>>,
     gate: tokio::sync::Mutex<()>,
 }
@@ -121,6 +145,8 @@ impl Taker {
             counters: counters.into_iter().map(|b| (b.chain(), b)).collect(),
             store,
             profile_floor: None,
+            claim_deadlines: BTreeMap::new(),
+            fee_escalations: BTreeMap::new(),
             halt_after: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
         }
@@ -133,6 +159,35 @@ impl Taker {
     pub fn with_profile_floor(mut self, profile: Profile) -> Self {
         self.profile_floor = Some(profile);
         self
+    }
+
+    /// Use `deadline` instead of [`ClaimDeadline::builtin`] for maker legs on `chain`.
+    pub fn with_claim_deadline(mut self, chain: Chain, deadline: ClaimDeadline) -> Self {
+        self.claim_deadlines.insert(chain, deadline);
+        self
+    }
+
+    /// The claim deadline this taker applies to a maker leg on `chain`.
+    pub fn claim_deadline(&self, chain: Chain) -> ClaimDeadline {
+        self.claim_deadlines
+            .get(&chain)
+            .copied()
+            .unwrap_or_else(|| ClaimDeadline::builtin(chain))
+    }
+
+    /// Use `escalation` instead of [`FeeEscalation::builtin`] for claims of maker legs on
+    /// `chain`; `None` never bumps them.
+    pub fn with_fee_escalation(mut self, chain: Chain, escalation: Option<FeeEscalation>) -> Self {
+        self.fee_escalations.insert(chain, escalation);
+        self
+    }
+
+    /// The fee escalation this taker applies to claims of maker legs on `chain`.
+    pub fn fee_escalation(&self, chain: Chain) -> Option<FeeEscalation> {
+        self.fee_escalations
+            .get(&chain)
+            .copied()
+            .unwrap_or_else(|| FeeEscalation::builtin(chain))
     }
 
     /// The counter chains this taker holds a key on.
@@ -182,6 +237,10 @@ impl Taker {
             maker_leg_claim: None,
             taker_leg_refund: None,
             claim_declined: None,
+            claim_base_feerate: None,
+            claim_feerate: None,
+            claim_replaced: Vec::new(),
+            claim_children: Vec::new(),
             last_error: None,
         })?;
         Ok((id, req))
@@ -270,7 +329,7 @@ impl Taker {
     pub async fn step(&self, local_id: &str, maker: Option<&SwapView>) -> Result<TakerState> {
         let _g = self.gate.lock().await;
         let mut r = self.load(local_id)?;
-        if r.state == TakerState::Done {
+        if r.state.is_terminal() {
             return Ok(r.state);
         }
         let had_error = r.last_error.take().is_some();
@@ -298,7 +357,7 @@ impl Taker {
     pub async fn refund(&self, local_id: &str) -> Result<TakerState> {
         let _g = self.gate.lock().await;
         let mut r = self.load(local_id)?;
-        if r.state == TakerState::Done {
+        if r.state.is_terminal() {
             return Ok(r.state);
         }
         let had_error = r.last_error.take().is_some();
@@ -321,8 +380,9 @@ impl Taker {
 
     /// [`Taker::refund`]'s state machine: `Locked`/`MakerLockConfirmed` only ever move to
     /// `Refunded` (never `Claimed`), and only once the taker leg is actually refundable;
-    /// `Refunded` drives the refund to `Done` the same way [`Taker::advance`] does; every
-    /// other state (including `Claimed`) is left exactly as it is.
+    /// `Refunded` drives the refund to `Done` (or `Lost`) the same way [`Taker::advance`] does;
+    /// `Claimed` moves to `Refunded` only once the maker has refunded its leg (nothing is
+    /// left to claim); every other state is left exactly as it is.
     async fn advance_refund_only(&self, r: &mut TakerRecord) -> Result<Flow> {
         match r.state {
             TakerState::Locked | TakerState::MakerLockConfirmed => {
@@ -332,11 +392,16 @@ impl Taker {
                     Ok(Flow::Idle)
                 }
             }
+            TakerState::Claimed if self.maker_leg_refunded(r).await? => {
+                r.maker_leg_claim = None;
+                self.enter(r, TakerState::Refunded)
+            }
             TakerState::Refunded => self.on_refunded(r).await,
             TakerState::Prepared
             | TakerState::Accepted
             | TakerState::Claimed
-            | TakerState::Done => Ok(Flow::Idle),
+            | TakerState::Done
+            | TakerState::Lost => Ok(Flow::Idle),
         }
     }
 
@@ -383,12 +448,63 @@ impl Taker {
 
     async fn advance(&self, r: &mut TakerRecord, maker: Option<&SwapView>) -> Result<Flow> {
         match r.state {
-            TakerState::Prepared | TakerState::Accepted | TakerState::Done => Ok(Flow::Idle),
+            TakerState::Prepared | TakerState::Accepted | TakerState::Done | TakerState::Lost => {
+                Ok(Flow::Idle)
+            }
             TakerState::Locked => self.on_locked(r, maker).await,
             TakerState::MakerLockConfirmed => self.on_maker_lock_confirmed(r).await,
             TakerState::Claimed => self.on_claimed(r).await,
             TakerState::Refunded => self.on_refunded(r).await,
         }
+    }
+
+    /// Whether a block holds a spend of the maker-leg lock that carries no preimage: the
+    /// maker's refund won, because we were down or offline from signing our claim until
+    /// past its locktime. Nothing is left to claim and the preimage never went out with a
+    /// spend of it, so our own leg comes back by refund.
+    async fn maker_leg_refunded(&self, r: &TakerRecord) -> Result<bool> {
+        let Some(op) = r.maker_leg_outpoint else {
+            return Ok(false);
+        };
+        let mb = self.mk(r)?;
+        // No spend predates the lock's own block.
+        let Some(confs) = mb.confirmations(&op.txid).await?.filter(|&c| c >= 1) else {
+            return Ok(false);
+        };
+        let from = (mb.tip_height().await? + 1).saturating_sub(confs as u64);
+        let Some(spend) = mb.find_spend(&op, from).await? else {
+            return Ok(false);
+        };
+        Ok(spend.height.is_some() && spend.extract_preimage(&r.hash).is_none())
+    }
+
+    /// The maker's claim of the taker leg, if one that carries our preimage is buried at
+    /// least as deep as the quote asks on that chain. Our refund can then never confirm: the
+    /// preimage went out with a maker-leg claim of ours that never confirmed, and the maker
+    /// spent both legs.
+    async fn taker_leg_lost(&self, r: &TakerRecord) -> Result<Option<SpendInfo>> {
+        let Some(f) = &r.taker_leg_funding else {
+            return Ok(None);
+        };
+        let tb = self.tk(r)?;
+        let Some(confs) = tb
+            .confirmations(&f.outpoint.txid)
+            .await?
+            .filter(|&c| c >= 1)
+        else {
+            return Ok(None);
+        };
+        let tip = tb.tip_height().await?;
+        let Some(spend) = tb
+            .find_spend(&f.outpoint, (tip + 1).saturating_sub(confs as u64))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let deep = spend
+            .height
+            .is_some_and(|h| tip + 1 - h >= r.quote.confirmations_on(r.quote.taker_chain()) as u64);
+        Ok((deep && spend.extract_preimage(&r.hash).is_some()).then_some(spend))
     }
 
     async fn taker_leg_refundable(&self, r: &TakerRecord) -> Result<bool> {
@@ -440,15 +556,11 @@ impl Taker {
             return Ok(Flow::Idle);
         }
         let mtp = mb.median_time_past().await?;
-        if (htlc.locktime as u64) < mtp as u64 + TAKER_SAFETY_MARGIN_SECS as u64 {
+        let chain = r.quote.maker_chain();
+        if let Err(reason) = self.claim_deadline(chain).check(chain, mtp, htlc.locktime) {
             // Not an error to retry: a claim now could confirm after the maker refunds, losing
             // the maker leg while revealing the preimage. Decide once, persist, and let the
             // taker-leg refund run its course.
-            let reason = format!(
-                "maker-leg locktime {} is less than {TAKER_SAFETY_MARGIN_SECS}s after its \
-                 chain's MTP {mtp}; not claiming, waiting for the taker-leg refund",
-                htlc.locktime
-            );
             tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
             r.claim_declined = Some(reason);
             self.store.put_taker_swap(r)?;
@@ -499,18 +611,25 @@ impl Taker {
             .maker_leg_htlc
             .ok_or_else(|| SwapError::Other("no verified maker lock".into()))?;
         let mtp = self.mk(r)?.median_time_past().await?;
-        if (mtp as u64) + TAKER_SAFETY_MARGIN_SECS as u64 <= htlc.locktime as u64 {
+        let chain = r.quote.maker_chain();
+        let deadline = match r.claim_declined {
+            Some(_) => Ok(()), // decided below on an earlier pass
+            None => self.claim_deadline(chain).check(chain, mtp, htlc.locktime),
+        };
+        if r.claim_declined.is_none() && deadline.is_ok() {
             let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
             let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
-            let claim = self
-                .mk(r)?
-                .build_claim(&htlc, &op, amount, &r.preimage)
-                .await?;
-            r.maker_leg_claim = Some(claim);
+            self.sign_first_claim(r, &htlc, &op, amount).await?;
             // Persist the signed claim (which reveals the preimage) before broadcasting it.
             return self.enter(r, TakerState::Claimed);
         }
-        // Too late to claim safely: wait out our own taker-leg timelock.
+        // Too late to claim safely: decide for good, record why, and wait out our own
+        // taker-leg timelock. Nothing has been revealed, so both legs refund.
+        if let Err(reason) = deadline {
+            tracing::warn!(swap = %r.id, %reason, "declining to claim the maker leg");
+            r.claim_declined = Some(reason);
+            self.store.put_taker_swap(r)?;
+        }
         if self.taker_leg_refundable(r).await? {
             return self.enter(r, TakerState::Refunded);
         }
@@ -526,24 +645,40 @@ impl Taker {
                     .ok_or_else(|| SwapError::Other("Claimed without a maker-leg lock".into()))?;
                 let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
                 let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
-                let tx = self
-                    .mk(r)?
-                    .build_claim(&htlc, &op, amount, &r.preimage)
-                    .await?;
-                r.maker_leg_claim = Some(tx.clone());
+                let tx = self.sign_first_claim(r, &htlc, &op, amount).await?;
                 self.store.put_taker_swap(r)?; // write-ahead
                 tx
             }
         };
+        // A version an RBF bump replaced may be the one that got mined.
+        for (old, _) in &r.claim_replaced {
+            if self
+                .mk(r)?
+                .confirmations(&old.txid)
+                .await?
+                .is_some_and(|c| c >= 1)
+            {
+                return self.enter(r, TakerState::Done);
+            }
+        }
         if let Err(e) = self.mk(r)?.broadcast(&claim).await {
             if matches!(e, SwapError::Rejected(_)) {
-                // Refused for good (e.g. signed by an older, buggy build): forget it so the
-                // next step re-signs from the persisted preimage, same as the maker/taker
-                // claim/refund paths.
-                r.maker_leg_claim = None;
-                self.store.put_taker_swap(r)?;
+                return self.claim_refused(r, &claim, e).await;
             }
             return Err(e);
+        }
+        for (i, child) in r.claim_children.clone().iter().enumerate() {
+            if let Err(e) = self.mk(r)?.broadcast(child).await {
+                if matches!(e, SwapError::Rejected(_)) {
+                    // Drop it and every child built on it; the next bump builds afresh.
+                    tracing::warn!(swap = %r.id, refused = %child.txid, error = %e,
+                        "claim CPFP child refused; dropping it");
+                    r.claim_children.truncate(i);
+                    r.claim_feerate = r.claim_base_feerate;
+                    self.store.put_taker_swap(r)?;
+                }
+                return Err(e);
+            }
         }
         if self
             .mk(r)?
@@ -553,10 +688,204 @@ impl Taker {
         {
             return self.enter(r, TakerState::Done);
         }
+        self.escalate_claim_fee(r, &claim).await?;
         Ok(Flow::Idle)
     }
 
+    /// The node refused `claim`, the current version of the maker-leg claim, for good.
+    ///
+    /// - The chain holds it after all, or holds a version it replaced: keep the newest version
+    ///   it holds (the refusal is not about the claim), dropping newer ones it never took.
+    ///   Re-signing at the first claim's feerate would only conflict with it.
+    /// - The maker refunded its leg: `Refunded`.
+    /// - Nothing is held (evicted below the mempool's minimum feerate, say) and the claim can
+    ///   be bumped: re-sign it at the escalation target, at least one unit per vbyte above
+    ///   what it paid and at least the current estimate, within the cap; send it now.
+    /// - Otherwise forget it so the next step re-signs from the persisted preimage (e.g.
+    ///   signed by an older, buggy build), as the other claim/refund paths do.
+    async fn claim_refused(
+        &self,
+        r: &mut TakerRecord,
+        claim: &SignedTx,
+        e: SwapError,
+    ) -> Result<Flow> {
+        let mk = self.mk(r)?;
+        if mk.confirmations(&claim.txid).await?.is_some() {
+            tracing::warn!(swap = %r.id, txid = %claim.txid, error = %e,
+                "claim rebroadcast refused but the chain holds it; keeping it");
+            return Err(e);
+        }
+        for i in (0..r.claim_replaced.len()).rev() {
+            let (prev, feerate) = r.claim_replaced[i].clone();
+            if mk.confirmations(&prev.txid).await?.is_some() {
+                tracing::warn!(swap = %r.id, refused = %claim.txid, back_to = %prev.txid,
+                    error = %e, "claim replacement refused; back to the claim the chain holds");
+                r.claim_replaced.truncate(i);
+                r.maker_leg_claim = Some(prev);
+                r.claim_feerate = Some(feerate);
+                r.claim_children.clear();
+                self.store.put_taker_swap(r)?;
+                return Err(e);
+            }
+        }
+        if self.maker_leg_refunded(r).await? {
+            r.maker_leg_claim = None;
+            r.claim_children.clear();
+            return self.enter(r, TakerState::Refunded);
+        }
+        let chain = r.quote.maker_chain();
+        if let (Some(esc), Some(base), Some(current), FeeBump::Rbf | FeeBump::Cpfp) = (
+            self.fee_escalation(chain),
+            r.claim_base_feerate,
+            r.claim_feerate,
+            mk.fee_bump(),
+        ) {
+            let htlc = r.maker_leg_htlc.expect("Claimed has a maker-leg lock");
+            let op = r.maker_leg_outpoint.expect("set with maker_leg_htlc");
+            let amount = r.maker_leg_amount.expect("set with maker_leg_htlc");
+            let left = i64::from(htlc.locktime) - i64::from(mk.median_time_past().await?);
+            let estimate = mk.claim_feerate().await?.unwrap_or(0);
+            let feerate = esc
+                .target(base, left)
+                .max(estimate)
+                .max(current.saturating_add(1))
+                .min(esc.cap(base));
+            if feerate <= current {
+                tracing::warn!(swap = %r.id, txid = %claim.txid, feerate = current, error = %e,
+                    "claim refused at the fee cap; resending it unchanged");
+                return Err(e);
+            }
+            let tx = mk
+                .build_claim_at(&htlc, &op, amount, &r.preimage, feerate)
+                .await?;
+            r.claim_replaced.push((claim.clone(), current));
+            r.maker_leg_claim = Some(tx.clone());
+            r.claim_feerate = Some(feerate);
+            r.claim_children.clear();
+            self.store.put_taker_swap(r)?; // write-ahead
+            tracing::info!(swap = %r.id, %chain, old_feerate = current, new_feerate = feerate,
+                txid = %tx.txid, claim = %claim.txid, secs_left = left, error = %e,
+                "claim refused and not held; re-signed at a higher feerate");
+            mk.broadcast(&tx).await?;
+            return Ok(Flow::Idle);
+        }
+        r.maker_leg_claim = None;
+        r.claim_children.clear();
+        self.store.put_taker_swap(r)?;
+        Err(e)
+    }
+
+    /// Sign the first maker-leg claim. Where the backend can bump it, at the feerate it
+    /// reports now, recorded as the base the escalation climbs from.
+    async fn sign_first_claim(
+        &self,
+        r: &mut TakerRecord,
+        htlc: &HtlcParams,
+        op: &Outpoint,
+        amount: Amount,
+    ) -> Result<SignedTx> {
+        let mk = self.mk(r)?;
+        let feerate = match (mk.fee_bump(), self.fee_escalation(r.quote.maker_chain())) {
+            (FeeBump::None, _) | (_, None) => None,
+            _ => mk.claim_feerate().await?,
+        };
+        let tx = match feerate {
+            Some(f) => mk.build_claim_at(htlc, op, amount, &r.preimage, f).await?,
+            None => mk.build_claim(htlc, op, amount, &r.preimage).await?,
+        };
+        r.maker_leg_claim = Some(tx.clone());
+        r.claim_base_feerate = feerate;
+        r.claim_feerate = feerate;
+        r.claim_replaced.clear();
+        r.claim_children.clear();
+        Ok(tx)
+    }
+
+    /// Raise the fee of the unconfirmed `claim` along the chain's [`FeeEscalation`] as the
+    /// maker-leg locktime nears: replace it (RBF) or add a child (CPFP), persisting the new
+    /// transaction before broadcasting it and logging every bump. A no-op where the backend
+    /// cannot bump, escalation is off, or the target is not yet worth a new transaction.
+    async fn escalate_claim_fee(&self, r: &mut TakerRecord, claim: &SignedTx) -> Result<()> {
+        let chain = r.quote.maker_chain();
+        let mk = self.mk(r)?;
+        let (Some(esc), Some(base), Some(current)) = (
+            self.fee_escalation(chain),
+            r.claim_base_feerate,
+            r.claim_feerate,
+        ) else {
+            return Ok(());
+        };
+        let kind = mk.fee_bump();
+        if kind == FeeBump::None {
+            return Ok(());
+        }
+        let (Some(htlc), Some(op), Some(amount)) =
+            (r.maker_leg_htlc, r.maker_leg_outpoint, r.maker_leg_amount)
+        else {
+            return Ok(());
+        };
+        let left = i64::from(htlc.locktime) - i64::from(mk.median_time_past().await?);
+        let target = esc.target(base, left);
+        if !esc.should_bump(base, current, target) {
+            return Ok(());
+        }
+        let tx = match kind {
+            FeeBump::Rbf => {
+                let tx = mk
+                    .build_claim_at(&htlc, &op, amount, &r.preimage, target)
+                    .await?;
+                r.claim_replaced.push((claim.clone(), current));
+                r.maker_leg_claim = Some(tx.clone());
+                tx
+            }
+            FeeBump::Cpfp => {
+                let mut package = vec![claim.clone()];
+                package.extend(r.claim_children.iter().cloned());
+                let tx = mk.build_cpfp(&package, amount, target).await?;
+                r.claim_children.push(tx.clone());
+                tx
+            }
+            FeeBump::None => unreachable!("returned above"),
+        };
+        r.claim_feerate = Some(target);
+        self.store.put_taker_swap(r)?; // write-ahead
+        tracing::info!(
+            swap = %r.id,
+            %chain,
+            bump = ?kind,
+            old_feerate = current,
+            new_feerate = target,
+            txid = %tx.txid,
+            claim = %claim.txid,
+            secs_left = left,
+            "claim fee bumped"
+        );
+        if let Err(e) = mk.broadcast(&tx).await {
+            // Kept: the next step resends it and, if refused for good, falls back.
+            tracing::warn!(swap = %r.id, txid = %tx.txid, error = %e, "fee bump broadcast failed");
+        }
+        Ok(())
+    }
+
     async fn on_refunded(&self, r: &mut TakerRecord) -> Result<Flow> {
+        if let Some(spend) = self.taker_leg_lost(r).await? {
+            // Without this the refund is refused for good on every step and re-signed
+            // forever.
+            tracing::error!(
+                swap = %r.id,
+                taker_leg = ?r.taker_leg_funding.as_ref().map(|f| f.outpoint),
+                maker_leg = ?r.maker_leg_outpoint,
+                maker_claim = %spend.txid,
+                "swap lost: the maker claimed the taker leg with our preimage and our \
+                 maker-leg claim never confirmed; nothing is left to refund or claim"
+            );
+            r.taker_leg_refund = None;
+            r.last_error = Some(format!(
+                "lost: the taker leg was claimed by {} with our preimage",
+                spend.txid
+            ));
+            return self.enter(r, TakerState::Lost);
+        }
         let refund = match r.taker_leg_refund.clone() {
             Some(tx) => tx,
             None => {
@@ -617,7 +946,7 @@ mod terminal_tests {
             | TakerState::MakerLockConfirmed
             | TakerState::Claimed
             | TakerState::Refunded => false,
-            TakerState::Done => true,
+            TakerState::Done | TakerState::Lost => true,
         }
     }
 
@@ -631,11 +960,12 @@ mod terminal_tests {
             TakerState::Claimed,
             TakerState::Refunded,
             TakerState::Done,
+            TakerState::Lost,
         ];
         for s in all {
             assert_eq!(s.is_terminal(), verdict(s), "{s:?}");
         }
-        // Refunded still owes its refund broadcast, so only Done is terminal.
-        assert_eq!(all.iter().filter(|s| s.is_terminal()).count(), 1);
+        // Refunded still owes its refund broadcast, so only Done and Lost are terminal.
+        assert_eq!(all.iter().filter(|s| s.is_terminal()).count(), 2);
     }
 }

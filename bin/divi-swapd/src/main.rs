@@ -1352,6 +1352,10 @@ mod tests {
             maker_leg_claim: None,
             taker_leg_refund: None,
             claim_declined: None,
+            claim_base_feerate: None,
+            claim_feerate: None,
+            claim_replaced: Vec::new(),
+            claim_children: Vec::new(),
             last_error: None,
         }
     }
@@ -1416,6 +1420,30 @@ mod tests {
             .reserved(Chain::Btc)
             .unwrap();
         assert!(!held.contains(&op(5, 0)) && held.contains(&op(6, 0)));
+    }
+
+    #[test]
+    fn a_lost_taker_swap_is_terminal_listed_as_lost_and_releasable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("swaps.db");
+        Store::open(&db)
+            .unwrap()
+            .put_taker_swap(&taker_lock_swap("tlost", divi_swap::TakerState::Lost, 0x53))
+            .unwrap();
+        InputReservations::open(&db)
+            .unwrap()
+            .reserve(Chain::Btc, &divi_swap::Txid([0x53; 32]), &[op(7, 0)])
+            .unwrap();
+        let cfg = inflight_cfg(&db, false);
+        let out = reservations_report(&cfg).unwrap();
+        assert!(out.contains("\ttlost\tlost\n"), "{out}");
+        let out = release_reservation(&cfg, Chain::Btc, &hex_of(0x53), true).unwrap();
+        assert!(out.released);
+        assert!(
+            out.text.contains("swap tlost (lost, terminal)"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

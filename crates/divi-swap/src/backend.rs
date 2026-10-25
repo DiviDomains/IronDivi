@@ -16,7 +16,7 @@
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{Result, SwapError};
 use crate::htlc::HtlcParams;
 use crate::types::{Amount, Chain, Funding, LockedOutput, Outpoint, SignedTx, SpendInfo, Txid};
 
@@ -31,6 +31,24 @@ pub fn normalize_block_hash(raw: &str) -> Result<String> {
             "malformed tip block hash {raw:?}"
         )))
     }
+}
+
+/// How a claim stuck in a chain's mempool can be made to pay more ([`ChainBackend::fee_bump`]).
+/// Which one a chain has was read from its node source, not assumed:
+/// `docs/plans/swap-poc/status/engine.md`, DJ round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeeBump {
+    /// Neither works: the chain's mempool refuses any spend that conflicts with one it holds,
+    /// and its miner scores each transaction on its own fee, so a child cannot pull a parent
+    /// in. The claim is resent unchanged (DIVI, ZEC).
+    #[default]
+    None,
+    /// Replace the claim with a re-signed one paying a higher feerate (BIP125 rules: more
+    /// absolute fee and a higher feerate). The node relays replacements (BTC).
+    Rbf,
+    /// Leave the claim, and spend its output in a child paying enough for the pair: the
+    /// miner selects by package feerate though replacements are not relayed (LTC).
+    Cpfp,
 }
 
 /// One chain, one engine key. A backend owns exactly one secp256k1 key (resolved from
@@ -134,6 +152,55 @@ pub trait ChainBackend: Send + Sync {
     /// `None` means this backend cannot tell cheaply; a caller must not refuse on it.
     async fn spendable(&self) -> Result<Option<Amount>> {
         Ok(None)
+    }
+
+    /// How this backend can raise the fee of a claim it built ([`FeeBump::None`] unless it
+    /// implements [`build_claim_at`](Self::build_claim_at) or
+    /// [`build_cpfp`](Self::build_cpfp)).
+    fn fee_bump(&self) -> FeeBump {
+        FeeBump::None
+    }
+
+    /// Feerate, in the chain's base unit per virtual byte, that
+    /// [`build_claim`](Self::build_claim) would pay now. `None`: fixed or not known, and so
+    /// nothing to escalate from.
+    async fn claim_feerate(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// [`build_claim`](Self::build_claim) paying `feerate` (base unit per vbyte) instead of
+    /// the backend's own rate. An [`FeeBump::Rbf`] backend signals replacement (BIP125
+    /// sequence) so that it can replace an earlier claim of the same outpoint; a
+    /// [`FeeBump::Cpfp`] backend implements it too, for the first claim only.
+    async fn build_claim_at(
+        &self,
+        _htlc: &HtlcParams,
+        _at: &Outpoint,
+        _amount: Amount,
+        _preimage: &[u8; 32],
+        _feerate: u64,
+    ) -> Result<SignedTx> {
+        Err(SwapError::Other(format!(
+            "{} backend cannot re-sign a claim at a new feerate",
+            self.chain()
+        )))
+    }
+
+    /// Build + sign a child spending output 0 of the last transaction in `package` back to
+    /// this key, paying enough that the package and the child together pay `feerate` (base
+    /// unit per vbyte). `package` is a claim this backend built of an HTLC worth
+    /// `htlc_amount`, then any children built on it, each spending its predecessor's only
+    /// output. **Does not broadcast.** Only for [`FeeBump::Cpfp`] backends.
+    async fn build_cpfp(
+        &self,
+        _package: &[SignedTx],
+        _htlc_amount: Amount,
+        _feerate: u64,
+    ) -> Result<SignedTx> {
+        Err(SwapError::Other(format!(
+            "{} backend cannot build a CPFP child",
+            self.chain()
+        )))
     }
 }
 

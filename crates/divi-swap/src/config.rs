@@ -76,6 +76,181 @@ impl ChainParams {
     }
 }
 
+/// How much time must be left before the maker-leg locktime for the taker to broadcast its
+/// **first** maker-leg claim ([`ClaimDeadline::builtin`]; `Taker::with_claim_deadline`
+/// overrides one chain).
+///
+/// Once that claim is out the preimage is public, and the maker may claim the taker leg with
+/// it at any time before the taker-leg locktime. The taker only keeps the maker leg if its
+/// claim confirms before the maker can refund (MTP reaching the maker-leg locktime), so it
+/// needs enough blocks to get mined in, not just enough seconds. Below the margin the taker
+/// declines for good and waits for its taker-leg refund: nothing has been revealed yet, so
+/// both sides get their coins back. A claim already broadcast is never abandoned.
+///
+/// The margin is `max(min_secs, min_blocks × block_secs)`: both must be met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimDeadline {
+    /// Target block interval of the chain, in seconds.
+    pub block_secs: u32,
+    /// Blocks that must still be due before the locktime.
+    pub min_blocks: u32,
+    /// Seconds of MTP that must be left before the locktime.
+    pub min_secs: u32,
+}
+
+impl ClaimDeadline {
+    /// Built-in margin for a maker leg on `chain`, the same on every profile (it is about how
+    /// fast the chain mines, not about how much the counterparty is trusted). Never below the
+    /// 1800 s every chain had before margins were per chain
+    /// (`taker::TAKER_SAFETY_MARGIN_SECS`).
+    pub fn builtin(chain: Chain) -> Self {
+        let (block_secs, min_blocks, min_secs) = match chain {
+            // 10-minute blocks. Six blocks: the chance of no block at all in an hour is
+            // e^-6 ≈ 0.25 %, against e^-3 ≈ 5 % for the three blocks 1800 s used to give,
+            // and every block in between is a fee-bump (RBF) step.
+            Chain::Btc => (600, 6, 3600),
+            // 2.5-minute blocks: 1800 s is twelve blocks (no block in 30 min: e^-12, about
+            // 6 in a million), and each one is a CPFP step.
+            Chain::Ltc => (150, 12, 1800),
+            // 75 s is the protocol target (ZIP-208); it is counted at the target, not the
+            // ~25 s measured on NU7, so the block arm never reads more blocks than mainnet
+            // mines. 24 blocks = 1800 s. Neither replacement nor CPFP helps on ZEC
+            // (docs/plans/swap-poc/status/engine.md, DJ round), so the claim is resent at its
+            // first fee and this margin is the whole defence.
+            Chain::Zec => (75, 24, 1800),
+            // 1-minute blocks; 30 blocks = 1800 s. DIVI Core relays no replacement and its
+            // miner ignores CPFP (engine.md, DJ round); it has no mempool size limit to evict
+            // from, so the claim is resent unchanged and thirty blocks is ample.
+            Chain::Divi => (60, 30, 1800),
+            // ~12-second blocks: 1800 s is 150 of them, far over the 180 s timestamp lag;
+            // the seconds floor binds, not the block count.
+            Chain::Usdc => (12, 150, 1800),
+            // 2-minute blocks. Monero has no CLTV, so no HTLC claim ever runs against it;
+            // the value only keeps every chain covered.
+            Chain::Xmr => (120, 15, 1800),
+        };
+        ClaimDeadline {
+            block_secs,
+            min_blocks,
+            min_secs,
+        }
+    }
+
+    /// Seconds that must be left before the locktime: `max(min_secs, min_blocks ×
+    /// block_secs)`, saturating.
+    pub fn margin_secs(&self) -> u32 {
+        self.min_secs
+            .max(self.min_blocks.saturating_mul(self.block_secs))
+    }
+
+    /// `Ok` if a first claim may still go out with the chain at `mtp` and the maker-leg
+    /// locktime at `locktime`; otherwise why not.
+    pub fn check(&self, chain: Chain, mtp: u32, locktime: u32) -> std::result::Result<(), String> {
+        let left = i64::from(locktime) - i64::from(mtp);
+        let blocks = left.max(0) / i64::from(self.block_secs.max(1));
+        if left < i64::from(self.min_secs) || blocks < i64::from(self.min_blocks) {
+            return Err(format!(
+                "maker-leg locktime {locktime} is {left}s (~{blocks} {chain} blocks) after its \
+                 chain's MTP {mtp}, short of the claim deadline (at least {}s and {} blocks); not \
+                 claiming, waiting for the taker-leg refund",
+                self.min_secs, self.min_blocks
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// How the taker raises the fee of a maker-leg claim that has not confirmed as the maker-leg
+/// locktime nears ([`FeeEscalation::builtin`]; `Taker::with_fee_escalation` overrides or
+/// turns it off for one chain). Applied only where the backend can bump
+/// (`FeeBump::Rbf` or `FeeBump::Cpfp`).
+///
+/// The feerate stays at what the first claim paid until `start_secs_left` seconds are left,
+/// then climbs geometrically to the cap, reached with `cap_secs_left` left. The cap is the
+/// lower of `cap_feerate` and `max_multiple` times the first claim's feerate: the claim is
+/// worth the maker leg, so overpaying beats losing it, but not without bound (a fee estimate
+/// gone wrong must not hand the leg to the miners).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeEscalation {
+    /// Seconds left before the maker-leg locktime when bumping starts.
+    pub start_secs_left: u32,
+    /// Seconds left when the cap is reached.
+    pub cap_secs_left: u32,
+    /// Highest feerate ever paid, base unit per vbyte.
+    pub cap_feerate: u64,
+    /// Highest multiple of the first claim's feerate ever paid.
+    pub max_multiple: u64,
+}
+
+impl FeeEscalation {
+    /// Built-in schedule for a maker leg on `chain`, or `None` where no backend can bump
+    /// (DIVI and ZEC relay no replacement and ignore CPFP; XMR has no HTLC; the EVM backend
+    /// does not replace by nonce yet). Bumping starts at twice the claim deadline
+    /// ([`ClaimDeadline::builtin`]) and caps out at half of it, so a claim sent at the
+    /// deadline is at the cap with three BTC blocks (six LTC blocks) still to come.
+    pub fn builtin(chain: Chain) -> Option<Self> {
+        let cap_feerate = match chain {
+            // sat/vB. Above every sustained mainnet peak so far (a few hundred sat/vB);
+            // 1000 sat/vB on a ~150 vB claim is 150 000 sat.
+            Chain::Btc => 1000,
+            // litoshi/vB. LTC fees sit near the relay floor; 500 is far above any backlog
+            // it has had, and its blocks are four times as frequent.
+            Chain::Ltc => 500,
+            Chain::Zec | Chain::Divi | Chain::Usdc | Chain::Xmr => return None,
+        };
+        let m = ClaimDeadline::builtin(chain).margin_secs();
+        Some(FeeEscalation {
+            start_secs_left: m.saturating_mul(2),
+            cap_secs_left: m / 2,
+            cap_feerate,
+            max_multiple: 50,
+        })
+    }
+
+    /// The feerate to pay with `left` seconds before the locktime, the first claim having paid
+    /// `base`. Never below `base` and never above the cap.
+    pub fn target(&self, base: u64, left: i64) -> u64 {
+        let base = base.max(1);
+        let cap = self.cap(base);
+        let (start, end) = (
+            i64::from(self.start_secs_left),
+            i64::from(self.cap_secs_left),
+        );
+        if left >= start {
+            return base;
+        }
+        if left <= end || start <= end {
+            return cap;
+        }
+        let t = (start - left) as f64 / (start - end) as f64;
+        let rate = base as f64 * (cap as f64 / base as f64).powf(t);
+        (rate.ceil() as u64).clamp(base, cap)
+    }
+
+    /// Whether paying `target` instead of `current` is worth a new transaction: at least a
+    /// quarter more, and at least one unit per vbyte more (BIP125's incremental relay fee, so
+    /// a replacement is never refused for paying too little extra). A quarter keeps a climb
+    /// to 50x within 18 bumps, so a CPFP chain stays inside the 25-transaction ancestor limit.
+    pub fn worth_bumping(current: u64, target: u64) -> bool {
+        target >= current.saturating_add((current / 4).max(1))
+    }
+
+    /// The highest feerate a claim whose first version paid `base` ever pays.
+    pub fn cap(&self, base: u64) -> u64 {
+        let base = base.max(1);
+        self.cap_feerate
+            .min(base.saturating_mul(self.max_multiple))
+            .max(base)
+    }
+
+    /// Whether to bump a claim paying `current` (first version `base`) to `target`: when
+    /// [`FeeEscalation::worth_bumping`], or to finish the climb to the cap, which a quarter
+    /// step could otherwise leave just short of (one more transaction at most).
+    pub fn should_bump(&self, base: u64, current: u64, target: u64) -> bool {
+        target > current && (Self::worth_bumping(current, target) || target == self.cap(base))
+    }
+}
+
 /// Swap timing and confirmation requirements. All durations in seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapConfig {
@@ -90,6 +265,8 @@ pub struct SwapConfig {
     /// How far BTC median time past lags wall clock (≈ 1 h).
     pub btc_mtp_lag_secs: u32,
     /// Time the maker needs to get its taker-leg claim confirmed after learning the preimage.
+    /// The taker's own margin before the maker-leg locktime is per chain, in
+    /// [`ClaimDeadline`], not this value.
     pub claim_margin_secs: u32,
     /// Quote validity.
     pub quote_expiry_secs: u32,
@@ -172,9 +349,15 @@ impl SwapConfig {
             .unwrap_or(self.btc_mtp_lag_secs)
     }
 
-    /// Required minimum of `taker_timeout − maker_timeout`.
+    /// Required minimum of `taker_timeout − maker_timeout`, saturating at `u32::MAX`.
     pub fn required_gap_secs(&self) -> u32 {
-        Self::MIN_TIMEOUT_GAP_SECS.max(2 * self.max_mtp_lag_secs() + self.claim_margin_secs)
+        u32::try_from(self.required_gap()).unwrap_or(u32::MAX)
+    }
+
+    /// `max(3 h, 2 × max MTP lag + claim margin)`, exact: lag and margin come from config.
+    fn required_gap(&self) -> u64 {
+        let need = 2 * u64::from(self.max_mtp_lag_secs()) + u64::from(self.claim_margin_secs);
+        need.max(u64::from(Self::MIN_TIMEOUT_GAP_SECS))
     }
 
     /// Enforce `taker_timeout − maker_timeout ≥ max(3 h, 2 × max MTP lag + claim margin)`
@@ -194,10 +377,10 @@ impl SwapConfig {
             .ok_or_else(|| {
                 SwapError::InvalidParams("taker timeout must exceed maker timeout".into())
             })?;
-        if gap < self.required_gap_secs() {
+        if u64::from(gap) < self.required_gap() {
             return Err(SwapError::InvalidParams(format!(
                 "timeout gap {gap}s < required {}s",
-                self.required_gap_secs()
+                self.required_gap()
             )));
         }
         if Chain::ALL.into_iter().any(|c| self.confirmations(c) == 0) {
@@ -488,6 +671,106 @@ mod tests {
     use super::*;
     use crate::api::Direction;
     use crate::types::Amount;
+
+    /// A lag near `u32::MAX` (divi-swapd takes `mtp_lag_secs` from the config file) does not
+    /// overflow the required gap: it is computed exactly, so no gap a `u32` holds satisfies it.
+    #[test]
+    fn huge_mtp_lag_does_not_overflow_the_gap() {
+        let mut c = SwapConfig::profile(Profile::Testnet);
+        c.taker_timeout_secs = u32::MAX;
+        c.maker_timeout_secs = 0;
+        c.btc_mtp_lag_secs = u32::MAX / 2;
+        c.claim_margin_secs = 2;
+        assert_eq!(c.required_gap_secs(), u32::MAX);
+        assert!(c.validate().is_err());
+        c.btc_mtp_lag_secs = u32::MAX;
+        assert!(c.validate().is_err());
+    }
+
+    /// Every chain's claim deadline keeps at least the old 1800 s, and fits inside the
+    /// mainnet maker leg's worst case: the maker timeout less the locktime tolerance taken on
+    /// both legs (2 × 1800 s) and the MTP lag on both (2 × the largest lag).
+    #[test]
+    fn claim_deadlines_hold_the_floor_and_fit_the_mainnet_window() {
+        let c = SwapConfig::profile(Profile::Mainnet);
+        let window = c.maker_timeout_secs - 2 * 1800 - 2 * c.max_mtp_lag_secs();
+        for chain in Chain::ALL {
+            let d = ClaimDeadline::builtin(chain);
+            assert!(
+                d.margin_secs() >= crate::taker::TAKER_SAFETY_MARGIN_SECS,
+                "{chain}"
+            );
+            assert!(d.margin_secs() >= d.min_blocks * d.block_secs, "{chain}");
+            assert!(
+                d.margin_secs() <= window,
+                "{chain}: {} > {window}",
+                d.margin_secs()
+            );
+        }
+    }
+
+    #[test]
+    fn fee_escalation_climbs_from_base_to_the_cap() {
+        let e = FeeEscalation::builtin(Chain::Btc).unwrap();
+        assert_eq!((e.start_secs_left, e.cap_secs_left), (7200, 1800));
+        assert_eq!(
+            e.target(10, 9000),
+            10,
+            "before the start: the first claim's rate"
+        );
+        assert_eq!(e.target(10, 7200), 10);
+        assert_eq!(e.target(10, 1800), 500, "cap: 50 x base, under 1000 sat/vB");
+        assert_eq!(e.target(10, -60), 500, "past the locktime: still the cap");
+        assert_eq!(e.target(100, 0), 1000, "cap: the absolute 1000 sat/vB");
+        let mid = e.target(10, 4500);
+        assert!(mid > 10 && mid < 500, "{mid}");
+        let mut last = 0;
+        for left in (0..=9000).rev().step_by(60) {
+            let t = e.target(10, left);
+            assert!(t >= last, "never falls as the locktime nears");
+            last = t;
+        }
+        assert!(FeeEscalation::worth_bumping(10, 12) && !FeeEscalation::worth_bumping(10, 11));
+        assert!(!FeeEscalation::worth_bumping(100, 124));
+        assert!(FeeEscalation::worth_bumping(1, 2) && !FeeEscalation::worth_bumping(1, 1));
+        let btc = FeeEscalation::builtin(Chain::Btc).unwrap();
+        assert_eq!((btc.cap(10), btc.cap(100)), (500, 1000));
+        assert!(
+            btc.should_bump(10, 450, 500),
+            "finishes the climb to the cap"
+        );
+        assert!(
+            !btc.should_bump(10, 450, 480),
+            "short of the cap: a quarter step"
+        );
+        assert!(!btc.should_bump(10, 500, 500));
+        for chain in [Chain::Divi, Chain::Zec, Chain::Xmr, Chain::Usdc] {
+            assert!(FeeEscalation::builtin(chain).is_none(), "{chain}");
+        }
+        assert!(FeeEscalation::builtin(Chain::Ltc).is_some());
+    }
+
+    #[test]
+    fn claim_deadline_check_needs_both_seconds_and_blocks() {
+        let d = ClaimDeadline {
+            block_secs: 600,
+            min_blocks: 6,
+            min_secs: 600,
+        };
+        assert_eq!(d.margin_secs(), 3600);
+        assert!(d.check(Chain::Btc, 0, 3600).is_ok());
+        assert!(d.check(Chain::Btc, 0, 3599).is_err(), "five blocks");
+        assert!(d.check(Chain::Btc, 100, 50).is_err(), "past the locktime");
+        let d = ClaimDeadline {
+            min_secs: 4000,
+            ..d
+        };
+        assert!(
+            d.check(Chain::Btc, 0, 3999).is_err(),
+            "six blocks, too few seconds"
+        );
+        assert!(d.check(Chain::Btc, 0, 4000).is_ok());
+    }
 
     #[test]
     fn both_profiles_valid() {

@@ -86,6 +86,10 @@ fn taker() -> TakerRecord {
         maker_leg_claim: None,
         taker_leg_refund: None,
         claim_declined: None,
+        claim_base_feerate: None,
+        claim_feerate: None,
+        claim_replaced: Vec::new(),
+        claim_children: Vec::new(),
         last_error: None,
     }
 }

@@ -870,6 +870,86 @@ mod tests {
         assert!(matches!(err, SwapError::InsufficientFunds(_)), "{err:?}");
     }
 
+    /// Property tests over the USDC unit conversions and the fundability floor: zero, one,
+    /// the `u64` limits and random values, plus amounts beyond 64 bits.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn edge() -> impl Strategy<Value = u64> {
+            prop_oneof![
+                Just(0u64),
+                Just(1),
+                Just(99),
+                Just(100),
+                Just(u64::MAX / ENGINE_PER_USDC_UNIT),
+                Just(u64::MAX / ENGINE_PER_USDC_UNIT + 1),
+                Just(u64::MAX),
+                0..=1_000_000_000u64,
+                any::<u64>(),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            /// Units become engine sats ×100 exactly, and round-trip; anything that would not
+            /// fit in a `u64` of sats is refused, never wrapped or saturated.
+            #[test]
+            fn usdc_units_to_amount_is_exact_or_refused(units in edge(), high in any::<bool>()) {
+                let u = if high {
+                    U256::from(units) + (U256::from(1u8) << 64)
+                } else {
+                    U256::from(units)
+                };
+                let fits = !high && units <= u64::MAX / ENGINE_PER_USDC_UNIT;
+                match usdc_units_to_amount(u) {
+                    Ok(a) => {
+                        prop_assert!(fits);
+                        prop_assert_eq!(u128::from(a.to_sat()), u128::from(units) * 100);
+                        prop_assert_eq!(amount_to_usdc_units(a).unwrap(), u);
+                    }
+                    Err(_) => prop_assert!(!fits),
+                }
+            }
+
+            /// Only a whole number of base units converts, exactly, and it converts back.
+            #[test]
+            fn amount_to_usdc_units_refuses_only_fractions(sat in edge()) {
+                match amount_to_usdc_units(Amount::from_sat(sat)) {
+                    Ok(u) => {
+                        prop_assert_eq!(sat % ENGINE_PER_USDC_UNIT, 0);
+                        prop_assert_eq!(u, U256::from(sat / ENGINE_PER_USDC_UNIT));
+                        prop_assert_eq!(usdc_units_to_amount(u).unwrap(), Amount::from_sat(sat));
+                    }
+                    Err(_) => prop_assert_ne!(sat % ENGINE_PER_USDC_UNIT, 0),
+                }
+            }
+
+            /// More ETH or more USDC never makes a fundable offer unfundable.
+            #[test]
+            fn usdc_offer_fundability_is_monotone(
+                pays_btc in any::<bool>(),
+                eth in edge(),
+                usdc in edge(),
+                more_eth in edge(),
+                more_usdc in edge(),
+                min_eth in edge(),
+                min_usdc in edge(),
+            ) {
+                let dir = if pays_btc { Direction::TakerPaysBtc } else { Direction::TakerPaysDivi };
+                let ok = |eth: U256, usdc: U256| {
+                    usdc_offer_is_fundable(dir, eth, usdc, u128::from(min_eth), min_usdc)
+                };
+                let (eth, usdc) = (U256::from(eth), U256::from(usdc));
+                if ok(eth, usdc) {
+                    prop_assert!(ok(eth + U256::from(more_eth), usdc));
+                    prop_assert!(ok(eth, usdc + U256::from(more_usdc)));
+                }
+            }
+        }
+    }
+
     #[test]
     fn nonce_conflict_recognizes_both_wordings() {
         assert!(is_nonce_conflict("nonce too low: next nonce 5, tx nonce 3"));

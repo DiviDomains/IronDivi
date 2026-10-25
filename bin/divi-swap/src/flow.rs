@@ -161,6 +161,7 @@ pub async fn run_swap_gated(
         if state == TakerState::Done {
             return Ok((local, state));
         }
+        lost_is_an_error(&local, state)?;
         held = gate.is_some() && state == TakerState::MakerLockConfirmed;
         if started.elapsed() > opts.timeout {
             bail!("timed out in taker state {state:?}; swap {local} left in place — rerun `status`/`refund`");
@@ -241,13 +242,27 @@ pub async fn step(
             None
         }
     };
-    Ok(taker.step(local, view.as_ref()).await?)
+    lost_is_an_error(local, taker.step(local, view.as_ref()).await?)
 }
 
 /// Refund `local`'s taker leg without ever claiming the maker leg (see [`Taker::refund`]) —
 /// never needs the maker's view, so no `client`/`sessions` lookup either.
 pub async fn refund(taker: &Taker, local: &str) -> Result<TakerState> {
-    Ok(taker.refund(local).await?)
+    lost_is_an_error(local, taker.refund(local).await?)
+}
+
+/// `Lost` is terminal but not a success: both legs went to the maker (see
+/// [`TakerState::Lost`]), so `claim`, `refund` and `run` exit non-zero instead of printing it
+/// as an ordinary state or polling it until the timeout.
+fn lost_is_an_error(local: &str, state: TakerState) -> Result<TakerState> {
+    if state == TakerState::Lost {
+        tracing::error!(swap = %local, "swap lost: the maker refunded its leg and claimed ours with our leaked preimage");
+        bail!(
+            "swap {local} is lost: our maker-leg claim never confirmed and the maker claimed the \
+             taker leg with its preimage; nothing is left to claim or refund"
+        );
+    }
+    Ok(state)
 }
 
 /// Whether the gate's policy now allows the claim (or, for `Never`, the claim window
@@ -282,4 +297,18 @@ async fn release(g: &ClaimGate, local: &str) -> Result<bool> {
         g.policy
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_is_an_error_and_every_other_state_passes_through() {
+        let err = lost_is_an_error("l1", TakerState::Lost).unwrap_err();
+        assert!(err.to_string().contains("swap l1 is lost"), "{err}");
+        for s in [TakerState::Done, TakerState::Refunded, TakerState::Claimed] {
+            assert_eq!(lost_is_an_error("l1", s).unwrap(), s);
+        }
+    }
 }

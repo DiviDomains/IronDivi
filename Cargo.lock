@@ -6868,6 +6868,7 @@ dependencies = [
  "clap",
  "divi-swap",
  "hex",
+ "proptest",
  "secp256k1 0.29.1",
  "serde_json",
  "sha2",

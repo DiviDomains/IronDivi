@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use divi_swap::api::{AcceptRequest, Direction, LockNotice, Offer, Quote};
 use divi_swap::htlc::ScriptVersion;
-use divi_swap::mock::{MockBackend, MockChain, TxCounts, TxKind, MOCK_FEE};
+use divi_swap::mock::{KindCounts, MockBackend, MockChain, TxKind, MOCK_FEE};
 use divi_swap::store::{MakerRecord, TakerRecord};
 use divi_swap::{
     Amount, Chain, ChainBackend, Funding, HtlcParams, LockedOutput, Maker, Outpoint, Profile,
@@ -119,8 +119,8 @@ const HOLD_ROUNDS: usize = 4;
 /// The refund-edge rows: MTP at L-1, L and L+1, and the late lock.
 const EDGES: [Edge; 4] = [Edge::At(-1), Edge::At(0), Edge::At(1), Edge::LateLock];
 
-fn add_counts(a: TxCounts, b: TxCounts) -> TxCounts {
-    TxCounts {
+fn add_counts(a: KindCounts, b: KindCounts) -> KindCounts {
+    KindCounts {
         funds: a.funds + b.funds,
         claims: a.claims + b.claims,
         refunds: a.refunds + b.refunds,
@@ -543,7 +543,7 @@ impl H {
     }
 
     /// Broadcast attempts on both chains, by kind, refused ones included.
-    fn attempts(&self) -> TxCounts {
+    fn attempts(&self) -> KindCounts {
         add_counts(self.btc.attempt_counts(), self.divi.attempt_counts())
     }
 
@@ -819,10 +819,15 @@ async fn case_d_body(dir: Direction) {
     assert_eq!(h.maker_state(), SwapState::MakerLockConfirmed);
     let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
     let locktime = rec.maker_leg_htlc.unwrap().locktime;
-    // Move to just inside the taker's claim window (locktime − safety margin).
+    // Move to just inside the taker's claim window (locktime − the maker-leg chain's claim
+    // deadline, which on BTC is wider than the 1800 s floor).
     let ml = h.ml_chain().clone();
     let now = ml.mtp();
-    let target = locktime - divi_swap::taker::TAKER_SAFETY_MARGIN_SECS - 30;
+    let ml_chain = match h.dir.maker_chain() {
+        Chain::Divi => Chain::Divi,
+        _ => counter().0,
+    };
+    let target = locktime - h.taker.claim_deadline(ml_chain).margin_secs() - 30;
     ml.advance_time(target - now);
     let view = h.maker.view(&h.maker_id).unwrap();
     h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
@@ -900,8 +905,8 @@ struct Outcome {
     maker: SwapState,
     taker: TakerState,
     balances: [u64; 4],
-    taker_leg_txs: TxCounts,
-    maker_leg_txs: TxCounts,
+    taker_leg_txs: KindCounts,
+    maker_leg_txs: KindCounts,
     coin_selections: (u64, u64),
     /// Maker locks handed back to the wallet as lost.
     released: usize,
@@ -918,8 +923,8 @@ impl H {
                 self.divi.balance(&self.tdivi.pubkey()).0,
                 self.btc.balance(&self.tbtc.pubkey()).0,
             ],
-            taker_leg_txs: self.tl_chain().tx_counts(),
-            maker_leg_txs: self.ml_chain().tx_counts(),
+            taker_leg_txs: self.tl_chain().kind_counts(),
+            maker_leg_txs: self.ml_chain().kind_counts(),
             coin_selections: (self.m_ml().funding_calls(), self.t_tl().funding_calls()),
             released: [&self.mdivi, &self.mbtc, &self.tdivi, &self.tbtc]
                 .iter()
@@ -983,7 +988,7 @@ async fn restart_matrix_body(dir: Direction) {
         base.restart_and_settle().await;
         let want = base.outcome();
         let happy = u64::from(scn == Scn::Happy);
-        let leg = TxCounts {
+        let leg = KindCounts {
             funds: 1,
             claims: happy,
             refunds: 1 - happy,
@@ -1194,7 +1199,7 @@ fn assert_no_early_refund(h: &H, what: &str) {
 }
 
 /// The per-matrix summary line: broadcast attempts on both chains, refused ones included.
-fn report_attempts(matrix: &str, dir: Direction, what: &str, runs: usize, a: TxCounts) {
+fn report_attempts(matrix: &str, dir: Direction, what: &str, runs: usize, a: KindCounts) {
     eprintln!(
         "DF-ATTEMPTS {matrix} {dir:?} {what}: {runs} runs, fund {} claim {} refund {} all {}",
         a.funds,
@@ -1953,7 +1958,7 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
         let rec = h.store.get_maker_swap(&h.maker_id).unwrap().unwrap();
         assert!(rec.maker_leg_refund.is_none(), "maker at mtp {at}");
         assert_eq!(
-            ml.tx_counts().refunds,
+            ml.kind_counts().refunds,
             0,
             "maker refund accepted at mtp {at}"
         );
@@ -1973,7 +1978,7 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
     ml.mine(1);
     // One step: MakerRefundable → MakerRefunded (refund confirmed) → Done.
     assert_eq!(h.maker.step(&h.maker_id).await.unwrap(), SwapState::Done);
-    assert_eq!(ml.tx_counts().refunds, 1);
+    assert_eq!(ml.kind_counts().refunds, 1);
     assert_eq!(
         ml.balance(&h.m_ml().pubkey()).0,
         bal.0 + f.amount.0 - MOCK_FEE.0
@@ -2010,7 +2015,7 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
         let rec = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
         assert!(rec.taker_leg_refund.is_none(), "taker at mtp {at}");
         assert_eq!(
-            tl.tx_counts().refunds,
+            tl.kind_counts().refunds,
             0,
             "taker refund accepted at mtp {at}"
         );
@@ -2032,7 +2037,7 @@ async fn refund_at_timelock_boundary_body(dir: Direction) {
         h.taker.step(&h.taker_id, None).await.unwrap(),
         TakerState::Done
     );
-    assert_eq!(tl.tx_counts().refunds, 1);
+    assert_eq!(tl.kind_counts().refunds, 1);
     assert_eq!(
         tl.balance(&h.t_tl().pubkey()).0,
         bal.0 + f.amount.0 - MOCK_FEE.0
@@ -2754,7 +2759,7 @@ async fn late_lock_refund_waits_for_final_body(dir: Direction) {
     ml.mine(1);
     h.maker.tick().await.unwrap();
     assert_eq!(h.maker_state(), SwapState::Done);
-    assert_eq!(ml.tx_counts().refunds, 1);
+    assert_eq!(ml.kind_counts().refunds, 1);
 }
 both!(
     late_lock_refund_waits_for_final,
@@ -3002,4 +3007,247 @@ both!(
     unseen_lock_is_not_released,
     rev_unseen_lock_is_not_released,
     unseen_lock_is_not_released_body
+);
+
+/// Found by `swap_model.rs`: the taker persists its claim and goes down before broadcasting
+/// it, and stays down past the maker-leg locktime, so the maker refunds its leg. The stored
+/// claim is now refused for good, and re-signing it gives the same refused bytes: the taker
+/// sat in `Claimed` forever and never refunded its own, still-locked leg. It must notice the
+/// maker leg is gone and refund instead — through `step` and through `refund` alike.
+async fn claimed_after_maker_refund_body(dir: Direction, refund_only: bool) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await; // signed and stored, not broadcast
+    h.restart();
+
+    let locktime = h.maker_rec().maker_leg_htlc.unwrap().locktime;
+    let ml = h.ml_chain().clone();
+    ml.advance_time(locktime + 1 - ml.mtp());
+    h.clock.fetch_add(22_000, Ordering::SeqCst);
+    for _ in 0..8 {
+        let _ = h.maker.tick().await;
+        h.mine_all(1);
+    }
+    assert_eq!(
+        h.maker_state(),
+        SwapState::Done,
+        "the maker refunds its leg"
+    );
+
+    h.tl_chain().advance_time(22_000); // past the taker's own timeout
+    for _ in 0..8 {
+        let _ = if refund_only {
+            h.taker.refund(&h.taker_id).await
+        } else {
+            let view = h.maker.view(&h.maker_id).unwrap();
+            h.taker.step(&h.taker_id, view.as_ref()).await
+        };
+        h.mine_all(1);
+    }
+    let taker = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(
+        taker.state,
+        TakerState::Done,
+        "the taker leg must be refunded"
+    );
+    let at = taker.taker_leg_funding.unwrap().outpoint;
+    let counts = h.tl_chain().tx_counts(&at);
+    assert_eq!((counts.claims, counts.refunds), (0, 1), "{counts:?}");
+}
+
+async fn claimed_after_maker_refund_steps_body(dir: Direction) {
+    claimed_after_maker_refund_body(dir, false).await
+}
+both!(
+    claimed_after_maker_refund_steps,
+    rev_claimed_after_maker_refund_steps,
+    claimed_after_maker_refund_steps_body
+);
+
+async fn claimed_after_maker_refund_refund_only_body(dir: Direction) {
+    claimed_after_maker_refund_body(dir, true).await
+}
+both!(
+    claimed_after_maker_refund_refund_only,
+    rev_claimed_after_maker_refund_refund_only,
+    claimed_after_maker_refund_refund_only_body
+);
+
+/// An evicted maker-leg claim is resent, the same signed bytes on every step, for as long as
+/// the maker cannot refund: the claim confirms before the maker-leg locktime and wins the leg,
+/// so an eviction alone never costs the taker the swap. DF's mempool-drop matrix (hp3,
+/// `lane/restart-safety` at 7ade81c, `crates/divi-swap/tests/engine.rs`, the "Fund/claim
+/// evicted" cases) covers evictions across restarts; this pins the resend itself.
+async fn evicted_claim_is_resent_body(dir: Direction) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await; // signed and stored, not broadcast
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let claim = t.maker_leg_claim.clone().unwrap();
+    let (htlc, at, amount) = (
+        t.maker_leg_htlc.unwrap(),
+        t.maker_leg_outpoint.unwrap(),
+        t.maker_leg_amount.unwrap(),
+    );
+    let ml = h.ml_chain().clone();
+    let maker_refund = h.m_ml().build_refund(&htlc, &at, amount).await.unwrap();
+    for _ in 0..3 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        let c = ml.tx_counts(&at);
+        assert_eq!(
+            (c.claims, c.claim_attempts),
+            (1, 1),
+            "the claim is resent: {c:?}"
+        );
+        ml.forget(&claim.txid); // evicted
+        assert_eq!(ml.tx_counts(&at).claims, 0);
+        assert!(
+            matches!(
+                h.m_ml().broadcast(&maker_refund).await,
+                Err(SwapError::Premature(_))
+            ),
+            "the maker's refund is not valid yet"
+        );
+        h.mine_all(1); // a block goes by without the claim
+    }
+    for _ in 0..2 {
+        let view = h.maker.view(&h.maker_id).unwrap();
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap();
+        h.mine_all(1);
+    }
+    assert_eq!(h.taker_state(), TakerState::Done);
+    assert!(
+        ml.mtp() < htlc.locktime,
+        "confirmed before the maker could refund"
+    );
+    assert_eq!(
+        h.t_ml().confirmations(&claim.txid).await.unwrap(),
+        Some(2),
+        "the stored claim is the one that confirmed"
+    );
+    let c = ml.tx_counts(&at);
+    assert_eq!((c.claims, c.refunds, c.claim_attempts), (1, 0, 1), "{c:?}");
+}
+both!(
+    evicted_claim_is_resent,
+    rev_evicted_claim_is_resent,
+    evicted_claim_is_resent_body
+);
+
+/// The loss the taker can only detect, not undo: its maker-leg claim reveals the preimage in
+/// the mempool and is evicted, the maker refunds the maker leg after its locktime and then
+/// claims the taker leg with the leaked preimage, before the taker-leg locktime. Both legs go
+/// to the maker. The taker must end `Lost` (error-level log naming the swap and both
+/// outpoints), never put a second spend of the taker leg on chain, and not re-sign its
+/// refused refund on every step forever.
+///
+/// Why moving `Claimed → Refunded` once the maker refunded (6420158) is safe: it needs a mined
+/// spend of the maker leg that carries no preimage, valid only after the maker-leg locktime,
+/// and the maker-leg locktime is earlier than the taker-leg one. Our refund is then built but
+/// stays premature until the taker-leg locktime; in that window the maker can claim the taker
+/// leg only with the preimage, i.e. only if a claim of ours leaked it. Without a leak our
+/// refund wins after the taker-leg locktime; with one the node refuses our refund as a double
+/// spend, so the move never makes a second spend of the taker leg, and `Lost` ends the
+/// retries.
+async fn lost_after_leaked_preimage_body(dir: Direction, refund_only: bool) {
+    let mut h = H::with(dir);
+    h.accept(None).await;
+    h.lock_and_notify(None).await;
+    drive_taker_to(&mut h, TakerState::Claimed).await;
+    let view = h.maker.view(&h.maker_id).unwrap();
+    h.taker.step(&h.taker_id, view.as_ref()).await.unwrap(); // the preimage is out
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    let (mhtlc, mat, mamount) = (
+        t.maker_leg_htlc.unwrap(),
+        t.maker_leg_outpoint.unwrap(),
+        t.maker_leg_amount.unwrap(),
+    );
+    let (thtlc, tf) = (
+        t.taker_leg_htlc.unwrap(),
+        t.taker_leg_funding.clone().unwrap(),
+    );
+    let (ml, tl) = (h.ml_chain().clone(), h.tl_chain().clone());
+    ml.forget(&t.maker_leg_claim.unwrap().txid); // evicted
+
+    // A hostile maker refunds its leg once the locktime allows...
+    ml.advance_time(mhtlc.locktime + 1 - ml.mtp());
+    let refund = h.m_ml().build_refund(&mhtlc, &mat, mamount).await.unwrap();
+    h.m_ml().broadcast(&refund).await.unwrap();
+    // ...and claims the taker leg with the preimage it saw, before the taker-leg locktime.
+    let claim = h
+        .m_tl()
+        .build_claim(&thtlc, &tf.outpoint, tf.amount, &t.preimage)
+        .await
+        .unwrap();
+    h.m_tl().broadcast(&claim).await.unwrap();
+    h.mine_all(1);
+    assert!(
+        tl.mtp() < thtlc.locktime,
+        "test setup: taker leg still locked"
+    );
+
+    let mut errors_when_lost = 0;
+    for round in 0..12 {
+        if round == 6 {
+            tl.advance_time(22_000); // past the taker-leg locktime too
+        }
+        let res = if refund_only {
+            h.taker.refund(&h.taker_id).await
+        } else {
+            let view = h.maker.view(&h.maker_id).unwrap();
+            h.taker.step(&h.taker_id, view.as_ref()).await
+        };
+        if h.taker_state() == TakerState::Lost && res.is_err() {
+            errors_when_lost += 1;
+        }
+        h.mine_all(1);
+    }
+    let t = h.store.get_taker_swap(&h.taker_id).unwrap().unwrap();
+    assert_eq!(t.state, TakerState::Lost, "last error: {:?}", t.last_error);
+    assert!(t.state.is_terminal());
+    assert_eq!(errors_when_lost, 0, "a Lost swap keeps failing");
+    assert!(
+        t.taker_leg_refund.is_none(),
+        "no refund is kept for resending"
+    );
+    assert!(t.last_error.as_deref().unwrap_or("").starts_with("lost"));
+    let c = tl.tx_counts(&tf.outpoint);
+    assert_eq!(
+        (c.claims, c.refunds),
+        (1, 0),
+        "one spend, the maker's: {c:?}"
+    );
+    assert!(c.refund_attempts <= 1, "{c:?}");
+    let c = ml.tx_counts(&mat);
+    assert_eq!((c.claims, c.refunds), (0, 1), "{c:?}");
+    // Once Lost, nothing is sent again.
+    let before = tl.tx_counts(&tf.outpoint);
+    let view = h.maker.view(&h.maker_id).unwrap();
+    assert_eq!(
+        h.taker.step(&h.taker_id, view.as_ref()).await.unwrap(),
+        TakerState::Lost
+    );
+    assert_eq!(h.taker.refund(&h.taker_id).await.unwrap(), TakerState::Lost);
+    assert_eq!(tl.tx_counts(&tf.outpoint), before);
+}
+
+async fn lost_after_leaked_preimage_steps_body(dir: Direction) {
+    lost_after_leaked_preimage_body(dir, false).await
+}
+both!(
+    lost_after_leaked_preimage_steps,
+    rev_lost_after_leaked_preimage_steps,
+    lost_after_leaked_preimage_steps_body
+);
+
+async fn lost_after_leaked_preimage_refund_only_body(dir: Direction) {
+    lost_after_leaked_preimage_body(dir, true).await
+}
+both!(
+    lost_after_leaked_preimage_refund_only,
+    rev_lost_after_leaked_preimage_refund_only,
+    lost_after_leaked_preimage_refund_only_body
 );
