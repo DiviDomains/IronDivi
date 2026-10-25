@@ -38,7 +38,6 @@ IRONDIVID_ONLY = {
     "bip38encrypt": "divid has bip38paperwallet only (rpcdump.cpp:249-293)",
     "setstakesplitthreshold": "divid takes -stakesplitthreshold at start only",
     "getstakesplitthreshold": "divid takes -stakesplitthreshold at start only",
-    "reservebalance": "divid has no reservebalance call in 3.0.0",
 }
 
 # Differences irondivid has on purpose, by row name. Each is listed in README.md
@@ -412,7 +411,7 @@ def unlocked():
     both("bip38encrypt <own address> <passphrase>", "bip38encrypt", X, PASS1, hide=True)
     both("bip38encrypt (no argument)", "bip38encrypt", hide=True)
 
-    # Stake split threshold and reserve balance: irondivid only
+    # Stake split threshold: irondivid only. reservebalance: neither node has it
     both("getstakesplitthreshold", "getstakesplitthreshold")
     both("setstakesplitthreshold 30000", "setstakesplitthreshold", 30000)
     both("setstakesplitthreshold -1", "setstakesplitthreshold", -1)
