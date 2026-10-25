@@ -120,30 +120,40 @@ impl Net {
         txs[0].clone()
     }
 
-    /// Give the wallet under test `COINS` confirmed coins of 0.1 DIVI, from a
-    /// mature coinbase of the funder; returns one of their addresses
-    fn fund(&self) -> Address {
+    /// Give the wallet under test `count` confirmed coins of 0.1 DIVI, from
+    /// mature coinbases of the funder, at most `COINS` to a transaction;
+    /// returns their address
+    fn fund(&self, count: usize) -> Address {
         let cb_addr = self.funder.new_receiving_address().unwrap();
-        let coinbase = self.mine(vec![], &cb_addr);
+        let coinbases: Vec<Transaction> = (0..count.div_ceil(COINS))
+            .map(|_| self.mine(vec![], &cb_addr))
+            .collect();
         // Coinbase maturity 20 on regtest: spendable with 21 confirmations
         for _ in 0..20 {
             self.mine(vec![], &self.miner);
         }
-        let mut builder = TransactionBuilder::new().add_input(
-            OutPoint::new(coinbase.txid(), 0),
-            coinbase.vout[0].script_pubkey.clone(),
-        );
         let addr = self.wallet.new_receiving_address().unwrap();
-        for _ in 0..COINS {
-            builder = builder.add_output_to_address(Amount::from_sat(COIN / 10), &addr);
+        let mut txs = Vec::new();
+        let mut left = count;
+        for coinbase in coinbases {
+            let n = left.min(COINS);
+            left -= n;
+            let mut builder = TransactionBuilder::new().add_input(
+                OutPoint::new(coinbase.txid(), 0),
+                coinbase.vout[0].script_pubkey.clone(),
+            );
+            for _ in 0..n {
+                builder = builder.add_output_to_address(Amount::from_sat(COIN / 10), &addr);
+            }
+            let rest = 1250 * COIN - n as i64 * (COIN / 10) - COIN / 100;
+            builder = builder.add_output_to_address(Amount::from_sat(rest), &self.miner);
+            let (mut tx, prev) = builder.build();
+            TransactionSigner::new(self.funder.keystore())
+                .sign_all_inputs(&mut tx, &prev)
+                .unwrap();
+            txs.push(tx);
         }
-        let rest = 1250 * COIN - COINS as i64 * (COIN / 10) - COIN / 100;
-        builder = builder.add_output_to_address(Amount::from_sat(rest), &self.miner);
-        let (mut tx, prev) = builder.build();
-        TransactionSigner::new(self.funder.keystore())
-            .sign_all_inputs(&mut tx, &prev)
-            .unwrap();
-        self.mine(vec![tx], &self.miner);
+        self.mine(txs, &self.miner);
         addr
     }
 }
@@ -170,7 +180,7 @@ fn walletlock_during_a_send_comes_before_or_after_it() {
     let rpc = net.rpc();
     let dest = Address::from_pubkey_hash(Hash160::from_bytes([0x42; 20]), Network::Regtest);
     for round in 0..3 {
-        let funded = net.fund();
+        let funded = net.fund(COINS);
         rpc.wallet_passphrase(&p(vec![json!("pw"), json!(0)]))
             .unwrap();
         let sent_before = net.submitted.lock().len();
@@ -226,4 +236,56 @@ fn walletlock_during_a_send_comes_before_or_after_it() {
             .unwrap_err();
         assert_eq!(code(&after), -13, "round {round}: a send after the lock");
     }
+}
+
+/// A block holding the wallet's own send, scanned while the wallet is read:
+/// every reply shows the wallet before the block or after it. In Divi Core a
+/// block's wallet update and a wallet call both run under cs_main. While
+/// irondivid scanned such a block, the send's change was already a confirmed
+/// coin but still an output of the send in the mempool, so listunspent 0 and
+/// getbalance at minconf 0 counted it twice.
+#[test]
+fn a_block_with_an_own_send_is_never_counted_twice() {
+    let net = Net::new();
+    let rpc = net.rpc();
+    let dest = Address::from_pubkey_hash(Hash160::from_bytes([0x42; 20]), Network::Regtest);
+    rpc.wallet_passphrase(&p(vec![json!("pw"), json!(0)]))
+        .unwrap();
+    net.fund(10 * COINS);
+    let mut seen_twice = 0;
+    let mut over = 0;
+    for round in 0..10 {
+        // About 250 inputs, so the block takes a while to scan
+        rpc.send_to_address(&p(vec![json!(dest.to_string()), json!(25.0)]))
+            .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        let tx = net.submitted.lock().last().cloned().unwrap();
+        assert!(net.wallet.add_mempool_tx(&tx));
+        let height = net.chain.height();
+        let ceiling = net.wallet.get_confirmed_balance(height, 0);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let (mut twice, mut above) = (0, 0);
+                while !done.load(Ordering::SeqCst) {
+                    let coins = net.wallet.get_utxos();
+                    let outpoints: std::collections::HashSet<_> =
+                        coins.iter().map(|u| u.outpoint()).collect();
+                    if outpoints.len() != coins.len() {
+                        twice += 1;
+                    }
+                    if net.wallet.get_confirmed_balance(height + 1, 0) > ceiling {
+                        above += 1;
+                    }
+                }
+                (twice, above)
+            });
+            net.mine(vec![tx], &net.miner);
+            done.store(true, Ordering::SeqCst);
+            let (twice, above) = reader.join().unwrap();
+            seen_twice += twice;
+            over += above;
+        });
+    }
+    assert_eq!(seen_twice, 0, "replies listing a coin twice");
+    assert_eq!(over, 0, "balances above the wallet's coins");
 }

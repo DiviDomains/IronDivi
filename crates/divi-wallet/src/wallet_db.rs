@@ -1917,16 +1917,19 @@ impl WalletDb {
             .flat_map(|e| e.spends.iter().copied())
             .collect();
 
-        let mut result: Vec<(WalletUtxo, CoinSource)> = self
-            .utxos
-            .read()
+        let utxos = self.utxos.read();
+        let mut result: Vec<(WalletUtxo, CoinSource)> = utxos
             .values()
             .filter(|u| !spent.contains(&u.outpoint()))
             .map(|u| (u.clone(), CoinSource::Block))
             .collect();
         for entry in overlay.values() {
             for u in &entry.outputs {
-                if !spent.contains(&u.outpoint()) {
+                // A block scan adds a transaction's coins before it drops the
+                // transaction from the mempool overlay: the confirmed coin is
+                // the one, as in Divi Core, where the block's wallet update
+                // and a wallet call do not overlap (both under cs_main)
+                if !spent.contains(&u.outpoint()) && !utxos.contains_key(&u.outpoint()) {
                     result.push((
                         u.clone(),
                         CoinSource::Mempool {
