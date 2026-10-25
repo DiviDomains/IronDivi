@@ -99,7 +99,17 @@ pub struct Connection {
     sent_nonce: Option<NonceGuard>,
     /// The node's own addresses (our address in the version message)
     local: Arc<crate::local::LocalAddresses>,
+    /// Messages the peer sent between its version and its verack, handled
+    /// once the handshake is done
+    pending: Vec<NetworkMessage>,
+    /// Bytes of `pending` on the wire
+    pending_bytes: u64,
 }
+
+/// Bytes of messages kept between a peer's version and its verack: Divi Core
+/// stops reading a peer whose receive buffer holds more than -maxreceivebuffer,
+/// default 5000 * 1000 bytes (Node.cpp:23)
+const MAX_PENDING_BYTES: u64 = 5_000_000;
 
 /// Nonces in the version messages a node has sent on its open connections:
 /// a version arriving with one of them comes from the node itself (Divi Core
@@ -185,6 +195,8 @@ impl Connection {
             local_nonces,
             sent_nonce: None,
             local,
+            pending: Vec::new(),
+            pending_bytes: 0,
         };
 
         Ok((conn, handle))
@@ -239,6 +251,8 @@ impl Connection {
             local_nonces,
             sent_nonce: None,
             local,
+            pending: Vec::new(),
+            pending_bytes: 0,
         };
 
         Ok((conn, handle))
@@ -282,6 +296,10 @@ impl Connection {
 
     /// Perform version handshake
     async fn handshake(&mut self) -> Result<(), NetworkError> {
+        // getpeerinfo lists a peer from its connection on, with start height
+        // -1 until a version names one (Divi Core nStartingHeight, Node.cpp:561)
+        self.info.publish(&self.stats);
+
         // For outbound connections, we send version first
         // For inbound, we wait for their version first
         if self.info.direction == PeerDirection::Outbound {
@@ -335,6 +353,9 @@ impl Connection {
         self.info.start_height = their_version.start_height;
         self.info.version = Some(their_version);
         self.info.state = PeerState::VersionReceived;
+        // Divi Core keeps the version's fields as it reads them (main.cpp:372-391),
+        // so getpeerinfo shows them before the verack
+        self.info.publish(&self.stats);
 
         // If inbound, now send our version
         if self.info.direction == PeerDirection::Inbound {
@@ -423,9 +444,13 @@ impl Connection {
         });
     }
 
-    /// Wait for verack message (during handshake - uses blocking read, ok because no select!)
+    /// Wait for verack message (during handshake - uses blocking read, ok because no select!).
+    /// Divi Core handles every message once the peer's version is in
+    /// (main.cpp:484-514 checks only for the version): a ping is answered at
+    /// once, the others are kept and handled after the handshake.
     async fn recv_verack(&mut self) -> Result<(), NetworkError> {
         loop {
+            let before = self.info.bytes_recv;
             match self.read_message_handshake().await? {
                 Some(Decoded::Message(NetworkMessage::Verack)) => return Ok(()),
                 Some(Decoded::Message(NetworkMessage::Version(_))) => {
@@ -436,8 +461,21 @@ impl Connection {
                     self.send_message(duplicate_version_reject()).await?;
                     let _ = self.event_tx.send(duplicate_version(self.peer_id));
                 }
+                Some(Decoded::Message(NetworkMessage::Ping(nonce))) => {
+                    self.send_message(NetworkMessage::Pong(nonce)).await?;
+                }
                 Some(Decoded::Message(msg)) => {
-                    debug!("Ignoring {} during handshake", msg.command());
+                    self.pending_bytes += self.info.bytes_recv - before;
+                    if self.pending_bytes <= MAX_PENDING_BYTES {
+                        self.pending.push(msg);
+                    } else {
+                        debug!(
+                            "Dropping {} from {}: over {} bytes before its verack",
+                            msg.command(),
+                            self.info.addr,
+                            MAX_PENDING_BYTES
+                        );
+                    }
                 }
                 Some(Decoded::Malformed { command, error }) => {
                     self.reject_malformed(&command, &error).await?;
@@ -532,10 +570,29 @@ impl Connection {
             local: _,
             // Kept until the loop ends: the nonce leaves the node's set then
             sent_nonce: _nonce_guard,
+            pending,
+            pending_bytes: _,
         } = self;
 
         // Split stream for concurrent read/write
         let (reader, mut writer) = tokio::io::split(stream);
+
+        // What the peer sent before its verack, in the order it came
+        for msg in pending {
+            if let Err(e) = Self::handle_message(
+                &mut writer,
+                &mut info,
+                magic,
+                &total_bytes_sent,
+                peer_id,
+                &event_tx,
+                msg,
+            )
+            .await
+            {
+                warn!("Error handling message from {}: {}", info.addr, e);
+            }
+        }
 
         // Wrap reader in FramedRead with our codec - this is CANCELLATION SAFE!
         let codec = DiviCodec::new(magic);
@@ -622,6 +679,13 @@ impl Connection {
                             info.last_recv_unix = crate::peer::unix_now();
                             total_bytes_recv.fetch_add(bytes_received, Ordering::Relaxed);
                             debug!("{} from {} does not parse: {}", command, info.addr, error);
+                            if command == "pong" {
+                                // Divi Core reads a pong without throwing: under 8
+                                // bytes ends the ping untimed ("Short payload",
+                                // Node.cpp:790-794)
+                                info.ping_nonce = None;
+                                info.ping_time = None;
+                            }
                             if let Some(answer) = malformed_reject(&command) {
                                 if let Err(e) = Self::write_message(&mut writer, &mut info, magic, &total_bytes_sent, answer).await {
                                     error!("Failed to send reject to {}: {}", info.addr, e);
@@ -714,7 +778,10 @@ impl Connection {
                 .await?;
             }
             NetworkMessage::Pong(nonce) => {
-                // Check if this matches our ping
+                // Divi Core ProcessReceivedPong (Node.cpp:754-808): our nonce
+                // ends the ping and times it; nonce 0 ends it untimed (a bug
+                // in the other implementation); another nonce leaves it
+                // outstanding (pings may overlap)
                 if let Some(sent_nonce) = info.ping_nonce {
                     if sent_nonce == *nonce {
                         if let Some(ping_time) = info.ping_time {
@@ -722,6 +789,10 @@ impl Connection {
                             info.ping_latency_us =
                                 Some((ping_time.elapsed().as_micros() as u64).max(1));
                         }
+                        info.ping_nonce = None;
+                        info.ping_time = None;
+                    } else if *nonce == 0 {
+                        debug!("Pong with nonce 0 from {}: ping cancelled", info.addr);
                         info.ping_nonce = None;
                         info.ping_time = None;
                     }
@@ -802,13 +873,14 @@ fn reject(command: &str, code: u8, reason: &str) -> NetworkMessage {
 
 /// The `reject` Divi Core sends for a message that does not parse
 /// (main.cpp:1054). None for a `reject`, which Divi Core reads only with
-/// -debug and whose parse errors it swallows (main.cpp:940-962), and for
+/// -debug and whose parse errors it swallows (main.cpp:940-962), for
 /// `headers`, which it never reads (main.cpp:669, HeadersFirstSyncingActive
 /// is false on every network): answering those could only start an
-/// exchange of rejects.
+/// exchange of rejects; and for a short `pong`, which Divi Core reads by
+/// the bytes it has (Node.cpp:759-794).
 fn malformed_reject(command: &str) -> Option<NetworkMessage> {
     match command {
-        "reject" | "headers" => None,
+        "reject" | "headers" | "pong" => None,
         _ => Some(reject(command, REJECT_MALFORMED, "error parsing message")),
     }
 }
