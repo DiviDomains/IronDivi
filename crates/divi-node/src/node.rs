@@ -1089,6 +1089,25 @@ impl Node {
                                 if masternode_items_asked.len() > 100_000 {
                                     masternode_items_asked.clear();
                                 }
+                                // Announced items the node has count for the
+                                // sync's list and winner stages (MasternodeIsKnown,
+                                // MasternodeWinnerIsKnown, MasternodeModule.cpp:346-370)
+                                for i in items.iter() {
+                                    use divi_network::message::InvType;
+                                    let now = divi_primitives::clock::now();
+                                    match i.inv_type {
+                                        InvType::MasternodeAnnounce
+                                            if masternode_list
+                                                .has(divi_rpc::mn_list::INV_BROADCAST, &i.hash.0) =>
+                                        {
+                                            masternode_sync.lock().sync.record_list_update(i.hash.0, true, now)
+                                        }
+                                        InvType::MasternodeWinner if masternode_votes.is_known(&i.hash.0) => {
+                                            masternode_sync.lock().sync.record_winner_update(i.hash.0, true, now)
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 let masternode_items: Vec<_> = items
                                     .iter()
                                     .filter(|i| masternode_inv_kind(i.inv_type).is_some())
@@ -1318,7 +1337,23 @@ impl Node {
                             // Broadcasts and pings in Divi Core's wire format, kept
                             // when they pass its checks (mn_list)
                             NetworkMessage::MasternodeBroadcast(payload) => {
-                                match masternode_list.accept_broadcast(&chain, &payload) {
+                                // A broadcast seen again or newly taken counts for
+                                // the sync's list stage (masternodeman.cpp:416-419, :474)
+                                let hash = divi_masternode::cpp_wire::CppBroadcast::decode(&payload)
+                                    .ok()
+                                    .map(|b| b.hash());
+                                let known = hash.is_some_and(|h| {
+                                    masternode_list.has(divi_rpc::mn_list::INV_BROADCAST, &h)
+                                });
+                                let result = masternode_list.accept_broadcast(&chain, &payload);
+                                if let (Some(hash), true) = (hash, known || result.is_ok()) {
+                                    masternode_sync.lock().sync.record_list_update(
+                                        hash,
+                                        known,
+                                        divi_primitives::clock::now(),
+                                    );
+                                }
+                                match result {
                                     Ok(true) => tracing::info!(
                                         "Masternode entry from peer {} added to the list",
                                         peer_id
@@ -1369,11 +1404,23 @@ impl Node {
                             // checks and then announced, as ProcessMasternodeWinners
                             // relays it (masternode-payments.cpp:250-267)
                             NetworkMessage::MasternodeWinner(payload) => {
-                                match masternode_votes.accept(&chain, &masternode_list, &payload) {
+                                // A vote seen again or newly taken counts for the
+                                // sync's winner stage (masternode-payments.cpp:205-209, :262-265)
+                                let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
+                                    .ok()
+                                    .map(|w| w.hash());
+                                let known = hash.is_some_and(|h| masternode_votes.is_known(&h));
+                                let result = masternode_votes.accept(&chain, &masternode_list, &payload);
+                                if let (Some(hash), true) = (hash, known || matches!(result, Ok(true))) {
+                                    masternode_sync.lock().sync.record_winner_update(
+                                        hash,
+                                        true,
+                                        divi_primitives::clock::now(),
+                                    );
+                                }
+                                match result {
                                     Ok(true) => {
-                                        let hash = divi_masternode::cpp_wire::CppWinner::decode(&payload)
-                                            .map(|w| w.hash());
-                                        if let Ok(hash) = hash {
+                                        if let Some(hash) = hash {
                                             relay_masternode_items(
                                                 &peer_manager,
                                                 &mut masternode_items_known,
