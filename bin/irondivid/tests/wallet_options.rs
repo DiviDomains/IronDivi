@@ -319,19 +319,19 @@ fn vault_hex(owner: &[u8], manager: &[u8]) -> String {
 #[test]
 fn whitelisted_vaults_are_registered_as_divid_registers_them() {
     let dir = tempfile::tempdir().unwrap();
-    let (rpc, p2p) = (free_port(), free_port());
-    let node = start(dir.path(), rpc, p2p, &[]);
+    let (mut rpc, mut p2p) = (free_port(), free_port());
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
     let key_hash = |n: &Value| {
         let a: divi_wallet::Address = n.as_str().unwrap().parse().unwrap();
         a.hash.as_bytes().to_vec()
     };
     let manager = key_hash(&ok(rpc, "getnewaddress", json!([])));
     let owner = key_hash(&ok(rpc, "getnewaddress", json!([])));
-    let registered = || {
+    let registered = |rpc: u16| {
         let reply = ok(rpc, "getcoinavailability", json!([]));
         reply["vaults"].as_array().unwrap().len()
     };
-    assert_eq!(registered(), 0);
+    assert_eq!(registered(rpc), 0);
     stop(node, rpc);
 
     let managed = format!("-whitelisted_vault={}", vault_hex(&[0x42; 20], &manager));
@@ -339,15 +339,15 @@ fn whitelisted_vaults_are_registered_as_divid_registers_them() {
     let p2pkh = format!("-whitelisted_vault=76a914{}88ac", hex::encode(&manager));
     let node = start(
         dir.path(),
-        rpc,
-        p2p,
+        &mut rpc,
+        &mut p2p,
         &[&managed, &owned, &p2pkh, "-whitelisted_vault=nothex"],
     );
-    assert_eq!(registered(), 1);
+    assert_eq!(registered(rpc), 1);
     stop(node, rpc);
 
-    let node = start(dir.path(), rpc, p2p, &[]);
-    assert_eq!(registered(), 1);
+    let node = start(dir.path(), &mut rpc, &mut p2p, &[]);
+    assert_eq!(registered(rpc), 1);
     stop(node, rpc);
 }
 
@@ -362,19 +362,22 @@ fn hdseed_is_logged_as_divid_logs_it() {
     let log = |dir: &Path| std::fs::read_to_string(dir.join("debug.log")).unwrap_or_default();
     let seed = format!("-hdseed={}", "5a".repeat(32));
     let words = "-mnemonic=these words are dropped unread";
-    let (rpc, p2p) = (free_port(), free_port());
+    let (mut rpc, mut p2p) = (free_port(), free_port());
 
     let dir = tempfile::tempdir().unwrap();
-    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    stop(start(dir.path(), &mut rpc, &mut p2p, &[&seed, words]), rpc);
     assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
     assert!(!log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
     // A wallet already there: logged all the same
     std::fs::remove_file(dir.path().join("debug.log")).unwrap();
-    stop(start(dir.path(), rpc, p2p, &[&seed, words]), rpc);
+    stop(start(dir.path(), &mut rpc, &mut p2p, &[&seed, words]), rpc);
     assert!(log(dir.path()).contains(PREFER), "{}", log(dir.path()));
 
     let dir = tempfile::tempdir().unwrap();
-    stop(start(dir.path(), rpc, p2p, &["-hdseed=nothex"]), rpc);
+    stop(
+        start(dir.path(), &mut rpc, &mut p2p, &["-hdseed=nothex"]),
+        rpc,
+    );
     assert!(log(dir.path()).contains(INCORRECT), "{}", log(dir.path()));
     assert!(!log(dir.path()).contains(PREFER), "{}", log(dir.path()));
 }
