@@ -555,8 +555,8 @@ impl RpcServer {
         self.dispatch_with(method, params, None)
     }
 
-    /// Dispatch a method call; `amounts` is sendmany's amounts object with
-    /// every pair as the request wrote it, when it came as JSON text
+    /// Dispatch a method call; `amounts` is sendmany's or fundvault's amounts
+    /// object with every pair as the request wrote it, when it came as JSON text
     fn dispatch_with(
         &self,
         method: &str,
@@ -797,7 +797,7 @@ impl RpcServer {
             "addvault" => self.wallet.add_vault(params),
             "removevault" => self.wallet.remove_vault(params),
             "getcoinavailability" => self.wallet.get_coin_availability(params),
-            "fundvault" => self.wallet.fund_vault(params),
+            "fundvault" => self.wallet.fund_vault_with(params, amounts),
             "debitvaultbyname" => self.wallet.debit_vault_by_name(params),
             "reclaimvaultfunds" => self.wallet.reclaim_vault_funds(params),
 
@@ -1719,12 +1719,16 @@ impl RpcServer {
             Some(Value::Array(a)) => Params::Array(a.clone()),
             Some(_) => return Err(RpcError::invalid_request("Params must be an array")),
         };
-        // sendmany reads each pair of its amounts object, equal addresses
-        // included (rpcwallet.cpp parseMultiSendJson)
+        // sendmany and fundvault read each pair of their amounts object, equal
+        // keys included (rpcwallet.cpp parseMultiSendJson, parseFundVaultRPCParameters)
         let amounts = match method.as_str() {
             "sendmany" => tree
                 .member("params")
                 .and_then(|p| p.element(1))
+                .and_then(|a| a.members()),
+            "fundvault" => tree
+                .member("params")
+                .and_then(|p| p.element(0))
                 .and_then(|a| a.members()),
             _ => None,
         };

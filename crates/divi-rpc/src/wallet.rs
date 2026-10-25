@@ -972,7 +972,17 @@ impl WalletRpc {
 
     /// fundvault, picking its coins and committing with no relayed transaction let in between
     pub fn fund_vault(&self, params: &Params) -> Result<serde_json::Value, Error> {
-        self.exclusive(|| self.fund_vault_held(params))
+        self.fund_vault_with(params, None)
+    }
+
+    /// fundvault with its fundings object's pairs as the request wrote them,
+    /// equal encodings included; None reads them from `params`
+    pub fn fund_vault_with(
+        &self,
+        params: &Params,
+        fundings: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
+        self.exclusive(|| self.fund_vault_held(params, fundings))
     }
 
     /// debitvaultbyname, picking its coins and committing with no relayed transaction let in between
@@ -3192,55 +3202,127 @@ impl WalletRpc {
     }
 
     /// Fund a vault - Adds funds to existing vault
-    fn fund_vault_held(&self, params: &Params) -> Result<serde_json::Value, Error> {
+    fn fund_vault_held(
+        &self,
+        params: &Params,
+        written: Option<&[(String, serde_json::Value)]>,
+    ) -> Result<serde_json::Value, Error> {
         let wallet = self.get_wallet()?;
 
         ensure_fully_unlocked(&wallet)?;
 
-        let vault_encoding = params.get_str(0).ok_or_else(|| {
-            RpcError::invalid_params("Missing required parameter: [owner_address:]manager_address")
-        })?;
-
-        let send_amount = amount_from_value(
-            params
-                .get(1)
-                .ok_or_else(|| RpcError::invalid_params("Missing required parameter: amount"))?,
-            false,
-        )?;
-
         // parseVaultAddressEncoding (rpcwallet.cpp:920-950): without an owner
         // a new key of the wallet owns the vault, put in the address book
         // with the name "" (rpcwallet.cpp:943)
-        let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
-            Some((owner, manager)) => (owner.to_string(), manager.to_string()),
-            None => {
-                let owner = wallet.new_receiving_address().map_err(new_key_error)?;
-                wallet.set_label(&owner, "").map_err(|e| {
-                    RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
-                })?;
-                (owner.to_base58(), vault_encoding.to_string())
-            }
-        };
-        // validateAndConstructVaultScriptFromParsedAddresses (rpcwallet.cpp:952-966)
-        let key_hash = |address: &str, which: &str| -> Result<[u8; 20], Error> {
-            match self.decode_address(address) {
-                Ok(a) if a.addr_type == divi_wallet::address::AddressType::P2PKH => {
-                    Ok(*a.hash.as_bytes())
+        let mut payees: Vec<TxOut> = Vec::new();
+        let mut vaults: Vec<VaultMetadata> = Vec::new();
+        let mut encodings: Vec<serde_json::Value> = Vec::new();
+        let mut fund = |vault_encoding: &str, amount: Amount, repetitions: usize| {
+            let (owner_addr, manager_addr) = match vault_encoding.split_once(':') {
+                Some((owner, manager)) => (owner.to_string(), manager.to_string()),
+                None => {
+                    let owner = wallet.new_receiving_address().map_err(new_key_error)?;
+                    wallet.set_label(&owner, "").map_err(|e| {
+                        RpcError::new(codes::WALLET_ERROR, format!("Failed to store label: {}", e))
+                    })?;
+                    (owner.to_base58(), vault_encoding.to_string())
                 }
-                _ => Err(RpcError::new(
-                    codes::INVALID_ADDRESS_OR_KEY,
-                    format!("Invalid {which} DIVI address"),
-                )
-                .into()),
+            };
+            // validateAndConstructVaultScriptFromParsedAddresses (rpcwallet.cpp:952-966)
+            let key_hash = |address: &str, which: &str| -> Result<[u8; 20], Error> {
+                match self.decode_address(address) {
+                    Ok(a) if a.addr_type == divi_wallet::address::AddressType::P2PKH => {
+                        Ok(*a.hash.as_bytes())
+                    }
+                    _ => Err(RpcError::new(
+                        codes::INVALID_ADDRESS_OR_KEY,
+                        format!("Invalid {which} DIVI address"),
+                    )
+                    .into()),
+                }
+            };
+            let manager_hash = key_hash(&manager_addr, "manager")?;
+            let owner_hash = key_hash(&owner_addr, "owner")?;
+            let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
+            for _ in 0..repetitions {
+                payees.push(TxOut::new(amount, vault_script.clone()));
             }
+            encodings.push(serde_json::json!({"encoding": format!("{owner_addr}:{manager_addr}")}));
+            vaults.push(VaultMetadata {
+                owner_address: owner_addr,
+                manager_address: manager_addr,
+                vault_script: vault_script.as_bytes().to_vec(),
+                funding_txid: [0; 32],
+            });
+            Ok::<(), Error>(())
         };
-        let manager_hash = key_hash(&manager_addr, "manager")?;
-        let owner_hash = key_hash(&owner_addr, "owner")?;
-        let encoding = format!("{owner_addr}:{manager_addr}");
-        let vault_script = StakingVaultScript::new(owner_hash, manager_hash).to_script();
-        let payees = [TxOut::new(send_amount, vault_script.clone())];
+
+        // parseFundVaultRPCParameters (rpcwallet.cpp:989-1036): an encoding and
+        // an amount, or one object of encodings, each with an amount or
+        // {"amount": a, "repetitions": n} for n outputs of a
+        match params.get(0) {
+            Some(serde_json::Value::Object(fundings)) => {
+                let fundings: Vec<(&String, &serde_json::Value)> = match written {
+                    Some(pairs) => pairs.iter().map(|(k, v)| (k, v)).collect(),
+                    None => fundings.iter().collect(),
+                };
+                for (encoding, value) in fundings {
+                    let unparsed = |what: &str| -> Error {
+                        RpcError::new(
+                            codes::INVALID_PARAMETER,
+                            format!("Unable to parse {what} for: {encoding}"),
+                        )
+                        .into()
+                    };
+                    match value {
+                        serde_json::Value::Number(_) => {
+                            fund(encoding, amount_from_value(value, false)?, 1)?
+                        }
+                        serde_json::Value::Object(details) => {
+                            let amount = details
+                                .get("amount")
+                                .filter(|v| v.is_number())
+                                .ok_or_else(|| unparsed("amount"))?;
+                            let repetitions = details
+                                .get("repetitions")
+                                .and_then(crate::protocol::json_spirit_int)
+                                .ok_or_else(|| unparsed("repetitions"))?;
+                            // std::max<int>(repetitions.get_int(), 1) (:1023)
+                            fund(
+                                encoding,
+                                amount_from_value(amount, false)?,
+                                repetitions.max(1) as usize,
+                            )?
+                        }
+                        _ => {
+                            return Err(RpcError::new(
+                                codes::INVALID_PARAMETER,
+                                format!("Unknown json input. Unable to parse input for {encoding}"),
+                            )
+                            .into())
+                        }
+                    }
+                }
+            }
+            _ => {
+                let send_amount = amount_from_value(
+                    params.get(1).ok_or_else(|| {
+                        RpcError::invalid_params("Missing required parameter: amount")
+                    })?,
+                    false,
+                )?;
+                let vault_encoding = params.get_str(0).ok_or_else(|| {
+                    RpcError::invalid_params(
+                        "Missing required parameter: [owner_address:]manager_address",
+                    )
+                })?;
+                fund(vault_encoding, send_amount, 1)?;
+            }
+        }
         check_send_total(&payees, spendable_balance(&wallet, self.current_height()))?;
-        ensure_not_dust(send_amount, &vault_script)?;
+        for out in &payees {
+            ensure_not_dust(out.value, &out.script_pubkey)?;
+        }
 
         let height = self.current_height();
 
@@ -3253,29 +3335,22 @@ impl WalletRpc {
             ChangeKind::P2pkh,
             &ChangeTo::NewKey,
         )?;
-        let vault_script_bytes = vault_script.as_bytes().to_vec();
         let txid = self.sign_and_submit(&wallet, &plan, ChangeTo::NewKey)?;
 
-        // Register the vault in the wallet so it can be tracked for staking/reclaiming
-        let metadata = VaultMetadata {
-            owner_address: owner_addr,
-            manager_address: manager_addr,
-            vault_script: vault_script_bytes,
-            funding_txid: *txid.as_bytes(),
-        };
-        wallet.store_vault(metadata);
-
-        info!(
-            "Funded vault {} with {} DIVI (txid: {})",
-            vault_encoding,
-            send_amount.as_divi_f64(),
-            txid
-        );
+        // Register each vault in the wallet so it can be tracked for staking/reclaiming
+        for mut metadata in vaults {
+            metadata.funding_txid = *txid.as_bytes();
+            info!(
+                "Funded vault {}:{} (txid: {})",
+                metadata.owner_address, metadata.manager_address, txid
+            );
+            wallet.store_vault(metadata);
+        }
 
         // rpcwallet.cpp:1059-1062
         Ok(serde_json::json!({
             "txhash": txid.to_string(),
-            "vault": [{"encoding": encoding}],
+            "vault": encodings,
         }))
     }
 
