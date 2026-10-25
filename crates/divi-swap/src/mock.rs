@@ -68,6 +68,21 @@ struct ChainState {
     /// Txids the node cannot look up (no txindex): `confirmations`/`htlc_output` say `None`
     /// although the tx stays in the chain and `broadcast` still answers already-known.
     blind: HashSet<Txid>,
+    /// Every distinct claim/refund ever handed to `broadcast`, accepted or not.
+    spend_attempts: HashMap<Txid, MockTx>,
+}
+
+/// What one HTLC outpoint has seen on a [`MockChain`] ([`MockChain::tx_counts`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TxCounts {
+    /// Funding txs the chain holds for the outpoint (0 or 1).
+    pub fundings: u32,
+    /// Claims / refunds of the outpoint the chain accepted (mempool or mined).
+    pub claims: u32,
+    pub refunds: u32,
+    /// Distinct claim / refund txids broadcast for the outpoint, accepted or refused.
+    pub claim_attempts: u32,
+    pub refund_attempts: u32,
 }
 
 /// A simulated chain shared by several backends.
@@ -169,6 +184,31 @@ impl MockChain {
     /// "a rejected claim/refund is forgotten and re-signed on the next step" paths.
     pub fn reject_next_broadcast(&self) {
         self.state.lock().reject_next_broadcast = true;
+    }
+
+    /// Funding, accepted spends and spend attempts of `at`. Test-only observation, e.g.
+    /// to check that no outpoint is ever claimed twice or both claimed and refunded.
+    pub fn tx_counts(&self, at: &Outpoint) -> TxCounts {
+        let s = self.state.lock();
+        let mut c = TxCounts {
+            fundings: s.txs.contains_key(&at.txid) as u32,
+            ..TxCounts::default()
+        };
+        for (tx, _) in s.txs.values() {
+            match tx {
+                MockTx::Claim { at: a, .. } if a == at => c.claims += 1,
+                MockTx::Refund { at: a, .. } if a == at => c.refunds += 1,
+                _ => {}
+            }
+        }
+        for tx in s.spend_attempts.values() {
+            match tx {
+                MockTx::Claim { at: a, .. } if a == at => c.claim_attempts += 1,
+                MockTx::Refund { at: a, .. } if a == at => c.refund_attempts += 1,
+                _ => {}
+            }
+        }
+        c
     }
 
     /// Current MTP.
@@ -369,6 +409,9 @@ impl ChainBackend for MockBackend {
         let parsed: MockTx = serde_json::from_slice(&tx.raw)
             .map_err(|e| SwapError::Rejected(format!("decode: {e}")))?;
         let mut s = self.chain.state.lock();
+        if !matches!(parsed, MockTx::Fund { .. }) {
+            s.spend_attempts.insert(tx.txid, parsed.clone());
+        }
         if s.reject_next_broadcast {
             s.reject_next_broadcast = false;
             return Err(SwapError::Rejected("mock: forced rejection (test)".into()));
@@ -541,6 +584,20 @@ mod tests {
             .await
             .unwrap();
         taker.broadcast(&c).await.unwrap();
+        taker.broadcast(&c).await.unwrap(); // idempotent
+        let r = maker.build_refund(&h, &f.outpoint, f.amount).await.unwrap();
+        assert!(maker.broadcast(&r).await.is_err()); // premature, and spent anyway
+        let counts = chain.tx_counts(&f.outpoint);
+        assert_eq!(
+            counts,
+            TxCounts {
+                fundings: 1,
+                claims: 1,
+                refunds: 0,
+                claim_attempts: 2,
+                refund_attempts: 1,
+            }
+        );
         let spend = maker.find_spend(&f.outpoint, 0).await.unwrap().unwrap();
         assert_eq!(spend.extract_preimage(&hash), Some(pre));
         assert_eq!(chain.balance(&taker.pubkey()), Amount(5_000_000 - 1_000));
