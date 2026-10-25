@@ -1797,10 +1797,13 @@ impl WalletRpc {
                 RpcError::new(codes::WALLET_ERROR, "Unable to sign for unknown address")
             })?;
         let unable = || RpcError::new(codes::WALLET_ERROR, "Unable to sign for input");
+        if input_index < 0 || input_index as usize >= tx.vin.len() {
+            return Err(unable().into());
+        }
         // SIGHASH_SINGLE with no output at the input's index hashes to the
         // constant 1, so that signature would spend any coin of this key.
         // Divi Core signs it; IronDivi refuses.
-        if input_index >= 0 && input_index as usize >= tx.vout.len() {
+        if input_index as usize >= tx.vout.len() {
             return Err(RpcError::new(
                 codes::INVALID_PARAMETER,
                 "Invalid parameter, SIGHASH_SINGLE needs an output at the input's index",
@@ -1812,9 +1815,6 @@ impl WalletRpc {
             .as_ref()
             .filter(|_| !entry.is_watch_only)
             .ok_or_else(unable)?;
-        if input_index < 0 || input_index as usize >= tx.vin.len() {
-            return Err(unable().into());
-        }
         let mut dummy = vec![];
         let pk = entry.pubkey_bytes();
         dummy.push(pk.len() as u8);
