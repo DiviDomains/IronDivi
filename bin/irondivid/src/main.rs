@@ -513,35 +513,81 @@ fn host_and_port(value: &str) -> (String, Option<u16>) {
 fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     let mut s = settings.clone();
     let regtest = config.network.network_type == NetworkType::Regtest;
-    // -bind or -whitebind means listening; -connect means no DNS seeds and
-    // no listening; -proxy means no listening (net.cpp:1672-1700)
+    // divid's parameter interactions, each logged as divid logs it when it
+    // sets an option not given (net.cpp:1672-1716). -bind or -whitebind means
+    // listening; -connect means no DNS seeds and no listening
+    let interaction = |set: bool, text: &str| {
+        if set {
+            info!("{}", text);
+        }
+    };
     if s.is_set("bind") || s.is_set("whitebind") {
-        s.soft_set_bool("listen", true);
+        let set = s.soft_set_bool("listen", true);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -bind or -whitebind set -> setting -listen=1",
+        );
     }
     if !s.get_multi("connect").is_empty() {
-        if s.soft_set_bool("dnsseed", false) {
-            info!("InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0");
-        }
-        s.soft_set_bool("listen", false);
+        let set = s.soft_set_bool("dnsseed", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -connect set -> setting -dnsseed=0",
+        );
+        let set = s.soft_set_bool("listen", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -connect set -> setting -listen=0",
+        );
     }
+    // -proxy means no listening, no UPnP and no discovery
     if s.is_set("proxy") {
-        s.soft_set_bool("listen", false);
-        s.soft_set_bool("upnp", false);
+        let set = s.soft_set_bool("listen", false);
+        interaction(
+            set,
+            "SetNetworkingParameters: parameter interaction: -proxy set -> setting -listen=0",
+        );
+        let set = s.soft_set_bool("upnp", false);
+        interaction(
+            set,
+            "SetNetworkingParameters: parameter interaction: -proxy set -> setting -upnp=0",
+        );
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -proxy set -> setting -discover=0",
+        );
     }
     // -salvagewallet rewrites nothing in Divi Core 3.0.0: it sets -rescan
     // (EnableWalletFeatures, init.cpp:763-766)
     if s.get_bool("salvagewallet", false) && s.soft_set_bool("rescan", true) {
         info!("InitializeDivi : parameter interaction: -salvagewallet=1 -> setting -rescan=1");
     }
-    // -proxy, -listen=0 and -externalip each turn -discover off unless it is
-    // given (net.cpp:1690-1716)
-    if s.is_set("proxy") || !s.get_bool("listen", true) || s.is_set("externalip") {
-        s.soft_set_bool("discover", false);
-    }
-    // -listen=0 turns -upnp and -listenonion off unless given (net.cpp:1700-1711)
+    // -listen=0 turns -upnp, -discover and -listenonion off unless given
     if !s.get_bool("listen", true) {
-        s.soft_set_bool("upnp", false);
-        s.soft_set_bool("listenonion", false);
+        let set = s.soft_set_bool("upnp", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -upnp=0",
+        );
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -discover=0",
+        );
+        let set = s.soft_set_bool("listenonion", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -listen=0 -> setting -listenonion=0",
+        );
+    }
+    // -externalip turns -discover off unless given
+    if s.is_set("externalip") {
+        let set = s.soft_set_bool("discover", false);
+        interaction(
+            set,
+            "InitializeDivi : parameter interaction: -externalip set -> setting -discover=0",
+        );
     }
     // Regtest does not stake unless asked (init.cpp:242); no wallet, no staking
     if regtest && !s.is_set("staking") {
@@ -619,12 +665,20 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     if let Some(p) = port("port") {
         config.p2p.port = p;
     }
-    if let Some(first) = s.get_multi("bind").first() {
+    // GetListenPort: -port, else the network's (net.cpp)
+    let listen_port = config.p2p.port;
+    let binds = s.get_multi("bind");
+    if let Some(first) = binds.first() {
         let (host, p) = host_and_port(first);
         config.p2p.listen_addr = host;
         if let Some(p) = p {
             config.p2p.port = p;
         }
+    }
+    // Every further -bind is listened on too, on its own port or the listen
+    // port (net.cpp:1809-1814)
+    for raw in binds.iter().skip(1) {
+        config.p2p.more_bind.push(bind_address(raw, listen_port)?);
     }
     if s.is_set("listen") {
         config.p2p.listen = Some(s.get_bool("listen", true));
@@ -667,10 +721,15 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         config.p2p.dns_seed = Some(s.get_bool("dnsseed", true));
     }
     config.p2p.force_dns_seed = s.get_bool("forcednsseed", false);
-    // -maxconnections counts inbound and outbound; at most 16 are outbound
-    // (net.cpp:106, :757, :1727)
-    if let Some(n) = number_option(&s, "maxconnections", 0..=i64::from(u32::MAX)) {
-        let n = n as usize;
+    // -maxconnections as divid reads it: atoi64, at most FD_SETSIZE (1024) less
+    // one for -bind and one for -whitebind (at least one) less 150 kept for
+    // files, at least 0, with no warning (net.cpp:1726-1728). Inbound peers
+    // may use it less 16 (net.cpp:757); at most 16 learnt addresses are dialled
+    if s.is_set("maxconnections") {
+        let binds = (i64::from(s.is_set("bind")) + i64::from(s.is_set("whitebind"))).max(1);
+        let n = settings::atoi(s.get("maxconnections").unwrap_or(""))
+            .min(1024 - binds - 150)
+            .max(0) as usize;
         config.p2p.max_outbound = n.min(16);
         config.p2p.max_inbound = n.saturating_sub(16);
     }
@@ -923,6 +982,22 @@ fn option_warning(settings: &Settings, k: &str) -> Option<String> {
     } else {
         format!("Unknown option -{}; ignored", settings.written_name(k))
     })
+}
+
+/// A -bind value as Divi Core's Lookup reads it without name lookup: `ip`,
+/// `ip:port` or `[ipv6]:port`, `port` when none is given; else the start stops
+/// with "Cannot resolve -bind address" (net.cpp:1809-1813)
+fn bind_address(text: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let text = text.trim();
+    text.parse::<std::net::SocketAddr>()
+        .ok()
+        .or_else(|| {
+            text.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve -bind address: '{}'", text))
 }
 
 /// A -whitebind value as Divi Core's Lookup reads it without name lookup:
@@ -5073,6 +5148,35 @@ mod proxy_tor_settings_tests {
         ];
         v.extend(argv.iter().map(|s| s.to_string()));
         build_config(&Args::parse_from(v)).unwrap().p2p
+    }
+
+    /// -maxconnections as divid reads it: a number below 0, a text or nothing
+    /// is 0, and at most FD_SETSIZE less the binds less 150 (net.cpp:1726-1728);
+    /// inbound peers get it less 16 (net.cpp:757)
+    #[test]
+    fn maxconnections_is_read_as_divid_reads_it() {
+        let slots = |argv: &[&str]| {
+            let c = p2p(argv);
+            (c.max_inbound, c.max_outbound)
+        };
+        for none in [
+            "-maxconnections=-1",
+            "-maxconnections=",
+            "-maxconnections=abc",
+        ] {
+            assert_eq!(slots(&[none]), (0, 0), "{none}");
+        }
+        assert_eq!(slots(&["-maxconnections=17"]), (1, 16));
+        assert_eq!(slots(&["-maxconnections=5"]), (0, 5));
+        assert_eq!(slots(&["-maxconnections=2000"]), (857, 16));
+        assert_eq!(
+            slots(&[
+                "-maxconnections=2000",
+                "-bind=127.0.0.1",
+                "-whitebind=127.0.0.1:1"
+            ]),
+            (856, 16)
+        );
     }
 
     /// -upnp: off by default; -proxy and -listen=0 turn it off unless it is

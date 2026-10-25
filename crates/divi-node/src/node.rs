@@ -788,6 +788,11 @@ impl Node {
             } else {
                 Vec::new()
             },
+            more_listen: if peer_sources.listen {
+                config.p2p.more_bind.clone()
+            } else {
+                Vec::new()
+            },
             // A -seednode host name is looked up only with -dns, as a
             // -connect one (ProcessOneShot, net.cpp:1071-1084, dials it by
             // name: ConnectSocketByName, netbase.cpp:631-660)

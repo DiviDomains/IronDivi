@@ -90,6 +90,9 @@ pub struct PeerManagerConfig {
     /// More listen addresses; every peer coming in on one is whitelisted
     /// (Divi Core -whitebind)
     pub white_listen: Vec<SocketAddr>,
+    /// More listen addresses (the -bind addresses after the first), their
+    /// peers not whitelisted
+    pub more_listen: Vec<SocketAddr>,
     /// `-seednode` peers: each dialled once, asked for addresses and dropped
     /// after its answer, `-connect` or not (Divi Core AddOneShot,
     /// net.cpp:1071-1084, :1096, :1112, :1842-1843)
@@ -179,6 +182,7 @@ impl Default for PeerManagerConfig {
             connect_only: false,
             whitelist: Vec::new(),
             white_listen: Vec::new(),
+            more_listen: Vec::new(),
             seed_nodes: Vec::new(),
             dns_seed: true,
             force_dns_seed: false,
@@ -732,6 +736,19 @@ impl PeerManager {
         self.added_nodes.read().contains(addr)
     }
 
+    /// The addresses to listen on, each with whether its peers are
+    /// whitelisted: the listen address, the other -bind addresses, and each
+    /// -whitebind address, whose peers are (net.cpp:1808-1823)
+    fn listen_addresses(&self) -> Vec<(SocketAddr, bool)> {
+        self.config
+            .listen_addr
+            .iter()
+            .chain(self.config.more_listen.iter())
+            .map(|a| (*a, false))
+            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
+            .collect()
+    }
+
     /// Bind the listeners before the node starts: the listen address and each
     /// -whitebind address. As Divi Core, an address that cannot be bound is
     /// reported ("Unable to bind to ... on this computer", net.cpp:1355-1365,
@@ -740,13 +757,7 @@ impl PeerManager {
     /// you want this.", net.cpp:1829-1831). Before, a listener that could not
     /// bind only logged it, and the node ran on without listening.
     pub async fn bind_listeners(&self) -> Result<(), String> {
-        let wanted: Vec<(SocketAddr, bool)> = self
-            .config
-            .listen_addr
-            .iter()
-            .map(|a| (*a, false))
-            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
-            .collect();
+        let wanted = self.listen_addresses();
         let mut bound = Vec::new();
         let mut failures = Vec::new();
         for (addr, white) in wanted.iter().copied() {
@@ -778,15 +789,8 @@ impl PeerManager {
     pub async fn start(self: Arc<Self>) -> Result<(), NetworkError> {
         info!("Starting peer manager");
 
-        // Start listeners for inbound connections: the listen address, and
-        // each -whitebind address, whose peers are whitelisted
-        let listeners: Vec<(SocketAddr, bool)> = self
-            .config
-            .listen_addr
-            .iter()
-            .map(|a| (*a, false))
-            .chain(self.config.white_listen.iter().map(|a| (*a, true)))
-            .collect();
+        // Start listeners for inbound connections
+        let listeners = self.listen_addresses();
         // The sockets bind_listeners bound, when it ran; else bind each here
         let to_run: Vec<(SocketAddr, bool, Option<TcpListener>)> = match self.prebound.lock().take()
         {
@@ -1006,7 +1010,8 @@ impl PeerManager {
                             // done or not, against -maxconnections less the outbound
                             // slots; outbound peers do not use them (net.cpp:744-759)
                             if !self.has_inbound_room() {
-                                warn!("Connection from {} dropped (full)", crate::peer_log::address(peer_addr));
+                                // divid's text, in its "net" debug category (net.cpp:757-759)
+                                debug!("connection from {} dropped (full)", peer_addr);
                                 continue;
                             }
 
@@ -1269,7 +1274,8 @@ impl PeerManager {
         let peer_addr = stream.peer_addr()?;
         let whitelisted = self.whitelisted_inbound(peer_addr.ip(), white_listener);
         if !whitelisted && self.is_banned(&peer_addr.ip()) {
-            warn!("Rejecting connection from banned IP {}", peer_addr.ip());
+            // divid's text (net.cpp:760-762)
+            info!("connection from {} dropped (banned)", peer_addr);
             return Err(NetworkError::ConnectionRefused(format!(
                 "{} is banned",
                 peer_addr.ip()
@@ -1589,8 +1595,8 @@ impl PeerManager {
 
     /// Periodic maintenance loop that ensures we maintain target outbound peer count.
     ///
-    /// Runs every 30 seconds and reconnects to peers if we've dropped below
-    /// `max_outbound`. Tries added nodes first, then static peers (with exponential
+    /// Runs every 30 seconds: dials the added nodes not connected, then, if
+    /// we've dropped below `max_outbound`, static peers (with exponential
     /// backoff for repeatedly-failing peers), then DNS seeds.
     ///
     /// Backoff schedule for static peers (consecutive failures → min wait before retry):
@@ -1608,24 +1614,13 @@ impl PeerManager {
 
             self.dial_one_shots();
 
-            let outbound = self.outbound_count();
-            let target = self.config.max_outbound;
-
-            if outbound >= target {
-                continue;
-            }
-
-            info!(
-                "Peer maintenance: {}/{} outbound peers, attempting reconnection",
-                outbound, target
-            );
-
-            // 1. Try added nodes first (manually added via RPC)
+            // 1. The added nodes (-addnode, addnode add), with -connect or
+            // not and whatever -maxconnections says: divid's added-node
+            // thread runs beside the -connect loop and counts no outbound
+            // slot since Divi Core f8c0d2e67 took its semaphore grant out; it skips a
+            // banned address (net.cpp:1214-1271, :1275-1285)
             let added: Vec<SocketAddr> = self.added_nodes.read().iter().copied().collect();
             for addr in added {
-                if !self.can_connect_outbound() {
-                    break;
-                }
                 if self.is_banned(&addr.ip()) {
                     continue;
                 }
@@ -1655,6 +1650,18 @@ impl PeerManager {
                     }
                 });
             }
+
+            let outbound = self.outbound_count();
+            let target = self.config.max_outbound;
+
+            if outbound >= target {
+                continue;
+            }
+
+            info!(
+                "Peer maintenance: {}/{} outbound peers, attempting reconnection",
+                outbound, target
+            );
 
             // 2. Try static peers (with exponential backoff for known-failing
             // peers); -connect peers have run_connect_loop instead

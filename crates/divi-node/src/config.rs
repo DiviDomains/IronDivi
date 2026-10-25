@@ -573,6 +573,11 @@ pub struct P2pConfig {
     #[serde(default)]
     pub white_bind: Vec<SocketAddr>,
 
+    /// The -bind addresses after the first, each listened on as the first is
+    /// (Divi Core binds every -bind, net.cpp:1809-1814)
+    #[serde(default)]
+    pub more_bind: Vec<SocketAddr>,
+
     /// Listen on `listen_addr`. Divi Core listens only on the -bind and
     /// -whitebind addresses when either is given, so -whitebind alone leaves
     /// this off (net.cpp:1808-1823)
@@ -725,6 +730,7 @@ impl Default for P2pConfig {
             interface_ips: Vec::new(),
             whitelist: Vec::new(),
             white_bind: Vec::new(),
+            more_bind: Vec::new(),
             listen_on_addr: true,
         }
     }
