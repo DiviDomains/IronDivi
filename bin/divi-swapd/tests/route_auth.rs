@@ -26,7 +26,10 @@ use common::*;
 use divi_swap::api::{AcceptRequest, SwapView};
 use divi_swap::{Store, SwapState};
 use divi_swap_cli::{flow, MakerClient, Sessions};
-use divi_swapd::{router_with_auth, AppState, HashlockAuth, ScanStatus};
+use divi_swapd::{
+    router_with_auth, AppState, HashlockAuth, ScanStatus, READ_LIMIT_PER_WINDOW,
+    WRITE_LIMIT_PER_WINDOW, XMR_TOKEN_MISS_LIMIT_PER_WINDOW,
+};
 use serde_json::{json, Value};
 
 const SUPPORT: &str = "x-swap-token-support";
@@ -479,5 +482,99 @@ async fn accept_reply_debug_redacts_the_token() {
     let reply: divi_swap::api::AcceptReply = serde_json::from_value(v).unwrap();
     assert!(!format!("{reply:?}").contains(&token));
     assert!(!format!("{reply:#?}").contains(&token));
+    s.handle.abort();
+}
+
+/// Token guesses on the hashlock `:id` routes: past `XMR_TOKEN_MISS_LIMIT_PER_WINDOW` misses
+/// (the XMR routes' limit) an address gets 429 on `GET /swaps/:id` and `POST .../lock`
+/// without the right token, while the right token still passes. Fails on 5a35a3e (every
+/// guess a 404).
+#[tokio::test]
+async fn hashlock_token_guesses_are_throttled() {
+    let w = World::new();
+    let s = serve_with(&w, None, false).await;
+    let (id, token) = open_swap(&w, &s.base).await;
+    let url = format!("{}/swaps/{id}", s.base);
+    let misses = XMR_TOKEN_MISS_LIMIT_PER_WINDOW;
+    for i in 0..misses {
+        let guess = format!("{i:064x}");
+        assert_eq!(
+            call("GET", &url, Some((SWAP_TOKEN, &guess))).await.0,
+            404,
+            "guess {i}"
+        );
+    }
+    let guess = format!("{misses:064x}");
+    assert_eq!(
+        call("GET", &url, Some((SWAP_TOKEN, &guess))).await.0,
+        429,
+        "the next guess"
+    );
+    let lock = format!("{url}/lock");
+    assert_eq!(
+        call("POST", &lock, Some((SWAP_TOKEN, &guess))).await.0,
+        429,
+        "lock"
+    );
+    let unknown = format!("{}/swaps/no-such-id", s.base);
+    assert_eq!(call("GET", &unknown, None).await.0, 429, "unknown id");
+    assert_eq!(
+        call("GET", &url, Some((SWAP_TOKEN, &token))).await.0,
+        200,
+        "the right token still passes"
+    );
+    let (code, _) = call("POST", &lock, Some((SWAP_TOKEN, &token))).await;
+    assert!(
+        code == 400 || code == 422,
+        "lock reaches the handler: {code}"
+    );
+    s.handle.abort();
+}
+
+/// The shared-bucket DoS on the hashlock routes: a prober on the client's address floods both
+/// `:id` routes with wrong and missing tokens, past the read and write buckets. The client
+/// holding the right token still reaches its lock and has its swap's whole read bucket: a
+/// wrong token for the real id never touches that swap's bucket. Fails on 5a35a3e (the
+/// flood spends the address's write bucket: the lock is a 429).
+#[tokio::test]
+async fn a_prober_cannot_lock_a_valid_token_hashlock_client_out() {
+    let w = World::new();
+    let s = serve_with(&w, None, false).await;
+    let (id, token) = open_swap(&w, &s.base).await;
+    let url = format!("{}/swaps/{id}", s.base);
+    let c = reqwest::Client::new();
+    for i in 0..2 * READ_LIMIT_PER_WINDOW {
+        c.get(&url)
+            .header(SWAP_TOKEN, format!("{i:064x}"))
+            .send()
+            .await
+            .unwrap();
+        c.get(format!("{}/swaps/no-such-id", s.base))
+            .send()
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 * WRITE_LIMIT_PER_WINDOW {
+        c.post(format!("{url}/lock"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let (code, _) = call("POST", &format!("{url}/lock"), Some((SWAP_TOKEN, &token))).await;
+    assert!(
+        code == 400 || code == 422,
+        "lock with the right token: {code}"
+    );
+    let mut ok = 0;
+    loop {
+        match call("GET", &url, Some((SWAP_TOKEN, &token))).await.0 {
+            200 => ok += 1,
+            429 => break,
+            other => panic!("status {other}"),
+        }
+        assert!(ok <= READ_LIMIT_PER_WINDOW, "no 429 after {ok} reads");
+    }
+    assert_eq!(ok, READ_LIMIT_PER_WINDOW, "the taker's whole read bucket");
     s.handle.abort();
 }
