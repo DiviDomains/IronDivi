@@ -21,7 +21,7 @@ tracing = { workspace = true }
 rocksdb = { workspace = true }
 
 # BIP32/BIP39
-bip32 = "0.5"
+bip32 = "0.6"
 bip39 = "2.0"
 hmac = "0.12"
 bs58 = "0.5"
