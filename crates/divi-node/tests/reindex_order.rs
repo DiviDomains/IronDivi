@@ -118,3 +118,23 @@ fn a_stopped_reindex_is_carried_out_at_the_next_start() {
     let node = Node::new(config(dir.path(), false)).unwrap();
     assert_eq!(indexed(&node, &txids), 30);
 }
+
+/// A held import thread (irondivid holds it until its wallet is loaded, as
+/// Divi Core starts its import thread then, init.cpp:1580) does nothing, and
+/// blocks from peers stay refused, until it is released
+#[test]
+fn a_held_import_waits_for_its_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let txids = mine(dir.path(), 10);
+
+    let node = Node::new(config(dir.path(), true)).unwrap();
+    node.hold_import();
+    node.spawn_import();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(node.chain().is_importing());
+    assert_eq!(indexed(&node, &txids), 0, "the reindex ran while held");
+    node.release_import();
+    node.wait_for_import();
+    assert!(!node.chain().is_importing());
+    assert_eq!(indexed(&node, &txids), 10);
+}

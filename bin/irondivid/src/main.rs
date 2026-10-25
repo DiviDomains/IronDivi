@@ -2235,6 +2235,10 @@ async fn run_daemon(
     // Never dropped: the process ends without running the destructors of the
     // node's state (databases, caches, mempool), see `exit_after_stop`
     let node = std::mem::ManuallyDrop::new(Node::new(config.clone()).map_err(start_error)?);
+    // Divi Core's import thread (-reindex, bootstrap.dat, -loadblock) starts
+    // once the wallet is loaded (init.cpp:1580); here the wallet is loaded
+    // after the node starts, so the thread waits until then (below)
+    node.hold_import();
 
     // -blocknotify, before any block comes in (init.cpp:1563-1564)
     if let Some(cmd) = config.blocknotify.clone() {
@@ -2710,6 +2714,10 @@ async fn run_daemon(
     } else {
         None
     };
+
+    // The wallet is loaded: the import thread goes on, a -reindex with it,
+    // while RPC answers, as Divi Core's (init.cpp:686-728, :1580, :1639)
+    node.release_import();
 
     // Start RPC server. RPC always requires authentication: without a complete
     // rpcuser/rpcpassword pair a random cookie is written to <datadir>/.cookie

@@ -294,6 +294,8 @@ pub struct Node {
     import_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<ImportResult>>>,
     /// A -reindex's index builds, carried out first on the import thread
     reindex_plan: parking_lot::Mutex<Option<ReindexPlan>>,
+    /// Set by `hold_import`: the import thread waits for `release_import`
+    import_held: Arc<std::sync::atomic::AtomicBool>,
     import_stop: Arc<std::sync::atomic::AtomicBool>,
 
     /// Current status
@@ -1063,6 +1065,7 @@ impl Node {
             config,
             import_thread: parking_lot::Mutex::new(None),
             reindex_plan: parking_lot::Mutex::new(reindex_plan),
+            import_held: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             import_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status: RwLock::new(NodeStatus::Stopped),
             chain,
@@ -1161,10 +1164,16 @@ impl Node {
         let load_block = self.config.load_block.clone();
         let magic = self.config.network.magic;
         let reindex = self.reindex_plan.lock().take();
+        let held = Arc::clone(&self.import_held);
         chain.set_importing(true);
         let spawned = std::thread::Builder::new()
             .name("divi-loadblk".into())
             .spawn(move || {
+                while held.load(std::sync::atomic::Ordering::SeqCst)
+                    && !stop.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
                 // A stopped reindex ends the thread, as Divi Core's
                 // interruption point ends its import thread (init.cpp:575)
                 let result = if reindex.is_none_or(|plan| plan.carry_out(&chain, &stop)) {
@@ -1188,6 +1197,21 @@ impl Node {
                 tracing::error!("Could not start the block import: {}", e);
             }
         }
+    }
+
+    /// Have the import thread `start` spawns wait, blocks from peers still
+    /// refused, until `release_import`: Divi Core starts its import thread
+    /// once the wallet is loaded (init.cpp:1580), which irondivid loads after
+    /// the node starts
+    pub fn hold_import(&self) {
+        self.import_held
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Let the import thread go on (see `hold_import`)
+    pub fn release_import(&self) {
+        self.import_held
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Wait for the block import to finish; None if none was started
