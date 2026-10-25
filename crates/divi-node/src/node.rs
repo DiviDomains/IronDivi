@@ -2070,11 +2070,6 @@ impl Node {
         }
         shutdown_stage("node loops stopped", started);
 
-        // Disconnect all peers
-        let started = std::time::Instant::now();
-        self.peer_manager.disconnect_all();
-        shutdown_stage("peers disconnected", started);
-
         // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
         let started = std::time::Instant::now();
         if let Err(e) = self.peer_manager.address_book().save() {
@@ -2104,6 +2099,14 @@ impl Node {
             }
         }
         shutdown_stage("UTXO cache flushed", started);
+
+        // The connections close last, after the chain state is flushed, as
+        // Divi Core's CleanupP2PConnections ends its shutdown (init.cpp:417);
+        // peers.dat was written above, while they were open (StopNode,
+        // net.cpp:1474-1485)
+        let started = std::time::Instant::now();
+        self.peer_manager.disconnect_all();
+        shutdown_stage("peers disconnected", started);
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());

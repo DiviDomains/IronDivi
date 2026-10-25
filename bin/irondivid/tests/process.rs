@@ -322,3 +322,20 @@ fn staking_stops_before_the_flush_and_the_wallet_save() {
     let saved = line_of(&lines, "Wallet saved").expect("wallet saved");
     assert!(stopped < flushed && stopped < saved, "{lines:#?}");
 }
+
+/// The stop writes peers.dat while the peers are still connected and closes
+/// the connections only after the chain state is flushed, as Divi Core's
+/// StopNode dumps the addresses and CleanupP2PConnections ends its shutdown
+/// (net.cpp:1474-1485, init.cpp:372, :381, :417)
+#[test]
+fn peers_are_written_before_and_closed_after_the_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path());
+    daemon.stop();
+    let lines = log_lines(dir.path());
+    let written = line_of(&lines, "Shutdown: peers.dat written").expect("peers.dat written");
+    let flushed = line_of(&lines, "Shutdown: UTXO cache flushed").expect("UTXO cache flushed");
+    let closed = line_of(&lines, "Shutdown: peers disconnected").expect("peers disconnected");
+    assert!(written < closed && flushed < closed, "{lines:#?}");
+    assert!(dir.path().join("peers.dat").exists());
+}
