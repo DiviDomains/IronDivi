@@ -1421,6 +1421,17 @@ impl Staker {
         for (utxo, vault_script) in &vault_utxos {
             candidates.push(StakeCandidate::Vault(utxo, vault_script.clone()));
         }
+        // Divi Core tries its stake set in the set's order, by outpoint
+        // (std::set<StakableCoin>, StakableCoin.h:20-23;
+        // PoSTransactionCreator.cpp:261), and shuffles it only with -vault
+        // (PoSTransactionCreator.cpp:63-72, :99). The first kernel found is
+        // the one staked, or on a locked wallet the one whose key is wanted.
+        if self.wallet.vault_mode() {
+            use rand::seq::SliceRandom;
+            candidates.shuffle(&mut rand::thread_rng());
+        } else {
+            candidates.sort_by_key(|c| (c.utxo().txid, c.utxo().vout));
+        }
 
         // Update stake weight for status (include vault UTXOs)
         let total_weight: u64 = candidates
