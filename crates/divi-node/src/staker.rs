@@ -680,6 +680,14 @@ impl Staker {
         }
     }
 
+    /// Stop staking and wait for a round under way to end, as Divi Core's
+    /// ShutdownCoinMintingModule stops and joins its minting thread before the
+    /// shutdown goes on (miner.cpp:110-115, init.cpp:373). Blocks the caller
+    pub fn stop_and_wait(&self) {
+        self.stop();
+        drop(self.producing.lock());
+    }
+
     /// Main staking loop
     async fn staking_loop(&self) {
         let interval = tokio::time::Duration::from_millis(self.config.read().loop_interval_ms);
@@ -710,6 +718,8 @@ impl Staker {
 
             // Try to stake; skip the round while setgenerate is producing
             let result = match self.producing.try_lock() {
+                // stop_and_wait may have come in since the loop's check
+                Some(_) if !self.running.load(Ordering::SeqCst) => break,
                 Some(_producing) => {
                     let result = self.try_stake();
                     if let StakeResult::Success {

@@ -2097,8 +2097,6 @@ impl Node {
 
         tracing::info!("Stopping Divi node...");
         *self.status.write() = NodeStatus::Stopping;
-        // netfulfilled.dat is written at shutdown (MasternodeModule.cpp:290-296)
-        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
 
         // Stop the block import between two records and wait for it, for a
         // minute at most (a read can block where the flag is not seen)
@@ -2147,10 +2145,12 @@ impl Node {
         }
         shutdown_stage("node loops stopped", started);
 
-        // Disconnect all peers
+        // netfulfilled.dat once the loops that change it have stopped, as
+        // Divi Core's SaveMasternodeDataToDisk follows StopNode
+        // (init.cpp:372, :376; MasternodeModule.cpp:284-297)
         let started = std::time::Instant::now();
-        self.peer_manager.disconnect_all();
-        shutdown_stage("peers disconnected", started);
+        crate::masternode_sync::save(&self.masternode_sync, &self.config.data_dir);
+        shutdown_stage("netfulfilled.dat written", started);
 
         // The addresses learnt, for the next start (Divi Core DumpAddresses at stop)
         let started = std::time::Instant::now();
@@ -2181,6 +2181,14 @@ impl Node {
             }
         }
         shutdown_stage("UTXO cache flushed", started);
+
+        // The connections close last, after the chain state is flushed, as
+        // Divi Core's CleanupP2PConnections ends its shutdown (init.cpp:417);
+        // peers.dat was written above, while they were open (StopNode,
+        // net.cpp:1474-1485)
+        let started = std::time::Instant::now();
+        self.peer_manager.disconnect_all();
+        shutdown_stage("peers disconnected", started);
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());
