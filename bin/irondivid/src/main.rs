@@ -1290,6 +1290,24 @@ fn warn_if_unencrypted(wallet: &WalletDb) {
     }
 }
 
+/// Put one wallet transaction back in the mempool with its real fee (inputs -
+/// outputs), as a local RPC send does, so the relay fee check applies to it.
+fn resubmit_tx(
+    tx: Transaction,
+    chain: &Arc<divi_storage::Chain>,
+    mempool: &Arc<divi_node::Mempool>,
+) -> std::result::Result<divi_primitives::hash::Hash256, String> {
+    let inputs_available = tx.vin.iter().all(|input| {
+        mempool.contains(&input.prevout.txid)
+            || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
+    });
+    if !inputs_available {
+        return Err("inputs no longer available".to_string());
+    }
+    let fee = Node::calculate_transaction_fee(&tx, chain, mempool).map_err(|e| e.to_string())?;
+    mempool.add(tx, fee).map_err(|e| e.to_string())
+}
+
 /// Put the wallet's unconfirmed transactions back into the mempool after a
 /// restart (Core's ReacceptWalletTransactions), so a send made before the
 /// node stopped can still confirm. Runs after the catch-up scan, which has
@@ -1302,23 +1320,10 @@ fn resubmit_wallet_txs(node: &Node, wallet: &Arc<WalletDb>) {
     if txs.is_empty() {
         return;
     }
-    let chain = node.chain();
-    let mempool = node.mempool();
     let mut resubmitted = 0;
     for tx in txs {
         let txid = tx.txid();
-        let inputs_available = tx.vin.iter().all(|input| {
-            mempool.contains(&input.prevout.txid)
-                || matches!(chain.get_utxo(&input.prevout), Ok(Some(_)))
-        });
-        // Same generous fee as a local RPC send (see set_tx_submit below)
-        let fee = Amount::from_sat((tx.size() as i64) * 10_000);
-        let result = if inputs_available {
-            mempool.add(tx, fee).map_err(|e| e.to_string())
-        } else {
-            Err("inputs no longer available".to_string())
-        };
-        match result {
+        match resubmit_tx(tx, node.chain(), node.mempool()) {
             Ok(_) => {
                 resubmitted += 1;
                 let relay = node.tx_relay().clone();
@@ -2971,5 +2976,61 @@ mod staking_status_tests {
 
         let info = staking_info(&status, false, 3, 1_761_000_000, true, 20000.0);
         assert!(info.wallet_unlocked && info.have_connections && info.valid_time && info.mnsync);
+    }
+}
+
+#[cfg(test)]
+mod resubmit_tests {
+    use super::*;
+    use divi_primitives::hash::Hash256;
+    use divi_primitives::script::Script;
+    use divi_primitives::transaction::{OutPoint, TxIn, TxOut};
+    use divi_storage::{Chain, ChainDatabase, ChainParams, NetworkType as StorageNetwork};
+
+    fn spend(prev: Hash256, value: i64) -> Transaction {
+        let mut tx = Transaction::new();
+        tx.vin.push(TxIn::new(
+            OutPoint::new(prev, 0),
+            Script::from_bytes(vec![0x51]),
+            0xffff_ffff,
+        ));
+        tx.vout.push(TxOut::new(
+            Amount::from_sat(value),
+            Script::new_p2pkh(&[9u8; 20]),
+        ));
+        tx
+    }
+
+    /// A wallet transaction put back after a restart used to be charged a
+    /// made-up fee of 10,000 sat per byte, so one paying less than the relay
+    /// fee got past the mempool's fee check. It now pays what it really pays.
+    #[test]
+    fn node21_resubmit_uses_the_real_fee() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDatabase::open(dir.path()).unwrap());
+        let params = ChainParams::for_network(StorageNetwork::Regtest, ChainMode::Divi);
+        let chain = Arc::new(Chain::new(db, params).unwrap());
+        let mempool = Arc::new(divi_node::Mempool::new(Default::default()));
+
+        let parent = spend(Hash256::from_bytes([7u8; 32]), 5_000_000);
+        let parent_id = parent.txid();
+        mempool.add(parent, Amount::from_sat(1_000_000)).unwrap();
+
+        // 100 sat for a ~85 byte transaction is under 10 sat/byte
+        let cheap = spend(parent_id, 5_000_000 - 100);
+        let cheap_id = cheap.txid();
+        assert!(resubmit_tx(cheap, &chain, &mempool).is_err());
+        assert!(!mempool.contains(&cheap_id));
+
+        let paid = spend(parent_id, 5_000_000 - 100_000);
+        let paid_id = paid.txid();
+        assert_eq!(resubmit_tx(paid, &chain, &mempool), Ok(paid_id));
+
+        // Inputs that exist nowhere are reported, not added
+        let orphan = spend(Hash256::from_bytes([8u8; 32]), 1_000);
+        assert_eq!(
+            resubmit_tx(orphan, &chain, &mempool),
+            Err("inputs no longer available".to_string())
+        );
     }
 }
