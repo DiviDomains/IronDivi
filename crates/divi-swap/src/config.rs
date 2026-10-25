@@ -342,18 +342,20 @@ impl FeeEscalation {
     /// seconds before the locktime, the first claim having paid `base`. Until
     /// `cap_secs_left` it is [`FeeEscalation::target`]. From there it climbs on
     /// geometrically from the fixed cap to [`FeeEscalation::cap_after_leak`] at the
-    /// locktime, as [`FeeEscalation::target_after_leak`] does to the ceiling; and where one
-    /// more price bump (`price_bump_pct`) over it would pass that cap, it is that cap, so the
-    /// last version reaches the cap instead of stopping short of it with no replacement
-    /// the node would take left under it.
+    /// locktime, as [`FeeEscalation::target_after_leak`] does to the ceiling. Either way
+    /// [`FeeEscalation::reach_cap`] applies.
     pub fn same_nonce_target(&self, base: u64, left: i64) -> u64 {
         let cap = self.cap_after_leak(base, left);
-        let target = self.target_after_leak(base, left, cap);
-        if left >= i64::from(self.cap_secs_left) || target >= cap {
-            return target;
-        }
+        self.reach_cap(self.target_after_leak(base, left, cap), cap)
+    }
+
+    /// A same-nonce `target` under `cap`, or `cap` itself where one more price bump
+    /// (`price_bump_pct`) over `target` would pass it: a version there could never be
+    /// replaced again within the cap (DM2 (c)), and would hold the claim short of the cap,
+    /// under a floor the cap still clears.
+    pub fn reach_cap(&self, target: u64, cap: u64) -> u64 {
         let next = u128::from(target) * u128::from(100 + self.price_bump_pct) / 100;
-        if next > u128::from(cap) {
+        if target < cap && next > u128::from(cap) {
             cap
         } else {
             target
@@ -1264,9 +1266,9 @@ mod tests {
         }
     }
 
-    /// The USDC target: unchanged before the cap point; past it a geometric climb from the
-    /// fixed cap to `cap_feerate`, never above it, never falling, and at `cap_feerate` once
-    /// one more 10% price bump would pass it, so the last version is the cap.
+    /// The USDC target: the fixed schedule before the cap point; past it a geometric climb
+    /// from the fixed cap to `cap_feerate`, never above it, never falling. Either way it is
+    /// the cap once one more 10% price bump would pass it, so the last version is the cap.
     #[test]
     fn after_the_leak_the_usdc_target_climbs_to_cap_feerate_and_ends_on_it() {
         let e = FeeEscalation::builtin(Chain::Usdc).unwrap();
@@ -1276,8 +1278,15 @@ mod tests {
             i64::from(e.cap_secs_left),
         );
         for base in [1, gwei, 2 * gwei, 10 * gwei] {
+            // Before the cap point: the fixed schedule, ending on the fixed cap.
+            let fixed = e.cap(base);
             for left in (end..=start + 600).step_by(7) {
-                assert_eq!(e.same_nonce_target(base, left), e.target(base, left));
+                let (t, plain) = (e.same_nonce_target(base, left), e.target(base, left));
+                if plain * 110 / 100 > fixed {
+                    assert_eq!(t, fixed, "{base} at {left}");
+                } else {
+                    assert_eq!(t, plain, "{base} at {left}");
+                }
             }
             let mut last = e.cap(base);
             for left in (-60..end).rev() {
@@ -1293,6 +1302,20 @@ mod tests {
         }
         let t = e.same_nonce_target(2 * gwei, end - 1);
         assert!(t > 100 * gwei && t < 110 * gwei, "{t}");
+        // The stalls `claim_race` and `maker_claim_race` found at 5000 cases (mock scale,
+        // cap 500): 456 and 487 could never be replaced under 500 at a 10% bump.
+        let mock = e.with_cap_feerate(500);
+        for (t, want) in [
+            (454, 454),
+            (455, 455),
+            (456, 500),
+            (487, 500),
+            (499, 500),
+            (500, 500),
+        ] {
+            assert_eq!(mock.reach_cap(t, 500), want, "{t}");
+        }
+        assert_eq!(mock.with_price_bump(30).reach_cap(390, 500), 500);
         // A node with a stricter bump ends on the cap from further away.
         let strict = e.with_price_bump(30);
         let left = (0..end)

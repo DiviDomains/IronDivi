@@ -389,7 +389,10 @@ impl ClaimCtx<'_> {
         // refusal, within the cap.
         let target = match kind {
             FeeBump::SameNonce if underpriced >= 2 => {
-                let raised = esc.underpriced_target_within(current, target, underpriced, cap);
+                let raised = esc.reach_cap(
+                    esc.underpriced_target_within(current, target, underpriced, cap),
+                    cap,
+                );
                 tracing::warn!(
                     swap = %r.swap_id(),
                     chain = %self.chain,
