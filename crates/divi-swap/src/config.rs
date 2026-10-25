@@ -160,10 +160,13 @@ impl ClaimDeadline {
     }
 }
 
-/// How the taker raises the fee of a maker-leg claim that has not confirmed as the maker-leg
-/// locktime nears ([`FeeEscalation::builtin`]; `Taker::with_fee_escalation` overrides or
-/// turns it off for one chain). Applied only where the backend can bump
-/// (`FeeBump::Rbf` or `FeeBump::Cpfp`).
+/// How a claim that has not confirmed has its fee raised as the claimed leg's locktime nears
+/// ([`FeeEscalation::builtin`]): the taker's claim of the maker leg, and the maker's claim of
+/// the taker leg, which the taker's refund takes back at the taker-leg locktime
+/// (`Taker::with_fee_escalation` and `Maker::with_fee_escalation` override or turn it off
+/// for one chain). Applied only where the backend can bump (`FeeBump::Rbf`, `Cpfp` or
+/// `SameNonce`). The schedule is written in terms of the maker leg; for the maker read
+/// "taker leg" throughout.
 ///
 /// The feerate stays at what the first claim paid until `start_secs_left` seconds are left,
 /// then climbs geometrically to the cap, reached with `cap_secs_left` left. The cap is the
@@ -404,6 +407,53 @@ impl FeeEscalation {
     pub fn should_bump(&self, base: u64, current: u64, target: u64) -> bool {
         target > current && (Self::worth_bumping(current, target) || target == self.cap(base))
     }
+}
+
+/// `CHAIN=N`, the value of the per-chain claim fee flags (`--claim-fee-cap`,
+/// `--claim-price-bump`) of the `divi-swap` and `divi-swapd` binaries.
+pub fn parse_chain_value(s: &str) -> std::result::Result<(Chain, u64), String> {
+    let (chain, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected CHAIN=N, got {s:?}"))?;
+    let chain = chain.parse::<Chain>().map_err(|e| e.to_string())?;
+    let value = value
+        .parse::<u64>()
+        .map_err(|e| format!("{chain}: {e} in {s:?}"))?;
+    Ok((chain, value))
+}
+
+/// The fee escalations the claim fee flags set: each named chain's
+/// [`FeeEscalation::builtin`] with `caps` ([`FeeEscalation::with_cap_feerate`]) and `bumps`
+/// ([`FeeEscalation::with_price_bump`]) applied, one entry per chain. Fails on a chain whose
+/// claims cannot be bumped (DIVI, ZEC, XMR).
+pub fn claim_fee_escalations(
+    caps: &[(Chain, u64)],
+    bumps: &[(Chain, u64)],
+) -> Result<Vec<(Chain, FeeEscalation)>> {
+    let mut out: Vec<(Chain, FeeEscalation)> = Vec::new();
+    let mut set = |chain: Chain, f: &dyn Fn(FeeEscalation) -> FeeEscalation| -> Result<()> {
+        let i = match out.iter().position(|(c, _)| *c == chain) {
+            Some(i) => i,
+            None => {
+                let builtin = FeeEscalation::builtin(chain).ok_or_else(|| {
+                    SwapError::InvalidParams(format!(
+                        "{chain} claims have no fee escalation to configure"
+                    ))
+                })?;
+                out.push((chain, builtin));
+                out.len() - 1
+            }
+        };
+        out[i].1 = f(out[i].1);
+        Ok(())
+    };
+    for &(chain, cap) in caps {
+        set(chain, &|e| e.with_cap_feerate(cap))?;
+    }
+    for &(chain, pct) in bumps {
+        set(chain, &|e| e.with_price_bump(pct))?;
+    }
+    Ok(out)
 }
 
 /// Swap timing and confirmation requirements. All durations in seconds.

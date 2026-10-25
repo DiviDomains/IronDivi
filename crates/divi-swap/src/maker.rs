@@ -28,7 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{AcceptRequest, LegView, LockNotice, Offer, Quote, SwapView};
 use crate::backend::ChainBackend;
-use crate::config::SwapConfig;
+use crate::claim_fee::ClaimCtx;
+use crate::config::{ClaimDeadline, FeeEscalation, SwapConfig};
 use crate::error::{Result, SwapError};
 use crate::htlc::{HtlcParams, ScriptVersion};
 use crate::state::SwapState;
@@ -94,6 +95,9 @@ pub struct Maker {
     gate: tokio::sync::Mutex<()>,
     gate_bound: Duration,
     engines: Vec<Arc<dyn OfferEngine>>,
+    /// Per-chain fee escalations of taker-leg claims replacing
+    /// [`FeeEscalation::builtin`] (`None`: off).
+    fee_escalations: BTreeMap<Chain, Option<FeeEscalation>>,
 }
 
 impl Maker {
@@ -156,7 +160,23 @@ impl Maker {
             gate: tokio::sync::Mutex::new(()),
             gate_bound: Duration::from_secs(GATE_BOUND_SECS),
             engines: Vec::new(),
+            fee_escalations: BTreeMap::new(),
         })
+    }
+
+    /// Use `escalation` instead of [`FeeEscalation::builtin`] for claims of taker legs on
+    /// `chain`; `None` never bumps them.
+    pub fn with_fee_escalation(mut self, chain: Chain, escalation: Option<FeeEscalation>) -> Self {
+        self.fee_escalations.insert(chain, escalation);
+        self
+    }
+
+    /// The fee escalation this maker applies to claims of taker legs on `chain`.
+    pub fn fee_escalation(&self, chain: Chain) -> Option<FeeEscalation> {
+        self.fee_escalations
+            .get(&chain)
+            .copied()
+            .unwrap_or_else(|| FeeEscalation::builtin(chain))
     }
 
     /// Replace the bound on each gate wait and gate-held chain read ([`GATE_BOUND_SECS`]).
@@ -402,6 +422,7 @@ impl Maker {
             taker_leg_claim: None,
             last_error: None,
             maker_lock_dropped: false,
+            claim_fees: Default::default(),
         };
         qr.used = true;
         self.store.put_quote(&qr)?;
@@ -843,51 +864,127 @@ impl Maker {
         }
     }
 
-    async fn on_taker_claimed(&self, r: &mut MakerRecord) -> Result<Flow> {
+    /// The taker-leg claim, for the shared escalation ([`crate::claim_fee`]).
+    fn claim_ctx(&self, r: &MakerRecord) -> Result<ClaimCtx<'_>> {
+        let chain = r.quote.taker_chain();
         let preimage = r
             .preimage
-            .ok_or_else(|| SwapError::Other("TakerClaimed without a preimage".into()))?;
+            .ok_or_else(|| SwapError::Other("claiming without a preimage".into()))?;
+        let amount = r
+            .taker_leg_locked
+            .ok_or_else(|| SwapError::Other("no verified taker-leg amount".into()))?;
+        Ok(ClaimCtx {
+            chain,
+            backend: self.tk(r)?.as_ref(),
+            escalation: self.fee_escalation(chain),
+            window: ClaimDeadline::builtin(chain).margin_secs(),
+            htlc: r.taker_leg_htlc,
+            op: self.taker_leg_outpoint(r)?,
+            amount,
+            preimage,
+            store: &self.store,
+        })
+    }
+
+    async fn on_taker_claimed(&self, r: &mut MakerRecord) -> Result<Flow> {
+        let ctx = self.claim_ctx(r)?;
         let claim = match r.taker_leg_claim.clone() {
             Some(tx) => tx,
             None => {
-                let op = self.taker_leg_outpoint(r)?;
-                let amount = r
-                    .taker_leg_locked
-                    .ok_or_else(|| SwapError::Other("no verified taker-leg amount".into()))?;
-                let tx = self
-                    .tk(r)?
-                    .build_claim(&r.taker_leg_htlc, &op, amount, &preimage)
-                    .await?;
-                r.taker_leg_claim = Some(tx.clone());
+                let tx = ctx.sign_first(r).await?;
                 self.store.put_maker_swap(r)?; // write-ahead
                 tx
             }
         };
-        if let Err(e) = self.tk(r)?.broadcast(&claim).await {
-            if matches!(e, SwapError::Rejected(_)) {
-                // The node refused these bytes for good (e.g. signed by an older, buggy
-                // build): forget them so the next step re-signs from the persisted preimage.
-                r.taker_leg_claim = None;
-                self.store.put_maker_swap(r)?;
+        if let Err(e) = ctx.backend.broadcast(&claim).await {
+            if matches!(e, SwapError::Rejected(_))
+                && self.claim_refused(&ctx, r, &claim, &e).await?
+            {
+                return self.enter(r, SwapState::MakerClaimed);
             }
             return Err(e);
         }
         self.enter(r, SwapState::MakerClaimed)
     }
 
+    /// Until the taker-leg claim confirms: resend it (and its CPFP children), and raise its
+    /// fee along the chain's [`FeeEscalation`] as the taker-leg locktime nears. The taker
+    /// revealed the preimage as late as its own claim deadline allowed, so the claim may
+    /// have little more than `claim_margin_secs` to confirm before the taker's refund can
+    /// take the leg back, with the maker leg already gone.
     async fn on_maker_claimed(&self, r: &mut MakerRecord) -> Result<Flow> {
-        let claim = r
-            .taker_leg_claim
-            .clone()
-            .ok_or_else(|| SwapError::Other("MakerClaimed without a claim tx".into()))?;
-        match self.tk(r)?.confirmations(&claim.txid).await? {
-            Some(c) if c >= 1 => self.enter(r, SwapState::Done),
-            _ => {
-                // Dropped from the mempool? Rebroadcasting identical bytes is harmless.
-                self.tk(r)?.broadcast(&claim).await?;
-                Ok(Flow::Idle)
+        let ctx = self.claim_ctx(r)?;
+        let claim = match r.taker_leg_claim.clone() {
+            Some(tx) => tx,
+            None => {
+                // Forgotten after a refusal: re-sign from the persisted preimage.
+                let tx = ctx.sign_first(r).await?;
+                self.store.put_maker_swap(r)?; // write-ahead
+                tx
             }
+        };
+        if ctx
+            .backend
+            .confirmations(&claim.txid)
+            .await?
+            .is_some_and(|c| c >= 1)
+            || ctx.replaced_confirmed(r).await?
+        {
+            return self.enter(r, SwapState::Done);
         }
+        if let Err(e) = ctx.backend.broadcast(&claim).await {
+            if matches!(e, SwapError::Rejected(_))
+                && self.claim_refused(&ctx, r, &claim, &e).await?
+            {
+                return Ok(Flow::Idle);
+            }
+            return Err(e);
+        }
+        ctx.resend_children(r).await?;
+        ctx.escalate(r, &claim).await?;
+        Ok(Flow::Idle)
+    }
+
+    /// The node refused `claim`, the newest taker-leg claim, for good: `true` if it was
+    /// re-signed higher and sent ([`ClaimCtx::resign_after_refusal`]). Nothing is re-signed
+    /// while the chain holds it or a version it replaced, or once the taker's refund of the
+    /// taker leg has confirmed: that leg is gone, and the error says so.
+    async fn claim_refused(
+        &self,
+        ctx: &ClaimCtx<'_>,
+        r: &mut MakerRecord,
+        claim: &SignedTx,
+        e: &SwapError,
+    ) -> Result<bool> {
+        if ctx.held_after_refusal(r, claim, e).await? {
+            return Ok(false);
+        }
+        if self.taker_leg_refunded(r).await? {
+            tracing::error!(swap = %r.id, chain = %ctx.chain, error = %e,
+                "the taker refunded the taker leg before the claim confirmed; the leg is lost");
+            return Err(SwapError::Other(format!(
+                "taker leg refunded before the claim confirmed ({e}); the leg is lost"
+            )));
+        }
+        ctx.resign_after_refusal(r, claim, e).await
+    }
+
+    /// Whether a confirmed spend of the taker-leg lock carries no preimage: the taker's
+    /// refund.
+    async fn taker_leg_refunded(&self, r: &MakerRecord) -> Result<bool> {
+        let Some(op) = r.taker_leg_outpoint else {
+            return Ok(false);
+        };
+        let tb = self.tk(r)?;
+        // No spend predates the lock's own block.
+        let Some(confs) = tb.confirmations(&op.txid).await?.filter(|&c| c >= 1) else {
+            return Ok(false);
+        };
+        let from = (tb.tip_height().await? + 1).saturating_sub(confs as u64);
+        let Some(spend) = tb.find_spend(&op, from).await? else {
+            return Ok(false);
+        };
+        Ok(spend.height.is_some() && spend.extract_preimage(&r.hash).is_none())
     }
 
     fn taker_leg_outpoint(&self, r: &MakerRecord) -> Result<Outpoint> {

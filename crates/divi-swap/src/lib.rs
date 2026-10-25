@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod backend;
+mod claim_fee;
 pub mod config;
 pub mod error;
 pub mod htlc;

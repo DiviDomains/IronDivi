@@ -92,6 +92,31 @@ pub struct MakerRecord {
     /// the watcher stops re-sending and keeps reporting one error. Absent in older records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub maker_lock_dropped: bool,
+    /// Fee history of `taker_leg_claim` (keys at the top level, as in [`TakerRecord`]).
+    /// Absent in older records.
+    #[serde(flatten)]
+    pub claim_fees: ClaimFees,
+}
+
+/// Fee history of the maker's taker-leg claim; each field as the same-named one of
+/// [`TakerRecord`] does for the maker-leg claim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimFees {
+    /// Feerate the first claim paid, where its backend can bump it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_base_feerate: Option<u64>,
+    /// Feerate the claim (with its CPFP children) pays now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_feerate: Option<u64>,
+    /// Earlier versions a replacement superseded, oldest first, with their feerates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_replaced: Vec<(SignedTx, u64)>,
+    /// CPFP children, in spend order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_children: Vec<SignedTx>,
+    /// Same-nonce replacements refused as underpriced since a version was last taken.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub claim_underpriced: u32,
 }
 
 /// The taker's persisted view of one swap (role-based legs, see [`MakerRecord`]).
@@ -187,6 +212,7 @@ impl std::fmt::Debug for MakerRecord {
             taker_leg_claim,
             last_error,
             maker_lock_dropped,
+            claim_fees,
         } = self;
         f.debug_struct("MakerRecord")
             .field("id", id)
@@ -207,6 +233,7 @@ impl std::fmt::Debug for MakerRecord {
             .field("taker_leg_claim", taker_leg_claim)
             .field("last_error", last_error)
             .field("maker_lock_dropped", maker_lock_dropped)
+            .field("claim_fees", claim_fees)
             .finish()
     }
 }
@@ -694,6 +721,7 @@ mod tests {
             taker_leg_claim: None,
             last_error: None,
             maker_lock_dropped: false,
+            claim_fees: Default::default(),
         }
     }
 

@@ -67,6 +67,7 @@ fn maker() -> MakerRecord {
         taker_leg_claim: None,
         last_error: None,
         maker_lock_dropped: false,
+        claim_fees: Default::default(),
     }
 }
 
