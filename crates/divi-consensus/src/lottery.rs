@@ -74,6 +74,13 @@ pub fn calculate_lottery_score(coinstake_hash: &Hash256, last_lottery_hash: &Has
 /// - Transaction must return stake to same address (output[1])
 /// - Total amount returned to staker must be > 10,000 DIVI
 pub fn is_coinstake_valid_for_lottery(tx: &Transaction) -> bool {
+    is_coinstake_valid_for_lottery_with_minimum(tx, LOTTERY_TICKET_MINIMUM)
+}
+
+/// [`is_coinstake_valid_for_lottery`] against a minimum in satoshis, which spork
+/// 16 can set (Divi Core `LotteryWinnersCalculator::minimumCoinstakeForTicket`,
+/// LotteryWinnersCalculator.cpp:27-37)
+pub fn is_coinstake_valid_for_lottery_with_minimum(tx: &Transaction, minimum: i64) -> bool {
     if tx.vout.len() < 2 {
         return false;
     }
@@ -89,7 +96,7 @@ pub fn is_coinstake_valid_for_lottery(tx: &Transaction) -> bool {
         .map(|out| out.value.as_sat())
         .sum();
 
-    total > LOTTERY_TICKET_MINIMUM
+    total > minimum
 }
 
 /// Get the last lottery block height before the given height

@@ -286,6 +286,9 @@ pub enum StakeResult {
     NoProofFound,
     /// Rate limited - too soon to try again
     RateLimited,
+    /// A kernel was found on a locked wallet and its key is derived from the
+    /// encrypted HD seed, so Divi Core's GetKey throws while signing
+    LockedHdKey,
     /// Error during staking
     Error(String),
 }
@@ -365,7 +368,12 @@ pub struct BlockOverrides {
     pub bits_shift: Option<u32>,
 }
 
-/// Why `generateblock` made no block
+/// Divi Core's GetKey on a key of an encrypted HD seed while the wallet is
+/// locked (wallet.cpp:544); the RPC server answers it as -1
+/// (rpcserver.cpp:1107-1108)
+pub const LOCKED_HD_KEY: &str = "GetKey: DecryptHDChainSeed failed";
+
+/// Why `setgenerate` or `generateblock` made no block
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateBlockError {
     /// Refused before a block was made, with Divi Core's message
@@ -765,6 +773,9 @@ impl Staker {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue; // Skip the default sleep at the end
                 }
+                StakeResult::LockedHdKey => {
+                    info!("Staking error: {}", LOCKED_HD_KEY);
+                }
                 StakeResult::Error(e) => {
                     info!("Staking error: {}", e);
                 }
@@ -872,24 +883,29 @@ impl Staker {
     /// their hashes. Proof-of-work up to the last PoW height, proof-of-stake
     /// after it, as Divi Core does. The staking loop's pacing guards (rate
     /// limit, stale tip, minimum coin age, reserve balance) do not apply.
-    pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, String> {
+    ///
+    /// A work block pays a keypool key, which a locked wallet still hands out
+    /// (CoinMinter.cpp:141-158). A stake block on a locked wallet is searched
+    /// for as on an unlocked one and fails where Divi Core signs it: `Refused`
+    /// with GetKey's message for a key of the HD seed, `Failed` otherwise.
+    pub fn generate_blocks(&self, n: u32) -> Result<Vec<Hash256>, GenerateBlockError> {
+        use GenerateBlockError::Failed;
         let _producing = self.producing.lock();
         let mut hashes = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let tip = self.chain.tip().ok_or("no chain tip")?;
+            let tip = self
+                .chain
+                .tip()
+                .ok_or_else(|| Failed("no chain tip".to_string()))?;
             let height = tip.height + 1;
-            // A work block pays a keypool key, which a locked wallet still
-            // hands out; only a stake block needs the wallet unlocked
-            // (CoinMinter.cpp:141-158)
             let block = if height <= divi_storage::chain::LAST_POW_BLOCK {
-                self.build_work_block(&tip)?
-            } else if self.wallet.is_locked() {
-                return Err("wallet is locked".to_string());
+                self.build_work_block(&tip).map_err(Failed)?
             } else {
                 self.build_generated_stake_block(&tip)?
             };
             let block_hash = compute_block_hash(&block.header);
-            self.accept_own_block(&block, block_hash, height)?;
+            self.accept_own_block(&block, block_hash, height)
+                .map_err(Failed)?;
             hashes.push(block_hash);
         }
         Ok(hashes)
@@ -906,9 +922,8 @@ impl Staker {
         overrides: &BlockOverrides,
     ) -> Result<Hash256, GenerateBlockError> {
         use GenerateBlockError::{Failed, Refused};
-        if self.wallet.is_locked() {
-            return Err(Failed("wallet is locked".to_string()));
-        }
+        // A locked wallet mines as in setgenerate: the same createNewBlock
+        // (rpcmining.cpp:200-208)
         let _producing = self.producing.lock();
         let tip = self
             .chain
@@ -923,12 +938,12 @@ impl Staker {
         }
         *self.next_block_txs.lock() = Some((overrides.ignore_mempool, overrides.extra_txs.clone()));
         let built = if work {
-            self.build_work_block(&tip)
+            self.build_work_block(&tip).map_err(Failed)
         } else {
             self.build_generated_stake_block(&tip)
         };
         *self.next_block_txs.lock() = None;
-        let mut block = built.map_err(Failed)?;
+        let mut block = built?;
 
         if work {
             // Core signs a changed proof-of-work block with a pay-to-pubkey
@@ -1047,12 +1062,51 @@ impl Staker {
 
     /// A proof-of-stake block on `tip`, its search starting past the median
     /// time so blocks made back to back stay valid
-    fn build_generated_stake_block(&self, tip: &divi_storage::BlockIndex) -> Result<Block, String> {
+    fn build_generated_stake_block(
+        &self,
+        tip: &divi_storage::BlockIndex,
+    ) -> Result<Block, GenerateBlockError> {
+        use GenerateBlockError::{Failed, Refused};
         match self.build_stake_block(tip, self.next_block_time(tip)) {
             StakeResult::Success { block, .. } => Ok(block),
-            StakeResult::NoStakeableUtxos => Err("no coins to stake".to_string()),
-            StakeResult::Error(e) => Err(e),
-            _ => Err("no coin found a proof of stake".to_string()),
+            StakeResult::NoStakeableUtxos => Err(Failed("no coins to stake".to_string())),
+            StakeResult::LockedHdKey => Err(Refused(LOCKED_HD_KEY.to_string())),
+            StakeResult::Error(e) => Err(Failed(e)),
+            _ => Err(Failed("no coin found a proof of stake".to_string())),
+        }
+    }
+
+    /// What signing the coinstake on a locked wallet comes to, as in Divi
+    /// Core, which finds the kernel first and only then signs with its key
+    /// (PoSTransactionCreator.cpp:368-371). A key of the HD seed is derived on
+    /// the fly, and GetKey throws as the seed is encrypted (wallet.cpp:536-545):
+    /// the RPC answers -1 with that text. An imported key is not in memory, so
+    /// the signing fails and no block is made.
+    fn locked_kernel(&self, candidate: &StakeCandidate) -> StakeResult {
+        let key_hash = match candidate {
+            StakeCandidate::Vault(_, vault_script) => {
+                Some(Hash160::from_bytes(vault_script.vault_pubkey_hash))
+            }
+            StakeCandidate::Regular(utxo) => {
+                let bytes = utxo.script_pubkey.as_bytes();
+                if divi_script::standard::is_p2pkh(bytes) {
+                    let mut hash = [0u8; 20];
+                    hash.copy_from_slice(&bytes[3..23]);
+                    Some(Hash160::from_bytes(hash))
+                } else if divi_script::standard::is_p2pk(bytes) {
+                    Some(divi_crypto::hash160(&bytes[1..bytes.len() - 1]))
+                } else {
+                    None
+                }
+            }
+        };
+        let from_seed = key_hash
+            .and_then(|hash| self.wallet.keystore().get_key(&hash))
+            .is_some_and(|entry| entry.hd_path.is_some());
+        if from_seed {
+            StakeResult::LockedHdKey
+        } else {
+            StakeResult::Error("CreateCoinStake : failed to sign coinstake".to_string())
         }
     }
 
@@ -1524,6 +1578,12 @@ impl Staker {
                     "Found valid stake for UTXO {}:{} at timestamp {} (MTP={}, current_time={})",
                     utxo.txid, utxo.vout, timestamp, mtp, current_time
                 );
+                // Only setgenerate gets here locked (the staking loop waits
+                // for an unlock, as CanStakeCoins does): the search needs no
+                // secret key, the signing does
+                if self.wallet.is_locked() {
+                    return self.locked_kernel(candidate);
+                }
 
                 // Create the block
                 match self.create_stake_block(tip, candidate, timestamp, n_bits, &combine_pool) {
@@ -1724,12 +1784,14 @@ impl Staker {
                 treasury_cycle,
                 treasury_lottery_cycle,
             );
-            let (treasury_payment, charity_payment) =
-                divi_consensus::block_subsidy::calculate_weighted_treasury_payment(
+            let (treasury_payment, charity_payment) = self.chain.with_sporks(|sporks| {
+                divi_consensus::block_subsidy::calculate_weighted_treasury_payment_with(
                     height,
                     payment_cycle,
                     halving_interval,
-                );
+                    sporks,
+                )
+            });
 
             info!(
                 "Treasury block {} payments: {} DIVI treasury, {} DIVI charity",
@@ -2157,13 +2219,8 @@ impl Staker {
     /// what would have gone to masternodes), but this is handled at the
     /// block validation level, not here.
     fn calculate_stake_reward(&self, height: u32) -> Amount {
-        // Use the proper block subsidy calculation from divi-consensus
-        let halving_interval = match self.chain.network_type() {
-            divi_storage::NetworkType::Mainnet => 525_600u32,
-            divi_storage::NetworkType::Testnet => 1_000u32,
-            divi_storage::NetworkType::Regtest => 100u32,
-        };
-        let rewards = divi_consensus::block_subsidy::get_block_subsidy(height, halving_interval);
+        // The chain's rewards, which the network's sporks 13 and 15 can change
+        let rewards = self.chain.block_rewards(height);
 
         // After DeprecateMasternodes fork (MTP >= Aug 23 2023), the masternode
         // reward is folded into the staker reward. Since PrivateDivi started in

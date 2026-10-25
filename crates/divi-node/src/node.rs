@@ -274,7 +274,20 @@ impl Node {
         }
 
         // Initialize database, optionally with UTXO cache
-        let db = Arc::new(if config.utxo_cache_size > 0 {
+        let db = Arc::new(if let Some(block_cache) = config.block_cache_size {
+            // -dbcache: divid's split of it (init.cpp:1046-1056)
+            tracing::info!(
+                "Cache configuration: block cache {} MiB, UTXO cache {} entries",
+                block_cache >> 20,
+                config.utxo_cache_size
+            );
+            ChainDatabase::open_with_caches(
+                config.chainstate_path(),
+                block_cache,
+                config.utxo_cache_size,
+            )
+            .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
+        } else if config.utxo_cache_size > 0 {
             tracing::info!("UTXO cache enabled: {} entries", config.utxo_cache_size);
             ChainDatabase::open_with_utxo_cache(config.chainstate_path(), config.utxo_cache_size)
                 .map_err(|e| NodeError::Init(format!("Failed to open chain database: {}", e)))?
@@ -692,6 +705,11 @@ impl Node {
                 })
                 .cloned()
                 .collect(),
+            dns_seed: config
+                .p2p
+                .dns_seed
+                .unwrap_or(config.p2p.connect.is_empty()),
+            force_dns_seed: config.p2p.force_dns_seed,
         };
         let peer_manager = PeerManager::new(peer_manager_config);
         // The -addnode values are the first added nodes (net.cpp:1218)
@@ -736,8 +754,8 @@ impl Node {
         {
             let chain_for_scripts = Arc::clone(&chain);
             mempool.set_validator(Arc::new(
-                move |pool: &Mempool, tx: &Transaction, limit_free: bool| {
-                    check_mempool_transaction(&chain_for_scripts, pool, tx, limit_free)
+                move |pool: &Mempool, tx: &Transaction, origin: crate::mempool::Origin| {
+                    check_mempool_transaction(&chain_for_scripts, pool, tx, origin)
                 },
             ));
         }
@@ -757,7 +775,21 @@ impl Node {
 
         // Create spork synchronization manager; sporks are kept in the chain
         // database across restarts, as Divi Core keeps them in its spork database
-        let spork_manager = SporkManager::with_db(Arc::clone(&peer_manager), Arc::clone(&db));
+        let spork_manager = SporkManager::with_chain(
+            Arc::clone(&peer_manager),
+            Arc::clone(&db),
+            chain.consensus_sporks(),
+        );
+
+        // A spork 14 entry sets the relay fee and the highest fee the mempool uses
+        {
+            let (chain, mempool) = (Arc::clone(&chain), Arc::clone(&mempool));
+            spork_manager.on_tx_fee_spork(Arc::new(move || {
+                if let Some(fee) = chain.tx_fee_spork_at_tip() {
+                    mempool.set_spork_fees(fee.min_fee_per_kb as i64, fee.max_fee as i64);
+                }
+            }));
+        }
 
         // Initialize masternode manager with database persistence
         let masternode_manager = match MasternodeManager::with_db(db.db_arc()) {
@@ -1003,7 +1035,9 @@ impl Node {
                 }
             }));
         }
-        let alert_key = divi_network::alert::alert_key(&self.config.network.magic);
+        // With -alerts=0 an alert message is not read at all (main.cpp:870)
+        let alert_key = divi_network::alert::alert_key(&self.config.network.magic)
+            .filter(|_| self.config.p2p.alerts);
         self.keep(tokio::spawn(async move {
             // Per peer: the last hash of a full getblocks answer (Divi Core
             // hashContinue) and the alerts already accepted from it
@@ -2233,7 +2267,7 @@ impl Node {
             protocol_version: self.config.network.protocol_version,
             connections: self.peer_manager.peer_count(),
             networks: vec!["ipv4".to_string(), "ipv6".to_string()],
-            relay_fee: self.config.mempool.min_relay_fee_per_kb as f64 / 100_000_000.0,
+            relay_fee: self.mempool.min_relay_fee_per_kb() as f64 / 100_000_000.0,
         }
     }
 
@@ -2555,10 +2589,11 @@ fn spendable_in_next_block(chain: &Chain, outpoint: &OutPoint) -> Result<bool, N
 /// each connected block confirms and those conflicting with it
 /// (ChainTipManager.cpp:139-141, :175-183). Here the chain has already moved:
 /// `disconnected` (parents before children, as `Chain::accept_block` returns
-/// them) is offered first, through `Mempool::add`, which works out the fee and
-/// applies Core's AcceptToMemoryPool with `fLimitFree` false as disconnectTip
-/// does; then every transaction the new chain made unspendable goes, with its
-/// descendants.
+/// them) is offered first, through `Mempool::add_from_disconnected_block`,
+/// which works out the fee and applies Core's AcceptToMemoryPool with
+/// `fLimitFree` false and the height lock checked at the transaction's block,
+/// as disconnectTip does; then every transaction the new chain made
+/// unspendable goes, with its descendants.
 pub fn update_mempool_after_reorg(
     chain: &Arc<Chain>,
     mempool: &Arc<Mempool>,
@@ -2568,7 +2603,7 @@ pub fn update_mempool_after_reorg(
     let mut returned = 0;
     for tx in disconnected {
         let txid = tx.txid();
-        match mempool.add(tx, divi_primitives::amount::Amount::ZERO) {
+        match mempool.add_from_disconnected_block(tx) {
             Ok(_) => returned += 1,
             Err(e) => tracing::debug!(
                 "Transaction {} of a disconnected block not returned to the mempool: {}",
@@ -2577,10 +2612,10 @@ pub fn update_mempool_after_reorg(
             ),
         }
     }
+    // A transaction a lower tip makes non-final stays, as in Core: only the
+    // staker waits for its lock
     let dropped = mempool
         .remove_unspendable(|outpoint| spendable_in_next_block(chain, outpoint).unwrap_or(true));
-    // The tip may now be lower: drop what can no longer be mined
-    mempool.remove_non_final();
     tracing::info!(
         "Reorg: returned {} of {} transaction(s) of disconnected blocks to the mempool, removed {} the new chain spends or lacks",
         returned,
@@ -2673,14 +2708,15 @@ pub fn check_standard_tx(
 /// CheckInputs (maturity, input values, value in at least value out) and every
 /// input script under the standard flags (and, to pick the reject reason, the
 /// mandatory ones). Returns the fee. Each refusal carries Core's reject code,
-/// reason and misbehaviour score. `limit_free` is Core's `fLimitFree` (true for
-/// relayed transactions).
+/// reason and misbehaviour score. `origin` gives Core's `fLimitFree` (true for
+/// relayed transactions) and the tip a height lock is checked against.
 pub fn check_mempool_transaction(
     chain: &Chain,
     mempool: &Mempool,
     tx: &Transaction,
-    limit_free: bool,
+    origin: crate::mempool::Origin,
 ) -> Result<crate::mempool::Admission, NodeError> {
+    let limit_free = origin.limit_free();
     use crate::error::reject;
     use divi_primitives::amount::Amount;
     use divi_primitives::script::Script;
@@ -2719,7 +2755,7 @@ pub fn check_mempool_transaction(
     if require_standard {
         check_standard_tx(
             tx,
-            tip_height,
+            origin.lock_tip(tip_height),
             now,
             mempool.min_relay_fee_per_kb(),
             mempool.permits_bare_multisig(),

@@ -24,10 +24,10 @@ parking_lot = { workspace = true }
 hex = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
+divi-consensus = { workspace = true }
 
 [dev-dependencies]
 divi-test-support = { workspace = true }
-divi-consensus = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = "0.4"
 proptest = { workspace = true }
