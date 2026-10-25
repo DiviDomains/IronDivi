@@ -21,6 +21,7 @@
 //!   irondivid --testnet --datadir=/path/to/data
 //!   irondivid --rpcuser=user --rpcpassword=pass
 
+mod private_files;
 mod snapshot_sig;
 
 use anyhow::{Context, Result};
@@ -1079,7 +1080,7 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
     } else {
         // Log to file (debug.log in data directory) like C++ divid
         // Create data directory if it doesn't exist
-        if let Err(e) = std::fs::create_dir_all(data_dir) {
+        if let Err(e) = private_files::ensure_private_dir(data_dir, false) {
             eprintln!(
                 "Warning: Could not create data directory {:?}: {}",
                 data_dir, e
@@ -1094,6 +1095,12 @@ fn init_logging(log_config: &LogConfig, data_dir: &PathBuf) {
 
         // Check for rotation before starting (in case log is already too big)
         maybe_rotate_logs(data_dir, log_config.max_file_size, log_config.max_files);
+
+        // Logs written before the umask was set may be readable by others (NODE-4)
+        private_files::restrict_file(&data_dir.join("debug.log"));
+        for i in 1..log_config.max_files {
+            private_files::restrict_file(&data_dir.join(format!("debug.log.{}", i)));
+        }
 
         // Create file appender - no rotation, just debug.log like C++ divid
         let file_appender = RollingFileAppender::new(Rotation::NEVER, data_dir, "debug.log");
@@ -1174,6 +1181,10 @@ fn load_or_create_wallet_from(
     // Try to open existing wallet
     if wallet_path.exists() {
         info!("Loading wallet from {:?}", wallet_path);
+        // Only this user may read the wallet (NODE-3)
+        if let Err(e) = private_files::ensure_private_dir(wallet_path, true) {
+            warn!("Could not check the wallet directory permissions: {}", e);
+        }
         let wallet = WalletDb::open(wallet_path, network)
             .with_context(|| format!("Failed to open wallet at {:?}", wallet_path))?;
 
@@ -1190,13 +1201,14 @@ fn load_or_create_wallet_from(
             }
         }
 
+        warn_if_unencrypted(&wallet);
         info!("Wallet loaded successfully");
         return Ok(Arc::new(wallet));
     }
 
     // Create new wallet (from WALLET_MNEMONIC env var if set, otherwise random)
     info!("Creating new wallet at {:?}", wallet_path);
-    std::fs::create_dir_all(wallet_path)
+    private_files::ensure_private_dir(wallet_path, true)
         .with_context(|| format!("Failed to create wallet directory: {:?}", wallet_path))?;
 
     let hd_wallet = if let Some(ref mnemonic) = restoring {
@@ -1258,8 +1270,24 @@ fn load_or_create_wallet_from(
     // Save immediately
     wallet.save().with_context(|| "Failed to save wallet")?;
 
+    warn_if_unencrypted(&wallet);
     info!("New wallet created successfully");
     Ok(Arc::new(wallet))
+}
+
+/// Say loudly that the seed and keys are stored in the clear (NODE-3). Staking keeps working
+/// on an encrypted wallet: `walletpassphrase <passphrase> 0 true` unlocks it for staking only.
+fn warn_if_unencrypted(wallet: &WalletDb) {
+    if !wallet.is_encrypted() {
+        warn!(
+            "The wallet is NOT encrypted: its seed and private keys are stored in the clear. \
+             Run encryptwallet, then walletpassphrase <passphrase> 0 true to keep staking."
+        );
+        eprintln!(
+            "WARNING: the wallet is not encrypted; anyone who can read its files can spend \
+             its coins. Run the encryptwallet RPC."
+        );
+    }
 }
 
 /// Put the wallet's unconfirmed transactions back into the mempool after a
@@ -1322,7 +1350,7 @@ async fn run_daemon(
     shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     // Create data directory if it doesn't exist
-    std::fs::create_dir_all(&config.data_dir)
+    private_files::ensure_private_dir(&config.data_dir, false)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
 
     // Initialize the node
@@ -2149,7 +2177,7 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
         .as_ref()
         .context("Missing --export-output")?;
 
-    std::fs::create_dir_all(&config.data_dir)
+    private_files::ensure_private_dir(&config.data_dir, false)
         .with_context(|| format!("Failed to create data directory: {:?}", config.data_dir))?;
 
     info!("Opening blockchain database...");
@@ -2180,6 +2208,9 @@ async fn export_chain_command(config: NodeConfig, args: &Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Before anything is written: the datadir holds the wallet and the RPC cookie (NODE-3)
+    private_files::restrict_umask();
+
     // Parse CLI arguments, completed from the config file where they are unset
     let args = match resolve_args(Args::parse()) {
         Ok(args) => args,
@@ -2198,7 +2229,7 @@ fn main() -> Result<()> {
         use std::os::unix::io::AsRawFd;
 
         // Ensure data directory exists before daemonizing
-        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        if let Err(e) = private_files::ensure_private_dir(&data_dir, false) {
             eprintln!("Failed to create data directory {:?}: {}", data_dir, e);
             std::process::exit(1);
         }
@@ -2238,9 +2269,12 @@ fn main() -> Result<()> {
         let _ = std::env::set_current_dir(&data_dir);
 
         // Redirect stdout/stderr to log file
+        use std::os::unix::fs::OpenOptionsExt;
+        private_files::restrict_file(&log_file);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&log_file)
             .unwrap_or_else(|e| {
                 eprintln!("Failed to open log file: {}", e);
@@ -2254,8 +2288,11 @@ fn main() -> Result<()> {
             libc::close(libc::STDIN_FILENO);
         }
 
-        // Write PID file
-        let _ = std::fs::write(&pid_file, format!("{}", std::process::id()));
+        // Write PID file: all at once, so a reader never sees a partial pid (NODE-23)
+        let pid = std::process::id().to_string();
+        if let Err(e) = private_files::write_private_atomic(&pid_file, pid.as_bytes()) {
+            eprintln!("Failed to write PID file {:?}: {}", pid_file, e);
+        }
     }
 
     #[cfg(not(unix))]
