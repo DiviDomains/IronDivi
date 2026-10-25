@@ -238,8 +238,12 @@ impl SporkManager {
             .unwrap_or(SporkSyncState::Pending)
     }
 
-    /// Handle sporkcount message from a peer
+    /// Handle sporkcount message from a peer. Divi Core takes a count of none
+    /// or less as nothing to wait for (Node.cpp SetSporkCount) and answers
+    /// every sporkcount with getsporks (spork.cpp ProcessSpork)
     pub async fn handle_sporkcount(&self, peer_id: PeerId, count: u32) {
+        // The count is a signed 32-bit integer on the wire
+        let count = if count > i32::MAX as u32 { 0 } else { count };
         tracing::info!("Peer {} has {} sporks", peer_id, count);
 
         // Update peer state
@@ -258,14 +262,11 @@ impl SporkManager {
             }
         }
 
-        // If peer has sporks, request them
-        if count > 0 {
-            tracing::debug!("Requesting sporks from peer {}", peer_id);
-            let _ = self
-                .peer_manager
-                .send_to_peer(peer_id, NetworkMessage::GetSporks)
-                .await;
-        }
+        tracing::debug!("Requesting sporks from peer {}", peer_id);
+        let _ = self
+            .peer_manager
+            .send_to_peer(peer_id, NetworkMessage::GetSporks)
+            .await;
 
         self.emit_progress();
     }
@@ -486,6 +487,59 @@ mod tests {
             listen_addr: None,
             ..Default::default()
         })
+    }
+
+    /// A peer registered with `peers`, and the receiver of what is sent to it
+    fn test_peer(
+        peers: &Arc<PeerManager>,
+        id: PeerId,
+    ) -> tokio::sync::mpsc::Receiver<NetworkMessage> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        peers.insert_test_peer(crate::peer::PeerHandle {
+            id,
+            addr: format!("127.0.0.1:{}", 2000 + id).parse().unwrap(),
+            tx,
+            inbound: true,
+            stats: Default::default(),
+        });
+        rx
+    }
+
+    fn received(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<NetworkMessage> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(msg);
+        }
+        got
+    }
+
+    /// Divi Core answers every sporkcount with getsporks, a count of none
+    /// included (spork.cpp:269-274), and takes a count of none or less as
+    /// "nothing to wait for" (Node.cpp:1008-1016)
+    #[tokio::test]
+    async fn every_sporkcount_is_answered_with_getsporks() {
+        let peers = quiet_peers();
+        let sporks = SporkManager::with_key(Arc::clone(&peers), None, None);
+        let mut rx = test_peer(&peers, 1);
+
+        sporks.handle_sporkcount(1, 0).await;
+        assert!(matches!(received(&mut rx)[..], [NetworkMessage::GetSporks]));
+        assert!(sporks.is_peer_synced(1));
+
+        // a count that is negative as a 32-bit integer
+        sporks.handle_sporkcount(1, u32::MAX).await;
+        assert!(matches!(received(&mut rx)[..], [NetworkMessage::GetSporks]));
+        assert!(sporks.is_peer_synced(1));
+
+        sporks.handle_sporkcount(1, 3).await;
+        assert!(matches!(received(&mut rx)[..], [NetworkMessage::GetSporks]));
+        assert_eq!(
+            sporks.peer_state(1),
+            SporkSyncState::Syncing {
+                expected: 3,
+                received: 0
+            }
+        );
     }
 
     /// Divi Core AddActiveSpork and GetActiveSporkCount (spork.cpp:144-168,
