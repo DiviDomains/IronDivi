@@ -20,6 +20,9 @@
 //! preimage is out the fee ceiling is a share of the maker leg, not the fixed cap. The same
 //! market with escalation off loses. A floor that would cost more than half the leg before
 //! anything is revealed is declined and refunded instead.
+//! USDC (same nonce, gas paid in ETH, so no share-of-leg ceiling) holds the same property
+//! for floors at or below `cap_feerate`, a first claim priced down to 1 gwei included: past
+//! the cap point the multiple of the first feerate gives way to `cap_feerate`.
 //! ZEC (and DIVI) cannot bump at all (no replacement, CPFP inert): the margin is all they
 //! have, so there the test is only that a claim paying the block floor confirms in time.
 //!
@@ -53,8 +56,8 @@ struct Market {
     /// Seconds of maker-leg time that pass before the taker first looks.
     delay_secs: u32,
     /// Per maker-leg block: block floor and mempool floor, as fractions (per mille) of
-    /// the fixed escalation cap (`FeeEscalation::cap`). Repeats its last entry once
-    /// exhausted.
+    /// the fixed escalation cap (`FeeEscalation::cap`; on USDC of `cap_feerate`). Repeats
+    /// its last entry once exhausted.
     floors: Vec<(u16, u16)>,
     /// What the maker's refund of its leg pays. `market()` draws it at least twice the BTC
     /// fixed cap, so above every floor: the hostile refund always gets mined once the
@@ -85,6 +88,38 @@ fn market() -> impl Strategy<Value = Market> {
         )
 }
 
+/// The USDC schedule at the mock's scale: one mock unit stands for one gwei, so the
+/// builtin 500 gwei cap is 500 (the mock pays a claim's fee out of the 1M unit leg, where a
+/// wei-denominated fee would not fit). Every rule of the schedule is a ratio.
+const USDC_GWEI_CAP: u64 = 500;
+
+/// The taker's schedule for `chain`: the builtin one, on USDC at the mock's scale.
+fn schedule(chain: Chain) -> Option<FeeEscalation> {
+    let esc = FeeEscalation::builtin(chain)?;
+    Some(match chain {
+        Chain::Usdc => esc.with_cap_feerate(USDC_GWEI_CAP),
+        _ => esc,
+    })
+}
+
+/// USDC markets: a first claim priced from 1 gwei, floors at or below `cap_feerate`
+/// (500 gwei), so up to 500 times the first feerate and far above its fixed cap.
+fn usdc_market() -> impl Strategy<Value = Market> {
+    (
+        1u64..60,
+        0u32..7200,
+        proptest::collection::vec((0u16..=1000, 0u16..=1000), 1..40),
+        2000u64..20_000,
+    )
+        .prop_map(|(estimate, delay_secs, floors, refund_feerate)| Market {
+            chain: Chain::Usdc,
+            estimate,
+            delay_secs,
+            floors,
+            refund_feerate,
+        })
+}
+
 /// `market()` with the maker's refund drawn under the floors: it may never be mined.
 fn low_refund_market() -> impl Strategy<Value = Market> {
     (market(), 1u64..2000).prop_map(|(m, refund_feerate)| Market {
@@ -98,6 +133,7 @@ fn block_secs(chain: Chain) -> u32 {
         Chain::Btc => 600,
         Chain::Ltc => 150,
         Chain::Zec => 75,
+        Chain::Usdc => 12,
         _ => 60,
     }
 }
@@ -106,6 +142,7 @@ fn bump(chain: Chain) -> FeeBump {
     match chain {
         Chain::Btc => FeeBump::Rbf,
         Chain::Ltc => FeeBump::Cpfp,
+        Chain::Usdc => FeeBump::SameNonce,
         _ => FeeBump::None,
     }
 }
@@ -149,11 +186,14 @@ async fn race(m: &Market, escalation: bool) -> Outcome {
         }],
     )
     .unwrap();
-    let mut taker = Taker::new(Arc::new(tdivi), Arc::new(tml.clone()), store.clone());
-    if !escalation {
-        taker = taker.with_fee_escalation(m.chain, None);
-    }
-    let cap = FeeEscalation::builtin(m.chain).map_or(m.estimate, |e| e.cap(m.estimate));
+    let esc = schedule(m.chain);
+    let taker = Taker::new(Arc::new(tdivi), Arc::new(tml.clone()), store.clone())
+        .with_fee_escalation(m.chain, esc.filter(|_| escalation));
+    // The floors' scale: the fixed cap, and on USDC (no post-leak ceiling) `cap_feerate`.
+    let cap = match (m.chain, esc) {
+        (Chain::Usdc, Some(e)) => e.cap_feerate,
+        (_, e) => e.map_or(m.estimate, |e| e.cap(m.estimate)),
+    };
 
     let q = maker.quote("o", SATS).await.unwrap();
     let (tid, req) = taker.prepare(&q).await.unwrap();
@@ -179,7 +219,9 @@ async fn race(m: &Market, escalation: bool) -> Outcome {
     let secs = block_secs(m.chain);
     let at = |f: u16| cap * u64::from(f) / 1000;
     let mut leaked = false;
-    for i in 0..400usize {
+    // USDC's 12 s blocks need more rounds to reach the locktime.
+    let rounds = if m.chain == Chain::Usdc { 2000 } else { 400 };
+    for i in 0..rounds {
         let (bf, mf) = m.floors[i.min(m.floors.len() - 1)];
         let block_floor = at(bf).max(1);
         ml.set_block_floor(block_floor);
@@ -278,6 +320,45 @@ fn congested(chain: Chain) -> Market {
         floors: vec![(400, 0), (400, 1000)],
         refund_feerate: 5000,
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+
+    #[test]
+    fn usdc_with_escalation_and_floors_under_cap_feerate_lost_is_unreachable(m in usdc_market()) {
+        let o = run(&m, true);
+        prop_assert_ne!(o.taker, TakerState::Lost, "{:?} {:?}", m, o);
+        prop_assert!(o.taker.is_terminal() && o.maker == SwapState::Done, "{:?} {:?}", m, o);
+        prop_assert_eq!(o.claimed, o.leaked, "{:?} {:?}", m, o);
+    }
+}
+
+#[test]
+fn a_usdc_floor_above_the_fifty_x_cap_after_the_leak_is_outbid_up_to_cap_feerate() {
+    // First claim at 2 gwei (fixed cap 100), held out of the first block by a 100 gwei
+    // floor (the preimage is out); then the block floor sits at 300 gwei. Past the cap
+    // point `cap_feerate` (500) binds and the claim confirms; without escalation it never
+    // does and the hostile refund takes the leg.
+    let m = Market {
+        chain: Chain::Usdc,
+        estimate: 2,
+        delay_secs: 0,
+        floors: vec![(200, 0), (600, 0)],
+        refund_feerate: 5000,
+    };
+    let on = run(&m, true);
+    assert_eq!(
+        (on.taker, on.claimed, on.leaked),
+        (TakerState::Done, true, true),
+        "{on:?}"
+    );
+    let off = run(&m, false);
+    assert_eq!(
+        (off.taker, off.claimed, off.leaked),
+        (TakerState::Lost, false, true),
+        "{off:?}"
+    );
 }
 
 #[test]

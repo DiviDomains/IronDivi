@@ -269,10 +269,22 @@ impl FeeEscalation {
     /// instead of refusing the same step forever. Never below `target`, never above the cap
     /// (or `target`, where a post-leak target is already above the cap).
     pub fn underpriced_target(&self, base: u64, current: u64, target: u64, refusals: u32) -> u64 {
+        self.underpriced_target_within(current, target, refusals, self.cap(base))
+    }
+
+    /// [`FeeEscalation::underpriced_target`] under the cap `cap` instead of the fixed one
+    /// (after the leak, [`FeeEscalation::cap_after_leak`]).
+    pub fn underpriced_target_within(
+        &self,
+        current: u64,
+        target: u64,
+        refusals: u32,
+        cap: u64,
+    ) -> u64 {
         let step = u128::from(target.saturating_sub(current));
         let doubled = step << (refusals / 2).min(64);
         let raised = (u128::from(current) + doubled).min(u128::from(u64::MAX)) as u64;
-        raised.min(self.cap(base).max(target)).max(target)
+        raised.min(cap.max(target)).max(target)
     }
 
     /// The feerate to pay with `left` seconds before the locktime, the first claim having paid
@@ -309,6 +321,43 @@ impl FeeEscalation {
         self.cap_feerate
             .min(base.saturating_mul(self.max_multiple))
             .max(base)
+    }
+
+    /// The highest feerate a claim whose fee is not paid out of the leg pays with `left`
+    /// seconds before the locktime, the first claim having paid `base`: on EVM (USDC) gas is
+    /// paid in ETH, so there is no share of the leg to bound it
+    /// ([`FeeEscalation::ceiling_fee`]). Until `cap_secs_left` it is the fixed cap. From
+    /// there the claim is unconfirmed with blocks running out and the preimage out, the
+    /// multiple of the first feerate no longer binds, and `cap_feerate` does: a claim first
+    /// priced low can still outbid a floor that rose after the leak.
+    pub fn cap_after_leak(&self, base: u64, left: i64) -> u64 {
+        let end = i64::from(self.cap_secs_left);
+        if left >= end || end <= 0 {
+            return self.cap(base);
+        }
+        self.cap_feerate.max(base.max(1))
+    }
+
+    /// The feerate for a same-nonce claim with no post-leak ceiling (EVM), with `left`
+    /// seconds before the locktime, the first claim having paid `base`. Until
+    /// `cap_secs_left` it is [`FeeEscalation::target`]. From there it climbs on
+    /// geometrically from the fixed cap to [`FeeEscalation::cap_after_leak`] at the
+    /// locktime, as [`FeeEscalation::target_after_leak`] does to the ceiling; and where one
+    /// more price bump (`price_bump_pct`) over it would pass that cap, it is that cap, so the
+    /// last version reaches the cap instead of stopping short of it with no replacement
+    /// the node would take left under it.
+    pub fn same_nonce_target(&self, base: u64, left: i64) -> u64 {
+        let cap = self.cap_after_leak(base, left);
+        let target = self.target_after_leak(base, left, cap);
+        if left >= i64::from(self.cap_secs_left) || target >= cap {
+            return target;
+        }
+        let next = u128::from(target) * u128::from(100 + self.price_bump_pct) / 100;
+        if next > u128::from(cap) {
+            cap
+        } else {
+            target
+        }
     }
 
     /// The most a maker-leg claim (with every CPFP child of it) pays in fees once its
@@ -405,7 +454,13 @@ impl FeeEscalation {
     /// [`FeeEscalation::worth_bumping`], or to finish the climb to the cap, which a quarter
     /// step could otherwise leave just short of (one more transaction at most).
     pub fn should_bump(&self, base: u64, current: u64, target: u64) -> bool {
-        target > current && (Self::worth_bumping(current, target) || target == self.cap(base))
+        Self::should_bump_within(current, target, self.cap(base))
+    }
+
+    /// [`FeeEscalation::should_bump`] finishing the climb to `cap` instead of the fixed cap
+    /// (after the leak, [`FeeEscalation::cap_after_leak`]).
+    pub fn should_bump_within(current: u64, target: u64, cap: u64) -> bool {
+        target > current && (Self::worth_bumping(current, target) || target == cap)
     }
 }
 
@@ -1177,6 +1232,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// USDC (no post-leak ceiling: gas is paid in ETH): before the cap point the cap is the
+    /// fixed `min(cap_feerate, 50 x base)`; past it `cap_feerate` binds, whatever the first
+    /// feerate. BTC and LTC keep their fixed cap (their post-leak ceiling governs instead).
+    #[test]
+    fn after_the_leak_the_usdc_cap_is_cap_feerate_and_before_it_the_fixed_cap() {
+        let e = FeeEscalation::builtin(Chain::Usdc).unwrap();
+        let (gwei, end) = (1_000_000_000u64, i64::from(e.cap_secs_left));
+        for base in [1, gwei, 2 * gwei, 5 * gwei, 10 * gwei, 20 * gwei] {
+            let fixed = e.cap_feerate.min(50 * base);
+            assert_eq!(e.cap(base), fixed);
+            for left in [7200, 3600, 1800, end] {
+                assert_eq!(e.cap_after_leak(base, left), fixed, "{base} at {left}");
+            }
+            for left in [end - 1, 600, 1, 0, -60] {
+                assert_eq!(
+                    e.cap_after_leak(base, left),
+                    e.cap_feerate,
+                    "{base} at {left}"
+                );
+            }
+        }
+        assert_eq!(e.cap(2 * gwei), 100 * gwei, "the clamp note 2 found");
+        // A first feerate above the cap is never undercut.
+        assert_eq!(e.cap_after_leak(600 * gwei, 0), 600 * gwei);
+        for chain in [Chain::Btc, Chain::Ltc] {
+            let e = FeeEscalation::builtin(chain).unwrap();
+            assert_eq!(e.cap(2), 100, "{chain}");
+        }
+    }
+
+    /// The USDC target: unchanged before the cap point; past it a geometric climb from the
+    /// fixed cap to `cap_feerate`, never above it, never falling, and at `cap_feerate` once
+    /// one more 10% price bump would pass it, so the last version is the cap.
+    #[test]
+    fn after_the_leak_the_usdc_target_climbs_to_cap_feerate_and_ends_on_it() {
+        let e = FeeEscalation::builtin(Chain::Usdc).unwrap();
+        let (gwei, start, end) = (
+            1_000_000_000u64,
+            i64::from(e.start_secs_left),
+            i64::from(e.cap_secs_left),
+        );
+        for base in [1, gwei, 2 * gwei, 10 * gwei] {
+            for left in (end..=start + 600).step_by(7) {
+                assert_eq!(e.same_nonce_target(base, left), e.target(base, left));
+            }
+            let mut last = e.cap(base);
+            for left in (-60..end).rev() {
+                let t = e.same_nonce_target(base, left);
+                assert!(t >= last && t <= e.cap_feerate, "{base} at {left}: {t}");
+                assert!(
+                    t == e.cap_feerate || t * 110 / 100 <= e.cap_feerate,
+                    "{base} at {left}: {t} is stuck under the cap"
+                );
+                last = t;
+            }
+            assert_eq!(e.same_nonce_target(base, 0), e.cap_feerate);
+        }
+        let t = e.same_nonce_target(2 * gwei, end - 1);
+        assert!(t > 100 * gwei && t < 110 * gwei, "{t}");
+        // A node with a stricter bump ends on the cap from further away.
+        let strict = e.with_price_bump(30);
+        let left = (0..end)
+            .rev()
+            .find(|&l| strict.same_nonce_target(2 * gwei, l) == e.cap_feerate)
+            .unwrap();
+        let before = strict.target_after_leak(2 * gwei, left, e.cap_feerate);
+        assert!(before * 130 / 100 > e.cap_feerate && before * 110 / 100 <= e.cap_feerate);
+        assert!(
+            FeeEscalation::should_bump_within(before, e.cap_feerate, e.cap_feerate),
+            "the last step to the cap is always sent"
+        );
     }
 
     #[test]
