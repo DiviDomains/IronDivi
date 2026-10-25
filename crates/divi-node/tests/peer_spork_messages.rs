@@ -140,3 +140,29 @@ async fn getdata_of_a_spork_is_served_or_not_found() {
     let missing = peer.expect("notfound", WAIT).await.expect("notfound");
     assert_eq!(inv_items(&missing), vec![(6, unknown)]);
 }
+
+/// Divi Core asks the peer that announced a spork it does not hold, once, and
+/// not for one it holds (main.cpp:559-612)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inv_of_a_spork_not_held_is_asked_for_once() {
+    let held = stored(10007, "1537971708", 1000);
+    let t = TestNode::start_with(|c| seed(c, std::slice::from_ref(&held))).await;
+    let mut peer = RawPeer::connect(&t, "127.0.0.2").await;
+    peer.handshake().await;
+
+    let unknown = [0x42u8; 32];
+    let announce = |hash: &[u8]| {
+        let mut inv = vec![1u8];
+        inv.extend_from_slice(&6u32.to_le_bytes());
+        inv.extend_from_slice(hash);
+        inv
+    };
+    peer.send("inv", &announce(&unknown)).await;
+    let asked = peer.expect("getdata", WAIT).await.expect("getdata");
+    assert_eq!(inv_items(&asked), vec![(6, unknown)]);
+
+    // the same again, and one it holds: nothing more is asked
+    peer.send("inv", &announce(&unknown)).await;
+    peer.send("inv", &announce(held.hash().as_bytes())).await;
+    assert_eq!(peer.expect("getdata", QUIET).await, None);
+}

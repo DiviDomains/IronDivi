@@ -1020,6 +1020,8 @@ impl Node {
                                         .send_to_peer(peer_id, NetworkMessage::GetData(masternode_items))
                                         .await;
                                 }
+                                // Sporks are announced by inv as well
+                                spork_manager.handle_inv(peer_id, &items).await;
                             }
                             NetworkMessage::NotFound(items) => {
                                 let items: Vec<_> = items

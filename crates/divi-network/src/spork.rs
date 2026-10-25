@@ -23,9 +23,10 @@ use crate::peer_manager::PeerManager;
 use crate::NetworkMessage;
 use divi_primitives::hash::Hash256;
 use divi_storage::ChainDatabase;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// Spork synchronization state per peer
@@ -56,6 +57,9 @@ const MAINNET_SPORK_KEY: &str =
     "02c1ed5eadcf6793fa22840febfbd667fabbabc48ddd75c2d228662d65e292eb00";
 const TESTNET_SPORK_KEY: &str =
     "034ffa41e5cffdd009f3b34a3e1482ec82b514bb218b7648948b5858cc5c035adb";
+
+/// How long before an inventory item is asked for again (net.cpp `AskFor`)
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(120);
 
 /// Points Divi Core adds for a spork with a bad signature (spork.cpp)
 pub const BAD_SPORK_SCORE: u32 = 100;
@@ -144,6 +148,10 @@ pub struct SporkManager {
     /// database); None keeps sporks in memory only
     db: Option<Arc<ChainDatabase>>,
 
+    /// When each spork inventory item was asked for, so it is asked for once
+    /// (Divi Core `AskFor` waits two minutes before asking again)
+    asked: Mutex<HashMap<Hash256, Instant>>,
+
     /// Progress event broadcaster
     progress_tx: broadcast::Sender<SporkSyncProgress>,
 }
@@ -177,6 +185,7 @@ impl SporkManager {
             sporks: RwLock::new(HashMap::new()),
             active_sporks: RwLock::new(BTreeMap::new()),
             db,
+            asked: Mutex::new(HashMap::new()),
             progress_tx,
         };
         manager.load_stored();
@@ -378,6 +387,30 @@ impl SporkManager {
             let _ = self
                 .peer_manager
                 .send_to_peer(peer_id, NetworkMessage::Spork(spork))
+                .await;
+        }
+    }
+
+    /// Handle an `inv` that announces sporks: ask for the ones this node does
+    /// not hold, once (Divi Core main.cpp:559-612, `AlreadyHave` then `AskFor`)
+    pub async fn handle_inv(&self, peer_id: PeerId, items: &[InvItem]) {
+        let wanted: Vec<InvItem> = {
+            let held = self.sporks.read();
+            let mut asked = self.asked.lock();
+            let now = Instant::now();
+            asked.retain(|_, when| now.duration_since(*when) < ASK_AGAIN_AFTER);
+            items
+                .iter()
+                .filter(|item| item.inv_type == InvType::Spork)
+                .filter(|item| !held.contains_key(&item.hash))
+                .filter(|item| asked.insert(item.hash, now).is_none())
+                .cloned()
+                .collect()
+        };
+        if !wanted.is_empty() {
+            let _ = self
+                .peer_manager
+                .send_to_peer(peer_id, NetworkMessage::GetData(wanted))
                 .await;
         }
     }
