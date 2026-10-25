@@ -119,3 +119,61 @@ async fn getheaders_is_answered_with_an_inv_as_getblocks() {
     );
     assert!(!got.iter().any(|(c, _)| c == "headers"));
 }
+
+fn getdata(list: &[(u32, Hash256)]) -> Vec<u8> {
+    let mut b = compact(list.len() as u64);
+    for (kind, hash) in list {
+        b.extend_from_slice(&kind.to_le_bytes());
+        b.extend_from_slice(hash.as_bytes());
+    }
+    b
+}
+
+/// getdata is answered in the order asked, a pass ending after each block
+/// item with the notfound of that pass; an unknown transaction is named in
+/// a notfound, an unknown block is not answered (main.cpp:283-347)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getdata_answers_in_order_and_names_only_missing_transactions() {
+    let t = TestNode::start().await;
+    let (b1, b2) = (mine(&t), mine(&t));
+    let (tx1, tx2, nb) = (
+        Hash256::from_bytes([1; 32]),
+        Hash256::from_bytes([2; 32]),
+        Hash256::from_bytes([3; 32]),
+    );
+    let mut p = peer(&t, "127.0.0.3").await;
+    p.send(
+        "getdata",
+        &getdata(&[(1, tx1), (2, b1), (1, tx2), (2, nb), (2, b2)]),
+    )
+    .await;
+    let got: Vec<String> = replies(&mut p)
+        .await
+        .iter()
+        .map(|(c, m)| match c.as_str() {
+            "block" => {
+                let parent = Hash256::from_bytes(m[4..36].try_into().unwrap());
+                let height = t
+                    .node
+                    .chain()
+                    .get_block_index(&parent)
+                    .unwrap()
+                    .unwrap()
+                    .height
+                    + 1;
+                format!("block {height}")
+            }
+            "notfound" => format!("notfound {:?}", items(m)),
+            other => other.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "block 1".to_string(),
+            format!("notfound {:?}", vec![(1u32, tx1)]),
+            format!("notfound {:?}", vec![(1u32, tx2)]),
+            "block 2".to_string(),
+        ]
+    );
+}

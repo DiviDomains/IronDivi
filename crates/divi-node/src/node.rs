@@ -77,6 +77,49 @@ pub fn getblocks_reply(
     (items, None)
 }
 
+/// One block of a getdata, as Divi Core's ProcessGetData sends it
+/// (main.cpp:300-319): only a block the node has and may send
+/// (GetBlockIndexOfRequestedBlock, main.cpp:213-247), and after the last block
+/// of a full getblocks answer an inv of the tip, so the peer asks for more.
+/// Nothing is sent for a block it does not have.
+async fn serve_block(
+    chain: &Chain,
+    peer_manager: &PeerManager,
+    hash_continue: &mut HashMap<divi_network::PeerId, Hash256>,
+    peer_id: divi_network::PeerId,
+    hash: &Hash256,
+) {
+    match chain.get_block_for_peer(hash) {
+        Ok(Some(block)) => {
+            if let Err(e) = peer_manager
+                .send_block_to_peer(peer_id, NetworkMessage::Block(block))
+                .await
+            {
+                tracing::warn!("Failed to send block {} to peer {}: {}", hash, peer_id, e);
+                return;
+            }
+            tracing::debug!("Served block {} to peer {} (getdata)", hash, peer_id);
+            if hash_continue.get(&peer_id) == Some(hash) {
+                hash_continue.remove(&peer_id);
+                if let Some(tip) = chain.tip() {
+                    let inv = NetworkMessage::Inv(vec![divi_network::InvItem::new(
+                        divi_network::InvType::Block,
+                        tip.hash,
+                    )]);
+                    let _ = peer_manager.send_block_to_peer(peer_id, inv).await;
+                }
+            }
+        }
+        Ok(None) => tracing::debug!("Block {} not found for getdata from peer {}", hash, peer_id),
+        Err(e) => tracing::warn!(
+            "Error looking up block {} for peer {}: {}",
+            hash,
+            peer_id,
+            e
+        ),
+    }
+}
+
 /// Node status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -1042,94 +1085,45 @@ impl Node {
                                     );
                                     continue;
                                 }
-                                // Split block and tx getdata items
-                                let block_items: Vec<_> = items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::Block)
-                                    .cloned()
-                                    .collect();
-                                let tx_items: Vec<_> = items
-                                    .iter()
-                                    .filter(|i| i.inv_type == divi_network::InvType::Tx)
-                                    .cloned()
-                                    .collect();
-
-                                // Handle block getdata: serve blocks from our chain
-                                for item in block_items {
-                                    match chain.get_block_for_peer(&item.hash) {
-                                        Ok(Some(block)) => {
-                                            let msg = NetworkMessage::Block(block);
-                                            if let Err(e) =
-                                                peer_manager.send_block_to_peer(peer_id, msg).await
-                                            {
-                                                tracing::warn!(
-                                                    "Failed to send block {} to peer {}: {}",
-                                                    item.hash,
-                                                    peer_id,
-                                                    e
-                                                );
-                                            } else {
-                                                tracing::debug!(
-                                                    "Served block {} to peer {} (getdata)",
-                                                    item.hash,
-                                                    peer_id
-                                                );
-                                                // The last block of a full getblocks
-                                                // answer: announce our tip so the peer
-                                                // asks for the next batch
-                                                if hash_continue.get(&peer_id) == Some(&item.hash) {
-                                                    hash_continue.remove(&peer_id);
-                                                    if let Some(tip) = chain.tip() {
-                                                        let inv = NetworkMessage::Inv(vec![
-                                                            divi_network::InvItem::new(
-                                                                divi_network::InvType::Block,
-                                                                tip.hash,
-                                                            ),
-                                                        ]);
-                                                        let _ = peer_manager
-                                                            .send_block_to_peer(peer_id, inv)
-                                                            .await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            tracing::debug!(
-                                                "Block {} not found for getdata from peer {}",
-                                                item.hash,
-                                                peer_id
-                                            );
-                                            // Tell the peer so it can ask elsewhere (pruned or unknown).
-                                            let msg = NetworkMessage::NotFound(vec![item.clone()]);
-                                            if let Err(e) =
-                                                peer_manager.send_block_to_peer(peer_id, msg).await
-                                            {
-                                                tracing::debug!(
-                                                    "Failed to send notfound for {} to peer {}: {}",
-                                                    item.hash,
-                                                    peer_id,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Error looking up block {} for peer {}: {}",
-                                                item.hash,
+                                // Divi Core's ProcessGetData (main.cpp:283-347): the
+                                // items in the order asked. A block is sent if the
+                                // node has it (and may send it, outside the main
+                                // chain only within the reorg depth), else nothing;
+                                // a transaction is sent from the mempool, else it is
+                                // named in a notfound. Each pass ends after a block
+                                // item, and its notfound goes out then, after the block
+                                let mut not_found = Vec::new();
+                                for item in items {
+                                    match item.inv_type {
+                                        divi_network::InvType::Block => {
+                                            serve_block(
+                                                &chain,
+                                                &peer_manager,
+                                                &mut hash_continue,
                                                 peer_id,
-                                                e
-                                            );
+                                                &item.hash,
+                                            )
+                                            .await;
+                                            if !not_found.is_empty() {
+                                                let msg = NetworkMessage::NotFound(std::mem::take(
+                                                    &mut not_found,
+                                                ));
+                                                let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
+                                            }
                                         }
+                                        divi_network::InvType::Tx => match mempool.get(&item.hash) {
+                                            Some(entry) => {
+                                                let msg = NetworkMessage::Tx(entry.tx);
+                                                let _ = peer_manager.send_block_to_peer(peer_id, msg).await;
+                                            }
+                                            None => not_found.push(item),
+                                        },
+                                        _ => {}
                                     }
                                 }
-
-                                // Handle tx getdata requests
-                                if !tx_items.is_empty() {
-                                    let mempool_ref = &mempool;
-                                    tx_relay
-                                        .handle_getdata(peer_id, tx_items, |txid| {
-                                            mempool_ref.get(txid).map(|e| e.tx)
-                                        })
+                                if !not_found.is_empty() {
+                                    let _ = peer_manager
+                                        .send_block_to_peer(peer_id, NetworkMessage::NotFound(not_found))
                                         .await;
                                 }
                             }
