@@ -720,6 +720,12 @@ pub struct MempoolConfig {
     /// on by default; MempoolConsensus.cpp:31, :107-109)
     #[serde(default = "default_true")]
     pub permit_bare_multisig: bool,
+
+    /// The largest OP_META output script that is standard, in bytes: Divi
+    /// Core's `-datacarriersize` (603, MAX_OP_META_RELAY), or 0 with
+    /// `-datacarrier=0` (MempoolConsensus.cpp:32-33)
+    #[serde(default = "default_max_datacarrier_bytes")]
+    pub max_datacarrier_bytes: u32,
 }
 
 impl Default for MempoolConfig {
@@ -732,12 +738,18 @@ impl Default for MempoolConfig {
             expiry_time: 336 * 60 * 60, // 2 weeks
             accept_nonstandard: false,
             permit_bare_multisig: true,
+            max_datacarrier_bytes: default_max_datacarrier_bytes(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Divi Core MAX_OP_META_RELAY (defaultValues.h:40)
+fn default_max_datacarrier_bytes() -> u32 {
+    603
 }
 
 /// Divi Core DEFAULT_TRANSACTION_MAXFEE, 100 DIVI (defaultValues.h:34)

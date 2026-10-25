@@ -167,8 +167,12 @@ fn serialize(coin: &(String, u32, i64), outputs: &[(i64, Vec<u8>)]) -> String {
     b.push(outputs.len() as u8);
     for (value, script) in outputs {
         b.extend(value.to_le_bytes());
-        assert!(script.len() < 0xfd);
-        b.push(script.len() as u8);
+        if script.len() < 0xfd {
+            b.push(script.len() as u8);
+        } else {
+            b.push(0xfd);
+            b.extend((script.len() as u16).to_le_bytes());
+        }
         b.extend(script);
     }
     b.extend(0u32.to_le_bytes());
@@ -213,6 +217,53 @@ fn permitbaremultisig_off_refuses_bare_multisig() {
             );
         } else {
             assert!(got.is_ok(), "{option:?}: {got:?}");
+        }
+    }
+}
+
+/// An OP_META output script of `size` bytes: OP_META and one push
+fn op_meta(size: usize) -> Vec<u8> {
+    let mut s = vec![0x6a];
+    match size {
+        1 => {}
+        2..=77 => s.push((size - 2) as u8),
+        78..=258 => s.extend([0x4c, (size - 3) as u8]),
+        _ => {
+            s.push(0x4d);
+            s.extend(((size - 4) as u16).to_le_bytes());
+        }
+    }
+    s.resize(size, 0xab);
+    s
+}
+
+/// The largest standard OP_META output is -datacarriersize bytes, and with
+/// -datacarrier=0 there is none (MempoolConsensus.cpp:32-33, script/standard.cpp:249)
+#[test]
+fn datacarrier_options_set_the_largest_op_meta() {
+    for (options, taken, refused) in [
+        (vec!["-datacarriersize=40"], 40, 41),
+        (vec!["-datacarriersize=1000"], 1000, 1001),
+        (vec!["-datacarrier=0", "-datacarriersize=1000"], 0, 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::funded(dir.path(), &options);
+        for (size, ok) in [(taken, true), (refused, false)] {
+            if size == 0 {
+                continue;
+            }
+            let coin = node.coin(1000 * COIN, None);
+            let tx = node.signed(&coin, &[(coin.2 - FEE, node.script()), (0, op_meta(size))]);
+            let got = node.send(&tx);
+            if ok {
+                assert!(got.is_ok(), "{options:?} {size}: {got:?}");
+            } else {
+                assert_eq!(
+                    got,
+                    Err((-26, "64: scriptpubkey".to_string())),
+                    "{options:?} {size}"
+                );
+            }
         }
     }
 }

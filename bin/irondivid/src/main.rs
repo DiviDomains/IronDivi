@@ -295,8 +295,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "budgetvotemode",
     "checklevel",
     "createwalletbackups",
-    "datacarrier",
-    "datacarriersize",
     "dbcache",
     "disablesystemnotifications",
     "dns",
@@ -600,6 +598,14 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     config.mempool.accept_nonstandard = s.get_bool("acceptnonstandard", false);
     // GetBoolArg("-permitbaremultisig", true), read once (MempoolConsensus.cpp:31)
     config.mempool.permit_bare_multisig = s.get_bool("permitbaremultisig", true);
+    // -datacarrier ? GetArg("-datacarriersize", MAX_OP_META_RELAY) : 0, kept as
+    // an unsigned int, read once (MempoolConsensus.cpp:32-33)
+    config.mempool.max_datacarrier_bytes = if s.get_bool("datacarrier", true) {
+        s.get("datacarriersize")
+            .map_or(603, |text| settings::atoi(text) as u32)
+    } else {
+        0
+    };
     // -maxtxfee: an amount ParseMoney reads, at least the relay fee for 1 kB;
     // above 10 DIVI a warning (init.cpp:831-845)
     if let Some(text) = s.get("maxtxfee") {
@@ -743,6 +749,8 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
         "minrelaytxfee",
         "acceptnonstandard",
         "permitbaremultisig",
+        "datacarrier",
+        "datacarriersize",
         "maxtxfee",
         "sporkkey",
         "staking",

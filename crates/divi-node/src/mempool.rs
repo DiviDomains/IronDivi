@@ -483,6 +483,11 @@ impl Mempool {
         !self.config.accept_nonstandard
     }
 
+    /// The largest standard OP_META output script (Core's `nMaxDatacarrierBytes`)
+    pub fn max_datacarrier_bytes(&self) -> usize {
+        self.config.max_datacarrier_bytes as usize
+    }
+
     /// Whether bare multisig outputs are standard (Core's `-permitbaremultisig`)
     pub fn permits_bare_multisig(&self) -> bool {
         self.config.permit_bare_multisig
