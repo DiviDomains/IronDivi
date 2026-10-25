@@ -2014,8 +2014,20 @@ mod tests {
     /// to the peer) and completes the handshake end to end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_outbound_connection_goes_through_socks5_proxy() {
-        let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
-        let server = PeerManager::new(local_only(Some(listen), None));
+        // The listener is bound before start runs, so a port taken since free_port is
+        // reported at once and another is tried
+        let (server, listen) = {
+            let mut found = None;
+            for _ in 0..5 {
+                let listen = SocketAddr::from(([127, 0, 0, 1], divi_test_support::free_port()));
+                let server = PeerManager::new(local_only(Some(listen), None));
+                if server.bind_listeners().await.is_ok() {
+                    found = Some((server, listen));
+                    break;
+                }
+            }
+            found.expect("a listening port could be bound in 5 tries")
+        };
         tokio::spawn(Arc::clone(&server).start());
         let (proxy, seen) = crate::socks5::stub::start().await;
         let client = PeerManager::new(local_only(None, Some(proxy)));
@@ -2110,8 +2122,11 @@ mod tests {
     /// addresses again and again (net.cpp:1094-1105), with no backoff
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connect_peer_is_dialled_again_once_it_is_up() {
-        let port = divi_test_support::free_port();
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        // A bound socket that does not listen yet refuses connects and keeps its port
+        // from every other process: the peer is "down" until listen() is called on it
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = socket.local_addr().unwrap();
         let pm = PeerManager::new(PeerManagerConfig {
             magic: crate::REGTEST_MAGIC,
             static_peers: vec![addr],
@@ -2122,7 +2137,7 @@ mod tests {
         // The peer is down at first: the first dials fail
         tokio::spawn(Arc::clone(&pm).run_connect_loop());
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let listener = socket.listen(16).unwrap();
         let accepted = tokio::time::timeout(Duration::from_secs(12), listener.accept()).await;
         assert!(
             accepted.is_ok(),
