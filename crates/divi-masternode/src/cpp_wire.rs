@@ -231,6 +231,13 @@ impl CppPing {
         })
     }
 
+    /// Serialize exactly like `CDataStream << CMasternodePing` (an `mnp` payload)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(150);
+        self.encode(&mut out);
+        out
+    }
+
     /// Parse a ping (`mnp`); the whole input must be consumed
     pub fn decode_bytes(data: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader { data, pos: 0 };

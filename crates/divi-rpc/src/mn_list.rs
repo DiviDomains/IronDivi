@@ -258,17 +258,15 @@ impl MasternodeList {
         Ok(true)
     }
 
-    /// A ping from a peer: taken for a masternode in the list when signed by
-    /// its masternode key and not too early after the last one
-    /// (CMasternodePing::CheckAndUpdate, masternodeman.cpp:303-360).
-    /// Ok(true) when the ping was taken.
-    pub fn accept_ping(&self, payload: &[u8]) -> Result<bool, String> {
+    /// A ping from a peer: taken for an enabled masternode in the list when
+    /// it passes CheckAndUpdatePing: its time, not too early after the last
+    /// ping, signed by the masternode key, naming a known block at most 24
+    /// below the tip (masternodeman.cpp:309-375, :504-534). Ok(true) when the
+    /// ping was taken.
+    pub fn accept_ping(&self, chain: &Chain, payload: &[u8]) -> Result<bool, String> {
         let ping = CppPing::decode_bytes(payload).map_err(|e| format!("{e:?}"))?;
         let now = now();
-        if ping.sig_time > now + 3600 || ping.sig_time <= now - 3600 {
-            return Err("ping signature time out of range".into());
-        }
-        let taken = {
+        {
             let mut entries = self.entries.write();
             let Some(e) = entries.iter_mut().find(|e| {
                 e.mnb.vin.prevout_hash == ping.vin.prevout_hash
@@ -276,20 +274,14 @@ impl MasternodeList {
             }) else {
                 return Ok(false);
             };
-            // IsTooEarlyToReceivePingUpdate: MIN_MNP_SECONDS - 60 since the last
-            if ping.sig_time - e.mnb.last_ping.sig_time < MIN_MNP_SECONDS - 60 {
+            if !e.is_enabled(now) {
                 return Ok(false);
             }
-            if !ping_signature_valid(&e.mnb, &ping) {
-                return Err("bad ping signature".into());
-            }
+            check_ping(chain, &e.mnb, Some(&e.mnb.last_ping), &ping, now)?;
             e.mnb.last_ping = ping;
-            true
-        };
-        if taken {
-            self.save();
         }
-        Ok(taken)
+        self.save();
+        Ok(true)
     }
 
     /// Mark the masternodes whose collateral the active chain has spent

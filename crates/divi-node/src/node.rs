@@ -1214,7 +1214,7 @@ impl Node {
                                 }
                             }
                             NetworkMessage::MasternodePing(payload) => {
-                                if let Err(e) = masternode_list.accept_ping(&payload) {
+                                if let Err(e) = masternode_list.accept_ping(&chain, &payload) {
                                     tracing::debug!(
                                         "Masternode ping from peer {} not taken: {}",
                                         peer_id,

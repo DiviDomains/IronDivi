@@ -443,3 +443,63 @@ fn broadcasts_are_refused_as_divid_refuses_them() {
     assert!(accept(&older).is_err());
     assert_eq!(n.list.entries()[0].mnb.sig_time, good.sig_time);
 }
+
+/// A ping is taken as Divi Core takes one: not when it names an unknown
+/// block or one more than 24 below the tip, nor a minute after the last
+/// ping; a ping ten minutes on naming a recent block is
+/// (masternodeman.cpp:309-375, MasternodeHelpers.cpp:172-190)
+#[test]
+fn pings_are_taken_as_divid_takes_them() {
+    use divi_masternode::cpp_wire::{CppBroadcast, CppPing};
+    let n = funded();
+    let (_, _, address, signed) = set_up(&n, "mn1", 16);
+    let (coll_key, mn_key) = keys(&n, &address);
+    let block = |depth: u32| {
+        *n.chain
+            .get_block_index_by_height(n.chain.height() - depth)
+            .unwrap()
+            .unwrap()
+            .hash
+            .as_bytes()
+    };
+    let mut mnb = CppBroadcast::decode(&hex::decode(&signed).unwrap()).unwrap();
+    mnb.sig_time = now();
+    mnb.last_ping.sig_time = now() - 3000;
+    mnb.last_ping.block_hash = block(2);
+    mnb.last_ping.sign(&mn_key).unwrap();
+    mnb.sign(&coll_key).unwrap();
+    assert_eq!(n.list.accept_broadcast(&n.chain, &mnb.encode()), Ok(true));
+    n.mine_n(30);
+    let ping = |sig_time: i64, block_hash: [u8; 32]| {
+        let mut p = CppPing {
+            vin: mnb.vin.clone(),
+            block_hash,
+            sig_time,
+            signature: vec![],
+        };
+        p.sign(&mn_key).unwrap();
+        p.to_bytes()
+    };
+    let last_seen = || n.list.entries()[0].mnb.last_ping.sig_time;
+    let first = last_seen();
+    assert!(n
+        .list
+        .accept_ping(&n.chain, &ping(now(), [0xcd; 32]))
+        .is_err());
+    assert!(n
+        .list
+        .accept_ping(&n.chain, &ping(now(), block(30)))
+        .is_err());
+    assert_eq!(last_seen(), first);
+    let good = now();
+    assert_eq!(
+        n.list.accept_ping(&n.chain, &ping(good, block(2))),
+        Ok(true)
+    );
+    assert_eq!(last_seen(), good);
+    assert!(n
+        .list
+        .accept_ping(&n.chain, &ping(good + 60, block(2)))
+        .is_err());
+    assert_eq!(last_seen(), good);
+}
