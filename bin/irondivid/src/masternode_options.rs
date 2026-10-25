@@ -10,8 +10,9 @@
 // licensed under the MIT License. See LICENSE-MIT-UPSTREAM for details.
 
 //! The masternode start options as divid reads them: `-mnconf` (which file
-//! is masternode.conf), the file itself and `-mnconflock`
-//! (MasternodeModule.cpp:210-219, :454-466; masternodeconfig.cpp:33-90).
+//! is masternode.conf), the file itself, `-mnconflock`, and the checks
+//! `-masternode`, `-masternodeaddr` and `-masternodeprivkey` go through at the
+//! start (MasternodeModule.cpp:163-240, :454-466; masternodeconfig.cpp:33-90).
 
 use crate::settings::Settings;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,10 @@ pub struct MasternodeOptions {
     pub conf_path: PathBuf,
     /// `-mnconflock`, default on: the entries' collateral is locked
     pub lock: bool,
+    /// `-masternode`, set (even empty) or not
+    masternode: Option<String>,
+    masternode_addr: Option<String>,
+    masternode_priv_key: Option<String>,
 }
 
 impl MasternodeOptions {
@@ -52,6 +57,9 @@ impl MasternodeOptions {
                 data_dir.join(conf)
             },
             lock: settings.get_bool("mnconflock", true),
+            masternode: settings.get("masternode").map(String::from),
+            masternode_addr: settings.get("masternodeaddr").map(String::from),
+            masternode_priv_key: settings.get("masternodeprivkey").map(String::from),
         }
     }
 
@@ -91,6 +99,82 @@ impl MasternodeOptions {
         }
         Ok(entries)
     }
+
+    /// The checks divid makes for `-masternode` once masternode.conf is read,
+    /// in its order (InitializeMasternodeIfRequested, SetupActiveMasternode,
+    /// ConfigureMasternodePrivateKey: MasternodeModule.cpp:163-240). When they
+    /// all pass, divid runs as that masternode; irondivid cannot, so it stops
+    /// with its own message there.
+    pub fn check_start(
+        &self,
+        entries: &[ConfLine],
+        txindex: bool,
+        network: divi_wallet::Network,
+    ) -> Result<(), String> {
+        let Some(alias) = &self.masternode else {
+            return Ok(());
+        };
+        if !txindex {
+            return Err(
+                "Enabling Masternode support requires turning on transaction indexing.\
+                        Please add txindex=1 to your configuration and start with -reindex"
+                    .to_string(),
+            );
+        }
+        if let Some(addr) = self.masternode_addr.as_deref().filter(|a| !a.is_empty()) {
+            if !service_is_valid(addr) {
+                return Err(format!("Invalid -masternodeaddr address: {addr}"));
+            }
+        }
+        let Some(entry) = entries.iter().find(|e| &e.alias == alias) else {
+            return Err("Unknown masternode configuration for masternode=<alias>.".to_string());
+        };
+        let key = self
+            .masternode_priv_key
+            .as_deref()
+            .unwrap_or(&entry.priv_key);
+        if !secret_is_valid(key, network) {
+            return Err("Invalid masternodeprivkey. Please see documenation.".to_string());
+        }
+        Err(format!(
+            "-masternode={alias}: irondivid does not run as a masternode; remove the masternode= line to start it"
+        ))
+    }
+}
+
+/// CService(str).IsValid() without name lookup: an IP address, with a port or
+/// not, that is not "any", the broadcast address or a documentation range
+fn service_is_valid(addr: &str) -> bool {
+    use std::net::{IpAddr, SocketAddr};
+    let ip = addr
+        .parse::<SocketAddr>()
+        .map(|s| s.ip())
+        .or_else(|_| addr.parse::<IpAddr>())
+        .or_else(|_| {
+            // host:port with an IPv4 host
+            addr.rsplit_once(':')
+                .filter(|(_, port)| port.parse::<u16>().is_ok())
+                .ok_or(())
+                .and_then(|(host, _)| host.parse::<IpAddr>().map_err(|_| ()))
+        });
+    match ip {
+        Ok(IpAddr::V4(v4)) => !(v4.is_unspecified() || v4.is_broadcast()),
+        Ok(IpAddr::V6(v6)) => {
+            !(v6.is_unspecified() || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8))
+        }
+        Err(_) => false,
+    }
+}
+
+/// CBitcoinSecret::SetString: a WIF private key of this network
+fn secret_is_valid(wif: &str, network: divi_wallet::Network) -> bool {
+    match divi_wallet::decode_wif(wif) {
+        Ok(k) => {
+            let main = |n: divi_wallet::Network| n == divi_wallet::Network::Mainnet;
+            main(k.network) == main(network)
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +187,14 @@ mod tests {
             s.set(k, v, false);
         }
         MasternodeOptions::from_settings(&s, dir)
+    }
+
+    /// A throwaway regtest key made for these tests only (test fixture)
+    fn regtest_key() -> String {
+        let key = divi_crypto::keys::SecretKey::new_random();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(key.as_bytes());
+        divi_wallet::encode_wif(&bytes, true, divi_wallet::Network::Regtest)
     }
 
     /// -mnconf names masternode.conf, relative to the data directory; a missing
@@ -142,5 +234,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.read_conf().unwrap().len(), 1);
+    }
+
+    /// -masternode: txindex, then -masternodeaddr, then the alias, then the
+    /// key (-masternodeprivkey over the entry's), each with divid's text;
+    /// past them irondivid stops with its own
+    #[test]
+    fn masternode_checks_in_divid_s_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = divi_wallet::Network::Regtest;
+        let good = regtest_key();
+        let entry = |key: &str| ConfLine {
+            alias: "mn1".into(),
+            ip: "127.0.0.2:1".into(),
+            priv_key: key.into(),
+            tx_hash: "11".repeat(32),
+            out_idx: "0".into(),
+        };
+        let check = |o: &[(&str, &str)], e: &[ConfLine], txindex: bool| {
+            opts(o, dir.path()).check_start(e, txindex, net)
+        };
+        assert_eq!(check(&[], &[], false), Ok(()));
+        assert!(check(&[("masternode", "mn1")], &[], false)
+            .unwrap_err()
+            .starts_with(
+                "Enabling Masternode support requires turning on transaction indexing.Please"
+            ));
+        assert_eq!(
+            check(
+                &[("masternode", "mn1"), ("masternodeaddr", "garbage")],
+                &[],
+                true
+            ),
+            Err("Invalid -masternodeaddr address: garbage".into())
+        );
+        assert_eq!(
+            check(&[("masternode", "mn1")], &[], true),
+            Err("Unknown masternode configuration for masternode=<alias>.".into())
+        );
+        let bad = "Invalid masternodeprivkey. Please see documenation.".to_string();
+        assert_eq!(
+            check(&[("masternode", "mn1")], &[entry("notakey")], true),
+            Err(bad.clone())
+        );
+        assert_eq!(
+            check(
+                &[("masternode", "mn1"), ("masternodeprivkey", "notakey")],
+                &[entry(&good)],
+                true
+            ),
+            Err(bad)
+        );
+        let runs = check(
+            &[
+                ("masternode", "mn1"),
+                ("masternodeprivkey", &good),
+                ("masternodeaddr", "127.0.0.2:53790"),
+            ],
+            &[entry("notakey")],
+            true,
+        );
+        assert!(runs
+            .unwrap_err()
+            .contains("irondivid does not run as a masternode"));
     }
 }

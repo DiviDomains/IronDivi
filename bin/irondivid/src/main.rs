@@ -306,9 +306,6 @@ const UNSUPPORTED_OPTIONS: &[&str] = &[
     "litemode",
     "logips",
     "logtimestamps",
-    "masternode",
-    "masternodeaddr",
-    "masternodeprivkey",
     "maxreceivebuffer",
     "maxsendbuffer",
     "mining",
@@ -723,6 +720,9 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
     const APPLIED: &[&str] = &[
         "vault",
         // read by masternode_options
+        "masternode",
+        "masternodeaddr",
+        "masternodeprivkey",
         "mnconf",
         "mnconflock",
         "rescan",
@@ -798,15 +798,7 @@ fn apply_settings(config: &mut NodeConfig, settings: &Settings) -> Result<()> {
             continue;
         }
         if UNSUPPORTED_OPTIONS.contains(&k) {
-            if k == "masternode" {
-                // divid reads -masternode=<alias> as "run as the masternode
-                // <alias> of masternode.conf" and refuses to start without it
-                // (MasternodeModule.cpp:163-190); irondivid cannot run as one
-                anyhow::bail!(
-                    "-masternode={}: irondivid does not run as a masternode; remove the masternode= line to start it",
-                    settings.get("masternode").unwrap_or("")
-                );
-            } else if k == "checklevel" {
+            if k == "checklevel" {
                 // divid refuses any -checklevel: it always checks at level 4
                 // (init.cpp:782-784)
                 anyhow::bail!(
@@ -1670,9 +1662,18 @@ async fn run_daemon(
     // One process per data directory, held until this one exits
     // (TryLockDataDirectory, init.cpp:850-862)
     let _datadir_lock = lock_data_dir(&config.data_dir)?;
-    // divid reads masternode.conf (-mnconf) at every start and makes it when
-    // missing (MasternodeModule.cpp:210-219; init.cpp:1594-1597)
-    mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
+    // divid reads masternode.conf (-mnconf) at every start, makes it when
+    // missing, and with -masternode checks the masternode's settings
+    // (MasternodeModule.cpp:210-240; init.cpp:1594-1597)
+    let mn_entries = mn_options.read_conf().map_err(|e| anyhow::anyhow!(e))?;
+    let mn_network = match config.network.network_type {
+        NetworkType::Mainnet => WalletNetwork::Mainnet,
+        NetworkType::Testnet => WalletNetwork::Testnet,
+        NetworkType::Regtest => WalletNetwork::Regtest,
+    };
+    mn_options
+        .check_start(&mn_entries, config.index.txindex, mn_network)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Divi Core Discover: the interfaces' addresses (net.cpp:1385-1425)
     if config.p2p.discover {
@@ -4297,18 +4298,18 @@ mod divid_option_tests {
         assert!(cfg("rpcuser=x\n").staking.enabled);
     }
 
-    /// divid reads any masternode=<alias> as running as that masternode and
-    /// refuses to start when it cannot; irondivid cannot run as one at all.
-    /// masternodeprivkey and masternodeaddr alone do nothing in either.
+    /// The masternode options are read when the node starts, after
+    /// masternode.conf, in divid's order (masternode_options); building the
+    /// configuration takes them without a word
     #[test]
-    fn a_masternode_line_is_refused() {
+    fn masternode_lines_are_checked_at_the_start() {
         for value in ["1", "0", "mn1"] {
             let conf = format!("rpcuser=x\nmasternode={}\n", value);
-            assert!(cfg_in("irondivi.conf", &conf, &[]).is_err(), "{value}");
+            assert!(cfg_in("irondivi.conf", &conf, &[]).is_ok(), "{value}");
         }
         let c = cfg_in(
             "irondivi.conf",
-            "rpcuser=x\nmasternodeprivkey=abc\nmasternodeaddr=1.2.3.4:51472\n",
+            "rpcuser=x\nmasternodeprivkey=abc\nmasternodeaddr=1.2.3.4:51472\nmnconf=x.conf\nmnconflock=0\n",
             &[],
         );
         assert!(c.is_ok());
