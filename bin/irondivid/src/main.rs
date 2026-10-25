@@ -3261,70 +3261,30 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Handle daemonization BEFORE initializing tokio runtime (Unix only)
+    // -daemon as Divi Core's AppInit does it, before the tokio runtime: the
+    // line on stdout, one fork, the parent exits 0 and the child calls setsid,
+    // keeping its working directory and its standard streams (divid.cpp:122-140)
     #[cfg(unix)]
     if args.daemon {
-        use std::os::unix::io::AsRawFd;
-
-        // Ensure data directory exists before daemonizing
-        if let Err(e) = std::fs::create_dir_all(&data_dir) {
-            eprintln!("Failed to create data directory {:?}: {}", data_dir, e);
-            std::process::exit(1);
-        }
-
-        let log_file = data_dir.join("debug.log");
-
-        // Divi Core's line before it forks (divid.cpp:124)
         println!("DIVI server starting");
-        {
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
-        }
-
-        // First fork
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
         match unsafe { libc::fork() } {
             -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "Error: fork() returned -1 errno {}",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                );
                 std::process::exit(1);
             }
-            pid if pid > 0 => std::process::exit(0), // Parent exits
-            _ => {}                                  // Child continues
+            pid if pid > 0 => std::process::exit(0), // the parent
+            _ => {}                                  // the child goes on
         }
-
-        // Create new session
         if unsafe { libc::setsid() } == -1 {
-            eprintln!("Failed to setsid: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
-        }
-
-        // Second fork (prevent reacquiring a controlling terminal)
-        match unsafe { libc::fork() } {
-            -1 => {
-                eprintln!("Failed to fork: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-            pid if pid > 0 => std::process::exit(0), // Intermediate parent exits
-            _ => {}                                  // Grandchild continues
-        }
-
-        // Set working directory
-        let _ = std::env::set_current_dir(&data_dir);
-
-        // Redirect stdout/stderr to log file
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to open log file: {}", e);
-                std::process::exit(1);
-            });
-        let log_fd = log.as_raw_fd();
-        unsafe {
-            libc::dup2(log_fd, libc::STDOUT_FILENO);
-            libc::dup2(log_fd, libc::STDERR_FILENO);
-            // Close stdin
-            libc::close(libc::STDIN_FILENO);
+            eprintln!(
+                "Error: setsid() returned -1 errno {}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            );
         }
     }
 

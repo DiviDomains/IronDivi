@@ -233,3 +233,20 @@ fn daemon_parent_says_divi_server_starting() {
     assert_eq!(out.lines().next(), Some("DIVI server starting"), "{out}");
     assert!(child.is_some(), "the child answered and wrote its pid file");
 }
+
+/// divid's `-daemon` child keeps the working directory and the standard
+/// streams it was started with: it calls setsid and nothing else
+/// (divid.cpp:132-139)
+#[test]
+fn daemon_child_keeps_its_directory_and_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (code, _, child, rpc_port) = start_daemon(dir.path(), cwd.path());
+    let pid = child.expect("the child answered and wrote its pid file");
+    let where_ = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    let stdout = std::fs::read_link(format!("/proc/{pid}/fd/1")).ok();
+    stop_daemon(child, rpc_port);
+    assert_eq!(code, Some(0));
+    assert_eq!(where_, Some(cwd.path().to_path_buf()));
+    assert_eq!(stdout, Some(cwd.path().join("out")));
+}
