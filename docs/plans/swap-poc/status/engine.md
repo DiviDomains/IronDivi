@@ -435,3 +435,50 @@
 - left: `Lost` is detected, not prevented: once the claim is evicted past the maker-leg locktime the swap is gone. A fee bump or CPFP of the claim, or claiming earlier with a wider gap between the two locktimes, would narrow that window; none is in scope here. The mock does not model mempool replacement by fee, so the tests cover eviction and resend, not a race between two mempool spends. No live run.
 - needs: nothing
 - decisions: `Lost` needs the taker-leg claim to be as deep as the quote's confirmations, so a shallow or reorged claim keeps the swap in `Refunded` and retrying. Only a claim carrying our preimage counts, so our own refund confirming still ends `Done`. The CLI treats `Lost` as an error, not a result. No timeout, confirmation count, margin, route or schema value changed.
+
+## 2026-10-25 round: claim-deadline (builder DJ, `lane/claim-deadline`, on `lane/swap-model-proptest`)
+- why: a wider gap between the locktimes does not fix the leaked-preimage loss DH found. Once a claim is in a mempool, the maker can claim the taker leg any time before the taker-leg locktime. The taker keeps the maker leg only if its claim confirms before the maker-leg locktime. So the defence is a claim that starts early enough and pays enough.
+- done 1 (361e630): `ClaimDeadline` (`crates/divi-swap/src/config.rs`) is a per-chain margin. The taker sends its first maker-leg claim only while both `min_blocks x block_secs` and `min_secs` remain before the maker-leg locktime. This mirrors the maker-leg floor and taker-term-floor checks. Below the margin it never reveals the preimage: it records `claim_declined`, on both the first-sight and the verified-lock paths, and waits for its taker-leg refund. Defaults:
+  - BTC: 6 x 600 s / 3600 s. With Poisson blocks, P(no block in 6 intervals) = e^-6 ≈ 0.25%; the old 1800 s was 3 blocks, ≈ 5%.
+  - LTC: 12 x 150 s / 1800 s (e^-12).
+  - ZEC: 24 x 75 s / 1800 s. ZEC cannot bump, so it needs the widest count.
+  - DIVI: 30 x 60 s / 1800 s. DIVI cannot bump and has no eviction.
+  - USDC: 150 x 12 s / 1800 s. The seconds floor binds.
+  - XMR: 15 x 120 s / 1800 s. Not used by this engine.
+  - `Taker::with_claim_deadline` overrides one chain.
+- done 2 (adb1ffa): fee escalation on the resent claim. `FeeEscalation` starts at 2 x the margin before the locktime and reaches its cap at margin / 2. The target is geometric between the two. The cap is `min(cap_feerate, 50 x first feerate)`: BTC 1000 sat/vB, LTC 500 sat/vB, none elsewhere. Each bump is persisted before broadcast (`claim_base_feerate`, `claim_feerate`, `claim_replaced`, `claim_children`) and logged at info level: swap id, chain, kind, old and new feerate, txid, seconds left. The backend's `FeeBump` sets the bump kind; each choice is from node source, read-only:
+  - BTC, `Rbf`: Bitcoin Core v28.1 has full RBF on by default (`src/kernel/mempool_options.h:25` `DEFAULT_MEMPOOL_FULL_RBF{true}`, `src/validation.cpp:843-845`). Claims now also signal BIP125 (`ENABLE_RBF_NO_LOCKTIME`).
+  - LTC, `Cpfp`: Litecoin Core v0.21.4 refuses replacements (`src/validation.cpp:641-655`; `src/validation.h:80` `DEFAULT_ENABLE_REPLACEMENT=false`). Its miner selects packages by ancestor feerate (`src/miner.cpp:159,351` `addPackageTxs`), so a child spending the claim output raises it.
+  - DIVI, `None`: DIVI Core ab3bf31 rejects any conflict ("Disable replacement feature for now", `divi/src/MempoolConsensus.cpp:303-313`). Its block assembler orders single transactions by their own fee and priority, not by package (`BlockMemoryPoolTransactionCollector.cpp:66-83,110-119,149-163,170-176,196-235`), so CPFP does nothing. It has no TrimToSize, maxmempool or expiry, so a claim is never evicted for its fee.
+  - ZEC, `None`: zcashd v6.10.0 rejects any spend conflict (`src/main.cpp:1833-1846`). Its miner orders by ZIP-317 weight, not ancestor feerate (`src/miner.cpp:501-510,628-645,684-686`). It evicts by ZIP-401 weighted random choice (`src/mempool_limit.cpp:42-51`, `mempool_limit.h:20-24`, `src/txmempool.cpp:316-323`). zebra v2.5.0 is the same: conflicts are rejected (`zebrad/src/components/mempool/storage/verified_set.rs:150-151,302-312`), eviction is ZIP-401 random (`storage.rs:70-75,279-304`) and the block template is ZIP-317 weighted random (`zebra-rpc/src/methods/types/get_block_template/zip317.rs:72-77,170`). The ZEC claim already pays at least the ZIP-317 conventional fee (`swap-chain-zec` `tx.rs:1081-1108`).
+- deviation from the brief: the brief said CPFP where a chain does not relay replacements. DIVI and ZEC get `None` instead, because on both CPFP is inert in block selection; a child would cost a fee and change nothing. They rely on the margin, which is why their block counts are the widest. This needs the Manager's confirmation.
+- done 3 (3c876c9): MockChain models a fee market:
+  - a block floor below which nothing is mined, with CPFP packages pulled in by their package feerate;
+  - a mempool floor that evicts and refuses lower-paying spends;
+  - BIP125 rules 3/4 replacement, scored over the package with descendants, for both claims and refunds;
+  - a configurable refund feerate.
+  `tests/claim_race.rs` runs the real Maker and Taker against random markets with a hostile maker. The maker refunds its leg as soon as the locktime allows, although it saw the claim. Property: with escalation on and the margin held, the taker is never `Lost`; it ends `Done`; and its claim confirmed exactly when the preimage was out. The race found two stalls, both fixed in the same commit:
+  - an evicted claim, refused on rebroadcast, was re-signed at the estimate forever. `claim_refused` now keeps a version the chain holds, or re-signs higher (at most the cap);
+  - the quarter-step rule could leave the claim short of the cap. `should_bump` allows the last step.
+- proof:
+  - fail-first 1 (88a6c6b): the deadline tests end `Claimed` where `MakerLockConfirmed`/`Locked` was required (rc=101).
+  - fail-first 2: with the escalate call removed, 4 of 5 `taker_fee_escalation` tests fail (rc=101). Before the fallback fix, the refused-rebroadcast test panicked "never forgets the claim while bumped".
+  - fail-first 3: new mock and race with the step-2 taker gives `Lost`, shrunk to BTC, estimate 1, floors `[(40, 0), (40, 40)]`; both congested markets end refunded and unclaimed (rc=101).
+  - planted bug: escalation off in the property gives `Lost`, shrunk to LTC, estimate 3, floors `[(74, 0), (74, 74)]` (rc=101). It was not committed and the regression file was deleted. With escalation off but the other assertions kept, the first failure is LTC stuck in `Claimed`: Litecoin will not let the refund replace the claim.
+  - `PROPTEST_CASES=2000`: passes in 39.1 s.
+  - suite counts, clippy and fmt are in `~/swap-lanes/builders/DJ/STATUS.md`.
+- left:
+  - the DIVI/ZEC `None` decision needs the Manager's confirmation;
+  - USDC/EVM nonce replacement of the claim is out of scope;
+  - the CLI `flow.rs:64` still validates against the 1800 s floor;
+  - with the BTC testnet profile's timeouts, the worst-case window between the margin and the locktime is about 0, so a late taker simply declines;
+  - the mock's eviction is by feerate, not ZIP-401 random;
+  - mock `forget` does not undo claim credits;
+  - an honest maker never refunds after a leak, so the race uses an out-of-band hostile refund;
+  - no live run.
+- needs: the Manager's yes or no on DIVI/ZEC `None`.
+- decisions:
+  - the taker declines rather than claim late, and records why;
+  - the cap is the lower of a hard feerate and 50 x the first feerate;
+  - every bumped version is kept, because any of them may confirm;
+  - no confirmation count, timeout, route or `deploy/` change. The store schema only gains defaulted fields, and the fixture was regenerated.
